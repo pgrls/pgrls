@@ -19,6 +19,13 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
+    """Loaded configuration.
+
+    `frozen=True` prevents field reassignment but does NOT freeze the list and
+    dict fields. Callers must treat `schemas`, `disable`, and `rule_options` as
+    read-only — do not mutate them in place.
+    """
+
     database_url: str | None = None
     schemas: list[str] = field(default_factory=lambda: ["public"])
     disable: list[str] = field(default_factory=list)
@@ -55,14 +62,27 @@ def _read_toml(path: Path) -> dict[str, Any]:
             return tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read config {path}: {exc}") from exc
 
 
 def _build_config(raw: dict[str, Any]) -> Config:
     database = raw.get("database", {})
+    if not isinstance(database, dict):
+        raise ConfigError("[database] must be a table")
     lint = raw.get("lint", {})
+    if not isinstance(lint, dict):
+        raise ConfigError("[lint] must be a table")
 
     url_raw = database.get("url")
-    database_url = _interpolate_env(url_raw) if isinstance(url_raw, str) else None
+    if url_raw is None:
+        database_url = None
+    elif isinstance(url_raw, str):
+        database_url = _interpolate_env(url_raw)
+    else:
+        raise ConfigError(
+            f"[database].url must be a string, got {type(url_raw).__name__}"
+        )
 
     schemas = database.get("schemas", ["public"])
     if not isinstance(schemas, list) or not all(isinstance(s, str) for s in schemas):
@@ -78,8 +98,11 @@ def _build_config(raw: dict[str, Any]) -> Config:
             f"[lint].fail_on must be one of {_VALID_FAIL_ON}, got {fail_on!r}"
         )
 
+    rules_raw = lint.get("rules", {})
+    if not isinstance(rules_raw, dict):
+        raise ConfigError("[lint.rules] must be a table")
     rule_options: dict[str, dict[str, Any]] = {}
-    for rule_id, opts in lint.get("rules", {}).items():
+    for rule_id, opts in rules_raw.items():
         if not isinstance(opts, dict):
             raise ConfigError(f"[lint.rules.{rule_id}] must be a table")
         rule_options[rule_id] = dict(opts)
