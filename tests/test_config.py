@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -83,3 +82,38 @@ def test_auto_discovers_pgrls_toml_in_cwd(
     (tmp_path / "pgrls.toml").write_text('[database]\nurl = "postgres://auto/db"\n')
     cfg = load_config(path=None)
     assert cfg.database_url == "postgres://auto/db"
+
+
+def test_explicit_path_does_not_exist_raises(tmp_path: Path) -> None:
+    missing = tmp_path / "does_not_exist.toml"
+    with pytest.raises(ConfigError, match="not found"):
+        load_config(path=missing)
+
+
+def test_database_section_must_be_a_table(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('database = "not-a-table"\n')
+    with pytest.raises(ConfigError, match=r"\[database\]"):
+        load_config(path=cfg_file)
+
+
+def test_url_must_be_a_string(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("[database]\nurl = 42\n")
+    with pytest.raises(ConfigError, match="url"):
+        load_config(path=cfg_file)
+
+
+def test_env_interpolation_does_not_apply_to_disable_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHOULD_NOT_EXPAND", "expanded-value")
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        """
+[lint]
+disable = ["$SHOULD_NOT_EXPAND"]
+"""
+    )
+    cfg = load_config(path=cfg_file)
+    assert cfg.disable == ["$SHOULD_NOT_EXPAND"]
