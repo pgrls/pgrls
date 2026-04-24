@@ -18,6 +18,7 @@ def main() -> None:
     envvar="DATABASE_URL",
     help="Postgres connection string. Falls back to $DATABASE_URL.",
 )
+# When --config is omitted, load_config() in Task 3 auto-discovers ./pgrls.toml.
 @click.option(
     "--config",
     "config_path",
