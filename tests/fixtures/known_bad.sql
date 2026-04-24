@@ -1,4 +1,4 @@
--- Two tables; only `users` lacks RLS, `orders` has it enabled.
+-- Two tables: only `users` lacks RLS, `orders` has it enabled.
 -- SEC001 should fire on `public.users` and not on `public.orders`.
 
 CREATE TABLE public.users (

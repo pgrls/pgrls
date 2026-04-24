@@ -6,7 +6,7 @@ between tests so each test starts from a clean DB.
 """
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 import psycopg
 import pytest
@@ -16,7 +16,7 @@ from testcontainers.postgres import PostgresContainer
 @pytest.fixture(scope="session")
 def pg_url() -> Generator[str, None, None]:
     with PostgresContainer("postgres:16-alpine", username="postgres", password="postgres", dbname="postgres") as pg:
-        yield pg.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
+        yield pg.get_connection_url(driver=None)
 
 
 @pytest.fixture
@@ -31,11 +31,10 @@ def pg_conn(pg_url: str) -> Generator[psycopg.Connection, None, None]:
 
 
 @pytest.fixture
-def apply_sql(pg_conn: psycopg.Connection):
+def apply_sql(pg_conn: psycopg.Connection) -> Callable[[str], None]:
     def _apply(sql: str) -> None:
-        # Naive `;` split — fine for our test fixtures (no PL/pgSQL bodies),
-        # avoids depending on psycopg's multi-statement behavior which varies
-        # between protocol modes.
+        # Naive `;` split — fine for our test fixtures.
+        # Constraint on fixtures: no PL/pgSQL bodies, no `;` in `--` comments.
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         with pg_conn.cursor() as cur:
             for statement in statements:
