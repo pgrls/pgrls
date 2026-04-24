@@ -1,0 +1,17 @@
+# Copy this file to `pgrls.toml` and adjust.
+# Environment variables can be referenced as `$VAR` or `${VAR}`.
+
+[database]
+url = "$DATABASE_URL"
+schemas = ["public"]
+
+[lint]
+# Rule IDs to skip entirely.
+disable = []
+# Severity that triggers a nonzero exit code: "error" | "warning" | "info".
+fail_on = "warning"
+
+# Per-rule options.
+[lint.rules.SEC001]
+# Tables (without schema prefix) where missing RLS is acceptable.
+allowlist = []
