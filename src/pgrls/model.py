@@ -5,7 +5,7 @@ Currently version 1.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
@@ -19,7 +19,7 @@ class Policy:
     name: str
     command: Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
     permissive: bool
-    roles: list[str]
+    roles: tuple[str, ...]
     using_sql: str | None
     with_check_sql: str | None
 
@@ -34,7 +34,7 @@ class Table:
     name: str
     rls_enabled: bool
     force_rls: bool
-    policies: list[Policy]
+    policies: tuple[Policy, ...]
 
     @property
     def qualified_name(self) -> str:
@@ -43,7 +43,7 @@ class Table:
 
 @dataclass(frozen=True)
 class Schema:
-    tables: list[Table] = field(default_factory=list)
+    tables: tuple[Table, ...] = ()
 
     def to_snapshot(self) -> Snapshot:
         return {
@@ -52,7 +52,7 @@ class Schema:
                 {
                     "schema": t.schema,
                     "name": t.name,
-                    "rls": t.rls_enabled,
+                    "rls_enabled": t.rls_enabled,
                     "force_rls": t.force_rls,
                 }
                 for t in self.tables
@@ -60,6 +60,9 @@ class Schema:
             "policies": [
                 {
                     "id": f"{t.schema}.{t.name}.{p.name}",
+                    "table_schema": t.schema,
+                    "table_name": t.name,
+                    "policy_name": p.name,
                     "command": p.command,
                     "permissive": p.permissive,
                     "roles": list(p.roles),
