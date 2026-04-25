@@ -104,6 +104,38 @@ def test_snapshot_is_json_serializable() -> None:
     assert '"rls_enabled": false' in text
 
 
+def test_snapshot_policy_ordering_is_deterministic() -> None:
+    p1 = Policy(
+        name="p1", command="SELECT", permissive=True, roles=("a",),
+        using_sql=None, with_check_sql=None,
+    )
+    p2 = Policy(
+        name="p2", command="UPDATE", permissive=True, roles=("b",),
+        using_sql=None, with_check_sql=None,
+    )
+    p3 = Policy(
+        name="p3", command="DELETE", permissive=False, roles=("c",),
+        using_sql=None, with_check_sql=None,
+    )
+    table_a = Table(
+        schema="public", name="a",
+        rls_enabled=True, force_rls=False,
+        policies=(p1, p2),
+    )
+    table_b = Table(
+        schema="public", name="b",
+        rls_enabled=True, force_rls=False,
+        policies=(p3,),
+    )
+    schema = Schema(tables=(table_a, table_b))
+
+    snap1 = schema.to_snapshot()
+    snap2 = schema.to_snapshot()
+    assert snap1 == snap2
+    policy_ids = [p["id"] for p in snap1["policies"]]
+    assert policy_ids == ["public.a.p1", "public.a.p2", "public.b.p3"]
+
+
 def test_model_classes_are_hashable() -> None:
     """Frozen dataclasses with tuple fields should be hashable for set/dict use."""
     p = Policy(

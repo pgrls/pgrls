@@ -62,3 +62,24 @@ def test_text_summary_pluralizes_for_multiple_violations() -> None:
     out = format_violations(vs, format="text")
     assert "2 errors" in out
     assert "1 error" not in out
+
+
+def test_text_summary_with_all_three_severities() -> None:
+    vs = [
+        Violation(
+            rule_id="SEC001", severity="error", title="t",
+            message="m", location="public.a",
+        ),
+        Violation(
+            rule_id="SEC002", severity="warning", title="t",
+            message="m", location="public.b",
+        ),
+        Violation(
+            rule_id="HYG001", severity="info", title="t",
+            message="m", location="public.c",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    assert "1 error" in out
+    assert "1 warning" in out
+    assert "1 info" in out
