@@ -23,6 +23,16 @@ def pg_url() -> Generator[str, None, None]:
 def pg_conn(pg_url: str) -> Generator[psycopg.Connection, None, None]:
     with psycopg.connect(pg_url, autocommit=True) as conn:
         with conn.cursor() as cur:
+            # Drop all non-system schemas (handles custom schemas created by tests).
+            cur.execute(
+                """
+                SELECT schema_name FROM information_schema.schemata
+                WHERE schema_name NOT IN ('public', 'information_schema')
+                  AND schema_name NOT LIKE 'pg_%'
+                """
+            )
+            for (schema_name,) in cur.fetchall():
+                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
             cur.execute("CREATE SCHEMA public")
             cur.execute("GRANT ALL ON SCHEMA public TO postgres")
