@@ -33,6 +33,12 @@ Limit the scan to specific schemas:
 pgrls lint --schemas public,tenant
 ```
 
+Point at a non-default config file, or pick an output format:
+
+```bash
+pgrls lint --config ./config/pgrls.toml --format text
+```
+
 ### Example output
 
 ```
