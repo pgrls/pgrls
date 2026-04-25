@@ -1,7 +1,8 @@
 """Rule protocol and registry.
 
-Rule discovery happens here. SEC001 is registered eagerly. When more rules land,
-add their imports below.
+Rule discovery happens here. SEC001 is registered lazily on first call to
+all_rules() or default_registry(). When more rules land, add their imports
+to _build_default_registry() below.
 """
 from __future__ import annotations
 
@@ -25,6 +26,11 @@ class RuleRegistry:
         self._rules: dict[str, Rule] = {}
 
     def register(self, rule: Rule) -> None:
+        if not isinstance(rule, Rule):
+            raise TypeError(
+                f"Expected a Rule, got {type(rule).__name__!r}. "
+                "Ensure the class defines id, severity, title, and check()."
+            )
         if rule.id in self._rules:
             raise ValueError(f"Rule {rule.id!r} is already registered")
         self._rules[rule.id] = rule
@@ -45,17 +51,14 @@ def _build_default_registry() -> RuleRegistry:
     return registry
 
 
-def all_rules() -> list[Rule]:
-    """Return every rule shipped with pgrls."""
-    global _DEFAULT_REGISTRY
-    if _DEFAULT_REGISTRY is None:
-        _DEFAULT_REGISTRY = _build_default_registry()
-    return _DEFAULT_REGISTRY.enabled(disabled_ids=[])
-
-
 def default_registry() -> RuleRegistry:
     """Return the registry of all built-in rules."""
     global _DEFAULT_REGISTRY
     if _DEFAULT_REGISTRY is None:
         _DEFAULT_REGISTRY = _build_default_registry()
     return _DEFAULT_REGISTRY
+
+
+def all_rules() -> list[Rule]:
+    """Return every rule shipped with pgrls."""
+    return default_registry().enabled(disabled_ids=[])
