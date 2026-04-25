@@ -2,7 +2,9 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from pgrls.cli import main
+from pgrls.cli import _merge_overrides, _should_fail, main
+from pgrls.config import Config
+from pgrls.violations import Violation
 
 
 def test_root_help_lists_lint():
@@ -24,7 +26,7 @@ def test_root_version_flag():
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.0.1" in result.output
+    assert "0.0.2" in result.output
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -122,3 +124,88 @@ def test_lint_bad_allowlist_type_errors_clearly(pg_url: str, tmp_path) -> None:
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "allowlist" in result.output
+
+
+def test_lint_allowlist_via_config_exempts_table(pg_url: str, apply_sql, tmp_path) -> None:
+    apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[lint.rules.SEC001]\nallowlist = ["users"]\n')
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "SEC001" not in result.output
+
+
+def test_lint_fail_on_info_flag_accepted(pg_url: str, apply_sql) -> None:
+    apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--fail-on", "info"]
+    )
+    assert result.exit_code == 1, result.output
+    assert "SEC001" in result.output
+
+
+def _violation(severity: str) -> Violation:
+    return Violation(
+        rule_id="X",
+        severity=severity,  # type: ignore[arg-type]
+        title="t",
+        message="m",
+        location=None,
+    )
+
+
+def test_should_fail_returns_true_when_violation_meets_threshold() -> None:
+    assert _should_fail([_violation("error")], threshold="error") is True
+    assert _should_fail([_violation("error")], threshold="warning") is True
+    assert _should_fail([_violation("error")], threshold="info") is True
+    assert _should_fail([_violation("warning")], threshold="warning") is True
+    assert _should_fail([_violation("warning")], threshold="info") is True
+    assert _should_fail([_violation("info")], threshold="info") is True
+
+
+def test_should_fail_returns_false_below_threshold() -> None:
+    assert _should_fail([_violation("warning")], threshold="error") is False
+    assert _should_fail([_violation("info")], threshold="warning") is False
+    assert _should_fail([_violation("info")], threshold="error") is False
+    assert _should_fail([], threshold="info") is False
+
+
+def test_merge_overrides_cli_takes_precedence_over_config() -> None:
+    config = Config(
+        database_url="postgres://config",
+        schemas=["config_schema"],
+        disable=[],
+        fail_on="error",
+        rule_options={},
+    )
+    merged = _merge_overrides(
+        config,
+        database_url="postgres://cli",
+        schemas_csv="cli_a,cli_b",
+        fail_on="warning",
+    )
+    assert merged.database_url == "postgres://cli"
+    assert merged.schemas == ["cli_a", "cli_b"]
+    assert merged.fail_on == "warning"
+
+
+def test_merge_overrides_falls_back_to_config_when_cli_missing() -> None:
+    config = Config(
+        database_url="postgres://config",
+        schemas=["config_schema"],
+        disable=["X"],
+        fail_on="error",
+        rule_options={"R": {"k": "v"}},
+    )
+    merged = _merge_overrides(
+        config, database_url=None, schemas_csv=None, fail_on=None
+    )
+    assert merged.database_url == "postgres://config"
+    assert merged.schemas == ["config_schema"]
+    assert merged.fail_on == "error"
+    assert merged.disable == ["X"]
+    assert merged.rule_options == {"R": {"k": "v"}}
