@@ -13,5 +13,5 @@ fail_on = "warning"
 
 # Per-rule options.
 [lint.rules.SEC001]
-# Tables (without schema prefix) where missing RLS is acceptable.
+# Tables where missing RLS is acceptable. Entries can be unqualified (countries) or qualified (tenant.things).
 allowlist = []

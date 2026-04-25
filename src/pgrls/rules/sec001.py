@@ -1,4 +1,4 @@
-"""SEC001 — RLS not enabled on a public-schema table.
+"""SEC001 — RLS not enabled on a table in a configured schema.
 
 DESIGN.md §4 detection: `pg_class.relrowsecurity = false` in the configured
 schemas, minus the per-rule `allowlist`. Allowlist entries can be unqualified
