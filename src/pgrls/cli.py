@@ -28,7 +28,6 @@ def main() -> None:
     envvar="DATABASE_URL",
     help="Postgres connection string. Falls back to $DATABASE_URL.",
 )
-# When --config is omitted, load_config() in Task 3 auto-discovers ./pgrls.toml.
 @click.option(
     "--config",
     "config_path",
@@ -88,7 +87,10 @@ def lint(
     except ValueError as exc:
         raise click.ClickException(str(exc))
 
-    violations = _run_rules(schema, config=effective)
+    try:
+        violations = _run_rules(schema, config=effective)
+    except (TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc))
 
     click.echo(format_violations(violations, format=output_format), nl=False)
 

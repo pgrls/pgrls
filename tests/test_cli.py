@@ -108,3 +108,17 @@ def test_lint_empty_schemas_errors_clearly(pg_url: str) -> None:
     )
     assert result.exit_code != 0
     assert "empty schema list" in result.output.lower()
+
+
+def test_lint_bad_allowlist_type_errors_clearly(pg_url: str, tmp_path) -> None:
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[lint.rules.SEC001]\nallowlist = "users"\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "allowlist" in result.output
