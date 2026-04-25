@@ -9,7 +9,7 @@ import pytest
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def pgrls_bin() -> str:
     binary = shutil.which("pgrls")
     if binary is None:
@@ -25,6 +25,8 @@ def test_subprocess_known_bad_exits_nonzero(
         [pgrls_bin, "lint", "--database-url", pg_url],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        timeout=30,
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "SEC001" in result.stdout
@@ -45,5 +47,8 @@ def test_subprocess_clean_db_exits_zero(
         [pgrls_bin, "lint", "--database-url", pg_url],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "no issues" in result.stdout.lower()
