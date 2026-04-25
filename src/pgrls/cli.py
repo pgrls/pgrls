@@ -1,9 +1,18 @@
 """Click entry point for the `pgrls` console script."""
 from __future__ import annotations
 
+import sys
+
 import click
+import psycopg
 
 from pgrls import __version__
+from pgrls.config import Config, ConfigError, load_config
+from pgrls.formatters import SUPPORTED_FORMATS, format_violations
+from pgrls.introspect import introspect
+from pgrls.model import Schema
+from pgrls.rules import default_registry
+from pgrls.violations import Violation, is_at_or_above
 
 
 @click.group()
@@ -37,11 +46,82 @@ def main() -> None:
     default=None,
     help="Severity threshold that triggers nonzero exit.",
 )
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(SUPPORTED_FORMATS, case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
 def lint(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
     fail_on: str | None,
+    output_format: str,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
-    raise click.ClickException("not implemented yet")
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc))
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=fail_on,
+    )
+
+    if effective.database_url is None:
+        raise click.ClickException(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+    except psycopg.Error as exc:
+        raise click.ClickException(f"Database error: {exc}")
+
+    violations = _run_rules(schema, config=effective)
+
+    click.echo(format_violations(violations, format=output_format), nl=False)
+
+    if _should_fail(violations, threshold=effective.fail_on):
+        sys.exit(1)
+
+
+def _merge_overrides(
+    config: Config,
+    *,
+    database_url: str | None,
+    schemas_csv: str | None,
+    fail_on: str | None,
+) -> Config:
+    schemas = (
+        [s.strip() for s in schemas_csv.split(",") if s.strip()]
+        if schemas_csv
+        else config.schemas
+    )
+    return Config(
+        database_url=database_url or config.database_url,
+        schemas=schemas,
+        disable=list(config.disable),
+        fail_on=fail_on or config.fail_on,  # type: ignore[arg-type]
+        rule_options=dict(config.rule_options),
+    )
+
+
+def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
+    registry = default_registry()
+    rules = registry.enabled(disabled_ids=config.disable)
+    out: list[Violation] = []
+    for rule in rules:
+        out.extend(rule.check(schema, config.rule_options.get(rule.id, {})))
+    return out
+
+
+def _should_fail(violations: list[Violation], *, threshold: str) -> bool:
+    return any(is_at_or_above(v.severity, threshold) for v in violations)  # type: ignore[arg-type]
