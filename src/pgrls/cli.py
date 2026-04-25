@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from typing import cast
 
 import click
 import psycopg
@@ -12,7 +13,7 @@ from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.rules import default_registry
-from pgrls.violations import Violation, is_at_or_above
+from pgrls.violations import Severity, Violation, is_at_or_above
 
 
 @click.group()
@@ -84,6 +85,8 @@ def lint(
             schema = introspect(conn, schemas=effective.schemas)
     except psycopg.Error as exc:
         raise click.ClickException(f"Database error: {exc}")
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
 
     violations = _run_rules(schema, config=effective)
 
@@ -100,16 +103,23 @@ def _merge_overrides(
     schemas_csv: str | None,
     fail_on: str | None,
 ) -> Config:
-    schemas = (
-        [s.strip() for s in schemas_csv.split(",") if s.strip()]
-        if schemas_csv
-        else config.schemas
+    if schemas_csv:
+        schemas = [s.strip() for s in schemas_csv.split(",") if s.strip()]
+        if not schemas:
+            raise click.ClickException(
+                f"--schemas {schemas_csv!r} produced an empty schema list. "
+                "Check for trailing commas or whitespace-only values."
+            )
+    else:
+        schemas = config.schemas
+    effective_fail_on: Severity = (
+        cast(Severity, fail_on) if fail_on is not None else config.fail_on
     )
     return Config(
         database_url=database_url or config.database_url,
         schemas=schemas,
         disable=list(config.disable),
-        fail_on=fail_on or config.fail_on,  # type: ignore[arg-type]
+        fail_on=effective_fail_on,
         rule_options=dict(config.rule_options),
     )
 
@@ -123,5 +133,5 @@ def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
     return out
 
 
-def _should_fail(violations: list[Violation], *, threshold: str) -> bool:
-    return any(is_at_or_above(v.severity, threshold) for v in violations)  # type: ignore[arg-type]
+def _should_fail(violations: list[Violation], *, threshold: Severity) -> bool:
+    return any(is_at_or_above(v.severity, threshold) for v in violations)

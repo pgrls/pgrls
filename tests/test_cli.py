@@ -86,5 +86,25 @@ def test_lint_schemas_flag_overrides_config(pg_url: str, apply_sql) -> None:
     result = runner.invoke(
         main, ["lint", "--database-url", pg_url, "--schemas", "tenant"]
     )
+    assert result.exit_code == 1, result.output
     assert "tenant.tenant_t" in result.output
     assert "public.public_t" not in result.output
+
+
+def test_lint_unknown_schema_errors_clearly(pg_url: str) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--schemas", "does_not_exist"]
+    )
+    assert result.exit_code != 0
+    assert "does_not_exist" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_lint_empty_schemas_errors_clearly(pg_url: str) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--schemas", ",,,"]
+    )
+    assert result.exit_code != 0
+    assert "empty schema list" in result.output.lower()
