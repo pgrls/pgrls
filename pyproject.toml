@@ -43,8 +43,8 @@ dev = [
 pgrls = "pgrls.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/dmitrymaranik/pgrls"
-Issues = "https://github.com/dmitrymaranik/pgrls/issues"
+Homepage = "https://github.com/pgrls/pgrls"
+Issues = "https://github.com/pgrls/pgrls/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pgrls"]
