@@ -68,3 +68,17 @@ def test_violation_dataclass() -> None:
     )
     assert v.rule_id == "SEC001"
     assert v.severity == "error"
+
+
+def test_registry_rejects_non_rule_object() -> None:
+    class _NotARule:
+        id = "BAD001"
+        # missing: severity, title, check
+
+    registry = RuleRegistry()
+    try:
+        registry.register(_NotARule())  # type: ignore[arg-type]
+    except TypeError as exc:
+        assert "Rule" in str(exc)
+    else:
+        raise AssertionError("expected TypeError")
