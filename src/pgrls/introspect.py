@@ -46,9 +46,12 @@ SELECT
     p.polpermissive AS permissive,
     COALESCE(
         (
-            SELECT array_agg(rolname ORDER BY rolname)
-            FROM pg_catalog.pg_roles
-            WHERE oid = ANY(p.polroles)
+            SELECT array_agg(
+                CASE WHEN ro.oid = 0 THEN 'PUBLIC' ELSE r.rolname END
+                ORDER BY CASE WHEN ro.oid = 0 THEN 0 ELSE 1 END, r.rolname
+            )
+            FROM (SELECT unnest(p.polroles) AS oid) ro
+            LEFT JOIN pg_catalog.pg_roles r ON r.oid = ro.oid
         ),
         ARRAY[]::TEXT[]
     ) AS roles,
