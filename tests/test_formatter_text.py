@@ -49,3 +49,16 @@ def test_unknown_format_raises() -> None:
         assert "yaml" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_text_location_none_uses_schema_fallback() -> None:
+    out = format_violations([_v(location=None)], format="text")
+    assert "<schema>" in out
+    assert "SEC001" in out
+
+
+def test_text_summary_pluralizes_for_multiple_violations() -> None:
+    vs = [_v(rule_id="SEC001"), _v(rule_id="SEC001")]
+    out = format_violations(vs, format="text")
+    assert "2 errors" in out
+    assert "1 error" not in out
