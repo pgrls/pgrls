@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
 from pgrls.model import Schema
 from pgrls.rules import Rule, RuleRegistry, all_rules
 from pgrls.violations import Severity, Violation
@@ -51,7 +49,6 @@ def test_registry_rejects_duplicate_id() -> None:
         raise AssertionError("expected ValueError")
 
 
-@pytest.mark.skip(reason="SEC001 lands in Task 8")
 def test_default_registry_has_sec001() -> None:
     rules: list[Rule] = all_rules()
     ids = [r.id for r in rules]
