@@ -125,3 +125,28 @@ def test_find_func_calls_finds_multiple() -> None:
     node = parse_expr("auth.uid() IS NULL OR auth.uid() = '1'")
     matches = find_func_calls(node, {"auth.uid"})
     assert len(matches) == 2
+
+
+from pgrls.ast_utils import match_is_null
+
+
+def test_match_is_null_matches_is_null() -> None:
+    node = parse_expr("auth.uid() IS NULL")
+    result = match_is_null(node)
+    assert result is not None
+    inner, is_null = result
+    assert is_null is True
+    assert inner is not None
+
+
+def test_match_is_null_matches_is_not_null() -> None:
+    node = parse_expr("auth.uid() IS NOT NULL")
+    result = match_is_null(node)
+    assert result is not None
+    _inner, is_null = result
+    assert is_null is False
+
+
+def test_match_is_null_returns_none_for_other_expr() -> None:
+    node = parse_expr("auth.uid() = '1'")
+    assert match_is_null(node) is None
