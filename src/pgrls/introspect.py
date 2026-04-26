@@ -7,6 +7,7 @@ from typing import cast
 import psycopg
 from psycopg.rows import dict_row
 
+from pgrls.ast_utils import parse_expr
 from pgrls.model import Policy, Schema, Table
 
 _POLICY_CMD_MAP: dict[str, str] = {
@@ -98,14 +99,18 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 f"Unknown pg_policy.polcmd value {cmd_letter!r} for "
                 f"policy {row['policy_name']!r}"
             )
+        using_sql = row["using_sql"]
+        with_check_sql = row["with_check_sql"]
         by_oid[row["table_oid"]].append(
             Policy(
                 name=row["policy_name"],
                 command=command,  # type: ignore[arg-type]
                 permissive=row["permissive"],
                 roles=tuple(row["roles"]),
-                using_sql=row["using_sql"],
-                with_check_sql=row["with_check_sql"],
+                using_sql=using_sql,
+                with_check_sql=with_check_sql,
+                using_ast=parse_expr(using_sql),
+                with_check_ast=parse_expr(with_check_sql),
             )
         )
 
