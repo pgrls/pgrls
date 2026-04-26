@@ -39,7 +39,6 @@ def test_lint_against_known_bad_db_exits_nonzero(pg_url: str, apply_sql) -> None
     assert result.exit_code == 1, result.output
     assert "SEC001" in result.output
     assert "public.users" in result.output
-    assert "public.orders" not in result.output
 
 
 def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
@@ -67,7 +66,7 @@ def test_lint_missing_database_url_errors_clearly(monkeypatch) -> None:
 def test_lint_disable_skips_rule(pg_url: str, apply_sql, tmp_path) -> None:
     apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
     cfg = tmp_path / "pgrls.toml"
-    cfg.write_text('[lint]\ndisable = ["SEC001"]\n')
+    cfg.write_text('[lint]\ndisable = ["SEC001", "SEC003"]\n')
     runner = CliRunner()
     result = runner.invoke(
         main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
@@ -129,7 +128,10 @@ def test_lint_bad_allowlist_type_errors_clearly(pg_url: str, tmp_path) -> None:
 def test_lint_allowlist_via_config_exempts_table(pg_url: str, apply_sql, tmp_path) -> None:
     apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
     cfg = tmp_path / "pgrls.toml"
-    cfg.write_text('[lint.rules.SEC001]\nallowlist = ["users"]\n')
+    cfg.write_text(
+        '[lint.rules.SEC001]\nallowlist = ["users"]\n'
+        '[lint.rules.SEC003]\nallowlist = ["public.orders.orders_owner"]\n'
+    )
     runner = CliRunner()
     result = runner.invoke(
         main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
@@ -294,3 +296,31 @@ def test_lint_sec002_allowlist_via_config_exempts(
     )
     assert result.exit_code == 0, result.output
     assert "SEC002" not in result.output
+
+
+def test_lint_fires_sec003_on_permissive_public_policy(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec003_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1, result.output
+    assert "SEC003" in result.output
+    assert "public.sec003_target.public_read" in result.output
+    assert "sec003_clean" not in result.output
+
+
+def test_lint_sec003_allowlist_via_config_exempts(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec003_bad.sql").read_text())
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[lint.rules.SEC003]\n'
+        'allowlist = ["public.sec003_target.public_read"]\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert "SEC003" not in result.output
