@@ -381,3 +381,20 @@ def test_lint_sec004_auth_functions_override_suppresses(
         main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
     )
     assert "SEC004" not in result.output
+
+
+def test_lint_fires_hyg001_on_orphaned_column_ref(
+    pg_url: str, apply_sql
+) -> None:
+    # Simulate the orphaned-column state: the column 'gone' is marked as
+    # dropped in pg_attribute (Postgres 16+ prevents DROP COLUMN when a
+    # policy depends on it, so we replicate the internal state directly).
+    # Postgres renders dropped column refs as '?dropped?column?' in pg_get_expr.
+    apply_sql((FIXTURES_DIR / "hyg001_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1, result.output
+    assert "HYG001" in result.output
+    assert "public.hyg001_target.orphaned" in result.output
+    assert "?dropped?column?" in result.output
+    assert "hyg001_clean" not in result.output
