@@ -67,6 +67,7 @@ def test_schema_to_snapshot_shape() -> None:
                 "name": "orders",
                 "rls_enabled": True,
                 "force_rls": False,
+                "columns": [],
             }
         ],
         "policies": [
@@ -177,3 +178,31 @@ def test_policy_has_optional_ast_fields_defaulting_to_none() -> None:
     )
     assert p.using_ast is None
     assert p.with_check_ast is None
+
+
+def test_table_has_columns_field_defaulting_empty() -> None:
+    from pgrls.model import Table
+
+    t = Table(
+        schema="public",
+        name="t",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+    )
+    assert t.columns == ()
+
+
+def test_snapshot_includes_table_columns() -> None:
+    from pgrls.model import Schema, Table
+
+    table = Table(
+        schema="public",
+        name="users",
+        rls_enabled=True,
+        force_rls=True,
+        policies=(),
+        columns=("id", "email"),
+    )
+    snap = Schema(tables=(table,)).to_snapshot()
+    assert snap["tables"][0]["columns"] == ["id", "email"]

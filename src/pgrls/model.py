@@ -37,6 +37,7 @@ class Table:
     rls_enabled: bool
     force_rls: bool
     policies: tuple[Policy, ...]
+    columns: tuple[str, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -56,6 +57,7 @@ class Schema:
                     "name": t.name,
                     "rls_enabled": t.rls_enabled,
                     "force_rls": t.force_rls,
+                    "columns": list(t.columns),
                 }
                 for t in self.tables
             ],
