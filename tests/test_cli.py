@@ -324,3 +324,33 @@ def test_lint_sec003_allowlist_via_config_exempts(
         main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
     )
     assert "SEC003" not in result.output
+
+
+def test_lint_fires_sec006_on_update_and_all_without_with_check(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec006_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1, result.output
+    assert "SEC006" in result.output
+    assert "public.sec006_update.update_bad" in result.output
+    assert "public.sec006_all.all_bad" in result.output
+    assert "public.sec006_clean" not in result.output
+
+
+def test_lint_sec006_allowlist_via_config_exempts(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec006_bad.sql").read_text())
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[lint.rules.SEC006]\n'
+        'allowlist = ["public.sec006_update.update_bad", '
+        '"public.sec006_all.all_bad"]\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert "SEC006" not in result.output
