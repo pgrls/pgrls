@@ -162,3 +162,18 @@ def test_model_classes_are_hashable() -> None:
 
     # And usable in a set
     assert {p, t, s} == {p, t, s}
+
+
+def test_policy_has_optional_ast_fields_defaulting_to_none() -> None:
+    from pgrls.model import Policy
+
+    p = Policy(
+        name="x",
+        command="SELECT",
+        permissive=True,
+        roles=("PUBLIC",),
+        using_sql="a = 1",
+        with_check_sql=None,
+    )
+    assert p.using_ast is None
+    assert p.with_check_ast is None
