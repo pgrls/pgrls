@@ -12,8 +12,8 @@ import sys
 from typing import Any
 
 import pglast
-from pglast.ast import A_Star, BoolExpr, ColumnRef, Node, String, SubLink
-from pglast.enums import BoolExprType
+from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, SQLValueFunction, String, SubLink
+from pglast.enums import BoolExprType, SQLValueFunctionOp
 
 
 def parse_expr(sql: str | None) -> Any | None:
@@ -90,3 +90,52 @@ def extract_column_refs(
 
     walk(node)
     return refs
+
+
+_SQL_VALUE_FUNCTION_NAMES: dict[Any, str] = {
+    SQLValueFunctionOp.SVFOP_CURRENT_USER: "current_user",
+    SQLValueFunctionOp.SVFOP_SESSION_USER: "session_user",
+    SQLValueFunctionOp.SVFOP_USER: "user",
+    SQLValueFunctionOp.SVFOP_CURRENT_ROLE: "current_role",
+}
+
+
+def find_func_calls(node: Any, names: set[str]) -> list[Any]:
+    """Find FuncCall and SQLValueFunction nodes whose name matches `names`.
+
+    For FuncCall, both the fully-qualified name (`auth.uid`) and the bare
+    name (`uid`) are checked; either match counts. For SQLValueFunction
+    (the AST node Postgres emits for grammar-special identifiers like
+    `current_user`), the node fires when its op corresponds to a name in
+    the set.
+    """
+    matches: list[Any] = []
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, FuncCall):
+            parts: list[str] = []
+            for f in n.funcname or ():
+                if isinstance(f, String):
+                    parts.append(f.sval)
+            if parts:
+                qualified = ".".join(parts)
+                bare = parts[-1]
+                if qualified in names or bare in names:
+                    matches.append(n)
+        if isinstance(n, SQLValueFunction):
+            name = _SQL_VALUE_FUNCTION_NAMES.get(n.op)
+            if name and name in names:
+                matches.append(n)
+        if isinstance(n, Node):
+            for field_name in n:
+                value = getattr(n, field_name, None)
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        walk(item)
+                elif isinstance(value, Node):
+                    walk(value)
+
+    walk(node)
+    return matches
