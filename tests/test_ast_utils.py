@@ -254,6 +254,39 @@ def test_find_func_calls_matches_session_user() -> None:
     assert len(matches) == 1
 
 
+def test_find_func_calls_default_finds_inside_sublink() -> None:
+    # Default behaviour walks into SubLinks and finds calls there.
+    node = parse_expr("x = (SELECT auth.uid())")
+    matches = find_func_calls(node, {"auth.uid"})
+    assert len(matches) == 1
+
+
+def test_find_func_calls_exclude_sublinks_skips_inside_sublink() -> None:
+    # PERF001 contract: a call wrapped in `(SELECT ...)` is "wrapped" and
+    # must not be reported.
+    node = parse_expr("x = (SELECT auth.uid())")
+    matches = find_func_calls(node, {"auth.uid"}, exclude_sublinks=True)
+    assert matches == []
+
+
+def test_find_func_calls_exclude_sublinks_still_finds_top_level() -> None:
+    # Excluding SubLinks must not hide top-level calls — PERF001 needs to
+    # see unwrapped `auth.uid()` directly in USING.
+    node = parse_expr("auth.uid() = user_id")
+    matches = find_func_calls(node, {"auth.uid"}, exclude_sublinks=True)
+    assert len(matches) == 1
+
+
+def test_find_func_calls_exclude_sublinks_skips_in_in_subquery() -> None:
+    # `x IN (SELECT auth.uid())` — the call is inside a SubLink so it must
+    # be skipped when exclude_sublinks=True. Pins the rule for IN/EXISTS
+    # subqueries (matches the spec definition: any SubLink ancestor =
+    # wrapped).
+    node = parse_expr("x IN (SELECT auth.uid())")
+    matches = find_func_calls(node, {"auth.uid"}, exclude_sublinks=True)
+    assert matches == []
+
+
 def test_match_is_null_returns_arg_for_function_call() -> None:
     node = parse_expr("auth.uid() IS NULL")
     result = match_is_null(node)

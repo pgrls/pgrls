@@ -100,7 +100,9 @@ _SQL_VALUE_FUNCTION_NAMES: dict[Any, str] = {
 }
 
 
-def find_func_calls(node: Any, names: set[str]) -> list[Any]:
+def find_func_calls(
+    node: Any, names: set[str], *, exclude_sublinks: bool = False
+) -> list[Any]:
     """Find FuncCall and SQLValueFunction nodes whose name matches `names`.
 
     For FuncCall, both the fully-qualified name (`auth.uid`) and the bare
@@ -108,11 +110,18 @@ def find_func_calls(node: Any, names: set[str]) -> list[Any]:
     (the AST node Postgres emits for grammar-special identifiers like
     `current_user`), the node fires when its op corresponds to a name in
     the set.
+
+    When `exclude_sublinks=True`, calls inside `SubLink` subtrees are not
+    collected. PERF001 uses this to detect "unwrapped" auth calls — a
+    call wrapped in `(SELECT auth.uid())` lives inside a SubLink and is
+    intentionally skipped.
     """
     matches: list[Any] = []
 
     def walk(n: Any) -> None:
         if n is None:
+            return
+        if exclude_sublinks and isinstance(n, SubLink):
             return
         if isinstance(n, FuncCall):
             parts: list[str] = []
