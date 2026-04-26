@@ -13,11 +13,11 @@ from pgrls.violations import Violation
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
         raise TypeError(
             "[lint.rules.SEC002].allowlist must be a list of table names"
         )
-    return {str(item) for item in raw}
+    return set(raw)
 
 
 class SEC002:
