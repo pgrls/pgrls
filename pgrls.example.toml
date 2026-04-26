@@ -33,7 +33,33 @@ allowlist = []
 # current_setting. Override with a list to add or replace.
 # auth_functions = ["auth.uid", "current_setting", "my.custom_auth"]
 
+[lint.rules.SEC005]
+# Policies whose expression legitimately has no own-column reference
+# (e.g. an admin-only audit log). Entries are fully-qualified policy IDs
+# of the form "schema.table.policy_name".
+allowlist = []
+
 [lint.rules.SEC006]
 # Policies allowed to omit WITH CHECK on INSERT/UPDATE/ALL. Entries are
 # fully-qualified policy IDs.
 allowlist = []
+
+[lint.rules.SEC007]
+# Tables where every-policy-permissive is intentional (e.g. reference
+# data). Same shape as SEC001: unqualified or "schema.table".
+allowlist = []
+
+[lint.rules.SEC008]
+# Policies allowed to keep `USING (true)`. Entries are fully-qualified
+# policy IDs.
+allowlist = []
+
+[lint.rules.PERF001]
+# Policies allowed to call an auth function unwrapped in USING. Reach
+# for this sparingly — the rewrite to `(SELECT auth.uid())` is
+# mechanical and always safe. Entries are fully-qualified policy IDs.
+allowlist = []
+# Functions whose unwrapped call in USING triggers PERF001. Defaults:
+# auth.uid, auth.role, auth.jwt, current_setting. Override REPLACES
+# the default — list every function you want covered.
+# auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]

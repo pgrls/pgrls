@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.0.3** — error-severity rules shipping (SEC001, SEC002, SEC003, SEC004, SEC006, HYG001). Warning/info rules and the `test` / `diff` commands are on the roadmap below.
+> **Status: 0.0.4** — ten rules across error, warning, and info severities (SEC001–SEC008, PERF001, HYG001). The `test` / `diff` commands are on the roadmap below.
 
 ## Install
 
@@ -71,23 +71,27 @@ allowlist = ["countries", "currencies"]
 
 ## Rules
 
-`pgrls lint` ships these rules at the **error** severity:
+`pgrls lint` ships these rules:
 
-| ID | Catches |
-|---|---|
-| SEC001 | Tables in scanned schemas with RLS disabled |
-| SEC002 | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
-| SEC003 | Permissive policies granted to PUBLIC |
-| SEC004 | Inverted auth check (Lovable CVE pattern) in USING |
-| SEC006 | INSERT/UPDATE/ALL policies with no WITH CHECK |
-| HYG001 | Policies referencing columns that don't exist on the table |
+| ID | Severity | Catches |
+|---|---|---|
+| SEC001 | error | Tables in scanned schemas with RLS disabled |
+| SEC002 | error | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
+| SEC003 | error | Permissive policies granted to PUBLIC |
+| SEC004 | error | Inverted auth check (Lovable CVE pattern) in USING |
+| SEC005 | warning | Policy expression has no own-column reference |
+| SEC006 | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
+| SEC007 | info | All policies on a table are permissive (no RESTRICTIVE floor) |
+| SEC008 | warning | Policy USING clause is constant `true` |
+| PERF001 | warning | Auth function called per-row in policy USING (unwrapped) |
+| HYG001 | error | Policies referencing columns that don't exist on the table |
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
 
 ## Roadmap
 
-- **More lint rules.** Full SEC / PERF / HYG catalog, including the marquee SEC004 (inverted auth check / Lovable CVE pattern). JSON, SARIF, and Markdown output. Polished error messages.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. JSON, SARIF, and Markdown output. Polished error messages.
 - **`pgrls test`.** Code-first RLS test DSL for Python, TypeScript, and Go.
 - **`pgrls diff`.** Semantic policy diff between branches with DANGEROUS / BREAKING / SAFE classification.
 

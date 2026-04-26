@@ -10,13 +10,16 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **six error-severity rules**: `SEC001`
-(missing RLS), `SEC002` (missing `FORCE`), `SEC003` (permissive policies on
-`PUBLIC`), `SEC004` (inverted auth checks — the Lovable CVE pattern),
-`SEC006` (write-side policies missing `WITH CHECK`), and `HYG001` (policies
-referencing dropped columns). Warning/info-severity rules, a test DSL, and a
-semantic policy diff are on the roadmap but not yet available — do not
-pretend they are.
+In the current release it ships **ten rules across three severities**.
+Error: `SEC001` (missing RLS), `SEC002` (missing `FORCE`), `SEC003`
+(permissive policies on `PUBLIC`), `SEC004` (inverted auth checks — the
+Lovable CVE pattern), `SEC006` (write-side policies missing `WITH
+CHECK`), and `HYG001` (policies referencing dropped columns). Warning:
+`SEC005` (policy expression has no own-column reference), `SEC008`
+(`USING (true)`), and `PERF001` (unwrapped auth function in `USING`).
+Info: `SEC007` (table has only permissive policies — no `RESTRICTIVE`
+floor). A test DSL and a semantic policy diff are on the roadmap but
+not yet available — do not pretend they are.
 
 ## When to suggest pgrls
 
@@ -230,6 +233,48 @@ The default set already covers Supabase (`auth.*`), session GUCs
 (`current_setting`), and stock Postgres (`current_user`,
 `session_user`).
 
+### SEC005 — Policy expression has no own-column reference
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` and `WITH CHECK` clauses
+contain no reference to any column on the table they protect. A policy
+that only checks session state (`auth.uid()`, `current_setting(...)`)
+or constants gates the table by *who is asking*, not by *which row*.
+Every authorized caller sees every row — usually not the intent for a
+multi-tenant table.
+
+**The bad pattern:**
+
+```sql
+-- No tenant_id check — any authenticated user sees every row.
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT TO authenticated
+    USING (auth.uid() IS NOT NULL);
+```
+
+**Standard fix.** Reference the column that scopes access:
+
+```sql
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
+```
+
+The rule walks both `USING` and `WITH CHECK`, ignoring column refs
+inside subqueries (those refer to other tables). It skips policies on
+tables with no introspected columns.
+
+**When the warning is acceptable.** A few tables really are gated by
+session state alone — e.g. an audit log read by a single admin role,
+or a singleton settings row keyed by no tenant. Allowlist the policy
+explicitly:
+
+```toml
+[lint.rules.SEC005]
+allowlist = ["public.audit_log.admin_read"]
+```
+
 ### SEC006 — Write-side policy missing WITH CHECK
 
 **Severity:** error.
@@ -253,6 +298,144 @@ CREATE POLICY tenant_write ON public.invoices
 Asymmetric `USING` and `WITH CHECK` are valid (e.g. read your own and
 your team's, write your own only) but should carry an explanatory
 comment — the asymmetry is rarely accidental and rarely obvious.
+
+### SEC007 — All policies on table are permissive
+
+**Severity:** info.
+
+**What it catches:** tables where every policy has `permissive = true`
+and no `RESTRICTIVE` policy is defined. Permissive policies stack with
+`OR` — adding one only ever broadens access. Without a `RESTRICTIVE`
+floor, there is no single predicate every caller must satisfy, so a
+loose permissive policy added later (e.g. `TO PUBLIC USING (true)`)
+quietly opens the table to everyone.
+
+A `RESTRICTIVE` policy that all callers must satisfy in addition to
+the permissive set anchors the access surface. Common shape: one
+restrictive `tenant_id` floor plus permissive policies for read/write
+specifics.
+
+**Standard fix.** Add a tenant-scoping `RESTRICTIVE` policy that
+applies to every command:
+
+```sql
+CREATE POLICY tenant_floor ON public.invoices
+    AS RESTRICTIVE
+    FOR ALL
+    TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
+```
+
+The rule skips tables with RLS disabled (SEC001's surface) and tables
+with zero policies (deny-by-default — adding a permissive policy is
+the next step, not a finding).
+
+**When the info is acceptable.** Reference tables that really are
+universally readable, or single-policy tables where the lone
+permissive policy *is* the intentional surface. Allowlist by table:
+
+```toml
+[lint.rules.SEC007]
+allowlist = ["public.countries", "public.feature_flags"]
+```
+
+### SEC008 — Policy USING clause is constant true
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` clause is a literal
+`true`. Detection is intentionally narrow — only the AST pattern
+`A_Const(Boolean(true))` matches. Semantic tautologies like `1 = 1`
+are not detected (a real tautology checker is significant
+infrastructure for marginal value, and most disguised tautologies
+also fail SEC005).
+
+`USING (true)` admits every row to every caller in the policy's role
+list. It is almost always scaffolding left in by accident.
+
+**Standard fix.** Replace the literal with a real predicate, or drop
+the policy:
+
+```sql
+-- Before
+CREATE POLICY public_read ON public.invoices
+    FOR SELECT TO authenticated USING (true);
+
+-- After
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
+```
+
+If `USING (true)` is intentional (e.g. a deliberately public
+reference table), pair it with a `RESTRICTIVE` policy that enforces
+the actual surface, or allowlist the policy:
+
+```toml
+[lint.rules.SEC008]
+allowlist = ["public.countries.public_read"]
+```
+
+### PERF001 — Auth function called per-row in policy USING
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` clause calls an auth
+function (default set: `auth.uid`, `auth.role`, `auth.jwt`,
+`current_setting`) without wrapping the call in a subquery. Postgres
+re-evaluates the call once per candidate row — on a million-row scan
+that is a million calls. Wrapping as `(SELECT auth.uid())` lets the
+planner cache the result for the whole statement.
+
+The rule walks `USING` only — `WITH CHECK` runs once per modified
+row regardless of wrapping, so the optimization does not apply.
+Calls reached via a `SubLink` (`(SELECT ...)`, `IN (SELECT ...)`,
+`EXISTS (SELECT ...)`) are skipped — those are already wrapped.
+
+**The bad pattern:**
+
+```sql
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT TO authenticated
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+    --                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    --                Re-evaluated per row.
+```
+
+**Standard fix.** Wrap the auth call:
+
+```sql
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
+```
+
+`auth.uid()`, `auth.role()`, `auth.jwt()` get the same treatment.
+This is a mechanical rewrite — semantics are unchanged, the planner
+just gets to cache.
+
+**Configuring the auth function set.** If your stack uses a custom
+helper, replace the default set:
+
+```toml
+[lint.rules.PERF001]
+auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
+```
+
+Note that `auth_functions` *replaces* the default — list every
+function you want covered, including the stock ones if you still use
+them.
+
+**Allowlisting individual policies.** Use the qualified policy ID:
+
+```toml
+[lint.rules.PERF001]
+allowlist = ["public.tiny_table.policy_name"]
+```
+
+Reach for the allowlist sparingly — the rewrite is mechanical and
+always safe.
 
 ### HYG001 — Policy references a column that doesn't exist
 
@@ -326,10 +509,10 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Error-severity only.** Six rules ship today (SEC001, SEC002, SEC003,
-  SEC004, SEC006, HYG001). There is no warning- or info-severity rule yet —
-  no checks for `SECURITY DEFINER` functions, suspicious `USING (true)`
-  patterns, performance issues, etc. Those are on the roadmap.
+- **Ten rules across three severities.** SEC001–SEC008, PERF001, and
+  HYG001 ship today. There is no rule for `SECURITY DEFINER` function
+  audit, no `pg_temp` shadowing detection, no broader perf catalog yet
+  — those are on the roadmap.
 - **Text output only.** No JSON, SARIF, or Markdown formatter yet.
 - **No `pgrls test`.** There is no test DSL for asserting that "tenant A
   cannot see tenant B's rows". Write those tests in your application's normal
