@@ -10,10 +10,13 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **one rule, `SEC001`**: tables in scanned
-schemas that do not have row-level security enabled. The roadmap covers more
-rules, a test DSL, and a semantic policy diff, but those are not yet
-available — do not pretend they are.
+In the current release it ships **six error-severity rules**: `SEC001`
+(missing RLS), `SEC002` (missing `FORCE`), `SEC003` (permissive policies on
+`PUBLIC`), `SEC004` (inverted auth checks — the Lovable CVE pattern),
+`SEC006` (write-side policies missing `WITH CHECK`), and `HYG001` (policies
+referencing dropped columns). Warning/info-severity rules, a test DSL, and a
+semantic policy diff are on the roadmap but not yet available — do not
+pretend they are.
 
 ## When to suggest pgrls
 
@@ -130,6 +133,147 @@ allowlist = ["countries", "currencies"]
 Add a one-line comment in `pgrls.toml` explaining why each entry is exempt —
 future maintainers (human and otherwise) need that context.
 
+### SEC002 — FORCE ROW LEVEL SECURITY missing
+
+**Severity:** error.
+
+**What it catches:** tables with `relrowsecurity = true` but
+`relforcerowsecurity = false`. Without `FORCE`, the table owner role
+bypasses RLS entirely. Migration tools and seed scripts often run as the
+owner, which lets them write rows that production roles wouldn't be
+allowed to write — a class of bug that only manifests when a regular
+application connection finally sees the data.
+
+**Standard fix.**
+
+```sql
+ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
+```
+
+If a specific role legitimately needs to bypass (e.g. a maintenance role
+that runs vacuum-style work), grant `BYPASSRLS` on that role rather than
+turning `FORCE` off table-wide.
+
+### SEC003 — Permissive policy grants access to PUBLIC
+
+**Severity:** error.
+
+**What it catches:** policies where `permissive = true` AND `PUBLIC` is
+in the role list. Permissive policies stack with `OR`; granting them to
+`PUBLIC` means any role — including unauthenticated connections — gets
+the policy's `USING` clause as the gate, regardless of any role-specific
+policies that might exist on the same table.
+
+**Standard fix.** Restrict the policy to the role that should actually
+have it:
+
+```sql
+DROP POLICY public_read ON public.invoices;
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT
+    TO authenticated
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+```
+
+If the table is genuinely public-readable (reference data), use a
+`RESTRICTIVE` policy instead of a `PERMISSIVE` one — restrictive policies
+narrow rather than expand access.
+
+### SEC004 — Inverted auth check (Lovable CVE pattern)
+
+**Severity:** error. **The marquee rule** — this is the pattern that
+caused real CVEs across hundreds of AI-generated apps.
+
+**What it catches:** policies whose `USING` clause contains a top-level
+`OR` disjunct shaped as `auth_func() IS NULL` for one of: `auth.uid`,
+`auth.role`, `auth.jwt`, `current_user`, `session_user`, or
+`current_setting`. The intent was usually "let unauthenticated requests
+through to a downstream check"; the bug is that the disjunct evaluates
+to `true` for anonymous connections, satisfying the `OR` and exposing
+every row.
+
+**The bad pattern:**
+
+```sql
+CREATE POLICY broken ON public.invoices
+    FOR SELECT TO PUBLIC
+    USING (
+        auth.uid() IS NULL                       -- ← exposes every row
+        OR user_id = auth.uid()
+    );
+```
+
+**Standard fix.** Drop the `IS NULL` disjunct entirely. Authentication
+should be enforced upstream (PostgREST refuses unauth, the application
+fails before the query, etc.); RLS is the *last* line of defense, not a
+fallback for missing auth.
+
+```sql
+CREATE POLICY scoped ON public.invoices
+    FOR SELECT TO authenticated
+    USING (user_id = auth.uid());
+```
+
+If anonymous read access is intentional for a specific table, model it
+explicitly with a separate policy granted to `anon` — don't bake the
+"anonymous → see everything" behavior into a tenant policy.
+
+**Configuring the auth function set.** If your stack uses a custom auth
+helper, extend the function list in `pgrls.toml`:
+
+```toml
+[lint.rules.SEC004]
+auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
+```
+
+The default set already covers Supabase (`auth.*`), session GUCs
+(`current_setting`), and stock Postgres (`current_user`,
+`session_user`).
+
+### SEC006 — Write-side policy missing WITH CHECK
+
+**Severity:** error.
+
+**What it catches:** policies whose `command` is `INSERT`, `UPDATE`, or
+`ALL` and whose `WITH CHECK` clause is absent. `USING` filters reads;
+`WITH CHECK` validates writes. A write-side policy without `WITH CHECK`
+lets clients insert or update rows that the same policy would forbid
+them from reading — silent cross-tenant data poisoning.
+
+**Standard fix.** Add a `WITH CHECK` clause that matches `USING`:
+
+```sql
+CREATE POLICY tenant_write ON public.invoices
+    FOR UPDATE
+    TO authenticated
+    USING (tenant_id = current_setting('app.tenant_id')::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+```
+
+Asymmetric `USING` and `WITH CHECK` are valid (e.g. read your own and
+your team's, write your own only) but should carry an explanatory
+comment — the asymmetry is rarely accidental and rarely obvious.
+
+### HYG001 — Policy references a column that doesn't exist
+
+**Severity:** error.
+
+**What it catches:** policies whose `USING` or `WITH CHECK` clauses
+reference an unqualified column name that isn't in the table's current
+column list. This usually happens when `ALTER TABLE ... DROP COLUMN`
+runs without the operator realizing a policy still mentions the column.
+Postgres permits the drop; the policy text persists and errors at
+evaluation time.
+
+**Standard fix.** Pick one:
+
+- If the column was meant to be removed, drop the policy and add a new
+  one that doesn't reference it.
+- If the column was renamed, recreate the policy with the new name.
+- If the policy is now obsolete, drop it.
+
+There is no `pgrls.toml` option for HYG001 — every fire is a real bug.
+
 ## CI integration
 
 `pgrls lint` is designed to run in CI against an ephemeral database that has
@@ -182,9 +326,10 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **One rule.** `SEC001` is the only check shipped today. There is no rule for
-  inverted auth checks, missing `WITH CHECK`, overly permissive policies,
-  function `SECURITY DEFINER` issues, etc. Those are on the roadmap.
+- **Error-severity only.** Six rules ship today (SEC001, SEC002, SEC003,
+  SEC004, SEC006, HYG001). There is no warning- or info-severity rule yet —
+  no checks for `SECURITY DEFINER` functions, suspicious `USING (true)`
+  patterns, performance issues, etc. Those are on the roadmap.
 - **Text output only.** No JSON, SARIF, or Markdown formatter yet.
 - **No `pgrls test`.** There is no test DSL for asserting that "tenant A
   cannot see tenant B's rows". Write those tests in your application's normal
