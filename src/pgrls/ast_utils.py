@@ -12,6 +12,8 @@ import sys
 from typing import Any
 
 import pglast
+from pglast.ast import BoolExpr
+from pglast.enums import BoolExprType
 
 
 def parse_expr(sql: str | None) -> Any | None:
@@ -34,3 +36,13 @@ def parse_expr(sql: str | None) -> Any | None:
     select_stmt = parsed[0].stmt
     target = select_stmt.targetList[0]
     return target.val
+
+
+def top_level_disjuncts(node: Any) -> list[Any]:
+    """If node is a top-level OR expression, return its disjunct children.
+
+    Otherwise return a single-element list containing the node itself.
+    """
+    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
+        return list(node.args or ())
+    return [node]
