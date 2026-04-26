@@ -22,6 +22,8 @@ class Policy:
     roles: tuple[str, ...]
     using_sql: str | None
     with_check_sql: str | None
+    using_ast: Any | None = None
+    with_check_ast: Any | None = None
 
     @property
     def is_permissive(self) -> bool:
