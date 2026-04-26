@@ -92,3 +92,36 @@ def test_extract_column_refs_skips_wildcard_a_star() -> None:
     for ref in refs:
         for part in ref:
             assert part != "*"
+
+
+from pgrls.ast_utils import find_func_calls
+
+
+def test_find_func_calls_matches_qualified_name() -> None:
+    node = parse_expr("auth.uid() = '1'")
+    matches = find_func_calls(node, {"auth.uid"})
+    assert len(matches) == 1
+
+
+def test_find_func_calls_matches_bare_name() -> None:
+    node = parse_expr("current_setting('x') = '1'")
+    matches = find_func_calls(node, {"current_setting"})
+    assert len(matches) == 1
+
+
+def test_find_func_calls_matches_current_user_sql_value_function() -> None:
+    node = parse_expr("current_user = 'x'")
+    matches = find_func_calls(node, {"current_user"})
+    assert len(matches) == 1
+
+
+def test_find_func_calls_returns_empty_when_no_match() -> None:
+    node = parse_expr("a = 1")
+    matches = find_func_calls(node, {"auth.uid"})
+    assert matches == []
+
+
+def test_find_func_calls_finds_multiple() -> None:
+    node = parse_expr("auth.uid() IS NULL OR auth.uid() = '1'")
+    matches = find_func_calls(node, {"auth.uid"})
+    assert len(matches) == 2
