@@ -71,7 +71,8 @@ def test_extract_column_refs_includes_sublink_by_default() -> None:
     )
     refs = extract_column_refs(node)
     assert ("tenant_id",) in refs
-    assert ("id",) in refs or ("active",) in refs
+    assert ("id",) in refs
+    assert ("active",) in refs
 
 
 def test_extract_column_refs_excludes_sublink_when_flag_set() -> None:
