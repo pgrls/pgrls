@@ -268,3 +268,29 @@ def test_introspect_omits_dropped_columns(pg_url: str, apply_sql) -> None:
     table = next(t for t in schema.tables if t.name == "dropped_cols")
     assert "gone" not in table.columns
     assert table.columns == ("id", "kept")
+
+
+def test_lint_fires_sec002_on_missing_force(pg_url: str, apply_sql) -> None:
+    apply_sql((FIXTURES_DIR / "sec002_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1, result.output
+    assert "SEC002" in result.output
+    assert "public.sec002_target" in result.output
+    assert "public.sec002_clean" not in result.output
+
+
+def test_lint_sec002_allowlist_via_config_exempts(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec002_bad.sql").read_text())
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[lint.rules.SEC002]\nallowlist = ["sec002_target"]\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "SEC002" not in result.output

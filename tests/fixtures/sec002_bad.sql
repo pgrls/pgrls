@@ -1,0 +1,8 @@
+-- SEC002: RLS enabled but FORCE missing.
+CREATE TABLE public.sec002_target (id INT);
+ALTER TABLE public.sec002_target ENABLE ROW LEVEL SECURITY;
+-- Note: no ALTER TABLE ... FORCE ROW LEVEL SECURITY.
+
+CREATE TABLE public.sec002_clean (id INT);
+ALTER TABLE public.sec002_clean ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sec002_clean FORCE ROW LEVEL SECURITY;
