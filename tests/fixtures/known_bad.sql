@@ -18,4 +18,4 @@ ALTER TABLE public.orders FORCE ROW LEVEL SECURITY;
 CREATE POLICY orders_owner ON public.orders
     FOR SELECT
     TO PUBLIC
-    USING (user_id = current_setting('app.user_id', true)::BIGINT);
+    USING (user_id = (SELECT current_setting('app.user_id', true)::BIGINT));

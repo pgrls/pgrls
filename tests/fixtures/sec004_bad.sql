@@ -21,4 +21,4 @@ CREATE POLICY positive_auth ON public.sec004_clean
     AS RESTRICTIVE
     FOR SELECT
     TO PUBLIC
-    USING (user_id = current_setting('app.user_id', true));
+    USING (user_id = (SELECT current_setting('app.user_id', true)));
