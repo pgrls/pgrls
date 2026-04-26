@@ -11,7 +11,29 @@ disable = []
 # Severity that triggers a nonzero exit code: "error" | "warning" | "info".
 fail_on = "warning"
 
-# Per-rule options.
+# Per-rule options. Each rule reads its own table; unknown rules are ignored.
+
 [lint.rules.SEC001]
-# Tables where missing RLS is acceptable. Entries can be unqualified (countries) or qualified (tenant.things).
+# Tables where missing RLS is acceptable. Entries can be unqualified
+# (countries) or qualified (tenant.things).
+allowlist = []
+
+[lint.rules.SEC002]
+# Tables where ENABLE without FORCE is acceptable. Same shape as SEC001.
+allowlist = []
+
+[lint.rules.SEC003]
+# Policies allowed to be permissive-and-PUBLIC. Entries are fully-qualified
+# policy IDs of the form "schema.table.policy_name".
+allowlist = []
+
+[lint.rules.SEC004]
+# Functions whose `IS NULL` in a top-level OR disjunct triggers SEC004.
+# Defaults: auth.uid, auth.role, auth.jwt, current_user, session_user,
+# current_setting. Override with a list to add or replace.
+# auth_functions = ["auth.uid", "current_setting", "my.custom_auth"]
+
+[lint.rules.SEC006]
+# Policies allowed to omit WITH CHECK on INSERT/UPDATE/ALL. Entries are
+# fully-qualified policy IDs.
 allowlist = []
