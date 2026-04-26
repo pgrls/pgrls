@@ -1,0 +1,91 @@
+"""SEC005 — Policy expression has no own-column reference.
+
+A policy whose USING and WITH CHECK clauses never reference any column
+of the table they're on is a "session-state-only" predicate — it admits
+or denies whole sets of rows based on configuration alone, not on row
+attributes. Almost always a mistake: the author meant to gate by role,
+not gate per row.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from pgrls.ast_utils import extract_column_refs
+from pgrls.model import Schema, Table
+from pgrls.violations import Violation
+
+
+def _parse_allowlist(options: dict[str, Any]) -> set[str]:
+    raw = options.get("allowlist", [])
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise TypeError(
+            "[lint.rules.SEC005].allowlist must be a list of policy IDs "
+            "of the form 'schema.table.policy_name'"
+        )
+    return set(raw)
+
+
+def _is_own_column_ref(ref: tuple[str, ...], table: Table) -> bool:
+    if len(ref) == 1:
+        return ref[0] in table.columns
+    if len(ref) == 2:
+        return ref[0] == table.name and ref[1] in table.columns
+    if len(ref) == 3:
+        return (
+            ref[0] == table.schema
+            and ref[1] == table.name
+            and ref[2] in table.columns
+        )
+    return False
+
+
+class SEC005:
+    id = "SEC005"
+    severity = "warning"
+    title = "Policy expression does not reference any column of the table"
+
+    def check(
+        self, schema: Schema, options: dict[str, Any]
+    ) -> list[Violation]:
+        allowlist = _parse_allowlist(options)
+        out: list[Violation] = []
+        for table in schema.tables:
+            if not table.columns:
+                continue
+            for policy in table.policies:
+                if policy.using_ast is None and policy.with_check_ast is None:
+                    continue
+                refs: set[tuple[str, ...]] = set()
+                if policy.using_ast is not None:
+                    refs |= extract_column_refs(
+                        policy.using_ast, exclude_sublinks=True
+                    )
+                if policy.with_check_ast is not None:
+                    refs |= extract_column_refs(
+                        policy.with_check_ast, exclude_sublinks=True
+                    )
+                if any(_is_own_column_ref(r, table) for r in refs):
+                    continue
+                policy_id = (
+                    f"{table.schema}.{table.name}.{policy.name}"
+                )
+                if policy_id in allowlist:
+                    continue
+                out.append(
+                    Violation(
+                        rule_id="SEC005",
+                        severity="warning",
+                        title=self.title,
+                        message=(
+                            f"Policy {policy.name!r} on "
+                            f"{table.qualified_name} does not reference "
+                            "any column of the table. The predicate is "
+                            "purely session-state — every row is admitted "
+                            "or denied based on configuration alone. "
+                            "Add a row-level condition (e.g. "
+                            "tenant_id = current_setting('app.tenant'))."
+                        ),
+                        location=policy_id,
+                    )
+                )
+        return out

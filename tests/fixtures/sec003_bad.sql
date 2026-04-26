@@ -1,11 +1,14 @@
--- SEC003: a permissive policy granted to PUBLIC.
+-- SEC003: a permissive policy granted to PUBLIC. The USING clause
+-- references an own column to keep this fixture targeted on SEC003 —
+-- otherwise SEC005 (no own-col ref) and SEC008 (USING true) would also
+-- fire and muddle the assertions.
 CREATE TABLE public.sec003_target (id INT);
 ALTER TABLE public.sec003_target ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec003_target FORCE ROW LEVEL SECURITY;
 CREATE POLICY public_read ON public.sec003_target
     FOR SELECT
     TO PUBLIC
-    USING (true);
+    USING (id IS NOT NULL);
 
 -- Same shape but RESTRICTIVE — should NOT fire SEC003.
 CREATE TABLE public.sec003_clean (id INT);
@@ -15,4 +18,4 @@ CREATE POLICY restricted_read ON public.sec003_clean
     AS RESTRICTIVE
     FOR SELECT
     TO PUBLIC
-    USING (true);
+    USING (id IS NOT NULL);
