@@ -70,3 +70,12 @@ def test_sec002_bad_allowlist_type_raises_clearly() -> None:
     import pytest
     with pytest.raises(TypeError, match="allowlist"):
         SEC002().check(schema, options={"allowlist": "t"})  # type: ignore[arg-type]
+
+
+def test_sec002_bad_allowlist_item_type_raises_clearly() -> None:
+    schema = Schema(
+        tables=(_table("public", "t", rls=True, force=False),)
+    )
+    import pytest
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC002().check(schema, options={"allowlist": [123]})  # type: ignore[list-item]
