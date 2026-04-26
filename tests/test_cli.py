@@ -354,3 +354,30 @@ def test_lint_sec006_allowlist_via_config_exempts(
         main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
     )
     assert "SEC006" not in result.output
+
+
+def test_lint_fires_sec004_on_lovable_cve_pattern(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1, result.output
+    assert "SEC004" in result.output
+    assert "public.sec004_target.inverted_auth" in result.output
+    assert "sec004_clean" not in result.output
+
+
+def test_lint_sec004_auth_functions_override_suppresses(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[lint.rules.SEC004]\nauth_functions = ["my.custom_auth"]\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert "SEC004" not in result.output

@@ -47,12 +47,14 @@ def _build_default_registry() -> RuleRegistry:
     from pgrls.rules.sec001 import SEC001
     from pgrls.rules.sec002 import SEC002
     from pgrls.rules.sec003 import SEC003
+    from pgrls.rules.sec004 import SEC004
     from pgrls.rules.sec006 import SEC006
 
     registry = RuleRegistry()
     registry.register(SEC001())
     registry.register(SEC002())
     registry.register(SEC003())
+    registry.register(SEC004())
     registry.register(SEC006())
     return registry
 
