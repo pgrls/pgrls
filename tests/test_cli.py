@@ -407,7 +407,18 @@ def test_lint_fires_every_rule_in_combined_fixture(
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    for rule_id in ("SEC001", "SEC002", "SEC003", "SEC004", "SEC006", "HYG001"):
+    for rule_id in (
+        "SEC001",
+        "SEC002",
+        "SEC003",
+        "SEC004",
+        "SEC005",
+        "SEC006",
+        "SEC007",
+        "SEC008",
+        "PERF001",
+        "HYG001",
+    ):
         assert rule_id in result.output, (
             f"{rule_id} missing from output: {result.output}"
         )
