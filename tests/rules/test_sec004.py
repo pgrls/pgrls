@@ -122,3 +122,58 @@ def test_sec004_bad_auth_functions_type_raises_clearly() -> None:
         SEC004().check(
             schema, {"auth_functions": "auth.uid"}  # type: ignore[dict-item]
         )
+
+
+def test_sec004_bad_auth_functions_item_type_raises_clearly() -> None:
+    import pytest
+    schema = _wrap(_policy_with_using("auth.uid() IS NULL OR a = 1"))
+    with pytest.raises(TypeError, match="auth_functions"):
+        SEC004().check(
+            schema,
+            {"auth_functions": ["auth.uid", 42]},  # type: ignore[list-item]
+        )
+
+
+def test_sec004_emits_only_one_violation_per_policy() -> None:
+    # Two qualifying disjuncts in the same policy must still produce one
+    # violation — the rule reports per-policy, not per-disjunct.
+    schema = _wrap(
+        _policy_with_using(
+            "auth.uid() IS NULL OR current_user IS NULL OR user_id = '1'"
+        )
+    )
+    violations = SEC004().check(schema, {})
+    assert len(violations) == 1
+
+
+def test_sec004_fires_on_with_check_disjunct_not_just_using() -> None:
+    # Document current behavior: SEC004 inspects USING only, not WITH CHECK.
+    # This test pins that decision so a future change is intentional.
+    policy = Policy(
+        name="p",
+        command="UPDATE",
+        permissive=True,
+        roles=("authenticated",),
+        using_sql="user_id = '1'",
+        with_check_sql="auth.uid() IS NULL OR user_id = '1'",
+        using_ast=parse_expr("user_id = '1'"),
+        with_check_ast=parse_expr(
+            "auth.uid() IS NULL OR user_id = '1'"
+        ),
+    )
+    schema = _wrap(policy)
+    assert SEC004().check(schema, {}) == []
+
+
+def test_sec004_default_set_covers_session_user() -> None:
+    schema = _wrap(
+        _policy_with_using("session_user IS NULL OR user_id = '1'")
+    )
+    assert len(SEC004().check(schema, {})) == 1
+
+
+def test_sec004_default_set_covers_auth_role() -> None:
+    schema = _wrap(
+        _policy_with_using("auth.role() IS NULL OR user_id = '1'")
+    )
+    assert len(SEC004().check(schema, {})) == 1

@@ -93,3 +93,51 @@ def test_sec006_bad_allowlist_type_raises_clearly() -> None:
             _wrap(_policy("p", command="INSERT", with_check=None)),
             {"allowlist": "p"},  # type: ignore[dict-item]
         )
+
+
+def test_sec006_bad_allowlist_item_type_raises_clearly() -> None:
+    import pytest
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC006().check(
+            _wrap(_policy("p", command="INSERT", with_check=None)),
+            {"allowlist": ["public.t.p", None]},  # type: ignore[list-item]
+        )
+
+
+def test_sec006_does_not_fire_on_delete_without_with_check() -> None:
+    # DELETE has no WITH CHECK semantics in Postgres; SEC006 must skip it.
+    violations = SEC006().check(
+        _wrap(_policy("p", command="DELETE", with_check=None)), {}
+    )
+    assert violations == []
+
+
+def test_sec006_with_check_treated_as_present_even_when_blank_string() -> None:
+    # An empty string for with_check_sql is still a "present" clause (the
+    # introspector wouldn't emit it for an absent clause). Pin behavior.
+    violations = SEC006().check(
+        _wrap(_policy("p", command="INSERT", with_check="")), {}
+    )
+    assert violations == []
+
+
+def test_sec006_fires_on_each_offending_policy_independently() -> None:
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    _policy("a", command="INSERT", with_check=None),
+                    _policy("b", command="UPDATE", with_check="x = 1"),
+                    _policy("c", command="ALL", with_check=None),
+                    _policy("d", command="SELECT", with_check=None),
+                ),
+            ),
+        )
+    )
+    violations = SEC006().check(schema, {})
+    locations = sorted(v.location for v in violations)
+    assert locations == ["public.t.a", "public.t.c"]

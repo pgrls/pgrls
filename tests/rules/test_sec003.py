@@ -88,3 +88,65 @@ def test_sec003_bad_allowlist_type_raises_clearly() -> None:
     import pytest
     with pytest.raises(TypeError, match="allowlist"):
         SEC003().check(schema, options={"allowlist": "p"})  # type: ignore[arg-type]
+
+
+def test_sec003_bad_allowlist_item_type_raises_clearly() -> None:
+    schema = Schema(
+        tables=(
+            _table_with_policy(
+                _policy("p", permissive=True, roles=("PUBLIC",))
+            ),
+        )
+    )
+    import pytest
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC003().check(
+            schema,
+            options={"allowlist": ["public.t.p", 42]},  # type: ignore[list-item]
+        )
+
+
+def test_sec003_empty_allowlist_behaves_like_default() -> None:
+    schema = Schema(
+        tables=(
+            _table_with_policy(
+                _policy("p", permissive=True, roles=("PUBLIC",))
+            ),
+        )
+    )
+    assert len(SEC003().check(schema, options={"allowlist": []})) == 1
+
+
+def test_sec003_does_not_fire_on_permissive_policy_with_no_roles() -> None:
+    # roles=() means the policy lists no roles at all. PUBLIC must be
+    # explicitly named for SEC003 to fire — implicit-PUBLIC behavior in
+    # Postgres is not assumed by this rule.
+    schema = Schema(
+        tables=(
+            _table_with_policy(
+                _policy("p", permissive=True, roles=())
+            ),
+        )
+    )
+    assert SEC003().check(schema, options={}) == []
+
+
+def test_sec003_fires_on_each_offending_policy_independently() -> None:
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    _policy("a", permissive=True, roles=("PUBLIC",)),
+                    _policy("b", permissive=True, roles=("PUBLIC",)),
+                    _policy("c", permissive=True, roles=("authenticated",)),
+                ),
+            ),
+        )
+    )
+    violations = SEC003().check(schema, options={})
+    locations = sorted(v.location for v in violations)
+    assert locations == ["public.t.a", "public.t.b"]
