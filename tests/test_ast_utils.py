@@ -48,3 +48,46 @@ def test_top_level_disjuncts_returns_singleton_for_leaf() -> None:
     disjuncts = top_level_disjuncts(node)
     assert len(disjuncts) == 1
     assert disjuncts[0] is node
+
+
+from pgrls.ast_utils import extract_column_refs
+
+
+def test_extract_column_refs_unqualified() -> None:
+    node = parse_expr("email = 'x'")
+    refs = extract_column_refs(node)
+    assert ("email",) in refs
+
+
+def test_extract_column_refs_qualified() -> None:
+    node = parse_expr("u.email = 'x'")
+    refs = extract_column_refs(node)
+    assert ("u", "email") in refs
+
+
+def test_extract_column_refs_includes_sublink_by_default() -> None:
+    node = parse_expr(
+        "tenant_id IN (SELECT id FROM tenants WHERE active = true)"
+    )
+    refs = extract_column_refs(node)
+    assert ("tenant_id",) in refs
+    assert ("id",) in refs or ("active",) in refs
+
+
+def test_extract_column_refs_excludes_sublink_when_flag_set() -> None:
+    node = parse_expr(
+        "tenant_id IN (SELECT id FROM tenants WHERE active = true)"
+    )
+    refs = extract_column_refs(node, exclude_sublinks=True)
+    assert ("tenant_id",) in refs
+    assert ("id",) not in refs
+    assert ("active",) not in refs
+
+
+def test_extract_column_refs_skips_wildcard_a_star() -> None:
+    node = parse_expr("count(*) > 0")
+    refs = extract_column_refs(node)
+    # No spurious tuple for `*`
+    for ref in refs:
+        for part in ref:
+            assert part != "*"
