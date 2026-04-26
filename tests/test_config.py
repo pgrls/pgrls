@@ -117,3 +117,139 @@ disable = ["$SHOULD_NOT_EXPAND"]
     )
     cfg = load_config(path=cfg_file)
     assert cfg.disable == ["$SHOULD_NOT_EXPAND"]
+
+
+def test_disable_must_be_a_list(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\ndisable = "SEC001"\n')
+    with pytest.raises(ConfigError, match="disable"):
+        load_config(path=cfg_file)
+
+
+def test_disable_items_must_be_strings(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("[lint]\ndisable = [42]\n")
+    with pytest.raises(ConfigError, match="disable"):
+        load_config(path=cfg_file)
+
+
+def test_schemas_must_be_a_list(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[database]\nschemas = "public"\n')
+    with pytest.raises(ConfigError, match="schemas"):
+        load_config(path=cfg_file)
+
+
+def test_schemas_items_must_be_strings(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("[database]\nschemas = [42]\n")
+    with pytest.raises(ConfigError, match="schemas"):
+        load_config(path=cfg_file)
+
+
+def test_lint_section_must_be_a_table(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('lint = "not-a-table"\n')
+    with pytest.raises(ConfigError, match=r"\[lint\]"):
+        load_config(path=cfg_file)
+
+
+def test_lint_rules_section_must_be_a_table(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\nrules = "nope"\n')
+    with pytest.raises(ConfigError, match=r"\[lint\.rules\]"):
+        load_config(path=cfg_file)
+
+
+def test_per_rule_options_must_be_a_table(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        """
+[lint.rules]
+SEC001 = "not-a-table"
+"""
+    )
+    with pytest.raises(ConfigError, match=r"\[lint\.rules\.SEC001\]"):
+        load_config(path=cfg_file)
+
+
+def test_invalid_toml_syntax_raises_config_error(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("[unclosed section\n")
+    with pytest.raises(ConfigError, match="Invalid TOML"):
+        load_config(path=cfg_file)
+
+
+def test_empty_toml_yields_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("")
+    cfg = load_config(path=cfg_file)
+    assert cfg.database_url is None
+    assert cfg.schemas == ["public"]
+    assert cfg.disable == []
+    assert cfg.fail_on == "warning"
+    assert cfg.rule_options == {}
+
+
+def test_unknown_top_level_keys_silently_ignored(tmp_path: Path) -> None:
+    # Unknown sections must not error — config is forward-compatible.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        """
+[database]
+url = "postgres://localhost/x"
+
+[future_feature]
+something = "ignored"
+"""
+    )
+    cfg = load_config(path=cfg_file)
+    assert cfg.database_url == "postgres://localhost/x"
+
+
+def test_rule_options_passed_through_unmodified(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        """
+[lint.rules.SEC004]
+auth_functions = ["auth.uid", "my.custom"]
+
+[lint.rules.SEC001]
+allowlist = ["countries", "currencies"]
+"""
+    )
+    cfg = load_config(path=cfg_file)
+    assert cfg.rule_options["SEC004"] == {
+        "auth_functions": ["auth.uid", "my.custom"]
+    }
+    assert cfg.rule_options["SEC001"] == {
+        "allowlist": ["countries", "currencies"]
+    }
+
+
+def test_env_interpolation_with_multiple_vars_in_one_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PG_USER", "alice")
+    monkeypatch.setenv("PG_HOST", "db.local")
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        '[database]\nurl = "postgres://${PG_USER}@${PG_HOST}/db"\n'
+    )
+    cfg = load_config(path=cfg_file)
+    assert cfg.database_url == "postgres://alice@db.local/db"
+
+
+def test_invalid_fail_on_error_mentions_valid_choices(
+    tmp_path: Path,
+) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\nfail_on = "fatal"\n')
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(path=cfg_file)
+    msg = str(exc_info.value)
+    # The error must surface the valid options so the user can act on it.
+    assert "error" in msg
+    assert "warning" in msg
+    assert "info" in msg
