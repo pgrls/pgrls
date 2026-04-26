@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "click>=8.1",
     "psycopg[binary]>=3.1",
+    "pglast>=6,<7",
 ]
 
 [project.optional-dependencies]
