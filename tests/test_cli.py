@@ -209,3 +209,28 @@ def test_merge_overrides_falls_back_to_config_when_cli_missing() -> None:
     assert merged.fail_on == "error"
     assert merged.disable == ["X"]
     assert merged.rule_options == {"R": {"k": "v"}}
+
+
+def test_introspect_populates_policy_using_ast(pg_url: str, apply_sql) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, tenant_id TEXT);
+        ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.t FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.t
+            FOR SELECT TO PUBLIC
+            USING (tenant_id = current_setting('app.tenant_id'));
+        """
+    )
+    import psycopg
+    from pgrls.introspect import introspect
+
+    with psycopg.connect(pg_url) as conn:
+        schema = introspect(conn, schemas=["public"])
+
+    table = next(t for t in schema.tables if t.name == "t")
+    policy = table.policies[0]
+    assert policy.using_sql is not None
+    assert policy.using_ast is not None
+    assert policy.with_check_sql is None
+    assert policy.with_check_ast is None
