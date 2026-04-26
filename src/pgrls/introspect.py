@@ -63,6 +63,17 @@ WHERE p.polrelid = ANY(%s)
 ORDER BY p.polrelid, p.polname
 """
 
+_COLUMNS_SQL = """
+SELECT
+    a.attrelid AS table_oid,
+    a.attname AS column_name
+FROM pg_catalog.pg_attribute a
+WHERE a.attrelid = ANY(%s)
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY a.attrelid, a.attnum
+"""
+
 
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
@@ -87,8 +98,14 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             return Schema(tables=())
 
         oids = [row["table_oid"] for row in table_rows]
+        cur.execute(_COLUMNS_SQL, (oids,))
+        column_rows = cur.fetchall()
         cur.execute(_POLICIES_SQL, (oids,))
         policy_rows = cur.fetchall()
+
+    columns_by_oid: dict[int, list[str]] = defaultdict(list)
+    for row in column_rows:
+        columns_by_oid[row["table_oid"]].append(row["column_name"])
 
     by_oid: dict[int, list[Policy]] = defaultdict(list)
     for row in policy_rows:
@@ -121,6 +138,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             rls_enabled=row["rls_enabled"],
             force_rls=row["force_rls"],
             policies=tuple(by_oid.get(row["table_oid"], [])),
+            columns=tuple(columns_by_oid.get(row["table_oid"], [])),
         )
         for row in table_rows
     ]

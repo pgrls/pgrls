@@ -234,3 +234,37 @@ def test_introspect_populates_policy_using_ast(pg_url: str, apply_sql) -> None:
     assert policy.using_ast is not None
     assert policy.with_check_sql is None
     assert policy.with_check_ast is None
+
+
+def test_introspect_populates_table_columns(pg_url: str, apply_sql) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.cols_test (id INT, email TEXT, tenant_id TEXT);
+        """
+    )
+    import psycopg
+    from pgrls.introspect import introspect
+
+    with psycopg.connect(pg_url) as conn:
+        schema = introspect(conn, schemas=["public"])
+
+    table = next(t for t in schema.tables if t.name == "cols_test")
+    assert table.columns == ("id", "email", "tenant_id")
+
+
+def test_introspect_omits_dropped_columns(pg_url: str, apply_sql) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.dropped_cols (id INT, gone TEXT, kept TEXT);
+        ALTER TABLE public.dropped_cols DROP COLUMN gone;
+        """
+    )
+    import psycopg
+    from pgrls.introspect import introspect
+
+    with psycopg.connect(pg_url) as conn:
+        schema = introspect(conn, schemas=["public"])
+
+    table = next(t for t in schema.tables if t.name == "dropped_cols")
+    assert "gone" not in table.columns
+    assert table.columns == ("id", "kept")
