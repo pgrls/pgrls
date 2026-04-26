@@ -23,4 +23,4 @@ CREATE POLICY clean_ref ON public.hyg001_clean
     AS RESTRICTIVE
     FOR SELECT
     TO PUBLIC
-    USING (tenant_id = current_setting('app.t', true));
+    USING (tenant_id = (SELECT current_setting('app.t', true)));

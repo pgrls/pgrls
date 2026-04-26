@@ -34,5 +34,5 @@ CREATE POLICY update_ok ON public.sec006_clean
     AS RESTRICTIVE
     FOR UPDATE
     TO PUBLIC
-    USING (tenant_id = current_setting('app.t', true))
-    WITH CHECK (tenant_id = current_setting('app.t', true));
+    USING (tenant_id = (SELECT current_setting('app.t', true)))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.t', true)));
