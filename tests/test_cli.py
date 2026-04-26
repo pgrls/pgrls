@@ -398,3 +398,16 @@ def test_lint_fires_hyg001_on_orphaned_column_ref(
     assert "public.hyg001_target.orphaned" in result.output
     assert "?dropped?column?" in result.output
     assert "hyg001_clean" not in result.output
+
+
+def test_lint_fires_every_rule_in_combined_fixture(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1, result.output
+    for rule_id in ("SEC001", "SEC002", "SEC003", "SEC004", "SEC006", "HYG001"):
+        assert rule_id in result.output, (
+            f"{rule_id} missing from output: {result.output}"
+        )
