@@ -12,8 +12,8 @@ import sys
 from typing import Any
 
 import pglast
-from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, SQLValueFunction, String, SubLink
-from pglast.enums import BoolExprType, SQLValueFunctionOp
+from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, NullTest, SQLValueFunction, String, SubLink
+from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
 def parse_expr(sql: str | None) -> Any | None:
@@ -139,3 +139,14 @@ def find_func_calls(node: Any, names: set[str]) -> list[Any]:
 
     walk(node)
     return matches
+
+
+def match_is_null(node: Any) -> tuple[Any, bool] | None:
+    """If node is `X IS NULL` or `X IS NOT NULL`, return (X, is_null_flag).
+
+    Returns None for any other expression shape.
+    """
+    if isinstance(node, NullTest):
+        is_null = node.nulltesttype == NullTestType.IS_NULL
+        return (node.arg, is_null)
+    return None
