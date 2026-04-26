@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.0.1** — first lint rule (SEC001) shipped. The full rule catalog and the `test` / `diff` commands are on the roadmap below.
+> **Status: 0.0.3** — error-severity rules shipping (SEC001, SEC002, SEC003, SEC004, SEC006, HYG001). Warning/info rules and the `test` / `diff` commands are on the roadmap below.
 
 ## Install
 
@@ -68,6 +68,22 @@ fail_on = "warning"
 [lint.rules.SEC001]
 allowlist = ["countries", "currencies"]
 ```
+
+## Rules
+
+`pgrls lint` ships these rules at the **error** severity:
+
+| ID | Catches |
+|---|---|
+| SEC001 | Tables in scanned schemas with RLS disabled |
+| SEC002 | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
+| SEC003 | Permissive policies granted to PUBLIC |
+| SEC004 | Inverted auth check (Lovable CVE pattern) in USING |
+| SEC006 | INSERT/UPDATE/ALL policies with no WITH CHECK |
+| HYG001 | Policies referencing columns that don't exist on the table |
+
+For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
+configuration options (allowlists, etc.), see `pgrls.example.toml`.
 
 ## Roadmap
 
