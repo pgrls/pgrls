@@ -531,6 +531,118 @@ def test_lint_fires_sec001_on_partition_child_when_parent_has_no_rls(
     assert "SEC001  public.events_2026\n" in result.output
 
 
+def test_lint_emits_unscoped_chain_message_when_parent_in_unscoped_schema(
+    pg_url: str, apply_sql
+) -> None:
+    # End-to-end coverage of the differentiated SEC001 message: parent
+    # lives in a schema not passed to `--schemas`, so pgrls cannot
+    # verify upstream RLS coverage. The unit test in test_sec001.py
+    # builds Schema by hand; this test exercises the real Postgres
+    # path including pg_inherits resolution across schemas.
+    apply_sql(
+        """
+        CREATE SCHEMA private;
+        CREATE TABLE private.events (id INT, day DATE)
+            PARTITION BY RANGE (day);
+        ALTER TABLE private.events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE private.events FORCE ROW LEVEL SECURITY;
+        CREATE TABLE public.events_2026 PARTITION OF private.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--schemas", "public"],
+    )
+    assert "SEC001  public.events_2026" in result.output
+    assert "leaves the scanned schemas" in result.output
+    # The classic message must NOT appear for this child — the rule
+    # was specifically refactored to differentiate the two.
+    classic_for_child = (
+        "Table public.events_2026 does not have row-level security"
+    )
+    assert classic_for_child not in result.output
+
+
+def test_lint_partition_x_sec003_fires_on_parent_policy(
+    pg_url: str, apply_sql
+) -> None:
+    # Cross-rule integration: when partition suppression silences
+    # SEC001 on a child, the per-policy rules must still fire on the
+    # parent's policies. Pins that partition awareness is scoped to
+    # SEC001 and doesn't leak into SEC003/SEC008 (the two that fire
+    # on a `USING (true) TO PUBLIC` permissive policy).
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, tenant_id UUID, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026 PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.events FORCE ROW LEVEL SECURITY;
+        CREATE POLICY all_read ON public.events
+            FOR SELECT TO PUBLIC USING (true);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    # SEC001 quiet on both parent (RLS enabled) and child (ancestor
+    # covers).
+    assert "SEC001  public.events\n" not in result.output
+    assert "SEC001  public.events_2026" not in result.output
+    # Per-policy rules fire on the parent's policy.
+    assert "SEC003  public.events.all_read\n" in result.output
+    assert "SEC008  public.events.all_read\n" in result.output
+    # Children have no policies of their own → no per-policy rules
+    # touch them.
+    assert "SEC003  public.events_2026" not in result.output
+    assert "SEC008  public.events_2026" not in result.output
+
+
+def test_lint_handles_partition_cycle_with_clean_error(
+    pg_url: str, monkeypatch
+) -> None:
+    # Postgres cannot produce a cycle in pg_inherits; only corrupted
+    # introspection state can. The CLI catches `ValueError` from the
+    # rule loop and turns it into a ClickException — pin that the
+    # path is exercised by something, since it is otherwise
+    # unreachable from any real database. Patch `introspect` to hand
+    # back a hand-built cycle Schema and verify the CLI exits cleanly
+    # without a Python traceback in the output.
+    import pgrls.cli as cli_mod
+    from pgrls.model import Schema, Table
+
+    a = Table(
+        schema="public",
+        name="a",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "b"),
+    )
+    b = Table(
+        schema="public",
+        name="b",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "a"),
+    )
+    cycle = Schema(tables=(a, b))
+    monkeypatch.setattr(
+        cli_mod, "introspect", lambda conn, schemas: cycle
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code != 0
+    assert "cycle" in result.output.lower()
+    # ClickException prints the message; an unhandled exception would
+    # leak a Python traceback. Pin the absence.
+    assert "Traceback" not in result.output
+
+
 def test_lint_fires_every_rule_in_combined_fixture(
     pg_url: str, apply_sql
 ) -> None:
