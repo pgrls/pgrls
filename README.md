@@ -89,9 +89,11 @@ allowlist = ["countries", "currencies"]
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
 
+For per-release changes, see [CHANGELOG.md](CHANGELOG.md).
+
 ## Roadmap
 
-- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. JSON, SARIF, and Markdown output. Polished error messages.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. SARIF and Markdown output. Polished error messages.
 - **`pgrls test`.** Code-first RLS test DSL for Python, TypeScript, and Go.
 - **`pgrls diff`.** Semantic policy diff between branches with DANGEROUS / BREAKING / SAFE classification.
 
