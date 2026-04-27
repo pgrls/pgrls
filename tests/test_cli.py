@@ -329,6 +329,36 @@ def test_lint_sec002_allowlist_via_config_exempts(
     assert "SEC002" not in result.output
 
 
+def test_lint_sec002_fires_on_partition_child_with_self_enabled_rls(
+    pg_url: str, apply_sql
+) -> None:
+    # Pins that SEC002 stays partition-agnostic: a partition child that
+    # the operator explicitly RLS-enables but forgot to FORCE must fire,
+    # regardless of whether the parent itself has FORCE. The semantics:
+    # direct queries on the child use the child's own flags only, and
+    # the operator opted into RLS on this specific child — they meant
+    # to FORCE it too. A future regression that gives SEC002 the same
+    # ancestor-suppression as SEC001 would silence this case incorrectly.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026 PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.events FORCE ROW LEVEL SECURITY;
+        ALTER TABLE public.events_2026 ENABLE ROW LEVEL SECURITY;
+        -- Child intentionally lacks FORCE — owner can bypass on direct
+        -- access to this partition. SEC002 must catch that.
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert "SEC002  public.events_2026\n" in result.output
+    # Parent has FORCE, so it must NOT fire.
+    assert "SEC002  public.events\n" not in result.output
+
+
 def test_lint_fires_sec003_on_permissive_public_policy(
     pg_url: str, apply_sql
 ) -> None:
