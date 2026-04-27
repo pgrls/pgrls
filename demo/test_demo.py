@@ -207,6 +207,122 @@ def test_uc15_visible_root_partition_message_names_the_root(
 
 
 # ============================================================
+# Use cases 16-22 — additional clean and rule-variant patterns
+# ============================================================
+
+def test_uc16_correlated_exists_membership_clean(
+    lint_output: str,
+) -> None:
+    # The C2 fix scenario: a correlated EXISTS that references the
+    # outer table's column via correlation. Before the fix, SEC005
+    # falsely fired here because exclude_sublinks=True discarded
+    # the correlated own-col ref. The demo pins it as clean.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.team_documents"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.team_documents"
+        )
+
+
+def test_uc17_asymmetric_using_with_check_clean(
+    lint_output: str,
+) -> None:
+    # Read team's tickets, write only your own. USING and WITH
+    # CHECK do different things by design; pgrls accepts that.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.tickets"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.tickets"
+        )
+
+
+def test_uc18_soft_delete_pattern_clean(lint_output: str) -> None:
+    # `deleted_at IS NULL` is a column-IS-NULL test, not an
+    # `auth_func() IS NULL` — SEC004 must distinguish them.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.users_v2"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.users_v2"
+        )
+
+
+def test_uc19_supabase_auth_uid_inverted_fires_sec004(
+    lint_output: str,
+) -> None:
+    assert "SEC004  app.profiles.allow_anon\n" in lint_output
+
+
+def test_uc20_supabase_auth_uid_unwrapped_fires_perf001(
+    lint_output: str,
+) -> None:
+    assert "PERF001  app.todos.todos_owner\n" in lint_output
+
+
+def test_uc21_perf001_silent_when_auth_only_in_with_check(
+    lint_output: str,
+) -> None:
+    # Pins the USING-only contract: `auth.uid()` in WITH CHECK
+    # alone must NOT trigger PERF001. A future regression
+    # extending the rule to WITH CHECK breaks this test loudly.
+    assert (
+        "PERF001  app.audit_inserts.insert_self_only" not in lint_output
+    )
+
+
+def test_uc22_hyg001_fires_on_orphan_in_with_check(
+    lint_output: str,
+) -> None:
+    # The dropped column is referenced only in WITH CHECK. Pins
+    # that HYG001 walks both clauses, not just USING.
+    assert "HYG001  app.posts_v2.only_approved_writes\n" in lint_output
+
+
+# ============================================================
+# Use cases 23-24 — extra partition shapes
+# ============================================================
+
+def test_uc23_three_level_partition_with_rls_root_silent(
+    lint_output: str,
+) -> None:
+    # Sub-partitioning: deep_events -> deep_events_t1 ->
+    # deep_events_t1_2026. RLS only on the root, but SEC001's
+    # iterative ancestor walk reaches it from any depth.
+    for table in (
+        "app.deep_events",
+        "app.deep_events_t1",
+        "app.deep_events_t1_2026",
+    ):
+        assert f"SEC001  {table}\n" not in lint_output, (
+            f"SEC001 unexpectedly fired on {table}"
+        )
+
+
+def test_uc24_partition_leaf_rls_only_fires_on_parent(
+    lint_output: str,
+) -> None:
+    # Parent bare, leaf has its own RLS. Pin the asymmetry —
+    # SEC001 must fire on the parent (no RLS there, no ancestor
+    # to cover it) but stay silent on the leaf (rls_enabled=true
+    # on the leaf itself).
+    assert "SEC001  app.leaf_metrics\n" in lint_output
+    assert "SEC001  app.leaf_metrics_2026" not in lint_output
+
+
+# ============================================================
+# Use case 25 — relkind filtering
+# ============================================================
+
+def test_uc25_view_invisible_to_introspector(
+    lint_output: str,
+) -> None:
+    # The introspector filters to relkind IN ('r', 'p'). Views
+    # (relkind='v') don't enter the table list, so no rule
+    # mentions `app.documents_view` even though it sits on top
+    # of an RLS-enabled table.
+    assert "app.documents_view" not in lint_output
+
+
+# ============================================================
 # Tour-level sanity checks
 # ============================================================
 

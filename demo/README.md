@@ -24,16 +24,26 @@ demo/
 | 03 | Tenant table, RLS forgotten | SEC001 | fires |
 | 04 | RLS enabled but no FORCE | SEC002 | fires |
 | 05 | Permissive PUBLIC policy | SEC003 + SEC005/7/8 | fires |
-| 06 | Inverted-auth (Lovable CVE shape) | SEC004 + PERF001 | fires |
+| 06 | Inverted-auth (`current_setting() IS NULL`) | SEC004 + PERF001 | fires |
 | 07 | Session-state-only predicate | SEC005 + PERF001 | fires |
 | 08 | UPDATE policy missing WITH CHECK | SEC006 | fires |
 | 09 | All policies permissive (no RESTRICTIVE floor) | SEC007 | fires |
 | 10 | `USING (true)` policy | SEC008 + SEC005 | fires |
 | 11 | Unwrapped auth call in USING | PERF001 | fires |
-| 12 | Orphaned column reference | HYG001 | fires |
+| 12 | Orphaned column reference (in USING) | HYG001 | fires |
 | 13 | Partitioned parent with RLS — clean | (none) | passes (children suppressed by ancestor walk) |
 | 14 | Cross-schema partition (parent unscoped) | SEC001 differentiated | fires with "leaves the scanned schemas" message |
 | 15 | Partition family with no RLS anywhere | SEC001 visible-root variant | fires; child message names the parent |
+| 16 | Correlated EXISTS membership join | (none) | passes (C2-fix scenario — must NOT trip SEC005) |
+| 17 | Asymmetric USING / WITH CHECK | (none) | passes (read team's, write own) |
+| 18 | Soft-delete pattern (`deleted_at IS NULL`) | (none) | passes (column-IS-NULL is not auth-IS-NULL) |
+| 19 | Supabase `auth.uid() IS NULL` (Lovable CVE shape) | SEC004 + PERF001 | fires |
+| 20 | Supabase `auth.uid()` unwrapped | PERF001 | fires |
+| 21 | `auth.uid()` in WITH CHECK only | (none) | passes (PERF001 is USING-only by design) |
+| 22 | Orphaned column referenced only in WITH CHECK | HYG001 | fires (rule walks both clauses) |
+| 23 | Three-level partition with RLS at root | (none) | passes (multi-level ancestor walk) |
+| 24 | RLS pushed down to leaf only | SEC001 | fires on parent only; leaf clean |
+| 25 | View on top of RLS-enabled table | (none) | passes (relkind='v' filtered out) |
 
 ## Running
 
@@ -71,8 +81,9 @@ pytest demo/test_demo.py -v
 ```
 
 Spins up an isolated Postgres via `testcontainers` (no port
-collisions), applies `setup.sql`, and runs 17 assertions — one per
-use case plus a few summary checks. Each test is named
+collisions), applies `setup.sql`, and runs 27 assertions — one per
+use case (with extra coverage for the partition variants) plus a
+few summary checks. Each test is named
 `test_uc<NN>_<what_it_does>` for top-to-bottom readability.
 
 To run the tests against a long-running DB you started with `run.sh`:
@@ -84,28 +95,37 @@ DATABASE_URL=postgres://demo:demo@localhost:5433/demo \
 
 ## Expected lint output
 
-Twenty-three violations across all three severities. Key lines:
+Roughly 30 violations across all three severities. Key lines:
 
 ```
-ERROR  SEC001  app.legacy_orders         (use case 03)
-ERROR  SEC001  app.bare_metrics_2026     (use case 15 — names the parent)
-ERROR  SEC001  app.audit_log_2026        (use case 14 — unscoped chain)
-ERROR  SEC002  app.notes                 (use case 04)
-ERROR  SEC003  app.posts.everyone_reads  (use case 05)
-ERROR  SEC004  app.accounts.allow_unset_user  (use case 06)
-ERROR  SEC006  app.invoices.update_without_check  (use case 08)
-ERROR  HYG001  app.comments.archived_filter  (use case 12)
-WARN   SEC005  app.singletons.admin_only  (use case 07)
-WARN   SEC008  app.feature_flags.public_flags  (use case 10)
-WARN   PERF001 app.messages.messages_owner  (use case 11)
-INFO   SEC007  app.tags                   (use case 09)
+ERROR  SEC001  app.legacy_orders                 (use case 03)
+ERROR  SEC001  app.bare_metrics_2026             (use case 15 — names the parent)
+ERROR  SEC001  app.audit_log_2026                (use case 14 — unscoped chain)
+ERROR  SEC001  app.leaf_metrics                  (use case 24 — leaf has its own RLS)
+ERROR  SEC002  app.notes                         (use case 04)
+ERROR  SEC003  app.posts.everyone_reads          (use case 05)
+ERROR  SEC004  app.accounts.allow_unset_user     (use case 06)
+ERROR  SEC004  app.profiles.allow_anon           (use case 19 — Supabase shape)
+ERROR  SEC006  app.invoices.update_without_check (use case 08)
+ERROR  HYG001  app.comments.archived_filter      (use case 12)
+ERROR  HYG001  app.posts_v2.only_approved_writes (use case 22 — orphan in WITH CHECK)
+WARN   SEC005  app.singletons.admin_only         (use case 07)
+WARN   SEC008  app.feature_flags.public_flags    (use case 10)
+WARN   PERF001 app.messages.messages_owner       (use case 11)
+WARN   PERF001 app.todos.todos_owner             (use case 20 — auth.uid unwrapped)
+INFO   SEC007  app.tags                          (use case 09)
 ```
 
 Several rules cross-fire — `USING (true)` triggers SEC005 + SEC008 +
-(if PERMISSIVE PUBLIC) SEC003 simultaneously. That's realistic, not a
-flaw: a single bad policy usually breaks several rules at once. The
-`test_uc<NN>_*` tests assert the *primary* rule per use case; cross-
-fires show up as additional lines in the lint output.
+(if PERMISSIVE PUBLIC) SEC003 simultaneously, and a Supabase
+`auth.uid() IS NULL OR ...` predicate fires SEC004 *and* PERF001. That
+is realistic, not a flaw: a single bad policy usually breaks several
+rules at once. The `test_uc<NN>_*` tests assert the *primary* rule per
+use case; cross-fires show up as additional lines in the lint output.
+
+Tables that should stay silent (cases 01, 02 via allowlist, 13, 16,
+17, 18, 21, 23, 25) never appear in any violation line. The clean
+tests assert this directly.
 
 ## Wiring this into CI
 
