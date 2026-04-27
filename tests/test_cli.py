@@ -31,14 +31,45 @@ def test_root_version_flag():
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+_ALL_RULE_IDS = (
+    "SEC001",
+    "SEC002",
+    "SEC003",
+    "SEC004",
+    "SEC005",
+    "SEC006",
+    "SEC007",
+    "SEC008",
+    "PERF001",
+    "HYG001",
+)
+
+
+def _assert_rules_fire_exactly(output: str, expected: set[str]) -> None:
+    """Assert exactly `expected` rule IDs appear in lint output.
+
+    Pins which rules a fixture is meant to exercise, so silent
+    cross-firing or silent regressions on other rules show up as
+    test failures rather than going unnoticed.
+    """
+    found = {rid for rid in _ALL_RULE_IDS if rid in output}
+    assert found == expected, (
+        f"expected {sorted(expected)}, got {sorted(found)}\n"
+        f"output:\n{output}"
+    )
+
 
 def test_lint_against_known_bad_db_exits_nonzero(pg_url: str, apply_sql) -> None:
     apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "SEC001" in result.output
     assert "public.users" in result.output
+    # users → SEC001. orders.orders_owner is permissive PUBLIC → SEC003.
+    # orders has only that one permissive policy → SEC007 (info).
+    _assert_rules_fire_exactly(
+        result.output, {"SEC001", "SEC003", "SEC007"}
+    )
 
 
 def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
@@ -305,9 +336,11 @@ def test_lint_fires_sec003_on_permissive_public_policy(
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "SEC003" in result.output
     assert "public.sec003_target.public_read" in result.output
     assert "sec003_clean" not in result.output
+    # sec003_target has only one permissive PUBLIC policy → SEC003 +
+    # SEC007 (info: no RESTRICTIVE floor). sec003_clean is RESTRICTIVE.
+    _assert_rules_fire_exactly(result.output, {"SEC003", "SEC007"})
 
 
 def test_lint_sec003_allowlist_via_config_exempts(
@@ -333,10 +366,16 @@ def test_lint_fires_sec006_on_update_and_all_without_with_check(
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "SEC006" in result.output
     assert "public.sec006_update.update_bad" in result.output
     assert "public.sec006_all.all_bad" in result.output
     assert "public.sec006_clean" not in result.output
+    # The three bad policies are permissive PUBLIC → SEC003 + SEC007.
+    # update_bad / all_bad have unwrapped current_setting → PERF001.
+    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005.
+    _assert_rules_fire_exactly(
+        result.output,
+        {"SEC003", "SEC005", "SEC006", "SEC007", "PERF001"},
+    )
 
 
 def test_lint_sec006_allowlist_via_config_exempts(
@@ -363,9 +402,15 @@ def test_lint_fires_sec004_on_lovable_cve_pattern(
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "SEC004" in result.output
     assert "public.sec004_target.inverted_auth" in result.output
     assert "sec004_clean" not in result.output
+    # inverted_auth is permissive PUBLIC → SEC003 + SEC007 (only
+    # permissive on the table). USING has unwrapped current_setting →
+    # PERF001. sec004_clean policy is RESTRICTIVE so SEC003/SEC007
+    # don't fire on that table.
+    _assert_rules_fire_exactly(
+        result.output, {"SEC003", "SEC004", "SEC007", "PERF001"}
+    )
 
 
 def test_lint_sec004_auth_functions_override_suppresses(
@@ -394,10 +439,16 @@ def test_lint_fires_hyg001_on_orphaned_column_ref(
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "HYG001" in result.output
     assert "public.hyg001_target.orphaned" in result.output
     assert "?dropped?column?" in result.output
     assert "hyg001_clean" not in result.output
+    # `orphaned` is permissive PUBLIC → SEC003 + SEC007 (only permissive
+    # on the table). The dropped column is excluded from table.columns,
+    # so SEC005 fires too — the policy has no live own-col ref. HYG001
+    # is the headline. hyg001_clean is RESTRICTIVE.
+    _assert_rules_fire_exactly(
+        result.output, {"SEC003", "SEC005", "SEC007", "HYG001"}
+    )
 
 
 def test_lint_fires_every_rule_in_combined_fixture(
