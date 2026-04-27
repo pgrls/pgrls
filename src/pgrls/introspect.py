@@ -34,9 +34,26 @@ SELECT
     c.oid AS table_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind = 'r'
+WHERE c.relkind IN ('r', 'p')
   AND n.nspname = ANY(%s)
 ORDER BY n.nspname, c.relname
+"""
+
+# Map declarative-partition children to their immediate parent. We filter
+# on `c.relispartition` so classic `INHERITS` children (which also go
+# through pg_inherits but are not declarative partitions) don't get a
+# partition_of set.
+_PARTITION_PARENTS_SQL = """
+SELECT
+    inh.inhrelid AS child_oid,
+    pn.nspname AS parent_schema,
+    pc.relname AS parent_name
+FROM pg_catalog.pg_inherits inh
+JOIN pg_catalog.pg_class cc ON cc.oid = inh.inhrelid
+JOIN pg_catalog.pg_class pc ON pc.oid = inh.inhparent
+JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
+WHERE cc.relispartition = true
+  AND inh.inhrelid = ANY(%s)
 """
 
 _POLICIES_SQL = """
@@ -102,10 +119,17 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         column_rows = cur.fetchall()
         cur.execute(_POLICIES_SQL, (oids,))
         policy_rows = cur.fetchall()
+        cur.execute(_PARTITION_PARENTS_SQL, (oids,))
+        partition_rows = cur.fetchall()
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
     for row in column_rows:
         columns_by_oid[row["table_oid"]].append(row["column_name"])
+
+    partition_parent_by_oid: dict[int, tuple[str, str]] = {
+        row["child_oid"]: (row["parent_schema"], row["parent_name"])
+        for row in partition_rows
+    }
 
     by_oid: dict[int, list[Policy]] = defaultdict(list)
     for row in policy_rows:
@@ -139,6 +163,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             force_rls=row["force_rls"],
             policies=tuple(by_oid.get(row["table_oid"], [])),
             columns=tuple(columns_by_oid.get(row["table_oid"], [])),
+            partition_of=partition_parent_by_oid.get(row["table_oid"]),
         )
         for row in table_rows
     ]
