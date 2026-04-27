@@ -68,6 +68,23 @@ class SEC001:
                 f"directly onto this table via "
                 f"`CREATE POLICY ... ON {table.qualified_name}`."
             )
+        elif ancestors:
+            # Partition child whose chain reaches the root inside scope,
+            # but no ancestor has RLS — point at the root rather than
+            # advising the user to enable RLS on the leaf. Enabling on
+            # the parent covers query-through-parent paths for every
+            # sibling; enabling on this leaf alone leaves siblings
+            # exposed and direct queries on this child still bypass
+            # the parent's policies (if any are added later).
+            root = ancestors[-1]
+            message = (
+                f"Table {table.qualified_name} is a partition of "
+                f"{root.qualified_name}, which also lacks row-level "
+                "security. Enable RLS on the parent (covers queries "
+                "routed through the parent for every partition), or "
+                "push policies onto each child if direct partition "
+                "access is part of your threat model."
+            )
         else:
             message = (
                 f"Table {table.qualified_name} does not have row-level "
