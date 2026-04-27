@@ -451,6 +451,56 @@ def test_lint_fires_hyg001_on_orphaned_column_ref(
     )
 
 
+def test_lint_does_not_fire_sec001_on_child_of_rls_enabled_parent(
+    pg_url: str, apply_sql
+) -> None:
+    # Postgres declarative partitioning: parent has RLS + a tenant policy,
+    # children inherit it at query time. Before the partition fix,
+    # introspection skipped the parent (relkind='p') and SEC001 falsely
+    # fired on every child because their relrowsecurity is independently
+    # false. With the fix the parent is visible AND SEC001 walks
+    # `partition_of` to recognize ancestor coverage.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id BIGINT, tenant_id UUID, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026 PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.events FORCE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_read ON public.events FOR SELECT TO PUBLIC
+            USING (tenant_id = current_setting('app.t', true)::uuid);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    # No SEC001/SEC002 on parent or child.
+    assert "SEC001  public.events" not in result.output
+    assert "SEC002  public.events" not in result.output
+    # SEC003 still fires on the parent's permissive PUBLIC policy — that
+    # behavior is untouched by the partition fix and is correct.
+    assert "SEC003  public.events.tenant_read\n" in result.output
+
+
+def test_lint_fires_sec001_on_partition_child_when_parent_has_no_rls(
+    pg_url: str, apply_sql
+) -> None:
+    # Conservative side of the suppression: when no ancestor has RLS,
+    # SEC001 still fires on every level — parent and child.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026 PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert "SEC001  public.events\n" in result.output
+    assert "SEC001  public.events_2026\n" in result.output
+
+
 def test_lint_fires_every_rule_in_combined_fixture(
     pg_url: str, apply_sql
 ) -> None:

@@ -5,6 +5,7 @@ Currently version 1.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -53,6 +54,34 @@ class Table:
 @dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
+
+    def ancestors_of(self, table: Table) -> Iterator[Table]:
+        """Yield partition-of ancestors of `table`, immediate parent first.
+
+        Stops at the root partitioned table or when an ancestor is outside
+        the schemas we introspected (whichever comes first). Rules use this
+        to walk inheritance for declarative partitioning — e.g. SEC001
+        skips a child when an ancestor has `rls_enabled = True`. A child
+        whose parent is in an unscoped schema gets an empty walk: we cannot
+        prove ancestor coverage, so the rule's default behavior applies.
+        """
+        by_qname = {t.qualified_name: t for t in self.tables}
+        current = table
+        seen: set[str] = set()
+        while current.partition_of is not None:
+            qname = (
+                f"{current.partition_of[0]}.{current.partition_of[1]}"
+            )
+            if qname in seen:
+                # Defensive — Postgres won't allow a real cycle here, but
+                # a malformed snapshot shouldn't loop.
+                return
+            seen.add(qname)
+            parent = by_qname.get(qname)
+            if parent is None:
+                return
+            yield parent
+            current = parent
 
     def to_snapshot(self) -> Snapshot:
         return {
