@@ -1,12 +1,14 @@
 """Normalized representation of a Postgres schema's RLS state.
 
-Snapshot format is versioned: structural changes bump major, additive bump minor.
-Currently version 1.
+Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
+on any change that adds, removes, or restructures an emitted field.
+Currently version 2 (v2 added `partition_of` to each table entry).
 """
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, Literal
 
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
@@ -55,6 +57,15 @@ class Table:
 class Schema:
     tables: tuple[Table, ...] = ()
 
+    @cached_property
+    def _by_qname(self) -> dict[str, Table]:
+        # Built once per Schema instance — `ancestors_of` would otherwise
+        # rebuild it on every call, which is O(N²) when SEC001 walks N
+        # partition children. `cached_property` writes to `__dict__`,
+        # bypassing the frozen dataclass's `__setattr__`. The cache is
+        # never invalidated because the dataclass is immutable.
+        return {t.qualified_name: t for t in self.tables}
+
     def ancestors_of(self, table: Table) -> Iterator[Table]:
         """Yield partition-of ancestors of `table`, immediate parent first.
 
@@ -71,7 +82,6 @@ class Schema:
         `pg_inherits`, so the only path here is corrupted state — silent
         truncation would mask the bug; raising surfaces it loudly.
         """
-        by_qname = {t.qualified_name: t for t in self.tables}
         current = table
         seen: set[str] = set()
         while current.partition_of is not None:
@@ -85,7 +95,7 @@ class Schema:
                     "this indicates corrupted introspection state."
                 )
             seen.add(qname)
-            parent = by_qname.get(qname)
+            parent = self._by_qname.get(qname)
             if parent is None:
                 return
             yield parent
