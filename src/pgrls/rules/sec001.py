@@ -58,7 +58,7 @@ class SEC001:
     def _violation(
         self, table: Table, ancestors: list[Table]
     ) -> Violation:
-        if self._walk_left_introspected_scope(table, ancestors):
+        if self._chain_exits_introspected_scope(table, ancestors):
             message = (
                 f"Table {table.qualified_name} is a partition whose "
                 "ancestor chain leaves the scanned schemas before pgrls "
@@ -83,11 +83,11 @@ class SEC001:
             location=table.qualified_name,
         )
 
-    def _walk_left_introspected_scope(
+    def _chain_exits_introspected_scope(
         self, table: Table, ancestors: list[Table]
     ) -> bool:
         # The walk reaches the root iff the last visited node has no
-        # `partition_of` link. Truncated walks indicate the next ancestor
+        # `partition_of` link. A truncated walk means the next ancestor
         # is in an unintrospected schema — pgrls can't see whether RLS
         # is enabled upstream, so the violation message changes shape.
         if table.partition_of is None:

@@ -83,7 +83,12 @@ class Schema:
         truncation would mask the bug; raising surfaces it loudly.
         """
         current = table
-        seen: set[str] = set()
+        # Seed with the starting table so a self-cycle (or a chain
+        # whose first ancestor points back to `table`) is caught
+        # before yielding `table` to the caller. Without this seed,
+        # a cycle of length 1 would emit the starting table as if it
+        # were its own ancestor before raising.
+        seen: set[str] = {table.qualified_name}
         while current.partition_of is not None:
             qname = (
                 f"{current.partition_of[0]}.{current.partition_of[1]}"
