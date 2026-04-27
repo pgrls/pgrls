@@ -66,6 +66,26 @@ demo/
 | 45 | `PARTITION OF parent DEFAULT` | (none) | passes (default partition walks ancestor chain) |
 | 46 | Generated column referenced in policy | (none) | passes (generated cols are real attributes) |
 | 47 | `<scalar> = ANY(array_col)` | (none) | passes (extract walks ArrayExpr) |
+| 48 | E-commerce orders + items via FK + EXISTS | (none) | passes (2-table tenant join) |
+| 49 | GDPR-style classification (ARRAY + CASE composite) | (none) | passes (rule walks both branches) |
+| 50 | Read-replica style (SELECT-only policies, no PUBLIC permissive) | (none) | passes |
+| 51 | ROW comparison `(a,b) = (c,d)` | (none) | passes (extract walks RowExpr) |
+| 52 | Two PERMISSIVE PUBLIC policies on one table | SEC003 ×2 + SEC007 | each policy fires its own line |
+| 53 | `auth_func() IS NULL` buried inside a nested OR | (none) | passes — documented false negative pin |
+| 54 | `email::text = ...` (TypeCast over column) | (none) | passes (extract walks TypeCast.arg) |
+| 55 | `USING (NOT false)` | SEC005 | fires; SEC008 specifically does NOT (literal-only detection) |
+| 56 | `gone IS TRUE` (BoolTest) on dropped column | HYG001 | fires (extract walks BoolTest.arg) |
+| 57 | `auth.uid()::text` (TypeCast over auth call) | PERF001 | fires (find_func_calls walks TypeCast.arg) |
+| 58 | `COALESCE(auth.uid(), default)` | PERF001 | fires (find_func_calls walks function args) |
+| 59 | `fail_on = "warning"` | gates (config) | exit code 1 on PERF001 |
+| 60 | `fail_on = "info"` | gates (config) | exit code 1 on SEC007 |
+| 61 | `--format text` (only supported format in 0.0.4) | accept/reject (config) | text accepted; json rejected with clean error |
+| 62 | `[lint].disable = ["SEC005", "SEC008"]` | disabled (config) | both rules skipped |
+| 63 | `allowlist = "..."` (string, not list) | error (config) | clean ClickException, no traceback |
+| 64 | `app."MixedCase Table"` quoted identifier | (none) | passes (round-trips through pg_class as plain string) |
+| 65 | SEC001 allowlist by unqualified name | silenced (config) | works for `legacy_orders` (no schema prefix) |
+| 66 | `payload->>'visibility'` JSON access | (none) | passes (HYG001 doesn't confuse JSON keys with column names) |
+| 67 | `BETWEEN now() - INTERVAL ... AND now()` | (none) | passes (extract walks AEXPR_BETWEEN) |
 
 ## Running
 
@@ -103,11 +123,11 @@ pytest demo/test_demo.py -v
 ```
 
 Spins up an isolated Postgres via `testcontainers` (no port
-collisions), applies `setup.sql`, and runs 49 assertions — one per
+collisions), applies `setup.sql`, and runs 69 assertions — one per
 use case plus configuration-driven scenarios that exercise per-test
 `--config` overrides (allowlist, disable, custom `auth_functions`,
-multi-schema). Each test is named `test_uc<NN>_<what_it_does>` for
-top-to-bottom readability.
+multi-schema, fail_on, format). Each test is named
+`test_uc<NN>_<what_it_does>` for top-to-bottom readability.
 
 To run the tests against a long-running DB you started with `run.sh`:
 
@@ -118,8 +138,8 @@ DATABASE_URL=postgres://demo:demo@localhost:5433/demo \
 
 ## Expected lint output
 
-Around 38 violations across all three severities (`19 errors,
-16 warnings, 3 infos.`). The fixture is intentionally noisy — most
+Around 45 violations across all three severities (`22 errors,
+19 warnings, 4 infos.`). The fixture is intentionally noisy — most
 violations come from cross-fires where one bad policy trips several
 rules at once (`USING (true)` → SEC005 + SEC008 + SEC003 if PUBLIC; a
 Supabase `auth.uid() IS NULL OR ...` → SEC004 + PERF001). Each
