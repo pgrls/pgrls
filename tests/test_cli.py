@@ -458,18 +458,39 @@ def test_lint_fires_every_rule_in_combined_fixture(
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    for rule_id in (
-        "SEC001",
-        "SEC002",
-        "SEC003",
-        "SEC004",
-        "SEC005",
-        "SEC006",
-        "SEC007",
-        "SEC008",
-        "PERF001",
-        "HYG001",
+    _assert_rules_fire_exactly(
+        result.output,
+        {
+            "SEC001",
+            "SEC002",
+            "SEC003",
+            "SEC004",
+            "SEC005",
+            "SEC006",
+            "SEC007",
+            "SEC008",
+            "PERF001",
+            "HYG001",
+        },
+    )
+    # Pin each (rule, location) pair to its intended target. Substring
+    # plus trailing newline anchors against the output's `RULE  LOC\n`
+    # shape (formatters/text.py) so a rule drifting onto the wrong
+    # policy fails loudly instead of silently slipping by.
+    for rule_loc in (
+        "SEC001  public.allbad_sec001\n",
+        "SEC002  public.allbad_sec002\n",
+        "SEC003  public.allbad_sec003.public_perm\n",
+        "SEC004  public.allbad_sec004.inverted\n",
+        "SEC005  public.allbad_sec003.public_perm\n",
+        "SEC005  public.allbad_hyg001.orphan\n",
+        "SEC006  public.allbad_sec006.update_no_check\n",
+        "SEC007  public.allbad_sec003\n",
+        "SEC008  public.allbad_sec003.public_perm\n",
+        "PERF001  public.allbad_sec004.inverted\n",
+        "PERF001  public.allbad_sec006.update_no_check\n",
+        "HYG001  public.allbad_hyg001.orphan\n",
     ):
-        assert rule_id in result.output, (
-            f"{rule_id} missing from output: {result.output}"
+        assert rule_loc in result.output, (
+            f"{rule_loc!r} missing from output:\n{result.output}"
         )

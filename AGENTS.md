@@ -261,9 +261,14 @@ CREATE POLICY tenant_read ON public.invoices
     USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
 
-The rule walks both `USING` and `WITH CHECK`, ignoring column refs
-inside subqueries (those refer to other tables). It skips policies on
-tables with no introspected columns.
+The rule walks the entire expression in both `USING` and `WITH CHECK`,
+including inside subqueries. That's deliberate so correlated patterns
+like `EXISTS (SELECT 1 FROM members m WHERE m.tenant_id = tenant_id)`
+— where the policy's own column is referenced via correlation — don't
+trip a false positive. The trade-off is a rare false negative when a
+subquery references a column with the same bare name as one on the
+policy's own table. Policies on tables with no introspected columns
+are skipped.
 
 **When the warning is acceptable.** A few tables really are gated by
 session state alone — e.g. an audit log read by a single admin role,

@@ -46,7 +46,7 @@ allowlist = []
 
 [lint.rules.SEC007]
 # Tables where every-policy-permissive is intentional (e.g. reference
-# data). Same shape as SEC001: unqualified or "schema.table".
+# data). Entries are qualified table IDs of the form "schema.table".
 allowlist = []
 
 [lint.rules.SEC008]
