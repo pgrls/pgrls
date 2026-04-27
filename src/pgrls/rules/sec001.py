@@ -7,10 +7,15 @@ schemas, minus the per-rule `allowlist`. Allowlist entries can be unqualified
 Declarative partitioning: Postgres does not propagate `relrowsecurity` from
 a partitioned parent down to its children, but queries through the parent
 DO apply the parent's policies. SEC001 skips a child when any ancestor in
-its `partition_of` chain has `rls_enabled = True`. Direct queries against
-a child bypass the parent's policies — a security caveat documented in
-`AGENTS.md` and worth allowlisting individual children for if direct access
-is part of the application's threat model.
+its `partition_of` chain has `rls_enabled = True`. When the chain leaves
+the introspected schema set before reaching anyone with RLS, the rule
+fires with a different message — telling the user pgrls cannot verify
+ancestor coverage rather than telling them to enable RLS on a table that
+may already be covered upstream.
+
+Direct queries against a child bypass the parent's policies — a security
+caveat documented in `AGENTS.md`. Push a policy onto every child when
+direct access is part of the application's threat model.
 """
 from __future__ import annotations
 
@@ -27,13 +32,17 @@ class SEC001:
 
     def check(self, schema: Schema, options: dict[str, Any]) -> list[Violation]:
         allowlist = self._parse_allowlist(options)
-        return [
-            self._violation(t)
-            for t in schema.tables
-            if not t.rls_enabled
-            and not self._is_allowlisted(t, allowlist)
-            and not self._ancestor_covers_rls(t, schema)
-        ]
+        out: list[Violation] = []
+        for table in schema.tables:
+            if table.rls_enabled:
+                continue
+            if self._is_allowlisted(table, allowlist):
+                continue
+            ancestors = list(schema.ancestors_of(table))
+            if any(a.rls_enabled for a in ancestors):
+                continue
+            out.append(self._violation(table, ancestors))
+        return out
 
     def _parse_allowlist(self, options: dict[str, Any]) -> set[str]:
         raw = options.get("allowlist", [])
@@ -46,18 +55,43 @@ class SEC001:
     def _is_allowlisted(self, table: Table, allowlist: set[str]) -> bool:
         return table.name in allowlist or table.qualified_name in allowlist
 
-    def _ancestor_covers_rls(self, table: Table, schema: Schema) -> bool:
-        return any(a.rls_enabled for a in schema.ancestors_of(table))
-
-    def _violation(self, table: Table) -> Violation:
+    def _violation(
+        self, table: Table, ancestors: list[Table]
+    ) -> Violation:
+        if self._walk_left_introspected_scope(table, ancestors):
+            message = (
+                f"Table {table.qualified_name} is a partition whose "
+                "ancestor chain leaves the scanned schemas before pgrls "
+                "could verify RLS coverage. Add the parent's schema to "
+                "`database.schemas` (or `--schemas`) so pgrls can "
+                "confirm RLS is enabled upstream, or push a policy "
+                f"directly onto this table via "
+                f"`CREATE POLICY ... ON {table.qualified_name}`."
+            )
+        else:
+            message = (
+                f"Table {table.qualified_name} does not have row-level "
+                "security enabled. Add ENABLE ROW LEVEL SECURITY or "
+                "include the table in [lint.rules.SEC001].allowlist if "
+                "it is a public reference table."
+            )
         return Violation(
             rule_id=self.id,
             severity=self.severity,
             title=self.title,
-            message=(
-                f"Table {table.qualified_name} does not have row-level "
-                "security enabled. Add ENABLE ROW LEVEL SECURITY or include the "
-                "table in [lint.rules.SEC001].allowlist if it is a public reference table."
-            ),
+            message=message,
             location=table.qualified_name,
         )
+
+    def _walk_left_introspected_scope(
+        self, table: Table, ancestors: list[Table]
+    ) -> bool:
+        # The walk reaches the root iff the last visited node has no
+        # `partition_of` link. Truncated walks indicate the next ancestor
+        # is in an unintrospected schema — pgrls can't see whether RLS
+        # is enabled upstream, so the violation message changes shape.
+        if table.partition_of is None:
+            return False
+        if not ancestors:
+            return True
+        return ancestors[-1].partition_of is not None
