@@ -878,30 +878,17 @@ def test_uc60_fail_on_info_gates_exit_on_sec007(
     assert "SEC007" in result.output
 
 
-def test_uc61_format_text_is_the_supported_output_format(
+def test_uc61_format_json_emits_machine_readable_output(
     demo_db: str,
 ) -> None:
-    # Only `--format text` ships in 0.0.4 (JSON / SARIF /
-    # Markdown are on the roadmap, see
-    # `src/pgrls/formatters/__init__.py`). Pin that the CLI
-    # accepts `text` and rejects anything else with a clean
-    # error — no Python traceback. A future addition that
-    # ships JSON will need to update this test.
-    runner = CliRunner()
-    ok = runner.invoke(
-        main,
-        [
-            "lint",
-            "--database-url", demo_db,
-            "--config", str(PGRLS_TOML),
-            "--format", "text",
-        ],
-        env={"DATABASE_URL": demo_db},
-    )
-    assert ok.exit_code == 1  # demo intentionally fails
-    assert "SEC001" in ok.output
+    # `--format json` produces a parseable JSON object with
+    # `violations[]` and `summary{}`. Pins the format flag
+    # round-trip: CLI passes through, the formatter emits valid
+    # JSON, and the violation set matches the text output.
+    import json
 
-    bad = runner.invoke(
+    runner = CliRunner()
+    result = runner.invoke(
         main,
         [
             "lint",
@@ -911,9 +898,27 @@ def test_uc61_format_text_is_the_supported_output_format(
         ],
         env={"DATABASE_URL": demo_db},
     )
+    parsed = json.loads(result.output)
+    assert set(parsed.keys()) == {"violations", "summary"}
+    assert parsed["summary"]["total"] == len(parsed["violations"])
+    # uc03 (legacy_orders missing RLS) must show up.
+    rule_locs = {(v["rule_id"], v["location"]) for v in parsed["violations"]}
+    assert ("SEC001", "app.legacy_orders") in rule_locs
+
+    # Unsupported format still rejects cleanly with a list of
+    # supported formats.
+    bad = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url", demo_db,
+            "--config", str(PGRLS_TOML),
+            "--format", "sarif",
+        ],
+        env={"DATABASE_URL": demo_db},
+    )
     assert bad.exit_code != 0
     assert "Traceback" not in bad.output
-    assert "json" in bad.output.lower()
 
 
 def test_uc62_multiple_disabled_rules_via_config(

@@ -196,6 +196,9 @@ def test_text_handles_long_message_and_special_chars() -> None:
 
 
 def test_unknown_format_message_lists_supported_formats() -> None:
+    # `sarif` is on the roadmap but not yet shipping. Use a format
+    # that's still unsupported so this test keeps exercising the
+    # unknown-format error path.
     import pytest
     with pytest.raises(ValueError, match="text"):
-        format_violations([], format="json")
+        format_violations([], format="sarif")
