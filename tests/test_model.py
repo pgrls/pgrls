@@ -350,3 +350,50 @@ def test_ancestors_of_raises_on_cycle() -> None:
     schema = Schema(tables=(a, b))
     with pytest.raises(ValueError, match="cycle"):
         list(schema.ancestors_of(a))
+
+
+def test_table_with_list_partition_of_is_unhashable() -> None:
+    # Contract: `partition_of` must be a tuple (or None). The type hint
+    # says so; the frozen dataclass auto-hash will fail loudly if
+    # someone passes a list. JSON has no tuples — a future consumer
+    # that round-trips through `to_snapshot` and feeds the resulting
+    # 2-list back into `Table(...)` must convert list → tuple first.
+    # Pin the failure so that bug surfaces at hash time instead of
+    # at some downstream set-membership check.
+    import pytest
+
+    t = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=["public", "events"],  # type: ignore[arg-type]
+    )
+    with pytest.raises(TypeError):
+        hash(t)
+
+
+def test_schema_by_qname_is_cached_across_calls() -> None:
+    # `Schema._by_qname` is a `cached_property`, so successive accesses
+    # must return the same dict instance. This pins the O(N) cost of
+    # the lookup map (vs O(N²) when SEC001 walks every partition).
+    parent = Table(
+        schema="public",
+        name="events",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    schema = Schema(tables=(parent, child))
+    first = schema._by_qname
+    second = schema._by_qname
+    assert first is second  # pragma: no mutate
