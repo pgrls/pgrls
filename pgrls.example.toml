@@ -15,11 +15,14 @@ fail_on = "warning"
 
 [lint.rules.SEC001]
 # Tables where missing RLS is acceptable. Entries can be unqualified
-# (countries) or qualified (tenant.things). Partitioned tables: SEC001
-# is partition-aware — it suppresses the violation on a child whose
-# parent (or any ancestor) has RLS enabled. Allowlist children
-# individually if your app accesses them directly, bypassing the
-# parent's policies.
+# (countries) or qualified (tenant.things). Partitioned tables:
+# SEC001 walks the `PARTITION OF` chain and suppresses the violation
+# on a child whose ancestor has RLS enabled. When the chain leaves
+# the scanned schemas before pgrls can verify coverage, the rule
+# fires with a different message asking the user to widen
+# `database.schemas`. When the chain reaches a visible RLS-less
+# root, the rule names the root in its message so the fix lands at
+# the right level.
 allowlist = []
 
 [lint.rules.SEC002]

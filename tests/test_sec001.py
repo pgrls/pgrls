@@ -167,11 +167,13 @@ def test_standalone_table_keeps_classic_message() -> None:
     assert "leaves the scanned schemas" not in violation.message
 
 
-def test_partition_child_with_visible_parent_keeps_classic_message() -> None:
-    # Parent IS in scope but neither parent nor child has RLS. The walk
-    # reached the root (parent.partition_of is None) so the message
-    # remains the classic "Add ENABLE ROW LEVEL SECURITY" — there's
-    # nothing unscoped about this scenario.
+def test_partition_child_with_visible_rls_less_parent_surfaces_root() -> None:
+    # Parent in scope but neither parent nor child has RLS. The classic
+    # advice ("Add ENABLE ROW LEVEL SECURITY") is ambiguous — fix the
+    # parent? the child? — and enabling RLS on the leaf is usually the
+    # wrong answer because direct queries still bypass siblings. The
+    # rule emits a third message variant that names the visible root
+    # so the maintainer pushes the fix to the right level.
     parent = _table("events", rls=False)
     child = _table(
         "events_2026", rls=False, partition_of=("public", "events")
@@ -179,9 +181,46 @@ def test_partition_child_with_visible_parent_keeps_classic_message() -> None:
     schema = Schema(tables=(parent, child))
     violations = SEC001().check(schema, options={})
     by_loc = {v.location: v for v in violations}
-    for loc in ("public.events", "public.events_2026"):
-        assert "ENABLE ROW LEVEL SECURITY" in by_loc[loc].message
-        assert "leaves the scanned schemas" not in by_loc[loc].message
+
+    # Parent itself isn't a partition — gets the classic message.
+    parent_msg = by_loc["public.events"].message
+    assert "ENABLE ROW LEVEL SECURITY" in parent_msg
+    assert "is a partition of" not in parent_msg
+
+    # Child names the visible root.
+    child_msg = by_loc["public.events_2026"].message
+    assert "is a partition of public.events" in child_msg
+    assert "Enable RLS on the parent" in child_msg
+    # Must NOT echo the unscoped-chain wording (different scenario).
+    assert "leaves the scanned schemas" not in child_msg
+    # Must NOT echo the classic standalone-table wording (the
+    # whole point of this variant is to NOT do that).
+    assert "Add ENABLE ROW LEVEL SECURITY" not in child_msg
+
+
+def test_multi_level_partition_with_no_rls_anywhere_names_root() -> None:
+    # leaf -> middle -> root, all RLS-less, all in scope. The leaf's
+    # message should name the ROOT (events), not the immediate parent
+    # (events_t1) — the root is where the user must enable RLS for
+    # the whole partitioned family to be covered.
+    root = _table("events", rls=False)
+    middle = _table(
+        "events_t1", rls=False, partition_of=("public", "events")
+    )
+    leaf = _table(
+        "events_t1_2026",
+        rls=False,
+        partition_of=("public", "events_t1"),
+    )
+    schema = Schema(tables=(root, middle, leaf))
+    by_loc = {
+        v.location: v for v in SEC001().check(schema, options={})
+    }
+    leaf_msg = by_loc["public.events_t1_2026"].message
+    assert "is a partition of public.events" in leaf_msg
+    # Specifically NOT events_t1 — root is the level the user enables
+    # RLS on.
+    assert "is a partition of public.events_t1" not in leaf_msg
 
 
 def test_mid_chain_leaves_scope_emits_unscoped_message() -> None:

@@ -141,11 +141,21 @@ partitioned parent down to its children, but queries that go through the
 parent DO apply the parent's policies. SEC001 walks each child's
 `PARTITION OF` chain and suppresses the violation when any ancestor has
 RLS enabled — otherwise SEC001 would fire on every partition of every
-RLS-enabled parent. When the chain leaves the scanned schema set before
-reaching an RLS-enabled ancestor, SEC001 fires with a different message:
-"ancestor chain leaves the scanned schemas before pgrls could verify RLS
-coverage." Fix that one by adding the parent's schema to
-`database.schemas` (or `--schemas`).
+RLS-enabled parent.
+
+The rule emits one of three messages so the maintainer can fix the right
+table at the right level:
+
+- **Standalone or partition root, no RLS** — classic message: "Add
+  `ENABLE ROW LEVEL SECURITY` or include the table in the allowlist."
+- **Partition child of a visible RLS-less parent** — names the root:
+  "is a partition of `<root>`, which also lacks row-level security.
+  Enable RLS on the parent…" Steers the fix to the level that covers
+  every sibling in one shot.
+- **Partition child whose chain leaves the scanned schemas** — "ancestor
+  chain leaves the scanned schemas before pgrls could verify RLS
+  coverage." Fix by adding the parent's schema to `database.schemas`
+  (or `--schemas`).
 
 The trade-off is real: a direct query against a partition (e.g.
 `SELECT FROM events_2026` rather than `SELECT FROM events`) bypasses the
