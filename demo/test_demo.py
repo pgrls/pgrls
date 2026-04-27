@@ -708,3 +708,315 @@ def test_uc43_sec003_allowlist_silences_intentional_public_read(
     )
     out = _run_lint(demo_db, config=cfg)
     assert "SEC003  app.public_metadata" not in out
+
+
+# ============================================================
+# Use cases 48-58 — realistic shapes + AST coverage
+# ============================================================
+
+def test_uc48_ec_orders_via_fk_clean(lint_output: str) -> None:
+    # Two-table FK relation: orders own tenant; items inherit
+    # tenant scope by EXISTS-joining the parent. Pins that the
+    # SubLink walk correctly correlates `order_id` against the
+    # outer items table.
+    for table in ("app.ec_orders", "app.ec_order_items"):
+        for rule_id in _ALL_RULE_IDS:
+            line = f"{rule_id}  {table}"
+            assert line not in lint_output, (
+                f"{rule_id} unexpectedly fired on {table}"
+            )
+
+
+def test_uc49_gdpr_classification_clean(lint_output: str) -> None:
+    # Composite predicate: tenant AND CASE-on-classification
+    # AND `(SELECT current_setting(...)) = ANY(visible_to)`.
+    # Pins that ARRAY ANY + CASE branches + outer AND all walk
+    # through extract correctly so SEC005 sees own-col refs.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.gdpr_records"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.gdpr_records"
+        )
+
+
+def test_uc50_read_replica_clean(lint_output: str) -> None:
+    # Read-only mirror: one RESTRICTIVE tenant floor + one
+    # PERMISSIVE grant to a non-PUBLIC role. No write policies
+    # to validate, so SEC006 is silent; SEC003 silent because
+    # the permissive isn't TO PUBLIC.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.read_replica"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.read_replica"
+        )
+
+
+def test_uc51_row_comparison_walks_tuple_arguments(
+    lint_output: str,
+) -> None:
+    # `(tenant_id, env) = (..., ...)` parses as a row-compare
+    # node. Pins extract_column_refs walking through the row
+    # constructors so SEC005 sees both `tenant_id` and `env`.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.row_comparison"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.row_comparison"
+        )
+
+
+def test_uc52_sec003_fires_per_offending_policy(
+    lint_output: str,
+) -> None:
+    # Two PERMISSIVE PUBLIC policies → two SEC003 lines.
+    # Pins per-policy reporting (one violation per policy,
+    # not per table). SEC007 still fires on the table because
+    # all policies are permissive.
+    assert "SEC003  app.multi_perm.perm_a\n" in lint_output
+    assert "SEC003  app.multi_perm.perm_b\n" in lint_output
+    assert "SEC007  app.multi_perm\n" in lint_output
+
+
+def test_uc53_sec004_silent_on_nested_or_documented_false_negative(
+    lint_output: str,
+) -> None:
+    # `flag = 'system' OR ((SELECT auth.uid()) IS NULL OR
+    # user_id = (SELECT auth.uid()))` — the auth IS NULL
+    # disjunct is buried inside a nested OR. SEC004 splits at
+    # the top level only (per top_level_disjuncts), so it
+    # does NOT fire here. This is a documented false negative;
+    # pin it so a future change to descend into nested ORs is
+    # deliberate (and probably noisier on real schemas).
+    assert "SEC004  app.nested_or_check" not in lint_output
+
+
+def test_uc54_sec005_walks_through_typecast(lint_output: str) -> None:
+    # `email::text = ...` — the column ref is inside a
+    # TypeCast. Pins that extract_column_refs descends into
+    # `TypeCast.arg`, so SEC005 still sees `email` and stays
+    # silent.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.typecast_email"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.typecast_email"
+        )
+
+
+def test_uc55_using_not_false_fires_sec005_not_sec008(
+    lint_output: str,
+) -> None:
+    # `USING (NOT false)` is logically `true` but the AST is a
+    # BoolExpr (NOT) over `A_Const(false)`, NOT a literal True.
+    # SEC008 specifically detects the literal-True A_Const, so
+    # this shape stays silent on SEC008 — and fires SEC005
+    # because there are no own-col refs.
+    assert "SEC005  app.not_false_table.not_false\n" in lint_output
+    assert "SEC008  app.not_false_table" not in lint_output
+
+
+def test_uc56_hyg001_walks_through_booltest(lint_output: str) -> None:
+    # `gone IS TRUE` wraps a column ref in a BoolTest node.
+    # extract_column_refs walks through BoolTest.arg so HYG001
+    # still flags the dropped column.
+    assert (
+        "HYG001  app.booltest_orphan.bt_check\n" in lint_output
+    )
+
+
+def test_uc57_perf001_through_typecast_on_auth_call(
+    lint_output: str,
+) -> None:
+    # `auth.uid()::text` — the auth call is inside a TypeCast.
+    # Pins find_func_calls descending into TypeCast.arg.
+    assert "PERF001  app.typecast_auth.auth_cast\n" in lint_output
+
+
+def test_uc58_perf001_through_coalesce_on_auth_call(
+    lint_output: str,
+) -> None:
+    # `COALESCE(auth.uid(), '...uuid...')` — auth call nested
+    # inside another function. Pins find_func_calls walking
+    # function args.
+    assert "PERF001  app.coalesce_auth.coalesced\n" in lint_output
+
+
+# ============================================================
+# Use cases 59-63 — additional configuration paths
+# ============================================================
+
+def test_uc59_fail_on_warning_gates_exit_on_perf001(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # Default fail_on='error' lets warnings through without
+    # affecting exit code. Setting fail_on='warning' makes
+    # PERF001 (warning severity) cause a nonzero exit.
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(_BASE_CONFIG + '[lint]\nfail_on = "warning"\n')
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", demo_db, "--config", str(cfg)],
+        env={"DATABASE_URL": demo_db},
+    )
+    assert result.exit_code == 1, "fail_on=warning should gate on warnings"
+    assert "PERF001" in result.output
+
+
+def test_uc60_fail_on_info_gates_exit_on_sec007(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # SEC007 is info-severity. fail_on='info' is the strictest
+    # gate; even pure info violations cause exit=1.
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(_BASE_CONFIG + '[lint]\nfail_on = "info"\n')
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", demo_db, "--config", str(cfg)],
+        env={"DATABASE_URL": demo_db},
+    )
+    assert result.exit_code == 1
+    assert "SEC007" in result.output
+
+
+def test_uc61_format_text_is_the_supported_output_format(
+    demo_db: str,
+) -> None:
+    # Only `--format text` ships in 0.0.4 (JSON / SARIF /
+    # Markdown are on the roadmap, see
+    # `src/pgrls/formatters/__init__.py`). Pin that the CLI
+    # accepts `text` and rejects anything else with a clean
+    # error — no Python traceback. A future addition that
+    # ships JSON will need to update this test.
+    runner = CliRunner()
+    ok = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url", demo_db,
+            "--config", str(PGRLS_TOML),
+            "--format", "text",
+        ],
+        env={"DATABASE_URL": demo_db},
+    )
+    assert ok.exit_code == 1  # demo intentionally fails
+    assert "SEC001" in ok.output
+
+    bad = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url", demo_db,
+            "--config", str(PGRLS_TOML),
+            "--format", "json",
+        ],
+        env={"DATABASE_URL": demo_db},
+    )
+    assert bad.exit_code != 0
+    assert "Traceback" not in bad.output
+    assert "json" in bad.output.lower()
+
+
+def test_uc62_multiple_disabled_rules_via_config(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # `[lint].disable = ["SEC005", "SEC008"]` — both rules
+    # turn off in one config; neither appears in output.
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint]\ndisable = ["SEC005", "SEC008"]\n'
+    )
+    out = _run_lint(demo_db, config=cfg)
+    assert "SEC005" not in out
+    assert "SEC008" not in out
+    # Other rules remain.
+    assert "SEC001" in out
+
+
+def test_uc63_bad_allowlist_type_emits_clear_error(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # `allowlist = "..."` (string instead of list) is caught
+    # by the rule's `_parse_allowlist`, raises TypeError, and
+    # the CLI converts that to a clean ClickException — no
+    # Python traceback in the output.
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint.rules.SEC001]\nallowlist = "app.countries"\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", demo_db, "--config", str(cfg)],
+        env={"DATABASE_URL": demo_db},
+    )
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "allowlist" in result.output.lower()
+
+
+# ============================================================
+# Use cases 64-67 — identifier handling, JSON, BETWEEN
+# ============================================================
+
+def test_uc64_quoted_mixed_case_identifier_handled_cleanly(
+    lint_output: str,
+) -> None:
+    # `app."MixedCase Table"` — Postgres preserves the case
+    # and the embedded space inside `pg_class.relname`. The
+    # introspector reads it as `MixedCase Table` (no quotes).
+    # The lint output and allowlist match by plain string, so
+    # this round-trips cleanly. No rule should fire on the
+    # well-configured policy.
+    line = "app.MixedCase Table"
+    # The qualified location pgrls emits.
+    for rule_id in _ALL_RULE_IDS:
+        composed = f"{rule_id}  {line}"
+        assert composed not in lint_output, (
+            f"{rule_id} unexpectedly fired on {line!r}"
+        )
+
+
+def test_uc65_sec001_allowlist_accepts_unqualified_name(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # Default config allowlists `app.countries` (qualified).
+    # The rule also accepts unqualified names — running with
+    # `allowlist = ["legacy_orders"]` (unqualified) should
+    # silence SEC001 on uc03's `app.legacy_orders`.
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        '[database]\nschemas = ["app"]\n'
+        '[lint.rules.SEC001]\n'
+        'allowlist = ["legacy_orders", "countries"]\n'
+    )
+    out = _run_lint(demo_db, config=cfg)
+    assert "SEC001  app.legacy_orders" not in out
+
+
+def test_uc66_hyg001_does_not_confuse_json_keys_with_columns(
+    lint_output: str,
+) -> None:
+    # `payload->>'visibility' = 'public'` — `'visibility'` is
+    # a JSON path key, NOT a column name. The only column ref
+    # in this expression is `payload`, which exists. Pin that
+    # HYG001 doesn't false-fire by treating the JSON key as a
+    # missing column.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.json_access"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.json_access"
+        )
+
+
+def test_uc67_between_operator_clean(lint_output: str) -> None:
+    # `created_at BETWEEN now() - INTERVAL ... AND now()`
+    # parses as A_Expr-AEXPR_BETWEEN. Pins extract_column_refs
+    # walking through it so SEC005 sees both `tenant_id` and
+    # `created_at`.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.recent_only"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.recent_only"
+        )

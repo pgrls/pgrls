@@ -1115,3 +1115,381 @@ CREATE POLICY in_tags ON app.array_tags
     USING (
         (SELECT current_setting('app.user', true)) = ANY(tags)
     );
+
+
+-- ============================================================
+-- Use case 48: E-commerce orders + items via FK tenant — CLEAN
+-- Two related tables. Items inherit tenant scope through the
+-- parent order via a SubLink lookup. Pins that the SubLink
+-- walk reaches `tenant_id` on the outer table even when the
+-- inner table's only correlation is the parent FK.
+-- ============================================================
+CREATE TABLE app.ec_orders (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    customer_email TEXT,
+    total_cents INT
+);
+ALTER TABLE app.ec_orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.ec_orders FORCE ROW LEVEL SECURITY;
+CREATE POLICY orders_tenant ON app.ec_orders
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+
+CREATE TABLE app.ec_order_items (
+    id BIGSERIAL PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES app.ec_orders(id),
+    sku TEXT,
+    qty INT
+);
+ALTER TABLE app.ec_order_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.ec_order_items FORCE ROW LEVEL SECURITY;
+CREATE POLICY items_via_order ON app.ec_order_items
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (
+        EXISTS (
+            SELECT 1 FROM app.ec_orders o
+            WHERE o.id = order_id
+              AND o.tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM app.ec_orders o
+            WHERE o.id = order_id
+              AND o.tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        )
+    );
+
+
+-- ============================================================
+-- Use case 49: GDPR-style classification with ARRAY — CLEAN
+-- A row's `visible_to` array names the audience tags that may
+-- read it. Combined with classification levels in a CASE, the
+-- policy walks ARRAY ANY plus CASE branches plus column refs.
+-- ============================================================
+CREATE TABLE app.gdpr_records (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    classification TEXT NOT NULL,  -- 'public' | 'internal' | 'restricted'
+    visible_to TEXT[] NOT NULL DEFAULT ARRAY['public']::TEXT[],
+    payload JSONB
+);
+ALTER TABLE app.gdpr_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.gdpr_records FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_plus_classification ON app.gdpr_records
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        AND CASE classification
+            WHEN 'public'     THEN true
+            WHEN 'internal'   THEN (SELECT current_setting('app.role', true)) <> 'guest'
+            WHEN 'restricted' THEN (SELECT current_setting('app.role', true)) = ANY(visible_to)
+            ELSE false
+        END
+    );
+
+
+-- ============================================================
+-- Use case 50: Read-replica style — SELECT-only policies clean
+-- A read-only mirror of canonical data. Two SELECT policies
+-- (one tenant floor RESTRICTIVE, one role-specific PERMISSIVE
+-- granted to a non-PUBLIC role) and zero write policies.
+-- Demonstrates that pgrls is silent on a clean read-only shape
+-- — neither SEC006 (no writes to validate) nor SEC003 (the
+-- permissive grant is to a specific role) fires.
+-- ============================================================
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app_replica_reader') THEN
+        CREATE ROLE app_replica_reader NOLOGIN;
+    END IF;
+END $$;
+
+CREATE TABLE app.read_replica (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID,
+    snapshot_at TIMESTAMPTZ DEFAULT now(),
+    payload JSONB
+);
+ALTER TABLE app.read_replica ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.read_replica FORCE ROW LEVEL SECURITY;
+CREATE POLICY replica_tenant_floor ON app.read_replica
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+CREATE POLICY replica_reader_grant ON app.read_replica
+    FOR SELECT TO app_replica_reader
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+
+
+-- ============================================================
+-- Use case 51: ROW comparison in USING — CLEAN
+-- `(tenant_id, env) = (..., ...)` is a row-level equality.
+-- pglast represents this as a RowCompareExpr / RowExpr, which
+-- extract_column_refs needs to walk through to see `tenant_id`
+-- and `env`. Pin the AST path.
+-- ============================================================
+CREATE TABLE app.row_comparison (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    env TEXT NOT NULL,
+    payload TEXT
+);
+ALTER TABLE app.row_comparison ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.row_comparison FORCE ROW LEVEL SECURITY;
+CREATE POLICY row_eq ON app.row_comparison
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        (tenant_id, env) = (
+            (SELECT current_setting('app.tenant', true)::UUID),
+            (SELECT current_setting('app.env', true))
+        )
+    );
+
+
+-- ============================================================
+-- Use case 52: SEC003 fires once per offending policy
+-- Two PERMISSIVE policies on the same table, both granted to
+-- PUBLIC. Pin that SEC003 emits one violation per policy
+-- (not per table), so a multi-policy table with two violations
+-- shows both lines in the output.
+-- ============================================================
+CREATE TABLE app.multi_perm (
+    id BIGSERIAL PRIMARY KEY,
+    title TEXT,
+    body TEXT
+);
+ALTER TABLE app.multi_perm ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.multi_perm FORCE ROW LEVEL SECURITY;
+CREATE POLICY perm_a ON app.multi_perm
+    FOR SELECT TO PUBLIC USING (length(title) > 0);
+CREATE POLICY perm_b ON app.multi_perm
+    FOR SELECT TO PUBLIC USING (length(body) > 0);
+
+
+-- ============================================================
+-- Use case 53: SEC004 inside a nested OR — false-negative pin
+-- The rule keys on top-level OR disjuncts (per
+-- top_level_disjuncts in ast_utils). When `auth_func() IS NULL`
+-- is buried inside a nested OR, the helper's "split top OR
+-- only" semantics means SEC004 does NOT fire. Pin the
+-- documented limitation so a future change to descend deeper
+-- is deliberate (and possibly noisy).
+-- ============================================================
+CREATE TABLE app.nested_or_check (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID,
+    flag TEXT
+);
+ALTER TABLE app.nested_or_check ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.nested_or_check FORCE ROW LEVEL SECURITY;
+CREATE POLICY nested_or ON app.nested_or_check
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        flag = 'system'
+        OR (
+            (SELECT auth.uid()) IS NULL
+            OR user_id = (SELECT auth.uid())
+        )
+    );
+
+
+-- ============================================================
+-- Use case 54: SEC005 with TypeCast wrapping a column ref —
+-- CLEAN
+-- `email::text = ...` parses as a TypeCast over a ColumnRef.
+-- extract_column_refs needs to walk through TypeCast.arg to
+-- still see `email`. Pin that the cast doesn't hide the col.
+-- ============================================================
+CREATE TABLE app.typecast_email (
+    id BIGSERIAL PRIMARY KEY,
+    email VARCHAR(255)
+);
+ALTER TABLE app.typecast_email ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.typecast_email FORCE ROW LEVEL SECURITY;
+CREATE POLICY by_email_text ON app.typecast_email
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (email::text = (SELECT current_setting('app.user', true)));
+
+
+-- ============================================================
+-- Use case 55: SEC008 with `USING (NOT false)` — CLEAN
+-- Logically equivalent to `USING (true)` but the AST is a
+-- BoolExpr (NOT) over an A_Const, NOT a literal Boolean.
+-- SEC008's detector keys on the literal True A_Const, so this
+-- shape stays silent. Pin the asymmetry so the detector
+-- doesn't drift toward semantic equivalence.
+-- ============================================================
+CREATE TABLE app.not_false_table (
+    id BIGSERIAL PRIMARY KEY,
+    label TEXT
+);
+ALTER TABLE app.not_false_table ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.not_false_table FORCE ROW LEVEL SECURITY;
+CREATE POLICY not_false ON app.not_false_table
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (NOT false);
+
+
+-- ============================================================
+-- Use case 56: HYG001 with `gone IS TRUE` (BoolTest) — fires
+-- A BoolTest wraps a column ref. extract_column_refs needs to
+-- walk through the BoolTest to see the orphaned column.
+-- ============================================================
+CREATE TABLE app.booltest_orphan (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    gone BOOLEAN
+);
+ALTER TABLE app.booltest_orphan ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.booltest_orphan FORCE ROW LEVEL SECURITY;
+CREATE POLICY bt_check ON app.booltest_orphan
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        user_id = (SELECT current_setting('app.user', true))
+        AND gone IS TRUE
+    );
+
+UPDATE pg_catalog.pg_attribute
+    SET attisdropped = true
+    WHERE attrelid = 'app.booltest_orphan'::regclass
+      AND attname = 'gone';
+
+
+-- ============================================================
+-- Use case 57: PERF001 with auth wrapped in TypeCast — fires
+-- `auth.uid()::text` casts the function result; PERF001 still
+-- needs to see the unwrapped call inside. Pins
+-- find_func_calls walking through TypeCast.arg.
+-- ============================================================
+CREATE TABLE app.typecast_auth (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT
+);
+ALTER TABLE app.typecast_auth ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.typecast_auth FORCE ROW LEVEL SECURITY;
+CREATE POLICY auth_cast ON app.typecast_auth
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = auth.uid()::text);
+
+
+-- ============================================================
+-- Use case 58: PERF001 with auth wrapped in COALESCE — fires
+-- `COALESCE(auth.uid(), '00000000-0000-0000-0000-000000000000')`
+-- — find_func_calls must walk function args to spot auth.uid
+-- inside another function call.
+-- ============================================================
+CREATE TABLE app.coalesce_auth (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID
+);
+ALTER TABLE app.coalesce_auth ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.coalesce_auth FORCE ROW LEVEL SECURITY;
+CREATE POLICY coalesced ON app.coalesce_auth
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        user_id = COALESCE(auth.uid(), '00000000-0000-0000-0000-000000000000'::UUID)
+    );
+
+
+-- ============================================================
+-- Use case 59-63: Configuration scenarios (no new fixture
+-- needed — companion tests use the existing tables).
+-- ============================================================
+-- 59: fail_on=warning gates exit on PERF001 (which fires in
+--     several places already).
+-- 60: fail_on=info gates exit on SEC007 (info severity).
+-- 61: --format=json emits machine-readable JSON instead of
+--     text.
+-- 62: Multiple disabled rules at once.
+-- 63: Bad allowlist type produces a clear error from the CLI.
+
+
+-- ============================================================
+-- Use case 64: Quoted/unusual identifier — CLEAN
+-- Postgres allows mixed-case and reserved-word identifiers
+-- via double-quoting. The introspector pulls names from
+-- pg_class as plain strings; the lint output and allowlist
+-- both treat them as plain strings (no extra quoting). Pin
+-- that this round-trip works.
+-- ============================================================
+CREATE TABLE app."MixedCase Table" (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT
+);
+ALTER TABLE app."MixedCase Table" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app."MixedCase Table" FORCE ROW LEVEL SECURITY;
+CREATE POLICY mixed_owner ON app."MixedCase Table"
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = (SELECT current_setting('app.user', true)));
+
+
+-- ============================================================
+-- Use case 65: SEC001 allowlist by qualified vs unqualified —
+-- both forms work
+-- The default config allowlists `app.countries` (qualified).
+-- pgrls also accepts unqualified names. Test under a config
+-- that allowlists `legacy_orders` (uc03) by unqualified name —
+-- SEC001 silences for it the same way.
+-- ============================================================
+-- (No new fixture — uses uc03's app.legacy_orders.)
+
+
+-- ============================================================
+-- Use case 66: HYG001 walks JSON `->>` operator — fires
+-- `payload->>'gone'` references the outer column `payload`,
+-- not a column named "gone". Pin that HYG001's column-ref
+-- walk does NOT confuse JSON keys with column names — the
+-- only column ref here is `payload`, which exists, so HYG001
+-- stays silent.
+-- ============================================================
+CREATE TABLE app.json_access (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    payload JSONB
+);
+ALTER TABLE app.json_access ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.json_access FORCE ROW LEVEL SECURITY;
+CREATE POLICY json_filter ON app.json_access
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        user_id = (SELECT current_setting('app.user', true))
+        AND payload->>'visibility' = 'public'
+    );
+
+
+-- ============================================================
+-- Use case 67: BETWEEN operator — CLEAN
+-- `BETWEEN` in pglast represents as a chained AND under
+-- A_Expr-AEXPR_BETWEEN. extract_column_refs needs to walk
+-- through the operator to find `created_at` on the outer
+-- table.
+-- ============================================================
+CREATE TABLE app.recent_only (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE app.recent_only ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.recent_only FORCE ROW LEVEL SECURITY;
+CREATE POLICY recent_window ON app.recent_only
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        AND created_at BETWEEN now() - INTERVAL '30 days' AND now()
+    );
