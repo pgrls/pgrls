@@ -139,19 +139,22 @@ future maintainers (human and otherwise) need that context.
 **Partitioned tables.** Postgres does not propagate `relrowsecurity` from a
 partitioned parent down to its children, but queries that go through the
 parent DO apply the parent's policies. SEC001 walks each child's
-`PARTITION OF` chain and suppresses the violation when any ancestor has RLS
-enabled — otherwise SEC001 would fire on every partition of every
-RLS-enabled parent. Children whose ancestors live in an unscanned schema
-still produce a violation: pgrls cannot prove ancestor coverage from
-outside the introspected set, and silent passes on missing data are worse
-than noisy ones.
+`PARTITION OF` chain and suppresses the violation when any ancestor has
+RLS enabled — otherwise SEC001 would fire on every partition of every
+RLS-enabled parent. When the chain leaves the scanned schema set before
+reaching an RLS-enabled ancestor, SEC001 fires with a different message:
+"ancestor chain leaves the scanned schemas before pgrls could verify RLS
+coverage." Fix that one by adding the parent's schema to
+`database.schemas` (or `--schemas`).
 
 The trade-off is real: a direct query against a partition (e.g.
 `SELECT FROM events_2026` rather than `SELECT FROM events`) bypasses the
 parent's policies. If direct child access is part of the application's
-threat model, allowlist the children explicitly and require RLS on each —
-or push the policy down to every child via `CREATE POLICY ... ON
-events_2026`.
+threat model, do NOT rely on inherited parent policies — push the policy
+down to every child via `CREATE POLICY ... ON public.events_2026` so
+each child carries its own protection. Allowlisting children is the
+wrong tool here: it removes the SEC001 check entirely, which is the
+opposite of what you want.
 
 ### SEC002 — FORCE ROW LEVEL SECURITY missing
 
