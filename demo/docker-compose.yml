@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pgrls-demo-postgres
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo
+    ports:
+      # Bound to 5433 so it doesn't collide with a host Postgres on 5432.
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
