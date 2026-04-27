@@ -136,6 +136,23 @@ allowlist = ["countries", "currencies"]
 Add a one-line comment in `pgrls.toml` explaining why each entry is exempt —
 future maintainers (human and otherwise) need that context.
 
+**Partitioned tables.** Postgres does not propagate `relrowsecurity` from a
+partitioned parent down to its children, but queries that go through the
+parent DO apply the parent's policies. SEC001 walks each child's
+`PARTITION OF` chain and suppresses the violation when any ancestor has RLS
+enabled — otherwise SEC001 would fire on every partition of every
+RLS-enabled parent. Children whose ancestors live in an unscanned schema
+still produce a violation: pgrls cannot prove ancestor coverage from
+outside the introspected set, and silent passes on missing data are worse
+than noisy ones.
+
+The trade-off is real: a direct query against a partition (e.g.
+`SELECT FROM events_2026` rather than `SELECT FROM events`) bypasses the
+parent's policies. If direct child access is part of the application's
+threat model, allowlist the children explicitly and require RLS on each —
+or push the policy down to every child via `CREATE POLICY ... ON
+events_2026`.
+
 ### SEC002 — FORCE ROW LEVEL SECURITY missing
 
 **Severity:** error.

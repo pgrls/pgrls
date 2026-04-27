@@ -15,7 +15,11 @@ fail_on = "warning"
 
 [lint.rules.SEC001]
 # Tables where missing RLS is acceptable. Entries can be unqualified
-# (countries) or qualified (tenant.things).
+# (countries) or qualified (tenant.things). Partitioned tables: SEC001
+# is partition-aware — it suppresses the violation on a child whose
+# parent (or any ancestor) has RLS enabled. Allowlist children
+# individually if your app accesses them directly, bypassing the
+# parent's policies.
 allowlist = []
 
 [lint.rules.SEC002]
