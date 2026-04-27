@@ -287,6 +287,16 @@ def test_find_func_calls_exclude_sublinks_skips_in_in_subquery() -> None:
     assert matches == []
 
 
+def test_find_func_calls_exclude_sublinks_walks_testexpr() -> None:
+    # `auth.uid() IN (SELECT id FROM trusted)` — the call is on the LHS
+    # (SubLink.testexpr), not inside the subselect. exclude_sublinks
+    # must still walk testexpr or PERF001 misses an unwrapped auth call.
+    # Mirrors extract_column_refs's testexpr-walking shape.
+    node = parse_expr("auth.uid() IN (SELECT id FROM trusted)")
+    matches = find_func_calls(node, {"auth.uid"}, exclude_sublinks=True)
+    assert len(matches) == 1
+
+
 def test_match_is_null_returns_arg_for_function_call() -> None:
     node = parse_expr("auth.uid() IS NULL")
     result = match_is_null(node)

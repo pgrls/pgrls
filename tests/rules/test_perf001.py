@@ -61,6 +61,16 @@ def test_perf001_does_not_fire_on_in_subquery_wrap() -> None:
     assert PERF001().check(schema, {}) == []
 
 
+def test_perf001_fires_on_unwrapped_auth_on_in_lhs() -> None:
+    # `auth.uid() IN (SELECT id FROM trusted)` — auth.uid() is on the
+    # IN-expression's LHS (SubLink.testexpr), not inside the subselect.
+    # The call is unwrapped and Postgres re-evaluates it per row, so
+    # PERF001 must fire. Pins find_func_calls(exclude_sublinks=True)
+    # walking testexpr.
+    schema = _wrap(_policy("auth.uid() IN (SELECT id FROM trusted_admins)"))
+    assert len(PERF001().check(schema, {})) == 1
+
+
 def test_perf001_fires_on_unwrapped_current_setting() -> None:
     schema = _wrap(
         _policy("current_setting('app.user') = user_id")
