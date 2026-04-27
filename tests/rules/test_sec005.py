@@ -109,15 +109,36 @@ def test_sec005_does_not_fire_when_with_check_has_own_column() -> None:
 
 
 def test_sec005_fires_when_only_refs_are_inside_a_sublink() -> None:
-    # Subquery refs columns of `tenants`, not the policy's table.
+    # Subquery refs `tenant_uid` (a column of `tenants`, not the policy's
+    # table). With no own-col anywhere in the expression, SEC005 fires.
+    # Choosing a column name absent from the policy's table is necessary
+    # because SEC005 walks subqueries too — see the module docstring for
+    # the false-negative trade-off.
     schema = _wrap(
         _policy(
             using=(
-                "current_setting('app.t') IN (SELECT id FROM tenants)"
+                "current_setting('app.t') IN (SELECT tenant_uid FROM tenants)"
             )
         )
     )
     assert len(SEC005().check(schema, {})) == 1
+
+
+def test_sec005_does_not_fire_on_correlated_exists_membership() -> None:
+    # Standard membership-table pattern: the policy's own `tenant_id`
+    # is referenced via correlation inside the EXISTS. SEC005 must not
+    # fire — the policy IS row-scoped, just through a join. Pins the
+    # fix for the false positive that exclude_sublinks=True introduced.
+    schema = _wrap(
+        _policy(
+            using=(
+                "EXISTS (SELECT 1 FROM tenant_members m "
+                "WHERE m.tenant_id = tenant_id "
+                "AND m.user_id = current_setting('app.user_id'))"
+            )
+        )
+    )
+    assert SEC005().check(schema, {}) == []
 
 
 def test_sec005_does_not_fire_with_function_wrapped_own_column() -> None:

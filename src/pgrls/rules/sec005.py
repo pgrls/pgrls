@@ -5,6 +5,15 @@ of the table they're on is a "session-state-only" predicate — it admits
 or denies whole sets of rows based on configuration alone, not on row
 attributes. Almost always a mistake: the author meant to gate by role,
 not gate per row.
+
+Detection walks the entire expression tree, including inside subqueries.
+That's deliberate: correlated subqueries (e.g. `EXISTS (SELECT 1 FROM
+members m WHERE m.tenant_id = tenant_id)`) reference the policy's own
+column via correlation, and SEC005 must not falsely fire on the
+membership-table pattern. The trade-off is a rare false negative when
+a subquery references a column with the same bare name as one on the
+policy's table (`x IN (SELECT id FROM other)` where the policy's table
+also has an `id` column) — uncommon enough to take the simpler walk.
 """
 from __future__ import annotations
 
@@ -57,13 +66,9 @@ class SEC005:
                     continue
                 refs: set[tuple[str, ...]] = set()
                 if policy.using_ast is not None:
-                    refs |= extract_column_refs(
-                        policy.using_ast, exclude_sublinks=True
-                    )
+                    refs |= extract_column_refs(policy.using_ast)
                 if policy.with_check_ast is not None:
-                    refs |= extract_column_refs(
-                        policy.with_check_ast, exclude_sublinks=True
-                    )
+                    refs |= extract_column_refs(policy.with_check_ast)
                 if any(_is_own_column_ref(r, table) for r in refs):
                     continue
                 policy_id = (
