@@ -26,7 +26,7 @@ def test_root_version_flag():
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.0.4" in result.output
+    assert "0.0.5" in result.output
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"

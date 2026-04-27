@@ -10,12 +10,19 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-04-27
+
 ### Added
 - `pgrls lint --format json` emits a stable, machine-readable shape
   with `violations[]` and `summary{}` keys. Pretty-printed,
   `ensure_ascii=False`, trailing newline. The keys are the public CI
   contract; consumers that ignore unknown keys keep working when the
   shape grows.
+- `.pre-commit-hooks.yaml` so consumers can drop `pgrls-lint` into
+  their `pre-commit` pipeline. README's new "CI integration" section
+  shows both the pre-commit recipe and a minimal GitHub Actions
+  workflow that spins up Postgres as a service container, applies a
+  schema, and emits the JSON report as a build artifact.
 - `CHANGELOG.md` (this file). Backfilled from tag annotations and
   GitHub release notes for v0.0.1 — v0.0.4.
 
