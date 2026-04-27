@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.0.4** — ten rules across error, warning, and info severities (SEC001–SEC008, PERF001, HYG001). The `test` / `diff` commands are on the roadmap below.
+> **Status: 0.0.5** — ten rules across error, warning, and info severities (SEC001–SEC008, PERF001, HYG001), plus JSON output for CI integrations. The `test` / `diff` commands are on the roadmap below.
 
 ## Install
 
@@ -90,6 +90,74 @@ For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
 
 For per-release changes, see [CHANGELOG.md](CHANGELOG.md).
+
+## CI integration
+
+pgrls is designed to live in your CI alongside any other linter. It
+needs a Postgres database with your schema applied; it then connects,
+introspects, and exits non-zero if any rule at or above
+`fail_on` (default `warning`) fires.
+
+### pre-commit
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/pgrls/pgrls
+    rev: v0.0.5
+    hooks:
+      - id: pgrls-lint
+        # pgrls hits a real database, so most teams scope this to
+        # `pre-push` rather than every commit.
+        stages: [pre-push]
+        args:
+          - --database-url=$DATABASE_URL
+          - --config=pgrls.toml
+```
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/pgrls.yml
+name: pgrls
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://ci:ci@localhost:5432/ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pgrls
+      - name: Apply schema
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/all.sql
+      - name: Lint RLS
+        run: pgrls lint --format json | tee pgrls.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pgrls-report
+          path: pgrls.json
+```
+
+`--format json` emits a stable shape with `violations[]` and
+`summary{}` keys; pipe it to `jq`, ship it to a dashboard, or
+upload as a build artifact.
 
 ## Roadmap
 

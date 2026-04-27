@@ -1,0 +1,21 @@
+- id: pgrls-lint
+  name: pgrls lint
+  description: Lint Postgres Row-Level Security policies for security and hygiene issues.
+  entry: pgrls lint
+  language: python
+  # pgrls scans a live database, not files. pre-commit must not pass
+  # changed-file paths as arguments (`pgrls lint` rejects positional
+  # args).
+  pass_filenames: false
+  # The schema state lives in the database, not in tracked files —
+  # any commit can have changed it via a separately-applied
+  # migration. Run on every invocation rather than only when matching
+  # files changed.
+  always_run: true
+  # The CLI invokes a single lint pass with one DB connection; no
+  # benefit to running concurrent invocations in the same hook.
+  require_serial: true
+  # `pgrls lint` requires `--database-url` (or `$DATABASE_URL` in the
+  # environment). Consumers configure that via `args:` and `env:` in
+  # their own `.pre-commit-config.yaml`.
+  minimum_pre_commit_version: "2.9.2"
