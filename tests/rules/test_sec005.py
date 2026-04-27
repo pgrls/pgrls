@@ -124,6 +124,24 @@ def test_sec005_fires_when_only_refs_are_inside_a_sublink() -> None:
     assert len(SEC005().check(schema, {})) == 1
 
 
+def test_sec005_pins_documented_false_negative_on_shared_column_name() -> None:
+    # Companion to test_sec005_fires_when_only_refs_are_inside_a_sublink:
+    # same shape, except the subquery selects `id`, which IS a column on
+    # the policy's table (default `_wrap` columns are id/tenant_id/email).
+    # The walker can't tell the bare `id` ref came from `other`, so it
+    # treats it as an own-col reference and SEC005 stays silent — even
+    # though the policy is semantically session-state-only. This is the
+    # explicit trade-off documented in the SEC005 module docstring; pin
+    # it so any future "fix" surfaces as a visible test breakage rather
+    # than a silent semantics change.
+    schema = _wrap(
+        _policy(
+            using="current_setting('app.t') IN (SELECT id FROM other)"
+        )
+    )
+    assert SEC005().check(schema, {}) == []
+
+
 def test_sec005_does_not_fire_on_correlated_exists_membership() -> None:
     # Standard membership-table pattern: the policy's own `tenant_id`
     # is referenced via correlation inside the EXISTS. SEC005 must not
