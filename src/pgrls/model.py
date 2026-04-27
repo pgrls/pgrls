@@ -12,7 +12,7 @@ from typing import Any, Literal
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -62,8 +62,14 @@ class Schema:
         the schemas we introspected (whichever comes first). Rules use this
         to walk inheritance for declarative partitioning — e.g. SEC001
         skips a child when an ancestor has `rls_enabled = True`. A child
-        whose parent is in an unscoped schema gets an empty walk: we cannot
-        prove ancestor coverage, so the rule's default behavior applies.
+        whose parent is in an unscoped schema gets a (possibly partial)
+        walk that terminates at the gap; rules check `child.partition_of`
+        themselves to distinguish "no ancestor" from "ancestor outside
+        scope" when the messaging differs.
+
+        Raises ValueError on a cycle. Postgres does not allow cycles in
+        `pg_inherits`, so the only path here is corrupted state — silent
+        truncation would mask the bug; raising surfaces it loudly.
         """
         by_qname = {t.qualified_name: t for t in self.tables}
         current = table
@@ -73,9 +79,11 @@ class Schema:
                 f"{current.partition_of[0]}.{current.partition_of[1]}"
             )
             if qname in seen:
-                # Defensive — Postgres won't allow a real cycle here, but
-                # a malformed snapshot shouldn't loop.
-                return
+                raise ValueError(
+                    f"partition_of cycle detected at {qname!r}; "
+                    "Postgres does not produce cycles in pg_inherits — "
+                    "this indicates corrupted introspection state."
+                )
             seen.add(qname)
             parent = by_qname.get(qname)
             if parent is None:
@@ -93,6 +101,11 @@ class Schema:
                     "rls_enabled": t.rls_enabled,
                     "force_rls": t.force_rls,
                     "columns": list(t.columns),
+                    "partition_of": (
+                        list(t.partition_of)
+                        if t.partition_of is not None
+                        else None
+                    ),
                 }
                 for t in self.tables
             ],

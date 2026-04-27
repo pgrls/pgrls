@@ -60,7 +60,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 1,
+        "version": 2,
         "tables": [
             {
                 "schema": "public",
@@ -68,6 +68,7 @@ def test_schema_to_snapshot_shape() -> None:
                 "rls_enabled": True,
                 "force_rls": False,
                 "columns": [],
+                "partition_of": None,
             }
         ],
         "policies": [
@@ -206,3 +207,146 @@ def test_snapshot_includes_table_columns() -> None:
     )
     snap = Schema(tables=(table,)).to_snapshot()
     assert snap["tables"][0]["columns"] == ["id", "email"]
+
+
+def test_snapshot_version_is_two_after_partition_of_addition() -> None:
+    # `partition_of` was added in 0.0.4; SNAPSHOT_VERSION bumped from
+    # 1 → 2 per the model.py docstring contract that additive structural
+    # changes bump the version. Pin the new version so a future bump is
+    # deliberate.
+    snap = Schema(tables=()).to_snapshot()
+    assert snap["version"] == 2
+
+
+def test_snapshot_includes_partition_of_when_set() -> None:
+    table = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    snap = Schema(tables=(table,)).to_snapshot()
+    # JSON has no tuples — round-tripping through a list is required for
+    # `json.dumps` to succeed without a custom encoder.
+    assert snap["tables"][0]["partition_of"] == ["public", "events"]
+
+
+def test_snapshot_partition_of_is_none_for_non_partition() -> None:
+    table = Table(
+        schema="public",
+        name="things",
+        rls_enabled=True,
+        force_rls=True,
+        policies=(),
+    )
+    snap = Schema(tables=(table,)).to_snapshot()
+    assert snap["tables"][0]["partition_of"] is None
+
+
+def test_ancestors_of_yields_nothing_for_non_partition() -> None:
+    t = Table(
+        schema="public",
+        name="t",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    schema = Schema(tables=(t,))
+    assert list(schema.ancestors_of(t)) == []
+
+
+def test_ancestors_of_walks_immediate_parent() -> None:
+    parent = Table(
+        schema="public",
+        name="events",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    schema = Schema(tables=(parent, child))
+    chain = list(schema.ancestors_of(child))
+    assert [t.qualified_name for t in chain] == ["public.events"]
+
+
+def test_ancestors_of_walks_multi_level_chain() -> None:
+    grandparent = Table(
+        schema="public",
+        name="events",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    middle = Table(
+        schema="public",
+        name="events_t1",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    leaf = Table(
+        schema="public",
+        name="events_t1_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events_t1"),
+    )
+    schema = Schema(tables=(grandparent, middle, leaf))
+    chain = list(schema.ancestors_of(leaf))
+    assert [t.qualified_name for t in chain] == [
+        "public.events_t1",
+        "public.events",
+    ]
+
+
+def test_ancestors_of_terminates_when_parent_outside_introspected_set() -> None:
+    # Parent in an unscoped schema isn't in `Schema.tables` — the walk
+    # ends at the gap. The caller (e.g. SEC001) checks
+    # `child.partition_of` to distinguish "no ancestor" from "ancestor
+    # we couldn't see".
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("private", "events"),
+    )
+    schema = Schema(tables=(child,))
+    assert list(schema.ancestors_of(child)) == []
+
+
+def test_ancestors_of_raises_on_cycle() -> None:
+    import pytest
+
+    # Postgres can't produce this; only corrupted state can. Surface it.
+    a = Table(
+        schema="public",
+        name="a",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "b"),
+    )
+    b = Table(
+        schema="public",
+        name="b",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "a"),
+    )
+    schema = Schema(tables=(a, b))
+    with pytest.raises(ValueError, match="cycle"):
+        list(schema.ancestors_of(a))
