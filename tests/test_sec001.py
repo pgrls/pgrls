@@ -143,3 +143,69 @@ def test_fires_on_partition_child_when_ancestor_outside_schema_scope() -> None:
     violations = SEC001().check(schema, options={})
     assert len(violations) == 1
     assert violations[0].location == "public.events_2026"
+
+
+def test_unscoped_parent_message_distinguishes_from_standalone_table() -> None:
+    # The standard "Add ENABLE ROW LEVEL SECURITY" advice is misleading
+    # when the parent may already have RLS but lives in a schema we
+    # didn't introspect. The differentiated message tells the user to
+    # widen `--schemas` (or push a policy onto this child) rather than
+    # to flip a switch on a table that might be covered upstream.
+    child = _table(
+        "events_2026", rls=False, partition_of=("private", "events")
+    )
+    schema = Schema(tables=(child,))
+    violation = SEC001().check(schema, options={})[0]
+    assert "leaves the scanned schemas" in violation.message
+    assert "ENABLE ROW LEVEL SECURITY" not in violation.message
+
+
+def test_standalone_table_keeps_classic_message() -> None:
+    schema = Schema(tables=(_table("things", rls=False),))
+    violation = SEC001().check(schema, options={})[0]
+    assert "ENABLE ROW LEVEL SECURITY" in violation.message
+    assert "leaves the scanned schemas" not in violation.message
+
+
+def test_partition_child_with_visible_parent_keeps_classic_message() -> None:
+    # Parent IS in scope but neither parent nor child has RLS. The walk
+    # reached the root (parent.partition_of is None) so the message
+    # remains the classic "Add ENABLE ROW LEVEL SECURITY" — there's
+    # nothing unscoped about this scenario.
+    parent = _table("events", rls=False)
+    child = _table(
+        "events_2026", rls=False, partition_of=("public", "events")
+    )
+    schema = Schema(tables=(parent, child))
+    violations = SEC001().check(schema, options={})
+    by_loc = {v.location: v for v in violations}
+    for loc in ("public.events", "public.events_2026"):
+        assert "ENABLE ROW LEVEL SECURITY" in by_loc[loc].message
+        assert "leaves the scanned schemas" not in by_loc[loc].message
+
+
+def test_mid_chain_leaves_scope_emits_unscoped_message() -> None:
+    # leaf -> visible_middle -> (unscoped grandparent). The walk yields
+    # one ancestor (visible_middle), but that ancestor still has
+    # `partition_of` set pointing outside scope. Treat as truncated:
+    # we couldn't verify upstream RLS, so the message changes.
+    middle = _table(
+        "events_t1",
+        rls=False,
+        partition_of=("private", "events"),
+    )
+    leaf = _table(
+        "events_t1_2026",
+        rls=False,
+        partition_of=("public", "events_t1"),
+    )
+    schema = Schema(tables=(middle, leaf))
+    violations = SEC001().check(schema, options={})
+    by_loc = {v.location: v for v in violations}
+    # Both fire; both should carry the unscoped-chain message.
+    assert "leaves the scanned schemas" in by_loc[
+        "public.events_t1_2026"
+    ].message
+    assert "leaves the scanned schemas" in by_loc[
+        "public.events_t1"
+    ].message
