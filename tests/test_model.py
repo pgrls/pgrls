@@ -352,6 +352,30 @@ def test_ancestors_of_raises_on_cycle() -> None:
         list(schema.ancestors_of(a))
 
 
+def test_ancestors_of_raises_on_self_cycle_without_yielding_self() -> None:
+    # A table whose `partition_of` points back to itself is a length-1
+    # cycle. The `seen` set is seeded with the starting table's qname
+    # specifically so this case raises before yielding the table as
+    # its own ancestor — that would mislead any caller doing
+    # `any(a.rls_enabled for a in ancestors)`. Pin the no-yield-then-
+    # raise contract.
+    import pytest
+
+    self_referential = Table(
+        schema="public",
+        name="loop",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "loop"),
+    )
+    schema = Schema(tables=(self_referential,))
+
+    iterator = schema.ancestors_of(self_referential)
+    with pytest.raises(ValueError, match="cycle"):
+        next(iterator)
+
+
 def test_table_with_list_partition_of_is_unhashable() -> None:
     # Contract: `partition_of` must be a tuple (or None). The type hint
     # says so; the frozen dataclass auto-hash will fail loudly if
