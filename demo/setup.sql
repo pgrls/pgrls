@@ -10,8 +10,24 @@
 
 DROP SCHEMA IF EXISTS app CASCADE;
 DROP SCHEMA IF EXISTS private CASCADE;
+DROP SCHEMA IF EXISTS auth CASCADE;
 CREATE SCHEMA app;
 CREATE SCHEMA private;
+
+-- Stub Supabase-style auth functions so use cases 19-21 can call
+-- `auth.uid()` etc. without running a real Supabase stack. The
+-- function bodies just read GUCs, which mirrors how Supabase wires
+-- the JWT claims into the session.
+CREATE SCHEMA auth;
+CREATE FUNCTION auth.uid() RETURNS UUID
+    LANGUAGE SQL STABLE
+    AS $$ SELECT current_setting('request.jwt.claim.sub', true)::UUID $$;
+CREATE FUNCTION auth.role() RETURNS TEXT
+    LANGUAGE SQL STABLE
+    AS $$ SELECT current_setting('request.jwt.claim.role', true) $$;
+CREATE FUNCTION auth.jwt() RETURNS JSONB
+    LANGUAGE SQL STABLE
+    AS $$ SELECT current_setting('request.jwt.claims', true)::JSONB $$;
 
 
 -- ============================================================
@@ -332,3 +348,265 @@ CREATE TABLE app.bare_metrics (
 CREATE TABLE app.bare_metrics_2026 PARTITION OF app.bare_metrics
     FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 -- No ENABLE ROW LEVEL SECURITY anywhere in this family.
+
+
+-- ============================================================
+-- Use case 16: Correlated EXISTS membership — CLEAN
+-- The classic team/membership-table pattern. The policy joins
+-- to `team_members` via a correlated EXISTS, referencing
+-- `team_id` from the outer `team_documents` table. SEC005
+-- must NOT fire here — the policy IS row-scoped through the
+-- join. A regression in the SubLink walk would silently turn
+-- this into a false positive (the C2 fix from 0.0.4).
+--
+-- NOTE on column naming: the membership table uses
+-- `member_team_id` rather than `team_id` to keep the inner
+-- subquery's name resolution unambiguous. With both columns
+-- named `team_id`, Postgres would resolve the bare `team_id`
+-- to the inner table's column (silent tautology) — not what
+-- the author meant. Distinct names make the correlation
+-- explicit.
+-- ============================================================
+CREATE TABLE app.team_members (
+    member_team_id UUID NOT NULL,
+    user_id TEXT NOT NULL,
+    role TEXT,
+    PRIMARY KEY (member_team_id, user_id)
+);
+ALTER TABLE app.team_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.team_members FORCE ROW LEVEL SECURITY;
+CREATE POLICY team_members_self ON app.team_members
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = (SELECT current_setting('app.user', true)));
+
+CREATE TABLE app.team_documents (
+    id BIGSERIAL PRIMARY KEY,
+    team_id UUID NOT NULL,
+    title TEXT NOT NULL
+);
+ALTER TABLE app.team_documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.team_documents FORCE ROW LEVEL SECURITY;
+CREATE POLICY team_member_visibility ON app.team_documents
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (
+        EXISTS (
+            SELECT 1 FROM app.team_members tm
+            WHERE tm.member_team_id = team_id
+              AND tm.user_id = (SELECT current_setting('app.user', true))
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM app.team_members tm
+            WHERE tm.member_team_id = team_id
+              AND tm.user_id = (SELECT current_setting('app.user', true))
+        )
+    );
+
+
+-- ============================================================
+-- Use case 17: Asymmetric USING / WITH CHECK — CLEAN
+-- Read your team's tickets, write only your own. A common
+-- real-world shape: USING and WITH CHECK do different things
+-- on purpose. pgrls accepts this — none of the rules complain
+-- about asymmetry as long as both clauses are present and
+-- reference table columns.
+-- ============================================================
+CREATE TABLE app.tickets (
+    id BIGSERIAL PRIMARY KEY,
+    team_id UUID NOT NULL,
+    user_id TEXT NOT NULL,
+    subject TEXT
+);
+ALTER TABLE app.tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.tickets FORCE ROW LEVEL SECURITY;
+CREATE POLICY read_team_write_own ON app.tickets
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (team_id = (SELECT current_setting('app.team', true)::UUID))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
+
+
+-- ============================================================
+-- Use case 18: Soft-delete pattern — CLEAN
+-- `deleted_at IS NULL` is a common way to filter out
+-- tombstoned rows from default reads. Note that `deleted_at IS
+-- NULL` is a column-IS-NULL test, NOT an `auth_func() IS NULL`
+-- — SEC004 only flags the latter. Pin that distinction at the
+-- demo level.
+-- ============================================================
+CREATE TABLE app.users_v2 (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    email TEXT NOT NULL,
+    deleted_at TIMESTAMPTZ
+);
+ALTER TABLE app.users_v2 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.users_v2 FORCE ROW LEVEL SECURITY;
+CREATE POLICY hide_deleted ON app.users_v2
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        deleted_at IS NULL
+        AND tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+    );
+
+
+-- ============================================================
+-- Use case 19: Supabase auth.uid() inverted — SEC004
+-- The exact shape of the public Lovable RLS CVE: a top-level
+-- OR with `auth.uid() IS NULL` lets anonymous connections see
+-- every row. Distinct from use case 06 only in the function
+-- name; pgrls's default `auth_functions` list covers both.
+-- ============================================================
+CREATE TABLE app.profiles (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID,
+    display_name TEXT
+);
+ALTER TABLE app.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.profiles FORCE ROW LEVEL SECURITY;
+CREATE POLICY allow_anon ON app.profiles
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (auth.uid() IS NULL OR user_id = auth.uid());
+    -- also fires PERF001 (auth.uid unwrapped)
+
+
+-- ============================================================
+-- Use case 20: Supabase auth.uid() unwrapped — PERF001
+-- Inline `auth.uid()` is re-evaluated per row. Wrap as
+-- `(SELECT auth.uid())` to let Postgres cache the result
+-- once per statement.
+-- ============================================================
+CREATE TABLE app.todos (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID,
+    body TEXT
+);
+ALTER TABLE app.todos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.todos FORCE ROW LEVEL SECURITY;
+CREATE POLICY todos_owner ON app.todos
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = auth.uid());  -- not wrapped
+
+
+-- ============================================================
+-- Use case 21: PERF001 silent on WITH CHECK — pin USING-only contract
+-- An INSERT policy whose only auth call is in WITH CHECK. PERF001
+-- is documented as USING-only (Postgres optimizes WITH CHECK
+-- differently). Pinned by the demo so a future regression that
+-- extends PERF001 to WITH CHECK fails this test loudly.
+-- ============================================================
+CREATE TABLE app.audit_inserts (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID,
+    event TEXT,
+    happened_at TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE app.audit_inserts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.audit_inserts FORCE ROW LEVEL SECURITY;
+CREATE POLICY insert_self_only ON app.audit_inserts
+    AS RESTRICTIVE
+    FOR INSERT TO PUBLIC
+    WITH CHECK (user_id = auth.uid());
+
+
+-- ============================================================
+-- Use case 22: HYG001 catches dropped column in WITH CHECK
+-- Same orphan-column pattern as use case 12 but the only
+-- reference to the dropped column is in WITH CHECK. Pin that
+-- HYG001 walks both clauses, not just USING.
+-- ============================================================
+CREATE TABLE app.posts_v2 (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    moderation_status TEXT
+);
+ALTER TABLE app.posts_v2 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.posts_v2 FORCE ROW LEVEL SECURITY;
+CREATE POLICY only_approved_writes ON app.posts_v2
+    AS RESTRICTIVE
+    FOR INSERT TO PUBLIC
+    WITH CHECK (
+        user_id = (SELECT current_setting('app.user', true))
+        AND moderation_status = 'approved'
+    );
+
+UPDATE pg_catalog.pg_attribute
+    SET attisdropped = true
+    WHERE attrelid = 'app.posts_v2'::regclass
+      AND attname = 'moderation_status';
+
+
+-- ============================================================
+-- Use case 23: Three-level partition with RLS at root — CLEAN
+-- Sub-partitioning (PARTITION BY ... PARTITION BY ...). SEC001
+-- walks ancestors iteratively, so leaves whose chain reaches
+-- the RLS-enabled root inherit coverage at any depth.
+-- ============================================================
+CREATE TABLE app.deep_events (
+    id BIGSERIAL,
+    tenant_id UUID NOT NULL,
+    bucket TEXT NOT NULL,
+    ts TIMESTAMPTZ NOT NULL,
+    payload JSONB
+) PARTITION BY LIST (bucket);
+
+CREATE TABLE app.deep_events_t1 PARTITION OF app.deep_events
+    FOR VALUES IN ('t1') PARTITION BY RANGE (ts);
+CREATE TABLE app.deep_events_t1_2026 PARTITION OF app.deep_events_t1
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+ALTER TABLE app.deep_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.deep_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY deep_tenant ON app.deep_events
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+
+
+-- ============================================================
+-- Use case 24: Partition with RLS pushed down to the leaf —
+-- mixed coverage
+-- The parent has no RLS but the leaf does. Per the AGENTS.md
+-- guidance, this is the right pattern when direct child access
+-- is part of the threat model: each leaf carries its own
+-- protection, so direct queries against leaves can't bypass
+-- a parent-level policy. SEC001 fires on the parent (no RLS
+-- there) but is silent on the leaf (rls_enabled=true on the
+-- leaf itself).
+-- ============================================================
+CREATE TABLE app.leaf_metrics (
+    id BIGSERIAL,
+    tenant_id UUID NOT NULL,
+    ts TIMESTAMPTZ NOT NULL,
+    value DOUBLE PRECISION
+) PARTITION BY RANGE (ts);
+
+CREATE TABLE app.leaf_metrics_2026 PARTITION OF app.leaf_metrics
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+ALTER TABLE app.leaf_metrics_2026 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.leaf_metrics_2026 FORCE ROW LEVEL SECURITY;
+CREATE POLICY leaf_tenant ON app.leaf_metrics_2026
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+
+
+-- ============================================================
+-- Use case 25: View on top of an RLS-enabled table —
+-- introspector skips
+-- Views (relkind='v') aren't RLS-bearing — Postgres applies
+-- the underlying table's RLS at evaluation time. The
+-- introspector filters to relkind IN ('r', 'p'), so views
+-- never enter pgrls's table list and no rule fires on them.
+-- ============================================================
+CREATE VIEW app.documents_view AS
+    SELECT id, title, created_at FROM app.documents;
