@@ -354,3 +354,357 @@ def test_lint_exits_nonzero_on_demo_db(demo_db: str) -> None:
         env={"DATABASE_URL": demo_db},
     )
     assert result.exit_code == 1
+
+
+# ============================================================
+# Use cases 26-31 — realistic application shapes
+# ============================================================
+
+def test_uc26_blog_admin_override_fires_sec003_on_public_permissive(
+    lint_output: str,
+) -> None:
+    # The RESTRICTIVE tenant floor is silent. The PERMISSIVE
+    # admin-or-author SELECT policy is granted to PUBLIC, so
+    # SEC003 fires on it — uc31 demos the canonical fix.
+    assert (
+        "SEC003  app.blog_posts.blog_admin_or_author_read\n" in lint_output
+    )
+    assert "SEC003  app.blog_posts.blog_tenant_floor" not in lint_output
+
+
+def test_uc27_delete_policy_without_with_check_clean(
+    lint_output: str,
+) -> None:
+    # DELETE is exempt from SEC006 by design — pin the contract
+    # against a future regression that broadens SEC006 to all
+    # write commands.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.todos_archive"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.todos_archive"
+        )
+
+
+def test_uc28_jwt_based_tenant_clean(lint_output: str) -> None:
+    # `auth.jwt()` is wrapped via `(SELECT auth.jwt())` — pin
+    # that PERF001 doesn't fire on the wrapped form even when
+    # combined with the `->>` JSON extractor.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.jwt_documents"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.jwt_documents"
+        )
+
+
+def test_uc29_public_or_tenant_mix_clean(lint_output: str) -> None:
+    # `is_public OR tenant_id = ...` — both branches reference
+    # table columns; SEC005 stays silent (own-col present).
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.kb_articles"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.kb_articles"
+        )
+
+
+def test_uc30_composite_tenant_key_clean(lint_output: str) -> None:
+    # Multi-column tenancy: `tenant_id = ... AND env = ...`.
+    # Both columns are own-table refs.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.composite_tenant"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.composite_tenant"
+        )
+
+
+def test_uc31_permissive_policy_to_specific_role_silences_sec003(
+    lint_output: str,
+) -> None:
+    # The RESTRICTIVE tenant_floor is silent; the PERMISSIVE
+    # auth_role_read is granted to `app_authenticated`
+    # (NOT PUBLIC), so SEC003 doesn't fire on it. This is the
+    # canonical fix for the SEC003 violation in uc26.
+    assert "SEC003  app.scoped_views" not in lint_output
+
+
+# ============================================================
+# Use cases 32-37 — Postgres feature & rule shape coverage
+# ============================================================
+
+def test_uc32_case_expression_in_policy_clean(
+    lint_output: str,
+) -> None:
+    # `CASE visibility WHEN 'public' THEN true WHEN 'private'
+    # THEN user_id = ... END`. Pins that extract_column_refs
+    # walks CASE branches — `visibility` and `user_id` are
+    # both reachable, so SEC005 stays silent.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.case_policy"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.case_policy"
+        )
+
+
+def test_uc33_classic_inherits_does_not_set_partition_of(
+    lint_output: str,
+) -> None:
+    # Pre-declarative INHERITS still goes through pg_inherits,
+    # but `relispartition` is false on classic-inherits
+    # children. The introspector filters on relispartition, so
+    # neither parent nor child gets a `partition_of`. SEC001
+    # fires on both with the standalone classic message —
+    # NOT the "is a partition of" variant.
+    assert "SEC001  app.legacy_parent\n" in lint_output
+    assert "SEC001  app.legacy_child\n" in lint_output
+    # The child's message must NOT name the parent (which
+    # would be the visible-root variant from uc15 — wrong here).
+    legacy_child_section = lint_output.split(
+        "SEC001  app.legacy_child"
+    )[1].split("\n\n")[0]
+    assert (
+        "is a partition of app.legacy_parent" not in legacy_child_section
+    )
+
+
+def test_uc34_sec004_nested_is_null_under_and_clean(
+    lint_output: str,
+) -> None:
+    # The expression is `user_id = auth.uid() AND flag_name IS NOT NULL`.
+    # SEC004 fires only on TOP-LEVEL OR disjuncts where one is
+    # `auth_func() IS NULL`. Top-level AND with a column
+    # IS-NOT-NULL stays silent. Pin the distinction.
+    assert "SEC004  app.flags_table" not in lint_output
+
+
+def test_uc35_using_one_eq_one_fires_sec005_not_sec008(
+    lint_output: str,
+) -> None:
+    # `USING (1=1)` is logically equivalent to `USING (true)`
+    # but the AST is different — SEC008 keys on the literal
+    # Boolean A_Const, not on the runtime value. Pin both:
+    # SEC005 fires (no own-col ref), SEC008 stays silent.
+    assert "SEC005  app.always_open.trivially_open\n" in lint_output
+    assert "SEC008  app.always_open" not in lint_output
+
+
+def test_uc36_pg_has_role_admin_escape_clean(lint_output: str) -> None:
+    # `pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')`
+    # is a built-in admin escape. Not in PERF001's default
+    # auth_functions set, so unwrapped is fine. RESTRICTIVE
+    # silences SEC003.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.admin_overrides"
+        assert line not in lint_output, (
+            f"{rule_id} unexpectedly fired on app.admin_overrides"
+        )
+
+
+def test_uc37_hyg001_isolated_to_offending_policy(
+    lint_output: str,
+) -> None:
+    # Two policies on `app.partial_orphan`: `clean_owner` (no
+    # orphan) and `orphan_filter` (refs the dropped `gone`
+    # column). HYG001 must fire ONLY on the offending policy.
+    assert (
+        "HYG001  app.partial_orphan.orphan_filter\n" in lint_output
+    )
+    assert (
+        "HYG001  app.partial_orphan.clean_owner" not in lint_output
+    )
+
+
+# ============================================================
+# Use case 38 — PERF001 walks the JSON extractor
+# ============================================================
+
+def test_uc38_perf001_on_unwrapped_jwt_json_access(
+    lint_output: str,
+) -> None:
+    # `auth.jwt() ->> 'sub'` — the `->>` operator wraps the
+    # auth call. Pin that find_func_calls walks operator
+    # arguments correctly.
+    assert (
+        "PERF001  app.jwt_unwrapped.jwt_unwrapped_owner\n" in lint_output
+    )
+
+
+# ============================================================
+# Use cases 44-47 — built-ins, partition variants, extra types
+# ============================================================
+
+def test_uc44_current_user_in_policy_does_not_fire_perf001(
+    lint_output: str,
+) -> None:
+    # `current_user` is a SQLValueFunction (cheap); PERF001's
+    # default auth_functions set deliberately excludes it.
+    # Pin the asymmetry so a future "broaden the default set"
+    # change is deliberate.
+    assert "PERF001  app.current_user_check" not in lint_output
+    # The whole table should be clean — `visibility` column
+    # ref keeps SEC005 silent, RESTRICTIVE silences SEC003.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.current_user_check"
+        assert line not in lint_output
+
+
+def test_uc45_default_partition_inherits_rls_via_ancestor_walk(
+    lint_output: str,
+) -> None:
+    # `PARTITION OF parent DEFAULT` is just another partition
+    # (relispartition=true, inhparent=root). SEC001's ancestor
+    # walk reaches the RLS-enabled root from any leaf, default
+    # included.
+    for table in (
+        "app.region_metrics",
+        "app.region_metrics_us",
+        "app.region_metrics_default",
+    ):
+        assert f"SEC001  {table}\n" not in lint_output, (
+            f"SEC001 unexpectedly fired on {table}"
+        )
+
+
+def test_uc46_generated_column_referenced_in_policy_clean(
+    lint_output: str,
+) -> None:
+    # `GENERATED ALWAYS AS (...) STORED` columns appear in
+    # pg_attribute alongside regular columns. HYG001 sees them
+    # as present; SEC005 sees them as own-col refs.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.gen_cols"
+        assert line not in lint_output
+
+
+def test_uc47_array_any_membership_clean(lint_output: str) -> None:
+    # `<scalar> = ANY(array_col)` — pins that
+    # extract_column_refs walks ArrayExpr / ANY arguments
+    # so the `tags` column ref counts as own.
+    for rule_id in _ALL_RULE_IDS:
+        line = f"{rule_id}  app.array_tags"
+        assert line not in lint_output
+
+
+# ============================================================
+# Use cases 39-43 — configuration-driven scenarios
+# ============================================================
+
+def _run_lint(
+    db: str,
+    *,
+    extra_args: tuple[str, ...] = (),
+    config: Path | None = None,
+) -> str:
+    runner = CliRunner()
+    args = ["lint", "--database-url", db, *extra_args]
+    if config is not None:
+        args.extend(["--config", str(config)])
+    return runner.invoke(
+        main, args, env={"DATABASE_URL": db}
+    ).output
+
+
+_BASE_CONFIG = (
+    '[database]\nschemas = ["app"]\n'
+    '[lint.rules.SEC001]\nallowlist = ["app.countries"]\n'
+)
+
+
+def test_uc39_custom_auth_function_detected_via_config(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # `app.current_user_id()` is silent under the default
+    # PERF001 auth_functions list. Override the list to add it,
+    # and PERF001 fires on `app.user_workspaces.workspace_owner`.
+    # Note: an override REPLACES the default list, so we
+    # re-include the defaults to avoid losing other detection.
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint.rules.PERF001]\n'
+        'auth_functions = ["auth.uid", "auth.role", "auth.jwt", '
+        '"current_setting", "app.current_user_id"]\n'
+    )
+    out = _run_lint(demo_db, config=cfg)
+    # Default config: silent on user_workspaces.
+    default_out = _run_lint(demo_db, config=PGRLS_TOML)
+    assert "PERF001  app.user_workspaces" not in default_out
+    # Custom config: fires.
+    assert (
+        "PERF001  app.user_workspaces.workspace_owner\n" in out
+    )
+
+
+def test_uc40_sec005_allowlist_silences_admin_audit(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # admin_audit's policy is legitimately session-state-only.
+    # SEC005 fires by default; allowlisting the qualified
+    # policy ID silences it.
+    default_out = _run_lint(demo_db, config=PGRLS_TOML)
+    assert (
+        "SEC005  app.admin_audit.admin_only_read\n" in default_out
+    )
+
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint.rules.SEC005]\n'
+        'allowlist = ["app.admin_audit.admin_only_read"]\n'
+    )
+    out = _run_lint(demo_db, config=cfg)
+    assert "SEC005  app.admin_audit" not in out
+
+
+def test_uc41_disable_via_config_turns_off_sec007(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # uc09's app.tags fires SEC007 in the default run. Adding
+    # SEC007 to `[lint].disable` skips the rule entirely;
+    # nothing in the output mentions it.
+    default_out = _run_lint(demo_db, config=PGRLS_TOML)
+    assert "SEC007  app.tags\n" in default_out
+
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint]\ndisable = ["SEC007"]\n'
+    )
+    out = _run_lint(demo_db, config=cfg)
+    assert "SEC007" not in out
+
+
+def test_uc42_multi_schema_scan_picks_up_other_schema(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # `tenant.tenant_orphans` is in a schema the default
+    # config doesn't scan. Adding `tenant` via --schemas
+    # surfaces SEC001 on it.
+    default_out = _run_lint(demo_db, config=PGRLS_TOML)
+    assert "SEC001  tenant.tenant_orphans" not in default_out
+
+    out = _run_lint(
+        demo_db,
+        config=PGRLS_TOML,
+        extra_args=("--schemas", "app,tenant"),
+    )
+    assert "SEC001  tenant.tenant_orphans\n" in out
+
+
+def test_uc43_sec003_allowlist_silences_intentional_public_read(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # `app.public_metadata.metadata_read` is a deliberate
+    # PUBLIC SELECT policy on a documentation table. SEC003
+    # fires by default; allowlisting silences it.
+    default_out = _run_lint(demo_db, config=PGRLS_TOML)
+    assert (
+        "SEC003  app.public_metadata.metadata_read\n" in default_out
+    )
+
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint.rules.SEC003]\n'
+        'allowlist = ["app.public_metadata.metadata_read"]\n'
+    )
+    out = _run_lint(demo_db, config=cfg)
+    assert "SEC003  app.public_metadata" not in out
