@@ -111,10 +111,13 @@ def find_func_calls(
     `current_user`), the node fires when its op corresponds to a name in
     the set.
 
-    When `exclude_sublinks=True`, calls inside `SubLink` subtrees are not
-    collected. PERF001 uses this to detect "unwrapped" auth calls — a
-    call wrapped in `(SELECT auth.uid())` lives inside a SubLink and is
-    intentionally skipped.
+    When `exclude_sublinks=True`, calls inside the SubLink's subselect
+    are skipped, but the SubLink's `testexpr` (the LHS of `IN`/`ANY`/
+    `ALL`) is still walked. PERF001 uses this to detect "unwrapped"
+    auth calls: `(SELECT auth.uid())` lives inside the subselect and is
+    correctly skipped, while `auth.uid() IN (SELECT ...)` keeps firing
+    because the auth call is on the LHS, not in the subselect. Mirrors
+    `extract_column_refs`'s shape.
     """
     matches: list[Any] = []
 
@@ -122,6 +125,7 @@ def find_func_calls(
         if n is None:
             return
         if exclude_sublinks and isinstance(n, SubLink):
+            walk(n.testexpr)
             return
         if isinstance(n, FuncCall):
             parts: list[str] = []
