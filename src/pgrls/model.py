@@ -38,6 +38,12 @@ class Table:
     force_rls: bool
     policies: tuple[Policy, ...]
     columns: tuple[str, ...] = ()
+    # Immediate parent for declarative partition children — `(schema, name)`
+    # of the partitioned table this row is `PARTITION OF`. None for
+    # standalone tables, partitioned-table parents themselves, and classic
+    # `INHERITS` children. The chain may be deeper than one level; rules
+    # walk it via the resolved Schema.
+    partition_of: tuple[str, str] | None = None
 
     @property
     def qualified_name(self) -> str:

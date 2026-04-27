@@ -261,3 +261,92 @@ def test_columns_empty_for_table_with_only_system_columns(
     schema = introspect(pg_conn, schemas=["public"])
     t = next(x for x in schema.tables if x.name == "empty_t")
     assert t.columns == ()
+
+
+def test_introspect_includes_partitioned_parent_with_rls_state(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Postgres declarative partitioning: parent has relkind='p', children
+    # have relkind='r'. Policies attach to the parent only; children
+    # inherit them at query time. Before the partitioning fix, the parent
+    # was filtered out (relkind='r' only), so the lint silently saw no
+    # parent and SEC001 falsely fired on every child.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id BIGINT, tenant_id UUID, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026 PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.events FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.events FOR SELECT TO PUBLIC
+            USING (tenant_id = current_setting('app.t', true)::uuid);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    by_name = {t.qualified_name: t for t in schema.tables}
+    # Parent is now visible.
+    assert "public.events" in by_name
+    assert "public.events_2026" in by_name
+
+    parent = by_name["public.events"]
+    child = by_name["public.events_2026"]
+
+    # Parent carries the RLS state and the policy.
+    assert parent.rls_enabled is True
+    assert parent.force_rls is True
+    assert len(parent.policies) == 1
+    # Parent itself is not a partition.
+    assert parent.partition_of is None
+
+    # Child has no policies of its own (they live on the parent).
+    assert child.policies == ()
+    # Child's relrowsecurity is independently false — Postgres does not
+    # propagate the flag down. The lint relies on partition_of to know
+    # the parent is the source of truth.
+    assert child.rls_enabled is False
+    assert child.partition_of == ("public", "events")
+
+
+def test_introspect_links_multi_level_partition(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A partition can itself be partitioned. partition_of stores only the
+    # immediate parent — the rule walks the chain.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, tenant_id INT, day DATE)
+            PARTITION BY LIST (tenant_id);
+        CREATE TABLE public.events_t1 PARTITION OF public.events
+            FOR VALUES IN (1) PARTITION BY RANGE (day);
+        CREATE TABLE public.events_t1_2026 PARTITION OF public.events_t1
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    by_name = {t.qualified_name: t for t in schema.tables}
+    assert by_name["public.events"].partition_of is None
+    assert by_name["public.events_t1"].partition_of == ("public", "events")
+    assert by_name["public.events_t1_2026"].partition_of == (
+        "public",
+        "events_t1",
+    )
+
+
+def test_introspect_does_not_set_partition_of_for_classic_inherits(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Classic INHERITS (pre-declarative partitioning) goes through
+    # pg_inherits too, but Postgres marks declarative-partition children
+    # with `relispartition = true`. We filter on that — classic inherit
+    # children must report partition_of = None.
+    apply_sql(
+        """
+        CREATE TABLE public.parent_t (id INT, name TEXT);
+        CREATE TABLE public.child_t (extra TEXT) INHERITS (public.parent_t);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    by_name = {t.qualified_name: t for t in schema.tables}
+    assert by_name["public.parent_t"].partition_of is None
+    assert by_name["public.child_t"].partition_of is None
