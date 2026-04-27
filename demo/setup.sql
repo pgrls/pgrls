@@ -610,3 +610,508 @@ CREATE POLICY leaf_tenant ON app.leaf_metrics_2026
 -- ============================================================
 CREATE VIEW app.documents_view AS
     SELECT id, title, created_at FROM app.documents;
+
+
+-- ============================================================
+-- Use case 26: Blog with admin-role override — CLEAN
+-- A real-world multi-policy shape. One RESTRICTIVE policy
+-- enforces tenant isolation; one PERMISSIVE policy grants
+-- read access to admins via auth.role(). Both clauses are
+-- wrapped to avoid PERF001. SEC007 stays silent because the
+-- table has at least one RESTRICTIVE policy (not all
+-- permissive). SEC005 and SEC008 stay silent because both
+-- clauses reference table columns and aren't `(true)`.
+-- ============================================================
+CREATE TABLE app.blog_posts (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    author_id UUID NOT NULL,
+    title TEXT,
+    body TEXT,
+    published BOOLEAN NOT NULL DEFAULT false
+);
+ALTER TABLE app.blog_posts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.blog_posts FORCE ROW LEVEL SECURITY;
+CREATE POLICY blog_tenant_floor ON app.blog_posts
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+CREATE POLICY blog_admin_or_author_read ON app.blog_posts
+    FOR SELECT TO PUBLIC
+    USING (
+        (SELECT auth.role()) = 'admin'
+        OR author_id = (SELECT current_setting('app.user', true)::UUID)
+    );
+-- One PERMISSIVE policy is granted to PUBLIC, but the policy is
+-- column-anchored (`author_id = ...`), so SEC003 still fires —
+-- this is intentional. Use case 31 below shows the way to silence
+-- SEC003: grant to a non-PUBLIC role.
+
+
+-- ============================================================
+-- Use case 27: DELETE policy without WITH CHECK — CLEAN
+-- DELETE policies have no WITH CHECK clause by design — you're
+-- removing rows, not validating writes. SEC006 explicitly
+-- skips DELETE; pin the contract so a future regression that
+-- extends SEC006 to DELETE fails this case loudly.
+-- ============================================================
+CREATE TABLE app.todos_archive (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    body TEXT
+);
+ALTER TABLE app.todos_archive ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.todos_archive FORCE ROW LEVEL SECURITY;
+CREATE POLICY archive_owner_delete ON app.todos_archive
+    AS RESTRICTIVE
+    FOR DELETE TO PUBLIC
+    USING (user_id = (SELECT current_setting('app.user', true)));
+
+
+-- ============================================================
+-- Use case 28: Tenant via JWT claim — CLEAN
+-- Supabase-flavored: the tenant scope comes from the JWT
+-- payload via `auth.jwt() ->> 'tenant_id'`. The wrap
+-- `(SELECT auth.jwt())` keeps PERF001 silent.
+-- ============================================================
+CREATE TABLE app.jwt_documents (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    title TEXT
+);
+ALTER TABLE app.jwt_documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.jwt_documents FORCE ROW LEVEL SECURITY;
+CREATE POLICY jwt_tenant ON app.jwt_documents
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (
+        tenant_id = ((SELECT auth.jwt()) ->> 'tenant_id')::UUID
+    )
+    WITH CHECK (
+        tenant_id = ((SELECT auth.jwt()) ->> 'tenant_id')::UUID
+    );
+
+
+-- ============================================================
+-- Use case 29: Public-or-tenant mix — CLEAN
+-- "Some rows are world-readable (`is_public = true`); others
+-- are tenant-scoped." The disjunction is column-anchored on
+-- both sides — SEC005 stays silent because the predicate
+-- references `is_public` AND `tenant_id`.
+-- ============================================================
+CREATE TABLE app.kb_articles (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID,
+    is_public BOOLEAN NOT NULL DEFAULT false,
+    title TEXT
+);
+ALTER TABLE app.kb_articles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.kb_articles FORCE ROW LEVEL SECURITY;
+CREATE POLICY public_or_tenant ON app.kb_articles
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        is_public
+        OR tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+    );
+
+
+-- ============================================================
+-- Use case 30: Composite tenant key — CLEAN
+-- Real-world tenancy is sometimes multi-dimensional: tenant
+-- AND environment, or tenant AND region. The policy AND-joins
+-- the columns. SEC005 stays silent because both columns are
+-- referenced; SEC003 stays silent because RESTRICTIVE.
+-- ============================================================
+CREATE TABLE app.composite_tenant (
+    id BIGSERIAL,
+    tenant_id UUID NOT NULL,
+    env TEXT NOT NULL,
+    payload JSONB,
+    PRIMARY KEY (tenant_id, env, id)
+);
+ALTER TABLE app.composite_tenant ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.composite_tenant FORCE ROW LEVEL SECURITY;
+CREATE POLICY composite_isolation ON app.composite_tenant
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        AND env = (SELECT current_setting('app.env', true))
+    )
+    WITH CHECK (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        AND env = (SELECT current_setting('app.env', true))
+    );
+
+
+-- ============================================================
+-- Use case 31: Permissive policy granted to a specific role
+-- (NOT PUBLIC) — CLEAN against SEC003
+-- SEC003 fires only when permissive AND TO PUBLIC. Granting
+-- to a specific application role (here `app_authenticated`)
+-- silences it. Demonstrates the canonical fix for SEC003 in
+-- multi-tenant apps that use a service account.
+-- ============================================================
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app_authenticated') THEN
+        CREATE ROLE app_authenticated NOLOGIN;
+    END IF;
+END $$;
+
+CREATE TABLE app.scoped_views (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID,
+    payload JSONB
+);
+ALTER TABLE app.scoped_views ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.scoped_views FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON app.scoped_views
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+CREATE POLICY auth_role_read ON app.scoped_views
+    FOR SELECT TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
+
+
+-- ============================================================
+-- Use case 32: CASE expression in policy — CLEAN
+-- A column-anchored predicate inside a `CASE ... END`. Pins
+-- that extract_column_refs walks CASE branches: SEC005 must
+-- find both `visibility` and `user_id` and stay silent.
+-- ============================================================
+CREATE TABLE app.case_policy (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    visibility TEXT
+);
+ALTER TABLE app.case_policy ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.case_policy FORCE ROW LEVEL SECURITY;
+CREATE POLICY visibility_case ON app.case_policy
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        CASE visibility
+            WHEN 'public'  THEN true
+            WHEN 'private' THEN user_id = (SELECT current_setting('app.user', true))
+            ELSE false
+        END
+    );
+
+
+-- ============================================================
+-- Use case 33: Classic INHERITS (non-declarative) — partition_of
+-- stays None
+-- Pre-declarative table inheritance still uses pg_inherits,
+-- but `cc.relispartition` is false on the child. The
+-- `_PARTITION_PARENTS_SQL` filter in introspect.py keys on
+-- `relispartition = true`, so this child does NOT get a
+-- `partition_of`, and SEC001 fires on both parent and child
+-- with the standalone classic message.
+-- ============================================================
+CREATE TABLE app.legacy_parent (
+    id BIGSERIAL PRIMARY KEY,
+    payload TEXT
+);
+CREATE TABLE app.legacy_child (
+    extra TEXT
+) INHERITS (app.legacy_parent);
+
+
+-- ============================================================
+-- Use case 34: SEC004 nested IS NULL inside AND — CLEAN
+-- The rule fires only on TOP-LEVEL OR disjuncts where one is
+-- `auth_func() IS NULL`. A nested `... AND auth.uid() IS NULL`
+-- (or `IS NULL` on a non-auth function) must NOT trip SEC004.
+-- ============================================================
+CREATE TABLE app.flags_table (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID,
+    flag_name TEXT
+);
+ALTER TABLE app.flags_table ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.flags_table FORCE ROW LEVEL SECURITY;
+CREATE POLICY flags_owner ON app.flags_table
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        user_id = (SELECT auth.uid())
+        AND flag_name IS NOT NULL
+    );
+
+
+-- ============================================================
+-- Use case 35: SEC005 with literal `USING (1=1)` — fires
+-- Not the literal Boolean true but evaluates to it. SEC008's
+-- detector keys on the literal Boolean `A_Const`, so the
+-- (1=1) shape only fires SEC005 (no own-column reference);
+-- SEC008 does NOT fire. Pin the asymmetry.
+-- ============================================================
+CREATE TABLE app.always_open (
+    id BIGSERIAL PRIMARY KEY,
+    label TEXT
+);
+ALTER TABLE app.always_open ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.always_open FORCE ROW LEVEL SECURITY;
+CREATE POLICY trivially_open ON app.always_open
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (1 = 1);
+
+
+-- ============================================================
+-- Use case 36: pg_has_role admin escape — CLEAN
+-- A common production pattern: tenant rows for normal users,
+-- but service-level roles (here `pg_read_all_data`, a built-in
+-- predefined role since PG 14) get to read everything. Note
+-- that `pg_has_role` is NOT in PERF001's default
+-- `auth_functions` set, so the unwrapped call is fine.
+-- ============================================================
+CREATE TABLE app.admin_overrides (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id UUID,
+    note TEXT
+);
+ALTER TABLE app.admin_overrides ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.admin_overrides FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_or_admin ON app.admin_overrides
+    AS RESTRICTIVE
+    FOR ALL TO PUBLIC
+    USING (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        OR pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')
+    )
+    WITH CHECK (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        OR pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')
+    );
+
+
+-- ============================================================
+-- Use case 37: HYG001 — per-policy isolation
+-- Two policies on the same table; one references a dropped
+-- column, the other does not. Pin that HYG001 fires only on
+-- the offending policy and leaves the clean one alone — a
+-- regression that broadens the scope to "any policy on a
+-- table with any orphan" would fail this assertion loudly.
+-- ============================================================
+CREATE TABLE app.partial_orphan (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    gone TEXT
+);
+ALTER TABLE app.partial_orphan ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.partial_orphan FORCE ROW LEVEL SECURITY;
+CREATE POLICY clean_owner ON app.partial_orphan
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = (SELECT current_setting('app.user', true)));
+CREATE POLICY orphan_filter ON app.partial_orphan
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (gone = 'x');
+
+UPDATE pg_catalog.pg_attribute
+    SET attisdropped = true
+    WHERE attrelid = 'app.partial_orphan'::regclass
+      AND attname = 'gone';
+
+
+-- ============================================================
+-- Use case 38: PERF001 with `auth.jwt() ->> 'sub'` unwrapped
+-- The JSON-text operator wraps a function call. PERF001 walks
+-- through `JsonbExtractPathText` (or the `->>` operator's
+-- arguments) to find unwrapped auth functions. Pin that.
+-- ============================================================
+CREATE TABLE app.jwt_unwrapped (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT
+);
+ALTER TABLE app.jwt_unwrapped ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.jwt_unwrapped FORCE ROW LEVEL SECURITY;
+CREATE POLICY jwt_unwrapped_owner ON app.jwt_unwrapped
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = auth.jwt() ->> 'sub');
+
+
+-- ============================================================
+-- Use case 39: Custom auth function — config-driven detection
+-- An app-defined function (`app.current_user_id()`) wrapping
+-- a session GUC. By default PERF001 doesn't know about it, so
+-- this table is silent. The companion test invokes pgrls with
+-- a one-off config that adds `app.current_user_id` to
+-- PERF001's `auth_functions` list — at which point PERF001
+-- catches the unwrapped call here.
+-- ============================================================
+CREATE FUNCTION app.current_user_id() RETURNS UUID
+    LANGUAGE SQL STABLE
+    AS $$ SELECT current_setting('app.user', true)::UUID $$;
+
+CREATE TABLE app.user_workspaces (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID
+);
+ALTER TABLE app.user_workspaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.user_workspaces FORCE ROW LEVEL SECURITY;
+CREATE POLICY workspace_owner ON app.user_workspaces
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id = app.current_user_id());
+
+
+-- ============================================================
+-- Use case 40: Admin audit log — SEC005 allowlist demo
+-- A legitimately session-state-only table: only admins read
+-- the audit log, and the predicate is `auth.role() = 'admin'`.
+-- The companion test runs pgrls with an inline config that
+-- allowlists `app.admin_audit.admin_only_read`, demonstrating
+-- the allowlist mechanism for known-good warnings.
+-- ============================================================
+CREATE TABLE app.admin_audit (
+    id BIGSERIAL PRIMARY KEY,
+    happened_at TIMESTAMPTZ DEFAULT now(),
+    detail JSONB
+);
+ALTER TABLE app.admin_audit ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.admin_audit FORCE ROW LEVEL SECURITY;
+CREATE POLICY admin_only_read ON app.admin_audit
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING ((SELECT auth.role()) = 'admin');
+
+
+-- ============================================================
+-- Use case 41: Disabled rule — SEC007 turned off via --disable
+-- The companion test runs `pgrls lint --disable SEC007` and
+-- asserts SEC007 doesn't fire on `app.tags` (use case 09)
+-- even though it would in the default run.
+-- (No new fixture required — uses tags from uc09.)
+-- ============================================================
+
+
+-- ============================================================
+-- Use case 42: Multi-schema scan — `tenant` schema
+-- pgrls accepts multiple schemas in `database.schemas` (or
+-- via `--schemas a,b`). This adds a `tenant` schema with a
+-- single bad table; the companion test runs pgrls with
+-- `--schemas app,tenant` and asserts SEC001 fires on
+-- `tenant.tenant_orphans`.
+-- ============================================================
+CREATE SCHEMA tenant;
+CREATE TABLE tenant.tenant_orphans (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT
+);
+
+
+-- ============================================================
+-- Use case 43: Custom rule allowlist via inline config —
+-- SEC003 intentional public read
+-- A read-only metadata table that the application
+-- intentionally exposes to PUBLIC. The companion test runs
+-- pgrls with `[lint.rules.SEC003].allowlist =
+-- ["app.public_metadata.metadata_read"]`. SEC003 still fires
+-- without the override.
+-- ============================================================
+CREATE TABLE app.public_metadata (
+    id BIGSERIAL PRIMARY KEY,
+    key TEXT NOT NULL,
+    value TEXT
+);
+ALTER TABLE app.public_metadata ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.public_metadata FORCE ROW LEVEL SECURITY;
+CREATE POLICY metadata_read ON app.public_metadata
+    FOR SELECT TO PUBLIC
+    USING (key NOT LIKE 'private.%');
+
+
+-- ============================================================
+-- Use case 44: SQLValueFunction `current_user` in policy —
+-- CLEAN against PERF001
+-- `current_user` is in SEC004's default auth_functions set
+-- but NOT in PERF001's. Postgres evaluates SQLValueFunctions
+-- like `current_user` cheaply, so wrapping buys nothing — the
+-- rule deliberately omits them. Pin the asymmetry from a real
+-- DB rather than only the unit test in test_perf001.py.
+-- ============================================================
+CREATE TABLE app.current_user_check (
+    id BIGSERIAL PRIMARY KEY,
+    visibility TEXT
+);
+ALTER TABLE app.current_user_check ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.current_user_check FORCE ROW LEVEL SECURITY;
+CREATE POLICY only_admin_role ON app.current_user_check
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (current_user = 'postgres' OR visibility = 'public');
+
+
+-- ============================================================
+-- Use case 45: Default partition — CLEAN
+-- `PARTITION OF parent DEFAULT` is the catch-all partition.
+-- Postgres still records it in pg_inherits with
+-- relispartition = true, so introspect.py picks it up like
+-- any partition; SEC001's ancestor walk reaches the
+-- RLS-enabled root from the default leaf the same way.
+-- ============================================================
+CREATE TABLE app.region_metrics (
+    id BIGSERIAL,
+    region TEXT NOT NULL,
+    value DOUBLE PRECISION
+) PARTITION BY LIST (region);
+CREATE TABLE app.region_metrics_us PARTITION OF app.region_metrics
+    FOR VALUES IN ('us');
+CREATE TABLE app.region_metrics_default PARTITION OF app.region_metrics DEFAULT;
+ALTER TABLE app.region_metrics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.region_metrics FORCE ROW LEVEL SECURITY;
+CREATE POLICY region_visibility ON app.region_metrics
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (region = (SELECT current_setting('app.region', true)));
+
+
+-- ============================================================
+-- Use case 46: Generated column referenced in policy — CLEAN
+-- `GENERATED ALWAYS AS (...) STORED` columns appear in
+-- pg_attribute alongside regular columns. Policies can
+-- reference them; HYG001 sees them as present. Pin that the
+-- generated column is treated like any other.
+-- ============================================================
+CREATE TABLE app.gen_cols (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    user_id_norm TEXT GENERATED ALWAYS AS (lower(user_id)) STORED
+);
+ALTER TABLE app.gen_cols ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.gen_cols FORCE ROW LEVEL SECURITY;
+CREATE POLICY gen_owner ON app.gen_cols
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (user_id_norm = lower((SELECT current_setting('app.user', true))));
+
+
+-- ============================================================
+-- Use case 47: ARRAY column with ANY() — CLEAN
+-- `<scalar> = ANY(array_col)` is a common pattern for tag-
+-- based access ("rows whose visible_to array contains the
+-- caller"). The column ref `tags` is on the RHS of `= ANY`.
+-- Pin that extract_column_refs walks ArrayExpr / ANY
+-- correctly so SEC005 stays silent.
+-- ============================================================
+CREATE TABLE app.array_tags (
+    id BIGSERIAL PRIMARY KEY,
+    tags TEXT[]
+);
+ALTER TABLE app.array_tags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.array_tags FORCE ROW LEVEL SECURITY;
+CREATE POLICY in_tags ON app.array_tags
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        (SELECT current_setting('app.user', true)) = ANY(tags)
+    );
