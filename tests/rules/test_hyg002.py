@@ -197,3 +197,26 @@ def test_hyg002_metadata_present() -> None:
     assert rule.id == "HYG002"
     assert rule.severity == "warning"
     assert rule.title
+
+
+def test_hyg002_message_mentions_only_default_vocabulary_examples() -> None:
+    # The violation message gives example placeholder words. They
+    # must come from the actual default vocabulary — Round 26 caught
+    # the message naming `wip`, which Round 18 had removed from the
+    # default set. A message advertising example matches the rule
+    # itself will never produce on default config is a credibility
+    # leak.
+    from pgrls.rules.hyg002 import _DEFAULT_PLACEHOLDER_WORDS
+
+    schema = _wrap(_policy(name="todo_thing"))
+    msg = HYG002().check(schema, {})[0].message
+    # No removed-from-defaults words.
+    for stale in ("wip", "draft", "temp"):
+        assert stale not in msg, (
+            f"HYG002 violation message contains {stale!r} which is "
+            "no longer in the default vocabulary."
+        )
+    # At least one default vocabulary word appears as an example.
+    assert any(
+        f"`{word}`" in msg for word in _DEFAULT_PLACEHOLDER_WORDS
+    )
