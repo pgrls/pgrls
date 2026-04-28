@@ -1,0 +1,10 @@
+-- ============================================================
+-- Use case 79: `pgrls fix` end-to-end
+-- The companion test runs `pgrls fix` against the demo DB and
+-- inspects its dry-run output. It uses the existing fixable
+-- violations elsewhere in the demo (uc04 SEC002 on app.notes,
+-- uc11 PERF001 on app.messages) — `pgrls fix` walks the schema,
+-- generates SQL for each mechanically-fixable violation, and
+-- prints it. Without `--apply`, the database is not modified.
+-- This case has no new SQL; the docs live in the test file.
+-- ============================================================

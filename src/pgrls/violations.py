@@ -1,0 +1,69 @@
+"""Violation and Severity types reported by rules.
+
+Single source of truth for the severity vocabulary. Other modules
+(`config`, `cli`, formatters, individual rules) import `Severity`
+and `ALL_SEVERITIES` from here — adding a fourth severity in a
+future release is a one-line edit.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, get_args
+
+__all__ = [
+    "ALL_SEVERITIES",
+    "SEVERITY_ORDER",
+    "Severity",
+    "Violation",
+    "coerce_severity",
+    "is_at_or_above",
+]
+
+Severity = Literal["error", "warning", "info"]
+
+# Exhaustive list of valid severities, ordered most-to-least
+# severe. Anything that needs to enumerate severities (Click choice
+# list, runtime validators, formatters that iterate severities for
+# count summaries) imports this instead of duplicating the tuple.
+# Built from `Severity`'s Literal members so the two can never
+# drift.
+ALL_SEVERITIES: tuple[Severity, ...] = get_args(Severity)
+SEVERITY_ORDER: dict[Severity, int] = {
+    sev: i for i, sev in enumerate(ALL_SEVERITIES)
+}
+
+
+def coerce_severity(value: str) -> Severity:
+    """Validate and normalize a string into a Severity.
+
+    Accepts case-insensitive input (`"ERROR"` → `"error"`) — Click
+    has `case_sensitive=False` on the `--fail-on` choice and we
+    honor that contract here too. Raises ValueError on any other
+    input so a typo in a config file or programmatic API call
+    surfaces at the validation boundary instead of as a KeyError
+    deep inside `is_at_or_above`.
+    """
+    normalized = value.lower() if isinstance(value, str) else value
+    if normalized not in ALL_SEVERITIES:
+        raise ValueError(
+            f"severity {value!r} is not one of {ALL_SEVERITIES}"
+        )
+    # Narrow to the Literal type. `cast` is safe here because the
+    # membership check above guarantees the value is a Severity.
+    from typing import cast
+
+    return cast(Severity, normalized)
+
+
+@dataclass(frozen=True)
+class Violation:
+    rule_id: str
+    severity: Severity
+    title: str
+    message: str
+    location: str | None  # qualified table name or policy id; None for schema-wide
+
+
+def is_at_or_above(severity: Severity, threshold: Severity) -> bool:
+    """True when `severity` is at least as severe as `threshold` (lower = more severe)."""
+    return SEVERITY_ORDER[severity] <= SEVERITY_ORDER[threshold]
