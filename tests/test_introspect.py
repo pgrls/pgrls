@@ -350,3 +350,83 @@ def test_introspect_does_not_set_partition_of_for_classic_inherits(
     by_name = {t.qualified_name: t for t in schema.tables}
     assert by_name["public.parent_t"].partition_of is None
     assert by_name["public.child_t"].partition_of is None
+
+
+def test_introspect_dedupes_duplicate_role_oids_in_polroles(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Postgres permits `TO r1, r1` and stores polroles = [oid_r1, oid_r1]
+    # verbatim. Without explicit deduplication, Policy.roles would be
+    # ('r1', 'r1') — corrupting set semantics for any rule that counts
+    # roles or compares against a known role list.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS dup_role_user;
+        CREATE ROLE dup_role_user NOLOGIN;
+        CREATE TABLE public.t (id INT);
+        ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.t FOR SELECT
+            TO dup_role_user, dup_role_user USING (true);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert t.policies[0].roles == ("dup_role_user",)
+
+
+def test_introspect_rejects_pg_catalog_schema(
+    pg_conn: psycopg.Connection,
+) -> None:
+    # pg_catalog has thousands of system tables and pgrls cannot lint
+    # any of them — refuse early instead of blowing up the report.
+    with pytest.raises(ValueError, match="reserved"):
+        introspect(pg_conn, schemas=["pg_catalog"])
+
+
+def test_introspect_rejects_information_schema(
+    pg_conn: psycopg.Connection,
+) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        introspect(pg_conn, schemas=["information_schema"])
+
+
+def test_introspect_rejects_pg_temp_schema_pattern(
+    pg_conn: psycopg.Connection,
+) -> None:
+    # pg_temp_N exists per session — reject the pattern, not just the
+    # exact name.
+    with pytest.raises(ValueError, match="reserved"):
+        introspect(pg_conn, schemas=["pg_temp_3"])
+
+
+def test_introspect_rejects_mixed_reserved_and_real_schemas(
+    pg_conn: psycopg.Connection,
+) -> None:
+    # Refuse the whole call rather than silently skipping the reserved
+    # one — a typo in a list of schemas should be loud.
+    with pytest.raises(ValueError, match="reserved"):
+        introspect(pg_conn, schemas=["public", "pg_catalog"])
+
+
+def test_partition_of_emitted_when_parent_outside_introspected_schemas(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Anchor SEC001's "chain leaves scope" path: when a partition's
+    # parent is not in the requested schema list, partition_of is
+    # still populated with the parent's (schema, name). SEC001 reads
+    # this to distinguish "chain ends at root" from "chain dangles
+    # out of scope". A future refactor that nulls cross-scope
+    # partition_of would silently break that distinction; this test
+    # pins the contract.
+    apply_sql(
+        """
+        CREATE SCHEMA other;
+        CREATE TABLE other.parent_t (id INT, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.leaf_t PARTITION OF other.parent_t
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    leaf = next(t for t in schema.tables if t.name == "leaf_t")
+    assert leaf.partition_of == ("other", "parent_t")
