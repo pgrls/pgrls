@@ -1,0 +1,7 @@
+-- ============================================================
+-- Use case 41: Disabled rule — SEC007 turned off via --disable
+-- The companion test runs `pgrls lint --disable SEC007` and
+-- asserts SEC007 doesn't fire on `app.tags` (use case 09)
+-- even though it would in the default run.
+-- (No new fixture required — uses tags from uc09.)
+-- ============================================================

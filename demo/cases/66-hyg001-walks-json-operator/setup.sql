@@ -1,0 +1,23 @@
+-- ============================================================
+-- Use case 66: HYG001 walks JSON `->>` operator — fires
+-- `payload->>'gone'` references the outer column `payload`,
+-- not a column named "gone". Pin that HYG001's column-ref
+-- walk does NOT confuse JSON keys with column names — the
+-- only column ref here is `payload`, which exists, so HYG001
+-- stays silent.
+-- ============================================================
+
+CREATE TABLE app.json_access (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    payload JSONB
+);
+ALTER TABLE app.json_access ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.json_access FORCE ROW LEVEL SECURITY;
+CREATE POLICY json_filter ON app.json_access
+    AS RESTRICTIVE
+    FOR SELECT TO PUBLIC
+    USING (
+        user_id = (SELECT current_setting('app.user', true))
+        AND payload->>'visibility' = 'public'
+    );

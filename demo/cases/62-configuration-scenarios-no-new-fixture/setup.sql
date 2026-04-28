@@ -1,0 +1,12 @@
+-- ============================================================
+-- Use case 62: Configuration scenarios (no new fixture
+-- needed — companion tests use the existing tables).
+-- ============================================================
+
+-- 59: fail_on=warning gates exit on PERF001 (which fires in
+--     several places already).
+-- 60: fail_on=info gates exit on SEC007 (info severity).
+-- 61: --format=json emits machine-readable JSON instead of
+--     text.
+-- 62: Multiple disabled rules at once.
+-- 63: Bad allowlist type produces a clear error from the CLI.
