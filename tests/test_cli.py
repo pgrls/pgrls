@@ -699,3 +699,131 @@ def test_lint_fires_every_rule_in_combined_fixture(
         assert rule_loc in result.output, (
             f"{rule_loc!r} missing from output:\n{result.output}"
         )
+
+
+# ============================================================
+# `pgrls fix` integration tests
+# ============================================================
+
+def test_fix_dry_run_emits_sec002_sql_without_applying(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_target (id INT);
+        ALTER TABLE public.fix_target ENABLE ROW LEVEL SECURITY;
+        -- FORCE intentionally missing → SEC002 fixable
+        CREATE POLICY p ON public.fix_target
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url]
+    )
+    assert result.exit_code == 0, result.output
+    # SQL was printed but not executed.
+    assert "ALTER TABLE public.fix_target FORCE ROW LEVEL SECURITY;" in result.output
+    assert "dry-run" in result.output
+
+    # Verify the DB was NOT modified — connect and check force_rls.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT relforcerowsecurity FROM pg_catalog.pg_class "
+                "WHERE oid = 'public.fix_target'::regclass"
+            )
+            (force,) = cur.fetchone()
+            assert force is False
+
+
+def test_fix_apply_executes_sec002_sql(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_apply_target (id INT);
+        ALTER TABLE public.fix_apply_target ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_apply_target
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--apply"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 1 fix" in result.output
+
+    # Verify the DB WAS modified.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT relforcerowsecurity FROM pg_catalog.pg_class "
+                "WHERE oid = 'public.fix_apply_target'::regclass"
+            )
+            (force,) = cur.fetchone()
+            assert force is True
+
+
+def test_fix_rule_filter_limits_to_requested_rule(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_filter_a (id INT);
+        ALTER TABLE public.fix_filter_a ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_filter_a
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        -- ^ SEC002 fixable
+
+        CREATE TABLE public.fix_filter_b (id INT, user_id TEXT);
+        ALTER TABLE public.fix_filter_b ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_filter_b FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_filter_b
+            AS RESTRICTIVE FOR SELECT TO PUBLIC
+            USING (user_id = current_setting('app.user', true));
+        -- ^ PERF001 fixable
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--rule", "SEC002",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "fix_filter_a" in result.output
+    assert "fix_filter_b" not in result.output
+
+
+def test_fix_no_violations_emits_clear_message(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_clean (id INT);
+        ALTER TABLE public.fix_clean ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_clean FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_clean
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url]
+    )
+    assert result.exit_code == 0, result.output
+    assert "no auto-fixable" in result.output
+
+
+def test_fix_missing_database_url_errors_clearly(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix"])
+    assert result.exit_code != 0
+    assert "DATABASE_URL" in result.output or "database-url" in result.output

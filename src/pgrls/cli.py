@@ -9,6 +9,7 @@ import psycopg
 
 from pgrls import __version__
 from pgrls.config import Config, ConfigError, load_config
+from pgrls.fixers import generate_fixes
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
@@ -137,3 +138,111 @@ def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
 
 def _should_fail(violations: list[Violation], *, threshold: Severity) -> bool:
     return any(is_at_or_above(v.severity, threshold) for v in violations)
+
+
+@main.command()
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    help="Postgres connection string. Falls back to $DATABASE_URL.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to scan (overrides config).",
+)
+@click.option(
+    "--rule",
+    "rules",
+    multiple=True,
+    help="Only generate fixes for these rule IDs (repeat for multiple).",
+)
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help="Execute the fixes. Default: dry-run (print SQL only).",
+)
+def fix(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    rules: tuple[str, ...],
+    apply: bool,
+) -> None:
+    """Auto-remediate violations whose fix is mechanical.
+
+    Currently fixes SEC002 (`ALTER TABLE … FORCE ROW LEVEL
+    SECURITY`) and PERF001 (wrap unwrapped auth calls in
+    `(SELECT …)` and emit `ALTER POLICY`). Other rules require
+    human intent (which role to grant to, what column to scope
+    by) and are not auto-fixed.
+
+    Default mode is dry-run: prints the SQL that WOULD be applied,
+    nothing is executed. Pass `--apply` to run the statements
+    against the configured database.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc))
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=None,
+    )
+
+    if effective.database_url is None:
+        raise click.ClickException(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+            try:
+                fixes = generate_fixes(
+                    schema,
+                    rule_options=effective.rule_options,
+                    rule_filter=set(rules) if rules else None,
+                )
+            except (TypeError, ValueError) as exc:
+                raise click.ClickException(str(exc))
+
+            if not fixes:
+                click.echo("pgrls: no auto-fixable violations found.")
+                return
+
+            for f in fixes:
+                click.echo(f"-- [{f.rule_id}] {f.description}")
+                click.echo(f.sql)
+                click.echo()
+
+            if apply:
+                with conn.cursor() as cur:
+                    for f in fixes:
+                        cur.execute(f.sql)
+                conn.commit()
+                click.echo(
+                    f"pgrls: applied {len(fixes)} "
+                    f"fix{'es' if len(fixes) != 1 else ''}."
+                )
+            else:
+                click.echo(
+                    f"pgrls: {len(fixes)} "
+                    f"fix{'es' if len(fixes) != 1 else ''} ready "
+                    "(dry-run). Re-run with --apply to execute."
+                )
+    except psycopg.Error as exc:
+        raise click.ClickException(f"Database error: {exc}")
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
