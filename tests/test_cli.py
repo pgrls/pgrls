@@ -915,3 +915,78 @@ def test_fix_unknown_rule_filter_emits_no_fixes_message(
     )
     assert result.exit_code == 0, result.output
     assert "no auto-fixable" in result.output
+
+
+def test_fix_apply_rolls_back_on_statement_failure(
+    pg_url: str, apply_sql, monkeypatch
+) -> None:
+    # Force the second SEC002 fix to fail at execute time and
+    # confirm that the all-or-nothing semantic holds: the first
+    # fix is rolled back, the user sees a clear ClickException
+    # with the offending (rule_id, location), and exit code is
+    # nonzero.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_rollback_a (id INT);
+        ALTER TABLE public.fix_rollback_a ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_rollback_a
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+
+        CREATE TABLE public.fix_rollback_b (id INT);
+        ALTER TABLE public.fix_rollback_b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_rollback_b
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+
+    # Inject a fixer that returns a deliberately-broken second
+    # statement so we can observe rollback.
+    from pgrls.fixers import Fix
+    import pgrls.cli as cli_mod
+
+    real_generate = cli_mod.generate_fixes
+
+    def fake(schema, *, rule_options, rule_filter=None):
+        real = real_generate(
+            schema, rule_options=rule_options, rule_filter=rule_filter
+        )
+        # Replace the second SEC002 fix with one that will fail at
+        # execute time (table doesn't exist).
+        out: list[Fix] = []
+        for i, f in enumerate(real):
+            if i == 1 and f.rule_id == "SEC002":
+                out.append(
+                    Fix(
+                        rule_id="SEC002",
+                        location="public.does_not_exist",
+                        sql="ALTER TABLE public.does_not_exist FORCE ROW LEVEL SECURITY;",
+                        description="will fail",
+                    )
+                )
+            else:
+                out.append(f)
+        return out
+
+    monkeypatch.setattr(cli_mod, "generate_fixes", fake)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "SEC002", "--apply"],
+    )
+    assert result.exit_code != 0
+    assert "fix 2/2 failed" in result.output
+    assert "public.does_not_exist" in result.output
+    assert "No fixes were applied" in result.output
+
+    # The first fix's table should NOT have FORCE applied — proving
+    # rollback worked.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT relforcerowsecurity FROM pg_catalog.pg_class "
+                "WHERE oid = 'public.fix_rollback_a'::regclass"
+            )
+            (force,) = cur.fetchone()
+            assert force is False, "rollback failed: fix 1's change persisted"

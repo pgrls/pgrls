@@ -188,6 +188,11 @@ def fix(
     Default mode is dry-run: prints the SQL that WOULD be applied,
     nothing is executed. Pass `--apply` to run the statements
     against the configured database.
+
+    `--apply` semantics: all-or-nothing. Every fix runs in the
+    same transaction; if any statement fails, the entire batch
+    is rolled back and the database is unchanged. The failing
+    fix's `(rule_id, location)` is reported in the error message.
     """
     try:
         config = load_config(config_path)
@@ -229,8 +234,21 @@ def fix(
 
             if apply:
                 with conn.cursor() as cur:
-                    for f in fixes:
-                        cur.execute(f.sql)
+                    for i, f in enumerate(fixes, start=1):
+                        try:
+                            cur.execute(f.sql)
+                        except psycopg.Error as exc:
+                            # All-or-nothing: psycopg's connection
+                            # context manager rolls back on
+                            # exception. Tell the user which fix
+                            # broke so they can investigate
+                            # without re-running the lint.
+                            conn.rollback()
+                            raise click.ClickException(
+                                f"fix {i}/{len(fixes)} failed "
+                                f"({f.rule_id} on {f.location}): "
+                                f"{exc}. No fixes were applied."
+                            )
                 conn.commit()
                 click.echo(
                     f"pgrls: applied {len(fixes)} "

@@ -59,7 +59,7 @@ def _parse_placeholder_words(options: dict[str, Any]) -> tuple[str, ...]:
     return tuple(s.lower() for s in raw)
 
 
-_TOKEN_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|\d|$)|\d+")
+_TOKEN_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z_]|\d|$)|\d+")
 
 
 def _tokenize_identifier(name: str) -> list[str]:

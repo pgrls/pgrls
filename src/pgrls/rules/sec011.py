@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, BoolExpr, Boolean, Node
+from pglast.ast import A_Const, BoolExpr, Boolean, Node, SubLink
 from pglast.enums import BoolExprType
 
 from pgrls.model import Schema
@@ -48,9 +48,22 @@ def _is_literal_true(node: Any) -> bool:
 
 
 def _has_or_true(node: Any) -> bool:
-    """True if any OR-BoolExpr anywhere in the tree has a literal-true arg."""
+    """True if any OR-BoolExpr in the policy's predicate has a
+    literal-true arg.
+
+    Does NOT descend into `SubLink.subselect` — an `OR true` in a
+    subquery's WHERE doesn't make the outer policy admit every row;
+    it makes the subquery return its rows. Walking the subselect
+    would produce false positives on legitimate
+    `EXISTS (SELECT 1 FROM t WHERE flag OR true)` patterns. We do
+    walk `SubLink.testexpr` (the LHS of `IN`/`ANY`/`ALL`) since
+    that's the policy's own expression. Mirrors the shape of
+    `extract_column_refs(exclude_sublinks=True)`.
+    """
     if node is None:
         return False
+    if isinstance(node, SubLink):
+        return _has_or_true(node.testexpr)
     if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
         for arg in node.args or ():
             if _is_literal_true(arg):
