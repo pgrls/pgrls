@@ -42,6 +42,16 @@ def parse_policy_id_allowlist(
     Raises TypeError on the first malformed entry with the rule_id
     and the offending value in the message — a typo'd entry no
     longer silently fails to match.
+
+    Splits right-to-left: `schema.table.weird.name` resolves as
+    `schema=schema, table=table, policy="weird.name"`. Schema and
+    table names cannot contain `.` from `pg_catalog` introspection
+    (`pg_namespace.nspname` and `pg_class.relname` reject `.` at
+    CREATE time), so the rightmost two `.`-separators are
+    unambiguous. Policy names CAN contain `.` (rare but legal —
+    Postgres allows `"weird.name"`); right-anchoring lets a user
+    allowlist them. Without this, the only way to silence such a
+    finding was to disable the rule globally.
     """
     raw = options.get("allowlist", [])
     items = _list_of_strings(
@@ -50,7 +60,7 @@ def parse_policy_id_allowlist(
         "of the form 'schema.table.policy_name'",
     )
     for entry in items:
-        parts = entry.split(".")
+        parts = entry.rsplit(".", 2)
         if len(parts) != 3 or not all(parts):
             raise TypeError(
                 f"[lint.rules.{rule_id}].allowlist entry {entry!r} is "
@@ -67,7 +77,9 @@ def parse_table_ref_allowlist(
     """Validate that every entry is `name` or `schema.name`.
 
     Used by rules that accept both unqualified and qualified table
-    references (SEC001, SEC002, SEC009).
+    references (SEC001, SEC002, SEC009). Schema and table names
+    cannot contain `.` from `pg_catalog`, so a literal `split('.')`
+    is unambiguous here.
     """
     raw = options.get("allowlist", [])
     items = _list_of_strings(
