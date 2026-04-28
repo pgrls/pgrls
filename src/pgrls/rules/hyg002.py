@@ -29,7 +29,7 @@ import re
 from typing import Any
 
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 _DEFAULT_PLACEHOLDER_WORDS: tuple[str, ...] = (
     "todo",
@@ -88,9 +88,9 @@ def _name_contains_placeholder(
 
 
 class HYG002:
-    id = "HYG002"
-    severity = "warning"
-    title = "Policy named like a placeholder"
+    id: str = "HYG002"
+    severity: Severity = "warning"
+    title: str = "Policy named like a placeholder"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

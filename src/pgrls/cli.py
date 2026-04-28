@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-from typing import cast
 
 import click
 import psycopg
@@ -14,7 +13,13 @@ from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.rules import default_registry
-from pgrls.violations import Severity, Violation, is_at_or_above
+from pgrls.violations import (
+    ALL_SEVERITIES,
+    Severity,
+    Violation,
+    coerce_severity,
+    is_at_or_above,
+)
 
 
 @click.group()
@@ -43,7 +48,7 @@ def main() -> None:
 )
 @click.option(
     "--fail-on",
-    type=click.Choice(["error", "warning", "info"], case_sensitive=False),
+    type=click.Choice(list(ALL_SEVERITIES), case_sensitive=False),
     default=None,
     help="Severity threshold that triggers nonzero exit.",
 )
@@ -115,8 +120,12 @@ def _merge_overrides(
             )
     else:
         schemas = config.schemas
+    # `coerce_severity` validates AND narrows. `cast` would have
+    # been a no-op at runtime — a programmatic caller passing
+    # garbage from a non-Click code path would silently land in
+    # `is_at_or_above` and KeyError there.
     effective_fail_on: Severity = (
-        cast(Severity, fail_on) if fail_on is not None else config.fail_on
+        coerce_severity(fail_on) if fail_on is not None else config.fail_on
     )
     return Config(
         database_url=database_url or config.database_url,

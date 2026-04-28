@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
@@ -21,9 +21,9 @@ def _parse_allowlist(options: dict[str, Any]) -> set[str]:
 
 
 class SEC002:
-    id = "SEC002"
-    severity = "error"
-    title = "FORCE ROW LEVEL SECURITY missing"
+    id: str = "SEC002"
+    severity: Severity = "error"
+    title: str = "FORCE ROW LEVEL SECURITY missing"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

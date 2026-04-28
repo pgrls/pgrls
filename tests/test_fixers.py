@@ -578,7 +578,29 @@ def test_quote_ident_rejects_empty_string() -> None:
         quote_ident("")
 
 
-def test_quote_ident_rejects_empty_string() -> None:
-    from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="empty"):
-        quote_ident("")
+def test_perf001_does_not_mutate_input_policy_ast() -> None:
+    # `_wrap_unwrapped_calls` mutates pglast Node fields in place
+    # — `Policy` is a frozen dataclass but `frozen=True` does NOT
+    # freeze the AST graph it holds. Without a deepcopy guard at
+    # the fixer entry, running PERF001Fixer would visibly alter
+    # `policy.using_ast` for any rule that re-walks the Schema
+    # afterwards (snapshot tests, programmatic API). Pin the
+    # "fixer is read-only over Schema" invariant.
+    from pglast.stream import RawStream
+
+    schema = _wrap_policy(_policy("user_id = auth.uid()"))
+    policy = schema.tables[0].policies[0]
+    original_id = id(policy.using_ast)
+    original_sql = RawStream()(policy.using_ast)
+
+    PERF001Fixer().fix(schema, {})
+
+    assert id(policy.using_ast) == original_id, (
+        "Policy.using_ast was replaced; the fixer should not "
+        "alter the input Schema."
+    )
+    assert RawStream()(policy.using_ast) == original_sql, (
+        "Policy.using_ast was mutated in place; got "
+        f"{RawStream()(policy.using_ast)!r}, expected "
+        f"{original_sql!r}."
+    )

@@ -17,7 +17,7 @@ from typing import Any
 
 from pgrls.ast_utils import find_func_calls
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
@@ -52,9 +52,9 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
 
 
 class PERF001:
-    id = "PERF001"
-    severity = "warning"
-    title = "Auth function called per-row in policy USING"
+    id: str = "PERF001"
+    severity: Severity = "warning"
+    title: str = "Auth function called per-row in policy USING"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

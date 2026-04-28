@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 from pgrls.model import Schema
-from pgrls.violations import Severity, Violation
+from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 
 @runtime_checkable
@@ -28,14 +28,40 @@ class RuleRegistry:
         self._rules: dict[str, Rule] = {}
 
     def register(self, rule: Rule) -> None:
-        if not isinstance(rule, Rule):
+        # `@runtime_checkable Protocol`'s `isinstance` only verifies
+        # that the named attributes exist — it does NOT check that
+        # `severity` is a Severity Literal or that `check` is
+        # callable. Validate the contract explicitly so a malformed
+        # rule (typo'd severity, non-callable `check`, empty id,
+        # missing attribute entirely) fails fast at registration
+        # with a useful message instead of KeyError-ing inside
+        # `is_at_or_above` or TypeError-ing inside `_run_rules` on
+        # the first lint.
+        rid = getattr(rule, "id", None)
+        if not isinstance(rid, str) or not rid:
             raise TypeError(
-                f"Expected a Rule, got {type(rule).__name__!r}. "
-                "Ensure the class defines id, severity, title, and check()."
+                f"Rule.id must be a non-empty str, got "
+                f"{type(rid).__name__}"
             )
-        if rule.id in self._rules:
-            raise ValueError(f"Rule {rule.id!r} is already registered")
-        self._rules[rule.id] = rule
+        sev = getattr(rule, "severity", None)
+        if sev not in ALL_SEVERITIES:
+            raise TypeError(
+                f"Rule {rid!r} severity {sev!r} is "
+                f"not one of {ALL_SEVERITIES}"
+            )
+        title = getattr(rule, "title", None)
+        if not isinstance(title, str) or not title:
+            raise TypeError(
+                f"Rule {rid!r} title must be a non-empty str"
+            )
+        if not callable(getattr(rule, "check", None)):
+            raise TypeError(
+                f"Rule {rid!r} must define a callable "
+                "check(schema, options) method"
+            )
+        if rid in self._rules:
+            raise ValueError(f"Rule {rid!r} is already registered")
+        self._rules[rid] = rule
 
     def enabled(self, disabled_ids: list[str]) -> list[Rule]:
         skip = set(disabled_ids)

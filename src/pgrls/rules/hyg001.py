@@ -14,13 +14,13 @@ from typing import Any
 
 from pgrls.ast_utils import extract_column_refs
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 class HYG001:
-    id = "HYG001"
-    severity = "error"
-    title = "Policy references a column that doesn't exist on the table"
+    id: str = "HYG001"
+    severity: Severity = "error"
+    title: str = "Policy references a column that doesn't exist on the table"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

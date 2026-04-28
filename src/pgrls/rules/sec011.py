@@ -26,7 +26,7 @@ from pglast.ast import A_Const, BoolExpr, Boolean, Node, SubLink
 from pglast.enums import BoolExprType
 
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
@@ -82,9 +82,9 @@ def _has_or_true(node: Any) -> bool:
 
 
 class SEC011:
-    id = "SEC011"
-    severity = "warning"
-    title = "Policy expression has an `OR true` branch"
+    id: str = "SEC011"
+    severity: Severity = "warning"
+    title: str = "Policy expression has an `OR true` branch"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

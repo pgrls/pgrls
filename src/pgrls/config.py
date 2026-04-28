@@ -6,10 +6,10 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-Severity = Literal["error", "warning", "info"]
-_VALID_FAIL_ON: tuple[Severity, ...] = ("error", "warning", "info")
+from pgrls.violations import ALL_SEVERITIES, Severity
+
 _ENV_PATTERN = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
 
@@ -100,9 +100,9 @@ def _build_config(raw: dict[str, Any]) -> Config:
         raise ConfigError("[lint].disable must be a list of rule-id strings")
 
     fail_on = lint.get("fail_on", "warning")
-    if fail_on not in _VALID_FAIL_ON:
+    if fail_on not in ALL_SEVERITIES:
         raise ConfigError(
-            f"[lint].fail_on must be one of {_VALID_FAIL_ON}, got {fail_on!r}"
+            f"[lint].fail_on must be one of {ALL_SEVERITIES}, got {fail_on!r}"
         )
 
     rules_raw = lint.get("rules", {})
