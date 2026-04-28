@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema, Table
+from pgrls.rules._allowlist import parse_table_ref_allowlist
 from pgrls.violations import Severity, Violation
 
 
@@ -45,12 +46,7 @@ class SEC001:
         return out
 
     def _parse_allowlist(self, options: dict[str, Any]) -> set[str]:
-        raw = options.get("allowlist", [])
-        if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
-            raise TypeError(
-                "SEC001 option 'allowlist' must be a list of strings"
-            )
-        return set(raw)
+        return parse_table_ref_allowlist("SEC001", options)
 
     def _is_allowlisted(self, table: Table, allowlist: set[str]) -> bool:
         return table.name in allowlist or table.qualified_name in allowlist

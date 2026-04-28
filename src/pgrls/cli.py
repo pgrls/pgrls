@@ -164,6 +164,35 @@ def _should_fail(violations: list[Violation], *, threshold: Severity) -> bool:
     return any(is_at_or_above(v.severity, threshold) for v in violations)
 
 
+def _fix_apply_failure_message(
+    i: int,
+    total: int,
+    fix: object,  # Fix dataclass; loose-typed to avoid circular import
+    exc: psycopg.Error,
+) -> str:
+    """Compose the all-or-nothing rollback message for `fix --apply`.
+
+    Includes the failing SQL (truncated to keep the message
+    readable when a complex PERF001 ALTER POLICY runs long), the
+    psycopg error string, and a remediation hint pointing the
+    user toward the next concrete action — so they don't have to
+    scroll back through stdout to figure out what broke.
+    """
+    sql = getattr(fix, "sql", "")
+    sql_preview = sql if len(sql) <= 200 else sql[:197] + "..."
+    return (
+        f"fix {i}/{total} failed "
+        f"({fix.rule_id} on {fix.location}).\n"  # type: ignore[attr-defined]
+        f"  SQL: {sql_preview}\n"
+        f"  psycopg error: {exc}\n"
+        "No fixes were applied — the transaction was rolled back, "
+        "your database is unchanged. Re-run `pgrls lint` to confirm "
+        "state, then either apply the remaining SQL by hand or "
+        "address the underlying error (permissions, concurrent "
+        "migration, etc.) and retry."
+    )
+
+
 @main.command()
 @click.option(
     "--database-url",
@@ -305,14 +334,17 @@ def fix(
                         except psycopg.Error as exc:
                             # All-or-nothing: psycopg's connection
                             # context manager rolls back on
-                            # exception. Tell the user which fix
-                            # broke so they can investigate
-                            # without re-running the lint.
+                            # exception. Surface the failing SQL,
+                            # the underlying psycopg error, AND a
+                            # remediation hint so the user can act
+                            # without scrolling back through
+                            # stdout to find which `-- [rule]`
+                            # block matched.
                             conn.rollback()
                             raise click.ClickException(
-                                f"fix {i}/{len(fixes)} failed "
-                                f"({f.rule_id} on {f.location}): "
-                                f"{exc}. No fixes were applied."
+                                _fix_apply_failure_message(
+                                    i, len(fixes), f, exc
+                                )
                             )
                 conn.commit()
                 click.echo(

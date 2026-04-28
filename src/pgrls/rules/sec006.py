@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Policy, Schema, Table
+from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 
@@ -33,13 +34,7 @@ _WRITE_COMMANDS = {"INSERT", "UPDATE", "ALL"}
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
-        raise TypeError(
-            "[lint.rules.SEC006].allowlist must be a list of policy IDs "
-            "of the form 'schema.table.policy_name'"
-        )
-    return set(raw)
+    return parse_policy_id_allowlist('SEC006', options)
 
 
 class SEC006:

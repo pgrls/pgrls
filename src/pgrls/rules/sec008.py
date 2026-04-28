@@ -15,17 +15,12 @@ from typing import Any
 from pglast.ast import A_Const, Boolean
 
 from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
-        raise TypeError(
-            "[lint.rules.SEC008].allowlist must be a list of policy IDs "
-            "of the form 'schema.table.policy_name'"
-        )
-    return set(raw)
+    return parse_policy_id_allowlist('SEC008', options)
 
 
 def _is_literal_true(node: Any) -> bool:
