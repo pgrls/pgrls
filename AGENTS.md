@@ -548,7 +548,9 @@ These are intentional in the current release. Do not invent capabilities.
   HYG001 ship today. There is no rule for `SECURITY DEFINER` function
   audit, no `pg_temp` shadowing detection, no broader perf catalog yet
   — those are on the roadmap.
-- **Text output only.** No JSON, SARIF, or Markdown formatter yet.
+- **Text and JSON output.** `--format text` (human-readable) and
+  `--format json` (machine-readable, stable CI contract). SARIF and
+  Markdown remain on the roadmap.
 - **No `pgrls test`.** There is no test DSL for asserting that "tenant A
   cannot see tenant B's rows". Write those tests in your application's normal
   test framework against a Postgres test database.
