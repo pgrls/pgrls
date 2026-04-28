@@ -521,11 +521,11 @@ def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
 
 
 def test_perf001_fix_sublink_wraps_do_not_alias_each_other() -> None:
-    # The fixer caches the `(SELECT NULL)` template at module
-    # import to avoid re-parsing per match. Each call returns a
-    # deep-copy so wrapping multiple FuncCalls in one pass
-    # doesn't alias their SubLinks (a shared subselect would
-    # cause the second wrap to overwrite the first's `val`).
+    # Each `_wrap_funccall` call constructs a fresh SubLink/
+    # SelectStmt tuple — wrapping multiple FuncCalls in one pass
+    # produces independent subtrees. A shared subselect would
+    # cause the second wrap to overwrite the first's `val` and
+    # emit `(SELECT auth.role())` twice.
     schema = _wrap_policy(
         _policy(
             "user_id = auth.uid() OR user_id = auth.role()::UUID"
@@ -537,6 +537,45 @@ def test_perf001_fix_sublink_wraps_do_not_alias_each_other() -> None:
     # functions intact — proves the SubLinks are independent.
     assert "(SELECT auth.uid())" in sql
     assert "(SELECT auth.role())" in sql
+
+
+def test_wrap_funccall_emits_select_sublink() -> None:
+    # Pin the direct-construction shape: `_wrap_funccall` returns a
+    # SubLink whose RawStream-emitted form is exactly the
+    # `(SELECT <call>)` Postgres expects. Regression guard for
+    # Round 17's deepcopy → direct-construction perf fix; if a
+    # future refactor swaps SubLinkType, drops the LimitOption
+    # default, or otherwise breaks the emitted SQL, this fails.
+    from pglast.ast import FuncCall, String
+    from pglast.stream import RawStream
+
+    from pgrls.fixers.perf001 import _wrap_funccall
+
+    fc = FuncCall(funcname=(String(sval="auth"), String(sval="uid")))
+    sublink = _wrap_funccall(fc)
+    assert RawStream()(sublink) == "(SELECT auth.uid())"
+
+
+def test_wrap_funccall_returns_independent_objects() -> None:
+    # Two consecutive calls must not share any mutable subtree:
+    # mutating one SubLink's targetList must not affect the other.
+    from pglast.ast import FuncCall, String
+
+    from pgrls.fixers.perf001 import _wrap_funccall
+
+    fc1 = FuncCall(funcname=(String(sval="auth"), String(sval="uid")))
+    fc2 = FuncCall(funcname=(String(sval="auth"), String(sval="role")))
+    s1 = _wrap_funccall(fc1)
+    s2 = _wrap_funccall(fc2)
+    assert s1 is not s2
+    assert s1.subselect is not s2.subselect
+    assert s1.subselect.targetList is not s2.subselect.targetList
+
+
+def test_quote_ident_rejects_empty_string() -> None:
+    from pgrls.fixers._idents import quote_ident
+    with pytest.raises(ValueError, match="empty"):
+        quote_ident("")
 
 
 def test_quote_ident_rejects_empty_string() -> None:
