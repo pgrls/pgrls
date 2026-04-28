@@ -1,4 +1,21 @@
-"""Click entry point for the `pgrls` console script."""
+"""Click entry point for the `pgrls` console script.
+
+Exit codes:
+
+  0  — lint completed; no findings at or above the fail-on threshold
+       (or `pgrls fix` ran successfully, dry-run or apply).
+
+  1  — lint completed; findings met or exceeded the fail-on
+       threshold. CI scripts can rely on this to block deploys.
+
+  2  — pgrls itself failed to run. Bad TOML config, missing
+       --database-url, unknown schema, DB connection error, fixer
+       SQL failure under --apply, etc. Distinct from exit 1 so a
+       CI pipeline can tell "your schema has an RLS bug" apart
+       from "pgrls can't reach the database / your config is
+       broken." Most lint tools (ESLint, ruff, mypy) follow this
+       three-tier convention.
+"""
 from __future__ import annotations
 
 import sys
@@ -20,6 +37,19 @@ from pgrls.violations import (
     coerce_severity,
     is_at_or_above,
 )
+
+
+class ToolError(click.ClickException):
+    """`pgrls` couldn't even run the lint — config / network / fixer error.
+
+    Exits with code 2 to distinguish "tool failed to start" from
+    `sys.exit(1)` (lint completed, findings exceeded threshold).
+    Without this distinction CI alerts cannot route "DB unreachable"
+    differently from "schema has an RLS bug" — the operator sees
+    `exit 1` for both and can't tell what action to take.
+    """
+
+    exit_code = 2
 
 
 @click.group()
@@ -71,7 +101,7 @@ def lint(
     try:
         config = load_config(config_path)
     except ConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
     effective = _merge_overrides(
         config,
@@ -81,7 +111,7 @@ def lint(
     )
 
     if effective.database_url is None:
-        raise click.ClickException(
+        raise ToolError(
             "No database connection: pass --database-url or set DATABASE_URL."
         )
 
@@ -89,14 +119,14 @@ def lint(
         with psycopg.connect(effective.database_url) as conn:
             schema = introspect(conn, schemas=effective.schemas)
     except psycopg.Error as exc:
-        raise click.ClickException(f"Database error: {exc}") from exc
+        raise ToolError(f"Database error: {exc}") from exc
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
     try:
         violations = _run_rules(schema, config=effective)
     except (TypeError, ValueError, RuntimeError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
     click.echo(format_violations(violations, format=output_format), nl=False)
 
@@ -114,7 +144,7 @@ def _merge_overrides(
     if schemas_csv:
         schemas = [s.strip() for s in schemas_csv.split(",") if s.strip()]
         if not schemas:
-            raise click.ClickException(
+            raise ToolError(
                 f"--schemas {schemas_csv!r} produced an empty schema list. "
                 "Check for trailing commas or whitespace-only values."
             )
@@ -260,7 +290,7 @@ def fix(
     try:
         config = load_config(config_path)
     except ConfigError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
     # Validate `--rule` early — a typo silently producing zero
     # fixes is hard to debug. The "no auto-fixable" message
@@ -270,7 +300,7 @@ def fix(
     if rules:
         unknown = sorted(set(rules) - auto_fixable)
         if unknown:
-            raise click.ClickException(
+            raise ToolError(
                 f"unknown auto-fixable rule(s): {', '.join(unknown)}. "
                 f"Available: {', '.join(sorted(auto_fixable))}."
             )
@@ -283,7 +313,7 @@ def fix(
     )
 
     if effective.database_url is None:
-        raise click.ClickException(
+        raise ToolError(
             "No database connection: pass --database-url or set DATABASE_URL."
         )
 
@@ -297,7 +327,7 @@ def fix(
                     rule_filter=set(rules) if rules else None,
                 )
             except (TypeError, ValueError) as exc:
-                raise click.ClickException(str(exc)) from exc
+                raise ToolError(str(exc)) from exc
 
             if not fixes:
                 click.echo(
@@ -341,7 +371,7 @@ def fix(
                             # stdout to find which `-- [rule]`
                             # block matched.
                             conn.rollback()
-                            raise click.ClickException(
+                            raise ToolError(
                                 _fix_apply_failure_message(
                                     i, len(fixes), f, exc
                                 )
@@ -360,6 +390,6 @@ def fix(
                     err=True,
                 )
     except psycopg.Error as exc:
-        raise click.ClickException(f"Database error: {exc}") from exc
+        raise ToolError(f"Database error: {exc}") from exc
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise ToolError(str(exc)) from exc

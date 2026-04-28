@@ -107,8 +107,47 @@ def test_lint_missing_database_url_errors_clearly(monkeypatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     runner = CliRunner()
     result = runner.invoke(main, ["lint"])
-    assert result.exit_code != 0
+    # Tool error (config / setup), not findings — exit code 2
+    # distinguishes "your DATABASE_URL is wrong" from "your schema
+    # has an RLS bug" so CI alerts can route differently.
+    assert result.exit_code == 2
     assert "DATABASE_URL" in result.output or "database-url" in result.output
+
+
+def test_lint_exit_code_1_is_violations_at_threshold_only(
+    pg_url: str, apply_sql
+) -> None:
+    # Pin the contract: exit 1 means "lint completed, findings
+    # reached threshold." Bad TOML, missing DB, unknown schema all
+    # produce exit 2 (tested below). This separation lets `pgrls
+    # lint && deploy` distinguish the two.
+    apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert result.exit_code == 1
+    assert "SEC001" in result.output
+
+
+def test_lint_unknown_schema_exits_2_not_1(
+    pg_url: str,
+) -> None:
+    # `--schemas` typo is a setup error, not a findings result.
+    # Pin exit 2 explicitly so a future regression that reroutes
+    # introspect.ValueError through `sys.exit(1)` fails this.
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--schemas", "no_such_schema"],
+    )
+    assert result.exit_code == 2
+
+
+def test_lint_bad_toml_exits_2_not_1(tmp_path) -> None:
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text("[database\n")  # malformed TOML
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--config", str(cfg)])
+    assert result.exit_code == 2
 
 
 def test_lint_disable_skips_rule(pg_url: str, apply_sql, tmp_path) -> None:

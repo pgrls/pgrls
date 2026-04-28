@@ -578,6 +578,26 @@ def test_quote_ident_rejects_empty_string() -> None:
         quote_ident("")
 
 
+def test_perf001_fixer_default_auth_functions_matches_rule_default() -> None:
+    # Pin "the fixer fixes exactly what the rule reports" by
+    # asserting both modules consume the same default set. Two
+    # parallel constants (the previous shape) would silently drift
+    # when a future change adds, e.g., `app.current_user_id` to
+    # the rule's defaults but not the fixer's — the user would
+    # see the lint flag the call but `pgrls fix` wouldn't generate
+    # a fix.
+    from pgrls.fixers import perf001 as fixer_mod
+    from pgrls.rules import perf001 as rule_mod
+
+    assert (
+        fixer_mod._DEFAULT_AUTH_FUNCTIONS
+        is rule_mod._DEFAULT_AUTH_FUNCTIONS
+    ), (
+        "Fixer must import the rule's _DEFAULT_AUTH_FUNCTIONS, "
+        "not maintain its own copy."
+    )
+
+
 def test_perf001_does_not_mutate_input_policy_ast() -> None:
     # `_wrap_unwrapped_calls` mutates pglast Node fields in place
     # — `Policy` is a frozen dataclass but `frozen=True` does NOT

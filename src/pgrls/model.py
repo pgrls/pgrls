@@ -11,6 +11,15 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, Literal
 
+__all__ = [
+    "Policy",
+    "PolicyCommand",
+    "SNAPSHOT_VERSION",
+    "Schema",
+    "Snapshot",
+    "Table",
+]
+
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
