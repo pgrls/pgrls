@@ -150,3 +150,28 @@ def test_sec011_metadata_present() -> None:
     assert rule.id == "SEC011"
     assert rule.severity == "warning"
     assert rule.title
+
+
+def test_sec011_fires_on_deeply_nested_or_true() -> None:
+    # `((a OR (b OR (c OR true)))` — the literal-true disjunct is
+    # several levels deep. The walker descends into every BoolExpr,
+    # so SEC011 still fires.
+    schema = _wrap(
+        _policy(
+            "id = 1 AND (id = 2 OR (id = 3 OR (id = 4 OR true)))"
+        )
+    )
+    assert len(SEC011().check(schema, {})) == 1
+
+
+def test_sec011_silent_on_or_false_branch() -> None:
+    # `OR false` is a no-op branch, not the OR-true smell. SEC011
+    # specifically detects the literal-true case.
+    schema = _wrap(_policy("id = 1 OR false"))
+    assert SEC011().check(schema, {}) == []
+
+
+def test_sec011_silent_on_and_true_branch() -> None:
+    # `AND true` is a no-op too — also not what SEC011 flags.
+    schema = _wrap(_policy("id = 1 AND true"))
+    assert SEC011().check(schema, {}) == []
