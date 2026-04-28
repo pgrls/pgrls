@@ -18,6 +18,24 @@ _POLICY_CMD_MAP: dict[str, str] = {
     "d": "DELETE",
 }
 
+# pg_catalog, information_schema, pg_toast and the per-session
+# pg_temp_*/pg_toast_temp_* schemas are reserved by Postgres for
+# system metadata, ephemeral state, or TOAST out-of-line storage.
+# Linting them is never the user's intent: pg_catalog has thousands
+# of system tables that swamp output and there is nothing the user
+# can change about them. Treat as a hard error so a typo in `--
+# schemas` surfaces clearly instead of producing an unreadable
+# 10MB report.
+_RESERVED_SCHEMAS: frozenset[str] = frozenset(
+    ("pg_catalog", "information_schema", "pg_toast")
+)
+
+
+def _is_reserved_schema(name: str) -> bool:
+    if name in _RESERVED_SCHEMAS:
+        return True
+    return name.startswith("pg_temp_") or name.startswith("pg_toast_temp_")
+
 
 _SCHEMA_EXISTS_SQL = """
 SELECT nspname
@@ -56,6 +74,19 @@ WHERE cc.relispartition = true
   AND inh.inhrelid = ANY(%s)
 """
 
+# Role-name resolution layers three concerns into one subquery:
+#   * `polroles` may contain duplicates — Postgres stores `TO r1, r1`
+#     verbatim. DISTINCT collapses them so `Policy.roles` is a set in
+#     tuple form, not a multiset.
+#   * OID 0 is the special PUBLIC bucket; it has no row in `pg_authid`,
+#     so the LEFT JOIN's `r.rolname` would be NULL there.
+#   * For non-zero OIDs that DON'T resolve (e.g. running pgrls as an
+#     unprivileged role that lacks SELECT on `pg_authid`, or a race
+#     against `DROP ROLE`), `r.rolname` is also NULL. A NULL leaking
+#     into `Policy.roles` violates the `tuple[str, ...]` annotation
+#     and breaks downstream `sorted(p.roles)`. Substitute a stable
+#     `oid:N` sentinel so the type contract holds and the operator
+#     can still see what role was referenced.
 _POLICIES_SQL = """
 SELECT
     p.polrelid AS table_oid,
@@ -64,12 +95,16 @@ SELECT
     p.polpermissive AS permissive,
     COALESCE(
         (
-            SELECT array_agg(
-                CASE WHEN ro.oid = 0 THEN 'PUBLIC' ELSE r.rolname END
-                ORDER BY CASE WHEN ro.oid = 0 THEN 0 ELSE 1 END, r.rolname
-            )
-            FROM (SELECT unnest(p.polroles) AS oid) ro
-            LEFT JOIN pg_catalog.pg_roles r ON r.oid = ro.oid
+            SELECT array_agg(rolname_resolved ORDER BY ord_key, rolname_resolved)
+            FROM (
+                SELECT DISTINCT
+                    CASE WHEN ro.oid = 0 THEN 'PUBLIC'
+                         ELSE COALESCE(r.rolname, 'oid:' || ro.oid::text)
+                    END AS rolname_resolved,
+                    CASE WHEN ro.oid = 0 THEN 0 ELSE 1 END AS ord_key
+                FROM unnest(p.polroles) AS ro(oid)
+                LEFT JOIN pg_catalog.pg_roles r ON r.oid = ro.oid
+            ) sub
         ),
         ARRAY[]::TEXT[]
     ) AS roles,
@@ -95,10 +130,21 @@ ORDER BY a.attrelid, a.attnum
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
 
-    Raises ValueError if any requested schema does not exist on the connection.
+    Raises ValueError if any requested schema does not exist on the
+    connection, or if any requested schema is a Postgres-reserved
+    schema (`pg_catalog`, `information_schema`, `pg_toast`,
+    `pg_temp_*`, `pg_toast_temp_*`).
     """
     if not schemas:
         return Schema(tables=())
+
+    reserved = sorted({s for s in schemas if _is_reserved_schema(s)})
+    if reserved:
+        raise ValueError(
+            f"Cannot lint Postgres-reserved schemas: {', '.join(reserved)}. "
+            "These hold system catalogs / ephemeral state and are not "
+            "user-managed. Pass user-defined schemas only."
+        )
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_SCHEMA_EXISTS_SQL, (schemas,))
