@@ -10,11 +10,12 @@ def _policy(
     *,
     command: str,
     with_check: str | None,
+    permissive: bool = True,
 ) -> Policy:
     return Policy(
         name=name,
         command=command,  # type: ignore[arg-type]
-        permissive=True,
+        permissive=permissive,
         roles=("authenticated",),
         using_sql="tenant_id = current_setting('app.t')",
         with_check_sql=with_check,
@@ -145,5 +146,45 @@ def test_sec006_fires_on_each_offending_policy_independently() -> None:
     violations = SEC006().check(schema, {})
     locations = sorted(v.location for v in violations)
     assert locations == ["public.t.a", "public.t.c"]
+
+
+def test_sec006_restrictive_write_policy_emits_dead_policy_message() -> None:
+    # A restrictive INSERT/UPDATE policy without WITH CHECK is
+    # NOT the security hole the permissive case is — Postgres
+    # defaults the missing clause to `true` and AND-combines into
+    # the restrictive group, so the policy imposes no constraint
+    # on new rows. That's a "dead policy" hygiene problem with a
+    # different remediation framing than the permissive case.
+    # Pin both: SEC006 still fires (the dead-policy bug is real),
+    # but the message reflects the actual diagnosis.
+    p = _policy(
+        "restrictive_floor",
+        command="INSERT",
+        with_check=None,
+        permissive=False,
+    )
+    schema = _wrap(p)
+    violations = SEC006().check(schema, {})
+    assert len(violations) == 1
+    msg = violations[0].message
+    assert "Restrictive policy" in msg
+    assert "dead policy" in msg
+    assert "defaults the missing clause to `true`" in msg
+
+
+def test_sec006_permissive_message_unchanged() -> None:
+    # The permissive case is the security hole the rule was
+    # originally written for. Pin its message wording so a future
+    # message refactor doesn't accidentally regress.
+    p = _policy(
+        "p",
+        command="INSERT",
+        with_check=None,
+        permissive=True,
+    )
+    schema = _wrap(p)
+    msg = SEC006().check(schema, {})[0].message
+    assert "Restrictive policy" not in msg
+    assert "writes that violate the policy's intent are accepted" in msg
 
 

@@ -38,23 +38,20 @@ def _wrap(policy: Policy) -> Schema:
     [
         "todo",
         "fixme",
-        "wip",
         "tmp",
-        "temp",
         "hack",
         "xxx",
-        "draft",
         "debug",
         "todo_filter",
         "fixme_owner",
         "TmpReadAll",  # case-insensitive match
-        "wip-policy",  # word-boundary inside identifier
+        "tmp-policy",  # word-boundary inside identifier
         "PLACEHOLDER",
         # SCREAMING_SNAKE — the SCREAMING_SNAKE branch of the
         # tokenizer requires `_` in the boundary lookahead;
-        # without it `WIP_POLICY` was tokenized as ['wi','policy']
+        # without it `TMP_POLICY` was tokenized as `['tm','policy']`
         # and the rule silently missed every screaming case.
-        "WIP_POLICY",
+        "TMP_POLICY",
         "TODO_OWNER",
         "FIXME_LATER",
     ],
@@ -77,11 +74,50 @@ def test_hyg002_fires_on_placeholder_words(name: str) -> None:
         "team_member_visibility",
         "p",  # short but not a placeholder word
         "stop",  # contains "top" but not a flagged token
+        # `temp`, `draft`, `wip` are real domain words; the default
+        # vocabulary deliberately excludes them. Each of these
+        # names is plausible in a real schema and HYG002 must not
+        # false-fire.
+        "temp_humidity_sensor_policy",  # IoT temperature, not "temporary"
+        "draft_visible_to_author",  # CMS publish state
+        "wip_orders_visibility",  # WIP = "work in process" inventory
+        "draft",  # domain word, not placeholder
+        "wip",
+        "temp",
     ],
 )
 def test_hyg002_silent_on_clean_names(name: str) -> None:
     schema = _wrap(_policy(name=name))
     assert HYG002().check(schema, {}) == []
+
+
+def test_hyg002_default_vocabulary_excludes_overloaded_domain_words() -> None:
+    # Pin the explicit vocabulary so a future PR adding `temp`/
+    # `draft`/`wip` back to the default list (a tempting "be
+    # more thorough" change) trips this test and re-surfaces the
+    # false-positive risk in code review.
+    from pgrls.rules.hyg002 import _DEFAULT_PLACEHOLDER_WORDS
+
+    excluded = {"temp", "draft", "wip"}
+    overlap = excluded & set(_DEFAULT_PLACEHOLDER_WORDS)
+    assert overlap == set(), (
+        f"HYG002 default vocabulary must exclude overloaded domain "
+        f"words but contains: {sorted(overlap)}. These words collide "
+        "with legitimate uses (temperature sensors, CMS draft "
+        "states, work-in-process inventory)."
+    )
+
+
+def test_hyg002_user_can_opt_into_broader_vocabulary() -> None:
+    # Defaults exclude `wip` to avoid false positives on real WIP
+    # inventory schemas. A user whose codebase wants the broader
+    # scaffolding-detection set opts back in via
+    # `placeholder_words`. Pin that the override re-enables them.
+    schema = _wrap(_policy(name="wip_orders_visibility"))
+    assert HYG002().check(schema, {}) == []
+    expanded = ["todo", "fixme", "tmp", "wip", "temp", "draft"]
+    out = HYG002().check(schema, {"placeholder_words": expanded})
+    assert len(out) == 1
 
 
 def test_hyg002_silent_when_no_policies() -> None:
@@ -147,13 +183,13 @@ def test_hyg002_fires_on_each_offending_policy_independently() -> None:
                 policies=(
                     _policy(name="todo_a"),
                     _policy(name="real_owner"),
-                    _policy(name="wip_b"),
+                    _policy(name="tmp_b"),
                 ),
             ),
         )
     )
     locations = sorted(v.location for v in HYG002().check(schema, {}))
-    assert locations == ["public.t.todo_a", "public.t.wip_b"]
+    assert locations == ["public.t.tmp_b", "public.t.todo_a"]
 
 
 def test_hyg002_metadata_present() -> None:
