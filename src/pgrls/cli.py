@@ -9,7 +9,7 @@ import psycopg
 
 from pgrls import __version__
 from pgrls.config import Config, ConfigError, load_config
-from pgrls.fixers import generate_fixes
+from pgrls.fixers import default_fixers, generate_fixes
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
@@ -208,6 +208,19 @@ def fix(
         config = load_config(config_path)
     except ConfigError as exc:
         raise click.ClickException(str(exc))
+
+    # Validate `--rule` early — a typo silently producing zero
+    # fixes is hard to debug. The "no auto-fixable" message
+    # should be reserved for "DB is clean", not "you spelled the
+    # rule wrong."
+    auto_fixable = {fixer.rule_id for fixer in default_fixers()}
+    if rules:
+        unknown = sorted(set(rules) - auto_fixable)
+        if unknown:
+            raise click.ClickException(
+                f"unknown auto-fixable rule(s): {', '.join(unknown)}. "
+                f"Available: {', '.join(sorted(auto_fixable))}."
+            )
 
     effective = _merge_overrides(
         config,

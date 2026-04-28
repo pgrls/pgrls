@@ -421,3 +421,61 @@ def test_perf001_fixer_silent_on_sql_value_function() -> None:
         schema, {"auth_functions": ["current_user"]}
     )
     assert fixes == []
+
+
+def test_sec002_fix_quotes_table_name_when_required() -> None:
+    # Mixed-case identifier requires double-quoting in Postgres.
+    # `pg_class.relname` returns the raw name; the fixer must
+    # quote when emitting back into SQL.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="MixedCase Table",
+                rls_enabled=True,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    fixes = SEC002Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert (
+        'ALTER TABLE public."MixedCase Table" FORCE ROW LEVEL SECURITY;'
+        == fixes[0].sql
+    )
+
+
+def test_sec002_fix_does_not_quote_plain_identifiers() -> None:
+    # `snake_case_users` is a plain identifier — emit bare to
+    # keep the common case readable.
+    schema = Schema(
+        tables=(
+            _table(name="snake_case_users", rls=True, force=False),
+        )
+    )
+    sql = SEC002Fixer().fix(schema, {})[0].sql
+    assert (
+        sql
+        == "ALTER TABLE public.snake_case_users FORCE ROW LEVEL SECURITY;"
+    )
+
+
+def test_perf001_fix_quotes_policy_and_table_when_required() -> None:
+    # Policy and table both have characters requiring quoting.
+    p = _policy("user_id = auth.uid()", name="My Policy")
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="MixedCase Table",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(p,),
+                columns=("id", "user_id"),
+            ),
+        )
+    )
+    sql = PERF001Fixer().fix(schema, {})[0].sql
+    assert 'ALTER POLICY "My Policy"' in sql
+    assert 'ON public."MixedCase Table"' in sql
