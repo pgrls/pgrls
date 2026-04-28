@@ -53,6 +53,17 @@ def _allowlist(options: dict[str, Any]) -> set[str]:
 
 
 def _funccall_matches(node: Any, names: set[str]) -> bool:
+    """True if `node` is a `FuncCall` whose name is in `names`.
+
+    Deliberately ignores `SQLValueFunction` (Postgres's grammar
+    special for `current_user`, `session_user`, etc.) — those
+    aren't valid as the body of a `(SELECT …)` SubLink the way a
+    regular `FuncCall` is, so the fixer can't safely wrap them.
+    PERF001's *check* DOES walk SQLValueFunctions for completeness;
+    a user who overrides `auth_functions = ["current_user"]` will
+    see the rule fire but no fix emitted. Documented in the
+    `pgrls fix` docstring; intentional asymmetry with the rule.
+    """
     if not isinstance(node, FuncCall):
         return False
     parts: list[str] = []

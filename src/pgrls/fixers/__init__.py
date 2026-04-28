@@ -60,7 +60,16 @@ def generate_fixes(
     rule_filter: set[str] | None = None,
 ) -> list[Fix]:
     """Run every fixer (or just the ones in `rule_filter`) and
-    return the union of Fix objects, ordered by (rule_id, location)."""
+    return the union of Fix objects, ordered by (rule_id, location).
+
+    Sort is alphabetical by `rule_id` then `location`. Today's
+    fixers (PERF001 ALTER POLICY + SEC002 ALTER TABLE FORCE) are
+    independent in Postgres, so the ordering is correctness-
+    irrelevant. A future fixer that depends on order (e.g. CREATE
+    POLICY before its referenced table is forced) will need
+    explicit dependency-based ordering — the alphabetical sort is
+    incidental, not guaranteed.
+    """
     out: list[Fix] = []
     for fixer in default_fixers():
         if rule_filter is not None and fixer.rule_id not in rule_filter:

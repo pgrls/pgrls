@@ -164,3 +164,15 @@ def test_perf002_metadata_present() -> None:
     assert rule.id == "PERF002"
     assert rule.severity == "warning"
     assert rule.title
+
+
+def test_perf002_fires_on_volatile_inside_subquery() -> None:
+    # Deliberate divergence from SEC011: PERF002 walks
+    # SubLink.subselect because a VOLATILE call inside any
+    # subquery is still non-deterministic at evaluation. Pin the
+    # behavior so a future "consistency" refactor that aligns
+    # PERF002 with SEC011's narrow scope fails this test loudly.
+    schema = _wrap(
+        _policy("id IN (SELECT random()::INT FROM generate_series(1,10))")
+    )
+    assert len(PERF002().check(schema, {})) == 1

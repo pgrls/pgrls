@@ -990,3 +990,33 @@ def test_fix_apply_rolls_back_on_statement_failure(
             )
             (force,) = cur.fetchone()
             assert force is False, "rollback failed: fix 1's change persisted"
+
+
+def test_fix_routes_sql_to_stdout_and_status_to_stderr(
+    pg_url: str, apply_sql
+) -> None:
+    # `pgrls fix > migration.sql` must produce a clean SQL file —
+    # no "dry-run" status lines mixed in. Status messages go to
+    # stderr; SQL bodies (and their `-- [rule] description`
+    # comments) go to stdout.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_streams (id INT);
+        ALTER TABLE public.fix_streams ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_streams
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    # Click 8.2 dropped the `mix_stderr` kwarg; stderr is exposed
+    # separately on the result by default.
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    # SQL body lands on stdout.
+    assert (
+        "ALTER TABLE public.fix_streams FORCE ROW LEVEL SECURITY;"
+        in result.stdout
+    )
+    # Status messages land on stderr.
+    assert "dry-run" in result.stderr
+    assert "dry-run" not in result.stdout

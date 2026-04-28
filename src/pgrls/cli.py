@@ -193,6 +193,16 @@ def fix(
     same transaction; if any statement fails, the entire batch
     is rolled back and the database is unchanged. The failing
     fix's `(rule_id, location)` is reported in the error message.
+
+    Output channels: SQL bodies go to stdout (so `pgrls fix >
+    migration.sql` produces a usable script). Status / progress /
+    error messages go to stderr.
+
+    The Schema is captured by introspection at the start of the
+    command and the generated fixes reflect that snapshot. A
+    concurrent migration between introspection and `--apply` could
+    cause individual statements to fail; the all-or-nothing rollback
+    keeps the database consistent in that case.
     """
     try:
         config = load_config(config_path)
@@ -224,9 +234,15 @@ def fix(
                 raise click.ClickException(str(exc))
 
             if not fixes:
-                click.echo("pgrls: no auto-fixable violations found.")
+                click.echo(
+                    "pgrls: no auto-fixable violations found.",
+                    err=True,
+                )
                 return
 
+            # SQL bodies + their `-- [rule] description` comments
+            # go to stdout so `pgrls fix > migration.sql` produces
+            # a clean, paste-able script.
             for f in fixes:
                 click.echo(f"-- [{f.rule_id}] {f.description}")
                 click.echo(f.sql)
@@ -252,13 +268,15 @@ def fix(
                 conn.commit()
                 click.echo(
                     f"pgrls: applied {len(fixes)} "
-                    f"fix{'es' if len(fixes) != 1 else ''}."
+                    f"fix{'es' if len(fixes) != 1 else ''}.",
+                    err=True,
                 )
             else:
                 click.echo(
                     f"pgrls: {len(fixes)} "
                     f"fix{'es' if len(fixes) != 1 else ''} ready "
-                    "(dry-run). Re-run with --apply to execute."
+                    "(dry-run). Re-run with --apply to execute.",
+                    err=True,
                 )
     except psycopg.Error as exc:
         raise click.ClickException(f"Database error: {exc}")
