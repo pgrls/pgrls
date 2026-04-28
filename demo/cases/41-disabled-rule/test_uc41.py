@@ -1,4 +1,4 @@
-"""Use case 41: Disabled rule — SEC007 turned off via --disable."""
+"""Use case 41: Disabled rule — SEC007 turned off via [lint].disable."""
 from __future__ import annotations
 
 from pathlib import Path  # noqa: F401
