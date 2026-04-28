@@ -151,28 +151,29 @@ The script honors `DATABASE_URL` and skips Docker.
 ### Option C — programmatic, via pytest
 
 ```bash
-pytest demo/test_demo.py -v
+pytest demo/ -v
 ```
 
 Spins up an isolated Postgres via `testcontainers` (no port
-collisions), applies `setup.sql`, and runs 77 assertions — one per
-use case plus configuration-driven scenarios that exercise per-test
-`--config` overrides (allowlist, disable, custom `auth_functions`,
-multi-schema, fail_on, format) and the JSON / SARIF output
-contracts. Each test is named `test_uc<NN>_<what_it_does>` for
-top-to-bottom readability.
+collisions), applies `_shared.sql` plus every case's `setup.sql`,
+and runs 83 assertions — one per use case plus configuration-
+driven scenarios that exercise per-test `--config` overrides
+(allowlist, disable, custom `auth_functions`, multi-schema,
+fail_on, format) and the JSON / SARIF output contracts. Each
+test is named `test_uc<NN>_<what_it_does>` for top-to-bottom
+readability.
 
 To run the tests against a long-running DB you started with `run.sh`:
 
 ```bash
 DATABASE_URL=postgres://demo:demo@localhost:5433/demo \
-    pytest demo/test_demo.py -v
+    pytest demo/ -v
 ```
 
 ## Expected lint output
 
-Around 45 violations across all three severities (`22 errors,
-19 warnings, 4 infos.`). The fixture is intentionally noisy — most
+Around 53 violations across all three severities (`22 errors,
+27 warnings, 4 infos.`). The fixture is intentionally noisy — most
 violations come from cross-fires where one bad policy trips several
 rules at once (`USING (true)` → SEC005 + SEC008 + SEC003 if PUBLIC; a
 Supabase `auth.uid() IS NULL OR ...` → SEC004 + PERF001). Each
@@ -201,7 +202,7 @@ Tables that must stay silent (clean cases 01, 02 via allowlist, 13,
 16-18, 21, 23, 25, 27-32, 34, 36, 44-47) never appear in any
 violation line. The clean tests assert this directly. The
 configuration-driven cases (39-43) verify behavior under specific
-`--config` overrides — see `test_demo.py::_run_lint` for the
+`--config` overrides — see `conftest.py::lint` for the
 helper that drives those.
 
 ## Wiring this into CI
