@@ -1,0 +1,121 @@
+# Copy this file to `pgrls.toml` and adjust.
+# Environment variables can be referenced as `$VAR` or `${VAR}`.
+
+[database]
+url = "$DATABASE_URL"
+schemas = ["public"]
+
+[lint]
+# Rule IDs to skip entirely.
+disable = []
+# Severity that triggers a nonzero exit code: "error" | "warning" | "info".
+fail_on = "warning"
+
+# Per-rule options. Each rule reads its own table; unknown rules are ignored.
+
+[lint.rules.SEC001]
+# Tables where missing RLS is acceptable. Entries can be unqualified
+# (countries) or qualified (tenant.things). Partitioned tables:
+# SEC001 walks the `PARTITION OF` chain and suppresses the violation
+# on a child whose ancestor has RLS enabled. When the chain leaves
+# the scanned schemas before pgrls can verify coverage, the rule
+# fires with a different message asking the user to widen
+# `database.schemas`. When the chain reaches a visible RLS-less
+# root, the rule names the root in its message so the fix lands at
+# the right level.
+allowlist = []
+
+[lint.rules.SEC002]
+# Tables where ENABLE without FORCE is acceptable. Same shape as SEC001.
+allowlist = []
+
+[lint.rules.SEC003]
+# Policies allowed to be permissive-and-PUBLIC. Entries are fully-qualified
+# policy IDs of the form "schema.table.policy_name".
+allowlist = []
+
+[lint.rules.SEC004]
+# Functions whose `IS NULL` in a top-level OR disjunct triggers SEC004.
+# Defaults: auth.uid, auth.role, auth.jwt, current_user, session_user,
+# current_setting. Override with a list to add or replace.
+# auth_functions = ["auth.uid", "current_setting", "my.custom_auth"]
+
+[lint.rules.SEC005]
+# Policies whose expression legitimately has no own-column reference
+# (e.g. an admin-only audit log). Entries are fully-qualified policy IDs
+# of the form "schema.table.policy_name".
+allowlist = []
+
+[lint.rules.SEC006]
+# Policies allowed to omit WITH CHECK on INSERT/UPDATE/ALL. Entries are
+# fully-qualified policy IDs.
+allowlist = []
+
+[lint.rules.SEC007]
+# Tables where every-policy-permissive is intentional (e.g. reference
+# data). Entries are qualified table IDs of the form "schema.table".
+allowlist = []
+
+[lint.rules.SEC008]
+# Policies allowed to keep `USING (true)`. Entries are fully-qualified
+# policy IDs.
+allowlist = []
+
+[lint.rules.SEC009]
+# Tables where deny-all (RLS enabled, no policies) is intentional —
+# e.g., a soft-deleted tombstone or a superuser-only audit log.
+# Entries can be unqualified (audit_events) or qualified
+# (private.audit_events). Same shape as SEC001 / SEC002.
+allowlist = []
+
+[lint.rules.SEC010]
+# Policies allowed to keep `USING (false)`. Rare but legal — usually
+# a temporary block coordinated with a feature flag. The right
+# primitive for permanent denial is REVOKE at the GRANT layer.
+# Entries are fully-qualified policy IDs.
+allowlist = []
+
+[lint.rules.SEC011]
+# Policies allowed to keep an `OR true` branch. Almost always a
+# leftover debug branch — reach for this only when the policy
+# really is supposed to admit every row. Entries are fully-
+# qualified policy IDs.
+allowlist = []
+
+[lint.rules.PERF001]
+# Policies allowed to call an auth function unwrapped in USING. Reach
+# for this sparingly — the rewrite to `(SELECT auth.uid())` is
+# mechanical and always safe (and `pgrls fix --rule PERF001` does
+# it for you). Entries are fully-qualified policy IDs.
+allowlist = []
+# Functions whose unwrapped call in USING triggers PERF001. Defaults:
+# auth.uid, auth.role, auth.jwt, current_setting. Override REPLACES
+# the default — list every function you want covered.
+# auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
+
+[lint.rules.PERF002]
+# Policies allowed to call a VOLATILE function in their predicate.
+# Rare — VOLATILE in a policy is almost always a bug (predicate
+# truth varies between calls, often a security hazard). Entries
+# are fully-qualified policy IDs.
+allowlist = []
+# Functions considered VOLATILE for the purposes of this rule.
+# Defaults: random, clock_timestamp, nextval, gen_random_uuid,
+# pg_backend_pid. Override REPLACES the default.
+# volatile_functions = ["random", "clock_timestamp", "my.volatile"]
+
+[lint.rules.HYG002]
+# Policy IDs allowed to keep placeholder names. Entries are fully-
+# qualified policy IDs.
+allowlist = []
+# Words that mark a policy name as a placeholder. Defaults: todo,
+# fixme, tmp, hack, xxx, debug, placeholder. The default list
+# deliberately excludes `temp`, `draft`, `wip` — they collide
+# with real domain words (temperature sensors, CMS draft state,
+# WIP inventory). Opt back into the broader scaffolding-detection
+# set by listing them explicitly below. Match is case-insensitive
+# and respects identifier-token boundaries (snake_case,
+# camelCase, SCREAMING_SNAKE). Setting this to an empty list
+# disables the rule entirely (no placeholder words to match
+# against). The override REPLACES the default list.
+# placeholder_words = ["todo", "fixme", "scratch"]

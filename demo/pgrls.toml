@@ -1,0 +1,20 @@
+# pgrls config for the demo. Use case 02 demonstrates the allowlist
+# mechanism: `app.countries` is reference data and is exempt from
+# SEC001 by qualified name. Note `database.schemas = ["app"]` —
+# the `private` schema in use case 14 is intentionally excluded so
+# SEC001 emits its "leaves the scanned schemas" message on
+# `app.audit_log_2026`.
+
+[database]
+url = "$DATABASE_URL"
+schemas = ["app"]
+
+[lint]
+# Show every violation but only exit nonzero on errors. Lets the
+# demo run end-to-end while still flagging anything that would
+# block CI.
+fail_on = "error"
+
+[lint.rules.SEC001]
+# `app.countries` is world-readable reference data by design.
+allowlist = ["app.countries"]

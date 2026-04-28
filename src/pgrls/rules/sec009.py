@@ -1,0 +1,66 @@
+"""SEC009 — RLS enabled but no policies defined.
+
+A table with `relrowsecurity = true` and zero rows in `pg_policy`
+acts as deny-all: every query against it returns no rows. That is
+sometimes intentional — an audit log read only by superusers, a
+soft-deleted "tombstone" table — but far more often it's a forgotten
+step. The migration enabled RLS planning to add policies, then the
+policy work was deferred and forgotten. Without SEC009 the table
+silently rejects everything, which can take an embarrassingly long
+time to notice in dev because the only symptom is "the table looks
+empty."
+
+Severity: warning. Allowlist by qualified or unqualified table name
+when the deny-all is genuinely the goal.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from pgrls.model import Schema, Table
+from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.violations import Severity, Violation
+
+
+def _parse_allowlist(options: dict[str, Any]) -> set[str]:
+    return parse_table_ref_allowlist('SEC009', options)
+
+
+class SEC009:
+    id: str = "SEC009"
+    severity: Severity = "warning"
+    title: str = "RLS enabled but no policies defined"
+
+    def check(
+        self, schema: Schema, options: dict[str, Any]
+    ) -> list[Violation]:
+        allowlist = _parse_allowlist(options)
+        out: list[Violation] = []
+        for table in schema.tables:
+            if not table.rls_enabled:
+                continue
+            if table.policies:
+                continue
+            if self._is_allowlisted(table, allowlist):
+                continue
+            out.append(self._violation(table))
+        return out
+
+    def _is_allowlisted(self, table: Table, allowlist: set[str]) -> bool:
+        return table.name in allowlist or table.qualified_name in allowlist
+
+    def _violation(self, table: Table) -> Violation:
+        return Violation(
+            rule_id=self.id,
+            severity=self.severity,
+            title=self.title,
+            message=(
+                f"Table {table.qualified_name} has RLS enabled but "
+                "no policies defined. Postgres treats this as deny-all "
+                "— every query returns zero rows, regardless of role. "
+                "If that's intentional (e.g., a deny-by-default audit "
+                "table), allowlist it in [lint.rules.SEC009]; otherwise "
+                "add the policies the migration was meant to include."
+            ),
+            location=table.qualified_name,
+        )
