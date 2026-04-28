@@ -20,8 +20,13 @@ else
     echo "==> Using existing DATABASE_URL=$DATABASE_URL"
 fi
 
-echo "==> Applying demo fixture (drops + recreates app/private schemas)"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f setup.sql
+echo "==> Applying demo fixtures"
+echo "    1/2 cases/_shared.sql (schemas + auth stub functions)"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f cases/_shared.sql
+echo "    2/2 cases/<NN>-*/setup.sql (one per use case, in order)"
+for case_sql in cases/[0-9][0-9]-*/setup.sql; do
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$case_sql"
+done
 
 echo
 echo "==> Running pgrls lint"

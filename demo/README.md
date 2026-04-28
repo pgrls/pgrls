@@ -8,13 +8,32 @@ cases in one fixture.
 
 ```
 demo/
-├── docker-compose.yml   # local Postgres on port 5433 (optional)
-├── pgrls.toml           # demo config (allowlists app.countries)
-├── README.md            # this file
-├── run.sh               # bring up DB + apply fixture + run pgrls
-├── setup.sql            # the 75-use-case fixture
-└── test_demo.py         # pytest assertions per use case
+├── conftest.py            # session-scoped fixtures
+├── docker-compose.yml     # local Postgres on port 5433 (optional)
+├── pgrls.toml             # demo config (allowlists app.countries)
+├── README.md              # this file
+├── run.sh                 # bring up DB + apply fixtures + run pgrls
+├── test_summary.py        # whole-fixture sanity checks
+└── cases/
+    ├── _shared.sql        # auth schema + auth.uid/role/jwt stubs
+    ├── 01-multi-tenant-saas-table/
+    │   ├── setup.sql      # the SQL for this case
+    │   └── test_uc01.py   # the assertions for this case
+    ├── 02-reference-data/
+    │   ├── setup.sql
+    │   └── test_uc02.py
+    ...
+    └── 75-sarif-formatter/
+        ├── setup.sql
+        └── test_uc75.py
 ```
+
+Each case folder is self-contained — open it to read the SQL
+fixture and the test assertions side by side. `pytest demo/`
+discovers every `cases/NN-*/test_uc<NN>.py` and shares one
+session-scoped Postgres testcontainer across them all (the conftest
+applies `_shared.sql` first, then every case's `setup.sql` in
+numeric order).
 
 ## Use cases
 
