@@ -112,7 +112,7 @@ class HYG002:
                             f"Policy {policy.name!r} on "
                             f"{table.qualified_name} has a name that "
                             "looks like a forgotten placeholder "
-                            "(`todo`, `fixme`, `wip`, etc.). Common "
+                            "(`todo`, `fixme`, `tmp`, etc.). Common "
                             "shape of an unfinished migration. Rename "
                             "to a descriptive policy name or, if the "
                             "policy is truly final, allowlist it "

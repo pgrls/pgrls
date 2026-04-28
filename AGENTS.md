@@ -115,8 +115,8 @@ ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON public.invoices
     FOR ALL
     TO authenticated
-    USING (tenant_id = current_setting('app.tenant_id')::uuid)
-    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
 
 Key points when generating the fix:
@@ -218,12 +218,17 @@ DROP POLICY public_read ON public.invoices;
 CREATE POLICY tenant_read ON public.invoices
     FOR SELECT
     TO authenticated
-    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
 
 If the table is genuinely public-readable (reference data), use a
 `RESTRICTIVE` policy instead of a `PERMISSIVE` one — restrictive policies
 narrow rather than expand access.
+
+**Allowlisting individual policies.** Use `[lint.rules.SEC003].allowlist`
+with qualified policy IDs of the form `schema.table.policy_name` —
+e.g. `["public.feature_flags.public_read"]`. Prefer this over
+`[lint].disable = ["SEC003"]`, which silences the rule globally.
 
 <a id="rule-sec004"></a>
 
@@ -267,11 +272,18 @@ explicitly with a separate policy granted to `anon` — don't bake the
 "anonymous → see everything" behavior into a tenant policy.
 
 **Configuring the auth function set.** If your stack uses a custom auth
-helper, extend the function list in `pgrls.toml`:
+helper, replace the default function set in `pgrls.toml`. The override
+REPLACES the default — list every function you want covered, including
+the stock ones if you still use them:
 
 ```toml
 [lint.rules.SEC004]
-auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
+# Includes the stock set (auth.uid, auth.role, auth.jwt, current_setting,
+# current_user, session_user) plus the custom helper.
+auth_functions = [
+    "auth.uid", "auth.role", "auth.jwt", "current_setting",
+    "current_user", "session_user", "my.current_user_id",
+]
 ```
 
 The default set already covers Supabase (`auth.*`), session GUCs
@@ -335,23 +347,39 @@ allowlist = ["public.audit_log.admin_read"]
 
 **What it catches:** policies whose `command` is `INSERT`, `UPDATE`, or
 `ALL` and whose `WITH CHECK` clause is absent. `USING` filters reads;
-`WITH CHECK` validates writes. A write-side policy without `WITH CHECK`
-lets clients insert or update rows that the same policy would forbid
-them from reading — silent cross-tenant data poisoning.
+`WITH CHECK` validates writes.
 
-**Standard fix.** Add a `WITH CHECK` clause that matches `USING`:
+For **permissive** write policies the failure is read-write asymmetry:
+without `WITH CHECK` the policy admits every write, including ones
+that violate the policy's own `USING` predicate — silent cross-tenant
+data poisoning.
+
+For **restrictive** write policies the failure is different: Postgres
+defaults the missing `WITH CHECK` to `true` and AND-combines it into
+the restrictive group, so the policy imposes no constraint on new
+rows. The author wrote a restrictive intending to forbid something;
+they're forbidding nothing — a dead policy. SEC006 fires on both
+shapes; the violation message branches so the diagnosis matches the
+actual problem (security hole vs. dead policy).
+
+**Standard fix.** Add a `WITH CHECK` clause that matches `USING`. Wrap
+the auth-style call in `(SELECT …)` so it doesn't itself fire PERF001
+(per-row re-evaluation of stable functions):
 
 ```sql
 CREATE POLICY tenant_write ON public.invoices
     FOR UPDATE
     TO authenticated
-    USING (tenant_id = current_setting('app.tenant_id')::uuid)
-    WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
 
 Asymmetric `USING` and `WITH CHECK` are valid (e.g. read your own and
 your team's, write your own only) but should carry an explanatory
 comment — the asymmetry is rarely accidental and rarely obvious.
+
+**Allowlisting individual policies.** Use `[lint.rules.SEC006].allowlist`
+with qualified policy IDs of the form `schema.table.policy_name`.
 
 <a id="rule-sec007"></a>
 
@@ -428,7 +456,8 @@ CREATE POLICY tenant_read ON public.invoices
 
 If `USING (true)` is intentional (e.g. a deliberately public
 reference table), pair it with a `RESTRICTIVE` policy that enforces
-the actual surface, or allowlist the policy:
+the actual surface, or allowlist the policy. The allowlist accepts
+qualified policy IDs of the form `schema.table.policy_name`:
 
 ```toml
 [lint.rules.SEC008]
