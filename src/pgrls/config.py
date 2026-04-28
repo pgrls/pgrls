@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pgrls.violations import ALL_SEVERITIES, Severity
+from pgrls.violations import ALL_SEVERITIES, Severity, coerce_severity
 
 _ENV_PATTERN = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
@@ -99,11 +99,25 @@ def _build_config(raw: dict[str, Any]) -> Config:
     if not isinstance(disable, list) or not all(isinstance(s, str) for s in disable):
         raise ConfigError("[lint].disable must be a list of rule-id strings")
 
-    fail_on = lint.get("fail_on", "warning")
-    if fail_on not in ALL_SEVERITIES:
+    fail_on_raw = lint.get("fail_on", "warning")
+    if not isinstance(fail_on_raw, str):
         raise ConfigError(
-            f"[lint].fail_on must be one of {ALL_SEVERITIES}, got {fail_on!r}"
+            f"[lint].fail_on must be a string, got {type(fail_on_raw).__name__}"
         )
+    # Route through `coerce_severity` so the TOML path matches the
+    # CLI's case-insensitive contract (Click's `--fail-on ERROR`
+    # accepts uppercase). Without this, `pgrls lint --fail-on
+    # WARNING` is accepted but `[lint].fail_on = "WARNING"` in
+    # the same project's pgrls.toml errors out — exactly the
+    # surprise a user copy-pasting between CLI and config will
+    # hit.
+    try:
+        fail_on: Severity = coerce_severity(fail_on_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"[lint].fail_on must be one of {ALL_SEVERITIES}, "
+            f"got {fail_on_raw!r}"
+        ) from exc
 
     rules_raw = lint.get("rules", {})
     if not isinstance(rules_raw, dict):

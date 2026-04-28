@@ -75,6 +75,25 @@ def test_invalid_fail_on_raises(tmp_path: Path) -> None:
         load_config(path=cfg_file)
 
 
+def test_fail_on_normalizes_case(tmp_path: Path) -> None:
+    # Click's `--fail-on ERROR` is accepted via case_sensitive=False;
+    # the TOML path should match the same contract. Without the
+    # `coerce_severity` route, a user copy-pasting `--fail-on
+    # WARNING` into `[lint].fail_on = "WARNING"` would hit a
+    # surprise ConfigError.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\nfail_on = "ERROR"\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.fail_on == "error"
+
+
+def test_fail_on_rejects_non_string(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("[lint]\nfail_on = 1\n")
+    with pytest.raises(ConfigError, match="fail_on"):
+        load_config(path=cfg_file)
+
+
 def test_auto_discovers_pgrls_toml_in_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
