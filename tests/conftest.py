@@ -68,6 +68,20 @@ def pg_conn(pg_url: str) -> Generator[psycopg.Connection, None, None]:
         yield conn
 
 
+@pytest.fixture(autouse=True)
+def _reset_default_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the cached registry between tests.
+
+    `pgrls.rules._DEFAULT_REGISTRY` is a module-level lazy cache.
+    No test mutates it today, but if a future test inserts /
+    removes rules to the singleton (legitimate test-of-test
+    pattern) the next test would inherit the corruption. Resetting
+    to `None` per test is cheap (build is sub-millisecond) and
+    pins the isolation contract.
+    """
+    monkeypatch.setattr("pgrls.rules._DEFAULT_REGISTRY", None)
+
+
 @pytest.fixture
 def apply_sql(pg_conn: psycopg.Connection) -> Callable[[str], None]:
     def _apply(sql: str) -> None:

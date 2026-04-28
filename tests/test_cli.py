@@ -23,10 +23,16 @@ def test_lint_help_runs():
 
 
 def test_root_version_flag():
+    # Pull the version from the package itself rather than
+    # hard-coding the literal — release bumps that forget to
+    # update test_cli.py would otherwise pass for substring-
+    # of-substring reasons (e.g. "0.0.7" is in "0.0.71").
+    from pgrls import __version__
+
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.0.7" in result.output
+    assert __version__ in result.output
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
