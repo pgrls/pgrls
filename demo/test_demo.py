@@ -37,6 +37,8 @@ _ALL_RULE_IDS = (
     "SEC006",
     "SEC007",
     "SEC008",
+    "SEC009",
+    "SEC010",
     "PERF001",
     "HYG001",
 )
@@ -1115,6 +1117,77 @@ def test_uc71_json_empty_when_every_rule_is_disabled(
     assert parsed["summary"] == {
         "errors": 0, "warnings": 0, "infos": 0, "total": 0,
     }
+
+
+# ============================================================
+# Use cases 73-75 — new in 0.0.6 (SEC009, SEC010, SARIF)
+# ============================================================
+
+def test_uc73_sec009_fires_on_rls_with_no_policies(
+    lint_output: str,
+) -> None:
+    # `app.deny_all_log` has RLS+FORCE but zero policies. Looks
+    # protected, is actually deny-all. Pin SEC009 catching the
+    # forgotten-policies migration.
+    assert "SEC009  app.deny_all_log\n" in lint_output
+
+
+def test_uc74_sec010_fires_on_using_false_deny_all(
+    lint_output: str,
+) -> None:
+    # `USING (false)` denies every row. SEC010 catches the
+    # anti-pattern. SEC005 also fires (no column ref); pin both
+    # — the demo's primary rule for this case is SEC010 but
+    # cross-firing is realistic.
+    assert "SEC010  app.deny_via_false.block_all\n" in lint_output
+    assert "SEC005  app.deny_via_false.block_all\n" in lint_output
+
+
+def test_uc75_sarif_format_end_to_end_against_demo_db(
+    demo_db: str,
+) -> None:
+    # Run the demo DB through `--format sarif` and validate the
+    # contract end-to-end: top-level schema, single run, tool
+    # driver name/version, rule descriptors, severity → level
+    # mapping, location shape.
+    import json as _json
+
+    text = _run_lint(
+        demo_db,
+        config=PGRLS_TOML,
+        extra_args=("--format", "sarif"),
+    )
+    parsed = _json.loads(text)
+
+    assert parsed["version"] == "2.1.0"
+    assert parsed["$schema"].endswith("sarif-schema-2.1.0.json")
+
+    run = parsed["runs"][0]
+    assert run["tool"]["driver"]["name"] == "pgrls"
+
+    # Rule descriptors are deduped per unique rule_id; every
+    # ruleId in results points back via ruleIndex.
+    rule_ids = [r["id"] for r in run["tool"]["driver"]["rules"]]
+    assert len(rule_ids) == len(set(rule_ids))
+    for result in run["results"]:
+        assert result["ruleId"] in rule_ids
+        assert (
+            run["tool"]["driver"]["rules"][result["ruleIndex"]]["id"]
+            == result["ruleId"]
+        )
+
+    # SARIF level enum: error|warning|note (no "info").
+    levels = {r["level"] for r in run["results"]}
+    assert levels.issubset({"error", "warning", "note"})
+
+    # Every result with a location uses logical-location form
+    # with fullyQualifiedName — that's what GH Code Scanning
+    # surfaces as the finding's path.
+    for result in run["results"]:
+        if result.get("locations"):
+            loc = result["locations"][0]["logicalLocations"][0]
+            assert "fullyQualifiedName" in loc
+            assert loc["fullyQualifiedName"]  # non-empty
 
 
 def test_uc72_json_summary_drops_when_allowlist_silences_a_rule(

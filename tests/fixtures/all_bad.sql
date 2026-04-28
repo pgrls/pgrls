@@ -4,7 +4,9 @@
 -- SEC001: RLS disabled.
 CREATE TABLE public.allbad_sec001 (id INT);
 
--- SEC002: RLS enabled, FORCE missing.
+-- SEC002 + SEC009: RLS enabled, FORCE missing, AND no policies
+-- defined. The empty policy list is what SEC009 catches. The
+-- missing FORCE is what SEC002 catches. Same shape exercises both.
 CREATE TABLE public.allbad_sec002 (id INT);
 ALTER TABLE public.allbad_sec002 ENABLE ROW LEVEL SECURITY;
 
@@ -56,3 +58,13 @@ UPDATE pg_catalog.pg_attribute
     SET attisdropped = true
     WHERE attrelid = 'public.allbad_hyg001'::regclass
       AND attname = 'gone';
+
+-- SEC010 + SEC005: deny-all anti-pattern. USING (false) denies
+-- every row through the policy form (the right primitive is REVOKE
+-- ALL ON TABLE x FROM <role>). SEC005 also fires because the
+-- predicate has no own-column reference.
+CREATE TABLE public.allbad_sec010 (id INT);
+ALTER TABLE public.allbad_sec010 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec010 FORCE ROW LEVEL SECURITY;
+CREATE POLICY block_all ON public.allbad_sec010
+    AS RESTRICTIVE FOR SELECT TO PUBLIC USING (false);
