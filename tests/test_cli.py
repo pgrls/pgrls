@@ -73,11 +73,17 @@ def test_lint_against_known_bad_db_exits_nonzero(pg_url: str, apply_sql) -> None
 
 
 def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
+    # RLS + FORCE + at least one policy = the canonical clean
+    # shape. Without the policy SEC009 fires (RLS enabled, no
+    # policies). RESTRICTIVE keeps SEC003 silent; the column ref
+    # `id` keeps SEC005 silent.
     apply_sql(
         """
         CREATE TABLE public.t (id INT);
         ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.t FORCE ROW LEVEL SECURITY;
+        CREATE POLICY t_p ON public.t
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
         """
     )
     runner = CliRunner()
