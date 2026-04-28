@@ -10,7 +10,7 @@ Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 pip install pgrls
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+ and Postgres 10+ (PG 12+ recommended; the demo's partition / generated-column fixtures need 12+, and uc36's `pg_read_all_data` predefined role needs 14+).
 
 ## Usage
 
