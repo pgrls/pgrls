@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.0.6** — twelve rules (SEC001–SEC010, PERF001, HYG001) across error, warning, and info severities. Text, JSON, and SARIF output for CI integrations. The `test` / `diff` commands are on the roadmap below.
+> **Status: 0.0.7** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. The `test` / `diff` commands are on the roadmap below.
 
 ## Install
 
@@ -77,6 +77,23 @@ SARIF (`--format sarif`) emits a SARIF v2.1.0 document. GitHub Code Scanning, Az
 
 Exit code is `1` when any violation meets or exceeds `fail_on` (default `warning`).
 
+### Auto-remediation: `pgrls fix`
+
+`pgrls fix` generates SQL for the rules whose remediation is mechanical. Default mode is dry-run — it prints the SQL but does not modify the database. Pass `--apply` to execute.
+
+```bash
+# Dry-run: print what would change.
+pgrls fix --database-url "$DATABASE_URL"
+
+# Apply for real.
+pgrls fix --database-url "$DATABASE_URL" --apply
+
+# Only fix one rule.
+pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
+```
+
+Currently fixable: **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`) and **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
+
 ## Configuration
 
 Drop a `pgrls.toml` next to your project. See `pgrls.example.toml` in the repo for a fully commented version.
@@ -110,8 +127,11 @@ allowlist = ["countries", "currencies"]
 | SEC008 | warning | Policy USING clause is constant `true` |
 | SEC009 | warning | RLS enabled but no policies defined (silent deny-all) |
 | SEC010 | warning | Policy USING clause is constant `false` (deny-all anti-pattern) |
+| SEC011 | warning | Policy expression has an `OR true` branch (debug bypass left in) |
 | PERF001 | warning | Auth function called per-row in policy USING (unwrapped) |
+| PERF002 | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | HYG001 | error | Policies referencing columns that don't exist on the table |
+| HYG002 | warning | Policy named like a placeholder (`todo`, `fixme`, `wip`, `tmp`, …) |
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
@@ -131,7 +151,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.0.6
+    rev: v0.0.7
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to

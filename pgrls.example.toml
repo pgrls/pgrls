@@ -75,12 +75,41 @@ allowlist = []
 # Entries are fully-qualified policy IDs.
 allowlist = []
 
+[lint.rules.SEC011]
+# Policies allowed to keep an `OR true` branch. Almost always a
+# leftover debug branch — reach for this only when the policy
+# really is supposed to admit every row. Entries are fully-
+# qualified policy IDs.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
-# mechanical and always safe. Entries are fully-qualified policy IDs.
+# mechanical and always safe (and `pgrls fix --rule PERF001` does
+# it for you). Entries are fully-qualified policy IDs.
 allowlist = []
 # Functions whose unwrapped call in USING triggers PERF001. Defaults:
 # auth.uid, auth.role, auth.jwt, current_setting. Override REPLACES
 # the default — list every function you want covered.
 # auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
+
+[lint.rules.PERF002]
+# Policies allowed to call a VOLATILE function in their predicate.
+# Rare — VOLATILE in a policy is almost always a bug (predicate
+# truth varies between calls, often a security hazard). Entries
+# are fully-qualified policy IDs.
+allowlist = []
+# Functions considered VOLATILE for the purposes of this rule.
+# Defaults: random, clock_timestamp, nextval, gen_random_uuid,
+# pg_backend_pid. Override REPLACES the default.
+# volatile_functions = ["random", "clock_timestamp", "my.volatile"]
+
+[lint.rules.HYG002]
+# Policy IDs allowed to keep placeholder names. Entries are fully-
+# qualified policy IDs.
+allowlist = []
+# Words that mark a policy name as a placeholder. Defaults: todo,
+# fixme, wip, tmp, temp, hack, xxx, debug, draft, placeholder.
+# Match is case-insensitive and respects identifier-token
+# boundaries (snake_case, camelCase, SCREAMING_SNAKE).
+# placeholder_words = ["todo", "fixme", "scratch"]
