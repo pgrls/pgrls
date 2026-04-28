@@ -62,17 +62,32 @@ def format_sarif(violations: list[Violation]) -> str:
 
 
 def _rule_descriptors(violations: list[Violation]) -> list[dict[str, Any]]:
+    # SARIF §3.49.7 says `name` must be an identifier (Pascal-ish,
+    # no whitespace). The rule_id is exactly that. The free-text
+    # title goes in `shortDescription` instead. Don't duplicate the
+    # title into `name` — some SARIF consumers (CodeQL conventions,
+    # Sonar) treat the two fields differently and would render the
+    # prose label where they expect a code-friendly handle.
+    #
+    # `defaultConfiguration.level` lets consumers like GitHub Code
+    # Scanning populate the rule list view even before any result
+    # fires. Pull from the first observed severity for this rule —
+    # all current rules emit a single severity value, so this is
+    # stable. (If a rule ever emitted mixed severities for different
+    # findings, the descriptor's default would still be informative;
+    # per-result `level` always wins.)
     seen: dict[str, dict[str, Any]] = {}
     for v in violations:
         if v.rule_id in seen:
             continue
         seen[v.rule_id] = {
             "id": v.rule_id,
-            "name": v.title,
+            "name": v.rule_id,
             "shortDescription": {"text": v.title},
+            "defaultConfiguration": {"level": _level(v.severity)},
             "helpUri": (
                 f"{_INFORMATION_URI}/blob/main/AGENTS.md#"
-                f"{v.rule_id.lower()}"
+                f"rule-{v.rule_id.lower()}"
             ),
         }
     return list(seen.values())
@@ -87,17 +102,16 @@ def _result(
         "level": _level(v.severity),
         "message": {"text": v.message},
     }
-    out["locations"] = (
-        [
-            {
-                "logicalLocations": [
-                    {"fullyQualifiedName": v.location}
-                ]
-            }
-        ]
-        if v.location is not None
-        else []
-    )
+    # SARIF §3.27.12 says `locations` SHOULD be omitted when none
+    # are known, but GitHub Code Scanning's SARIF upload endpoint
+    # rejects results with an empty `locations` array. Synthesize a
+    # `<schema>` logicalLocation when the violation has none — keeps
+    # the document GitHub-ingestible for any future schema-wide rule
+    # that doesn't pin to a specific table or policy.
+    fqn = v.location if v.location is not None else "<schema>"
+    out["locations"] = [
+        {"logicalLocations": [{"fullyQualifiedName": fqn}]}
+    ]
     return out
 
 

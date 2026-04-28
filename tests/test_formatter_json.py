@@ -147,6 +147,39 @@ def test_json_violation_keys_are_stable_contract() -> None:
     }
 
 
+def test_json_violation_key_order_is_stable_contract() -> None:
+    # The docstring on json.py promises a specific field order
+    # (rule_id, severity, title, message, location). Today this
+    # works because Python 3.7+ dicts are insertion-ordered and
+    # the formatter constructs the violation dict literally in
+    # that order. A future refactor that builds via `**kwargs` or
+    # `dataclasses.asdict` would silently change byte output —
+    # baseline-diff workflows would flap. Pin the order here.
+    import re
+
+    out = format_violations([_v()], format="json")
+    keys_in_violation = re.findall(
+        r'"(rule_id|severity|title|message|location)":', out
+    )
+    assert keys_in_violation == [
+        "rule_id",
+        "severity",
+        "title",
+        "message",
+        "location",
+    ]
+
+
+def test_json_output_is_byte_stable_across_repeated_calls() -> None:
+    # Two calls with identical inputs must produce byte-identical
+    # output — baseline files / "diff vs last run" workflows
+    # depend on it.
+    inputs = [_v(), _v(rule_id="SEC002", severity="warning")]
+    a = format_violations(inputs, format="json")
+    b = format_violations(inputs, format="json")
+    assert a == b
+
+
 def test_json_severity_values_match_internal_literals() -> None:
     for sev in ("error", "warning", "info"):
         parsed = json.loads(
