@@ -34,6 +34,8 @@ def quote_ident(name: str) -> str:
     clearer than emitting `"a\\x00b"` and getting a confusing
     parse error from the server.
     """
+    if not name:
+        raise ValueError("identifier is empty")
     if "\x00" in name or "\n" in name or "\r" in name:
         raise ValueError(
             f"identifier contains a null byte or newline; "

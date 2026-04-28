@@ -90,7 +90,7 @@ def lint(
 
     try:
         violations = _run_rules(schema, config=effective)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     click.echo(format_violations(violations, format=output_format), nl=False)
@@ -132,7 +132,22 @@ def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
     rules = registry.enabled(disabled_ids=config.disable)
     out: list[Violation] = []
     for rule in rules:
-        out.extend(rule.check(schema, config.rule_options.get(rule.id, {})))
+        try:
+            out.extend(
+                rule.check(schema, config.rule_options.get(rule.id, {}))
+            )
+        except RecursionError as exc:
+            # Pathologically deep policy AST (thousands of nested
+            # ANDs/ORs) blows the default Python recursion limit
+            # in any of the AST walkers. Real-world policies are
+            # nowhere near this depth, but a hand-crafted policy
+            # could trigger it. Surface a clean error instead of
+            # crashing the whole lint run.
+            raise RuntimeError(
+                f"{rule.id}: policy AST too deep to walk "
+                "(RecursionError in rule check). Increase "
+                "sys.setrecursionlimit or simplify the policy."
+            ) from exc
     return out
 
 

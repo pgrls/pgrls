@@ -112,13 +112,17 @@ def test_sec006_does_not_fire_on_delete_without_with_check() -> None:
     assert violations == []
 
 
-def test_sec006_with_check_treated_as_present_even_when_blank_string() -> None:
-    # An empty string for with_check_sql is still a "present" clause (the
-    # introspector wouldn't emit it for an absent clause). Pin behavior.
+def test_sec006_treats_empty_with_check_as_absent() -> None:
+    # `pg_get_expr` never returns "" for a real WITH CHECK clause,
+    # so an empty string can only come from a hand-built or
+    # snapshot-loaded Policy. Treat it as functionally absent so
+    # the rule doesn't silently slip past on the empty-string
+    # boundary.
     violations = SEC006().check(
         _wrap(_policy("p", command="INSERT", with_check="")), {}
     )
-    assert violations == []
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.p"
 
 
 def test_sec006_fires_on_each_offending_policy_independently() -> None:
@@ -141,3 +145,5 @@ def test_sec006_fires_on_each_offending_policy_independently() -> None:
     violations = SEC006().check(schema, {})
     locations = sorted(v.location for v in violations)
     assert locations == ["public.t.a", "public.t.c"]
+
+
