@@ -10,7 +10,7 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
-## [0.0.7] - 2026-04-27
+## [0.0.7] - 2026-04-28
 
 ### Added
 - **Three new rules**:
@@ -53,6 +53,87 @@ breaking changes — they will be called out in this file.
   `lint_json`, `base_config`, `all_rule_ids`, `pgrls_toml`) as
   fixtures so each test declares precisely what it needs in its
   signature. 79 cases / 83 tests.
+- **HYG002 default vocabulary tightened.** Removed `temp`, `draft`,
+  `wip` from the default placeholder words — they collide with real
+  domain terms (temperature sensors, CMS draft state, WIP
+  inventory). Default set is now `todo, fixme, tmp, hack, xxx,
+  debug, placeholder`. Users wanting the broader scaffolding-
+  detection set can opt back in via `placeholder_words`.
+- **SEC006 message branches on permissive vs restrictive.** Permissive
+  write-policy with no `WITH CHECK` keeps the read-write asymmetry
+  framing. Restrictive write-policy with no `WITH CHECK` is now
+  flagged as a "dead policy" — Postgres defaults the missing clause
+  to `true`, so the policy imposes no constraint.
+- **SEC010 walks `WITH CHECK` too.** Previously only `USING (false)`
+  was caught. `WITH CHECK (false)` (a deny-all-writes anti-pattern)
+  now fires with a write-side framing and a `REVOKE INSERT, UPDATE`
+  remediation hint.
+- **Three-tier exit codes.** Exit 0 = clean, exit 1 = findings met
+  threshold, exit 2 = pgrls itself failed (bad TOML, DB unreachable,
+  fixer SQL rolled back). CI alerts can now route "schema bug"
+  separately from "tool error."
+
+### Fixed
+- **Postgres catalog correctness.** Role deduplication for policies
+  with `TO r1, r1`. NULL-rolname COALESCE for unprivileged callers.
+  Reserved schemas (`pg_catalog`, `information_schema`, `pg_toast`,
+  per-session temp) are refused with a clear error instead of
+  introspecting thousands of system tables.
+- **Identifier handling.** `quote_ident` now quotes Postgres reserved
+  keywords (`select`, `from`, `order`, etc.) — fixer SQL no longer
+  produces syntax errors on legacy schemas with reserved-word table
+  names. All C0 control characters and DEL are rejected (was: only
+  null/newline). Empty-string identifiers raise rather than emit
+  `""`.
+- **Allowlist shape validation.** Per-policy rules (SEC003, SEC005,
+  SEC006, SEC008, SEC010, SEC011, PERF001, PERF002, HYG002) now
+  validate every entry as `schema.table.policy_name` and surface a
+  clear `TypeError` on malformed entries. Previously a typo'd entry
+  (e.g. unqualified `users`) was silently never matched. Right-
+  anchored split also lets users allowlist policies whose names
+  contain `.`.
+- **Schema lookup error messages.** "Schemas not found" now lists
+  available user schemas and suggests close matches via difflib.
+- **Parse-error visibility.** When `pglast` cannot parse a policy's
+  USING/WITH CHECK clause, the warning now names the policy and
+  lists the AST-based rules (SEC004, SEC005, SEC008, SEC010, SEC011,
+  HYG001, PERF001, PERF002) that were skipped — closing a silent
+  false-negative path.
+- **`pgrls fix --apply` rollback message.** Includes the failing SQL
+  (truncated), the underlying psycopg error, and a remediation hint
+  pointing at next concrete actions.
+- **`pgrls fix` is read-only over Schema.** PERF001 fixer no longer
+  mutates the input policy AST; rules running after the fixer in the
+  same process now see the original Schema.
+- **Severity vocabulary case-insensitivity.** `[lint].fail_on =
+  "ERROR"` is now accepted (mirrors Click's `--fail-on ERROR`); both
+  paths route through the same validator.
+- **Fixer/rule default sync.** `_DEFAULT_AUTH_FUNCTIONS` is now
+  imported by the PERF001 fixer from the rule, closing a silent-
+  drift path where adding to the rule's defaults would not extend
+  the fixer's coverage.
+
+### Security
+- **CI workflow least-privilege.** GitHub Actions `GITHUB_TOKEN`
+  permissions explicitly set to `contents: read` — defense in depth
+  against malicious dependencies in the PyPI install chain.
+- **Test fixture DDL via `psycopg.sql.Identifier`.** Conftest no
+  longer concatenates DB-controlled identifiers into DDL strings.
+
+### CI / packaging
+- Test matrix runs the suite on Postgres 10–17 (was: 16 only).
+- `py.typed` marker shipped — downstream `mypy` / `pyright` now see
+  pgrls's annotations instead of `Any`. `Typing :: Typed` PyPI
+  classifier added.
+- `[project.urls]` extended with `Repository`, `Changelog`,
+  `Documentation` so PyPI's project sidebar links work.
+- `uv.lock` policy: gitignored and excluded from the published
+  sdist (each contributor resolves fresh against the dependency
+  ranges; CI matrix verifies the resolution).
+- AGENTS.md gained stable `<a id="rule-xxx"></a>` anchors for every
+  rule heading. SARIF `helpUri` now deep-links via these (instead
+  of the GitHub-slugified heading, which broke on title rewording).
+  README's rule table links the same anchors.
 
 ## [0.0.6] - 2026-04-27
 
