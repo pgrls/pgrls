@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.0.5** — ten rules across error, warning, and info severities (SEC001–SEC008, PERF001, HYG001), plus JSON output for CI integrations. The `test` / `diff` commands are on the roadmap below.
+> **Status: 0.0.6** — twelve rules (SEC001–SEC010, PERF001, HYG001) across error, warning, and info severities. Text, JSON, and SARIF output for CI integrations. The `test` / `diff` commands are on the roadmap below.
 
 ## Install
 
@@ -36,8 +36,9 @@ pgrls lint --schemas public,tenant
 Point at a non-default config file, or pick an output format:
 
 ```bash
-pgrls lint --config ./config/pgrls.toml --format text   # human-readable (default)
-pgrls lint --config ./config/pgrls.toml --format json   # machine-readable for CI
+pgrls lint --config ./config/pgrls.toml --format text    # human-readable (default)
+pgrls lint --config ./config/pgrls.toml --format json    # machine-readable for CI
+pgrls lint --config ./config/pgrls.toml --format sarif   # GitHub Code Scanning
 ```
 
 ### Example output
@@ -72,6 +73,8 @@ JSON (`--format json`):
 
 The JSON shape is the public CI contract — top-level keys, per-violation keys, and summary keys are stable across releases. Pipe through `jq` to filter, count, or transform; ship to a dashboard; upload as a build artifact.
 
+SARIF (`--format sarif`) emits a SARIF v2.1.0 document. GitHub Code Scanning, Azure DevOps, and other static-analysis aggregators consume it directly — see the GitHub Actions recipe below for the upload step that puts findings inline on PRs.
+
 Exit code is `1` when any violation meets or exceeds `fail_on` (default `warning`).
 
 ## Configuration
@@ -105,6 +108,8 @@ allowlist = ["countries", "currencies"]
 | SEC006 | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
 | SEC007 | info | All policies on a table are permissive (no RESTRICTIVE floor) |
 | SEC008 | warning | Policy USING clause is constant `true` |
+| SEC009 | warning | RLS enabled but no policies defined (silent deny-all) |
+| SEC010 | warning | Policy USING clause is constant `false` (deny-all anti-pattern) |
 | PERF001 | warning | Auth function called per-row in policy USING (unwrapped) |
 | HYG001 | error | Policies referencing columns that don't exist on the table |
 
@@ -126,7 +131,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.0.5
+    rev: v0.0.6
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to
@@ -169,21 +174,22 @@ jobs:
       - name: Apply schema
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/all.sql
       - name: Lint RLS
-        run: pgrls lint --format json | tee pgrls.json
-      - uses: actions/upload-artifact@v4
+        run: pgrls lint --format sarif > pgrls.sarif
+      - name: Upload SARIF for code scanning
+        uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          name: pgrls-report
-          path: pgrls.json
+          sarif_file: pgrls.sarif
 ```
 
-`--format json` emits a stable shape with `violations[]` and
-`summary{}` keys; pipe it to `jq`, ship it to a dashboard, or
-upload as a build artifact.
+The SARIF upload puts findings inline on the PR as code-scanning
+alerts — no extra dashboard plumbing. Use `--format json` instead
+of `--format sarif` if you want to pipe to `jq`, build your own
+dashboard, or keep the report as a build artifact.
 
 ## Roadmap
 
-- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. SARIF and Markdown output. Polished error messages.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. Markdown output. Polished error messages.
 - **`pgrls test`.** Code-first RLS test DSL for Python, TypeScript, and Go.
 - **`pgrls diff`.** Semantic policy diff between branches with DANGEROUS / BREAKING / SAFE classification.
 

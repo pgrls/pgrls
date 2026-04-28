@@ -10,6 +10,38 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-04-27
+
+### Added
+- **Two new rules**:
+  - `SEC009` (warning) — RLS enabled but no policies defined.
+    Postgres treats this as deny-all: every query returns no rows
+    regardless of role. Almost always a forgotten step from a
+    migration that enabled RLS planning to add policies.
+  - `SEC010` (warning) — policy `USING` clause is the literal
+    `false`. Mirror of SEC008. Denies every row through the policy
+    form when the right primitive is `REVOKE ALL ON TABLE … FROM
+    role` at the GRANT layer; the policy form is misleading because
+    the table looks "RLS protected" when it's actually disabled.
+- **SARIF v2.1.0 output**. `pgrls lint --format sarif` emits a SARIF
+  document GitHub Code Scanning (and similar aggregators) consume
+  directly: one `run`, deduped `tool.driver.rules[]` with name +
+  shortDescription + helpUri pointing at the AGENTS.md anchor, and
+  one `result` per violation locating the finding via
+  `logicalLocations[0].fullyQualifiedName`. Severity maps as
+  error → "error", warning → "warning", info → "note" (SARIF
+  v2.1.0 has no "info" level).
+
+### Changed
+- README CI integration recipe now uploads SARIF via
+  `github/codeql-action/upload-sarif@v3`, putting findings inline
+  on PRs as code-scanning alerts. JSON remains documented for the
+  `jq` / dashboard / build-artifact use cases.
+- The combined fixture (`tests/fixtures/all_bad.sql`) gained a
+  SEC010 block and acknowledges that its existing SEC002 block has
+  always also been a SEC009 case (RLS enabled, no policies). The
+  `_ALL_RULE_IDS` constant in test files grew SEC009 + SEC010.
+
 ## [0.0.5] - 2026-04-27
 
 ### Added

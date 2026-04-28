@@ -1,8 +1,8 @@
 # pgrls demo
 
 A self-contained walkthrough of every rule pgrls ships, plus the
-partition-aware paths and the JSON output contract. 72 use cases in
-one fixture.
+partition-aware paths and the JSON / SARIF output contracts. 75 use
+cases in one fixture.
 
 ## Layout
 
@@ -12,7 +12,7 @@ demo/
 ├── pgrls.toml           # demo config (allowlists app.countries)
 ├── README.md            # this file
 ├── run.sh               # bring up DB + apply fixture + run pgrls
-├── setup.sql            # the 72-use-case fixture
+├── setup.sql            # the 75-use-case fixture
 └── test_demo.py         # pytest assertions per use case
 ```
 
@@ -92,6 +92,9 @@ demo/
 | 70 | Every JSON `rule_id` is in the shipping catalog | (catalog) | catches accidental rule typos before they reach a consumer |
 | 71 | JSON empty case via `[lint].disable = [...]` | (CI contract) | `violations: []`, all-zero summary — pin for downstream parsers |
 | 72 | JSON allowlist diff (default → allowlisted) | (CI contract) | summary errors drop by exactly the allowlisted policy count |
+| 73 | RLS enabled, no policies defined | SEC009 | fires (silent deny-all that looks RLS-protected) |
+| 74 | `USING (false)` deny-all anti-pattern | SEC010 + SEC005 | fires (deny-via-policy is misleading; REVOKE is the right primitive) |
+| 75 | `--format sarif` end-to-end shape | (CI contract) | top-level $schema, single run, rule descriptors deduped, severity → level (info → note), `fullyQualifiedName` per result |
 
 ## Running
 
@@ -129,12 +132,12 @@ pytest demo/test_demo.py -v
 ```
 
 Spins up an isolated Postgres via `testcontainers` (no port
-collisions), applies `setup.sql`, and runs 74 assertions — one per
+collisions), applies `setup.sql`, and runs 77 assertions — one per
 use case plus configuration-driven scenarios that exercise per-test
 `--config` overrides (allowlist, disable, custom `auth_functions`,
-multi-schema, fail_on, format) and the JSON output contract. Each
-test is named `test_uc<NN>_<what_it_does>` for top-to-bottom
-readability.
+multi-schema, fail_on, format) and the JSON / SARIF output
+contracts. Each test is named `test_uc<NN>_<what_it_does>` for
+top-to-bottom readability.
 
 To run the tests against a long-running DB you started with `run.sh`:
 
