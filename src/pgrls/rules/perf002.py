@@ -38,7 +38,7 @@ from typing import Any
 
 from pgrls.ast_utils import find_func_calls
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 _DEFAULT_VOLATILE_FUNCTIONS: tuple[str, ...] = (
     "random",
@@ -72,9 +72,9 @@ def _parse_volatile_functions(options: dict[str, Any]) -> set[str]:
 
 
 class PERF002:
-    id = "PERF002"
-    severity = "warning"
-    title = "Policy expression uses a VOLATILE function"
+    id: str = "PERF002"
+    severity: Severity = "warning"
+    title: str = "Policy expression uses a VOLATILE function"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

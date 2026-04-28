@@ -32,6 +32,7 @@ bare for readability.
 """
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from pglast.ast import FuncCall, Node, ResTarget, SelectStmt, String, SubLink
@@ -184,8 +185,21 @@ class PERF001Fixer:
                 if policy_id in skip:
                     continue
 
+                # `_wrap_unwrapped_calls` mutates pglast Node
+                # fields in place (setattr via setitem on tuple-
+                # of-children parents). Policy is a frozen
+                # dataclass but `frozen=True` does NOT freeze the
+                # AST node graph it holds. Without the deepcopy
+                # here, the fixer would visibly alter
+                # `policy.using_ast` for any rule that re-walks
+                # the Schema after `pgrls fix` runs (snapshot
+                # tests, programmatic API, future
+                # `pgrls fix && pgrls lint` chain). The
+                # invariant is "fixer is read-only over Schema";
+                # honor it by working on a copy.
+                ast_copy = copy.deepcopy(policy.using_ast)
                 new_using_ast, changed = _wrap_unwrapped_calls(
-                    policy.using_ast, names
+                    ast_copy, names
                 )
                 if not changed:
                     continue

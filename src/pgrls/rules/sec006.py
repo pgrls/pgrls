@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Policy, Schema, Table
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 _WRITE_COMMANDS = {"INSERT", "UPDATE", "ALL"}
@@ -43,9 +43,9 @@ def _parse_allowlist(options: dict[str, Any]) -> set[str]:
 
 
 class SEC006:
-    id = "SEC006"
-    severity = "error"
-    title = "Write-side policy missing WITH CHECK"
+    id: str = "SEC006"
+    severity: Severity = "error"
+    title: str = "Write-side policy missing WITH CHECK"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

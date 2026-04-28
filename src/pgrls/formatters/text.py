@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from pgrls.violations import Severity, Violation
+from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
     "error": "ERROR",
@@ -26,8 +26,8 @@ def format_text(violations: list[Violation]) -> str:
 
     counts: Counter[Severity] = Counter(v.severity for v in violations)
     parts: list[str] = []
-    for sev in ("error", "warning", "info"):
-        n = counts.get(sev, 0)  # type: ignore[arg-type]
+    for sev in ALL_SEVERITIES:
+        n = counts.get(sev, 0)
         if n:
             parts.append(f"{n} {sev}{'s' if n != 1 else ''}")
     summary = ", ".join(parts) or "0 issues"

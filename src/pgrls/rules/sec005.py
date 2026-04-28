@@ -21,7 +21,7 @@ from typing import Any
 
 from pgrls.ast_utils import extract_column_refs
 from pgrls.model import Schema, Table
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
@@ -49,9 +49,9 @@ def _is_own_column_ref(ref: tuple[str, ...], table: Table) -> bool:
 
 
 class SEC005:
-    id = "SEC005"
-    severity = "warning"
-    title = "Policy expression does not reference any column of the table"
+    id: str = "SEC005"
+    severity: Severity = "warning"
+    title: str = "Policy expression does not reference any column of the table"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

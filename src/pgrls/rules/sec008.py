@@ -15,7 +15,7 @@ from typing import Any
 from pglast.ast import A_Const, Boolean
 
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
@@ -37,9 +37,9 @@ def _is_literal_true(node: Any) -> bool:
 
 
 class SEC008:
-    id = "SEC008"
-    severity = "warning"
-    title = "Policy USING clause is constant true"
+    id: str = "SEC008"
+    severity: Severity = "warning"
+    title: str = "Policy USING clause is constant true"
 
     def check(
         self, schema: Schema, options: dict[str, Any]

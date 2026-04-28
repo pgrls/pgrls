@@ -61,8 +61,8 @@ def format_json(violations: list[Violation]) -> str:
 def _summary(violations: list[Violation]) -> dict[str, int]:
     counts: Counter[Severity] = Counter(v.severity for v in violations)
     return {
-        "errors": counts.get("error", 0),  # type: ignore[arg-type]
-        "warnings": counts.get("warning", 0),  # type: ignore[arg-type]
-        "infos": counts.get("info", 0),  # type: ignore[arg-type]
+        "errors": counts.get("error", 0),
+        "warnings": counts.get("warning", 0),
+        "infos": counts.get("info", 0),
         "total": len(violations),
     }

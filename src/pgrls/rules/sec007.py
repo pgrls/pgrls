@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema
-from pgrls.violations import Violation
+from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
@@ -26,9 +26,9 @@ def _parse_allowlist(options: dict[str, Any]) -> set[str]:
 
 
 class SEC007:
-    id = "SEC007"
-    severity = "info"
-    title = "All policies on table are permissive"
+    id: str = "SEC007"
+    severity: Severity = "info"
+    title: str = "All policies on table are permissive"
 
     def check(
         self, schema: Schema, options: dict[str, Any]
