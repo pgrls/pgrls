@@ -10,6 +10,7 @@ from collections.abc import Callable, Generator
 
 import psycopg
 import pytest
+from psycopg import sql
 from testcontainers.postgres import PostgresContainer
 
 
@@ -32,7 +33,15 @@ def pg_conn(pg_url: str) -> Generator[psycopg.Connection, None, None]:
                 """
             )
             for (schema_name,) in cur.fetchall():
-                cur.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
+                # Use psycopg.sql.Identifier to compose DDL safely.
+                # Today the names come from information_schema (DB-
+                # controlled), but f-stringing identifiers into DDL
+                # is bad discipline regardless.
+                cur.execute(
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                        sql.Identifier(schema_name)
+                    )
+                )
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
             cur.execute("CREATE SCHEMA public")
             cur.execute("GRANT ALL ON SCHEMA public TO postgres")
