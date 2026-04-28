@@ -39,7 +39,13 @@ class SEC006:
             for policy in table.policies:
                 if policy.command not in _WRITE_COMMANDS:
                     continue
-                if policy.with_check_sql is not None:
+                # Truthy check (not just `is not None`) so a hand-
+                # built or snapshot-loaded Policy with
+                # `with_check_sql=""` doesn't silently slip past.
+                # Postgres's `pg_get_expr` never returns "" for a
+                # real WITH CHECK clause, but defensive check costs
+                # nothing.
+                if policy.with_check_sql:
                     continue
                 policy_id = (
                     f"{table.schema}.{table.name}.{policy.name}"

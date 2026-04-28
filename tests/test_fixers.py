@@ -537,3 +537,9 @@ def test_perf001_fix_sublink_wraps_do_not_alias_each_other() -> None:
     # functions intact — proves the SubLinks are independent.
     assert "(SELECT auth.uid())" in sql
     assert "(SELECT auth.role())" in sql
+
+
+def test_quote_ident_rejects_empty_string() -> None:
+    from pgrls.fixers._idents import quote_ident
+    with pytest.raises(ValueError, match="empty"):
+        quote_ident("")
