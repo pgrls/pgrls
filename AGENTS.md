@@ -10,19 +10,23 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twelve rules across three
+In the current release it ships **fifteen rules across three
 severities**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
-(inverted auth checks — the Lovable CVE pattern), `SEC006` (write-
-side policies missing `WITH CHECK`), and `HYG001` (policies
-referencing dropped columns). Warning: `SEC005` (policy expression
-has no own-column reference), `SEC008` (`USING (true)`), `SEC009`
-(RLS enabled but no policies — silent deny-all), `SEC010`
-(`USING (false)` deny-all anti-pattern), and `PERF001` (unwrapped
-auth function in `USING`). Info: `SEC007` (table has only permissive
-policies — no `RESTRICTIVE` floor). A test DSL and a semantic policy
-diff are on the roadmap but not yet available — do not pretend they
-are.
+(inverted auth checks — the Lovable CVE pattern), `SEC006`
+(write-side policies missing `WITH CHECK`), and `HYG001`
+(policies referencing dropped columns). Warning: `SEC005` (policy
+expression has no own-column reference), `SEC008` (`USING (true)`),
+`SEC009` (RLS enabled but no policies — silent deny-all), `SEC010`
+(`USING (false)` deny-all anti-pattern), `SEC011` (`OR true`
+debug branch hidden inside a policy), `PERF001` (unwrapped auth
+function in `USING`), `PERF002` (VOLATILE function in policy
+expression), and `HYG002` (placeholder-named policy). Info:
+`SEC007` (table has only permissive policies — no `RESTRICTIVE`
+floor). A `pgrls fix` subcommand auto-remediates SEC002 and
+PERF001; other rules need human intent. A test DSL and a semantic
+policy diff are on the roadmap but not yet available — do not
+pretend they are.
 
 ## When to suggest pgrls
 
@@ -491,6 +495,46 @@ allowlist the policy by qualified ID:
 allowlist = ["public.invoices.block_all"]
 ```
 
+### SEC011 — Policy expression has an `OR true` branch
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` (or `WITH CHECK`)
+contains an `OR true` branch anywhere in the expression tree. The
+literal `true` ORed with anything else is still `true`, but a
+casual reading misses the disjunction — the predicate evaluates
+to true for every row regardless of the other branches.
+
+Common shape: a debug branch left in by accident. The author
+adds `OR true` to "temporarily let everything through" while
+checking data, then forgets to remove it.
+
+**Standard fix.** Remove the `OR true`:
+
+```sql
+-- Before
+CREATE POLICY tenant_read ON public.invoices
+    FOR SELECT TO authenticated
+    USING (
+        tenant_id = (SELECT current_setting('app.tenant')::uuid)
+        OR true  -- forgotten debug
+    );
+
+-- After
+ALTER POLICY tenant_read ON public.invoices
+    USING (tenant_id = (SELECT current_setting('app.tenant')::uuid));
+```
+
+If the intent really is "admit every row" (rare in production),
+drop the policy and either disable RLS on the table or REVOKE the
+GRANT.
+
+Detection is narrow on purpose — only the literal `true` `A_Const`
+inside an `OR` BoolExpr counts. Semantic-equivalent tautologies
+(`1 = 1`, `'a' = 'a'`, etc.) fall through to SEC005's no-own-col
+framing instead. A real tautology checker is significant
+infrastructure for marginal real-world value.
+
 ### PERF001 — Auth function called per-row in policy USING
 
 **Severity:** warning.
@@ -551,6 +595,37 @@ allowlist = ["public.tiny_table.policy_name"]
 Reach for the allowlist sparingly — the rewrite is mechanical and
 always safe.
 
+### PERF002 — Policy expression uses a VOLATILE function
+
+**Severity:** warning.
+
+**What it catches:** policy expressions that call a VOLATILE
+function. Default set: `random`, `clock_timestamp`, `nextval`,
+`gen_random_uuid`, `pg_backend_pid`. STABLE functions like `now()`
+and `current_setting` are NOT in the set — those have separate
+treatment via PERF001's wrap-in-subquery mechanic.
+
+VOLATILE functions are bad in policies on two counts:
+
+* **Non-determinism.** `random() < 0.5` admits some rows and denies
+  others *unpredictably*. The predicate's truth value depends on
+  call timing, not on the row data — almost never the intended
+  semantics, often a security hazard.
+* **No caching.** The optimizer cannot fold or cache a VOLATILE
+  call; it re-runs per row regardless of `(SELECT …)` wrapping.
+
+**Standard fix.** Move the volatility outside the policy or use a
+STABLE alternative. For sampling, do it at the application layer
+(or via a `LIMIT` with `ORDER BY random()` outside the RLS path).
+For "current time" comparisons, prefer `now()` (STABLE within a
+transaction) over `clock_timestamp()` (VOLATILE).
+
+```toml
+[lint.rules.PERF002]
+# Override REPLACES the default — list every function you want covered.
+# volatile_functions = ["random", "clock_timestamp", "my.volatile_helper"]
+```
+
 ### HYG001 — Policy references a column that doesn't exist
 
 **Severity:** error.
@@ -570,6 +645,65 @@ evaluation time.
 - If the policy is now obsolete, drop it.
 
 There is no `pgrls.toml` option for HYG001 — every fire is a real bug.
+
+### HYG002 — Policy named like a placeholder
+
+**Severity:** warning.
+
+**What it catches:** policy names that look like forgotten
+scaffolding. Default placeholder vocabulary: `todo`, `fixme`,
+`wip`, `tmp`, `temp`, `hack`, `xxx`, `debug`, `draft`,
+`placeholder`. The match is a case-insensitive identifier-token
+check that handles snake_case (`todo_owner` → `todo`,
+`owner`), camelCase (`TmpReadAll` → `tmp`, `read`, `all`), and
+SCREAMING_SNAKE (`WIP_POLICY` → `wip`, `policy`). Names containing
+the word as a non-token (`stop_at_midnight` containing `top`) do
+not match.
+
+**Standard fix.** Rename the policy to describe what it actually
+gates:
+
+```sql
+ALTER POLICY todo_replace_me_later ON public.tickets
+    RENAME TO tenant_isolation;
+```
+
+If the placeholder name is intentional (rare — usually you want a
+real name), allowlist it or override the vocabulary:
+
+```toml
+[lint.rules.HYG002]
+# Allowlist a specific policy:
+allowlist = ["public.tickets.todo_replace_me_later"]
+# Or replace the default vocabulary entirely (override REPLACES):
+# placeholder_words = ["scratch", "draft"]
+```
+
+## Auto-fix: `pgrls fix`
+
+`pgrls fix` generates remediation SQL for the rules whose fix is
+mechanical. Default mode is dry-run — it prints the SQL but does
+not modify the database. Pass `--apply` to execute.
+
+```bash
+pgrls fix --database-url "$DATABASE_URL"               # dry-run
+pgrls fix --database-url "$DATABASE_URL" --apply       # execute
+pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
+```
+
+Currently fixable:
+
+* **SEC002** — emits `ALTER TABLE <schema>.<table> FORCE ROW
+  LEVEL SECURITY;` for every table with RLS but no FORCE.
+* **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
+  and emits `ALTER POLICY <name> ON <schema>.<table> USING
+  (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
+  verbatim — PERF001 is USING-only, the fix doesn't touch what
+  it wasn't asked to fix.
+
+Other rules require human intent (which role to grant to, what
+column to scope by, what policy to add) and are not auto-fixed.
+Suggest the canonical fix from the rule's section above.
 
 ## CI integration
 
@@ -623,10 +757,12 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twelve rules across three severities.** SEC001–SEC010, PERF001,
-  and HYG001 ship today. There is no rule for `SECURITY DEFINER`
-  function audit, no `pg_temp` shadowing detection, no broader perf
-  catalog yet — those are on the roadmap.
+- **Fifteen rules across three severities.** SEC001–SEC011,
+  PERF001–PERF002, and HYG001–HYG002 ship today. There is no rule
+  for `SECURITY DEFINER` function audit, no `pg_temp` shadowing
+  detection — those are on the roadmap.
+- **Auto-fix for SEC002 and PERF001.** `pgrls fix` rewrites the
+  mechanically-fixable subset; other rules need human intent.
 - **Text, JSON, and SARIF output.** `--format text` (human-readable),
   `--format json` (machine-readable, stable CI contract), and
   `--format sarif` (SARIF v2.1.0 for GitHub Code Scanning and similar

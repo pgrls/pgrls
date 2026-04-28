@@ -1,8 +1,8 @@
 # pgrls demo
 
 A self-contained walkthrough of every rule pgrls ships, plus the
-partition-aware paths and the JSON / SARIF output contracts. 75 use
-cases in one fixture.
+partition-aware paths, the JSON / SARIF output contracts, and the
+`pgrls fix` auto-remediation flow. 79 use cases.
 
 ## Layout
 
@@ -114,6 +114,10 @@ numeric order).
 | 73 | RLS enabled, no policies defined | SEC009 | fires (silent deny-all that looks RLS-protected) |
 | 74 | `USING (false)` deny-all anti-pattern | SEC010 + SEC005 | fires (deny-via-policy is misleading; REVOKE is the right primitive) |
 | 75 | `--format sarif` end-to-end shape | (CI contract) | top-level $schema, single run, rule descriptors deduped, severity → level (info → note), `fullyQualifiedName` per result |
+| 76 | `OR true` debug branch buried in policy | SEC011 | fires |
+| 77 | Policy named `todo_replace_me_later` | HYG002 | fires (identifier tokenizer matches `todo`) |
+| 78 | `random()` in USING | PERF002 + SEC005 | fires |
+| 79 | `pgrls fix` end-to-end against the demo DB | (CLI behavior) | dry-run prints SEC002 ALTER TABLE + PERF001 ALTER POLICY; --rule SEC002 filters PERF001 out |
 
 ## Running
 

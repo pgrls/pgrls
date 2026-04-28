@@ -10,6 +10,48 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-04-27
+
+### Added
+- **Three new rules**:
+  - `SEC011` (warning) — policy expression has an `OR true`
+    branch. Common shape of a leftover debug bypass. Detection
+    is narrow on purpose — only the literal `true` `A_Const`
+    inside an `OR` BoolExpr counts.
+  - `PERF002` (warning) — policy expression uses a VOLATILE
+    function. Default set: `random`, `clock_timestamp`,
+    `nextval`, `gen_random_uuid`, `pg_backend_pid`. Bad on two
+    counts: non-determinism (`random() < 0.5` admits/denies rows
+    unpredictably) and per-row evaluation cost. STABLE
+    alternatives like `now()` are NOT in this set; PERF001
+    handles them.
+  - `HYG002` (warning) — policy named like a placeholder (`todo`,
+    `fixme`, `wip`, `tmp`, `temp`, `hack`, `xxx`, `debug`,
+    `draft`, `placeholder`). Identifier tokenizer handles
+    snake_case, camelCase, and SCREAMING_SNAKE so `todo_owner`,
+    `TmpReadAll`, `WIP_POLICY` all match while `stop_at_midnight`
+    does not.
+- **`pgrls fix` subcommand** — auto-remediates SEC002 and PERF001.
+  SEC002 emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`. PERF001
+  walks the policy USING via pglast, replaces unwrapped auth
+  calls with `(SELECT …)` SubLinks, and emits an `ALTER POLICY
+  … USING (…) [WITH CHECK (…)];` statement. WITH CHECK is
+  preserved verbatim. Default mode is dry-run; `--apply` executes.
+  `--rule SEC002` / `--rule PERF001` filter. Other rules
+  (SEC003 — which role? SEC005 — which column? SEC009 — what
+  policy?) require human intent and are not auto-fixed.
+
+### Changed
+- **Demo restructured into per-case folders.** Each use case now
+  lives at `demo/cases/NN-slug/` with `setup.sql` + `test_uc<NN>.py`
+  side by side — open one folder to read the SQL fixture and the
+  test assertions together. Shared schema setup (auth schema +
+  `auth.uid` / `auth.role` / `auth.jwt` stubs) lives at
+  `demo/cases/_shared.sql`. Conftest exposes helpers (`lint`,
+  `lint_json`, `base_config`, `all_rule_ids`, `pgrls_toml`) as
+  fixtures so each test declares precisely what it needs in its
+  signature. 79 cases / 83 tests.
+
 ## [0.0.6] - 2026-04-27
 
 ### Added
