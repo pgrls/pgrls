@@ -79,6 +79,13 @@ def _build_config(raw: dict[str, Any]) -> Config:
         database_url = None
     elif isinstance(url_raw, str):
         database_url = _interpolate_env(url_raw)
+        if not database_url:
+            raise ConfigError(
+                "[database].url is empty after env-var interpolation. "
+                "This usually means a referenced env var is set to "
+                "the empty string. Set the variable to a real "
+                "connection string or remove the [database].url key."
+            )
     else:
         raise ConfigError(
             f"[database].url must be a string, got {type(url_raw).__name__}"
@@ -117,7 +124,16 @@ def _build_config(raw: dict[str, Any]) -> Config:
 
 
 def _interpolate_env(value: str) -> str:
-    """Replace `$VAR` and `${VAR}` with environment values. Missing vars raise."""
+    """Replace `$VAR` and `${VAR}` with environment values.
+
+    Missing vars raise. Use `$$` to insert a literal `$` (necessary
+    when a Postgres password legitimately contains `$` next to a
+    letter, e.g. `pa$$word`).
+    """
+    # First step: protect literal-$ escapes by substituting a
+    # placeholder that the env-var pattern can't match.
+    _PLACEHOLDER = "\x00DOLLAR\x00"
+    value = value.replace("$$", _PLACEHOLDER)
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1) or match.group(2)
@@ -125,4 +141,5 @@ def _interpolate_env(value: str) -> str:
             raise ConfigError(f"Environment variable {name!r} is not set")
         return os.environ[name]
 
-    return _ENV_PATTERN.sub(replace, value)
+    out = _ENV_PATTERN.sub(replace, value)
+    return out.replace(_PLACEHOLDER, "$")
