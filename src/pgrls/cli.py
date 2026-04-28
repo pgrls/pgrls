@@ -66,7 +66,7 @@ def lint(
     try:
         config = load_config(config_path)
     except ConfigError as exc:
-        raise click.ClickException(str(exc))
+        raise click.ClickException(str(exc)) from exc
 
     effective = _merge_overrides(
         config,
@@ -84,14 +84,14 @@ def lint(
         with psycopg.connect(effective.database_url) as conn:
             schema = introspect(conn, schemas=effective.schemas)
     except psycopg.Error as exc:
-        raise click.ClickException(f"Database error: {exc}")
+        raise click.ClickException(f"Database error: {exc}") from exc
     except ValueError as exc:
-        raise click.ClickException(str(exc))
+        raise click.ClickException(str(exc)) from exc
 
     try:
         violations = _run_rules(schema, config=effective)
     except (TypeError, ValueError) as exc:
-        raise click.ClickException(str(exc))
+        raise click.ClickException(str(exc)) from exc
 
     click.echo(format_violations(violations, format=output_format), nl=False)
 
@@ -207,7 +207,7 @@ def fix(
     try:
         config = load_config(config_path)
     except ConfigError as exc:
-        raise click.ClickException(str(exc))
+        raise click.ClickException(str(exc)) from exc
 
     # Validate `--rule` early — a typo silently producing zero
     # fixes is hard to debug. The "no auto-fixable" message
@@ -244,7 +244,7 @@ def fix(
                     rule_filter=set(rules) if rules else None,
                 )
             except (TypeError, ValueError) as exc:
-                raise click.ClickException(str(exc))
+                raise click.ClickException(str(exc)) from exc
 
             if not fixes:
                 click.echo(
@@ -304,6 +304,6 @@ def fix(
                     err=True,
                 )
     except psycopg.Error as exc:
-        raise click.ClickException(f"Database error: {exc}")
+        raise click.ClickException(f"Database error: {exc}") from exc
     except ValueError as exc:
-        raise click.ClickException(str(exc))
+        raise click.ClickException(str(exc)) from exc
