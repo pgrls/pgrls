@@ -10,7 +10,7 @@ Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 pip install pgrls
 ```
 
-Requires Python 3.11+ and Postgres 10+ (PG 12+ recommended; the demo's partition / generated-column fixtures need 12+, and uc36's `pg_read_all_data` predefined role needs 14+).
+Requires Python 3.11+ and Postgres 10+. pgrls is tested in CI against PostgreSQL 10–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix). The demo suite uses some features that require PG 12+ (declarative partitions, generated columns) and PG 14+ (uc36's `pg_read_all_data` predefined role) — but `pgrls lint` and `pgrls fix` themselves work on PG10 and up.
 
 ## Usage
 
@@ -75,7 +75,11 @@ The JSON shape is the public CI contract — top-level keys, per-violation keys,
 
 SARIF (`--format sarif`) emits a SARIF v2.1.0 document. GitHub Code Scanning, Azure DevOps, and other static-analysis aggregators consume it directly — see the GitHub Actions recipe below for the upload step that puts findings inline on PRs.
 
-Exit code is `1` when any violation meets or exceeds `fail_on` (default `warning`).
+Exit codes follow the standard linter convention:
+
+- `0` — clean (or findings below `fail_on`)
+- `1` — findings met or exceeded `fail_on` (default `warning`); your schema has an RLS issue
+- `2` — `pgrls` itself failed to run (bad config, DB unreachable, fixer SQL rolled back, etc.). Distinct from `1` so CI alerts can route "schema bug" differently from "tool error."
 
 ### Auto-remediation: `pgrls fix`
 
@@ -117,21 +121,21 @@ allowlist = ["countries", "currencies"]
 
 | ID | Severity | Catches |
 |---|---|---|
-| SEC001 | error | Tables in scanned schemas with RLS disabled |
-| SEC002 | error | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
-| SEC003 | error | Permissive policies granted to PUBLIC |
-| SEC004 | error | Inverted auth check (Lovable CVE pattern) in USING |
-| SEC005 | warning | Policy expression has no own-column reference |
-| SEC006 | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
-| SEC007 | info | All policies on a table are permissive (no RESTRICTIVE floor) |
-| SEC008 | warning | Policy USING clause is constant `true` |
-| SEC009 | warning | RLS enabled but no policies defined (silent deny-all) |
-| SEC010 | warning | Policy USING clause is constant `false` (deny-all anti-pattern) |
-| SEC011 | warning | Policy expression has an `OR true` branch (debug bypass left in) |
-| PERF001 | warning | Auth function called per-row in policy USING (unwrapped) |
-| PERF002 | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
-| HYG001 | error | Policies referencing columns that don't exist on the table |
-| HYG002 | warning | Policy named like a placeholder (`todo`, `fixme`, `wip`, `tmp`, …) |
+| [SEC001](AGENTS.md#rule-sec001) | error | Tables in scanned schemas with RLS disabled |
+| [SEC002](AGENTS.md#rule-sec002) | error | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
+| [SEC003](AGENTS.md#rule-sec003) | error | Permissive policies granted to PUBLIC |
+| [SEC004](AGENTS.md#rule-sec004) | error | Inverted auth check (Lovable CVE pattern) in USING |
+| [SEC005](AGENTS.md#rule-sec005) | warning | Policy expression has no own-column reference |
+| [SEC006](AGENTS.md#rule-sec006) | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
+| [SEC007](AGENTS.md#rule-sec007) | info | All policies on a table are permissive (no RESTRICTIVE floor) |
+| [SEC008](AGENTS.md#rule-sec008) | warning | Policy USING clause is constant `true` |
+| [SEC009](AGENTS.md#rule-sec009) | warning | RLS enabled but no policies defined (silent deny-all) |
+| [SEC010](AGENTS.md#rule-sec010) | warning | Policy `USING`/`WITH CHECK` clause is constant `false` (deny-all anti-pattern) |
+| [SEC011](AGENTS.md#rule-sec011) | warning | Policy expression has an `OR true` branch (debug bypass left in) |
+| [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
+| [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
+| [HYG001](AGENTS.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
+| [HYG002](AGENTS.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
