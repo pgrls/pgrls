@@ -177,8 +177,16 @@ class PERF001Fixer:
                     f"ON {quote_qualified(table.schema, table.name)}\n"
                     f"    USING ({new_using_sql})"
                 )
-                if policy.with_check_sql is not None:
-                    stmt += f"\n    WITH CHECK ({policy.with_check_sql})"
+                if policy.with_check_ast is not None:
+                    # Round-trip WITH CHECK through RawStream too so
+                    # the emission uses pglast's escaping consistently
+                    # — symmetric with USING. A future change that
+                    # sources `with_check_sql` from somewhere other
+                    # than `pg_get_expr` (config override, snapshot
+                    # file, hand-edited fixture) doesn't bypass the
+                    # round-trip and become an injection vector.
+                    new_with_check_sql = RawStream()(policy.with_check_ast)
+                    stmt += f"\n    WITH CHECK ({new_with_check_sql})"
                 stmt += ";"
 
                 out.append(

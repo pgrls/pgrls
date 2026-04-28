@@ -26,7 +26,19 @@ def quote_ident(name: str) -> str:
 
     Doubled quotes inside the name are escaped (`he"llo` →
     `"he""llo"`), matching Postgres's standard escaping rule.
+
+    Rejects null bytes and embedded newlines/carriage returns
+    explicitly. Postgres rejects them at CREATE time so they
+    can't reach this helper from real introspection, but a
+    snapshot or hand-built `Schema` could; failing fast here is
+    clearer than emitting `"a\\x00b"` and getting a confusing
+    parse error from the server.
     """
+    if "\x00" in name or "\n" in name or "\r" in name:
+        raise ValueError(
+            f"identifier contains a null byte or newline; "
+            f"refusing to emit: {name!r}"
+        )
     if _PLAIN_IDENT_RE.match(name):
         return name
     return '"' + name.replace('"', '""') + '"'

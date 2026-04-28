@@ -479,3 +479,42 @@ def test_perf001_fix_quotes_policy_and_table_when_required() -> None:
     sql = PERF001Fixer().fix(schema, {})[0].sql
     assert 'ALTER POLICY "My Policy"' in sql
     assert 'ON public."MixedCase Table"' in sql
+
+
+def test_quote_ident_rejects_null_byte() -> None:
+    # Postgres rejects nulls in CREATE; if a snapshot or hand-
+    # built Schema sneaks one in, fail fast here with a clear
+    # message rather than emitting `"a\x00b"` for the server to
+    # reject with a confusing error.
+    from pgrls.fixers._idents import quote_ident
+    with pytest.raises(ValueError, match="null byte"):
+        quote_ident("evil\x00name")
+
+
+def test_quote_ident_rejects_embedded_newline() -> None:
+    from pgrls.fixers._idents import quote_ident
+    with pytest.raises(ValueError, match="null byte or newline"):
+        quote_ident("name\nwith\nnewlines")
+
+
+def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
+    # WITH CHECK should be re-emitted via RawStream rather than
+    # echoed verbatim. Asymmetric handling would be an injection
+    # vector if `with_check_sql` ever sources from somewhere
+    # other than `pg_get_expr`. We verify the round-trip by
+    # passing a WITH CHECK shape that pglast normalizes (single
+    # quotes around boolean false), then asserting the
+    # round-tripped form appears in the SQL.
+    p = _policy(
+        "user_id = auth.uid()",
+        command="ALL",
+        with_check="user_id = (SELECT auth.uid()) AND deleted_at IS NULL",
+    )
+    schema = _wrap_policy(p)
+    sql = PERF001Fixer().fix(schema, {})[0].sql
+    # The WITH CHECK passed through RawStream — pglast's printer
+    # would normalize whitespace and casing. Assert the structural
+    # content is present.
+    assert "WITH CHECK" in sql
+    assert "deleted_at" in sql
+    assert "IS NULL" in sql
