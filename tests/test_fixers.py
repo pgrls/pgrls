@@ -518,3 +518,22 @@ def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
     assert "WITH CHECK" in sql
     assert "deleted_at" in sql
     assert "IS NULL" in sql
+
+
+def test_perf001_fix_sublink_wraps_do_not_alias_each_other() -> None:
+    # The fixer caches the `(SELECT NULL)` template at module
+    # import to avoid re-parsing per match. Each call returns a
+    # deep-copy so wrapping multiple FuncCalls in one pass
+    # doesn't alias their SubLinks (a shared subselect would
+    # cause the second wrap to overwrite the first's `val`).
+    schema = _wrap_policy(
+        _policy(
+            "user_id = auth.uid() OR user_id = auth.role()::UUID"
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    sql = fixes[0].sql
+    # Both calls should be wrapped with their respective inner
+    # functions intact — proves the SubLinks are independent.
+    assert "(SELECT auth.uid())" in sql
+    assert "(SELECT auth.role())" in sql
