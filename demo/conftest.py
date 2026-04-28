@@ -42,8 +42,11 @@ _ALL_RULE_IDS = (
     "SEC008",
     "SEC009",
     "SEC010",
+    "SEC011",
     "PERF001",
+    "PERF002",
     "HYG001",
+    "HYG002",
 )
 
 _BASE_CONFIG = (
