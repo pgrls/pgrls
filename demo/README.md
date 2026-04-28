@@ -1,7 +1,8 @@
 # pgrls demo
 
-A self-contained walkthrough of every rule pgrls 0.0.4 ships, plus the
-partition-aware paths. 15 use cases in one fixture.
+A self-contained walkthrough of every rule pgrls ships, plus the
+partition-aware paths and the JSON output contract. 72 use cases in
+one fixture.
 
 ## Layout
 
@@ -11,7 +12,7 @@ demo/
 ├── pgrls.toml           # demo config (allowlists app.countries)
 ├── README.md            # this file
 ├── run.sh               # bring up DB + apply fixture + run pgrls
-├── setup.sql            # the 15-use-case fixture
+├── setup.sql            # the 72-use-case fixture
 └── test_demo.py         # pytest assertions per use case
 ```
 
@@ -79,13 +80,18 @@ demo/
 | 58 | `COALESCE(auth.uid(), default)` | PERF001 | fires (find_func_calls walks function args) |
 | 59 | `fail_on = "warning"` | gates (config) | exit code 1 on PERF001 |
 | 60 | `fail_on = "info"` | gates (config) | exit code 1 on SEC007 |
-| 61 | `--format text` (only supported format in 0.0.4) | accept/reject (config) | text accepted; json rejected with clean error |
+| 61 | `--format json` machine-readable output | (config) | parses to a dict with `violations[]` + `summary{}`; sarif still rejects cleanly |
 | 62 | `[lint].disable = ["SEC005", "SEC008"]` | disabled (config) | both rules skipped |
 | 63 | `allowlist = "..."` (string, not list) | error (config) | clean ClickException, no traceback |
 | 64 | `app."MixedCase Table"` quoted identifier | (none) | passes (round-trips through pg_class as plain string) |
 | 65 | SEC001 allowlist by unqualified name | silenced (config) | works for `legacy_orders` (no schema prefix) |
 | 66 | `payload->>'visibility'` JSON access | (none) | passes (HYG001 doesn't confuse JSON keys with column names) |
 | 67 | `BETWEEN now() - INTERVAL ... AND now()` | (none) | passes (extract walks AEXPR_BETWEEN) |
+| 68 | `--format json` end-to-end shape | (CI contract) | top-level keys + per-violation keys + summary keys all match |
+| 69 | JSON `summary` matches `violations[]` body | (invariant) | per-severity counts and total agree |
+| 70 | Every JSON `rule_id` is in the shipping catalog | (catalog) | catches accidental rule typos before they reach a consumer |
+| 71 | JSON empty case via `[lint].disable = [...]` | (CI contract) | `violations: []`, all-zero summary — pin for downstream parsers |
+| 72 | JSON allowlist diff (default → allowlisted) | (CI contract) | summary errors drop by exactly the allowlisted policy count |
 
 ## Running
 
@@ -123,11 +129,12 @@ pytest demo/test_demo.py -v
 ```
 
 Spins up an isolated Postgres via `testcontainers` (no port
-collisions), applies `setup.sql`, and runs 69 assertions — one per
+collisions), applies `setup.sql`, and runs 74 assertions — one per
 use case plus configuration-driven scenarios that exercise per-test
 `--config` overrides (allowlist, disable, custom `auth_functions`,
-multi-schema, fail_on, format). Each test is named
-`test_uc<NN>_<what_it_does>` for top-to-bottom readability.
+multi-schema, fail_on, format) and the JSON output contract. Each
+test is named `test_uc<NN>_<what_it_does>` for top-to-bottom
+readability.
 
 To run the tests against a long-running DB you started with `run.sh`:
 
@@ -173,27 +180,34 @@ helper that drives those.
 
 ## Wiring this into CI
 
-```toml
-# pgrls.toml in your repo
-[database]
-url = "$DATABASE_URL"
-schemas = ["public", "app"]  # adjust
+The repo root [README.md](../README.md#ci-integration) has a full
+GitHub Actions recipe with a Postgres service container and a JSON
+report artifact. Two demo-relevant snippets:
 
+**Block the build on errors only:**
+
+```toml
+# pgrls.toml
 [lint]
 fail_on = "error"
-
-[lint.rules.SEC001]
-allowlist = ["public.countries", "public.currencies"]
 ```
 
-```yaml
-# .github/workflows/lint.yml
-- name: Lint RLS
-  run: pgrls lint --config pgrls.toml
-  env:
-    DATABASE_URL: ${{ secrets.LINT_DATABASE_URL }}
-```
+`fail_on = "error"` blocks on SEC001/2/3/4/6/HYG001. Bump to
+`warning` to also block on SEC005/8/PERF001, or `info` to also block
+on SEC007.
 
-`fail_on = "error"` blocks the build on SEC001/2/3/4/6/HYG001. Bump
-to `warning` to also block on SEC005/8/PERF001, or to `info` to also
-block on SEC007.
+**Extract specific rules from the JSON output via `jq`:**
+
+```bash
+# Count violations per rule:
+pgrls lint --format json | jq '.violations | group_by(.rule_id) |
+    map({rule: .[0].rule_id, count: length})'
+
+# List every SEC001 location:
+pgrls lint --format json | jq '.violations[] |
+    select(.rule_id == "SEC001") | .location'
+
+# Fail the build only if SEC004 or HYG001 fires (overrides fail_on):
+pgrls lint --format json | jq -e '
+    .violations | map(select(.rule_id == "SEC004" or .rule_id == "HYG001")) | length == 0'
+```

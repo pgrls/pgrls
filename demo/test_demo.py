@@ -1025,3 +1025,124 @@ def test_uc67_between_operator_clean(lint_output: str) -> None:
         assert line not in lint_output, (
             f"{rule_id} unexpectedly fired on app.recent_only"
         )
+
+
+# ============================================================
+# Use cases 68-72 — JSON output (new in 0.0.5)
+# ============================================================
+
+def _run_lint_json(
+    db: str,
+    *,
+    config: Path = PGRLS_TOML,
+    extra_args: tuple[str, ...] = (),
+) -> dict:
+    """Run pgrls lint against the demo DB and parse the JSON output."""
+    import json as _json
+
+    text = _run_lint(
+        db, config=config, extra_args=("--format", "json", *extra_args)
+    )
+    return _json.loads(text)
+
+
+def test_uc68_json_top_level_contract_end_to_end(demo_db: str) -> None:
+    # Pin the public CI contract from a real lint run, not just
+    # from the unit tests. CI consumers hard-code these keys.
+    parsed = _run_lint_json(demo_db)
+    assert set(parsed.keys()) == {"violations", "summary"}
+    assert set(parsed["summary"].keys()) == {
+        "errors", "warnings", "infos", "total",
+    }
+    if parsed["violations"]:
+        assert set(parsed["violations"][0].keys()) == {
+            "rule_id", "severity", "title", "message", "location",
+        }
+
+
+def test_uc69_json_summary_matches_violation_body_invariant(
+    demo_db: str,
+) -> None:
+    # `summary.total == len(violations)` and per-severity counts
+    # match the actual violation list. This is the invariant CI
+    # dashboards rely on. A regression that drifts the summary
+    # away from the body fails this loudly.
+    parsed = _run_lint_json(demo_db)
+    violations = parsed["violations"]
+    summary = parsed["summary"]
+
+    assert summary["total"] == len(violations)
+    assert summary["errors"] == sum(
+        1 for v in violations if v["severity"] == "error"
+    )
+    assert summary["warnings"] == sum(
+        1 for v in violations if v["severity"] == "warning"
+    )
+    assert summary["infos"] == sum(
+        1 for v in violations if v["severity"] == "info"
+    )
+
+
+def test_uc70_json_emits_only_known_rule_ids(demo_db: str) -> None:
+    # Every violation's rule_id should be in the shipping catalog.
+    # Catches accidental rule typos or string-formatting bugs that
+    # would emit something unparseable to a downstream consumer.
+    parsed = _run_lint_json(demo_db)
+    rule_ids_in_output = {v["rule_id"] for v in parsed["violations"]}
+    unknown = rule_ids_in_output - set(_ALL_RULE_IDS)
+    assert not unknown, (
+        f"Unknown rule IDs in JSON output: {sorted(unknown)}"
+    )
+
+
+def test_uc71_json_empty_when_every_rule_is_disabled(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # Disable every rule via config. Even with the demo DB's many
+    # violating policies, the output must serialize to an empty
+    # `violations[]` and an all-zero summary — a useful sanity
+    # check for downstream parsers ("does our JSON consumer handle
+    # the empty case?").
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint]\ndisable = ' + repr(list(_ALL_RULE_IDS)) + '\n'
+    )
+    parsed = _run_lint_json(demo_db, config=cfg)
+    assert parsed["violations"] == []
+    assert parsed["summary"] == {
+        "errors": 0, "warnings": 0, "infos": 0, "total": 0,
+    }
+
+
+def test_uc72_json_summary_drops_when_allowlist_silences_a_rule(
+    demo_db: str, tmp_path: Path
+) -> None:
+    # Run twice: default config, then a config that allowlists
+    # `app.public_metadata.metadata_read` (the SEC003 violation
+    # from uc43). The summary `errors` count must drop by exactly
+    # the number of SEC003-on-public_metadata violations the
+    # allowlist silenced (one). Demonstrates the JSON shape's
+    # usefulness for "what changed?" diffs in CI.
+    default = _run_lint_json(demo_db)
+
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(
+        _BASE_CONFIG
+        + '[lint.rules.SEC003]\n'
+        'allowlist = ["app.public_metadata.metadata_read"]\n'
+    )
+    silenced = _run_lint_json(demo_db, config=cfg)
+
+    silenced_violations = {
+        (v["rule_id"], v["location"])
+        for v in default["violations"]
+    } - {
+        (v["rule_id"], v["location"])
+        for v in silenced["violations"]
+    }
+    assert silenced_violations == {
+        ("SEC003", "app.public_metadata.metadata_read"),
+    }
+    assert silenced["summary"]["errors"] == default["summary"]["errors"] - 1
+    assert silenced["summary"]["total"] == default["summary"]["total"] - 1

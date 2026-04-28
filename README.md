@@ -36,10 +36,13 @@ pgrls lint --schemas public,tenant
 Point at a non-default config file, or pick an output format:
 
 ```bash
-pgrls lint --config ./config/pgrls.toml --format text
+pgrls lint --config ./config/pgrls.toml --format text   # human-readable (default)
+pgrls lint --config ./config/pgrls.toml --format json   # machine-readable for CI
 ```
 
 ### Example output
+
+Text (default):
 
 ```
   ERROR  SEC001  public.users
@@ -49,6 +52,25 @@ pgrls lint --config ./config/pgrls.toml --format text
 
 pgrls: 1 error.
 ```
+
+JSON (`--format json`):
+
+```json
+{
+  "violations": [
+    {
+      "rule_id": "SEC001",
+      "severity": "error",
+      "title": "RLS not enabled on table",
+      "message": "Table public.users does not have row-level security enabled. Add ENABLE ROW LEVEL SECURITY or include the table in [lint.rules.SEC001].allowlist if it is a public reference table.",
+      "location": "public.users"
+    }
+  ],
+  "summary": { "errors": 1, "warnings": 0, "infos": 0, "total": 1 }
+}
+```
+
+The JSON shape is the public CI contract — top-level keys, per-violation keys, and summary keys are stable across releases. Pipe through `jq` to filter, count, or transform; ship to a dashboard; upload as a build artifact.
 
 Exit code is `1` when any violation meets or exceeds `fail_on` (default `warning`).
 
