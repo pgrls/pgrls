@@ -29,6 +29,7 @@ import re
 from typing import Any
 
 from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 _DEFAULT_PLACEHOLDER_WORDS: tuple[str, ...] = (
@@ -43,13 +44,7 @@ _DEFAULT_PLACEHOLDER_WORDS: tuple[str, ...] = (
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
-        raise TypeError(
-            "[lint.rules.HYG002].allowlist must be a list of policy IDs "
-            "of the form 'schema.table.policy_name'"
-        )
-    return set(raw)
+    return parse_policy_id_allowlist('HYG002', options)
 
 
 def _parse_placeholder_words(options: dict[str, Any]) -> tuple[str, ...]:

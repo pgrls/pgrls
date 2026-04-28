@@ -408,6 +408,51 @@ def test_introspect_rejects_mixed_reserved_and_real_schemas(
         introspect(pg_conn, schemas=["public", "pg_catalog"])
 
 
+def test_introspect_reserved_schema_message_suggests_user_schemas(
+    pg_conn: psycopg.Connection,
+) -> None:
+    # The rejection message should leave the user one keystroke
+    # from the fix — name `public` (and tenant schemas if they
+    # exist) so a copy-paste from another tool's `pg_catalog`
+    # lands somewhere actionable.
+    try:
+        introspect(pg_conn, schemas=["pg_catalog"])
+    except ValueError as exc:
+        assert "public" in str(exc) or "tenant" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_introspect_unknown_schema_lists_available(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql("CREATE SCHEMA tenant_a; CREATE SCHEMA tenant_b;")
+    try:
+        introspect(pg_conn, schemas=["tenent_a"])  # typo
+    except ValueError as exc:
+        msg = str(exc)
+        # Error names what's missing AND what's available.
+        assert "tenent_a" in msg
+        assert "Available user schemas" in msg
+        assert "tenant_a" in msg
+        assert "tenant_b" in msg
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_introspect_unknown_schema_suggests_close_match(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql("CREATE SCHEMA tenant;")
+    try:
+        introspect(pg_conn, schemas=["tenent"])  # one-letter typo
+    except ValueError as exc:
+        assert "Did you mean" in str(exc)
+        assert "tenant" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_partition_of_emitted_when_parent_outside_introspected_schemas(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

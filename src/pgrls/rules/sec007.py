@@ -12,17 +12,12 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_qualified_table_allowlist
 from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
-        raise TypeError(
-            "[lint.rules.SEC007].allowlist must be a list of table IDs "
-            "of the form 'schema.table'"
-        )
-    return set(raw)
+    return parse_qualified_table_allowlist('SEC007', options)
 
 
 class SEC007:
