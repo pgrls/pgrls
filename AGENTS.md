@@ -264,8 +264,11 @@ fallback for missing auth.
 ```sql
 CREATE POLICY scoped ON public.invoices
     FOR SELECT TO authenticated
-    USING (user_id = auth.uid());
+    USING (user_id = (SELECT auth.uid()));
 ```
+
+(The `(SELECT auth.uid())` wrap is the same one PERF001 recommends —
+keeping it here means the SEC004 fix doesn't itself trigger PERF001.)
 
 If anonymous read access is intentional for a specific table, model it
 explicitly with a separate policy granted to `anon` — don't bake the
