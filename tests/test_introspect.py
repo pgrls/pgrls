@@ -221,8 +221,14 @@ def test_captures_restrictive_policy_permissive_false(
 def test_captures_multi_role_policy(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
+    # Roles are cluster-global; the session-scoped pg_conn fixture
+    # only resets schemas. `DROP ROLE IF EXISTS` first so a re-run
+    # within the same pytest session (e.g. `--count=2`) doesn't
+    # fail with "role already exists".
     apply_sql(
         """
+        DROP ROLE IF EXISTS role_a;
+        DROP ROLE IF EXISTS role_b;
         CREATE ROLE role_a NOLOGIN;
         CREATE ROLE role_b NOLOGIN;
         CREATE TABLE public.t (id INT);

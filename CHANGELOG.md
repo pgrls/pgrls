@@ -26,11 +26,13 @@ breaking changes — they will be called out in this file.
     alternatives like `now()` are NOT in this set; PERF001
     handles them.
   - `HYG002` (warning) — policy named like a placeholder (`todo`,
-    `fixme`, `wip`, `tmp`, `temp`, `hack`, `xxx`, `debug`,
-    `draft`, `placeholder`). Identifier tokenizer handles
-    snake_case, camelCase, and SCREAMING_SNAKE so `todo_owner`,
-    `TmpReadAll`, `WIP_POLICY` all match while `stop_at_midnight`
-    does not.
+    `fixme`, `tmp`, `hack`, `xxx`, `debug`, `placeholder`).
+    Identifier tokenizer handles snake_case, camelCase, and
+    SCREAMING_SNAKE so `todo_owner`, `TmpReadAll`, `TMP_POLICY`
+    all match while `stop_at_midnight` does not. Default
+    vocabulary excludes `temp`, `draft`, `wip` — they collide
+    with real domain words (temperature sensors, CMS draft state,
+    WIP inventory); opt back in via `placeholder_words`.
 - **`pgrls fix` subcommand** — auto-remediates SEC002 and PERF001.
   SEC002 emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`. PERF001
   walks the policy USING via pglast, replaces unwrapped auth

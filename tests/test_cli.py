@@ -699,30 +699,24 @@ def test_lint_handles_partition_cycle_with_clean_error(
     assert "Traceback" not in result.output
 
 
-def test_lint_fires_every_rule_in_combined_fixture(
+def test_lint_fires_every_registered_rule_in_combined_fixture(
     pg_url: str, apply_sql
 ) -> None:
+    # Cross-rule combined fixture — every shipped rule must fire
+    # at least once. Renaming from "every rule" to "every
+    # registered rule" makes the contract explicit: when a new
+    # rule is added to default_registry(), this test fails until
+    # all_bad.sql gets a block that triggers it. Catches the
+    # silent under-coverage Round 23 found (SEC011, PERF002,
+    # HYG002 missing from the previous fixture).
     apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    _assert_rules_fire_exactly(
-        result.output,
-        {
-            "SEC001",
-            "SEC002",
-            "SEC003",
-            "SEC004",
-            "SEC005",
-            "SEC006",
-            "SEC007",
-            "SEC008",
-            "SEC009",
-            "SEC010",
-            "PERF001",
-            "HYG001",
-        },
-    )
+    from pgrls.rules import all_rules
+
+    expected = {r.id for r in all_rules()}
+    _assert_rules_fire_exactly(result.output, expected)
     # Pin each (rule, location) pair to its intended target. Substring
     # plus trailing newline anchors against the output's `RULE  LOC\n`
     # shape (formatters/text.py) so a rule drifting onto the wrong
@@ -740,9 +734,12 @@ def test_lint_fires_every_rule_in_combined_fixture(
         "SEC008  public.allbad_sec003.public_perm\n",
         "SEC009  public.allbad_sec002\n",
         "SEC010  public.allbad_sec010.block_all\n",
+        "SEC011  public.allbad_sec011.or_true_bypass\n",
         "PERF001  public.allbad_sec004.inverted\n",
         "PERF001  public.allbad_sec006.update_no_check\n",
+        "PERF002  public.allbad_perf002.randomized\n",
         "HYG001  public.allbad_hyg001.orphan\n",
+        "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
     ):
         assert rule_loc in result.output, (
             f"{rule_loc!r} missing from output:\n{result.output}"
