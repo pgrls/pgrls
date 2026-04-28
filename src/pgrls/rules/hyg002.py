@@ -1,20 +1,25 @@
 """HYG002 — Policy named like a placeholder.
 
-A policy named `todo`, `fixme`, `wip`, `tmp`, `temp`, `hack`,
-`xxx`, `debug`, `draft`, or `placeholder` is almost always a
-forgotten scaffold from an unfinished migration. The migration
-introduced an RLS policy as a "figure this out later" stub and
-never came back to harden it.
+A policy named `todo`, `fixme`, `tmp`, `hack`, `xxx`, `debug`, or
+`placeholder` is almost always a forgotten scaffold from an
+unfinished migration. The migration introduced an RLS policy as a
+"figure this out later" stub and never came back to harden it.
 
 Detection is a case-insensitive identifier-token match against
 the policy name (handles `snake_case`, `camelCase`, and
-`SCREAMING_SNAKE`). Default vocabulary: `todo`, `fixme`, `wip`,
-`tmp`, `temp`, `hack`, `xxx`, `debug`, `draft`, `placeholder`.
-Override
-with `[lint.rules.HYG002].placeholder_words = [...]` — the override
+`SCREAMING_SNAKE`). Default vocabulary: `todo`, `fixme`, `tmp`,
+`hack`, `xxx`, `debug`, `placeholder`. Override with
+`[lint.rules.HYG002].placeholder_words = [...]` — the override
 REPLACES the default list (consistent with SEC004 / PERF001's
-`auth_functions` shape). Allowlist exact policy IDs that legitimately
-use the words.
+`auth_functions` shape). Allowlist exact policy IDs that
+legitimately use the words.
+
+Default vocabulary deliberately excludes `temp`, `draft`, and
+`wip` — all are real domain words. `temp` collides with
+"temperature" in IoT / sensor schemas; `draft` is a CMS publish
+state; `wip` is an inventory accounting term ("work in process").
+Users who want the broader scaffolding-detection set can opt back
+in via `placeholder_words`.
 
 Severity: warning.
 """
@@ -29,13 +34,10 @@ from pgrls.violations import Violation
 _DEFAULT_PLACEHOLDER_WORDS: tuple[str, ...] = (
     "todo",
     "fixme",
-    "wip",
     "tmp",
-    "temp",
     "hack",
     "xxx",
     "debug",
-    "draft",
     "placeholder",
 )
 

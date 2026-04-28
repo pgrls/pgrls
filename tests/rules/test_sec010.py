@@ -14,6 +14,7 @@ def _policy(
     name: str = "p",
     command: str = "SELECT",
     permissive: bool = True,
+    with_check: str | None = None,
 ) -> Policy:
     return Policy(
         name=name,
@@ -21,9 +22,9 @@ def _policy(
         permissive=permissive,
         roles=("PUBLIC",),
         using_sql=using,
-        with_check_sql=None,
+        with_check_sql=with_check,
         using_ast=parse_expr(using) if using else None,
-        with_check_ast=None,
+        with_check_ast=parse_expr(with_check) if with_check else None,
     )
 
 
@@ -135,3 +136,56 @@ def test_sec010_metadata_present() -> None:
     assert rule.id == "SEC010"
     assert rule.severity == "warning"
     assert rule.title
+
+
+def test_sec010_fires_on_with_check_false_for_insert_policy() -> None:
+    # `WITH CHECK (false)` is the write-side mirror of
+    # `USING (false)`. The author wrote a deny-all-writes policy
+    # — the right primitive is REVOKE INSERT at the GRANT layer,
+    # not a policy that makes the table look RLS-protected.
+    p = _policy(using=None, command="INSERT", with_check="false")
+    schema = _wrap(p)
+    violations = SEC010().check(schema, {})
+    assert len(violations) == 1
+    assert "WITH CHECK" in violations[0].message
+    assert "rejects every write" in violations[0].message
+
+
+def test_sec010_fires_on_with_check_false_when_using_is_real() -> None:
+    # The most damaging case: USING references a real own-column
+    # so SEC005 stays silent. WITH CHECK is `false`, so all writes
+    # die. Without walking with_check_ast, no rule catches this.
+    p = _policy(
+        using="id > 0",
+        command="UPDATE",
+        with_check="false",
+        permissive=False,  # Restrictive UPDATE; common shape.
+    )
+    schema = _wrap(p)
+    violations = SEC010().check(schema, {})
+    assert len(violations) == 1
+    assert "WITH CHECK" in violations[0].message
+
+
+def test_sec010_message_distinguishes_using_vs_with_check() -> None:
+    # USING (false) → "denies every row"; WITH CHECK (false) →
+    # "rejects every write". Two different framings because the
+    # remediation hint differs (REVOKE ALL vs REVOKE INSERT,UPDATE).
+    using_only = _wrap(_policy("false"))
+    check_only = _wrap(
+        _policy(using=None, command="INSERT", with_check="false")
+    )
+    using_msg = SEC010().check(using_only, {})[0].message
+    check_msg = SEC010().check(check_only, {})[0].message
+    assert "denies every row" in using_msg
+    assert "REVOKE ALL" in using_msg
+    assert "rejects every write" in check_msg
+    assert "REVOKE INSERT" in check_msg
+
+
+def test_sec010_silent_on_with_check_true() -> None:
+    # `WITH CHECK (true)` is permissive's no-op — out of SEC010
+    # scope. Mirror of the SEC008/SEC010 split on USING.
+    p = _policy(using=None, command="INSERT", with_check="true")
+    schema = _wrap(p)
+    assert SEC010().check(schema, {}) == []

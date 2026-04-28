@@ -475,15 +475,16 @@ shape as SEC001 and SEC002.
 
 <a id="rule-sec010"></a>
 
-### SEC010 — Policy USING clause is constant false
+### SEC010 — Policy clause is constant false
 
 **Severity:** warning.
 
-**What it catches:** policies whose `USING` clause is a literal
-`false`. Detection mirrors SEC008 — only the AST pattern
-`A_Const(Boolean(false))` matches. Semantic equivalents like
-`NOT true` or `1 = 0` are not detected; like SEC008 the disguised
-cases are usually also SEC005 findings (no own-column reference).
+**What it catches:** policies whose `USING` or `WITH CHECK`
+clause is a literal `false`. Detection mirrors SEC008 — only the
+AST pattern `A_Const(Boolean(false))` matches. Semantic
+equivalents like `NOT true` or `1 = 0` are not detected; like
+SEC008 the disguised cases are usually also SEC005 findings (no
+own-column reference).
 
 `USING (false)` denies every row from the policy. As the only
 policy on a table it produces deny-all (the same effect as SEC009 —
@@ -492,6 +493,11 @@ mechanism: the table looks "RLS protected" because it has a policy,
 but the predicate makes it effectively disabled). As one of several
 policies it's a no-op for permissive combinations and forces
 deny-all for restrictive ones.
+
+`WITH CHECK (false)` is the write-side mirror — every
+INSERT/UPDATE through the policy fails. Same anti-pattern: the
+intent ("nobody can write through this role") belongs at the
+GRANT layer.
 
 **Standard fix.** Express denial at the GRANT layer instead — that
 is the right primitive:
@@ -682,13 +688,19 @@ There is no `pgrls.toml` option for HYG001 — every fire is a real bug.
 
 **What it catches:** policy names that look like forgotten
 scaffolding. Default placeholder vocabulary: `todo`, `fixme`,
-`wip`, `tmp`, `temp`, `hack`, `xxx`, `debug`, `draft`,
-`placeholder`. The match is a case-insensitive identifier-token
-check that handles snake_case (`todo_owner` → `todo`,
-`owner`), camelCase (`TmpReadAll` → `tmp`, `read`, `all`), and
-SCREAMING_SNAKE (`WIP_POLICY` → `wip`, `policy`). Names containing
-the word as a non-token (`stop_at_midnight` containing `top`) do
-not match.
+`tmp`, `hack`, `xxx`, `debug`, `placeholder`. The match is a
+case-insensitive identifier-token check that handles snake_case
+(`todo_owner` → `todo`, `owner`), camelCase (`TmpReadAll` →
+`tmp`, `read`, `all`), and SCREAMING_SNAKE (`TMP_POLICY` →
+`tmp`, `policy`). Names containing the word as a non-token
+(`stop_at_midnight` containing `top`) do not match.
+
+The default vocabulary deliberately excludes `temp`, `draft`,
+and `wip` — all are real domain words. `temp` collides with
+"temperature" in IoT / sensor schemas; `draft` is a standard CMS
+publish state; `wip` is the inventory accounting term ("work in
+process"). Schemas that genuinely use those words as scaffolding
+markers can opt back in via `placeholder_words`.
 
 **Standard fix.** Rename the policy to describe what it actually
 gates:
