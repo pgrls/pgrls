@@ -1493,3 +1493,50 @@ CREATE POLICY recent_window ON app.recent_only
         tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
         AND created_at BETWEEN now() - INTERVAL '30 days' AND now()
     );
+
+
+-- ============================================================
+-- Use case 73: RLS enabled, no policies — SEC009 (new in 0.0.6)
+-- A migration enabled RLS planning to add policies later, then
+-- forgot. The table now silently rejects every query — looks
+-- "RLS protected" but is actually deny-all. SEC009 catches the
+-- forgotten step.
+-- ============================================================
+CREATE TABLE app.deny_all_log (
+    id BIGSERIAL,
+    event TEXT
+);
+ALTER TABLE app.deny_all_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.deny_all_log FORCE ROW LEVEL SECURITY;
+-- No CREATE POLICY here. SEC009 fires.
+
+
+-- ============================================================
+-- Use case 74: USING (false) deny-all anti-pattern — SEC010
+-- (new in 0.0.6)
+-- The policy denies every row by writing the denial as a
+-- predicate. Misleading: the table looks RLS-protected (it has
+-- a policy) but the predicate makes it effectively disabled.
+-- The right primitive is `REVOKE ALL ON TABLE x FROM <role>`.
+-- SEC005 also fires here (no own-column reference) — a
+-- correctly-noisy outcome since the policy is defective on
+-- multiple counts.
+-- ============================================================
+CREATE TABLE app.deny_via_false (
+    id BIGSERIAL,
+    payload TEXT
+);
+ALTER TABLE app.deny_via_false ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.deny_via_false FORCE ROW LEVEL SECURITY;
+CREATE POLICY block_all ON app.deny_via_false
+    AS RESTRICTIVE FOR SELECT TO PUBLIC USING (false);
+
+
+-- ============================================================
+-- Use case 75: SARIF formatter — no new fixture
+-- The companion test runs the demo DB through
+-- `pgrls lint --format sarif` and validates the shape:
+-- top-level $schema, the single run, tool.driver.name='pgrls',
+-- rule descriptors, severity-to-level mapping, and
+-- logicalLocations.fullyQualifiedName for each result.
+-- ============================================================
