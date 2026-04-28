@@ -1,7 +1,13 @@
 """Unit tests for AST helpers. Pure Python, no database."""
 from __future__ import annotations
 
-from pgrls.ast_utils import parse_expr
+from pgrls.ast_utils import (
+    extract_column_refs,
+    find_func_calls,
+    match_is_null,
+    parse_expr,
+    top_level_disjuncts,
+)
 
 
 def test_parse_expr_returns_node_for_valid_expression() -> None:
@@ -22,9 +28,6 @@ def test_parse_expr_returns_none_for_empty_string() -> None:
 
 def test_parse_expr_returns_none_for_none_input() -> None:
     assert parse_expr(None) is None  # type: ignore[arg-type]
-
-
-from pgrls.ast_utils import top_level_disjuncts
 
 
 def test_top_level_disjuncts_splits_or_chain() -> None:
@@ -50,7 +53,6 @@ def test_top_level_disjuncts_returns_singleton_for_leaf() -> None:
     assert disjuncts[0] is node
 
 
-from pgrls.ast_utils import extract_column_refs
 
 
 def test_extract_column_refs_unqualified() -> None:
@@ -94,8 +96,6 @@ def test_extract_column_refs_skips_wildcard_a_star() -> None:
             assert part != "*"
 
 
-from pgrls.ast_utils import find_func_calls
-
 
 def test_find_func_calls_matches_qualified_name() -> None:
     node = parse_expr("auth.uid() = '1'")
@@ -126,8 +126,6 @@ def test_find_func_calls_finds_multiple() -> None:
     matches = find_func_calls(node, {"auth.uid"})
     assert len(matches) == 2
 
-
-from pgrls.ast_utils import match_is_null
 
 
 def test_match_is_null_matches_is_null() -> None:
