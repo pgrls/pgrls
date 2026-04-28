@@ -56,7 +56,10 @@ _BASE_CONFIG = (
 
 
 def _apply_all_setup(url: str) -> None:
-    sqls = [(CASES_DIR / "_shared.sql").read_text()]
+    # Explicit UTF-8 — on Windows, default `read_text()` uses
+    # `locale.getpreferredencoding()` which can be cp1252; a
+    # non-ASCII byte in any fixture would blow up here.
+    sqls = [(CASES_DIR / "_shared.sql").read_text(encoding="utf-8")]
     case_dirs = sorted(
         d
         for d in CASES_DIR.iterdir()
@@ -65,7 +68,7 @@ def _apply_all_setup(url: str) -> None:
     for case_dir in case_dirs:
         case_sql = case_dir / "setup.sql"
         if case_sql.exists():
-            sqls.append(case_sql.read_text())
+            sqls.append(case_sql.read_text(encoding="utf-8"))
     full = "\n".join(sqls)
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:

@@ -1,0 +1,10 @@
+# Force LF endings on shell scripts and SQL fixtures so Windows users
+# with `git config core.autocrlf=true` don't end up with CRLF in
+# files where it matters (the `#!/usr/bin/env bash` shebang in
+# `demo/run.sh` is broken by trailing \r; Postgres is technically
+# tolerant of \r in SQL but the test fixtures are easier to read
+# with one line-ending convention).
+*.sh text eol=lf
+*.sql text eol=lf
+
+# Python source files left to git's default — autocrlf is fine on .py.

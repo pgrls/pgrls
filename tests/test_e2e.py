@@ -20,7 +20,7 @@ def pgrls_bin() -> str:
 def test_subprocess_known_bad_exits_nonzero(
     pg_url: str, apply_sql, pgrls_bin: str
 ) -> None:
-    apply_sql((FIXTURES_DIR / "known_bad.sql").read_text())
+    apply_sql((FIXTURES_DIR / "known_bad.sql").read_text(encoding="utf-8"))
     result = subprocess.run(
         [pgrls_bin, "lint", "--database-url", pg_url],
         capture_output=True,

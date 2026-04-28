@@ -1,11 +1,17 @@
 """Pytest fixtures shared across the suite.
 
-`pg_url` boots a single Postgres testcontainer per test session and yields its
-connection string. `pg_conn` is a per-test psycopg connection that resets schemas
+`pg_url` boots a single Postgres testcontainer per test session and
+yields its connection string. Set `PGRLS_TEST_DATABASE_URL` to skip
+the testcontainer and reuse an existing Postgres (useful on Windows
+or any environment without Docker; the schemas are still reset
+between tests via `pg_conn`).
+
+`pg_conn` is a per-test psycopg connection that resets schemas
 between tests so each test starts from a clean DB.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Generator
 
 import psycopg
@@ -16,7 +22,20 @@ from testcontainers.postgres import PostgresContainer
 
 @pytest.fixture(scope="session")
 def pg_url() -> Generator[str, None, None]:
-    with PostgresContainer("postgres:16-alpine", username="postgres", password="postgres", dbname="postgres") as pg:
+    existing = os.environ.get("PGRLS_TEST_DATABASE_URL")
+    if existing:
+        # Escape hatch for environments without Docker (Windows
+        # sandboxes, CI matrices that already provide a Postgres
+        # service container, etc.). Per-test schema reset still
+        # runs via `pg_conn`.
+        yield existing
+        return
+    with PostgresContainer(
+        "postgres:16-alpine",
+        username="postgres",
+        password="postgres",
+        dbname="postgres",
+    ) as pg:
         yield pg.get_connection_url(driver=None)
 
 
