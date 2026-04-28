@@ -23,6 +23,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from pgrls.model import Schema
 
+__all__ = ["Fix", "Fixer", "default_fixers", "generate_fixes"]
+
 
 @dataclass(frozen=True)
 class Fix:

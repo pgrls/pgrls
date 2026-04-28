@@ -421,3 +421,65 @@ def test_schema_by_qname_is_cached_across_calls() -> None:
     first = schema._by_qname
     second = schema._by_qname
     assert first is second  # pragma: no mutate
+
+
+def test_snapshot_v2_top_level_keys_are_stable_contract() -> None:
+    # Snapshot top-level keys are part of the public surface (any
+    # consumer reading the JSON depends on these names). Pin
+    # `version`, `tables`, `policies` so a quiet refactor that
+    # renames `policies` to `rls_policies` etc. fails this test
+    # rather than slipping past CI.
+    snap = Schema(tables=()).to_snapshot()
+    assert set(snap.keys()) == {"version", "tables", "policies"}
+    assert snap["version"] == 2
+
+
+def test_snapshot_v2_table_entry_keys_are_stable() -> None:
+    table = Table(
+        schema="public",
+        name="t",
+        rls_enabled=True,
+        force_rls=True,
+        policies=(),
+        columns=("id",),
+        partition_of=("public", "parent"),
+    )
+    snap = Schema(tables=(table,)).to_snapshot()
+    assert set(snap["tables"][0].keys()) == {
+        "schema",
+        "name",
+        "rls_enabled",
+        "force_rls",
+        "columns",
+        "partition_of",
+    }
+
+
+def test_snapshot_v2_policy_entry_keys_are_stable() -> None:
+    p = Policy(
+        name="p",
+        command="SELECT",
+        permissive=True,
+        roles=("PUBLIC",),
+        using_sql="true",
+        with_check_sql=None,
+    )
+    table = Table(
+        schema="public",
+        name="t",
+        rls_enabled=True,
+        force_rls=True,
+        policies=(p,),
+    )
+    snap = Schema(tables=(table,)).to_snapshot()
+    assert set(snap["policies"][0].keys()) == {
+        "id",
+        "table_schema",
+        "table_name",
+        "policy_name",
+        "command",
+        "permissive",
+        "roles",
+        "using_sql",
+        "with_check_sql",
+    }
