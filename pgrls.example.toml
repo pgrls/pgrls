@@ -109,9 +109,13 @@ allowlist = []
 # qualified policy IDs.
 allowlist = []
 # Words that mark a policy name as a placeholder. Defaults: todo,
-# fixme, wip, tmp, temp, hack, xxx, debug, draft, placeholder.
-# Match is case-insensitive and respects identifier-token
-# boundaries (snake_case, camelCase, SCREAMING_SNAKE).
-# Setting this to an empty list disables the rule entirely (no
-# placeholder words to match against).
+# fixme, tmp, hack, xxx, debug, placeholder. The default list
+# deliberately excludes `temp`, `draft`, `wip` — they collide
+# with real domain words (temperature sensors, CMS draft state,
+# WIP inventory). Opt back into the broader scaffolding-detection
+# set by listing them explicitly below. Match is case-insensitive
+# and respects identifier-token boundaries (snake_case,
+# camelCase, SCREAMING_SNAKE). Setting this to an empty list
+# disables the rule entirely (no placeholder words to match
+# against). The override REPLACES the default list.
 # placeholder_words = ["todo", "fixme", "scratch"]

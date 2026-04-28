@@ -68,3 +68,33 @@ ALTER TABLE public.allbad_sec010 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.allbad_sec010 FORCE ROW LEVEL SECURITY;
 CREATE POLICY block_all ON public.allbad_sec010
     AS RESTRICTIVE FOR SELECT TO PUBLIC USING (false);
+
+-- SEC011: policy expression has an `OR true` branch. Common shape
+-- of a leftover debug bypass that admits every row regardless of
+-- the rest of the predicate.
+CREATE TABLE public.allbad_sec011 (id INT, owner_id TEXT);
+ALTER TABLE public.allbad_sec011 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec011 FORCE ROW LEVEL SECURITY;
+CREATE POLICY or_true_bypass ON public.allbad_sec011
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (owner_id = 'x' OR true);
+
+-- PERF002: policy expression uses a VOLATILE function. `random()`
+-- in USING re-evaluates per row, producing non-deterministic
+-- visibility. STABLE alternatives (`now()`, `current_setting`)
+-- don't fire — only the volatile set does.
+CREATE TABLE public.allbad_perf002 (id INT, score FLOAT);
+ALTER TABLE public.allbad_perf002 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_perf002 FORCE ROW LEVEL SECURITY;
+CREATE POLICY randomized ON public.allbad_perf002
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (score < random());
+
+-- HYG002: policy named like a placeholder (`todo_*`). Common
+-- shape of a forgotten scaffold from an unfinished migration.
+CREATE TABLE public.allbad_hyg002 (id INT, owner_id TEXT);
+ALTER TABLE public.allbad_hyg002 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_hyg002 FORCE ROW LEVEL SECURITY;
+CREATE POLICY todo_replace_me_later ON public.allbad_hyg002
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (owner_id = 'x');
