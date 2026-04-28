@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+
+jobs:
+  pytest:
+    name: "pytest pg${{ matrix.pg }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor (10) plus every still-supported major. Keep this
+        # in sync with README.md's stated PG floor and with
+        # tests/test_pg_version_floor.py::_README_PG_FLOOR_NUM.
+        pg: ["10", "11", "12", "13", "14", "15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Skip the testcontainer in conftest.py — CI provides
+      # Postgres as a service. Conftest's `pg_conn` still resets
+      # schemas between tests against this connection.
+      PGRLS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -q
+
+      - name: Run demo tests (PG12+ only)
+        if: ${{ matrix.pg != '10' && matrix.pg != '11' }}
+        run: uv run pytest demo/ -q
