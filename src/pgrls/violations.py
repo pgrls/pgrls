@@ -10,6 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, get_args
 
+__all__ = [
+    "ALL_SEVERITIES",
+    "SEVERITY_ORDER",
+    "Severity",
+    "Violation",
+    "coerce_severity",
+    "is_at_or_above",
+]
+
 Severity = Literal["error", "warning", "info"]
 
 # Exhaustive list of valid severities, ordered most-to-least

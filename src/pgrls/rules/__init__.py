@@ -13,6 +13,13 @@ from typing import Any, Protocol, runtime_checkable
 from pgrls.model import Schema
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
+__all__ = [
+    "Rule",
+    "RuleRegistry",
+    "all_rules",
+    "default_registry",
+]
+
 
 @runtime_checkable
 class Rule(Protocol):
