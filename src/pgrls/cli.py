@@ -263,6 +263,18 @@ def fix(
 
             if apply:
                 with conn.cursor() as cur:
+                    # Advisory lock keyed on a stable hash of
+                    # 'pgrls.fix' so two concurrent `pgrls fix
+                    # --apply` runs serialize. Without this, the
+                    # second process would introspect a stale
+                    # snapshot, regenerate fixes against pre-
+                    # mutation policy text, and either undo the
+                    # first process's PERF001 wrap or double-
+                    # wrap it.
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtext('pgrls.fix'))"
+                    )
                     for i, f in enumerate(fixes, start=1):
                         try:
                             cur.execute(f.sql)
