@@ -906,14 +906,16 @@ def test_uc61_format_json_emits_machine_readable_output(
     assert ("SEC001", "app.legacy_orders") in rule_locs
 
     # Unsupported format still rejects cleanly with a list of
-    # supported formats.
+    # supported formats. `markdown` is on the roadmap but not yet
+    # shipping; use it so this test keeps exercising the
+    # unknown-format error path even as more formats land.
     bad = runner.invoke(
         main,
         [
             "lint",
             "--database-url", demo_db,
             "--config", str(PGRLS_TOML),
-            "--format", "sarif",
+            "--format", "markdown",
         ],
         env={"DATABASE_URL": demo_db},
     )
