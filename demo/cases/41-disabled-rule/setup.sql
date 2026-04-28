@@ -1,7 +1,9 @@
 -- ============================================================
--- Use case 41: Disabled rule — SEC007 turned off via --disable
--- The companion test runs `pgrls lint --disable SEC007` and
--- asserts SEC007 doesn't fire on `app.tags` (use case 09)
--- even though it would in the default run.
+-- Use case 41: Disabled rule — SEC007 turned off via [lint].disable
+-- The companion test passes a pgrls.toml with
+-- `[lint].disable = ["SEC007"]` and asserts SEC007 doesn't fire
+-- on `app.tags` (use case 09) even though it would in the
+-- default run. There is no `--disable` CLI flag; rule disabling
+-- lives in the TOML config only.
 -- (No new fixture required — uses tags from uc09.)
 -- ============================================================

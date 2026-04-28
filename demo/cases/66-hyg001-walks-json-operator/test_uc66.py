@@ -1,4 +1,4 @@
-"""Use case 66: HYG001 walks JSON `->>` operator — fires."""
+"""Use case 66: HYG001 walks JSON `->>` operator — clean."""
 from __future__ import annotations
 
 

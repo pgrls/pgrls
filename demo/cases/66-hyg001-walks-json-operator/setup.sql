@@ -1,10 +1,10 @@
 -- ============================================================
--- Use case 66: HYG001 walks JSON `->>` operator — fires
--- `payload->>'gone'` references the outer column `payload`,
--- not a column named "gone". Pin that HYG001's column-ref
--- walk does NOT confuse JSON keys with column names — the
--- only column ref here is `payload`, which exists, so HYG001
--- stays silent.
+-- Use case 66: HYG001 walks JSON `->>` operator — CLEAN
+-- `payload->>'visibility'` references the outer column
+-- `payload`, not a column named "visibility". Pin that
+-- HYG001's column-ref walk does NOT confuse JSON keys with
+-- column names — the only column ref here is `payload`, which
+-- exists, so HYG001 stays silent.
 -- ============================================================
 
 CREATE TABLE app.json_access (
