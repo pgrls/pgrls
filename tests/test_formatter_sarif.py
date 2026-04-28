@@ -143,3 +143,25 @@ def test_sarif_handles_unicode_in_messages() -> None:
     out = format_violations([_v(message=msg)], format="sarif")
     parsed = json.loads(out)
     assert parsed["runs"][0]["results"][0]["message"]["text"] == msg
+
+
+def test_sarif_severity_mapping_exhaustive_contract() -> None:
+    # SARIF v2.1.0 levels: "error" | "warning" | "note" | "none".
+    # pgrls's three severities map as follows; this is the public
+    # contract for any tool that consumes pgrls's SARIF output
+    # (e.g., GitHub Code Scanning treats "note" specifically).
+    # Pin all three so a refactor flipping `info → "none"` fails.
+    cases = [
+        ("error", "error"),
+        ("warning", "warning"),
+        ("info", "note"),
+    ]
+    for severity, expected_sarif_level in cases:
+        out = format_violations(
+            [_v(severity=severity)], format="sarif"
+        )
+        parsed = json.loads(out)
+        assert (
+            parsed["runs"][0]["results"][0]["level"]
+            == expected_sarif_level
+        ), f"{severity} should map to {expected_sarif_level}"
