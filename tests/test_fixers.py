@@ -282,3 +282,127 @@ def test_fix_dataclass_is_frozen() -> None:
     )
     with pytest.raises(Exception):
         f.rule_id = "Y"  # type: ignore[misc]
+
+
+# ============================================================
+# Edge cases — fixer robustness
+# ============================================================
+
+def test_sec002_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Bad config types should fail closed: don't crash, don't
+    # apply mystery fixes. SEC002Fixer's `_is_allowlisted` checks
+    # the type and returns False on a non-list — so bad config
+    # means "nothing is allowlisted", which means the table fires
+    # as expected. Pin the conservative behavior.
+    schema = Schema(tables=(_table(rls=True, force=False),))
+    fixes = SEC002Fixer().fix(schema, {"allowlist": "public.t"})
+    assert len(fixes) == 1
+    assert fixes[0].location == "public.t"
+
+
+def test_perf001_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Same shape: bad allowlist type → conservatively no
+    # exemption applied → fix still emitted.
+    schema = _wrap_policy(_policy("user_id = auth.uid()"))
+    fixes = PERF001Fixer().fix(schema, {"allowlist": "public.t.p"})
+    assert len(fixes) == 1
+
+
+def test_perf001_fix_falls_back_to_default_on_bad_auth_functions() -> None:
+    # Unlike PERF001's rule which raises TypeError, the FIXER
+    # falls back to the default auth function set. Reason: the
+    # rule has already fired for this policy, the fixer is just
+    # generating remediation SQL — bailing out with a TypeError
+    # would prevent users from getting any fix output. Pin this
+    # behavior.
+    schema = _wrap_policy(_policy("user_id = auth.uid()"))
+    fixes = PERF001Fixer().fix(
+        schema, {"auth_functions": "auth.uid"}  # bad type
+    )
+    assert len(fixes) == 1
+    assert "(SELECT auth.uid())" in fixes[0].sql
+
+
+def test_perf001_fix_wraps_nested_auth_calls_independently() -> None:
+    # `COALESCE(auth.uid(), auth.role()::uuid)` — two auth calls
+    # nested inside another function call. Each should get its
+    # own SubLink wrapping, neither should swallow the other.
+    schema = _wrap_policy(
+        _policy(
+            "user_id = COALESCE(auth.uid(), auth.role()::UUID)"
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql
+    assert "(SELECT auth.uid())" in sql
+    assert "(SELECT auth.role())" in sql
+
+
+def test_perf001_fix_preserves_other_function_calls_verbatim() -> None:
+    # `lower(email) = lower((SELECT auth.uid())::text)` — the
+    # `lower` calls are NOT auth functions; they should pass
+    # through untouched. The fixer must wrap only what matches
+    # the auth set.
+    schema = _wrap_policy(
+        _policy("lower(email) = lower(auth.uid()::text)")
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql.lower()
+    assert "lower(email)" in sql
+    # The nested auth.uid() got wrapped.
+    assert "(select auth.uid())" in sql
+
+
+def test_perf001_fix_emits_one_alter_policy_per_offending_policy() -> None:
+    # Two policies on the same table, both with unwrapped auth.
+    # Two ALTER POLICY statements, one per policy.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    _policy("user_id = auth.uid()", name="p1"),
+                    _policy(
+                        "tenant_id = current_setting('app.t', true)::UUID",
+                        name="p2",
+                    ),
+                ),
+                columns=("id", "user_id", "tenant_id"),
+            ),
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 2
+    assert {f.location for f in fixes} == {"public.t.p1", "public.t.p2"}
+
+
+def test_perf001_fix_silent_when_auth_unwrapped_only_in_with_check() -> None:
+    # PERF001 is USING-only. If WITH CHECK has an unwrapped auth
+    # call but USING does not, PERF001Fixer must not generate a
+    # fix — there's nothing for it to repair.
+    p = _policy(
+        "id > 0",  # USING is clean
+        with_check="user_id = auth.uid()",  # WITH CHECK is unwrapped
+    )
+    schema = _wrap_policy(p)
+    assert PERF001Fixer().fix(schema, {}) == []
+
+
+def test_generate_fixes_with_empty_schema() -> None:
+    schema = Schema(tables=())
+    assert generate_fixes(schema, rule_options={}) == []
+
+
+def test_generate_fixes_with_unknown_rule_filter_returns_empty() -> None:
+    # `--rule SEC999` typo: no fixer registers under that ID, so
+    # nothing is generated. Should not crash.
+    schema = _wrap_policy(_policy("user_id = auth.uid()"))
+    fixes = generate_fixes(
+        schema, rule_options={}, rule_filter={"SEC999"}
+    )
+    assert fixes == []

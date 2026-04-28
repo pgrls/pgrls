@@ -830,3 +830,88 @@ def test_fix_missing_database_url_errors_clearly(monkeypatch) -> None:
     result = runner.invoke(main, ["fix"])
     assert result.exit_code != 0
     assert "DATABASE_URL" in result.output or "database-url" in result.output
+
+
+def test_fix_apply_handles_multiple_fixes(
+    pg_url: str, apply_sql
+) -> None:
+    # Two SEC002-fixable tables. `--apply` runs both ALTER TABLE
+    # statements in one shot.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_multi_a (id INT);
+        ALTER TABLE public.fix_multi_a ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_multi_a
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+
+        CREATE TABLE public.fix_multi_b (id INT);
+        ALTER TABLE public.fix_multi_b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_multi_b
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "SEC002", "--apply"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 2 fixes" in result.output
+
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT relname FROM pg_catalog.pg_class "
+                "WHERE relrowsecurity AND relforcerowsecurity "
+                "AND relname LIKE 'fix_multi_%' "
+                "ORDER BY relname"
+            )
+            assert [row[0] for row in cur.fetchall()] == [
+                "fix_multi_a",
+                "fix_multi_b",
+            ]
+
+
+def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
+    # First --apply executes; second --apply finds nothing to do.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_idempotent (id INT);
+        ALTER TABLE public.fix_idempotent ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_idempotent
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    first = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--apply"]
+    )
+    assert first.exit_code == 0
+    assert "applied 1 fix" in first.output
+
+    second = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--apply"]
+    )
+    assert second.exit_code == 0
+    assert "no auto-fixable" in second.output
+
+
+def test_fix_unknown_rule_filter_emits_no_fixes_message(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_unknown (id INT);
+        ALTER TABLE public.fix_unknown ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_unknown
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "SEC999"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no auto-fixable" in result.output
