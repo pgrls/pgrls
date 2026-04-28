@@ -13,7 +13,10 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def pgrls_bin() -> str:
     binary = shutil.which("pgrls")
     if binary is None:
-        pytest.fail("`pgrls` not on PATH; reinstall with `pip install -e \".[dev]\"`")
+        # `skip` is friendlier than `fail` here: a fresh checkout
+        # without `pip install -e .[dev]` shouldn't crash the
+        # whole runner, just the e2e tests.
+        pytest.skip("`pgrls` not on PATH; install with `pip install -e \".[dev]\"`")
     return binary
 
 
