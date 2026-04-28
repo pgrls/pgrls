@@ -897,9 +897,13 @@ def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
     assert "no auto-fixable" in second.output
 
 
-def test_fix_unknown_rule_filter_emits_no_fixes_message(
+def test_fix_unknown_rule_filter_errors_clearly(
     pg_url: str, apply_sql
 ) -> None:
+    # `--rule SEC999` is a typo. Producing zero fixes silently
+    # would be indistinguishable from "DB is clean" — confusing.
+    # Validate eagerly and tell the user which rules are
+    # auto-fixable.
     apply_sql(
         """
         CREATE TABLE public.fix_unknown (id INT);
@@ -913,8 +917,41 @@ def test_fix_unknown_rule_filter_emits_no_fixes_message(
         main,
         ["fix", "--database-url", pg_url, "--rule", "SEC999"],
     )
-    assert result.exit_code == 0, result.output
-    assert "no auto-fixable" in result.output
+    assert result.exit_code != 0
+    assert "unknown auto-fixable rule" in result.output
+    assert "SEC999" in result.output
+    # The error message should list the actually-fixable rules
+    # so the user can spot their typo.
+    assert "SEC002" in result.output
+    assert "PERF001" in result.output
+
+
+def test_fix_unknown_rule_does_not_block_known_rule_in_same_invocation(
+    pg_url: str, apply_sql
+) -> None:
+    # `--rule SEC002 --rule SEC999` — one valid, one typo. The
+    # validation rejects the whole invocation rather than silently
+    # filtering out the typo.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_mixed (id INT);
+        ALTER TABLE public.fix_mixed ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_mixed
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix",
+            "--database-url", pg_url,
+            "--rule", "SEC002",
+            "--rule", "SEC999",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "SEC999" in result.output
 
 
 def test_fix_apply_rolls_back_on_statement_failure(
@@ -968,6 +1005,12 @@ def test_fix_apply_rolls_back_on_statement_failure(
         return out
 
     monkeypatch.setattr(cli_mod, "generate_fixes", fake)
+    # Pin that the patch actually replaced the symbol cli.py
+    # references; if a future refactor changes the import shape
+    # to `import pgrls.fixers as F; F.generate_fixes(...)` the
+    # monkeypatch would silently no-op and this test would pass
+    # vacuously. The assert below catches that.
+    assert cli_mod.generate_fixes is fake
 
     runner = CliRunner()
     result = runner.invoke(

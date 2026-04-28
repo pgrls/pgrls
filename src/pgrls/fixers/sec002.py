@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.fixers import Fix
+from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table
 
 
@@ -29,7 +30,8 @@ class SEC002Fixer:
             if _is_allowlisted(table, options):
                 continue
             sql = (
-                f"ALTER TABLE {table.qualified_name} "
+                "ALTER TABLE "
+                f"{quote_qualified(table.schema, table.name)} "
                 "FORCE ROW LEVEL SECURITY;"
             )
             out.append(

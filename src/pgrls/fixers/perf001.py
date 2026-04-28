@@ -2,10 +2,14 @@
 emit an `ALTER POLICY` statement.
 
 The rewrite walks the policy's USING expression AST. Each FuncCall
-(or SQLValueFunction node) matching the rule's auth_functions set
-is replaced with a SubLink wrapping it — `auth.uid()` becomes
-`(SELECT auth.uid())`. SubLinks already in the tree are skipped so
-already-wrapped calls stay as they are.
+matching the rule's auth_functions set is replaced with a SubLink
+wrapping it — `auth.uid()` becomes `(SELECT auth.uid())`. SubLinks
+already in the tree are skipped so already-wrapped calls stay as
+they are.
+
+`SQLValueFunction` nodes (`current_user`, `session_user`) are
+intentionally NOT wrapped: see `_funccall_matches` for the
+rationale. PERF001's *check* walks them; the fixer does not.
 
 The new SQL is round-tripped via `pglast.stream.RawStream`. Output:
 
@@ -13,8 +17,18 @@ The new SQL is round-tripped via `pglast.stream.RawStream`. Output:
         USING (<new expression>)
         [WITH CHECK (<original with-check>)];
 
-WITH CHECK is preserved verbatim — PERF001 is USING-only, and the
-fix should not touch what it wasn't asked to fix.
+WITH CHECK is preserved verbatim — PERF001's scope is USING-only,
+matching the rule's check shape. Unwrapped auth calls in WITH CHECK
+are left alone because PERF001's check doesn't fire on them either
+(see `tests/rules/test_perf001.py::test_perf001_does_not_fire_on_with_check_only`).
+A future PERF003 (or a wider PERF001 scope) could fix WITH CHECK
+too; today, this fixer mirrors the rule's USING-only scope so the
+"fixer fixes exactly what the rule reports" contract holds.
+
+Identifiers are double-quoted via `_idents.quote_ident` /
+`_idents.quote_qualified` when Postgres syntax requires it (mixed
+case, embedded special chars). Plain `snake_case` names are emitted
+bare for readability.
 """
 from __future__ import annotations
 
@@ -25,6 +39,7 @@ from pglast.stream import RawStream
 
 from pgrls.ast_utils import parse_expr
 from pgrls.fixers import Fix
+from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema
 
 _DEFAULT_AUTH_FUNCTIONS: tuple[str, ...] = (
@@ -88,7 +103,13 @@ def _wrap_funccall(funccall: FuncCall) -> SubLink:
 
 def _wrap_unwrapped_calls(node: Any, names: set[str]) -> tuple[Any, bool]:
     """Replace each matching FuncCall outside any SubLink with a
-    SubLink wrapping it. Returns (possibly-new-node, did_change)."""
+    SubLink wrapping it.
+
+    Mutates `node` in place when descendants need wrapping (the
+    parent's field is reassigned via `setattr`). The returned
+    node is the SAME object — `did_change` is the caller's signal
+    to re-emit the SQL, not an indication of replacement.
+    """
     if node is None:
         return node, False
     if _funccall_matches(node, names):
@@ -152,8 +173,8 @@ class PERF001Fixer:
 
                 new_using_sql = RawStream()(new_using_ast)
                 stmt = (
-                    f"ALTER POLICY {policy.name} "
-                    f"ON {table.qualified_name}\n"
+                    f"ALTER POLICY {quote_ident(policy.name)} "
+                    f"ON {quote_qualified(table.schema, table.name)}\n"
                     f"    USING ({new_using_sql})"
                 )
                 if policy.with_check_sql is not None:
