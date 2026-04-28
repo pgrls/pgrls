@@ -19,15 +19,21 @@ from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 def parse_expr(sql: str | None) -> Any | None:
     """Parse a USING/WITH CHECK SQL fragment into a pglast AST node.
 
-    Returns the expression node, or None if the input is empty or pglast
-    cannot parse it. On parse failure, prints a one-line warning to stderr.
+    Returns the expression node, or None if the input is empty or
+    pglast cannot parse it. On parse failure, prints a one-line
+    warning to stderr.
+
+    Catches `pglast.parser.ParseError` specifically — any other
+    exception (MemoryError, AttributeError from pglast shape
+    drift, etc.) propagates so genuine bugs aren't swallowed as
+    "could not parse" lines per policy.
     """
     if not sql:
         return None
     wrapped = f"SELECT ({sql}) AS _expr"
     try:
         parsed = pglast.parse_sql(wrapped)
-    except Exception:
+    except pglast.parser.ParseError:
         print(
             f"pgrls: warning: could not parse SQL fragment: {sql!r}",
             file=sys.stderr,
