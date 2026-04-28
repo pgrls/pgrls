@@ -30,8 +30,13 @@ def pg_url() -> Generator[str, None, None]:
         # runs via `pg_conn`.
         yield existing
         return
+    # Image is env-overridable so a developer can verify
+    # behavior against the floor (`postgres:12-alpine`) without
+    # editing this file. CI matrices can iterate the supported
+    # majors via the same env var.
+    image = os.environ.get("PGRLS_TEST_PG_IMAGE", "postgres:16-alpine")
     with PostgresContainer(
-        "postgres:16-alpine",
+        image,
         username="postgres",
         password="postgres",
         dbname="postgres",
