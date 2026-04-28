@@ -406,3 +406,18 @@ def test_generate_fixes_with_unknown_rule_filter_returns_empty() -> None:
         schema, rule_options={}, rule_filter={"SEC999"}
     )
     assert fixes == []
+
+
+def test_perf001_fixer_silent_on_sql_value_function() -> None:
+    # `current_user` is a Postgres SQLValueFunction, not a regular
+    # FuncCall. Wrapping it in `(SELECT current_user)` is dubious
+    # (the grammar special doesn't compose the same way), so the
+    # fixer deliberately skips it. PERF001's check still catches
+    # it when configured; the rule fires, the fixer emits nothing.
+    # Pin the deliberate asymmetry — a future change that wraps
+    # SQLValueFunction would be visible here.
+    schema = _wrap_policy(_policy("current_user = 'admin'"))
+    fixes = PERF001Fixer().fix(
+        schema, {"auth_functions": ["current_user"]}
+    )
+    assert fixes == []

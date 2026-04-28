@@ -17,6 +17,14 @@ STABLE functions (`now()`, `current_setting`, `auth.uid` and the
 other Supabase auth helpers) are NOT in this rule's set — they have
 their own treatment via PERF001 for the per-row evaluation cost.
 
+**SubLink scope.** Unlike SEC011 (which deliberately stops at
+`SubLink.subselect` to avoid false-firing on subqueries' own WHERE
+clauses), PERF002 *does* walk subselects. Reason: a VOLATILE call
+inside a correlated subquery still re-runs per outer row, and even
+in an uncorrelated subquery the non-determinism leaks ("rows
+admitted depend on the random() draw at scan time"). Both shapes
+are real footguns, so PERF002 errs on the side of catching them.
+
 Default volatile set: `random`, `clock_timestamp`, `nextval`,
 `gen_random_uuid`, `pg_backend_pid`. Override with
 `[lint.rules.PERF002].volatile_functions = [...]` (the list

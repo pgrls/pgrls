@@ -112,4 +112,6 @@ allowlist = []
 # fixme, wip, tmp, temp, hack, xxx, debug, draft, placeholder.
 # Match is case-insensitive and respects identifier-token
 # boundaries (snake_case, camelCase, SCREAMING_SNAKE).
+# Setting this to an empty list disables the rule entirely (no
+# placeholder words to match against).
 # placeholder_words = ["todo", "fixme", "scratch"]
