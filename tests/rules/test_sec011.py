@@ -175,3 +175,29 @@ def test_sec011_silent_on_and_true_branch() -> None:
     # `AND true` is a no-op too — also not what SEC011 flags.
     schema = _wrap(_policy("id = 1 AND true"))
     assert SEC011().check(schema, {}) == []
+
+
+def test_sec011_silent_on_or_true_inside_subquery_where() -> None:
+    # `EXISTS (SELECT 1 FROM t WHERE flag OR true)` — the OR-true
+    # is in the subquery's WHERE, not in the policy's predicate.
+    # SEC011 must not descend into `SubLink.subselect`; doing so
+    # would false-fire on legitimate join patterns. Pin the
+    # narrow scope mirroring extract_column_refs's shape.
+    schema = _wrap(
+        _policy(
+            "id IN (SELECT a FROM other WHERE flag OR true)"
+        )
+    )
+    assert SEC011().check(schema, {}) == []
+
+
+def test_sec011_fires_on_or_true_in_in_lhs() -> None:
+    # `(id = 1 OR true) IN (SELECT a FROM other)` — the OR-true
+    # is on the IN-expression's LHS (SubLink.testexpr), which IS
+    # the policy's own expression. The walker must still see it.
+    schema = _wrap(
+        _policy(
+            "(id = 1 OR true) IN (SELECT a FROM other)"
+        )
+    )
+    assert len(SEC011().check(schema, {})) == 1

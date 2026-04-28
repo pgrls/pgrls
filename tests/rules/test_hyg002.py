@@ -50,6 +50,13 @@ def _wrap(policy: Policy) -> Schema:
         "TmpReadAll",  # case-insensitive match
         "wip-policy",  # word-boundary inside identifier
         "PLACEHOLDER",
+        # SCREAMING_SNAKE — the SCREAMING_SNAKE branch of the
+        # tokenizer requires `_` in the boundary lookahead;
+        # without it `WIP_POLICY` was tokenized as ['wi','policy']
+        # and the rule silently missed every screaming case.
+        "WIP_POLICY",
+        "TODO_OWNER",
+        "FIXME_LATER",
     ],
 )
 def test_hyg002_fires_on_placeholder_words(name: str) -> None:
