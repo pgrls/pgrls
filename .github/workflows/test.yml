@@ -5,6 +5,17 @@ on:
     branches: [main, "release/**"]
   pull_request:
 
+# Defense-in-depth: this workflow only runs pytest, so the
+# GITHUB_TOKEN has no need for write permissions. Without an
+# explicit block the token inherits the repo's default permission
+# set, which on most repos includes write access to contents,
+# issues, PRs, etc. — a malicious dependency in `pglast` /
+# `testcontainers` (both pulled from PyPI in CI) could exfiltrate
+# the token to push commits or open issues. `contents: read` is
+# the least privilege for "checkout the repo and run tests".
+permissions:
+  contents: read
+
 jobs:
   pytest:
     name: "pytest pg${{ matrix.pg }}"

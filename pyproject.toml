@@ -24,6 +24,7 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
 ]
 dependencies = [
     "click>=8.2",
@@ -32,8 +33,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `hatchling` is the build backend (declared in [build-system]) and
+# is installed automatically by `python -m build` / pip's PEP 517
+# isolated env. Don't list it here — including it would suggest to
+# contributors that hatchling is needed for daily development.
 dev = [
-    "hatchling>=1.21",
     "pytest>=8.0",
     "testcontainers[postgres]>=4.0",
     "build>=1.0",
@@ -45,10 +49,22 @@ pgrls = "pgrls.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pgrls/pgrls"
+Repository = "https://github.com/pgrls/pgrls"
 Issues = "https://github.com/pgrls/pgrls/issues"
+Changelog = "https://github.com/pgrls/pgrls/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/pgrls/pgrls#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pgrls"]
+
+[tool.hatch.build.targets.sdist]
+# Don't ship `uv.lock` in the sdist. The lock file is a developer
+# convenience — committing it for reproducible local environments
+# is fine, but baking it into the published artifact misleads
+# downstream packagers about which transitive versions are
+# "supported." Same convention as pyproject + Poetry projects:
+# lock for dev, install via dependency ranges in production.
+exclude = ["uv.lock"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

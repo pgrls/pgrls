@@ -1,6 +1,15 @@
 .claude/
 .idea/
 
+# uv lock file — pgrls is a library + CLI distributed via PyPI;
+# transitive versions are pinned via dependency ranges in
+# pyproject.toml, not via a committed lock. Each contributor's
+# `uv sync` resolves fresh against the ranges. CI matrix
+# (.github/workflows/test.yml) verifies the resolution still
+# works. The published sdist explicitly excludes uv.lock via
+# [tool.hatch.build.targets.sdist].exclude.
+uv.lock
+
 # Python
 __pycache__/
 *.py[cod]
