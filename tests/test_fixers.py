@@ -487,13 +487,13 @@ def test_quote_ident_rejects_null_byte() -> None:
     # message rather than emitting `"a\x00b"` for the server to
     # reject with a confusing error.
     from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="null byte"):
+    with pytest.raises(ValueError, match="control character"):
         quote_ident("evil\x00name")
 
 
 def test_quote_ident_rejects_embedded_newline() -> None:
     from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="null byte or newline"):
+    with pytest.raises(ValueError, match="control character"):
         quote_ident("name\nwith\nnewlines")
 
 
@@ -576,6 +576,61 @@ def test_quote_ident_rejects_empty_string() -> None:
     from pgrls.fixers._idents import quote_ident
     with pytest.raises(ValueError, match="empty"):
         quote_ident("")
+
+
+def test_quote_ident_quotes_reserved_keywords() -> None:
+    # Round 27: a table named "select" or a policy named "order"
+    # must be quoted at emission time, otherwise pgrls's fixer SQL
+    # is a syntax error on the server. The previous regex-only check
+    # treated reserved words as plain identifiers because they match
+    # `[a-z_][a-z0-9_]*`.
+    from pgrls.fixers._idents import quote_ident
+
+    for kw in ("select", "from", "where", "table", "user", "order"):
+        out = quote_ident(kw)
+        assert out == f'"{kw}"', (
+            f"reserved keyword {kw!r} must be quoted, got {out!r}"
+        )
+
+
+def test_quote_ident_keyword_check_is_case_insensitive() -> None:
+    # Postgres parses identifiers case-insensitively before
+    # quoting. `SELECT` / `Select` / `select` all collide with the
+    # reserved token. A user with a `"Select"` table (mixed case)
+    # gets quoting either way (mixed case alone forces it), but
+    # pin the case-folded path explicitly.
+    from pgrls.fixers._idents import quote_ident
+
+    assert quote_ident("SELECT") == '"SELECT"'
+    assert quote_ident("Select") == '"Select"'
+
+
+def test_quote_ident_rejects_tab_character() -> None:
+    # Round 14 rejected null/newline; tab is the same hazard. Pin
+    # the wider control-char check so the defense is uniform.
+    from pgrls.fixers._idents import quote_ident
+
+    with pytest.raises(ValueError, match="control character"):
+        quote_ident("weird\tname")
+
+
+def test_quote_ident_rejects_all_c0_controls() -> None:
+    from pgrls.fixers._idents import quote_ident
+
+    for codepoint in list(range(0x20)) + [0x7f]:
+        ch = chr(codepoint)
+        with pytest.raises(ValueError, match="control character"):
+            quote_ident(f"x{ch}y")
+
+
+def test_quote_ident_quotes_non_ascii() -> None:
+    # ASCII-only regex is the gate; pin so a future swap to
+    # str.isidentifier() (which accepts Unicode letters) doesn't
+    # silently emit non-ASCII bare on locale-dependent servers.
+    from pgrls.fixers._idents import quote_ident
+
+    assert quote_ident("café") == '"café"'
+    assert quote_ident("über") == '"über"'
 
 
 def test_perf001_fixer_default_auth_functions_matches_rule_default() -> None:

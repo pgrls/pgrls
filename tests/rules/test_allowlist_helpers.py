@@ -45,11 +45,18 @@ def test_policy_id_allowlist_rejects_table_only() -> None:
         )
 
 
-def test_policy_id_allowlist_rejects_too_many_dots() -> None:
-    with pytest.raises(TypeError, match="not a valid policy ID"):
-        parse_policy_id_allowlist(
-            "SEC003", {"allowlist": ["a.b.c.d"]}
-        )
+def test_policy_id_allowlist_accepts_more_than_three_dots_as_dotted_policy_name() -> None:
+    # Round 27: rsplit('.', 2) right-anchors the parse so a policy
+    # name containing `.` is allowlistable. `a.b.c.d` resolves as
+    # schema=a.b, table=c, policy=d would be ambiguous, but Postgres
+    # never produces a `.` in nspname/relname (rejected at CREATE).
+    # The user's responsibility is to ensure the entry matches the
+    # `policy_id` string the rule actually emits; we accept the
+    # rsplit and trust the introspection invariants.
+    out = parse_policy_id_allowlist(
+        "SEC003", {"allowlist": ["a.b.c.d"]}
+    )
+    assert out == {"a.b.c.d"}
 
 
 def test_policy_id_allowlist_rejects_empty_part() -> None:
@@ -97,6 +104,27 @@ def test_policy_id_allowlist_empty_list_is_fine() -> None:
 def test_policy_id_allowlist_missing_key_returns_empty_set() -> None:
     out = parse_policy_id_allowlist("SEC003", {})
     assert out == set()
+
+
+def test_policy_id_allowlist_accepts_dot_in_policy_name() -> None:
+    # Policy names CAN contain `.` — Postgres allows `"weird.name"`.
+    # Right-anchoring the split (rsplit('.', 2)) lets the user
+    # allowlist such a finding. Without this, the rule would fire
+    # forever because the validator rejected the only entry that
+    # could match.
+    out = parse_policy_id_allowlist(
+        "SEC003", {"allowlist": ["public.users.weird.name"]}
+    )
+    assert out == {"public.users.weird.name"}
+
+
+def test_policy_id_allowlist_still_rejects_too_few_parts() -> None:
+    # rsplit doesn't loosen the "must have schema and table" check.
+    # 2-part `users.weird` is still invalid.
+    with pytest.raises(TypeError, match="not a valid policy ID"):
+        parse_policy_id_allowlist(
+            "SEC003", {"allowlist": ["users.weird"]}
+        )
 
 
 # --- parse_table_ref_allowlist ---------------------------------
