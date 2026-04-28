@@ -1,0 +1,113 @@
+"""SEC011 — Policy expression has an `OR true` branch.
+
+`x = 1 OR true` evaluates to `true` for every row — the `x = 1`
+half is dead code. The shape commonly appears as a leftover debug
+branch ("temporarily let everything through to test the data
+model"), where the author never circles back to remove it.
+
+SEC008 catches the literal `USING (true)` at the top level. SEC011
+catches the same effect buried inside a larger expression: the
+literal `true` ORed with anything else is still `true`, but a
+casual reading misses the disjunction.
+
+Detection is narrow on purpose — only the literal `true` A_Const
+inside an OR-BoolExpr counts. Semantic equivalents (`1 = 1`,
+`'a' = 'a'`, etc.) fall through to SEC005's "no own-column ref"
+framing instead. A real tautology checker is significant
+infrastructure for marginal real-world value.
+
+Severity: warning. Allowlist by qualified policy ID.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from pglast.ast import A_Const, BoolExpr, Boolean, Node
+from pglast.enums import BoolExprType
+
+from pgrls.model import Schema
+from pgrls.violations import Violation
+
+
+def _parse_allowlist(options: dict[str, Any]) -> set[str]:
+    raw = options.get("allowlist", [])
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise TypeError(
+            "[lint.rules.SEC011].allowlist must be a list of policy IDs "
+            "of the form 'schema.table.policy_name'"
+        )
+    return set(raw)
+
+
+def _is_literal_true(node: Any) -> bool:
+    return (
+        isinstance(node, A_Const)
+        and isinstance(node.val, Boolean)
+        and node.val.boolval is True
+    )
+
+
+def _has_or_true(node: Any) -> bool:
+    """True if any OR-BoolExpr anywhere in the tree has a literal-true arg."""
+    if node is None:
+        return False
+    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
+        for arg in node.args or ():
+            if _is_literal_true(arg):
+                return True
+    if isinstance(node, Node):
+        for field_name in node:
+            value = getattr(node, field_name, None)
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    if _has_or_true(item):
+                        return True
+            elif isinstance(value, Node):
+                if _has_or_true(value):
+                    return True
+    return False
+
+
+class SEC011:
+    id = "SEC011"
+    severity = "warning"
+    title = "Policy expression has an `OR true` branch"
+
+    def check(
+        self, schema: Schema, options: dict[str, Any]
+    ) -> list[Violation]:
+        allowlist = _parse_allowlist(options)
+        out: list[Violation] = []
+        for table in schema.tables:
+            for policy in table.policies:
+                if not (
+                    _has_or_true(policy.using_ast)
+                    or _has_or_true(policy.with_check_ast)
+                ):
+                    continue
+                policy_id = (
+                    f"{table.schema}.{table.name}.{policy.name}"
+                )
+                if policy_id in allowlist:
+                    continue
+                out.append(
+                    Violation(
+                        rule_id="SEC011",
+                        severity="warning",
+                        title=self.title,
+                        message=(
+                            f"Policy {policy.name!r} on "
+                            f"{table.qualified_name} has an `OR true` "
+                            "branch — the predicate evaluates to true "
+                            "for every row regardless of the other "
+                            "branches. Almost always a leftover debug "
+                            "branch. Remove the `OR true` or, if the "
+                            "intent is genuinely 'admit every row,' "
+                            "drop the policy and rely on RLS-disabled "
+                            "(or `REVOKE ALL` on the table for full "
+                            "denial)."
+                        ),
+                        location=policy_id,
+                    )
+                )
+        return out
