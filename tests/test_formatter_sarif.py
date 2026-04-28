@@ -100,14 +100,22 @@ def test_sarif_result_uses_logical_location_with_fully_qualified_name() -> None:
     ] == "public.users.tenant_isolation"
 
 
-def test_sarif_handles_location_none() -> None:
-    # Schema-level diagnostics (no specific table/policy) emit the
-    # result without a location entry. SARIF allows results with no
-    # locations.
+def test_sarif_handles_location_none_with_schema_placeholder() -> None:
+    # SARIF §3.27.12 says `locations` SHOULD be omitted when none
+    # are known, but GitHub Code Scanning's upload endpoint rejects
+    # results with an empty `locations` array. Synthesize a
+    # `<schema>` logicalLocation so a future schema-wide rule that
+    # doesn't pin to a table or policy still produces an
+    # ingestible SARIF document.
     out = format_violations([_v(location=None)], format="sarif")
     parsed = json.loads(out)
     result = parsed["runs"][0]["results"][0]
-    assert result.get("locations", []) == []
+    locs = result["locations"]
+    assert len(locs) == 1
+    assert (
+        locs[0]["logicalLocations"][0]["fullyQualifiedName"]
+        == "<schema>"
+    )
 
 
 def test_sarif_zero_violations_emits_valid_empty_run() -> None:
@@ -135,7 +143,54 @@ def test_sarif_rule_descriptor_includes_short_description_and_help_uri() -> None
     rule = parsed["runs"][0]["tool"]["driver"]["rules"][0]
     assert rule["shortDescription"]["text"] == "RLS not enabled on table"
     assert "AGENTS.md" in rule["helpUri"]
-    assert "sec001" in rule["helpUri"].lower()
+    # helpUri uses `rule-sec001` to match an explicit
+    # <a id="rule-sec001"></a> anchor in AGENTS.md, not the
+    # GitHub-slugified heading (which would include the title and
+    # break on title rewording).
+    assert rule["helpUri"].endswith("#rule-sec001")
+
+
+def test_sarif_rule_descriptor_name_is_rule_id_not_title() -> None:
+    # SARIF §3.49.7 specifies `name` as an identifier (Pascal-ish,
+    # no whitespace) — distinct from the prose `shortDescription`.
+    # Emitting the title in `name` would confuse SARIF consumers
+    # like CodeQL conventions and Sonar that treat the two fields
+    # differently. Pin `name == rule_id`.
+    out = format_violations([_v()], format="sarif")
+    parsed = json.loads(out)
+    rule = parsed["runs"][0]["tool"]["driver"]["rules"][0]
+    assert rule["name"] == "SEC001"
+    assert rule["shortDescription"]["text"] == "RLS not enabled on table"
+
+
+def test_sarif_rule_descriptor_includes_default_configuration_level() -> None:
+    # GitHub Code Scanning uses `defaultConfiguration.level` to
+    # populate the rule list view. Without it, the UI shows
+    # "Unknown severity" until a result fires. Pin presence and
+    # the SARIF-level mapping.
+    out = format_violations(
+        [_v(severity="warning")], format="sarif"
+    )
+    parsed = json.loads(out)
+    rule = parsed["runs"][0]["tool"]["driver"]["rules"][0]
+    assert rule["defaultConfiguration"]["level"] == "warning"
+
+
+def test_sarif_rule_descriptor_names_are_unique_across_descriptors() -> None:
+    # SARIF §3.49.7 SHOULD: `name` unique across rule descriptors.
+    # Putting rule_id in `name` makes uniqueness automatic; pin it
+    # so a future change that puts the title back can't slip
+    # duplicate-title rules past.
+    vs = [
+        _v(rule_id="SEC001", title="Same title"),
+        _v(rule_id="SEC002", title="Same title"),
+    ]
+    out = format_violations(vs, format="sarif")
+    parsed = json.loads(out)
+    names = [
+        r["name"] for r in parsed["runs"][0]["tool"]["driver"]["rules"]
+    ]
+    assert len(names) == len(set(names))
 
 
 def test_sarif_handles_unicode_in_messages() -> None:

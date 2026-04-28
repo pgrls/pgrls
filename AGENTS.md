@@ -95,6 +95,8 @@ Notes:
 
 ## Rules reference
 
+<a id="rule-sec001"></a>
+
 ### SEC001 — RLS not enabled on table
 
 **Severity:** error.
@@ -173,6 +175,8 @@ each child carries its own protection. Allowlisting children is the
 wrong tool here: it removes the SEC001 check entirely, which is the
 opposite of what you want.
 
+<a id="rule-sec002"></a>
+
 ### SEC002 — FORCE ROW LEVEL SECURITY missing
 
 **Severity:** error.
@@ -193,6 +197,8 @@ ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
 If a specific role legitimately needs to bypass (e.g. a maintenance role
 that runs vacuum-style work), grant `BYPASSRLS` on that role rather than
 turning `FORCE` off table-wide.
+
+<a id="rule-sec003"></a>
 
 ### SEC003 — Permissive policy grants access to PUBLIC
 
@@ -218,6 +224,8 @@ CREATE POLICY tenant_read ON public.invoices
 If the table is genuinely public-readable (reference data), use a
 `RESTRICTIVE` policy instead of a `PERMISSIVE` one — restrictive policies
 narrow rather than expand access.
+
+<a id="rule-sec004"></a>
 
 ### SEC004 — Inverted auth check (Lovable CVE pattern)
 
@@ -270,6 +278,8 @@ The default set already covers Supabase (`auth.*`), session GUCs
 (`current_setting`), and stock Postgres (`current_user`,
 `session_user`).
 
+<a id="rule-sec005"></a>
+
 ### SEC005 — Policy expression has no own-column reference
 
 **Severity:** warning.
@@ -317,6 +327,8 @@ explicitly:
 allowlist = ["public.audit_log.admin_read"]
 ```
 
+<a id="rule-sec006"></a>
+
 ### SEC006 — Write-side policy missing WITH CHECK
 
 **Severity:** error.
@@ -340,6 +352,8 @@ CREATE POLICY tenant_write ON public.invoices
 Asymmetric `USING` and `WITH CHECK` are valid (e.g. read your own and
 your team's, write your own only) but should carry an explanatory
 comment — the asymmetry is rarely accidental and rarely obvious.
+
+<a id="rule-sec007"></a>
 
 ### SEC007 — All policies on table are permissive
 
@@ -382,6 +396,8 @@ permissive policy *is* the intentional surface. Allowlist by table:
 allowlist = ["public.countries", "public.feature_flags"]
 ```
 
+<a id="rule-sec008"></a>
+
 ### SEC008 — Policy USING clause is constant true
 
 **Severity:** warning.
@@ -419,6 +435,8 @@ the actual surface, or allowlist the policy:
 allowlist = ["public.countries.public_read"]
 ```
 
+<a id="rule-sec009"></a>
+
 ### SEC009 — RLS enabled but no policies defined
 
 **Severity:** warning.
@@ -454,6 +472,8 @@ allowlist = ["audit.events", "private.tombstones"]
 
 The allowlist accepts unqualified or `schema.table` entries — same
 shape as SEC001 and SEC002.
+
+<a id="rule-sec010"></a>
 
 ### SEC010 — Policy USING clause is constant false
 
@@ -495,6 +515,8 @@ allowlist the policy by qualified ID:
 allowlist = ["public.invoices.block_all"]
 ```
 
+<a id="rule-sec011"></a>
+
 ### SEC011 — Policy expression has an `OR true` branch
 
 **Severity:** warning.
@@ -534,6 +556,8 @@ inside an `OR` BoolExpr counts. Semantic-equivalent tautologies
 (`1 = 1`, `'a' = 'a'`, etc.) fall through to SEC005's no-own-col
 framing instead. A real tautology checker is significant
 infrastructure for marginal real-world value.
+
+<a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
 
@@ -595,6 +619,8 @@ allowlist = ["public.tiny_table.policy_name"]
 Reach for the allowlist sparingly — the rewrite is mechanical and
 always safe.
 
+<a id="rule-perf002"></a>
+
 ### PERF002 — Policy expression uses a VOLATILE function
 
 **Severity:** warning.
@@ -626,6 +652,8 @@ transaction) over `clock_timestamp()` (VOLATILE).
 # volatile_functions = ["random", "clock_timestamp", "my.volatile_helper"]
 ```
 
+<a id="rule-hyg001"></a>
+
 ### HYG001 — Policy references a column that doesn't exist
 
 **Severity:** error.
@@ -645,6 +673,8 @@ evaluation time.
 - If the policy is now obsolete, drop it.
 
 There is no `pgrls.toml` option for HYG001 — every fire is a real bug.
+
+<a id="rule-hyg002"></a>
 
 ### HYG002 — Policy named like a placeholder
 
