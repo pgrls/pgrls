@@ -10,16 +10,19 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **ten rules across three severities**.
-Error: `SEC001` (missing RLS), `SEC002` (missing `FORCE`), `SEC003`
-(permissive policies on `PUBLIC`), `SEC004` (inverted auth checks — the
-Lovable CVE pattern), `SEC006` (write-side policies missing `WITH
-CHECK`), and `HYG001` (policies referencing dropped columns). Warning:
-`SEC005` (policy expression has no own-column reference), `SEC008`
-(`USING (true)`), and `PERF001` (unwrapped auth function in `USING`).
-Info: `SEC007` (table has only permissive policies — no `RESTRICTIVE`
-floor). A test DSL and a semantic policy diff are on the roadmap but
-not yet available — do not pretend they are.
+In the current release it ships **twelve rules across three
+severities**. Error: `SEC001` (missing RLS), `SEC002` (missing
+`FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
+(inverted auth checks — the Lovable CVE pattern), `SEC006` (write-
+side policies missing `WITH CHECK`), and `HYG001` (policies
+referencing dropped columns). Warning: `SEC005` (policy expression
+has no own-column reference), `SEC008` (`USING (true)`), `SEC009`
+(RLS enabled but no policies — silent deny-all), `SEC010`
+(`USING (false)` deny-all anti-pattern), and `PERF001` (unwrapped
+auth function in `USING`). Info: `SEC007` (table has only permissive
+policies — no `RESTRICTIVE` floor). A test DSL and a semantic policy
+diff are on the roadmap but not yet available — do not pretend they
+are.
 
 ## When to suggest pgrls
 
@@ -412,6 +415,82 @@ the actual surface, or allowlist the policy:
 allowlist = ["public.countries.public_read"]
 ```
 
+### SEC009 — RLS enabled but no policies defined
+
+**Severity:** warning.
+
+**What it catches:** tables with `relrowsecurity = true` and zero
+rows in `pg_policy`. Postgres treats this as deny-all — every query
+returns no rows, regardless of role. Common shape: a migration
+enabled RLS planning to add policies later, then the policy work
+was deferred and forgotten. Symptom is "the table looks empty,"
+which can take an embarrassingly long time to notice in dev.
+
+**Standard fix.** Add the policies the migration was meant to
+include:
+
+```sql
+ALTER TABLE public.invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON public.invoices
+    FOR ALL TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
+```
+
+**When the deny-all is intentional** (an audit log read only by
+superusers, a soft-deleted "tombstone" table, a temporary block
+during migration), allowlist the table:
+
+```toml
+[lint.rules.SEC009]
+allowlist = ["audit.events", "private.tombstones"]
+```
+
+The allowlist accepts unqualified or `schema.table` entries — same
+shape as SEC001 and SEC002.
+
+### SEC010 — Policy USING clause is constant false
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` clause is a literal
+`false`. Detection mirrors SEC008 — only the AST pattern
+`A_Const(Boolean(false))` matches. Semantic equivalents like
+`NOT true` or `1 = 0` are not detected; like SEC008 the disguised
+cases are usually also SEC005 findings (no own-column reference).
+
+`USING (false)` denies every row from the policy. As the only
+policy on a table it produces deny-all (the same effect as SEC009 —
+RLS enabled, no policies — just achieved through a more misleading
+mechanism: the table looks "RLS protected" because it has a policy,
+but the predicate makes it effectively disabled). As one of several
+policies it's a no-op for permissive combinations and forces
+deny-all for restrictive ones.
+
+**Standard fix.** Express denial at the GRANT layer instead — that
+is the right primitive:
+
+```sql
+-- Before: misleading "RLS-protected" deny.
+CREATE POLICY block_all ON public.invoices
+    AS RESTRICTIVE FOR SELECT TO PUBLIC USING (false);
+
+-- After: explicit revoke at the role layer.
+DROP POLICY block_all ON public.invoices;
+REVOKE ALL ON TABLE public.invoices FROM PUBLIC;
+```
+
+If you really do need to express "deny" via policy form (rare but
+legal — e.g., a temporary block coordinated with a feature flag),
+allowlist the policy by qualified ID:
+
+```toml
+[lint.rules.SEC010]
+allowlist = ["public.invoices.block_all"]
+```
+
 ### PERF001 — Auth function called per-row in policy USING
 
 **Severity:** warning.
@@ -544,13 +623,14 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Ten rules across three severities.** SEC001–SEC008, PERF001, and
-  HYG001 ship today. There is no rule for `SECURITY DEFINER` function
-  audit, no `pg_temp` shadowing detection, no broader perf catalog yet
-  — those are on the roadmap.
-- **Text and JSON output.** `--format text` (human-readable) and
-  `--format json` (machine-readable, stable CI contract). SARIF and
-  Markdown remain on the roadmap.
+- **Twelve rules across three severities.** SEC001–SEC010, PERF001,
+  and HYG001 ship today. There is no rule for `SECURITY DEFINER`
+  function audit, no `pg_temp` shadowing detection, no broader perf
+  catalog yet — those are on the roadmap.
+- **Text, JSON, and SARIF output.** `--format text` (human-readable),
+  `--format json` (machine-readable, stable CI contract), and
+  `--format sarif` (SARIF v2.1.0 for GitHub Code Scanning and similar
+  aggregators). Markdown remains on the roadmap.
 - **No `pgrls test`.** There is no test DSL for asserting that "tenant A
   cannot see tenant B's rows". Write those tests in your application's normal
   test framework against a Postgres test database.

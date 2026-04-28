@@ -61,6 +61,20 @@ allowlist = []
 # policy IDs.
 allowlist = []
 
+[lint.rules.SEC009]
+# Tables where deny-all (RLS enabled, no policies) is intentional —
+# e.g., a soft-deleted tombstone or a superuser-only audit log.
+# Entries can be unqualified (audit_events) or qualified
+# (private.audit_events). Same shape as SEC001 / SEC002.
+allowlist = []
+
+[lint.rules.SEC010]
+# Policies allowed to keep `USING (false)`. Rare but legal — usually
+# a temporary block coordinated with a feature flag. The right
+# primitive for permanent denial is REVOKE at the GRANT layer.
+# Entries are fully-qualified policy IDs.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
