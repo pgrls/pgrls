@@ -253,3 +253,34 @@ def test_invalid_fail_on_error_mentions_valid_choices(
     assert "error" in msg
     assert "warning" in msg
     assert "info" in msg
+
+
+def test_dollar_dollar_escapes_to_literal_dollar(monkeypatch) -> None:
+    # A Postgres password like `pa$$word` contains a literal `$`
+    # next to a letter — pgrls must not treat that as `${VAR}`.
+    # `$$` escapes to a single `$`.
+    from pgrls.config import _interpolate_env
+    out = _interpolate_env("postgres://user:pa$$word@host/db")
+    assert out == "postgres://user:pa$word@host/db"
+
+
+def test_dollar_dollar_escape_does_not_interfere_with_real_var(
+    monkeypatch,
+) -> None:
+    from pgrls.config import _interpolate_env
+    monkeypatch.setenv("PGUSER", "alice")
+    out = _interpolate_env("$PGUSER says $$$$")
+    # Two `$$` pairs → two literal dollars after the env-resolved name.
+    assert out == "alice says $$"
+
+
+def test_empty_env_var_value_raises_clear_error(
+    monkeypatch, tmp_path,
+) -> None:
+    from pgrls.config import ConfigError, load_config
+    monkeypatch.setenv("EMPTY_DB", "")
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "${EMPTY_DB}"\n')
+    import pytest
+    with pytest.raises(ConfigError, match="empty after env-var interpolation"):
+        load_config(cfg)
