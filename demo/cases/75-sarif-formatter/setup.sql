@@ -1,0 +1,8 @@
+-- ============================================================
+-- Use case 75: SARIF formatter — no new fixture
+-- The companion test runs the demo DB through
+-- `pgrls lint --format sarif` and validates the shape:
+-- top-level $schema, the single run, tool.driver.name='pgrls',
+-- rule descriptors, severity-to-level mapping, and
+-- logicalLocations.fullyQualifiedName for each result.
+-- ============================================================
