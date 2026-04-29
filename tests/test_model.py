@@ -60,7 +60,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 2,
+        "version": 3,
         "tables": [
             {
                 "schema": "public",
@@ -69,6 +69,7 @@ def test_schema_to_snapshot_shape() -> None:
                 "force_rls": False,
                 "columns": [],
                 "partition_of": None,
+                "grants": [],
             }
         ],
         "policies": [
@@ -209,13 +210,13 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_two_after_partition_of_addition() -> None:
-    # `partition_of` was added in 0.0.4; SNAPSHOT_VERSION bumped from
-    # 1 → 2 per the model.py docstring contract that additive structural
+def test_snapshot_version_is_three_after_grants_addition() -> None:
+    # `grants` was added for v0.2 diff — SNAPSHOT_VERSION bumped from
+    # 2 → 3 per the model.py docstring contract that additive structural
     # changes bump the version. Pin the new version so a future bump is
     # deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 2
+    assert snap["version"] == 3
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -423,7 +424,7 @@ def test_schema_by_qname_is_cached_across_calls() -> None:
     assert first is second  # pragma: no mutate
 
 
-def test_snapshot_v2_top_level_keys_are_stable_contract() -> None:
+def test_snapshot_v3_top_level_keys_are_stable_contract() -> None:
     # Snapshot top-level keys are part of the public surface (any
     # consumer reading the JSON depends on these names). Pin
     # `version`, `tables`, `policies` so a quiet refactor that
@@ -431,10 +432,10 @@ def test_snapshot_v2_top_level_keys_are_stable_contract() -> None:
     # rather than slipping past CI.
     snap = Schema(tables=()).to_snapshot()
     assert set(snap.keys()) == {"version", "tables", "policies"}
-    assert snap["version"] == 2
+    assert snap["version"] == 3
 
 
-def test_snapshot_v2_table_entry_keys_are_stable() -> None:
+def test_snapshot_v3_table_entry_keys_are_stable() -> None:
     table = Table(
         schema="public",
         name="t",
@@ -452,6 +453,7 @@ def test_snapshot_v2_table_entry_keys_are_stable() -> None:
         "force_rls",
         "columns",
         "partition_of",
+        "grants",
     }
 
 

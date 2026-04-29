@@ -30,6 +30,47 @@ def test_parse_expr_returns_none_for_none_input() -> None:
     assert parse_expr(None) is None  # type: ignore[arg-type]
 
 
+def test_parse_expr_default_fail_message_tail_lists_lint_rules(capsys) -> None:
+    # The default tail (lint context) lists the SEC/PERF/HYG rule IDs
+    # that get skipped on parse failure, so a `pgrls lint` user knows
+    # which rules silently dropped output for the policy.
+    parse_expr("garbage :::")
+    err = capsys.readouterr().err
+    assert "AST-based rules (SEC004" in err
+    assert "PERF001" in err
+    assert "HYG001" in err
+
+
+def test_parse_expr_custom_fail_message_tail_replaces_default(capsys) -> None:
+    # Pin the kwarg contract: callers (e.g. pgrls.diff) override the
+    # tail so the warning describes the calling context (diff)
+    # rather than lint. A future refactor that drops the kwarg or
+    # ignores it would surface here.
+    parse_expr("garbage :::", fail_message_tail="Custom diff-context tail.")
+    err = capsys.readouterr().err
+    assert "Custom diff-context tail." in err
+    # The default lint tail must NOT appear when an override is set —
+    # otherwise the user sees both messages and gets confused.
+    assert "AST-based rules (SEC004" not in err
+
+
+def test_parse_expr_custom_tail_with_location_keeps_named_policy(
+    capsys,
+) -> None:
+    # When both location and a custom tail are passed, the warning
+    # should still name the policy (head) AND use the custom tail.
+    parse_expr(
+        "garbage :::",
+        location="public.t.bad_policy",
+        clause="USING",
+        fail_message_tail="Diff falls back to REQUIRES_REVIEW.",
+    )
+    err = capsys.readouterr().err
+    assert "could not parse policy public.t.bad_policy" in err
+    assert "(USING clause)" in err
+    assert "Diff falls back to REQUIRES_REVIEW." in err
+
+
 def test_top_level_disjuncts_splits_or_chain() -> None:
     node = parse_expr("a = 1 OR b = 2 OR c = 3")
     assert node is not None

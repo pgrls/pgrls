@@ -16,11 +16,18 @@ from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, NullTest, SQ
 from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
+_LINT_AST_RULES_TAIL = (
+    "AST-based rules (SEC004, SEC005, SEC008, SEC010, SEC011, "
+    "HYG001, PERF001, PERF002) skipped for this clause."
+)
+
+
 def parse_expr(
     sql: str | None,
     *,
     location: str | None = None,
     clause: str | None = None,
+    fail_message_tail: str | None = None,
 ) -> Any | None:
     """Parse a USING/WITH CHECK SQL fragment into a pglast AST node.
 
@@ -28,10 +35,15 @@ def parse_expr(
     pglast cannot parse it. On parse failure, prints a one-line
     warning to stderr that names which policy and which clause
     couldn't be parsed — without that location, AST-based rules
-    (SEC004, SEC005, SEC008, SEC010, HYG001, PERF001, PERF002,
-    SEC011) silently skip the policy with no signal in the lint
-    output. Naming the policy lets the user grep `pg_policy` for
-    the actual SQL pglast couldn't handle.
+    silently skip the policy with no signal in the lint output.
+    Naming the policy lets the user grep `pg_policy` for the
+    actual SQL pglast couldn't handle.
+
+    The `fail_message_tail` kwarg lets the caller customize the
+    "what got skipped" suffix on the warning line. Defaults to the
+    lint-context message ("AST-based rules (SEC...) skipped...");
+    `pgrls.diff` callers pass a diff-context tail so the user
+    isn't told about lint rules that don't run during diff.
 
     Catches `pglast.parser.ParseError` specifically — any other
     exception (MemoryError, AttributeError from pglast shape
@@ -54,11 +66,9 @@ def parse_expr(
                 head += f" ({clause} clause)"
         else:
             head = "could not parse SQL fragment"
+        tail = fail_message_tail if fail_message_tail is not None else _LINT_AST_RULES_TAIL
         print(
-            f"pgrls: warning: {head}. AST-based rules (SEC004, "
-            "SEC005, SEC008, SEC010, SEC011, HYG001, PERF001, "
-            f"PERF002) skipped for this clause. Original SQL: "
-            f"{sql!r}",
+            f"pgrls: warning: {head}. {tail} Original SQL: {sql!r}",
             file=sys.stderr,
         )
         return None
