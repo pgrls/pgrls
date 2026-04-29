@@ -1,0 +1,128 @@
+# pgrls test — Layer 1 protocol
+
+**PROTOCOL_VERSION = 1**
+
+This document specifies the Postgres-side conventions any pgrls test
+client follows. The Python client (`pgrls.testing.PgrlsTestClient`)
+is the reference implementation; future TypeScript / Go ports
+implementing this contract are guaranteed to interoperate with the
+same RLS-protected schemas.
+
+## Per-test wire sequence
+
+For each test, on a single Postgres connection:
+
+1. `BEGIN` — open a transaction.
+2. (Optional) data setup as the connecting (admin) role.
+3. For each scenario block within the test:
+    1. Capture the prior role and claims so they can be restored
+       on clean exit:
+       `SELECT current_user, current_setting('request.jwt.claims',
+       true)`. Hold the two values as `<prev_role>` and
+       `<prev_claims>` for steps 5–6.
+    2. `SAVEPOINT pgrls_actor_<n>` (n increments per scenario).
+    3. `SET LOCAL ROLE <role>` — switch to the role under test.
+    4. If a claims object is provided (including the empty
+       object `{}`):
+       `SELECT set_config('request.jwt.claims', $1, true)`
+       with `$1` set to the JSON-encoded claims object. The
+       empty object MUST be sent as `'{}'`, not skipped — it is
+       a deliberate "actor with no claims" request and is
+       distinct from omitting claims entirely. To skip the
+       `set_config` call, the client API exposes the absent-
+       claims state as `null` / `None` / `nil`.
+    5. Run the scenario's queries; capture results / exceptions.
+    6. On clean exit:
+       `RELEASE SAVEPOINT pgrls_actor_<n>`, then explicitly restore
+       prior state. Two cases:
+       * `<prev_claims>` is non-NULL: issue
+         `SET LOCAL ROLE <prev_role>` and
+         `SELECT set_config('request.jwt.claims', <prev_claims>, true)`.
+       * `<prev_claims>` is NULL: issue `SET LOCAL ROLE <prev_role>`
+         and, only if the inner block set claims, issue
+         `SELECT set_config('request.jwt.claims', NULL, true)` to
+         clear the GUC value. (Postgres collapses NULL to `''` on
+         custom GUCs once they've been touched — true-NULL is no
+         longer reachable for the rest of the session — but the
+         JSON content is gone, so a downstream policy doing
+         `::jsonb` fails loudly instead of silently authorizing as
+         the inner-block actor. If the inner block never set
+         claims, skip the call entirely so the GUC stays at its
+         pre-block state.)
+       Required because `RELEASE SAVEPOINT` keeps the inner
+       `SET LOCAL` changes merged into the outer transaction —
+       a `RESET ROLE` here would clobber an outer block's role
+       in the nested case.
+    7. On exception:
+       `ROLLBACK TO SAVEPOINT pgrls_actor_<n>` only.
+       `ROLLBACK TO SAVEPOINT` automatically reverts every
+       `SET LOCAL` made inside the savepoint, so role and
+       claims state revert to whatever step 1 captured.
+4. `ROLLBACK` — drop the test's entire transaction.
+
+Nested scenario blocks are supported by construction: every
+inner block captures `<prev_role>` and `<prev_claims>` in step 1
+and restores them in step 6 (or via `ROLLBACK TO SAVEPOINT` in
+step 7). Nesting an inner block whose role differs from the
+outer's leaves the outer's role intact after the inner block
+exits.
+
+## Why these primitives
+
+* **`SET LOCAL ROLE`** (not session-level `SET ROLE`) is bound to
+  the current transaction; the outer `ROLLBACK` resets it
+  automatically.
+* **`set_config(key, value, true)`** is the procedural form of
+  `SET LOCAL` for GUC keys whose names contain a dot.
+  `request.jwt.claims` has a dot, so `SET LOCAL request.jwt.claims
+  = ...` is a parse error in Postgres; `set_config` is the only
+  way to set it.
+* **`SAVEPOINT` per scenario** prevents one role's GUC values from
+  bleeding into the next scenario in the same test.
+* **PostgREST conventions** (`request.jwt.claims` GUC) are the
+  default for Supabase-style stacks, which is the dominant
+  deployment pgrls targets. Non-PostgREST shops can configure
+  alternative claim helpers in a future protocol version 2.
+
+## Conformance criteria
+
+A client conforms to v1 of the contract iff it:
+
+1. Uses `SET LOCAL` (not session-level `SET`) so transaction
+   rollback resets state. **Conformance test:** issue
+   `SET LOCAL ROLE x` inside a transaction, rollback, assert
+   `current_user` is back to the connecting admin role.
+2. Uses `set_config(..., true)` for the `request.jwt.claims` GUC.
+   **Conformance test:** set claims via the helper, rollback,
+   assert `current_setting('request.jwt.claims', true)` is empty.
+3. Honors PostgreSQL's `InsufficientPrivilege` error class
+   (SQLSTATE `42501`) for "rejected" assertion semantics.
+   **Conformance test:** insert a row that violates a
+   `WITH CHECK (false)` policy, assert SQLSTATE `42501`.
+4. Treats `UPDATE ... RETURNING` (or `DELETE ... RETURNING`)
+   returning zero rows as "silently dropped" — `USING` filtered
+   the row out before the write touched it.
+   **Conformance test:** update a row whose `USING` predicate
+   denies for the current role/claims; assert `RETURNING id`
+   returns `[]`. (`INSERT ... RETURNING` does NOT exhibit this
+   shape — Postgres enforces `WITH CHECK` on the new row and
+   raises `InsufficientPrivilege` rather than silently
+   filtering, by design to prevent leak-via-RETURNING.)
+
+## What's deliberately out of contract
+
+These are per-language idiomatic choices, not protocol invariants:
+
+* The Postgres client library used (psycopg, pg-promise, lib/pq).
+* The test framework integrated with (pytest, vitest, `testing.T`).
+* Assertion helper names (`assert_visible` vs `expectVisible`).
+* Seeding API (a `seed()` method, an integration with Drizzle,
+  factory_boy, etc.).
+
+## Versioning
+
+Breaking changes to the wire sequence — new required SQL, changed
+GUC name, etc. — bump `PROTOCOL_VERSION`. Adding new optional
+helpers is non-breaking. The version lives in this document and in
+`pgrls.testing.PROTOCOL_VERSION`; clients should assert they
+understand the document's version when bootstrapping.

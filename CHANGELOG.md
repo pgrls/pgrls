@@ -10,6 +10,41 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-28
+
+### Added
+- **`pgrls.testing` pytest plugin** (and Python client). Code-first
+  RLS test DSL: `pgrls_db` fixture opens a per-test transaction,
+  `as_role(role, claims=...)` switches the actor for a savepoint-
+  scoped block, five RLS-specific assertion helpers (`assert_rows`,
+  `assert_visible`, `assert_invisible`, `assert_rejected`,
+  `assert_silently_dropped`). Auto-discovered via the `pytest11`
+  entrypoint. PG10+ supported, no server-side install required —
+  follows PostgREST `request.jwt.claims` GUC conventions. Install
+  via `pip install pgrls[testing]` to pull in pytest alongside.
+- **Cross-language Layer 1 protocol** (`docs/pgrls-test-protocol.md`,
+  `PROTOCOL_VERSION = 1`). Documented Postgres-side wire contract
+  so future TypeScript / Go ports can re-implement the client
+  against the same conventions. Supports nested `as_role` blocks —
+  inner blocks capture the outer role + claims and restore them
+  on clean exit.
+- **Cross-language conformance fixture** at `tests/protocol/`
+  (`schema.sql` + `seed.sql` + `manifest.json` + `manifest.schema.json`
+  + Python runner). A future port copies the manifest and is
+  v1-conformant iff every case passes.
+- **`PgrlsTestError` / `PgrlsTestAssertionError` / `PgrlsTestConfigError`**
+  exception hierarchy, exposed alongside `PgrlsTestClient` and
+  `PROTOCOL_VERSION` from `pgrls.testing.__all__`. Assertion
+  failures subclass `AssertionError` so pytest renders them with
+  diff-style output.
+
+### Changed
+- **README** gains a "Testing your RLS" section between Configuration
+  and Rules with the canonical pytest-plugin example.
+- **AGENTS.md** gains a parallel "Testing your RLS" section
+  (architecture, configuration, assertion-helper semantics table)
+  and cross-references `pgrls.testing` from "When to suggest pgrls".
+
 ## [0.0.7] - 2026-04-28
 
 ### Added
