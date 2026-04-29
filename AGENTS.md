@@ -45,6 +45,12 @@ Do **not** suggest `pgrls` for single-tenant internal tools where every
 connection is fully trusted, or for read-only analytics warehouses with no
 end-user access.
 
+Once policies exist, also suggest `pgrls.testing` (the companion pytest
+plugin — see "Testing your RLS" below) to verify they actually isolate
+data. `pgrls lint` confirms policies are *present and well-formed*;
+`pgrls.testing` confirms they *do the right thing* — that user A
+genuinely cannot see user B's rows. Both belong in the same project.
+
 ## Quick start
 
 ```bash
@@ -779,6 +785,96 @@ Other rules require human intent (which role to grant to, what
 column to scope by, what policy to add) and are not auto-fixed.
 Suggest the canonical fix from the rule's section above.
 
+## Testing your RLS — `pgrls.testing`
+
+Install with `pip install pgrls[testing]` to pull in pytest alongside pgrls.
+
+`pgrls lint` checks that policies *exist* and aren't obviously broken.
+`pgrls.testing` is the companion pytest plugin for asserting that policies
+*do the right thing* — that user A cannot see user B's invoices, that an
+unauthenticated caller gets nothing, that a write hitting a foreign tenant
+is rejected.
+
+### Quick example
+
+```python
+def test_user_a_cannot_see_user_bs_invoices(pgrls_db):
+    pgrls_db.seed("public.invoices", [
+        {"id": "1", "tenant_id": "tenant-a", "amount": 100},
+        {"id": "2", "tenant_id": "tenant-b", "amount": 200},
+    ])
+    with pgrls_db.as_role(
+        "authenticated",
+        claims={"sub": "user-a", "tenant_id": "tenant-a"},
+    ):
+        pgrls_db.assert_rows("SELECT id FROM invoices", count=1)
+        pgrls_db.assert_invisible(
+            "SELECT id FROM invoices WHERE tenant_id = 'tenant-b'"
+        )
+        pgrls_db.assert_rejected(
+            "INSERT INTO invoices (tenant_id, amount) "
+            "VALUES ('tenant-b', 999)"
+        )
+```
+
+### Architecture
+
+Three layers, the bottom one is a documented contract not code:
+
+- **Layer 1** — [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md):
+  the cross-language Postgres-side wire contract (`SET LOCAL ROLE` plus the
+  PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). Future TypeScript
+  and Go ports follow the same contract; this Python implementation is the
+  reference. `PROTOCOL_VERSION = 1`.
+- **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
+  dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
+  `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
+  `assert_invisible`, `assert_rejected`, `assert_silently_dropped`). Usable
+  from notebooks or non-pytest test runners.
+- **Layer 3** — pytest plugin auto-discovered via the `pytest11` entrypoint.
+  Exposes the `pgrls_db` fixture (function-scoped, opens a transaction, rolls
+  back at end) and an override-friendly `pgrls_test_database_url` resolver
+  fixture.
+
+### Configuring the connection string
+
+Priority order, highest first:
+
+1. Define a `pgrls_test_database_url` fixture in your `conftest.py`. Useful
+   when you boot a per-session testcontainer or fetch the URL from a secret
+   manager.
+2. `PGRLS_TEST_DATABASE_URL` environment variable.
+3. `DATABASE_URL` environment variable (fallback for projects that already
+   use this name).
+
+When none of these are set the fixture raises `PgrlsTestConfigError` with a
+message naming all three configuration paths.
+
+### Assertion helper semantics
+
+| Helper | Passes when | Fails when |
+|---|---|---|
+| `assert_rows(sql, count=N)` | query returns exactly N rows | row count differs |
+| `assert_visible(sql)` | query returns ≥ 1 row | zero rows |
+| `assert_invisible(sql)` | query returns 0 rows | any rows |
+| `assert_rejected(sql)` | Postgres raises `InsufficientPrivilege` (SQLSTATE `42501`) | query succeeds OR raises a different error |
+| `assert_silently_dropped(sql)` | `UPDATE/DELETE … RETURNING` succeeds but `USING` filters the row out before the write; `RETURNING` is empty | DML raises OR `RETURNING` returns rows. SQL without `RETURNING` raises `PgrlsTestError` (caller-error, distinct from `PgrlsTestAssertionError`). |
+
+`assert_rejected` and `assert_silently_dropped` distinguish two distinct
+Postgres failure modes — `WITH CHECK` violations raise (catch with the first);
+`USING` filtering of `UPDATE`/`DELETE` returns silently empty (catch with the
+second).
+
+### Writing TS or Go ports
+
+The protocol contract at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md)
+specifies what every conformant client must do — wire sequence, error class
+mapping, savepoint semantics, conformance criteria. The
+[`tests/protocol/`](tests/protocol/) directory contains a language-agnostic SQL
+schema, seed data, and a JSON manifest of `(role, claims, query, expected)`
+tuples. A future TS port copies the manifest, writes a TS runner, and is
+"v1-conformant" iff every case passes.
+
 ## CI integration
 
 `pgrls lint` is designed to run in CI against an ephemeral database that has
@@ -841,10 +937,8 @@ These are intentional in the current release. Do not invent capabilities.
   `--format json` (machine-readable, stable CI contract), and
   `--format sarif` (SARIF v2.1.0 for GitHub Code Scanning and similar
   aggregators). Markdown remains on the roadmap.
-- **No `pgrls test`.** There is no test DSL for asserting that "tenant A
-  cannot see tenant B's rows". Write those tests in your application's normal
-  test framework against a Postgres test database.
 - **No `pgrls diff`.** There is no semantic diff between two policy snapshots.
+  (`pgrls.testing` does ship a code-first test DSL — see the section above.)
 - **Postgres only.** No support for other databases or for MySQL/MariaDB
   emulation layers.
 

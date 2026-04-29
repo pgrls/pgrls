@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/pgrls/pgrls/tests/protocol/manifest.schema.json",
+  "title": "pgrls test protocol conformance manifest",
+  "description": "Schema for tests/protocol/manifest.json. A future TS / Go port loads the same manifest and is 'v1-conformant' iff every case passes against the schema.sql + seed.sql fixture.",
+  "type": "object",
+  "required": ["protocol_version", "fixture", "cases"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "description": "The Layer 1 contract version this manifest exercises. Bumps in lockstep with docs/pgrls-test-protocol.md.",
+      "type": "integer",
+      "const": 1
+    },
+    "fixture": {
+      "description": "Paths (relative to the manifest) of the schema and seed SQL files. Applied in admin context before any case runs.",
+      "type": "object",
+      "required": ["schema", "seed"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"type": "string"},
+        "seed": {"type": "string"}
+      }
+    },
+    "cases": {
+      "description": "Each case runs in a fresh per-test transaction with a single SAVEPOINT-scoped role + claims block.",
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "required": ["name", "role", "claims", "kind", "sql"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Human-readable case identifier. Used as the pytest parameter id.",
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "description": "Postgres role name to switch to via SET LOCAL ROLE.",
+          "type": "string",
+          "minLength": 1
+        },
+        "claims": {
+          "description": "JWT claims object set into the request.jwt.claims GUC. Use null to skip the set_config call entirely (an actor with no claims at all). Use {} to set the GUC to the empty JSON object (an actor with claims but none of the keys the policy reads).",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "object"}
+          ]
+        },
+        "kind": {
+          "description": "Which assertion helper drives this case.",
+          "type": "string",
+          "enum": [
+            "fetchall",
+            "assert_visible",
+            "assert_invisible",
+            "assert_rejected",
+            "assert_silently_dropped"
+          ]
+        },
+        "sql": {
+          "description": "Statement to execute. For 'assert_silently_dropped' the SQL must contain RETURNING.",
+          "type": "string",
+          "minLength": 1
+        },
+        "expect": {
+          "description": "Required for 'fetchall'; a list of column→value dicts the query must return. Forbidden for the assert_* kinds (those have implicit pass/fail semantics).",
+          "type": "array",
+          "items": {"type": "object"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "fetchall"}}},
+          "then": {"required": ["expect"]}
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "assert_visible",
+                  "assert_invisible",
+                  "assert_rejected",
+                  "assert_silently_dropped"
+                ]
+              }
+            }
+          },
+          "then": {"not": {"required": ["expect"]}}
+        }
+      ]
+    }
+  }
+}
