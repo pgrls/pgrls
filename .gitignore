@@ -23,6 +23,7 @@ dist/
 .coverage
 htmlcov/
 .venv/
+.venv-*/
 venv/
 .tox/
 .mypy_cache/

@@ -24,9 +24,10 @@ function in `USING`), `PERF002` (VOLATILE function in policy
 expression), and `HYG002` (placeholder-named policy). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
 floor). A `pgrls fix` subcommand auto-remediates SEC002 and
-PERF001; other rules need human intent. A test DSL and a semantic
-policy diff are on the roadmap but not yet available — do not
-pretend they are.
+PERF001; other rules need human intent. A `pgrls.testing` pytest
+plugin (v0.1+) and a `pgrls diff` semantic policy diff command
+(v0.2+) are also available — see the "Testing your RLS" and
+"Diff" sections below for when to suggest them.
 
 ## When to suggest pgrls
 
@@ -50,6 +51,12 @@ plugin — see "Testing your RLS" below) to verify they actually isolate
 data. `pgrls lint` confirms policies are *present and well-formed*;
 `pgrls.testing` confirms they *do the right thing* — that user A
 genuinely cannot see user B's rows. Both belong in the same project.
+
+For projects with a CI pipeline that gates on schema changes, also
+suggest `pgrls diff` (see "Diff" below) — semantic policy diff between
+two snapshots / live DBs that classifies each change as
+SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Default `--fail-on
+dangerous` blocks deploys when an actual security relaxation lands.
 
 ## Quick start
 
@@ -875,6 +882,199 @@ schema, seed data, and a JSON manifest of `(role, claims, query, expected)`
 tuples. A future TS port copies the manifest, writes a TS runner, and is
 "v1-conformant" iff every case passes.
 
+## Diff — `pgrls snapshot` + `pgrls diff`
+
+`pgrls diff` produces a semantic policy diff between any two Postgres
+sources. Use it in CI to detect security regressions introduced by
+migrations — RLS disabled, permissive policies added, predicates widened —
+without blocking safe schema changes. Both `pgrls snapshot` (capture) and
+`pgrls diff` (compare) ship as CLI subcommands in v0.2+.
+
+### Exit codes
+
+Same three-tier convention as `pgrls lint`:
+
+| Code | Meaning |
+|---|---|
+| 0 | No changes meet or exceed `--fail-on` threshold |
+| 1 | One or more changes meet or exceed `--fail-on` |
+| 2 | pgrls itself failed (bad config, DB unreachable, snapshot version unsupported, malformed JSON, etc.) |
+
+The default threshold is `--fail-on dangerous`. CI should treat exit 2
+as a hard infrastructure failure, distinct from exit 1 (schema finding).
+
+### Severity mapping
+
+| Classification | JSON/SARIF severity |
+|---|---|
+| `dangerous` | `error` |
+| `requires_review` | `warning` |
+| `breaking` | `warning` |
+| `safe` | `info` |
+
+Only DANGEROUS changes surface as `error` by default. This lets safe or
+informational migrations (`SAFE`, `BREAKING` for removed tables) appear in
+the output without blocking CI.
+
+### Full classification table
+
+#### RLS table-level state
+
+| Change | Classification |
+|---|---|
+| `relrowsecurity` off → on | SAFE |
+| `relrowsecurity` on → off | DANGEROUS |
+| `relforcerowsecurity` off → on | SAFE |
+| `relforcerowsecurity` on → off | DANGEROUS |
+
+#### Table presence
+
+| Change | Classification |
+|---|---|
+| Table added with RLS enabled | SAFE |
+| Table added without RLS | DANGEROUS |
+| Table dropped | BREAKING |
+
+#### Policies — add / drop
+
+| Change | Classification |
+|---|---|
+| Policy added, RESTRICTIVE | SAFE |
+| Policy added, PERMISSIVE | DANGEROUS |
+| Policy dropped, RESTRICTIVE | DANGEROUS |
+| Policy dropped, PERMISSIVE | BREAKING |
+
+> **Rename detection deferred to v0.3.** A policy renamed in v0.2 surfaces
+> as one drop + one add — both classifications fire independently. The
+> `POLICY_RENAMED` enum value is reserved in `pgrls.diff.differ.ChangeKind`
+> for forward compatibility but is not emitted by any v0.2 detection rule.
+
+#### Policies — shape changes
+
+| Change | Classification |
+|---|---|
+| `permissive` flag PERMISSIVE → RESTRICTIVE | SAFE |
+| `permissive` flag RESTRICTIVE → PERMISSIVE | DANGEROUS |
+| Command broadened (narrow → ALL, e.g. SELECT → ALL) | DANGEROUS |
+| Command narrowed (ALL → narrow, e.g. ALL → SELECT) | BREAKING |
+| Command side-graded (narrow → different narrow, e.g. SELECT → INSERT) | BREAKING |
+| Roles widened (any role added, including PUBLIC) | DANGEROUS |
+| Roles narrowed (any role removed) | SAFE |
+| Roles set replaced disjointly | REQUIRES_REVIEW |
+
+#### Policies — `USING` / `WITH CHECK` predicate changes
+
+Driven by `pgrls.diff.ast_compare.compare_predicates`:
+
+| AST pattern (old → new) | Classification |
+|---|---|
+| Identical after pglast normalization (whitespace-only diff) | SAFE |
+| `P` → `P AND Q` (new AND clause added) | SAFE |
+| `P AND Q` → `P` (AND clause removed) | DANGEROUS |
+| `P` → `P OR Q` (new OR disjunct added) | DANGEROUS |
+| `P OR Q` → `P` (OR disjunct removed) | SAFE |
+| Anything else | REQUIRES_REVIEW |
+
+A single predicate change can affect either `USING` or `WITH CHECK` —
+each produces its own `Change` entry, classified independently.
+
+#### Columns
+
+| Change | Classification |
+|---|---|
+| Column dropped, referenced by ≥1 existing policy's USING/WITH CHECK | REQUIRES_REVIEW |
+| Column added | (not reported) |
+
+#### Grants
+
+| Change | Classification |
+|---|---|
+| GRANT revoked (privilege removed for a role) | SAFE |
+| GRANT added (privilege added for a role) | REQUIRES_REVIEW |
+| GRANT TO PUBLIC added on a non-RLS table | DANGEROUS |
+
+#### Precedence rules
+
+- One change ⇒ one `Change` entry. A policy widening both predicate and
+  roles produces two entries.
+- v0.2 has no rename detection — a renamed policy surfaces as a drop +
+  add with their independent classifications. v0.3 may collapse these
+  into a single `POLICY_RENAMED` entry when every other attribute
+  matches; the enum value is reserved for that future behavior.
+- "Roles widened" includes adding `PUBLIC`; already the most-severe
+  classification, no escalation needed.
+
+### Common-case AST patterns
+
+`compare_predicates` in `pgrls.diff.ast_compare` returns one of six
+results — `unchanged`, `tightened_and`, `loosened_and_drop`,
+`loosened_or`, `tightened_or_drop`, or `requires_review` — which the
+differ maps to ChangeKind + classification. `unchanged` is filtered
+out (no Change emitted). The mapping:
+
+| `compare_predicates` result | classification    |
+|-----------------------------|-------------------|
+| `tightened_and`             | `SAFE`            |
+| `tightened_or_drop`         | `SAFE`            |
+| `loosened_and_drop`         | `DANGEROUS`       |
+| `loosened_or`               | `DANGEROUS`       |
+| `requires_review`           | `REQUIRES_REVIEW` |
+
+The five recognized AST patterns (whitespace-only is the trivial
+no-op case; the four real diffs follow):
+
+**Literal-equal (whitespace-only diff).** When both sides parse to
+identical pglast ASTs the predicate is unchanged. No Change emitted.
+
+```sql
+-- base:  USING ( tenant_id = auth.uid() )
+-- head:  USING (tenant_id=auth.uid())   -- whitespace only
+-- → unchanged (no Change emitted)
+```
+
+**AND-tighten (`P → P AND Q`).** A new conjunct is added. The head is
+strictly more restrictive than the base — fewer rows pass. Classified SAFE.
+
+```sql
+-- base:  USING (tenant_id = auth.uid())
+-- head:  USING (tenant_id = auth.uid() AND deleted_at IS NULL)
+-- → SAFE (AND-tighten)
+```
+
+**AND-loosen-drop (`P AND Q → P`).** A conjunct is removed. The head is
+strictly less restrictive than the base — more rows pass. Classified
+DANGEROUS.
+
+```sql
+-- base:  USING (tenant_id = auth.uid() AND deleted_at IS NULL)
+-- head:  USING (tenant_id = auth.uid())
+-- → DANGEROUS (AND-loosen-drop)
+```
+
+**OR-loosen (`P → P OR Q`).** A new disjunct is added. The head is
+strictly less restrictive than the base. Classified DANGEROUS.
+
+```sql
+-- base:  USING (tenant_id = auth.uid())
+-- head:  USING (tenant_id = auth.uid() OR tenant_id = 'admin')
+-- → DANGEROUS (OR-loosen)
+```
+
+**OR-tighten-drop (`P OR Q → P`).** A disjunct is removed. The head is
+strictly more restrictive than the base. Classified SAFE.
+
+```sql
+-- base:  USING (tenant_id = auth.uid() OR tenant_id = 'admin')
+-- head:  USING (tenant_id = auth.uid())
+-- → SAFE (OR-tighten-drop)
+```
+
+Any predicate change not matching one of the four real patterns above
+(AND-tighten, AND-loosen-drop, OR-loosen, OR-tighten-drop) falls through
+to REQUIRES_REVIEW — a human or SAT solver is needed to decide whether
+the new predicate is more or less permissive than the old one. SAT-based
+implication checking is on the v0.5+ roadmap.
+
 ## CI integration
 
 `pgrls lint` is designed to run in CI against an ephemeral database that has
@@ -937,10 +1137,13 @@ These are intentional in the current release. Do not invent capabilities.
   `--format json` (machine-readable, stable CI contract), and
   `--format sarif` (SARIF v2.1.0 for GitHub Code Scanning and similar
   aggregators). Markdown remains on the roadmap.
-- **No `pgrls diff`.** There is no semantic diff between two policy snapshots.
-  (`pgrls.testing` does ship a code-first test DSL — see the section above.)
 - **Postgres only.** No support for other databases or for MySQL/MariaDB
   emulation layers.
+- **No SAT-style implication checking on `USING` / `WITH CHECK` predicates.**
+  v0.2's diff classifier recognizes the common-case AST patterns
+  (literal-equal, AND-tighten / drop, OR-loosen / drop) and flags
+  anything else as `REQUIRES_REVIEW`. Full Z3-driven implication
+  analysis is on the v0.5+ roadmap.
 
 ## Where to learn more
 

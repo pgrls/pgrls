@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.0.7** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. The `test` / `diff` commands are on the roadmap below.
+> **Status: 0.2.0** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
 
 ## Install
 
@@ -148,6 +148,48 @@ The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `reque
 
 The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). TypeScript and Go ports following the same contract are tracked on the roadmap.
 
+## Diff — `pgrls snapshot` + `pgrls diff`
+
+`pgrls diff` is the semantic policy diff command. Point it at any two
+Postgres sources — two snapshot files, a snapshot and a live DB, or two
+live DBs — and it classifies every RLS change as SAFE, BREAKING,
+REQUIRES_REVIEW, or DANGEROUS. Use it in CI to gate deployments on
+actual security regressions without blocking safe migrations.
+
+```bash
+# Capture a baseline from the current branch (filter to a schema list
+# to keep snapshots small and stable).
+pgrls snapshot --database-url "$DATABASE_URL" --schemas app -o base.json
+
+# After applying a migration, compare live DB to the baseline. The
+# --schemas filter applies to the URL side only (the snapshot file
+# already carries the filter from capture time).
+pgrls diff base.json --database-url "$DATABASE_URL" --schemas app
+```
+
+The default `--fail-on dangerous` threshold means CI only fails when a
+genuinely dangerous change is detected (RLS toggled off, a permissive
+policy added, a predicate widened, etc.). Pass `--fail-on requires-review`
+for a stricter gate. Output is git-diff-style by default (`--format
+text`); use `--format json` or `--format sarif` for CI integrations
+that already parse `pgrls lint` output — the same `Violation` shape is
+reused.
+
+| Change category                        | Default classification |
+|----------------------------------------|------------------------|
+| RLS toggled off                        | DANGEROUS              |
+| Table dropped                          | BREAKING               |
+| Permissive policy added                | DANGEROUS              |
+| Restrictive policy dropped             | DANGEROUS              |
+| USING predicate widened (OR added)     | DANGEROUS              |
+| USING predicate tightened (AND added)  | SAFE                   |
+| Roles widened (PUBLIC or new role)     | DANGEROUS              |
+| Column dropped (still referenced)      | REQUIRES_REVIEW        |
+| GRANT added on non-RLS table to PUBLIC | DANGEROUS              |
+
+See [AGENTS.md](AGENTS.md) for the full classification table and AST
+pattern documentation.
+
 ## Rules
 
 `pgrls lint` ships these rules:
@@ -247,8 +289,9 @@ dashboard, or keep the report as a build artifact.
 ## Roadmap
 
 - **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. Markdown output. Polished error messages.
-- **`pgrls test`.** Code-first RLS test DSL for Python, TypeScript, and Go.
-- **`pgrls diff`.** Semantic policy diff between branches with DANGEROUS / BREAKING / SAFE classification.
+- **TypeScript / Go ports.** Cross-language ports of `pgrls.testing` (v0.3) and `pgrls.diff` (v0.3+) backed by the same Layer-1 protocol fixtures.
+- **SAT-based predicate implication checking.** v0.2 recognizes common-case AST patterns (literal-equal, AND-tighten/drop, OR-tighten/drop) for `USING` / `WITH CHECK` diffs; everything else is `REQUIRES_REVIEW`. Z3-driven analysis to widen automatic classification is tracked for v0.5+.
+- **Migration-as-input.** `pgrls diff --apply migration.sql` to diff a live DB against the post-migration shape without applying it. Tracked for v0.5+.
 
 ## License
 
