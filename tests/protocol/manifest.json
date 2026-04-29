@@ -1,0 +1,69 @@
+{
+  "protocol_version": 1,
+  "fixture": {
+    "schema": "schema.sql",
+    "seed": "seed.sql"
+  },
+  "cases": [
+    {
+      "name": "tenant-a sees only tenant-a rows",
+      "role": "pgrls_protocol_actor",
+      "claims": { "tenant_id": "tenant-a" },
+      "kind": "fetchall",
+      "sql": "SELECT count(*) AS n FROM protocol_invoices",
+      "expect": [{ "n": 2 }]
+    },
+    {
+      "name": "tenant-b sees only tenant-b rows",
+      "role": "pgrls_protocol_actor",
+      "claims": { "tenant_id": "tenant-b" },
+      "kind": "fetchall",
+      "sql": "SELECT count(*) AS n FROM protocol_invoices",
+      "expect": [{ "n": 3 }]
+    },
+    {
+      "name": "tenant-a cannot see tenant-b rows directly",
+      "role": "pgrls_protocol_actor",
+      "claims": { "tenant_id": "tenant-a" },
+      "kind": "assert_invisible",
+      "sql": "SELECT id FROM protocol_invoices WHERE tenant_id = 'tenant-b'"
+    },
+    {
+      "name": "tenant-a inserting into tenant-b is rejected",
+      "role": "pgrls_protocol_actor",
+      "claims": { "tenant_id": "tenant-a" },
+      "kind": "assert_rejected",
+      "sql": "INSERT INTO protocol_invoices (tenant_id, amount) VALUES ('tenant-b', 999)"
+    },
+    {
+      "name": "tenant-a own-tenant insert succeeds",
+      "role": "pgrls_protocol_actor",
+      "claims": { "tenant_id": "tenant-a" },
+      "kind": "fetchall",
+      "sql": "INSERT INTO protocol_invoices (tenant_id, amount) VALUES ('tenant-a', 999) RETURNING tenant_id",
+      "expect": [{ "tenant_id": "tenant-a" }]
+    },
+    {
+      "name": "no-claim caller sees zero rows",
+      "role": "pgrls_protocol_actor",
+      "claims": null,
+      "kind": "assert_invisible",
+      "sql": "SELECT id FROM protocol_invoices"
+    },
+    {
+      "name": "tenant-a UPDATE on tenant-b row is silently dropped",
+      "role": "pgrls_protocol_actor",
+      "claims": { "tenant_id": "tenant-a" },
+      "kind": "assert_silently_dropped",
+      "sql": "UPDATE protocol_invoices SET amount = 0 WHERE tenant_id = 'tenant-b' RETURNING id"
+    },
+    {
+      "name": "explicit empty claims object is sent (not skipped)",
+      "role": "pgrls_protocol_actor",
+      "claims": {},
+      "kind": "fetchall",
+      "sql": "SELECT current_setting('request.jwt.claims', true) AS c",
+      "expect": [{ "c": "{}" }]
+    }
+  ]
+}

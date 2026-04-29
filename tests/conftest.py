@@ -19,6 +19,8 @@ import pytest
 from psycopg import sql
 from testcontainers.postgres import PostgresContainer
 
+pytest_plugins = ["pytester"]
+
 
 @pytest.fixture(scope="session")
 def pg_url() -> Generator[str, None, None]:
