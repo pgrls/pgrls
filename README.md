@@ -115,6 +115,39 @@ fail_on = "warning"
 allowlist = ["countries", "currencies"]
 ```
 
+## Testing your RLS — `pgrls.testing`
+
+Install with `pip install pgrls[testing]` to pull in pytest alongside pgrls.
+
+`pgrls.testing` is a pytest plugin that lets you write RLS tests with idiomatic pytest ergonomics. The `pgrls_db` fixture opens a connection, starts a per-test transaction, lets you switch roles + claims for each scenario, and rolls back at end so nothing persists between tests.
+
+```python
+def test_user_a_cannot_see_user_bs_invoices(pgrls_db):
+    pgrls_db.seed("public.invoices", [
+        {"id": "1", "tenant_id": "tenant-a", "amount": 100},
+        {"id": "2", "tenant_id": "tenant-b", "amount": 200},
+    ])
+    with pgrls_db.as_role(
+        "authenticated",
+        claims={"sub": "user-a", "tenant_id": "tenant-a"},
+    ):
+        pgrls_db.assert_rows("SELECT id FROM invoices", count=1)
+        pgrls_db.assert_invisible(
+            "SELECT id FROM invoices WHERE tenant_id = 'tenant-b'"
+        )
+        pgrls_db.assert_rejected(
+            "INSERT INTO invoices (tenant_id, amount) VALUES ('tenant-b', 999)"
+        )
+```
+
+The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `request.jwt.claims` GUC). Configure the connection string via:
+
+- A `pgrls_test_database_url` fixture in your `conftest.py` (highest priority — useful for per-session testcontainers).
+- The `PGRLS_TEST_DATABASE_URL` environment variable.
+- The `DATABASE_URL` environment variable (fallback).
+
+The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). TypeScript and Go ports following the same contract are tracked on the roadmap.
+
 ## Rules
 
 `pgrls lint` ships these rules:

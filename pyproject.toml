@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.0.7"
+version = "0.1.0"
 description = "Framework-agnostic linter and testing toolkit for Postgres Row-Level Security."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,6 +33,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `pgrls.testing` registers a pytest11 entrypoint at the wheel level
+# but pytest itself is not in the runtime deps — keeping `pgrls`
+# slim for the lint-only path. Users who want the testing toolkit
+# install with `pip install pgrls[testing]`.
+testing = ["pytest>=8.0"]
 # `hatchling` is the build backend (declared in [build-system]) and
 # is installed automatically by `python -m build` / pip's PEP 517
 # isolated env. Don't list it here — including it would suggest to
@@ -46,6 +51,9 @@ dev = [
 
 [project.scripts]
 pgrls = "pgrls.cli:main"
+
+[project.entry-points.pytest11]
+pgrls = "pgrls.testing.pytest_plugin"
 
 [project.urls]
 Homepage = "https://github.com/pgrls/pgrls"
