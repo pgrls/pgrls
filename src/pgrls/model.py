@@ -2,7 +2,8 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 2 (v2 added `partition_of` to each table entry).
+Currently version 3 (v3 added `grants` to each table entry; v2 added
+`partition_of`).
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from functools import cached_property
 from typing import Any, Literal
 
 __all__ = [
+    "Grant",
     "Policy",
     "PolicyCommand",
     "SNAPSHOT_VERSION",
@@ -23,7 +25,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,20 @@ class Policy:
 
 
 @dataclass(frozen=True)
+class Grant:
+    """A privilege grant on a table.
+
+    Captured in snapshot v3+. Privileges use Postgres's canonical
+    string forms: SELECT, INSERT, UPDATE, DELETE, TRUNCATE,
+    REFERENCES, TRIGGER. PUBLIC pseudo-role is represented as
+    `role="PUBLIC"`, mirroring the Policy.roles convention.
+    """
+
+    role: str
+    privileges: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Table:
     schema: str
     name: str
@@ -56,6 +72,12 @@ class Table:
     # `INHERITS` children. The chain may be deeper than one level; rules
     # walk it via the resolved Schema.
     partition_of: tuple[str, str] | None = None
+    # Privilege grants on this table — populated from `pg_class.relacl` in
+    # snapshot v3+. Default `()` keeps existing call sites that construct
+    # `Table(...)` without grants working unchanged. A v2 baseline loaded
+    # via `Schema.from_snapshot` always yields `grants=()` because the
+    # field didn't exist in that format.
+    grants: tuple[Grant, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -130,6 +152,10 @@ class Schema:
                         if t.partition_of is not None
                         else None
                     ),
+                    "grants": [
+                        {"role": g.role, "privileges": list(g.privileges)}
+                        for g in t.grants
+                    ],
                 }
                 for t in self.tables
             ],
@@ -149,3 +175,114 @@ class Schema:
                 for p in t.policies
             ],
         }
+
+    @classmethod
+    def from_snapshot(cls, payload: dict) -> "Schema":
+        """Reconstruct a Schema from a v2 or v3 snapshot dict.
+
+        v3 (current): full fidelity. v2 (legacy): grants come back as
+        `()` per table; a `pgrls diff` against a v2 baseline silently
+        classifies any grant-affecting change as REQUIRES_REVIEW (the
+        diff layer handles this — model only carries the empty data).
+
+        v1 / unknown versions: raises ValueError with a clear
+        "snapshot version N is not supported" message naming the
+        supported set.
+
+        AST fields (`using_ast`, `with_check_ast`) are NOT serialized;
+        the loader re-parses `using_sql` / `with_check_sql` via
+        `pgrls.ast_utils.parse_expr` so a freshly-loaded Schema has
+        AST data ready for rule code that walks it.
+        """
+        from pgrls.ast_utils import parse_expr
+
+        version = payload.get("version")
+        if version not in (2, 3):
+            raise ValueError(
+                f"snapshot version {version!r} is not supported by this "
+                f"pgrls release. Supported versions: 2, 3. v1 snapshots "
+                "must be regenerated against the current schema."
+            )
+
+        # Build a {(schema, name): [policy_dict, ...]} index from the
+        # top-level "policies" array that to_snapshot() produces.
+        # Per-table embedded policies (used in manual test fixtures and
+        # the legacy v2 format) are also accepted as a fallback.
+        top_level_policies: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for p in payload.get("policies", []):
+            key = (p["table_schema"], p["table_name"])
+            top_level_policies.setdefault(key, []).append(p)
+
+        # Snapshot-load-context tail for parse_expr's parse-failure
+        # warning. Without this override, parse_expr emits the
+        # lint-context "AST-based rules (SEC*, PERF*, HYG*) skipped"
+        # message even when the snapshot is being loaded for `pgrls
+        # diff`, where those rules never run.
+        _load_fail_tail = (
+            "Snapshot policy AST will be unavailable for "
+            "column-reference checks."
+        )
+
+        tables: list[Table] = []
+        for t in payload.get("tables", []):
+            key = (t["schema"], t["name"])
+            # Prefer top-level policies (canonical format); fall back to
+            # per-table embedded policies (legacy / manual test fixtures).
+            # When BOTH paths have data, top-level wins (Python `or` short-
+            # circuits on the truthy first list); the embedded list is
+            # silently ignored. This is a defensive choice — to_snapshot
+            # only writes top-level — but a malformed snapshot mixing
+            # both should not silently merge them.
+            raw_policies = top_level_policies.get(key) or t.get("policies", [])
+            policies = tuple(
+                Policy(
+                    # Top-level format uses "policy_name"; embedded uses "name".
+                    name=p.get("policy_name") or p["name"],
+                    command=p["command"],
+                    permissive=p["permissive"],
+                    roles=tuple(p["roles"]),
+                    using_sql=p.get("using_sql"),
+                    with_check_sql=p.get("with_check_sql"),
+                    using_ast=parse_expr(
+                        p.get("using_sql"),
+                        location=(
+                            f"{t['schema']}.{t['name']}."
+                            f"{p.get('policy_name') or p['name']}"
+                        ),
+                        clause="USING",
+                        fail_message_tail=_load_fail_tail,
+                    ),
+                    with_check_ast=parse_expr(
+                        p.get("with_check_sql"),
+                        location=(
+                            f"{t['schema']}.{t['name']}."
+                            f"{p.get('policy_name') or p['name']}"
+                        ),
+                        clause="WITH CHECK",
+                        fail_message_tail=_load_fail_tail,
+                    ),
+                )
+                for p in raw_policies
+            )
+            grants_raw = t.get("grants", []) if version >= 3 else []
+            grants = tuple(
+                Grant(role=g["role"], privileges=tuple(g["privileges"]))
+                for g in grants_raw
+            )
+            partition_of_raw = t.get("partition_of")
+            partition_of = (
+                tuple(partition_of_raw) if partition_of_raw else None
+            )
+            tables.append(
+                Table(
+                    schema=t["schema"],
+                    name=t["name"],
+                    rls_enabled=t["rls_enabled"],
+                    force_rls=t["force_rls"],
+                    policies=policies,
+                    columns=tuple(t.get("columns", ())),
+                    partition_of=partition_of,
+                    grants=grants,
+                )
+            )
+        return cls(tables=tuple(tables))

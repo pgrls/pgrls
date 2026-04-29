@@ -18,13 +18,17 @@ Exit codes:
 """
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 import click
 import psycopg
 
 from pgrls import __version__
 from pgrls.config import Config, ConfigError, load_config
+from pgrls.diff import diff_schemas
+from pgrls.diff.formatters import format_diff_json, format_diff_sarif, format_diff_text
 from pgrls.fixers import default_fixers, generate_fixes
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
@@ -393,3 +397,271 @@ def fix(
         raise ToolError(f"Database error: {exc}") from exc
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+
+
+@main.command()
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    help="Postgres connection string. Falls back to $DATABASE_URL.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to scan (overrides config).",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Path to write the JSON snapshot (default: stdout).",
+)
+def snapshot(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    output_path: str | None,
+) -> None:
+    """Capture a JSON snapshot of the database's RLS state.
+
+    The snapshot format is documented in CHANGELOG.md and is
+    intended to be consumed by `pgrls diff` (or stored as a
+    baseline in CI). Output is the same JSON shape
+    `Schema.to_snapshot()` produces — top-level `version` plus a
+    `tables` list, deterministic within a single Postgres
+    instance.
+
+    Without `--output`, the snapshot is written to stdout. With
+    `--output PATH`, it's written to the path with a trailing
+    newline (POSIX-friendly).
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=None,
+    )
+
+    if effective.database_url is None:
+        raise ToolError(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+    payload = json.dumps(schema.to_snapshot(), indent=2, ensure_ascii=False)
+    if output_path:
+        Path(output_path).write_text(payload + "\n", encoding="utf-8")
+    else:
+        click.echo(payload)
+
+
+# ---------------------------------------------------------------------------
+# diff helpers
+# ---------------------------------------------------------------------------
+
+# Map the user-facing --fail-on value (with hyphens) to the set of internal
+# Classification Literal values (with underscores) that should trigger exit 1.
+_FAIL_ON_TO_THRESHOLD: dict[str, set[str]] = {
+    "safe":            {"safe", "breaking", "requires_review", "dangerous"},
+    "breaking":        {"breaking", "requires_review", "dangerous"},
+    "requires-review": {"requires_review", "dangerous"},
+    "dangerous":       {"dangerous"},
+}
+
+
+def _classifications_at_or_above(fail_on: str) -> set[str]:
+    """Return the set of Classification values that meet or exceed `fail_on`."""
+    return _FAIL_ON_TO_THRESHOLD[fail_on]
+
+
+def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
+    """Resolve a base/head argument into a Schema.
+
+    - If arg contains '://' → treat as DB URL, connect via psycopg, introspect.
+    - Else if file exists → load JSON, parse via Schema.from_snapshot.
+    - Else raise ToolError (exit 2) with a clear message.
+
+    The schemas filter only applies to URL sources; snapshot files already have
+    their filter baked in at capture time.
+    """
+    if "://" in arg:
+        try:
+            with psycopg.connect(arg) as conn:
+                return introspect(conn, schemas=schemas)
+        except psycopg.Error as exc:
+            raise ToolError(
+                f"Database error connecting to {arg!r}: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+
+    p = Path(arg)
+    if p.is_file():
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ToolError(
+                f"{arg!r}: not valid JSON ({exc.msg} at line {exc.lineno}). "
+                "Snapshot files are JSON; for a database URL, include "
+                "'://' (e.g. postgres://...)."
+            ) from exc
+        try:
+            return Schema.from_snapshot(payload)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ToolError(
+                f"{arg!r}: not a valid pgrls snapshot — {exc}"
+            ) from exc
+
+    raise ToolError(
+        f"{arg!r}: not a database URL (no '://') and not an existing file. "
+        "Pass a URL like postgres://... or a path to a snapshot JSON file."
+    )
+
+
+# ---------------------------------------------------------------------------
+# diff command
+# ---------------------------------------------------------------------------
+
+_DIFF_FAIL_ON_VALUES = list(_FAIL_ON_TO_THRESHOLD)
+_DIFF_FORMAT_VALUES = ["text", "json", "sarif"]
+
+
+@main.command()
+@click.argument("base", required=True)
+@click.argument("head", required=False, default=None)
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    default=None,
+    help=(
+        "Postgres connection string used as the head when <head> is "
+        "omitted. Falls back to $DATABASE_URL, then [database].url "
+        "in pgrls.toml. Ignored when <head> is given explicitly."
+    ),
+)
+@click.option(
+    "--fail-on",
+    "fail_on",
+    type=click.Choice(_DIFF_FAIL_ON_VALUES, case_sensitive=False),
+    default="dangerous",
+    show_default=True,
+    help="Exit 1 when any change at or above this classification is present.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(_DIFF_FORMAT_VALUES, case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to introspect (applied to URL sources only).",
+)
+def diff(
+    base: str,
+    head: str | None,
+    database_url: str | None,
+    fail_on: str,
+    output_format: str,
+    config_path: str | None,
+    schemas: str | None,
+) -> None:
+    """Diff two RLS schema snapshots — report semantic changes with classification."""
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    # Resolve --schemas (CSV) — only passed to URL-source resolution.
+    if schemas:
+        schema_list = [s.strip() for s in schemas.split(",") if s.strip()]
+        if not schema_list:
+            raise ToolError(
+                f"--schemas {schemas!r} produced an empty list."
+            )
+    else:
+        schema_list = config.schemas
+
+    # Default head fallback chain (mirrors `pgrls lint` / `snapshot`):
+    #   1. <head> positional arg (already-resolved before this point)
+    #   2. --database-url flag (Click reads $DATABASE_URL via envvar=)
+    #   3. [database].url in pgrls.toml (lives on config.database_url)
+    # All three are documented in the design spec; the implementation
+    # here was previously honoring only #3, which broke the common
+    # "DATABASE_URL is set, no toml file exists" CI workflow.
+    if head is None:
+        head = database_url or config.database_url
+        if head is None:
+            raise ToolError(
+                "No head: pass <head> argument, set DATABASE_URL, "
+                "or configure [database].url in pgrls.toml."
+            )
+
+    # Warn early if --schemas was passed explicitly but neither side
+    # is a URL — snapshot files are pre-filtered at capture time, so
+    # the flag is silently ineffective on file inputs. Without this
+    # warning, a user typing `pgrls diff base.json head.json --schemas
+    # app` would get a misleadingly-passing run that didn't filter at
+    # all. Only warn when the user passed --schemas explicitly (CLI
+    # arg, not toml inheritance) AND both sources are file-shaped.
+    base_is_url = "://" in base
+    head_is_url = "://" in head
+    if schemas and not (base_is_url or head_is_url):
+        click.echo(
+            "pgrls: warning: --schemas is ignored when both <base> and "
+            "<head> are snapshot files (filters apply only to live DB "
+            "introspection). Snapshots are already filtered at "
+            "`pgrls snapshot` capture time.",
+            err=True,
+        )
+
+    base_schema = _resolve_diff_source(base, schemas=schema_list)
+    head_schema = _resolve_diff_source(head, schemas=schema_list)
+
+    changes = diff_schemas(base_schema, head_schema)
+
+    # --fail-on filter
+    threshold_classifications = _classifications_at_or_above(fail_on)
+    failing = [c for c in changes if c.classification in threshold_classifications]
+
+    # Format and emit
+    if output_format == "text":
+        click.echo(format_diff_text(changes), nl=True)
+    elif output_format == "json":
+        click.echo(format_diff_json(changes), nl=False)
+    elif output_format == "sarif":
+        click.echo(format_diff_sarif(changes), nl=False)
+
+    if failing:
+        sys.exit(1)

@@ -8,7 +8,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from pgrls.ast_utils import parse_expr
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Grant, Policy, Schema, Table
 
 _POLICY_CMD_MAP: dict[str, str] = {
     "*": "ALL",
@@ -171,6 +171,52 @@ WHERE a.attrelid = ANY(%s)
 ORDER BY a.attrelid, a.attnum
 """
 
+# Per-table grants from `pg_class.relacl`. `aclexplode` expands
+# the ACL array into one row per (grantor, grantee, privilege,
+# is_grantable) tuple. The CASE on `ax.grantee = 0` resolves the
+# special PUBLIC pseudo-role to the literal string "PUBLIC",
+# mirroring the convention already used for `Policy.roles`.
+#
+# Role-name resolution mirrors the `polroles` handling above: a
+# non-superuser pgrls run may not be able to SELECT from
+# `pg_authid` (RLS, missing permissions, race against `DROP
+# ROLE`), leaving `ar.rolname` NULL even when the grantee OID
+# exists. A NULL leaking into `Grant.role` violates the `str`
+# annotation and breaks downstream JSON serialization and
+# `sorted()` calls. COALESCE to a stable `oid:N` sentinel so the
+# type contract holds and the operator can still see what role
+# was referenced.
+#
+# `c.relacl IS NOT NULL` short-circuits before the LATERAL: for
+# tables with the default ACL (no explicit GRANT), `aclexplode`
+# returns zero rows, but Postgres still evaluates the LATERAL
+# per row. Filtering these out lets the planner skip the entire
+# evaluation. Pure performance — same correctness as the
+# original.
+#
+# Sort: role name first (alphabetical, with PUBLIC sorting
+# before user roles per ASCII), then privilege type. Postgres's
+# native privilege order is implementation-defined; sorting
+# here so two introspections of the same DB produce byte-
+# identical Schema (downstream snapshot determinism).
+_GRANTS_SQL = """
+SELECT
+    c.oid AS table_oid,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN LATERAL aclexplode(c.relacl) ax ON true
+LEFT JOIN pg_catalog.pg_authid ar ON ar.oid = ax.grantee
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname = ANY(%s)
+  AND c.relacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+ORDER BY c.oid, role_name, ax.privilege_type
+"""
+
 
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
@@ -213,6 +259,14 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         policy_rows = cur.fetchall()
         cur.execute(_PARTITION_PARENTS_SQL, (oids,))
         partition_rows = cur.fetchall()
+        cur.execute(_GRANTS_SQL, (schemas,))
+        grants_by_oid: dict[int, dict[str, list[str]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for row in cur.fetchall():
+            grants_by_oid[row["table_oid"]][row["role_name"]].append(
+                row["privilege_type"]
+            )
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
     for row in column_rows:
@@ -273,6 +327,12 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             policies=tuple(by_oid.get(row["table_oid"], [])),
             columns=tuple(columns_by_oid.get(row["table_oid"], [])),
             partition_of=partition_parent_by_oid.get(row["table_oid"]),
+            grants=tuple(
+                Grant(role=role, privileges=tuple(privileges))
+                for role, privileges in sorted(
+                    grants_by_oid.get(row["table_oid"], {}).items()
+                )
+            ),
         )
         for row in table_rows
     ]

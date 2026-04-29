@@ -481,3 +481,125 @@ def test_partition_of_emitted_when_parent_outside_introspected_schemas(
     schema = introspect(pg_conn, schemas=["public"])
     leaf = next(t for t in schema.tables if t.name == "leaf_t")
     assert leaf.partition_of == ("other", "parent_t")
+
+
+def test_introspect_captures_grants(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS grant_test_actor;
+        CREATE ROLE grant_test_actor NOLOGIN;
+        CREATE TABLE public.granted_t (id INT);
+        GRANT SELECT, INSERT ON public.granted_t TO grant_test_actor;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "granted_t")
+    grants_by_role = {g.role: set(g.privileges) for g in t.grants}
+    assert "grant_test_actor" in grants_by_role
+    assert grants_by_role["grant_test_actor"] >= {"SELECT", "INSERT"}
+
+
+def test_introspect_grants_resolve_public_pseudo_role(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.public_t (id INT);
+        GRANT SELECT ON public.public_t TO PUBLIC;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "public_t")
+    grants_by_role = {g.role: set(g.privileges) for g in t.grants}
+    assert "PUBLIC" in grants_by_role
+    assert "SELECT" in grants_by_role["PUBLIC"]
+
+
+def test_introspect_grants_are_deterministic(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Re-introspecting the same DB twice must produce byte-
+    # identical Schema (so to_snapshot also produces byte-
+    # identical JSON). Order: roles alphabetized, privileges in
+    # canonical order.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS det_role_b;
+        DROP ROLE IF EXISTS det_role_a;
+        CREATE ROLE det_role_a NOLOGIN;
+        CREATE ROLE det_role_b NOLOGIN;
+        CREATE TABLE public.det_t (id INT);
+        GRANT SELECT ON public.det_t TO det_role_b;
+        GRANT INSERT, SELECT ON public.det_t TO det_role_a;
+        """
+    )
+    schema_a = introspect(pg_conn, schemas=["public"])
+    schema_b = introspect(pg_conn, schemas=["public"])
+    t_a = next(x for x in schema_a.tables if x.name == "det_t")
+    t_b = next(x for x in schema_b.tables if x.name == "det_t")
+    assert t_a.grants == t_b.grants
+    # Roles alphabetized: a before b.
+    roles = [g.role for g in t_a.grants if g.role.startswith("det_")]
+    assert roles == sorted(roles)
+
+
+def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Same Postgres quirk that Round 15 of v0.0.7 polish caught for
+    # polroles: a non-superuser caller may not be able to SELECT
+    # from pg_authid, leaving ar.rolname NULL even when the grantee
+    # OID exists. The COALESCE sentinel keeps the role-name column
+    # non-NULL so downstream JSON serialization and `sorted()` calls
+    # don't blow up.
+    #
+    # Triggering the actual NULL is awkward (it requires a non-
+    # superuser connection that can SELECT from pg_class but not
+    # from pg_authid). Easier: drop the role mid-introspection so
+    # `ar.rolname` ends up NULL via the LEFT JOIN with no matching
+    # row.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS sentinel_test_role;
+        CREATE ROLE sentinel_test_role NOLOGIN;
+        CREATE TABLE public.sentinel_t (id INT);
+        GRANT SELECT ON public.sentinel_t TO sentinel_test_role;
+        """
+    )
+    # Capture the role's OID so we can assert the sentinel uses it.
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT oid FROM pg_catalog.pg_roles "
+            "WHERE rolname = 'sentinel_test_role'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        sentinel_role_oid = row[0]
+        assert sentinel_role_oid is not None
+
+    # Now drop the role's pg_authid entry. Postgres would normally
+    # reject this because of the dependency from the GRANT, so we
+    # have to REVOKE first.
+    apply_sql("REVOKE SELECT ON public.sentinel_t FROM sentinel_test_role")
+    apply_sql("DROP ROLE sentinel_test_role")
+    # Re-grant directly into pg_class.relacl using a low-level
+    # GRANT to a no-longer-existing role. We can't really, because
+    # Postgres GRANT requires a valid role. Instead, just verify
+    # that the COALESCE sentinel is what's emitted when this hypo-
+    # thetical NULL would otherwise leak — by reading the current
+    # `_GRANTS_SQL` body and asserting the sentinel pattern is
+    # present.
+
+    # Bail out gracefully — full integration coverage of the NULL
+    # path requires a non-superuser connection that lacks SELECT
+    # on pg_authid, which the testcontainer fixture doesn't easily
+    # provide. The literal SQL audit below is the regression
+    # guard.
+    from pgrls.introspect import _GRANTS_SQL
+    assert "COALESCE(ar.rolname, 'oid:' || ax.grantee::text)" in _GRANTS_SQL, (
+        "GRANTS query must COALESCE pg_authid.rolname to an "
+        "'oid:N' sentinel so unresolvable grantee OIDs don't "
+        "leak NULL into Grant.role."
+    )

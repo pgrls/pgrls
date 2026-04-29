@@ -10,6 +10,41 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-29
+
+### Added
+- **`pgrls snapshot` + `pgrls diff`** — semantic policy diff with
+  SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification.
+  Compare any two RLS schemas (snapshot files, live DBs, or one of
+  each — argument disambiguation: `://` ⇒ URL, else file-must-exist
+  ⇒ snapshot). Common-case AST patterns for `USING` / `WITH CHECK`
+  text changes (literal-equal, AND-tighten / drop, OR-tighten /
+  drop); anything else falls into REQUIRES_REVIEW. `--fail-on
+  dangerous` (default) gates CI builds on actual security
+  relaxations; `--fail-on requires-review` for a stricter gate.
+- **Three-tier exit code** matching `pgrls lint`: 0 clean, 1
+  changes meet/exceed `--fail-on`, 2 tool error (bad config,
+  unreachable DB, malformed snapshot file, etc.).
+- **Reuses the existing `Violation` JSON / SARIF shape** for
+  `--format json` and `--format sarif`. CI dashboards that already
+  parse `pgrls lint` output handle `pgrls diff` output without
+  changes; rule_ids use the `DIFF_*` prefix to avoid collisions
+  with lint's `SEC*` / `PERF*` / `HYG*`.
+- **Snapshot v3** — bumps `SNAPSHOT_VERSION` from 2 to 3. Adds
+  per-table `grants` field. `Schema.from_snapshot` accepts v2 + v3
+  and rejects v1 / unknown versions with a clear error. v2
+  baselines roundtrip into v3 with empty grants on every table —
+  diff against a v2 baseline classifies any grant change as
+  REQUIRES_REVIEW (the v2 data didn't capture the prior state).
+- **Public Python API** — `from pgrls.diff import Change,
+  ChangeKind, Classification, diff_schemas`. Stable for v0.2;
+  the formatters (`pgrls.diff.formatters`) and AST helpers
+  (`pgrls.diff.ast_compare`) remain internal.
+- **Demo cases** — `demo/cases/81-83/` exercise the DANGEROUS
+  (dropped RESTRICTIVE policy), SAFE (added RESTRICTIVE policy),
+  and REQUIRES_REVIEW (column dropped while still referenced)
+  classifications end-to-end against a live DB.
+
 ## [0.1.0] - 2026-04-28
 
 ### Added
