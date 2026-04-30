@@ -137,6 +137,20 @@ def test_extract_column_refs_skips_wildcard_a_star() -> None:
             assert part != "*"
 
 
+def test_extract_column_refs_descends_into_range_function_in_from_clause() -> None:
+    # Companion to
+    # `test_find_func_calls_descends_into_range_function_in_from_clause`
+    # — the same `RangeFunction.functions = tuple[tuple[FuncCall,
+    # None]]` shape would silently swallow ColumnRef nodes nested
+    # inside a function call in the FROM clause if the walker
+    # didn't recurse into bare tuples. Pin both helpers so a
+    # walker rewrite that breaks one surfaces here as well.
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT 1 FROM public.f(t.col)")
+    refs = extract_column_refs(parsed[0].stmt)
+    assert ("t", "col") in refs
+
 
 def test_find_func_calls_matches_qualified_name() -> None:
     node = parse_expr("auth.uid() = '1'")

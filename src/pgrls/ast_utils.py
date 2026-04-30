@@ -104,6 +104,19 @@ def extract_column_refs(
     def walk(n: Any) -> None:
         if n is None:
             return
+        if isinstance(n, (list, tuple)):
+            # A few pglast Node fields are tuple-of-tuples rather
+            # than tuple-of-Node — most notably
+            # `RangeFunction.functions` which is
+            # `tuple[tuple[FuncCall, None]]` (the inner tuple holds
+            # the call plus optional column-list aliasing). The
+            # field-iteration loop below handles the outer level,
+            # so each *inner* tuple lands here on recursion. Walk
+            # every item; the type guards below filter back to
+            # actual nodes.
+            for item in n:
+                walk(item)
+            return
         if exclude_sublinks and isinstance(n, SubLink):
             # Walk the test expression (e.g. `tenant_id` in `tenant_id IN (...)`)
             # but skip the inner subquery to avoid collecting refs from other tables.
@@ -163,6 +176,16 @@ def find_func_calls(
 
     def walk(n: Any) -> None:
         if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            # See `extract_column_refs.walk` for the rationale —
+            # `RangeFunction.functions` is tuple-of-tuples and the
+            # inner tuple lands here on recursion. The set-returning
+            # function in `SELECT * FROM f()` lives inside that
+            # inner tuple, so without this branch VIEW004 would
+            # silently miss SECDEF calls used in FROM clauses.
+            for item in n:
+                walk(item)
             return
         if exclude_sublinks and isinstance(n, SubLink):
             walk(n.testexpr)
