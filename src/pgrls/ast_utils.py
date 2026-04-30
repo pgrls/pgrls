@@ -3,8 +3,9 @@
 Used by AST-based rules (SEC004, HYG001) and by introspection to populate
 Policy.using_ast / Policy.with_check_ast.
 
-This module is internal; no API stability promise yet. Plugin interface
-stability is a v1.0 commitment per DESIGN §3.
+This module is internal; no API stability promise yet. The plugin
+interface (third-party rule packages reaching for these helpers)
+stays internal until v1.0.
 """
 from __future__ import annotations
 

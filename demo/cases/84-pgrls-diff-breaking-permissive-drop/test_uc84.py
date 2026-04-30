@@ -51,7 +51,8 @@ def uc84_diff_runner(demo_db: str, tmp_path: Path):
     # 2. Apply the "migration": drop the PERMISSIVE policy.
     # Removing a PERMISSIVE policy removes an OR-clause from the
     # row-visibility set — previously-visible rows may no longer be.
-    # That's BREAKING per the v0.2 classification spec.
+    # That's BREAKING per the v0.2 classification table (see
+    # AGENTS.md "Diff" section).
     with psycopg.connect(demo_db) as conn:
         with conn.cursor() as cur:
             cur.execute(

@@ -655,7 +655,9 @@ def test_column_dropped_unreferenced_emits_no_change() -> None:
 
 def test_column_added_emits_no_change() -> None:
     # base has columns (id,); head gains tenant_id.
-    # Column added — not reported per spec.
+    # Column-added is intentionally not reported (see AGENTS.md
+    # classification table — only column-DROPPED-while-referenced
+    # fires; column-added is a benign forward change).
     base = Schema(tables=(_t(rls=True, columns=("id",)),))
     head = Schema(tables=(_t(rls=True, columns=("id", "tenant_id")),))
     changes = diff_schemas(base, head)

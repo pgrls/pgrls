@@ -706,9 +706,10 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
     # at least once. Renaming from "every rule" to "every
     # registered rule" makes the contract explicit: when a new
     # rule is added to default_registry(), this test fails until
-    # all_bad.sql gets a block that triggers it. Catches the
-    # silent under-coverage Round 23 found (SEC011, PERF002,
-    # HYG002 missing from the previous fixture).
+    # all_bad.sql gets a block that triggers it. Catches a class
+    # of silent under-coverage drift (e.g., when SEC011, PERF002,
+    # HYG002 were added to the registry but missing from the
+    # then-current fixture).
     apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])

@@ -1,9 +1,14 @@
 -- pgrls demo fixture.
 --
--- 15 use cases that together exercise every rule shipping in 0.0.4
--- (SEC001-SEC008, PERF001, HYG001) plus the partition-aware paths.
--- Each block is labeled with the rule(s) it is meant to demonstrate
--- and whether the example is intentionally violating or clean.
+-- This shared schema is consumed by 84 use cases (cases/01–84) that
+-- together exercise every lint rule (SEC001–SEC011, PERF001–PERF002,
+-- HYG001–HYG002), the `pgrls.testing` pytest plugin (case 80), and
+-- the four `pgrls diff` classifications (cases 81–84: DANGEROUS,
+-- SAFE, REQUIRES_REVIEW, BREAKING). Per-case `setup.sql` files add
+-- their own fixtures on top of this shared base.
+--
+-- Each block here is labeled with the rule(s) it demonstrates and
+-- whether the example is intentionally violating or clean.
 --
 -- The fixture is idempotent: it drops the demo schemas at the top so
 -- you can re-apply it freely.

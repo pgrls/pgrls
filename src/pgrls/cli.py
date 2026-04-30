@@ -27,7 +27,12 @@ import click
 import psycopg
 
 from pgrls import __version__
-from pgrls.config import Config, ConfigError, load_config
+from pgrls.config import (
+    DIFF_FAIL_ON_VALUES,
+    Config,
+    ConfigError,
+    load_config,
+)
 from pgrls.diff import Change, diff_schemas
 from pgrls.diff.formatters import (
     DIFF_SUPPORTED_FORMATS,
@@ -385,7 +390,7 @@ def fix(
                                 _fix_apply_failure_message(
                                     i, len(fixes), f, exc
                                 )
-                            )
+                            ) from exc
                 conn.commit()
                 click.echo(
                     f"pgrls: applied {len(fixes)} "
@@ -488,12 +493,28 @@ def snapshot(
 
 # Map the user-facing --fail-on value (with hyphens) to the set of internal
 # Classification Literal values (with underscores) that should trigger exit 1.
+# Keys MUST match `DIFF_FAIL_ON_VALUES` from config.py (the [diff].fail_on
+# allowlist). The import-time assertion below pins this — a future change
+# that adds a value to one without the other fails at module load.
 _FAIL_ON_TO_THRESHOLD: dict[str, set[str]] = {
     "safe":            {"safe", "breaking", "requires_review", "dangerous"},
     "breaking":        {"breaking", "requires_review", "dangerous"},
     "requires-review": {"requires_review", "dangerous"},
     "dangerous":       {"dangerous"},
 }
+
+# Cross-module invariant: cli.py's threshold dict keys and config.py's
+# allowlist tuple must enumerate the same set of fail-on values. Failing
+# this at import surfaces drift via `import pgrls` (caught in unit-test
+# collection) instead of at the moment a user passes the un-aligned
+# value.
+if set(_FAIL_ON_TO_THRESHOLD) != set(DIFF_FAIL_ON_VALUES):
+    raise RuntimeError(  # pragma: no cover — import-time invariant
+        "pgrls.cli._FAIL_ON_TO_THRESHOLD keys "
+        f"{sorted(_FAIL_ON_TO_THRESHOLD)!r} do not match "
+        f"pgrls.config.DIFF_FAIL_ON_VALUES {sorted(DIFF_FAIL_ON_VALUES)!r}. "
+        "These two surfaces must accept the same set of --fail-on values."
+    )
 
 
 def _classifications_at_or_above(fail_on: str) -> set[str]:
@@ -557,7 +578,7 @@ def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
 # diff command
 # ---------------------------------------------------------------------------
 
-_DIFF_FAIL_ON_VALUES = list(_FAIL_ON_TO_THRESHOLD)
+_DIFF_FAIL_ON_VALUES = list(DIFF_FAIL_ON_VALUES)
 _DIFF_FORMAT_VALUES = list(DIFF_SUPPORTED_FORMATS)
 
 
@@ -659,9 +680,10 @@ def diff(
     #   1. <head> positional arg (already-resolved before this point)
     #   2. --database-url flag (Click reads $DATABASE_URL via envvar=)
     #   3. [database].url in pgrls.toml (lives on config.database_url)
-    # All three are documented in the design spec; the implementation
-    # here was previously honoring only #3, which broke the common
-    # "DATABASE_URL is set, no toml file exists" CI workflow.
+    # All three are documented in CHANGELOG.md and AGENTS.md;
+    # the implementation here was previously honoring only #3,
+    # which broke the common "DATABASE_URL is set, no toml file
+    # exists" CI workflow.
     if head is None:
         head = database_url or config.database_url
         if head is None:
@@ -677,8 +699,17 @@ def diff(
     # app` would get a misleadingly-passing run that didn't filter at
     # all. Only warn when the user passed --schemas explicitly (CLI
     # arg, not toml inheritance) AND both sources are file-shaped.
-    base_is_url = "://" in base
-    head_is_url = "://" in head
+    #
+    # `file://` URLs are URL-shaped by syntax but resolve as snapshot
+    # files in `_resolve_diff_source` (the prefix is stripped). Treat
+    # them as files for the warning gate so a `pgrls diff file://...
+    # file://...` invocation doesn't silently swallow the --schemas
+    # warning.
+    def _is_db_url(arg: str) -> bool:
+        return "://" in arg and not arg.startswith("file://")
+
+    base_is_url = _is_db_url(base)
+    head_is_url = _is_db_url(head)
     if schemas and not (base_is_url or head_is_url):
         click.echo(
             "pgrls: warning: --schemas is ignored when both <base> and "
