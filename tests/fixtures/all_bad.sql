@@ -105,11 +105,31 @@ CREATE POLICY todo_replace_me_later ON public.allbad_hyg002
 -- SEC005, SEC007, SEC008, SEC009, PERF001 stay silent on it). The
 -- view itself runs with the owner's privileges and bypasses RLS,
 -- which is exactly what VIEW001 catches.
+--
+-- The view is created `WITH (security_barrier = true)` so VIEW002
+-- stays silent here — VIEW002's own block below pins that rule's
+-- behavior on a separately-named view.
 CREATE TABLE public.allbad_view001_base (id INT, tenant_id TEXT);
 ALTER TABLE public.allbad_view001_base ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.allbad_view001_base FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_floor ON public.allbad_view001_base
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
-CREATE VIEW public.allbad_view001 AS
+CREATE VIEW public.allbad_view001
+    WITH (security_barrier = true) AS
     SELECT * FROM public.allbad_view001_base;
+
+-- VIEW002: view over RLS-protected table without `security_barrier`.
+-- The view is created `WITH (security_invoker = true)` so VIEW001
+-- stays silent — pinning VIEW002 firing on a distinct table+view
+-- pair makes the rule_loc contract test catch a rule drifting onto
+-- the wrong view. The base table mirrors VIEW001's policy shape.
+CREATE TABLE public.allbad_view002_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view002_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view002_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view002_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE VIEW public.allbad_view002
+    WITH (security_invoker = true) AS
+    SELECT * FROM public.allbad_view002_base;

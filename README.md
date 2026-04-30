@@ -212,6 +212,7 @@ pattern documentation.
 | [HYG001](AGENTS.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
 | [HYG002](AGENTS.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
 | [VIEW001](AGENTS.md#rule-view001) | error | View over RLS-protected table without `WITH (security_invoker = true)` |
+| [VIEW002](AGENTS.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.

@@ -54,6 +54,7 @@ _ALL_RULE_IDS = (
     "HYG001",
     "HYG002",
     "VIEW001",
+    "VIEW002",
 )
 
 
@@ -743,6 +744,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         "HYG001  public.allbad_hyg001.orphan\n",
         "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
         "VIEW001  public.allbad_view001\n",
+        "VIEW002  public.allbad_view002\n",
     ):
         assert rule_loc in result.output, (
             f"{rule_loc!r} missing from output:\n{result.output}"
@@ -970,6 +972,7 @@ def test_fix_unknown_rule_filter_errors_clearly(
     assert "SEC002" in result.output
     assert "PERF001" in result.output
     assert "VIEW001" in result.output
+    assert "VIEW002" in result.output
 
 
 def test_fix_unknown_rule_does_not_block_known_rule_in_same_invocation(
