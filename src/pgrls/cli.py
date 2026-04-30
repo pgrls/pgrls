@@ -278,10 +278,11 @@ def fix(
     """Auto-remediate violations whose fix is mechanical.
 
     Currently fixes SEC002 (`ALTER TABLE … FORCE ROW LEVEL
-    SECURITY`) and PERF001 (wrap unwrapped auth calls in
-    `(SELECT …)` and emit `ALTER POLICY`). Other rules require
-    human intent (which role to grant to, what column to scope
-    by) and are not auto-fixed.
+    SECURITY`), PERF001 (wrap unwrapped auth calls in
+    `(SELECT …)` and emit `ALTER POLICY`), and VIEW001
+    (`ALTER VIEW … SET (security_invoker = true)`). Other
+    rules require human intent (which role to grant to, what
+    column to scope by) and are not auto-fixed.
 
     Default mode is dry-run: prints the SQL that WOULD be applied,
     nothing is executed. Pass `--apply` to run the statements

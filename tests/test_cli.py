@@ -969,6 +969,7 @@ def test_fix_unknown_rule_filter_errors_clearly(
     # so the user can spot their typo.
     assert "SEC002" in result.output
     assert "PERF001" in result.output
+    assert "VIEW001" in result.output
 
 
 def test_fix_unknown_rule_does_not_block_known_rule_in_same_invocation(
