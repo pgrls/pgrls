@@ -474,13 +474,13 @@ def test_change_to_violation_title_humanizes_kind_name():
         (ChangeKind.USING_TIGHTENED, "Using Tightened"),
         # Four-word kind to cover deeper humanization.
         (ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "With Check Requires Review"),
-        # Acronym-bearing kind. Python's str.title() lowercases past
-        # the first character of each token, so "RLS" becomes "Rls".
-        # Pin the (currently awkward) output rather than fudge it —
-        # v0.3 polish may add an acronym allowlist; until then, this
-        # is the contract.
-        (ChangeKind.GRANT_PUBLIC_NO_RLS, "Grant Public No Rls"),
-        (ChangeKind.RLS_FLIPPED, "Rls Flipped"),
+        # Acronym-bearing kinds: v0.2.1 added a tight allowlist
+        # (`_TITLE_ACRONYMS = frozenset({"RLS"})`) so the RLS
+        # token survives humanization in its uppercase form
+        # rather than being crushed by str.title() to `Rls`.
+        (ChangeKind.GRANT_PUBLIC_NO_RLS, "Grant Public No RLS"),
+        (ChangeKind.RLS_FLIPPED, "RLS Flipped"),
+        (ChangeKind.FORCE_RLS_FLIPPED, "Force RLS Flipped"),
         # Single-component shape from the policy-shape family.
         (ChangeKind.PERMISSIVE_FLAG_TIGHTENED, "Permissive Flag Tightened"),
     ],

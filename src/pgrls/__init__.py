@@ -26,6 +26,6 @@ without notice. Pin pgrls to a specific minor version if you build
 on internals.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = ["__version__"]

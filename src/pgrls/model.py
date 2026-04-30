@@ -189,13 +189,19 @@ class Schema:
         "snapshot version N is not supported" message naming the
         supported set.
 
-        AST fields (`using_ast`, `with_check_ast`) are NOT serialized;
-        the loader re-parses `using_sql` / `with_check_sql` via
-        `pgrls.ast_utils.parse_expr` so a freshly-loaded Schema has
-        AST data ready for rule code that walks it.
-        """
-        from pgrls.ast_utils import parse_expr
+        AST fields (`using_ast`, `with_check_ast`) are NOT serialized
+        AND are NOT eagerly re-parsed on load. v0.2+ leaves both as
+        `None` after `from_snapshot`. Callers that need ASTs must
+        parse on demand via `pgrls.ast_utils.parse_expr(policy.using_sql)`.
 
+        Rationale: the only consumer that reads ASTs from a loaded
+        snapshot is `pgrls.diff._diff_columns` (column-reference
+        extraction); the predicate-diff path re-parses raw SQL via
+        `compare_predicates` anyway. Eager parsing on load was
+        wasted work for every diff that doesn't drop columns. The
+        lint path (`pgrls lint`) doesn't use `from_snapshot` — it
+        introspects directly, which still parses ASTs on capture.
+        """
         version = payload.get("version")
         if version not in (2, 3):
             raise ValueError(
@@ -213,16 +219,6 @@ class Schema:
             key = (p["table_schema"], p["table_name"])
             top_level_policies.setdefault(key, []).append(p)
 
-        # Snapshot-load-context tail for parse_expr's parse-failure
-        # warning. Without this override, parse_expr emits the
-        # lint-context "AST-based rules (SEC*, PERF*, HYG*) skipped"
-        # message even when the snapshot is being loaded for `pgrls
-        # diff`, where those rules never run.
-        _load_fail_tail = (
-            "Snapshot policy AST will be unavailable for "
-            "column-reference checks."
-        )
-
         tables: list[Table] = []
         for t in payload.get("tables", []):
             key = (t["schema"], t["name"])
@@ -234,6 +230,10 @@ class Schema:
             # only writes top-level — but a malformed snapshot mixing
             # both should not silently merge them.
             raw_policies = top_level_policies.get(key) or t.get("policies", [])
+            # ASTs are intentionally left as None here — the v0.2.1
+            # contract documents that callers parse on demand. The
+            # only in-tree consumer that needs them is
+            # pgrls.diff._diff_columns, which now lazy-parses.
             policies = tuple(
                 Policy(
                     # Top-level format uses "policy_name"; embedded uses "name".
@@ -243,24 +243,8 @@ class Schema:
                     roles=tuple(p["roles"]),
                     using_sql=p.get("using_sql"),
                     with_check_sql=p.get("with_check_sql"),
-                    using_ast=parse_expr(
-                        p.get("using_sql"),
-                        location=(
-                            f"{t['schema']}.{t['name']}."
-                            f"{p.get('policy_name') or p['name']}"
-                        ),
-                        clause="USING",
-                        fail_message_tail=_load_fail_tail,
-                    ),
-                    with_check_ast=parse_expr(
-                        p.get("with_check_sql"),
-                        location=(
-                            f"{t['schema']}.{t['name']}."
-                            f"{p.get('policy_name') or p['name']}"
-                        ),
-                        clause="WITH CHECK",
-                        fail_message_tail=_load_fail_tail,
-                    ),
+                    using_ast=None,
+                    with_check_ast=None,
                 )
                 for p in raw_policies
             )

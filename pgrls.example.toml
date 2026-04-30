@@ -11,6 +11,16 @@ disable = []
 # Severity that triggers a nonzero exit code: "error" | "warning" | "info".
 fail_on = "warning"
 
+[diff]
+# Default classification at or above which `pgrls diff` exits 1.
+# Values: "safe" | "breaking" | "requires-review" | "dangerous".
+# `dangerous` (the default) gates CI on actual security regressions
+# only; `requires-review` is the strict-review setting that also
+# fails on auto-classifier-uncertain changes (column references,
+# disjoint role replacements, unrecognized AST patterns). Override
+# per-invocation with `--fail-on`.
+fail_on = "dangerous"
+
 # Per-rule options. Each rule reads its own table; unknown rules are ignored.
 
 [lint.rules.SEC001]
