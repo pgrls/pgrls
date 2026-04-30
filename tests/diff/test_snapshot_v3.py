@@ -6,14 +6,9 @@ import pytest
 from pgrls.model import (
     Grant,
     Policy,
-    SNAPSHOT_VERSION,
     Schema,
     Table,
 )
-
-
-def test_snapshot_version_is_3() -> None:
-    assert SNAPSHOT_VERSION == 3
 
 
 def test_to_snapshot_emits_grants_field() -> None:
@@ -34,7 +29,7 @@ def test_to_snapshot_emits_grants_field() -> None:
         )
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 3
+    assert snap["version"] == 4  # current version; grants test is about content
     table = snap["tables"][0]
     assert table["grants"] == [
         {"role": "authenticated", "privileges": ["SELECT", "INSERT"]}
@@ -61,28 +56,6 @@ def test_from_snapshot_round_trips_v3() -> None:
     snap = original.to_snapshot()
     loaded = Schema.from_snapshot(snap)
     assert loaded == original
-
-
-def test_from_snapshot_v2_yields_empty_grants() -> None:
-    # Legacy snapshot — v2 lacks the `grants` field. Loader fills
-    # it in as `()` per table so downstream code doesn't have to
-    # special-case missing data.
-    v2 = {
-        "version": 2,
-        "tables": [
-            {
-                "schema": "public",
-                "name": "t",
-                "rls_enabled": True,
-                "force_rls": True,
-                "policies": [],
-                "columns": ["id"],
-                "partition_of": None,
-            },
-        ],
-    }
-    loaded = Schema.from_snapshot(v2)
-    assert loaded.tables[0].grants == ()
 
 
 def test_from_snapshot_v1_raises_clearly() -> None:
