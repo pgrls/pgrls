@@ -882,6 +882,8 @@ schema, seed data, and a JSON manifest of `(role, claims, query, expected)`
 tuples. A future TS port copies the manifest, writes a TS runner, and is
 "v1-conformant" iff every case passes.
 
+<a id="diff-rules"></a>
+
 ## Diff — `pgrls snapshot` + `pgrls diff`
 
 `pgrls diff` produces a semantic policy diff between any two Postgres

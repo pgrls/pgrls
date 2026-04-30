@@ -25,7 +25,8 @@ import shapes and helper signatures may change between releases
 without notice. Pin pgrls to a specific minor version if you build
 on internals.
 """
+from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = ["__version__"]

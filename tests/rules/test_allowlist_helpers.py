@@ -1,11 +1,11 @@
 """Unit tests for `pgrls.rules._allowlist` shape validators.
 
-Round 21 introduced these helpers to close a footgun: every
-per-policy rule had its own `_parse_allowlist` that only checked
-`isinstance(raw, list)` and silently accepted entries with the
-wrong shape (e.g. unqualified `"users"` in a policy-ID allowlist).
-The mismatch never matched any policy, never raised, never
-warned — the user's exemption was silently ignored.
+These helpers exist to close a footgun: earlier versions had
+every per-policy rule do its own `_parse_allowlist` that only
+checked `isinstance(raw, list)` and silently accepted entries
+with the wrong shape (e.g. unqualified `"users"` in a policy-ID
+allowlist). The mismatch never matched any policy, never raised,
+never warned — the user's exemption was silently ignored.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def test_policy_id_allowlist_accepts_qualified_id() -> None:
 
 
 def test_policy_id_allowlist_rejects_unqualified_table_name() -> None:
-    # The Round 21 finding case: copy-paste from SEC001 example
+    # The original-finding case: copy-paste from SEC001 example
     # into SEC003 produces an entry like `users` that silently
     # never matches. Now it raises with a clear hint.
     with pytest.raises(TypeError, match="not a valid policy ID"):
@@ -46,8 +46,8 @@ def test_policy_id_allowlist_rejects_table_only() -> None:
 
 
 def test_policy_id_allowlist_accepts_more_than_three_dots_as_dotted_policy_name() -> None:
-    # Round 27: rsplit('.', 2) right-anchors the parse so a policy
-    # name containing `.` is allowlistable. `a.b.c.d` resolves as
+    # rsplit('.', 2) right-anchors the parse so a policy name
+    # containing `.` is allowlistable. `a.b.c.d` resolves as
     # schema=a.b, table=c, policy=d would be ambiguous, but Postgres
     # never produces a `.` in nspname/relname (rejected at CREATE).
     # The user's responsibility is to ensure the entry matches the

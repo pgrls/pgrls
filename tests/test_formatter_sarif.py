@@ -150,6 +150,33 @@ def test_sarif_rule_descriptor_includes_short_description_and_help_uri() -> None
     assert rule["helpUri"].endswith("#rule-sec001")
 
 
+def test_sarif_help_uri_for_diff_rules_routes_to_diff_section() -> None:
+    """DIFF_* rule_ids (emitted by `pgrls diff` via the diff
+    formatters' Change → Violation projection) don't have per-kind
+    anchors in AGENTS.md. Without this routing, helpUri pointed at
+    `#rule-diff_using_tightened` etc. — non-existent anchors that
+    silently 404 in GitHub Code Scanning. v0.2.2 routes them to
+    the shared `#diff-rules` anchor (defined just above the
+    "## Diff" heading) so the user lands on the classification
+    table that documents what the rule means.
+    """
+    diff_violation = Violation(
+        rule_id="DIFF_USING_TIGHTENED",
+        severity="info",
+        title="Using Tightened",
+        message="Test predicate change.",
+        location="public.t.policy",
+    )
+    out = format_violations([diff_violation], format="sarif")
+    parsed = json.loads(out)
+    rule = parsed["runs"][0]["tool"]["driver"]["rules"][0]
+    assert rule["helpUri"].endswith("#diff-rules")
+    # And lint rules continue to use their per-rule anchors:
+    out2 = format_violations([_v()], format="sarif")
+    rule2 = json.loads(out2)["runs"][0]["tool"]["driver"]["rules"][0]
+    assert rule2["helpUri"].endswith("#rule-sec001")
+
+
 def test_sarif_rule_descriptor_name_is_rule_id_not_title() -> None:
     # SARIF §3.49.7 specifies `name` as an identifier (Pascal-ish,
     # no whitespace) — distinct from the prose `shortDescription`.

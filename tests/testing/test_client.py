@@ -303,8 +303,9 @@ def test_seed_rejects_inconsistent_keys() -> None:
 def test_seed_quotes_table_and_column_identifiers(
     testing_pg_conn: psycopg.Connection,
 ) -> None:
-    # Round 27 already pinned that quote_ident handles mixed case
-    # and reserved keywords. Confirm the seed helper uses it.
+    # `quote_ident` already handles mixed case and reserved
+    # keywords (pinned in tests/test_fixers.py). Confirm the seed
+    # helper uses it.
     with testing_pg_conn.cursor() as cur:
         cur.execute(
             'CREATE TABLE "Mixed Case Table" '

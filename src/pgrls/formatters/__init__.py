@@ -10,7 +10,7 @@ here.
 """
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from pgrls.formatters.json import format_json
 from pgrls.formatters.sarif import format_sarif

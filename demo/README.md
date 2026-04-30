@@ -1,8 +1,10 @@
 # pgrls demo
 
 A self-contained walkthrough of every rule pgrls ships, plus the
-partition-aware paths, the JSON / SARIF output contracts, and the
-`pgrls fix` auto-remediation flow. 79 use cases.
+partition-aware paths, the JSON / SARIF output contracts, the
+`pgrls fix` auto-remediation flow, the `pgrls.testing` pytest plugin,
+and the four `pgrls diff` classifications (DANGEROUS / SAFE /
+REQUIRES_REVIEW / BREAKING). 84 use cases.
 
 ## Layout
 
@@ -22,10 +24,14 @@ demo/
     ├── 02-reference-data/
     │   ├── setup.sql
     │   └── test_uc02.py
-    ...
-    └── 75-sarif-formatter/
-        ├── setup.sql
-        └── test_uc75.py
+    ├── ...
+    ├── 80-pgrls-test-pytest-plugin/      # pgrls.testing smoke test
+    │   ├── setup.sql
+    │   └── test_uc80.py
+    ├── 81-pgrls-diff-end-to-end/         # diff DANGEROUS path
+    ├── 82-pgrls-diff-safe-restrictive-add/        # diff SAFE
+    ├── 83-pgrls-diff-column-dropped-referenced/   # diff REQUIRES_REVIEW
+    └── 84-pgrls-diff-breaking-permissive-drop/    # diff BREAKING
 ```
 
 Each case folder is self-contained — open it to read the SQL
@@ -118,6 +124,11 @@ numeric order).
 | 77 | Policy named `todo_replace_me_later` | HYG002 | fires (identifier tokenizer matches `todo`) |
 | 78 | `random()` in USING | PERF002 + SEC005 | fires |
 | 79 | `pgrls fix` end-to-end against the demo DB | (CLI behavior) | dry-run prints SEC002 ALTER TABLE + PERF001 ALTER POLICY; --rule SEC002 filters PERF001 out |
+| 80 | `pgrls.testing` pytest plugin smoke | (test DSL) | seed + fetchall round-trip via PgrlsTestClient |
+| 81 | `pgrls diff`: dropped RESTRICTIVE policy | DIFF_POLICY_DROPPED_RESTRICTIVE | DANGEROUS classification, severity=error, exit 1 |
+| 82 | `pgrls diff`: added RESTRICTIVE policy | DIFF_POLICY_ADDED_RESTRICTIVE | SAFE classification, severity=info, exit 0 |
+| 83 | `pgrls diff`: dropped column referenced by policy | DIFF_COLUMN_DROPPED_REFERENCED | REQUIRES_REVIEW, severity=warning, gated by --fail-on requires-review |
+| 84 | `pgrls diff`: dropped PERMISSIVE policy | DIFF_POLICY_DROPPED_PERMISSIVE | BREAKING classification, severity=warning, gated by --fail-on breaking |
 
 ## Running
 
@@ -156,12 +167,13 @@ pytest demo/ -v
 
 Spins up an isolated Postgres via `testcontainers` (no port
 collisions), applies `_shared.sql` plus every case's `setup.sql`,
-and runs 83 assertions — one per use case plus configuration-
-driven scenarios that exercise per-test `--config` overrides
-(allowlist, disable, custom `auth_functions`, multi-schema,
-fail_on, format) and the JSON / SARIF output contracts. Each
-test is named `test_uc<NN>_<what_it_does>` for top-to-bottom
-readability.
+and runs 90 assertions — one or more per use case plus
+configuration-driven scenarios that exercise per-test `--config`
+overrides (allowlist, disable, custom `auth_functions`,
+multi-schema, fail_on, format), the JSON / SARIF output
+contracts, the `pgrls.testing` plugin, and the four `pgrls diff`
+classifications. Each test is named `test_uc<NN>_<what_it_does>`
+for top-to-bottom readability.
 
 To run the tests against a long-running DB you started with `run.sh`:
 

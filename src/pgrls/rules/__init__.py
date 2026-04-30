@@ -1,10 +1,9 @@
 """Rule protocol and registry.
 
-Every built-in rule (SEC001-SEC011, PERF001-PERF002, HYG001-HYG002
-as of 0.0.7) is registered lazily on the first call to
-`default_registry()` or `all_rules()`. When a new rule lands, add
-its import + `registry.register(...)` call to
-`_build_default_registry()` below.
+Every built-in rule (SEC001-SEC011, PERF001-PERF002, HYG001-HYG002)
+is registered lazily on the first call to `default_registry()` or
+`all_rules()`. When a new rule lands, add its import +
+`registry.register(...)` call to `_build_default_registry()` below.
 """
 from __future__ import annotations
 
