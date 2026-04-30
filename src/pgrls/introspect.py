@@ -4,10 +4,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, cast
 
+import pglast
 import psycopg
 from psycopg.rows import dict_row
 
-from pgrls.ast_utils import parse_expr
+from pgrls.ast_utils import find_func_calls, parse_expr
 from pgrls.model import Grant, Policy, Schema, Table, View
 
 _POLICY_CMD_MAP: dict[str, str] = {
@@ -265,6 +266,87 @@ WHERE v.relkind IN ('v', 'm')
 ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
 """
 
+# Functions with SECURITY DEFINER set in the configured schemas. Used to
+# match view bodies against — VIEW004 flags views whose definitions call
+# any of these functions because a SECDEF call inside a non-invoker view
+# bypasses the caller's RLS.
+_SECDEF_FUNCS_SQL = """
+SELECT n.nspname || '.' || p.proname AS qname
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prosecdef = TRUE
+  AND n.nspname = ANY(%s)
+ORDER BY qname
+"""
+
+
+def _build_secdef_calls_index(
+    cur: Any, schemas: list[str], view_rows: list[dict[str, Any]]
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """For each view, return the sorted SECDEF function names it calls.
+
+    Two-pass: first fetch the set of qualified SECDEF function names in
+    the configured schemas, then walk each view's `definition` via
+    pglast to find `FuncCall` nodes whose names match. `pg_get_viewdef`
+    may emit either qualified (`public.read_secret`) or bare
+    (`read_secret`) names depending on Postgres version + search_path,
+    so we feed `find_func_calls` both forms and canonicalize matches
+    back to the qualified name (the form VIEW004 messages with).
+    """
+    cur.execute(_SECDEF_FUNCS_SQL, [list(schemas)])
+    secdef_qnames: set[str] = {row["qname"] for row in cur.fetchall()}
+    if not secdef_qnames:
+        return {}
+    # Map bare last-segment back to its qualified form so a `read_secret()`
+    # reference (no schema prefix in viewdef output) can be canonicalized
+    # to `public.read_secret` for storage. If two SECDEF functions share
+    # the same bare name across schemas, `setdefault` keeps the first;
+    # this is fine because `find_func_calls` matches on the bare name and
+    # the canonical lookup picks one — collisions across schemas are rare
+    # and the qualified form would still match exactly when emitted.
+    bare_to_qual: dict[str, str] = {}
+    for q in secdef_qnames:
+        bare_to_qual.setdefault(q.rsplit(".", 1)[-1], q)
+    name_set = secdef_qnames | set(bare_to_qual.keys())
+
+    out: dict[tuple[str, str], tuple[str, ...]] = {}
+    for row in view_rows:
+        key = (row["schema_name"], row["view_name"])
+        try:
+            parsed = pglast.parse_sql(row["definition"])
+        except pglast.parser.ParseError:
+            # An unparseable view body is not a fatal error for
+            # introspection — skip SECDEF detection for this view
+            # (other rules still see its references / flags).
+            out[key] = ()
+            continue
+        if not parsed:
+            out[key] = ()
+            continue
+        matches = find_func_calls(parsed[0].stmt, name_set)
+        found: set[str] = set()
+        for m in matches:
+            # `find_func_calls` may also return `SQLValueFunction`
+            # nodes (e.g. `current_user`); those have no `funcname`
+            # so they only land here if a SECDEF function happens to
+            # share a grammar-special name. Skip them — VIEW004 only
+            # cares about user-defined SECDEF refs.
+            funcname = getattr(m, "funcname", None)
+            if funcname is None:
+                continue
+            parts = [f.sval for f in funcname if hasattr(f, "sval")]
+            if not parts:
+                continue
+            qualified = ".".join(parts)
+            if qualified in secdef_qnames:
+                found.add(qualified)
+            else:
+                bare = parts[-1]
+                if bare in bare_to_qual:
+                    found.add(bare_to_qual[bare])
+        out[key] = tuple(sorted(found))
+    return out
+
 
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
@@ -308,6 +390,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 deps_index_early.setdefault(key, set()).add(
                     (row["ref_schema"], row["ref_name"])
                 )
+            secdef_index_early = _build_secdef_calls_index(
+                cur, schemas, view_rows_early
+            )
             views_early = tuple(
                 View(
                     schema=row["schema_name"],
@@ -321,7 +406,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                             (row["schema_name"], row["view_name"]), set()
                         )
                     )),
-                    security_definer_calls=(),  # Task 5 populates this
+                    security_definer_calls=secdef_index_early.get(
+                        (row["schema_name"], row["view_name"]), ()
+                    ),
                 )
                 for row in view_rows_early
             )
@@ -352,6 +439,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             deps_index.setdefault(key, set()).add(
                 (row["ref_schema"], row["ref_name"])
             )
+        secdef_index = _build_secdef_calls_index(cur, schemas, view_rows)
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
     for row in column_rows:
@@ -433,7 +521,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             references=tuple(sorted(
                 deps_index.get((row["schema_name"], row["view_name"]), set())
             )),
-            security_definer_calls=(),  # Task 5 populates this
+            security_definer_calls=secdef_index.get(
+                (row["schema_name"], row["view_name"]), ()
+            ),
         )
         for row in view_rows
     )
