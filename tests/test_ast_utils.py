@@ -150,6 +150,22 @@ def test_find_func_calls_matches_bare_name() -> None:
     assert len(matches) == 1
 
 
+def test_find_func_calls_descends_into_range_function_in_from_clause() -> None:
+    # `RangeFunction.functions` is a tuple-of-tuples (each
+    # entry is `(FuncCall, None)` — the inner tuple holds the
+    # call node plus optional column-list aliasing). The walker
+    # used to handle `tuple[Node]` but not `tuple[tuple]`, so
+    # set-returning functions in FROM clauses (the canonical
+    # `SELECT * FROM f()` pattern) were silently skipped.
+    # Pin the recursion explicitly here so a future walker
+    # rewrite can't reintroduce the gap.
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT * FROM public.read_secret()")
+    matches = find_func_calls(parsed[0].stmt, {"public.read_secret"})
+    assert len(matches) == 1
+
+
 def test_find_func_calls_matches_current_user_sql_value_function() -> None:
     node = parse_expr("current_user = 'x'")
     matches = find_func_calls(node, {"current_user"})
