@@ -244,6 +244,27 @@ WHERE c.relkind IN ('v', 'm')
 ORDER BY n.nspname, c.relname
 """
 
+_VIEW_DEPS_SQL = """
+SELECT
+    vn.nspname AS view_schema,
+    v.relname AS view_name,
+    tn.nspname AS ref_schema,
+    t.relname AS ref_name
+FROM pg_catalog.pg_rewrite r
+JOIN pg_catalog.pg_class v ON v.oid = r.ev_class
+JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+JOIN pg_catalog.pg_depend d
+  ON d.objid = r.oid
+ AND d.classid = 'pg_rewrite'::regclass
+JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
+JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
+WHERE v.relkind IN ('v', 'm')
+  AND t.relkind IN ('r', 'p')   -- regular tables + partitioned tables
+  AND vn.nspname = ANY(%s)
+  AND v.oid != t.oid             -- exclude self-rule rows
+ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
+"""
+
 
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
@@ -280,6 +301,13 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             # No tables, but we still need to check for views.
             cur.execute(_VIEWS_SQL, (schemas,))
             view_rows_early = cur.fetchall()
+            deps_index_early: dict[tuple[str, str], set[tuple[str, str]]] = {}
+            cur.execute(_VIEW_DEPS_SQL, [list(schemas)])
+            for row in cur.fetchall():
+                key = (row["view_schema"], row["view_name"])
+                deps_index_early.setdefault(key, set()).add(
+                    (row["ref_schema"], row["ref_name"])
+                )
             views_early = tuple(
                 View(
                     schema=row["schema_name"],
@@ -288,7 +316,11 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                     security_invoker=row["security_invoker"],
                     security_barrier=row["security_barrier"],
                     definition=row["definition"],
-                    references=(),  # Task 4 populates this
+                    references=tuple(sorted(
+                        deps_index_early.get(
+                            (row["schema_name"], row["view_name"]), set()
+                        )
+                    )),
                     security_definer_calls=(),  # Task 5 populates this
                 )
                 for row in view_rows_early
@@ -313,6 +345,13 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
 
         cur.execute(_VIEWS_SQL, (schemas,))
         view_rows = cur.fetchall()
+        deps_index: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        cur.execute(_VIEW_DEPS_SQL, [list(schemas)])
+        for row in cur.fetchall():
+            key = (row["view_schema"], row["view_name"])
+            deps_index.setdefault(key, set()).add(
+                (row["ref_schema"], row["ref_name"])
+            )
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
     for row in column_rows:
@@ -391,7 +430,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             security_invoker=row["security_invoker"],
             security_barrier=row["security_barrier"],
             definition=row["definition"],
-            references=(),  # Task 4 populates this
+            references=tuple(sorted(
+                deps_index.get((row["schema_name"], row["view_name"]), set())
+            )),
             security_definer_calls=(),  # Task 5 populates this
         )
         for row in view_rows
