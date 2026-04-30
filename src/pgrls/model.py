@@ -2,8 +2,8 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 3 (v3 added `grants` to each table entry; v2 added
-`partition_of`).
+Currently version 4 (v4 added top-level `views`; v3 added `grants` to
+each table entry; v2 added `partition_of`).
 """
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ __all__ = [
     "Schema",
     "Snapshot",
     "Table",
+    "View",
 ]
 
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,38 @@ class Grant:
 
 
 @dataclass(frozen=True)
+class View:
+    """A view or materialized view captured by introspection.
+
+    Captured in snapshot v4+. `is_materialized` distinguishes
+    `pg_class.relkind = 'v'` (regular view) from `'m'`
+    (materialized view). `security_invoker` and `security_barrier`
+    correspond to `pg_class.reloptions` entries; both default to
+    False on PG15+ unless explicitly set via
+    `WITH (security_invoker = true)` / `WITH (security_barrier = true)`.
+
+    `references` is the sorted, de-duplicated set of `(schema, name)`
+    table pairs the view body reads from (resolved via `pg_depend`).
+    `security_definer_calls` is the sorted, de-duplicated tuple of
+    qualified function names called by the view body that have
+    `pg_proc.prosecdef = true`. Both default to empty.
+    """
+
+    schema: str
+    name: str
+    is_materialized: bool
+    security_invoker: bool
+    security_barrier: bool
+    definition: str
+    references: tuple[tuple[str, str], ...]
+    security_definer_calls: tuple[str, ...]
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass(frozen=True)
 class Table:
     schema: str
     name: str
@@ -87,6 +120,7 @@ class Table:
 @dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
+    views: tuple[View, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -174,23 +208,29 @@ class Schema:
                 for t in self.tables
                 for p in t.policies
             ],
+            "views": [
+                {
+                    "schema": v.schema,
+                    "name": v.name,
+                    "is_materialized": v.is_materialized,
+                    "security_invoker": v.security_invoker,
+                    "security_barrier": v.security_barrier,
+                    "definition": v.definition,
+                    "references": [list(ref) for ref in v.references],
+                    "security_definer_calls": list(v.security_definer_calls),
+                }
+                for v in self.views
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v2 or v3 snapshot dict.
+        """Reconstruct a Schema from a v3 or v4 snapshot dict.
 
-        v3 (current): full fidelity. v2 (legacy): grants come back
-        as `()` per table — v2 didn't capture grants. **Caveat:** the
-        diff layer doesn't know which side is v2-shaped, so any
-        per-table grant present in the v3 head will look like a
-        GRANT_ADDED (or, in the PUBLIC + no-RLS shape, a
-        GRANT_PUBLIC_NO_RLS) when diffed against a v2 baseline,
-        even when the actual cluster state was unchanged. Treat
-        v2 baselines as ground-truth-incomplete on the grants axis;
-        re-capture as v3 once available.
+        v4 (current): full fidelity, includes views. v3 (legacy):
+        views come back as `()` — v3 didn't capture view metadata.
 
-        v1 / unknown versions: raises ValueError with a clear
+        v1 / v2 / unknown versions: raises ValueError with a clear
         "snapshot version N is not supported" message naming the
         supported set.
 
@@ -208,11 +248,11 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (2, 3):
+        if version not in (3, 4):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 2, 3. v1 snapshots "
-                "must be regenerated against the current schema."
+                f"pgrls release. Supported versions: 3, 4. v1 / v2 "
+                "snapshots must be regenerated against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -253,7 +293,7 @@ class Schema:
                 )
                 for p in raw_policies
             )
-            grants_raw = t.get("grants", []) if version >= 3 else []
+            grants_raw = t.get("grants", [])
             grants = tuple(
                 Grant(role=g["role"], privileges=tuple(g["privileges"]))
                 for g in grants_raw
@@ -274,4 +314,20 @@ class Schema:
                     grants=grants,
                 )
             )
-        return cls(tables=tuple(tables))
+        # v3 has no "views" array; treat as empty tuple.
+        raw_views = payload.get("views", []) if version >= 4 else []
+        views = tuple(
+            View(
+                schema=v["schema"],
+                name=v["name"],
+                is_materialized=v["is_materialized"],
+                security_invoker=v["security_invoker"],
+                security_barrier=v["security_barrier"],
+                definition=v["definition"],
+                references=tuple(tuple(r) for r in v["references"]),
+                security_definer_calls=tuple(v["security_definer_calls"]),
+            )
+            for v in raw_views
+        )
+
+        return cls(tables=tuple(tables), views=views)
