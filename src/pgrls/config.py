@@ -17,6 +17,20 @@ class ConfigError(Exception):
     """Raised when the user's config file is invalid or references missing env vars."""
 
 
+# User-facing values for `[diff].fail_on` — match the CLI's
+# `pgrls diff --fail-on` choices exactly. The hyphen in
+# `requires-review` is intentional (mirrors `_BUCKET_LABEL` in
+# `pgrls.diff.formatters`); internal Classification values use
+# underscores. Kept here as a tuple, not duplicated, so the CLI
+# imports it for `click.Choice` validation.
+DIFF_FAIL_ON_VALUES: tuple[str, ...] = (
+    "safe",
+    "breaking",
+    "requires-review",
+    "dangerous",
+)
+
+
 @dataclass(frozen=True)
 class Config:
     """Loaded configuration.
@@ -31,6 +45,11 @@ class Config:
     disable: list[str] = field(default_factory=list)
     fail_on: Severity = "warning"
     rule_options: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # `[diff].fail_on` default — the threshold below which `pgrls
+    # diff` exits 0 even when changes are detected. CLI flag takes
+    # precedence when supplied. Defaults to "dangerous" (only
+    # security regressions block CI).
+    diff_fail_on: str = "dangerous"
 
 
 def load_config(path: Path | str | None) -> Config:
@@ -128,12 +147,32 @@ def _build_config(raw: dict[str, Any]) -> Config:
             raise ConfigError(f"[lint.rules.{rule_id}] must be a table")
         rule_options[rule_id] = dict(opts)
 
+    diff = raw.get("diff", {})
+    if not isinstance(diff, dict):
+        raise ConfigError("[diff] must be a table")
+    diff_fail_on_raw = diff.get("fail_on", "dangerous")
+    if not isinstance(diff_fail_on_raw, str):
+        raise ConfigError(
+            f"[diff].fail_on must be a string, got "
+            f"{type(diff_fail_on_raw).__name__}"
+        )
+    # Match the CLI's case-insensitive contract. `pgrls diff
+    # --fail-on REQUIRES-REVIEW` works; `[diff].fail_on =
+    # "REQUIRES-REVIEW"` should too.
+    diff_fail_on = diff_fail_on_raw.lower()
+    if diff_fail_on not in DIFF_FAIL_ON_VALUES:
+        raise ConfigError(
+            f"[diff].fail_on must be one of {DIFF_FAIL_ON_VALUES}, "
+            f"got {diff_fail_on_raw!r}"
+        )
+
     return Config(
         database_url=database_url,
         schemas=list(schemas),
         disable=list(disable),
         fail_on=fail_on,
         rule_options=rule_options,
+        diff_fail_on=diff_fail_on,
     )
 
 

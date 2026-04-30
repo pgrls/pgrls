@@ -279,12 +279,39 @@ if _missing_classifications:
 del _missing_classifications, _all_classifications
 
 
+# Acronym tokens that must keep all-caps capitalization in the
+# humanized `title` field. `str.title()` would otherwise crush
+# them: "RLS_FLIPPED" → "Rls Flipped", "GRANT_PUBLIC_NO_RLS" →
+# "Grant Public No Rls". Each entry is the UPPERCASE form that
+# both appears in ChangeKind names AND should appear in titles.
+# Add new acronyms here as they enter the enum — keep this
+# allowlist tight, NOT forward-looking. A speculative entry like
+# "OR" or "AND" would incorrectly preserve a future kind that
+# happens to use those tokens (e.g. `BROADENED_OR_NARROWED`).
+_TITLE_ACRONYMS: frozenset[str] = frozenset({"RLS"})
+
+
+def _humanize_kind_name(kind_name: str) -> str:
+    """Render `USING_TIGHTENED` → `Using Tightened`, `RLS_FLIPPED` → `RLS Flipped`.
+
+    `str.title()` lowercases past the first character of each
+    whitespace-delimited token, which crushes acronyms. Iterate
+    word-by-word and preserve any token in `_TITLE_ACRONYMS`
+    in its uppercase form; otherwise apply title-case to the
+    individual word.
+    """
+    return " ".join(
+        word if word in _TITLE_ACRONYMS else word.title()
+        for word in kind_name.split("_")
+    )
+
+
 def _change_to_violation(c: Change) -> Violation:
     """Project a Change into a Violation for the existing JSON/SARIF formatters."""
     return Violation(
         rule_id=c.kind.value,
         severity=_CLASSIFICATION_TO_SEVERITY[c.classification],
-        title=c.kind.name.replace("_", " ").title(),
+        title=_humanize_kind_name(c.kind.name),
         message=c.message,
         location=c.location,
     )
@@ -300,3 +327,11 @@ def format_diff_sarif(changes: list[Change]) -> str:
     """Render a list of Changes as a SARIF v2.1.0 JSON document."""
     violations = [_change_to_violation(c) for c in changes]
     return format_sarif(violations)
+
+
+# Public constant for the CLI: the user-facing values for the
+# `pgrls diff --format` option. Mirrors `pgrls.formatters.
+# SUPPORTED_FORMATS` (the lint command's source of truth) and is
+# kept here so a future format addition (e.g. markdown) only
+# requires editing this module — the CLI consumes the constant.
+DIFF_SUPPORTED_FORMATS: tuple[str, ...] = ("text", "json", "sarif")

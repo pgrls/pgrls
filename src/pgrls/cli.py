@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import click
@@ -27,8 +28,13 @@ import psycopg
 
 from pgrls import __version__
 from pgrls.config import Config, ConfigError, load_config
-from pgrls.diff import diff_schemas
-from pgrls.diff.formatters import format_diff_json, format_diff_sarif, format_diff_text
+from pgrls.diff import Change, diff_schemas
+from pgrls.diff.formatters import (
+    DIFF_SUPPORTED_FORMATS,
+    format_diff_json,
+    format_diff_sarif,
+    format_diff_text,
+)
 from pgrls.fixers import default_fixers, generate_fixes
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
@@ -498,14 +504,22 @@ def _classifications_at_or_above(fail_on: str) -> set[str]:
 def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
     """Resolve a base/head argument into a Schema.
 
-    - If arg contains '://' → treat as DB URL, connect via psycopg, introspect.
+    - If arg starts with `file://` → strip the prefix, treat the rest as
+      a local path (matches the URL-shaped form some tools emit).
+    - Else if arg contains '://' → treat as DB URL, connect via psycopg, introspect.
     - Else if file exists → load JSON, parse via Schema.from_snapshot.
     - Else raise ToolError (exit 2) with a clear message.
 
     The schemas filter only applies to URL sources; snapshot files already have
     their filter baked in at capture time.
     """
-    if "://" in arg:
+    # `file://` is a URL by syntax but a path by intent. Strip the
+    # prefix and fall through to the file-path branch — psycopg
+    # would otherwise try to dial it as a connection string and
+    # produce a confusing connection-error message.
+    if arg.startswith("file://"):
+        arg = arg[len("file://") :]
+    elif "://" in arg:
         try:
             with psycopg.connect(arg) as conn:
                 return introspect(conn, schemas=schemas)
@@ -544,7 +558,24 @@ def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
 # ---------------------------------------------------------------------------
 
 _DIFF_FAIL_ON_VALUES = list(_FAIL_ON_TO_THRESHOLD)
-_DIFF_FORMAT_VALUES = ["text", "json", "sarif"]
+_DIFF_FORMAT_VALUES = list(DIFF_SUPPORTED_FORMATS)
+
+
+# Dispatch table for `pgrls diff --format <choice>`. Each entry
+# pairs the user-facing choice with (renderer, click.echo nl arg).
+# `text` ends without a trailing newline (the formatter emits a
+# clean summary line as the final line); pass `nl=True` so the
+# terminal's prompt lands on its own line. `json` and `sarif`
+# delegate to the lint formatters which already emit a final
+# newline; pass `nl=False` to avoid doubling. Mirrors the
+# `_FORMATTERS` dispatch dict in `pgrls.formatters` — adding a
+# new diff format requires only this dict + the formatter
+# function + an entry in `DIFF_SUPPORTED_FORMATS`.
+_DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
+    "text": (format_diff_text, True),
+    "json": (format_diff_json, False),
+    "sarif": (format_diff_sarif, False),
+}
 
 
 @main.command()
@@ -564,9 +595,12 @@ _DIFF_FORMAT_VALUES = ["text", "json", "sarif"]
     "--fail-on",
     "fail_on",
     type=click.Choice(_DIFF_FAIL_ON_VALUES, case_sensitive=False),
-    default="dangerous",
-    show_default=True,
-    help="Exit 1 when any change at or above this classification is present.",
+    default=None,
+    help=(
+        "Exit 1 when any change at or above this classification is present. "
+        "Falls back to [diff].fail_on in pgrls.toml, then to 'dangerous' "
+        "as the built-in default."
+    ),
 )
 @click.option(
     "--format",
@@ -592,7 +626,7 @@ def diff(
     base: str,
     head: str | None,
     database_url: str | None,
-    fail_on: str,
+    fail_on: str | None,
     output_format: str,
     config_path: str | None,
     schemas: str | None,
@@ -602,6 +636,14 @@ def diff(
         config = load_config(config_path)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
+
+    # `--fail-on` fallback chain:
+    #   1. CLI flag (if passed; Click resolves to lower-case via Choice).
+    #   2. `[diff].fail_on` in pgrls.toml (config.diff_fail_on, default "dangerous").
+    # Without this, `[diff].fail_on` is silently ignored when the
+    # CLI flag default takes precedence — defeating the point of
+    # configuring it in TOML.
+    effective_fail_on: str = fail_on if fail_on is not None else config.diff_fail_on
 
     # Resolve --schemas (CSV) — only passed to URL-source resolution.
     if schemas:
@@ -652,16 +694,13 @@ def diff(
     changes = diff_schemas(base_schema, head_schema)
 
     # --fail-on filter
-    threshold_classifications = _classifications_at_or_above(fail_on)
+    threshold_classifications = _classifications_at_or_above(effective_fail_on)
     failing = [c for c in changes if c.classification in threshold_classifications]
 
-    # Format and emit
-    if output_format == "text":
-        click.echo(format_diff_text(changes), nl=True)
-    elif output_format == "json":
-        click.echo(format_diff_json(changes), nl=False)
-    elif output_format == "sarif":
-        click.echo(format_diff_sarif(changes), nl=False)
+    # Format and emit. Single dispatch via _DIFF_FORMATTERS keeps
+    # the format list in lockstep with DIFF_SUPPORTED_FORMATS.
+    formatter, append_newline = _DIFF_FORMATTERS[output_format]
+    click.echo(formatter(changes), nl=append_newline)
 
     if failing:
         sys.exit(1)

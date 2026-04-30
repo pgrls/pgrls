@@ -10,6 +10,39 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-29
+
+### Changed
+- **`pgrls.diff.formatters`: title field preserves the `RLS`
+  acronym.** The JSON / SARIF `title` projection of
+  `ChangeKind.name` now keeps `RLS` in its uppercase form
+  (`Grant Public No RLS` instead of `Grant Public No Rls`,
+  `RLS Flipped` instead of `Rls Flipped`). The `_TITLE_ACRONYMS`
+  allowlist is intentionally tight — it covers the acronyms that
+  appear in current `ChangeKind` names, not speculative future
+  ones. Add entries when a real kind needs them.
+- **`Schema.from_snapshot` no longer eagerly parses ASTs.**
+  `Policy.using_ast` and `with_check_ast` are left as `None` after
+  load; the only in-tree consumer that needs them
+  (`pgrls.diff._diff_columns`) lazy-parses on demand. Saves
+  meaningful upfront work on large schemas. External callers that
+  relied on AST-populated-after-load must parse via
+  `pgrls.ast_utils.parse_expr(policy.using_sql)`.
+
+### Added
+- **`[diff].fail_on` in `pgrls.toml`.** Default `--fail-on`
+  threshold for `pgrls diff` is now configurable. Fallback chain:
+  CLI flag → `[diff].fail_on` in TOML → built-in `dangerous`.
+  Mirrors the lint command's `[lint].fail_on` precedent.
+- **`pgrls diff` accepts `file://` URLs as paths.** Useful when
+  shell completions or CI variables emit URL-shaped paths.
+  Previously the `://` heuristic mis-classified them as DB URLs
+  and surfaced a confusing connection error.
+- **`DIFF_SUPPORTED_FORMATS` constant** in `pgrls.diff.formatters`
+  is now the source of truth for the `--format` choice list. The
+  CLI imports it instead of hard-coding `["text", "json", "sarif"]`,
+  matching how the lint command sources `SUPPORTED_FORMATS`.
+
 ## [0.2.0] - 2026-04-29
 
 ### Added

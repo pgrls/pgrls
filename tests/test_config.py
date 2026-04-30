@@ -303,3 +303,73 @@ def test_empty_env_var_value_raises_clear_error(
     import pytest
     with pytest.raises(ConfigError, match="empty after env-var interpolation"):
         load_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# [diff] section (v0.2.1+)
+# ---------------------------------------------------------------------------
+
+
+def test_diff_fail_on_default_when_section_absent(tmp_path: Path) -> None:
+    # No `[diff]` section at all → `diff_fail_on` falls back to the
+    # built-in "dangerous" default.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "postgres://x/"\n')
+    config = load_config(cfg)
+    assert config.diff_fail_on == "dangerous"
+
+
+def test_diff_fail_on_reads_from_section(tmp_path: Path) -> None:
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[database]\nurl = "postgres://x/"\n'
+        '[diff]\nfail_on = "requires-review"\n'
+    )
+    config = load_config(cfg)
+    assert config.diff_fail_on == "requires-review"
+
+
+def test_diff_fail_on_normalizes_case(tmp_path: Path) -> None:
+    # `[diff].fail_on = "BREAKING"` should match the CLI's
+    # case-insensitive `--fail-on BREAKING`. Lower-case before
+    # the membership check.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[database]\nurl = "postgres://x/"\n'
+        '[diff]\nfail_on = "BREAKING"\n'
+    )
+    config = load_config(cfg)
+    assert config.diff_fail_on == "breaking"
+
+
+def test_diff_fail_on_invalid_value_raises(tmp_path: Path) -> None:
+    import pytest
+
+    from pgrls.config import ConfigError
+
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[database]\nurl = "postgres://x/"\n'
+        '[diff]\nfail_on = "super-extra-dangerous"\n'
+    )
+    with pytest.raises(ConfigError, match=r"\[diff\]\.fail_on"):
+        load_config(cfg)
+
+
+def test_diff_section_must_be_a_table(tmp_path: Path) -> None:
+    import pytest
+
+    from pgrls.config import ConfigError
+
+    # `diff = "..."` MUST go before any `[...]` header so TOML
+    # parses it as a top-level scalar (root.diff), not as a
+    # key inside the prior section. With it at the top, raw["diff"]
+    # is the string "not-a-table" and the isinstance(dict) check
+    # in _build_config rejects it.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        'diff = "not-a-table"\n'
+        '[database]\nurl = "postgres://x/"\n'
+    )
+    with pytest.raises(ConfigError, match=r"\[diff\] must be a table"):
+        load_config(cfg)
