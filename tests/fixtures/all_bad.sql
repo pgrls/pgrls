@@ -98,3 +98,17 @@ ALTER TABLE public.allbad_hyg002 FORCE ROW LEVEL SECURITY;
 CREATE POLICY todo_replace_me_later ON public.allbad_hyg002
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (owner_id = 'x');
+
+-- VIEW001: view over RLS-protected table without `security_invoker`.
+-- The base table has RLS enabled and a RESTRICTIVE policy with an
+-- own-column reference, so SEC001/SEC005/SEC007/SEC008/SEC009 stay
+-- silent on the base table. The view itself runs with the owner's
+-- privileges and bypasses RLS.
+CREATE TABLE public.allbad_view001_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view001_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view001_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view001_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = current_setting('app.tenant', true));
+CREATE VIEW public.allbad_view001 AS
+    SELECT * FROM public.allbad_view001_base;
