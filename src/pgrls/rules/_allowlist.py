@@ -122,3 +122,30 @@ def parse_qualified_table_allowlist(
                 f"'schema.table' (e.g. 'public.users')."
             )
     return set(items)
+
+
+def parse_qualified_view_allowlist(
+    rule_id: str, options: dict[str, Any]
+) -> set[str]:
+    """Validate that every entry is `schema.view` (exactly two parts).
+
+    Used by VIEW001-VIEW004 — the rule scope is the qualified view
+    object, and an exempt entry is meaningless without a schema
+    qualifier (two views with the same name in different schemas
+    would otherwise both be silenced by a bare-name allowlist).
+    """
+    raw = options.get("allowlist", [])
+    items = _list_of_strings(
+        rule_id,
+        raw,
+        "of the form 'schema.view'",
+    )
+    for entry in items:
+        parts = entry.split(".")
+        if len(parts) != 2 or not all(parts):
+            raise TypeError(
+                f"[lint.rules.{rule_id}].allowlist entry {entry!r} is "
+                f"not a valid qualified view ID. Expected "
+                f"'schema.view' (e.g. 'public.user_summary')."
+            )
+    return set(items)

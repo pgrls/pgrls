@@ -46,9 +46,10 @@ def test_readme_rule_table_lists_every_registered_rule(
     from pgrls.rules import all_rules
 
     registered_ids = {rule.id for rule in all_rules()}
-    # Find every `SEC###` / `PERF###` / `HYG###` token in the README.
+    # Find every `SEC###` / `PERF###` / `HYG###` / `VIEW###` token in
+    # the README.
     documented_ids = set(
-        re.findall(r"\b((?:SEC|PERF|HYG)\d{3})\b", readme_text)
+        re.findall(r"\b((?:SEC|PERF|HYG|VIEW)\d{3})\b", readme_text)
     )
     missing = registered_ids - documented_ids
     assert not missing, (

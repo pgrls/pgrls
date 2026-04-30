@@ -53,6 +53,7 @@ _ALL_RULE_IDS = (
     "PERF002",
     "HYG001",
     "HYG002",
+    "VIEW001",
 )
 
 
@@ -741,6 +742,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         "PERF002  public.allbad_perf002.randomized\n",
         "HYG001  public.allbad_hyg001.orphan\n",
         "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
+        "VIEW001  public.allbad_view001\n",
     ):
         assert rule_loc in result.output, (
             f"{rule_loc!r} missing from output:\n{result.output}"
