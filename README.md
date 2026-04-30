@@ -10,7 +10,7 @@ Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 pip install pgrls
 ```
 
-Requires Python 3.11+ and Postgres 10+. pgrls is tested in CI against PostgreSQL 10–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix). The demo suite uses some features that require PG 12+ (declarative partitions, generated columns) and PG 14+ (uc36's `pg_read_all_data` predefined role) — but `pgrls lint` and `pgrls fix` themselves work on PG10 and up.
+Requires Python 3.11+ and Postgres 15+. pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
 
 ## Usage
 
