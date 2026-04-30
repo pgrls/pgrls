@@ -130,9 +130,11 @@ def test_from_snapshot_round_trips_v3_with_policies() -> None:
         )
     )
     loaded = Schema.from_snapshot(original.to_snapshot())
-    # Equality compare doesn't hold (loaded re-parses ASTs while
-    # `original` has using_ast=None) — assert on user-facing fields
-    # explicitly so the contract is visible in the test body.
+    # Under v0.2.1's lazy-AST contract both sides have
+    # `using_ast=None` after construction, so equality holds —
+    # but assert on user-facing fields explicitly so the contract
+    # is visible in the test body and the test stays readable
+    # without depending on dataclass `__eq__` semantics.
     assert len(loaded.tables) == 1
     assert len(loaded.tables[0].policies) == 1
     p = loaded.tables[0].policies[0]
@@ -142,6 +144,9 @@ def test_from_snapshot_round_trips_v3_with_policies() -> None:
     assert p.roles == ("PUBLIC",)
     assert p.using_sql == "id > 0"
     assert p.with_check_sql is None
+    # Sanity-check the lazy-AST contract is actually in effect.
+    assert p.using_ast is None
+    assert p.with_check_ast is None
 
 
 def test_from_snapshot_round_trips_v3_with_grants() -> None:
@@ -173,9 +178,15 @@ def test_from_snapshot_round_trips_v3_with_grants() -> None:
     assert set(g.privileges) == {"SELECT", "INSERT"}
 
 
-def test_from_snapshot_reparses_using_ast() -> None:
-    # using_ast / with_check_ast aren't serialized; from_snapshot
-    # re-parses them via parse_expr.
+def test_from_snapshot_does_not_eagerly_parse_ast() -> None:
+    # v0.2.1 contract change: from_snapshot leaves using_ast and
+    # with_check_ast as None. The only consumer that needed the
+    # AST was pgrls.diff._diff_columns, which now lazy-parses.
+    # Eager parsing on load was wasted work for diffs that don't
+    # drop columns — see Schema.from_snapshot docstring rationale.
+    #
+    # Callers that need the AST after from_snapshot must parse on
+    # demand via `pgrls.ast_utils.parse_expr(policy.using_sql)`.
     snap = {
         "version": 3,
         "tables": [
@@ -202,5 +213,157 @@ def test_from_snapshot_reparses_using_ast() -> None:
     }
     loaded = Schema.from_snapshot(snap)
     policy = loaded.tables[0].policies[0]
-    assert policy.using_ast is not None
+    # SQL fields survive — only the ASTs are skipped.
+    assert policy.using_sql == "id > 0"
+    assert policy.with_check_sql is None
+    # Both ASTs are None per the new contract.
+    assert policy.using_ast is None
     assert policy.with_check_ast is None
+
+
+def test_diff_columns_lazy_parses_when_ast_is_none() -> None:
+    # End-to-end pin: a snapshot loaded via from_snapshot has no
+    # using_ast populated, but `_diff_columns` must still detect
+    # column references via on-demand parsing. Without the lazy
+    # path, snapshot-vs-anything diffs would silently lose the
+    # COLUMN_DROPPED_REFERENCED rule.
+    from pgrls.diff import ChangeKind, diff_schemas
+
+    base_snap = {
+        "version": 3,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "t",
+                "rls_enabled": True,
+                "force_rls": True,
+                "columns": ["id", "tenant_id"],
+                "partition_of": None,
+                "grants": [],
+            }
+        ],
+        "policies": [
+            {
+                "table_schema": "public",
+                "table_name": "t",
+                "policy_name": "isolate",
+                "command": "SELECT",
+                "permissive": True,
+                "roles": ["PUBLIC"],
+                "using_sql": "tenant_id = 'x'",
+                "with_check_sql": None,
+            }
+        ],
+    }
+    head_snap = {
+        "version": 3,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "t",
+                "rls_enabled": True,
+                "force_rls": True,
+                "columns": ["id"],  # tenant_id dropped
+                "partition_of": None,
+                "grants": [],
+            }
+        ],
+        "policies": [
+            {
+                "table_schema": "public",
+                "table_name": "t",
+                "policy_name": "isolate",
+                "command": "SELECT",
+                "permissive": True,
+                "roles": ["PUBLIC"],
+                "using_sql": "tenant_id = 'x'",  # still references the dropped column
+                "with_check_sql": None,
+            }
+        ],
+    }
+    base = Schema.from_snapshot(base_snap)
+    head = Schema.from_snapshot(head_snap)
+    # Pre-condition: ASTs are None (lazy contract).
+    assert base.tables[0].policies[0].using_ast is None
+    assert head.tables[0].policies[0].using_ast is None
+
+    changes = diff_schemas(base, head)
+    column_changes = [
+        c for c in changes if c.kind == ChangeKind.COLUMN_DROPPED_REFERENCED
+    ]
+    assert len(column_changes) == 1
+    assert column_changes[0].location == "public.t.tenant_id"
+    assert column_changes[0].classification == "requires_review"
+
+
+def test_diff_columns_lazy_parses_with_check_sql_path() -> None:
+    # Mirror of test_diff_columns_lazy_parses_when_ast_is_none for
+    # the with_check_sql branch of the lazy-parse loop. Both
+    # branches share identical structure; this test pins the
+    # with-check half so a regression that drops the second
+    # iteration of the per-policy loop surfaces here.
+    from pgrls.diff import ChangeKind, diff_schemas
+
+    base_snap = {
+        "version": 3,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "t",
+                "rls_enabled": True,
+                "force_rls": True,
+                "columns": ["id", "tenant_id"],
+                "partition_of": None,
+                "grants": [],
+            }
+        ],
+        "policies": [
+            {
+                "table_schema": "public",
+                "table_name": "t",
+                "policy_name": "isolate",
+                "command": "INSERT",
+                "permissive": True,
+                "roles": ["PUBLIC"],
+                "using_sql": None,
+                # The reference lives in WITH CHECK, not USING.
+                "with_check_sql": "tenant_id = 'x'",
+            }
+        ],
+    }
+    head_snap = {
+        "version": 3,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "t",
+                "rls_enabled": True,
+                "force_rls": True,
+                "columns": ["id"],  # tenant_id dropped
+                "partition_of": None,
+                "grants": [],
+            }
+        ],
+        "policies": [
+            {
+                "table_schema": "public",
+                "table_name": "t",
+                "policy_name": "isolate",
+                "command": "INSERT",
+                "permissive": True,
+                "roles": ["PUBLIC"],
+                "using_sql": None,
+                "with_check_sql": "tenant_id = 'x'",
+            }
+        ],
+    }
+    base = Schema.from_snapshot(base_snap)
+    head = Schema.from_snapshot(head_snap)
+    assert head.tables[0].policies[0].with_check_ast is None
+
+    changes = diff_schemas(base, head)
+    column_changes = [
+        c for c in changes if c.kind == ChangeKind.COLUMN_DROPPED_REFERENCED
+    ]
+    assert len(column_changes) == 1
+    assert column_changes[0].location == "public.t.tenant_id"
