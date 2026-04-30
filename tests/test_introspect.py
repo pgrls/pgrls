@@ -682,6 +682,40 @@ def test_introspect_captures_materialized_view(
     assert mv.is_materialized is True
 
 
+def test_introspect_captures_secdef_function_calls_in_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.secret (id INT);
+        CREATE FUNCTION public.read_secret() RETURNS SETOF public.secret
+            LANGUAGE sql SECURITY DEFINER AS $$
+            SELECT * FROM public.secret
+            $$;
+        CREATE VIEW public.secret_v AS SELECT * FROM public.read_secret();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "secret_v")
+    assert v.security_definer_calls == ("public.read_secret",)
+
+
+def test_introspect_view_calling_invoker_function_no_secdef_entry(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t5 (id INT);
+        CREATE FUNCTION public.t5_count() RETURNS BIGINT
+            LANGUAGE sql AS $$ SELECT count(*) FROM public.t5 $$;
+        CREATE VIEW public.t5_count_v AS SELECT public.t5_count() AS n;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "t5_count_v")
+    assert v.security_definer_calls == ()
+
+
 def test_introspect_resolves_view_to_table_references(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
