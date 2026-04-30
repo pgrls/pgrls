@@ -603,3 +603,73 @@ def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
         "'oid:N' sentinel so unresolvable grantee OIDs don't "
         "leak NULL into Grant.role."
     )
+
+
+def test_introspect_captures_views(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE VIEW public.t_v AS SELECT * FROM public.t;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    view_qnames = [v.qualified_name for v in schema.views]
+    assert "public.t_v" in view_qnames
+
+    v = next(view for view in schema.views if view.name == "t_v")
+    assert v.is_materialized is False
+    # security_invoker / security_barrier default to False unless
+    # explicitly set via WITH (...) at CREATE time.
+    assert v.security_invoker is False
+    assert v.security_barrier is False
+    assert v.definition  # non-empty
+    # Task 4/5 populate these; Task 3 leaves them empty.
+    assert v.references == ()
+    assert v.security_definer_calls == ()
+
+
+def test_introspect_captures_security_invoker_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t2 (id INT);
+        CREATE VIEW public.t2_v WITH (security_invoker = true)
+            AS SELECT * FROM public.t2;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "t2_v")
+    assert v.security_invoker is True
+
+
+def test_introspect_captures_security_barrier_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t3 (id INT);
+        CREATE VIEW public.t3_v WITH (security_barrier = true)
+            AS SELECT * FROM public.t3;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "t3_v")
+    assert v.security_barrier is True
+
+
+def test_introspect_captures_materialized_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t4 (id INT);
+        CREATE MATERIALIZED VIEW public.t4_mv
+            AS SELECT * FROM public.t4 WITH NO DATA;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    mv = next(view for view in schema.views if view.name == "t4_mv")
+    assert mv.is_materialized is True
