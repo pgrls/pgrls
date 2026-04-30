@@ -8,7 +8,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from pgrls.ast_utils import parse_expr
-from pgrls.model import Grant, Policy, Schema, Table
+from pgrls.model import Grant, Policy, Schema, Table, View
 
 _POLICY_CMD_MAP: dict[str, str] = {
     "*": "ALL",
@@ -217,6 +217,33 @@ WHERE c.relkind IN ('r', 'p')
 ORDER BY c.oid, role_name, ax.privilege_type
 """
 
+_VIEWS_SQL = """
+SELECT
+    n.nspname AS schema_name,
+    c.relname AS view_name,
+    c.relkind = 'm' AS is_materialized,
+    -- pg_class.reloptions is text[] like {security_invoker=on, security_barrier=on}.
+    -- We accept both 'on' and 'true' since both are valid in PG syntax.
+    COALESCE(
+        (SELECT TRUE
+         FROM unnest(c.reloptions) AS o(opt)
+         WHERE o.opt = 'security_invoker=on' OR o.opt = 'security_invoker=true'),
+        FALSE
+    ) AS security_invoker,
+    COALESCE(
+        (SELECT TRUE
+         FROM unnest(c.reloptions) AS o(opt)
+         WHERE o.opt = 'security_barrier=on' OR o.opt = 'security_barrier=true'),
+        FALSE
+    ) AS security_barrier,
+    pg_get_viewdef(c.oid, true) AS definition
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('v', 'm')
+  AND n.nspname = ANY(%s)
+ORDER BY n.nspname, c.relname
+"""
+
 
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
@@ -227,7 +254,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     `pg_temp_*`, `pg_toast_temp_*`).
     """
     if not schemas:
-        return Schema(tables=())
+        return Schema(tables=(), views=())
 
     reserved = sorted({s for s in schemas if _is_reserved_schema(s)})
     if reserved:
@@ -250,7 +277,23 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
         if not table_rows:
-            return Schema(tables=())
+            # No tables, but we still need to check for views.
+            cur.execute(_VIEWS_SQL, (schemas,))
+            view_rows_early = cur.fetchall()
+            views_early = tuple(
+                View(
+                    schema=row["schema_name"],
+                    name=row["view_name"],
+                    is_materialized=row["is_materialized"],
+                    security_invoker=row["security_invoker"],
+                    security_barrier=row["security_barrier"],
+                    definition=row["definition"],
+                    references=(),  # Task 4 populates this
+                    security_definer_calls=(),  # Task 5 populates this
+                )
+                for row in view_rows_early
+            )
+            return Schema(tables=(), views=views_early)
 
         oids = [row["table_oid"] for row in table_rows]
         cur.execute(_COLUMNS_SQL, (oids,))
@@ -267,6 +310,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             grants_by_oid[row["table_oid"]][row["role_name"]].append(
                 row["privilege_type"]
             )
+
+        cur.execute(_VIEWS_SQL, (schemas,))
+        view_rows = cur.fetchall()
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
     for row in column_rows:
@@ -337,4 +383,18 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         for row in table_rows
     ]
 
-    return Schema(tables=tuple(tables))
+    views = tuple(
+        View(
+            schema=row["schema_name"],
+            name=row["view_name"],
+            is_materialized=row["is_materialized"],
+            security_invoker=row["security_invoker"],
+            security_barrier=row["security_barrier"],
+            definition=row["definition"],
+            references=(),  # Task 4 populates this
+            security_definer_calls=(),  # Task 5 populates this
+        )
+        for row in view_rows
+    )
+
+    return Schema(tables=tuple(tables), views=views)
