@@ -60,10 +60,10 @@ _MOD_KINDS: frozenset[ChangeKind] = frozenset(
         ChangeKind.ROLES_WIDENED,
         ChangeKind.ROLES_NARROWED,
         ChangeKind.ROLES_DISJOINT_REPLACED,
-        # POLICY_RENAMED is in the ChangeKind enum (Task 4 contract)
-        # but no v0.2 detection rule emits it — rename detection is
-        # deferred to v0.3, see _diff_policies docstring. Classify as
-        # a modification anyway so a future detection rule (or
+        # POLICY_RENAMED is reserved in the ChangeKind enum but no
+        # v0.2 detection rule emits it — rename detection is deferred
+        # to v0.3, see `_diff_policies` docstring. Classify as a
+        # modification anyway so a future detection rule (or
         # programmatic Change construction in tests) doesn't crash
         # the formatter with "unknown ChangeKind".
         ChangeKind.POLICY_RENAMED,
@@ -144,6 +144,23 @@ _BUCKET_LABEL: dict[str, str] = {
     "breaking": "breaking",
     "safe": "safe",
 }
+
+# Import-time exhaustiveness check — every Classification literal value
+# must appear as a key in _BUCKET_LABEL AND in _BUCKET_ORDER. Mirrors the
+# `_CLASSIFICATION_TO_SEVERITY` exhaustiveness guard further down. A 5th
+# Classification ever added would silently drop from the trailing summary
+# without this check.
+_classification_values: frozenset[str] = frozenset(get_args(Classification))
+_missing_labels = _classification_values - set(_BUCKET_LABEL)
+_missing_order = _classification_values - set(_BUCKET_ORDER)
+if _missing_labels or _missing_order:
+    raise RuntimeError(  # pragma: no cover — import-time invariant
+        "pgrls.diff.formatters bucket tables must cover every "
+        f"Classification value. Missing from _BUCKET_LABEL: "
+        f"{sorted(_missing_labels)}; missing from _BUCKET_ORDER: "
+        f"{sorted(_missing_order)}."
+    )
+del _classification_values, _missing_labels, _missing_order
 
 
 # ---------------------------------------------------------------------------

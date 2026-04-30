@@ -548,7 +548,7 @@ def test_introspect_grants_are_deterministic(
 def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
-    # Same Postgres quirk that Round 15 of v0.0.7 polish caught for
+    # Same Postgres quirk an earlier polish pass caught for
     # polroles: a non-superuser caller may not be able to SELECT
     # from pg_authid, leaving ar.rolname NULL even when the grantee
     # OID exists. The COALESCE sentinel keeps the role-name column

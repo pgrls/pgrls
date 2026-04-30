@@ -30,11 +30,11 @@ import re
 
 _PLAIN_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-# C0 controls (\x00..\x1f) and DEL (\x7f). Round 14 rejected null
-# byte, LF, and CR; tab and the rest of the C0 range pose the same
-# embedding-in-quoted-SQL hazard. Catch the whole range so the
-# defense is uniform and a future reader doesn't read the
-# null-only test and assume tab is fine.
+# C0 controls (\x00..\x1f) and DEL (\x7f). An earlier change
+# rejected null byte, LF, and CR; tab and the rest of the C0 range
+# pose the same embedding-in-quoted-SQL hazard. Catch the whole
+# range so the defense is uniform and a future reader doesn't read
+# the null-only test and assume tab is fine.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 # Postgres 16 fully-reserved keywords (appendix C, "reserved" column).

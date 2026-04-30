@@ -6,8 +6,9 @@ Public exports for v0.2:
 * `diff_schemas` — top-level entry point.
 
 The Python API is documented but NOT promoted to the top-level
-`pgrls` package surface in v0.2 (see the design spec's non-goals
-section). v0.3 may promote.
+`pgrls` package surface in v0.2; consumers must import from
+`pgrls.diff` explicitly. v0.3 may promote `Change`, `ChangeKind`,
+`Classification`, and `diff_schemas` to the top-level package.
 """
 from __future__ import annotations
 

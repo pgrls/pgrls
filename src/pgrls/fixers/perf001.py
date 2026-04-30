@@ -42,12 +42,10 @@ from pglast.stream import RawStream
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema
-# Single source of truth for the default auth-function set. Round 22
-# caught two parallel constants — `pgrls.rules.perf001._DEFAULT_AUTH_FUNCTIONS`
-# and a duplicate here in the fixer. A future addition (e.g.
-# `app.current_user_id`) to the rule's defaults would silently miss
-# the fixer if the fixer re-defined the list. Importing from the
-# rule pins the "fixer fixes exactly what the rule reports" contract.
+# Single source of truth for the default auth-function set —
+# imported from the rule so a future addition (e.g.
+# `app.current_user_id`) to the rule's defaults can't silently
+# miss the fixer. The fixer fixes exactly what the rule reports.
 from pgrls.rules.perf001 import _DEFAULT_AUTH_FUNCTIONS
 
 def _parse_auth_functions(options: dict[str, Any]) -> set[str]:

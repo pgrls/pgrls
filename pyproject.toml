@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.2.1"
+version = "0.2.2"
 description = "Framework-agnostic linter and testing toolkit for Postgres Row-Level Security."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -77,3 +77,17 @@ exclude = ["uv.lock"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# pglast (the Postgres SQL parser pgrls uses for AST-based rules
+# and the diff predicate matcher) doesn't ship `py.typed` in the
+# v6.x range we pin, so mypy --strict reports `[import-untyped]`
+# for every `from pglast import …` line. Silence at the
+# import-resolver level so real type errors elsewhere stay loud,
+# without sprinkling per-import `# type: ignore` comments.
+[[tool.mypy.overrides]]
+module = ["pglast", "pglast.*"]
+ignore_missing_imports = true

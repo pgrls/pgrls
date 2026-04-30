@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-04-29
+
+### Changed
+- **`pgrls.diff.differ` split into focused modules.** The 700-line
+  orchestrator has been decomposed by concern:
+  `pgrls.diff.differ` keeps the public types (`Change`,
+  `ChangeKind`, `Classification`) and the `diff_schemas`
+  orchestrator (231 lines); per-table helpers live in sibling
+  modules — `pgrls.diff.policies` (`_diff_policies` add/drop +
+  `_diff_policy_shapes` permissive/command/roles/predicate),
+  `pgrls.diff.columns` (`_diff_columns`), `pgrls.diff.grants`
+  (`_diff_grants`). No public API change — these are all
+  module-private helpers — but importers of `pgrls.diff` and the
+  rest of the public surface (`Change`, `ChangeKind`,
+  `Classification`, `diff_schemas`) are unchanged.
+
 ## [0.2.1] - 2026-04-29
 
 ### Changed
@@ -51,7 +67,7 @@ breaking changes — they will be called out in this file.
   Compare any two RLS schemas (snapshot files, live DBs, or one of
   each — argument disambiguation: `://` ⇒ URL, else file-must-exist
   ⇒ snapshot). Common-case AST patterns for `USING` / `WITH CHECK`
-  text changes (literal-equal, AND-tighten / drop, OR-tighten /
+  text changes (literal-equal, AND-tighten / drop, OR-loosen /
   drop); anything else falls into REQUIRES_REVIEW. `--fail-on
   dangerous` (default) gates CI builds on actual security
   relaxations; `--fail-on requires-review` for a stricter gate.

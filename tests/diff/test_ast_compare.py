@@ -184,8 +184,9 @@ def test_duplicate_clause_dedup_then_add_returns_tightened_and():
     # canonical sets {"a = 1"} and {"a = 1", "b = 2"}. Set delta is 1, so
     # the function returns tightened_and. This is *probably* still safe
     # (the head predicate is at least as restrictive as base), but the
-    # detection is via deduplication, not via the spec's literal `P → P
-    # AND Q` shape. Pin so a future Counter-based switch surfaces here.
+    # detection is via deduplication, not via the documented literal
+    # `P → P AND Q` shape (see AGENTS.md AST patterns table). Pin so
+    # a future Counter-based switch surfaces here.
     assert (
         compare_predicates(
             "a = 1 AND a = 1",
