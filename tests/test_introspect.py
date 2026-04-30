@@ -61,9 +61,14 @@ def test_filters_by_schema(pg_conn: psycopg.Connection, apply_sql) -> None:
     }
 
 
-def test_skips_views_and_system_tables(
+def test_views_routed_to_schema_views_not_tables(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
+    # As of v0.3.0 introspect captures views — but they go into
+    # `schema.views`, not `schema.tables`. The test name predates
+    # the split; the body now pins both halves of the routing
+    # contract: tables only contain real relations, and the view
+    # does land on the views side.
     apply_sql(
         """
         CREATE TABLE public.real (id INT);
@@ -71,8 +76,10 @@ def test_skips_views_and_system_tables(
         """
     )
     schema = introspect(pg_conn, schemas=["public"])
-    names = {t.qualified_name for t in schema.tables}
-    assert names == {"public.real"}
+    table_names = {t.qualified_name for t in schema.tables}
+    view_names = {v.qualified_name for v in schema.views}
+    assert table_names == {"public.real"}
+    assert "public.view_real" in view_names
 
 
 def test_unknown_schema_raises(pg_conn: psycopg.Connection) -> None:
