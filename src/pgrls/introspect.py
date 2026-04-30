@@ -299,13 +299,21 @@ def _build_secdef_calls_index(
         return {}
     # Map bare last-segment back to its qualified form so a `read_secret()`
     # reference (no schema prefix in viewdef output) can be canonicalized
-    # to `public.read_secret` for storage. If two SECDEF functions share
-    # the same bare name across schemas, `setdefault` keeps the first;
-    # this is fine because `find_func_calls` matches on the bare name and
-    # the canonical lookup picks one — collisions across schemas are rare
-    # and the qualified form would still match exactly when emitted.
+    # to `public.read_secret` for storage. Iterate `secdef_qnames` in
+    # sorted order so the bare→qualified mapping is deterministic across
+    # runs — set iteration order in CPython is hash-randomized for
+    # strings, and snapshot v4 stores `security_definer_calls` as part
+    # of the byte-stable Schema serialization, so non-deterministic
+    # canonicalization would silently shuffle snapshots between runs.
+    # If two SECDEF functions share the same bare name across schemas,
+    # `setdefault` keeps the alphabetically-first qualified form; this
+    # is acceptable because `find_func_calls` still matches the
+    # qualified form exactly when `pg_get_viewdef` emits it. The
+    # bare-name fallback is only a best-effort attribution path —
+    # VIEW004 (Task 10) will tighten the collision story before any
+    # user-facing message is built off this.
     bare_to_qual: dict[str, str] = {}
-    for q in secdef_qnames:
+    for q in sorted(secdef_qnames):
         bare_to_qual.setdefault(q.rsplit(".", 1)[-1], q)
     name_set = secdef_qnames | set(bare_to_qual.keys())
 
