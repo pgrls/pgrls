@@ -500,7 +500,7 @@ def test_generate_fixes_passes_rule_options() -> None:
     assert fixes == []
 
 
-def test_default_fixers_includes_sec002_and_perf001() -> None:
+def test_default_fixers_registers_every_shipping_fixer() -> None:
     rule_ids = {fixer.rule_id for fixer in default_fixers()}
     assert {"SEC002", "PERF001", "VIEW001"} <= rule_ids
 
