@@ -632,9 +632,9 @@ def test_introspect_captures_views(
     assert v.security_invoker is False
     assert v.security_barrier is False
     assert v.definition  # non-empty
-    # Task 4/5 populate these; Task 3 leaves them empty.
-    assert v.references == ()
-    assert v.security_definer_calls == ()
+    # Task 4 populates references; t_v reads from public.t.
+    assert v.references == (("public", "t"),)
+    assert v.security_definer_calls == ()  # Task 5 populates this
 
 
 def test_introspect_captures_security_invoker_view(
@@ -680,3 +680,107 @@ def test_introspect_captures_materialized_view(
     schema = introspect(pg_conn, schemas=["public"])
     mv = next(view for view in schema.views if view.name == "t4_mv")
     assert mv.is_materialized is True
+
+
+def test_introspect_resolves_view_to_table_references(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.users (id INT, email TEXT);
+        CREATE TABLE public.orders (id INT, user_id INT, amount INT);
+        CREATE VIEW public.user_orders AS
+            SELECT u.email, o.amount
+            FROM public.users u
+            JOIN public.orders o ON o.user_id = u.id;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "user_orders")
+
+    # references should be sorted (schema, name) tuples
+    assert v.references == (
+        ("public", "orders"),
+        ("public", "users"),
+    )
+
+
+def test_introspect_view_with_no_references_has_empty_tuple(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        "CREATE VIEW public.vw_const AS SELECT 42 AS answer;"
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "vw_const")
+    assert v.references == ()
+
+
+def test_introspect_view_referencing_partitioned_table(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A view over a partitioned parent table should resolve the
+    # parent (relkind='p') as a reference. Postgres rewrites the
+    # query at runtime to fan out to children, but the dependency
+    # edge in pg_depend points at the parent.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026
+            PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        CREATE VIEW public.events_v AS SELECT * FROM public.events;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "events_v")
+    assert ("public", "events") in v.references
+
+
+def test_introspect_view_chained_through_view_does_not_chase(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # v0.3.0 design: view→table deps are SINGLE HOP. A view that
+    # reads ANOTHER view that reads an RLS-protected table should
+    # NOT have the underlying table in its `references`. The
+    # intermediate view's references point at the table; the outer
+    # view's references point at the intermediate view (filtered
+    # out by relkind='r','p' in the query).
+    #
+    # This test pins the deferral — v0.4 may add transitive
+    # walks; if so, this test should be deleted in the same change
+    # so the intent is visible.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE VIEW public.inner_v AS SELECT * FROM public.t;
+        CREATE VIEW public.outer_v AS SELECT * FROM public.inner_v;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    outer = next(view for view in schema.views if view.name == "outer_v")
+    # `inner_v` is a view (relkind='v'), filtered out by query.
+    # `t` is a table BUT outer_v's pg_depend doesn't link to it
+    # directly — the chain goes through inner_v.
+    assert ("public", "t") not in outer.references
+
+
+def test_introspect_view_dependency_filter_by_schema(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # The schema filter applies to the VIEW side. A view in
+    # schema "app" that reads a table in schema "shared" — if
+    # we introspect ["app"] only, the view shows up but its
+    # references include the cross-schema table.
+    apply_sql(
+        """
+        CREATE SCHEMA shared;
+        CREATE SCHEMA app;
+        CREATE TABLE shared.lookup (id INT);
+        CREATE VIEW app.lookup_v AS SELECT * FROM shared.lookup;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["app", "shared"])
+    v = next(view for view in schema.views if view.name == "lookup_v")
+    assert v.references == (("shared", "lookup"),)
