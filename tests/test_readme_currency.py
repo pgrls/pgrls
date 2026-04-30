@@ -1,10 +1,11 @@
 """Pin user-visible README claims against the codebase.
 
-Round 25 caught the README still describing 2-tier exit codes
-after Round 22 added a third tier, plus a stale PG version
-disclaimer. These tests guard against that class of drift —
-README is the first contact for any potential user, so claims
-that no longer match reality are credibility issues.
+A prior review caught the README still describing 2-tier exit
+codes after the codebase had added a third tier (tool-error),
+plus a stale PG version disclaimer. These tests guard against
+that class of drift — README is the first contact for any
+potential user, so claims that no longer match reality are
+credibility issues.
 """
 from __future__ import annotations
 
@@ -23,15 +24,15 @@ def readme_text() -> str:
 
 
 def test_readme_documents_all_three_exit_codes(readme_text: str) -> None:
-    # Round 22 added exit code 2 for tool errors (config / network /
-    # fixer SQL failure). The README must cover all three tiers so
-    # CI engineers know they can route alerts differently — that's
-    # the entire point of having a third code.
+    # Three-tier exit codes: 0 clean, 1 findings, 2 tool errors
+    # (config / network / fixer SQL failure). The README must
+    # cover all three so CI engineers know they can route alerts
+    # differently — that's the entire point of having a third code.
     for marker in ("`0`", "`1`", "`2`"):
         assert marker in readme_text, (
             f"README missing exit-code documentation for {marker}. "
-            "Round 22's tool-error tier (2) must appear alongside "
-            "the existing clean (0) and findings (1) descriptions."
+            "The tool-error tier (2) must appear alongside the "
+            "existing clean (0) and findings (1) descriptions."
         )
 
 

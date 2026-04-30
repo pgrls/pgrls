@@ -12,10 +12,15 @@ from pgrls.cli import main
 # Minimal snapshot fixtures
 # ---------------------------------------------------------------------------
 
-# Snapshot v3 stores per-table policies inside each table dict; there is
-# no top-level `policies` key. Earlier fixtures carried one as dead noise
-# that Schema.from_snapshot silently ignored — drop it so a future
-# reader doesn't mistake the layout.
+# Snapshot v3 layout (matches Schema.to_snapshot in src/pgrls/model.py):
+#  * top-level "policies" array — canonical location, indexed by
+#    (table_schema, table_name, policy_name) on load.
+#  * per-table "policies" key — accepted by Schema.from_snapshot as
+#    a legacy fallback (used by manual fixtures + v2 baselines).
+# These fixtures use neither — the tables have no policies, so an
+# empty layout works for both readers. When adding a fixture WITH
+# policies, prefer the top-level form to match what `pgrls snapshot`
+# emits in production.
 _EMPTY_SNAP = {"version": 3, "tables": []}
 
 # A table with RLS enabled — no dangerous changes vs another enabled-RLS table.
@@ -497,6 +502,36 @@ def test_diff_warns_when_schemas_passed_with_two_file_inputs(
         # output contains the warning text.
     )
     assert result.exit_code == 0, result.output
+    assert "--schemas is ignored" in result.output
+
+
+def test_diff_warns_when_schemas_passed_with_file_scheme_urls(
+    tmp_path: Path,
+) -> None:
+    """`file://` URLs resolve as snapshot files in the source resolver
+    (the prefix is stripped). The --schemas warning gate must treat
+    them as files too, not as URL-shaped DB connections — otherwise
+    a user passing `--schemas` alongside two `file://` arguments
+    would silently miss the "filter is ineffective" warning."""
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            f"file://{base}",
+            f"file://{head}",
+            "--schemas",
+            "app",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # `_is_db_url` strips file:// before the URL-substring check, so
+    # both inputs count as file-shaped → the warning fires.
     assert "--schemas is ignored" in result.output
 
 

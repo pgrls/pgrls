@@ -1,7 +1,7 @@
 """SEC001 — RLS not enabled on a table in a configured schema.
 
-DESIGN.md §4 detection: `pg_class.relrowsecurity = false` in the configured
-schemas, minus the per-rule `allowlist`. Allowlist entries can be unqualified
+Detection: `pg_class.relrowsecurity = false` in the configured schemas,
+minus the per-rule `allowlist`. Allowlist entries can be unqualified
 (`countries`) or schema-qualified (`tenant.things`).
 
 Declarative partitioning: Postgres does not propagate `relrowsecurity` from

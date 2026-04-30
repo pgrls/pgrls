@@ -9,9 +9,10 @@ Recognizes a small set of structural transformations:
   * tightened_or_drop   — head OR dropped_disjunct (fewer alternatives)
   * requires_review     — anything else
 
-Anything outside the table falls through to requires_review. The
-v0.2 design defers SAT-style implication checking to v0.5+ — see
-the design spec's non-goals section.
+Anything outside the table falls through to requires_review.
+SAT-style implication checking that would automatically classify
+arbitrary predicate transformations is deferred to v0.5+; see the
+README Roadmap and CHANGELOG.
 """
 from __future__ import annotations
 
@@ -48,12 +49,16 @@ def _or_clauses(node: Any) -> list[Any]:
 
 def _canon(node: Any) -> str:
     """Canonicalize a pglast node to a stable SQL string via RawStream."""
-    # `RawStream` is the canonical pglast renderer. pglast doesn't
-    # ship type stubs, so mypy --strict sees `RawStream()` as
-    # `Any`-typed and the call site as returning `Any` from a
-    # `str`-declared function. The runtime contract is fine — every
-    # RawStream call returns a str.
-    rendered: str = RawStream()(node)  # type: ignore[no-untyped-call]
+    # pglast v6 (the pinned range) ships without type stubs, so
+    # mypy --strict treats `RawStream()(node)` as `Any -> Any`.
+    # The explicit `: str` annotation on the local pins the
+    # boundary — a real type error elsewhere in the file still
+    # surfaces, while the unavoidable Any-leak from pglast is
+    # absorbed locally without a per-call `# type: ignore`. If
+    # pglast ever ships `py.typed` (or this project pins to a
+    # typed v7+), the annotation simply becomes a redundant
+    # narrow and mypy stays happy.
+    rendered: str = RawStream()(node)
     return rendered
 
 

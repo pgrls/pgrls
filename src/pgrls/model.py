@@ -177,13 +177,18 @@ class Schema:
         }
 
     @classmethod
-    def from_snapshot(cls, payload: dict) -> "Schema":
+    def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
         """Reconstruct a Schema from a v2 or v3 snapshot dict.
 
-        v3 (current): full fidelity. v2 (legacy): grants come back as
-        `()` per table; a `pgrls diff` against a v2 baseline silently
-        classifies any grant-affecting change as REQUIRES_REVIEW (the
-        diff layer handles this — model only carries the empty data).
+        v3 (current): full fidelity. v2 (legacy): grants come back
+        as `()` per table — v2 didn't capture grants. **Caveat:** the
+        diff layer doesn't know which side is v2-shaped, so any
+        per-table grant present in the v3 head will look like a
+        GRANT_ADDED (or, in the PUBLIC + no-RLS shape, a
+        GRANT_PUBLIC_NO_RLS) when diffed against a v2 baseline,
+        even when the actual cluster state was unchanged. Treat
+        v2 baselines as ground-truth-incomplete on the grants axis;
+        re-capture as v3 once available.
 
         v1 / unknown versions: raises ValueError with a clear
         "snapshot version N is not supported" message naming the

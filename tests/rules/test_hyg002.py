@@ -201,11 +201,11 @@ def test_hyg002_metadata_present() -> None:
 
 def test_hyg002_message_mentions_only_default_vocabulary_examples() -> None:
     # The violation message gives example placeholder words. They
-    # must come from the actual default vocabulary — Round 26 caught
-    # the message naming `wip`, which Round 18 had removed from the
-    # default set. A message advertising example matches the rule
-    # itself will never produce on default config is a credibility
-    # leak.
+    # must come from the actual default vocabulary — an earlier
+    # review caught the message naming `wip`, which had been
+    # removed from the default set. A message advertising example
+    # matches the rule itself will never produce on default
+    # config is a credibility leak.
     from pgrls.rules.hyg002 import _DEFAULT_PLACEHOLDER_WORDS
 
     schema = _wrap(_policy(name="todo_thing"))

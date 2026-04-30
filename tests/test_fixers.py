@@ -277,10 +277,12 @@ def test_default_fixers_includes_sec002_and_perf001() -> None:
 
 
 def test_fix_dataclass_is_frozen() -> None:
+    import dataclasses
+
     f = Fix(
         rule_id="X", location="public.t", sql="--", description="test"
     )
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         f.rule_id = "Y"  # type: ignore[misc]
 
 
@@ -543,9 +545,9 @@ def test_wrap_funccall_emits_select_sublink() -> None:
     # Pin the direct-construction shape: `_wrap_funccall` returns a
     # SubLink whose RawStream-emitted form is exactly the
     # `(SELECT <call>)` Postgres expects. Regression guard for
-    # Round 17's deepcopy → direct-construction perf fix; if a
-    # future refactor swaps SubLinkType, drops the LimitOption
-    # default, or otherwise breaks the emitted SQL, this fails.
+    # the deepcopy → direct-construction perf fix; if a future
+    # refactor swaps SubLinkType, drops the LimitOption default,
+    # or otherwise breaks the emitted SQL, this fails.
     from pglast.ast import FuncCall, String
     from pglast.stream import RawStream
 
@@ -579,11 +581,11 @@ def test_quote_ident_rejects_empty_string() -> None:
 
 
 def test_quote_ident_quotes_reserved_keywords() -> None:
-    # Round 27: a table named "select" or a policy named "order"
-    # must be quoted at emission time, otherwise pgrls's fixer SQL
-    # is a syntax error on the server. The previous regex-only check
-    # treated reserved words as plain identifiers because they match
-    # `[a-z_][a-z0-9_]*`.
+    # A table named "select" or a policy named "order" must be
+    # quoted at emission time, otherwise pgrls's fixer SQL is a
+    # syntax error on the server. An earlier regex-only check
+    # treated reserved words as plain identifiers because they
+    # match `[a-z_][a-z0-9_]*`.
     from pgrls.fixers._idents import quote_ident
 
     for kw in ("select", "from", "where", "table", "user", "order"):
@@ -606,8 +608,9 @@ def test_quote_ident_keyword_check_is_case_insensitive() -> None:
 
 
 def test_quote_ident_rejects_tab_character() -> None:
-    # Round 14 rejected null/newline; tab is the same hazard. Pin
-    # the wider control-char check so the defense is uniform.
+    # An earlier change rejected null/newline; tab is the same
+    # hazard. Pin the wider control-char check so the defense is
+    # uniform.
     from pgrls.fixers._idents import quote_ident
 
     with pytest.raises(ValueError, match="control character"):

@@ -44,7 +44,7 @@ def test_public_modules_declare_all() -> None:
 
 
 def test_pgrls_testing_subpackage_importable() -> None:
-    # Round 0 of pgrls test scaffolding — assert the subpackage
+    # Initial pgrls.testing scaffolding — assert the subpackage
     # exists and exposes a stable import surface. Detailed exports
     # are pinned by `test_public_modules_declare_all` once the
     # client/assertions modules land.
@@ -60,10 +60,10 @@ def test_pgrls_testing_exports_client_and_protocol_version() -> None:
 
 
 def test_pgrls_diff_exports_change_and_diff_schemas() -> None:
-    # Pin the v0.2 public surface for the diff machinery. Per the
-    # design spec's non-goals, these names are importable from
-    # `pgrls.diff` but NOT promoted to the top-level `pgrls`
-    # package — that promotion is a v0.3 decision.
+    # Pin the v0.2 public surface for the diff machinery. These
+    # names are importable from `pgrls.diff` but NOT promoted to
+    # the top-level `pgrls` package — promotion to top-level is a
+    # v0.3 decision (see README Roadmap).
     import pgrls.diff
 
     expected = {"Change", "ChangeKind", "Classification", "diff_schemas"}

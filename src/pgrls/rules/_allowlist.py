@@ -13,7 +13,7 @@ Allowlist entries fall into three shapes:
 * **Qualified table ID** (`schema.table` only) — used by rules whose
   scope is the qualified table object specifically (SEC007).
 
-Until Round 21, every rule did the bare list-of-strings check
+Earlier versions had every rule do the bare list-of-strings check
 (`isinstance(raw, list) and all(isinstance(s, str))`) and accepted any
 shape silently. A user copy-pasting an unqualified `users` into
 `[lint.rules.SEC003].allowlist` got no error and no exemption — the

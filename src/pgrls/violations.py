@@ -48,11 +48,10 @@ def coerce_severity(value: str) -> Severity:
         raise ValueError(
             f"severity {value!r} is not one of {ALL_SEVERITIES}"
         )
-    # Narrow to the Literal type. `cast` is safe here because the
-    # membership check above guarantees the value is a Severity.
-    from typing import cast
-
-    return cast(Severity, normalized)
+    # The membership check narrows `normalized` to Severity; mypy
+    # picks this up so an explicit `cast` would be a redundant
+    # no-op. Defensive type-check still preserved at the boundary.
+    return normalized
 
 
 @dataclass(frozen=True)
