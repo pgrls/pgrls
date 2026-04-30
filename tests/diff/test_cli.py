@@ -341,6 +341,101 @@ def test_diff_no_changes_emits_no_changes_summary(tmp_path: Path) -> None:
     assert result.output.rstrip("\n").endswith("pgrls diff: no changes.")
 
 
+def test_diff_uses_diff_fail_on_from_pgrls_toml(tmp_path: Path) -> None:
+    """[diff].fail_on in pgrls.toml is honored when --fail-on is not
+    on the CLI. Pin the fallback chain end-to-end.
+
+    Fixture: a SAFE-only diff (added RESTRICTIVE, classified safe).
+    Default `--fail-on dangerous` would exit 0; if we set
+    `[diff].fail_on = "safe"` in TOML, the SAFE change should
+    trip the threshold and exit 1.
+    """
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_TABLE_ADDED_WITH_RLS), encoding="utf-8")
+
+    toml_path = tmp_path / "pgrls.toml"
+    toml_path.write_text(
+        '[diff]\nfail_on = "safe"\n',
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base),
+            str(head),
+            "--config",
+            str(toml_path),
+        ],
+    )
+    # SAFE change × fail_on=safe ⇒ change meets threshold ⇒ exit 1.
+    assert result.exit_code == 1, result.output
+
+
+def test_diff_cli_fail_on_overrides_pgrls_toml(tmp_path: Path) -> None:
+    """When both --fail-on and [diff].fail_on are set, the CLI flag wins."""
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_TABLE_ADDED_WITH_RLS), encoding="utf-8")
+
+    toml_path = tmp_path / "pgrls.toml"
+    # TOML says fail-on safe (would exit 1).
+    toml_path.write_text(
+        '[diff]\nfail_on = "safe"\n',
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base),
+            str(head),
+            "--config",
+            str(toml_path),
+            # CLI overrides to dangerous → SAFE change is below threshold → exit 0.
+            "--fail-on",
+            "dangerous",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_diff_accepts_file_scheme_url_as_path(tmp_path: Path) -> None:
+    """`file:///abs/path/snap.json` should resolve as a local file,
+    not be passed to psycopg as a connection string.
+
+    The naive `://` heuristic catches `file://` and treats it as a
+    DB URL — psycopg then errors with a connection-shaped message
+    that doesn't hint "did you mean a file path?". v0.2.1 strips
+    the file:// prefix and falls through to the file-path branch.
+    """
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+
+    # `file://` + absolute path — works on POSIX. URL-encoded paths
+    # (with %20 etc.) are out of scope; this test pins the simple
+    # case that everyday tools (e.g. shell completions, CI
+    # variables) would emit.
+    base_url = f"file://{base}"
+    head_url = f"file://{head}"
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["diff", base_url, head_url])
+
+    # Two identical empty snapshots → exit 0, no changes.
+    assert result.exit_code == 0, result.output
+    assert "no changes" in result.output
+
+
 def test_diff_invalid_config_toml_exits_2(tmp_path: Path) -> None:
     """Mirror of the lint command's invalid-config test for diff.
 

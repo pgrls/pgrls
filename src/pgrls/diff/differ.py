@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
-from pgrls.ast_utils import extract_column_refs
+from pgrls.ast_utils import extract_column_refs, parse_expr
 from pgrls.diff.ast_compare import compare_predicates
 from pgrls.model import Policy, Schema, Table
 
@@ -458,12 +458,44 @@ def _diff_columns(base_table: Table, head_table: Table) -> list[Change]:
     # dropped column, check membership in O(1). This drops the
     # nested loop from O(dropped × policies × ast-walk) to
     # O(policies × ast-walk + dropped).
+    #
+    # AST may not be populated when the head Schema came from
+    # `Schema.from_snapshot` — v0.2.1 stops eagerly parsing on
+    # snapshot load (see `from_snapshot` docstring). Fall back to
+    # parsing the SQL on demand so this rule still fires for
+    # snapshot-vs-anything diffs. parse_expr returns None for
+    # empty/None input and on parse failure; either path produces
+    # zero refs from this policy and the loop continues.
+    #
+    # On parse failure, parse_expr emits a stderr warning. Pass
+    # location and a diff-context tail so the user sees the
+    # offending policy named instead of a generic lint-context
+    # message about SEC/PERF/HYG rules that don't run during diff.
+    fail_tail = (
+        "Snapshot policy AST will be unavailable for "
+        "column-reference checks."
+    )
+
     referenced_names: set[str] = set()
     for policy in head_table.policies:
-        for ast_node in (policy.using_ast, policy.with_check_ast):
-            if ast_node is None:
+        policy_loc = f"{qname}.{policy.name}"
+        for ast_node, sql, clause in (
+            (policy.using_ast, policy.using_sql, "USING"),
+            (policy.with_check_ast, policy.with_check_sql, "WITH CHECK"),
+        ):
+            node = (
+                ast_node
+                if ast_node is not None
+                else parse_expr(
+                    sql,
+                    location=policy_loc,
+                    clause=clause,
+                    fail_message_tail=fail_tail,
+                )
+            )
+            if node is None:
                 continue
-            for ref in extract_column_refs(ast_node):
+            for ref in extract_column_refs(node):
                 if ref:  # tuple is non-empty
                     referenced_names.add(ref[-1])
 
