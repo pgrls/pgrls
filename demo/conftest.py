@@ -47,6 +47,10 @@ _ALL_RULE_IDS = (
     "PERF002",
     "HYG001",
     "HYG002",
+    "VIEW001",
+    "VIEW002",
+    "VIEW003",
+    "VIEW004",
 )
 
 _BASE_CONFIG = (
