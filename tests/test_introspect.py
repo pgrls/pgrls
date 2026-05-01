@@ -716,6 +716,49 @@ def test_introspect_view_calling_invoker_function_no_secdef_entry(
     assert v.security_definer_calls == ()
 
 
+def test_introspect_captures_security_definer_function_bodies(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Introspection populates `Schema.security_definer_functions` with
+    # the SECDEF function body and language. VIEW004 reads the body to
+    # detect RLS-protected reads inside the function.
+    apply_sql(
+        """
+        CREATE TABLE public.body_secret (id INT);
+        CREATE FUNCTION public.body_read() RETURNS SETOF public.body_secret
+            LANGUAGE sql SECURITY DEFINER AS $$
+            SELECT * FROM public.body_secret
+            $$;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    secdef = next(
+        f
+        for f in schema.security_definer_functions
+        if f.qualified_name == "public.body_read"
+    )
+    assert secdef.language == "sql"
+    assert "public.body_secret" in secdef.body
+
+
+def test_introspect_skips_invoker_function_in_security_definer_functions(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Functions WITHOUT SECURITY DEFINER must NOT land in
+    # `Schema.security_definer_functions` — VIEW004 only cares about
+    # SECDEF bodies.
+    apply_sql(
+        """
+        CREATE TABLE public.invoker_t (id INT);
+        CREATE FUNCTION public.invoker_count() RETURNS BIGINT
+            LANGUAGE sql AS $$ SELECT count(*) FROM public.invoker_t $$;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    qnames = {f.qualified_name for f in schema.security_definer_functions}
+    assert "public.invoker_count" not in qnames
+
+
 def test_introspect_resolves_view_to_table_references(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

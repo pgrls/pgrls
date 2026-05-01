@@ -6,6 +6,7 @@ import pytest
 from pgrls.model import (
     SNAPSHOT_VERSION,
     Schema,
+    SecdefFunction,
     View,
 )
 
@@ -86,3 +87,73 @@ def test_from_snapshot_rejects_v2_with_clear_message() -> None:
 def test_from_snapshot_rejects_unknown_version() -> None:
     with pytest.raises(Exception, match="version 999"):
         Schema.from_snapshot({"version": 999, "tables": []})
+
+
+def test_to_snapshot_emits_security_definer_functions_field() -> None:
+    schema = Schema(
+        tables=(),
+        views=(),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.read_secret",
+                body="SELECT * FROM public.secret",
+                language="sql",
+            ),
+        ),
+    )
+    snap = schema.to_snapshot()
+    assert "security_definer_functions" in snap
+    assert snap["security_definer_functions"] == [
+        {
+            "qualified_name": "public.read_secret",
+            "body": "SELECT * FROM public.secret",
+            "language": "sql",
+        }
+    ]
+
+
+def test_from_snapshot_round_trips_v4_with_security_definer_functions() -> None:
+    original = Schema(
+        tables=(),
+        views=(),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.read_secret",
+                body="SELECT * FROM public.secret",
+                language="sql",
+            ),
+            SecdefFunction(
+                qualified_name="public.audit_lookup",
+                body="DECLARE r RECORD; BEGIN ... END;",
+                language="plpgsql",
+            ),
+        ),
+    )
+    loaded = Schema.from_snapshot(original.to_snapshot())
+    assert loaded.security_definer_functions == original.security_definer_functions
+
+
+def test_from_snapshot_v4_without_security_definer_functions_loads_clean() -> None:
+    # An older v4 snapshot written before the additive
+    # `security_definer_functions` extension shipped — the field is
+    # absent from the JSON. Loading must succeed and yield `()`.
+    legacy_v4 = {
+        "version": 4,
+        "tables": [],
+        "policies": [],
+        "views": [],
+    }
+    loaded = Schema.from_snapshot(legacy_v4)
+    assert loaded.security_definer_functions == ()
+
+
+def test_from_snapshot_v3_yields_empty_security_definer_functions() -> None:
+    # v3 has no `security_definer_functions`; load must succeed and
+    # the field defaults to an empty tuple.
+    v3 = {
+        "version": 3,
+        "tables": [],
+        "policies": [],
+    }
+    loaded = Schema.from_snapshot(v3)
+    assert loaded.security_definer_functions == ()

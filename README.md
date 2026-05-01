@@ -214,6 +214,7 @@ pattern documentation.
 | [VIEW001](AGENTS.md#rule-view001) | error | View over RLS-protected table without `WITH (security_invoker = true)` |
 | [VIEW002](AGENTS.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
 | [VIEW003](AGENTS.md#rule-view003) | warning | Materialized view over RLS-protected table (RLS not honored at query time) |
+| [VIEW004](AGENTS.md#rule-view004) | warning | View calls SECURITY DEFINER function that reads an RLS-protected table |
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.

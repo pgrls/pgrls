@@ -88,6 +88,7 @@ def test_schema_to_snapshot_shape() -> None:
             }
         ],
         "views": [],
+        "security_definer_functions": [],
     }
 
 
@@ -430,11 +431,17 @@ def test_schema_by_qname_is_cached_across_calls() -> None:
 def test_snapshot_v4_top_level_keys_are_stable_contract() -> None:
     # Snapshot top-level keys are part of the public surface (any
     # consumer reading the JSON depends on these names). Pin
-    # `version`, `tables`, `policies`, `views` so a quiet refactor
-    # that renames or drops a key fails this test rather than
-    # slipping past CI.
+    # `version`, `tables`, `policies`, `views`,
+    # `security_definer_functions` so a quiet refactor that renames
+    # or drops a key fails this test rather than slipping past CI.
     snap = Schema(tables=()).to_snapshot()
-    assert set(snap.keys()) == {"version", "tables", "policies", "views"}
+    assert set(snap.keys()) == {
+        "version",
+        "tables",
+        "policies",
+        "views",
+        "security_definer_functions",
+    }
     assert snap["version"] == 4
 
 
