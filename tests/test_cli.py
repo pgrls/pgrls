@@ -56,6 +56,7 @@ _ALL_RULE_IDS = (
     "VIEW001",
     "VIEW002",
     "VIEW003",
+    "VIEW004",
 )
 
 
@@ -747,6 +748,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         "VIEW001  public.allbad_view001\n",
         "VIEW002  public.allbad_view002\n",
         "VIEW003  public.allbad_view003\n",
+        "VIEW004  public.allbad_view004\n",
     ):
         assert rule_loc in result.output, (
             f"{rule_loc!r} missing from output:\n{result.output}"

@@ -149,3 +149,30 @@ CREATE POLICY tenant_floor ON public.allbad_view003_base
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
 CREATE MATERIALIZED VIEW public.allbad_view003 AS
     SELECT * FROM public.allbad_view003_base;
+
+-- VIEW004: view that calls a SECURITY DEFINER function that reads
+-- an RLS-protected table. The function bypasses RLS via the
+-- function owner's privileges, so even though the view is
+-- configured `security_invoker = true` + `security_barrier = true`
+-- (silencing VIEW001 and VIEW002), the SECDEF call inside the body
+-- is the leak vector — that's the gap VIEW004 catches.
+--
+-- The view is a regular (non-materialized) view so VIEW003 stays
+-- silent. The view's `references` does NOT include
+-- `allbad_view004_base` (pg_depend tracks function-result deps via
+-- pg_proc, not pg_class), so VIEW001 has nothing to flag here.
+-- The base table mirrors the other VIEW blocks' policy shape so
+-- the SEC and PERF rules stay silent on it.
+CREATE TABLE public.allbad_view004_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view004_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view004_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view004_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE FUNCTION public.allbad_view004_read()
+    RETURNS SETOF public.allbad_view004_base
+    LANGUAGE sql SECURITY DEFINER AS
+    'SELECT * FROM public.allbad_view004_base';
+CREATE VIEW public.allbad_view004
+    WITH (security_invoker = true, security_barrier = true) AS
+    SELECT * FROM public.allbad_view004_read();

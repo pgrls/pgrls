@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 import pglast
-from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, NullTest, SQLValueFunction, String, SubLink
+from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, NullTest, RangeVar, SQLValueFunction, String, SubLink
 from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
@@ -215,6 +215,57 @@ def find_func_calls(
 
     walk(node)
     return matches
+
+
+def extract_range_vars(node: Any) -> list[tuple[str | None, str]]:
+    """Walk the tree and return every RangeVar's `(schemaname, relname)`.
+
+    A `FROM public.secret` produces `("public", "secret")`. A bare
+    `FROM secret` (no schema prefix) produces `(None, "secret")` —
+    the caller is responsible for resolving bare names against a
+    known set of qualified table refs (VIEW004 does this against
+    its set of RLS-protected tables).
+
+    Covers SELECT/INSERT/UPDATE/DELETE: RangeVar appears in
+    `SelectStmt.fromClause`, `InsertStmt.relation`,
+    `UpdateStmt.relation`, `DeleteStmt.relation`. Walks Node fields
+    and tuple/list containers like `extract_column_refs` and
+    `find_func_calls` — same shape, same recursion semantics for
+    `RangeFunction.functions`-style nested tuples.
+    """
+    refs: list[tuple[str | None, str]] = []
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, RangeVar):
+            # `relname` is the table name; `schemaname` may be None
+            # when the SQL writer didn't qualify it. Don't synthesize
+            # a schema here — the caller knows the introspection
+            # scope and resolves bare names against it.
+            relname = getattr(n, "relname", None)
+            if isinstance(relname, str) and relname:
+                schemaname = getattr(n, "schemaname", None)
+                refs.append((schemaname, relname))
+            # Don't return here — a RangeVar can in principle have
+            # nested children (e.g. `alias` is a separate field but
+            # carries no further range vars). Walking children is
+            # safe; just skip the early return.
+        if isinstance(n, Node):
+            for field_name in n:
+                value = getattr(n, field_name, None)
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        walk(item)
+                elif isinstance(value, Node):
+                    walk(value)
+
+    walk(node)
+    return refs
 
 
 def match_is_null(node: Any) -> tuple[Any, bool] | None:

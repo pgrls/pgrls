@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pgrls.ast_utils import (
     extract_column_refs,
+    extract_range_vars,
     find_func_calls,
     match_is_null,
     parse_expr,
@@ -390,3 +391,62 @@ def test_match_is_null_distinguishes_is_null_from_is_not_null() -> None:
     not_null_node = parse_expr("a IS NOT NULL")
     assert match_is_null(null_node)[1] is True  # type: ignore[index]
     assert match_is_null(not_null_node)[1] is False  # type: ignore[index]
+
+
+def test_extract_range_vars_qualified_select() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT * FROM public.secret")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert refs == [("public", "secret")]
+
+
+def test_extract_range_vars_bare_select() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT * FROM secret")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert refs == [(None, "secret")]
+
+
+def test_extract_range_vars_qualified_insert() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("INSERT INTO public.t (id) VALUES (1)")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "t") in refs
+
+
+def test_extract_range_vars_qualified_update() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("UPDATE public.t SET x = 1")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "t") in refs
+
+
+def test_extract_range_vars_qualified_delete() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("DELETE FROM public.t WHERE id = 1")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "t") in refs
+
+
+def test_extract_range_vars_collects_join_targets() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql(
+        "SELECT a.id FROM public.a JOIN public.b ON a.id = b.id"
+    )
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "a") in refs
+    assert ("public", "b") in refs
+
+
+def test_extract_range_vars_returns_empty_when_no_tables() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT 1")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert refs == []

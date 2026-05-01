@@ -18,6 +18,7 @@ __all__ = [
     "PolicyCommand",
     "SNAPSHOT_VERSION",
     "Schema",
+    "SecdefFunction",
     "Snapshot",
     "Table",
     "View",
@@ -118,9 +119,32 @@ class Table:
 
 
 @dataclass(frozen=True)
+class SecdefFunction:
+    """A SECURITY DEFINER function captured by introspection.
+
+    Captured in snapshot v4+ alongside `Schema.views`. VIEW004
+    inspects the `body` (parsed via pglast against `pg_proc.prosrc`)
+    to detect SELECT/INSERT/UPDATE/DELETE references against an
+    RLS-protected table — a SECDEF call from a non-invoker view body
+    bypasses the caller's RLS via the function owner's privileges.
+
+    `language` is the `pg_language.lanname` for the function (e.g.
+    `sql`, `plpgsql`). VIEW004 only attempts pglast parsing for
+    `sql` bodies; PL/pgSQL bodies start with `DECLARE`/`BEGIN`
+    which pglast can't parse as a top-level statement, so they're
+    skipped explicitly with a stderr warning.
+    """
+
+    qualified_name: str
+    body: str
+    language: str
+
+
+@dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
     views: tuple[View, ...] = ()
+    security_definer_functions: tuple[SecdefFunction, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -220,6 +244,14 @@ class Schema:
                     "security_definer_calls": list(v.security_definer_calls),
                 }
                 for v in self.views
+            ],
+            "security_definer_functions": [
+                {
+                    "qualified_name": f.qualified_name,
+                    "body": f.body,
+                    "language": f.language,
+                }
+                for f in self.security_definer_functions
             ],
         }
 
@@ -329,5 +361,28 @@ class Schema:
             )
             for v in raw_views
         )
+        # `security_definer_functions` is an additive v4 extension
+        # added after the initial v4 release of `views`. `.get(...,
+        # [])` keeps older v4 snapshots written before this extension
+        # loadable — they get an empty tuple, which means VIEW004
+        # finds nothing to flag (correct, since the snapshot didn't
+        # capture the bodies). Snapshot version stays at 4 because v4
+        # has not shipped externally yet; this is an in-development
+        # extension to v4, not a v5 bump.
+        raw_secdef_funcs = (
+            payload.get("security_definer_functions", []) if version >= 4 else []
+        )
+        secdef_funcs = tuple(
+            SecdefFunction(
+                qualified_name=f["qualified_name"],
+                body=f["body"],
+                language=f["language"],
+            )
+            for f in raw_secdef_funcs
+        )
 
-        return cls(tables=tuple(tables), views=views)
+        return cls(
+            tables=tuple(tables),
+            views=views,
+            security_definer_functions=secdef_funcs,
+        )
