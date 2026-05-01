@@ -133,3 +133,19 @@ CREATE POLICY tenant_floor ON public.allbad_view002_base
 CREATE VIEW public.allbad_view002
     WITH (security_invoker = true) AS
     SELECT * FROM public.allbad_view002_base;
+
+-- VIEW003: materialized view over RLS-protected table. Matviews
+-- capture rows at REFRESH time per the refresher's privileges and
+-- do NOT honor RLS on subsequent queries — VIEW001/VIEW002 don't
+-- apply (matviews lack `security_invoker` / `security_barrier`
+-- reloptions, and both rules early-exit on `is_materialized=True`).
+-- The base table mirrors VIEW001/VIEW002's policy shape so SEC and
+-- PERF rules stay silent on it.
+CREATE TABLE public.allbad_view003_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view003_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view003_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view003_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE MATERIALIZED VIEW public.allbad_view003 AS
+    SELECT * FROM public.allbad_view003_base;
