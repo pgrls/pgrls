@@ -4,7 +4,7 @@ A self-contained walkthrough of every rule pgrls ships, plus the
 partition-aware paths, the JSON / SARIF output contracts, the
 `pgrls fix` auto-remediation flow, the `pgrls.testing` pytest plugin,
 and the four `pgrls diff` classifications (DANGEROUS / SAFE /
-REQUIRES_REVIEW / BREAKING). 84 use cases.
+REQUIRES_REVIEW / BREAKING). 88 use cases.
 
 ## Layout
 
@@ -31,7 +31,11 @@ demo/
     ├── 81-pgrls-diff-end-to-end/         # diff DANGEROUS path
     ├── 82-pgrls-diff-safe-restrictive-add/        # diff SAFE
     ├── 83-pgrls-diff-column-dropped-referenced/   # diff REQUIRES_REVIEW
-    └── 84-pgrls-diff-breaking-permissive-drop/    # diff BREAKING
+    ├── 84-pgrls-diff-breaking-permissive-drop/    # diff BREAKING
+    ├── 85-view001-non-invoker-view/      # VIEW001
+    ├── 86-view002-non-barrier-view/      # VIEW002
+    ├── 87-view003-matview-over-rls/      # VIEW003
+    └── 88-view004-view-thru-secdef/      # VIEW004
 ```
 
 Each case folder is self-contained — open it to read the SQL
@@ -69,7 +73,7 @@ numeric order).
 | 22 | Orphaned column referenced only in WITH CHECK | HYG001 | fires (rule walks both clauses) |
 | 23 | Three-level partition with RLS at root | (none) | passes (multi-level ancestor walk) |
 | 24 | RLS pushed down to leaf only | SEC001 | fires on parent only; leaf clean |
-| 25 | View on top of RLS-enabled table | (none) | passes (relkind='v' filtered out) |
+| 25 | View on top of RLS-enabled table — clean (both flags set) | (none) | passes |
 | 26 | Blog with PERMISSIVE admin override granted to PUBLIC | SEC003 | fires; uc31 demonstrates the canonical fix |
 | 27 | DELETE policy without WITH CHECK | (none) | passes (SEC006 doesn't apply to DELETE) |
 | 28 | Tenant via JWT claim (`auth.jwt() ->> 'tenant_id'`, wrapped) | (none) | passes |
@@ -129,6 +133,10 @@ numeric order).
 | 82 | `pgrls diff`: added RESTRICTIVE policy | DIFF_POLICY_ADDED_RESTRICTIVE | SAFE classification, severity=info, exit 0 |
 | 83 | `pgrls diff`: dropped column referenced by policy | DIFF_COLUMN_DROPPED_REFERENCED | REQUIRES_REVIEW, severity=warning, gated by --fail-on requires-review |
 | 84 | `pgrls diff`: dropped PERMISSIVE policy | DIFF_POLICY_DROPPED_PERMISSIVE | BREAKING classification, severity=warning, gated by --fail-on breaking |
+| 85 | Non-`security_invoker` view over RLS table | VIEW001 | fires |
+| 86 | Non-`security_barrier` view over RLS table | VIEW002 | fires |
+| 87 | Materialized view over RLS table | VIEW003 | fires |
+| 88 | View calling SECDEF function reading RLS table | VIEW004 | fires |
 
 ## Running
 
@@ -167,7 +175,7 @@ pytest demo/ -v
 
 Spins up an isolated Postgres via `testcontainers` (no port
 collisions), applies `_shared.sql` plus every case's `setup.sql`,
-and runs 90 assertions — one or more per use case plus
+and runs 94 assertions — one or more per use case plus
 configuration-driven scenarios that exercise per-test `--config`
 overrides (allowlist, disable, custom `auth_functions`,
 multi-schema, fail_on, format), the JSON / SARIF output
@@ -184,8 +192,8 @@ DATABASE_URL=postgres://demo:demo@localhost:5433/demo \
 
 ## Expected lint output
 
-Around 53 violations across all three severities (`22 errors,
-27 warnings, 4 infos.`). The fixture is intentionally noisy — most
+Around 68 violations across all three severities (`27 errors,
+35 warnings, 6 infos.`). The fixture is intentionally noisy — most
 violations come from cross-fires where one bad policy trips several
 rules at once (`USING (true)` → SEC005 + SEC008 + SEC003 if PUBLIC; a
 Supabase `auth.uid() IS NULL OR ...` → SEC004 + PERF001). Each
