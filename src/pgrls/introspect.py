@@ -338,12 +338,19 @@ def _build_secdef_calls_index(
     # of the byte-stable Schema serialization, so non-deterministic
     # canonicalization would silently shuffle snapshots between runs.
     # If two SECDEF functions share the same bare name across schemas,
-    # `setdefault` keeps the alphabetically-first qualified form; this
-    # is acceptable because `find_func_calls` still matches the
-    # qualified form exactly when `pg_get_viewdef` emits it. The
-    # bare-name fallback is only a best-effort attribution path —
-    # VIEW004 (Task 10) will tighten the collision story before any
-    # user-facing message is built off this.
+    # `setdefault` keeps the alphabetically-first qualified form. This
+    # is a best-effort attribution path: `find_func_calls` still
+    # matches the qualified form exactly when `pg_get_viewdef` emits
+    # it, and the bare-only fallback is rare in practice (most viewdef
+    # output qualifies cross-schema function calls). VIEW004 takes a
+    # different tack at the *table*-ref layer — when a bare table name
+    # in a function body could resolve to multiple RLS-protected
+    # tables, it over-reports all candidates rather than picking one —
+    # because the rule's user-facing message is what surfaces the
+    # leak, and under-attribution there would be silently insecure.
+    # The two layers (function-name canonicalization here, table-name
+    # over-reporting in VIEW004) chose opposite trade-offs based on
+    # what failure mode hurts the user most.
     bare_to_qual: dict[str, str] = {}
     for q in sorted(secdef_qnames):
         bare_to_qual.setdefault(q.rsplit(".", 1)[-1], q)

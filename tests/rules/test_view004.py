@@ -406,6 +406,43 @@ def test_view004_resolves_bare_table_name_in_function_body() -> None:
     assert "public.secret" in violations[0].message
 
 
+def test_view004_bare_name_collision_reports_all_rls_candidates() -> None:
+    # Two RLS-protected tables in different schemas share the same
+    # bare name (`core.user` and `staging.user`). A SECDEF function
+    # body that says `SELECT * FROM "user"` can't be unambiguously
+    # attributed — the actual target depends on the search_path the
+    # function ran with. VIEW004 over-reports rather than under-
+    # attributes: emit BOTH qualified candidates so the operator sees
+    # every RLS-protected table that could leak. Under-attribution in
+    # a security check would let the operator dismiss the warning
+    # while the other table is still vulnerable; over-attribution at
+    # most produces a false positive the operator can allowlist.
+    schema = Schema(
+        tables=(
+            _table("core", "user", rls=True),
+            _table("staging", "user", rls=True),
+        ),
+        views=(
+            _view(
+                schema="public",
+                name="vw",
+                security_definer_calls=("public.read_user",),
+            ),
+        ),
+        security_definer_functions=(
+            _secdef(
+                "public.read_user",
+                "SELECT * FROM \"user\"",  # bare, ambiguous across schemas
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    msg = violations[0].message
+    assert "core.user" in msg
+    assert "staging.user" in msg
+
+
 def test_view004_does_not_fire_when_function_reads_no_table() -> None:
     # SECDEF function exists, view calls it, but the function body
     # doesn't read any table (e.g. a pure scalar computation).

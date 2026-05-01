@@ -21,11 +21,23 @@ The two architectural fixes are mutually exclusive — pgrls can't pick:
 Hence: severity `warning`, no auto-fix. The rule's job is to surface the
 implicit RLS bypass so the operator chooses one of the above explicitly.
 
-Tolerance: the rule parses `pg_proc.prosrc` with pglast. Bodies in
-non-SQL languages (e.g. PL/pgSQL with `DECLARE`/`BEGIN` or dynamic SQL
-via `EXECUTE`) and unparseable SQL bodies are skipped with a stderr
-warning per function — VIEW004 may produce false negatives on those,
-matching the existing AST-based rule convention.
+Tolerance: the rule parses `pg_proc.prosrc` with pglast. Three
+documented false-negative paths, each handled silently or with a
+stderr warning:
+
+1. **Non-SQL language** (PL/pgSQL with `DECLARE`/`BEGIN`, PL/Python,
+   etc.): skipped with a stderr warning naming the function.
+2. **Unparseable SQL** (e.g. dynamic SQL via `EXECUTE` constructed
+   at runtime): skipped with a stderr warning naming the function.
+3. **Cross-scope SECDEF function**: a view whose
+   `security_definer_calls` resolves to a function NOT in the
+   introspected `--schemas` set is skipped silently. The function
+   exists somewhere on the database but pgrls hasn't read its body,
+   so VIEW004 can't analyze it. To exercise the rule against such
+   functions, expand `--schemas` to include the function's home
+   schema.
+
+These match the existing AST-based rule convention.
 """
 from __future__ import annotations
 
@@ -67,14 +79,22 @@ class VIEW004:
             f.qualified_name: f for f in schema.security_definer_functions
         }
 
-        # Build bare-name → qualified mapping for table refs in function
-        # bodies. `pg_proc.prosrc` may emit either form depending on how
-        # the function was written; mirror the bare/qualified handling
-        # in `_build_secdef_calls_index`. Iterate sorted so collisions
-        # resolve deterministically across runs.
-        bare_table_to_qual: dict[str, tuple[str, str]] = {}
+        # Build bare-name → list-of-qualified mapping for table refs in
+        # function bodies. `pg_proc.prosrc` may emit either form
+        # depending on how the function was written. When two
+        # RLS-protected tables in different schemas share a bare name
+        # (e.g. `core.user` AND `staging.user`), a function body
+        # `SELECT * FROM "user"` can't be unambiguously attributed —
+        # the actual target depends on the search_path the function
+        # ran with. We over-report rather than under-attribute: emit
+        # all RLS-protected qualified candidates and let the operator
+        # decide which one(s) actually leak. False negatives in a
+        # security check are corrosive; false positives the operator
+        # can dismiss via the allowlist. Iterate sorted so the message
+        # ordering is deterministic across runs.
+        bare_table_to_qual: dict[str, list[tuple[str, str]]] = {}
         for s, n in sorted(rls_tables):
-            bare_table_to_qual.setdefault(n, (s, n))
+            bare_table_to_qual.setdefault(n, []).append((s, n))
 
         out: list[Violation] = []
         for view in schema.views:
@@ -143,8 +163,8 @@ class VIEW004:
                                 leaked_tables.add(f"{sname}.{tname}")
                                 fn_leaks_a_table = True
                         elif tname in bare_table_to_qual:
-                            s, n = bare_table_to_qual[tname]
-                            leaked_tables.add(f"{s}.{n}")
+                            for s, n in bare_table_to_qual[tname]:
+                                leaked_tables.add(f"{s}.{n}")
                             fn_leaks_a_table = True
                 if fn_leaks_a_table:
                     leaked_fns.add(fn_qname)
