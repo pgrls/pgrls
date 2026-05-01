@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.2.2** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
+> **Status: 0.3.0** — nineteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
 
 ## Install
 
@@ -96,7 +96,7 @@ pgrls fix --database-url "$DATABASE_URL" --apply
 pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
 ```
 
-Currently fixable: **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`) and **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
+Currently fixable: **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
 
 ## Configuration
 
@@ -234,7 +234,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.2.2
+    rev: v0.3.0
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to
@@ -292,8 +292,8 @@ dashboard, or keep the report as a build artifact.
 
 ## Roadmap
 
-- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. Markdown output. Polished error messages.
-- **TypeScript / Go ports.** Cross-language ports of `pgrls.testing` (v0.3) and `pgrls.diff` (v0.3+) backed by the same Layer-1 protocol fixtures.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Markdown output. Polished error messages.
+- **TypeScript / Go ports.** Cross-language ports of `pgrls.testing` (v0.4) and `pgrls.diff` (v0.4+) backed by the same Layer-1 protocol fixtures.
 - **SAT-based predicate implication checking.** v0.2 recognizes common-case AST patterns (literal-equal, AND-tighten / drop, OR-loosen / drop) for `USING` / `WITH CHECK` diffs; everything else is `REQUIRES_REVIEW`. Z3-driven analysis to widen automatic classification is tracked for v0.5+.
 - **Migration-as-input.** `pgrls diff --apply migration.sql` to diff a live DB against the post-migration shape without applying it. Tracked for v0.5+.
 
