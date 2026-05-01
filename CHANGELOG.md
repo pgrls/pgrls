@@ -10,6 +10,134 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-30
+
+### BREAKING
+- **Postgres floor bumped 13 → 15.** Older PG releases (10–14) are no
+  longer supported. The CI matrix is narrowed to {15, 16, 17}. The
+  proximate driver is the new VIEW001 rule and its auto-fixer:
+  `security_invoker` is a PG15+ reloption, so a floor below 15 would
+  ship a rule the runtime can't satisfy. The conftest's PG-version
+  gate, the demo `run.sh` image tag list, the `tests/test_floor_currency`
+  fixture, and the AGENTS.md / README disclaimers all reflect the new
+  floor.
+
+### Added
+- **Four VIEW lint rules.** A new rule category alongside SEC / PERF /
+  HYG. Each rule walks the schema's view → table dependency graph and
+  fires only when the view actually references an RLS-protected
+  table — views over reference data don't trigger.
+  - `VIEW001` (error) — view bypasses RLS without
+    `WITH (security_invoker = true)`. PG15+ defaults
+    `security_invoker` to false; without the flag the view runs
+    queries with the view *owner's* privileges and RLS on the
+    underlying table is evaluated against the owner instead of the
+    calling user. Materialized views are skipped (VIEW003's domain).
+  - `VIEW002` (warning) — view is not a `security_barrier`. Without
+    the flag, a caller-supplied predicate (e.g. a volatile / side-
+    effecting `leak()` in `WHERE`) can be pushed below the view's
+    RLS-derived filter and observe rows the caller should never have
+    seen. Independent of VIEW001 — neither subsumes the other; a view
+    lacking both flags fires both rules.
+  - `VIEW003` (warning) — materialized view captures RLS-protected
+    data at REFRESH time. A matview reads from its own physical heap
+    at query time and does NOT re-evaluate the underlying body, so
+    RLS on source tables is bypassed regardless of any flag.
+    Architectural fix only (per-tenant refresh, or per-tenant
+    matview); no auto-fixer.
+  - `VIEW004` (warning) — view calls a `SECURITY DEFINER` function
+    that, in turn, reads from an RLS-protected table. The function
+    runs with the function owner's privileges, so RLS is evaluated
+    against the owner — bypass happens one frame below the view,
+    so VIEW001's `security_invoker` defense doesn't help. Three
+    documented false-negative paths (non-SQL language, unparseable
+    SQL, cross-scope SECDEF function) match the existing AST-based
+    rule convention. Over-attributes rather than under-reports when
+    a function body uses an unqualified table name shared between
+    two RLS-protected schemas.
+- **Two new auto-fixers**, doubling the previously fixable surface.
+  - `VIEW001Fixer` — emits `ALTER VIEW <schema>.<view> SET
+    (security_invoker = true);` per offending view. Mirrors VIEW001's
+    detection in lockstep so the fixer never emits an ALTER for a
+    view the rule wouldn't flag.
+  - `VIEW002Fixer` — emits `ALTER VIEW <schema>.<view> SET
+    (security_barrier = true);` with the same lockstep detection. A
+    view lacking both flags gets two separate `ALTER VIEW … SET (...)`
+    statements (one per fixer), which is the natural shape — neither
+    flag implies the other.
+- **`View` dataclass and `Schema.views` field.** Snapshot model now
+  carries views and matviews alongside tables. Each `View` has
+  `schema`, `name`, `is_materialized`, `security_invoker`,
+  `security_barrier`, `references` (set of `(schema, name)` pairs the
+  view body reads — populated from `pg_depend`), and
+  `security_definer_calls` (set of qualified function names called in
+  the view body that are SECURITY DEFINER).
+- **`SecdefFunction` dataclass and `Schema.security_definer_functions`
+  field.** Captures `pg_proc` rows where `prosecdef = true`, with the
+  function body and language so VIEW004 can parse and walk it. Limited
+  to functions in the introspected `--schemas` set; functions outside
+  that scope are silently skipped by VIEW004.
+- **Snapshot v4** — `SNAPSHOT_VERSION` bumped from 3 to 4, additive
+  within v4 since v4 hasn't shipped externally. Adds top-level
+  `views` and `security_definer_functions` arrays. `Schema.from_snapshot`
+  accepts v3 + v4 (v3 baselines roundtrip with empty views /
+  security_definer_functions).
+- **Introspection of views, matviews, and view → table dependencies
+  via `pg_depend`.** The introspector now joins `pg_class` (for
+  `relkind IN ('v', 'm')`), `pg_rewrite` (to walk `ev_action`), and
+  `pg_depend` (to materialize the view → underlying-table edges). The
+  `security_invoker` and `security_barrier` reloptions are pulled
+  from `pg_class.reloptions`. Materialized views are tagged via
+  `is_materialized = true`. Bare-name canonicalization in SECDEF call
+  detection sorts qnames before resolving so the result is
+  deterministic across runs.
+- **SECURITY DEFINER function-call detection in view bodies.** The
+  introspector walks each view body for `FuncCall` nodes whose target
+  is a SECURITY DEFINER function in the introspected scope, and
+  records the qualified function names on `View.security_definer_calls`.
+  This is the substrate VIEW004 walks.
+- **Four new demo cases (85–88)** covering one rule each. Each case's
+  `setup.sql` deliberately satisfies the *other* VIEW rules so the
+  scenario fires only the targeted rule (e.g. case 85 for VIEW001 sets
+  `security_barrier = true` so VIEW002 stays silent).
+- **`parse_qualified_view_allowlist` helper** in
+  `pgrls.rules._allowlist`. Validates `[lint.rules.VIEWnnn].allowlist`
+  entries as exactly two parts (`schema.view`); bare-name entries are
+  rejected with a clear `TypeError` so two views with the same name
+  in different schemas can't both be silenced by a typo.
+- **`extract_range_vars` AST walker** in `pgrls.ast_utils`. Walks a
+  parsed statement and yields every `(schema, name)` pair that appears
+  as a `RangeVar` or `RangeFunction`. Used by VIEW004 to enumerate
+  table references inside a SECURITY DEFINER function body.
+
+### Changed
+- **Demo case 25 (`view-on-top-of-an-rls-enabled-table`)** updated to
+  set both `security_invoker = true` and `security_barrier = true` on
+  the view so the case stays clean post-v0.3 instead of newly tripping
+  VIEW001 / VIEW002. The case's intent (a clean view example) is
+  preserved.
+- **README, AGENTS.md, conftest, demo runner, and floor-currency
+  fixture** all updated for the PG15 floor (see BREAKING above).
+- **AGENTS.md** gains four new rule sections (VIEW001–VIEW004) after
+  HYG002, mirroring the existing SEC / PERF / HYG section pattern.
+  The "Auto-fix" section's "Currently fixable" list grew to four
+  rules. The "Limitations" preamble now reads "nineteen rules across
+  four categories" and drops the obsolete "no SECURITY DEFINER
+  function audit" caveat (VIEW004 covers the view-leak path; a
+  free-standing function audit remains on the roadmap).
+
+### Fixed
+- **`find_func_calls` and `extract_column_refs` walkers now recurse
+  into bare tuples.** The pglast AST exposes
+  `RangeFunction.functions` as a tuple-of-tuples shape (each inner
+  tuple is `(funccall, coldeflist)`); the walkers were previously
+  bailing out at the outer tuple boundary, silently swallowing
+  function calls and column refs reachable via that path. Set-
+  returning functions used in `FROM` clauses (`FROM unnest(arr)`,
+  etc.) were not matched by PERF001 / SEC005 etc. as a result. Both
+  walkers now descend through bare tuples; the tuple-of-tuples shape
+  is no longer a blind spot.
+
 ## [0.2.2] - 2026-04-29
 
 ### Changed
