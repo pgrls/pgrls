@@ -15,7 +15,9 @@ UPDATE pg_catalog.pg_attribute
     WHERE attrelid = 'public.hyg001_target'::regclass
       AND attname = 'gone';
 
--- Clean: policy refs only existing columns. RESTRICTIVE keeps SEC003 quiet.
+-- Clean: policy refs only existing columns. RESTRICTIVE keeps
+-- SEC003 quiet, and the PERMISSIVE-postgres companion keeps
+-- SEC012 quiet.
 CREATE TABLE public.hyg001_clean (id INT, tenant_id TEXT);
 ALTER TABLE public.hyg001_clean ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.hyg001_clean FORCE ROW LEVEL SECURITY;
@@ -23,4 +25,8 @@ CREATE POLICY clean_ref ON public.hyg001_clean
     AS RESTRICTIVE
     FOR SELECT
     TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.t', true)));
+CREATE POLICY clean_permit ON public.hyg001_clean
+    FOR SELECT
+    TO postgres
     USING (tenant_id = (SELECT current_setting('app.t', true)));
