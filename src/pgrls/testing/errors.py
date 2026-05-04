@@ -24,5 +24,10 @@ class PgrlsTestAssertionError(PgrlsTestError, AssertionError):
 
 
 class PgrlsTestConfigError(PgrlsTestError):
-    """Raised when pgrls.testing is misconfigured (no DATABASE_URL,
-    invalid override, etc.)."""
+    """Raised when pgrls.testing has no database URL to use.
+
+    Surfaced by the `pgrls_test_database_url` fixture when neither
+    `PGRLS_TEST_DATABASE_URL` nor `DATABASE_URL` is set in the
+    environment and the user hasn't supplied a
+    `pgrls_test_database_url` override in conftest.
+    """

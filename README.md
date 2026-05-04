@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.2.2** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
+> **Status: 0.2.3** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
 
 ## Install
 
@@ -140,11 +140,13 @@ def test_user_a_cannot_see_user_bs_invoices(pgrls_db):
         )
 ```
 
-The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `request.jwt.claims` GUC). Configure the connection string via:
+The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `request.jwt.claims` GUC). Configure the connection string via one of the following — the first one defined wins:
 
-- A `pgrls_test_database_url` fixture in your `conftest.py` (highest priority — useful for per-session testcontainers).
+- A `pgrls_test_database_url` fixture in your `conftest.py`. This *replaces* the plugin's default fixture (pytest fixture shadowing); when you supply one, the env-var fallback below is not consulted. Useful for per-session testcontainers.
 - The `PGRLS_TEST_DATABASE_URL` environment variable.
 - The `DATABASE_URL` environment variable (fallback).
+
+Setting none of the three causes `pgrls_db` to raise `PgrlsTestConfigError`.
 
 The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). TypeScript and Go ports following the same contract are tracked on the roadmap.
 
@@ -170,9 +172,11 @@ pgrls diff base.json --database-url "$DATABASE_URL" --schemas app
 The default `--fail-on dangerous` threshold means CI only fails when a
 genuinely dangerous change is detected (RLS toggled off, a permissive
 policy added, a predicate widened, etc.). Pass `--fail-on requires-review`
-for a stricter gate. Output is git-diff-style by default (`--format
-text`); use `--format json` or `--format sarif` for CI integrations
-that already parse `pgrls lint` output — the same `Violation` shape is
+for a stricter gate, or set `[diff].fail_on` in `pgrls.toml` to make
+the choice persistent (CLI flag → `[diff].fail_on` → built-in
+`dangerous`). Output is git-diff-style by default (`--format text`);
+use `--format json` or `--format sarif` for CI integrations that
+already parse `pgrls lint` output — the same `Violation` shape is
 reused.
 
 | Change category                        | Default classification |
@@ -230,7 +234,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.2.2
+    rev: v0.2.3
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to

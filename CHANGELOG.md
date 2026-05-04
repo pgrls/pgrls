@@ -10,6 +10,51 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-03
+
+### Changed
+- **`[lint].disable` and `[lint.rules.<ID>]` rule IDs are
+  case-insensitive.** Lowercase keys (`disable = ["sec001"]`,
+  `[lint.rules.sec001]`) are now normalized to canonical
+  uppercase, mirroring the case-insensitive contract on
+  `--fail-on`, `[lint].fail_on`, and `[diff].fail_on`. Two
+  TOML keys that differ only in case (`[lint.rules.SEC001]` and
+  `[lint.rules.sec001]`) raise `ConfigError` rather than
+  silently keeping one.
+- **`pgrls fix --rule` accepts case-insensitive input.** `pgrls
+  fix --rule sec002` is equivalent to `--rule SEC002`. Aligns
+  with the config surfaces above.
+- **`pgrls.testing.assert_silently_dropped` gates on the
+  statement verb.** SELECT/INSERT no longer slip past the
+  helper as zero-row passes; the helper now raises
+  `PgrlsTestError` for any verb other than UPDATE/DELETE,
+  closing a false-pass shape where a typo'd assertion silently
+  succeeded against a SELECT returning no rows.
+
+### Fixed
+- **`[lint].disable` rejects unknown rule IDs.** A typo
+  (`disable = ["SEC0001"]`) used to silently leave the rule
+  enabled. The validator now lists the unknown id and the
+  full rule catalog so the user can spot the typo.
+- **`[lint.rules.<ID>]` rejects unknown rule IDs.** Same
+  silent-acceptance bug in the per-rule options surface; same
+  fix shape with the rule catalog in the error.
+- **`pgrls diff` GRANT-to-PUBLIC dangerous classification
+  fires when RLS is off, even if stale policies exist.** With
+  RLS disabled, Postgres ignores any policies on the table —
+  the `policies == ()` guard previously suppressed the
+  dangerous classification for tables with dormant policies,
+  letting wide-open PUBLIC grants through as
+  `requires_review`.
+- **SARIF and text formatters use a consistent `(schema-wide)`
+  sentinel** for violations with no specific table or policy.
+  The previous `<schema>` literal looked like markup in some
+  SARIF viewers; real qualified names never contain
+  parentheses, so the new sentinel is unambiguous.
+- **`pgrls.testing` documentation** in README clarifies that a
+  user's `pgrls_test_database_url` fixture *replaces* the
+  plugin's env-var resolver (it doesn't compose).
+
 ## [0.2.2] - 2026-04-29
 
 ### Changed
@@ -89,10 +134,11 @@ breaking changes — they will be called out in this file.
   ChangeKind, Classification, diff_schemas`. Stable for v0.2;
   the formatters (`pgrls.diff.formatters`) and AST helpers
   (`pgrls.diff.ast_compare`) remain internal.
-- **Demo cases** — `demo/cases/81-83/` exercise the DANGEROUS
+- **Demo cases** — `demo/cases/81-84/` exercise the DANGEROUS
   (dropped RESTRICTIVE policy), SAFE (added RESTRICTIVE policy),
-  and REQUIRES_REVIEW (column dropped while still referenced)
-  classifications end-to-end against a live DB.
+  REQUIRES_REVIEW (column dropped while still referenced), and
+  BREAKING (dropped PERMISSIVE policy) classifications end-to-end
+  against a live DB. Demo grew to 84 cases / 90 tests.
 
 ## [0.1.0] - 2026-04-28
 

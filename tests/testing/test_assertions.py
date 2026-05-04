@@ -222,29 +222,62 @@ def test_assert_silently_dropped_rejects_sql_without_returning(
     testing_pg_conn: psycopg.Connection,
 ) -> None:
     # The helper checks RETURNING's row count; SQL without
-    # RETURNING gives no signal. The new implementation runs
-    # the SQL and converts the resulting "no result set"
-    # ProgrammingError from psycopg's fetchall into a
-    # PgrlsTestError with a helpful message.
+    # RETURNING gives no signal. The implementation gates on the
+    # statement verb first (UPDATE/DELETE only), so an INSERT
+    # raises with the verb-mismatch message rather than running
+    # to the fetchall path.
     from pgrls.testing.errors import PgrlsTestError
 
     client = PgrlsTestClient(testing_pg_conn)
     with client.transaction():
-        with pytest.raises(PgrlsTestError, match="RETURNING"):
+        with pytest.raises(PgrlsTestError, match="UPDATE|DELETE"):
             client.assert_silently_dropped(
                 "INSERT INTO rls_audit (actor, event) "
                 "VALUES ('a', 'b')"
             )
 
 
-def test_assert_silently_dropped_rejects_returning_inside_string_literal(
+def test_assert_silently_dropped_rejects_select(
     testing_pg_conn: psycopg.Connection,
 ) -> None:
-    # Previously, the `_RETURNING_RE` regex matched RETURNING
-    # inside a string literal, letting non-RETURNING SQL through
-    # the upfront check and surfacing a confusing psycopg error
-    # at fetchall() time. The fix: just attempt fetchall and
-    # convert "no result set" into the helpful message.
+    # SELECT produces a result set whether or not it returns rows.
+    # Without a verb gate, a typo'd test like
+    # `assert_silently_dropped("SELECT * FROM t WHERE 1=0")` would
+    # silently pass with zero rows even though no RLS-aware DML
+    # ran. Pin the verb-check rejection so the false-pass shape
+    # can't regress.
+    from pgrls.testing.errors import PgrlsTestError
+
+    client = PgrlsTestClient(testing_pg_conn)
+    with client.transaction():
+        with pytest.raises(PgrlsTestError, match="SELECT"):
+            client.assert_silently_dropped(
+                "SELECT id FROM rls_audit WHERE 1 = 0"
+            )
+
+
+def test_assert_silently_dropped_passes_on_update_returning_empty(
+    testing_pg_conn: psycopg.Connection,
+) -> None:
+    # The happy path: an UPDATE … RETURNING that hits no rows (the
+    # silent-drop shape) passes cleanly under the new verb-gate.
+    client = PgrlsTestClient(testing_pg_conn)
+    with client.transaction():
+        client.assert_silently_dropped(
+            "UPDATE rls_audit SET actor = 'x' "
+            "WHERE actor = 'never-exists' RETURNING id"
+        )
+
+
+def test_assert_silently_dropped_string_literal_returning_falls_through_verb_gate(
+    testing_pg_conn: psycopg.Connection,
+) -> None:
+    # An INSERT carrying the word RETURNING inside a string literal
+    # used to slip past a regex pre-check and surface a confusing
+    # psycopg error from fetchall() later. The current verb-gate
+    # rejects it cleanly because the statement verb is INSERT, not
+    # UPDATE/DELETE — the test pins the verb-rejection path so the
+    # earlier shape can't regress.
     from pgrls.testing.errors import PgrlsTestError
 
     client = PgrlsTestClient(testing_pg_conn)
