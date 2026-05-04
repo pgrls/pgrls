@@ -18,7 +18,11 @@ def format_text(violations: list[Violation]) -> str:
 
     lines: list[str] = []
     for v in violations:
-        loc = v.location or "<schema>"
+        # Sentinel matches the SARIF formatter's
+        # `(schema-wide)` for cross-format consistency. Real
+        # qualified names never contain parentheses, so the
+        # placeholder is unambiguous.
+        loc = v.location or "(schema-wide)"
         lines.append(
             f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
             f"         {v.message}"

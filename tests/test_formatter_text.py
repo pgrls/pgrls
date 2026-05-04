@@ -53,7 +53,7 @@ def test_unknown_format_raises() -> None:
 
 def test_text_location_none_uses_schema_fallback() -> None:
     out = format_violations([_v(location=None)], format="text")
-    assert "<schema>" in out
+    assert "(schema-wide)" in out
     assert "SEC001" in out
 
 

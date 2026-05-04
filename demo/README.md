@@ -211,9 +211,9 @@ INFO   SEC007  app.tags                          (use case 09)
 ```
 
 Tables that must stay silent (clean cases 01, 02 via allowlist, 13,
-16-18, 21, 23, 25, 27-32, 34, 36, 44-51, 54, 64-67) never appear in
-any violation line. The clean tests assert this directly. The
-configuration-driven cases (39-43, 63) verify behavior under
+16-18, 21, 23, 25, 27-32, 34, 36, 44-51, 53, 54, 64-67) never appear
+in any violation line. The clean tests assert this directly. The
+configuration-driven cases (39-43, 59-63) verify behavior under
 specific `--config` overrides — see `conftest.py::lint` for the
 helper that drives those.
 

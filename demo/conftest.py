@@ -26,28 +26,16 @@ from click.testing import CliRunner
 from testcontainers.postgres import PostgresContainer
 
 from pgrls.cli import main
+from pgrls.rules import all_rules
 
 DEMO_DIR = Path(__file__).parent
 CASES_DIR = DEMO_DIR / "cases"
 PGRLS_TOML_PATH = DEMO_DIR / "pgrls.toml"
 
-_ALL_RULE_IDS = (
-    "SEC001",
-    "SEC002",
-    "SEC003",
-    "SEC004",
-    "SEC005",
-    "SEC006",
-    "SEC007",
-    "SEC008",
-    "SEC009",
-    "SEC010",
-    "SEC011",
-    "PERF001",
-    "PERF002",
-    "HYG001",
-    "HYG002",
-)
+# Derive from the rule registry so a 16th rule lands without the
+# demo's all-rules tuple drifting from the lint test suite's copy
+# (tests/test_cli.py does the same).
+_ALL_RULE_IDS = tuple(rule.id for rule in all_rules())
 
 _BASE_CONFIG = (
     '[database]\nschemas = ["app"]\n'
