@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.3.0** — nineteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
+> **Status: 0.3.0** — twenty rules (SEC001–SEC012, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
 
 ## Install
 
@@ -36,9 +36,10 @@ pgrls lint --schemas public,tenant
 Point at a non-default config file, or pick an output format:
 
 ```bash
-pgrls lint --config ./config/pgrls.toml --format text    # human-readable (default)
-pgrls lint --config ./config/pgrls.toml --format json    # machine-readable for CI
-pgrls lint --config ./config/pgrls.toml --format sarif   # GitHub Code Scanning
+pgrls lint --config ./config/pgrls.toml --format text     # human-readable (default)
+pgrls lint --config ./config/pgrls.toml --format json     # machine-readable for CI
+pgrls lint --config ./config/pgrls.toml --format sarif    # GitHub Code Scanning
+pgrls lint --config ./config/pgrls.toml --format markdown # PR comments / rendered CI reports
 ```
 
 ### Example output
@@ -211,6 +212,7 @@ pattern documentation.
 | [SEC009](AGENTS.md#rule-sec009) | warning | RLS enabled but no policies defined (silent deny-all) |
 | [SEC010](AGENTS.md#rule-sec010) | warning | Policy `USING`/`WITH CHECK` clause is constant `false` (deny-all anti-pattern) |
 | [SEC011](AGENTS.md#rule-sec011) | warning | Policy expression has an `OR true` branch (debug bypass left in) |
+| [SEC012](AGENTS.md#rule-sec012) | warning | Table has only RESTRICTIVE policies (silent deny-all — needs at least one PERMISSIVE) |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [HYG001](AGENTS.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |

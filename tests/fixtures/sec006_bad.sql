@@ -25,8 +25,9 @@ CREATE POLICY all_bad ON public.sec006_all
     TO PUBLIC
     USING (tenant_id = current_setting('app.t', true));
 
--- Clean: RESTRICTIVE UPDATE policy with WITH CHECK present — SEC006 does not fire.
--- RESTRICTIVE type also keeps SEC003 from firing on this table.
+-- Clean: RESTRICTIVE UPDATE policy with WITH CHECK present —
+-- SEC006 does not fire. RESTRICTIVE type keeps SEC003 from
+-- firing, and a PERMISSIVE-postgres companion keeps SEC012 quiet.
 CREATE TABLE public.sec006_clean (id INT, tenant_id TEXT);
 ALTER TABLE public.sec006_clean ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec006_clean FORCE ROW LEVEL SECURITY;
@@ -34,5 +35,10 @@ CREATE POLICY update_ok ON public.sec006_clean
     AS RESTRICTIVE
     FOR UPDATE
     TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.t', true)))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.t', true)));
+CREATE POLICY update_permit ON public.sec006_clean
+    FOR UPDATE
+    TO postgres
     USING (tenant_id = (SELECT current_setting('app.t', true)))
     WITH CHECK (tenant_id = (SELECT current_setting('app.t', true)));

@@ -121,10 +121,33 @@ breaking changes — they will be called out in this file.
 - **AGENTS.md** gains four new rule sections (VIEW001–VIEW004) after
   HYG002, mirroring the existing SEC / PERF / HYG section pattern.
   The "Auto-fix" section's "Currently fixable" list grew to four
-  rules. The "Limitations" preamble now reads "nineteen rules across
+  rules. The "Limitations" preamble now reads "twenty rules across
   four categories" and drops the obsolete "no SECURITY DEFINER
   function audit" caveat (VIEW004 covers the view-leak path; a
   free-standing function audit remains on the roadmap).
+- **Markdown output for `pgrls lint` (`--format markdown`).** New
+  formatter alongside text/json/sarif. Renders cleanly in
+  GitHub-flavored Markdown — paste into a PR comment, drop into an
+  issue template, or commit as a CI artifact. Pipe table with
+  per-violation rows (severity emoji + label, rule_id linked to
+  AGENTS.md, location in backticks, message); summary line below.
+  Empty findings emit the same `pgrls: no issues found.` line as
+  the text formatter so a one-liner that gates on the literal
+  string works against either format. Cell escaping (pipe → `\\|`,
+  newline → `<br>`) makes the table layout robust to adversarial
+  message content.
+- **SEC012 — table has only RESTRICTIVE policies (silent
+  deny-all).** Postgres composes RLS policies as
+  `permissive_or | (restrictive_and & ...)`: a row is visible iff
+  at least one PERMISSIVE policy matches AND every RESTRICTIVE
+  policy matches. With zero PERMISSIVE policies, the disjunction
+  is empty — no row passes. Common shape: a developer adds a
+  `AS RESTRICTIVE` policy thinking it "layers on top of" an
+  implicit permissive default; there is no implicit default.
+  Severity: warning. Allowlist by qualified or unqualified table
+  name when the deny-all is intentional. Disjoint by construction
+  from SEC009 (zero policies) and SEC010 (`USING (false)`) —
+  a table can't trigger more than one of the three deny-all rules.
 
 ### Fixed
 - **`find_func_calls` and `extract_column_refs` walkers now recurse
