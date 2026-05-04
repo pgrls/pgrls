@@ -18,12 +18,15 @@ def _diff_grants(base_table: Table, head_table: Table) -> list[Change]:
     the sorted union of all role names. For each role:
     - Revoked privileges (in base, not head) → GRANT_REVOKED (safe).
     - Added privileges (in head, not base) → GRANT_ADDED (requires_review),
-      UNLESS role == "PUBLIC" AND head_table has no policies AND
-      head_table.rls_enabled is False, in which case → GRANT_PUBLIC_NO_RLS
-      (dangerous).
+      UNLESS role == "PUBLIC" AND head_table.rls_enabled is False, in
+      which case → GRANT_PUBLIC_NO_RLS (dangerous). Postgres only
+      enforces policies when RLS is on; with RLS off, any policies on
+      the table are dormant, so a PUBLIC grant exposes every row
+      regardless of whether policies are defined.
 
     Roles iterated in sorted order; privilege lists in messages sorted
-    for determinism. If base and head both have empty grants, returns [].
+    for determinism. Returns [] when no per-role privilege difference
+    exists (including the trivial both-sides-empty case).
     """
     base_grants_by_role: dict[str, set[str]] = {
         g.role: set(g.privileges) for g in base_table.grants
@@ -71,9 +74,7 @@ def _diff_grants(base_table: Table, head_table: Table) -> list[Change]:
         if added_privs:
             added_str = ", ".join(sorted(added_privs))
             public_no_rls = (
-                role == "PUBLIC"
-                and head_table.policies == ()
-                and not head_table.rls_enabled
+                role == "PUBLIC" and not head_table.rls_enabled
             )
             if public_no_rls:
                 changes.append(

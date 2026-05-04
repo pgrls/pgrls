@@ -784,6 +784,33 @@ def test_grant_public_no_rls_is_dangerous() -> None:
     assert public_no_rls[0].classification == "dangerous"
 
 
+def test_grant_public_no_rls_fires_even_when_stale_policies_present() -> None:
+    # Postgres only enforces policies when RLS is on; with RLS off,
+    # any policies on the table are dormant. A new PUBLIC grant on
+    # an RLS-off table is therefore wide-open whether or not policies
+    # exist — pin the dangerous classification so a future
+    # "tightening" of the rule can't silently reintroduce the
+    # false-negative.
+    pol = _p("allow_read", permissive=True, using_sql="true")
+    base = Schema(tables=(_t(rls=False, policies=(pol,), grants=()),))
+    head = Schema(
+        tables=(
+            _t(
+                rls=False,
+                policies=(pol,),
+                grants=(Grant(role="PUBLIC", privileges=("SELECT",)),),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    kinds = {c.kind for c in changes}
+    assert ChangeKind.GRANT_PUBLIC_NO_RLS in kinds
+    assert ChangeKind.GRANT_ADDED not in kinds
+    public_no_rls = [c for c in changes if c.kind == ChangeKind.GRANT_PUBLIC_NO_RLS]
+    assert len(public_no_rls) == 1
+    assert public_no_rls[0].classification == "dangerous"
+
+
 def test_grant_public_added_with_rls_enabled_is_just_requires_review() -> None:
     # head: rls_enabled=True with a policy, PUBLIC gains SELECT.
     # Expect GRANT_ADDED (requires_review), NOT GRANT_PUBLIC_NO_RLS.
@@ -962,6 +989,68 @@ def test_composite_change_within_table_ordering_is_deterministic() -> None:
     assert kinds_in_order.index(
         ChangeKind.POLICY_DROPPED_RESTRICTIVE
     ) < kinds_in_order.index(ChangeKind.GRANT_REVOKED)
+
+
+def test_composite_change_six_step_ordering_is_deterministic() -> None:
+    # Cover all six steps from `diff_schemas`'s within-table
+    # docstring on a single table: (1) RLS state flip, (2) skipped
+    # — no policies presence change, (3) policy-shape role
+    # widening, (4) predicate change, (5) column drop referenced by
+    # head policy, (6) grant change. Without this test, a future
+    # reorder of the `changes.extend(...)` calls in
+    # `pgrls/diff/differ.py:diff_schemas` would silently flip the
+    # CLI/JSON/SARIF output without breaking
+    # `test_composite_change_within_table_ordering_is_deterministic`
+    # (which only pins steps 1, 3, 6 — three of the six).
+    base_pol = _p(
+        "isolate",
+        permissive=False,
+        command="SELECT",
+        roles=("app",),
+        using_sql="tenant_id = 'a'",
+    )
+    head_pol = _p(
+        "isolate",
+        permissive=False,
+        command="SELECT",
+        roles=("app", "admin"),  # role widened → POLICY_ROLES_WIDENED
+        using_sql="tenant_id = 'a' OR tenant_id = 'b'",  # OR added → loosened
+    )
+    base = Schema(
+        tables=(
+            _t(
+                rls=True,
+                policies=(base_pol,),
+                columns=("id", "tenant_id"),
+                grants=(Grant(role="app", privileges=("SELECT",)),),
+            ),
+        )
+    )
+    head = Schema(
+        tables=(
+            _t(
+                rls=False,  # RLS toggled off → step 1
+                policies=(head_pol,),  # shape change → step 3
+                columns=("id",),  # tenant_id dropped (still ref'd) → step 5
+                grants=(),  # GRANT_REVOKED → step 6
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    kinds_in_order = [c.kind for c in changes]
+    # Step 1 (RLS) < step 3 (policy shape — roles) < step 4
+    # (predicate) < step 5 (column dropped) < step 6 (grant). Step 2
+    # (policy presence) doesn't fire because both sides have the
+    # same policy by name; that's deliberately omitted to keep the
+    # fixture realistic.
+    rls_idx = kinds_in_order.index(ChangeKind.RLS_FLIPPED)
+    roles_idx = kinds_in_order.index(ChangeKind.ROLES_WIDENED)
+    pred_idx = kinds_in_order.index(ChangeKind.USING_LOOSENED)
+    col_idx = kinds_in_order.index(
+        ChangeKind.COLUMN_DROPPED_REFERENCED
+    )
+    grant_idx = kinds_in_order.index(ChangeKind.GRANT_REVOKED)
+    assert rls_idx < roles_idx < pred_idx < col_idx < grant_idx
 
 
 # ---------------------------------------------------------------------------

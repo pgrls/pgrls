@@ -117,6 +117,43 @@ def _build_config(raw: dict[str, Any]) -> Config:
     disable = lint.get("disable", [])
     if not isinstance(disable, list) or not all(isinstance(s, str) for s in disable):
         raise ConfigError("[lint].disable must be a list of rule-id strings")
+    # Validate disable entries against the rule catalog so a typo
+    # (`SEC0001`, `sec01`) surfaces as a config error instead of
+    # silently leaving the rule enabled. Same UX motivation as the
+    # `--rule` validation in `pgrls fix`. Lazy import — keeps
+    # `load_config()` from pulling in all 15 rule modules for
+    # callers that only want to read e.g. `Config.database_url`.
+    from pgrls.rules import all_rules
+
+    known_rule_ids = {rule.id for rule in all_rules()}
+    # Case-normalize so `[lint].disable = ["sec001"]` matches the
+    # canonical uppercase rule id; mirrors the `[lint.rules.<ID>]`
+    # case treatment below.
+    normalized_disable = [s.upper() for s in disable]
+    unknown_disable = sorted(set(normalized_disable) - known_rule_ids)
+    if unknown_disable:
+        known_sorted = ", ".join(sorted(known_rule_ids))
+        raise ConfigError(
+            f"[lint].disable references unknown rule id(s): "
+            f"{', '.join(unknown_disable)}. Known rules: {known_sorted}."
+        )
+    # Reject case-collisions (`["SEC001", "sec001"]`) loud, parallel
+    # to the `[lint.rules.<ID>]` collision check below. Lowercased
+    # comparison surfaces the original strings so the user sees both
+    # sides of the duplicate in the error message.
+    seen: dict[str, str] = {}
+    for original, normalized in zip(disable, normalized_disable, strict=True):
+        if normalized in seen and seen[normalized] != original:
+            raise ConfigError(
+                f"[lint].disable lists {seen[normalized]!r} and "
+                f"{original!r} which both normalize to "
+                f"{normalized!r} (rule ids are case-insensitive)"
+            )
+        seen.setdefault(normalized, original)
+    # Deduplicate identical entries (`["SEC001", "SEC001"]`) — the
+    # registry-side `enabled()` already deduplicates via `set()`,
+    # so this is purely Config-shape hygiene.
+    disable = list(dict.fromkeys(normalized_disable))
 
     fail_on_raw = lint.get("fail_on", "warning")
     if not isinstance(fail_on_raw, str):
@@ -145,7 +182,30 @@ def _build_config(raw: dict[str, Any]) -> Config:
     for rule_id, opts in rules_raw.items():
         if not isinstance(opts, dict):
             raise ConfigError(f"[lint.rules.{rule_id}] must be a table")
-        rule_options[rule_id] = dict(opts)
+        # Case-normalize the rule id key so `[lint.rules.sec001]`
+        # works the same as `[lint.rules.SEC001]`. Without this,
+        # a lowercase TOML key would silently miss the lookup at
+        # `config.rule_options.get(rule.id, {})` (rule.id is
+        # always uppercase). Same case-insensitive contract as
+        # `--fail-on`, `[lint].fail_on`, and `[diff].fail_on`.
+        normalized_id = rule_id.upper()
+        # Validate against the rule catalog so a typo'd section
+        # (`[lint.rules.SEC0001]`) fails loud instead of silently
+        # parking options the rule will never read. Mirrors the
+        # `[lint].disable` validation above.
+        if normalized_id not in known_rule_ids:
+            known_sorted = ", ".join(sorted(known_rule_ids))
+            raise ConfigError(
+                f"[lint.rules.{rule_id}] references unknown rule id. "
+                f"Known rules: {known_sorted}."
+            )
+        if normalized_id in rule_options:
+            raise ConfigError(
+                f"[lint.rules.{rule_id}] duplicates "
+                f"[lint.rules.{normalized_id}] (rule ids are "
+                "case-insensitive)"
+            )
+        rule_options[normalized_id] = dict(opts)
 
     diff = raw.get("diff", {})
     if not isinstance(diff, dict):

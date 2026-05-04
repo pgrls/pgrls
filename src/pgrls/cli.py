@@ -178,6 +178,7 @@ def _merge_overrides(
         disable=list(config.disable),
         fail_on=effective_fail_on,
         rule_options=dict(config.rule_options),
+        diff_fail_on=config.diff_fail_on,
     )
 
 
@@ -310,15 +311,19 @@ def fix(
     # Validate `--rule` early — a typo silently producing zero
     # fixes is hard to debug. The "no auto-fixable" message
     # should be reserved for "DB is clean", not "you spelled the
-    # rule wrong."
+    # rule wrong." Case-normalize to match the rest of the
+    # config surfaces (`[lint].disable`, `[lint.rules.<ID>]`,
+    # `--fail-on`).
     auto_fixable = {fixer.rule_id for fixer in default_fixers()}
     if rules:
-        unknown = sorted(set(rules) - auto_fixable)
+        normalized_rules = {r.upper() for r in rules}
+        unknown = sorted(normalized_rules - auto_fixable)
         if unknown:
             raise ToolError(
                 f"unknown auto-fixable rule(s): {', '.join(unknown)}. "
                 f"Available: {', '.join(sorted(auto_fixable))}."
             )
+        rules = tuple(sorted(normalized_rules))
 
     effective = _merge_overrides(
         config,
@@ -539,7 +544,7 @@ def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
     # would otherwise try to dial it as a connection string and
     # produce a confusing connection-error message.
     if arg.startswith("file://"):
-        arg = arg[len("file://") :]
+        arg = arg.removeprefix("file://")
     elif "://" in arg:
         try:
             with psycopg.connect(arg) as conn:
