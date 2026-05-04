@@ -104,8 +104,8 @@ def test_sarif_handles_location_none_with_schema_placeholder() -> None:
     # SARIF §3.27.12 says `locations` SHOULD be omitted when none
     # are known, but GitHub Code Scanning's upload endpoint rejects
     # results with an empty `locations` array. Synthesize a
-    # `<schema>` logicalLocation so a future schema-wide rule that
-    # doesn't pin to a table or policy still produces an
+    # `(schema-wide)` logicalLocation so a future schema-wide rule
+    # that doesn't pin to a table or policy still produces an
     # ingestible SARIF document.
     out = format_violations([_v(location=None)], format="sarif")
     parsed = json.loads(out)
@@ -114,7 +114,7 @@ def test_sarif_handles_location_none_with_schema_placeholder() -> None:
     assert len(locs) == 1
     assert (
         locs[0]["logicalLocations"][0]["fullyQualifiedName"]
-        == "<schema>"
+        == "(schema-wide)"
     )
 
 

@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 
 import psycopg
 
+from pgrls.testing.errors import PgrlsTestError
+
 if TYPE_CHECKING:
     from typing import Any, Self
 
@@ -148,7 +150,16 @@ class PgrlsTestClient:
                 "current_setting('request.jwt.claims', true)"
             )
             row = cur.fetchone()
-            assert row is not None  # SELECT always returns one row here
+            if row is None:
+                # Defensive: SELECT current_user always returns one
+                # row, but `python -O` strips assertions and a swallowed
+                # raise here would surface as a confusing
+                # `cannot unpack non-iterable NoneType` later.
+                raise PgrlsTestError(
+                    "as_role: failed to capture current role/claims "
+                    "(SELECT current_user returned no row — connection "
+                    "in unexpected state)"
+                )
             prev_user, prev_claims = row
 
         with self._conn.cursor() as cur:
@@ -241,8 +252,6 @@ class PgrlsTestClient:
         ships a tiny seeder, not a factory framework.
         """
         from pgrls.fixers._idents import quote_ident, quote_qualified
-
-        from pgrls.testing.errors import PgrlsTestError
 
         if not rows:
             return
