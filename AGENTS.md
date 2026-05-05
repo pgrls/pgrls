@@ -614,6 +614,68 @@ inside an `OR` BoolExpr counts. Semantic-equivalent tautologies
 framing instead. A real tautology checker is significant
 infrastructure for marginal real-world value.
 
+<a id="rule-sec012"></a>
+
+### SEC012 — Table has only RESTRICTIVE policies (silent deny-all)
+
+**Severity:** warning.
+
+**What it catches:** tables where RLS is enabled, at least one
+policy exists, and every policy is `RESTRICTIVE`. Postgres composes
+RLS as `permissive_or | (restrictive_and & ...)`: a row is visible
+iff at least one PERMISSIVE policy matches AND every RESTRICTIVE
+policy matches. With zero PERMISSIVE policies the disjunction is
+empty — no row passes, regardless of how many RESTRICTIVE policies
+you've added or what they say.
+
+Common shape: a developer adds a `AS RESTRICTIVE` policy thinking
+it "layers on top of" an implicit permissive default. There is no
+implicit default. The table is silently deny-all from the moment
+RLS is enabled.
+
+This is the same effective shape as SEC009 (RLS enabled, zero
+policies) and SEC010 (`USING (false)` deny-all anti-pattern),
+just achieved through a different mechanism. SEC009 catches the
+explicit "no policies at all" case; SEC010 catches the explicit
+`false` literal; SEC012 catches the silent "only RESTRICTIVE"
+case where the user intended access but composed the policies
+wrong. The three rules are disjoint by construction — a table
+can't trigger more than one.
+
+**Standard fix.** Add a PERMISSIVE policy that describes who
+CAN see rows. The existing RESTRICTIVE policies will narrow
+that access further:
+
+```sql
+-- Before: silent deny-all (no PERMISSIVE).
+CREATE POLICY tenant_lock ON public.invoices
+    AS RESTRICTIVE FOR ALL
+    TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant')::uuid));
+
+-- After: PERMISSIVE grants access; RESTRICTIVE narrows it.
+CREATE POLICY tenant_read ON public.invoices
+    FOR ALL TO authenticated
+    USING (true);
+CREATE POLICY tenant_lock ON public.invoices
+    AS RESTRICTIVE FOR ALL
+    TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant')::uuid));
+```
+
+(A bare `USING (true)` PERMISSIVE will trip SEC008 — narrow it to
+the access predicate the table actually wants.)
+
+If the deny-all is genuinely intentional — e.g., a "shadow" table
+that exists only to be queried via a SECURITY DEFINER function and
+should never be visible through direct `SELECT` — allowlist by
+qualified or unqualified table name:
+
+```toml
+[lint.rules.SEC012]
+allowlist = ["public.shadow_audit"]
+```
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
