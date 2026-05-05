@@ -7,7 +7,9 @@ from pgrls.ast_utils import parse_expr
 from pgrls.fixers import Fix, default_fixers, generate_fixes
 from pgrls.fixers.perf001 import PERF001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
-from pgrls.model import Policy, Schema, Table
+from pgrls.fixers.view001 import VIEW001Fixer
+from pgrls.fixers.view002 import VIEW002Fixer
+from pgrls.model import Policy, Schema, Table, View
 
 
 # ---------- SEC002 fixer ----------
@@ -81,6 +83,451 @@ def test_sec002_fix_emits_one_per_offending_table() -> None:
     )
     fixes = SEC002Fixer().fix(schema, {})
     assert sorted(f.location for f in fixes) == ["public.a", "public.c"]
+
+
+# ---------- VIEW001 fixer ----------
+
+
+def _view(
+    name: str = "v",
+    *,
+    schema: str = "public",
+    is_materialized: bool = False,
+    security_invoker: bool = False,
+    security_barrier: bool = False,
+    references: tuple[tuple[str, str], ...] = (),
+    security_definer_calls: tuple[str, ...] = (),
+    definition: str = "SELECT 1",
+) -> View:
+    return View(
+        schema=schema,
+        name=name,
+        is_materialized=is_materialized,
+        security_invoker=security_invoker,
+        security_barrier=security_barrier,
+        definition=definition,
+        references=references,
+        security_definer_calls=security_definer_calls,
+    )
+
+
+def test_view001_fix_emits_alter_view_set_security_invoker() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "VIEW001"
+    assert f.location == "public.user_summary"
+    assert "ALTER VIEW" in f.sql
+    assert "public.user_summary" in f.sql
+    assert "SET (security_invoker = true)" in f.sql
+    assert (
+        f.sql
+        == "ALTER VIEW public.user_summary "
+        "SET (security_invoker = true);"
+    )
+
+
+def test_view001_fix_silent_when_security_invoker_already_true() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    assert VIEW001Fixer().fix(schema, {}) == []
+
+
+def test_view001_fix_silent_when_referenced_table_has_no_rls() -> None:
+    # No RLS-protected reference → nothing to leak → no fix.
+    schema = Schema(
+        tables=(_table(name="users", rls=False, force=False),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    assert VIEW001Fixer().fix(schema, {}) == []
+
+
+def test_view001_fix_silent_on_materialized_view() -> None:
+    # Matviews are VIEW003's domain — VIEW001 must skip them and so
+    # must its fixer. `ALTER VIEW … SET (security_invoker = true)`
+    # would also be invalid syntax against a matview.
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                is_materialized=True,
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    assert VIEW001Fixer().fix(schema, {}) == []
+
+
+def test_view001_fix_respects_qualified_allowlist() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW001Fixer().fix(
+        schema, {"allowlist": ["public.user_summary"]}
+    )
+    assert fixes == []
+
+
+def test_view001_fix_description_mentions_view_and_leaked_tables() -> None:
+    schema = Schema(
+        tables=(
+            _table(name="users", rls=True, force=True),
+            _table(name="invoices", rls=True, force=True),
+        ),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=False,
+                references=(
+                    ("public", "users"),
+                    ("public", "invoices"),
+                ),
+            ),
+        ),
+    )
+    fixes = VIEW001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    desc = fixes[0].description
+    assert "public.user_summary" in desc
+    assert "public.invoices" in desc
+    assert "public.users" in desc
+
+
+def test_view001_fix_silent_when_view_has_no_references() -> None:
+    # A constant-only view has nothing to leak → no fix.
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="constant_view",
+                security_invoker=False,
+                references=(),
+            ),
+        ),
+    )
+    assert VIEW001Fixer().fix(schema, {}) == []
+
+
+def test_view001_fix_emits_one_per_offending_view() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="bad_a",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+            _view(
+                name="bad_b",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+            _view(
+                name="good",
+                security_invoker=True,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW001Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.bad_a",
+        "public.bad_b",
+    ]
+
+
+def test_view001_fix_quotes_view_name_when_required() -> None:
+    # Mixed-case identifier requires double-quoting in Postgres.
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="MixedCase Summary",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert (
+        fixes[0].sql
+        == 'ALTER VIEW public."MixedCase Summary" '
+        "SET (security_invoker = true);"
+    )
+
+
+def test_view001_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Mirror SEC002's pattern: bad config types fail closed (no
+    # exemption applied), so the view still fires. The rule's
+    # check() raises on bad allowlist shape; the fixer trusts the
+    # rule has already validated and uses an inline shim, so a
+    # non-list allowlist resolves to "nothing exempt".
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW001Fixer().fix(
+        schema, {"allowlist": "public.user_summary"}
+    )
+    assert len(fixes) == 1
+    assert fixes[0].location == "public.user_summary"
+
+
+# ---------- VIEW002 fixer ----------
+
+
+def test_view002_fix_emits_alter_view_set_security_barrier() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW002Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "VIEW002"
+    assert f.location == "public.user_summary"
+    assert "ALTER VIEW" in f.sql
+    assert "public.user_summary" in f.sql
+    assert "SET (security_barrier = true)" in f.sql
+    assert (
+        f.sql
+        == "ALTER VIEW public.user_summary "
+        "SET (security_barrier = true);"
+    )
+
+
+def test_view002_fix_silent_when_security_barrier_already_true() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                security_barrier=True,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    assert VIEW002Fixer().fix(schema, {}) == []
+
+
+def test_view002_fix_silent_when_referenced_table_has_no_rls() -> None:
+    # No RLS-protected reference → nothing to leak → no fix.
+    schema = Schema(
+        tables=(_table(name="users", rls=False, force=False),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    assert VIEW002Fixer().fix(schema, {}) == []
+
+
+def test_view002_fix_silent_on_materialized_view() -> None:
+    # Matviews are VIEW003's domain — VIEW002 must skip them.
+    # `ALTER VIEW … SET (security_barrier = true)` would also be
+    # invalid syntax against a matview.
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                is_materialized=True,
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    assert VIEW002Fixer().fix(schema, {}) == []
+
+
+def test_view002_fix_respects_qualified_allowlist() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW002Fixer().fix(
+        schema, {"allowlist": ["public.user_summary"]}
+    )
+    assert fixes == []
+
+
+def test_view002_fix_description_mentions_view_and_leaked_tables() -> None:
+    schema = Schema(
+        tables=(
+            _table(name="users", rls=True, force=True),
+            _table(name="invoices", rls=True, force=True),
+        ),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                security_barrier=False,
+                references=(
+                    ("public", "users"),
+                    ("public", "invoices"),
+                ),
+            ),
+        ),
+    )
+    fixes = VIEW002Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    desc = fixes[0].description
+    assert "public.user_summary" in desc
+    assert "public.invoices" in desc
+    assert "public.users" in desc
+
+
+def test_view002_fix_silent_when_view_has_no_references() -> None:
+    # A constant-only view has nothing to leak → no fix.
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="constant_view",
+                security_invoker=True,
+                security_barrier=False,
+                references=(),
+            ),
+        ),
+    )
+    assert VIEW002Fixer().fix(schema, {}) == []
+
+
+def test_view002_fix_emits_one_per_offending_view() -> None:
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="bad_a",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+            _view(
+                name="bad_b",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+            _view(
+                name="good",
+                security_invoker=True,
+                security_barrier=True,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW002Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.bad_a",
+        "public.bad_b",
+    ]
+
+
+def test_view002_fix_quotes_view_name_when_required() -> None:
+    # Mixed-case identifier requires double-quoting in Postgres.
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="MixedCase Summary",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW002Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert (
+        fixes[0].sql
+        == 'ALTER VIEW public."MixedCase Summary" '
+        "SET (security_barrier = true);"
+    )
+
+
+def test_view002_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Mirror SEC002/VIEW001: bad config types fail closed (no
+    # exemption applied), so the view still fires. The rule's
+    # check() raises on bad allowlist shape; the fixer trusts the
+    # rule has already validated and uses an inline shim, so a
+    # non-list allowlist resolves to "nothing exempt".
+    schema = Schema(
+        tables=(_table(name="users", rls=True, force=True),),
+        views=(
+            _view(
+                name="user_summary",
+                security_invoker=True,
+                security_barrier=False,
+                references=(("public", "users"),),
+            ),
+        ),
+    )
+    fixes = VIEW002Fixer().fix(
+        schema, {"allowlist": "public.user_summary"}
+    )
+    assert len(fixes) == 1
+    assert fixes[0].location == "public.user_summary"
 
 
 # ---------- PERF001 fixer ----------
@@ -271,9 +718,9 @@ def test_generate_fixes_passes_rule_options() -> None:
     assert fixes == []
 
 
-def test_default_fixers_includes_sec002_and_perf001() -> None:
+def test_default_fixers_registers_every_shipping_fixer() -> None:
     rule_ids = {fixer.rule_id for fixer in default_fixers()}
-    assert {"SEC002", "PERF001"} <= rule_ids
+    assert {"SEC002", "PERF001", "VIEW001", "VIEW002"} <= rule_ids
 
 
 def test_fix_dataclass_is_frozen() -> None:

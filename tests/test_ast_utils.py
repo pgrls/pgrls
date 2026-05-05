@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pgrls.ast_utils import (
     extract_column_refs,
+    extract_range_vars,
     find_func_calls,
     match_is_null,
     parse_expr,
@@ -137,6 +138,20 @@ def test_extract_column_refs_skips_wildcard_a_star() -> None:
             assert part != "*"
 
 
+def test_extract_column_refs_descends_into_range_function_in_from_clause() -> None:
+    # Companion to
+    # `test_find_func_calls_descends_into_range_function_in_from_clause`
+    # — the same `RangeFunction.functions = tuple[tuple[FuncCall,
+    # None]]` shape would silently swallow ColumnRef nodes nested
+    # inside a function call in the FROM clause if the walker
+    # didn't recurse into bare tuples. Pin both helpers so a
+    # walker rewrite that breaks one surfaces here as well.
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT 1 FROM public.f(t.col)")
+    refs = extract_column_refs(parsed[0].stmt)
+    assert ("t", "col") in refs
+
 
 def test_find_func_calls_matches_qualified_name() -> None:
     node = parse_expr("auth.uid() = '1'")
@@ -147,6 +162,22 @@ def test_find_func_calls_matches_qualified_name() -> None:
 def test_find_func_calls_matches_bare_name() -> None:
     node = parse_expr("current_setting('x') = '1'")
     matches = find_func_calls(node, {"current_setting"})
+    assert len(matches) == 1
+
+
+def test_find_func_calls_descends_into_range_function_in_from_clause() -> None:
+    # `RangeFunction.functions` is a tuple-of-tuples (each
+    # entry is `(FuncCall, None)` — the inner tuple holds the
+    # call node plus optional column-list aliasing). The walker
+    # used to handle `tuple[Node]` but not `tuple[tuple]`, so
+    # set-returning functions in FROM clauses (the canonical
+    # `SELECT * FROM f()` pattern) were silently skipped.
+    # Pin the recursion explicitly here so a future walker
+    # rewrite can't reintroduce the gap.
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT * FROM public.read_secret()")
+    matches = find_func_calls(parsed[0].stmt, {"public.read_secret"})
     assert len(matches) == 1
 
 
@@ -360,3 +391,62 @@ def test_match_is_null_distinguishes_is_null_from_is_not_null() -> None:
     not_null_node = parse_expr("a IS NOT NULL")
     assert match_is_null(null_node)[1] is True  # type: ignore[index]
     assert match_is_null(not_null_node)[1] is False  # type: ignore[index]
+
+
+def test_extract_range_vars_qualified_select() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT * FROM public.secret")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert refs == [("public", "secret")]
+
+
+def test_extract_range_vars_bare_select() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT * FROM secret")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert refs == [(None, "secret")]
+
+
+def test_extract_range_vars_qualified_insert() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("INSERT INTO public.t (id) VALUES (1)")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "t") in refs
+
+
+def test_extract_range_vars_qualified_update() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("UPDATE public.t SET x = 1")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "t") in refs
+
+
+def test_extract_range_vars_qualified_delete() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("DELETE FROM public.t WHERE id = 1")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "t") in refs
+
+
+def test_extract_range_vars_collects_join_targets() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql(
+        "SELECT a.id FROM public.a JOIN public.b ON a.id = b.id"
+    )
+    refs = extract_range_vars(parsed[0].stmt)
+    assert ("public", "a") in refs
+    assert ("public", "b") in refs
+
+
+def test_extract_range_vars_returns_empty_when_no_tables() -> None:
+    import pglast
+
+    parsed = pglast.parse_sql("SELECT 1")
+    refs = extract_range_vars(parsed[0].stmt)
+    assert refs == []

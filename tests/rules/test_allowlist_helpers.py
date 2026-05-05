@@ -14,6 +14,7 @@ import pytest
 from pgrls.rules._allowlist import (
     parse_policy_id_allowlist,
     parse_qualified_table_allowlist,
+    parse_qualified_view_allowlist,
     parse_table_ref_allowlist,
 )
 
@@ -179,4 +180,38 @@ def test_qualified_table_allowlist_rejects_three_parts() -> None:
     with pytest.raises(TypeError, match="not a valid qualified table ID"):
         parse_qualified_table_allowlist(
             "SEC007", {"allowlist": ["public.users.policy"]}
+        )
+
+
+# --- parse_qualified_view_allowlist ----------------------------
+
+
+def test_qualified_view_allowlist_accepts_qualified() -> None:
+    out = parse_qualified_view_allowlist(
+        "VIEW001", {"allowlist": ["public.user_summary"]}
+    )
+    assert out == {"public.user_summary"}
+
+
+def test_qualified_view_allowlist_rejects_unqualified() -> None:
+    # The error wording mentions "view", not "table" — that's the
+    # whole reason this helper exists as a sibling of
+    # parse_qualified_table_allowlist.
+    with pytest.raises(TypeError, match="not a valid qualified view ID"):
+        parse_qualified_view_allowlist(
+            "VIEW001", {"allowlist": ["user_summary"]}
+        )
+
+
+def test_qualified_view_allowlist_rejects_three_parts() -> None:
+    with pytest.raises(TypeError, match="not a valid qualified view ID"):
+        parse_qualified_view_allowlist(
+            "VIEW001", {"allowlist": ["public.user_summary.col"]}
+        )
+
+
+def test_qualified_view_allowlist_rejects_empty_part() -> None:
+    with pytest.raises(TypeError, match="not a valid qualified view ID"):
+        parse_qualified_view_allowlist(
+            "VIEW001", {"allowlist": [".user_summary"]}
         )

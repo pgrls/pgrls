@@ -13,7 +13,9 @@ CREATE POLICY inverted_auth ON public.sec004_target
         OR user_id = current_setting('app.user_id', true)
     );
 
--- Clean: positive auth check, no IS NULL disjunct. RESTRICTIVE keeps SEC003 quiet.
+-- Clean: positive auth check, no IS NULL disjunct. RESTRICTIVE
+-- keeps SEC003 quiet, and the PERMISSIVE-postgres companion
+-- keeps SEC012 quiet.
 CREATE TABLE public.sec004_clean (id INT, user_id TEXT);
 ALTER TABLE public.sec004_clean ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec004_clean FORCE ROW LEVEL SECURITY;
@@ -21,4 +23,8 @@ CREATE POLICY positive_auth ON public.sec004_clean
     AS RESTRICTIVE
     FOR SELECT
     TO PUBLIC
+    USING (user_id = (SELECT current_setting('app.user_id', true)));
+CREATE POLICY permit_auth ON public.sec004_clean
+    FOR SELECT
+    TO postgres
     USING (user_id = (SELECT current_setting('app.user_id', true)));

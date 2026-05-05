@@ -61,9 +61,14 @@ def test_filters_by_schema(pg_conn: psycopg.Connection, apply_sql) -> None:
     }
 
 
-def test_skips_views_and_system_tables(
+def test_views_routed_to_schema_views_not_tables(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
+    # As of v0.3.0 introspect captures views — but they go into
+    # `schema.views`, not `schema.tables`. The test name predates
+    # the split; the body now pins both halves of the routing
+    # contract: tables only contain real relations, and the view
+    # does land on the views side.
     apply_sql(
         """
         CREATE TABLE public.real (id INT);
@@ -71,8 +76,10 @@ def test_skips_views_and_system_tables(
         """
     )
     schema = introspect(pg_conn, schemas=["public"])
-    names = {t.qualified_name for t in schema.tables}
-    assert names == {"public.real"}
+    table_names = {t.qualified_name for t in schema.tables}
+    view_names = {v.qualified_name for v in schema.views}
+    assert table_names == {"public.real"}
+    assert "public.view_real" in view_names
 
 
 def test_unknown_schema_raises(pg_conn: psycopg.Connection) -> None:
@@ -603,3 +610,254 @@ def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
         "'oid:N' sentinel so unresolvable grantee OIDs don't "
         "leak NULL into Grant.role."
     )
+
+
+def test_introspect_captures_views(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE VIEW public.t_v AS SELECT * FROM public.t;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    view_qnames = [v.qualified_name for v in schema.views]
+    assert "public.t_v" in view_qnames
+
+    v = next(view for view in schema.views if view.name == "t_v")
+    assert v.is_materialized is False
+    # security_invoker / security_barrier default to False unless
+    # explicitly set via WITH (...) at CREATE time.
+    assert v.security_invoker is False
+    assert v.security_barrier is False
+    assert v.definition  # non-empty
+    # Task 4 populates references; t_v reads from public.t.
+    assert v.references == (("public", "t"),)
+    assert v.security_definer_calls == ()  # Task 5 populates this
+
+
+def test_introspect_captures_security_invoker_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t2 (id INT);
+        CREATE VIEW public.t2_v WITH (security_invoker = true)
+            AS SELECT * FROM public.t2;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "t2_v")
+    assert v.security_invoker is True
+
+
+def test_introspect_captures_security_barrier_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t3 (id INT);
+        CREATE VIEW public.t3_v WITH (security_barrier = true)
+            AS SELECT * FROM public.t3;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "t3_v")
+    assert v.security_barrier is True
+
+
+def test_introspect_captures_materialized_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t4 (id INT);
+        CREATE MATERIALIZED VIEW public.t4_mv
+            AS SELECT * FROM public.t4 WITH NO DATA;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    mv = next(view for view in schema.views if view.name == "t4_mv")
+    assert mv.is_materialized is True
+
+
+def test_introspect_captures_secdef_function_calls_in_view(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.secret (id INT);
+        CREATE FUNCTION public.read_secret() RETURNS SETOF public.secret
+            LANGUAGE sql SECURITY DEFINER AS $$
+            SELECT * FROM public.secret
+            $$;
+        CREATE VIEW public.secret_v AS SELECT * FROM public.read_secret();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "secret_v")
+    assert v.security_definer_calls == ("public.read_secret",)
+
+
+def test_introspect_view_calling_invoker_function_no_secdef_entry(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.t5 (id INT);
+        CREATE FUNCTION public.t5_count() RETURNS BIGINT
+            LANGUAGE sql AS $$ SELECT count(*) FROM public.t5 $$;
+        CREATE VIEW public.t5_count_v AS SELECT public.t5_count() AS n;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "t5_count_v")
+    assert v.security_definer_calls == ()
+
+
+def test_introspect_captures_security_definer_function_bodies(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Introspection populates `Schema.security_definer_functions` with
+    # the SECDEF function body and language. VIEW004 reads the body to
+    # detect RLS-protected reads inside the function.
+    apply_sql(
+        """
+        CREATE TABLE public.body_secret (id INT);
+        CREATE FUNCTION public.body_read() RETURNS SETOF public.body_secret
+            LANGUAGE sql SECURITY DEFINER AS $$
+            SELECT * FROM public.body_secret
+            $$;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    secdef = next(
+        f
+        for f in schema.security_definer_functions
+        if f.qualified_name == "public.body_read"
+    )
+    assert secdef.language == "sql"
+    assert "public.body_secret" in secdef.body
+
+
+def test_introspect_skips_invoker_function_in_security_definer_functions(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Functions WITHOUT SECURITY DEFINER must NOT land in
+    # `Schema.security_definer_functions` — VIEW004 only cares about
+    # SECDEF bodies.
+    apply_sql(
+        """
+        CREATE TABLE public.invoker_t (id INT);
+        CREATE FUNCTION public.invoker_count() RETURNS BIGINT
+            LANGUAGE sql AS $$ SELECT count(*) FROM public.invoker_t $$;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    qnames = {f.qualified_name for f in schema.security_definer_functions}
+    assert "public.invoker_count" not in qnames
+
+
+def test_introspect_resolves_view_to_table_references(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.users (id INT, email TEXT);
+        CREATE TABLE public.orders (id INT, user_id INT, amount INT);
+        CREATE VIEW public.user_orders AS
+            SELECT u.email, o.amount
+            FROM public.users u
+            JOIN public.orders o ON o.user_id = u.id;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "user_orders")
+
+    # references should be sorted (schema, name) tuples
+    assert v.references == (
+        ("public", "orders"),
+        ("public", "users"),
+    )
+
+
+def test_introspect_view_with_no_references_has_empty_tuple(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    apply_sql(
+        "CREATE VIEW public.vw_const AS SELECT 42 AS answer;"
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "vw_const")
+    assert v.references == ()
+
+
+def test_introspect_view_referencing_partitioned_table(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A view over a partitioned parent table should resolve the
+    # parent (relkind='p') as a reference. Postgres rewrites the
+    # query at runtime to fan out to children, but the dependency
+    # edge in pg_depend points at the parent.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, day DATE)
+            PARTITION BY RANGE (day);
+        CREATE TABLE public.events_2026
+            PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+        CREATE VIEW public.events_v AS SELECT * FROM public.events;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    v = next(view for view in schema.views if view.name == "events_v")
+    assert ("public", "events") in v.references
+
+
+def test_introspect_view_chained_through_view_does_not_chase(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # v0.3.0 design: view→table deps are SINGLE HOP. A view that
+    # reads ANOTHER view that reads an RLS-protected table should
+    # NOT have the underlying table in its `references`. The
+    # intermediate view's references point at the table; the outer
+    # view's references point at the intermediate view (filtered
+    # out by relkind='r','p' in the query).
+    #
+    # This test pins the deferral — v0.4 may add transitive
+    # walks; if so, this test should be deleted in the same change
+    # so the intent is visible.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE VIEW public.inner_v AS SELECT * FROM public.t;
+        CREATE VIEW public.outer_v AS SELECT * FROM public.inner_v;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    outer = next(view for view in schema.views if view.name == "outer_v")
+    # `inner_v` is a view (relkind='v'), filtered out by query.
+    # `t` is a table BUT outer_v's pg_depend doesn't link to it
+    # directly — the chain goes through inner_v.
+    assert ("public", "t") not in outer.references
+
+
+def test_introspect_view_dependency_filter_by_schema(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # The schema filter applies to the VIEW side. A view in
+    # schema "app" that reads a table in schema "shared" — if
+    # we introspect ["app"] only, the view shows up but its
+    # references include the cross-schema table.
+    apply_sql(
+        """
+        CREATE SCHEMA shared;
+        CREATE SCHEMA app;
+        CREATE TABLE shared.lookup (id INT);
+        CREATE VIEW app.lookup_v AS SELECT * FROM shared.lookup;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["app", "shared"])
+    v = next(view for view in schema.views if view.name == "lookup_v")
+    assert v.references == (("shared", "lookup"),)

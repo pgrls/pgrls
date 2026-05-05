@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from pgrls.model import Policy, PolicyCommand, Schema, Snapshot, Table
 
 
@@ -60,7 +62,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 3,
+        "version": 4,
         "tables": [
             {
                 "schema": "public",
@@ -85,6 +87,8 @@ def test_schema_to_snapshot_shape() -> None:
                 "with_check_sql": None,
             }
         ],
+        "views": [],
+        "security_definer_functions": [],
     }
 
 
@@ -210,13 +214,13 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_three_after_grants_addition() -> None:
-    # `grants` was added for v0.2 diff — SNAPSHOT_VERSION bumped from
-    # 2 → 3 per the model.py docstring contract that additive structural
+def test_snapshot_version_is_four_after_views_addition() -> None:
+    # `views` was added for v0.3 — SNAPSHOT_VERSION bumped from
+    # 3 → 4 per the model.py docstring contract that additive structural
     # changes bump the version. Pin the new version so a future bump is
     # deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 3
+    assert snap["version"] == 4
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -424,15 +428,21 @@ def test_schema_by_qname_is_cached_across_calls() -> None:
     assert first is second  # pragma: no mutate
 
 
-def test_snapshot_v3_top_level_keys_are_stable_contract() -> None:
+def test_snapshot_v4_top_level_keys_are_stable_contract() -> None:
     # Snapshot top-level keys are part of the public surface (any
     # consumer reading the JSON depends on these names). Pin
-    # `version`, `tables`, `policies` so a quiet refactor that
-    # renames `policies` to `rls_policies` etc. fails this test
-    # rather than slipping past CI.
+    # `version`, `tables`, `policies`, `views`,
+    # `security_definer_functions` so a quiet refactor that renames
+    # or drops a key fails this test rather than slipping past CI.
     snap = Schema(tables=()).to_snapshot()
-    assert set(snap.keys()) == {"version", "tables", "policies"}
-    assert snap["version"] == 3
+    assert set(snap.keys()) == {
+        "version",
+        "tables",
+        "policies",
+        "views",
+        "security_definer_functions",
+    }
+    assert snap["version"] == 4
 
 
 def test_snapshot_v3_table_entry_keys_are_stable() -> None:
@@ -485,3 +495,41 @@ def test_snapshot_v2_policy_entry_keys_are_stable() -> None:
         "using_sql",
         "with_check_sql",
     }
+
+
+def test_view_dataclass_has_expected_fields() -> None:
+    from pgrls.model import View
+
+    v = View(
+        schema="public",
+        name="invoices_v",
+        is_materialized=False,
+        security_invoker=True,
+        security_barrier=False,
+        definition="SELECT * FROM public.invoices",
+        references=(("public", "invoices"),),
+        security_definer_calls=(),
+    )
+    assert v.qualified_name == "public.invoices_v"
+    assert v.is_materialized is False
+    assert v.security_invoker is True
+    assert v.references == (("public", "invoices"),)
+
+
+def test_view_dataclass_is_frozen() -> None:
+    import dataclasses
+
+    from pgrls.model import View
+
+    v = View(
+        schema="public",
+        name="vw",
+        is_materialized=False,
+        security_invoker=False,
+        security_barrier=False,
+        definition="",
+        references=(),
+        security_definer_calls=(),
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        v.name = "x"  # type: ignore[misc]

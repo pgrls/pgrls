@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.2.3** — fifteen rules (SEC001–SEC011, PERF001–PERF002, HYG001–HYG002) and a `pgrls fix` subcommand that auto-remediates SEC002 and PERF001. Text, JSON, and SARIF output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
+> **Status: 0.3.0** — twenty rules (SEC001–SEC012, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification).
 
 ## Install
 
@@ -10,7 +10,7 @@ Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 pip install pgrls
 ```
 
-Requires Python 3.11+ and Postgres 10+. pgrls is tested in CI against PostgreSQL 10–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix). The demo suite uses some features that require PG 12+ (declarative partitions, generated columns) and PG 14+ (uc36's `pg_read_all_data` predefined role) — but `pgrls lint` and `pgrls fix` themselves work on PG10 and up.
+Requires Python 3.11+ and Postgres 15+. pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
 
 ## Usage
 
@@ -36,9 +36,10 @@ pgrls lint --schemas public,tenant
 Point at a non-default config file, or pick an output format:
 
 ```bash
-pgrls lint --config ./config/pgrls.toml --format text    # human-readable (default)
-pgrls lint --config ./config/pgrls.toml --format json    # machine-readable for CI
-pgrls lint --config ./config/pgrls.toml --format sarif   # GitHub Code Scanning
+pgrls lint --config ./config/pgrls.toml --format text     # human-readable (default)
+pgrls lint --config ./config/pgrls.toml --format json     # machine-readable for CI
+pgrls lint --config ./config/pgrls.toml --format sarif    # GitHub Code Scanning
+pgrls lint --config ./config/pgrls.toml --format markdown # PR comments / rendered CI reports
 ```
 
 ### Example output
@@ -96,7 +97,7 @@ pgrls fix --database-url "$DATABASE_URL" --apply
 pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
 ```
 
-Currently fixable: **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`) and **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
+Currently fixable: **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
 
 ## Configuration
 
@@ -211,10 +212,15 @@ pattern documentation.
 | [SEC009](AGENTS.md#rule-sec009) | warning | RLS enabled but no policies defined (silent deny-all) |
 | [SEC010](AGENTS.md#rule-sec010) | warning | Policy `USING`/`WITH CHECK` clause is constant `false` (deny-all anti-pattern) |
 | [SEC011](AGENTS.md#rule-sec011) | warning | Policy expression has an `OR true` branch (debug bypass left in) |
+| [SEC012](AGENTS.md#rule-sec012) | warning | Table has only RESTRICTIVE policies (silent deny-all — needs at least one PERMISSIVE) |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [HYG001](AGENTS.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
 | [HYG002](AGENTS.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
+| [VIEW001](AGENTS.md#rule-view001) | error | View over RLS-protected table without `WITH (security_invoker = true)` |
+| [VIEW002](AGENTS.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
+| [VIEW003](AGENTS.md#rule-view003) | warning | Materialized view over RLS-protected table (RLS not honored at query time) |
+| [VIEW004](AGENTS.md#rule-view004) | warning | View calls SECURITY DEFINER function that reads an RLS-protected table |
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
@@ -234,7 +240,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.2.3
+    rev: v0.3.0
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to
@@ -292,8 +298,8 @@ dashboard, or keep the report as a build artifact.
 
 ## Roadmap
 
-- **More lint rules.** Continued expansion of the SEC / PERF / HYG catalog. Markdown output. Polished error messages.
-- **TypeScript / Go ports.** Cross-language ports of `pgrls.testing` (v0.3) and `pgrls.diff` (v0.3+) backed by the same Layer-1 protocol fixtures.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Markdown output. Polished error messages.
+- **TypeScript / Go ports.** Cross-language ports of `pgrls.testing` (v0.4) and `pgrls.diff` (v0.4+) backed by the same Layer-1 protocol fixtures.
 - **SAT-based predicate implication checking.** v0.2 recognizes common-case AST patterns (literal-equal, AND-tighten / drop, OR-loosen / drop) for `USING` / `WITH CHECK` diffs; everything else is `REQUIRES_REVIEW`. Z3-driven analysis to widen automatic classification is tracked for v0.5+.
 - **Migration-as-input.** `pgrls diff --apply migration.sql` to diff a live DB against the post-migration shape without applying it. Tracked for v0.5+.
 

@@ -10,24 +10,31 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **fifteen rules across three
-severities**. Error: `SEC001` (missing RLS), `SEC002` (missing
+In the current release it ships **twenty rules across four
+categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
-(write-side policies missing `WITH CHECK`), and `HYG001`
-(policies referencing dropped columns). Warning: `SEC005` (policy
-expression has no own-column reference), `SEC008` (`USING (true)`),
-`SEC009` (RLS enabled but no policies — silent deny-all), `SEC010`
-(`USING (false)` deny-all anti-pattern), `SEC011` (`OR true`
-debug branch hidden inside a policy), `PERF001` (unwrapped auth
-function in `USING`), `PERF002` (VOLATILE function in policy
-expression), and `HYG002` (placeholder-named policy). Info:
+(write-side policies missing `WITH CHECK`), `HYG001`
+(policies referencing dropped columns), and `VIEW001`
+(view bypasses RLS without `security_invoker`). Warning:
+`SEC005` (policy expression has no own-column reference),
+`SEC008` (`USING (true)`), `SEC009` (RLS enabled but no policies —
+silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
+`SEC011` (`OR true` debug branch hidden inside a policy),
+`SEC012` (table has only RESTRICTIVE policies — silent deny-all),
+`PERF001` (unwrapped auth function in `USING`), `PERF002`
+(VOLATILE function in policy expression), `HYG002`
+(placeholder-named policy), `VIEW002` (view is not a
+`security_barrier`), `VIEW003` (matview captures RLS-protected
+data at REFRESH time), and `VIEW004` (view calls a SECURITY
+DEFINER function reading an RLS-protected table). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
-floor). A `pgrls fix` subcommand auto-remediates SEC002 and
-PERF001; other rules need human intent. A `pgrls.testing` pytest
-plugin (v0.1+) and a `pgrls diff` semantic policy diff command
-(v0.2+) are also available — see the "Testing your RLS" and
-"Diff" sections below for when to suggest them.
+floor). A `pgrls fix` subcommand auto-remediates SEC002, PERF001,
+VIEW001, and VIEW002; other rules need human intent. A
+`pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
+policy diff command (v0.2+) are also available — see the
+"Testing your RLS" and "Diff" sections below for when to suggest
+them.
 
 ## When to suggest pgrls
 
@@ -608,6 +615,68 @@ inside an `OR` BoolExpr counts. Semantic-equivalent tautologies
 framing instead. A real tautology checker is significant
 infrastructure for marginal real-world value.
 
+<a id="rule-sec012"></a>
+
+### SEC012 — Table has only RESTRICTIVE policies (silent deny-all)
+
+**Severity:** warning.
+
+**What it catches:** tables where RLS is enabled, at least one
+policy exists, and every policy is `RESTRICTIVE`. Postgres composes
+RLS as `permissive_or | (restrictive_and & ...)`: a row is visible
+iff at least one PERMISSIVE policy matches AND every RESTRICTIVE
+policy matches. With zero PERMISSIVE policies the disjunction is
+empty — no row passes, regardless of how many RESTRICTIVE policies
+you've added or what they say.
+
+Common shape: a developer adds a `AS RESTRICTIVE` policy thinking
+it "layers on top of" an implicit permissive default. There is no
+implicit default. The table is silently deny-all from the moment
+RLS is enabled.
+
+This is the same effective shape as SEC009 (RLS enabled, zero
+policies) and SEC010 (`USING (false)` deny-all anti-pattern),
+just achieved through a different mechanism. SEC009 catches the
+explicit "no policies at all" case; SEC010 catches the explicit
+`false` literal; SEC012 catches the silent "only RESTRICTIVE"
+case where the user intended access but composed the policies
+wrong. The three rules are disjoint by construction — a table
+can't trigger more than one.
+
+**Standard fix.** Add a PERMISSIVE policy that describes who
+CAN see rows. The existing RESTRICTIVE policies will narrow
+that access further:
+
+```sql
+-- Before: silent deny-all (no PERMISSIVE).
+CREATE POLICY tenant_lock ON public.invoices
+    AS RESTRICTIVE FOR ALL
+    TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant')::uuid));
+
+-- After: PERMISSIVE grants access; RESTRICTIVE narrows it.
+CREATE POLICY tenant_read ON public.invoices
+    FOR ALL TO authenticated
+    USING (true);
+CREATE POLICY tenant_lock ON public.invoices
+    AS RESTRICTIVE FOR ALL
+    TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant')::uuid));
+```
+
+(A bare `USING (true)` PERMISSIVE will trip SEC008 — narrow it to
+the access predicate the table actually wants.)
+
+If the deny-all is genuinely intentional — e.g., a "shadow" table
+that exists only to be queried via a SECURITY DEFINER function and
+should never be visible through direct `SELECT` — allowlist by
+qualified or unqualified table name:
+
+```toml
+[lint.rules.SEC012]
+allowlist = ["public.shadow_audit"]
+```
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -766,6 +835,247 @@ allowlist = ["public.tickets.todo_replace_me_later"]
 # placeholder_words = ["scratch", "draft"]
 ```
 
+<a id="rule-view001"></a>
+
+### VIEW001 — View bypasses RLS without `security_invoker`
+
+**Severity:** error.
+
+**What it catches:** views (regular, not materialized) that read from
+an RLS-protected table without `WITH (security_invoker = true)`.
+Postgres 15+ defaults `security_invoker` to `false`, matching the
+historical "DEFINER-style" semantics — the view runs queries with the
+view *owner's* privileges, not the calling user's. RLS policies on the
+underlying table are then evaluated against the owner (typically a
+privileged migration / admin role), so per-tenant predicates leak past
+the policy boundary every time anyone selects from the view.
+
+**The bad pattern:**
+
+```sql
+CREATE VIEW public.user_summary AS
+    SELECT id, display_name FROM public.users;
+-- security_invoker defaults to false → RLS evaluated as the
+-- view owner, not the caller. Every row is visible.
+```
+
+**Standard fix.** Flip the reloption — the auto-fixer emits this
+exact statement:
+
+```sql
+ALTER VIEW public.user_summary SET (security_invoker = true);
+```
+
+After this, `SELECT FROM public.user_summary` evaluates the
+underlying RLS policies against the calling user's role and session
+GUCs, which is the modern default.
+
+VIEW001 walks the schema's view → table dependency graph (via
+`pg_depend`) and skips views whose `references` contain no
+RLS-enabled tables — a view over reference data does not need
+`security_invoker`. Materialized views are skipped entirely; they
+are VIEW003's domain (RLS is bypassed by construction at REFRESH
+time, regardless of any flag).
+
+**When the bypass is intentional.** Some views legitimately want
+DEFINER-style semantics — e.g. an admin dashboard view that
+deliberately surfaces cross-tenant aggregates. Allowlist the view
+by qualified ID:
+
+```toml
+[lint.rules.VIEW001]
+allowlist = ["public.admin_user_summary"]
+```
+
+The allowlist requires `schema.view` (exactly two parts) — bare-name
+entries are rejected so two views with the same name in different
+schemas can't both be silenced by a single typo'd entry.
+
+<a id="rule-view002"></a>
+
+### VIEW002 — View is not a `security_barrier`
+
+**Severity:** warning.
+
+**What it catches:** views over RLS-protected tables that lack
+`WITH (security_barrier = true)`. Without the flag, the planner is
+free to push a caller-supplied predicate (a volatile or
+side-effecting function in `WHERE`) *below* the view's RLS-derived
+filter. The classic exploit:
+
+```sql
+SELECT * FROM v WHERE leak(secret_column);
+```
+
+The volatile `leak(...)` evaluates BEFORE the underlying RLS
+predicates restrict the row set — leaking rows the calling user
+should never have seen, by side-effect rather than return value.
+
+`security_invoker` (VIEW001) and `security_barrier` (this rule) are
+*independent* defenses against *different* leak vectors. A view
+referencing RLS-protected tables and lacking both flags fires both
+rules — neither subsumes the other.
+
+**Standard fix.** Set the reloption — the auto-fixer emits this
+exact statement:
+
+```sql
+ALTER VIEW public.user_summary SET (security_barrier = true);
+```
+
+`security_barrier` tells the planner the view is a privilege
+boundary: predicates the user adds in the outer query MUST NOT be
+pushed below the view's own qualifications. RLS still applies
+normally; the flag closes the orthogonal "WHERE-clause function as
+oracle" leak.
+
+**When the warning is acceptable.** Views with no caller-controlled
+function calls in WHERE clauses are not exposed to this attack — but
+the safer posture is to set the flag anyway and forget about the
+distinction. Reach for the allowlist only when the planner cost of
+the barrier is measurably bad and the surface is provably safe:
+
+```toml
+[lint.rules.VIEW002]
+allowlist = ["public.tiny_constant_view"]
+```
+
+Same `schema.view` shape as VIEW001.
+
+<a id="rule-view003"></a>
+
+### VIEW003 — Materialized view captures RLS-protected data at refresh time
+
+**Severity:** warning.
+
+**What it catches:** materialized views whose body reads from an
+RLS-enabled table. A matview captures rows by running its body at
+`REFRESH MATERIALIZED VIEW` time, with the privileges of whoever
+issued the REFRESH (typically a privileged migration / cron / admin
+role). The captured rows are written to the matview's own physical
+heap; queries against the matview read from that heap directly —
+they do NOT re-evaluate the underlying body and therefore do NOT
+honor RLS on the source tables, regardless of any flag.
+
+This is structurally different from a regular view: VIEW001 /
+VIEW002 territory is about per-query evaluation hooks, which a
+matview lacks by design. There is no `security_invoker` knob that
+restores per-caller RLS on a matview.
+
+**Standard fix.** No mechanical fix exists; the rule has no
+auto-fixer for the same reason. Pick one of the two architectural
+choices:
+
+```sql
+-- Option A: refresh as a per-tenant role so the captured rows are
+-- already filtered to that tenant's view.
+SET LOCAL ROLE tenant_a;
+SET LOCAL app.tenant_id = '...';
+REFRESH MATERIALIZED VIEW public.user_summary;
+
+-- Option B: replicate the matview per-tenant. One physical heap per
+-- tenant; queries route to the right one.
+CREATE MATERIALIZED VIEW public.user_summary_tenant_a AS
+    SELECT plan, count(*) FROM public.users
+    WHERE tenant_id = '...' GROUP BY plan;
+```
+
+Hence: `warning`, no auto-fix. The rule's job is to flag the
+architectural gap so the operator chooses one of the above
+explicitly rather than discovering the leak in production.
+
+**When the warning is acceptable.** Aggregates that are
+intentionally cross-tenant (an admin dashboard counting all users,
+say) belong on the allowlist:
+
+```toml
+[lint.rules.VIEW003]
+allowlist = ["public.global_user_count"]
+```
+
+Same `schema.view` shape as VIEW001 / VIEW002.
+
+<a id="rule-view004"></a>
+
+### VIEW004 — View calls SECURITY DEFINER function reading RLS-protected table
+
+**Severity:** warning.
+
+**What it catches:** views whose body calls a `SECURITY DEFINER`
+function that, in turn, reads from an RLS-protected table. Because
+the function runs with the function owner's privileges (typically a
+privileged migration / admin role), RLS on the underlying table is
+evaluated against the function owner — NOT the calling user. This
+bypasses the per-tenant filter even when the *view* itself is
+configured with `security_invoker = true` (VIEW001's defense),
+because the bypass happens one frame deeper, inside the function
+call.
+
+**The bad pattern:**
+
+```sql
+CREATE FUNCTION public.read_users()
+    RETURNS SETOF public.users
+    LANGUAGE sql SECURITY DEFINER
+    AS $$ SELECT * FROM public.users $$;
+
+CREATE VIEW public.user_summary
+    WITH (security_invoker = true, security_barrier = true)
+    AS SELECT id, email FROM public.read_users();
+-- VIEW001 + VIEW002 are both satisfied; the leak happens INSIDE
+-- public.read_users(), where SECURITY DEFINER hands the function
+-- the owner's privileges and RLS on public.users is evaluated
+-- against the owner instead of the caller.
+```
+
+**Standard fix.** No mechanical fix exists; the rule has no
+auto-fixer. Pick one of the two architectural choices:
+
+```sql
+-- Option A: re-write the function as INVOKER (drop SECURITY
+-- DEFINER). The function runs with the caller's privileges and
+-- RLS applies normally.
+CREATE OR REPLACE FUNCTION public.read_users()
+    RETURNS SETOF public.users
+    LANGUAGE sql  -- no SECURITY DEFINER
+    AS $$ SELECT * FROM public.users $$;
+
+-- Option B: document why the bypass is intentional (e.g. a
+-- system-level function that legitimately needs to see all rows
+-- for an aggregation/audit purpose) and allowlist the view.
+```
+
+Tolerance: the rule parses `pg_proc.prosrc` with pglast. Three
+documented false-negative paths, each handled silently or with a
+stderr warning:
+
+* **Non-SQL language** (PL/pgSQL with `DECLARE`/`BEGIN`, PL/Python,
+  etc.): skipped with a stderr warning naming the function.
+* **Unparseable SQL** (e.g. dynamic SQL via `EXECUTE` constructed at
+  runtime): skipped with a stderr warning naming the function.
+* **Cross-scope SECDEF function**: a view whose function call
+  resolves to a function in a schema outside `--schemas` is skipped
+  silently. To exercise the rule against such functions, expand
+  `--schemas` to include the function's home schema.
+
+These match the existing AST-based rule convention (SEC004, PERF001,
+etc.).
+
+When a function body uses an unqualified table name and two
+RLS-protected tables in different schemas share that bare name, the
+rule over-reports rather than under-attributes — the message lists
+all candidates and the operator decides which leak (if any) is real.
+
+**When the bypass is intentional.** Allowlist the view by qualified
+ID:
+
+```toml
+[lint.rules.VIEW004]
+allowlist = ["public.admin_user_summary"]
+```
+
+Same `schema.view` shape as VIEW001 / VIEW002 / VIEW003.
+
 ## Auto-fix: `pgrls fix`
 
 `pgrls fix` generates remediation SQL for the rules whose fix is
@@ -787,10 +1097,21 @@ Currently fixable:
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
   verbatim — PERF001 is USING-only, the fix doesn't touch what
   it wasn't asked to fix.
+* **VIEW001** — emits `ALTER VIEW <schema>.<view> SET
+  (security_invoker = true);` for every regular view that reads
+  RLS-protected tables and lacks the flag. Mirrors VIEW001's
+  detection in lockstep — matviews and views over non-RLS data
+  are skipped.
+* **VIEW002** — emits `ALTER VIEW <schema>.<view> SET
+  (security_barrier = true);` with the same lockstep detection.
+  Independent of VIEW001 — a view lacking both flags gets two
+  separate `ALTER VIEW … SET (...)` statements.
 
 Other rules require human intent (which role to grant to, what
-column to scope by, what policy to add) and are not auto-fixed.
-Suggest the canonical fix from the rule's section above.
+column to scope by, what policy to add, whether to re-architect a
+matview as per-tenant or drop SECURITY DEFINER from a function) and
+are not auto-fixed. Suggest the canonical fix from the rule's
+section above.
 
 ## Testing your RLS — `pgrls.testing`
 
@@ -1135,23 +1456,33 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Fifteen rules across three severities.** SEC001–SEC011,
-  PERF001–PERF002, and HYG001–HYG002 ship today. There is no rule
-  for `SECURITY DEFINER` function audit, no `pg_temp` shadowing
-  detection — those are on the roadmap.
-- **Auto-fix for SEC002 and PERF001.** `pgrls fix` rewrites the
-  mechanically-fixable subset; other rules need human intent.
+- **Nineteen rules across four categories.** SEC001–SEC011,
+  PERF001–PERF002, HYG001–HYG002, and VIEW001–VIEW004 ship today.
+  There is no `pg_temp` shadowing detection, and SECURITY DEFINER
+  function audit is currently scoped to the view-leak path
+  (VIEW004) — a free-standing function audit independent of view
+  bodies remains on the roadmap.
+- **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
+  fix` rewrites the mechanically-fixable subset; other rules need
+  human intent.
 - **Text, JSON, and SARIF output.** `--format text` (human-readable),
   `--format json` (machine-readable, stable CI contract), and
   `--format sarif` (SARIF v2.1.0 for GitHub Code Scanning and similar
   aggregators). Markdown remains on the roadmap.
-- **Postgres only.** No support for other databases or for MySQL/MariaDB
-  emulation layers.
+- **Postgres only.** No support for other databases or for
+  MySQL/MariaDB emulation layers.
+- **Postgres 15+.** Older PG releases (10–14) are no longer
+  supported. The CI matrix runs against PG15, PG16, and PG17.
+  `security_invoker` (the VIEW001 fix target) is a PG15+ reloption,
+  which is the proximate reason for the floor bump.
 - **No SAT-style implication checking on `USING` / `WITH CHECK` predicates.**
   v0.2's diff classifier recognizes the common-case AST patterns
   (literal-equal, AND-tighten / drop, OR-loosen / drop) and flags
   anything else as `REQUIRES_REVIEW`. Full Z3-driven implication
   analysis is on the v0.5+ roadmap.
+- **Cross-language ports tracked for v0.4.** TypeScript and Go ports
+  of `pgrls.testing` and `pgrls.diff`, backed by the Layer-1
+  protocol fixtures, are the next milestone.
 
 ## Where to learn more
 

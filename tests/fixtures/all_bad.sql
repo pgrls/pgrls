@@ -98,3 +98,81 @@ ALTER TABLE public.allbad_hyg002 FORCE ROW LEVEL SECURITY;
 CREATE POLICY todo_replace_me_later ON public.allbad_hyg002
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (owner_id = 'x');
+
+-- VIEW001: view over RLS-protected table without `security_invoker`.
+-- The base table has RLS enabled and a RESTRICTIVE policy with an
+-- own-column reference and a wrapped `current_setting` (so SEC001,
+-- SEC005, SEC007, SEC008, SEC009, PERF001 stay silent on it). The
+-- view itself runs with the owner's privileges and bypasses RLS,
+-- which is exactly what VIEW001 catches.
+--
+-- The view is created `WITH (security_barrier = true)` so VIEW002
+-- stays silent here — VIEW002's own block below pins that rule's
+-- behavior on a separately-named view.
+CREATE TABLE public.allbad_view001_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view001_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view001_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view001_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE VIEW public.allbad_view001
+    WITH (security_barrier = true) AS
+    SELECT * FROM public.allbad_view001_base;
+
+-- VIEW002: view over RLS-protected table without `security_barrier`.
+-- The view is created `WITH (security_invoker = true)` so VIEW001
+-- stays silent — pinning VIEW002 firing on a distinct table+view
+-- pair makes the rule_loc contract test catch a rule drifting onto
+-- the wrong view. The base table mirrors VIEW001's policy shape.
+CREATE TABLE public.allbad_view002_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view002_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view002_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view002_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE VIEW public.allbad_view002
+    WITH (security_invoker = true) AS
+    SELECT * FROM public.allbad_view002_base;
+
+-- VIEW003: materialized view over RLS-protected table. Matviews
+-- capture rows at REFRESH time per the refresher's privileges and
+-- do NOT honor RLS on subsequent queries — VIEW001/VIEW002 don't
+-- apply (matviews lack `security_invoker` / `security_barrier`
+-- reloptions, and both rules early-exit on `is_materialized=True`).
+-- The base table mirrors VIEW001/VIEW002's policy shape so SEC and
+-- PERF rules stay silent on it.
+CREATE TABLE public.allbad_view003_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view003_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view003_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view003_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE MATERIALIZED VIEW public.allbad_view003 AS
+    SELECT * FROM public.allbad_view003_base;
+
+-- VIEW004: view that calls a SECURITY DEFINER function that reads
+-- an RLS-protected table. The function bypasses RLS via the
+-- function owner's privileges, so even though the view is
+-- configured `security_invoker = true` + `security_barrier = true`
+-- (silencing VIEW001 and VIEW002), the SECDEF call inside the body
+-- is the leak vector — that's the gap VIEW004 catches.
+--
+-- The view is a regular (non-materialized) view so VIEW003 stays
+-- silent. The view's `references` does NOT include
+-- `allbad_view004_base` (pg_depend tracks function-result deps via
+-- pg_proc, not pg_class), so VIEW001 has nothing to flag here.
+-- The base table mirrors the other VIEW blocks' policy shape so
+-- the SEC and PERF rules stay silent on it.
+CREATE TABLE public.allbad_view004_base (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_view004_base ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_view004_base FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_view004_base
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE FUNCTION public.allbad_view004_read()
+    RETURNS SETOF public.allbad_view004_base
+    LANGUAGE sql SECURITY DEFINER AS
+    'SELECT * FROM public.allbad_view004_base';
+CREATE VIEW public.allbad_view004
+    WITH (security_invoker = true, security_barrier = true) AS
+    SELECT * FROM public.allbad_view004_read();
