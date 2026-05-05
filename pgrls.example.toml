@@ -98,6 +98,17 @@ allowlist = []
 # qualified policy IDs.
 allowlist = []
 
+[lint.rules.SEC012]
+# Tables allowed to have only RESTRICTIVE policies (silent deny-all).
+# Postgres needs at least one PERMISSIVE policy to grant access; this
+# rule's default behavior is to flag tables that are RLS-on with
+# only-RESTRICTIVE policies as silently denying every row. Allowlist
+# the rare cases where deny-all is intentional — e.g., a "shadow"
+# table queried only via SECURITY DEFINER functions, never directly.
+# Entries can be unqualified ("shadow_audit") or qualified
+# ("public.shadow_audit").
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is

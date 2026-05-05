@@ -196,9 +196,10 @@ def test_text_handles_long_message_and_special_chars() -> None:
 
 
 def test_unknown_format_message_lists_supported_formats() -> None:
-    # `markdown` is the next on the roadmap but not yet shipping.
-    # Pick a still-unsupported format so this test keeps exercising
-    # the unknown-format error path.
+    # Pick a format that's never been on the roadmap so the test
+    # keeps exercising the unknown-format error path even as new
+    # formats land. `xml` and `yaml` are the obvious pseudo-formats
+    # users sometimes try; either is fine.
     import pytest
     with pytest.raises(ValueError, match="text"):
-        format_violations([], format="markdown")
+        format_violations([], format="xml")
