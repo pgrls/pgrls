@@ -10,7 +10,7 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-04-30
+## [0.3.0] - 2026-05-04
 
 ### BREAKING
 - **Postgres floor bumped 13 → 15.** Older PG releases (10–14) are no
