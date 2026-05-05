@@ -4,6 +4,7 @@ from click.testing import CliRunner
 
 from pgrls.cli import _merge_overrides, _should_fail, main
 from pgrls.config import Config
+from pgrls.rules import all_rules
 from pgrls.violations import Violation
 
 
@@ -37,27 +38,10 @@ def test_root_version_flag():
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-_ALL_RULE_IDS = (
-    "SEC001",
-    "SEC002",
-    "SEC003",
-    "SEC004",
-    "SEC005",
-    "SEC006",
-    "SEC007",
-    "SEC008",
-    "SEC009",
-    "SEC010",
-    "SEC011",
-    "PERF001",
-    "PERF002",
-    "HYG001",
-    "HYG002",
-    "VIEW001",
-    "VIEW002",
-    "VIEW003",
-    "VIEW004",
-)
+# Derive from the rule registry so a 16th-or-Nth rule lands without
+# the tuple drifting silently. `all_rules()` itself is covered by
+# tests/test_readme_currency.py against the README rules table.
+_ALL_RULE_IDS = tuple(rule.id for rule in all_rules())
 
 
 def _assert_rules_fire_exactly(output: str, expected: set[str]) -> None:
@@ -302,6 +286,28 @@ def test_merge_overrides_falls_back_to_config_when_cli_missing() -> None:
     assert merged.fail_on == "error"
     assert merged.disable == ["X"]
     assert merged.rule_options == {"R": {"k": "v"}}
+
+
+def test_merge_overrides_preserves_diff_fail_on() -> None:
+    # `_merge_overrides` is a lint-side helper, but every command
+    # that goes through it (`lint`, `fix`, `snapshot`) must round-
+    # trip every Config field. Dropping `diff_fail_on` would let
+    # a hypothetical caller chain `lint`/`fix` and then `diff` and
+    # silently lose the user's `[diff].fail_on` setting. Pin the
+    # threading so a future refactor of the Config(...) constructor
+    # call can't regress it.
+    config = Config(
+        database_url="postgres://config",
+        schemas=["public"],
+        disable=[],
+        fail_on="warning",
+        rule_options={},
+        diff_fail_on="requires-review",
+    )
+    merged = _merge_overrides(
+        config, database_url=None, schemas_csv=None, fail_on=None
+    )
+    assert merged.diff_fail_on == "requires-review"
 
 
 def test_introspect_populates_policy_using_ast(pg_url: str, apply_sql) -> None:
@@ -977,6 +983,34 @@ def test_fix_unknown_rule_filter_errors_clearly(
     assert "PERF001" in result.output
     assert "VIEW001" in result.output
     assert "VIEW002" in result.output
+
+
+def test_fix_rule_filter_normalizes_case(
+    pg_url: str, apply_sql
+) -> None:
+    # `--rule sec002` is the same as `--rule SEC002` — mirrors the
+    # case-insensitive contract on `[lint].disable`,
+    # `[lint.rules.<ID>]`, `--fail-on`, etc. Without normalization,
+    # lowercase input would error with "unknown auto-fixable rule"
+    # even though the rule exists.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_case_norm (id INT);
+        ALTER TABLE public.fix_case_norm ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_case_norm
+            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "sec002"],
+    )
+    assert result.exit_code == 0
+    # SEC002 emits ALTER TABLE … FORCE ROW LEVEL SECURITY; the
+    # canonical fix output should reach stdout despite the
+    # lowercase input.
+    assert "FORCE ROW LEVEL SECURITY" in result.output
 
 
 def test_fix_unknown_rule_does_not_block_known_rule_in_same_invocation(
