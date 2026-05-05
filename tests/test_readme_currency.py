@@ -46,9 +46,10 @@ def test_readme_rule_table_lists_every_registered_rule(
     from pgrls.rules import all_rules
 
     registered_ids = {rule.id for rule in all_rules()}
-    # Find every `SEC###` / `PERF###` / `HYG###` token in the README.
+    # Find every `SEC###` / `PERF###` / `HYG###` / `VIEW###` token in
+    # the README.
     documented_ids = set(
-        re.findall(r"\b((?:SEC|PERF|HYG)\d{3})\b", readme_text)
+        re.findall(r"\b((?:SEC|PERF|HYG|VIEW)\d{3})\b", readme_text)
     )
     missing = registered_ids - documented_ids
     assert not missing, (
@@ -71,10 +72,10 @@ def test_readme_pg_floor_matches_ci_matrix(readme_text: str) -> None:
             if m.strip().isdigit()},
     )
     matrix_min = matrix_majors[0]
-    # README's floor mention: "Postgres 10+" / "Postgres 12+"
+    # README's floor mention: "Postgres 15+" / "Postgres 17+"
     floor_match = re.search(r"Postgres (\d+)\+", readme_text)
     assert floor_match is not None, (
-        "README must declare a Postgres floor like 'Postgres 10+'."
+        "README must declare a Postgres floor like 'Postgres 15+'."
     )
     declared_floor = int(floor_match.group(1))
     assert declared_floor <= matrix_min, (

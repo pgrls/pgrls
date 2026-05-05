@@ -38,8 +38,8 @@ def test_root_version_flag():
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-# Derive from the rule registry so a 16th rule lands without two
-# tuples drifting silently. `all_rules()` itself is covered by
+# Derive from the rule registry so a new rule lands without the
+# tuple drifting silently. `all_rules()` itself is covered by
 # tests/test_readme_currency.py against the README rules table.
 _ALL_RULE_IDS = tuple(rule.id for rule in all_rules())
 
@@ -72,17 +72,25 @@ def test_lint_against_known_bad_db_exits_nonzero(pg_url: str, apply_sql) -> None
 
 
 def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
-    # RLS + FORCE + at least one policy = the canonical clean
-    # shape. Without the policy SEC009 fires (RLS enabled, no
-    # policies). RESTRICTIVE keeps SEC003 silent; the column ref
-    # `id` keeps SEC005 silent.
+    # RLS + FORCE + a PERMISSIVE-non-PUBLIC policy + a RESTRICTIVE
+    # floor = the canonical clean shape:
+    #   - SEC001: RLS on
+    #   - SEC002: FORCE on
+    #   - SEC003: PERMISSIVE is to postgres, not PUBLIC
+    #   - SEC005: USING references the own column `id`
+    #   - SEC006: SELECT-only policies, no WITH CHECK needed
+    #   - SEC007: at least one RESTRICTIVE → not all-permissive
+    #   - SEC009: at least one policy → not RLS-without-policies
+    #   - SEC012: at least one PERMISSIVE → not silent deny-all
     apply_sql(
         """
         CREATE TABLE public.t (id INT);
         ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.t FORCE ROW LEVEL SECURITY;
-        CREATE POLICY t_p ON public.t
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+        CREATE POLICY t_permit ON public.t
+            FOR SELECT TO postgres USING (id > 0);
+        CREATE POLICY t_lock ON public.t
+            AS RESTRICTIVE FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -751,6 +759,10 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         "PERF002  public.allbad_perf002.randomized\n",
         "HYG001  public.allbad_hyg001.orphan\n",
         "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
+        "VIEW001  public.allbad_view001\n",
+        "VIEW002  public.allbad_view002\n",
+        "VIEW003  public.allbad_view003\n",
+        "VIEW004  public.allbad_view004\n",
     ):
         assert rule_loc in result.output, (
             f"{rule_loc!r} missing from output:\n{result.output}"
@@ -770,7 +782,7 @@ def test_fix_dry_run_emits_sec002_sql_without_applying(
         ALTER TABLE public.fix_target ENABLE ROW LEVEL SECURITY;
         -- FORCE intentionally missing → SEC002 fixable
         CREATE POLICY p ON public.fix_target
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -802,7 +814,7 @@ def test_fix_apply_executes_sec002_sql(
         CREATE TABLE public.fix_apply_target (id INT);
         ALTER TABLE public.fix_apply_target ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_apply_target
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -832,7 +844,7 @@ def test_fix_rule_filter_limits_to_requested_rule(
         CREATE TABLE public.fix_filter_a (id INT);
         ALTER TABLE public.fix_filter_a ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_filter_a
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         -- ^ SEC002 fixable
 
         CREATE TABLE public.fix_filter_b (id INT, user_id TEXT);
@@ -866,7 +878,7 @@ def test_fix_no_violations_emits_clear_message(
         ALTER TABLE public.fix_clean ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.fix_clean FORCE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_clean
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -895,12 +907,12 @@ def test_fix_apply_handles_multiple_fixes(
         CREATE TABLE public.fix_multi_a (id INT);
         ALTER TABLE public.fix_multi_a ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_multi_a
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
 
         CREATE TABLE public.fix_multi_b (id INT);
         ALTER TABLE public.fix_multi_b ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_multi_b
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -933,7 +945,7 @@ def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
         CREATE TABLE public.fix_idempotent (id INT);
         ALTER TABLE public.fix_idempotent ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_idempotent
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -962,7 +974,7 @@ def test_fix_unknown_rule_filter_errors_clearly(
         CREATE TABLE public.fix_unknown (id INT);
         ALTER TABLE public.fix_unknown ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_unknown
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -977,6 +989,8 @@ def test_fix_unknown_rule_filter_errors_clearly(
     # so the user can spot their typo.
     assert "SEC002" in result.output
     assert "PERF001" in result.output
+    assert "VIEW001" in result.output
+    assert "VIEW002" in result.output
 
 
 def test_fix_rule_filter_normalizes_case(
@@ -1018,7 +1032,7 @@ def test_fix_unknown_rule_does_not_block_known_rule_in_same_invocation(
         CREATE TABLE public.fix_mixed (id INT);
         ALTER TABLE public.fix_mixed ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_mixed
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     runner = CliRunner()
@@ -1048,12 +1062,12 @@ def test_fix_apply_rolls_back_on_statement_failure(
         CREATE TABLE public.fix_rollback_a (id INT);
         ALTER TABLE public.fix_rollback_a ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_rollback_a
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
 
         CREATE TABLE public.fix_rollback_b (id INT);
         ALTER TABLE public.fix_rollback_b ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_rollback_b
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
 
@@ -1128,7 +1142,7 @@ def test_fix_routes_sql_to_stdout_and_status_to_stderr(
         CREATE TABLE public.fix_streams (id INT);
         ALTER TABLE public.fix_streams ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_streams
-            AS RESTRICTIVE FOR SELECT TO PUBLIC USING (id > 0);
+            FOR SELECT TO postgres USING (id > 0);
         """
     )
     # Click 8.2 dropped the `mix_stderr` kwarg; stderr is exposed

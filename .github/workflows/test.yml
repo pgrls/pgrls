@@ -23,10 +23,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Floor (10) plus every still-supported major. Keep this
+        # Floor (15) plus every still-supported major. Keep this
         # in sync with README.md's stated PG floor and with
         # tests/test_pg_version_floor.py::_README_PG_FLOOR_NUM.
-        pg: ["10", "11", "12", "13", "14", "15", "16", "17"]
+        pg: ["15", "16", "17"]
     services:
       postgres:
         image: postgres:${{ matrix.pg }}-alpine
@@ -61,6 +61,5 @@ jobs:
       - name: Run unit tests
         run: uv run pytest tests/ -q
 
-      - name: Run demo tests (PG12+ only)
-        if: ${{ matrix.pg != '10' && matrix.pg != '11' }}
+      - name: Run demo tests
         run: uv run pytest demo/ -q

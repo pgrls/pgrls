@@ -32,14 +32,37 @@ DEMO_DIR = Path(__file__).parent
 CASES_DIR = DEMO_DIR / "cases"
 PGRLS_TOML_PATH = DEMO_DIR / "pgrls.toml"
 
-# Derive from the rule registry so a 16th rule lands without the
+# Derive from the rule registry so a new rule lands without the
 # demo's all-rules tuple drifting from the lint test suite's copy
 # (tests/test_cli.py does the same).
 _ALL_RULE_IDS = tuple(rule.id for rule in all_rules())
 
+# `_SEC012_ALLOWLIST_BLOCK` is the full per-table allowlist that the
+# demo's pgrls.toml uses (see the pgrls.toml comment for the
+# rationale — these tables predate SEC012 and are kept as-is to
+# avoid rewriting every demo case fixture). Embedding the same
+# block here keeps `_BASE_CONFIG`-based tests (uc72 etc.) seeing
+# the same SEC012-quiet shape; a future demo overhaul that updates
+# the fixtures to use proper PERMISSIVE+RESTRICTIVE pairs will
+# delete both.
+import tomllib  # noqa: E402
+
+_PGRLS_TOML_CONTENT = (DEMO_DIR / "pgrls.toml").read_text(encoding="utf-8")
+_PARSED_TOML = tomllib.loads(_PGRLS_TOML_CONTENT)
+_SEC012_ALLOWLIST = _PARSED_TOML.get("lint", {}).get(
+    "rules", {}
+).get("SEC012", {}).get("allowlist", [])
+_SEC012_ALLOWLIST_BLOCK = (
+    "[lint.rules.SEC012]\n"
+    "allowlist = [\n"
+    + "".join(f'    "{t}",\n' for t in _SEC012_ALLOWLIST)
+    + "]\n"
+)
+
 _BASE_CONFIG = (
     '[database]\nschemas = ["app"]\n'
     '[lint.rules.SEC001]\nallowlist = ["app.countries"]\n'
+    + _SEC012_ALLOWLIST_BLOCK
 )
 
 
