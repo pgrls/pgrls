@@ -69,6 +69,15 @@ def _tokenize_identifier(name: str) -> list[str]:
     (`TmpReadAll` → `tmp`, `read`, `all`), and SCREAMING_SNAKE
     (`TODO_OWNER` → `todo`, `owner`). Used by HYG002 to spot
     placeholder words inside any of those styles.
+
+    Edge case: identifiers that mix an all-caps acronym directly
+    against a lowercase word with no separator and no capital
+    boundary (e.g. `TODOcleanup`) are fundamentally ambiguous —
+    the same text could equally split as `TOD` + `Ocleanup`. The
+    tokenizer takes the latter; users who want HYG002 coverage
+    should write `TODO_cleanup`, `TODOCleanup`, or
+    `todo_cleanup` (any of the three standard conventions). Real
+    schemas don't produce the ambiguous form.
     """
     return [m.group(0).lower() for m in _TOKEN_RE.finditer(name)]
 

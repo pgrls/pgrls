@@ -1123,12 +1123,18 @@ message naming all three configuration paths.
 | `assert_visible(sql)` | query returns ≥ 1 row | zero rows |
 | `assert_invisible(sql)` | query returns 0 rows | any rows |
 | `assert_rejected(sql)` | Postgres raises `InsufficientPrivilege` (SQLSTATE `42501`) | query succeeds OR raises a different error |
-| `assert_silently_dropped(sql)` | `UPDATE/DELETE … RETURNING` succeeds but `USING` filters the row out before the write; `RETURNING` is empty | DML raises OR `RETURNING` returns rows. SQL without `RETURNING` raises `PgrlsTestError` (caller-error, distinct from `PgrlsTestAssertionError`). |
+| `assert_silently_dropped(sql)` | `UPDATE/DELETE … RETURNING` succeeds but `USING` filters the row out before the write; `RETURNING` is empty | DML raises OR `RETURNING` returns rows. Non-UPDATE/DELETE SQL (SELECT, INSERT, …) and UPDATE/DELETE missing `RETURNING` both raise `PgrlsTestError` (caller-error, distinct from `PgrlsTestAssertionError`). |
 
 `assert_rejected` and `assert_silently_dropped` distinguish two distinct
 Postgres failure modes — `WITH CHECK` violations raise (catch with the first);
 `USING` filtering of `UPDATE`/`DELETE` returns silently empty (catch with the
 second).
+
+`assert_silently_dropped` rejects mis-shaped SQL via psycopg's
+post-execute statement-tag (`statusmessage`), which means the SQL
+is fully executed (and any side effects committed within the
+current transaction) before the verb-gate rejects it. Pass only
+the UPDATE/DELETE you actually want to execute.
 
 ### Writing TS or Go ports
 
@@ -1228,7 +1234,7 @@ Driven by `pgrls.diff.ast_compare.compare_predicates`:
 
 | AST pattern (old → new) | Classification |
 |---|---|
-| Identical after pglast normalization (whitespace-only diff) | SAFE |
+| Identical after pglast normalization (whitespace-only diff) | (no Change emitted) |
 | `P` → `P AND Q` (new AND clause added) | SAFE |
 | `P AND Q` → `P` (AND clause removed) | DANGEROUS |
 | `P` → `P OR Q` (new OR disjunct added) | DANGEROUS |
