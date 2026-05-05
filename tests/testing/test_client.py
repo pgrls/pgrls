@@ -234,6 +234,26 @@ def test_nested_as_role_restores_outer_role_on_inner_clean_exit(
             assert parsed["sub"] == "alice"
 
 
+def test_as_role_recovers_when_role_does_not_exist(
+    testing_pg_conn: psycopg.Connection,
+) -> None:
+    # Postgres raises InvalidParameterValue (SQLSTATE 22023) when
+    # SET LOCAL ROLE names a role that doesn't exist. The savepoint
+    # cleanup must roll back so the outer transaction stays usable
+    # for subsequent statements — pin this so a future refactor of
+    # the try/finally can't regress the path.
+    import pytest
+
+    client = PgrlsTestClient(testing_pg_conn)
+    with client.transaction():
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            with client.as_role("pgrls_test_role_does_not_exist"):
+                pass  # never reached
+        # Connection still works (transaction not aborted).
+        rows = client.fetchall("SELECT 1 AS x")
+        assert rows == [{"x": 1}]
+
+
 def test_as_role_setup_exception_runs_cleanup(
     testing_pg_conn: psycopg.Connection,
 ) -> None:

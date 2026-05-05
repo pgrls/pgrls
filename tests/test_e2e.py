@@ -1,31 +1,63 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
+import sys
 from pathlib import Path
-
-import pytest
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+# Invoke the CLI via `python -m pgrls` against the test runner's
+# own interpreter, not whatever `pgrls` happens to be on $PATH.
+# Guarantees the subprocess sees the same `site-packages` (and
+# therefore the same `pgrls` package) that the test process
+# imported, so the e2e tests work in any env — venv, uv,
+# tox, CI — without needing a separately-installed console script.
+_PGRLS_CMD: tuple[str, ...] = (sys.executable, "-m", "pgrls")
 
-@pytest.fixture(scope="session")
-def pgrls_bin() -> str:
-    binary = shutil.which("pgrls")
-    if binary is None:
-        # `skip` is friendlier than `fail` here: a fresh checkout
-        # without `pip install -e .[dev]` shouldn't crash the
-        # whole runner, just the e2e tests.
-        pytest.skip("`pgrls` not on PATH; install with `pip install -e \".[dev]\"`")
-    return binary
+
+def test_python_m_pgrls_help_works() -> None:
+    # Pin that `python -m pgrls` is a supported entry point. The
+    # `pgrls/__main__.py` module exists for callers that need to
+    # bypass $PATH lookup of the console script (this test, the
+    # other e2e tests, anyone running pgrls inside a venv that
+    # didn't install console scripts onto $PATH).
+    result = subprocess.run(
+        [*_PGRLS_CMD, "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Subcommands surface in the top-level --help: lint/fix/snapshot/diff.
+    for sub in ("lint", "fix", "snapshot", "diff"):
+        assert sub in result.stdout, f"{sub!r} missing from --help"
+
+
+def test_python_m_pgrls_version_matches_package() -> None:
+    # `python -m pgrls --version` must report the same string the
+    # package's `__version__` exposes — pins the entry-point
+    # contract in case a future refactor mounts a different `main`
+    # callable behind `python -m pgrls`.
+    from pgrls import __version__
+
+    result = subprocess.run(
+        [*_PGRLS_CMD, "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert __version__ in result.stdout
 
 
 def test_subprocess_known_bad_exits_nonzero(
-    pg_url: str, apply_sql, pgrls_bin: str
+    pg_url: str, apply_sql
 ) -> None:
     apply_sql((FIXTURES_DIR / "known_bad.sql").read_text(encoding="utf-8"))
     result = subprocess.run(
-        [pgrls_bin, "lint", "--database-url", pg_url],
+        [*_PGRLS_CMD, "lint", "--database-url", pg_url],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -37,7 +69,7 @@ def test_subprocess_known_bad_exits_nonzero(
 
 
 def test_subprocess_clean_db_exits_zero(
-    pg_url: str, apply_sql, pgrls_bin: str
+    pg_url: str, apply_sql
 ) -> None:
     # "Clean" means: every rule (SEC001-SEC011, PERF001-PERF002,
     # HYG001-HYG002) is satisfied, not just SEC001-SEC002. The
@@ -71,7 +103,7 @@ def test_subprocess_clean_db_exits_zero(
         """
     )
     result = subprocess.run(
-        [pgrls_bin, "lint", "--database-url", pg_url],
+        [*_PGRLS_CMD, "lint", "--database-url", pg_url],
         capture_output=True,
         text=True,
         encoding="utf-8",

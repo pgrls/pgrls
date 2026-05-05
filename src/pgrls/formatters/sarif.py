@@ -8,10 +8,12 @@ with `tool.driver.rules` listing the unique rule descriptors for
 every rule that fired (deduplicated, order-preserved). Each
 violation becomes a `result` with `ruleId`, `level`, `message`,
 and `locations[0].logicalLocations[0].fullyQualifiedName` set to
-`<schema>.<table>[.<policy>]`. SARIF doesn't have a "table" or
+`schema.table[.policy]`. SARIF doesn't have a "table" or
 "policy" location kind in its physical-source taxonomy, so we use
 the logical-location form GitHub Code Scanning displays as the
-finding's "Path".
+finding's "Path". Schema-wide findings (no specific table) use
+the literal `(schema-wide)` sentinel — readable in the GitHub UI
+and unambiguous (no real qualified name contains parentheses).
 
 Severity mapping:
 
@@ -125,10 +127,12 @@ def _result(
     # SARIF §3.27.12 says `locations` SHOULD be omitted when none
     # are known, but GitHub Code Scanning's SARIF upload endpoint
     # rejects results with an empty `locations` array. Synthesize a
-    # `<schema>` logicalLocation when the violation has none — keeps
-    # the document GitHub-ingestible for any future schema-wide rule
-    # that doesn't pin to a specific table or policy.
-    fqn = v.location if v.location is not None else "<schema>"
+    # `(schema-wide)` logicalLocation when the violation has none —
+    # keeps the document GitHub-ingestible for any future schema-
+    # wide rule that doesn't pin to a specific table or policy.
+    # Real qualified names never contain parentheses, so the
+    # sentinel is unambiguous.
+    fqn = v.location if v.location is not None else "(schema-wide)"
     out["locations"] = [
         {"logicalLocations": [{"fullyQualifiedName": fqn}]}
     ]
