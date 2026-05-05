@@ -126,6 +126,11 @@ def test_url_must_be_a_string(tmp_path: Path) -> None:
 def test_env_interpolation_does_not_apply_to_disable_list(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Env interpolation runs on `[database].url` only, not on the
+    # disable list. The validator therefore sees the literal
+    # `$SHOULD_NOT_EXPAND` (not the env value) — confirming this
+    # by asserting the rule-id-validation error reports the literal
+    # token, never the expanded value.
     monkeypatch.setenv("SHOULD_NOT_EXPAND", "expanded-value")
     cfg_file = tmp_path / "pgrls.toml"
     cfg_file.write_text(
@@ -134,8 +139,10 @@ def test_env_interpolation_does_not_apply_to_disable_list(
 disable = ["$SHOULD_NOT_EXPAND"]
 """
     )
-    cfg = load_config(path=cfg_file)
-    assert cfg.disable == ["$SHOULD_NOT_EXPAND"]
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path=cfg_file)
+    assert "$SHOULD_NOT_EXPAND" in str(excinfo.value)
+    assert "expanded-value" not in str(excinfo.value)
 
 
 def test_disable_must_be_a_list(tmp_path: Path) -> None:
@@ -245,6 +252,114 @@ allowlist = ["countries", "currencies"]
     assert cfg.rule_options["SEC001"] == {
         "allowlist": ["countries", "currencies"]
     }
+
+
+def test_disable_rejects_unknown_rule_id(tmp_path: Path) -> None:
+    # A typo in `[lint].disable` should fail loud, not silently
+    # leave the rule enabled. The error mentions both the unknown
+    # token and the catalog so the user can spot the typo.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\ndisable = ["SEC0001"]\n')
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path=cfg_file)
+    msg = str(excinfo.value)
+    assert "SEC0001" in msg
+    assert "SEC001" in msg
+
+
+def test_disable_normalizes_rule_id_case(tmp_path: Path) -> None:
+    # `[lint].disable = ["sec001"]` is the same as ["SEC001"] —
+    # mirrors the case-insensitive contract on `--fail-on`,
+    # `[lint].fail_on`, `[diff].fail_on`, and `[lint.rules.<ID>]`.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\ndisable = ["sec001", "Hyg002"]\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.disable == ["SEC001", "HYG002"]
+
+
+def test_disable_rejects_case_collision(tmp_path: Path) -> None:
+    # Two entries that differ only in case both normalize to
+    # SEC001 — surface as a config error, parallel to the
+    # `[lint.rules.<ID>]` collision check.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\ndisable = ["SEC001", "sec001"]\n')
+    with pytest.raises(ConfigError, match="case-insensitive"):
+        load_config(path=cfg_file)
+
+
+def test_disable_dedupes_identical_entries(tmp_path: Path) -> None:
+    # `["SEC001", "SEC001"]` is harmless (same id twice) — keep
+    # the first, drop the second so the resulting Config is clean.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\ndisable = ["SEC001", "SEC001"]\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.disable == ["SEC001"]
+
+
+def test_disable_accepts_full_rule_catalog(tmp_path: Path) -> None:
+    # Disabling every shipping rule simultaneously is a degenerate
+    # but valid config — pins that the validator's known-id set is
+    # derived from the same `all_rules()` source as the runtime
+    # registry. A drift between the two (e.g. validator hand-codes
+    # rule ids that fall behind a new SEC012) would surface here.
+    from pgrls.rules import all_rules
+
+    catalog = sorted(rule.id for rule in all_rules())
+    cfg_file = tmp_path / "pgrls.toml"
+    quoted = ", ".join(f'"{rid}"' for rid in catalog)
+    cfg_file.write_text(f"[lint]\ndisable = [{quoted}]\n")
+    cfg = load_config(path=cfg_file)
+    assert sorted(cfg.disable) == catalog
+
+
+def test_rule_options_normalizes_section_id_case(tmp_path: Path) -> None:
+    # `[lint.rules.sec004]` should reach SEC004's check via the
+    # canonical uppercase rule id.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        """
+[lint.rules.sec004]
+auth_functions = ["auth.custom"]
+"""
+    )
+    cfg = load_config(path=cfg_file)
+    assert cfg.rule_options == {
+        "SEC004": {"auth_functions": ["auth.custom"]}
+    }
+
+
+def test_rule_options_rejects_unknown_rule_id(tmp_path: Path) -> None:
+    # `[lint.rules.SEC0001]` is shape-valid (table-of-table) but
+    # references a nonexistent rule. Without validation, the
+    # options would be silently parked and the user would think
+    # they'd configured an allowlist that the rule never sees.
+    # Mirror the `[lint].disable` validation hint with the catalog.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        '[lint.rules.SEC0001]\nallowlist = ["countries"]\n'
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path=cfg_file)
+    msg = str(excinfo.value)
+    assert "SEC0001" in msg
+    assert "SEC001" in msg
+
+
+def test_rule_options_rejects_case_collision(tmp_path: Path) -> None:
+    # Two TOML sections that differ only in case both normalize to
+    # the same id — should fail loud rather than silently keep one.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        """
+[lint.rules.SEC001]
+allowlist = ["countries"]
+
+[lint.rules.sec001]
+allowlist = ["currencies"]
+"""
+    )
+    with pytest.raises(ConfigError, match="case-insensitive"):
+        load_config(path=cfg_file)
 
 
 def test_env_interpolation_with_multiple_vars_in_one_string(

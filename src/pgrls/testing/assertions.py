@@ -16,7 +16,7 @@ import secrets
 
 import psycopg
 
-from pgrls.testing.errors import PgrlsTestAssertionError
+from pgrls.testing.errors import PgrlsTestAssertionError, PgrlsTestError
 
 
 def _row_count(
@@ -136,25 +136,48 @@ def assert_silently_dropped(
     standard error path rather than being swallowed. If you
     want savepoint-tolerant rejection assertions, use
     `assert_rejected` for the raise path.
-    """
-    from pgrls.testing.errors import PgrlsTestError
 
+    Side-effect note: the SQL runs to completion before the
+    statement-verb check rejects a non-UPDATE/DELETE call.
+    Passing a SELECT or INSERT here therefore executes the
+    statement (potentially side-effecting) and *then* raises
+    `PgrlsTestError`. Don't rely on the verb-gate to short-
+    circuit destructive SQL; only call this with UPDATE/DELETE
+    that you actually want to run.
+    """
     with conn.cursor() as cur:
         cur.execute(sql)
+        # `statusmessage` is psycopg's command-tag exposure: "UPDATE
+        # 5", "DELETE 0", "SELECT 12", etc. Gate on the verb so a
+        # SELECT (which produces a result set whether or not it
+        # returns rows) can't silently masquerade as the
+        # silent-drop shape — `assert_silently_dropped("SELECT * FROM
+        # t WHERE 1=0")` would otherwise pass with zero rows even
+        # though no RLS-aware DML ran.
+        status = (cur.statusmessage or "").upper()
+        verb = status.split(" ", 1)[0] if status else ""
+        if verb not in {"UPDATE", "DELETE"}:
+            raise PgrlsTestError(
+                "assert_silently_dropped is for UPDATE/DELETE … "
+                "RETURNING (USING acts as a row pre-filter); "
+                "INSERT … RETURNING does NOT silently drop — "
+                "Postgres raises InsufficientPrivilege on a WITH "
+                "CHECK violation. Use assert_invisible for SELECT "
+                "and assert_rejected for INSERT."
+                f" Got command verb {verb or '(unknown)'!r} for "
+                f"query: {sql!r}"
+            )
         try:
             rows = cur.fetchall()
         except psycopg.ProgrammingError as exc:
-            # No result set produced — the SQL didn't have a
-            # RETURNING clause, or the statement isn't a DML.
+            # No result set produced — the UPDATE/DELETE didn't have
+            # a RETURNING clause; without it the row count is not
+            # the relevant signal.
             raise PgrlsTestError(
                 "assert_silently_dropped requires the SQL to use "
                 "RETURNING — the helper checks that the affected "
                 "row was hidden from the current role by counting "
-                "RETURNING's output. assert_silently_dropped is "
-                "for UPDATE/DELETE … RETURNING (USING acts as a "
-                "row pre-filter); INSERT … RETURNING does NOT "
-                "silently drop — Postgres raises "
-                "InsufficientPrivilege on a WITH CHECK violation. "
+                "RETURNING's output. "
                 f"Query produced no result set: {sql!r}"
             ) from exc
     if rows:

@@ -32,7 +32,7 @@ from typing import Any
 
 from pglast.ast import A_Const, Boolean
 
-from pgrls.model import Schema
+from pgrls.model import Policy, Schema, Table
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -81,7 +81,7 @@ class SEC010:
         return out
 
     @staticmethod
-    def _which_clause_is_false(policy: Any) -> str | None:
+    def _which_clause_is_false(policy: Policy) -> str | None:
         # Symmetric with SEC011: walk both clauses. Prefer USING in
         # the "both clauses are false" case (rare but legal —
         # `USING (false) WITH CHECK (false)` — the USING phrasing
@@ -98,7 +98,7 @@ class SEC010:
         return None
 
     @staticmethod
-    def _message(table: Any, policy: Any, clause: str) -> str:
+    def _message(table: Table, policy: Policy, clause: str) -> str:
         # USING (false) denies reads/visibility; WITH CHECK (false)
         # denies writes. Same remediation (REVOKE at the GRANT
         # layer), different framing of what's broken, so the

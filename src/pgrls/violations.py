@@ -25,9 +25,16 @@ Severity = Literal["error", "warning", "info"]
 # severe. Anything that needs to enumerate severities (Click choice
 # list, runtime validators, formatters that iterate severities for
 # count summaries) imports this instead of duplicating the tuple.
-# Built from `Severity`'s Literal members so the two can never
-# drift.
-ALL_SEVERITIES: tuple[Severity, ...] = get_args(Severity)
+# Order is explicit (not derived from `get_args(Severity)`) — the
+# `is_at_or_above` contract depends on it, and `Literal[...]` member
+# order is a contract Python doesn't surface. The assert below pins
+# both halves: the tuple covers every Literal member, and the
+# Literal covers every tuple entry.
+ALL_SEVERITIES: tuple[Severity, ...] = ("error", "warning", "info")
+assert set(ALL_SEVERITIES) == set(get_args(Severity)), (
+    "ALL_SEVERITIES must enumerate every Severity Literal member "
+    "exactly once"
+)
 SEVERITY_ORDER: dict[Severity, int] = {
     sev: i for i, sev in enumerate(ALL_SEVERITIES)
 }
