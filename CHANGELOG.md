@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-05
+
+### Changed
+- **Demo case 01 (`app.documents` — canonical clean tenant table)
+  rewritten to use a proper PERMISSIVE + RESTRICTIVE pair.** v0.3.0
+  added SEC012 (table has only RESTRICTIVE policies — silent
+  deny-all). The demo's flagship "canonical clean shape" was using
+  RESTRICTIVE-only and was therefore silently deny-all in real
+  Postgres (verified empirically). uc01 now demonstrates the
+  correct pattern: a PERMISSIVE policy grants tenant-scoped access,
+  and a RESTRICTIVE policy enforces tenant scoping. `app.documents`
+  is removed from `[lint.rules.SEC012].allowlist`. The first
+  installment of [issue #11](https://github.com/pgrls/pgrls/issues/11);
+  remaining cases land in v0.3.2+.
+
 ## [0.3.0] - 2026-05-04
 
 ### BREAKING

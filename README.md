@@ -240,7 +240,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.3.0
+    rev: v0.3.1
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to
