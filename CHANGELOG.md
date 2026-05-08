@@ -10,6 +10,49 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-05-08
+
+### Added
+- **`pgrls diff -v / --verbose`**. With `--apply`, emits cache
+  hit/miss state, the cache image tag, and per-step timings
+  (boot, baseline restore, migration apply, introspect) on
+  stderr. Stdout (the diff text/JSON/SARIF payload) stays
+  machine-parsable. On the snapshot-vs-snapshot path the flag
+  is a silent no-op (nothing to time).
+
+  ```sh
+  pgrls diff base.json --apply migration.sql -v
+  # pgrls: cache: miss pgrls-baseline:abcdef0123456789; booting postgres:17-alpine and will commit after baseline restore
+  # pgrls: booted in 1.34s
+  # pgrls: created 2 role(s): ['app_user', 'tenant_admin']
+  # pgrls: baseline restored in 0.12s
+  # pgrls: committed baseline cache pgrls-baseline:abcdef0123456789 in 0.45s
+  # pgrls: migration applied in 0.08s
+  # pgrls: introspected in 0.21s
+  ```
+
+- **`pgrls cache` subcommand group** (`list` and `prune`). Thin
+  wrappers around `docker images` / `docker image rm` that
+  filter by the `org.pgrls.cache=baseline` label so user-tagged
+  images aren't touched.
+
+  ```sh
+  pgrls cache list
+  # pgrls-baseline:abcdef0123456789  437.0MB
+  # pgrls-baseline:fedcba9876543210  437.0MB
+  # -- 2 image(s), 874.0MB total
+
+  pgrls cache prune          # interactive (y/N prompt)
+  pgrls cache prune --yes    # CI-friendly, no prompt
+  ```
+
+### Internal
+- Refactored `_apply_migration_for_diff` to thread a `verbose`
+  flag through to a small `vlog()` closure. Output goes to
+  stderr; never pollutes stdout.
+- New `_human_bytes()` helper for the cache list output. Uses
+  decimal (1000-based) units to match `docker images`.
+
 ## [0.5.2] - 2026-05-08
 
 ### Added
