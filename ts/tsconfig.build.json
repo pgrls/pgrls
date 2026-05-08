@@ -1,0 +1,14 @@
+{
+  /* Build config — extends the dev tsconfig but emits .js + .d.ts. */
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["test/**/*", "**/*.test.ts"]
+}
