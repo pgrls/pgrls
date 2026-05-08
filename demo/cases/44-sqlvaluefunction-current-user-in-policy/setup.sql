@@ -14,6 +14,13 @@ CREATE TABLE app.current_user_check (
 );
 ALTER TABLE app.current_user_check ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.current_user_check FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy referencing the own `visibility` column so
+-- SEC005 stays silent. `visibility IS NOT NULL` is a benign own-
+-- column predicate, no auth involved → PERF001 / SEC004 silent.
+CREATE POLICY current_user_check_authenticated_access ON app.current_user_check
+    FOR ALL TO app_authenticated
+    USING (visibility IS NOT NULL)
+    WITH CHECK (visibility IS NOT NULL);
 CREATE POLICY only_admin_role ON app.current_user_check
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
