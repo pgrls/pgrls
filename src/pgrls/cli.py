@@ -19,6 +19,7 @@ Exit codes:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -581,6 +582,109 @@ def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
     )
 
 
+def _apply_migration_for_diff(
+    *,
+    base_schema: Schema,
+    migration_path: str,
+    schemas: list[str],
+) -> Schema:
+    """Spin up an ephemeral Postgres, restore base, apply migration, introspect.
+
+    Used by ``pgrls diff --apply migration.sql``. The baseline schema
+    is restored via ``Schema.to_sql()``; the migration SQL is applied
+    on top; the resulting schema is introspected and returned as the
+    diff's "head". The container is torn down at function exit
+    (testcontainers context manager).
+
+    Roles referenced by base policies / grants are pre-created
+    idempotently in the container so the restore SQL applies. The
+    migration SQL is treated as opaque — Postgres parses it. A
+    migration that fails to apply surfaces the psycopg error
+    verbatim and the caller raises ToolError(exit 2).
+
+    Requires the ``pgrls[diff-apply]`` extra (testcontainers). When
+    the extra isn't installed, raises ToolError with a clear
+    install hint — the diff command stays usable for the
+    snapshot-vs-snapshot and snapshot-vs-DB paths even without
+    testcontainers.
+    """
+    try:
+        from testcontainers.postgres import PostgresContainer
+    except ImportError as exc:
+        raise ToolError(
+            "--apply requires the `pgrls[diff-apply]` extra "
+            "(testcontainers + Docker). Install with `pip install "
+            "'pgrls[diff-apply]'` and ensure Docker is running."
+        ) from exc
+
+    try:
+        baseline_sql = base_schema.to_sql()
+    except ValueError as exc:
+        # Snapshot v3/v4 baseline — no column_details, so to_sql
+        # can't fabricate the CREATE TABLE statements. Surface the
+        # clear "re-capture against v0.5+" message.
+        raise ToolError(str(exc)) from exc
+
+    migration_sql = Path(migration_path).read_text(encoding="utf-8")
+
+    # Collect the set of role names referenced by base policies
+    # and grants so we can pre-create them in the ephemeral
+    # container. PUBLIC is a Postgres pseudo-role and doesn't need
+    # creation; everything else is created NOLOGIN, idempotent.
+    role_names: set[str] = set()
+    for table in base_schema.tables:
+        for policy in table.policies:
+            for role in policy.roles:
+                if role != "PUBLIC":
+                    role_names.add(role)
+        for grant in table.grants:
+            if grant.role != "PUBLIC":
+                role_names.add(grant.role)
+
+    # Pin to the same Postgres major as the user's CI matrix; the
+    # default :latest pull is stable but a migration that depends on
+    # PG version-specific syntax could surprise the user. Read from
+    # PGRLS_DIFF_APPLY_PG_IMAGE for explicit override, else
+    # postgres:17-alpine (the highest in the project's CI matrix).
+    image = os.environ.get(
+        "PGRLS_DIFF_APPLY_PG_IMAGE", "postgres:17-alpine"
+    )
+
+    with PostgresContainer(
+        image,
+        username="postgres",
+        password="postgres",
+        dbname="postgres",
+    ) as pg:
+        url = pg.get_connection_url(driver=None)
+        try:
+            with psycopg.connect(url, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    # 1. Pre-create roles referenced by base.
+                    for role in sorted(role_names):
+                        cur.execute(
+                            "DO $$ BEGIN "
+                            "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN "
+                            "EXECUTE format('CREATE ROLE %%I NOLOGIN', %s); "
+                            "END IF; END $$;",
+                            (role, role),
+                        )
+                    # 2. Restore baseline DDL.
+                    cur.execute(baseline_sql)
+                    # 3. Apply migration as a single multi-statement
+                    # script. Any syntax / runtime error surfaces as
+                    # a psycopg.Error caught below.
+                    cur.execute(migration_sql)
+            # 4. Introspect the resulting schema.
+            with psycopg.connect(url) as conn:
+                return introspect(conn, schemas=schemas)
+        except psycopg.Error as exc:
+            raise ToolError(
+                f"--apply: migration {migration_path!r} failed against "
+                f"the restored baseline: {exc}"
+            ) from exc
+
+
 # ---------------------------------------------------------------------------
 # diff command
 # ---------------------------------------------------------------------------
@@ -650,6 +754,19 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
     default=None,
     help="Comma-separated schemas to introspect (applied to URL sources only).",
 )
+@click.option(
+    "--apply",
+    "migration_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Path to a SQL migration file. Diff against the post-migration "
+        "schema by spinning up an ephemeral Postgres testcontainer, "
+        "restoring <base> via Schema.to_sql(), applying the migration, "
+        "and introspecting the result. Mutually exclusive with <head>. "
+        "Requires `pip install pgrls[diff-apply]`."
+    ),
+)
 def diff(
     base: str,
     head: str | None,
@@ -658,12 +775,24 @@ def diff(
     output_format: str,
     config_path: str | None,
     schemas: str | None,
+    migration_path: str | None,
 ) -> None:
     """Diff two RLS schema snapshots — report semantic changes with classification."""
     try:
         config = load_config(config_path)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
+
+    # --apply and <head> are mutually exclusive. --apply produces
+    # the head from the migration; specifying <head> too is
+    # ambiguous about which one wins.
+    if migration_path is not None and head is not None:
+        raise ToolError(
+            "--apply and <head> are mutually exclusive. Pass either a "
+            "migration file (post-migration head computed via "
+            "ephemeral Postgres) or a head argument (URL or snapshot), "
+            "not both."
+        )
 
     # `--fail-on` fallback chain:
     #   1. CLI flag (if passed; Click resolves to lower-case via Choice).
@@ -687,11 +816,10 @@ def diff(
     #   1. <head> positional arg (already-resolved before this point)
     #   2. --database-url flag (Click reads $DATABASE_URL via envvar=)
     #   3. [database].url in pgrls.toml (lives on config.database_url)
-    # All three are documented in CHANGELOG.md and AGENTS.md;
-    # the implementation here was previously honoring only #3,
-    # which broke the common "DATABASE_URL is set, no toml file
-    # exists" CI workflow.
-    if head is None:
+    # --apply bypasses this entirely — the head comes from applying
+    # the migration to a restored copy of <base>, not from any
+    # external source.
+    if migration_path is None and head is None:
         head = database_url or config.database_url
         if head is None:
             raise ToolError(
@@ -716,8 +844,8 @@ def diff(
         return "://" in arg and not arg.startswith("file://")
 
     base_is_url = _is_db_url(base)
-    head_is_url = _is_db_url(head)
-    if schemas and not (base_is_url or head_is_url):
+    head_is_url = _is_db_url(head) if head is not None else False
+    if schemas and not (base_is_url or head_is_url) and migration_path is None:
         click.echo(
             "pgrls: warning: --schemas is ignored when both <base> and "
             "<head> are snapshot files (filters apply only to live DB "
@@ -727,7 +855,18 @@ def diff(
         )
 
     base_schema = _resolve_diff_source(base, schemas=schema_list)
-    head_schema = _resolve_diff_source(head, schemas=schema_list)
+
+    if migration_path is not None:
+        # --apply path: spin up testcontainer, restore base via
+        # Schema.to_sql(), apply migration, introspect → head.
+        head_schema = _apply_migration_for_diff(
+            base_schema=base_schema,
+            migration_path=migration_path,
+            schemas=schema_list,
+        )
+    else:
+        assert head is not None  # guaranteed by the fallback chain above
+        head_schema = _resolve_diff_source(head, schemas=schema_list)
 
     changes = diff_schemas(base_schema, head_schema)
 
