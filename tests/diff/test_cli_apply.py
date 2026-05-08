@@ -350,6 +350,207 @@ def test_diff_apply_auto_detects_create_extension_in_migration(
     assert result.exit_code == 0, result.output
 
 
+def test_diff_apply_baseline_cache_creates_image_on_first_run_and_reuses_on_second(
+    pg_url: str, apply_sql, tmp_path: Path
+) -> None:
+    """v0.5.2 baseline cache: the first --apply run for a given
+    (pg_image, baseline, roles, extensions) combination boots a
+    fresh container, restores the baseline, commits the result
+    into a tagged docker image, then continues. The second run
+    with the same inputs short-circuits — boots directly from the
+    cached image, skips the baseline restore.
+
+    Pin the cache contract by checking:
+      1. After run 1, the cached image exists in the local docker daemon.
+      2. Both runs return the same diff output (cache reuse must
+         not change observable behaviour).
+      3. The cached image carries the `org.pgrls.cache=baseline`
+         label so users can `docker image prune --filter` it.
+    """
+    import docker
+    from docker.errors import ImageNotFound
+
+    from pgrls.diff import _apply_cache
+    from pgrls.model import Schema
+
+    apply_sql(
+        """
+        CREATE TABLE public.cache_test_orders (
+            id BIGSERIAL,
+            tenant_id UUID NOT NULL
+        );
+        ALTER TABLE public.cache_test_orders ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.cache_test_orders FORCE ROW LEVEL SECURITY;
+        """
+    )
+
+    runner = CliRunner()
+    snap_result = runner.invoke(
+        main,
+        ["snapshot", "--database-url", pg_url, "--schemas", "public"],
+    )
+    assert snap_result.exit_code == 0, snap_result.output
+    base_path = tmp_path / "base.json"
+    base_path.write_text(snap_result.output, encoding="utf-8")
+
+    migration_path = tmp_path / "migration.sql"
+    migration_path.write_text(
+        "CREATE POLICY tenant_lock ON public.cache_test_orders "
+        "AS RESTRICTIVE FOR ALL TO PUBLIC "
+        "USING (tenant_id IS NOT NULL) "
+        "WITH CHECK (tenant_id IS NOT NULL);\n",
+        encoding="utf-8",
+    )
+
+    # Compute the expected cache key so we can assert on the
+    # specific image tag and clean it up at the end.
+    base_schema = Schema.from_snapshot(json.loads(snap_result.output))
+    baseline_sql = base_schema.to_sql()
+    expected_key = _apply_cache.compute_cache_key(
+        pg_image="postgres:17-alpine",
+        baseline_sql=baseline_sql,
+        roles=set(),  # no roles in this baseline
+        extensions=set(),  # no extensions
+    )
+    expected_tag = _apply_cache.cached_image_tag(expected_key)
+
+    # Pre-clean: remove any cache image left from a prior test
+    # run so we observe a clean miss → hit transition.
+    docker_client = docker.from_env()
+    try:
+        docker_client.images.remove(expected_tag, force=True)
+    except ImageNotFound:
+        pass  # already absent — that's the desired starting state
+
+    # Run 1 — cache miss. Should create the image.
+    result1 = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result1.exit_code == 0, result1.output
+
+    # Verify the image exists with the expected label.
+    image = docker_client.images.get(expected_tag)
+    labels = image.attrs.get("Config", {}).get("Labels") or {}
+    assert labels.get(_apply_cache.CACHE_LABEL_KEY) == _apply_cache.CACHE_LABEL_VALUE, (
+        f"Expected label {_apply_cache.CACHE_LABEL_KEY}="
+        f"{_apply_cache.CACHE_LABEL_VALUE}, got {labels}"
+    )
+
+    # Run 2 — cache hit. Should produce identical output.
+    result2 = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result2.exit_code == 0, result2.output
+    assert result1.output == result2.output, (
+        "Cached run must produce identical output to fresh run; "
+        f"got\nrun1:\n{result1.output}\nrun2:\n{result2.output}"
+    )
+
+    # Cleanup — leave the daemon as we found it.
+    try:
+        docker_client.images.remove(expected_tag, force=True)
+    except ImageNotFound:
+        pass
+
+
+def test_diff_apply_baseline_cache_can_be_disabled_via_env(
+    pg_url: str, apply_sql, tmp_path: Path, monkeypatch
+) -> None:
+    """Set ``PGRLS_DIFF_APPLY_NO_CACHE=1`` and the cache must not
+    be touched — no image lookup, no commit. Useful as an escape
+    hatch when debugging cache-related issues.
+    """
+    import docker
+    from docker.errors import ImageNotFound
+
+    from pgrls.diff import _apply_cache
+    from pgrls.model import Schema
+
+    monkeypatch.setenv(_apply_cache.DISABLE_ENV_VAR, "1")
+
+    apply_sql(
+        """
+        CREATE TABLE public.cache_disabled_test (
+            id BIGSERIAL,
+            tenant_id UUID NOT NULL
+        );
+        ALTER TABLE public.cache_disabled_test ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.cache_disabled_test FORCE ROW LEVEL SECURITY;
+        """
+    )
+
+    runner = CliRunner()
+    snap_result = runner.invoke(
+        main,
+        ["snapshot", "--database-url", pg_url, "--schemas", "public"],
+    )
+    assert snap_result.exit_code == 0, snap_result.output
+    base_path = tmp_path / "base.json"
+    base_path.write_text(snap_result.output, encoding="utf-8")
+
+    base_schema = Schema.from_snapshot(json.loads(snap_result.output))
+    baseline_sql = base_schema.to_sql()
+    expected_key = _apply_cache.compute_cache_key(
+        pg_image="postgres:17-alpine",
+        baseline_sql=baseline_sql,
+        roles=set(),
+        extensions=set(),
+    )
+    expected_tag = _apply_cache.cached_image_tag(expected_key)
+
+    # Pre-clean: confirm the image is absent before the run.
+    docker_client = docker.from_env()
+    try:
+        docker_client.images.remove(expected_tag, force=True)
+    except ImageNotFound:
+        pass
+
+    migration_path = tmp_path / "migration.sql"
+    migration_path.write_text(
+        "ALTER TABLE public.cache_disabled_test ADD COLUMN note TEXT;\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    # Cache was disabled, so no image should have been created.
+    try:
+        docker_client.images.get(expected_tag)
+        # If we got here, the env-var disable mechanism is broken.
+        # Clean up anyway, then fail loudly.
+        docker_client.images.remove(expected_tag, force=True)
+        raise AssertionError(
+            f"Cache was disabled but {expected_tag} was still committed"
+        )
+    except ImageNotFound:
+        pass  # the expected state — nothing was committed
+
+
 def test_diff_apply_rejects_v4_baseline_with_clear_message(
     tmp_path: Path,
 ) -> None:

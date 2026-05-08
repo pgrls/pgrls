@@ -664,53 +664,101 @@ def _apply_migration_for_diff(
     # PG version-specific syntax could surprise the user. Read from
     # PGRLS_DIFF_APPLY_PG_IMAGE for explicit override, else
     # postgres:17-alpine (the highest in the project's CI matrix).
-    image = os.environ.get(
+    base_image = os.environ.get(
         "PGRLS_DIFF_APPLY_PG_IMAGE", "postgres:17-alpine"
     )
 
-    with PostgresContainer(
+    # v0.5.2 baseline cache. Compute the cache key over inputs that
+    # determine baseline state; if a cached image exists in the
+    # local docker daemon, boot from it and skip the role + extension
+    # + baseline-restore steps. On miss, do the setup once and commit
+    # the result so the next run with the same inputs can short-
+    # circuit. Disabled when PGRLS_DIFF_APPLY_NO_CACHE=1.
+    from pgrls.diff import _apply_cache
+
+    cache_active = not _apply_cache.cache_disabled()
+    cache_key = _apply_cache.compute_cache_key(
+        pg_image=base_image,
+        baseline_sql=baseline_sql,
+        roles=role_names,
+        extensions=extension_set,
+    )
+    cache_tag = _apply_cache.cached_image_tag(cache_key)
+    cache_hit = cache_active and _apply_cache.image_exists(cache_tag)
+
+    # Pick the image to boot. On hit we boot the cached image
+    # directly (it inherits postgres:VERSION-alpine's entrypoint
+    # because it was committed from one). On miss we boot the
+    # configured base image and (if caching is active) commit
+    # afterwards.
+    image = cache_tag if cache_hit else base_image
+
+    container = PostgresContainer(
         image,
         username="postgres",
         password="postgres",
         dbname="postgres",
-    ) as pg:
+    )
+    # Override PGDATA to a path OUTSIDE the postgres image's
+    # declared `VOLUME /var/lib/postgresql/data` so docker commit
+    # captures the data files in the resulting image's filesystem
+    # layer. Without this, the cache would always commit an empty
+    # data directory and every "hit" would actually be empty.
+    container.with_env("PGDATA", _apply_cache.PGDATA_PATH)
+
+    with container as pg:
         url = pg.get_connection_url(driver=None)
         try:
             with psycopg.connect(url, autocommit=True) as conn:
                 with conn.cursor() as cur:
-                    # 1. Pre-create roles referenced by base.
-                    for role in sorted(role_names):
-                        cur.execute(
-                            "DO $$ BEGIN "
-                            "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN "
-                            "EXECUTE format('CREATE ROLE %%I NOLOGIN', %s); "
-                            "END IF; END $$;",
-                            (role, role),
-                        )
-                    # 2. Pre-install extensions (auto-detected from
-                    # the migration's CREATE EXTENSION statements
-                    # + user-supplied --extension flags). IF NOT
-                    # EXISTS makes this idempotent — a migration
-                    # that has its own CREATE EXTENSION line still
-                    # works after we've pre-installed it. Format-
-                    # safe identifier interpolation via psycopg's
-                    # sql.Identifier defends against unusual names.
-                    if extension_set:
-                        from psycopg import sql
-
-                        for ext in sorted(extension_set):
+                    if not cache_hit:
+                        # 1. Pre-create roles referenced by base.
+                        for role in sorted(role_names):
                             cur.execute(
-                                sql.SQL(
-                                    "CREATE EXTENSION IF NOT EXISTS {}"
-                                ).format(sql.Identifier(ext))
+                                "DO $$ BEGIN "
+                                "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN "
+                                "EXECUTE format('CREATE ROLE %%I NOLOGIN', %s); "
+                                "END IF; END $$;",
+                                (role, role),
                             )
-                    # 3. Restore baseline DDL.
-                    cur.execute(baseline_sql)
-                    # 4. Apply migration as a single multi-statement
+                        # 2. Pre-install extensions (auto-detected from
+                        # the migration's CREATE EXTENSION statements
+                        # + user-supplied --extension flags). IF NOT
+                        # EXISTS makes this idempotent — a migration
+                        # that has its own CREATE EXTENSION line still
+                        # works after we've pre-installed it. Format-
+                        # safe identifier interpolation via psycopg's
+                        # sql.Identifier defends against unusual names.
+                        if extension_set:
+                            from psycopg import sql
+
+                            for ext in sorted(extension_set):
+                                cur.execute(
+                                    sql.SQL(
+                                        "CREATE EXTENSION IF NOT EXISTS {}"
+                                    ).format(sql.Identifier(ext))
+                                )
+                        # 3. Restore baseline DDL.
+                        cur.execute(baseline_sql)
+                        # 4. Cache commit. CHECKPOINT first so dirty
+                        # buffers hit disk before the docker layer
+                        # snapshot is taken; otherwise the cached
+                        # image could carry torn writes that confuse
+                        # crash recovery on next boot.
+                        if cache_active:
+                            cur.execute("CHECKPOINT;")
+                            wrapped = pg.get_wrapped_container()
+                            if wrapped is not None:
+                                _apply_cache.commit_baseline(
+                                    container_id=wrapped.id,
+                                    tag=cache_tag,
+                                )
+                    # 5. Apply migration as a single multi-statement
                     # script. Any syntax / runtime error surfaces as
-                    # a psycopg.Error caught below.
+                    # a psycopg.Error caught below. Runs on every
+                    # invocation; only baseline setup is cached.
                     cur.execute(migration_sql)
-            # 4. Introspect the resulting schema.
+            # 6. Introspect the resulting schema.
             with psycopg.connect(url) as conn:
                 return introspect(conn, schemas=schemas)
         except psycopg.Error as exc:
