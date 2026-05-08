@@ -14,6 +14,14 @@ CREATE TABLE app.audit_inserts (
 );
 ALTER TABLE app.audit_inserts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.audit_inserts FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with auth.uid() WRAPPED so PERF001 doesn't
+-- fire on it. The RESTRICTIVE policy below has unwrapped
+-- auth.uid() in WITH CHECK only — the demo pins that PERF001
+-- is USING-only and stays silent on that policy.
+CREATE POLICY audit_inserts_authenticated_access ON app.audit_inserts
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.uid()))
+    WITH CHECK (user_id = (SELECT auth.uid()));
 CREATE POLICY insert_self_only ON app.audit_inserts
     AS RESTRICTIVE
     FOR INSERT TO PUBLIC

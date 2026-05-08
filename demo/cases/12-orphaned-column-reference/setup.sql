@@ -13,6 +13,15 @@ CREATE TABLE app.comments (
 );
 ALTER TABLE app.comments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.comments FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy granting per-user access. Deliberately does
+-- NOT reference `archived` — that column is dropped at the end
+-- of this fixture, and HYG001 should fire on `archived_filter`
+-- only (the policy with the orphan reference). Pinning the
+-- one-policy-fires invariant is the whole point of this case.
+CREATE POLICY comments_authenticated_access ON app.comments
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY archived_filter ON app.comments
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
