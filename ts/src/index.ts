@@ -25,6 +25,8 @@ export {
   type PostgresJsSql,
 } from './drivers/postgres-js.js';
 
+export { PgrlsTestClient, type AsRoleOptions } from './client.js';
+
 /**
  * The version of the cross-language Layer 1 contract this
  * client implements. Bumped only when the wire-level sequence
