@@ -2,17 +2,23 @@
 
 Recognizes a small set of structural transformations:
 
-  * unchanged           — identical after pglast canonicalization
-  * tightened_and       — base AND new_clause (more conditions)
-  * loosened_and_drop   — head AND dropped_clause (fewer conditions)
-  * loosened_or         — base OR new_disjunct (more alternatives)
-  * tightened_or_drop   — head OR dropped_disjunct (fewer alternatives)
-  * requires_review     — anything else
+  * unchanged             — identical after pglast canonicalization
+  * tightened_and         — base AND new_clause (more conditions)
+  * loosened_and_drop     — head AND dropped_clause (fewer conditions)
+  * loosened_or           — base OR new_disjunct (more alternatives)
+  * tightened_or_drop     — head OR dropped_disjunct (fewer alternatives)
+  * semantic_equivalent   — Z3 proves both predicates are equivalent
+  * semantic_tightened    — Z3 proves head → base only (head stricter, SAFE)
+  * semantic_loosened     — Z3 proves base → head only (head looser, DANGEROUS)
+  * requires_review       — anything else
 
-Anything outside the table falls through to requires_review.
-SAT-style implication checking that would automatically classify
-arbitrary predicate transformations is deferred to v0.5+; see the
-README Roadmap and CHANGELOG.
+The first 5 results are syntactic — fast structural matches that
+cover the common predicate-edit shapes without any solver. When
+none match, the comparator can optionally call into Z3 (via
+``_z3_compare.classify_via_z3``) to attempt a semantic decision.
+The Z3 path is opt-in via ``pip install pgrls[diff-z3]``; without
+the extra it returns None and the comparator falls through to
+``requires_review`` (the historical behavior).
 """
 from __future__ import annotations
 
@@ -74,6 +80,9 @@ def compare_predicates(
     "loosened_and_drop",
     "loosened_or",
     "tightened_or_drop",
+    "semantic_equivalent",
+    "semantic_tightened",
+    "semantic_loosened",
     "requires_review",
 ]:
     """Compare two SQL predicate strings and classify the structural change.
@@ -160,5 +169,17 @@ def compare_predicates(
 
     if head_or < base_or and len(base_or) - len(head_or) == 1:
         return "tightened_or_drop"
+
+    # Syntactic patterns exhausted. Optional fall-through to Z3
+    # implication. Returns None when Z3 isn't installed
+    # (`pgrls[diff-z3]` extra not selected) or the predicate uses
+    # an AST node Phase 1 doesn't model (function calls, casts,
+    # CASE, etc.). In either case, the comparator falls back to
+    # ``requires_review`` — the historical behavior.
+    from pgrls.diff._z3_compare import classify_via_z3
+
+    z3_result = classify_via_z3(base_node, head_node)
+    if z3_result is not None:
+        return z3_result
 
     return "requires_review"

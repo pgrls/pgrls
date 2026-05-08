@@ -102,23 +102,41 @@ def test_function_arg_change_returns_requires_review():
 
 
 def test_two_unrelated_predicates_return_requires_review():
+    # `a = 1` and `b = 2` reference different columns — neither
+    # implies the other (a row matching one needn't match the other).
+    # Z3 confirms incomparable; falls through to requires_review.
     assert compare_predicates("a = 1", "b = 2") == "requires_review"
 
 
-def test_and_to_or_returns_requires_review():
-    assert compare_predicates("a = 1 AND b = 2", "a = 1 OR b = 2") == "requires_review"
+def test_and_to_or_returns_semantic_loosened():
+    # `a = 1 AND b = 2` admits exactly one combination; `a = 1 OR b = 2`
+    # admits a strict superset (every row where either condition holds).
+    # The syntactic patterns don't match (the operator changed), but
+    # Z3 proves base → head — head is strictly looser. v0.4+:
+    # semantic_loosened. (v0.3- behavior: requires_review.)
+    assert (
+        compare_predicates("a = 1 AND b = 2", "a = 1 OR b = 2")
+        == "semantic_loosened"
+    )
 
 
-def test_drop_two_clauses_returns_requires_review():
-    # Only single-clause add/drop is detected; dropping two falls through
-    assert compare_predicates("a = 1 AND b = 2 AND c = 3", "a = 1") == "requires_review"
+def test_drop_two_clauses_returns_semantic_loosened():
+    # Dropping conjuncts admits more rows. The single-clause syntactic
+    # pattern only catches drop-one; Z3's implication query catches
+    # drop-N. v0.4+: semantic_loosened. (v0.3- behavior: requires_review.)
+    assert (
+        compare_predicates("a = 1 AND b = 2 AND c = 3", "a = 1")
+        == "semantic_loosened"
+    )
 
 
-def test_or_drop_two_disjuncts_returns_requires_review():
-    # Mirror of test_drop_two_clauses_returns_requires_review for OR.
+def test_or_drop_two_disjuncts_returns_semantic_tightened():
+    # Mirror of test_drop_two_clauses_returns_semantic_loosened. Dropping
+    # disjuncts admits fewer rows. v0.4+: semantic_tightened. (v0.3-
+    # behavior: requires_review.)
     assert (
         compare_predicates("a = 1 OR b = 2 OR c = 3", "a = 1")
-        == "requires_review"
+        == "semantic_tightened"
     )
 
 
@@ -166,16 +184,16 @@ def test_outer_paren_wrap_around_and_chain_returns_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def test_clause_reorder_returns_requires_review():
-    # `a = 1 AND b = 2` and `b = 2 AND a = 1` are commutatively equal in
-    # propositional logic, but RawStream preserves source ordering, so the
-    # canonical strings differ and neither is a strict subset of the other.
-    # v0.2 chooses the conservative classification: requires_review. This
-    # test pins that choice — a future relaxation should remove this test
-    # as part of the same change so the intent is visible in the diff.
+def test_clause_reorder_returns_semantic_equivalent():
+    # `a = 1 AND b = 2` and `b = 2 AND a = 1` are commutatively equal
+    # in propositional logic. RawStream preserves source ordering so
+    # the canonical strings differ and the syntactic patterns can't
+    # decide. v0.4+'s Z3 fall-through proves both implications and
+    # classifies as semantic_equivalent — no Change emitted.
+    # (v0.3- behavior: requires_review.)
     assert (
         compare_predicates("a = 1 AND b = 2", "b = 2 AND a = 1")
-        == "requires_review"
+        == "semantic_equivalent"
     )
 
 
