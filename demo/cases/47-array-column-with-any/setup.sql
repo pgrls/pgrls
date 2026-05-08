@@ -13,6 +13,17 @@ CREATE TABLE app.array_tags (
 );
 ALTER TABLE app.array_tags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.array_tags FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy mirroring the array-membership predicate.
+-- `tags` (the array column) is referenced inside ANY(); the
+-- case pins that extract_column_refs walks through that.
+CREATE POLICY array_tags_authenticated_access ON app.array_tags
+    FOR ALL TO app_authenticated
+    USING (
+        (SELECT current_setting('app.user', true)) = ANY(tags)
+    )
+    WITH CHECK (
+        (SELECT current_setting('app.user', true)) = ANY(tags)
+    );
 CREATE POLICY in_tags ON app.array_tags
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

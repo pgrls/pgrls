@@ -15,6 +15,14 @@ CREATE TABLE app.nested_or_check (
 );
 ALTER TABLE app.nested_or_check ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.nested_or_check FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a flat predicate (no top-level OR
+-- with auth IS NULL) — SEC004 stays silent. The buggy nested-
+-- OR shape SEC004 deliberately misses lives on the RESTRICTIVE
+-- below.
+CREATE POLICY nested_or_check_authenticated_access ON app.nested_or_check
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.uid()))
+    WITH CHECK (user_id = (SELECT auth.uid()));
 CREATE POLICY nested_or ON app.nested_or_check
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

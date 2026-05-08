@@ -10,6 +10,36 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-05-08
+
+### Changed
+- **Demo cases batch 3: issue #11 chip-away.** Ten more demo
+  case fixtures rewritten from RESTRICTIVE-only to the canonical
+  PERMISSIVE+RESTRICTIVE pattern. Each case still demonstrates
+  the rule (or AST-walk invariant) it pins; SEC012 stops firing.
+
+  Rewritten:
+  - **uc35** `app.always_open` (SEC005 — `USING (1=1)`)
+  - **uc38** `app.jwt_unwrapped` (PERF001 — auth.jwt unwrapped through `->>`)
+  - **uc39** `app.user_workspaces` (config-driven custom auth function)
+  - **uc44** `app.current_user_check` (CLEAN — `current_user` cheap SQLValueFunction)
+  - **uc47** `app.array_tags` (CLEAN — array column with ANY)
+  - **uc51** `app.row_comparison` (CLEAN — RowCompareExpr walking)
+  - **uc53** `app.nested_or_check` (false-negative pin — SEC004 only top-level OR)
+  - **uc54** `app.typecast_email` (CLEAN — TypeCast over column ref)
+  - **uc57** `app.typecast_auth` (PERF001 — auth in TypeCast)
+  - **uc58** `app.coalesce_auth` (PERF001 — auth in COALESCE)
+
+  Same pattern as v0.5.4 / v0.5.5: PERMISSIVE policy targeting
+  `app_authenticated` with wrapped predicates so the new policy
+  doesn't itself trip any rule. Original RESTRICTIVE policy
+  preserved verbatim.
+
+  10 entries removed from `[lint.rules.SEC012].allowlist` in
+  `demo/pgrls.toml`. ~22 entries remain.
+
+  Cumulative issue #11 progress: **30 of 62 (~48%)**.
+
 ## [0.5.5] - 2026-05-08
 
 ### Changed

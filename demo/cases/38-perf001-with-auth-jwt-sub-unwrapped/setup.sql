@@ -11,6 +11,13 @@ CREATE TABLE app.jwt_unwrapped (
 );
 ALTER TABLE app.jwt_unwrapped ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.jwt_unwrapped FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with auth.jwt() WRAPPED (PERF001 silent).
+-- The RESTRICTIVE policy below has the unwrapped `auth.jwt()
+-- ->> 'sub'` form the case demonstrates.
+CREATE POLICY jwt_unwrapped_authenticated_access ON app.jwt_unwrapped
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.jwt()) ->> 'sub')
+    WITH CHECK (user_id = (SELECT auth.jwt()) ->> 'sub');
 CREATE POLICY jwt_unwrapped_owner ON app.jwt_unwrapped
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
