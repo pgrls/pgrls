@@ -314,14 +314,37 @@ def test_coalesce_with_added_and_clause_is_semantic_tightened():
 # ---------------------------------------------------------------------------
 
 
-def test_typecast_is_unsupported_returns_none():
-    # `'a'::text` is a TypeCast node — out of scope for Phase 1+3.
-    assert _classify("col = 'a'::text", "col = 'a'") is None
+def test_typecast_to_text_of_string_literal_is_semantic_equivalent():
+    # Phase 4: `'a'::text` is supported — text → String sort matches
+    # the inner literal's String sort, so the cast is a no-op and
+    # both sides reduce to the same Z3 expression.
+    # (v0.4.0/v0.4.1 returned None.)
+    assert (
+        _classify("col = 'a'::text", "col = 'a'") == "semantic_equivalent"
+    )
+
+
+def test_typecast_to_int_of_int_literal_is_semantic_equivalent():
+    # `5::int` matches the inner Integer's Int sort.
+    assert (
+        _classify("col = 5::int", "col = 5") == "semantic_equivalent"
+    )
+
+
+def test_typecast_sort_changing_uses_opaque_var():
+    # `id::text` casts an Int column to text. Phase 4 models the
+    # cast as opaque under the target sort. Two predicates with the
+    # same `id::text = 'a'` shape collapse to the same opaque Z3
+    # variable on both sides → semantic_equivalent.
+    assert (
+        _classify("id::text = 'a'", "id::text = 'a'") == "semantic_equivalent"
+    )
 
 
 def test_subquery_in_is_unsupported_returns_none():
-    # `IN (SELECT ...)` is AEXPR_IN_SUB-style; Phase 1+3 only handles
-    # literal lists.
+    # `IN (SELECT ...)` is AEXPR_IN_SUB-style; not supported in any
+    # phase (the subquery scoping is out of scope for the predicate-
+    # implication contract).
     assert (
         _classify(
             "col IN (SELECT id FROM other)",
@@ -331,10 +354,28 @@ def test_subquery_in_is_unsupported_returns_none():
     )
 
 
-def test_arithmetic_in_predicate_is_unsupported_returns_none():
-    # `col + 1 > 0` involves arithmetic on a column — Phase 1's
-    # binop handler only models `col OP literal` and `literal OP col`.
-    assert _classify("col + 1 > 0", "col > -1") is None
+def test_arithmetic_in_predicate_is_semantic_equivalent():
+    # Phase 4: `col + 1 > 0` is equivalent to `col > -1` (Z3 proves
+    # both implications). v0.4.0/v0.4.1 returned None because the
+    # arithmetic translator wasn't implemented.
+    assert (
+        _classify("col + 1 > 0", "col > -1") == "semantic_equivalent"
+    )
+
+
+def test_arithmetic_widening_constant_is_semantic_loosened():
+    # `col + 5 > 0` (i.e. col > -5) is strictly looser than
+    # `col + 1 > 0` (col > -1).
+    assert (
+        _classify("col + 1 > 0", "col + 5 > 0") == "semantic_loosened"
+    )
+
+
+def test_arithmetic_subtraction_is_supported():
+    # `col - 3 > 0` ⟺ `col > 3`.
+    assert (
+        _classify("col - 3 > 0", "col > 3") == "semantic_equivalent"
+    )
 
 
 # ---------------------------------------------------------------------------
