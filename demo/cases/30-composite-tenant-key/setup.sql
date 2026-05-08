@@ -15,6 +15,19 @@ CREATE TABLE app.composite_tenant (
 );
 ALTER TABLE app.composite_tenant ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.composite_tenant FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy mirroring the composite-key predicate. Both
+-- columns are own-table refs (SEC005 silent); both lookups
+-- wrapped (PERF001 silent).
+CREATE POLICY composite_tenant_authenticated_access ON app.composite_tenant
+    FOR ALL TO app_authenticated
+    USING (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        AND env = (SELECT current_setting('app.env', true))
+    )
+    WITH CHECK (
+        tenant_id = (SELECT current_setting('app.tenant', true)::UUID)
+        AND env = (SELECT current_setting('app.env', true))
+    );
 CREATE POLICY composite_isolation ON app.composite_tenant
     AS RESTRICTIVE
     FOR ALL TO PUBLIC

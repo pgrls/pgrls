@@ -15,6 +15,14 @@ CREATE TABLE app.flags_table (
 );
 ALTER TABLE app.flags_table ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.flags_table FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy granting per-user access. No top-level OR
+-- with auth IS NULL → SEC004 silent on this policy. The
+-- RESTRICTIVE below has the nested IS NULL the case is built
+-- to test.
+CREATE POLICY flags_table_authenticated_access ON app.flags_table
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.uid()))
+    WITH CHECK (user_id = (SELECT auth.uid()));
 -- The `(SELECT auth.uid()) IS NULL` test is reachable but lives
 -- under a top-level AND (the outer conjunction). SEC004 must
 -- skip it — the rule's job is to flag inverted USING shapes

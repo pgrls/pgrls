@@ -12,6 +12,17 @@ CREATE TABLE app.jwt_documents (
 );
 ALTER TABLE app.jwt_documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.jwt_documents FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy mirroring the JWT-tenant predicate. Wrapping
+-- via `(SELECT auth.jwt())` keeps PERF001 silent on this policy
+-- — the case demonstrates the wrapped form is correct.
+CREATE POLICY jwt_documents_authenticated_access ON app.jwt_documents
+    FOR ALL TO app_authenticated
+    USING (
+        tenant_id = ((SELECT auth.jwt()) ->> 'tenant_id')::UUID
+    )
+    WITH CHECK (
+        tenant_id = ((SELECT auth.jwt()) ->> 'tenant_id')::UUID
+    );
 CREATE POLICY jwt_tenant ON app.jwt_documents
     AS RESTRICTIVE
     FOR ALL TO PUBLIC

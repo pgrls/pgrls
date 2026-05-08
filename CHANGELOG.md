@@ -10,6 +10,35 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-05-08
+
+### Changed
+- **Demo cases batch 2: issue #11 chip-away.** Ten more demo
+  case fixtures rewritten from RESTRICTIVE-only to the canonical
+  PERMISSIVE+RESTRICTIVE pattern. Each case still demonstrates
+  the rule it was written for; SEC012 stops firing on the
+  now-clean shape.
+
+  Rewritten:
+  - **uc10** `app.feature_flags` (SEC008 — USING true)
+  - **uc12** `app.comments` (HYG001 — orphan column)
+  - **uc17** `app.tickets` (CLEAN — asymmetric USING/WITH CHECK)
+  - **uc21** `app.audit_inserts` (PERF001-silent-on-WITH-CHECK contract)
+  - **uc27** `app.todos_archive` (CLEAN — DELETE-exempt SEC006)
+  - **uc28** `app.jwt_documents` (CLEAN — JWT tenant claim)
+  - **uc29** `app.kb_articles` (CLEAN — public-or-tenant mix)
+  - **uc30** `app.composite_tenant` (CLEAN — composite key)
+  - **uc34** `app.flags_table` (CLEAN — SEC004 nested IS NULL under AND)
+  - **uc36** `app.admin_overrides` (CLEAN — pg_has_role admin escape)
+
+  Same approach as v0.5.4: PERMISSIVE policy targeting
+  `app_authenticated` with wrapped predicates so the new
+  policy itself doesn't trip SEC003/SEC005/SEC008/PERF001.
+  The original RESTRICTIVE policy is preserved verbatim.
+
+  10 entries removed from `[lint.rules.SEC012].allowlist` in
+  `demo/pgrls.toml`. ~32 entries remain for future batches.
+
 ## [0.5.4] - 2026-05-08
 
 ### Changed

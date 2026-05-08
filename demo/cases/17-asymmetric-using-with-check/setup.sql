@@ -15,6 +15,14 @@ CREATE TABLE app.tickets (
 );
 ALTER TABLE app.tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.tickets FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy mirroring the asymmetric USING/WITH CHECK
+-- shape — read your team, write your own. Same predicates as
+-- the RESTRICTIVE below, just on the PERMISSIVE side so the
+-- table isn't silently deny-all (SEC012).
+CREATE POLICY tickets_authenticated_access ON app.tickets
+    FOR ALL TO app_authenticated
+    USING (team_id = (SELECT current_setting('app.team', true)::UUID))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY read_team_write_own ON app.tickets
     AS RESTRICTIVE
     FOR ALL TO PUBLIC
