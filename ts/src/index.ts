@@ -27,6 +27,14 @@ export {
 
 export { PgrlsTestClient, type AsRoleOptions } from './client.js';
 
+export {
+  assertInvisible,
+  assertRejected,
+  assertRows,
+  assertSilentlyDropped,
+  assertVisible,
+} from './assertions.js';
+
 /**
  * The version of the cross-language Layer 1 contract this
  * client implements. Bumped only when the wire-level sequence
