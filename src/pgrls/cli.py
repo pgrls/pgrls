@@ -23,6 +23,7 @@ import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import click
 import psycopg
@@ -588,6 +589,7 @@ def _apply_migration_for_diff(
     migration_path: str,
     schemas: list[str],
     extensions: tuple[str, ...] = (),
+    verbose: bool = False,
 ) -> Schema:
     """Spin up an ephemeral Postgres, restore base, apply migration, introspect.
 
@@ -676,6 +678,16 @@ def _apply_migration_for_diff(
     # circuit. Disabled when PGRLS_DIFF_APPLY_NO_CACHE=1.
     from pgrls.diff import _apply_cache
 
+    # Verbose output goes to stderr so stdout stays machine-parsable.
+    # Use a tiny closure rather than a logger so the prefix is
+    # consistent across pgrls subcommands and we don't fight Click's
+    # echo plumbing.
+    import time
+
+    def vlog(msg: str) -> None:
+        if verbose:
+            click.echo(f"pgrls: {msg}", err=True)
+
     cache_active = not _apply_cache.cache_disabled()
     cache_key = _apply_cache.compute_cache_key(
         pg_image=base_image,
@@ -693,6 +705,13 @@ def _apply_migration_for_diff(
     # afterwards.
     image = cache_tag if cache_hit else base_image
 
+    if not cache_active:
+        vlog(f"cache: disabled (PGRLS_DIFF_APPLY_NO_CACHE set); booting {base_image}")
+    elif cache_hit:
+        vlog(f"cache: hit {cache_tag}; booting cached image")
+    else:
+        vlog(f"cache: miss {cache_tag}; booting {base_image} and will commit after baseline restore")
+
     container = PostgresContainer(
         image,
         username="postgres",
@@ -706,12 +725,15 @@ def _apply_migration_for_diff(
     # data directory and every "hit" would actually be empty.
     container.with_env("PGDATA", _apply_cache.PGDATA_PATH)
 
+    boot_start = time.monotonic()
     with container as pg:
+        vlog(f"booted in {time.monotonic() - boot_start:.2f}s")
         url = pg.get_connection_url(driver=None)
         try:
             with psycopg.connect(url, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     if not cache_hit:
+                        baseline_start = time.monotonic()
                         # 1. Pre-create roles referenced by base.
                         for role in sorted(role_names):
                             cur.execute(
@@ -721,6 +743,8 @@ def _apply_migration_for_diff(
                                 "END IF; END $$;",
                                 (role, role),
                             )
+                        if role_names:
+                            vlog(f"created {len(role_names)} role(s): {sorted(role_names)}")
                         # 2. Pre-install extensions (auto-detected from
                         # the migration's CREATE EXTENSION statements
                         # + user-supplied --extension flags). IF NOT
@@ -738,14 +762,20 @@ def _apply_migration_for_diff(
                                         "CREATE EXTENSION IF NOT EXISTS {}"
                                     ).format(sql.Identifier(ext))
                                 )
+                            vlog(
+                                f"pre-installed {len(extension_set)} extension(s): "
+                                f"{sorted(extension_set)}"
+                            )
                         # 3. Restore baseline DDL.
                         cur.execute(baseline_sql)
+                        vlog(f"baseline restored in {time.monotonic() - baseline_start:.2f}s")
                         # 4. Cache commit. CHECKPOINT first so dirty
                         # buffers hit disk before the docker layer
                         # snapshot is taken; otherwise the cached
                         # image could carry torn writes that confuse
                         # crash recovery on next boot.
                         if cache_active:
+                            commit_start = time.monotonic()
                             cur.execute("CHECKPOINT;")
                             wrapped = pg.get_wrapped_container()
                             if wrapped is not None:
@@ -753,14 +783,23 @@ def _apply_migration_for_diff(
                                     container_id=wrapped.id,
                                     tag=cache_tag,
                                 )
+                                vlog(
+                                    f"committed baseline cache {cache_tag} in "
+                                    f"{time.monotonic() - commit_start:.2f}s"
+                                )
                     # 5. Apply migration as a single multi-statement
                     # script. Any syntax / runtime error surfaces as
                     # a psycopg.Error caught below. Runs on every
                     # invocation; only baseline setup is cached.
+                    migration_start = time.monotonic()
                     cur.execute(migration_sql)
+                    vlog(f"migration applied in {time.monotonic() - migration_start:.2f}s")
             # 6. Introspect the resulting schema.
+            introspect_start = time.monotonic()
             with psycopg.connect(url) as conn:
-                return introspect(conn, schemas=schemas)
+                result = introspect(conn, schemas=schemas)
+            vlog(f"introspected in {time.monotonic() - introspect_start:.2f}s")
+            return result
         except psycopg.Error as exc:
             raise ToolError(
                 f"--apply: migration {migration_path!r} failed against "
@@ -865,6 +904,20 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
         "here. Only meaningful with --apply."
     ),
 )
+@click.option(
+    "-v",
+    "--verbose",
+    "verbose",
+    is_flag=True,
+    default=False,
+    help=(
+        "Emit progress + cache + timing telemetry on stderr. With "
+        "--apply, prints whether the baseline cache hit or missed, "
+        "the cache image tag, and per-step timings. Output on stdout "
+        "is unchanged so the diff JSON / SARIF / text payload stays "
+        "machine-parsable."
+    ),
+)
 def diff(
     base: str,
     head: str | None,
@@ -875,6 +928,7 @@ def diff(
     schemas: str | None,
     migration_path: str | None,
     extensions: tuple[str, ...],
+    verbose: bool,
 ) -> None:
     """Diff two RLS schema snapshots — report semantic changes with classification."""
     try:
@@ -974,6 +1028,7 @@ def diff(
             migration_path=migration_path,
             schemas=schema_list,
             extensions=extensions,
+            verbose=verbose,
         )
     else:
         assert head is not None  # guaranteed by the fallback chain above
@@ -992,3 +1047,167 @@ def diff(
 
     if failing:
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# pgrls cache — manage the v0.5.2 baseline cache for `diff --apply`
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def cache() -> None:
+    """Manage the baseline-image cache used by ``pgrls diff --apply``.
+
+    The cache lives in the local Docker daemon as tagged images
+    named ``pgrls-baseline:<HASH>`` with the
+    ``org.pgrls.cache=baseline`` label. These commands are thin
+    wrappers around ``docker images`` / ``docker image rm`` so
+    you don't need to remember the label-filter incantation.
+    """
+
+
+def _cache_images() -> list[Any]:
+    """Return the list of locally-cached baseline images.
+
+    Filters by the ``org.pgrls.cache=baseline`` label so user-
+    tagged images that happen to start with ``pgrls-baseline``
+    are not picked up; only images this CLI committed are
+    returned. Element type is ``docker.models.images.Image``
+    but typed as ``Any`` here so we can avoid pulling the
+    docker SDK into the import-time module surface — the SDK
+    is only required when the diff-apply extra is installed.
+    """
+    try:
+        import docker
+
+        from pgrls.diff import _apply_cache
+    except ImportError:
+        raise ToolError(
+            "`pgrls cache` requires the docker SDK. Install via "
+            "`pip install 'pgrls[diff-apply]'`."
+        ) from None
+
+    try:
+        client = docker.from_env()
+        result: list[Any] = list(
+            client.images.list(
+                filters={
+                    "label": (
+                        f"{_apply_cache.CACHE_LABEL_KEY}="
+                        f"{_apply_cache.CACHE_LABEL_VALUE}"
+                    )
+                }
+            )
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        # Docker daemon down / unreachable — surface as ToolError
+        # rather than an uncaught traceback.
+        raise ToolError(
+            f"Docker daemon error while listing cache images: {exc}"
+        ) from exc
+
+
+@cache.command("list")
+def cache_list() -> None:
+    """List baseline images currently cached locally.
+
+    One image per line: ``<tag>  <size>``. Total image count
+    and combined disk usage are summarized on the final line.
+    Empty cache → "no cached baselines."
+    """
+    # Lazy import to keep `pgrls cache --help` fast even when the
+    # diff-apply extra isn't installed.
+    from pgrls.diff import _apply_cache
+
+    images = _cache_images()
+    if not images:
+        click.echo("pgrls cache: no cached baselines.")
+        return
+
+    total_bytes = 0
+    rows: list[tuple[str, int]] = []
+    for image in images:
+        # Each image may carry multiple tags; only the
+        # `pgrls-baseline:*` ones are interesting here.
+        size = int(image.attrs.get("Size", 0))
+        total_bytes += size
+        tags = [
+            t for t in (image.tags or [])
+            if t.startswith(f"{_apply_cache.CACHE_IMAGE_REPO}:")
+        ]
+        for tag in tags or [f"<untagged {image.short_id}>"]:
+            rows.append((tag, size))
+
+    # Sort by tag for stable output across runs.
+    rows.sort()
+    width = max(len(tag) for tag, _ in rows)
+    for tag, size in rows:
+        click.echo(f"{tag.ljust(width)}  {_human_bytes(size)}")
+    click.echo(
+        f"-- {len(rows)} image(s), {_human_bytes(total_bytes)} total"
+    )
+
+
+def _human_bytes(n: int) -> str:
+    """Compact size string: 437MB rather than 437,234,128 bytes.
+
+    Decimal (1000-based) rather than binary because that's how
+    Docker reports image sizes — keeps the numbers consistent
+    with what `docker images` shows.
+    """
+    units = ("B", "kB", "MB", "GB", "TB")
+    size = float(n)
+    for unit in units:
+        if size < 1000:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1000
+    return f"{size:.1f}PB"
+
+
+@cache.command("prune")
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help="Skip the confirmation prompt (for CI / scripts).",
+)
+def cache_prune(assume_yes: bool) -> None:
+    """Remove every locally-cached baseline image.
+
+    Matches images by the ``org.pgrls.cache=baseline`` label, so
+    user-tagged images that happen to share the
+    ``pgrls-baseline:`` prefix are NOT removed. Prompts for
+    confirmation unless ``--yes`` is passed.
+    """
+    images = _cache_images()
+    if not images:
+        click.echo("pgrls cache: nothing to prune (no cached baselines).")
+        return
+
+    if not assume_yes:
+        total_bytes = sum(int(i.attrs.get("Size", 0)) for i in images)
+        click.echo(
+            f"pgrls cache: about to remove {len(images)} cached baseline(s) "
+            f"reclaiming {_human_bytes(total_bytes)}."
+        )
+        if not click.confirm("Proceed?"):
+            click.echo("aborted.")
+            return
+
+    import docker
+
+    client = docker.from_env()
+    removed = 0
+    for image in images:
+        try:
+            client.images.remove(image.id, force=True)
+            removed += 1
+        except Exception as exc:  # noqa: BLE001
+            click.echo(
+                f"pgrls cache: failed to remove {image.short_id}: {exc}",
+                err=True,
+            )
+    click.echo(f"pgrls cache: removed {removed} image(s).")

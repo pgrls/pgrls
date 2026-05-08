@@ -469,6 +469,128 @@ def test_diff_apply_baseline_cache_creates_image_on_first_run_and_reuses_on_seco
         pass
 
 
+def test_diff_apply_verbose_emits_cache_and_timing_telemetry(
+    pg_url: str, apply_sql, tmp_path: Path
+) -> None:
+    """v0.5.3 ``-v / --verbose`` flag emits cache miss/hit + per-
+    step timings to stderr while leaving stdout (the diff JSON
+    payload) machine-parsable.
+
+    Pin: stderr contains the cache state, baseline-restore
+    timing, migration apply timing. stdout JSON parses cleanly
+    without verbose noise leaking into it.
+    """
+    import docker
+    from docker.errors import ImageNotFound
+
+    from pgrls.diff import _apply_cache
+    from pgrls.model import Schema
+
+    apply_sql(
+        """
+        CREATE TABLE public.verbose_test_orders (
+            id BIGSERIAL,
+            tenant_id UUID NOT NULL
+        );
+        ALTER TABLE public.verbose_test_orders ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.verbose_test_orders FORCE ROW LEVEL SECURITY;
+        """
+    )
+
+    runner = CliRunner()
+    snap_result = runner.invoke(
+        main,
+        ["snapshot", "--database-url", pg_url, "--schemas", "public"],
+    )
+    assert snap_result.exit_code == 0, snap_result.output
+    base_path = tmp_path / "base.json"
+    base_path.write_text(snap_result.output, encoding="utf-8")
+
+    migration_path = tmp_path / "migration.sql"
+    migration_path.write_text(
+        "ALTER TABLE public.verbose_test_orders ADD COLUMN note TEXT;\n",
+        encoding="utf-8",
+    )
+
+    # Pre-clean any existing cache image so we observe the miss
+    # path's full telemetry on run 1.
+    base_schema = Schema.from_snapshot(json.loads(snap_result.output))
+    expected_key = _apply_cache.compute_cache_key(
+        pg_image="postgres:17-alpine",
+        baseline_sql=base_schema.to_sql(),
+        roles=set(),
+        extensions=set(),
+    )
+    expected_tag = _apply_cache.cached_image_tag(expected_key)
+    docker_client = docker.from_env()
+    try:
+        docker_client.images.remove(expected_tag, force=True)
+    except ImageNotFound:
+        pass
+
+    # Click 8.3+ exposes result.stdout / result.stderr separately
+    # by default — no mix_stderr knob needed. We rely on this so
+    # the verbose telemetry and the diff JSON payload can be
+    # asserted on independently.
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+            "--verbose",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+
+    # stdout: clean JSON payload, no verbose lines mixed in.
+    payload = json.loads(result.stdout)
+    assert "violations" in payload, payload
+
+    # stderr: cache miss line + boot/baseline/migration/introspect timings.
+    err = result.stderr
+    assert "cache: miss" in err, err
+    assert "booted in" in err, err
+    assert "baseline restored in" in err, err
+    assert "committed baseline cache" in err, err
+    assert "migration applied in" in err, err
+    assert "introspected in" in err, err
+
+    # Run 2 — should now hit the cache. Different stderr shape:
+    # "cache: hit" instead of "cache: miss", and no "baseline
+    # restored" / "committed" lines (those are skipped on hit).
+    result2 = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+            "--verbose",
+            "--format",
+            "json",
+        ],
+    )
+    assert result2.exit_code == 0, (result2.stdout, result2.stderr)
+    err2 = result2.stderr
+    assert "cache: hit" in err2, err2
+    # The hit path skips the role/extension/baseline restore +
+    # commit steps, so neither line should appear.
+    assert "baseline restored in" not in err2, err2
+    assert "committed baseline cache" not in err2, err2
+    # Migration apply + introspect still happen on every run.
+    assert "migration applied in" in err2, err2
+
+    # Cleanup.
+    try:
+        docker_client.images.remove(expected_tag, force=True)
+    except ImageNotFound:
+        pass
+
+
 def test_diff_apply_baseline_cache_can_be_disabled_via_env(
     pg_url: str, apply_sql, tmp_path: Path, monkeypatch
 ) -> None:
