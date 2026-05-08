@@ -13,6 +13,13 @@ CREATE TABLE app.gen_cols (
 );
 ALTER TABLE app.gen_cols ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.gen_cols FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy mirroring the generated-column predicate
+-- the case pins. FOR SELECT only — generated columns can't be
+-- INSERT/UPDATE'd by callers, so a FOR ALL PERMISSIVE here
+-- would be misleading.
+CREATE POLICY gen_cols_authenticated_access ON app.gen_cols
+    FOR SELECT TO app_authenticated
+    USING (user_id_norm = lower((SELECT current_setting('app.user', true))));
 CREATE POLICY gen_owner ON app.gen_cols
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

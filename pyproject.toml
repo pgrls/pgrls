@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.5.6"
+version = "0.5.7"
 description = "Framework-agnostic linter and testing toolkit for Postgres Row-Level Security."
 readme = "README.md"
 license = { file = "LICENSE" }

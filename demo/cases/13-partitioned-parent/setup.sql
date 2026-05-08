@@ -20,6 +20,14 @@ CREATE TABLE app.events_2026 PARTITION OF app.events
 
 ALTER TABLE app.events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.events FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy on the partitioned parent — children
+-- inherit it at query time the same way they inherit the
+-- RESTRICTIVE below. Tenant-scoped predicate matches the
+-- RESTRICTIVE so semantics stay aligned.
+CREATE POLICY events_authenticated_access ON app.events
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY events_tenant ON app.events
     AS RESTRICTIVE
     FOR ALL TO PUBLIC

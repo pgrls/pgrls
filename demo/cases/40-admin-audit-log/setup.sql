@@ -14,6 +14,14 @@ CREATE TABLE app.admin_audit (
 );
 ALTER TABLE app.admin_audit ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.admin_audit FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy referencing an own column (`detail IS NOT
+-- NULL`) so SEC005 stays silent on this policy. The
+-- session-state-only RESTRICTIVE policy below is what the
+-- case demonstrates (and what the companion test allowlists).
+CREATE POLICY admin_audit_authenticated_access ON app.admin_audit
+    FOR ALL TO app_authenticated
+    USING (detail IS NOT NULL)
+    WITH CHECK (detail IS NOT NULL);
 CREATE POLICY admin_only_read ON app.admin_audit
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

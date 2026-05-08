@@ -10,6 +10,64 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-05-08
+
+### Changed
+- **Issue #11 closed.** All remaining demo case fixtures
+  rewritten from RESTRICTIVE-only to the canonical
+  PERMISSIVE+RESTRICTIVE pattern. SEC012 allowlist in
+  `demo/pgrls.toml` removed entirely — the demo fixture is
+  now self-consistent: every RLS-enabled table has at least
+  one PERMISSIVE policy. Each case still demonstrates the
+  rule (or AST-walk invariant) it pins.
+
+  This release:
+  - **Single-table** (14 cases): uc32 case_policy, uc37
+    partial_orphan, uc40 admin_audit, uc46 gen_cols, uc49
+    gdpr_records, uc55 not_false_table, uc56 booltest_orphan,
+    uc64 MixedCase Table, uc66 json_access, uc67 recent_only,
+    uc74 deny_via_false, uc76 or_true_table, uc77
+    placeholder_named, uc78 volatile_predicate.
+  - **Partitioned families** (5 cases): uc13 events, uc15
+    team_documents+team_members, uc23 deep_events, uc24
+    leaf_metrics_2026, uc45 region_metrics. PERMISSIVE
+    policies on the partitioned root (or leaf, where uc24
+    deliberately pushes RLS down) so children inherit.
+  - **FK-tenant + diff/view fixtures**: uc48 ec_orders+
+    ec_order_items (correlated EXISTS mirrored on PERMISSIVE);
+    uc81/83 uc8X_invoices (diff fixtures); uc85-88 uc8X_users
+    (view-related — VIEW001/002/003/004 still pin on the
+    overlying view, table-level policies don't change the
+    test).
+
+  Cumulative across the chip-away:
+  - v0.3.1: 1 case (uc01)
+  - v0.5.4: 9 cases (batch 1)
+  - v0.5.5: 10 cases (batch 2)
+  - v0.5.6: 10 cases (batch 3)
+  - v0.5.7: 22 cases (final batch — closes the issue)
+  - **Total: 52 of 52** ✓
+
+### Notable subtleties
+- **uc77** (placeholder_named): the new PERMISSIVE policy is
+  named `pn_user_access` — deliberately avoids HYG002's
+  placeholder vocabulary (todo / fixme / tmp / hack / xxx /
+  debug / placeholder) so the new policy doesn't itself trip
+  the rule the case is built to demonstrate.
+- **uc46** (gen_cols): PERMISSIVE is FOR SELECT only — the
+  table has a generated column, so a FOR ALL PERMISSIVE
+  with WITH CHECK on the generated column would be misleading
+  (callers can't write the generated value).
+- **uc64** (MixedCase Table): the new PERMISSIVE policy uses a
+  quoted identifier name (`"MixedCase authenticated access"`)
+  to keep the case's mixed-case round-trip pinned for the
+  PERMISSIVE side too.
+- **uc81/83** (diff fixtures): the new PERMISSIVE doesn't
+  reference any column the diff tests drop, so
+  `DIFF_POLICY_DROPPED_RESTRICTIVE` and
+  `DIFF_COLUMN_DROPPED_REFERENCED` still fire on the
+  intended RESTRICTIVE policies only.
+
 ## [0.5.6] - 2026-05-08
 
 ### Changed

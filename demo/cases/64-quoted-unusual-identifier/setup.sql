@@ -13,6 +13,13 @@ CREATE TABLE app."MixedCase Table" (
 );
 ALTER TABLE app."MixedCase Table" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app."MixedCase Table" FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy on the quoted-identifier table. Pins that
+-- the round-trip works for unusual names (the case's whole
+-- point) including for the new authenticated-access policy.
+CREATE POLICY "MixedCase authenticated access" ON app."MixedCase Table"
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY mixed_owner ON app."MixedCase Table"
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

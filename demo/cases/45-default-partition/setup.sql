@@ -17,6 +17,12 @@ CREATE TABLE app.region_metrics_us PARTITION OF app.region_metrics
 CREATE TABLE app.region_metrics_default PARTITION OF app.region_metrics DEFAULT;
 ALTER TABLE app.region_metrics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.region_metrics FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy on the partitioned root — both named and
+-- DEFAULT partitions inherit it (the case's whole point).
+CREATE POLICY region_metrics_authenticated_access ON app.region_metrics
+    FOR ALL TO app_authenticated
+    USING (region = (SELECT current_setting('app.region', true)))
+    WITH CHECK (region = (SELECT current_setting('app.region', true)));
 CREATE POLICY region_visibility ON app.region_metrics
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
