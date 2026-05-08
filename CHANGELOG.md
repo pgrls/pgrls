@@ -10,6 +10,45 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-08
+
+### Added
+- **Auto-detect extensions in migration SQL** (issue #13 Phase 3).
+  `pgrls diff --apply migration.sql` now walks the migration's
+  pglast AST for `CREATE EXTENSION` statements and pre-installs
+  each named extension in the ephemeral testcontainer (via
+  `CREATE EXTENSION IF NOT EXISTS <name>`) before restoring the
+  baseline. A migration that declares its own extensions just
+  works — no extra flags needed.
+
+- **`--extension <name>` flag** (repeatable). Use this when the
+  *baseline* assumes an extension is already present (e.g. a
+  `citext` column or `gen_random_uuid()` default that the
+  migration doesn't redeclare). Without it, restoring the
+  baseline DDL inside the testcontainer would fail at the
+  `CREATE TABLE ... CITEXT` line.
+
+  ```sh
+  # Auto-detect: nothing extra needed.
+  pgrls diff base.json --apply migration_with_create_extension.sql
+
+  # Baseline uses citext that migration never touches:
+  pgrls diff base.json --apply migration.sql --extension citext
+
+  # Combine multiple:
+  pgrls diff base.json --apply m.sql --extension citext --extension pgcrypto
+  ```
+
+  The flag is meaningful only with `--apply`; passing it without
+  `--apply` emits a warning and is otherwise a no-op.
+
+### Internal
+- New helper module `pgrls.diff._migration_extensions` exposes
+  `detect_extensions(migration_sql) -> list[str]` — pglast-AST
+  walk for `CreateExtensionStmt`, deduplicated and sorted.
+  Degrades gracefully on unparseable SQL (returns `[]` so the
+  real psycopg error surfaces from `cur.execute(migration_sql)`).
+
 ## [0.5.0] - 2026-05-08
 
 ### Added

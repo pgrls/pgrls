@@ -535,6 +535,32 @@ def test_diff_warns_when_schemas_passed_with_file_scheme_urls(
     assert "--schemas is ignored" in result.output
 
 
+def test_diff_warns_when_extension_passed_without_apply(
+    tmp_path: Path,
+) -> None:
+    """`--extension` only controls the testcontainer used by --apply;
+    pin the v0.5.1 contract that passing it without --apply emits a
+    warning rather than silently being a no-op."""
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base),
+            str(head),
+            "--extension",
+            "citext",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "--extension is ignored" in result.output
+
+
 def test_diff_picks_up_database_url_env_when_no_pgrls_toml(
     pg_url: str, tmp_path: Path, monkeypatch
 ) -> None:

@@ -587,6 +587,7 @@ def _apply_migration_for_diff(
     base_schema: Schema,
     migration_path: str,
     schemas: list[str],
+    extensions: tuple[str, ...] = (),
 ) -> Schema:
     """Spin up an ephemeral Postgres, restore base, apply migration, introspect.
 
@@ -595,6 +596,12 @@ def _apply_migration_for_diff(
     on top; the resulting schema is introspected and returned as the
     diff's "head". The container is torn down at function exit
     (testcontainers context manager).
+
+    Extensions named in the migration's ``CREATE EXTENSION``
+    statements (auto-detected via ``detect_extensions``) plus any
+    explicitly passed via ``extensions`` are installed before the
+    baseline DDL — covers the case where the baseline schema
+    assumes the extension is already present.
 
     Roles referenced by base policies / grants are pre-created
     idempotently in the container so the restore SQL applies. The
@@ -626,6 +633,17 @@ def _apply_migration_for_diff(
         raise ToolError(str(exc)) from exc
 
     migration_sql = Path(migration_path).read_text(encoding="utf-8")
+
+    # Phase 3 (v0.5.1) — auto-detect extensions named in the
+    # migration's CREATE EXTENSION statements; deduplicate against
+    # user-supplied --extension flags so a migration with both a
+    # CREATE EXTENSION line AND a matching --extension flag doesn't
+    # try to install twice (idempotent IF NOT EXISTS handles that
+    # too, but the dedup keeps the loop predictable).
+    from pgrls.diff._migration_extensions import detect_extensions
+
+    extension_set: set[str] = set(extensions)
+    extension_set.update(detect_extensions(migration_sql))
 
     # Collect the set of role names referenced by base policies
     # and grants so we can pre-create them in the ephemeral
@@ -669,9 +687,26 @@ def _apply_migration_for_diff(
                             "END IF; END $$;",
                             (role, role),
                         )
-                    # 2. Restore baseline DDL.
+                    # 2. Pre-install extensions (auto-detected from
+                    # the migration's CREATE EXTENSION statements
+                    # + user-supplied --extension flags). IF NOT
+                    # EXISTS makes this idempotent — a migration
+                    # that has its own CREATE EXTENSION line still
+                    # works after we've pre-installed it. Format-
+                    # safe identifier interpolation via psycopg's
+                    # sql.Identifier defends against unusual names.
+                    if extension_set:
+                        from psycopg import sql
+
+                        for ext in sorted(extension_set):
+                            cur.execute(
+                                sql.SQL(
+                                    "CREATE EXTENSION IF NOT EXISTS {}"
+                                ).format(sql.Identifier(ext))
+                            )
+                    # 3. Restore baseline DDL.
                     cur.execute(baseline_sql)
-                    # 3. Apply migration as a single multi-statement
+                    # 4. Apply migration as a single multi-statement
                     # script. Any syntax / runtime error surfaces as
                     # a psycopg.Error caught below.
                     cur.execute(migration_sql)
@@ -767,6 +802,21 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
         "Requires `pip install pgrls[diff-apply]`."
     ),
 )
+@click.option(
+    "--extension",
+    "extensions",
+    multiple=True,
+    default=(),
+    help=(
+        "Extension to pre-install in the ephemeral testcontainer "
+        "before applying the migration. Repeatable. Use this when the "
+        "baseline schema assumes an extension is already present "
+        "(e.g. `citext` columns) but the migration doesn't declare "
+        "it. Extensions named in the migration's CREATE EXTENSION "
+        "statements are auto-detected and don't need to be listed "
+        "here. Only meaningful with --apply."
+    ),
+)
 def diff(
     base: str,
     head: str | None,
@@ -776,6 +826,7 @@ def diff(
     config_path: str | None,
     schemas: str | None,
     migration_path: str | None,
+    extensions: tuple[str, ...],
 ) -> None:
     """Diff two RLS schema snapshots — report semantic changes with classification."""
     try:
@@ -792,6 +843,17 @@ def diff(
             "migration file (post-migration head computed via "
             "ephemeral Postgres) or a head argument (URL or snapshot), "
             "not both."
+        )
+
+    # --extension only makes sense with --apply (it controls the
+    # ephemeral testcontainer's environment); warn if passed without
+    # --apply rather than silently ignore.
+    if extensions and migration_path is None:
+        click.echo(
+            "pgrls: warning: --extension is ignored without --apply "
+            "(it pre-installs extensions in the testcontainer used "
+            "by --apply; without --apply there's no testcontainer).",
+            err=True,
         )
 
     # `--fail-on` fallback chain:
@@ -863,6 +925,7 @@ def diff(
             base_schema=base_schema,
             migration_path=migration_path,
             schemas=schema_list,
+            extensions=extensions,
         )
     else:
         assert head is not None  # guaranteed by the fallback chain above
