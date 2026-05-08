@@ -1,0 +1,23 @@
+# What goes into the npm package — by default npm publishes
+# everything not in .npmignore. Use `files` in package.json
+# to invert the model (allowlist instead). This .npmignore is
+# kept for the few cases `files` doesn't catch (e.g. nested
+# editor configs).
+
+# Dev / source files — `files` in package.json already
+# allowlists `dist`, README, LICENSE.
+src
+test
+node_modules
+coverage
+.vitest-cache
+.eslintcache
+.eslintrc*
+eslint.config.*
+.prettierrc*
+.prettierignore
+tsconfig*.json
+vitest.config.*
+.gitignore
+*.log
+.DS_Store

@@ -1,0 +1,65 @@
+name: ts
+
+on:
+  push:
+    branches: [main, "release/**"]
+    paths:
+      # Trigger on TS surface or workflow itself; saves CI minutes
+      # when only Python files change.
+      - "ts/**"
+      - ".github/workflows/ts.yml"
+  pull_request:
+    paths:
+      - "ts/**"
+      - ".github/workflows/ts.yml"
+
+# Same defense-in-depth posture as the pytest workflow — only
+# runs `npm run *` against checked-out code, no need for write
+# privileges. A malicious npm dep can exfiltrate `GITHUB_TOKEN`;
+# narrowing scope to `contents: read` is the least privilege for
+# "checkout, install, build, test."
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: "ts (node ${{ matrix.node }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    strategy:
+      fail-fast: false
+      matrix:
+        # Match `engines.node >= 20` from package.json. Test on
+        # the active LTS line plus the next one — protects
+        # against subtle ESM / TS ergonomic regressions when
+        # users hop majors.
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test

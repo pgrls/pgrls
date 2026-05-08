@@ -1,0 +1,80 @@
+{
+  "name": "pgrls-test",
+  "version": "0.6.0-dev.0",
+  "description": "Code-first RLS testing for Postgres — TypeScript port of pgrls.testing. Implements the cross-language Layer 1 protocol (PROTOCOL_VERSION 1).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test --max-warnings=0",
+    "lint:fix": "eslint src test --fix",
+    "format": "prettier --write src test",
+    "format:check": "prettier --check src test"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "rls",
+    "row-level-security",
+    "testing",
+    "vitest",
+    "supabase",
+    "drizzle"
+  ],
+  "author": "Dmitry Maranik",
+  "license": "MIT",
+  "homepage": "https://github.com/pgrls/pgrls",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pgrls/pgrls.git",
+    "directory": "ts"
+  },
+  "bugs": {
+    "url": "https://github.com/pgrls/pgrls/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "pg": ">=8",
+    "postgres": ">=3"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "postgres": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@typescript-eslint/eslint-plugin": "^8.20.0",
+    "@typescript-eslint/parser": "^8.20.0",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^10.0.1",
+    "pg": "^8.13.0",
+    "postgres": "^3.4.5",
+    "prettier": "^3.4.2",
+    "testcontainers": "^10.16.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.4"
+  }
+}
