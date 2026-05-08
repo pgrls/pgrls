@@ -20,6 +20,12 @@ CREATE TABLE app.deep_events_t1_2026 PARTITION OF app.deep_events_t1
 
 ALTER TABLE app.deep_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.deep_events FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy on the partitioned root — sub-partition
+-- leaves inherit it the same way they inherit the RESTRICTIVE.
+CREATE POLICY deep_events_authenticated_access ON app.deep_events
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY deep_tenant ON app.deep_events
     AS RESTRICTIVE
     FOR ALL TO PUBLIC

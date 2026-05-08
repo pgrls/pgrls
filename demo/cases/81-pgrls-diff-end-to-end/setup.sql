@@ -18,6 +18,19 @@ CREATE TABLE app.uc81_invoices (
 ALTER TABLE app.uc81_invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.uc81_invoices FORCE ROW LEVEL SECURITY;
 
+-- PERMISSIVE policy granting tenant-scoped access. Wrapped via
+-- `(SELECT current_setting(...))` so PERF001 stays silent on
+-- this policy. The RESTRICTIVE below is what the diff test
+-- drops to exercise DIFF_POLICY_DROPPED_RESTRICTIVE.
+CREATE POLICY uc81_invoices_authenticated_access ON app.uc81_invoices
+    FOR ALL TO app_authenticated
+    USING (
+        tenant_id = (SELECT current_setting('request.jwt.claims', true))::jsonb->>'tenant_id'
+    )
+    WITH CHECK (
+        tenant_id = (SELECT current_setting('request.jwt.claims', true))::jsonb->>'tenant_id'
+    );
+
 CREATE POLICY tenant_isolation ON app.uc81_invoices
     AS RESTRICTIVE
     FOR ALL

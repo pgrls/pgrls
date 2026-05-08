@@ -14,6 +14,13 @@ CREATE TABLE app.json_access (
 );
 ALTER TABLE app.json_access ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.json_access FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a flat per-user predicate. The case
+-- pins HYG001's JSON-operator walk on the RESTRICTIVE below;
+-- this PERMISSIVE keeps SEC012 silent without affecting that.
+CREATE POLICY json_access_authenticated_access ON app.json_access
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY json_filter ON app.json_access
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

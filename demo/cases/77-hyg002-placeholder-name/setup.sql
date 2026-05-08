@@ -17,6 +17,15 @@ CREATE TABLE app.placeholder_named (
 );
 ALTER TABLE app.placeholder_named ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.placeholder_named FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy whose name deliberately avoids HYG002's
+-- placeholder vocabulary (todo / fixme / tmp / hack / xxx /
+-- debug / placeholder) — `pn_user_access` splits to {pn, user,
+-- access}, none in the placeholder set. The RESTRICTIVE below
+-- keeps `todo_replace_me_later`, the name HYG002 catches.
+CREATE POLICY pn_user_access ON app.placeholder_named
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY todo_replace_me_later ON app.placeholder_named
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

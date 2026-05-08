@@ -16,5 +16,12 @@ CREATE TABLE app.deny_via_false (
 );
 ALTER TABLE app.deny_via_false ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.deny_via_false FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a benign own-column predicate so
+-- SEC005 stays silent here. The RESTRICTIVE below has the
+-- `USING (false)` shape SEC010 catches.
+CREATE POLICY deny_via_false_authenticated_access ON app.deny_via_false
+    FOR ALL TO app_authenticated
+    USING (id IS NOT NULL)
+    WITH CHECK (id IS NOT NULL);
 CREATE POLICY block_all ON app.deny_via_false
     AS RESTRICTIVE FOR SELECT TO PUBLIC USING (false);

@@ -14,6 +14,13 @@ CREATE TABLE app.partial_orphan (
 );
 ALTER TABLE app.partial_orphan ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.partial_orphan FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy. Deliberately doesn't reference the `gone`
+-- column dropped at the bottom of this file — HYG001 must fire
+-- on `orphan_filter` only.
+CREATE POLICY partial_orphan_authenticated_access ON app.partial_orphan
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY clean_owner ON app.partial_orphan
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

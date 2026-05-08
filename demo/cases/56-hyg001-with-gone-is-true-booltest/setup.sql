@@ -11,6 +11,13 @@ CREATE TABLE app.booltest_orphan (
 );
 ALTER TABLE app.booltest_orphan ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.booltest_orphan FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy. Deliberately doesn't reference the `gone`
+-- column dropped at the bottom of this file — HYG001 must
+-- fire on `bt_check` only.
+CREATE POLICY booltest_orphan_authenticated_access ON app.booltest_orphan
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY bt_check ON app.booltest_orphan
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

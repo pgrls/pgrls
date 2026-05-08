@@ -15,6 +15,13 @@ CREATE TABLE app.volatile_predicate (
 );
 ALTER TABLE app.volatile_predicate ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.volatile_predicate FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a non-volatile predicate (`id IS NOT
+-- NULL`) — PERF002 stays silent on it. The RESTRICTIVE below
+-- has the `random()` call PERF002 catches.
+CREATE POLICY volatile_predicate_authenticated_access ON app.volatile_predicate
+    FOR ALL TO app_authenticated
+    USING (id IS NOT NULL)
+    WITH CHECK (id IS NOT NULL);
 CREATE POLICY random_sampling ON app.volatile_predicate
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
