@@ -149,7 +149,7 @@ The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `reque
 
 Setting none of the three causes `pgrls_db` to raise `PgrlsTestConfigError`.
 
-The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). TypeScript and Go ports following the same contract are tracked on the roadmap.
+The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). The **TypeScript port** ships as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm — same Layer 1 protocol, same wire-level behaviour, idiomatic JS/TS surface (camelCase API, `pg` and `postgres.js` adapters). Source under [`ts/`](ts/) in this repo. A Go port following the same contract is tracked on the roadmap.
 
 ## Diff — `pgrls snapshot` + `pgrls diff`
 
@@ -299,9 +299,10 @@ dashboard, or keep the report as a build artifact.
 ## Roadmap
 
 - **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Markdown output. Polished error messages.
-- **TypeScript / Go ports.** Cross-language ports of `pgrls.testing` (v0.4) and `pgrls.diff` (v0.4+) backed by the same Layer-1 protocol fixtures.
-- **SAT-based predicate implication checking.** v0.2 recognizes common-case AST patterns (literal-equal, AND-tighten / drop, OR-loosen / drop) for `USING` / `WITH CHECK` diffs; everything else is `REQUIRES_REVIEW`. Z3-driven analysis to widen automatic classification is tracked for v0.5+.
-- **Migration-as-input.** `pgrls diff --apply migration.sql` to diff a live DB against the post-migration shape without applying it. Tracked for v0.5+.
+- ~~**TypeScript port of `pgrls.testing`**~~ — landed in v0.6.0 as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test). Source: [`ts/`](ts/).
+- **Go port** of `pgrls.testing` following the same Layer 1 protocol — tracked but not started.
+- ~~**SAT-based predicate implication checking.**~~ Z3-driven semantic predicate analysis landed in v0.4.x.
+- ~~**Migration-as-input.**~~ `pgrls diff --apply migration.sql` shipped in v0.5.0; baseline cache + extension auto-detect in v0.5.1–v0.5.2.
 
 ## License
 
