@@ -44,6 +44,12 @@ CREATE TABLE app.team_members (
 );
 ALTER TABLE app.team_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.team_members FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy granting per-user access. The RESTRICTIVE
+-- below is what uc16's correlated-EXISTS pin lives on.
+CREATE POLICY team_members_authenticated_access ON app.team_members
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY team_members_self ON app.team_members
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
@@ -56,6 +62,25 @@ CREATE TABLE app.team_documents (
 );
 ALTER TABLE app.team_documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.team_documents FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy mirroring the correlated-EXISTS shape so
+-- the case still demonstrates uc16's SubLink walk, just on
+-- the PERMISSIVE side too. Same predicate as the RESTRICTIVE.
+CREATE POLICY team_documents_authenticated_access ON app.team_documents
+    FOR ALL TO app_authenticated
+    USING (
+        EXISTS (
+            SELECT 1 FROM app.team_members tm
+            WHERE tm.member_team_id = team_id
+              AND tm.user_id = (SELECT current_setting('app.user', true))
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM app.team_members tm
+            WHERE tm.member_team_id = team_id
+              AND tm.user_id = (SELECT current_setting('app.user', true))
+        )
+    );
 CREATE POLICY team_member_visibility ON app.team_documents
     AS RESTRICTIVE
     FOR ALL TO PUBLIC

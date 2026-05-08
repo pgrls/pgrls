@@ -19,61 +19,8 @@ fail_on = "error"
 # `app.countries` is world-readable reference data by design.
 allowlist = ["app.countries"]
 
-[lint.rules.SEC012]
-# The demo's case fixtures predate SEC012 and were written when the
-# demo author (and Postgres docs reader) believed RESTRICTIVE-only
-# was a valid pattern. SEC012 is correct: a RESTRICTIVE-only table
-# is silently deny-all. The demo's RESTRICTIVE-only tables are
-# preserved as-is to keep the case-vs-rule scenarios stable and
-# their violation counts unchanged; treating each as "deny-all by
-# design for demo purposes" via this allowlist isolates the new
-# rule's noise from the existing demo cases. A follow-up release
-# may rewrite the affected cases to use a proper PERMISSIVE +
-# RESTRICTIVE pattern; until then the allowlist stops SEC012 from
-# tripping the "no rule fires on this clean case" tests.
-allowlist = [
-    "app.MixedCase Table",
-    "app.admin_audit",
-    "app.booltest_orphan",
-    "app.case_policy",
-    "app.deep_events",
-    "app.deny_via_false",
-    # Issue #11 chip-away log:
-    #   v0.3.1 — `app.documents` (uc01) → canonical PERMISSIVE+RESTRICTIVE.
-    #   v0.5.4 — uc04 notes, uc06 accounts, uc07 singletons,
-    #            uc08 invoices, uc11 messages, uc18 users_v2,
-    #            uc19 profiles, uc20 todos, uc22 posts_v2.
-    #   v0.5.5 — uc10 feature_flags, uc12 comments, uc17 tickets,
-    #            uc21 audit_inserts, uc27 todos_archive,
-    #            uc28 jwt_documents, uc29 kb_articles,
-    #            uc30 composite_tenant, uc34 flags_table,
-    #            uc36 admin_overrides.
-    #   v0.5.6 — uc35 always_open, uc38 jwt_unwrapped,
-    #            uc39 user_workspaces, uc44 current_user_check,
-    #            uc47 array_tags, uc51 row_comparison,
-    #            uc53 nested_or_check, uc54 typecast_email,
-    #            uc57 typecast_auth, uc58 coalesce_auth.
-    # Remaining entries below are the next chip-away targets.
-    "app.ec_order_items",
-    "app.ec_orders",
-    "app.events",
-    "app.gdpr_records",
-    "app.gen_cols",
-    "app.json_access",
-    "app.leaf_metrics_2026",
-    "app.not_false_table",
-    "app.or_true_table",
-    "app.partial_orphan",
-    "app.placeholder_named",
-    "app.recent_only",
-    "app.region_metrics",
-    "app.team_documents",
-    "app.team_members",
-    "app.uc81_invoices",
-    "app.uc83_invoices",
-    "app.uc85_users",
-    "app.uc86_users",
-    "app.uc87_users",
-    "app.uc88_users",
-    "app.volatile_predicate",
-]
+# Issue #11 fully closed in v0.5.7 — every demo fixture that used
+# RESTRICTIVE-only has been rewritten to the canonical
+# PERMISSIVE+RESTRICTIVE pattern, so the SEC012 allowlist is no
+# longer needed. The chip-away history is preserved in the release
+# notes (v0.3.1, v0.5.4–v0.5.7).

@@ -12,6 +12,13 @@ CREATE TABLE app.case_policy (
 );
 ALTER TABLE app.case_policy ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.case_policy FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a flat predicate (own column, no
+-- CASE expression) so the new policy doesn't change what
+-- SEC005's CASE-walk pin demonstrates.
+CREATE POLICY case_policy_authenticated_access ON app.case_policy
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY visibility_case ON app.case_policy
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
