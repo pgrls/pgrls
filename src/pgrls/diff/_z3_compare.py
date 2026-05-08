@@ -1,4 +1,4 @@
-"""SAT-based predicate implication via Z3 (Phase 1).
+"""SAT-based predicate implication via Z3 (Phases 1 + 3).
 
 Z3 is an optional dependency (``pip install pgrls[diff-z3]``). When
 unavailable, ``Z3_AVAILABLE`` is False and ``classify_via_z3``
@@ -23,11 +23,15 @@ Implication is decided by checking unsatisfiability of the negation:
 
 Phase 1 supports a deliberate subset of pglast nodes. Unsupported
 nodes return None from the translator, which propagates up to
-``classify_via_z3`` returning None. Function calls (``auth.uid()``,
-``current_setting``) are NOT supported in Phase 1 — they require
-uninterpreted-function modeling that lands in Phase 3 (issue #12).
+``classify_via_z3`` returning None.
 
-Supported AST nodes (Phase 1):
+Phase 3 (v0.4.1+) extends the supported set with function calls
+(modeled as uninterpreted Z3 constants keyed by canonical shape so
+the same call in base and head reuses the same Z3 variable),
+``COALESCE`` and ``CASE`` (treated opaquely the same way), and
+``BETWEEN`` (translated to the equivalent AND-of-comparisons).
+
+Supported AST nodes (Phase 1 + 3):
 
 * ``ColumnRef`` — single-table column references resolve to Z3
   free variables. Type is inferred from comparison context (Int
@@ -46,6 +50,23 @@ Supported AST nodes (Phase 1):
   not constrained to be non-null, so 3VL nuances may produce
   inconclusive results in either direction. The caller falls
   through to ``requires_review`` rather than misclassifying.
+* ``A_Expr`` with ``BETWEEN`` / ``NOT BETWEEN`` (Phase 3) —
+  translated to the equivalent AND/OR of inequalities. Symmetric
+  variants (``BETWEEN SYMMETRIC``) currently abort.
+* ``FuncCall`` (Phase 3) — translated to a fresh Z3 String constant
+  keyed by ``<funcname>(<canonical-args>)``. Repeated identical
+  calls reuse the same Z3 variable across base and head, so two
+  predicates that reference the same function call (e.g.
+  ``auth.uid()``, ``current_setting('app.tenant')``) can be
+  compared via implication. Aggregates and window functions abort.
+* ``CoalesceExpr`` and ``CaseExpr`` (Phase 3) — treated as opaque
+  uninterpreted Z3 String constants, keyed by their canonical
+  RawStream rendering. Two predicates with ``COALESCE(col, 'x')``
+  on each side reuse the same Z3 variable; nuanced reasoning about
+  the WHEN/ELSE branches is deferred to a later phase. Sound but
+  coarse: predicates that differ only inside the COALESCE/CASE
+  fall through to ``requires_review`` because the canonical strings
+  differ and Z3 sees two unrelated free variables.
 
 Type unification per column: the first comparison fixes the type.
 A subsequent reference with a conflicting type (e.g. ``col = 5``
@@ -70,8 +91,11 @@ from pglast.ast import (
     A_Expr,
     Boolean,
     BoolExpr,
+    CaseExpr,
+    CoalesceExpr,
     ColumnRef,
     Float,
+    FuncCall,
     Integer,
     NullTest,
     String,
@@ -81,6 +105,7 @@ from pglast.enums import (
     BoolExprType,
     NullTestType,
 )
+from pglast.stream import RawStream
 
 
 # Comparison operator strings appearing in `A_Expr.name[0].sval` for
@@ -112,6 +137,12 @@ class _Context:
     def __init__(self) -> None:
         self._vars: dict[str, Any] = {}  # column-key → z3.ExprRef
         self._null_vars: dict[str, Any] = {}  # column-key → z3.BoolRef
+        # Phase 3 — opaque expressions (function calls,
+        # COALESCE, CASE) keyed by their canonical-string shape.
+        # Same key on both sides of the diff yields the same Z3
+        # variable, enabling implication checks across predicates
+        # that reference identical opaque expressions.
+        self._opaque_vars: dict[str, Any] = {}
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -135,6 +166,20 @@ class _Context:
             existing = z3.Bool(f"_isnull__{key}")
             self._null_vars[key] = existing
         return existing
+
+    def opaque(self, key: str, sort: Any) -> Any:
+        """Return a Z3 free variable for an opaque expression keyed by
+        its canonical shape. Bound to ``sort`` on first use; subsequent
+        calls with a different sort return None (type-conflict abort).
+        """
+        existing = self._opaque_vars.get(key)
+        if existing is None:
+            var = z3.Const(f"_opaque__{key}", sort)
+            self._opaque_vars[key] = var
+            return var
+        if existing.sort() == sort:
+            return existing
+        return None
 
 
 def _column_key(node: ColumnRef) -> str:
@@ -231,12 +276,23 @@ def _to_z3(node: Any, ctx: _Context) -> Any:
 
     # Comparison expressions.
     if isinstance(node, A_Expr):
-        # Only handle the simple AOP_OP / IN kinds.
+        # Only handle the simple AOP_OP / IN / BETWEEN kinds.
         if node.kind == A_Expr_Kind.AEXPR_OP:
             return _binop_to_z3(node, ctx)
         if node.kind == A_Expr_Kind.AEXPR_IN:
             return _in_to_z3(node, ctx)
+        if node.kind == A_Expr_Kind.AEXPR_BETWEEN:
+            return _between_to_z3(node, ctx, negate=False)
+        if node.kind == A_Expr_Kind.AEXPR_NOT_BETWEEN:
+            return _between_to_z3(node, ctx, negate=True)
         return None
+
+    # Phase 3 — function calls, COALESCE, CASE: each becomes an
+    # opaque Z3 variable keyed by canonical shape.
+    if isinstance(node, FuncCall):
+        return _func_call_to_z3(node, ctx)
+    if isinstance(node, (CoalesceExpr, CaseExpr)):
+        return _opaque_expression(node, ctx, sort=z3.StringSort())
 
     # Bare ColumnRef appearing as a Boolean (e.g. `WHERE is_admin`).
     if isinstance(node, ColumnRef):
@@ -254,7 +310,13 @@ def _to_z3(node: Any, ctx: _Context) -> Any:
 
 
 def _binop_to_z3(node: A_Expr, ctx: _Context) -> Any:
-    """Translate `A_Expr(AEXPR_OP)` — a comparison or arithmetic op."""
+    """Translate `A_Expr(AEXPR_OP)` — a binary comparison.
+
+    Either side may be a ColumnRef, A_Const, or any other supported
+    node (FuncCall in Phase 3, COALESCE/CASE in Phase 3, etc.).
+    Type inference for a bare ColumnRef on one side reads the sort
+    of the other side's translation.
+    """
     # `node.name` is a tuple-of-String per pglast; exact length is
     # operator-dependent (`OPERATOR(schema.+)` shapes can be 2-tuples).
     # Phase 1 only handles single-name operators.
@@ -266,55 +328,167 @@ def _binop_to_z3(node: A_Expr, ctx: _Context) -> Any:
     if op_fn is None:
         return None  # unsupported operator
 
-    lexpr = node.lexpr
-    rexpr = node.rexpr
-
-    # Phase 1 supports `col OP literal` and `literal OP col` and
-    # `literal OP literal` (rare). `col OP col` could be supported
-    # but isn't in Phase 1 — return None for now; falls through to
-    # requires_review.
-    if isinstance(lexpr, ColumnRef) and isinstance(rexpr, A_Const):
-        return _col_op_const(lexpr, op_fn, rexpr, ctx)
-    if isinstance(lexpr, A_Const) and isinstance(rexpr, ColumnRef):
-        # Reverse: const OP col. For =, !=: symmetric. For ordered
-        # comparisons, swap is fine if op_fn handles it (it does —
-        # the lambda is just `a < b` etc., applied to the swapped
-        # pair).
-        return _col_op_const(
-            rexpr, lambda a, b: op_fn(b, a), lexpr, ctx
-        )
-    if isinstance(lexpr, A_Const) and isinstance(rexpr, A_Const):
-        l_z3 = _const_to_z3(lexpr)
-        r_z3 = _const_to_z3(rexpr)
-        if l_z3 is None or r_z3 is None:
-            return None
-        try:
-            return op_fn(l_z3, r_z3)
-        except z3.Z3Exception:
-            return None
-    return None
-
-
-def _col_op_const(
-    col: ColumnRef, op_fn: Any, const: A_Const, ctx: _Context
-) -> Any:
-    """`<col> OP <literal>` — bind col with the literal's sort."""
-    key = _column_key(col)
-    if not key:
-        return None
-    sort = _infer_sort(const)
-    if sort is None:
-        return None
-    var = ctx.column(key, sort)
-    if var is None:  # type conflict
-        return None
-    rhs = _const_to_z3(const)
-    if rhs is None:
+    lhs, rhs = _resolve_binop_operands(node.lexpr, node.rexpr, ctx)
+    if lhs is None or rhs is None:
         return None
     try:
-        return op_fn(var, rhs)
+        return op_fn(lhs, rhs)
     except z3.Z3Exception:
         return None
+
+
+def _resolve_binop_operands(
+    lexpr: Any, rexpr: Any, ctx: _Context
+) -> tuple[Any, Any]:
+    """Translate both sides of a binary comparison, inferring column
+    types from the other side when one side is a bare ColumnRef.
+
+    Returns ``(None, None)`` on any unsupported / type-conflict path.
+    """
+    l_is_col = isinstance(lexpr, ColumnRef)
+    r_is_col = isinstance(rexpr, ColumnRef)
+
+    if l_is_col and not r_is_col:
+        rhs = _to_z3(rexpr, ctx)
+        if rhs is None:
+            return (None, None)
+        lhs = _bind_column(lexpr, rhs.sort(), ctx)
+        return (lhs, rhs)
+    if r_is_col and not l_is_col:
+        lhs = _to_z3(lexpr, ctx)
+        if lhs is None:
+            return (None, None)
+        rhs = _bind_column(rexpr, lhs.sort(), ctx)
+        return (lhs, rhs)
+    if l_is_col and r_is_col:
+        # `col OP col`: bind both sides as String by default — pglast
+        # introspection can't tell us the actual Postgres type. Z3
+        # equality across mismatched sorts would raise; defaulting to
+        # String works for the common UUID-vs-UUID and text-vs-text
+        # shapes. Two String columns compared with `<` will succeed
+        # (Z3 strings have lex order); Int-vs-Int comparisons need a
+        # prior literal context that we don't have here.
+        lhs = _bind_column(lexpr, z3.StringSort(), ctx)
+        rhs = _bind_column(rexpr, z3.StringSort(), ctx)
+        return (lhs, rhs)
+    # Neither side is a column — translate generically.
+    return (_to_z3(lexpr, ctx), _to_z3(rexpr, ctx))
+
+
+def _bind_column(node: ColumnRef, sort: Any, ctx: _Context) -> Any:
+    """Bind ``node`` to a Z3 free variable of ``sort``."""
+    key = _column_key(node)
+    if not key:
+        return None
+    return ctx.column(key, sort)
+
+
+def _between_to_z3(node: A_Expr, ctx: _Context, *, negate: bool) -> Any:
+    """`<expr> BETWEEN <lo> AND <hi>` ⇒ ``lo <= expr AND expr <= hi``.
+
+    pglast represents BETWEEN as ``A_Expr(kind=AEXPR_BETWEEN,
+    lexpr=<expr>, rexpr=[<lo>, <hi>])``. NOT BETWEEN is the same
+    shape with ``kind=AEXPR_NOT_BETWEEN``; translates as the
+    ``Not(...)`` of the same body.
+
+    Built from two ``_resolve_binop_operands`` calls so that bare
+    ColumnRef on the lexpr side gets typed by the lo/hi literals
+    (otherwise the column would default to Bool sort and the Int
+    comparisons would silently coerce via ``If(x, 1, 0)``).
+
+    Symmetric variants (``BETWEEN SYMMETRIC``) use
+    ``AEXPR_BETWEEN_SYM`` / ``AEXPR_NOT_BETWEEN_SYM`` and abort
+    here — supporting them needs ``min(lo, hi) <= expr AND expr <=
+    max(lo, hi)`` which Z3 can express but the translation is
+    non-trivial; deferred until a real RLS predicate uses it.
+    """
+    lexpr = node.lexpr
+    rexpr_list = node.rexpr
+    if not isinstance(rexpr_list, (list, tuple)) or len(rexpr_list) != 2:
+        return None
+    lo, hi = rexpr_list
+
+    # `lo <= expr` (sorted as `_resolve_binop_operands(lo, expr)`)
+    lo_z3, expr_z3_low = _resolve_binop_operands(lo, lexpr, ctx)
+    if lo_z3 is None or expr_z3_low is None:
+        return None
+    # `expr <= hi`
+    expr_z3_high, hi_z3 = _resolve_binop_operands(lexpr, hi, ctx)
+    if expr_z3_high is None or hi_z3 is None:
+        return None
+
+    try:
+        body = z3.And(lo_z3 <= expr_z3_low, expr_z3_high <= hi_z3)
+    except z3.Z3Exception:
+        return None
+    return z3.Not(body) if negate else body
+
+
+def _func_call_to_z3(node: FuncCall, ctx: _Context) -> Any:
+    """Translate a function call to an opaque Z3 String constant.
+
+    The call is keyed by ``<funcname>(<canonical-args>)`` so the
+    same call on base and head sides yields the same Z3 variable.
+    Aggregates, window functions, and DISTINCT-aggregates abort —
+    those don't appear in RLS predicates.
+
+    Args may be literals, ColumnRefs, or other supported nodes;
+    each must translate via ``_to_z3`` (which is itself recursive).
+    The argument list is canonicalized via RawStream so cosmetic
+    differences (whitespace, redundant parens) collapse. Two calls
+    that differ only in canonical arg ordering are NOT considered
+    equal — RawStream preserves source order.
+    """
+    if node.agg_filter is not None:
+        return None  # FILTER (WHERE ...) — out of scope
+    if node.agg_within_group:
+        return None  # WITHIN GROUP (ORDER BY ...) — out of scope
+    if node.over is not None:
+        return None  # window function — out of scope
+    if node.agg_star:
+        return None  # `count(*)` etc. — out of scope
+    funcname_parts = node.funcname or ()
+    if not all(isinstance(part, String) for part in funcname_parts):
+        return None
+    func_name = ".".join(p.sval for p in funcname_parts)
+    if not func_name:
+        return None
+
+    # Sanity-check args translate. We don't actually consume the
+    # translated Z3 expressions here — the function call is opaque
+    # — but if any argument is unsupported, abort upward so we
+    # don't synthesize a misleading Z3 variable for an unparseable
+    # signature.
+    for arg in (node.args or ()):
+        if _to_z3(arg, ctx) is None:
+            return None
+
+    # Use the syntactic canonical rendering as the cache key. Two
+    # base/head predicates that reference the exact same call (e.g.
+    # `current_setting('app.tenant')`) get the same Z3 variable.
+    key = _canon(node)
+    return ctx.opaque(key, z3.StringSort())
+
+
+def _opaque_expression(node: Any, ctx: _Context, *, sort: Any) -> Any:
+    """Generic opaque-Z3-variable wrapper for nodes whose semantics
+    Phase 3 doesn't fully model (currently CoalesceExpr, CaseExpr).
+
+    Two identical RawStream renderings on base and head produce the
+    same Z3 variable, so predicates like ``COALESCE(col, 'default')
+    = 'foo'`` are comparable across base and head when they appear
+    verbatim. Predicates whose CASE/COALESCE bodies differ get
+    different variables and Z3 reports them as incomparable
+    (caller falls through to ``requires_review``).
+    """
+    key = _canon(node)
+    return ctx.opaque(key, sort)
+
+
+def _canon(node: Any) -> str:
+    """Canonical RawStream rendering of an AST node."""
+    rendered: str = RawStream()(node)
+    return rendered
 
 
 def _in_to_z3(node: A_Expr, ctx: _Context) -> Any:
