@@ -46,6 +46,15 @@ jobs:
       # Postgres as a service. Conftest's `pg_conn` still resets
       # schemas between tests against this connection.
       PGRLS_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      # Tests that DO spawn a testcontainer (e.g. the v0.5+
+      # `Schema.to_sql` round-trip soundness pin) must use the
+      # same major as the service container; PG17 introduced the
+      # `MAINTAIN` grant privilege which earlier majors reject as
+      # unrecognized syntax. Without this, capturing under PG17
+      # then restoring to a hardcoded PG16 target reproduces the
+      # bug `tests/test_schema_to_sql.py::test_to_sql_round_trips_through_real_postgres`
+      # caught in CI on PR #18.
+      PGRLS_TEST_PG_IMAGE: postgres:${{ matrix.pg }}-alpine
     steps:
       - uses: actions/checkout@v4
 
