@@ -47,7 +47,10 @@ allowlist = [
     "app.current_user_check",
     "app.deep_events",
     "app.deny_via_false",
-    "app.documents",
+    # `app.documents` (uc01) removed in v0.3.1 — uc01's setup.sql
+    # now uses a proper PERMISSIVE+RESTRICTIVE pair (the canonical
+    # clean tenant-table shape). Remaining entries are the
+    # incremental remainder of issue #11; v0.3.2+ will chip away.
     "app.ec_order_items",
     "app.ec_orders",
     "app.events",
