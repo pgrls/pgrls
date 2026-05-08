@@ -10,6 +10,61 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-05-08
+
+### Added
+- **Z3 Phase 4 — TypeCast and arithmetic operators** (issue #12
+  phase 4). Closes the v0.4.x roadmap's "still pending" items.
+- **`TypeCast`** (`'a'::text`, `col::int`, etc.) translates against
+  a small target-type → Z3-sort table:
+  - `text`, `varchar`, `char`, `character`, `bpchar`, `uuid`,
+    `name`, `citext` → Z3 String
+  - `int`, `int2`, `int4`, `int8`, `integer`, `smallint`,
+    `bigint`, `oid` → Z3 Int
+  - `float4`, `float8`, `real`, `double`, `numeric`, `decimal`
+    → Z3 Real
+  - `bool`, `boolean` → Z3 Bool
+  When the cast doesn't change the Z3 sort (e.g. `int8 → integer`,
+  `text → varchar`), the inner expression's translation is
+  returned unchanged. Sort-changing casts (`id::text` for an Int
+  column) are modeled as opaque Z3 variables under the target
+  sort — identical casts on base and head reuse the same variable;
+  differing casts produce unrelated variables and the predicate
+  falls through to `requires_review`.
+- **Arithmetic operators** (`+`, `-`, `*`, `/`, `%`) on Int and
+  Real operands. A typical RLS predicate like `score > col + 5`
+  now translates faithfully. Type inference flows through the
+  non-column operand (same shape as comparisons). Two-column
+  arithmetic (`col_a + col_b`) defaults both columns to String,
+  which Z3 then refuses, so the translator falls through to None
+  for that shape — fine in practice because real RLS predicates
+  use `col + literal`, not `col + col`.
+
+### Cases this reclassifies (vs v0.4.1)
+
+| Predicate change | v0.4.1 | v0.4.2 |
+|---|---|---|
+| `col = 'a'::text` ↔ `col = 'a'` | `requires_review` | `semantic_equivalent` |
+| `col + 1 > 0` ↔ `col > -1` | `requires_review` | `semantic_equivalent` |
+| `col - 3 > 0` ↔ `col > 3` | `requires_review` | `semantic_equivalent` |
+| `col + 1 > 0` → `col + 5 > 0` (col > -5) | `requires_review` | `semantic_loosened` |
+| `id::text = 'a'` (both sides) | `requires_review` | `semantic_equivalent` |
+
+### Phase 4 closes issue #12
+
+With Phase 4 shipped, [issue #12](https://github.com/pgrls/pgrls/issues/12)
+covers the planned scope. Subquery-RHS `IN` remains a deliberate
+non-goal — proper variable scoping is out of scope for the
+predicate-implication contract; teams using subquery RLS
+patterns continue to hit `requires_review` (the v0.3.x behavior).
+
+### Test coverage
+- 6 new tests in `tests/diff/test_z3_compare.py` (TypeCast
+  no-op + sort-changing-opaque, arithmetic equivalence /
+  widening / subtraction).
+- 2 existing "unsupported → None" tests updated to assert
+  Phase 4's new positive classifications.
+
 ## [0.4.1] - 2026-05-08
 
 ### Added

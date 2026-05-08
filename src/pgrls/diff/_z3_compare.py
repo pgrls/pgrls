@@ -1,10 +1,14 @@
-"""SAT-based predicate implication via Z3 (Phases 1 + 3).
+"""SAT-based predicate implication via Z3 (Phases 1, 3, and 4).
 
 Z3 is an optional dependency (``pip install pgrls[diff-z3]``). When
 unavailable, ``Z3_AVAILABLE`` is False and ``classify_via_z3``
 returns None — callers fall through to whatever existing syntactic
-classifier they were using. When Z3 is installed, predicates that
-fall outside the syntactic patterns can be re-checked via implication:
+classifier they were using. ``compare_predicates`` (the public
+entry point in ``ast_compare.py``) imports this module lazily so
+the Z3 codepath can never break the lint / non-diff paths even if
+``z3-solver`` is missing or fails to import. When Z3 is installed,
+predicates that fall outside the syntactic patterns can be
+re-checked via implication:
 
 * ``base → head`` AND ``head → base``: predicates are semantically
   equivalent. Z3 says the row sets are identical even though the
@@ -25,13 +29,19 @@ Phase 1 supports a deliberate subset of pglast nodes. Unsupported
 nodes return None from the translator, which propagates up to
 ``classify_via_z3`` returning None.
 
-Phase 3 (v0.4.1+) extends the supported set with function calls
+Phase 3 (v0.4.1) extended the supported set with function calls
 (modeled as uninterpreted Z3 constants keyed by canonical shape so
 the same call in base and head reuses the same Z3 variable),
 ``COALESCE`` and ``CASE`` (treated opaquely the same way), and
 ``BETWEEN`` (translated to the equivalent AND-of-comparisons).
 
-Supported AST nodes (Phase 1 + 3):
+Phase 4 (v0.4.2) adds ``TypeCast`` (e.g. ``'a'::text``,
+``col::int``) — supported when the cast target's Z3 sort matches
+the inner expression's sort, otherwise opaque — and basic
+arithmetic operators (``+``, ``-``, ``*``, ``/``, ``%``) for Int
+and Real operands.
+
+Supported AST nodes (Phases 1 + 3 + 4):
 
 * ``ColumnRef`` — single-table column references resolve to Z3
   free variables. Type is inferred from comparison context (Int
@@ -67,6 +77,23 @@ Supported AST nodes (Phase 1 + 3):
   coarse: predicates that differ only inside the COALESCE/CASE
   fall through to ``requires_review`` because the canonical strings
   differ and Z3 sees two unrelated free variables.
+* ``TypeCast`` (Phase 4) — ``'a'::text``, ``col::int`` etc. The
+  target type name (last segment of ``pg_catalog.<type>``-style
+  qualified names) is mapped to a Z3 sort via a small table:
+  ``text``/``varchar``/``uuid`` → String, ``int``/``bigint`` → Int,
+  ``numeric``/``float`` → Real, ``bool`` → Bool. When the resolved
+  sort matches the inner expression's sort, the cast is a no-op
+  and the inner translation is returned; otherwise the cast is
+  treated as opaque (keyed by its full canonical rendering, so
+  identical casts on base and head reuse the same Z3 variable).
+* ``A_Expr(AEXPR_OP)`` with arithmetic operators (Phase 4) —
+  ``+``, ``-``, ``*``, ``/``, ``%``. Translated to the matching
+  Z3 op. Type inference flows through the non-column operand,
+  same as comparisons. ``col + col`` two-column arithmetic
+  defaults both columns to String for type-inference reasons,
+  which Z3 then refuses, so the translator falls through to None
+  for that shape — fine in practice because real RLS predicates
+  use ``col + literal``, not ``col + col``.
 
 Type unification per column: the first comparison fixes the type.
 A subsequent reference with a conflicting type (e.g. ``col = 5``
@@ -99,6 +126,7 @@ from pglast.ast import (
     Integer,
     NullTest,
     String,
+    TypeCast,
 )
 from pglast.enums import (
     A_Expr_Kind,
@@ -123,6 +151,39 @@ _COMPARISON_OPS: dict[str, Any] = {
     "<=": lambda a, b: a <= b,
     ">=": lambda a, b: a >= b,
 }
+
+# Phase 4 — arithmetic operators. The Z3 ExprRef class overloads
+# the Python operators, so the lambdas just produce the
+# corresponding z3.ArithRef expressions when both operands are
+# Int or Real. Z3 raises Z3Exception if the operands' sorts don't
+# support arithmetic (e.g. String); the caller catches and
+# returns None.
+_ARITHMETIC_OPS: dict[str, Any] = {
+    "+": lambda a, b: a + b,
+    "-": lambda a, b: a - b,
+    "*": lambda a, b: a * b,
+    "/": lambda a, b: a / b,
+    "%": lambda a, b: a % b,
+}
+
+# Postgres type-name (last segment of `pg_catalog.<type>`-style
+# qualified names) → Z3 sort, for Phase 4 TypeCast resolution.
+# Coarse on purpose: numeric / decimal collapse to Real, the
+# integer variants collapse to Int, character variants collapse
+# to String. Casts to a target NOT in this table fall through to
+# the opaque-variable codepath.
+_STRING_TYPES = frozenset({
+    "text", "varchar", "char", "character", "bpchar", "uuid",
+    "name", "citext",
+})
+_INT_TYPES = frozenset({
+    "int", "int2", "int4", "int8", "integer", "smallint",
+    "bigint", "oid",
+})
+_REAL_TYPES = frozenset({
+    "float4", "float8", "real", "double", "numeric", "decimal",
+})
+_BOOL_TYPES = frozenset({"bool", "boolean"})
 
 
 class _Context:
@@ -294,6 +355,13 @@ def _to_z3(node: Any, ctx: _Context) -> Any:
     if isinstance(node, (CoalesceExpr, CaseExpr)):
         return _opaque_expression(node, ctx, sort=z3.StringSort())
 
+    # Phase 4 — TypeCast. Resolve the target type to a Z3 sort and,
+    # if it matches the inner expression's sort, return the inner
+    # translation unchanged (the cast is a no-op for our purposes).
+    # Otherwise the cast is opaque, keyed by canonical rendering.
+    if isinstance(node, TypeCast):
+        return _type_cast_to_z3(node, ctx)
+
     # Bare ColumnRef appearing as a Boolean (e.g. `WHERE is_admin`).
     if isinstance(node, ColumnRef):
         key = _column_key(node)
@@ -310,21 +378,23 @@ def _to_z3(node: Any, ctx: _Context) -> Any:
 
 
 def _binop_to_z3(node: A_Expr, ctx: _Context) -> Any:
-    """Translate `A_Expr(AEXPR_OP)` — a binary comparison.
+    """Translate `A_Expr(AEXPR_OP)` — a binary comparison or arithmetic op.
 
     Either side may be a ColumnRef, A_Const, or any other supported
-    node (FuncCall in Phase 3, COALESCE/CASE in Phase 3, etc.).
-    Type inference for a bare ColumnRef on one side reads the sort
-    of the other side's translation.
+    node (FuncCall in Phase 3, COALESCE/CASE in Phase 3, TypeCast
+    in Phase 4). Type inference for a bare ColumnRef on one side
+    reads the sort of the other side's translation. Arithmetic
+    operators (Phase 4: ``+``, ``-``, ``*``, ``/``, ``%``) produce
+    a Z3 ArithRef; comparisons produce a Z3 BoolRef.
     """
     # `node.name` is a tuple-of-String per pglast; exact length is
     # operator-dependent (`OPERATOR(schema.+)` shapes can be 2-tuples).
-    # Phase 1 only handles single-name operators.
+    # Phase 1+ only handles single-name operators.
     op_names = list(node.name or ())
     if len(op_names) != 1 or not isinstance(op_names[0], String):
         return None
     op = op_names[0].sval
-    op_fn = _COMPARISON_OPS.get(op)
+    op_fn = _COMPARISON_OPS.get(op) or _ARITHMETIC_OPS.get(op)
     if op_fn is None:
         return None  # unsupported operator
 
@@ -381,6 +451,72 @@ def _bind_column(node: ColumnRef, sort: Any, ctx: _Context) -> Any:
     if not key:
         return None
     return ctx.column(key, sort)
+
+
+def _type_cast_to_z3(node: TypeCast, ctx: _Context) -> Any:
+    """Translate ``<expr>::<type>`` (Phase 4).
+
+    Strategy:
+
+    * Resolve the target type to a Z3 sort. If unknown, the cast is
+      opaque (keyed by full canonical rendering).
+    * Translate the inner expression. If it failed (None), abort
+      and produce an opaque variable for the whole cast — that way
+      ``COALESCE(...)::text`` on both sides is still comparable
+      via canonical-string keying even though the inner COALESCE
+      itself is opaque.
+    * If the inner expression's sort matches the target sort, return
+      the inner translation unchanged (the cast is a no-op for
+      Z3's purposes — e.g. ``int8 → integer`` both resolve to Int).
+    * Otherwise, the cast is sort-changing (e.g. ``Int → Text`` for
+      ``id::text``); model as opaque so an identical cast on the
+      other side reuses the same Z3 variable.
+    """
+    target_sort = _typename_segments_to_sort(node.typeName)
+    inner = _to_z3(node.arg, ctx)
+
+    if target_sort is None:
+        # Unknown target type — fall back to opaque, keyed by the
+        # whole cast's canonical form so identical casts collapse.
+        return _opaque_expression(node, ctx, sort=z3.StringSort())
+
+    if inner is None:
+        # Inner expression unsupported — opaque the whole cast,
+        # under the target sort so subsequent comparisons can match.
+        return _opaque_expression(node, ctx, sort=target_sort)
+
+    inner_sort = inner.sort()
+    if inner_sort == target_sort:
+        # Cast is a no-op at the Z3 level (e.g. `'a'::text` where
+        # the inner is already a Z3 String).
+        return inner
+
+    # Sort-changing cast (`id::text`, `created_at::date`). Model as
+    # opaque under the target sort so identical casts on both sides
+    # collapse to the same Z3 variable.
+    return _opaque_expression(node, ctx, sort=target_sort)
+
+
+def _typename_segments_to_sort(typename: Any) -> Any:
+    """Resolve a pglast ``TypeName`` to a Z3 sort, or None."""
+    if typename is None:
+        return None
+    segments = typename.names or ()
+    if not segments:
+        return None
+    last = segments[-1]
+    if not isinstance(last, String):
+        return None
+    name = last.sval.lower()
+    if name in _STRING_TYPES:
+        return z3.StringSort()
+    if name in _INT_TYPES:
+        return z3.IntSort()
+    if name in _REAL_TYPES:
+        return z3.RealSort()
+    if name in _BOOL_TYPES:
+        return z3.BoolSort()
+    return None
 
 
 def _between_to_z3(node: A_Expr, ctx: _Context, *, negate: bool) -> Any:
