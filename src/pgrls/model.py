@@ -2,8 +2,9 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 4 (v4 added top-level `views`; v3 added `grants` to
-each table entry; v2 added `partition_of`).
+Currently version 5 (v5 added per-column type info via the new
+``column_details`` per table; v4 added top-level ``views``; v3 added
+``grants`` to each table entry; v2 added ``partition_of``).
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from functools import cached_property
 from typing import Any, Literal
 
 __all__ = [
+    "Column",
     "Grant",
     "Policy",
     "PolicyCommand",
@@ -27,7 +29,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 4
+SNAPSHOT_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,31 @@ class Policy:
     @property
     def is_permissive(self) -> bool:
         return self.permissive
+
+
+@dataclass(frozen=True)
+class Column:
+    """A column captured by snapshot v5+.
+
+    Captured fields are the minimum the Schema-to-SQL emitter needs
+    to reconstruct ``CREATE TABLE`` statements compatible with a
+    migration: name, Postgres-canonical data type, nullability.
+
+    ``data_type`` is the Postgres type expression as it would appear
+    in ``CREATE TABLE`` — e.g. ``text``, ``integer``, ``timestamp
+    with time zone``, ``jsonb``, ``uuid``, ``numeric(10,2)``.
+    Generated columns, identity columns, defaults, check constraints,
+    and foreign keys are deliberately NOT captured — the emitter
+    targets the minimum DDL needed to make the migration apply.
+
+    Snapshot v3/v4 baselines round-trip into v5 with empty
+    ``column_details`` per table; the legacy ``columns`` field
+    (tuple of names) keeps working for every existing rule.
+    """
+
+    name: str
+    data_type: str
+    is_nullable: bool = True
 
 
 @dataclass(frozen=True)
@@ -112,6 +139,14 @@ class Table:
     # via `Schema.from_snapshot` always yields `grants=()` because the
     # field didn't exist in that format.
     grants: tuple[Grant, ...] = ()
+    # Column type / nullability info — populated in snapshot v5+. The
+    # ordered tuple parallels `columns` (same length, same order) so
+    # callers that need full column info iterate this; callers that
+    # need only names continue to read `columns`. v3/v4 baselines
+    # round-trip with `column_details=()` since the field didn't exist.
+    # The `Schema.to_sql()` emitter requires `column_details` to be
+    # populated; otherwise it raises `ValueError`.
+    column_details: tuple[Column, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -214,6 +249,20 @@ class Schema:
                         {"role": g.role, "privileges": list(g.privileges)}
                         for g in t.grants
                     ],
+                    # v5 extension — emit per-column type info when
+                    # populated. v3/v4 baselines round-trip with
+                    # `column_details=()` so this becomes an empty
+                    # array, which `from_snapshot` interprets as
+                    # "no type info" rather than re-creating Column
+                    # rows with placeholder types.
+                    "column_details": [
+                        {
+                            "name": c.name,
+                            "data_type": c.data_type,
+                            "is_nullable": c.is_nullable,
+                        }
+                        for c in t.column_details
+                    ],
                 }
                 for t in self.tables
             ],
@@ -257,10 +306,15 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3 or v4 snapshot dict.
+        """Reconstruct a Schema from a v3, v4, or v5 snapshot dict.
 
-        v4 (current): full fidelity, includes views. v3 (legacy):
-        views come back as `()` — v3 didn't capture view metadata.
+        v5 (current): adds per-column type info via the new
+        ``column_details`` array on each table. Required for
+        ``Schema.to_sql()`` and the migration-as-input flow
+        (``pgrls diff --apply``).
+        v4: full fidelity for views and SECDEF functions; no
+        column type info.
+        v3: legacy — views come back as ``()``, no column type info.
 
         v1 / v2 / unknown versions: raises ValueError with a clear
         "snapshot version N is not supported" message naming the
@@ -280,10 +334,10 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4):
+        if version not in (3, 4, 5):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 3, 4. v1 / v2 "
+                f"pgrls release. Supported versions: 3, 4, 5. v1 / v2 "
                 "snapshots must be regenerated against the current schema."
             )
 
@@ -334,6 +388,19 @@ class Schema:
             partition_of = (
                 tuple(partition_of_raw) if partition_of_raw else None
             )
+            # v5 extension — `column_details` gives full type info per
+            # column. v3/v4 baselines have it absent or empty; that
+            # path leaves `column_details=()` and `Schema.to_sql()`
+            # later raises ValueError if the user tries to restore.
+            column_details_raw = t.get("column_details", [])
+            column_details = tuple(
+                Column(
+                    name=c["name"],
+                    data_type=c["data_type"],
+                    is_nullable=c.get("is_nullable", True),
+                )
+                for c in column_details_raw
+            )
             tables.append(
                 Table(
                     schema=t["schema"],
@@ -344,6 +411,7 @@ class Schema:
                     columns=tuple(t.get("columns", ())),
                     partition_of=partition_of,
                     grants=grants,
+                    column_details=column_details,
                 )
             )
         # v3 has no "views" array; treat as empty tuple.
@@ -386,3 +454,156 @@ class Schema:
             views=views,
             security_definer_functions=secdef_funcs,
         )
+
+    def to_sql(self) -> str:
+        """Emit DDL that re-creates this Schema in an empty Postgres.
+
+        Used by ``pgrls diff --apply migration.sql`` (v0.5+) to spin
+        up a baseline-equivalent state in a throwaway testcontainer
+        before applying the user's migration. The output covers the
+        minimum DDL needed to make the migration apply against the
+        captured shape:
+
+        * ``CREATE SCHEMA IF NOT EXISTS <schema>`` per distinct schema
+          referenced by tables. Idempotent so it can be re-run.
+        * ``CREATE TABLE <qname> (<col1 type1>, <col2 type2>, ...)``
+          per table. Constraints, defaults, generated columns,
+          indexes, and foreign keys are NOT emitted — the diff target
+          is RLS-state changes, not data integrity. A migration that
+          ALTERs a column's type, drops a column, or adds a CHECK
+          constraint will still apply correctly because the column
+          exists with a compatible type.
+        * ``ALTER TABLE … ENABLE ROW LEVEL SECURITY`` /
+          ``FORCE ROW LEVEL SECURITY`` as captured.
+        * ``CREATE POLICY`` per policy with ``AS RESTRICTIVE`` /
+          ``FOR <command>`` / ``TO <roles>`` / ``USING (...)`` /
+          ``WITH CHECK (...)`` mirroring the captured fields.
+        * ``GRANT <privs> ON <qname> TO <role>`` per (role, table)
+          pair.
+
+        Roles referenced by policies and grants are NOT created here
+        — Postgres rejects ``CREATE POLICY ... TO <role>`` if the
+        role doesn't exist. The caller (``pgrls diff --apply``) wraps
+        each ``CREATE POLICY`` and ``GRANT`` in a
+        ``DO $$ ... CREATE ROLE IF NOT EXISTS ... $$`` preamble, so
+        the testcontainer has the named roles before this DDL runs.
+        That keeps ``Schema.to_sql()`` itself a pure function of the
+        Schema object — no role-creation side effects.
+
+        Raises ValueError if any table is missing ``column_details``
+        — the emitter cannot fabricate types. v3/v4 baselines need
+        to be re-captured against a live database before they can
+        be used for ``--apply``.
+
+        The emitted SQL is multi-statement; safe to feed to a single
+        ``cur.execute()`` call against a Postgres connection.
+        """
+        # Pre-flight: every table must have column_details populated.
+        # Surface a single error listing all missing tables so the
+        # user fixes the snapshot once instead of replay-hunting.
+        tables_missing_details = [
+            t.qualified_name for t in self.tables if not t.column_details
+        ]
+        if tables_missing_details:
+            raise ValueError(
+                "Schema.to_sql() requires every table to have "
+                "column_details populated. The following tables are "
+                "missing it: "
+                + ", ".join(tables_missing_details)
+                + ". Snapshots from pgrls v0.4 or earlier don't "
+                "capture column types; re-capture against a live "
+                "database with pgrls v0.5+ to populate the field."
+            )
+
+        from pgrls.fixers._idents import quote_ident
+
+        out: list[str] = []
+
+        # 1. Schemas. Emit a CREATE SCHEMA IF NOT EXISTS for every
+        # distinct schema referenced. Idempotent so applying twice
+        # is a no-op.
+        schemas = sorted({t.schema for t in self.tables})
+        for schema in schemas:
+            out.append(
+                f"CREATE SCHEMA IF NOT EXISTS {quote_ident(schema)};"
+            )
+
+        # 2. Tables (CREATE TABLE).
+        for t in self.tables:
+            qname = (
+                f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
+            )
+            cols = ", ".join(
+                f"{quote_ident(c.name)} {c.data_type}"
+                + ("" if c.is_nullable else " NOT NULL")
+                for c in t.column_details
+            )
+            out.append(f"CREATE TABLE {qname} ({cols});")
+
+        # 3. RLS toggles.
+        for t in self.tables:
+            qname = (
+                f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
+            )
+            if t.rls_enabled:
+                out.append(f"ALTER TABLE {qname} ENABLE ROW LEVEL SECURITY;")
+            if t.force_rls:
+                out.append(f"ALTER TABLE {qname} FORCE ROW LEVEL SECURITY;")
+
+        # 4. Policies. Emitted in a fixed order: by table then by
+        # policy name, so two `to_sql()` calls on the same Schema
+        # produce byte-identical output (helpful for smoke-tests
+        # and golden-file comparisons).
+        for t in self.tables:
+            qname = (
+                f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
+            )
+            for p in t.policies:
+                out.append(_policy_to_sql(p, qname))
+
+        # 5. Grants. PUBLIC pseudo-role keeps its bare-PUBLIC form;
+        # named roles are quoted via quote_ident.
+        for t in self.tables:
+            qname = (
+                f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
+            )
+            for g in t.grants:
+                privs = ", ".join(g.privileges)
+                role_sql = (
+                    "PUBLIC"
+                    if g.role == "PUBLIC"
+                    else quote_ident(g.role)
+                )
+                out.append(
+                    f"GRANT {privs} ON {qname} TO {role_sql};"
+                )
+
+        return "\n".join(out) + "\n"
+
+
+def _policy_to_sql(p: Policy, qname: str) -> str:
+    """Render a single CREATE POLICY statement for `Schema.to_sql()`.
+
+    Mirrors the canonical Postgres syntax: AS PERMISSIVE/RESTRICTIVE
+    (omit if PERMISSIVE — that's the default), FOR <command> (omit
+    if ALL), TO <roles>, USING (...) and/or WITH CHECK (...).
+    Roles are emitted bare-comma-separated, matching pg_policy
+    output — Postgres parses both quoted and unquoted forms in
+    most cases, but we follow the dump style for predictability.
+    """
+    from pgrls.fixers._idents import quote_ident
+
+    parts = ["CREATE POLICY", quote_ident(p.name), "ON", qname]
+    if not p.permissive:
+        parts.append("AS RESTRICTIVE")
+    if p.command != "ALL":
+        parts.append(f"FOR {p.command}")
+    role_strs = [
+        "PUBLIC" if r == "PUBLIC" else quote_ident(r) for r in p.roles
+    ]
+    parts.append(f"TO {', '.join(role_strs)}")
+    if p.using_sql:
+        parts.append(f"USING ({p.using_sql})")
+    if p.with_check_sql:
+        parts.append(f"WITH CHECK ({p.with_check_sql})")
+    return " ".join(parts) + ";"
