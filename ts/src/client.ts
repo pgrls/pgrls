@@ -40,6 +40,13 @@
  * abstraction over the user's Postgres client; same client
  * constructor accepts a `pg` driver or a `postgres.js` driver.
  */
+import {
+  assertInvisible as _assertInvisible,
+  assertRejected as _assertRejected,
+  assertRows as _assertRows,
+  assertSilentlyDropped as _assertSilentlyDropped,
+  assertVisible as _assertVisible,
+} from './assertions.js';
 import type { Driver } from './drivers/types.js';
 import { PgrlsTestError } from './errors.js';
 import { quoteIdent, quoteQualified } from './idents.js';
@@ -394,5 +401,57 @@ export class PgrlsTestClient {
       const values = keys.map((k) => row[k]);
       await this.driver.query(sql, values);
     }
+  }
+
+  /**
+   * Assert the query returns exactly `count` rows.
+   *
+   * @throws {PgrlsTestAssertionError} If the count doesn't match.
+   */
+  async assertRows(sql: string, options: { count: number }): Promise<void> {
+    await _assertRows(this, sql, options);
+  }
+
+  /**
+   * Assert the query returns at least one row.
+   *
+   * @throws {PgrlsTestAssertionError} If zero rows returned.
+   */
+  async assertVisible(sql: string): Promise<void> {
+    await _assertVisible(this, sql);
+  }
+
+  /**
+   * Assert the query returns zero rows.
+   *
+   * @throws {PgrlsTestAssertionError} If any rows returned.
+   */
+  async assertInvisible(sql: string): Promise<void> {
+    await _assertInvisible(this, sql);
+  }
+
+  /**
+   * Assert that running `sql` raises Postgres `InsufficientPrivilege`
+   * (SQLSTATE 42501).
+   *
+   * Wraps in a savepoint so the failure doesn't poison
+   * subsequent queries. See `assertions.ts` for full details.
+   *
+   * @throws {PgrlsTestAssertionError} If the query succeeded
+   *   or raised a different error.
+   */
+  async assertRejected(sql: string): Promise<void> {
+    await _assertRejected(this, sql);
+  }
+
+  /**
+   * Assert that a DML with RETURNING returns zero rows
+   * (UPDATE/DELETE only — INSERT raises 42501 instead).
+   *
+   * @throws {PgrlsTestError} If the SQL is not an UPDATE/DELETE.
+   * @throws {PgrlsTestAssertionError} If RETURNING yields rows.
+   */
+  async assertSilentlyDropped(sql: string): Promise<void> {
+    await _assertSilentlyDropped(this, sql);
   }
 }
