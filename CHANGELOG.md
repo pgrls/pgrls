@@ -10,6 +10,44 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-05-08
+
+### Changed
+- **Demo cases batch 1: issue #11 chip-away.** Nine demo case
+  fixtures rewritten from RESTRICTIVE-only to the canonical
+  PERMISSIVE+RESTRICTIVE pattern (same shape as uc01
+  `app.documents`). The rule each case demonstrates still
+  fires; SEC012 stops firing on the now-clean shape.
+
+  Rewritten:
+  - **uc04** `app.notes` (SEC002)
+  - **uc06** `app.accounts` (SEC004)
+  - **uc07** `app.singletons` (SEC005)
+  - **uc08** `app.invoices` (SEC006)
+  - **uc11** `app.messages` (PERF001)
+  - **uc18** `app.users_v2` (CLEAN — was masked by SEC012 allowlist;
+    now genuinely clean)
+  - **uc19** `app.profiles` (SEC004 Supabase)
+  - **uc20** `app.todos` (PERF001 Supabase)
+  - **uc22** `app.posts_v2` (HYG001)
+
+  Each rewrite adds a PERMISSIVE policy targeting `app_authenticated`
+  that grants per-user or per-tenant access via wrapped
+  `(SELECT current_setting('app.user', true))` /
+  `(SELECT auth.uid())` / `(SELECT current_setting('app.tenant', true)::UUID)`
+  expressions, so the new policy doesn't itself trip SEC003,
+  SEC005, SEC008, or PERF001. The original RESTRICTIVE policy
+  is preserved verbatim — that's where the per-case rule
+  demonstration lives.
+
+  Removed from `[lint.rules.SEC012].allowlist` in `demo/pgrls.toml`:
+  9 entries above. ~50 entries remain for future batches.
+
+- **Shared `app_authenticated` role** in `demo/cases/_shared.sql`.
+  Created idempotently up front so per-case `setup.sql` files
+  can `CREATE POLICY … TO app_authenticated` directly without
+  repeating the role-creation block.
+
 ## [0.5.3] - 2026-05-08
 
 ### Added

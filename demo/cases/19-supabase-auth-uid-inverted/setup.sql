@@ -13,6 +13,14 @@ CREATE TABLE app.profiles (
 );
 ALTER TABLE app.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.profiles FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy gating per-user access via Supabase's
+-- `auth.uid()`. Wrapped in `(SELECT ...)` so PERF001 doesn't
+-- fire on this policy. The buggy RESTRICTIVE policy below is
+-- what SEC004 catches.
+CREATE POLICY profiles_authenticated_access ON app.profiles
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.uid()))
+    WITH CHECK (user_id = (SELECT auth.uid()));
 CREATE POLICY allow_anon ON app.profiles
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

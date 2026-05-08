@@ -12,6 +12,16 @@ CREATE TABLE app.posts_v2 (
 );
 ALTER TABLE app.posts_v2 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.posts_v2 FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policies for SELECT and INSERT so the table isn't
+-- silently deny-all (SEC012). The orphan-column reference lives
+-- in the RESTRICTIVE WITH CHECK below; HYG001 still flags it
+-- regardless of any other policies on the table.
+CREATE POLICY posts_v2_authenticated_select ON app.posts_v2
+    FOR SELECT TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)));
+CREATE POLICY posts_v2_authenticated_insert ON app.posts_v2
+    FOR INSERT TO app_authenticated
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY only_approved_writes ON app.posts_v2
     AS RESTRICTIVE
     FOR INSERT TO PUBLIC

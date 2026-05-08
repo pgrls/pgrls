@@ -11,6 +11,15 @@ CREATE TABLE app.singletons (
 );
 ALTER TABLE app.singletons ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.singletons FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy targeting `app_authenticated`. The
+-- RESTRICTIVE policy below has no own-column ref (SEC005's
+-- catch); this PERMISSIVE has one (`key IS NOT NULL`) so it
+-- doesn't itself trip SEC005, and it keeps the table from being
+-- silently deny-all (SEC012).
+CREATE POLICY singletons_authenticated_access ON app.singletons
+    FOR ALL TO app_authenticated
+    USING (key IS NOT NULL)
+    WITH CHECK (key IS NOT NULL);
 CREATE POLICY admin_only ON app.singletons
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

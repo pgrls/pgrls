@@ -12,6 +12,14 @@ CREATE TABLE app.todos (
 );
 ALTER TABLE app.todos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.todos FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with the *correctly wrapped* form for
+-- contrast — pgrls expects this to NOT fire PERF001. The
+-- RESTRICTIVE policy below has the unwrapped call (the rule's
+-- catch).
+CREATE POLICY todos_authenticated_access ON app.todos
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.uid()))
+    WITH CHECK (user_id = (SELECT auth.uid()));
 CREATE POLICY todos_owner ON app.todos
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

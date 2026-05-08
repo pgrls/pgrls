@@ -12,6 +12,14 @@ CREATE TABLE app.invoices (
 );
 ALTER TABLE app.invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.invoices FORCE ROW LEVEL SECURITY;
+-- Canonical PERMISSIVE policy for tenant-scoped read+write. The
+-- buggy RESTRICTIVE UPDATE policy below (no WITH CHECK) is what
+-- SEC006 catches; this PERMISSIVE keeps the table from being
+-- silently deny-all (SEC012) for non-UPDATE statements.
+CREATE POLICY invoices_authenticated_access ON app.invoices
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY update_without_check ON app.invoices
     AS RESTRICTIVE
     FOR UPDATE TO PUBLIC
