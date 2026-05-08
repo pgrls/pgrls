@@ -200,29 +200,127 @@ def test_is_null_negated_is_incomparable_to_unrelated():
 
 
 # ---------------------------------------------------------------------------
-# Unsupported AST nodes → None (translator aborts; caller falls through)
+# Phase 3 — function calls (uninterpreted), COALESCE, CASE, BETWEEN
 # ---------------------------------------------------------------------------
 
 
-def test_function_call_is_unsupported_returns_none():
-    # `current_setting(...)` is a function call — unsupported in
-    # Phase 1, planned for Phase 3.
+def test_identical_function_call_in_predicate_is_semantic_equivalent():
+    # Phase 3: `current_setting(...)` is modeled as an opaque Z3
+    # String constant keyed by canonical shape. Identical calls on
+    # both sides reuse the same Z3 var, so the predicates are
+    # equivalent. (Phase 1 returned None — see the v0.4.0
+    # changelog entry; v0.4.1 reclassifies.)
     assert (
         _classify(
             "tenant_id = current_setting('app.tenant')",
             "tenant_id = current_setting('app.tenant')",
         )
+        == "semantic_equivalent"
+    )
+
+
+def test_function_call_with_added_and_clause_is_semantic_tightened():
+    # Both predicates reference `auth.uid()`; head adds an AND
+    # clause. Z3 sees the same opaque var on both sides and proves
+    # head → base. Head is stricter.
+    assert (
+        _classify(
+            "user_id = auth.uid()",
+            "user_id = auth.uid() AND deleted_at IS NULL",
+        )
+        == "semantic_tightened"
+    )
+
+
+def test_different_function_call_args_are_incomparable():
+    # `current_setting('app.tenant')` and `current_setting('app.role')`
+    # are different opaque vars — Z3 can't relate them.
+    assert (
+        _classify(
+            "x = current_setting('app.tenant')",
+            "x = current_setting('app.role')",
+        )
         is None
     )
 
 
+def test_between_is_translated_as_and_of_inequalities():
+    # Phase 3: BETWEEN translates to `lo <= expr AND expr <= hi`,
+    # so `x BETWEEN 1 AND 10` and `x >= 1 AND x <= 10` are
+    # semantically equivalent.
+    assert (
+        _classify("x BETWEEN 1 AND 10", "x >= 1 AND x <= 10")
+        == "semantic_equivalent"
+    )
+
+
+def test_between_widening_is_semantic_loosened():
+    # `x BETWEEN 1 AND 5` is a strict subset of `x BETWEEN 1 AND 10`.
+    # Head admits more rows.
+    assert (
+        _classify("x BETWEEN 1 AND 5", "x BETWEEN 1 AND 10")
+        == "semantic_loosened"
+    )
+
+
+def test_not_between_is_negation_of_between():
+    # `x NOT BETWEEN 1 AND 10` translates to `Not(1 <= x AND x <= 10)`,
+    # equivalent to `x < 1 OR x > 10`.
+    assert (
+        _classify("x NOT BETWEEN 1 AND 10", "x < 1 OR x > 10")
+        == "semantic_equivalent"
+    )
+
+
+def test_identical_coalesce_is_semantic_equivalent():
+    # CoalesceExpr is treated as an opaque Z3 var keyed by canonical
+    # shape. Identical COALESCE on both sides → same var → equivalent.
+    assert (
+        _classify(
+            "COALESCE(role, 'guest') = 'admin'",
+            "COALESCE(role, 'guest') = 'admin'",
+        )
+        == "semantic_equivalent"
+    )
+
+
+def test_identical_case_is_semantic_equivalent():
+    # CaseExpr is treated as an opaque Z3 var keyed by canonical
+    # shape. Identical CASE on both sides → same var → equivalent.
+    assert (
+        _classify(
+            "CASE WHEN role = 'admin' THEN tenant ELSE 'none' END = 'tenant_a'",
+            "CASE WHEN role = 'admin' THEN tenant ELSE 'none' END = 'tenant_a'",
+        )
+        == "semantic_equivalent"
+    )
+
+
+def test_coalesce_with_added_and_clause_is_semantic_tightened():
+    # The opaque COALESCE var must be the same across base and head
+    # for the AND-tightening to be detectable. Z3 sees them as the
+    # same var → head → base holds → tightened.
+    assert (
+        _classify(
+            "COALESCE(tenant, 'default') = 'foo'",
+            "COALESCE(tenant, 'default') = 'foo' AND active = true",
+        )
+        == "semantic_tightened"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unsupported AST nodes → None (translator aborts; caller falls through)
+# ---------------------------------------------------------------------------
+
+
 def test_typecast_is_unsupported_returns_none():
-    # `'a'::text` is a TypeCast node — out of scope for Phase 1.
+    # `'a'::text` is a TypeCast node — out of scope for Phase 1+3.
     assert _classify("col = 'a'::text", "col = 'a'") is None
 
 
 def test_subquery_in_is_unsupported_returns_none():
-    # `IN (SELECT ...)` is AEXPR_IN_SUB-style; Phase 1 only handles
+    # `IN (SELECT ...)` is AEXPR_IN_SUB-style; Phase 1+3 only handles
     # literal lists.
     assert (
         _classify(

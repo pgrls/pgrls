@@ -10,6 +10,60 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-08
+
+### Added
+- **Z3 Phase 3 — function calls, COALESCE, CASE, BETWEEN** (issue
+  #12 phase 3). Extends the AST → Z3 translator with the most-
+  common predicate shapes that Phase 1 didn't cover.
+  - **`FuncCall`** is modeled as a Z3 free variable (sort:
+    String) keyed by the call's canonical RawStream rendering.
+    The same call on base and head sides reuses the same Z3 var,
+    so two predicates that reference the identical function call
+    (e.g. `auth.uid()`, `current_setting('app.tenant')`) are
+    comparable via implication. Aggregates, window functions,
+    `FILTER (WHERE ...)`, and `WITHIN GROUP` aborts.
+  - **`A_Expr` with `BETWEEN` / `NOT BETWEEN`** translates to the
+    equivalent `lo <= expr AND expr <= hi` (or its negation).
+    Symmetric variants (`BETWEEN SYMMETRIC`) abort. Type
+    inference flows through the lo/hi literals to the bare
+    ColumnRef on the lexpr side via the new
+    `_resolve_binop_operands` helper.
+  - **`CoalesceExpr` and `CaseExpr`** are translated as opaque Z3
+    String constants keyed by canonical shape. Two identical
+    `COALESCE` / `CASE` expressions on base and head reuse the
+    same Z3 var; bodies that differ are seen as unrelated vars
+    and the predicate falls through to `requires_review`.
+- Reuse-friendly **`_resolve_binop_operands`** helper handles
+  the bare-ColumnRef-on-one-side type inference for both
+  comparisons and BETWEEN. `_binop_to_z3` now accepts ColumnRef,
+  literal, FuncCall, COALESCE, CASE on either side.
+
+### Cases this reclassifies (vs v0.4.0)
+
+| Predicate change | v0.4.0 | v0.4.1 |
+|---|---|---|
+| `tenant = auth.uid()` → `tenant = auth.uid() AND deleted_at IS NULL` | `requires_review` | `semantic_tightened` |
+| `x BETWEEN 1 AND 5` → `x BETWEEN 1 AND 10` | `requires_review` | `semantic_loosened` |
+| `x BETWEEN 1 AND 10` ↔ `x >= 1 AND x <= 10` | `requires_review` | `semantic_equivalent` |
+| `COALESCE(x, 'd') = 'foo'` → same with added AND clause | `requires_review` | `semantic_tightened` |
+
+### Test coverage
+- 8 new tests in `tests/diff/test_z3_compare.py` covering the
+  Phase 3 nodes (function calls — identical / different args,
+  BETWEEN / NOT BETWEEN, COALESCE, CASE, AND-tightening through
+  function calls).
+- 1 existing test renamed and re-asserted: the previous
+  "function calls unsupported → None" pin is now Phase 3's
+  "identical function calls → semantic_equivalent" pin.
+
+### Phase 4 (still pending)
+Packaging polish, optional-import fallback documentation, and
+Type cast (`'a'::text`) / arithmetic in predicates remain on the
+v0.4.x roadmap. Subquery-RHS `IN` is deferred — it requires
+proper variable scoping which is out of scope for the simple
+predicate-implication contract.
+
 ## [0.4.0] - 2026-05-08
 
 ### Added
