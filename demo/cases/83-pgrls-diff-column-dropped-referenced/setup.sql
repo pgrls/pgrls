@@ -25,6 +25,20 @@ CREATE TABLE app.uc83_invoices (
 ALTER TABLE app.uc83_invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.uc83_invoices FORCE ROW LEVEL SECURITY;
 
+-- PERMISSIVE policy granting tenant-scoped access. Deliberately
+-- does NOT reference `doomed_col` — the case's diff scenario
+-- removes that column from the in-memory head snapshot, and
+-- the test asserts DIFF_COLUMN_DROPPED_REFERENCED fires on
+-- `tenant_isolation` only.
+CREATE POLICY uc83_invoices_authenticated_access ON app.uc83_invoices
+    FOR ALL TO app_authenticated
+    USING (
+        tenant_id = (SELECT current_setting('request.jwt.claims', true))::jsonb->>'tenant_id'
+    )
+    WITH CHECK (
+        tenant_id = (SELECT current_setting('request.jwt.claims', true))::jsonb->>'tenant_id'
+    );
+
 CREATE POLICY tenant_isolation ON app.uc83_invoices
     AS RESTRICTIVE
     FOR ALL

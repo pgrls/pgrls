@@ -14,6 +14,14 @@ CREATE TABLE app.gdpr_records (
 );
 ALTER TABLE app.gdpr_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.gdpr_records FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a flat tenant predicate (no CASE) so
+-- it doesn't compete with the RESTRICTIVE policy below as the
+-- demonstration. The case's intent is the CASE/ARRAY walk on
+-- the RESTRICTIVE; this PERMISSIVE just keeps SEC012 silent.
+CREATE POLICY gdpr_records_authenticated_access ON app.gdpr_records
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY tenant_plus_classification ON app.gdpr_records
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

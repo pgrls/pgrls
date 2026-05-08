@@ -13,6 +13,13 @@ CREATE TABLE app.recent_only (
 );
 ALTER TABLE app.recent_only ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.recent_only FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with a flat tenant predicate (no BETWEEN).
+-- The RESTRICTIVE below is what the case pins (BETWEEN walking
+-- via extract_column_refs).
+CREATE POLICY recent_only_authenticated_access ON app.recent_only
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY recent_window ON app.recent_only
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

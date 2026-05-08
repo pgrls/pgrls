@@ -14,6 +14,12 @@ CREATE TABLE app.uc86_users (
 );
 ALTER TABLE app.uc86_users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.uc86_users FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy granting tenant-scoped access. The case
+-- pins VIEW002 on the view that selects from this table.
+CREATE POLICY uc86_users_authenticated_access ON app.uc86_users
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true))::UUID)
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true))::UUID);
 CREATE POLICY p_uc86 ON app.uc86_users
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (

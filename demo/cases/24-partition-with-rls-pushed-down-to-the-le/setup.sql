@@ -22,6 +22,12 @@ CREATE TABLE app.leaf_metrics_2026 PARTITION OF app.leaf_metrics
 
 ALTER TABLE app.leaf_metrics_2026 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.leaf_metrics_2026 FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy on the leaf (RLS lives on the leaf, not
+-- the parent, in this case's deliberate "pushed down" pattern).
+CREATE POLICY leaf_metrics_2026_authenticated_access ON app.leaf_metrics_2026
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY leaf_tenant ON app.leaf_metrics_2026
     AS RESTRICTIVE
     FOR ALL TO PUBLIC
