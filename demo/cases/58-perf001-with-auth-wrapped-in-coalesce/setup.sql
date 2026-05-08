@@ -11,6 +11,13 @@ CREATE TABLE app.coalesce_auth (
 );
 ALTER TABLE app.coalesce_auth ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.coalesce_auth FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with auth.uid() wrapped via `(SELECT …)` —
+-- PERF001 silent. The COALESCE-wrapped unwrapped form the case
+-- demonstrates lives on the RESTRICTIVE policy below.
+CREATE POLICY coalesce_auth_authenticated_access ON app.coalesce_auth
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT auth.uid()))
+    WITH CHECK (user_id = (SELECT auth.uid()));
 CREATE POLICY coalesced ON app.coalesce_auth
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

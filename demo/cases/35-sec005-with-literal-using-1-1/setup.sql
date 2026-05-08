@@ -12,6 +12,13 @@ CREATE TABLE app.always_open (
 );
 ALTER TABLE app.always_open ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.always_open FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with an own-column reference (`label IS NOT
+-- NULL`) so SEC005 stays silent here. The RESTRICTIVE policy
+-- below has the `1 = 1` shape SEC005 catches.
+CREATE POLICY always_open_authenticated_access ON app.always_open
+    FOR ALL TO app_authenticated
+    USING (label IS NOT NULL)
+    WITH CHECK (label IS NOT NULL);
 CREATE POLICY trivially_open ON app.always_open
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
