@@ -26,18 +26,22 @@ from pgrls.model import Policy, Table
 # up. The two dicts must stay in lockstep: same keys, same
 # Classification, only the kind enum differs.
 _USING_RESULT_TO_CHANGE: dict[str, tuple[ChangeKind, Classification]] = {
-    "tightened_and":     (ChangeKind.USING_TIGHTENED,       "safe"),
-    "loosened_and_drop": (ChangeKind.USING_LOOSENED,        "dangerous"),
-    "loosened_or":       (ChangeKind.USING_LOOSENED,        "dangerous"),
-    "tightened_or_drop": (ChangeKind.USING_TIGHTENED,       "safe"),
-    "requires_review":   (ChangeKind.USING_REQUIRES_REVIEW, "requires_review"),
+    "tightened_and":       (ChangeKind.USING_TIGHTENED,       "safe"),
+    "loosened_and_drop":   (ChangeKind.USING_LOOSENED,        "dangerous"),
+    "loosened_or":         (ChangeKind.USING_LOOSENED,        "dangerous"),
+    "tightened_or_drop":   (ChangeKind.USING_TIGHTENED,       "safe"),
+    "semantic_tightened":  (ChangeKind.USING_TIGHTENED,       "safe"),
+    "semantic_loosened":   (ChangeKind.USING_LOOSENED,        "dangerous"),
+    "requires_review":     (ChangeKind.USING_REQUIRES_REVIEW, "requires_review"),
 }
 _WITH_CHECK_RESULT_TO_CHANGE: dict[str, tuple[ChangeKind, Classification]] = {
-    "tightened_and":     (ChangeKind.WITH_CHECK_TIGHTENED,       "safe"),
-    "loosened_and_drop": (ChangeKind.WITH_CHECK_LOOSENED,        "dangerous"),
-    "loosened_or":       (ChangeKind.WITH_CHECK_LOOSENED,        "dangerous"),
-    "tightened_or_drop": (ChangeKind.WITH_CHECK_TIGHTENED,       "safe"),
-    "requires_review":   (ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review"),
+    "tightened_and":       (ChangeKind.WITH_CHECK_TIGHTENED,       "safe"),
+    "loosened_and_drop":   (ChangeKind.WITH_CHECK_LOOSENED,        "dangerous"),
+    "loosened_or":         (ChangeKind.WITH_CHECK_LOOSENED,        "dangerous"),
+    "tightened_or_drop":   (ChangeKind.WITH_CHECK_TIGHTENED,       "safe"),
+    "semantic_tightened":  (ChangeKind.WITH_CHECK_TIGHTENED,       "safe"),
+    "semantic_loosened":   (ChangeKind.WITH_CHECK_LOOSENED,        "dangerous"),
+    "requires_review":     (ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review"),
 }
 
 # Per-result message fragment, keyed off compare_predicates's result.
@@ -48,11 +52,13 @@ _WITH_CHECK_RESULT_TO_CHANGE: dict[str, tuple[ChangeKind, Classification]] = {
 # `tightened_or_drop` says "disjunct removed", whereas the prior
 # substring-on-kind branching collapsed both into one message.
 _PREDICATE_RESULT_MESSAGES: dict[str, str] = {
-    "tightened_and":     "tightened (clause added)",
-    "loosened_and_drop": "loosened (clause removed) — broader row set",
-    "loosened_or":       "loosened (disjunct added) — broader row set",
-    "tightened_or_drop": "tightened (disjunct removed)",
-    "requires_review":   (
+    "tightened_and":       "tightened (clause added)",
+    "loosened_and_drop":   "loosened (clause removed) — broader row set",
+    "loosened_or":         "loosened (disjunct added) — broader row set",
+    "tightened_or_drop":   "tightened (disjunct removed)",
+    "semantic_tightened":  "tightened (Z3-verified semantic stricter — head admits a strict subset of base's row set)",
+    "semantic_loosened":   "loosened (Z3-verified semantic looser — head admits a strict superset of base's row set)",
+    "requires_review":     (
         "changed in a way the auto-classifier can't analyze "
         "— manual review required"
     ),

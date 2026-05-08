@@ -10,6 +10,54 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-08
+
+### Added
+- **Z3-based semantic predicate analysis** for `pgrls diff` (Phase
+  1+2 of [issue #12](https://github.com/pgrls/pgrls/issues/12)).
+  Predicate edits that don't match a syntactic pattern
+  (`tightened_and`, `loosened_and_drop`, `loosened_or`,
+  `tightened_or_drop`) now get a second-chance check via Z3
+  implication: a predicate-pair is `semantic_equivalent` when both
+  implications hold; `semantic_tightened` when head → base only
+  (head admits a strict subset of base's row set — SAFE);
+  `semantic_loosened` when base → head only (head admits a strict
+  superset — DANGEROUS); falls through to `requires_review` when
+  Z3 is incomparable, the AST uses an unsupported node, or
+  `pgrls[diff-z3]` isn't installed.
+- **`pgrls[diff-z3]` optional extra** — installs `z3-solver`
+  alongside pgrls. Without it, `pgrls diff` uses only the syntactic
+  patterns and falls through to `requires_review` for everything
+  else (the v0.3.x behavior).
+- **Phase 1 supported subset** in the AST → Z3 translator: bool/int/
+  text columns, comparison operators (`=`, `!=`, `<`, `>`, `<=`,
+  `>=`), boolean connectives (`AND`, `OR`, `NOT`), `IS NULL`/`IS
+  NOT NULL` (modeled as opaque markers — sound but coarse), and
+  `IN (literal-list)`. Real-world RLS predicate transformations
+  outside this subset (function calls, type casts, arithmetic,
+  subqueries) return `None` from the translator and fall through
+  to `requires_review`. Phase 3 (function calls, COALESCE, CASE,
+  BETWEEN) lands in v0.4.x patches.
+- Three new `compare_predicates` result Literals
+  (`semantic_equivalent`, `semantic_tightened`, `semantic_loosened`)
+  routed through `_USING_RESULT_TO_CHANGE` and
+  `_WITH_CHECK_RESULT_TO_CHANGE` in `pgrls.diff.policies`. Existing
+  ChangeKind enum values reused — the new results map to
+  `*_TIGHTENED`/`*_LOOSENED` with a Z3-flavored message variant
+  in `_PREDICATE_RESULT_MESSAGES`.
+
+### Test coverage
+- 27 new unit tests in `tests/diff/test_z3_compare.py` covering
+  every operator in the supported subset + the four
+  classification quadrants (equivalent / tightened / loosened /
+  incomparable) + the unsupported-node fallthrough paths +
+  type-conflict abort.
+- 5 existing `tests/diff/test_ast_compare.py` tests updated:
+  cases that previously returned `requires_review` for shapes Z3
+  can decide now correctly assert the `semantic_*` classification.
+  Each test's docstring notes the v0.3- vs v0.4+ behavior so the
+  intent of the change is visible in the diff.
+
 ## [0.3.1] - 2026-05-05
 
 ### Changed
