@@ -1,0 +1,277 @@
+"""Unit tests for ``pgrls.diff._z3_compare`` (Z3-backed predicate
+implication, Phase 1).
+
+These tests exercise the AST → Z3 translator and the implication
+classifier on the supported subset (bool/int/text + comparisons,
+boolean connectives, NULL tests, IN-of-literals). Anything outside
+the supported subset must return None from the translator and fall
+through to ``requires_review`` at the ``compare_predicates`` boundary.
+"""
+from __future__ import annotations
+
+import pytest
+
+# Skip the whole module if z3 isn't installed — Phase 1's testing
+# matrix uses `pgrls[diff-z3]` (which pulls in z3-solver), so a
+# missing z3 means a wider environment problem; better to surface
+# that as a skip than to crash module-load.
+z3_solver = pytest.importorskip("z3")
+
+from pgrls.ast_utils import parse_expr  # noqa: E402
+from pgrls.diff._z3_compare import classify_via_z3, Z3_AVAILABLE  # noqa: E402
+
+
+def _classify(base_sql: str, head_sql: str) -> object:
+    """Helper: parse + classify, surfacing parse failures clearly."""
+    base = parse_expr(base_sql)
+    head = parse_expr(head_sql)
+    assert base is not None and head is not None, (
+        "test predicate should parse"
+    )
+    return classify_via_z3(base, head)
+
+
+def test_z3_is_available_when_installed():
+    # Sanity check: if `pgrls[diff-z3]` is installed the module's
+    # `Z3_AVAILABLE` flag flips True. The pytest `importorskip` above
+    # already gates the module on `import z3`, so this is belt+
+    # suspenders.
+    assert Z3_AVAILABLE is True
+
+
+# ---------------------------------------------------------------------------
+# Equivalence (both implications hold)
+# ---------------------------------------------------------------------------
+
+
+def test_identical_predicate_is_semantic_equivalent():
+    assert _classify("a = 1", "a = 1") == "semantic_equivalent"
+
+
+def test_and_reorder_is_semantic_equivalent():
+    # Commutativity of AND.
+    assert _classify("a = 1 AND b = 2", "b = 2 AND a = 1") == "semantic_equivalent"
+
+
+def test_or_reorder_is_semantic_equivalent():
+    # Commutativity of OR.
+    assert _classify("a = 1 OR b = 2", "b = 2 OR a = 1") == "semantic_equivalent"
+
+
+def test_de_morgan_law_is_semantic_equivalent():
+    # NOT (a AND b) ⟺ (NOT a) OR (NOT b). Z3's Boolean reasoning
+    # should prove both implications.
+    assert (
+        _classify("NOT (a AND b)", "(NOT a) OR (NOT b)") == "semantic_equivalent"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tightening (head → base only)
+# ---------------------------------------------------------------------------
+
+
+def test_drop_or_disjunct_is_semantic_tightened():
+    # `a=1 OR b=2 OR c=3` admits more rows than `a=1 OR b=2`.
+    # Head is strictly stricter — semantic_tightened.
+    assert (
+        _classify("a = 1 OR b = 2 OR c = 3", "a = 1 OR b = 2")
+        == "semantic_tightened"
+    )
+
+
+def test_add_and_clause_via_z3_is_semantic_tightened_or_falls_through():
+    # `a=1` → `a=1 AND b=2`: head admits a strict subset (only rows
+    # where a=1 AND b=2). The syntactic AND-tighten pattern catches
+    # this BEFORE Z3 fires (returning "tightened_and"), so this
+    # test is a sanity check that Z3 alone would also classify
+    # correctly when called in isolation.
+    assert _classify("a = 1", "a = 1 AND b = 2") == "semantic_tightened"
+
+
+def test_int_range_intersection_is_semantic_tightened():
+    # `x > 0` admits all positive ints; `x > 0 AND x < 10` admits
+    # only positive ints below 10. Head is stricter.
+    assert _classify("x > 0", "x > 0 AND x < 10") == "semantic_tightened"
+
+
+# ---------------------------------------------------------------------------
+# Loosening (base → head only)
+# ---------------------------------------------------------------------------
+
+
+def test_add_or_disjunct_is_semantic_loosened():
+    # Mirror of test_drop_or_disjunct: adding admits more rows.
+    # The syntactic OR-loosen pattern catches single-disjunct adds;
+    # Z3 catches the multi-disjunct case symmetrically.
+    assert (
+        _classify("a = 1", "a = 1 OR b = 2 OR c = 3")
+        == "semantic_loosened"
+    )
+
+
+def test_and_to_or_is_semantic_loosened():
+    # `a=1 AND b=2` requires both; `a=1 OR b=2` requires either.
+    # OR is strictly looser than AND for the same operands.
+    assert _classify("a = 1 AND b = 2", "a = 1 OR b = 2") == "semantic_loosened"
+
+
+def test_int_range_widening_is_semantic_loosened():
+    # `x > 5` ⊂ `x > 0` (every row satisfying x > 5 satisfies x > 0).
+    # Head is the wider range — looser.
+    assert _classify("x > 5", "x > 0") == "semantic_loosened"
+
+
+# ---------------------------------------------------------------------------
+# Incomparable (neither implication holds) → None → requires_review
+# ---------------------------------------------------------------------------
+
+
+def test_disjoint_predicates_are_incomparable():
+    # `a = 1` and `b = 2`: neither implies the other (rows can satisfy
+    # one but not the other). Z3 returns None.
+    assert _classify("a = 1", "b = 2") is None
+
+
+def test_partially_overlapping_ranges_are_incomparable():
+    # `x > 0` and `x < 10`: rows can be in one set, the other set,
+    # both, or neither. Neither set is a subset of the other.
+    assert _classify("x > 0", "x < 10") is None
+
+
+def test_different_columns_with_same_constant_are_incomparable():
+    assert _classify("foo = 'a'", "bar = 'a'") is None
+
+
+# ---------------------------------------------------------------------------
+# IN list (literal RHS)
+# ---------------------------------------------------------------------------
+
+
+def test_in_list_subset_is_semantic_tightened():
+    # `x IN (1,2,3,4)` admits more rows than `x IN (1,2)`.
+    # Head is the smaller set — stricter.
+    assert (
+        _classify("x IN (1, 2, 3, 4)", "x IN (1, 2)")
+        == "semantic_tightened"
+    )
+
+
+def test_in_list_superset_is_semantic_loosened():
+    assert (
+        _classify("x IN (1, 2)", "x IN (1, 2, 3, 4)")
+        == "semantic_loosened"
+    )
+
+
+def test_in_list_equal_is_semantic_equivalent():
+    # IN-list rendering may differ but semantically equal.
+    assert _classify("x IN (1, 2, 3)", "x IN (3, 2, 1)") == "semantic_equivalent"
+
+
+def test_in_list_string_subset_is_semantic_tightened():
+    # IN-list with string literals — same logic, different sort.
+    assert (
+        _classify("role IN ('admin', 'user')", "role IN ('admin')")
+        == "semantic_tightened"
+    )
+
+
+# ---------------------------------------------------------------------------
+# NULL tests (opaque markers)
+# ---------------------------------------------------------------------------
+
+
+def test_is_null_with_added_predicate_is_semantic_tightened():
+    # `col IS NULL` ⊃ `col IS NULL AND tenant = 'a'`. The added
+    # AND-conjunct only restricts. NULL is treated as opaque so the
+    # tenant-comparison and the IS NULL marker share the same column
+    # variable per the translator's binding policy.
+    assert (
+        _classify("col IS NULL", "col IS NULL AND tenant = 'a'")
+        == "semantic_tightened"
+    )
+
+
+def test_is_null_negated_is_incomparable_to_unrelated():
+    # `IS NOT NULL` and an unrelated column comparison: neither
+    # implies the other.
+    assert _classify("col IS NOT NULL", "other = 'x'") is None
+
+
+# ---------------------------------------------------------------------------
+# Unsupported AST nodes → None (translator aborts; caller falls through)
+# ---------------------------------------------------------------------------
+
+
+def test_function_call_is_unsupported_returns_none():
+    # `current_setting(...)` is a function call — unsupported in
+    # Phase 1, planned for Phase 3.
+    assert (
+        _classify(
+            "tenant_id = current_setting('app.tenant')",
+            "tenant_id = current_setting('app.tenant')",
+        )
+        is None
+    )
+
+
+def test_typecast_is_unsupported_returns_none():
+    # `'a'::text` is a TypeCast node — out of scope for Phase 1.
+    assert _classify("col = 'a'::text", "col = 'a'") is None
+
+
+def test_subquery_in_is_unsupported_returns_none():
+    # `IN (SELECT ...)` is AEXPR_IN_SUB-style; Phase 1 only handles
+    # literal lists.
+    assert (
+        _classify(
+            "col IN (SELECT id FROM other)",
+            "col IN (SELECT id FROM other)",
+        )
+        is None
+    )
+
+
+def test_arithmetic_in_predicate_is_unsupported_returns_none():
+    # `col + 1 > 0` involves arithmetic on a column — Phase 1's
+    # binop handler only models `col OP literal` and `literal OP col`.
+    assert _classify("col + 1 > 0", "col > -1") is None
+
+
+# ---------------------------------------------------------------------------
+# Mixed-shape: predicates that the syntactic patterns CAN'T decide but
+# Z3 CAN. These are the v0.4 marquee — REQUIRES_REVIEW used to be the
+# answer; now we get a real classification.
+# ---------------------------------------------------------------------------
+
+
+def test_drop_multiple_and_clauses_via_z3_is_semantic_loosened():
+    # The syntactic loosened_and_drop pattern only catches dropping
+    # one clause. Dropping two falls through to Z3.
+    assert (
+        _classify("a = 1 AND b = 2 AND c = 3", "a = 1")
+        == "semantic_loosened"
+    )
+
+
+def test_drop_multiple_or_disjuncts_via_z3_is_semantic_tightened():
+    # Symmetric: syntactic tightened_or_drop only catches single-
+    # disjunct drops; Z3 catches multi-drop.
+    assert (
+        _classify("a = 1 OR b = 2 OR c = 3", "a = 1")
+        == "semantic_tightened"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Soundness pin: type conflict aborts the translator (returns None
+# rather than producing a misleading classification).
+# ---------------------------------------------------------------------------
+
+
+def test_type_conflict_on_column_returns_none():
+    # `col = 5` then `col = 'foo'` would bind `col` to two different
+    # Z3 sorts (Int and String). The translator refuses and returns
+    # None rather than misclassifying.
+    assert _classify("col = 5", "col = 'foo'") is None
