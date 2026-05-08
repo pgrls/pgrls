@@ -213,6 +213,143 @@ def test_diff_apply_surfaces_migration_sql_error_clearly(
     assert "failed" in result.output
 
 
+def test_diff_apply_with_extension_flag_pre_installs_extension(
+    pg_url: str, apply_sql, tmp_path: Path
+) -> None:
+    """`--extension citext` pre-installs the extension in the
+    testcontainer before restoring the baseline. Without the flag,
+    a baseline that uses ``citext`` columns would fail to restore
+    because the type is unknown until the extension is installed.
+
+    Pin the v0.5.1 contract: passing --extension makes the migration
+    apply succeed against a baseline whose Schema.to_sql() emits a
+    ``citext`` column type.
+    """
+    # Baseline uses citext — the extension is installed in the
+    # *source* DB so introspection captures the column as
+    # data_type='citext'. The testcontainer used by --apply is
+    # ephemeral and does NOT have citext, hence --extension.
+    apply_sql(
+        """
+        CREATE EXTENSION IF NOT EXISTS citext;
+        CREATE TABLE public.contacts_ext_test (
+            id BIGSERIAL,
+            email CITEXT,
+            tenant_id UUID NOT NULL
+        );
+        ALTER TABLE public.contacts_ext_test ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.contacts_ext_test FORCE ROW LEVEL SECURITY;
+        """
+    )
+
+    runner = CliRunner()
+    snap_result = runner.invoke(
+        main,
+        ["snapshot", "--database-url", pg_url, "--schemas", "public"],
+    )
+    assert snap_result.exit_code == 0, snap_result.output
+    base_path = tmp_path / "base.json"
+    base_path.write_text(snap_result.output, encoding="utf-8")
+
+    # Sanity check: baseline really does carry a citext column.
+    # If snapshot stopped emitting that, the test would silently
+    # stop covering the case.
+    base_payload = json.loads(snap_result.output)
+    contacts = next(
+        t for t in base_payload["tables"]
+        if t["schema"] == "public" and t["name"] == "contacts_ext_test"
+    )
+    assert any(
+        col["data_type"] == "citext"
+        for col in contacts.get("column_details", [])
+    ), contacts
+
+    # Migration that doesn't touch citext at all — only adds a new
+    # plain-text column. Without --extension citext, the baseline
+    # restore inside the testcontainer would fail at the
+    # `email CITEXT` line.
+    migration_path = tmp_path / "migration.sql"
+    migration_path.write_text(
+        "ALTER TABLE public.contacts_ext_test ADD COLUMN note TEXT;\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+            "--extension",
+            "citext",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The migration only adds a column — no diff classification
+    # should fire. Pin the smoke-test invariant: empty violations
+    # list (column adds aren't an RLS-related diff change).
+    payload = json.loads(result.output)
+    assert payload["violations"] == [], payload
+
+
+def test_diff_apply_auto_detects_create_extension_in_migration(
+    pg_url: str, apply_sql, tmp_path: Path
+) -> None:
+    """A migration with ``CREATE EXTENSION pgcrypto;`` followed by a
+    column default that calls ``gen_random_uuid()`` should apply
+    cleanly without --extension, because the v0.5.1 auto-detect
+    walks the migration AST and pre-installs every extension it
+    declares.
+    """
+    apply_sql(
+        """
+        CREATE TABLE public.tokens_autodetect (
+            id BIGSERIAL,
+            tenant_id UUID NOT NULL
+        );
+        ALTER TABLE public.tokens_autodetect ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.tokens_autodetect FORCE ROW LEVEL SECURITY;
+        """
+    )
+
+    runner = CliRunner()
+    snap_result = runner.invoke(
+        main,
+        ["snapshot", "--database-url", pg_url, "--schemas", "public"],
+    )
+    assert snap_result.exit_code == 0, snap_result.output
+    base_path = tmp_path / "base.json"
+    base_path.write_text(snap_result.output, encoding="utf-8")
+
+    # Migration declares the extension itself; auto-detect picks
+    # it up from the migration's CreateExtensionStmt — no
+    # --extension flag needed. Pre-installing under `IF NOT EXISTS`
+    # is idempotent with the migration's own statement.
+    migration_path = tmp_path / "migration.sql"
+    migration_path.write_text(
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto;\n"
+        "ALTER TABLE public.tokens_autodetect "
+        "ADD COLUMN token UUID DEFAULT gen_random_uuid();\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base_path),
+            "--apply",
+            str(migration_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
 def test_diff_apply_rejects_v4_baseline_with_clear_message(
     tmp_path: Path,
 ) -> None:
