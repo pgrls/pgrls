@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from pgrls.ast_utils import find_func_calls, parse_expr
-from pgrls.model import Grant, Policy, Schema, SecdefFunction, Table, View
+from pgrls.model import Column, Grant, Policy, Schema, SecdefFunction, Table, View
 
 _POLICY_CMD_MAP: dict[str, str] = {
     "*": "ALL",
@@ -164,7 +164,13 @@ ORDER BY p.polrelid, p.polname
 _COLUMNS_SQL = """
 SELECT
     a.attrelid AS table_oid,
-    a.attname AS column_name
+    a.attname AS column_name,
+    -- `format_type(atttypid, atttypmod)` produces the canonical SQL type
+    -- the way Postgres itself formats CREATE TABLE: `numeric(10,2)`,
+    -- `timestamp with time zone`, `text`, etc. This is what we want
+    -- to round-trip through Schema.to_sql() in v0.5+.
+    pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+    NOT a.attnotnull AS is_nullable
 FROM pg_catalog.pg_attribute a
 WHERE a.attrelid = ANY(%s)
   AND a.attnum > 0
@@ -495,8 +501,16 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         secdef_index = _build_secdef_calls_index(secdef_funcs, view_rows)
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
+    column_details_by_oid: dict[int, list[Column]] = defaultdict(list)
     for row in column_rows:
         columns_by_oid[row["table_oid"]].append(row["column_name"])
+        column_details_by_oid[row["table_oid"]].append(
+            Column(
+                name=row["column_name"],
+                data_type=row["data_type"],
+                is_nullable=row["is_nullable"],
+            )
+        )
 
     partition_parent_by_oid: dict[int, tuple[str, str]] = {
         row["child_oid"]: (row["parent_schema"], row["parent_name"])
@@ -558,6 +572,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 for role, privileges in sorted(
                     grants_by_oid.get(row["table_oid"], {}).items()
                 )
+            ),
+            column_details=tuple(
+                column_details_by_oid.get(row["table_oid"], [])
             ),
         )
         for row in table_rows

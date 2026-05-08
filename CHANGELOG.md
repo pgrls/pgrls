@@ -10,6 +10,80 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-08
+
+### Added
+- **Migration-as-input for `pgrls diff`** (issue #13). New
+  `--apply migration.sql` flag spins up an ephemeral Postgres
+  testcontainer, restores the captured baseline via
+  `Schema.to_sql()`, applies the migration SQL, introspects the
+  result, and uses that as the diff's head. Lets CI gate
+  deployments against the *post-migration* schema without
+  applying the migration to a real database.
+
+  ```sh
+  pgrls diff base.json --apply migration.sql
+  ```
+
+  Mutually exclusive with `<head>`. Requires
+  `pip install pgrls[diff-apply]` (testcontainers + Docker).
+  The default install stays slim — testcontainers is heavy and
+  most users don't need this path.
+
+- **Snapshot v5** — adds per-column type info via the new
+  `column_details` array on each table. v3 / v4 baselines still
+  round-trip (`Schema.from_snapshot` accepts 3, 4, 5). The
+  `Column` dataclass captures `name`, `data_type` (the canonical
+  Postgres `format_type` rendering — `numeric(10,2)`, `timestamp
+  with time zone`, etc.), and `is_nullable`. Required by the
+  `--apply` flow's `Schema.to_sql()` emitter; v3 / v4 snapshots
+  raise `ValueError` when used with `to_sql()`, with a clear
+  "re-capture against v0.5+" message.
+
+- **`Schema.to_sql()`** — emit DDL that re-creates the captured
+  schema in an empty Postgres. Covers `CREATE SCHEMA IF NOT
+  EXISTS`, `CREATE TABLE` with column types and nullability,
+  `ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`, `CREATE
+  POLICY`, and `GRANT`. Indexes, constraints, defaults, and
+  generated columns are deliberately NOT emitted — the diff
+  target is RLS-state changes, not data integrity, and the
+  migration applies on top of the bare-minimum DDL. Roles
+  referenced by policies / grants are NOT created — that's the
+  `--apply` caller's responsibility (it pre-creates roles
+  idempotently in the testcontainer before applying the DDL).
+
+- **`pgrls[diff-apply]` extra** — pulls in
+  `testcontainers[postgres]>=4.0` for the `--apply` path.
+  Without it, `--apply` raises a clear "install
+  pgrls[diff-apply]" error and the snapshot-vs-snapshot /
+  snapshot-vs-DB paths continue working unchanged.
+
+### Test coverage
+- 22 new unit tests in `tests/test_schema_to_sql.py` covering the
+  emitter's output shape (CREATE SCHEMA per distinct schema,
+  CREATE TABLE column rendering, RLS toggles, policy clause
+  composition, GRANT-per-role-pair, PUBLIC vs named role
+  rendering, deterministic byte-identical output), plus a real-
+  Postgres round-trip that captures a complex schema, emits SQL
+  via `to_sql()`, applies it to a fresh container, re-introspects,
+  and asserts `diff_schemas(...) == []`.
+- 5 new integration tests in `tests/diff/test_cli_apply.py`
+  covering the end-to-end `pgrls diff --apply` path: SAFE
+  migration classification, DANGEROUS migration triggering exit 1,
+  `--apply` + `<head>` mutual exclusion, migration SQL error
+  surfacing as a clean ToolError, and the v3 / v4 baseline reject
+  path with the "re-capture against v0.5+" message.
+
+### Deprecations
+- None. v0.5.0 is purely additive on top of v0.4.x.
+
+### Phase plan (issue #13)
+- Phase 1+2 (this release): snapshot v5, `Schema.to_sql()`,
+  `--apply` CLI flag, end-to-end tests.
+- Phase 3 (v0.5.x): extension auto-detect from migration SQL,
+  cached intermediate state to avoid re-applying the baseline
+  for repeated invocations.
+
 ## [0.4.2] - 2026-05-08
 
 ### Added
