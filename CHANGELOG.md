@@ -10,6 +10,50 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-08
+
+### Added
+- **Baseline cache for `pgrls diff --apply`**. The first `--apply`
+  run for a given (PG image, baseline DDL, role list, extension
+  list) tuple commits the post-restore container into a tagged
+  Docker image (`pgrls-baseline:<HASH>`); subsequent runs with
+  the same inputs boot directly from that image, skipping role
+  pre-creation, extension install, and baseline DDL execution.
+  Migration apply + introspection still run on every invocation
+  — only the deterministic setup is cached.
+
+  Cache hit / miss is decided by a SHA-256 over the four inputs;
+  any change to baseline DDL, roles, extensions, or the source
+  PG image invalidates the entry. Cached images carry the
+  `org.pgrls.cache=baseline` label, so users can prune them
+  with:
+
+  ```sh
+  docker image prune --filter label=org.pgrls.cache=baseline
+  ```
+
+  Set `PGRLS_DIFF_APPLY_NO_CACHE=1` to disable the cache (useful
+  when debugging or when the baseline genuinely changes every
+  run and the commit overhead is pure waste).
+
+- **`PGDATA=/var/lib/postgresql/pgrls-data` override** in the
+  testcontainer. The official Postgres image declares
+  `VOLUME /var/lib/postgresql/data`, so data written there
+  doesn't end up in the container's filesystem layer and isn't
+  captured by `docker commit`. Pointing PGDATA elsewhere puts
+  the data in the container layer where the cache can capture
+  it.
+
+### Internal
+- New helper module `pgrls.diff._apply_cache`:
+  - `compute_cache_key(pg_image, baseline_sql, roles, extensions)`
+    — deterministic SHA-256 truncated to 16 hex chars.
+  - `image_exists(tag)` — best-effort lookup; degrades to False
+    on any docker daemon error so the diff command stays robust.
+  - `commit_baseline(container_id, tag)` — wraps
+    `docker.containers.get().commit()` with the cache label.
+- Added `docker` mypy override to silence missing-stub warnings.
+
 ## [0.5.1] - 2026-05-08
 
 ### Added

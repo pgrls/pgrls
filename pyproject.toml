@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.5.1"
+version = "0.5.2"
 description = "Framework-agnostic linter and testing toolkit for Postgres Row-Level Security."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -125,4 +125,12 @@ ignore_missing_imports = true
 # stay loud.
 [[tool.mypy.overrides]]
 module = ["testcontainers", "testcontainers.*"]
+ignore_missing_imports = true
+
+# `docker` SDK (transitive via testcontainers) similarly has no
+# stubs. Used by the v0.5.2 baseline cache module to look up and
+# commit cached images. Same rationale: optional path, suppress
+# at the resolver level rather than peppering `# type: ignore`.
+[[tool.mypy.overrides]]
+module = ["docker", "docker.*"]
 ignore_missing_imports = true
