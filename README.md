@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.5.1** — twenty rules (SEC001–SEC012, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification). v0.4+ adds optional Z3-based semantic predicate analysis (`pip install pgrls[diff-z3]`). v0.5+ adds **migration-as-input** — `pgrls diff base.json --apply migration.sql` spins up an ephemeral Postgres, restores the baseline, applies the migration, and diffs the result (`pip install pgrls[diff-apply]`). v0.5.1 auto-detects `CREATE EXTENSION` statements in the migration and pre-installs them in the testcontainer; `--extension <name>` (repeatable) supplements the auto-detect when the baseline assumes an extension is already present.
+> **Status: 0.5.2** — twenty rules (SEC001–SEC012, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification). v0.4+ adds optional Z3-based semantic predicate analysis (`pip install pgrls[diff-z3]`). v0.5+ adds **migration-as-input** — `pgrls diff base.json --apply migration.sql` spins up an ephemeral Postgres, restores the baseline, applies the migration, and diffs the result (`pip install pgrls[diff-apply]`). v0.5.1 auto-detects `CREATE EXTENSION` statements in the migration and pre-installs them in the testcontainer; `--extension <name>` (repeatable) supplements the auto-detect when the baseline assumes an extension is already present. v0.5.2 caches the restored baseline as a tagged Docker image so subsequent `--apply` runs with the same baseline boot directly from the cached state, skipping role + extension + DDL setup.
 
 ## Install
 
@@ -240,7 +240,7 @@ introspects, and exits non-zero if any rule at or above
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.5.1
+    rev: v0.5.2
     hooks:
       - id: pgrls-lint
         # pgrls hits a real database, so most teams scope this to
