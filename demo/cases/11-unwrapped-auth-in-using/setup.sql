@@ -12,6 +12,15 @@ CREATE TABLE app.messages (
 );
 ALTER TABLE app.messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.messages FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy with the *correctly wrapped* form for
+-- contrast — pgrls expects this to NOT fire PERF001. The
+-- RESTRICTIVE policy below has the unwrapped call (the rule's
+-- catch). Keeping both side-by-side makes the right-vs-wrong
+-- shape visible in one fixture.
+CREATE POLICY messages_authenticated_access ON app.messages
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY messages_owner ON app.messages
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC

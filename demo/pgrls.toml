@@ -33,7 +33,6 @@ allowlist = ["app.countries"]
 # tripping the "no rule fires on this clean case" tests.
 allowlist = [
     "app.MixedCase Table",
-    "app.accounts",
     "app.admin_audit",
     "app.admin_overrides",
     "app.always_open",
@@ -47,10 +46,12 @@ allowlist = [
     "app.current_user_check",
     "app.deep_events",
     "app.deny_via_false",
-    # `app.documents` (uc01) removed in v0.3.1 — uc01's setup.sql
-    # now uses a proper PERMISSIVE+RESTRICTIVE pair (the canonical
-    # clean tenant-table shape). Remaining entries are the
-    # incremental remainder of issue #11; v0.3.2+ will chip away.
+    # Issue #11 chip-away log:
+    #   v0.3.1 — `app.documents` (uc01) → canonical PERMISSIVE+RESTRICTIVE.
+    #   v0.5.4 — uc04 notes, uc06 accounts, uc07 singletons,
+    #            uc08 invoices, uc11 messages, uc18 users_v2,
+    #            uc19 profiles, uc20 todos, uc22 posts_v2.
+    # Remaining entries below are the next chip-away targets.
     "app.ec_order_items",
     "app.ec_orders",
     "app.events",
@@ -58,29 +59,22 @@ allowlist = [
     "app.flags_table",
     "app.gdpr_records",
     "app.gen_cols",
-    "app.invoices",
     "app.json_access",
     "app.jwt_documents",
     "app.jwt_unwrapped",
     "app.kb_articles",
     "app.leaf_metrics_2026",
-    "app.messages",
     "app.nested_or_check",
     "app.not_false_table",
-    "app.notes",
     "app.or_true_table",
     "app.partial_orphan",
     "app.placeholder_named",
-    "app.posts_v2",
-    "app.profiles",
     "app.recent_only",
     "app.region_metrics",
     "app.row_comparison",
-    "app.singletons",
     "app.team_documents",
     "app.team_members",
     "app.tickets",
-    "app.todos",
     "app.todos_archive",
     "app.typecast_auth",
     "app.typecast_email",
@@ -91,6 +85,5 @@ allowlist = [
     "app.uc87_users",
     "app.uc88_users",
     "app.user_workspaces",
-    "app.users_v2",
     "app.volatile_predicate",
 ]

@@ -15,6 +15,13 @@ CREATE TABLE app.users_v2 (
 );
 ALTER TABLE app.users_v2 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.users_v2 FORCE ROW LEVEL SECURITY;
+-- Canonical PERMISSIVE policy granting tenant-scoped access. The
+-- RESTRICTIVE policy below layers a soft-delete filter on top.
+-- Together: read your own tenant's non-deleted rows.
+CREATE POLICY users_v2_authenticated_access ON app.users_v2
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)::UUID))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant', true)::UUID));
 CREATE POLICY hide_deleted ON app.users_v2
     AS RESTRICTIVE
     FOR SELECT TO PUBLIC
