@@ -34,3 +34,17 @@ CREATE FUNCTION auth.role() RETURNS TEXT
 CREATE FUNCTION auth.jwt() RETURNS JSONB
     LANGUAGE SQL STABLE
     AS $$ SELECT current_setting('request.jwt.claims', true)::JSONB $$;
+
+-- Shared application role used by case fixtures that follow the
+-- canonical PERMISSIVE+RESTRICTIVE pattern (uc01 documents, uc04
+-- notes, uc06 accounts, etc.). Pre-creating it once here means
+-- per-case setup files can `CREATE POLICY ... TO app_authenticated`
+-- without repeating the idempotent role-creation block. NOLOGIN —
+-- pgrls.testing's role-as-user semantics drive it via
+-- SET LOCAL ROLE; nothing logs in as this role directly.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app_authenticated') THEN
+        CREATE ROLE app_authenticated NOLOGIN;
+    END IF;
+END $$;
