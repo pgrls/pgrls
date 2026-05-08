@@ -341,10 +341,20 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
     # so the to_sql output applies cleanly. `Schema.to_sql()`
     # deliberately doesn't emit role-creation — that's the
     # caller's responsibility.
+    #
+    # CRITICAL: use the same image as `pg_url`. PG17 introduced the
+    # `MAINTAIN` grant privilege; capturing from PG17 then restoring
+    # to PG16 fails with `unrecognized privilege type "maintain"`.
+    # `PGRLS_TEST_PG_IMAGE` is the same env var the conftest's
+    # `pg_url` fixture reads, so the source and target images match.
+    import os
+
     from testcontainers.postgres import PostgresContainer
 
+    image = os.environ.get("PGRLS_TEST_PG_IMAGE", "postgres:16-alpine")
+
     with PostgresContainer(
-        "postgres:16-alpine",
+        image,
         username="postgres",
         password="postgres",
         dbname="postgres",
