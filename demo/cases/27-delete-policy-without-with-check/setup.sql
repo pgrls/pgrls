@@ -13,6 +13,15 @@ CREATE TABLE app.todos_archive (
 );
 ALTER TABLE app.todos_archive ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.todos_archive FORCE ROW LEVEL SECURITY;
+-- PERMISSIVE policy granting per-user access to authenticated
+-- users. The DELETE-only RESTRICTIVE policy below pins SEC006's
+-- "DELETE-exempt" contract; this PERMISSIVE keeps the table
+-- from being silently deny-all (SEC012) for non-DELETE
+-- statements.
+CREATE POLICY todos_archive_authenticated_access ON app.todos_archive
+    FOR ALL TO app_authenticated
+    USING (user_id = (SELECT current_setting('app.user', true)))
+    WITH CHECK (user_id = (SELECT current_setting('app.user', true)));
 CREATE POLICY archive_owner_delete ON app.todos_archive
     AS RESTRICTIVE
     FOR DELETE TO PUBLIC
