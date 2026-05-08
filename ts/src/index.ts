@@ -5,10 +5,17 @@
  * cross-language Layer 1 protocol documented at
  * `docs/pgrls-test-protocol.md` in the source repo.
  *
- * The full public surface (PgrlsTestClient, drivers, assertions,
- * errors) lands in subsequent commits; this module re-exports
- * them as they're added.
+ * Subsequent commits add `PgrlsTestClient`, drivers, and
+ * assertions; this module re-exports them as they're added.
  */
+
+export {
+  PgrlsTestAssertionError,
+  PgrlsTestConfigError,
+  PgrlsTestError,
+} from './errors.js';
+
+export { quoteIdent, quoteQualified, RESERVED_KEYWORDS } from './idents.js';
 
 /**
  * The version of the cross-language Layer 1 contract this
