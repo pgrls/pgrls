@@ -1,44 +1,194 @@
 # pgrls-test
 
-> 🚧 **v0.6.0-dev** — TypeScript port of `pgrls.testing`. The
-> full public surface (`PgrlsTestClient`, drivers, assertions,
-> errors) lands in incremental PRs over the v0.6.0 milestone.
-> This file's recipe section will fill in as those PRs land.
+> **Code-first RLS testing for Postgres** — TypeScript port of [`pgrls.testing`](https://github.com/pgrls/pgrls) (Python). Implements the cross-language [Layer 1 protocol](https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md) (`PROTOCOL_VERSION = 1`).
 
-Code-first RLS testing for Postgres, in TypeScript. Implements
-the cross-language Layer 1 contract documented at
-[`docs/pgrls-test-protocol.md`](https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md)
-in the source repo. Companion to the Python `pgrls.testing`
-package — same protocol, byte-for-byte equivalent wire
-behaviour, idiomatic JS/TS surface.
+`pgrls-test` lets you write RLS tests with idiomatic JS/TS ergonomics: per-test transactions, role + JWT-claims switching, parameterized SQL execution, and five RLS-specific assertion helpers — all in a small package that wraps your existing Postgres client (no replacement, no fork).
 
-## Status
+```ts
+import { Client } from 'pg';
+import { PgrlsTestClient, pgDriver } from 'pgrls-test';
 
-| Component | Status |
-|---|---|
-| Scaffold (build, lint, test, types) | ✅ landed |
-| `PROTOCOL_VERSION` export | ✅ landed |
-| `errors.ts` (PgrlsTestError + subclasses) | 🔜 next |
-| `idents.ts` (quote_ident port) | 🔜 next |
-| `drivers/` (Driver interface, pg adapter, postgres.js adapter) | 🔜 |
-| `client.ts` (PgrlsTestClient, transaction, asRole) | 🔜 |
-| `assertions.ts` (5 RLS-specific assertions) | 🔜 |
-| Cross-lang conformance suite | 🔜 |
-| Released to npm as `pgrls-test@0.6.0` | 🔜 |
+const pg = new Client({ connectionString: process.env.DATABASE_URL });
+await pg.connect();
+const client = new PgrlsTestClient(pgDriver(pg));
 
-## Development
+await client.transaction(async () => {
+  await client.seed('app.invoices', [
+    { tenant_id: 'tenant-a', amount: 100 },
+    { tenant_id: 'tenant-b', amount: 200 },
+  ]);
 
-Once the `ts/` directory has installable dependencies:
+  await client.asRole(
+    'app_authenticated',
+    { claims: { sub: 'user-a', tenant_id: 'tenant-a' } },
+    async () => {
+      await client.assertRows(
+        'SELECT id FROM app.invoices',
+        { count: 1 },
+      );
+      await client.assertRejected(
+        "INSERT INTO app.invoices (tenant_id, amount) VALUES ('tenant-b', 999)",
+      );
+    },
+  );
+});
+```
+
+## Install
 
 ```sh
-cd ts
-npm install   # or pnpm install
-npm test      # vitest
-npm run typecheck
-npm run lint
-npm run build
+npm install --save-dev pgrls-test pg
+# or
+npm install --save-dev pgrls-test postgres
 ```
+
+`pg` and `postgres` (postgres.js) are **optional peer dependencies** — install only the driver you actually use.
+
+| Package | Node | TypeScript |
+|---|---|---|
+| `pgrls-test` | ≥ 20 | strict mode supported, ESM-only |
+
+## Drivers
+
+Both `pg` (node-postgres) and `postgres.js` are first-class:
+
+```ts
+// node-postgres:
+import { Client } from 'pg';
+import { PgrlsTestClient, pgDriver } from 'pgrls-test';
+
+const pg = new Client({ connectionString: url });
+await pg.connect();
+const client = new PgrlsTestClient(pgDriver(pg));
+
+// postgres.js:
+import postgres from 'postgres';
+import { PgrlsTestClient, postgresJsDriver } from 'pgrls-test';
+
+const sql = postgres(url, { max: 1 }); // single connection so SET LOCAL sticks
+const client = new PgrlsTestClient(postgresJsDriver(sql));
+```
+
+The cross-language conformance suite runs the same tests against both adapters in CI.
+
+## API
+
+### Lifecycle
+
+| Method | Behaviour |
+|---|---|
+| `new PgrlsTestClient(driver)` | Wrap a driver into the client surface. |
+| `client.transaction(body)` | Run `body` inside a transaction; ROLLBACK on exit (always). |
+
+### SQL
+
+| Method | Behaviour |
+|---|---|
+| `client.exec(sql, params?)` | Execute one statement; discard rows. |
+| `client.fetchAll<T>(sql, params?)` | Execute and return rows as `T[]`. |
+| `client.asRole(role, { claims }, body)` | Switch role + claims for the duration of `body`. Nests cleanly. |
+| `client.seed(table, rows)` | Bulk-insert plain objects. |
+
+### Assertions (five RLS-specific helpers)
+
+| Method | Pass when… |
+|---|---|
+| `client.assertRows(sql, { count })` | Query returns exactly `count` rows. |
+| `client.assertVisible(sql)` | Query returns at least one row. |
+| `client.assertInvisible(sql)` | Query returns zero rows. |
+| `client.assertRejected(sql)` | Query throws Postgres `InsufficientPrivilege` (SQLSTATE 42501). |
+| `client.assertSilentlyDropped(sql)` | UPDATE/DELETE … RETURNING returns zero rows (USING filtered them out). |
+
+All five are also exported as standalone functions taking a client argument first — usable from any test framework, not just Vitest.
+
+## Vitest setup recipe
+
+```ts
+// vitest.setup.ts
+import { afterAll, afterEach, beforeAll } from 'vitest';
+import { Client } from 'pg';
+import { PgrlsTestClient, pgDriver } from 'pgrls-test';
+
+let pg: Client;
+let client: PgrlsTestClient;
+
+beforeAll(async () => {
+  pg = new Client({ connectionString: process.env.DATABASE_URL });
+  await pg.connect();
+  client = new PgrlsTestClient(pgDriver(pg));
+});
+
+afterAll(async () => {
+  await pg.end();
+});
+
+export { client };
+```
+
+```ts
+// my-feature.test.ts
+import { describe, it } from 'vitest';
+import { client } from './vitest.setup.js';
+
+describe('invoices RLS', () => {
+  it('a user can only see their tenant', async () => {
+    await client.transaction(async () => {
+      await client.seed('app.invoices', [
+        { tenant_id: 't1', amount: 100 },
+        { tenant_id: 't2', amount: 200 },
+      ]);
+      await client.asRole(
+        'app_authenticated',
+        { claims: { tenant_id: 't1' } },
+        async () => {
+          await client.assertRows('SELECT id FROM app.invoices', { count: 1 });
+          await client.assertInvisible(
+            "SELECT id FROM app.invoices WHERE tenant_id = 't2'",
+          );
+        },
+      );
+    });
+  });
+});
+```
+
+Each test runs inside `client.transaction(async () => …)`, which rolls back at the end — no fixture cleanup, no test order dependencies.
+
+## Errors
+
+The error hierarchy mirrors the Python client byte-for-byte:
+
+```
+Error
+└── PgrlsTestError              — base for any pgrls-test error
+    ├── PgrlsTestAssertionError — thrown by assert* helpers
+    └── PgrlsTestConfigError    — thrown when the driver isn't usable
+```
+
+Catch any pgrls-test failure with `if (e instanceof PgrlsTestError) …`.
+
+## Cross-language guarantee
+
+`pgrls-test` and Python's `pgrls.testing` implement the same Layer 1 protocol. The wire-level sequence — `SET LOCAL ROLE`, `set_config('request.jwt.claims', …, true)`, `SAVEPOINT pgrls_actor_<random>`, the four-case claim restoration logic — is byte-for-byte equivalent.
+
+The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across languages: `RESERVED_KEYWORDS.size === 78` matches Python's `len(_RESERVED_KEYWORDS)`. CI runs the conformance suite on both implementations against an identical Postgres testcontainer to catch any drift.
+
+## Comparison to Python
+
+| Operation | Python (`pgrls.testing`) | TypeScript (`pgrls-test`) |
+|---|---|---|
+| Open client | `PgrlsTestClient(conn)` | `new PgrlsTestClient(driver)` |
+| Per-test tx | `with client.transaction():` | `await client.transaction(async () => …)` |
+| Switch role | `with client.as_role(r, claims=c):` | `await client.asRole(r, { claims: c }, async () => …)` |
+| Assert rows | `client.assert_rows(sql, count=n)` | `await client.assertRows(sql, { count: n })` |
+| Assert reject | `client.assert_rejected(sql)` | `await client.assertRejected(sql)` |
+
+Naming follows JS conventions (camelCase) rather than mirroring snake_case — protocol invariants are language-neutral, but the surface API is per-language idiomatic.
 
 ## License
 
-MIT. See [LICENSE](https://github.com/pgrls/pgrls/blob/main/LICENSE) in the repo root.
+MIT. See [LICENSE](https://github.com/pgrls/pgrls/blob/main/LICENSE) at the repo root.
+
+## Source
+
+The TS port is developed alongside the Python client in the [pgrls/pgrls](https://github.com/pgrls/pgrls) repo, under `ts/`. Issues, PRs, and discussions for both clients live there.

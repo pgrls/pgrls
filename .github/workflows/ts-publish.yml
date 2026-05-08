@@ -1,0 +1,88 @@
+name: ts-publish
+
+# Publish `pgrls-test` to npm when a `ts-v*` tag is pushed.
+#
+# Tag convention: `ts-v0.6.0`, `ts-v0.6.1`, …. Distinct from
+# Python release tags (`v0.5.4`, etc.) so the two release tracks
+# don't collide. The trailing version is whatever's in
+# ts/package.json — release script bumps both.
+#
+# Manual publish from a maintainer's laptop also works
+# (`npm publish` from `ts/`); this workflow is the CI version
+# that uses `NPM_TOKEN` from repo secrets.
+
+on:
+  push:
+    tags:
+      - "ts-v*"
+  # Allow manual dispatch in case a tag is pushed before this
+  # workflow exists, or the user wants to retry after a hiccup.
+  workflow_dispatch:
+
+# Defense-in-depth: only writes a release artifact (npm tarball)
+# and reads the repo. No need for issue / PR write permissions.
+permissions:
+  contents: read
+  # `id-token: write` is required for npm provenance — the
+  # signed attestation that ties the published tarball to the
+  # GitHub Actions run that built it. Reduces supply-chain risk
+  # vs. classic npm tokens alone.
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          # Match `engines.node >= 20` from package.json. Newer
+          # Node is fine to publish from but we pin to LTS.
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify package.json version matches tag
+        run: |
+          # Tag is `ts-v0.6.0`; strip the `ts-v` prefix.
+          TAG_VERSION="${GITHUB_REF_NAME#ts-v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version $TAG_VERSION != package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "Publishing pgrls-test@$PKG_VERSION"
+
+      - name: Publish to npm with provenance
+        env:
+          # Provenance signing uses the OIDC token from the
+          # `id-token: write` permission above, plus NPM_TOKEN
+          # for the actual publish. NPM_TOKEN must be a granular
+          # access token scoped to the `pgrls-test` package.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
