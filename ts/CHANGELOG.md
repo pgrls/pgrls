@@ -7,7 +7,7 @@ package adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `PROTOCOL_VERSION` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python client.
 
-## [0.6.1] - 2026-05-10
+## [0.6.1] - 2026-05-12
 
 Post-release review pass. Bug fix + polish; no protocol changes.
 
@@ -25,8 +25,13 @@ Post-release review pass. Bug fix + polish; no protocol changes.
   pass whenever RLS happened to filter every row, defeating
   the test's purpose. v0.6.1 adds a SQL-keyword pre-check
   (`/\bRETURNING\b/i`) that fires the same `PgrlsTestError`
-  Python raises, restoring byte-for-byte parity. Three new
-  unit tests + behavior pinned in the conformance suite.
+  Python raises, restoring byte-for-byte parity. Four new
+  unit tests cover UPDATE/DELETE without RETURNING,
+  case-insensitive matching, and word-boundary handling
+  (`returning_col` is rejected; `returning` keyword is
+  accepted). The regex is documented as deliberately not
+  parsing SQL: false positives like RETURNING inside a
+  string literal aren't the helper's responsibility.
 
 ### Internal
 
