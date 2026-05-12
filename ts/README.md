@@ -171,7 +171,7 @@ Catch any pgrls-test failure with `if (e instanceof PgrlsTestError) …`.
 
 `pgrls-test` and Python's `pgrls.testing` implement the same Layer 1 protocol. The wire-level sequence — `SET LOCAL ROLE`, `set_config('request.jwt.claims', …, true)`, `SAVEPOINT pgrls_actor_<random>`, the four-case claim restoration logic — is byte-for-byte equivalent.
 
-The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across languages: `RESERVED_KEYWORDS.size === 78` matches Python's `len(_RESERVED_KEYWORDS)`. CI runs the conformance suite on both implementations against an identical Postgres testcontainer to catch any drift.
+The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across languages: `RESERVED_KEYWORDS.size === 78` matches Python's `len(_RESERVED_KEYWORDS)` (Postgres 16 fully-reserved keywords, appendix C). Each implementation's CI runs its own conformance suite against a Postgres testcontainer; drift protection comes from the shared protocol doc and matching wire-level test cases on both sides, not a single shared CI job.
 
 ## Comparison to Python
 

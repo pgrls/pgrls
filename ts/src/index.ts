@@ -2,11 +2,15 @@
  * pgrls-test — Code-first RLS testing for Postgres.
  *
  * TypeScript port of `pgrls.testing` (Python). Implements the
- * cross-language Layer 1 protocol documented at
- * `docs/pgrls-test-protocol.md` in the source repo.
+ * cross-language wire protocol at
+ * https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md.
  *
- * Subsequent commits add `PgrlsTestClient` and assertions; this
- * module re-exports the public surface as it grows.
+ * Re-exports the full public surface: `PgrlsTestClient`, the
+ * five RLS-specific assertion helpers (standalone + as
+ * methods on the client), the two driver factories
+ * (`pgDriver` / `postgresJsDriver`), the error hierarchy,
+ * identifier-quoting helpers, and the `PROTOCOL_VERSION`
+ * constant.
  */
 
 export {
@@ -39,7 +43,8 @@ export {
  * The version of the cross-language Layer 1 contract this
  * client implements. Bumped only when the wire-level sequence
  * (SQL emitted, GUC names used, savepoint convention) changes
- * in a non-additive way. See `docs/pgrls-test-protocol.md` for
- * the contract itself.
+ * in a non-additive way. See
+ * https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md
+ * for the contract itself.
  */
 export const PROTOCOL_VERSION = 1 as const;

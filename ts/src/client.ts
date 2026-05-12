@@ -5,8 +5,8 @@
  * wire-level sequence is identical: same SAVEPOINT name format,
  * same SET LOCAL ROLE / set_config call, same restoration logic
  * on clean exit, same ROLLBACK TO SAVEPOINT on exception.
- * Documented in `docs/pgrls-test-protocol.md` as the Layer 1
- * contract.
+ * Documented at https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md
+ * as the cross-language wire contract.
  *
  * Usage with `pg`:
  *
@@ -105,10 +105,12 @@ export class PgrlsTestClient {
    * Exceptions from the body propagate; the rollback runs in
    * the `finally` so cleanup always happens.
    *
-   * The first `query` issued inside the body implicitly starts
-   * a transaction (Postgres autocommit semantics). If the user's
-   * driver is in autocommit mode, this still works — Postgres
-   * accepts a no-op `ROLLBACK` outside an explicit transaction.
+   * Issues an explicit `BEGIN` at entry and `ROLLBACK` at exit.
+   * Works regardless of the driver's autocommit setting — being
+   * explicit means the same code runs whether the user's
+   * `pg.Client` is autocommit=true or autocommit=false, and
+   * whether they're using a Pool client (autocommit by default)
+   * or a dedicated session.
    */
   async transaction<T>(body: () => Promise<T>): Promise<T> {
     // Begin an explicit transaction so the rollback at the end

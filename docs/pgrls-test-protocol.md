@@ -23,7 +23,8 @@ For each test, on a single Postgres connection:
     2. `SAVEPOINT pgrls_actor_<rand>` — `<rand>` is an 8-char
        hex string from a 4-byte cryptographically-random source
        (Python: `secrets.token_hex(4)`; TS:
-       `crypto.getRandomValues(Uint8Array(4))` then hex-format).
+       `crypto.getRandomValues(new Uint8Array(4))` then
+       hex-format).
        Random rather than monotonic so nested scenario blocks
        can't collide if a future client implementation forgets
        per-call counter bookkeeping; collisions in the same
@@ -147,10 +148,10 @@ understand the document's version when bootstrapping.
 
 Package versions evolve **independently per language**:
 
-* Python `pgrls` is at v0.5.7 (as of 2026-05-10), shipped via
-  PyPI tags `v*`.
-* TS `pgrls-test` is at v0.6.0 (as of 2026-05-10), shipped via
-  npm tags `ts-v*`.
+* Python `pgrls` ships via PyPI tags `v*` (see
+  [`CHANGELOG.md`](../CHANGELOG.md) for the current version).
+* TS `pgrls-test` ships via npm tags `ts-v*` (see
+  [`ts/CHANGELOG.md`](../ts/CHANGELOG.md)).
 
 What ties them together is `PROTOCOL_VERSION`. Any two clients
 that expose the same `PROTOCOL_VERSION` are guaranteed to
