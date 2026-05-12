@@ -209,7 +209,12 @@ describe('PgrlsTestClient — asRole (entry sequence)', () => {
     expect(setConfig).toBeUndefined();
   });
 
-  it('treats undefined claims like null (skips set_config)', async () => {
+  it('treats absent claims key like null (skips set_config)', async () => {
+    // `exactOptionalPropertyTypes: true` rejects `claims: undefined`
+    // at compile time, so the absent-key case is what users actually
+    // hit when they don't want claims. The runtime `?? null` collapse
+    // still handles `undefined` defensively, but it's not reachable
+    // via the typed API.
     const driver = makeRecordingDriver();
     driver.on('SELECT current_user', () => captureResponse('admin', null));
     const client = new PgrlsTestClient(driver);

@@ -65,7 +65,11 @@ export interface AsRoleOptions {
    * "actor with no claims" request). The protocol distinguishes
    * the two: `null` doesn't issue `set_config(...)`, `{}` does.
    *
-   * `undefined` is treated as `null` by JS convention.
+   * Omitting the `claims` key entirely has the same effect as
+   * passing `null`. With `exactOptionalPropertyTypes: true`
+   * (the recommended TS config and the one this package uses),
+   * `claims: undefined` is rejected at compile time — pass
+   * `null` explicitly or drop the key.
    */
   claims?: Record<string, unknown> | null;
 }
@@ -141,18 +145,27 @@ export class PgrlsTestClient {
    *
    * Both drivers return rows as `Record<string, unknown>` (key
    * = column name, value = the driver's deserialized JS value).
-   * Type the result with a generic for ergonomics:
+   * Type the result with a generic for ergonomics — both
+   * `interface` and `type` declarations work:
    *
    * ```ts
-   * type Invoice = { id: number; tenant_id: string; amount: number };
+   * interface Invoice { id: number; tenant_id: string; amount: number }
    * const rows = await client.fetchAll<Invoice>('SELECT * FROM invoices');
    * ```
    *
    * The generic is a *type cast* — there's no runtime validation.
    * Mirrors Python's `client.fetchall(sql, params=[...])` which
    * also returns un-validated dicts.
+   *
+   * Note: the generic has no `extends Record<string, unknown>`
+   * constraint deliberately. That constraint would force users
+   * to declare row types as `type` aliases (which have implicit
+   * index signatures) and reject `interface` declarations
+   * (which don't, under TS's structural typing rules). Since
+   * the cast is unchecked anyway, the constraint adds friction
+   * without safety.
    */
-  async fetchAll<TRow extends Record<string, unknown> = Record<string, unknown>>(
+  async fetchAll<TRow = Record<string, unknown>>(
     sql: string,
     params: readonly unknown[] = [],
   ): Promise<TRow[]> {
