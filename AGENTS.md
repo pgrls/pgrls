@@ -1151,9 +1151,10 @@ Three layers, the bottom one is a documented contract not code:
 
 - **Layer 1** — [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md):
   the cross-language Postgres-side wire contract (`SET LOCAL ROLE` plus the
-  PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). Future TypeScript
-  and Go ports follow the same contract; this Python implementation is the
-  reference. `PROTOCOL_VERSION = 1`.
+  PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). The TypeScript
+  port ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
+  this same contract; a Go port is tracked for a future release. Python is
+  the reference implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
@@ -1199,15 +1200,30 @@ is fully executed (and any side effects committed within the
 current transaction) before the verb-gate rejects it. Pass only
 the UPDATE/DELETE you actually want to execute.
 
-### Writing TS or Go ports
+### Writing additional language ports
 
 The protocol contract at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md)
 specifies what every conformant client must do — wire sequence, error class
-mapping, savepoint semantics, conformance criteria. The
-[`tests/protocol/`](tests/protocol/) directory contains a language-agnostic SQL
-schema, seed data, and a JSON manifest of `(role, claims, query, expected)`
-tuples. A future TS port copies the manifest, writes a TS runner, and is
-"v1-conformant" iff every case passes.
+mapping, savepoint semantics, conformance criteria. Two approaches to
+v1-conformance both work:
+
+1. **Reuse the language-agnostic manifest.** The
+   [`tests/protocol/`](tests/protocol/) directory contains a SQL schema, seed
+   data, and a JSON manifest (`manifest.json` + `manifest.schema.json`) of
+   `(role, claims, query, expected)` tuples. Copy the manifest into the new
+   port, write a runner that exercises every case against a real Postgres,
+   pass iff every assertion matches.
+2. **Hand-roll a language-native conformance suite.** What the TypeScript
+   port did: `ts/test/conformance/_helpers.ts` defines its own `FIXTURE_SQL`
+   + `runConformanceTests(getClient)` driver-agnostic harness, then each
+   driver's conformance test file (`pg.conformance.test.ts`,
+   `postgres-js.conformance.test.ts`) spins up its own testcontainer and
+   plugs the harness in. Doesn't reuse `tests/protocol/`, but covers the same
+   four criteria from the protocol doc. Equivalent conformance proof, more
+   idiomatic to the host ecosystem.
+
+Either path satisfies v1. New ports should reach for whichever pattern fits
+the host language's testing idiom better.
 
 <a id="diff-rules"></a>
 
@@ -1456,7 +1472,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Nineteen rules across four categories.** SEC001–SEC011,
+- **Twenty rules across four categories.** SEC001–SEC012,
   PERF001–PERF002, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   There is no `pg_temp` shadowing detection, and SECURITY DEFINER
   function audit is currently scoped to the view-leak path
@@ -1475,14 +1491,18 @@ These are intentional in the current release. Do not invent capabilities.
   supported. The CI matrix runs against PG15, PG16, and PG17.
   `security_invoker` (the VIEW001 fix target) is a PG15+ reloption,
   which is the proximate reason for the floor bump.
-- **No SAT-style implication checking on `USING` / `WITH CHECK` predicates.**
-  v0.2's diff classifier recognizes the common-case AST patterns
-  (literal-equal, AND-tighten / drop, OR-loosen / drop) and flags
-  anything else as `REQUIRES_REVIEW`. Full Z3-driven implication
-  analysis is on the v0.5+ roadmap.
-- **Cross-language ports tracked for v0.4.** TypeScript and Go ports
-  of `pgrls.testing` and `pgrls.diff`, backed by the Layer-1
-  protocol fixtures, are the next milestone.
+- **SAT-style predicate implication is opt-in.** v0.2's diff
+  classifier recognizes common-case AST patterns (literal-equal,
+  AND-tighten / drop, OR-loosen / drop) and flags anything else
+  as `REQUIRES_REVIEW`. Z3-driven implication analysis shipped in
+  v0.4 as the optional `pip install pgrls[diff-z3]` extra; without
+  it, the diff classifier falls back to syntactic patterns only.
+- **Go port tracked.** The TypeScript port of `pgrls.testing`
+  shipped in v0.6.0 as the [`pgrls-test`](https://www.npmjs.com/package/pgrls-test)
+  npm package, following the Layer 1 protocol. A Go port using
+  the same protocol is the next cross-language milestone. The
+  `pgrls lint / fix / snapshot / diff` CLIs stay Python — they
+  depend on pglast (no drop-in TS/Go equivalent).
 
 ## Where to learn more
 
