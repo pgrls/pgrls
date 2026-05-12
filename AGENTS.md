@@ -1289,10 +1289,12 @@ the output without blocking CI.
 | Policy dropped, RESTRICTIVE | DANGEROUS |
 | Policy dropped, PERMISSIVE | BREAKING |
 
-> **Rename detection deferred to v0.3.** A policy renamed in v0.2 surfaces
-> as one drop + one add — both classifications fire independently. The
-> `POLICY_RENAMED` enum value is reserved in `pgrls.diff.differ.ChangeKind`
-> for forward compatibility but is not emitted by any v0.2 detection rule.
+> **Rename detection not yet implemented.** A policy renamed in any
+> v0.x release surfaces as one drop + one add — both classifications
+> fire independently. The `POLICY_RENAMED` enum value is reserved in
+> `pgrls.diff.differ.ChangeKind` for forward compatibility, but no
+> current detection rule emits it. (Originally targeted for v0.3;
+> still unimplemented through v0.5.7.)
 
 #### Policies — shape changes
 
@@ -1342,10 +1344,11 @@ each produces its own `Change` entry, classified independently.
 
 - One change ⇒ one `Change` entry. A policy widening both predicate and
   roles produces two entries.
-- v0.2 has no rename detection — a renamed policy surfaces as a drop +
-  add with their independent classifications. v0.3 may collapse these
-  into a single `POLICY_RENAMED` entry when every other attribute
-  matches; the enum value is reserved for that future behavior.
+- No release through v0.5.7 implements rename detection — a renamed
+  policy surfaces as a drop + add with their independent classifications.
+  A future release may collapse these into a single `POLICY_RENAMED`
+  entry when every other attribute matches; the enum value is reserved
+  in `pgrls.diff.differ.ChangeKind` for that behavior.
 - "Roles widened" includes adding `PUBLIC`; already the most-severe
   classification, no escalation needed.
 

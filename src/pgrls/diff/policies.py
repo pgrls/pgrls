@@ -75,8 +75,9 @@ def _diff_policies(base_table: Table, head_table: Table) -> list[Change]:
       (dangerous — previously-blocked rows become visible); dropping one
       narrows it (breaking — previously-visible rows may disappear).
 
-    Rename detection is deferred to v0.3; each rename appears here as one drop
-    + one add.
+    No release through v0.5.7 implements rename detection; each rename
+    appears here as one drop + one add. The `POLICY_RENAMED` enum value
+    is reserved in `ChangeKind` for a future implementation.
     """
     base_by_name: dict[str, Policy] = {p.name: p for p in base_table.policies}
     head_by_name: dict[str, Policy] = {p.name: p for p in head_table.policies}
