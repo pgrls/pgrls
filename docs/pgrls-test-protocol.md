@@ -4,9 +4,11 @@
 
 This document specifies the Postgres-side conventions any pgrls test
 client follows. The Python client (`pgrls.testing.PgrlsTestClient`)
-is the reference implementation; future TypeScript / Go ports
-implementing this contract are guaranteed to interoperate with the
-same RLS-protected schemas.
+is the reference implementation; the TypeScript port
+([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
+this same contract, and a Go port following the same contract is
+tracked. All conformant clients interoperate against the same
+RLS-protected schemas.
 
 ## Per-test wire sequence
 
