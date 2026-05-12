@@ -298,7 +298,7 @@ dashboard, or keep the report as a build artifact.
 
 ## Roadmap
 
-- **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Markdown output. Polished error messages.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Polished error messages.
 - ~~**TypeScript port of `pgrls.testing`**~~ — landed in v0.6.0 as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test). Source: [`ts/`](ts/).
 - **Go port** of `pgrls.testing` following the same Layer 1 protocol — tracked but not started.
 - ~~**SAT-based predicate implication checking.**~~ Z3-driven semantic predicate analysis landed in v0.4.x.

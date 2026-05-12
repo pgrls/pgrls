@@ -1417,8 +1417,10 @@ strictly more restrictive than the base. Classified SAFE.
 Any predicate change not matching one of the four real patterns above
 (AND-tighten, AND-loosen-drop, OR-loosen, OR-tighten-drop) falls through
 to REQUIRES_REVIEW — a human or SAT solver is needed to decide whether
-the new predicate is more or less permissive than the old one. SAT-based
-implication checking is on the v0.5+ roadmap.
+the new predicate is more or less permissive than the old one. The
+SAT-style implication path shipped in v0.4 as the optional
+`pip install pgrls[diff-z3]` extra (Z3-backed); without it, REQUIRES_REVIEW
+is the terminal classification.
 
 ## CI integration
 
@@ -1481,10 +1483,11 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
   fix` rewrites the mechanically-fixable subset; other rules need
   human intent.
-- **Text, JSON, and SARIF output.** `--format text` (human-readable),
-  `--format json` (machine-readable, stable CI contract), and
-  `--format sarif` (SARIF v2.1.0 for GitHub Code Scanning and similar
-  aggregators). Markdown remains on the roadmap.
+- **Text, JSON, SARIF, and Markdown output.** `--format text`
+  (human-readable, default), `--format json` (machine-readable,
+  stable CI contract), `--format sarif` (SARIF v2.1.0 for GitHub
+  Code Scanning and similar aggregators), and `--format markdown`
+  (PR comments / rendered CI reports).
 - **Postgres only.** No support for other databases or for
   MySQL/MariaDB emulation layers.
 - **Postgres 15+.** Older PG releases (10–14) are no longer
