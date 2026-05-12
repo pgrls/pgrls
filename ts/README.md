@@ -105,7 +105,7 @@ All five are also exported as standalone functions taking a client argument firs
 
 ```ts
 // vitest.setup.ts
-import { afterAll, afterEach, beforeAll } from 'vitest';
+import { afterAll, beforeAll } from 'vitest';
 import { Client } from 'pg';
 import { PgrlsTestClient, pgDriver } from 'pgrls-test';
 
@@ -180,6 +180,7 @@ The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across la
 | Open client | `PgrlsTestClient(conn)` | `new PgrlsTestClient(driver)` |
 | Per-test tx | `with client.transaction():` | `await client.transaction(async () => …)` |
 | Switch role | `with client.as_role(r, claims=c):` | `await client.asRole(r, { claims: c }, async () => …)` |
+| Bulk insert | `client.seed(table, rows)` | `await client.seed(table, rows)` |
 | Assert rows | `client.assert_rows(sql, count=n)` | `await client.assertRows(sql, { count: n })` |
 | Assert reject | `client.assert_rejected(sql)` | `await client.assertRejected(sql)` |
 

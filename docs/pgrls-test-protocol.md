@@ -20,7 +20,15 @@ For each test, on a single Postgres connection:
        `SELECT current_user, current_setting('request.jwt.claims',
        true)`. Hold the two values as `<prev_role>` and
        `<prev_claims>` for steps 5–6.
-    2. `SAVEPOINT pgrls_actor_<n>` (n increments per scenario).
+    2. `SAVEPOINT pgrls_actor_<rand>` — `<rand>` is an 8-char
+       hex string from a 4-byte cryptographically-random source
+       (Python: `secrets.token_hex(4)`; TS:
+       `crypto.getRandomValues(Uint8Array(4))` then hex-format).
+       Random rather than monotonic so nested scenario blocks
+       can't collide if a future client implementation forgets
+       per-call counter bookkeeping; collisions in the same
+       transaction are astronomically unlikely (4 billion
+       options).
     3. `SET LOCAL ROLE <role>` — switch to the role under test.
     4. If a claims object is provided (including the empty
        object `{}`):
@@ -31,9 +39,17 @@ For each test, on a single Postgres connection:
        distinct from omitting claims entirely. To skip the
        `set_config` call, the client API exposes the absent-
        claims state as `null` / `None` / `nil`.
+
+       Values inside the claims object must be JSON-serializable
+       (string / number / boolean / null / nested object / array).
+       Use the language's standard JSON encoder with no custom
+       `default` — `json.dumps` in Python, `JSON.stringify` in
+       TS. Non-serializable values (e.g. a `Date` object, a
+       Python `datetime`) are a programmer error at the
+       language layer, not a protocol-level concern.
     5. Run the scenario's queries; capture results / exceptions.
     6. On clean exit:
-       `RELEASE SAVEPOINT pgrls_actor_<n>`, then explicitly restore
+       `RELEASE SAVEPOINT pgrls_actor_<rand>`, then explicitly restore
        prior state. Two cases:
        * `<prev_claims>` is non-NULL: issue
          `SET LOCAL ROLE <prev_role>` and
@@ -54,7 +70,7 @@ For each test, on a single Postgres connection:
        a `RESET ROLE` here would clobber an outer block's role
        in the nested case.
     7. On exception:
-       `ROLLBACK TO SAVEPOINT pgrls_actor_<n>` only.
+       `ROLLBACK TO SAVEPOINT pgrls_actor_<rand>` only.
        `ROLLBACK TO SAVEPOINT` automatically reverts every
        `SET LOCAL` made inside the savepoint, so role and
        claims state revert to whatever step 1 captured.
@@ -126,3 +142,22 @@ GUC name, etc. — bump `PROTOCOL_VERSION`. Adding new optional
 helpers is non-breaking. The version lives in this document and in
 `pgrls.testing.PROTOCOL_VERSION`; clients should assert they
 understand the document's version when bootstrapping.
+
+### Package version vs protocol version
+
+Package versions evolve **independently per language**:
+
+* Python `pgrls` is at v0.5.7 (as of 2026-05-10), shipped via
+  PyPI tags `v*`.
+* TS `pgrls-test` is at v0.6.0 (as of 2026-05-10), shipped via
+  npm tags `ts-v*`.
+
+What ties them together is `PROTOCOL_VERSION`. Any two clients
+that expose the same `PROTOCOL_VERSION` are guaranteed to
+interoperate against the same RLS-protected schema — the wire
+sequence is identical regardless of package version.
+
+Bumping `PROTOCOL_VERSION` requires a coordinated release of all
+maintained clients. Adding wire-level additions stays at the
+current version (clients on older versions ignore the new
+optional steps).
