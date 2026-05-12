@@ -33,6 +33,28 @@ Post-release review pass. Bug fix + polish; no protocol changes.
   parsing SQL: false positives like RETURNING inside a
   string literal aren't the helper's responsibility.
 
+- **`fetchAll<TRow>` generic constraint relaxed.** v0.6.0
+  declared `fetchAll<TRow extends Record<string, unknown> = …>`,
+  which under TS structural typing rejects `interface` row
+  declarations (`interface Invoice { id: number; … }`) because
+  interfaces lack implicit index signatures — only `type`
+  aliases get them. Most users declare row shapes as
+  `interface`, so the constraint produced a confusing
+  compile error on the dominant idiom. v0.6.1 drops the
+  `extends` constraint; the default type is still
+  `Record<string, unknown>` and the cast was unchecked anyway
+  (mirrors Python's untyped `dict` return from `fetchall`).
+
+- **`AsRoleOptions.claims` docstring corrected.** Was
+  "`undefined` is treated as `null` by JS convention" — true
+  at runtime but misleading under
+  `exactOptionalPropertyTypes: true` (which this package's
+  `tsconfig` enables), which rejects `claims: undefined` at
+  compile time. Docstring now says "omit the key or pass
+  `null`" and the corresponding test was renamed from "treats
+  undefined claims like null" to "treats absent claims key
+  like null" to match what's actually reachable.
+
 ### Internal
 
 - Extracted shared `newSavepointName(prefix)` helper to
