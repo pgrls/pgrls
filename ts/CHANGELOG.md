@@ -7,6 +7,47 @@ package adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `PROTOCOL_VERSION` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python client.
 
+## [0.6.1] - 2026-05-10
+
+Post-release review pass. Bug fix + polish; no protocol changes.
+
+### Fixed
+
+- **`assertSilentlyDropped` now rejects UPDATE/DELETE without
+  RETURNING.** The Python helper catches `psycopg.
+  ProgrammingError` from `cur.fetchall()` when there's no
+  result set, so a typo like `assertSilentlyDropped('UPDATE
+  t SET x = 1')` (forgot to add `RETURNING id`) raises a
+  clear `PgrlsTestError`. Both `pg` and `postgres.js`
+  synthesize an empty rows array instead, so v0.6.0's TS
+  port couldn't distinguish "RETURNING returned 0 rows"
+  from "no RETURNING at all" — the helper would silently
+  pass whenever RLS happened to filter every row, defeating
+  the test's purpose. v0.6.1 adds a SQL-keyword pre-check
+  (`/\bRETURNING\b/i`) that fires the same `PgrlsTestError`
+  Python raises, restoring byte-for-byte parity. Three new
+  unit tests + behavior pinned in the conformance suite.
+
+### Internal
+
+- Extracted shared `newSavepointName(prefix)` helper to
+  `src/_savepoint.ts`. Was duplicated between `client.ts`
+  (`pgrls_actor_` prefix) and `assertions.ts`
+  (`pgrls_check_` prefix).
+- Extracted shared `makeRecordingDriver` / `captureResponse`
+  / `selectRows` test helpers to `test/_recording-driver.ts`.
+  Was duplicated between `client.test.ts` and
+  `assertions.test.ts`.
+- Tightened `QueryResult.command` from `string` to the
+  known-verb union widened with `(string & {})`, giving
+  editor autocomplete for verbs we care about while
+  remaining assignable from any string.
+- Added two new conformance tests covering `asRole` claim-
+  restore cases 2 (outer had no claims, inner set claims)
+  and 4 (outer had claims, inner didn't set claims).
+  Previous v0.6.0 conformance only covered case 1; cases
+  2-4 were unit-test-only.
+
 ## [0.6.0] - 2026-05-08
 
 Initial public release. TypeScript port of the Python `pgrls.testing` package.

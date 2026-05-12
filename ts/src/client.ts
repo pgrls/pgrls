@@ -40,6 +40,7 @@
  * abstraction over the user's Postgres client; same client
  * constructor accepts a `pg` driver or a `postgres.js` driver.
  */
+import { newSavepointName } from './_savepoint.js';
 import {
   assertInvisible as _assertInvisible,
   assertRejected as _assertRejected,
@@ -50,27 +51,6 @@ import {
 import type { Driver } from './drivers/types.js';
 import { PgrlsTestError } from './errors.js';
 import { quoteIdent, quoteQualified } from './idents.js';
-
-/**
- * Generate a savepoint name with a 4-byte random suffix.
- *
- * Random suffix lets nested `asRole` blocks have non-conflicting
- * savepoints (each block makes its own). 4 bytes = 8 hex chars =
- * 4 billion options; collisions in the same transaction are
- * astronomically unlikely.
- *
- * Mirrors Python's `secrets.token_hex(4)` call site exactly.
- */
-function newSavepointName(): string {
-  // crypto.getRandomValues is the WHATWG-standard API; available
-  // in Node ≥18 (which our `engines` floor of 20 covers) and in
-  // every browser. Reach via globalThis so we don't need a
-  // 'node:crypto' import or an ambient `crypto` global decl.
-  const bytes = new Uint8Array(4);
-  globalThis.crypto.getRandomValues(bytes);
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  return `pgrls_actor_${hex}`;
-}
 
 /**
  * Options passed to `client.asRole`.
@@ -216,7 +196,7 @@ export class PgrlsTestClient {
     body: () => Promise<T>,
   ): Promise<T> {
     const claims = options.claims ?? null;
-    const savepoint = newSavepointName();
+    const savepoint = newSavepointName('pgrls_actor');
 
     // 1. Capture state BEFORE the savepoint so we can restore
     // it on clean exit. RELEASE SAVEPOINT keeps SET LOCAL

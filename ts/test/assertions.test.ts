@@ -11,59 +11,9 @@ import {
   PgrlsTestAssertionError,
   PgrlsTestClient,
   PgrlsTestError,
-  type Driver,
-  type QueryResult,
 } from '../src/index.js';
 
-interface RecordedCall {
-  sql: string;
-  params: readonly unknown[];
-}
-
-type ResponseFn = (sql: string, params: readonly unknown[]) => QueryResult | Error;
-
-interface RecordingDriver extends Driver {
-  calls: RecordedCall[];
-  on(sqlSubstring: string, response: ResponseFn): void;
-}
-
-function makeRecordingDriver(): RecordingDriver {
-  const calls: RecordedCall[] = [];
-  const responders: { match: string; fn: ResponseFn }[] = [];
-  return {
-    calls,
-    on(sqlSubstring, response) {
-      responders.push({ match: sqlSubstring, fn: response });
-    },
-    async query(sql, params = []) {
-      calls.push({ sql, params });
-      for (const { match, fn } of responders) {
-        if (sql.includes(match)) {
-          const result = fn(sql, params);
-          if (result instanceof Error) throw result;
-          return await Promise.resolve(result);
-        }
-      }
-      return await Promise.resolve({ rows: [], command: 'SELECT', rowCount: 0 });
-    },
-    async rollback() {
-      calls.push({ sql: 'ROLLBACK', params: [] });
-      await Promise.resolve();
-    },
-    isInsufficientPrivilege(error: unknown) {
-      return (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        (error as { code?: unknown }).code === '42501'
-      );
-    },
-  };
-}
-
-function rows(...rs: Record<string, unknown>[]): QueryResult {
-  return { rows: rs, command: 'SELECT', rowCount: rs.length };
-}
+import { makeRecordingDriver, selectRows as rows } from './_recording-driver.js';
 
 describe('assertRows', () => {
   it('passes when count matches', async () => {
@@ -290,5 +240,72 @@ describe('assertSilentlyDropped', () => {
     const client = new PgrlsTestClient(driver);
 
     await expect(client.assertSilentlyDropped('TRUNCATE t')).rejects.toThrow(/TRUNCATE/);
+  });
+
+  it('throws PgrlsTestError when UPDATE has no RETURNING clause', async () => {
+    // Pin the missing-RETURNING gate. Without this check, a
+    // user typo "UPDATE t SET x = 1" (forgot to add `RETURNING
+    // id`) would silently pass whenever RLS filtered all rows
+    // — there's no RLS-aware signal in the empty result. Python
+    // catches this via `psycopg.ProgrammingError` on
+    // `cur.fetchall()`; both pg + postgres.js synthesize an
+    // empty array instead, so we detect it via a SQL-regex
+    // pre-check on the keyword.
+    const driver = makeRecordingDriver();
+    driver.on('UPDATE', () => ({
+      rows: [],
+      command: 'UPDATE',
+      rowCount: 0,
+    }));
+    const client = new PgrlsTestClient(driver);
+
+    await expect(client.assertSilentlyDropped('UPDATE t SET x = 1')).rejects.toThrow(
+      PgrlsTestError,
+    );
+    await expect(client.assertSilentlyDropped('UPDATE t SET x = 1')).rejects.toThrow(
+      /requires the SQL to use RETURNING/,
+    );
+  });
+
+  it('throws PgrlsTestError when DELETE has no RETURNING clause', async () => {
+    const driver = makeRecordingDriver();
+    driver.on('DELETE', () => ({
+      rows: [],
+      command: 'DELETE',
+      rowCount: 0,
+    }));
+    const client = new PgrlsTestClient(driver);
+
+    await expect(client.assertSilentlyDropped('DELETE FROM t')).rejects.toThrow(
+      PgrlsTestError,
+    );
+    await expect(client.assertSilentlyDropped('DELETE FROM t')).rejects.toThrow(
+      /requires the SQL to use RETURNING/,
+    );
+  });
+
+  it('RETURNING detection is case-insensitive', async () => {
+    // Lowercase `returning` is valid Postgres SQL; the helper
+    // must accept it.
+    const driver = makeRecordingDriver();
+    driver.on('UPDATE', () => ({ rows: [], command: 'UPDATE', rowCount: 0 }));
+    const client = new PgrlsTestClient(driver);
+
+    await expect(
+      client.assertSilentlyDropped('UPDATE t SET x = 1 returning id'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('RETURNING detection uses word boundaries', async () => {
+    // A column literally named "returning_col" must NOT fool
+    // the regex. The `\bRETURNING\b` pattern requires a word
+    // boundary on both sides.
+    const driver = makeRecordingDriver();
+    driver.on('UPDATE', () => ({ rows: [], command: 'UPDATE', rowCount: 0 }));
+    const client = new PgrlsTestClient(driver);
+
+    await expect(
+      client.assertSilentlyDropped('UPDATE t SET returning_col = 1'),
+    ).rejects.toThrow(/requires the SQL to use RETURNING/);
   });
 });

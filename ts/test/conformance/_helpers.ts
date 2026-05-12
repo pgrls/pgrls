@@ -253,7 +253,9 @@ export function runConformanceTests(getClient: () => PgrlsTestClient): void {
     });
 
     it('nested asRole restores outer role + claims', async () => {
-      // Pin the protocol's nested-block contract.
+      // Pin the protocol's nested-block contract (asRole
+      // restore case 1: outer had claims, inner set claims,
+      // outer claims restored).
       await client.transaction(async () => {
         await client.asRole(
           'conf_app_authenticated',
@@ -276,6 +278,69 @@ export function runConformanceTests(getClient: () => PgrlsTestClient): void {
             expect(rows[0]?.claims).toContain('outer');
           },
         );
+      });
+    });
+
+    it('asRole inner-no-claims preserves outer claims (case 4)', async () => {
+      // Pin asRole restore case 4: outer set claims, inner
+      // didn't (claims: null). On inner exit, outer claims
+      // must still be active — RELEASE SAVEPOINT keeps inner
+      // SET LOCAL changes merged, then explicit restore via
+      // set_config puts the outer claims back. Without the
+      // explicit restore, the inner's "no claims set" would
+      // mean the GUC stays at whatever value the outer set
+      // (which happens to be right here), but the protocol
+      // requires the restore to be deliberate, not accidental.
+      await client.transaction(async () => {
+        await client.asRole(
+          'conf_app_authenticated',
+          { claims: { tenant_id: 'outer' } },
+          async () => {
+            await client.asRole('conf_app_authenticated', { claims: null }, async () => {
+              // Inner didn't set claims, but the outer
+              // GUC value persists because set_config has
+              // transaction-local scope.
+              const rows = await client.fetchAll<{ claims: string }>(
+                "SELECT current_setting('request.jwt.claims', true) AS claims",
+              );
+              expect(rows[0]?.claims).toContain('outer');
+            });
+            // After inner exit: outer claims still active.
+            const rows = await client.fetchAll<{ claims: string }>(
+              "SELECT current_setting('request.jwt.claims', true) AS claims",
+            );
+            expect(rows[0]?.claims).toContain('outer');
+          },
+        );
+      });
+    });
+
+    it('asRole inner-sets-claims-on-empty-outer clears on inner exit (case 2)', async () => {
+      // Pin asRole restore case 2: outer had no claims, inner
+      // set some. On inner exit, set_config('…', NULL, true)
+      // is issued to clear the GUC value — without it, the
+      // inner's claims would leak to the outer block (since
+      // RELEASE SAVEPOINT merges the inner's SET LOCAL into
+      // the outer transaction).
+      await client.transaction(async () => {
+        // No outer asRole — start with claims unset.
+        await client.asRole(
+          'conf_app_authenticated',
+          { claims: { tenant_id: 'inner-only' } },
+          async () => {
+            const inside = await client.fetchAll<{ claims: string }>(
+              "SELECT current_setting('request.jwt.claims', true) AS claims",
+            );
+            expect(inside[0]?.claims).toContain('inner-only');
+          },
+        );
+        // After asRole exit: claims cleared (set_config NULL
+        // collapses to empty string on a touched GUC).
+        const after = await client.fetchAll<{ claims: string | null }>(
+          "SELECT current_setting('request.jwt.claims', true) AS claims",
+        );
+        const value = after[0]?.claims;
+        expect(value === '' || value === null).toBe(true);
       });
     });
 
