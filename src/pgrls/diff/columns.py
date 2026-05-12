@@ -30,8 +30,8 @@ def _diff_columns(base_table: Table, head_table: Table) -> list[Change]:
     classification is `requires_review` — humans handle the trade-off
     correctly. A stricter match that verified the qualifier matches
     the diffed table would miss real `t.tenant_id` and unqualified
-    `tenant_id` references that motivated the rule. v0.3 may revisit
-    if false-positive volume warrants it.
+    `tenant_id` references that motivated the rule. A future
+    release may revisit if false-positive volume warrants it.
 
     Emits one COLUMN_DROPPED_REFERENCED (requires_review) per dropped
     column that is still referenced. Columns added in head or unchanged
