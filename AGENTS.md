@@ -1473,7 +1473,7 @@ the output without blocking CI.
 > fire independently. The `POLICY_RENAMED` enum value is reserved in
 > `pgrls.diff.differ.ChangeKind` for forward compatibility, but no
 > current detection rule emits it. (Originally targeted for v0.3;
-> still unimplemented through v0.5.7.)
+> still unimplemented through v0.5.10.)
 
 #### Policies — shape changes
 
@@ -1523,7 +1523,7 @@ each produces its own `Change` entry, classified independently.
 
 - One change ⇒ one `Change` entry. A policy widening both predicate and
   roles produces two entries.
-- No release through v0.5.7 implements rename detection — a renamed
+- No release through v0.5.10 implements rename detection — a renamed
   policy surfaces as a drop + add with their independent classifications.
   A future release may collapse these into a single `POLICY_RENAMED`
   entry when every other attribute matches; the enum value is reserved
