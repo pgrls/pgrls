@@ -12,6 +12,7 @@ from pgrls.ast_utils import find_func_calls, parse_expr
 from pgrls.model import (
     Column,
     Grant,
+    Index,
     Policy,
     Schema,
     SecdefFunction,
@@ -378,6 +379,63 @@ WHERE t.tgisinternal = false
 ORDER BY t.tgrelid, t.tgname
 """
 
+# Valid + ready indexes on the captured tables. PERF003 walks the
+# captured `Table.indexes` to check whether columns referenced in
+# a policy predicate have a leading-column index — without one,
+# the planner does a sequential scan to filter rows, which is fine
+# for small tables but catastrophic on multi-tenant tables with
+# millions of rows.
+#
+# Filtering criteria:
+#   * `i.indisvalid AND i.indisready` — a half-built index from a
+#     failed `CREATE INDEX CONCURRENTLY` doesn't help the planner.
+#     Capturing it would silence PERF003 and mislead the operator.
+#
+# Expression positions: `pg_index.indkey` is a `int2vector` of
+# attribute numbers (attnum). Position values that are 0 are
+# expression-index positions (the expression list lives in
+# `indexprs`); pgrls doesn't decode the expressions in v0.5.10, so
+# expression positions become empty strings in the `columns` array.
+# PERF003 only checks the leading column by name, so expression
+# leading positions naturally don't match any policy column — the
+# operator is responsible for knowing their expression index helps.
+#
+# `WITH ORDINALITY` on the unnest preserves the column order from
+# `indkey`. The `LEFT JOIN` against `pg_attribute` returns NULL for
+# expression positions (attnum 0 has no matching row); COALESCE to
+# empty string for the snapshot's JSON-friendly representation.
+#
+# `array_remove(..., NULL)` is NOT used here — we want positional
+# alignment in `columns` so a future caller can correlate position
+# back to the expression list.
+#
+# ORDER BY (indrelid, index_name) for snapshot determinism.
+_INDEXES_SQL = """
+SELECT
+    i.indrelid AS table_oid,
+    c.relname AS index_name,
+    am.amname AS access_method,
+    i.indisunique AS is_unique,
+    i.indpred IS NOT NULL AS is_partial,
+    COALESCE(
+        ARRAY(
+            SELECT COALESCE(a.attname, '')
+            FROM unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord)
+            LEFT JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+            ORDER BY k.ord
+        ),
+        ARRAY[]::TEXT[]
+    ) AS columns
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+JOIN pg_catalog.pg_am am ON am.oid = c.relam
+WHERE i.indisvalid
+  AND i.indisready
+  AND i.indrelid = ANY(%s)
+ORDER BY i.indrelid, c.relname
+"""
+
 # Functions with SECURITY DEFINER set in the configured schemas. Used to
 # match view bodies against — VIEW004 flags views whose definitions call
 # any of these functions because a SECDEF call inside a non-invoker view
@@ -587,6 +645,8 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         partition_rows = cur.fetchall()
         cur.execute(_TRIGGERS_SQL, (oids,))
         trigger_rows = cur.fetchall()
+        cur.execute(_INDEXES_SQL, (oids,))
+        index_rows = cur.fetchall()
         cur.execute(_GRANTS_SQL, (schemas,))
         grants_by_oid: dict[int, dict[str, list[str]]] = defaultdict(
             lambda: defaultdict(list)
@@ -624,6 +684,25 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         row["child_oid"]: (row["parent_schema"], row["parent_name"])
         for row in partition_rows
     }
+
+    indexes_by_oid: dict[int, list[Index]] = defaultdict(list)
+    for row in index_rows:
+        indexes_by_oid[row["table_oid"]].append(
+            Index(
+                name=row["index_name"],
+                access_method=row["access_method"],
+                # Each column-name comes from the LEFT JOIN to
+                # pg_attribute. Expression positions (where attnum
+                # was 0) yielded empty strings in the array via
+                # the COALESCE in the SQL. The conversion to tuple
+                # here preserves positional alignment for any
+                # future caller that wants to correlate the
+                # `columns` tuple back to `indkey`.
+                columns=tuple(row["columns"]),
+                is_unique=row["is_unique"],
+                is_partial=row["is_partial"],
+            )
+        )
 
     triggers_by_oid: dict[int, list[Trigger]] = defaultdict(list)
     for row in trigger_rows:
@@ -719,6 +798,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 column_details_by_oid.get(row["table_oid"], [])
             ),
             triggers=tuple(triggers_by_oid.get(row["table_oid"], [])),
+            indexes=tuple(indexes_by_oid.get(row["table_oid"], [])),
         )
         for row in table_rows
     ]

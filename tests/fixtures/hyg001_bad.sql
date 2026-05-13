@@ -10,6 +10,13 @@ CREATE POLICY orphaned ON public.hyg001_target
     FOR SELECT
     TO PUBLIC
     USING (gone = 'x');
+-- Index `gone` so PERF003 doesn't fire on the policy column. The
+-- column is about to be marked-dropped via pg_attribute hackery
+-- below, but the index is created first while `gone` still exists.
+-- After the attisdropped flip, the index logically references a
+-- dropped column. Introspection still captures it and PERF003 sees
+-- a leading-column match.
+CREATE INDEX hyg001_target_gone_idx ON public.hyg001_target (gone);
 UPDATE pg_catalog.pg_attribute
     SET attisdropped = true
     WHERE attrelid = 'public.hyg001_target'::regclass
@@ -30,3 +37,5 @@ CREATE POLICY clean_permit ON public.hyg001_clean
     FOR SELECT
     TO postgres
     USING (tenant_id = (SELECT current_setting('app.t', true)));
+-- Index tenant_id so PERF003 doesn't fire on the clean fixture.
+CREATE INDEX hyg001_clean_tenant_idx ON public.hyg001_clean (tenant_id);

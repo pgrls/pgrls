@@ -73,7 +73,7 @@ def test_lint_against_known_bad_db_exits_nonzero(pg_url: str, apply_sql) -> None
 
 def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
     # RLS + FORCE + a PERMISSIVE-non-PUBLIC policy + a RESTRICTIVE
-    # floor = the canonical clean shape:
+    # floor + PRIMARY KEY = the canonical clean shape:
     #   - SEC001: RLS on
     #   - SEC002: FORCE on
     #   - SEC003: PERMISSIVE is to postgres, not PUBLIC
@@ -82,9 +82,11 @@ def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
     #   - SEC007: at least one RESTRICTIVE → not all-permissive
     #   - SEC009: at least one policy → not RLS-without-policies
     #   - SEC012: at least one PERMISSIVE → not silent deny-all
+    #   - PERF003: PRIMARY KEY creates an implicit B-tree on `id`,
+    #     so the `id > 0` predicate has a leading-column index
     apply_sql(
         """
-        CREATE TABLE public.t (id INT);
+        CREATE TABLE public.t (id INT PRIMARY KEY);
         ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.t FORCE ROW LEVEL SECURITY;
         CREATE POLICY t_permit ON public.t
@@ -756,6 +758,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         "SEC011  public.allbad_sec011.or_true_bypass\n",
         "SEC013  public.allbad_sec013.audit_writes\n",
         "PERF001  public.allbad_sec004.inverted\n",
+        "PERF003  public.allbad_perf003.tenant_unindexed\n",
         "PERF001  public.allbad_sec006.update_no_check\n",
         "PERF002  public.allbad_perf002.randomized\n",
         "HYG001  public.allbad_hyg001.orphan\n",

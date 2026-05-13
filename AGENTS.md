@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-one rules across four
+In the current release it ships **twenty-two rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -25,7 +25,9 @@ silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 `SEC013` (trigger on RLS-protected table can bypass policies —
 triggers fire as table owner),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
-(VOLATILE function in policy expression), `HYG002`
+(VOLATILE function in policy expression),
+`PERF003` (policy predicate column without leading-column index —
+sequential scan per query), `HYG002`
 (placeholder-named policy), `VIEW002` (view is not a
 `security_barrier`), `VIEW003` (matview captures RLS-protected
 data at REFRESH time), and `VIEW004` (view calls a SECURITY
@@ -863,6 +865,81 @@ transaction) over `clock_timestamp()` (VOLATILE).
 # volatile_functions = ["random", "clock_timestamp", "my.volatile_helper"]
 ```
 
+<a id="rule-perf003"></a>
+
+### PERF003 — Policy predicate column without leading-column index
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` or `WITH CHECK`
+clauses reference a column on the protected table that has no
+index where the column is the leading entry. Postgres evaluates
+the policy predicate for every candidate row, so without a
+leading-column index the planner does a sequential scan to
+filter rows. On a multi-tenant table with millions of rows this
+is the typical reason "we turned on RLS and the API timed out."
+
+Detection is structural:
+
+1. Walk every RLS-enabled table.
+2. For each policy, collect column references in `using_ast` and
+   `with_check_ast` via `extract_column_refs(exclude_sublinks=True)`
+   — sublinks reference other tables and aren't this rule's concern.
+3. Drop refs that don't resolve to a column on the policy's own
+   table. Unqualified refs are assumed own-table; qualified refs
+   (`alias.col`, `schema.table.col`) are kept only when the
+   qualifier matches.
+4. Drop refs to columns not in `Table.columns` — those are
+   HYG001's territory and PERF003 has nothing useful to say about
+   indexing a column that doesn't exist.
+5. For each remaining column, look up `Table.indexes` for an
+   index whose leading column matches. If none, fire.
+
+The rule treats any access method as "indexed" — B-tree, hash,
+GIN, GiST, BRIN. The operator chose the index type and pgrls
+doesn't second-guess. A leading-column match is the relevant
+signal: a B-tree on `(tenant_id, created_at)` helps `WHERE
+tenant_id = X`, but a B-tree on `(created_at, tenant_id)` does
+not. Partial indexes also count — the operator is responsible
+for ensuring the partial predicate is satisfied by the policy
+predicate (pgrls can't statically prove that compatibility).
+
+**Standard fix.** Add a B-tree index whose leading column
+matches the policy's filter column:
+
+```sql
+-- Policy: USING (tenant_id = current_setting('app.tenant_id')::uuid)
+CREATE INDEX invoices_tenant_idx ON public.invoices (tenant_id);
+```
+
+For composite predicates (`USING (tenant_id = X AND owner = Y)`),
+PERF003 fires for each unindexed column independently. A composite
+index `(tenant_id, owner)` silences the rule for `tenant_id` only;
+add a second index on `owner` if the policy needs both columns
+indexed, or live with the false-positive `owner` finding and
+allowlist it.
+
+**Known limitations in v0.5.10:**
+
+* **Expression indexes** (`CREATE INDEX ON tbl (lower(email))`)
+  are not matched. The expression list lives in
+  `pg_index.indexprs` which v0.5.10's introspection doesn't
+  decode. PERF003 will flag the column as un-indexed even when a
+  matching expression index exists — allowlist the policy ID when
+  this surfaces a false positive.
+* **Composite-key policies** fire per referenced column; see the
+  example above.
+* **Partial indexes** are always treated as helping — pgrls
+  can't verify the partial predicate matches the policy predicate.
+
+Severity: warning. Allowlist by qualified policy ID
+(`schema.table.policy_name`):
+
+```toml
+[lint.rules.PERF003]
+allowlist = ["public.invoices.tenant_read"]
+```
+
 <a id="rule-hyg001"></a>
 
 ### HYG001 — Policy references a column that doesn't exist
@@ -1568,8 +1645,8 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-one rules across four categories.** SEC001–SEC013,
-  PERF001–PERF002, HYG001–HYG002, and VIEW001–VIEW004 ship today.
+- **Twenty-two rules across four categories.** SEC001–SEC013,
+  PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   There is no `pg_temp` shadowing detection, and SECURITY DEFINER
   function audit is currently scoped to the view-leak path
   (VIEW004) and the trigger-bypass path (SEC013); a free-standing

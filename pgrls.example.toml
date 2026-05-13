@@ -143,6 +143,20 @@ allowlist = []
 # the default — list every function you want covered.
 # auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
 
+[lint.rules.PERF003]
+# Policies whose predicate columns are allowed to remain un-indexed.
+# Postgres evaluates a policy's USING / WITH CHECK clause per row, so
+# without an index on the filtering column the planner does a
+# sequential scan — fine for small tables, catastrophic on multi-
+# tenant tables with millions of rows. Allowlist when:
+#   * an expression index exists that pgrls's v0.5.10 introspection
+#     doesn't decode (`CREATE INDEX ON tbl (lower(email))`);
+#   * the table is intentionally small and sequential scan is fine;
+#   * the column is part of a composite predicate where the OTHER
+#     column carries the leading-column index.
+# Entries are fully-qualified policy IDs.
+allowlist = []
+
 [lint.rules.PERF002]
 # Policies allowed to call a VOLATILE function in their predicate.
 # Rare — VOLATILE in a policy is almost always a bug (predicate
