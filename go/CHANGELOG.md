@@ -9,12 +9,13 @@ on wire-level breaking changes shared with the Python and TypeScript clients.
 
 ## [0.7.0] - 2026-05-13
 
-**Step 1 of N — scaffold.** Establishes the module path, the Layer 1 protocol-
-version constant, and the error types. Subsequent steps add the `Driver`
-interface, the pgx + lib/pq adapters, the `Client` API, the five assertion
-helpers, and the cross-language conformance suite. The TypeScript port took
-seven steps from v0.6.0 → v0.6.2; the Go port follows the same staged
-release pattern so each step ships as a reviewable PR.
+**Step 1 of 7 — scaffold.** Establishes the module path, the Layer 1 protocol-
+version constant, and the error types. Subsequent steps ship as their own
+minor versions (v0.7.1 = Driver interface; v0.7.2 = pgx + lib/pq adapters;
+v0.7.3 = Client API; v0.7.4 = assertion helpers; v0.7.5 = conformance suite;
+v0.7.6 = CI hardening + release plumbing). Each step ships as a separately-
+reviewable PR. The TypeScript port took seven steps from v0.6.0 → v0.6.2;
+the Go port follows the same staged release pattern.
 
 ### Added
 
@@ -43,22 +44,25 @@ release pattern so each step ships as a reviewable PR.
 
 ### Planned (later steps in v0.7.x)
 
-- Step 2: `Driver` interface (`Query`, `Rollback`, `IsInsufficientPrivilege`,
-  optional `Close`). Mirrors the TypeScript `Driver` shape that the pgx
-  and lib/pq adapters will implement.
-- Step 3: pgx adapter (`pgrlstest/drivers/pgx`) + lib/pq adapter
-  (`pgrlstest/drivers/lib_pq`). The two cover the dominant Go Postgres
-  drivers; both expose a single `*pgxpool.Conn` / `*sql.Conn` for the
-  pinned-connection semantics the protocol needs.
-- Step 4: `Client` struct with `Transaction`, `AsRole`, `Exec`,
-  `FetchAll`, `Seed` methods.
-- Step 5: five assertion helpers (`AssertRows`, `AssertVisible`,
-  `AssertInvisible`, `AssertRejected`, `AssertSilentlyDropped`).
-- Step 6: cross-language conformance suite running against
+- **v0.7.1** — Step 2: `Driver` interface (`Query`, `Rollback`,
+  `IsInsufficientPrivilege`, optional `Close`). Mirrors the TypeScript
+  `Driver` shape that the pgx and lib/pq adapters will implement.
+- **v0.7.2** — Step 3: pgx adapter (`pgrlstest/drivers/pgx`) + lib/pq
+  adapter (`pgrlstest/drivers/lib_pq`). The two cover the dominant Go
+  Postgres drivers; both expose a single `*pgxpool.Conn` / `*sql.Conn`
+  for the pinned-connection semantics the protocol needs.
+- **v0.7.3** — Step 4: `Client` struct with `Transaction`, `AsRole`,
+  `Exec`, `FetchAll`, `Seed` methods.
+- **v0.7.4** — Step 5: five assertion helpers (`AssertRows`,
+  `AssertVisible`, `AssertInvisible`, `AssertRejected`,
+  `AssertSilentlyDropped`).
+- **v0.7.5** — Step 6: cross-language conformance suite running against
   testcontainers-go, exercising the same Layer 1 contract the Python
   and TypeScript conformance suites verify.
-- Step 7: `go/v0.7.0` release tag + GitHub Release plumbing, including
-  the `go vet` / `go test -race` / `golangci-lint` CI gates.
+- **v0.7.6** — Step 7: CI hardening (`golangci-lint`, `govulncheck`)
+  and GitHub Release plumbing. The `go/v0.7.x` tags trigger
+  per-version `go list -m` proxy refreshes; no separate publish
+  registry — Go consumers `go get github.com/pgrls/pgrls/go@<tag>`.
 
 The step numbering matches the TypeScript port's history at PRs #28–#41
 for ease of cross-reference; the Go port may collapse steps if a single

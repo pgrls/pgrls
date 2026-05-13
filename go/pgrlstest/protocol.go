@@ -7,7 +7,7 @@
 // sequence (savepoint-bracketed `SET LOCAL ROLE` + `set_config`
 // for the JWT claims, rollback to savepoint on scenario exit).
 //
-// **Status: scaffold (v0.7.0 step 1 of N).** Subsequent steps
+// **Status: scaffold (v0.7.0 step 1 of 7).** Subsequent steps
 // add the Driver interface, the pgx adapter, the assertion
 // helpers, the conformance suite, and CI integration. See
 // CHANGELOG.md for the per-step plan.

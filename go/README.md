@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.0 — step 1 of N (scaffold).** This release establishes the module path, protocol-version constant, and error types. Subsequent steps add the `Driver` interface, the [pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq) adapters, the `Client` API (transactions, role-switching, seed), the five assertion helpers, and the cross-language conformance suite. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.0 — step 1 of 7 (scaffold).** This release establishes the module path, protocol-version constant, and error types. Subsequent steps add the `Driver` interface, the [pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq) adapters, the `Client` API (transactions, role-switching, seed), the five assertion helpers, and the cross-language conformance suite. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 

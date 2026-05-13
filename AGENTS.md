@@ -1332,7 +1332,7 @@ Three layers, the bottom one is a documented contract not code:
   PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). The TypeScript
   port ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
   this same contract; a Go port at [`go/`](go/) shipped its scaffold +
-  protocol-version constant + error types in v0.7.0 (step 1 of N — subsequent
+  protocol-version constant + error types in v0.7.0 (step 1 of 7 — subsequent
   steps add the Driver interface, pgx + lib/pq adapters, Client API,
   assertion helpers, and conformance suite). Python is the reference
   implementation. `PROTOCOL_VERSION = 1`.
