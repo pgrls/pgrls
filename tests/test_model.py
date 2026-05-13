@@ -62,7 +62,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 5,
+        "version": 6,
         "tables": [
             {
                 "schema": "public",
@@ -73,6 +73,7 @@ def test_schema_to_snapshot_shape() -> None:
                 "partition_of": None,
                 "grants": [],
                 "column_details": [],
+                "triggers": [],
             }
         ],
         "policies": [
@@ -215,13 +216,13 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_five_after_column_details_addition() -> None:
-    # `column_details` was added for v0.5 — SNAPSHOT_VERSION bumped
-    # from 4 → 5 per the model.py docstring contract that additive
-    # structural changes bump the version. Pin the new version so a
-    # future bump is deliberate.
+def test_snapshot_version_is_six_after_triggers_addition() -> None:
+    # `triggers` was added for v0.5.8 — SNAPSHOT_VERSION bumped
+    # from 5 → 6 per the model.py docstring contract that additive
+    # structural changes bump the version. Pin the new version so
+    # a future bump is deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 5
+    assert snap["version"] == 6
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -429,12 +430,15 @@ def test_schema_by_qname_is_cached_across_calls() -> None:
     assert first is second  # pragma: no mutate
 
 
-def test_snapshot_v5_top_level_keys_are_stable_contract() -> None:
+def test_snapshot_v6_top_level_keys_are_stable_contract() -> None:
     # Snapshot top-level keys are part of the public surface (any
     # consumer reading the JSON depends on these names). Pin
     # `version`, `tables`, `policies`, `views`,
     # `security_definer_functions` so a quiet refactor that renames
     # or drops a key fails this test rather than slipping past CI.
+    # The v6 bump (SEC013 triggers) added the `triggers` field
+    # inside each table entry, not a top-level key — top-level set
+    # is unchanged from v5.
     snap = Schema(tables=()).to_snapshot()
     assert set(snap.keys()) == {
         "version",
@@ -443,10 +447,10 @@ def test_snapshot_v5_top_level_keys_are_stable_contract() -> None:
         "views",
         "security_definer_functions",
     }
-    assert snap["version"] == 5
+    assert snap["version"] == 6
 
 
-def test_snapshot_v5_table_entry_keys_are_stable() -> None:
+def test_snapshot_v6_table_entry_keys_are_stable() -> None:
     table = Table(
         schema="public",
         name="t",
@@ -466,6 +470,7 @@ def test_snapshot_v5_table_entry_keys_are_stable() -> None:
         "partition_of",
         "grants",
         "column_details",
+        "triggers",
     }
 
 

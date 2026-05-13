@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty rules across four
+In the current release it ships **twenty-one rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -22,6 +22,8 @@ categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 `SEC011` (`OR true` debug branch hidden inside a policy),
 `SEC012` (table has only RESTRICTIVE policies — silent deny-all),
+`SEC013` (trigger on RLS-protected table can bypass policies —
+triggers fire as table owner),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression), `HYG002`
 (placeholder-named policy), `VIEW002` (view is not a
@@ -676,6 +678,95 @@ qualified or unqualified table name:
 [lint.rules.SEC012]
 allowlist = ["public.shadow_audit"]
 ```
+
+<a id="rule-sec013"></a>
+
+### SEC013 — Trigger on RLS-protected table can bypass policies
+
+**Severity:** warning.
+
+**What it catches:** every user-authored, enabled trigger on a
+table with `rls_enabled = true`. Triggers fire as the table OWNER,
+not as the role that ran the statement, so any `SELECT` / `INSERT`
+/ `UPDATE` / `DELETE` inside the trigger function body sees the
+owner's view of the database — every row, RLS bypassed — even
+when the invoking role has policies that would hide or reject
+those rows directly.
+
+The bypass is silent: no SQLSTATE 42501, no error in the log.
+A multi-tenant table protected by `WHERE tenant_id =
+current_setting('app.tenant_id')` looks impregnable until a
+`BEFORE INSERT` trigger written for an unrelated purpose
+(denormalization, audit logging, cache invalidation) cross-
+references another tenant's data with the same logic and quietly
+leaks it into the invoking session's view.
+
+Common leak shapes worth auditing for:
+
+* Audit trigger writes `(NEW.id, current_setting('app.tenant_id'),
+  (SELECT count(*) FROM peer_table))` into an audit table. The
+  subquery runs as owner and counts every tenant's rows.
+* Trigger that "syncs" a derived column reads from a peer table
+  with no tenant filter, exposing peer-tenant values through the
+  synced column.
+
+The rule cannot read the trigger function body (PL/pgSQL bodies
+aren't parseable by pglast as top-level statements, and
+`SECURITY INVOKER` does not change the trigger-fires-as-owner
+contract — `pg_proc.prosecdef` is irrelevant here), so the
+warning is intentionally a prompt-to-audit rather than a proof
+of leak.
+
+Internal triggers (foreign-key check helpers, RI plumbing,
+partition-routing triggers) are filtered out at the introspection
+layer via `pg_trigger.tgisinternal = false`. Disabled triggers
+(`tgenabled = 'D'`) are captured in the snapshot but skipped by
+the rule — they can't fire under any `session_replication_role`.
+
+**Out of scope in v0.5.8**: INSTEAD OF triggers on views. The
+introspection layer only captures triggers whose `tgrelid` points
+to a regular or partitioned table (`relkind IN ('r','p')`).
+INSTEAD OF view-triggers are a real bypass surface — a write
+routed by an INSTEAD OF trigger can land in a base table without
+honoring the view's WHERE clause — and warrant a future
+companion rule on the view side. Until that lands, operators
+relying on view-triggers for security-sensitive writes should
+audit them manually.
+
+**Snapshot tampering**: `pgrls diff` does not yet emit
+`DIFF_TRIGGER_*` change kinds — an edit to a checked-in v6
+snapshot file that deletes a `triggers` entry or flips
+`enabled: true → false` will not show up as a diff finding.
+Treat snapshot files like any other security-relevant artifact:
+review changes, sign commits, restrict write access. A future
+release should add `DIFF_TRIGGER_ADDED` / `DIFF_TRIGGER_DROPPED`
+/ `DIFF_TRIGGER_DISABLED` (the last classifiable as
+`requires_review` since it silences SEC013).
+
+**Standard fix.** Audit the trigger function body for:
+
+* Reads from peer tables without a tenant filter.
+* Writes the caller couldn't issue directly (insertions into
+  audit / cache tables that include cross-tenant data, writes
+  to a peer tenant's rows, etc.).
+* Owner-visible data echoed back to the caller through derived
+  columns, `RAISE NOTICE`, or `RAISE EXCEPTION` messages.
+
+If the trigger needs cross-tenant visibility (legitimate use case
+for audit / replication / global-counter triggers), rewrite the
+function to take the tenant explicitly and reject rows whose
+`NEW.tenant_id` doesn't match `current_setting('app.tenant_id')`.
+Then allowlist the trigger by qualified ID:
+
+```toml
+[lint.rules.SEC013]
+allowlist = ["public.invoices.audit_writes"]
+```
+
+The allowlist key is `schema.table.trigger_name` (three parts).
+Bare `trigger_name` is rejected because two tables can carry
+identically-named triggers — Postgres scopes trigger names per
+table, and a name-only allowlist would silence both.
 
 <a id="rule-perf001"></a>
 
@@ -1477,12 +1568,13 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty rules across four categories.** SEC001–SEC012,
+- **Twenty-one rules across four categories.** SEC001–SEC013,
   PERF001–PERF002, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   There is no `pg_temp` shadowing detection, and SECURITY DEFINER
   function audit is currently scoped to the view-leak path
-  (VIEW004) — a free-standing function audit independent of view
-  bodies remains on the roadmap.
+  (VIEW004) and the trigger-bypass path (SEC013); a free-standing
+  function audit independent of those entry points remains on the
+  roadmap.
 - **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
   fix` rewrites the mechanically-fixable subset; other rules need
   human intent.

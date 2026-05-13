@@ -10,6 +10,56 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-05-12
+
+### Added
+- **SEC013 — Trigger on RLS-protected table can bypass policies**
+  (severity: warning). Triggers fire as the table OWNER, not as
+  the role that ran the statement, so any SELECT / INSERT /
+  UPDATE / DELETE inside the trigger function body bypasses the
+  invoking role's RLS policies — a quiet privilege-escalation
+  vector that's silent in the absence of static analysis. The
+  rule flags every user-authored, enabled trigger on a table
+  with `rls_enabled = true` and prompts the operator to audit
+  the function body for cross-tenant reads, writes the caller
+  couldn't issue directly, and owner-visible data echoed back
+  through derived columns or RAISE messages. Internal triggers
+  (foreign-key check helpers, RI plumbing, partition-routing
+  triggers) are filtered out at the introspection layer via
+  `pg_trigger.tgisinternal = false`. Disabled triggers
+  (`tgenabled = 'D'`) are captured but skipped by the rule —
+  they can't fire under any `session_replication_role`.
+
+  Allowlist by qualified trigger ID
+  (`schema.table.trigger_name`) once the function body has
+  been audited and the bypass is documented intentional:
+
+  ```toml
+  [lint.rules.SEC013]
+  allowlist = ["public.invoices.audit_writes"]
+  ```
+
+  Bare `trigger_name` is rejected — Postgres scopes trigger
+  names per table, so two tables can carry identically-named
+  triggers and a name-only allowlist would silence both.
+
+### Changed
+- **Snapshot version 5 → 6.** Each `tables[i]` entry now carries
+  a `triggers` array with one entry per user-authored trigger
+  (`name`, `function_schema`, `function_name`, `event`, `timing`,
+  `enabled`). Triggers don't carry their own `schema` field —
+  Postgres scopes triggers per table (`pg_trigger` has no
+  `tgnamespace` column), so a trigger's schema is always its
+  table's. v3 / v4 / v5 baselines still **load** via
+  `Schema.from_snapshot` with `triggers=()` on every table; the
+  loaded Schema re-emits as v6 (matching the v4→v5 bump's load
+  semantics). SEC013 simply finds nothing to flag against older
+  snapshots until they're re-captured.
+
+  Existing snapshots remain forward-compatible: `pgrls diff` and
+  `pgrls fix` continue to work against v3+ baselines without
+  re-snapshotting. Only SEC013 needs v6 to surface findings.
+
 ## [0.5.7] - 2026-05-08
 
 ### Changed
