@@ -1685,12 +1685,17 @@ These are intentional in the current release. Do not invent capabilities.
   as `REQUIRES_REVIEW`. Z3-driven implication analysis shipped in
   v0.4 as the optional `pip install pgrls[diff-z3]` extra; without
   it, the diff classifier falls back to syntactic patterns only.
-- **Go port tracked.** The TypeScript port of `pgrls.testing`
-  shipped in v0.6.0 as the [`pgrls-test`](https://www.npmjs.com/package/pgrls-test)
-  npm package, following the Layer 1 protocol. A Go port using
-  the same protocol is the next cross-language milestone. The
-  `pgrls lint / fix / snapshot / diff` CLIs stay Python — they
-  depend on pglast (no drop-in TS/Go equivalent).
+- **Go port shipping in stages.** The TypeScript port of
+  `pgrls.testing` shipped in v0.6.0 as the
+  [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm
+  package, following the Layer 1 protocol. The Go port lives in
+  [`go/`](go/) at module path `github.com/pgrls/pgrls/go` — its
+  scaffold + protocol-version constant + error types shipped in
+  v0.7.0 (step 1 of 7), and subsequent v0.7.x steps add the
+  Driver interface, pgx + lib/pq adapters, Client API, assertion
+  helpers, and conformance suite. The `pgrls lint / fix /
+  snapshot / diff` CLIs stay Python — they depend on pglast
+  (no drop-in TS/Go equivalent).
 
 ## Where to learn more
 
