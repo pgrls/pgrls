@@ -12,20 +12,9 @@
  *
  * Direct port of `src/pgrls/testing/assertions.py`.
  */
+import { newSavepointName } from './_savepoint.js';
 import type { PgrlsTestClient } from './client.js';
 import { PgrlsTestAssertionError, PgrlsTestError } from './errors.js';
-
-/**
- * Generate a savepoint name for `assertRejected`'s rollback
- * scope. Same shape as `client.ts`'s newSavepointName but with
- * a `pgrls_check_` prefix to distinguish in any debug output.
- */
-function newCheckSavepointName(): string {
-  const bytes = new Uint8Array(4);
-  globalThis.crypto.getRandomValues(bytes);
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  return `pgrls_check_${hex}`;
-}
 
 /**
  * Assert the query returns exactly `count` rows.
@@ -99,7 +88,7 @@ export async function assertRejected(
   client: PgrlsTestClient,
   sql: string,
 ): Promise<void> {
-  const savepoint = newCheckSavepointName();
+  const savepoint = newSavepointName('pgrls_check');
   await client.driver.query(`SAVEPOINT ${savepoint}`);
 
   let rejectedAsExpected = false;
@@ -213,6 +202,32 @@ export async function assertSilentlyDropped(
         `and assertRejected for INSERT. Got command verb ` +
         `${verb ? JSON.stringify(verb) : "'(unknown)'"} for query: ` +
         `${JSON.stringify(sql)}`,
+    );
+  }
+
+  // Require a RETURNING clause. Python's `assert_silently_dropped`
+  // catches `psycopg.ProgrammingError` from `cur.fetchall()` when
+  // there's no result set; both `pg` and `postgres.js` instead
+  // synthesize an empty rows array, so we can't distinguish
+  // "RETURNING returned 0 rows" from "no RETURNING at all" by
+  // looking at the result. Detect the missing-RETURNING case
+  // upfront via a literal-keyword check — false positives
+  // (RETURNING inside a comment / string) are not the helper's
+  // problem to handle; the helper's contract is "the SQL has
+  // RETURNING and we're checking its row count".
+  //
+  // Without this gate, `assertSilentlyDropped("UPDATE t SET x = 1")`
+  // (no RETURNING) silently passes whenever RLS happens to filter
+  // every row, even though there's no RLS-aware signal in the
+  // empty result. The Python helper explicitly warns about this
+  // case in its docstring.
+  if (!/\bRETURNING\b/i.test(sql)) {
+    throw new PgrlsTestError(
+      `assertSilentlyDropped requires the SQL to use RETURNING — ` +
+        `the helper checks that the affected row was hidden from ` +
+        `the current role by counting RETURNING's output. Without ` +
+        `RETURNING, the row count is not the relevant signal. ` +
+        `Query: ${JSON.stringify(sql)}`,
     );
   }
 

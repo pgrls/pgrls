@@ -3,6 +3,8 @@
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
 > **Status: 0.5.7** — twenty rules (SEC001–SEC012, PERF001–PERF002, HYG001–HYG002, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC002, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification). v0.4+ adds optional Z3-based semantic predicate analysis (`pip install pgrls[diff-z3]`). v0.5+ adds **migration-as-input** — `pgrls diff base.json --apply migration.sql` spins up an ephemeral Postgres, restores the baseline, applies the migration, and diffs the result (`pip install pgrls[diff-apply]`). v0.5.1 auto-detects `CREATE EXTENSION` statements in the migration and pre-installs them in the testcontainer; `--extension <name>` (repeatable) supplements the auto-detect when the baseline assumes an extension is already present. v0.5.2 caches the restored baseline as a tagged Docker image so subsequent `--apply` runs with the same baseline boot directly from the cached state, skipping role + extension + DDL setup. v0.5.3 adds `pgrls diff -v / --verbose` (cache hit/miss + per-step timings on stderr) and a `pgrls cache list / prune` subcommand group for managing the local image cache.
+>
+> **TypeScript port**: [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm (v0.6.0+) implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
 
 ## Install
 
@@ -298,7 +300,7 @@ dashboard, or keep the report as a build artifact.
 
 ## Roadmap
 
-- **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Markdown output. Polished error messages.
+- **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Polished error messages.
 - ~~**TypeScript port of `pgrls.testing`**~~ — landed in v0.6.0 as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test). Source: [`ts/`](ts/).
 - **Go port** of `pgrls.testing` following the same Layer 1 protocol — tracked but not started.
 - ~~**SAT-based predicate implication checking.**~~ Z3-driven semantic predicate analysis landed in v0.4.x.

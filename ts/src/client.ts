@@ -5,8 +5,8 @@
  * wire-level sequence is identical: same SAVEPOINT name format,
  * same SET LOCAL ROLE / set_config call, same restoration logic
  * on clean exit, same ROLLBACK TO SAVEPOINT on exception.
- * Documented in `docs/pgrls-test-protocol.md` as the Layer 1
- * contract.
+ * Documented at https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md
+ * as the cross-language wire contract.
  *
  * Usage with `pg`:
  *
@@ -40,6 +40,7 @@
  * abstraction over the user's Postgres client; same client
  * constructor accepts a `pg` driver or a `postgres.js` driver.
  */
+import { newSavepointName } from './_savepoint.js';
 import {
   assertInvisible as _assertInvisible,
   assertRejected as _assertRejected,
@@ -50,27 +51,6 @@ import {
 import type { Driver } from './drivers/types.js';
 import { PgrlsTestError } from './errors.js';
 import { quoteIdent, quoteQualified } from './idents.js';
-
-/**
- * Generate a savepoint name with a 4-byte random suffix.
- *
- * Random suffix lets nested `asRole` blocks have non-conflicting
- * savepoints (each block makes its own). 4 bytes = 8 hex chars =
- * 4 billion options; collisions in the same transaction are
- * astronomically unlikely.
- *
- * Mirrors Python's `secrets.token_hex(4)` call site exactly.
- */
-function newSavepointName(): string {
-  // crypto.getRandomValues is the WHATWG-standard API; available
-  // in Node ≥18 (which our `engines` floor of 20 covers) and in
-  // every browser. Reach via globalThis so we don't need a
-  // 'node:crypto' import or an ambient `crypto` global decl.
-  const bytes = new Uint8Array(4);
-  globalThis.crypto.getRandomValues(bytes);
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  return `pgrls_actor_${hex}`;
-}
 
 /**
  * Options passed to `client.asRole`.
@@ -85,7 +65,11 @@ export interface AsRoleOptions {
    * "actor with no claims" request). The protocol distinguishes
    * the two: `null` doesn't issue `set_config(...)`, `{}` does.
    *
-   * `undefined` is treated as `null` by JS convention.
+   * Omitting the `claims` key entirely has the same effect as
+   * passing `null`. With `exactOptionalPropertyTypes: true`
+   * (the recommended TS config and the one this package uses),
+   * `claims: undefined` is rejected at compile time — pass
+   * `null` explicitly or drop the key.
    */
   claims?: Record<string, unknown> | null;
 }
@@ -121,10 +105,12 @@ export class PgrlsTestClient {
    * Exceptions from the body propagate; the rollback runs in
    * the `finally` so cleanup always happens.
    *
-   * The first `query` issued inside the body implicitly starts
-   * a transaction (Postgres autocommit semantics). If the user's
-   * driver is in autocommit mode, this still works — Postgres
-   * accepts a no-op `ROLLBACK` outside an explicit transaction.
+   * Issues an explicit `BEGIN` at entry and `ROLLBACK` at exit.
+   * Works regardless of the driver's autocommit setting — being
+   * explicit means the same code runs whether the user's
+   * `pg.Client` is autocommit=true or autocommit=false, and
+   * whether they're using a Pool client (autocommit by default)
+   * or a dedicated session.
    */
   async transaction<T>(body: () => Promise<T>): Promise<T> {
     // Begin an explicit transaction so the rollback at the end
@@ -161,18 +147,27 @@ export class PgrlsTestClient {
    *
    * Both drivers return rows as `Record<string, unknown>` (key
    * = column name, value = the driver's deserialized JS value).
-   * Type the result with a generic for ergonomics:
+   * Type the result with a generic for ergonomics — both
+   * `interface` and `type` declarations work:
    *
    * ```ts
-   * type Invoice = { id: number; tenant_id: string; amount: number };
+   * interface Invoice { id: number; tenant_id: string; amount: number }
    * const rows = await client.fetchAll<Invoice>('SELECT * FROM invoices');
    * ```
    *
    * The generic is a *type cast* — there's no runtime validation.
    * Mirrors Python's `client.fetchall(sql, params=[...])` which
    * also returns un-validated dicts.
+   *
+   * Note: the generic has no `extends Record<string, unknown>`
+   * constraint deliberately. That constraint would force users
+   * to declare row types as `type` aliases (which have implicit
+   * index signatures) and reject `interface` declarations
+   * (which don't, under TS's structural typing rules). Since
+   * the cast is unchecked anyway, the constraint adds friction
+   * without safety.
    */
-  async fetchAll<TRow extends Record<string, unknown> = Record<string, unknown>>(
+  async fetchAll<TRow = Record<string, unknown>>(
     sql: string,
     params: readonly unknown[] = [],
   ): Promise<TRow[]> {
@@ -216,7 +211,7 @@ export class PgrlsTestClient {
     body: () => Promise<T>,
   ): Promise<T> {
     const claims = options.claims ?? null;
-    const savepoint = newSavepointName();
+    const savepoint = newSavepointName('pgrls_actor');
 
     // 1. Capture state BEFORE the savepoint so we can restore
     // it on clean exit. RELEASE SAVEPOINT keeps SET LOCAL
