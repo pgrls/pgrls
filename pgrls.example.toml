@@ -143,6 +143,17 @@ allowlist = []
 # the default — list every function you want covered.
 # auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
 
+[lint.rules.PERF002]
+# Policies allowed to call a VOLATILE function in their predicate.
+# Rare — VOLATILE in a policy is almost always a bug (predicate
+# truth varies between calls, often a security hazard). Entries
+# are fully-qualified policy IDs.
+allowlist = []
+# Functions considered VOLATILE for the purposes of this rule.
+# Defaults: random, clock_timestamp, nextval, gen_random_uuid,
+# pg_backend_pid. Override REPLACES the default.
+# volatile_functions = ["random", "clock_timestamp", "my.volatile"]
+
 [lint.rules.PERF003]
 # Policies whose predicate columns are allowed to remain un-indexed.
 # Postgres evaluates a policy's USING / WITH CHECK clause per row, so
@@ -156,17 +167,6 @@ allowlist = []
 #     column carries the leading-column index.
 # Entries are fully-qualified policy IDs.
 allowlist = []
-
-[lint.rules.PERF002]
-# Policies allowed to call a VOLATILE function in their predicate.
-# Rare — VOLATILE in a policy is almost always a bug (predicate
-# truth varies between calls, often a security hazard). Entries
-# are fully-qualified policy IDs.
-allowlist = []
-# Functions considered VOLATILE for the purposes of this rule.
-# Defaults: random, clock_timestamp, nextval, gen_random_uuid,
-# pg_backend_pid. Override REPLACES the default.
-# volatile_functions = ["random", "clock_timestamp", "my.volatile"]
 
 [lint.rules.HYG002]
 # Policy IDs allowed to keep placeholder names. Entries are fully-

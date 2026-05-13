@@ -940,6 +940,13 @@ Severity: warning. Allowlist by qualified policy ID
 allowlist = ["public.invoices.tenant_read"]
 ```
 
+**Note on the demo**: pgrls's own demo (`demo/`) disables PERF003
+globally in `demo/pgrls.toml` because the 50+ demo fixtures don't
+carry indexes and PERF003 would obscure the rule each case is
+built to demonstrate. Real production schemas should KEEP PERF003
+enabled — it catches a load-bearing perf bug that's invisible
+until traffic hits.
+
 <a id="rule-hyg001"></a>
 
 ### HYG001 — Policy references a column that doesn't exist
