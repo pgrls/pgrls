@@ -176,3 +176,34 @@ CREATE FUNCTION public.allbad_view004_read()
 CREATE VIEW public.allbad_view004
     WITH (security_invoker = true, security_barrier = true) AS
     SELECT * FROM public.allbad_view004_read();
+
+-- SEC013: trigger on an RLS-protected table. Triggers fire as the
+-- table OWNER, so the trigger function body bypasses the invoking
+-- role's RLS policies, a quiet privilege-escalation vector that
+-- this rule prompts the operator to audit. The base table mirrors
+-- the other RLS-on blocks (RESTRICTIVE policy with wrapped
+-- `current_setting`) so SEC001/SEC002/SEC005/SEC007/SEC008/SEC009/
+-- PERF001 stay silent on it. SEC012 also fires on this table
+-- because the policy set is RESTRICTIVE-only (mirroring the
+-- VIEW001-VIEW004 base tables) and SEC012 carries no rule_loc pin
+-- so the extra firing is silent-by-design.
+--
+-- The trigger function is `pg_catalog.suppress_redundant_updates_trigger`,
+-- a Postgres built-in that takes no arguments and returns TRIGGER.
+-- Used here because conftest.apply_sql does a naive split on the
+-- SQL terminator and can't handle PL/pgSQL bodies. A built-in
+-- trigger function sidesteps the need to declare a user function
+-- inside this fixture. The `tgisinternal` distinction is about
+-- WHO created the trigger, not which function it calls. This
+-- CREATE TRIGGER is user-issued, so `tgisinternal = false` and
+-- SEC013 sees it just like any user-authored trigger calling a
+-- plpgsql function.
+CREATE TABLE public.allbad_sec013 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_sec013 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec013 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_floor ON public.allbad_sec013
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE TRIGGER audit_writes
+    BEFORE UPDATE ON public.allbad_sec013
+    FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
