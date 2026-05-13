@@ -400,6 +400,16 @@ ORDER BY t.tgrelid, t.tgname
 # leading positions naturally don't match any policy column — the
 # operator is responsible for knowing their expression index helps.
 #
+# Dropped-column positions: Postgres normally drops indexes that
+# reference a dropped column, but the `attisdropped` filter on the
+# LEFT JOIN keeps the introspection contract clean in the edge
+# cases where a dropped attnum somehow survives (manual catalog
+# surgery, partial state during PG upgrades). A dropped-column
+# attnum joins to no pg_attribute row → COALESCE yields the empty
+# string, the same representation as an expression position. From
+# PERF003's perspective both are "can't match by name," which is
+# the correct read for both.
+#
 # `WITH ORDINALITY` on the unnest preserves the column order from
 # `indkey`. The `LEFT JOIN` against `pg_attribute` returns NULL for
 # expression positions (attnum 0 has no matching row); COALESCE to
@@ -422,7 +432,9 @@ SELECT
             SELECT COALESCE(a.attname, '')
             FROM unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord)
             LEFT JOIN pg_catalog.pg_attribute a
-                ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                ON a.attrelid = i.indrelid
+               AND a.attnum = k.attnum
+               AND NOT a.attisdropped
             ORDER BY k.ord
         ),
         ARRAY[]::TEXT[]
