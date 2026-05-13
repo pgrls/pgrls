@@ -1331,8 +1331,11 @@ Three layers, the bottom one is a documented contract not code:
   the cross-language Postgres-side wire contract (`SET LOCAL ROLE` plus the
   PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). The TypeScript
   port ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
-  this same contract; a Go port is tracked for a future release. Python is
-  the reference implementation. `PROTOCOL_VERSION = 1`.
+  this same contract; a Go port at [`go/`](go/) shipped its scaffold +
+  protocol-version constant + error types in v0.7.0 (step 1 of N — subsequent
+  steps add the Driver interface, pgx + lib/pq adapters, Client API,
+  assertion helpers, and conformance suite). Python is the reference
+  implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
