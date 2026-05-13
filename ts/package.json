@@ -1,6 +1,6 @@
 {
   "name": "pgrls-test",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Code-first RLS testing for Postgres — TypeScript port of pgrls.testing. Implements the cross-language Layer 1 protocol (PROTOCOL_VERSION 1).",
   "type": "module",
   "main": "./dist/index.js",
@@ -54,7 +54,7 @@
   },
   "peerDependencies": {
     "pg": ">=8",
-    "postgres": ">=3"
+    "postgres": ">=3.4"
   },
   "peerDependenciesMeta": {
     "pg": {

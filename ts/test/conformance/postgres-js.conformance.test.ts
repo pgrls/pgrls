@@ -31,11 +31,13 @@ let sql: ReturnType<typeof postgres> | null = null;
 
 beforeAll(async () => {
   container = await new PostgreSqlContainer('postgres:17-alpine').start();
-  // Single connection so the SET LOCAL ROLE / GUC state from
-  // the conformance criteria 1+2 actually persists within a
-  // transaction. postgres.js defaults to a pool of 10; force 1
-  // to mirror the pg.Client semantics.
-  sql = postgres(container.getConnectionUri(), { max: 1 });
+  // Default pool (max: 10) — the v0.6.2 adapter pins one
+  // connection internally via `sql.reserve()` so SET LOCAL
+  // ROLE / GUC state inside a transaction persists across
+  // separate `query()` calls. Before v0.6.2 this test
+  // forced `max: 1` as a workaround; the adapter fix
+  // removes the need.
+  sql = postgres(container.getConnectionUri());
 }, 60_000);
 
 afterAll(async () => {

@@ -7,6 +7,61 @@ package adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `PROTOCOL_VERSION` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python client.
 
+## [0.6.2] - 2026-05-13
+
+TS polish bundle. No protocol changes; `PROTOCOL_VERSION` stays at `1`.
+
+### Fixed
+
+- **postgres.js adapter now pins one pool connection internally.**
+  `postgres.js` is a pool by default (10 connections), and
+  `PgrlsTestClient.transaction()` issues `BEGIN` / queries /
+  `ROLLBACK` as separate driver calls. Without pinning, each
+  call could land on a different pool connection — transaction
+  state (`SET LOCAL`, the implicit `BEGIN`) wouldn't persist,
+  and `ROLLBACK` would undo nothing. The adapter now lazily
+  calls `sql.reserve()` on the first `query()` and uses the
+  reserved connection for every subsequent call. Users no
+  longer need the `{ max: 1 }` workaround the README previously
+  recommended. The conformance suite drops that workaround
+  too; twelve new unit tests cover the reserve / reuse /
+  release / re-acquire lifecycle including concurrent-first-
+  queries race-safety, close-while-reserving, retry after
+  reservation rejection (so a transient connection failure
+  doesn't permanently jam the driver), close-after-rejection
+  (so the recommended `try { ... } finally { await close() }`
+  pattern doesn't mask the original error), and a late-
+  rejection identity-guard preventing P1's eventual catch
+  from clobbering a P2 reservation taken after close.
+
+### Added
+
+- **`PgrlsTestClient.close()` and optional `Driver.close()`.**
+  `client.close()` forwards to `driver.close?.()` and releases
+  driver-pinned resources. The `postgres.js` adapter uses it
+  to release the reserved pool connection back to the pool;
+  the `pg` adapter is a no-op (the caller owns the `Client`).
+  Idempotent. Recommended in `try/finally` after the test
+  body — without it, the postgres.js reservation leaks until
+  `sql.end()` is called.
+
+- **Drizzle ORM recipe** in `README.md`. Covers both
+  `drizzle-orm/node-postgres` (use `pool.connect()` to get a
+  dedicated `pg.Client` for the test) and
+  `drizzle-orm/postgres-js` (share the `sql` pool; the
+  adapter's connection pinning handles isolation). The
+  Drizzle `db` object and the `pgrls-test` client stay
+  independent — Drizzle owns the ORM surface, `pgrls-test`
+  owns the raw-SQL test transaction.
+
+- **JSR publish** (`jsr.json` + workflow job). `pgrls-test`
+  is now published to both [npm](https://www.npmjs.com/package/pgrls-test)
+  (as `pgrls-test`) and [JSR](https://jsr.io/@pgrls/test) (as
+  `@pgrls/test`). The JSR publish uses GitHub OIDC for
+  provenance — no long-lived secret needed. Both publishes
+  gate on the same `ts-v*` git tag so the two registries
+  track the same version.
+
 ## [0.6.1] - 2026-05-12
 
 Post-release review pass. Bug fix + polish; no protocol changes.

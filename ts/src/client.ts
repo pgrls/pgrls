@@ -449,4 +449,39 @@ export class PgrlsTestClient {
   async assertSilentlyDropped(sql: string): Promise<void> {
     await _assertSilentlyDropped(this, sql);
   }
+
+  /**
+   * Release any driver resources acquired during testing.
+   *
+   * Forwards to the driver's optional `close()`. The
+   * `postgres.js` adapter uses this to release the pinned
+   * pool connection back to the pool — without `close()`, the
+   * connection stays held until `sql.end()` is called, which
+   * leaks one of postgres.js's default 10 connections per
+   * `PgrlsTestClient` instance.
+   *
+   * The `pg` adapter is a no-op: the caller already owns the
+   * `pg.Client` and releases it through their own lifecycle.
+   *
+   * Idempotent: calling `close()` more than once is safe; the
+   * second call is a no-op. A `transaction()` / `exec()` /
+   * `fetchAll()` / assertion call after `close()` may
+   * re-acquire a fresh connection (adapter-specific).
+   *
+   * Typical test usage:
+   *
+   * ```ts
+   * const client = new PgrlsTestClient(postgresJsDriver(sql));
+   * try {
+   *   await client.transaction(async () => { ... });
+   * } finally {
+   *   await client.close();
+   * }
+   * ```
+   */
+  async close(): Promise<void> {
+    if (this.driver.close !== undefined) {
+      await this.driver.close();
+    }
+  }
 }
