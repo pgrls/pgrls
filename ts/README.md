@@ -92,7 +92,8 @@ const db = drizzle(pool); // your app code keeps using this
 
 // For pgrls-test: pull a dedicated client out of the pool so
 // BEGIN / SET LOCAL ROLE / queries / ROLLBACK all land on one
-// connection. `await pgClient.release()` when the test ends.
+// connection. `pgClient.release()` (sync, void) when the test
+// ends — returns the connection to the pool.
 const pgClient = await pool.connect();
 const test = new PgrlsTestClient(pgDriver(pgClient));
 ```

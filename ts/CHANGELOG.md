@@ -24,8 +24,10 @@ TS polish bundle. No protocol changes; `PROTOCOL_VERSION` stays at `1`.
   reserved connection for every subsequent call. Users no
   longer need the `{ max: 1 }` workaround the README previously
   recommended. The conformance suite drops that workaround
-  too; seven new unit tests cover the reserve / reuse /
-  release / re-acquire lifecycle.
+  too; nine new unit tests cover the reserve / reuse /
+  release / re-acquire lifecycle including the concurrent-
+  first-queries race-safety and close-while-reserving edge
+  cases.
 
 ### Added
 
