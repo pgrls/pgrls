@@ -245,3 +245,119 @@ def test_markdown_rule_link_matches_sarif_anchor_convention(
     # scheme has to update both formatters together.
     out = format_violations([_v(rule_id=rule_id)], format="markdown")
     assert f"#{expected_anchor})" in out
+
+
+# ---------------------------------------------------------------------------
+# Hostile-input hardening (operator-controlled identifiers)
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_location_with_newline_does_not_split_table_row() -> None:
+    # The most critical contract: a `\n` inside a Postgres
+    # quoted-identifier name MUST NOT split the GFM pipe-table row.
+    # A row split would push the next cell ("Message") onto a fresh
+    # line that the parser treats as a header-less continuation,
+    # corrupting the visible table.
+    out = format_violations(
+        [
+            _v(
+                rule_id="SEC013",
+                severity="warning",
+                location="public.invoices.evil\nINJECTED",
+                message="audit",
+            )
+        ],
+        format="markdown",
+    )
+    # Locate the violation row. It must be a single line containing
+    # all four expected `|` separators (5 pipes since each row starts
+    # and ends with `|`).
+    table_rows = [
+        line for line in out.splitlines() if line.startswith("| ⚠️")
+    ]
+    assert len(table_rows) == 1
+    assert table_rows[0].count("|") == 5
+    # The escape representation is visible in the cell.
+    assert "evil\\nINJECTED" in table_rows[0]
+    # And no bare newline leaked into the table portion.
+    table_section = out.split("**Summary:**")[0]
+    assert "evil\nINJECTED" not in table_section
+
+
+def test_markdown_location_with_pipe_escaped() -> None:
+    # A `|` character in a Postgres identifier (quoted form allows
+    # it) would split the cell mid-row. Must be backslash-escaped
+    # so the pipe-table parser treats it as part of the location
+    # cell.
+    out = format_violations(
+        [_v(location="public.weird|name")], format="markdown"
+    )
+    table_rows = [
+        line for line in out.splitlines() if line.startswith("| ❌")
+    ]
+    assert len(table_rows) == 1
+    # 5 pipes for cell separators + 1 backslash-escaped pipe
+    # inside the location cell. (The backslash precedes the pipe.)
+    assert table_rows[0].count("\\|") == 1
+    # Total pipe count is 5 separators + 1 escaped = 6. If it were
+    # an unescaped pipe, the row would have 6 cell separators which
+    # would push everything one column to the right.
+    assert table_rows[0].count("|") == 6
+    # The escape sequence is right next to "weird" in the location.
+    assert "weird\\|name" in table_rows[0]
+
+
+def test_markdown_location_with_zero_width_dropped() -> None:
+    # Zero-width formatting chars (U+200B etc.) hide content from
+    # visual inspection. Drop them so the rendered cell shows the
+    # real identifier the lint output is referring to.
+    out = format_violations(
+        [_v(location="public.use​rs")], format="markdown"
+    )
+    assert "public.users" in out
+    assert "​" not in out
+
+
+def test_markdown_location_with_tab_escaped() -> None:
+    # Tabs render as variable-width whitespace in GFM. Escape so
+    # the column boundary stays visible and the rendered text
+    # matches the actual identifier.
+    out = format_violations(
+        [_v(location="public.a\tcol")], format="markdown"
+    )
+    assert "public.a\\tcol" in out
+    # No raw tab in the table section.
+    table_section = out.split("**Summary:**")[0]
+    assert "\t" not in table_section
+
+
+def test_markdown_location_well_formed_uses_backticks_unchanged() -> None:
+    # The fast-path: a well-formed location renders inside
+    # backticks just like before the hardening. Pin so a future
+    # tightening of `safe_location` doesn't accidentally introduce
+    # escape sequences for benign input.
+    out = format_violations(
+        [_v(location="public.invoices.audit_writes")], format="markdown"
+    )
+    assert "`public.invoices.audit_writes`" in out
+    # And no stray backslashes appear next to the well-formed name.
+    table_rows = [
+        line for line in out.splitlines() if line.startswith("| ❌")
+    ]
+    assert "\\" not in table_rows[0].split("audit_writes")[0]
+
+
+def test_markdown_location_newline_escape_does_not_double_escape() -> None:
+    # safe_location turns `\n` into the two characters `\n` (backslash
+    # + n). The markdown formatter intentionally skips `_escape_cell`'s
+    # backslash doubling for the location field, so the rendered text
+    # shows `\n` (one backslash, one n) — not `\\n` (two backslashes,
+    # which would render as the literal two-char text "\\n" in a code
+    # span and be misleading). Pin both halves of the contract.
+    out = format_violations(
+        [_v(location="public.a\nb")], format="markdown"
+    )
+    assert "public.a\\nb" in out
+    # NOT double-escaped — `\\nb` with two backslashes would mean
+    # `\\` doubled by `_escape_cell` got applied on top.
+    assert "public.a\\\\nb" not in out

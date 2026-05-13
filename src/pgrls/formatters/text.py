@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from pgrls.formatters._common import safe_location
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
@@ -22,7 +23,12 @@ def format_text(violations: list[Violation]) -> str:
         # `(schema-wide)` for cross-format consistency. Real
         # qualified names never contain parentheses, so the
         # placeholder is unambiguous.
-        loc = v.location or "(schema-wide)"
+        # `safe_location` keeps the line single — operator-supplied
+        # identifiers can contain `\n` (legal in quoted Postgres
+        # identifiers) which would otherwise split the row and
+        # break line-anchored CI grep patterns like
+        # `^  WARN \s+ SEC\d+\s+ <loc>$`.
+        loc = safe_location(v.location) if v.location else "(schema-wide)"
         lines.append(
             f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
             f"         {v.message}"

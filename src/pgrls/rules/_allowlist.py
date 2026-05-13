@@ -31,6 +31,24 @@ def _list_of_strings(rule_id: str, raw: Any, shape_hint: str) -> list[str]:
             f"[lint.rules.{rule_id}].allowlist must be a list of "
             f"strings ({shape_hint})"
         )
+    # Surface accidental leading/trailing whitespace early. Postgres
+    # allows whitespace inside quoted identifiers, but in pgrls.toml
+    # an entry like `" public.users.evil "` is almost always a typo
+    # (copy-paste from a wider list, trailing newline, etc.). The
+    # silent-fail-open behavior — entry never matches any built
+    # location, rule fires forever — is exactly the footgun the
+    # validators here exist to close. Raise loudly with the stripped
+    # form in the message so the fix is one keystroke.
+    for entry in raw:
+        if entry != entry.strip():
+            raise TypeError(
+                f"[lint.rules.{rule_id}].allowlist entry {entry!r} "
+                "has leading or trailing whitespace. pgrls compares "
+                "entries with byte-exact equality against built "
+                "location strings, which never carry surrounding "
+                "whitespace — the entry would silently fail to match. "
+                f"Use {entry.strip()!r} instead."
+            )
     return raw
 
 

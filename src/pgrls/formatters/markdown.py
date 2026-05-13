@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from pgrls.formatters._common import safe_location
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
@@ -78,7 +79,23 @@ def _row(v: Violation) -> str:
     # match the SARIF / text formatters' `(schema-wide)` sentinel
     # but italicize it so it visually distinguishes from a real
     # qualified name in the same column.
-    location = f"`{v.location}`" if v.location else "_(schema-wide)_"
+    #
+    # `safe_location` strips / escapes newlines, tabs, and zero-width
+    # chars first so the table row stays intact even when a Postgres
+    # identifier carries `\n` (legal inside a quoted identifier). The
+    # remaining `|` characters then get backslash-escaped manually —
+    # we deliberately skip `_escape_cell` because that helper doubles
+    # `\` (correct for rule-author messages that contain literal
+    # backslashes, wrong for our own backslash-escaped representation
+    # of a newline, which would become a misleading `\\n` in the
+    # rendered cell). The cell-content is also a no-op for the well-
+    # formed case: `safe_location` short-circuits on clean input and
+    # the `.replace("|", "\\|")` does nothing.
+    if v.location:
+        clean = safe_location(v.location).replace("|", "\\|")
+        location = f"`{clean}`"
+    else:
+        location = "_(schema-wide)_"
     message = _escape_cell(v.message)
     return f"| {severity} | {rule_link} | {location} | {message} |\n"
 
