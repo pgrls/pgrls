@@ -5,6 +5,7 @@ import pytest
 
 from pgrls.model import (
     SNAPSHOT_VERSION,
+    Index,
     Policy,
     Schema,
     SecdefFunction,
@@ -248,3 +249,95 @@ def test_from_snapshot_v5_yields_empty_triggers() -> None:
     }
     loaded = Schema.from_snapshot(v5)
     assert loaded.tables[0].triggers == ()
+
+
+def test_from_snapshot_round_trips_v7_with_indexes() -> None:
+    # PERF003 reads `Table.indexes` from the snapshot. If a future
+    # refactor of `to_snapshot` / `from_snapshot` drifts the field
+    # names (e.g. renaming `is_partial` → `partial`), the write/
+    # read pair stays internally consistent inside a single
+    # process — so a unit test that only checks `to_snapshot()`
+    # output won't catch it. Round-tripping through `json.dumps`
+    # forces the JSON shape to match what a file-persisted snapshot
+    # carries, the way `pgrls diff` actually exercises the contract.
+    # Mirrors `test_from_snapshot_round_trips_v6_with_triggers`.
+    import json
+
+    original = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="invoices",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    Policy(
+                        name="tenant_read",
+                        command="SELECT",
+                        permissive=True,
+                        roles=("authenticated",),
+                        using_sql="tenant_id = current_setting('app.tenant')",
+                        with_check_sql=None,
+                    ),
+                ),
+                indexes=(
+                    Index(
+                        name="invoices_tenant_idx",
+                        access_method="btree",
+                        columns=("tenant_id",),
+                        is_unique=False,
+                        is_partial=False,
+                    ),
+                    Index(
+                        name="invoices_active_partial",
+                        access_method="btree",
+                        columns=("id",),
+                        is_unique=True,
+                        is_partial=True,
+                    ),
+                    Index(
+                        name="invoices_lower_email",
+                        access_method="btree",
+                        # Expression-index position: empty string
+                        # placeholder (introspection's COALESCE
+                        # output for `pg_index.indkey = 0`).
+                        columns=("",),
+                        is_unique=False,
+                        is_partial=False,
+                    ),
+                ),
+            ),
+        ),
+    )
+    snap_json = json.dumps(original.to_snapshot())
+    loaded = Schema.from_snapshot(json.loads(snap_json))
+    assert loaded.tables[0].indexes == original.tables[0].indexes
+    assert loaded == original
+
+
+def test_from_snapshot_v6_yields_empty_indexes() -> None:
+    # v6 (released as v0.5.8 with SEC013) has no `indexes` field on
+    # table entries. Loading must succeed and the field defaults
+    # to `()` — PERF003 then simply finds nothing to flag against
+    # the older snapshot until it's re-captured.
+    v6 = {
+        "version": 6,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "t",
+                "rls_enabled": True,
+                "force_rls": True,
+                "columns": ["id"],
+                "partition_of": None,
+                "grants": [],
+                "column_details": [],
+                "triggers": [],
+            }
+        ],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [],
+    }
+    loaded = Schema.from_snapshot(v6)
+    assert loaded.tables[0].indexes == ()

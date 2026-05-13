@@ -10,13 +10,15 @@ CREATE POLICY orphaned ON public.hyg001_target
     FOR SELECT
     TO PUBLIC
     USING (gone = 'x');
--- Index `gone` so PERF003 doesn't fire on the policy column. The
--- column is about to be marked-dropped via pg_attribute hackery
--- below, but the index is created first while `gone` still exists.
--- After the attisdropped flip, the index logically references a
--- dropped column. Introspection still captures it and PERF003 sees
--- a leading-column match.
-CREATE INDEX hyg001_target_gone_idx ON public.hyg001_target (gone);
+-- The fake-drop hack below sets `attisdropped = true` on the
+-- `gone` column. After that, introspection's index query
+-- (`_INDEXES_SQL`, with `AND NOT a.attisdropped`) yields the
+-- empty string for any index position referencing `gone`. PERF003
+-- also filters out policy refs to columns not in `Table.columns`,
+-- so the `gone` ref in the orphaned policy never reaches the
+-- leading-column-index check. No index needed here — both
+-- defenses (introspection filter + PERF003 live_columns filter)
+-- keep the rule silent on this fixture.
 UPDATE pg_catalog.pg_attribute
     SET attisdropped = true
     WHERE attrelid = 'public.hyg001_target'::regclass
