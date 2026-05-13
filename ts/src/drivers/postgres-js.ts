@@ -130,12 +130,34 @@ export function postgresJsDriver(sql: PostgresJsSql): Driver {
     // replaying the rejection forever. Without this, a transient
     // failure (timeout, connection blip during initial handshake,
     // pool just-closed-and-reopened) would permanently jam the
-    // driver. Re-throws after clearing so the caller still sees
-    // the underlying error from their `query()` call.
-    reservedPromise ??= sql.reserve().catch((err: unknown) => {
-      reservedPromise = null;
-      throw err;
-    });
+    // driver.
+    //
+    // The clear is **conditional** on `reservedPromise` still
+    // pointing at the rejecting promise. Without this guard, a
+    // subtle race leaks reservations:
+    //   1. query1() triggers P1 = sql.reserve() that will reject.
+    //   2. close() copies P1, sets reservedPromise = null, awaits.
+    //   3. query2() runs before P1's .catch fires: observes
+    //      reservedPromise = null, kicks off P2 = sql.reserve()
+    //      that succeeds. reservedPromise = P2.
+    //   4. P1's .catch fires LATE, unconditionally writes
+    //      reservedPromise = null — clobbering P2. P2's
+    //      reservation is now untracked → a later close() can't
+    //      release it. LEAK.
+    // The `reservedPromise === guarded` identity check prevents
+    // step 4 from touching reservedPromise when a different
+    // reservation has taken over.
+    if (reservedPromise === null) {
+      const guarded: Promise<PostgresJsReservedSql> = sql
+        .reserve()
+        .catch((err: unknown) => {
+          if (reservedPromise === guarded) {
+            reservedPromise = null;
+          }
+          throw err;
+        });
+      reservedPromise = guarded;
+    }
     return reservedPromise;
   }
 

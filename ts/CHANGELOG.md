@@ -24,13 +24,15 @@ TS polish bundle. No protocol changes; `PROTOCOL_VERSION` stays at `1`.
   reserved connection for every subsequent call. Users no
   longer need the `{ max: 1 }` workaround the README previously
   recommended. The conformance suite drops that workaround
-  too; eleven new unit tests cover the reserve / reuse /
+  too; twelve new unit tests cover the reserve / reuse /
   release / re-acquire lifecycle including concurrent-first-
   queries race-safety, close-while-reserving, retry after
   reservation rejection (so a transient connection failure
-  doesn't permanently jam the driver), and close-after-
-  rejection (so the recommended `try { ... } finally { await
-  close() }` pattern doesn't mask the original error).
+  doesn't permanently jam the driver), close-after-rejection
+  (so the recommended `try { ... } finally { await close() }`
+  pattern doesn't mask the original error), and a late-
+  rejection identity-guard preventing P1's eventual catch
+  from clobbering a P2 reservation taken after close.
 
 ### Added
 

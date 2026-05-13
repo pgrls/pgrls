@@ -337,6 +337,64 @@ describe('postgresJsDriver — connection pinning (v0.6.2+)', () => {
     expect(reserveSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('late rejection of P1 does not clobber a P2 reservation taken after close', async () => {
+    // Subtle race regression caught in iter 4:
+    //   1. query1() kicks off P1 = sql.reserve() that will reject.
+    //   2. close() copies P1, sets reservedPromise = null, awaits.
+    //   3. query2() runs BEFORE P1's .catch fires: sees
+    //      reservedPromise = null, kicks off P2 = sql.reserve()
+    //      that succeeds; reservedPromise = P2.
+    //   4. P1's .catch fires LATE. Without the identity guard it
+    //      would unconditionally write reservedPromise = null,
+    //      clobbering P2. A later close() would then see
+    //      reservedPromise === null and not release P2 → leak.
+    // The fix's identity check makes P1's .catch a no-op when
+    // reservedPromise no longer points at the rejecting promise.
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const reserved = await mock.reserve();
+    // Hold the rejection back via a settler so we can sequence
+    // the catch firing AFTER P2 is in place. Initial assignment
+    // is a noop-throw so TypeScript sees a definite assignment
+    // without needing `let rejectP1!: ...`.
+    let rejectP1: (err: Error) => void = () => {
+      throw new Error('rejectP1 not yet assigned');
+    };
+    const p1 = new Promise<typeof reserved>((_, reject) => {
+      rejectP1 = reject;
+    });
+    let callCount = 0;
+    mock.reserve = vi.fn(() => {
+      callCount += 1;
+      if (callCount === 1) {
+        return p1;
+      }
+      return Promise.resolve(reserved);
+    });
+
+    const driver = postgresJsDriver(mock);
+
+    // 1. Start query1 → kicks off P1 (pending).
+    const query1 = driver.query('SELECT 1');
+    // 2. close() copies P1, clears reservedPromise, awaits P1.
+    const close1 = driver.close!();
+    // 3. query2 starts before P1 settles → kicks off P2.
+    const query2 = driver.query('SELECT 2');
+    // 4. Now reject P1. Its catch fires AFTER P2 is in place.
+    rejectP1(new Error('connection refused'));
+
+    // query1 sees its rejection; close1 swallows it.
+    await expect(query1).rejects.toThrow('connection refused');
+    await expect(close1).resolves.toBeUndefined();
+    // query2 must succeed against P2.
+    await query2;
+
+    // Now close() must release P2. If the identity guard were
+    // missing, P1's late .catch would have nulled reservedPromise
+    // and this close() would be a no-op → released.count stays 0.
+    await driver.close!();
+    expect(mock.released.count).toBe(1);
+  });
+
   it('close() after rejected reservation swallows the rejection', async () => {
     // `try { exec(...) } finally { await close() }` is the
     // recommended usage pattern. If the original exec failed
