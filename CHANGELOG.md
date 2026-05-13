@@ -10,6 +10,17 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-13
+
+The Python core (`pgrls` package) version stays at 0.5.10 — v0.7.0 is
+the **first release of the Go port** (`pgrls-test-go`), shipping the
+module scaffold + Layer 1 protocol-version constant + error types at
+[`go/`](go/) in this monorepo. The Go port follows a staged release
+plan (step 1 of 7); per-port details and the planned v0.7.1–v0.7.6
+roadmap live in [`go/CHANGELOG.md`](go/CHANGELOG.md). Module path
+`github.com/pgrls/pgrls/go`; tag convention `go/v0.7.0`. See
+[`go/README.md`](go/README.md) for usage.
+
 ## [0.5.10] - 2026-05-13
 
 ### Added
