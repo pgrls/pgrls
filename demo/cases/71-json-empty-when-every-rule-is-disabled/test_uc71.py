@@ -17,9 +17,15 @@ def test_uc71_json_empty_when_every_rule_is_disabled(
     # check for downstream parsers ("does our JSON consumer handle
     # the empty case?").
     cfg = tmp_path / "p.toml"
+    # `base_config` already opens a `[lint]` block (to disable
+    # PERF003 demo-wide); we replace that disable list with the
+    # full set rather than declaring `[lint]` twice (TOML forbids
+    # duplicate sections).
     cfg.write_text(
-        base_config
-        + '[lint]\ndisable = ' + repr(list(all_rule_ids)) + '\n'
+        base_config.replace(
+            'disable = ["PERF003"]',
+            'disable = ' + repr(list(all_rule_ids)),
+        )
     )
     parsed = lint_json(config=cfg)
     assert parsed["violations"] == []

@@ -30,9 +30,10 @@ def test_to_snapshot_emits_grants_field() -> None:
     )
     snap = schema.to_snapshot()
     # bumped 4 → 5 in v0.5 (column_details); 5 → 6 in v0.5.8
-    # (triggers). The grants test is about content, not version —
-    # pin the latest so a future bump is deliberate.
-    assert snap["version"] == 6
+    # (triggers); 6 → 7 in v0.5.10 (indexes). The grants test is
+    # about content, not version — pin the latest so a future
+    # bump is deliberate.
+    assert snap["version"] == 7
     table = snap["tables"][0]
     assert table["grants"] == [
         {"role": "authenticated", "privileges": ["SELECT", "INSERT"]}

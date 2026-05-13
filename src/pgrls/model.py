@@ -2,10 +2,11 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 6 (v6 added per-table ``triggers`` for SEC013;
-v5 added per-column type info via the new ``column_details`` per
-table; v4 added top-level ``views``; v3 added ``grants`` to each
-table entry; v2 added ``partition_of``).
+Currently version 7 (v7 added per-table ``indexes`` for PERF003; v6
+added per-table ``triggers`` for SEC013; v5 added per-column type
+info via the new ``column_details`` per table; v4 added top-level
+``views``; v3 added ``grants`` to each table entry; v2 added
+``partition_of``).
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from typing import Any, Literal
 __all__ = [
     "Column",
     "Grant",
+    "Index",
     "Policy",
     "PolicyCommand",
     "SNAPSHOT_VERSION",
@@ -31,7 +33,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 6
+SNAPSHOT_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,60 @@ class View:
     @property
     def qualified_name(self) -> str:
         return f"{self.schema}.{self.name}"
+
+
+@dataclass(frozen=True)
+class Index:
+    """An index captured by snapshot v7+.
+
+    PERF003 uses ``Table.indexes`` to check whether columns
+    referenced in a policy predicate have a leading-column B-tree
+    index (or any leading-column index in v0.5.10). Without one,
+    every query against the RLS-enabled table does a sequential
+    scan to filter rows — fine for small tables, catastrophic for
+    multi-tenant tables with millions of rows.
+
+    Captured fields are the minimum PERF003 needs to evaluate
+    "does this column have an index that helps the planner with
+    the policy predicate":
+
+    * ``name`` — the index name (``pg_class.relname`` for the
+      index relation). Used in violation messages so the operator
+      can locate the index in their schema.
+    * ``access_method`` — ``btree``, ``hash``, ``gin``, ``gist``,
+      ``brin``, etc. PERF003 v1 treats any access method as
+      "indexed" (the operator picked the right method for their
+      query shape); future versions may narrow to btree/hash for
+      equality predicates.
+    * ``columns`` — ordered tuple of column names. Expression
+      index positions (where ``pg_index.indkey`` carries 0) become
+      the empty string in this tuple, preserving positional
+      alignment without misleading callers into thinking a column
+      is indexed when it isn't. PERF003 checks only the leading
+      column; trailing-column matches don't help an equality
+      predicate without the leading column also being part of the
+      query.
+    * ``is_unique`` — informational; a unique index is still a
+      B-tree on the captured columns.
+    * ``is_partial`` — ``pg_index.indpred IS NOT NULL``. Partial
+      indexes only help when the partial predicate is satisfied
+      by the query predicate; pgrls can't statically prove that
+      compatibility, so PERF003 v1 treats partial indexes as
+      "indexed" and trusts the operator's intent. The flag is
+      captured so a future rule can warn on partial-but-mismatched
+      cases.
+
+    Only valid + ready indexes (``indisvalid AND indisready``) are
+    captured. A half-built index from a failed ``CREATE INDEX
+    CONCURRENTLY`` doesn't help the planner and shouldn't make
+    PERF003 silent.
+    """
+
+    name: str
+    access_method: str
+    columns: tuple[str, ...]
+    is_unique: bool
+    is_partial: bool
 
 
 @dataclass(frozen=True)
@@ -221,6 +277,15 @@ class Table:
     # triggers (e.g. unit tests) working unchanged; v3/v4/v5 baselines
     # round-trip with `triggers=()` since the field didn't exist.
     triggers: tuple[Trigger, ...] = ()
+    # Indexes on this table — populated in snapshot v7+. PERF003
+    # walks this on every policy to check whether referenced columns
+    # have a leading-column index. Only valid + ready indexes are
+    # captured (a failed CREATE INDEX CONCURRENTLY produces an
+    # invalid index that doesn't help the planner). Default `()`
+    # keeps test fixtures working unchanged; v3/v4/v5/v6 baselines
+    # round-trip with `indexes=()` so PERF003 simply finds nothing
+    # to flag against older snapshots until they're re-captured.
+    indexes: tuple[Index, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -354,6 +419,21 @@ class Schema:
                         }
                         for tr in t.triggers
                     ],
+                    # v7 extension — emit valid+ready indexes. PERF003
+                    # reads this on every policy. Order matches
+                    # `Table.indexes` (sorted by name at introspection
+                    # time) for snapshot determinism. v3-v6 baselines
+                    # round-trip with `indexes=()` → empty array.
+                    "indexes": [
+                        {
+                            "name": idx.name,
+                            "access_method": idx.access_method,
+                            "columns": list(idx.columns),
+                            "is_unique": idx.is_unique,
+                            "is_partial": idx.is_partial,
+                        }
+                        for idx in t.indexes
+                    ],
                 }
                 for t in self.tables
             ],
@@ -397,9 +477,10 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3, v4, v5, or v6 snapshot dict.
+        """Reconstruct a Schema from a v3-v7 snapshot dict.
 
-        v6 (current): adds per-table ``triggers`` for SEC013.
+        v7 (current): adds per-table ``indexes`` for PERF003.
+        v6: adds per-table ``triggers`` for SEC013.
         v5: adds per-column type info via the new ``column_details``
         array on each table. Required for ``Schema.to_sql()`` and
         the migration-as-input flow (``pgrls diff --apply``).
@@ -425,11 +506,12 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6):
+        if version not in (3, 4, 5, 6, 7):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 3, 4, 5, 6. v1 / v2 "
-                "snapshots must be regenerated against the current schema."
+                f"pgrls release. Supported versions: 3, 4, 5, 6, 7. v1 / "
+                "v2 snapshots must be regenerated against the current "
+                "schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -508,6 +590,22 @@ class Schema:
                 )
                 for tr in triggers_raw
             )
+            # v7 extension — `indexes` holds the valid+ready indexes
+            # captured for PERF003. v3-v6 baselines round-trip with
+            # the field absent (`.get(...) → []`), which yields an
+            # empty tuple — PERF003 finds nothing to flag against
+            # older snapshots until they're re-captured.
+            indexes_raw = t.get("indexes", [])
+            indexes = tuple(
+                Index(
+                    name=idx["name"],
+                    access_method=idx["access_method"],
+                    columns=tuple(idx["columns"]),
+                    is_unique=idx["is_unique"],
+                    is_partial=idx["is_partial"],
+                )
+                for idx in indexes_raw
+            )
             tables.append(
                 Table(
                     schema=t["schema"],
@@ -520,6 +618,7 @@ class Schema:
                     grants=grants,
                     column_details=column_details,
                     triggers=triggers,
+                    indexes=indexes,
                 )
             )
         # v3 has no "views" array; treat as empty tuple.

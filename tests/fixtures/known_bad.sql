@@ -19,3 +19,9 @@ CREATE POLICY orders_owner ON public.orders
     FOR SELECT
     TO PUBLIC
     USING (user_id = (SELECT current_setting('app.user_id', true)::BIGINT));
+
+-- PERF003 floor: a leading-column index on the policy's filtering
+-- column. Without this, PERF003 would fire on orders.user_id and
+-- pollute the `known_bad` rule-set assertions (which target SEC001,
+-- SEC003, SEC007 specifically).
+CREATE INDEX orders_user_id_idx ON public.orders (user_id);

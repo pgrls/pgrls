@@ -115,6 +115,8 @@ ALTER TABLE public.allbad_view001_base FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_floor ON public.allbad_view001_base
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_view001_base_tenant_idx
+    ON public.allbad_view001_base (tenant_id);
 CREATE VIEW public.allbad_view001
     WITH (security_barrier = true) AS
     SELECT * FROM public.allbad_view001_base;
@@ -130,6 +132,8 @@ ALTER TABLE public.allbad_view002_base FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_floor ON public.allbad_view002_base
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_view002_base_tenant_idx
+    ON public.allbad_view002_base (tenant_id);
 CREATE VIEW public.allbad_view002
     WITH (security_invoker = true) AS
     SELECT * FROM public.allbad_view002_base;
@@ -147,6 +151,8 @@ ALTER TABLE public.allbad_view003_base FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_floor ON public.allbad_view003_base
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_view003_base_tenant_idx
+    ON public.allbad_view003_base (tenant_id);
 CREATE MATERIALIZED VIEW public.allbad_view003 AS
     SELECT * FROM public.allbad_view003_base;
 
@@ -169,6 +175,8 @@ ALTER TABLE public.allbad_view004_base FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_floor ON public.allbad_view004_base
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_view004_base_tenant_idx
+    ON public.allbad_view004_base (tenant_id);
 CREATE FUNCTION public.allbad_view004_read()
     RETURNS SETOF public.allbad_view004_base
     LANGUAGE sql SECURITY DEFINER AS
@@ -204,6 +212,19 @@ ALTER TABLE public.allbad_sec013 FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_floor ON public.allbad_sec013
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_sec013_tenant_idx ON public.allbad_sec013 (tenant_id);
 CREATE TRIGGER audit_writes
     BEFORE UPDATE ON public.allbad_sec013
     FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+
+-- PERF003: policy predicate column without a leading-column index.
+-- The other RLS-enabled tables in this fixture all carry an index
+-- on their policy filter column so PERF003 doesn't fire on them.
+-- This dedicated block keeps PERF003 pinned to exactly one
+-- location for the rule_loc contract in test_cli.
+CREATE TABLE public.allbad_perf003 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_perf003 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_perf003 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_unindexed ON public.allbad_perf003
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));

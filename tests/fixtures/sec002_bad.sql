@@ -4,7 +4,10 @@
 -- policies), SEC003 (permissive PUBLIC), and SEC012 (no PERMISSIVE
 -- → silent deny-all) don't fire and confound the SEC002
 -- assertions.
-CREATE TABLE public.sec002_target (id INT);
+-- PRIMARY KEY on `id` creates an implicit B-tree index so PERF003
+-- doesn't fire on the `id > 0` policy predicate. The SEC002 test
+-- targets RLS-FORCE state, not index health.
+CREATE TABLE public.sec002_target (id INT PRIMARY KEY);
 ALTER TABLE public.sec002_target ENABLE ROW LEVEL SECURITY;
 -- Note: no ALTER TABLE ... FORCE ROW LEVEL SECURITY.
 CREATE POLICY sec002_target_p ON public.sec002_target
@@ -12,7 +15,7 @@ CREATE POLICY sec002_target_p ON public.sec002_target
 CREATE POLICY sec002_target_permit ON public.sec002_target
     FOR SELECT TO postgres USING (id > 0);
 
-CREATE TABLE public.sec002_clean (id INT);
+CREATE TABLE public.sec002_clean (id INT PRIMARY KEY);
 ALTER TABLE public.sec002_clean ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec002_clean FORCE ROW LEVEL SECURITY;
 CREATE POLICY sec002_clean_p ON public.sec002_clean
