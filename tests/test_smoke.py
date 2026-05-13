@@ -60,10 +60,10 @@ def test_pgrls_testing_exports_client_and_protocol_version() -> None:
 
 
 def test_pgrls_diff_exports_change_and_diff_schemas() -> None:
-    # Pin the v0.2 public surface for the diff machinery. These
-    # names are importable from `pgrls.diff` but NOT promoted to
-    # the top-level `pgrls` package — promotion to top-level is a
-    # v0.3 decision (see README Roadmap).
+    # Pin the v0.2 public surface for the diff machinery. As of
+    # v0.5.9 these four names are also re-exported from the
+    # top-level `pgrls` package — see
+    # `test_top_level_promotes_diff_api` below for that contract.
     import pgrls.diff
 
     expected = {"Change", "ChangeKind", "Classification", "diff_schemas"}
@@ -79,3 +79,41 @@ def test_pgrls_diff_exports_change_and_diff_schemas() -> None:
             f"pgrls.diff.__all__ lists {name!r} but the attribute "
             "does not exist."
         )
+
+
+def test_top_level_promotes_diff_api() -> None:
+    # v0.5.9 promoted the four diff symbols (Change, ChangeKind,
+    # Classification, diff_schemas) from `pgrls.diff` to the
+    # top-level `pgrls` package. The re-exports MUST resolve to the
+    # exact same objects — `isinstance(c, pgrls.Change)` must work
+    # on a Change instance built via either import path, and
+    # callers comparing classes (e.g. for routing tests) must not
+    # see two separate identities.
+    #
+    # Pinning identity (`is`) rather than equality so a future
+    # refactor that accidentally re-defines the classes inside
+    # `pgrls/__init__.py` (instead of re-exporting) fails this test
+    # loudly — defining the class twice would silently break every
+    # isinstance check across the public surface.
+    import pgrls
+    import pgrls.diff
+
+    assert pgrls.diff_schemas is pgrls.diff.diff_schemas
+    assert pgrls.Change is pgrls.diff.Change
+    assert pgrls.ChangeKind is pgrls.diff.ChangeKind
+    # `Classification` is a typing.Literal alias; identity still
+    # holds because it's a module-level binding, not a class
+    # constructor — `is` is the right check here too.
+    assert pgrls.Classification is pgrls.diff.Classification
+
+    # The four names + `__version__` are the entire top-level
+    # surface as of v0.5.9. Pinning the full set so a future
+    # accidental import leak (e.g. `from pgrls.cli import main`
+    # at module top) doesn't silently expand the public surface.
+    assert set(pgrls.__all__) == {
+        "Change",
+        "ChangeKind",
+        "Classification",
+        "__version__",
+        "diff_schemas",
+    }

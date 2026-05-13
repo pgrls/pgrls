@@ -10,6 +10,30 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-05-12
+
+### Added
+- **Top-level diff API.** `diff_schemas`, `Change`, `ChangeKind`,
+  and `Classification` are now re-exported from the top-level
+  `pgrls` package. Both import paths resolve to the same object
+  identities:
+
+  ```python
+  from pgrls import diff_schemas, Change            # new in v0.5.9
+  from pgrls.diff import diff_schemas, Change       # still works
+  ```
+
+  `pgrls.diff` remains the canonical submodule; the top-level
+  binding is a re-export, not a copy. `isinstance(c, pgrls.Change)`
+  and `isinstance(c, pgrls.diff.Change)` both work on the same
+  object, and class identity (`pgrls.Change is pgrls.diff.Change`)
+  holds — so callers comparing classes across the public surface
+  don't see two separate identities.
+
+  No behavior change for callers who keep importing from
+  `pgrls.diff`. The promotion is additive — existing code paths
+  are unaffected.
+
 ## [0.5.8] - 2026-05-12
 
 ### Added
