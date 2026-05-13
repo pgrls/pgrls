@@ -46,11 +46,15 @@ breaking changes — they will be called out in this file.
 ### Changed
 - **Snapshot version 5 → 6.** Each `tables[i]` entry now carries
   a `triggers` array with one entry per user-authored trigger
-  (`schema`, `name`, `function_schema`, `function_name`,
-  `event`, `timing`, `enabled`). v3 / v4 / v5 baselines still
-  load via `Schema.from_snapshot` and round-trip with
-  `triggers=()` — SEC013 simply finds nothing to flag against
-  older snapshots until they're re-captured.
+  (`name`, `function_schema`, `function_name`, `event`, `timing`,
+  `enabled`). Triggers don't carry their own `schema` field —
+  Postgres scopes triggers per table (`pg_trigger` has no
+  `tgnamespace` column), so a trigger's schema is always its
+  table's. v3 / v4 / v5 baselines still **load** via
+  `Schema.from_snapshot` with `triggers=()` on every table; the
+  loaded Schema re-emits as v6 (matching the v4→v5 bump's load
+  semantics). SEC013 simply finds nothing to flag against older
+  snapshots until they're re-captured.
 
   Existing snapshots remain forward-compatible: `pgrls diff` and
   `pgrls fix` continue to work against v3+ baselines without

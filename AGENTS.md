@@ -709,8 +709,6 @@ Common leak shapes worth auditing for:
 * Trigger that "syncs" a derived column reads from a peer table
   with no tenant filter, exposing peer-tenant values through the
   synced column.
-* `INSTEAD OF` trigger on a view re-routes a write to a base
-  table bypassing the view's `WHERE` clause.
 
 The rule cannot read the trigger function body (PL/pgSQL bodies
 aren't parseable by pglast as top-level statements, and
@@ -724,6 +722,26 @@ partition-routing triggers) are filtered out at the introspection
 layer via `pg_trigger.tgisinternal = false`. Disabled triggers
 (`tgenabled = 'D'`) are captured in the snapshot but skipped by
 the rule — they can't fire under any `session_replication_role`.
+
+**Out of scope in v0.5.8**: INSTEAD OF triggers on views. The
+introspection layer only captures triggers whose `tgrelid` points
+to a regular or partitioned table (`relkind IN ('r','p')`).
+INSTEAD OF view-triggers are a real bypass surface — a write
+routed by an INSTEAD OF trigger can land in a base table without
+honoring the view's WHERE clause — and warrant a future
+companion rule on the view side. Until that lands, operators
+relying on view-triggers for security-sensitive writes should
+audit them manually.
+
+**Snapshot tampering**: `pgrls diff` does not yet emit
+`DIFF_TRIGGER_*` change kinds — an edit to a checked-in v6
+snapshot file that deletes a `triggers` entry or flips
+`enabled: true → false` will not show up as a diff finding.
+Treat snapshot files like any other security-relevant artifact:
+review changes, sign commits, restrict write access. A future
+release should add `DIFF_TRIGGER_ADDED` / `DIFF_TRIGGER_DROPPED`
+/ `DIFF_TRIGGER_DISABLED` (the last classifiable as
+`requires_review` since it silences SEC013).
 
 **Standard fix.** Audit the trigger function body for:
 

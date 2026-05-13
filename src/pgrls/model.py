@@ -136,12 +136,18 @@ class Trigger:
     Captured fields are the minimum SEC013 needs to message clearly
     and the operator needs to triage:
 
-    * ``schema`` + ``name`` — the trigger's identity; combined with
-      the table's qualified name they form the allowlist key
-      ``schema.table.trigger_name``.
+    * ``name`` — the trigger's identity; combined with the owning
+      table's qualified name it forms the allowlist key
+      ``schema.table.trigger_name``. Postgres scopes triggers per
+      table, not per schema (``pg_trigger`` has no ``tgnamespace``
+      column), so a separate trigger-schema field would always
+      duplicate the table's schema — omitted for clarity.
     * ``function_schema`` + ``function_name`` — the function this
       trigger calls. SEC013's message names it explicitly so the
-      operator knows what code to audit.
+      operator knows what code to audit. The function CAN live in
+      a different schema than the table (cross-schema callouts are
+      legal and common with audit-functions in an ``audit`` schema),
+      so this is captured separately.
     * ``event`` — the event mask rendered as Postgres syntax (e.g.
       ``INSERT``, ``UPDATE``, ``INSERT OR UPDATE``, ``TRUNCATE``).
     * ``timing`` — ``BEFORE``, ``AFTER``, or ``INSTEAD OF``.
@@ -154,9 +160,19 @@ class Trigger:
     foreign-key check triggers, RI constraint helpers, etc.) are
     filtered at the SQL layer; they're not user-authored and don't
     represent an audit target.
+
+    Trigger captures the audit-relevant subset of ``pg_trigger``,
+    not the DDL-regeneration-complete shape. Fields NOT captured:
+    ``WHEN`` clauses, ``REFERENCING NEW TABLE`` / ``OLD TABLE``
+    transition tables, ``UPDATE OF column_list`` filters, and the
+    ROW vs STATEMENT axis (``tgtype`` bit 0). ``Schema.to_sql()``
+    does NOT emit ``CREATE TRIGGER`` statements; the migration-as-
+    input flow (``pgrls diff --apply``) treats triggers as
+    pre-existing on the live DB and doesn't replicate them into
+    the ephemeral baseline container. A future release that wants
+    DDL regeneration would need a snapshot bump to capture these.
     """
 
-    schema: str
     name: str
     function_schema: str
     function_name: str
@@ -329,7 +345,6 @@ class Schema:
                     # with `triggers=()` → empty array.
                     "triggers": [
                         {
-                            "schema": tr.schema,
                             "name": tr.name,
                             "function_schema": tr.function_schema,
                             "function_name": tr.function_name,
@@ -484,7 +499,6 @@ class Schema:
             triggers_raw = t.get("triggers", [])
             triggers = tuple(
                 Trigger(
-                    schema=tr["schema"],
                     name=tr["name"],
                     function_schema=tr["function_schema"],
                     function_name=tr["function_name"],

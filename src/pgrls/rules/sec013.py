@@ -22,9 +22,6 @@ Examples of the silent leak in practice:
 * Trigger that "syncs" a derived column reads from a peer table with
   no tenant filter, exposing peer-tenant values through the synced
   column.
-* INSTEAD OF trigger on a view re-routes a write to a base table
-  bypassing the view's WHERE clause.
-
 Detection is structural: every user-authored, enabled trigger on an
 RLS-enabled table gets a warning. The rule can't read the trigger
 function body (PL/pgSQL bodies aren't parseable by pglast as
@@ -34,6 +31,16 @@ here), so the warning is intentionally a prompt-to-audit rather
 than a proof of leak. Internal triggers (foreign-key check helpers,
 partition-routing triggers, RI plumbing) are filtered at the
 introspection layer via `pg_trigger.tgisinternal = false`.
+User-authored `CREATE CONSTRAINT TRIGGER` rows (`tgconstraint != 0`
+but `tgisinternal = false`) are NOT filtered — deferred constraint
+triggers still fire as the table owner and present the same RLS
+bypass surface as any other AFTER trigger.
+
+Out of scope in v0.5.8: INSTEAD OF triggers on views
+(``relkind = 'v'``) and triggers on foreign tables
+(``relkind = 'f'``). See AGENTS.md SEC013 section for the full
+rationale; operators in those situations should audit the
+relevant triggers manually until follow-up rules land.
 
 Severity: warning. Allowlist by qualified trigger ID
 (`schema.table.trigger_name`) once the operator has audited the
@@ -47,7 +54,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.model import Schema, Trigger
+from pgrls.model import Schema, Table, Trigger
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -90,20 +97,17 @@ class SEC013:
                 )
                 if trigger_id in allowlist:
                     continue
-                out.append(self._violation(table_qname=table.qualified_name,
-                                           trigger_id=trigger_id,
-                                           trigger=trigger))
+                out.append(self._violation(table, trigger))
         return out
 
-    def _violation(
-        self, *, table_qname: str, trigger_id: str, trigger: Trigger
-    ) -> Violation:
+    def _violation(self, table: Table, trigger: Trigger) -> Violation:
+        trigger_id = f"{table.schema}.{table.name}.{trigger.name}"
         return Violation(
             rule_id=self.id,
             severity=self.severity,
             title=self.title,
             message=(
-                f"Table {table_qname} has RLS enabled but trigger "
+                f"Table {table.qualified_name} has RLS enabled but trigger "
                 f"{trigger.name!r} ({trigger.timing} {trigger.event}) "
                 f"calls function {trigger.function_qualified_name}. "
                 "Triggers fire as the table owner — any SELECT, "

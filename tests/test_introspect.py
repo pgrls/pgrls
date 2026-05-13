@@ -887,7 +887,6 @@ def test_populates_table_triggers(
     t = next(x for x in schema.tables if x.name == "t")
     assert len(t.triggers) == 1
     trg = t.triggers[0]
-    assert trg.schema == "public"
     assert trg.name == "guard"
     # Built-in trigger function lives in pg_catalog.
     assert trg.function_schema == "pg_catalog"
@@ -987,3 +986,87 @@ def test_triggers_are_deterministic_per_table(
     schema = introspect(pg_conn, schemas=["public"])
     t = next(x for x in schema.tables if x.name == "t")
     assert [tr.name for tr in t.triggers] == ["alpha_guard", "zeta_guard"]
+
+
+def test_triggers_captures_truncate_event(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # `TRUNCATE` is forced to STATEMENT-level by Postgres. The
+    # CASE-chain bit for TRUNCATE (`tgtype & 32`) must produce
+    # the literal "TRUNCATE" — the `or ""` fallback in introspect
+    # would mask a decoding bug as a missing event, so pin this
+    # explicitly. TRUNCATE-only triggers are common for cache /
+    # audit invalidation, so this is a real shape SEC013 needs
+    # to surface cleanly.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE TRIGGER on_truncate
+            BEFORE TRUNCATE ON public.t
+            FOR EACH STATEMENT EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert t.triggers[0].event == "TRUNCATE"
+
+
+def test_triggers_captures_statement_level_trigger(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # `FOR EACH STATEMENT` triggers fire once per UPDATE/DELETE
+    # statement rather than per row. They still run as the table
+    # owner, so the RLS-bypass surface is identical to a ROW
+    # trigger — SEC013 must fire on both. The ROW-vs-STATEMENT
+    # axis (`tgtype` bit 0) is intentionally not captured by the
+    # Trigger dataclass; this test just pins that the trigger
+    # surfaces in `Table.triggers` regardless of which axis it
+    # was declared on.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE TRIGGER stmt_guard
+            AFTER UPDATE ON public.t
+            FOR EACH STATEMENT EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert len(t.triggers) == 1
+    assert t.triggers[0].name == "stmt_guard"
+    assert t.triggers[0].timing == "AFTER"
+    assert t.triggers[0].event == "UPDATE"
+
+
+def test_triggers_propagation_from_partition_parent(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # On PG13+, declaring a trigger on a partitioned parent
+    # automatically clones it onto each child partition. The
+    # clones carry `tgparentid != 0` but `tgisinternal = false`,
+    # so the `tgisinternal` filter alone would leave them visible
+    # and SEC013 would double-fire (parent + each child). The
+    # `tgparentid = 0` filter keeps only the user-declared parent
+    # row. Pin this so a future PG version that flips the
+    # propagation semantics (or a refactor that drops the filter)
+    # doesn't silently produce duplicate violations per child.
+    apply_sql(
+        """
+        CREATE TABLE public.events (id INT, tenant TEXT) PARTITION BY LIST (tenant);
+        CREATE TABLE public.events_a PARTITION OF public.events FOR VALUES IN ('a');
+        CREATE TABLE public.events_b PARTITION OF public.events FOR VALUES IN ('b');
+        CREATE TRIGGER guard
+            BEFORE UPDATE ON public.events
+            FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    parent = next(x for x in schema.tables if x.name == "events")
+    child_a = next(x for x in schema.tables if x.name == "events_a")
+    child_b = next(x for x in schema.tables if x.name == "events_b")
+    # Parent carries the user-declared trigger.
+    assert [tr.name for tr in parent.triggers] == ["guard"]
+    # Children's auto-cloned triggers have `tgisinternal = true`
+    # and get filtered out — SEC013 won't double-fire.
+    assert child_a.triggers == ()
+    assert child_b.triggers == ()

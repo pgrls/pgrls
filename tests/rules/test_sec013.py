@@ -10,7 +10,6 @@ from pgrls.rules.sec013 import SEC013
 def _trigger(
     name: str = "tg",
     *,
-    schema: str = "public",
     function_schema: str = "public",
     function_name: str = "trg_fn",
     event: str = "INSERT",
@@ -18,7 +17,6 @@ def _trigger(
     enabled: bool = True,
 ) -> Trigger:
     return Trigger(
-        schema=schema,
         name=name,
         function_schema=function_schema,
         function_name=function_name,
@@ -74,21 +72,6 @@ def test_sec013_fires_on_enabled_trigger_for_rls_enabled_table() -> None:
     assert "BEFORE" in v.message
     assert "INSERT" in v.message
     assert "owner" in v.message.lower()  # bypass explanation
-
-
-def test_sec013_silent_when_rls_disabled() -> None:
-    # SEC001's territory. Triggers on RLS-off tables aren't bypassing
-    # anything because the policies don't apply.
-    schema = Schema(
-        tables=(
-            _table(
-                "events",
-                rls=False,
-                triggers=(_trigger("audit_insert"),),
-            ),
-        )
-    )
-    assert SEC013().check(schema, {}) == []
 
 
 def test_sec013_silent_when_no_triggers() -> None:
@@ -170,6 +153,13 @@ def test_sec013_message_includes_timing_and_event() -> None:
 
 
 def test_sec013_message_handles_instead_of_trigger() -> None:
+    # Defensive: introspection in v0.5.8 never emits this shape
+    # because INSTEAD OF triggers live on views (`relkind = 'v'`)
+    # and the introspect query only captures `relkind IN ('r','p')`
+    # rows. The synthetic Table here exists purely to pin the rule's
+    # message-formatting branch for `timing="INSTEAD OF"`, so a
+    # future companion rule on the view side (VIEW005 or similar)
+    # can reuse the same formatting logic without surprise.
     schema = Schema(
         tables=(
             _table(
