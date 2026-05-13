@@ -1,0 +1,69 @@
+name: go
+
+# Run on every PR / push to main that touches `go/` files or this
+# workflow. Keeps CI scoped — a pure-Python change doesn't trigger
+# a Go matrix run, and vice-versa for the existing `test.yml` /
+# `ts.yml` workflows.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "go/**"
+      - ".github/workflows/go.yml"
+  pull_request:
+    paths:
+      - "go/**"
+      - ".github/workflows/go.yml"
+
+# Defense-in-depth: this workflow only reads the repo and reports
+# back via the default check-run mechanism. No write permissions.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go (${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.22 is the minimum declared in go.mod. 1.23 catches
+        # newer-Go regressions before they bite a downstream user.
+        # Bump alongside go.mod when raising the floor.
+        go-version: ["1.22", "1.23"]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache-dependency-path: go/go.sum
+
+      - name: Verify go.mod is tidy
+        # `go mod tidy` is idempotent — if running it produces a
+        # diff, the committed go.mod / go.sum is out of date.
+        # Step 1 ships no third-party deps so go.sum doesn't
+        # exist yet; the conditional avoids a "file not found"
+        # error until step 3 adds the pgx + lib/pq deps.
+        run: |
+          go mod tidy
+          if [ -f go.sum ]; then
+            git diff --exit-code go.mod go.sum
+          else
+            git diff --exit-code go.mod
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (with race detector)
+        # `-race` catches the kind of concurrency bug the TS port's
+        # postgres.js adapter had (cached promise overwriting a
+        # newer reservation). The Go race detector is the standard
+        # tool for that class of bug.
+        run: go test -race -v ./...
