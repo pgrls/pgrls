@@ -14,80 +14,9 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import {
-  PgrlsTestClient,
-  PgrlsTestError,
-  type Driver,
-  type QueryResult,
-} from '../src/index.js';
+import { PgrlsTestClient, PgrlsTestError } from '../src/index.js';
 
-interface RecordedCall {
-  sql: string;
-  params: readonly unknown[];
-}
-
-type ResponseFn = (sql: string, params: readonly unknown[]) => QueryResult | Error;
-
-interface RecordingDriver extends Driver {
-  calls: RecordedCall[];
-  /**
-   * Set a canned response for queries whose SQL matches a
-   * substring. The first matching responder wins. Default:
-   * empty result, command='SELECT', rowCount=0.
-   */
-  on(sqlSubstring: string, response: ResponseFn): void;
-}
-
-function makeRecordingDriver(): RecordingDriver {
-  const calls: RecordedCall[] = [];
-  const responders: { match: string; fn: ResponseFn }[] = [];
-  const driver: RecordingDriver = {
-    calls,
-    on(sqlSubstring, response) {
-      responders.push({ match: sqlSubstring, fn: response });
-    },
-    async query(sql, params = []) {
-      calls.push({ sql, params });
-      for (const { match, fn } of responders) {
-        if (sql.includes(match)) {
-          const result = fn(sql, params);
-          if (result instanceof Error) throw result;
-          return await Promise.resolve(result);
-        }
-      }
-      return await Promise.resolve({
-        rows: [],
-        command: 'SELECT',
-        rowCount: 0,
-      });
-    },
-    async rollback() {
-      calls.push({ sql: 'ROLLBACK', params: [] });
-      await Promise.resolve();
-    },
-    isInsufficientPrivilege(error: unknown) {
-      return (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        (error as { code?: unknown }).code === '42501'
-      );
-    },
-  };
-  return driver;
-}
-
-/**
- * Default capture response for the SELECT-current-user-and-claims
- * query that asRole emits at entry.
- */
-function captureResponse(user: string, claims: string | null): QueryResult {
-  return {
-    rows: [{ current_user: user, claims: claims ?? '' }],
-    command: 'SELECT',
-    rowCount: 1,
-  };
-}
+import { captureResponse, makeRecordingDriver } from './_recording-driver.js';
 
 describe('PgrlsTestClient — transaction', () => {
   it('issues BEGIN before body, ROLLBACK after', async () => {
@@ -280,7 +209,12 @@ describe('PgrlsTestClient — asRole (entry sequence)', () => {
     expect(setConfig).toBeUndefined();
   });
 
-  it('treats undefined claims like null (skips set_config)', async () => {
+  it('treats absent claims key like null (skips set_config)', async () => {
+    // `exactOptionalPropertyTypes: true` rejects `claims: undefined`
+    // at compile time, so the absent-key case is what users actually
+    // hit when they don't want claims. The runtime `?? null` collapse
+    // still handles `undefined` defensively, but it's not reachable
+    // via the typed API.
     const driver = makeRecordingDriver();
     driver.on('SELECT current_user', () => captureResponse('admin', null));
     const client = new PgrlsTestClient(driver);

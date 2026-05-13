@@ -7,6 +7,74 @@ package adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `PROTOCOL_VERSION` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python client.
 
+## [0.6.1] - 2026-05-12
+
+Post-release review pass. Bug fix + polish; no protocol changes.
+
+### Fixed
+
+- **`assertSilentlyDropped` now rejects UPDATE/DELETE without
+  RETURNING.** The Python helper catches `psycopg.
+  ProgrammingError` from `cur.fetchall()` when there's no
+  result set, so a typo like `assertSilentlyDropped('UPDATE
+  t SET x = 1')` (forgot to add `RETURNING id`) raises a
+  clear `PgrlsTestError`. Both `pg` and `postgres.js`
+  synthesize an empty rows array instead, so v0.6.0's TS
+  port couldn't distinguish "RETURNING returned 0 rows"
+  from "no RETURNING at all" — the helper would silently
+  pass whenever RLS happened to filter every row, defeating
+  the test's purpose. v0.6.1 adds a SQL-keyword pre-check
+  (`/\bRETURNING\b/i`) that fires the same `PgrlsTestError`
+  Python raises, restoring byte-for-byte parity. Four new
+  unit tests cover UPDATE/DELETE without RETURNING,
+  case-insensitive matching, and word-boundary handling
+  (`returning_col` is rejected; `returning` keyword is
+  accepted). The regex is documented as deliberately not
+  parsing SQL: false positives like RETURNING inside a
+  string literal aren't the helper's responsibility.
+
+- **`fetchAll<TRow>` generic constraint relaxed.** v0.6.0
+  declared `fetchAll<TRow extends Record<string, unknown> = …>`,
+  which under TS structural typing rejects `interface` row
+  declarations (`interface Invoice { id: number; … }`) because
+  interfaces lack implicit index signatures — only `type`
+  aliases get them. Most users declare row shapes as
+  `interface`, so the constraint produced a confusing
+  compile error on the dominant idiom. v0.6.1 drops the
+  `extends` constraint; the default type is still
+  `Record<string, unknown>` and the cast was unchecked anyway
+  (mirrors Python's untyped `dict` return from `fetchall`).
+
+- **`AsRoleOptions.claims` docstring corrected.** Was
+  "`undefined` is treated as `null` by JS convention" — true
+  at runtime but misleading under
+  `exactOptionalPropertyTypes: true` (which this package's
+  `tsconfig` enables), which rejects `claims: undefined` at
+  compile time. Docstring now says "omit the key or pass
+  `null`" and the corresponding test was renamed from "treats
+  undefined claims like null" to "treats absent claims key
+  like null" to match what's actually reachable.
+
+### Internal
+
+- Extracted shared `newSavepointName(prefix)` helper to
+  `src/_savepoint.ts`. Was duplicated between `client.ts`
+  (`pgrls_actor_` prefix) and `assertions.ts`
+  (`pgrls_check_` prefix).
+- Extracted shared `makeRecordingDriver` / `captureResponse`
+  / `selectRows` test helpers to `test/_recording-driver.ts`.
+  Was duplicated between `client.test.ts` and
+  `assertions.test.ts`.
+- Tightened `QueryResult.command` from `string` to the
+  known-verb union widened with `(string & {})`, giving
+  editor autocomplete for verbs we care about while
+  remaining assignable from any string.
+- Added two new conformance tests covering `asRole` claim-
+  restore cases 2 (outer had no claims, inner set claims)
+  and 4 (outer had claims, inner didn't set claims).
+  Previous v0.6.0 conformance only covered case 1; cases
+  2-4 were unit-test-only.
+
 ## [0.6.0] - 2026-05-08
 
 Initial public release. TypeScript port of the Python `pgrls.testing` package.

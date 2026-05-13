@@ -54,8 +54,27 @@ export interface QueryResult {
    * Always upper-case. Empty string when the driver can't
    * determine the verb (defensive — shouldn't happen in
    * practice).
+   *
+   * Type is a known-verb union widened with `(string & {})`
+   * — the union gives editor autocomplete for the verbs we
+   * actually care about, while the intersection keeps the
+   * field assignable from any string (CREATE, ALTER, DO,
+   * etc., plus any Postgres tag we haven't enumerated). The
+   * pattern is a standard TypeScript idiom for "literal
+   * suggestions without restricting to those literals."
    */
-  command: string;
+  command:
+    | 'SELECT'
+    | 'INSERT'
+    | 'UPDATE'
+    | 'DELETE'
+    | 'BEGIN'
+    | 'COMMIT'
+    | 'ROLLBACK'
+    | 'SAVEPOINT'
+    | 'RELEASE'
+    | ''
+    | (string & {});
 
   /**
    * Affected-row count from the command tag.

@@ -105,7 +105,7 @@ All five are also exported as standalone functions taking a client argument firs
 
 ```ts
 // vitest.setup.ts
-import { afterAll, afterEach, beforeAll } from 'vitest';
+import { afterAll, beforeAll } from 'vitest';
 import { Client } from 'pg';
 import { PgrlsTestClient, pgDriver } from 'pgrls-test';
 
@@ -171,7 +171,7 @@ Catch any pgrls-test failure with `if (e instanceof PgrlsTestError) …`.
 
 `pgrls-test` and Python's `pgrls.testing` implement the same Layer 1 protocol. The wire-level sequence — `SET LOCAL ROLE`, `set_config('request.jwt.claims', …, true)`, `SAVEPOINT pgrls_actor_<random>`, the four-case claim restoration logic — is byte-for-byte equivalent.
 
-The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across languages: `RESERVED_KEYWORDS.size === 78` matches Python's `len(_RESERVED_KEYWORDS)`. CI runs the conformance suite on both implementations against an identical Postgres testcontainer to catch any drift.
+The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across languages: `RESERVED_KEYWORDS.size === 78` matches Python's `len(_RESERVED_KEYWORDS)` (Postgres 16 fully-reserved keywords, appendix C). Each implementation's CI runs its own conformance suite against a Postgres testcontainer; drift protection comes from the shared protocol doc and matching wire-level test cases on both sides, not a single shared CI job.
 
 ## Comparison to Python
 
@@ -180,6 +180,7 @@ The `RESERVED_KEYWORDS` set used for identifier quoting is also pinned across la
 | Open client | `PgrlsTestClient(conn)` | `new PgrlsTestClient(driver)` |
 | Per-test tx | `with client.transaction():` | `await client.transaction(async () => …)` |
 | Switch role | `with client.as_role(r, claims=c):` | `await client.asRole(r, { claims: c }, async () => …)` |
+| Bulk insert | `client.seed(table, rows)` | `await client.seed(table, rows)` |
 | Assert rows | `client.assert_rows(sql, count=n)` | `await client.assertRows(sql, { count: n })` |
 | Assert reject | `client.assert_rejected(sql)` | `await client.assertRejected(sql)` |
 

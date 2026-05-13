@@ -1,6 +1,6 @@
 {
   "name": "pgrls-test",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Code-first RLS testing for Postgres — TypeScript port of pgrls.testing. Implements the cross-language Layer 1 protocol (PROTOCOL_VERSION 1).",
   "type": "module",
   "main": "./dist/index.js",
