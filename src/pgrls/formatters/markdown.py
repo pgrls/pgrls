@@ -31,8 +31,13 @@ a reader follows the link.
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 
+from pgrls.formatters._common import (
+    EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    safe_location,
+)
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
@@ -73,14 +78,75 @@ def format_markdown(violations: list[Violation]) -> str:
 def _row(v: Violation) -> str:
     severity = _SEVERITY_LABEL[v.severity]
     rule_link = _rule_link(v.rule_id)
-    # Backtick the location so identifiers with mixed case or spaces
-    # don't get auto-linked or re-rendered. Schema-wide findings
-    # match the SARIF / text formatters' `(schema-wide)` sentinel
-    # but italicize it so it visually distinguishes from a real
-    # qualified name in the same column.
-    location = f"`{v.location}`" if v.location else "_(schema-wide)_"
     message = _escape_cell(v.message)
-    return f"| {severity} | {rule_link} | {location} | {message} |\n"
+    return f"| {severity} | {rule_link} | {_location_cell(v.location)} | {message} |\n"
+
+
+def _location_cell(location: str | None) -> str:
+    """Render a `Violation.location` for the GFM table.
+
+    Backtick the location so identifiers with mixed case or spaces
+    don't get auto-linked or re-rendered. Schema-wide findings
+    match the SARIF / text formatters' `(schema-wide)` sentinel
+    but italicize it so it visually distinguishes from a real
+    qualified name in the same column.
+
+    `safe_location` strips / escapes newlines, tabs, and zero-width
+    chars first so the table row stays intact even when a Postgres
+    identifier carries `\\n` (legal inside a quoted identifier). The
+    remaining `|` characters then get backslash-escaped manually —
+    we deliberately skip `_escape_cell` because that helper doubles
+    `\\` (correct for rule-author messages that contain literal
+    backslashes, wrong for our own backslash-escaped representation
+    of a newline, which would become a misleading `\\\\n` in the
+    rendered cell). The cell-content is also a no-op for the well-
+    formed case: `safe_location` short-circuits on clean input and
+    the `.replace("|", "\\|")` does nothing.
+
+    Two edge cases need special handling:
+
+    * **Backticks inside the location.** Wrapping in single
+      backticks `` `loc` `` would let an inner backtick close the
+      code span early, leaving the rest of the cell as plain
+      markdown (where `*`, `_`, `[`, etc. would re-render). The
+      GFM rule for code spans is that the wrapper must be a run
+      of backticks LONGER than any run inside the content — a
+      cell with 2 consecutive `` `` `` requires a 3-backtick
+      wrapper, and so on. The wrapper width here is computed as
+      `(longest_run_inside + 1)`, with space padding so the
+      content can also start or end with backticks. Pure-single-
+      backtick path stays cheap: no inner backticks → 1-backtick
+      wrapper, no padding (matches the well-formed common case).
+    * **Empty after sanitization.** A location composed entirely
+      of zero-width chars (e.g. `chr(0x200B)`) collapses to `""`
+      once `safe_location` drops the formatting chars. Emitting
+      `` ` ` `` (empty backtick pair) renders as a blank cell
+      that's indistinguishable from `None`; instead, fall back
+      to the `EMPTY_OR_ZERO_WIDTH_SENTINEL` so the operator sees
+      there WAS something at that location, just nothing
+      displayable.
+    """
+    if not location:
+        return "_(schema-wide)_"
+    clean = safe_location(location).replace("|", "\\|")
+    if not clean:
+        # The original location was non-empty but `safe_location`
+        # dropped every character (e.g. all zero-width). Surface
+        # this fact rather than rendering a silent blank cell.
+        return f"_{EMPTY_OR_ZERO_WIDTH_SENTINEL}_"
+    if "`" not in clean:
+        return f"`{clean}`"
+    # Compute the longest run of consecutive backticks inside the
+    # cleaned location, then pick a wrapper of (longest + 1)
+    # backticks. The space padding is the GFM idiom that lets the
+    # content start or end with a backtick — the renderer strips
+    # one space from each side before rendering literal content.
+    longest_run = max(
+        (len(m) for m in re.findall(r"`+", clean)),
+        default=0,
+    )
+    wrapper = "`" * (longest_run + 1)
+    return f"{wrapper} {clean} {wrapper}"
 
 
 def _rule_link(rule_id: str) -> str:
