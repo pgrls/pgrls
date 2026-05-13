@@ -889,9 +889,13 @@ Detection is structural:
    table. Unqualified refs are assumed own-table; qualified refs
    (`alias.col`, `schema.table.col`) are kept only when the
    qualifier matches.
-4. Drop refs to columns not in `Table.columns` — those are
-   HYG001's territory and PERF003 has nothing useful to say about
-   indexing a column that doesn't exist.
+4. Drop refs to columns not in `Table.columns` (when
+   `Table.columns` is populated — v5+ snapshots and all live
+   introspection) — those are HYG001's territory and PERF003 has
+   nothing useful to say about indexing a column that doesn't
+   exist. The check is gated on a non-empty `columns` set so v3 /
+   v4 baselines that legitimately have empty columns don't lose
+   all PERF003 coverage.
 5. For each remaining column, look up `Table.indexes` for an
    index whose leading column matches. If none, fire.
 

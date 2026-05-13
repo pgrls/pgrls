@@ -42,9 +42,10 @@ breaking changes — they will be called out in this file.
   loaded Schema re-emits as v7. PERF003 simply finds nothing to
   flag against older snapshots until they're re-captured.
 
-  Existing snapshots remain forward-compatible: `pgrls diff` and
-  `pgrls fix` continue to work against v3+ baselines without
-  re-snapshotting. Only PERF003 needs v7 to surface findings.
+  Existing snapshots remain forward-compatible: `pgrls diff`
+  continues to work against v3+ baselines without re-snapshotting.
+  `pgrls fix` operates against a live DB only (not a baseline) and
+  is unaffected. Only PERF003 needs v7 to surface findings.
 
 - **Allowlist entries with leading/trailing whitespace now raise**
   (rolled in from PR #44 — was Unreleased prior to v0.5.10).
@@ -57,7 +58,7 @@ breaking changes — they will be called out in this file.
   with the stripped form shown in the message. Affects every
   allowlist parser:
   `parse_policy_id_allowlist` (SEC003, SEC005, SEC006, SEC008,
-  SEC010, SEC011, SEC013, PERF001, PERF002, HYG002),
+  SEC010, SEC011, SEC013, PERF001, PERF002, PERF003, HYG002),
   `parse_table_ref_allowlist` (SEC001, SEC002, SEC009, SEC012),
   `parse_qualified_table_allowlist` (SEC007),
   `parse_qualified_view_allowlist` (VIEW001-VIEW004). Internal
