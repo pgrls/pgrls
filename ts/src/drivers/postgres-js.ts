@@ -111,14 +111,22 @@ export type PostgresJsResult<TRow> = readonly TRow[] & {
  * test harnesses that recycle the driver across test cases.
  */
 export function postgresJsDriver(sql: PostgresJsSql): Driver {
-  // The pinned connection. `null` means "no reservation yet";
-  // `query()` lazily reserves on first use. After `close()`,
-  // this returns to `null` so a subsequent `query()` re-pins.
-  let reserved: PostgresJsReservedSql | null = null;
+  // The pinned-connection promise. `null` means "no reservation
+  // in flight yet"; `query()` lazily kicks off `sql.reserve()`
+  // on first use and stores the promise (NOT the resolved value)
+  // so concurrent callers all await the same promise instead of
+  // each kicking off their own reservation. Storing only the
+  // resolved value would race: two concurrent `pinnedSql()` calls
+  // could both observe `reserved === null`, both call
+  // `sql.reserve()`, and the second reservation would leak (its
+  // `release()` never called). The promise variant is atomic by
+  // construction. After `close()`, this returns to `null` so a
+  // subsequent `query()` re-pins.
+  let reservedPromise: Promise<PostgresJsReservedSql> | null = null;
 
-  async function pinnedSql(): Promise<PostgresJsReservedSql> {
-    reserved ??= await sql.reserve();
-    return reserved;
+  function pinnedSql(): Promise<PostgresJsReservedSql> {
+    reservedPromise ??= sql.reserve();
+    return reservedPromise;
   }
 
   return {
@@ -163,19 +171,23 @@ export function postgresJsDriver(sql: PostgresJsSql): Driver {
       );
     },
 
-    close(): Promise<void> {
+    async close(): Promise<void> {
       // Idempotent: noop on second call. A `query()` after
-      // `close()` re-acquires (see `pinnedSql`).
-      // `release()` is synchronous in postgres.js v3.4+ but the
-      // method signature returns `Promise<void>` to match the
-      // optional `Driver.close()` contract (other adapters may
-      // need to do async teardown — e.g. a future Bun.sql
-      // adapter could `await sql.end()` here).
-      if (reserved !== null) {
-        reserved.release();
-        reserved = null;
+      // `close()` re-acquires (see `pinnedSql`). Awaits any
+      // in-flight reservation before releasing so a concurrent
+      // `close()` + first-`query()` race resolves to "reserve
+      // then immediately release" rather than leaving the
+      // reservation orphaned. `release()` is synchronous in
+      // postgres.js v3.4+ but the method signature returns
+      // `Promise<void>` to match the optional `Driver.close()`
+      // contract (other adapters may need async teardown — e.g.
+      // a future Bun.sql adapter could `await sql.end()` here).
+      if (reservedPromise !== null) {
+        const inFlight = reservedPromise;
+        reservedPromise = null;
+        const reservation = await inFlight;
+        reservation.release();
       }
-      return Promise.resolve();
     },
   };
 }

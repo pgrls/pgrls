@@ -262,6 +262,38 @@ describe('postgresJsDriver — connection pinning (v0.6.2+)', () => {
     expect(mock.released.count).toBe(0);
   });
 
+  it('concurrent first-queries share one reservation (race-safe)', async () => {
+    // Two queries start before either reservation resolves.
+    // The naive `reserved ??= await sql.reserve()` pattern would
+    // race: both observers see `null`, both call `reserve()`, the
+    // second reservation leaks. The promise-based pinning stores
+    // the in-flight promise so both awaits see the same one.
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    await Promise.all([driver.query('SELECT 1'), driver.query('SELECT 2')]);
+
+    // Exactly one reserve call across both concurrent queries.
+    expect(mock.reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it('close while reservation is in flight releases on settle', async () => {
+    // Edge case: close() called before the lazy reserve has
+    // resolved. The implementation should await the in-flight
+    // promise and then release, not orphan the reservation.
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    // Kick off a query but don't await it yet.
+    const inFlight = driver.query('SELECT 1');
+    // Close immediately. The reservation promise is in flight.
+    const closing = driver.close!();
+    // Both settle.
+    await Promise.all([inFlight, closing]);
+
+    expect(mock.released.count).toBe(1);
+  });
+
   it('query after close re-reserves a fresh connection', async () => {
     const mock = makeMockSql(makeResult([], 'SELECT', 0));
     const driver = postgresJsDriver(mock);

@@ -54,7 +54,7 @@
   },
   "peerDependencies": {
     "pg": ">=8",
-    "postgres": ">=3"
+    "postgres": ">=3.4"
   },
   "peerDependenciesMeta": {
     "pg": {
