@@ -61,15 +61,63 @@ const pg = new Client({ connectionString: url });
 await pg.connect();
 const client = new PgrlsTestClient(pgDriver(pg));
 
-// postgres.js:
+// postgres.js (v0.6.2+ pins one pool connection internally
+// via sql.reserve() — no need for { max: 1 } anymore):
 import postgres from 'postgres';
 import { PgrlsTestClient, postgresJsDriver } from 'pgrls-test';
 
-const sql = postgres(url, { max: 1 }); // single connection so SET LOCAL sticks
+const sql = postgres(url);
 const client = new PgrlsTestClient(postgresJsDriver(sql));
+try {
+  // ... run tests ...
+} finally {
+  await client.close(); // release the pinned pool connection
+}
 ```
 
 The cross-language conformance suite runs the same tests against both adapters in CI.
+
+### Drizzle ORM
+
+Drizzle wraps either `pg.Pool` or `postgres.Sql` — `pgrls-test` works alongside either with no extra plumbing. Get a dedicated connection (or sql instance) for the test client; share the rest of your test setup with Drizzle:
+
+```ts
+// Drizzle on node-postgres
+import { drizzle } from 'drizzle-orm/node-postgres';
+import pg from 'pg';
+import { PgrlsTestClient, pgDriver } from 'pgrls-test';
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const db = drizzle(pool); // your app code keeps using this
+
+// For pgrls-test: pull a dedicated client out of the pool so
+// BEGIN / SET LOCAL ROLE / queries / ROLLBACK all land on one
+// connection. `await pgClient.release()` when the test ends.
+const pgClient = await pool.connect();
+const test = new PgrlsTestClient(pgDriver(pgClient));
+```
+
+```ts
+// Drizzle on postgres.js
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+import { PgrlsTestClient, postgresJsDriver } from 'pgrls-test';
+
+const sql = postgres(process.env.DATABASE_URL);
+const db = drizzle(sql); // your app code keeps using this
+
+// `pgrls-test`'s postgres.js adapter pins one pool connection
+// internally; `test.close()` releases it. No `{ max: 1 }` config
+// or separate sql instance needed.
+const test = new PgrlsTestClient(postgresJsDriver(sql));
+try {
+  // ... assertions ...
+} finally {
+  await test.close();
+}
+```
+
+The Drizzle `db` object and the `pgrls-test` client are independent — Drizzle owns the ORM surface, `pgrls-test` owns the raw-SQL test transaction. Both run against the same database; neither blocks the other.
 
 ## API
 
@@ -79,6 +127,7 @@ The cross-language conformance suite runs the same tests against both adapters i
 |---|---|
 | `new PgrlsTestClient(driver)` | Wrap a driver into the client surface. |
 | `client.transaction(body)` | Run `body` inside a transaction; ROLLBACK on exit (always). |
+| `client.close()` | Release driver-pinned resources (e.g. the postgres.js reserved connection). Idempotent. No-op for the `pg` adapter — the caller owns the `Client`. |
 
 ### SQL
 

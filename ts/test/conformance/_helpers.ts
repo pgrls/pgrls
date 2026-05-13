@@ -115,6 +115,14 @@ export function runConformanceTests(getClient: () => PgrlsTestClient): void {
     } catch {
       // Ignore — caller will see the error if it matters.
     }
+    // Release any driver-pinned resources (postgres.js's
+    // reserved connection). `pg` is a no-op since the caller
+    // owns the Client. v0.6.2+ — older suite versions didn't
+    // call this; the conformance suite happened to work
+    // because the test runner shut down the sql pool itself,
+    // but explicit close keeps the connection accounting
+    // clean and surfaces leaks early.
+    await client.close();
   });
 
   describe('Layer 1 protocol — conformance', () => {

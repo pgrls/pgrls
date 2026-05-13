@@ -1,0 +1,26 @@
+{
+  "$schema": "https://jsr.io/schema/config-file.v1.json",
+  "name": "@pgrls/test",
+  "version": "0.6.2",
+  "description": "Code-first RLS testing for Postgres — TypeScript port of pgrls.testing. Implements the cross-language Layer 1 protocol (PROTOCOL_VERSION 1).",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "publish": {
+    "include": [
+      "src/**/*.ts",
+      "README.md",
+      "CHANGELOG.md",
+      "LICENSE",
+      "jsr.json"
+    ],
+    "exclude": [
+      "src/**/*.test.ts",
+      "test/**",
+      "dist/**",
+      "coverage/**",
+      "node_modules/**"
+    ]
+  }
+}

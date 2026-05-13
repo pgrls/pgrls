@@ -10,6 +10,13 @@
  * mimics that shape so the adapter's `Array.from()`
  * normalization is exercised end-to-end.
  */
+/* eslint-disable @typescript-eslint/unbound-method --
+ * Test-only: vi.Mock spies are read directly off the mock
+ * object to assert `toHaveBeenCalled` etc. The unbound-method
+ * rule's "the method might forget its `this`" concern doesn't
+ * apply — these are vi spies, not the original methods, and
+ * the test never invokes them through the read reference.
+ */
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -41,18 +48,42 @@ function makeResult<T extends Record<string, unknown>>(
 
 /**
  * Build a mock postgres.js Sql that returns a canned result.
- * Records every call.
+ * Records every call. `reserve()` returns a reserved-shaped
+ * proxy that forwards `unsafe` to the same recorder and
+ * exposes a `release()` we can spy on (v0.6.2+: the adapter
+ * lazily reserves a connection on first query).
  */
-function makeMockSql(
-  canned: PostgresJsResult<Record<string, unknown>>,
-): PostgresJsSql & { calls: { text: string; params?: readonly unknown[] }[] } {
+function makeMockSql(canned: PostgresJsResult<Record<string, unknown>>): PostgresJsSql & {
+  calls: { text: string; params?: readonly unknown[] }[];
+  released: { count: number };
+} {
   const calls: { text: string; params?: readonly unknown[] }[] = [];
+  const released = { count: 0 };
+  const unsafe = vi.fn(async (text: string, params?: readonly unknown[]) => {
+    calls.push(params === undefined ? { text } : { text, params });
+    return await Promise.resolve(canned);
+  }) as unknown as PostgresJsSql['unsafe'];
+  // Reserved variant: same `unsafe` recorder + a chained
+  // `reserve()` (the postgres.js type extends Sql, so a
+  // ReservedSql is itself a Sql with `release()` tacked on)
+  // and a `release()` that increments the counter. Arrow
+  // functions (not `vi.fn`) so the lint rule that warns
+  // about unbound method scoping doesn't fire on the mock —
+  // these are test plumbing, not assertion subjects.
+  const reserved = {
+    calls,
+    released,
+    unsafe,
+    reserve: () => Promise.resolve(reserved),
+    release: () => {
+      released.count += 1;
+    },
+  };
   return {
     calls,
-    unsafe: vi.fn(async (text: string, params?: readonly unknown[]) => {
-      calls.push(params === undefined ? { text } : { text, params });
-      return await Promise.resolve(canned);
-    }) as unknown as PostgresJsSql['unsafe'],
+    released,
+    unsafe,
+    reserve: vi.fn(() => Promise.resolve(reserved)),
   };
 }
 
@@ -151,6 +182,97 @@ describe('postgresJsDriver — rollback', () => {
     await driver.rollback();
 
     expect(mock.calls).toEqual([{ text: 'ROLLBACK' }]);
+  });
+});
+
+describe('postgresJsDriver — connection pinning (v0.6.2+)', () => {
+  it('lazily reserves a connection on first query', async () => {
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    // Before any query, no reservation yet.
+    expect(mock.reserve).not.toHaveBeenCalled();
+
+    await driver.query('SELECT 1');
+
+    // One reservation, used for the first query.
+    expect(mock.reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses the reserved connection across multiple queries', async () => {
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    await driver.query('SELECT 1');
+    await driver.query('SELECT 2');
+    await driver.query('SELECT 3');
+
+    // One reserve call total — the adapter caches the
+    // reservation and reuses it. Without this caching,
+    // BEGIN/queries/ROLLBACK would scatter across pool
+    // connections and the transaction would break.
+    expect(mock.reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it('rollback uses the same pinned connection', async () => {
+    const mock = makeMockSql(makeResult([], 'ROLLBACK', 0));
+    const driver = postgresJsDriver(mock);
+
+    await driver.query('BEGIN');
+    await driver.rollback();
+
+    // One reservation, two queries (BEGIN + ROLLBACK) on the
+    // same pinned connection.
+    expect(mock.reserve).toHaveBeenCalledTimes(1);
+    expect(mock.calls.map((c) => c.text)).toEqual(['BEGIN', 'ROLLBACK']);
+  });
+
+  it('close() releases the reserved connection', async () => {
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    await driver.query('SELECT 1');
+    expect(mock.released.count).toBe(0);
+
+    await driver.close!();
+    expect(mock.released.count).toBe(1);
+  });
+
+  it('close() is idempotent', async () => {
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    await driver.query('SELECT 1');
+    await driver.close!();
+    await driver.close!();
+    await driver.close!();
+
+    // First close released the reservation; subsequent
+    // closes are no-ops.
+    expect(mock.released.count).toBe(1);
+  });
+
+  it('close() without any prior query is a no-op', async () => {
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    await driver.close!();
+
+    expect(mock.reserve).not.toHaveBeenCalled();
+    expect(mock.released.count).toBe(0);
+  });
+
+  it('query after close re-reserves a fresh connection', async () => {
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    const driver = postgresJsDriver(mock);
+
+    await driver.query('SELECT 1');
+    await driver.close!();
+    await driver.query('SELECT 2');
+
+    // Two reservations: one before close, one after. Useful
+    // for test harnesses that recycle a driver across cases.
+    expect(mock.reserve).toHaveBeenCalledTimes(2);
   });
 });
 

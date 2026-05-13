@@ -141,4 +141,21 @@ export interface Driver {
    * that detail.
    */
   isInsufficientPrivilege(error: unknown): boolean;
+
+  /**
+   * Release any resources the driver acquired lazily.
+   *
+   * Optional — adapters whose underlying client doesn't need
+   * explicit release (e.g. `pg.Client`, which the caller
+   * already owns) can omit this. The `postgres.js` adapter
+   * implements it because it lazily reserves a pool
+   * connection on first `query()` and must release that
+   * reservation back to the pool when the test finishes.
+   *
+   * `PgrlsTestClient.close()` forwards to this when present.
+   * Calling `close()` more than once is a no-op; subsequent
+   * `query()` / `rollback()` calls after `close()` may
+   * re-acquire a fresh connection (adapter-specific).
+   */
+  close?(): Promise<void>;
 }
