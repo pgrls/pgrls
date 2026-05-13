@@ -86,3 +86,47 @@ jobs:
           # access token scoped to the `pgrls-test` package.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public
+
+  publish-jsr:
+    name: Publish to JSR
+    # Run in parallel with the npm job — neither depends on the
+    # other, but both gate on the same tag push so the two
+    # registries track the same version.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    permissions:
+      contents: read
+      # OIDC token used by `npx jsr publish` for the JSR
+      # provenance attestation. Mirrors the npm provenance flow.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify jsr.json version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#ts-v}"
+          JSR_VERSION="$(node -p "require('./jsr.json').version")"
+          if [ "$TAG_VERSION" != "$JSR_VERSION" ]; then
+            echo "::error::Tag version $TAG_VERSION != jsr.json version $JSR_VERSION"
+            exit 1
+          fi
+          echo "Publishing @pgrls/test@$JSR_VERSION to JSR"
+
+      - name: Publish to JSR
+        # `npx jsr publish` reads jsr.json and pushes via the
+        # OIDC token. No long-lived secret needed — the GitHub
+        # OIDC claim is what JSR verifies for "this was built
+        # by the repo it claims to be from."
+        run: npx --yes jsr publish
