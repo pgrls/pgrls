@@ -215,3 +215,56 @@ def test_qualified_view_allowlist_rejects_empty_part() -> None:
         parse_qualified_view_allowlist(
             "VIEW001", {"allowlist": [".user_summary"]}
         )
+
+
+# --- whitespace handling (shared across all allowlist parsers) ---
+
+
+@pytest.mark.parametrize(
+    "parser, rule_id, sample",
+    [
+        (parse_policy_id_allowlist, "SEC003", " public.users.tenant_isolation"),
+        (parse_policy_id_allowlist, "SEC003", "public.users.tenant_isolation "),
+        (parse_table_ref_allowlist, "SEC001", " public.users "),
+        (parse_qualified_table_allowlist, "SEC007", " public.users"),
+        (parse_qualified_view_allowlist, "VIEW001", "public.user_summary "),
+    ],
+)
+def test_allowlist_rejects_leading_or_trailing_whitespace(
+    parser, rule_id: str, sample: str
+) -> None:
+    # Allowlist entries are compared with byte-exact equality
+    # against location strings built by introspection (e.g.
+    # `f"{schema}.{table}.{policy_name}"`), which never carry
+    # surrounding whitespace. A whitespaced entry would silently
+    # never match — the rule would keep firing and the operator
+    # would wonder why the allowlist isn't working. Raise loudly.
+    with pytest.raises(TypeError, match="leading or trailing whitespace"):
+        parser(rule_id, {"allowlist": [sample]})
+
+
+def test_allowlist_whitespace_error_includes_stripped_form() -> None:
+    # The error message hands the operator the fix verbatim so
+    # they don't have to figure out which character ran wrong.
+    try:
+        parse_policy_id_allowlist(
+            "SEC003", {"allowlist": ["  public.users.p  "]}
+        )
+    except TypeError as exc:
+        assert "'public.users.p'" in str(exc)
+        assert "SEC003" in str(exc)
+    else:
+        raise AssertionError("expected TypeError")
+
+
+def test_allowlist_internal_whitespace_still_allowed() -> None:
+    # Whitespace strictly at the boundaries is the typo case.
+    # Whitespace inside the entry (Postgres quoted identifier
+    # with a space in the name) is legal — Postgres allows
+    # `"my table"` as a relname, and a rule built from that
+    # would emit a location with that internal space. Don't
+    # over-correct.
+    out = parse_table_ref_allowlist(
+        "SEC001", {"allowlist": ["public.my table"]}
+    )
+    assert out == {"public.my table"}

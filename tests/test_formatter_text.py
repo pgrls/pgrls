@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pgrls.formatters import format_violations
+from pgrls.formatters._common import EMPTY_OR_ZERO_WIDTH_SENTINEL
 from pgrls.violations import Violation
 
 
@@ -203,3 +204,152 @@ def test_unknown_format_message_lists_supported_formats() -> None:
     import pytest
     with pytest.raises(ValueError, match="text"):
         format_violations([], format="xml")
+
+
+# ---------------------------------------------------------------------------
+# Hostile-input hardening (operator-controlled identifiers)
+# ---------------------------------------------------------------------------
+
+
+def test_text_location_with_newline_renders_single_line() -> None:
+    # Postgres allows `\n` inside quoted identifiers
+    # (`"weird\nname"`), so an attacker (or a confused dev) can
+    # create a trigger whose name embeds a newline. The text
+    # formatter must escape it so the violation row stays on a
+    # single line — otherwise CI scripts grepping with
+    # line-anchored patterns silently break.
+    vs = [
+        Violation(
+            rule_id="SEC013",
+            severity="warning",
+            title="t",
+            message="m",
+            location="public.invoices.evil\nINJECTED",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    # The literal newline is gone from the location row.
+    location_line = [
+        ln for ln in out.splitlines() if "SEC013" in ln
+    ][0]
+    assert "evil\\nINJECTED" in location_line
+    assert "INJECTED" in location_line
+    # No bare-newline split: the rule_id, location, and any
+    # injected content are all in one line.
+    assert location_line.count("SEC013") == 1
+
+
+def test_text_location_with_carriage_return_escaped() -> None:
+    # `\r` alone (no `\n`) can hide content from naive grep:
+    # `printf "first\rsecond" | cat` prints `second`, overwriting
+    # `first`. Escape so the operator sees both halves.
+    vs = [
+        Violation(
+            rule_id="SEC001",
+            severity="error",
+            title="t",
+            message="m",
+            location="public.a\rhidden",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    assert "\\r" in out
+    assert "hidden" in out
+    # No bare CR remains.
+    assert "\rhidden" not in out
+
+
+def test_text_location_with_tab_escaped() -> None:
+    # Tabs in identifiers shift downstream column alignment in
+    # whitespace-delimited parsers. Escape so the output columns
+    # stay aligned.
+    vs = [
+        Violation(
+            rule_id="SEC001",
+            severity="error",
+            title="t",
+            message="m",
+            location="public.a\tcol",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    assert "public.a\\tcol" in out
+    # No literal tab remains in the location segment.
+    location_line = [
+        ln for ln in out.splitlines() if "SEC001" in ln
+    ][0]
+    assert "\t" not in location_line
+
+
+def test_text_location_with_zero_width_dropped() -> None:
+    # Zero-width formatting chars (U+200B etc.) hide content from
+    # visual inspection. Drop them outright — leaving them in the
+    # output would let a malicious identifier visually shadow a
+    # well-known one (e.g. `users` vs `use\u200brs`).
+    vs = [
+        Violation(
+            rule_id="SEC001",
+            severity="error",
+            title="t",
+            message="m",
+            location="public.use\u200brs",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    # The zero-width char is gone — what remains reads as `users`.
+    assert "public.users" in out
+    assert "\u200b" not in out
+
+
+def test_text_location_with_other_control_chars_hex_escaped() -> None:
+    # ASCII control chars other than \n/\r/\t (e.g. BEL = 0x07,
+    # DEL = 0x7F) are uncommon in identifiers but legal in quoted
+    # form. Render them as `\xHH` so the operator sees what's
+    # there. Pin BEL specifically since terminals beep on it,
+    # which could be used to harass an operator scrolling the
+    # output.
+    vs = [
+        Violation(
+            rule_id="SEC001",
+            severity="error",
+            title="t",
+            message="m",
+            location="public.a\x07bell",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    assert "\\x07" in out
+    # The raw BEL byte is gone.
+    assert "\x07" not in out
+
+
+def test_text_location_well_formed_passes_through_unchanged() -> None:
+    # The fast-path: no special chars, no rewrite. Pin so a
+    # well-formed location renders byte-identical to pre-hardening
+    # output (no perf regression on the common case).
+    vs = [_v(rule_id="SEC013", location="public.invoices.audit_writes")]
+    out = format_violations(vs, format="text")
+    assert "public.invoices.audit_writes" in out
+    # And the location segment doesn't gain stray escape chars.
+    assert "\\" not in out.split("public.invoices.audit_writes")[1].split("\n")[0]
+
+
+def test_text_location_zero_width_only_uses_empty_sentinel() -> None:
+    # A location composed entirely of zero-width formatting chars
+    # (e.g. ZWSP + ZWNJ) collapses to "" after `safe_location` drops
+    # them. The text formatter would otherwise produce a bare-
+    # whitespace location segment that visually merges with the
+    # surrounding column padding. The `(empty-or-zero-width)`
+    # sentinel surfaces the fact that there WAS something at that
+    # location, just nothing displayable.
+    vs = [
+        Violation(
+            rule_id="SEC001",
+            severity="error",
+            title="t",
+            message="m",
+            location="\u200b\u200c",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    assert EMPTY_OR_ZERO_WIDTH_SENTINEL in out

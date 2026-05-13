@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from collections import Counter
 
+from pgrls.formatters._common import (
+    EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    safe_location,
+)
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
@@ -22,7 +26,20 @@ def format_text(violations: list[Violation]) -> str:
         # `(schema-wide)` for cross-format consistency. Real
         # qualified names never contain parentheses, so the
         # placeholder is unambiguous.
-        loc = v.location or "(schema-wide)"
+        # `safe_location` keeps the line single — operator-supplied
+        # identifiers can contain `\n` (legal in quoted Postgres
+        # identifiers) which would otherwise split the row and
+        # break line-anchored CI grep patterns like
+        # `^  WARN \s+ SEC\d+\s+ <loc>$`. A location that's entirely
+        # zero-width chars collapses to `""` after sanitization; in
+        # that case the `(empty-or-zero-width)` sentinel surfaces
+        # the fact that there WAS something at that location, just
+        # nothing displayable.
+        if not v.location:
+            loc = "(schema-wide)"
+        else:
+            cleaned = safe_location(v.location)
+            loc = cleaned if cleaned else EMPTY_OR_ZERO_WIDTH_SENTINEL
         lines.append(
             f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
             f"         {v.message}"
