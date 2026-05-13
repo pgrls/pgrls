@@ -8,20 +8,34 @@ from __future__ import annotations
 import re
 
 # Match characters that break line-oriented or table-oriented
-# rendering: ASCII control chars (0x00-0x1F, including \n / \r /
-# \t which split rows), DEL (0x7F), and the four zero-width
-# unicode formatting chars commonly used for spoofing identifiers.
-# Postgres allows any of these inside a quoted-identifier form
-# (`"weird\nname"`), so operator-supplied names that flow into
-# `Violation.location` can in fact carry them.
-_UNSAFE_PATTERN = re.compile(r"[\x00-\x1F\x7F​-‍﻿]")
+# rendering. The character class is built from explicit \uXXXX
+# escapes — no literal zero-width chars in the source — so editor
+# tooling that strips invisible bytes (autoformat passes, terminal
+# copy/paste through normalizers, locale-aware editors) can't
+# silently delete part of the range and leave a gap.
+#
+# Members, in order:
+#   * \x00-\x1f  — ASCII control chars (NUL through US). Includes
+#     \n (0x0a), \r (0x0d), \t (0x09) which split lines / table
+#     rows, plus rarer chars (BEL, VT, FF) that disrupt terminal
+#     output.
+#   * \x7f       — DEL (ASCII 127). Pre-emptive: most renderers
+#     skip it silently, masking content.
+#   * U+200B..U+200D — Zero-width space, non-joiner, joiner.
+#     Invisible formatting chars commonly used for spoofing
+#     identifiers.
+#   * U+FEFF     — Byte order mark / zero-width no-break space.
+#     Same risk; UTF-8 BOMs sometimes leak into name strings.
+_UNSAFE_PATTERN = re.compile(
+    "[\x00-\x1f\x7f\u200b-\u200d\ufeff]"
+)
 
-# The four zero-width formatting chars worth dropping outright:
-# ZWSP (U+200B), ZWNJ (U+200C), ZWJ (U+200D), BOM / ZWNBSP (U+FEFF).
-# They have no readable representation, so showing them as an
-# escape sequence would just lengthen the line without helping
-# the operator find the offending content in their schema.
-_ZERO_WIDTH = frozenset("​‌‍﻿")
+# Zero-width formatting chars that are dropped outright. They have
+# no readable representation, so showing them as a `\xHH` escape
+# would just lengthen the line without helping the operator find
+# the offending content in their schema. Built from explicit \u
+# escapes for the same anti-bit-rot reason as `_UNSAFE_PATTERN`.
+_ZERO_WIDTH = frozenset("\u200b\u200c\u200d\ufeff")
 
 
 def safe_location(text: str) -> str:
@@ -64,10 +78,18 @@ def safe_location(text: str) -> str:
     Backticks, pipes, and backslashes are NOT rewritten here.
     Pipes are a Markdown-table concern that the markdown formatter
     handles separately; backticks visually disrupt the markdown
-    code-span wrap but don't break the table structure; backslashes
-    are common in regex hints elsewhere in the message stream and
-    rewriting them here would prevent a future caller from passing
-    a deliberately escaped string through.
+    code-span wrap but the markdown formatter switches to a
+    double-backtick wrapper when it sees one — see `markdown._row`.
+    Backslashes are common in regex hints elsewhere in the
+    formatter pipeline and rewriting them here would prevent a
+    future caller from passing a deliberately escaped string
+    through.
+
+    Edge case: a string composed entirely of zero-width chars
+    (e.g. `chr(0x200B)`) collapses to `""`. Callers must check the
+    result and choose their own fallback (the `text` and `markdown`
+    formatters fall back to the `(schema-wide)` sentinel) — this
+    helper's contract is strictly the rewrite, not display policy.
     """
     if not text:
         return text

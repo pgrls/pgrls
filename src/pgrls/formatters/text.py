@@ -27,8 +27,16 @@ def format_text(violations: list[Violation]) -> str:
         # identifiers can contain `\n` (legal in quoted Postgres
         # identifiers) which would otherwise split the row and
         # break line-anchored CI grep patterns like
-        # `^  WARN \s+ SEC\d+\s+ <loc>$`.
-        loc = safe_location(v.location) if v.location else "(schema-wide)"
+        # `^  WARN \s+ SEC\d+\s+ <loc>$`. A location that's entirely
+        # zero-width chars collapses to `""` after sanitization; in
+        # that case the `(empty-or-zero-width)` sentinel surfaces
+        # the fact that there WAS something at that location, just
+        # nothing displayable.
+        if not v.location:
+            loc = "(schema-wide)"
+        else:
+            cleaned = safe_location(v.location)
+            loc = cleaned if cleaned else "(empty-or-zero-width)"
         lines.append(
             f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
             f"         {v.message}"

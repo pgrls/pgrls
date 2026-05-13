@@ -10,6 +10,47 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Allowlist entries with leading/trailing whitespace now raise.**
+  `[lint.rules.X].allowlist` entries are compared with byte-exact
+  equality against location strings built by introspection (which
+  never carry surrounding whitespace), so a typo like
+  `" public.users.evil "` in `pgrls.toml` previously silently
+  failed to match — the rule kept firing with no signal to the
+  operator. `pgrls` now raises `TypeError` at config-load time
+  with the stripped form shown in the message. Affects every
+  allowlist parser:
+  `parse_policy_id_allowlist` (SEC003, SEC005, SEC006, SEC008,
+  SEC010, SEC011, SEC013, PERF001, PERF002, HYG002),
+  `parse_table_ref_allowlist` (SEC001, SEC002, SEC009, SEC012),
+  `parse_qualified_table_allowlist` (SEC007),
+  `parse_qualified_view_allowlist` (VIEW001-VIEW004). Internal
+  whitespace (Postgres quoted identifier with a space in the name,
+  e.g. `"my table"`) is still allowed — that's a real identifier
+  shape the rule can legitimately allowlist.
+
+  **Migration**: if upgrading from v0.5.9 or earlier with a
+  whitespaced entry in `pgrls.toml`, the `TypeError` message
+  names the offending entry and the stripped form. One-keystroke
+  fix; no behavior change for well-formed configs.
+
+### Fixed
+- **Text and Markdown formatters harden `Violation.location`
+  rendering against newlines, tabs, and zero-width chars.**
+  Postgres allows any character inside a quoted identifier
+  (`"weird\nname"`), so operator-supplied names that flow into
+  `Violation.location` (table, policy, trigger, etc.) could
+  previously break line-oriented CI grep patterns and GFM pipe-
+  table layouts. The new `safe_location` helper rewrites these
+  chars with visible escape text (`\n` / `\r` / `\t` text,
+  `\xHH` hex for other control chars) and drops zero-width
+  formatting chars (U+200B, U+200C, U+200D, U+FEFF). JSON and
+  SARIF output is unchanged — `json.dumps` already escapes safely.
+  The Markdown formatter additionally switches to a double-
+  backtick code-span wrap when the location contains a literal
+  backtick, and surfaces a `(empty-or-zero-width)` sentinel when
+  sanitization empties a non-`None` location.
+
 ## [0.5.9] - 2026-05-12
 
 ### Added

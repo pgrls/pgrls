@@ -74,30 +74,65 @@ def format_markdown(violations: list[Violation]) -> str:
 def _row(v: Violation) -> str:
     severity = _SEVERITY_LABEL[v.severity]
     rule_link = _rule_link(v.rule_id)
-    # Backtick the location so identifiers with mixed case or spaces
-    # don't get auto-linked or re-rendered. Schema-wide findings
-    # match the SARIF / text formatters' `(schema-wide)` sentinel
-    # but italicize it so it visually distinguishes from a real
-    # qualified name in the same column.
-    #
-    # `safe_location` strips / escapes newlines, tabs, and zero-width
-    # chars first so the table row stays intact even when a Postgres
-    # identifier carries `\n` (legal inside a quoted identifier). The
-    # remaining `|` characters then get backslash-escaped manually —
-    # we deliberately skip `_escape_cell` because that helper doubles
-    # `\` (correct for rule-author messages that contain literal
-    # backslashes, wrong for our own backslash-escaped representation
-    # of a newline, which would become a misleading `\\n` in the
-    # rendered cell). The cell-content is also a no-op for the well-
-    # formed case: `safe_location` short-circuits on clean input and
-    # the `.replace("|", "\\|")` does nothing.
-    if v.location:
-        clean = safe_location(v.location).replace("|", "\\|")
-        location = f"`{clean}`"
-    else:
-        location = "_(schema-wide)_"
     message = _escape_cell(v.message)
-    return f"| {severity} | {rule_link} | {location} | {message} |\n"
+    return f"| {severity} | {rule_link} | {_location_cell(v.location)} | {message} |\n"
+
+
+def _location_cell(location: str | None) -> str:
+    """Render a `Violation.location` for the GFM table.
+
+    Backtick the location so identifiers with mixed case or spaces
+    don't get auto-linked or re-rendered. Schema-wide findings
+    match the SARIF / text formatters' `(schema-wide)` sentinel
+    but italicize it so it visually distinguishes from a real
+    qualified name in the same column.
+
+    `safe_location` strips / escapes newlines, tabs, and zero-width
+    chars first so the table row stays intact even when a Postgres
+    identifier carries `\\n` (legal inside a quoted identifier). The
+    remaining `|` characters then get backslash-escaped manually —
+    we deliberately skip `_escape_cell` because that helper doubles
+    `\\` (correct for rule-author messages that contain literal
+    backslashes, wrong for our own backslash-escaped representation
+    of a newline, which would become a misleading `\\\\n` in the
+    rendered cell). The cell-content is also a no-op for the well-
+    formed case: `safe_location` short-circuits on clean input and
+    the `.replace("|", "\\|")` does nothing.
+
+    Two edge cases need special handling:
+
+    * **Backtick inside the location.** Wrapping in single backticks
+      `` `loc` `` would let the inner backtick close the code span
+      early, leaving the rest of the cell as plain markdown (where
+      `*`, `_`, `[`, etc. would re-render). GFM supports a code
+      span wrapped in *double* backticks (`` ``...`` ``) which can
+      contain single backticks unchanged; we switch to that form
+      when a backtick is detected. The space padding after the
+      opening `` `` and before the closing `` `` is the GFM
+      convention that lets the content start/end with a backtick.
+    * **Empty after sanitization.** A location composed entirely of
+      zero-width chars (e.g. `chr(0x200B)`) collapses to `""` once
+      `safe_location` drops the formatting chars. Emitting `` ` ` ``
+      (empty backtick pair) renders as a blank cell that's
+      indistinguishable from `None`; instead, fall back to a
+      `(empty-or-zero-width)` sentinel so the operator sees there
+      WAS something at that location, just nothing displayable.
+    """
+    if not location:
+        return "_(schema-wide)_"
+    clean = safe_location(location).replace("|", "\\|")
+    if not clean:
+        # The original location was non-empty but `safe_location`
+        # dropped every character (e.g. all zero-width). Surface
+        # this fact rather than rendering a silent blank cell.
+        return "_(empty-or-zero-width)_"
+    if "`" in clean:
+        # Switch to a double-backtick code span. The space padding
+        # is the GFM idiom for code spans whose content contains
+        # backticks; the renderer strips one space from each side
+        # before rendering the literal content.
+        return f"`` {clean} ``"
+    return f"`{clean}`"
 
 
 def _rule_link(rule_id: str) -> str:

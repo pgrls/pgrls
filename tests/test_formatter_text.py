@@ -284,20 +284,20 @@ def test_text_location_with_zero_width_dropped() -> None:
     # Zero-width formatting chars (U+200B etc.) hide content from
     # visual inspection. Drop them outright — leaving them in the
     # output would let a malicious identifier visually shadow a
-    # well-known one (e.g. `users` vs `use​rs`).
+    # well-known one (e.g. `users` vs `use\u200brs`).
     vs = [
         Violation(
             rule_id="SEC001",
             severity="error",
             title="t",
             message="m",
-            location="public.use​rs",
+            location="public.use\u200brs",
         ),
     ]
     out = format_violations(vs, format="text")
     # The zero-width char is gone — what remains reads as `users`.
     assert "public.users" in out
-    assert "​" not in out
+    assert "\u200b" not in out
 
 
 def test_text_location_with_other_control_chars_hex_escaped() -> None:
@@ -331,3 +331,24 @@ def test_text_location_well_formed_passes_through_unchanged() -> None:
     assert "public.invoices.audit_writes" in out
     # And the location segment doesn't gain stray escape chars.
     assert "\\" not in out.split("public.invoices.audit_writes")[1].split("\n")[0]
+
+
+def test_text_location_zero_width_only_uses_empty_sentinel() -> None:
+    # A location composed entirely of zero-width formatting chars
+    # (e.g. ZWSP + ZWNJ) collapses to "" after `safe_location` drops
+    # them. The text formatter would otherwise produce a bare-
+    # whitespace location segment that visually merges with the
+    # surrounding column padding. The `(empty-or-zero-width)`
+    # sentinel surfaces the fact that there WAS something at that
+    # location, just nothing displayable.
+    vs = [
+        Violation(
+            rule_id="SEC001",
+            severity="error",
+            title="t",
+            message="m",
+            location="\u200b\u200c",
+        ),
+    ]
+    out = format_violations(vs, format="text")
+    assert "(empty-or-zero-width)" in out

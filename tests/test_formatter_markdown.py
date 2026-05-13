@@ -312,10 +312,10 @@ def test_markdown_location_with_zero_width_dropped() -> None:
     # visual inspection. Drop them so the rendered cell shows the
     # real identifier the lint output is referring to.
     out = format_violations(
-        [_v(location="public.use​rs")], format="markdown"
+        [_v(location="public.use\u200brs")], format="markdown"
     )
     assert "public.users" in out
-    assert "​" not in out
+    assert "\u200b" not in out
 
 
 def test_markdown_location_with_tab_escaped() -> None:
@@ -361,3 +361,64 @@ def test_markdown_location_newline_escape_does_not_double_escape() -> None:
     # NOT double-escaped — `\\nb` with two backslashes would mean
     # `\\` doubled by `_escape_cell` got applied on top.
     assert "public.a\\\\nb" not in out
+
+
+def test_markdown_location_with_backtick_uses_double_backtick_wrap() -> None:
+    # Postgres identifiers can contain literal backticks
+    # (`"weird`name"`). Wrapping such a location in single backticks
+    # `` `weird`name` `` would close the code span at the inner
+    # backtick, leaking the rest of the cell as plain markdown — any
+    # `*`, `_`, `[` would then re-render and corrupt the row.
+    # GFM supports double-backtick code spans `` ``...`` `` that can
+    # contain single backticks; the formatter switches to that form
+    # when a backtick is detected.
+    out = format_violations(
+        [_v(location="public.has`tick")], format="markdown"
+    )
+    # Double-backtick wrap with space padding (GFM idiom).
+    assert "`` public.has`tick ``" in out
+    # The single-backtick form must NOT appear for this input — it
+    # would have closed the code span at the inner backtick.
+    assert "`public.has`tick`" not in out
+
+
+def test_markdown_location_zero_width_only_uses_empty_sentinel() -> None:
+    # A location composed entirely of zero-width formatting chars
+    # collapses to `""` after `safe_location` drops them. Emitting
+    # an empty backtick pair `` ` ` `` would render as a blank cell,
+    # indistinguishable from a `None` location. The
+    # `(empty-or-zero-width)` sentinel surfaces the fact that there
+    # WAS something at that location, just nothing displayable.
+    out = format_violations(
+        [_v(location="\u200b\u200c")], format="markdown"
+    )
+    assert "_(empty-or-zero-width)_" in out
+    # No bare-empty backtick pair.
+    assert "| `` |" not in out
+    assert "| ` ` |" not in out
+
+
+def test_markdown_location_backslash_then_pipe_keeps_table_intact() -> None:
+    # A location that already contains a literal backslash followed
+    # by a pipe (e.g. someone tested injection and we want to render
+    # cleanly) must still produce exactly 5 cell separators per row.
+    # `safe_location` passes the `\` through (not a control char),
+    # and the explicit `.replace("|", "\\|")` then prefixes the pipe.
+    # The rendered output reads as `weird\|name` inside the backticks.
+    out = format_violations(
+        [_v(location="public.weird\\|name")], format="markdown"
+    )
+    table_rows = [
+        line for line in out.splitlines() if line.startswith("| ❌")
+    ]
+    assert len(table_rows) == 1
+    # Total pipes per row: 5 cell separators + 1 escaped \| inside
+    # the location cell = 6.
+    assert table_rows[0].count("|") == 6
+    # The escaped pipe is preceded by exactly two backslash chars
+    # in raw text: the operator's original `\` followed by the
+    # formatter's escaping `\` — `weird\\|name`. Visually inside
+    # the code span this renders as `weird\\|name` (literal text,
+    # backticks suppress markdown processing), which is faithful
+    # to the input.
+    assert "weird\\\\|name" in table_rows[0]
