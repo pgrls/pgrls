@@ -936,8 +936,7 @@ allowlist it.
 * **Partial indexes** are always treated as helping — pgrls
   can't verify the partial predicate matches the policy predicate.
 
-Severity: warning. Allowlist by qualified policy ID
-(`schema.table.policy_name`):
+Allowlist by qualified policy ID (`schema.table.policy_name`):
 
 ```toml
 [lint.rules.PERF003]
@@ -946,10 +945,10 @@ allowlist = ["public.invoices.tenant_read"]
 
 **Note on the demo**: pgrls's own demo (`demo/`) disables PERF003
 globally in `demo/pgrls.toml` because the 50+ demo fixtures don't
-carry indexes and PERF003 would obscure the rule each case is
-built to demonstrate. Real production schemas should KEEP PERF003
-enabled — it catches a load-bearing perf bug that's invisible
-until traffic hits.
+carry indexes and PERF003 would obscure the rule that each case
+is built to demonstrate. Real production schemas should KEEP
+PERF003 enabled — it catches a load-bearing perf bug that's
+invisible until traffic hits.
 
 <a id="rule-hyg001"></a>
 
