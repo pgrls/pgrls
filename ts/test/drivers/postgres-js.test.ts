@@ -306,6 +306,54 @@ describe('postgresJsDriver — connection pinning (v0.6.2+)', () => {
     // for test harnesses that recycle a driver across cases.
     expect(mock.reserve).toHaveBeenCalledTimes(2);
   });
+
+  it('rejected sql.reserve() does not jam the driver — next query retries', async () => {
+    // If `sql.reserve()` rejects (closed pool, timeout, etc.)
+    // the rejection must propagate out of the failing `query()`
+    // call AND the cached promise must be cleared so the next
+    // `query()` retries `sql.reserve()` instead of replaying
+    // the same rejection forever.
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    // Override reserve to reject once, then resolve.
+    const reserved = await mock.reserve();
+    let callCount = 0;
+    const reserveSpy = vi.fn(() => {
+      callCount += 1;
+      if (callCount === 1) {
+        return Promise.reject(new Error('connection refused'));
+      }
+      return Promise.resolve(reserved);
+    });
+    mock.reserve = reserveSpy;
+
+    const driver = postgresJsDriver(mock);
+
+    // First query fails with the reservation error.
+    await expect(driver.query('SELECT 1')).rejects.toThrow('connection refused');
+
+    // Second query succeeds — the driver retried.
+    await driver.query('SELECT 2');
+
+    expect(reserveSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('close() after rejected reservation swallows the rejection', async () => {
+    // `try { exec(...) } finally { await close() }` is the
+    // recommended usage pattern. If the original exec failed
+    // because reserve rejected, close() must NOT re-throw the
+    // same rejection — that would mask the original error.
+    const mock = makeMockSql(makeResult([], 'SELECT', 0));
+    mock.reserve = vi.fn(() => Promise.reject(new Error('reserve failed')));
+
+    const driver = postgresJsDriver(mock);
+
+    // Provoke a rejected query without awaiting.
+    const queryPromise = driver.query('SELECT 1');
+    // close() must resolve, not throw the reservation error.
+    await expect(driver.close!()).resolves.toBeUndefined();
+    // The original query still rejects with its actual error.
+    await expect(queryPromise).rejects.toThrow('reserve failed');
+  });
 });
 
 describe('postgresJsDriver — isInsufficientPrivilege', () => {

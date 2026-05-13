@@ -120,12 +120,22 @@ export function postgresJsDriver(sql: PostgresJsSql): Driver {
   // could both observe `reserved === null`, both call
   // `sql.reserve()`, and the second reservation would leak (its
   // `release()` never called). The promise variant is atomic by
-  // construction. After `close()`, this returns to `null` so a
-  // subsequent `query()` re-pins.
+  // construction. After `close()` (or a rejected reservation),
+  // this returns to `null` so a subsequent `query()` re-pins.
   let reservedPromise: Promise<PostgresJsReservedSql> | null = null;
 
   function pinnedSql(): Promise<PostgresJsReservedSql> {
-    reservedPromise ??= sql.reserve();
+    // The `.catch` clears the cached promise on rejection so the
+    // next `pinnedSql()` retries `sql.reserve()` instead of
+    // replaying the rejection forever. Without this, a transient
+    // failure (timeout, connection blip during initial handshake,
+    // pool just-closed-and-reopened) would permanently jam the
+    // driver. Re-throws after clearing so the caller still sees
+    // the underlying error from their `query()` call.
+    reservedPromise ??= sql.reserve().catch((err: unknown) => {
+      reservedPromise = null;
+      throw err;
+    });
     return reservedPromise;
   }
 
@@ -177,15 +187,28 @@ export function postgresJsDriver(sql: PostgresJsSql): Driver {
       // in-flight reservation before releasing so a concurrent
       // `close()` + first-`query()` race resolves to "reserve
       // then immediately release" rather than leaving the
-      // reservation orphaned. `release()` is synchronous in
-      // postgres.js v3.4+ but the method signature returns
-      // `Promise<void>` to match the optional `Driver.close()`
-      // contract (other adapters may need async teardown — e.g.
-      // a future Bun.sql adapter could `await sql.end()` here).
+      // reservation orphaned.
+      //
+      // Rejection handling: if `sql.reserve()` failed there's
+      // nothing to release. Swallow that rejection in `close()`
+      // so it doesn't mask the original error in
+      // `try { ... } finally { await client.close() }` — the
+      // caller already saw the rejection from their `query()`
+      // call. `release()` is synchronous in postgres.js v3.4+
+      // but the method signature returns `Promise<void>` to
+      // match the optional `Driver.close()` contract (other
+      // adapters may need async teardown — e.g. a future
+      // Bun.sql adapter could `await sql.end()` here).
       if (reservedPromise !== null) {
         const inFlight = reservedPromise;
         reservedPromise = null;
-        const reservation = await inFlight;
+        let reservation: PostgresJsReservedSql | null = null;
+        try {
+          reservation = await inFlight;
+        } catch {
+          // Reservation never succeeded — nothing to release.
+          return;
+        }
         reservation.release();
       }
     },
