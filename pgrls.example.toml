@@ -109,6 +109,21 @@ allowlist = []
 # ("public.shadow_audit").
 allowlist = []
 
+[lint.rules.SEC013]
+# Triggers allowed on RLS-protected tables. Triggers fire as the
+# table OWNER, so any SELECT / INSERT / UPDATE / DELETE inside the
+# function body bypasses the invoking role's RLS policies. The rule
+# warns on every user-authored, enabled trigger on an RLS-enabled
+# table; allowlist after auditing the function body for cross-
+# tenant reads, writes the caller couldn't issue directly, and
+# owner-visible data echoed back through derived columns or RAISE
+# messages. Entries are fully-qualified trigger IDs of the form
+# "schema.table.trigger_name". Bare trigger names are rejected
+# because Postgres scopes trigger names per table — two tables can
+# carry identically-named triggers and a name-only allowlist would
+# silence both.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is

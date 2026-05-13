@@ -2,9 +2,10 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 5 (v5 added per-column type info via the new
-``column_details`` per table; v4 added top-level ``views``; v3 added
-``grants`` to each table entry; v2 added ``partition_of``).
+Currently version 6 (v6 added per-table ``triggers`` for SEC013;
+v5 added per-column type info via the new ``column_details`` per
+table; v4 added top-level ``views``; v3 added ``grants`` to each
+table entry; v2 added ``partition_of``).
 """
 from __future__ import annotations
 
@@ -23,13 +24,14 @@ __all__ = [
     "SecdefFunction",
     "Snapshot",
     "Table",
+    "Trigger",
     "View",
 ]
 
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 5
+SNAPSHOT_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,54 @@ class View:
 
 
 @dataclass(frozen=True)
+class Trigger:
+    """A trigger captured by snapshot v6+.
+
+    Triggers are the focus of SEC013 — they run as the table OWNER
+    (not the invoking role), so any SELECT/INSERT/UPDATE/DELETE in
+    the trigger function body bypasses the invoker's RLS policies.
+    A poorly-audited trigger function on an RLS-protected table is
+    a silent privilege-escalation vector: tenant A's INSERT can fire
+    a trigger that reads tenant B's rows (or worse, writes to them)
+    without any policy violation surfacing.
+
+    Captured fields are the minimum SEC013 needs to message clearly
+    and the operator needs to triage:
+
+    * ``schema`` + ``name`` — the trigger's identity; combined with
+      the table's qualified name they form the allowlist key
+      ``schema.table.trigger_name``.
+    * ``function_schema`` + ``function_name`` — the function this
+      trigger calls. SEC013's message names it explicitly so the
+      operator knows what code to audit.
+    * ``event`` — the event mask rendered as Postgres syntax (e.g.
+      ``INSERT``, ``UPDATE``, ``INSERT OR UPDATE``, ``TRUNCATE``).
+    * ``timing`` — ``BEFORE``, ``AFTER``, or ``INSTEAD OF``.
+    * ``enabled`` — false iff ``pg_trigger.tgenabled = 'D'`` (the
+      trigger is disabled and can't fire under any session_replication_
+      role). Disabled triggers are still captured so a snapshot diff
+      surfaces a re-enable as a change; SEC013 skips them.
+
+    Internal system triggers (``pg_trigger.tgisinternal = true`` —
+    foreign-key check triggers, RI constraint helpers, etc.) are
+    filtered at the SQL layer; they're not user-authored and don't
+    represent an audit target.
+    """
+
+    schema: str
+    name: str
+    function_schema: str
+    function_name: str
+    event: str
+    timing: str
+    enabled: bool
+
+    @property
+    def function_qualified_name(self) -> str:
+        return f"{self.function_schema}.{self.function_name}"
+
+
+@dataclass(frozen=True)
 class Table:
     schema: str
     name: str
@@ -147,6 +197,14 @@ class Table:
     # The `Schema.to_sql()` emitter requires `column_details` to be
     # populated; otherwise it raises `ValueError`.
     column_details: tuple[Column, ...] = ()
+    # User-authored triggers on this table — populated in snapshot v6+.
+    # SEC013 inspects this on every `rls_enabled=True` table; internal
+    # system triggers (FK constraint helpers etc.) are filtered at the
+    # introspection-SQL layer via `pg_trigger.tgisinternal = false`.
+    # Default `()` keeps callers that construct `Table(...)` without
+    # triggers (e.g. unit tests) working unchanged; v3/v4/v5 baselines
+    # round-trip with `triggers=()` since the field didn't exist.
+    triggers: tuple[Trigger, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -263,6 +321,24 @@ class Schema:
                         }
                         for c in t.column_details
                     ],
+                    # v6 extension — emit user-authored triggers. SEC013
+                    # reads this on every `rls_enabled=True` table. The
+                    # ordering matches `Table.triggers`, which the
+                    # introspection layer sorts by trigger name for
+                    # snapshot determinism. v3/v4/v5 baselines round-trip
+                    # with `triggers=()` → empty array.
+                    "triggers": [
+                        {
+                            "schema": tr.schema,
+                            "name": tr.name,
+                            "function_schema": tr.function_schema,
+                            "function_name": tr.function_name,
+                            "event": tr.event,
+                            "timing": tr.timing,
+                            "enabled": tr.enabled,
+                        }
+                        for tr in t.triggers
+                    ],
                 }
                 for t in self.tables
             ],
@@ -306,12 +382,12 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3, v4, or v5 snapshot dict.
+        """Reconstruct a Schema from a v3, v4, v5, or v6 snapshot dict.
 
-        v5 (current): adds per-column type info via the new
-        ``column_details`` array on each table. Required for
-        ``Schema.to_sql()`` and the migration-as-input flow
-        (``pgrls diff --apply``).
+        v6 (current): adds per-table ``triggers`` for SEC013.
+        v5: adds per-column type info via the new ``column_details``
+        array on each table. Required for ``Schema.to_sql()`` and
+        the migration-as-input flow (``pgrls diff --apply``).
         v4: full fidelity for views and SECDEF functions; no
         column type info.
         v3: legacy — views come back as ``()``, no column type info.
@@ -334,10 +410,10 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5):
+        if version not in (3, 4, 5, 6):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 3, 4, 5. v1 / v2 "
+                f"pgrls release. Supported versions: 3, 4, 5, 6. v1 / v2 "
                 "snapshots must be regenerated against the current schema."
             )
 
@@ -401,6 +477,23 @@ class Schema:
                 )
                 for c in column_details_raw
             )
+            # v6 extension — `triggers` holds the user-authored triggers
+            # captured for SEC013. v3/v4/v5 baselines have the field
+            # absent (`.get(...) → []`), which round-trips into an empty
+            # tuple — SEC013 simply finds nothing to flag.
+            triggers_raw = t.get("triggers", [])
+            triggers = tuple(
+                Trigger(
+                    schema=tr["schema"],
+                    name=tr["name"],
+                    function_schema=tr["function_schema"],
+                    function_name=tr["function_name"],
+                    event=tr["event"],
+                    timing=tr["timing"],
+                    enabled=tr["enabled"],
+                )
+                for tr in triggers_raw
+            )
             tables.append(
                 Table(
                     schema=t["schema"],
@@ -412,6 +505,7 @@ class Schema:
                     partition_of=partition_of,
                     grants=grants,
                     column_details=column_details,
+                    triggers=triggers,
                 )
             )
         # v3 has no "views" array; treat as empty tuple.

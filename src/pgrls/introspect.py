@@ -9,7 +9,16 @@ import psycopg
 from psycopg.rows import dict_row
 
 from pgrls.ast_utils import find_func_calls, parse_expr
-from pgrls.model import Column, Grant, Policy, Schema, SecdefFunction, Table, View
+from pgrls.model import (
+    Column,
+    Grant,
+    Policy,
+    Schema,
+    SecdefFunction,
+    Table,
+    Trigger,
+    View,
+)
 
 _POLICY_CMD_MAP: dict[str, str] = {
     "*": "ALL",
@@ -272,6 +281,74 @@ WHERE v.relkind IN ('v', 'm')
 ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
 """
 
+# User-authored triggers on the captured tables. `tgisinternal = false`
+# strips the foreign-key check / RI helper / partition-routing triggers
+# Postgres auto-creates — those are framework plumbing, not an audit
+# target. The event mask is decoded from `pg_trigger.tgtype` bit by bit
+# in SQL so introspection produces a human-readable string the rule can
+# put straight into a message ("INSERT", "INSERT OR UPDATE", etc.) and
+# the snapshot doesn't carry an opaque integer that future readers would
+# have to redecode.
+#
+# Bit assignments (from include/catalog/pg_trigger.h — stable across
+# every Postgres version pgrls supports):
+#   bit 0 (mask 1)  = ROW-level (else STATEMENT)
+#   bit 1 (mask 2)  = BEFORE
+#   bit 2 (mask 4)  = INSERT
+#   bit 3 (mask 8)  = DELETE
+#   bit 4 (mask 16) = UPDATE
+#   bit 5 (mask 32) = TRUNCATE
+#   bit 6 (mask 64) = INSTEAD OF
+#
+# `array_to_string(array_remove(ARRAY[...], NULL), ' OR ')` collapses
+# the per-event NULL-or-keyword cells into a single string in the order
+# Postgres itself uses (INSERT, DELETE, UPDATE, TRUNCATE) — matches
+# `pg_get_triggerdef` output and is what an operator reading the
+# violation message expects.
+#
+# `tgenabled` is a single char: 'D' = disabled, 'O' (origin / normal),
+# 'R' (replica only), 'A' (always). SEC013 cares about the boolean
+# "could this trigger fire under any circumstance" — anything other than
+# 'D' satisfies that. Captured as a bool here so the rule logic stays
+# simple; the snapshot still flips on a re-enable.
+#
+# ORDER BY trigger schema/table/name keeps the per-table tuple
+# deterministic across runs so snapshots are byte-stable.
+_TRIGGERS_SQL = """
+SELECT
+    t.tgrelid AS table_oid,
+    tn.nspname AS trigger_schema,
+    t.tgname AS trigger_name,
+    fn.nspname AS function_schema,
+    p.proname AS function_name,
+    CASE
+        WHEN t.tgtype & 64 = 64 THEN 'INSTEAD OF'
+        WHEN t.tgtype & 2 = 2 THEN 'BEFORE'
+        ELSE 'AFTER'
+    END AS timing,
+    array_to_string(
+        array_remove(
+            ARRAY[
+                CASE WHEN t.tgtype & 4 = 4 THEN 'INSERT' END,
+                CASE WHEN t.tgtype & 8 = 8 THEN 'DELETE' END,
+                CASE WHEN t.tgtype & 16 = 16 THEN 'UPDATE' END,
+                CASE WHEN t.tgtype & 32 = 32 THEN 'TRUNCATE' END
+            ],
+            NULL
+        ),
+        ' OR '
+    ) AS event,
+    t.tgenabled != 'D' AS enabled
+FROM pg_catalog.pg_trigger t
+JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+JOIN pg_catalog.pg_namespace tn ON tn.oid = c.relnamespace
+JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+WHERE t.tgisinternal = false
+  AND t.tgrelid = ANY(%s)
+ORDER BY t.tgrelid, t.tgname
+"""
+
 # Functions with SECURITY DEFINER set in the configured schemas. Used to
 # match view bodies against — VIEW004 flags views whose definitions call
 # any of these functions because a SECDEF call inside a non-invoker view
@@ -479,6 +556,8 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         policy_rows = cur.fetchall()
         cur.execute(_PARTITION_PARENTS_SQL, (oids,))
         partition_rows = cur.fetchall()
+        cur.execute(_TRIGGERS_SQL, (oids,))
+        trigger_rows = cur.fetchall()
         cur.execute(_GRANTS_SQL, (schemas,))
         grants_by_oid: dict[int, dict[str, list[str]]] = defaultdict(
             lambda: defaultdict(list)
@@ -516,6 +595,27 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         row["child_oid"]: (row["parent_schema"], row["parent_name"])
         for row in partition_rows
     }
+
+    triggers_by_oid: dict[int, list[Trigger]] = defaultdict(list)
+    for row in trigger_rows:
+        # `event` is NULL only for trigger types pgrls doesn't know how
+        # to decode (every supported Postgres version's tgtype lights up
+        # at least one of INSERT/DELETE/UPDATE/TRUNCATE; the CASE chain
+        # in `_TRIGGERS_SQL` covers all four). Fall back to empty string
+        # so the field stays non-None and SEC013's message still renders
+        # — surfacing an unfamiliar trigger is more useful than dropping
+        # it silently.
+        triggers_by_oid[row["table_oid"]].append(
+            Trigger(
+                schema=row["trigger_schema"],
+                name=row["trigger_name"],
+                function_schema=row["function_schema"],
+                function_name=row["function_name"],
+                event=row["event"] or "",
+                timing=row["timing"],
+                enabled=row["enabled"],
+            )
+        )
 
     # Build a per-OID schema/name lookup so the parse-error warning
     # can report the policy's qualified location (`schema.table.policy`)
@@ -576,6 +676,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             column_details=tuple(
                 column_details_by_oid.get(row["table_oid"], [])
             ),
+            triggers=tuple(triggers_by_oid.get(row["table_oid"], [])),
         )
         for row in table_rows
     ]

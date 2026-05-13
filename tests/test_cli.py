@@ -754,6 +754,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         "SEC009  public.allbad_sec002\n",
         "SEC010  public.allbad_sec010.block_all\n",
         "SEC011  public.allbad_sec011.or_true_bypass\n",
+        "SEC013  public.allbad_sec013.audit_writes\n",
         "PERF001  public.allbad_sec004.inverted\n",
         "PERF001  public.allbad_sec006.update_no_check\n",
         "PERF002  public.allbad_perf002.randomized\n",

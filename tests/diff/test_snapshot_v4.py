@@ -11,11 +11,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_5() -> None:
-    # Bumped 4 → 5 in v0.5.0 to add per-column type info via the
-    # new `column_details` per-table field. v3 / v4 baselines still
-    # round-trip (Schema.from_snapshot accepts 3, 4, 5).
-    assert SNAPSHOT_VERSION == 5
+def test_snapshot_version_is_6() -> None:
+    # Bumped 5 → 6 in v0.5.8 to add per-table `triggers` for SEC013.
+    # v3 / v4 / v5 baselines still round-trip (Schema.from_snapshot
+    # accepts 3, 4, 5, 6).
+    assert SNAPSHOT_VERSION == 6
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -35,7 +35,10 @@ def test_to_snapshot_emits_views_field() -> None:
         ),
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 5  # views added at v4; v5 added column_details (orthogonal)
+    # views added at v4; v5 added column_details; v6 added triggers
+    # (all additive and orthogonal to the views field this test
+    # exercises).
+    assert snap["version"] == 6
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True

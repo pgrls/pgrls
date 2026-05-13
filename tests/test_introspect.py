@@ -861,3 +861,129 @@ def test_introspect_view_dependency_filter_by_schema(
     schema = introspect(pg_conn, schemas=["app", "shared"])
     v = next(view for view in schema.views if view.name == "lookup_v")
     assert v.references == (("shared", "lookup"),)
+
+
+# ---------------------------------------------------------------------------
+# Trigger introspection (SEC013, snapshot v6+)
+# ---------------------------------------------------------------------------
+
+
+def test_populates_table_triggers(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC013 walks `Table.triggers`. Without this introspection wiring,
+    # the rule silently never fires on real databases — pin both the
+    # field population and the per-trigger fields the rule and snapshot
+    # depend on.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE TRIGGER guard
+            BEFORE UPDATE ON public.t
+            FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert len(t.triggers) == 1
+    trg = t.triggers[0]
+    assert trg.schema == "public"
+    assert trg.name == "guard"
+    # Built-in trigger function lives in pg_catalog.
+    assert trg.function_schema == "pg_catalog"
+    assert trg.function_name == "suppress_redundant_updates_trigger"
+    assert trg.timing == "BEFORE"
+    assert trg.event == "UPDATE"
+    assert trg.enabled is True
+
+
+def test_triggers_filters_internal_constraint_triggers(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Foreign-key constraints, RI check triggers, partition-routing
+    # triggers, etc. live in `pg_trigger` with `tgisinternal = true`.
+    # SEC013 isn't interested in them — they're framework plumbing,
+    # not an audit target. Pin the filter so a future query refactor
+    # that forgets `tgisinternal = false` doesn't drown the operator
+    # in noise.
+    apply_sql(
+        """
+        CREATE TABLE public.parent (id INT PRIMARY KEY);
+        CREATE TABLE public.child (
+            id INT PRIMARY KEY,
+            parent_id INT REFERENCES public.parent(id)
+        );
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    child = next(x for x in schema.tables if x.name == "child")
+    parent = next(x for x in schema.tables if x.name == "parent")
+    # FK creates internal `RI_*` triggers on both sides; the user
+    # didn't author any user-level triggers, so SEC013 sees nothing.
+    assert child.triggers == ()
+    assert parent.triggers == ()
+
+
+def test_triggers_captures_disabled_state(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # `ALTER TABLE ... DISABLE TRIGGER` flips `tgenabled` to 'D'.
+    # SEC013 skips disabled triggers (they can't fire) but the
+    # snapshot still records the state so a re-enable surfaces as
+    # a diff. Pin both halves.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE TRIGGER guard
+            BEFORE UPDATE ON public.t
+            FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        ALTER TABLE public.t DISABLE TRIGGER guard;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert len(t.triggers) == 1
+    assert t.triggers[0].enabled is False
+
+
+def test_triggers_decodes_multi_event_mask(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A trigger declared `BEFORE INSERT OR UPDATE ...` packs two
+    # event bits into `tgtype`. The introspection-SQL CASE chain
+    # must surface both in Postgres's canonical order ("INSERT OR
+    # UPDATE") so SEC013's message reads correctly.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE TRIGGER guard
+            BEFORE INSERT OR UPDATE ON public.t
+            FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert t.triggers[0].event == "INSERT OR UPDATE"
+
+
+def test_triggers_are_deterministic_per_table(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Snapshot byte-stability depends on triggers being sorted
+    # consistently across runs. The introspection SQL orders by
+    # (table_oid, trigger_name) — verify the alphabetic order
+    # surfaces at the Table.triggers tuple level.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT);
+        CREATE TRIGGER zeta_guard
+            BEFORE UPDATE ON public.t
+            FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        CREATE TRIGGER alpha_guard
+            BEFORE INSERT ON public.t
+            FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger();
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert [tr.name for tr in t.triggers] == ["alpha_guard", "zeta_guard"]
