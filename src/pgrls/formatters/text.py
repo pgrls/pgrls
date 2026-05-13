@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from collections import Counter
 
-from pgrls.formatters._common import safe_location
+from pgrls.formatters._common import (
+    EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    safe_location,
+)
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
@@ -36,7 +39,7 @@ def format_text(violations: list[Violation]) -> str:
             loc = "(schema-wide)"
         else:
             cleaned = safe_location(v.location)
-            loc = cleaned if cleaned else "(empty-or-zero-width)"
+            loc = cleaned if cleaned else EMPTY_OR_ZERO_WIDTH_SENTINEL
         lines.append(
             f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
             f"         {v.message}"

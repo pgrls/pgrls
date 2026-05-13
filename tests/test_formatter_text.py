@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pgrls.formatters import format_violations
+from pgrls.formatters._common import EMPTY_OR_ZERO_WIDTH_SENTINEL
 from pgrls.violations import Violation
 
 
@@ -351,4 +352,4 @@ def test_text_location_zero_width_only_uses_empty_sentinel() -> None:
         ),
     ]
     out = format_violations(vs, format="text")
-    assert "(empty-or-zero-width)" in out
+    assert EMPTY_OR_ZERO_WIDTH_SENTINEL in out

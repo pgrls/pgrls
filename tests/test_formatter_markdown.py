@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from pgrls.formatters import format_violations
+from pgrls.formatters._common import EMPTY_OR_ZERO_WIDTH_SENTINEL
 from pgrls.violations import Violation
 
 
@@ -386,16 +387,54 @@ def test_markdown_location_zero_width_only_uses_empty_sentinel() -> None:
     # A location composed entirely of zero-width formatting chars
     # collapses to `""` after `safe_location` drops them. Emitting
     # an empty backtick pair `` ` ` `` would render as a blank cell,
-    # indistinguishable from a `None` location. The
-    # `(empty-or-zero-width)` sentinel surfaces the fact that there
-    # WAS something at that location, just nothing displayable.
+    # indistinguishable from a `None` location. The sentinel
+    # surfaces the fact that there WAS something at that location,
+    # just nothing displayable.
     out = format_violations(
         [_v(location="\u200b\u200c")], format="markdown"
     )
-    assert "_(empty-or-zero-width)_" in out
+    assert f"_{EMPTY_OR_ZERO_WIDTH_SENTINEL}_" in out
     # No bare-empty backtick pair.
     assert "| `` |" not in out
     assert "| ` ` |" not in out
+
+
+def test_markdown_location_with_double_backtick_uses_triple_wrap() -> None:
+    # GFM code spans end at the first run of backticks matching the
+    # opening run's length. A location with `` `` `` (two
+    # consecutive backticks) wrapped in `` `` ``  `` `` `` (also
+    # two) would close prematurely, leaking the rest as plain
+    # markdown. The formatter must compute a wrapper longer than
+    # the longest internal backtick run \u2014 for `` `` `` inside, it
+    # picks a 3-backtick wrapper.
+    out = format_violations(
+        [_v(location="public.bad``name")], format="markdown"
+    )
+    # Three-backtick wrap with space padding so the inner content
+    # can carry adjacent backticks.
+    assert "``` public.bad``name ```" in out
+    # Locate the table row and pin the cell-boundary structure:
+    # the cell separators must surround the 3-backtick wrap on both
+    # sides ("| ``` ... ``` |"), proving the wrapper extends across
+    # the full location and doesn't close prematurely.
+    table_row = [
+        line for line in out.splitlines() if line.startswith("| \u274c")
+    ][0]
+    assert "| ``` public.bad``name ``` |" in table_row
+
+
+def test_markdown_location_with_triple_backtick_uses_quad_wrap() -> None:
+    # Stress the (longest_run + 1) rule one step further: a
+    # location with three consecutive backticks needs a 4-backtick
+    # wrapper. The wrapper width tracks the worst inner run, not
+    # a fixed magic constant.
+    out = format_violations(
+        [_v(location="public.bad```name")], format="markdown"
+    )
+    table_row = [
+        line for line in out.splitlines() if line.startswith("| \u274c")
+    ][0]
+    assert "| ```` public.bad```name ```` |" in table_row
 
 
 def test_markdown_location_backslash_then_pipe_keeps_table_intact() -> None:

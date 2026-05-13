@@ -7,6 +7,13 @@ from __future__ import annotations
 
 import re
 
+# Sentinel shown by the text and markdown formatters when a
+# non-`None` location collapses to `""` after `safe_location` drops
+# every character (e.g. a location consisting entirely of zero-width
+# formatting chars). Imported by both formatters and both formatter
+# test files so the wording is changed in exactly one place.
+EMPTY_OR_ZERO_WIDTH_SENTINEL = "(empty-or-zero-width)"
+
 # Match characters that break line-oriented or table-oriented
 # rendering. The character class is built from explicit \uXXXX
 # escapes — no literal zero-width chars in the source — so editor

@@ -31,9 +31,13 @@ a reader follows the link.
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 
-from pgrls.formatters._common import safe_location
+from pgrls.formatters._common import (
+    EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    safe_location,
+)
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 _SEVERITY_LABEL: dict[Severity, str] = {
@@ -101,22 +105,26 @@ def _location_cell(location: str | None) -> str:
 
     Two edge cases need special handling:
 
-    * **Backtick inside the location.** Wrapping in single backticks
-      `` `loc` `` would let the inner backtick close the code span
-      early, leaving the rest of the cell as plain markdown (where
-      `*`, `_`, `[`, etc. would re-render). GFM supports a code
-      span wrapped in *double* backticks (`` ``...`` ``) which can
-      contain single backticks unchanged; we switch to that form
-      when a backtick is detected. The space padding after the
-      opening `` `` and before the closing `` `` is the GFM
-      convention that lets the content start/end with a backtick.
-    * **Empty after sanitization.** A location composed entirely of
-      zero-width chars (e.g. `chr(0x200B)`) collapses to `""` once
-      `safe_location` drops the formatting chars. Emitting `` ` ` ``
-      (empty backtick pair) renders as a blank cell that's
-      indistinguishable from `None`; instead, fall back to a
-      `(empty-or-zero-width)` sentinel so the operator sees there
-      WAS something at that location, just nothing displayable.
+    * **Backticks inside the location.** Wrapping in single
+      backticks `` `loc` `` would let an inner backtick close the
+      code span early, leaving the rest of the cell as plain
+      markdown (where `*`, `_`, `[`, etc. would re-render). The
+      GFM rule for code spans is that the wrapper must be a run
+      of backticks LONGER than any run inside the content — a
+      cell with 2 consecutive `` `` `` requires a 3-backtick
+      wrapper, and so on. The wrapper width here is computed as
+      `(longest_run_inside + 1)`, with space padding so the
+      content can also start or end with backticks. Pure-single-
+      backtick path stays cheap: no inner backticks → 1-backtick
+      wrapper, no padding (matches the well-formed common case).
+    * **Empty after sanitization.** A location composed entirely
+      of zero-width chars (e.g. `chr(0x200B)`) collapses to `""`
+      once `safe_location` drops the formatting chars. Emitting
+      `` ` ` `` (empty backtick pair) renders as a blank cell
+      that's indistinguishable from `None`; instead, fall back
+      to the `EMPTY_OR_ZERO_WIDTH_SENTINEL` so the operator sees
+      there WAS something at that location, just nothing
+      displayable.
     """
     if not location:
         return "_(schema-wide)_"
@@ -125,14 +133,20 @@ def _location_cell(location: str | None) -> str:
         # The original location was non-empty but `safe_location`
         # dropped every character (e.g. all zero-width). Surface
         # this fact rather than rendering a silent blank cell.
-        return "_(empty-or-zero-width)_"
-    if "`" in clean:
-        # Switch to a double-backtick code span. The space padding
-        # is the GFM idiom for code spans whose content contains
-        # backticks; the renderer strips one space from each side
-        # before rendering the literal content.
-        return f"`` {clean} ``"
-    return f"`{clean}`"
+        return f"_{EMPTY_OR_ZERO_WIDTH_SENTINEL}_"
+    if "`" not in clean:
+        return f"`{clean}`"
+    # Compute the longest run of consecutive backticks inside the
+    # cleaned location, then pick a wrapper of (longest + 1)
+    # backticks. The space padding is the GFM idiom that lets the
+    # content start or end with a backtick — the renderer strips
+    # one space from each side before rendering literal content.
+    longest_run = max(
+        (len(m) for m in re.findall(r"`+", clean)),
+        default=0,
+    )
+    wrapper = "`" * (longest_run + 1)
+    return f"{wrapper} {clean} {wrapper}"
 
 
 def _rule_link(rule_id: str) -> str:
