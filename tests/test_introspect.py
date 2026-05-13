@@ -1070,3 +1070,177 @@ def test_triggers_propagation_from_partition_parent(
     # and get filtered out — SEC013 won't double-fire.
     assert child_a.triggers == ()
     assert child_b.triggers == ()
+
+
+# ---------------------------------------------------------------------------
+# Index introspection (PERF003, snapshot v7+)
+# ---------------------------------------------------------------------------
+
+
+def test_populates_table_indexes(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # PERF003 walks `Table.indexes`. Without this introspection
+    # wiring, the rule silently never fires on real databases —
+    # pin both the field population and the per-index fields the
+    # rule depends on.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, tenant_id TEXT);
+        CREATE INDEX t_tenant_idx ON public.t (tenant_id);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert len(t.indexes) == 1
+    idx = t.indexes[0]
+    assert idx.name == "t_tenant_idx"
+    assert idx.access_method == "btree"
+    assert idx.columns == ("tenant_id",)
+    assert idx.is_unique is False
+    assert idx.is_partial is False
+
+
+def test_indexes_captures_composite_column_order(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # The order of columns in a multi-column index matters: PERF003
+    # only checks the LEADING column. A B-tree on (a, b) helps
+    # `WHERE a = X` but not `WHERE b = Y`. Pin that the introspection
+    # captures the column order from `pg_index.indkey` correctly.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, a TEXT, b TEXT);
+        CREATE INDEX t_ab_idx ON public.t (a, b);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    [idx] = [i for i in t.indexes if i.name == "t_ab_idx"]
+    assert idx.columns == ("a", "b")
+
+
+def test_indexes_captures_unique_constraint(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # PRIMARY KEY and UNIQUE constraints create implicit B-tree
+    # indexes. They appear in `pg_index` like any other index. Pin
+    # that they surface with `is_unique=True` so a future rule can
+    # distinguish them from explicit `CREATE INDEX`.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT PRIMARY KEY, email TEXT UNIQUE);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    by_name = {i.name: i for i in t.indexes}
+    # Two implicit indexes: the PK on `id` and the unique on `email`.
+    pk = next(i for i in t.indexes if i.columns == ("id",))
+    email_uniq = next(i for i in t.indexes if i.columns == ("email",))
+    assert pk.is_unique is True
+    assert email_uniq.is_unique is True
+
+
+def test_indexes_captures_partial_index(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Partial indexes have `pg_index.indpred IS NOT NULL`. PERF003
+    # treats them as "indexed" (the operator's responsibility to
+    # match the partial predicate to the policy predicate), but the
+    # snapshot still captures the flag so a future rule could
+    # warn on mismatch.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, active BOOLEAN);
+        CREATE INDEX t_active_idx ON public.t (id) WHERE active = true;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    [idx] = [i for i in t.indexes if i.name == "t_active_idx"]
+    assert idx.is_partial is True
+
+
+def test_indexes_captures_non_btree_access_method(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Hash, GIN, GiST, BRIN are valid access methods. Pin that
+    # the introspection captures the method name verbatim so PERF003
+    # (which treats any method as "indexed") sees consistent data.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, tags TEXT[]);
+        CREATE INDEX t_tags_gin ON public.t USING gin (tags);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    [idx] = [i for i in t.indexes if i.name == "t_tags_gin"]
+    assert idx.access_method == "gin"
+
+
+def test_indexes_skips_invalid_indexes(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A half-built index (from a failed CREATE INDEX CONCURRENTLY)
+    # has `indisvalid = false`. Such an index doesn't help the
+    # planner — capturing it would silence PERF003 and mislead the
+    # operator. Simulate the state by flipping the flag directly
+    # in pg_index (same internal state a real failed concurrent
+    # build leaves behind).
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, tenant_id TEXT);
+        CREATE INDEX t_tenant_idx ON public.t (tenant_id);
+        UPDATE pg_catalog.pg_index
+            SET indisvalid = false
+            WHERE indexrelid = 't_tenant_idx'::regclass;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    # The invalid index is filtered — PERF003 will fire on policies
+    # that filter on tenant_id because no usable index exists.
+    assert t.indexes == ()
+
+
+def test_indexes_handles_expression_index_with_empty_string(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # `CREATE INDEX ON tbl (lower(email))` has an expression
+    # position in `pg_index.indkey` (attnum 0). The LEFT JOIN to
+    # pg_attribute returns NULL there; the COALESCE in the
+    # introspection SQL maps NULL → empty string. PERF003 then
+    # cannot match this position by column name, which is the
+    # intentional documented limitation in v0.5.10.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, email TEXT);
+        CREATE INDEX t_lower_email_idx ON public.t (lower(email));
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    [idx] = [i for i in t.indexes if i.name == "t_lower_email_idx"]
+    # Expression position becomes empty string in the columns tuple.
+    assert idx.columns == ("",)
+
+
+def test_indexes_deterministic_per_table(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Snapshot byte-stability depends on indexes being sorted
+    # consistently across runs. The introspection SQL orders by
+    # (table_oid, index_name) — verify the alphabetic order
+    # surfaces at the Table.indexes tuple level.
+    apply_sql(
+        """
+        CREATE TABLE public.t (id INT, a TEXT, b TEXT);
+        CREATE INDEX zeta_idx ON public.t (a);
+        CREATE INDEX alpha_idx ON public.t (b);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "t")
+    assert [i.name for i in t.indexes] == ["alpha_idx", "zeta_idx"]

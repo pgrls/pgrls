@@ -61,6 +61,13 @@ _SEC012_ALLOWLIST_BLOCK = (
 
 _BASE_CONFIG = (
     '[database]\nschemas = ["app"]\n'
+    # PERF003 is disabled for the demo (see pgrls.toml comment) —
+    # the rule fires on every RLS-enabled table that lacks a
+    # leading-column index, and the 50+ demo fixtures don't carry
+    # indexes. Embedding the same disable here keeps
+    # `_BASE_CONFIG`-based tests (uc72 etc.) seeing the same
+    # ruleset the demo's pgrls.toml runs with.
+    '[lint]\ndisable = ["PERF003"]\n'
     '[lint.rules.SEC001]\nallowlist = ["app.countries"]\n'
     + _SEC012_ALLOWLIST_BLOCK
 )

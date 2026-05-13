@@ -14,6 +14,15 @@ schemas = ["app"]
 # demo run end-to-end while still flagging anything that would
 # block CI.
 fail_on = "error"
+# Disable PERF003 globally for the demo. The 50+ demo fixtures
+# focus on the SEC* / HYG* / VIEW* / SEC013 / PERF001-PERF002
+# catalog; adding a B-tree index per filter column on each fixture
+# would triple the SQL volume and obscure the rule each case is
+# built to demonstrate. Per-case tests only assert the rule(s) the
+# case targets, so silencing PERF003 here is the right scoping.
+# Real production schemas should KEEP PERF003 enabled — it catches
+# a load-bearing perf bug that's invisible until traffic hits.
+disable = ["PERF003"]
 
 [lint.rules.SEC001]
 # `app.countries` is world-readable reference data by design.

@@ -61,7 +61,7 @@ _MOD_KINDS: frozenset[ChangeKind] = frozenset(
         ChangeKind.ROLES_NARROWED,
         ChangeKind.ROLES_DISJOINT_REPLACED,
         # POLICY_RENAMED is reserved in the ChangeKind enum but no
-        # detection rule through v0.5.7 emits it — rename detection
+        # detection rule through v0.5.10 emits it — rename detection
         # remains unimplemented (see `_diff_policies` docstring).
         # Classify as a modification anyway so a future detection
         # rule (or programmatic Change construction in tests) doesn't

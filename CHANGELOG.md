@@ -10,8 +10,45 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-05-13
+
+### Added
+- **PERF003 — Policy predicate column without leading-column
+  index** (severity: warning). Detects RLS policy predicates that
+  filter on a column with no leading-column index. Postgres
+  evaluates the policy predicate per row, so without an index the
+  planner does a sequential scan — fine for small tables,
+  catastrophic on multi-tenant tables with millions of rows. The
+  rule treats any access method as "indexed" (B-tree, hash, GIN,
+  GiST, BRIN) and considers a leading-column match sufficient.
+  Partial indexes are accepted on trust (pgrls can't statically
+  verify the partial predicate matches the policy predicate);
+  expression indexes (`CREATE INDEX ON tbl (lower(email))`) are
+  not matched in v0.5.10 — allowlist the policy when a matching
+  expression index exists. Allowlist by qualified policy ID
+  (`schema.table.policy_name`):
+
+  ```toml
+  [lint.rules.PERF003]
+  allowlist = ["public.invoices.tenant_read"]
+  ```
+
 ### Changed
-- **Allowlist entries with leading/trailing whitespace now raise.**
+- **Snapshot version 6 → 7.** Each `tables[i]` entry now carries
+  an `indexes` array with one entry per valid + ready index
+  (`name`, `access_method`, `columns`, `is_unique`, `is_partial`).
+  v3 / v4 / v5 / v6 baselines still load via
+  `Schema.from_snapshot` with `indexes=()` on every table; the
+  loaded Schema re-emits as v7. PERF003 simply finds nothing to
+  flag against older snapshots until they're re-captured.
+
+  Existing snapshots remain forward-compatible: `pgrls diff`
+  continues to work against v3+ baselines without re-snapshotting.
+  `pgrls fix` operates against a live DB only (not a baseline) and
+  is unaffected. Only PERF003 needs v7 to surface findings.
+
+- **Allowlist entries with leading/trailing whitespace now raise**
+  (rolled in from PR #44 — was Unreleased prior to v0.5.10).
   `[lint.rules.X].allowlist` entries are compared with byte-exact
   equality against location strings built by introspection (which
   never carry surrounding whitespace), so a typo like
@@ -21,7 +58,7 @@ breaking changes — they will be called out in this file.
   with the stripped form shown in the message. Affects every
   allowlist parser:
   `parse_policy_id_allowlist` (SEC003, SEC005, SEC006, SEC008,
-  SEC010, SEC011, SEC013, PERF001, PERF002, HYG002),
+  SEC010, SEC011, SEC013, PERF001, PERF002, PERF003, HYG002),
   `parse_table_ref_allowlist` (SEC001, SEC002, SEC009, SEC012),
   `parse_qualified_table_allowlist` (SEC007),
   `parse_qualified_view_allowlist` (VIEW001-VIEW004). Internal

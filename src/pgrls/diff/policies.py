@@ -75,7 +75,7 @@ def _diff_policies(base_table: Table, head_table: Table) -> list[Change]:
       (dangerous — previously-blocked rows become visible); dropping one
       narrows it (breaking — previously-visible rows may disappear).
 
-    No release through v0.5.7 implements rename detection; each rename
+    No release through v0.5.10 implements rename detection; each rename
     appears here as one drop + one add. The `POLICY_RENAMED` enum value
     is reserved in `ChangeKind` for a future implementation.
     """

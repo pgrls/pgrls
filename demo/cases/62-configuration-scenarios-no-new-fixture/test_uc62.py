@@ -9,12 +9,18 @@ def test_uc62_multiple_disabled_rules_via_config(
     lint,
     base_config,
 ) -> None:
-    # `[lint].disable = ["SEC005", "SEC008"]` — both rules
-    # turn off in one config; neither appears in output.
+    # `[lint].disable = [..., "SEC005", "SEC008"]` — both rules
+    # turn off in one config; neither appears in output. The
+    # `base_config` fixture already opens a `[lint]` block (to
+    # disable PERF003 demo-wide); we extend that same disable
+    # list rather than declaring `[lint]` twice (TOML forbids
+    # duplicate sections).
     cfg = tmp_path / "p.toml"
     cfg.write_text(
-        base_config
-        + '[lint]\ndisable = ["SEC005", "SEC008"]\n'
+        base_config.replace(
+            'disable = ["PERF003"]',
+            'disable = ["PERF003", "SEC005", "SEC008"]',
+        )
     )
     out = lint(config=cfg)
     assert "SEC005" not in out

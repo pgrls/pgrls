@@ -71,7 +71,7 @@ def test_subprocess_known_bad_exits_nonzero(
 def test_subprocess_clean_db_exits_zero(
     pg_url: str, apply_sql
 ) -> None:
-    # "Clean" means: every rule (SEC001-SEC011, PERF001-PERF002,
+    # "Clean" means: every rule (SEC001-SEC013, PERF001-PERF003,
     # HYG001-HYG002) is satisfied, not just SEC001-SEC002. The
     # table needs policies that:
     #   - are scoped to a non-PUBLIC role (SEC003)
@@ -80,13 +80,15 @@ def test_subprocess_clean_db_exits_zero(
     #   - don't use placeholder names (HYG002)
     #   - don't have `OR true` branches (SEC011)
     #   - include at least one RESTRICTIVE policy (SEC007 info)
+    #   - reference indexed columns (PERF003) — PRIMARY KEY on
+    #     `id` creates the implicit B-tree the policy uses
     # `DROP ROLE IF EXISTS` first because pg_conn resets schemas
     # but not roles between tests.
     apply_sql(
         """
         DROP ROLE IF EXISTS pgrls_test_role;
         CREATE ROLE pgrls_test_role;
-        CREATE TABLE public.t (id INT NOT NULL);
+        CREATE TABLE public.t (id INT PRIMARY KEY);
         ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.t FORCE ROW LEVEL SECURITY;
         CREATE POLICY tenant_scope ON public.t
