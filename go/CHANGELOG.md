@@ -7,6 +7,67 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.4] - 2026-05-14
+
+**Step 5 of 7 — assertion helpers.** Wires the Layer 1 wire
+contract for the five RLS-shape assertions; matches the Python
+(`pgrls.testing.assertions`) and TypeScript (`pgrls-test`'s
+`assertions.ts`) byte-for-byte wire output (same `pgrls_check`
+savepoint prefix, same RELEASE-on-success / ROLLBACK-on-failure
+pattern, same UPDATE/DELETE verb gate, same RETURNING-keyword
+word-boundary check, same error-message shapes).
+
+### Added
+
+- **Five assertion helpers** at `pgrlstest/assertions.go`,
+  exposed both as `Client` methods (`Client.AssertRows`,
+  `Client.AssertVisible`, `Client.AssertInvisible`,
+  `Client.AssertRejected`, `Client.AssertSilentlyDropped`) and
+  as package-level functions for non-Client contexts:
+  - `AssertRows(ctx, sql, &AssertRowsOptions{Count: N})` —
+    exact row-count match. Returns `*AssertionError` (matches
+    `ErrAssertion`) on mismatch.
+  - `AssertVisible(ctx, sql)` — at least one row. Returns
+    `*AssertionError` on zero rows.
+  - `AssertInvisible(ctx, sql)` — zero rows. Returns
+    `*AssertionError` on any rows.
+  - `AssertRejected(ctx, sql)` — SQL must raise SQLSTATE 42501
+    (`InsufficientPrivilege`). Wraps the query in a
+    `SAVEPOINT pgrls_check_<rand>` so the aborted-transaction
+    state doesn't poison subsequent queries; RELEASEs on
+    success, ROLLBACK TO SAVEPOINTs on any error path.
+  - `AssertSilentlyDropped(ctx, sql)` — UPDATE/DELETE with
+    RETURNING that yields zero rows (the Postgres RLS
+    silent-drop shape). Rejects non-UPDATE/DELETE verbs and
+    missing-RETURNING SQL upfront as misuse (`*Error`,
+    matches `ErrAPIError`), distinct from the RLS-misbehavior
+    case (`*AssertionError`).
+
+- **`AssertRowsOptions` struct** wrapping the row-count argument
+  for `Client.AssertRows`. Keeps the call site readable and lets
+  future optional knobs (partial-match, regex over a column,
+  etc.) extend without churning callers.
+
+- **27 unit tests** in `assertions_test.go` covering the
+  pass/fail branches of each helper, the savepoint wire
+  sequence in `AssertRejected` (success → RELEASE,
+  42501-rejection → ROLLBACK TO SAVEPOINT, wrong-shape error →
+  ROLLBACK TO SAVEPOINT + AssertionError wrapping the underlying
+  error), the misuse-error branches in `AssertSilentlyDropped`
+  (SELECT, INSERT, missing RETURNING, RETURNING inside a column
+  name), and case-insensitive / word-boundary matching for the
+  RETURNING regex. Driver-error propagation through every
+  helper is pinned.
+
+### Changed
+
+- **`protocol.go` status comment** advanced to step 5 of 7.
+- **Module surface** grows by six new exports: the five
+  `AssertX` methods on `Client`, plus the `AssertRowsOptions`
+  config struct. (The package-level `assertRows` /
+  `assertVisible` / etc. helpers are unexported — callers go
+  through the methods.)
+
 ## [0.7.3] - 2026-05-14
 
 **Step 4 of 7 — Client API.** Wires the `Driver` adapters (v0.7.2)
