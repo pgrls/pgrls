@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.0 — step 1 of 7 (scaffold).** This release establishes the module path, protocol-version constant, and error types. Subsequent steps add the `Driver` interface, the [pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq) adapters, the `Client` API (transactions, role-switching, seed), the five assertion helpers, and the cross-language conformance suite. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.1 — step 2 of 7 (Driver interface).** This release adds the `Driver` interface and the `Closer` optional secondary interface alongside the v0.7.0 scaffold (module + protocol-version constant + error types). Subsequent steps add the [pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq) adapters, the `Client` API (transactions, role-switching, seed), the five assertion helpers, and the cross-language conformance suite. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -22,15 +22,15 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 
 | Capability | Step | Status |
 |---|---|---|
-| `ProtocolVersion` constant | 1 | ✅ shipped |
-| `Error` + `AssertionError` types | 1 | ✅ shipped |
-| `Driver` interface | 2 | planned |
-| pgx adapter | 3 | planned |
-| lib/pq adapter | 3 | planned |
-| `Client` (transaction, AsRole, Exec, FetchAll, Seed) | 4 | planned |
-| Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | planned |
-| Cross-language conformance suite | 6 | planned |
-| `go/v0.7.0` release tag + GitHub Release | 7 | planned |
+| `ProtocolVersion` constant | 1 | ✅ shipped (v0.7.0) |
+| `Error` + `AssertionError` types | 1 | ✅ shipped (v0.7.0) |
+| `Driver` + `Closer` interfaces + `QueryResult` | 2 | ✅ shipped (v0.7.1) |
+| pgx adapter | 3 | planned (v0.7.2) |
+| lib/pq adapter | 3 | planned (v0.7.2) |
+| `Client` (Transaction, AsRole, Exec, FetchAll, Seed) | 4 | planned (v0.7.3) |
+| Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | planned (v0.7.4) |
+| Cross-language conformance suite | 6 | planned (v0.7.5) |
+| CI hardening + release plumbing | 7 | planned (v0.7.6) |
 
 ## Cross-language guarantee
 
@@ -46,8 +46,13 @@ See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent
 | Error base | `PgrlsTestError` | `PgrlsTestError` | `*pgrlstest.Error` |
 | Assertion error | `PgrlsTestAssertionError` | `PgrlsTestAssertionError` | `*pgrlstest.AssertionError` |
 | Protocol version | `PROTOCOL_VERSION = 1` | `PROTOCOL_VERSION = 1` | `ProtocolVersion = 1` |
+| Driver abstraction | (inlined psycopg cursor) | `Driver` interface | `Driver` interface |
+| Row shape | `Cursor.fetchall()` tuples | `readonly Record<string, unknown>[]` | `[]map[string]any` |
+| Driver teardown | caller-owned connection | optional `close?()` method | separate `Closer` interface |
 
 The Go type names use Go's idiomatic short form (just `Error`, `AssertionError`) since they're already namespaced under the `pgrlstest` package. The `errors.Is` machinery exposes two sentinel values — `ErrAPIError` and `ErrAssertion` — for callers that want to route errors without type-asserting.
+
+The `Driver` and `Closer` interfaces are structurally aligned with the TypeScript `Driver` — semantically identical operations (parameterized query, rollback, error classification, optional teardown) with Go-idiomatic adaptations (`ctx context.Context` first arg, variadic `params ...any`, error return alongside the result, separate `Closer` interface for the optional-teardown method).
 
 ## License
 

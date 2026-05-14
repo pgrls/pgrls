@@ -29,6 +29,13 @@ breaking changes — they will be called out in this file.
   route through `format_violations` / `format_sarif` which
   serialize via `json.dumps`.
 
+## [0.7.1] - 2026-05-13
+
+Go port step 2 of 7 — `Driver` interface, `Closer` optional interface,
+`QueryResult` struct. The Python core (`pgrls` package) stays at 0.5.10
+and the TypeScript port stays at 0.6.2. Per-port details live in
+[`go/CHANGELOG.md`](go/CHANGELOG.md).
+
 ## [0.7.0] - 2026-05-13
 
 The Python core (`pgrls` package) version stays at 0.5.10 — v0.7.0 is
