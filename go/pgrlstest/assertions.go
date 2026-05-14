@@ -10,25 +10,39 @@ import (
 // `pgrls.testing.assertions` (Python) and `pgrls-test`'s
 // `assertions.ts` (TypeScript).
 //
-// Each helper takes a `*Client` and a SQL string. `Client`
-// exposes them as instance methods (`AssertRows`, etc.) for
-// the common case; the package-level functions stay reachable
-// for non-`Client` contexts (custom drivers, ad-hoc scripts,
-// alternative test runners).
+// Each helper is exposed both as a `*Client` method
+// (`Client.AssertRows`, etc.) for the common case AND as a
+// package-level function (`pgrlstest.AssertRows`, etc.) for
+// callers wiring their own assertion suites or driving a
+// `*Client` from outside an `AsRole` block (notebooks, ad-hoc
+// scripts, alternative test runners). The two forms have
+// identical wire output — the methods are thin forwarders to
+// the functions.
 //
 // Failure mode: every helper returns `*AssertionError` (which
 // matches the `ErrAssertion` sentinel via `errors.Is`) so the
 // `go test` runner renders the failure with its standard
 // machinery. A helper that detects misuse (wrong-shape SQL
-// passed to `AssertSilentlyDropped`) returns `*Error` instead —
-// distinct from an RLS-misbehavior assertion failure.
+// passed to `AssertSilentlyDropped`, or a nil
+// `AssertRowsOptions`) returns `*Error` instead — distinct
+// from an RLS-misbehavior assertion failure.
 
-// assertRows is the package-level helper. Callers typically
-// reach it via `Client.AssertRows` (defined below).
+// AssertRows is the package-level helper backing
+// `Client.AssertRows`. Cross-language analogue of Python's
+// `pgrls.testing.assertions.assert_rows` and TypeScript's
+// `assertRows`.
 //
 // Returns `*AssertionError` (matches `ErrAssertion`) if the
-// query's row count differs from `count`.
-func assertRows(ctx context.Context, c *Client, sqlText string, count int) error {
+// query's row count differs from `options.Count`. Returns
+// `*Error` (matches `ErrAPIError`) if `options` is nil.
+func AssertRows(ctx context.Context, c *Client, sqlText string, options *AssertRowsOptions) error {
+	if options == nil {
+		return &Error{Msg: "AssertRows: options is nil; pass &AssertRowsOptions{Count: N}"}
+	}
+	return assertRowsImpl(ctx, c, sqlText, options.Count)
+}
+
+func assertRowsImpl(ctx context.Context, c *Client, sqlText string, count int) error {
 	result, err := c.driver.Query(ctx, sqlText)
 	if err != nil {
 		return err
@@ -45,9 +59,10 @@ func assertRows(ctx context.Context, c *Client, sqlText string, count int) error
 	return nil
 }
 
-// assertVisible is the package-level helper. Returns
-// `*AssertionError` when the query yields zero rows.
-func assertVisible(ctx context.Context, c *Client, sqlText string) error {
+// AssertVisible is the package-level helper backing
+// `Client.AssertVisible`. Returns `*AssertionError` if the
+// query yields zero rows.
+func AssertVisible(ctx context.Context, c *Client, sqlText string) error {
 	result, err := c.driver.Query(ctx, sqlText)
 	if err != nil {
 		return err
@@ -63,9 +78,10 @@ func assertVisible(ctx context.Context, c *Client, sqlText string) error {
 	return nil
 }
 
-// assertInvisible is the package-level helper. Returns
-// `*AssertionError` when the query yields any rows.
-func assertInvisible(ctx context.Context, c *Client, sqlText string) error {
+// AssertInvisible is the package-level helper backing
+// `Client.AssertInvisible`. Returns `*AssertionError` if the
+// query yields any rows.
+func AssertInvisible(ctx context.Context, c *Client, sqlText string) error {
 	result, err := c.driver.Query(ctx, sqlText)
 	if err != nil {
 		return err
@@ -81,7 +97,8 @@ func assertInvisible(ctx context.Context, c *Client, sqlText string) error {
 	return nil
 }
 
-// assertRejected is the package-level helper.
+// AssertRejected is the package-level helper backing
+// `Client.AssertRejected`.
 //
 // Layer 1 wire sequence:
 //
@@ -100,8 +117,10 @@ func assertInvisible(ctx context.Context, c *Client, sqlText string) error {
 //
 // Cross-language guarantee: same savepoint prefix
 // (`pgrls_check`), same RELEASE-on-success / ROLLBACK-on-failure
-// pattern, same error-message shapes as Python and TypeScript.
-func assertRejected(ctx context.Context, c *Client, sqlText string) error {
+// pattern, shape-equivalent error messages (helper-name prefix
+// differs per language idiom: `AssertRejected:` here,
+// `assertRejected:` in TS, `assert_rejected:` in Python).
+func AssertRejected(ctx context.Context, c *Client, sqlText string) error {
 	savepoint, err := NewSavepointName("pgrls_check")
 	if err != nil {
 		return err
@@ -164,10 +183,11 @@ func assertRejected(ctx context.Context, c *Client, sqlText string) error {
 // returningKeywordRe matches the literal `RETURNING` keyword in
 // SQL, case-insensitively, with word boundaries (so column
 // names like `returning_col` don't trip it). Used by
-// `assertSilentlyDropped` to reject mis-shaped DML upfront.
+// `AssertSilentlyDropped` to reject mis-shaped DML upfront.
 var returningKeywordRe = regexp.MustCompile(`(?i)\bRETURNING\b`)
 
-// assertSilentlyDropped is the package-level helper.
+// AssertSilentlyDropped is the package-level helper backing
+// `Client.AssertSilentlyDropped`.
 //
 // Asserts that an UPDATE or DELETE with RETURNING succeeds but
 // yields zero rows — the Postgres RLS shape where the policy's
@@ -191,7 +211,7 @@ var returningKeywordRe = regexp.MustCompile(`(?i)\bRETURNING\b`)
 // with no rows," and a real driver error (typo, bad column ref)
 // should surface loudly. If you want savepoint-tolerant
 // rejection assertions, use `AssertRejected` for the raise path.
-func assertSilentlyDropped(ctx context.Context, c *Client, sqlText string) error {
+func AssertSilentlyDropped(ctx context.Context, c *Client, sqlText string) error {
 	result, err := c.driver.Query(ctx, sqlText)
 	if err != nil {
 		return err
@@ -269,37 +289,39 @@ type AssertRowsOptions struct {
 }
 
 // AssertRows asserts the query returns exactly
-// `options.Count` rows.
+// `options.Count` rows. Forwards to the package-level
+// `pgrlstest.AssertRows`.
 //
 // Returns `*AssertionError` (matches `ErrAssertion`) if the
-// count differs.
+// count differs. Returns `*Error` (matches `ErrAPIError`) if
+// `options` is nil.
 func (c *Client) AssertRows(
 	ctx context.Context,
 	sqlText string,
 	options *AssertRowsOptions,
 ) error {
-	if options == nil {
-		return &Error{Msg: "AssertRows: options is nil; pass &AssertRowsOptions{Count: N}"}
-	}
-	return assertRows(ctx, c, sqlText, options.Count)
+	return AssertRows(ctx, c, sqlText, options)
 }
 
 // AssertVisible asserts the query returns at least one row.
+// Forwards to the package-level `pgrlstest.AssertVisible`.
 //
 // Returns `*AssertionError` if zero rows.
 func (c *Client) AssertVisible(ctx context.Context, sqlText string) error {
-	return assertVisible(ctx, c, sqlText)
+	return AssertVisible(ctx, c, sqlText)
 }
 
 // AssertInvisible asserts the query returns zero rows.
+// Forwards to the package-level `pgrlstest.AssertInvisible`.
 //
 // Returns `*AssertionError` if any rows returned.
 func (c *Client) AssertInvisible(ctx context.Context, sqlText string) error {
-	return assertInvisible(ctx, c, sqlText)
+	return AssertInvisible(ctx, c, sqlText)
 }
 
 // AssertRejected asserts that running `sqlText` raises Postgres
-// `InsufficientPrivilege` (SQLSTATE 42501).
+// `InsufficientPrivilege` (SQLSTATE 42501). Forwards to the
+// package-level `pgrlstest.AssertRejected`.
 //
 // Wraps the query in a savepoint so the failure (which puts the
 // transaction in 'aborted' state until rollback) doesn't poison
@@ -311,13 +333,14 @@ func (c *Client) AssertInvisible(ctx context.Context, sqlText string) error {
 // TO SAVEPOINT / RELEASE SAVEPOINT calls themselves propagate
 // unchanged (catastrophic connection loss, etc.).
 func (c *Client) AssertRejected(ctx context.Context, sqlText string) error {
-	return assertRejected(ctx, c, sqlText)
+	return AssertRejected(ctx, c, sqlText)
 }
 
 // AssertSilentlyDropped asserts that an UPDATE/DELETE with
 // RETURNING yields zero rows — the Postgres RLS shape where
 // the policy's USING expression filters every row out before
-// the write.
+// the write. Forwards to the package-level
+// `pgrlstest.AssertSilentlyDropped`.
 //
 // Returns `*Error` (matches `ErrAPIError`) for misuse (non-
 // UPDATE/DELETE verb, missing RETURNING) — distinct from
@@ -328,5 +351,5 @@ func (c *Client) AssertRejected(ctx context.Context, sqlText string) error {
 // fires. Only call with the UPDATE/DELETE you actually want to
 // execute.
 func (c *Client) AssertSilentlyDropped(ctx context.Context, sqlText string) error {
-	return assertSilentlyDropped(ctx, c, sqlText)
+	return AssertSilentlyDropped(ctx, c, sqlText)
 }

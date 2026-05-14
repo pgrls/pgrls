@@ -12,18 +12,27 @@ on wire-level breaking changes shared with the Python and TypeScript clients.
 **Step 5 of 7 — assertion helpers.** Wires the Layer 1 wire
 contract for the five RLS-shape assertions; matches the Python
 (`pgrls.testing.assertions`) and TypeScript (`pgrls-test`'s
-`assertions.ts`) byte-for-byte wire output (same `pgrls_check`
+`assertions.ts`) byte-for-byte wire SQL (same `pgrls_check`
 savepoint prefix, same RELEASE-on-success / ROLLBACK-on-failure
 pattern, same UPDATE/DELETE verb gate, same RETURNING-keyword
-word-boundary check, same error-message shapes).
+word-boundary check) and shape-equivalent error messages (each
+port leads with its idiomatic helper-name prefix —
+`AssertRejected:` here, `assertRejected:` in TS,
+`assert_rejected:` in Python — same substantive content).
 
 ### Added
 
 - **Five assertion helpers** at `pgrlstest/assertions.go`,
   exposed both as `Client` methods (`Client.AssertRows`,
   `Client.AssertVisible`, `Client.AssertInvisible`,
-  `Client.AssertRejected`, `Client.AssertSilentlyDropped`) and
-  as package-level functions for non-Client contexts:
+  `Client.AssertRejected`, `Client.AssertSilentlyDropped`) AND
+  as exported package-level functions (`pgrlstest.AssertRows`,
+  etc.) taking a `*Client` argument. The methods are thin
+  forwarders; both forms have identical wire output. Mirrors
+  the TS port's `assertRows(client, sql, options)` and Python's
+  `assert_rows(conn, sql, *, count=N)` callable shapes so
+  callers building their own assertion suites can reach the
+  helpers without going through `Client`.
   - `AssertRows(ctx, sql, &AssertRowsOptions{Count: N})` —
     exact row-count match. Returns `*AssertionError` (matches
     `ErrAssertion`) on mismatch.
@@ -48,25 +57,28 @@ word-boundary check, same error-message shapes).
   future optional knobs (partial-match, regex over a column,
   etc.) extend without churning callers.
 
-- **27 unit tests** in `assertions_test.go` covering the
+- **24 unit tests** in `assertions_test.go` covering the
   pass/fail branches of each helper, the savepoint wire
   sequence in `AssertRejected` (success → RELEASE,
   42501-rejection → ROLLBACK TO SAVEPOINT, wrong-shape error →
   ROLLBACK TO SAVEPOINT + AssertionError wrapping the underlying
-  error), the misuse-error branches in `AssertSilentlyDropped`
-  (SELECT, INSERT, missing RETURNING, RETURNING inside a column
-  name), and case-insensitive / word-boundary matching for the
-  RETURNING regex. Driver-error propagation through every
-  helper is pinned.
+  error), savepoint-call failure paths (SAVEPOINT-on-entry,
+  ROLLBACK after wrong-shape body error, RELEASE on success),
+  the misuse-error branches in `AssertSilentlyDropped` (SELECT,
+  INSERT, missing RETURNING, RETURNING inside a column name,
+  empty Command verb), and case-insensitive / word-boundary
+  matching for the RETURNING regex. Driver-error propagation
+  through every helper is pinned.
 
 ### Changed
 
 - **`protocol.go` status comment** advanced to step 5 of 7.
-- **Module surface** grows by six new exports: the five
-  `AssertX` methods on `Client`, plus the `AssertRowsOptions`
-  config struct. (The package-level `assertRows` /
-  `assertVisible` / etc. helpers are unexported — callers go
-  through the methods.)
+- **Module surface** grows by eleven new exports: the five
+  `Client.AssertX` methods, the five package-level `AssertX`
+  functions (`pgrlstest.AssertRows` / `AssertVisible` /
+  `AssertInvisible` / `AssertRejected` /
+  `AssertSilentlyDropped`), and the `AssertRowsOptions`
+  config struct.
 
 ## [0.7.3] - 2026-05-14
 

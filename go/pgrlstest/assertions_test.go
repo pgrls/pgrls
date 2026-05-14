@@ -460,3 +460,110 @@ func TestAssertSilentlyDropped_PropagatesDriverError(t *testing.T) {
 
 // Compile-time pin for the wrapper used in TestAssertRejected_PropagatesSavepointError.
 var _ Driver = (*savepointFailDriver)(nil)
+
+func TestAssertSilentlyDropped_EmptyCommandFallsThroughMisuse(t *testing.T) {
+	// Defensive: a driver that returns "" for Command (e.g. an
+	// unknown command tag) must trigger the misuse branch with
+	// the `'(unknown)'` verb rendering, not silently pass.
+	d := &assertionDriver{
+		rowsBySQL: map[string]QueryResult{
+			"DO $$ ... $$": {Rows: nil, Command: "", RowCount: 0},
+		},
+	}
+	c := NewClient(d)
+
+	err := c.AssertSilentlyDropped(context.Background(), "DO $$ ... $$")
+	if err == nil {
+		t.Fatal("expected misuse error for empty Command")
+	}
+	if !errors.Is(err, ErrAPIError) {
+		t.Errorf("error %v does not match ErrAPIError sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "'(unknown)'") {
+		t.Errorf("error %q should mention '(unknown)' verb", err.Error())
+	}
+}
+
+func TestAssertRejected_RollbackFailureOnWrongShapeError(t *testing.T) {
+	// Defensive: if the ROLLBACK TO SAVEPOINT call itself fails
+	// after the body raised a wrong-shape error, AssertRejected
+	// surfaces the rollback error (the wrong-shape error and
+	// associated AssertionError are dropped — the rollback
+	// failure is the more catastrophic event).
+	wrongErr := errors.New("23505 unique_violation")
+	rollbackErr := errors.New("connection lost")
+	d := &rollbackFailDriver{
+		bodyErr:     wrongErr,
+		rollbackErr: rollbackErr,
+	}
+	c := NewClient(d)
+
+	err := c.AssertRejected(context.Background(), "INSERT INTO t (x) VALUES (1)")
+	if !errors.Is(err, rollbackErr) {
+		t.Errorf("got %v, want rollback error %v", err, rollbackErr)
+	}
+}
+
+func TestAssertRejected_ReleaseFailureOnSuccess(t *testing.T) {
+	// Defensive: if the RELEASE SAVEPOINT call fails on the
+	// success path, AssertRejected surfaces the release error
+	// (the "succeeded but expected rejection" AssertionError is
+	// dropped — the release failure is more catastrophic).
+	releaseErr := errors.New("connection lost")
+	d := &releaseFailDriver{releaseErr: releaseErr}
+	c := NewClient(d)
+
+	err := c.AssertRejected(context.Background(), "SELECT 1")
+	if !errors.Is(err, releaseErr) {
+		t.Errorf("got %v, want release error %v", err, releaseErr)
+	}
+}
+
+// rollbackFailDriver: first Query (SAVEPOINT) succeeds; second
+// (body SQL) returns bodyErr; third (ROLLBACK TO SAVEPOINT)
+// returns rollbackErr. classifyError returns false so the body
+// error is classified as wrong-shape.
+type rollbackFailDriver struct {
+	calls       int
+	bodyErr     error
+	rollbackErr error
+}
+
+func (d *rollbackFailDriver) Query(_ context.Context, _ string, _ ...any) (QueryResult, error) {
+	d.calls++
+	switch d.calls {
+	case 1: // SAVEPOINT
+		return QueryResult{}, nil
+	case 2: // body SQL
+		return QueryResult{}, d.bodyErr
+	case 3: // ROLLBACK TO SAVEPOINT
+		return QueryResult{}, d.rollbackErr
+	default:
+		return QueryResult{}, nil
+	}
+}
+func (d *rollbackFailDriver) Rollback(_ context.Context) error     { return nil }
+func (d *rollbackFailDriver) IsInsufficientPrivilege(_ error) bool { return false }
+
+// releaseFailDriver: first Query (SAVEPOINT) succeeds; second
+// (body SQL) succeeds; third (RELEASE SAVEPOINT) returns
+// releaseErr.
+type releaseFailDriver struct {
+	calls      int
+	releaseErr error
+}
+
+func (d *releaseFailDriver) Query(_ context.Context, _ string, _ ...any) (QueryResult, error) {
+	d.calls++
+	if d.calls == 3 {
+		return QueryResult{}, d.releaseErr
+	}
+	return QueryResult{}, nil
+}
+func (d *releaseFailDriver) Rollback(_ context.Context) error     { return nil }
+func (d *releaseFailDriver) IsInsufficientPrivilege(_ error) bool { return false }
+
+var (
+	_ Driver = (*rollbackFailDriver)(nil)
+	_ Driver = (*releaseFailDriver)(nil)
+)

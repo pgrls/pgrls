@@ -34,6 +34,22 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 | Cross-language conformance suite | 6 | planned (v0.7.5) |
 | CI hardening + release plumbing | 7 | planned (v0.7.6) |
 
+## Assertion helper semantics
+
+| Helper | Passes when | Fails when |
+|---|---|---|
+| `AssertRows(ctx, sql, &AssertRowsOptions{Count: N})` | query returns exactly N rows | row count differs (`*AssertionError`) |
+| `AssertVisible(ctx, sql)` | query returns ≥ 1 row | zero rows (`*AssertionError`) |
+| `AssertInvisible(ctx, sql)` | query returns 0 rows | any rows (`*AssertionError`) |
+| `AssertRejected(ctx, sql)` | Postgres raises `InsufficientPrivilege` (SQLSTATE `42501`) | query succeeded OR raised a different error (`*AssertionError`) |
+| `AssertSilentlyDropped(ctx, sql)` | `UPDATE/DELETE … RETURNING` succeeds but `USING` filters the row out before the write; `RETURNING` is empty | DML raises (driver error propagates) OR `RETURNING` returns rows (`*AssertionError`). Non-UPDATE/DELETE SQL (SELECT, INSERT, …) and UPDATE/DELETE missing `RETURNING` both return `*Error` (matches `ErrAPIError`) — caller-error, distinct from RLS-misbehavior. |
+
+`AssertRejected` and `AssertSilentlyDropped` distinguish two distinct Postgres failure modes — `WITH CHECK` violations raise (catch with the first); `USING` filtering of `UPDATE`/`DELETE` returns silently empty (catch with the second).
+
+`AssertSilentlyDropped` rejects mis-shaped SQL via the result's command-tag verb, which means the SQL is fully executed (and any side-effects committed within the current transaction) before the verb-gate rejects it. Pass only the UPDATE/DELETE you actually want to execute.
+
+Each helper is exposed both as a `Client` method (`client.AssertRows(ctx, sql, opts)`) AND as a package-level function (`pgrlstest.AssertRows(ctx, client, sql, opts)`). The two forms have identical wire output — the methods are thin forwarders.
+
 ## Cross-language guarantee
 
 The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) follows the same step-by-step pattern across the three. Two language-driven knobs are NOT byte-equal but don't affect RLS evaluation:

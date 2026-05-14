@@ -20,7 +20,9 @@
 // suffix generator); v0.7.4 added the five assertion helpers
 // (`AssertRows`, `AssertVisible`, `AssertInvisible`,
 // `AssertRejected`, `AssertSilentlyDropped`) — both as `Client`
-// methods and as package-level functions for non-Client contexts.
+// methods and as exported package-level functions taking a
+// `*Client` (matching the TS port's `assertRows(client, ...)`
+// and Python's `assert_rows(conn, ...)` callable shapes).
 // Subsequent steps add the conformance suite (v0.7.5) and CI
 // hardening + release plumbing (v0.7.6). See CHANGELOG.md for
 // the per-step plan.
