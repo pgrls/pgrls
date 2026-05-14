@@ -12,10 +12,11 @@
 // v0.7.1 added the Driver and Closer interfaces alongside the
 // QueryResult struct; v0.7.2 added the pgx and lib/pq driver
 // adapters (each with a single-conn + pool-backed constructor);
-// v0.7.3 added the Client API (`Client.Transaction`, `Client.AsRole`,
-// `Client.Exec`, `Client.FetchAll`, `Client.Seed`, `Client.Close`)
-// alongside `QuoteIdent` / `QuoteQualified` (identifier quoting
-// with reserved-keyword handling) and `NewSavepointName`
+// v0.7.3 added the Client API (`Client.Transaction`, `Client.Exec`,
+// `Client.FetchAll`, `Client.AsRole`, `Client.Seed`, `Client.Close`,
+// plus a `Client.Driver` accessor for the v0.7.4 assertion
+// helpers) alongside `QuoteIdent` / `QuoteQualified` (identifier
+// quoting with reserved-keyword handling) and `NewSavepointName`
 // (crypto/rand-backed savepoint suffix generator). Subsequent
 // steps add the assertion helpers (v0.7.4), the conformance
 // suite (v0.7.5), and CI hardening + release plumbing (v0.7.6).

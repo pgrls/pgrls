@@ -78,7 +78,7 @@ func (d *noCloserDriver) Query(_ context.Context, _ string, _ ...any) (QueryResu
 	return QueryResult{}, nil
 }
 
-func (d *noCloserDriver) Rollback(_ context.Context) error      { return nil }
+func (d *noCloserDriver) Rollback(_ context.Context) error     { return nil }
 func (d *noCloserDriver) IsInsufficientPrivilege(_ error) bool { return false }
 
 func TestClient_Transaction_BeginAndRollback(t *testing.T) {
@@ -757,4 +757,3 @@ var (
 	_ Closer = (*recordingDriver)(nil)
 	_ Driver = (*noCloserDriver)(nil)
 )
-

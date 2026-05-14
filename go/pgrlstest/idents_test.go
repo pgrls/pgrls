@@ -76,12 +76,12 @@ func TestQuoteIdent_ReservedKeywordQuoted(t *testing.T) {
 
 func TestQuoteIdent_NonPlainQuoted(t *testing.T) {
 	cases := map[string]string{
-		"MixedCase":   `"MixedCase"`,
-		"with space":  `"with space"`,
-		"with-dash":   `"with-dash"`,
-		"1leading":    `"1leading"`,
-		"weird.name":  `"weird.name"`,
-		"weïrd":       `"weïrd"`,
+		"MixedCase":  `"MixedCase"`,
+		"with space": `"with space"`,
+		"with-dash":  `"with-dash"`,
+		"1leading":   `"1leading"`,
+		"weird.name": `"weird.name"`,
+		"weïrd":      `"weïrd"`,
 	}
 	for input, want := range cases {
 		t.Run(input, func(t *testing.T) {
@@ -149,8 +149,8 @@ func TestQuoteQualified_BothComponents(t *testing.T) {
 		schema, name, want string
 	}{
 		{"app", "invoices", "app.invoices"},
-		{"app", "user", `app."user"`},   // name is reserved
-		{"order", "x", `"order".x`},     // schema is reserved
+		{"app", "user", `app."user"`}, // name is reserved
+		{"order", "x", `"order".x`},   // schema is reserved
 		{"MixedCase", "y", `"MixedCase".y`},
 	}
 	for _, c := range cases {

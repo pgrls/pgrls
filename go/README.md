@@ -27,7 +27,7 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 | `Driver` + `Closer` interfaces + `QueryResult` | 2 | ✅ shipped (v0.7.1) |
 | pgx adapter (`drivers/pgx`: `Conn` + `Pool`) | 3 | ✅ shipped (v0.7.2) |
 | lib/pq adapter (`drivers/pq`: `Conn` + `DB`) | 3 | ✅ shipped (v0.7.2) |
-| `Client` (Transaction, AsRole, Exec, FetchAll, Seed, Close) | 4 | ✅ shipped (v0.7.3) |
+| `Client` (Transaction, AsRole, Exec, FetchAll, Seed, Close, Driver) | 4 | ✅ shipped (v0.7.3) |
 | `QuoteIdent` + `QuoteQualified` + `ReservedKeywords` (78 entries) | 4 | ✅ shipped (v0.7.3) |
 | `NewSavepointName` (crypto/rand 4-byte → 8-hex) | 4 | ✅ shipped (v0.7.3) |
 | Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | planned (v0.7.4) |
@@ -36,7 +36,10 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 
 ## Cross-language guarantee
 
-The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) is identical across the three. Two language-driven knobs aren't byte-equal: the JWT claims JSON-encoding uses each language's stock JSON encoder (Python `json.dumps` and TS `JSON.stringify` both preserve insertion order; Go `encoding/json` sorts keys alphabetically), and Go's `Seed` emits sorted column order in the generated SQL while Python and TS preserve dict / object insertion order. Neither affects RLS evaluation; both are noted in the protocol spec.
+The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) follows the same step-by-step pattern across the three. Two language-driven knobs are NOT byte-equal but don't affect RLS evaluation:
+
+- **JWT claims JSON encoding.** Each port uses its language's stock encoder: Python `json.dumps` and TS `JSON.stringify` preserve insertion order; Go `encoding/json` sorts keys alphabetically. The encoded JSON string is the `$1` parameter passed to `set_config('request.jwt.claims', $1, true)` — the SQL itself is identical; only the parameter bytes differ on input.
+- **`Seed` column ordering.** Python and TS preserve dict / object insertion order in the emitted `INSERT INTO t (col1, col2)` SQL; Go sorts alphabetically (Go has no insertion-order map primitive). `Seed` is the test-helper layer, deliberately scoped out of the Layer 1 protocol — see `docs/pgrls-test-protocol.md` ("What's deliberately out of contract").
 
 See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent directory) for the full spec.
 
@@ -49,7 +52,7 @@ See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent
 | Assertion error | `PgrlsTestAssertionError` | `PgrlsTestAssertionError` | `*pgrlstest.AssertionError` |
 | Protocol version | `PROTOCOL_VERSION = 1` | `PROTOCOL_VERSION = 1` | `ProtocolVersion = 1` |
 | Driver abstraction | (inlined psycopg cursor) | `Driver` interface | `Driver` interface |
-| Row shape | `Cursor.fetchall()` tuples | `readonly Record<string, unknown>[]` | `[]map[string]any` |
+| Row shape | `list[dict[str, object]]` (psycopg `dict_row` factory) | `readonly Record<string, unknown>[]` | `[]map[string]any` |
 | Driver teardown | caller-owned connection | optional `close?()` method | separate `Closer` interface |
 
 The Go type names use Go's idiomatic short form (just `Error`, `AssertionError`) since they're already namespaced under the `pgrlstest` package. The `errors.Is` machinery exposes two sentinel values — `ErrAPIError` and `ErrAssertion` — for callers that want to route errors without type-asserting.

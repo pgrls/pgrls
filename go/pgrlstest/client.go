@@ -181,12 +181,13 @@ type AsRoleOptions struct {
 //     SELECT set_config('request.jwt.claims', $1, true) with the
 //     JSON-encoded claims.
 //  5. Run body.
-//  6a. Clean exit: RELEASE SAVEPOINT, then explicitly restore
+//  6. On clean exit: RELEASE SAVEPOINT, then explicitly restore
 //     prior role + claims. RELEASE keeps SET LOCAL changes merged
 //     into the outer transaction; without explicit restoration,
 //     nested AsRole blocks would lose the outer role on return.
-//  6b. Exception path: ROLLBACK TO SAVEPOINT, which auto-restores
-//     SET LOCAL state (role and GUC both revert).
+//  7. On body error: ROLLBACK TO SAVEPOINT, which auto-restores
+//     SET LOCAL state (role and GUC both revert). Steps 6 and 7
+//     are mutually exclusive — exactly one runs on each call.
 //
 // The role identifier is quoted via QuoteIdent — reserved
 // keywords (`"order"`, `"user"`) and mixed-case / special-char
@@ -401,11 +402,22 @@ func (c *Client) AsRole(
 // independently. Names with more than one dot are rejected —
 // cross-database refs aren't supported.
 //
+// **Column ordering divergence from Python/TS.** The emitted
+// `INSERT INTO t (col1, col2, …)` column list is sorted
+// alphabetically; the Python (`pgrls.testing`) and TypeScript
+// (`pgrls-test`) seeders preserve dict / object insertion
+// order. Go's map iteration is randomized, so sorting is the
+// closest deterministic-output analogue. `Seed` is deliberately
+// outside the Layer 1 wire protocol (see
+// `docs/pgrls-test-protocol.md`) — the divergence affects test
+// query logs and SQL snapshots, not the RLS evaluation
+// semantics.
+//
 // Mirrors the Python `client.seed(table, rows)` and TypeScript
-// `client.seed(table, rows)`. For richer factory needs
-// (sequencing, faker integration, post-insert hooks), use a
-// dedicated factory framework — pgrls-test's seeder is
-// intentionally tiny.
+// `client.seed(table, rows)` semantically (rows-in, INSERTs-out).
+// For richer factory needs (sequencing, faker integration,
+// post-insert hooks), use a dedicated factory framework —
+// pgrls-test's seeder is intentionally tiny.
 func (c *Client) Seed(ctx context.Context, table string, rows []map[string]any) error {
 	if len(rows) == 0 {
 		return nil
@@ -451,7 +463,7 @@ func (c *Client) Seed(ctx context.Context, table string, rows []map[string]any) 
 			sort.Strings(rowKeys)
 			return &Error{
 				Msg: fmt.Sprintf(
-					"Seed: rows must all have the same keys; row 0 has %v, row %d has %v",
+					"Seed: rows must all have the same keys; row 0 has %q, row %d has %q",
 					keys, i, rowKeys,
 				),
 			}

@@ -18,8 +18,10 @@ a shared fixture once testcontainers-go is wired up.
 
 ### Added
 
-- **`Client` struct** at `pgrlstest/client.go` with six public
-  methods:
+- **`Client` struct** at `pgrlstest/client.go` with a
+  `NewClient` constructor and seven public methods
+  (`Transaction`, `Exec`, `FetchAll`, `AsRole`, `Seed`, `Close`,
+  `Driver`):
   - `NewClient(driver)` builds a client from any `Driver`-shaped
     adapter (typically `pgxdriver.Conn` / `pgxdriver.Pool` or
     `pqdriver.Conn` / `pqdriver.DB`).
