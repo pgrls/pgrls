@@ -58,7 +58,7 @@ version constant, and the error types. Subsequent steps ship as their own
 minor versions (v0.7.1 = Driver interface; v0.7.2 = pgx + lib/pq adapters;
 v0.7.3 = Client API; v0.7.4 = assertion helpers; v0.7.5 = conformance suite;
 v0.7.6 = CI hardening + release plumbing). Each step ships as a separately-
-reviewable PR. The TypeScript port took seven steps culminating in v0.6.1;
+reviewable PR. The TypeScript port took seven steps to ship v0.6.0;
 the Go port follows the same staged release pattern.
 
 ### Added
