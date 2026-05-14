@@ -1333,11 +1333,13 @@ Three layers, the bottom one is a documented contract not code:
   port ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
   this same contract; a Go port at [`go/`](go/) shipped its scaffold +
   protocol-version constant + error types in v0.7.0, with the Driver +
-  Closer interfaces + QueryResult shape added in v0.7.1, and the
-  pgx + lib/pq adapter packages added in v0.7.2 (step 3 of 7 —
-  subsequent steps add the Client API,
-  assertion helpers, and conformance suite). Python is the reference
-  implementation. `PROTOCOL_VERSION = 1`.
+  Closer interfaces + QueryResult shape added in v0.7.1, the
+  pgx + lib/pq adapter packages added in v0.7.2, and the Client
+  API (`Transaction`, `AsRole`, `Exec`, `FetchAll`, `Seed`, `Close`)
+  added in v0.7.3 alongside `QuoteIdent` / `QuoteQualified` and
+  `NewSavepointName` (step 4 of 7 — subsequent steps add the
+  assertion helpers, the conformance suite, and CI hardening).
+  Python is the reference implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
@@ -1695,10 +1697,12 @@ These are intentional in the current release. Do not invent capabilities.
   scaffold + protocol-version constant + error types shipped in
   v0.7.0; the Driver + Closer interfaces + QueryResult shape
   shipped in v0.7.1; the pgx + lib/pq driver adapters shipped
-  in v0.7.2 (step 3 of 7). Subsequent v0.7.x steps add the
-  Client API, assertion helpers, and conformance suite. The `pgrls lint / fix /
-  snapshot / diff` CLIs stay Python — they depend on pglast
-  (no drop-in TS/Go equivalent).
+  in v0.7.2; the Client API (`Transaction`, `AsRole`, `Exec`,
+  `FetchAll`, `Seed`, `Close`) plus `QuoteIdent` / `QuoteQualified`
+  / `NewSavepointName` shipped in v0.7.3 (step 4 of 7). Subsequent
+  v0.7.x steps add the assertion helpers, conformance suite, and
+  CI hardening. The `pgrls lint / fix / snapshot / diff` CLIs stay
+  Python — they depend on pglast (no drop-in TS/Go equivalent).
 
 ## Where to learn more
 

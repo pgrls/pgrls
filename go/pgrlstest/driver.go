@@ -32,10 +32,12 @@ type QueryResult struct {
 	// `[]map[string]any` (Go 1.18+) keeps the test ergonomics
 	// — `result.Rows[0]["tenant_id"]` reads naturally — and
 	// matches the row shape the TS / Python clients return.
-	// Strongly-typed row decoding is a future addition (a
-	// generic `FetchAll[T]` wrapper, planned for v0.7.3 step
-	// 4); the Driver interface stays untyped so adapters
-	// don't have to carry generic plumbing.
+	// `Client.FetchAll` (v0.7.3) returns this shape directly;
+	// the TS port carries a `fetchAll<TRow>` generic cast for
+	// ergonomics, but Go's type system doesn't permit a free
+	// generic over `map[string]any` without forcing a
+	// conversion step, so callers wrap with their own typed-
+	// row helper if desired (see `Client.FetchAll`'s godoc).
 	//
 	// **Mutation contract**: callers MUST treat Rows as read-
 	// only. Adapter implementations are free to reuse backing

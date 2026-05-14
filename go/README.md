@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.2 — step 3 of 7 (pgx + lib/pq adapters).** This release adds adapter packages for the two dominant Go Postgres drivers ([pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq)). Each ships two constructors: one for a caller-owned pinned connection, one for the pool variant that lazily acquires + releases via `Closer`. Subsequent steps add the `Client` API (transactions, role-switching, seed), the five assertion helpers, the cross-language conformance suite, and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.3 — step 4 of 7 (Client API).** This release adds the `Client` struct that wires the Driver adapters (v0.7.2) behind a stable API: `Transaction`, `AsRole` (role + JWT claims switching via `SAVEPOINT pgrls_actor_<rand>`), `Exec`, `FetchAll`, `Seed`, and `Close`. The wire sequence is byte-equivalent to the Python and TypeScript ports. Also ships `QuoteIdent` / `QuoteQualified` (Postgres 16 reserved-keyword aware) and `NewSavepointName` (crypto/rand-backed savepoint suffix). Subsequent steps add the five assertion helpers, the cross-language conformance suite, and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -27,14 +27,19 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 | `Driver` + `Closer` interfaces + `QueryResult` | 2 | ✅ shipped (v0.7.1) |
 | pgx adapter (`drivers/pgx`: `Conn` + `Pool`) | 3 | ✅ shipped (v0.7.2) |
 | lib/pq adapter (`drivers/pq`: `Conn` + `DB`) | 3 | ✅ shipped (v0.7.2) |
-| `Client` (Transaction, AsRole, Exec, FetchAll, Seed) | 4 | planned (v0.7.3) |
+| `Client` (Transaction, AsRole, Exec, FetchAll, Seed, Close, Driver) | 4 | ✅ shipped (v0.7.3) |
+| `QuoteIdent` + `QuoteQualified` + `ReservedKeywords` (78 entries) | 4 | ✅ shipped (v0.7.3) |
+| `NewSavepointName` (crypto/rand 4-byte → 8-hex) | 4 | ✅ shipped (v0.7.3) |
 | Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | planned (v0.7.4) |
 | Cross-language conformance suite | 6 | planned (v0.7.5) |
 | CI hardening + release plumbing | 7 | planned (v0.7.6) |
 
 ## Cross-language guarantee
 
-The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) is byte-identical across the three.
+The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) follows the same step-by-step pattern across the three. Two language-driven knobs are NOT byte-equal but don't affect RLS evaluation:
+
+- **JWT claims JSON encoding.** Each port uses its language's stock encoder: Python `json.dumps` and TS `JSON.stringify` preserve insertion order; Go `encoding/json` sorts keys alphabetically. The encoded JSON string is the `$1` parameter passed to `set_config('request.jwt.claims', $1, true)` — the SQL itself is identical; only the parameter bytes differ on input.
+- **`Seed` column ordering.** Python and TS preserve dict / object insertion order in the emitted `INSERT INTO t (col1, col2)` SQL; Go sorts alphabetically (Go has no insertion-order map primitive). `Seed` is the test-helper layer, deliberately scoped out of the Layer 1 protocol — see `docs/pgrls-test-protocol.md` ("What's deliberately out of contract").
 
 See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent directory) for the full spec.
 
@@ -42,12 +47,12 @@ See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent
 
 | Concept | Python | TypeScript | Go |
 |---|---|---|---|
-| Package | `pgrls.testing.PgrlsTestClient` | `pgrls-test.PgrlsTestClient` | `pgrlstest.Client` (step 4) |
+| Package | `pgrls.testing.PgrlsTestClient` | `pgrls-test.PgrlsTestClient` | `pgrlstest.Client` |
 | Error base | `PgrlsTestError` | `PgrlsTestError` | `*pgrlstest.Error` |
 | Assertion error | `PgrlsTestAssertionError` | `PgrlsTestAssertionError` | `*pgrlstest.AssertionError` |
 | Protocol version | `PROTOCOL_VERSION = 1` | `PROTOCOL_VERSION = 1` | `ProtocolVersion = 1` |
 | Driver abstraction | (inlined psycopg cursor) | `Driver` interface | `Driver` interface |
-| Row shape | `Cursor.fetchall()` tuples | `readonly Record<string, unknown>[]` | `[]map[string]any` |
+| Row shape | `list[dict[str, object]]` (psycopg `dict_row` factory) | `readonly Record<string, unknown>[]` | `[]map[string]any` |
 | Driver teardown | caller-owned connection | optional `close?()` method | separate `Closer` interface |
 
 The Go type names use Go's idiomatic short form (just `Error`, `AssertionError`) since they're already namespaced under the `pgrlstest` package. The `errors.Is` machinery exposes two sentinel values — `ErrAPIError` and `ErrAssertion` — for callers that want to route errors without type-asserting.
