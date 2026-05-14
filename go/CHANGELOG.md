@@ -55,18 +55,19 @@ one for the pool variant that lazily acquires + releases via `Closer`.
   word-boundaried so a literal column named `returning_col`
   doesn't accidentally route as a returning DML.
 
-- **16 unit-test functions** (8 per adapter package, parametrized
-  so the actual test-case count is higher) pinning SQLSTATE
-  classification correctness against both wrapped and direct
-  error chains, `firstWord` / `hasReturning` / `isIdentChar`
-  helper behavior (including the underscore-boundary case —
-  `returning_col` must NOT match RETURNING; earlier letters-
-  only boundary was a real bug caught during local testing),
-  and compile-time interface-satisfaction (`var _
-  pgrlstest.Driver = (*…)(nil)` + `var _ pgrlstest.Closer =
-  (*…)(nil)`). Real-Postgres integration tests land in v0.7.5
-  step 6 via testcontainers-go; this release verifies what can
-  be verified without a database.
+- **20 unit-test functions** (10 per adapter package,
+  parametrized so the actual test-case count is higher) pinning
+  SQLSTATE classification correctness against both wrapped and
+  direct error chains, `firstWord` / `hasReturning` /
+  `isIdentChar` helper behavior (including the underscore-
+  boundary case — `returning_col` must NOT match RETURNING;
+  earlier letters-only boundary was a real bug caught during
+  local testing), pool / DB driver `Close` idempotency on
+  never-used drivers, and compile-time interface-satisfaction
+  (`var _ pgrlstest.Driver = (*…)(nil)` + `var _
+  pgrlstest.Closer = (*…)(nil)`). Real-Postgres integration
+  tests land in v0.7.5 step 6 via testcontainers-go; this
+  release verifies what can be verified without a database.
 
 ### Changed
 

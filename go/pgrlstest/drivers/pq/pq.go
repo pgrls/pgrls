@@ -110,16 +110,34 @@ type dbDriver struct {
 	acquired *sql.Conn
 }
 
+// Query holds the mutex for the entire query lifetime — the
+// lazy `db.Conn(ctx)` acquire AND the driver call. Without
+// this, a concurrent `Close` could close the pinned
+// `*sql.Conn` while `queryWith` is mid-flight, causing a
+// use-after-close panic or pool corruption.
+//
+// The test-client use case naturally has serial driver calls
+// (one logical test thread at a time issuing BEGIN → queries
+// → ROLLBACK), so the mutex's serialization of parallel Query
+// calls is a non-cost.
 func (d *dbDriver) Query(ctx context.Context, sql string, params ...any) (pgrlstest.QueryResult, error) {
-	conn, err := d.pinnedConn(ctx)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	conn, err := d.acquireLocked(ctx)
 	if err != nil {
 		return pgrlstest.QueryResult{}, err
 	}
 	return queryWith(ctx, conn, sql, params...)
 }
 
+// Rollback holds the mutex like Query — same race-safety
+// reasoning. ROLLBACK against an already-closed *sql.Conn
+// would surface a confusing "sql: connection is already
+// closed" rather than the operator's actual error.
 func (d *dbDriver) Rollback(ctx context.Context) error {
-	conn, err := d.pinnedConn(ctx)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	conn, err := d.acquireLocked(ctx)
 	if err != nil {
 		return err
 	}
@@ -133,6 +151,12 @@ func (d *dbDriver) IsInsufficientPrivilege(err error) bool {
 // Close releases the pinned *sql.Conn back to the pool.
 // Idempotent — a second call is a no-op. After Close, the
 // next Query / Rollback re-acquires.
+//
+// `ctx` is intentionally unused: `*sql.Conn.Close()` has no
+// ctx-aware variant in the stdlib. Kept in the signature to
+// satisfy `pgrlstest.Closer`. Callers that need cancellable
+// teardown rely on subsequent `Query` / `Rollback` (which DO
+// honor ctx) to surface deadline issues.
 func (d *dbDriver) Close(ctx context.Context) error {
 	_ = ctx
 	d.mu.Lock()
@@ -145,9 +169,10 @@ func (d *dbDriver) Close(ctx context.Context) error {
 	return nil
 }
 
-func (d *dbDriver) pinnedConn(ctx context.Context) (*sql.Conn, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// acquireLocked returns the pinned *sql.Conn, lazily
+// acquiring via db.Conn(ctx) if needed. MUST be called with
+// `d.mu` held.
+func (d *dbDriver) acquireLocked(ctx context.Context) (*sql.Conn, error) {
 	if d.acquired != nil {
 		return d.acquired, nil
 	}

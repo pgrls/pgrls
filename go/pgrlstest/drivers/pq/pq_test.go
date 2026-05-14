@@ -127,6 +127,25 @@ func TestHasReturning_DetectsKeyword(t *testing.T) {
 	}
 }
 
+func TestDBDriver_CloseIsIdempotentSerial(t *testing.T) {
+	// Pin idempotency: a dbDriver with no pinned conn yet
+	// MUST treat Close as a no-op (acquired == nil branch).
+	d := &dbDriver{}
+	if err := d.Close(nil); err != nil { //nolint:staticcheck // nil ctx test
+		t.Errorf("first Close on never-used driver: %v", err)
+	}
+	if err := d.Close(nil); err != nil { //nolint:staticcheck
+		t.Errorf("second Close on never-used driver: %v", err)
+	}
+}
+
+func TestDBDriver_CloseOnlyReleasesWhenAcquired(t *testing.T) {
+	d := &dbDriver{}
+	if err := d.Close(nil); err != nil { //nolint:staticcheck
+		t.Errorf("Close on zero-value dbDriver: %v", err)
+	}
+}
+
 func TestIsIdentChar_MatchesSQLIdentifierShape(t *testing.T) {
 	cases := map[byte]bool{
 		// Letters

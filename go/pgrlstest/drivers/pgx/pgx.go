@@ -127,16 +127,36 @@ type poolDriver struct {
 	acquired *pgxpool.Conn
 }
 
+// Query holds the mutex for the entire query lifetime — both
+// the lazy acquire (if needed) AND the actual driver call.
+// Without this, a concurrent `Close` could `Release()` the
+// pinned `*pgxpool.Conn` while `queryWith` is mid-flight,
+// causing a use-after-release panic or pool corruption.
+//
+// The test-client use case naturally has serial driver calls
+// (one logical test thread at a time issuing BEGIN → queries
+// → ROLLBACK), so the mutex's serialization of parallel Query
+// calls is a non-cost. A hypothetical user that issues
+// `Promise.all([driver.Query(...), driver.Query(...)])`-style
+// concurrent calls (NOT supported by the test client) would
+// get serial execution rather than concurrent — acceptable.
 func (d *poolDriver) Query(ctx context.Context, sql string, params ...any) (pgrlstest.QueryResult, error) {
-	conn, err := d.pinnedConn(ctx)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	conn, err := d.acquireLocked(ctx)
 	if err != nil {
 		return pgrlstest.QueryResult{}, err
 	}
 	return queryWith(ctx, conn, sql, params...)
 }
 
+// Rollback holds the mutex like Query — same race-safety
+// reasoning. ROLLBACK against an already-released pool
+// connection would corrupt the pool's internal state.
 func (d *poolDriver) Rollback(ctx context.Context) error {
-	conn, err := d.pinnedConn(ctx)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	conn, err := d.acquireLocked(ctx)
 	if err != nil {
 		return err
 	}
@@ -151,10 +171,21 @@ func (d *poolDriver) IsInsufficientPrivilege(err error) bool {
 // second call is a no-op. After Close, the next Query /
 // Rollback re-acquires a fresh connection from the pool.
 //
-// `ctx` is currently unused (pgxpool.Conn.Release is
-// synchronous and signature-less) but kept to match the
-// pgrlstest.Closer contract. Future adapter implementations
-// (e.g. a future bun.sql Go binding) may honor the context.
+// Holds the mutex for the duration so a concurrent Query /
+// Rollback either runs to completion before Close fires or
+// gets a freshly-acquired conn after Close returns. The
+// pre-iter-1 version dropped the mutex between acquire and
+// queryWith, leaving a use-after-release window between
+// Query observing the pinned conn and Close releasing it.
+//
+// `ctx` is intentionally unused: `pgxpool.Conn.Release()` is
+// non-blocking and has no signature for cancellation. Kept in
+// the method signature to satisfy `pgrlstest.Closer` and so a
+// future adapter (e.g. a Bun.sql binding) can honor the
+// context without changing the interface. Callers that need
+// cancellable teardown should set a deadline on `ctx` and
+// rely on subsequent `Query` / `Rollback` calls (which DO
+// honor ctx) to surface it.
 func (d *poolDriver) Close(ctx context.Context) error {
 	_ = ctx
 	d.mu.Lock()
@@ -166,9 +197,11 @@ func (d *poolDriver) Close(ctx context.Context) error {
 	return nil
 }
 
-func (d *poolDriver) pinnedConn(ctx context.Context) (*pgxpool.Conn, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// acquireLocked returns the pinned connection, lazily
+// acquiring it if needed. MUST be called with `d.mu` held.
+// Renamed from `pinnedConn` post-iter-1 to make the locking
+// requirement explicit at the call site.
+func (d *poolDriver) acquireLocked(ctx context.Context) (*pgxpool.Conn, error) {
 	if d.acquired != nil {
 		return d.acquired, nil
 	}
@@ -249,11 +282,22 @@ func queryReturningRows(ctx context.Context, q connQueryer, sql string, params .
 	if err := rows.Err(); err != nil {
 		return pgrlstest.QueryResult{}, err
 	}
+	// Read RowCount from the command tag, not from
+	// `len(out)`. The two agree for plain SELECT, but they
+	// DIVERGE for RETURNING DML when the SQL contains the
+	// literal string `'RETURNING'` (or a false positive from
+	// `hasReturning`) — the routing puts the SQL on this
+	// path, but Postgres reports the actual affected-row
+	// count via `CommandTag.RowsAffected()`, not via the
+	// number of rows it streamed back. AssertSilentlyDropped
+	// (planned step 5) gates on `Command == "UPDATE" &&
+	// RowCount == 0`, so a stale `len(out)` would forge a
+	// false-silent-drop reading.
 	tag := rows.CommandTag()
 	return pgrlstest.QueryResult{
 		Rows:     out,
 		Command:  firstWord(tag.String()),
-		RowCount: int64(len(out)),
+		RowCount: tag.RowsAffected(),
 	}, nil
 }
 

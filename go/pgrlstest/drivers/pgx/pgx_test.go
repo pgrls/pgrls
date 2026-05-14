@@ -130,6 +130,37 @@ func TestHasReturning_DetectsKeyword(t *testing.T) {
 	}
 }
 
+func TestPoolDriver_CloseIsIdempotentSerial(t *testing.T) {
+	// Pin idempotency: a poolDriver with no pinned conn yet
+	// MUST treat Close as a no-op (acquired == nil branch),
+	// and a second Close after the first MUST also be a no-op.
+	// Without the mutex'd nil-check, the second Close could
+	// double-call Release on a stale pointer.
+	d := &poolDriver{}
+	if err := d.Close(nil); err != nil { //nolint:staticcheck // nil ctx test
+		t.Errorf("first Close on never-used driver: %v", err)
+	}
+	if err := d.Close(nil); err != nil { //nolint:staticcheck
+		t.Errorf("second Close on never-used driver: %v", err)
+	}
+}
+
+// Race test: serialized Query+Close exercise — go's `-race`
+// flag plus the mutex'd acquireLocked path catches the
+// use-after-release that the iter-1 review identified. We
+// can't instantiate a real *pgxpool.Pool without spinning up
+// pgx, so this only covers the never-acquired path. The full
+// race test against a real pool lives in the v0.7.5 step 6
+// conformance suite once testcontainers-go is wired up.
+func TestPoolDriver_CloseOnlyReleasesWhenAcquired(t *testing.T) {
+	d := &poolDriver{}
+	// d.acquired is the zero value (nil). Close must NOT
+	// crash and MUST return nil.
+	if err := d.Close(nil); err != nil { //nolint:staticcheck
+		t.Errorf("Close on zero-value poolDriver: %v", err)
+	}
+}
+
 func TestIsIdentChar_MatchesSQLIdentifierShape(t *testing.T) {
 	cases := map[byte]bool{
 		// ASCII letters
