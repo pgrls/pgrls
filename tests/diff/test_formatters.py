@@ -510,3 +510,98 @@ def test_change_to_violation_passes_through_location_and_message():
     assert v.message == change.message
     assert v.rule_id == "DIFF_USING_LOOSENED"
     assert v.severity == "error"
+
+
+# ---------------------------------------------------------------------------
+# Hostile-input hardening (operator-controlled identifiers)
+# ---------------------------------------------------------------------------
+
+
+def test_text_location_with_newline_renders_single_line() -> None:
+    # `Change.location` is built from `pg_catalog` introspection
+    # of identifiers, which can legally contain `\n` inside a
+    # quoted Postgres identifier (`"weird\nname"`). Without
+    # `safe_location` escaping, the diff stanza header splits into
+    # two lines that a `^- (\S+)$` CI grep can't distinguish from
+    # a legitimate second stanza. Mirrors the v0.5.10 lint-text
+    # hardening.
+    change = _change(
+        kind=ChangeKind.TABLE_DROPPED,
+        classification="breaking",
+        location="public.evil\nINJECTED",
+        message="m",
+    )
+    result = format_diff_text([change])
+    # Locate the stanza header. It must be exactly one line.
+    header_lines = [ln for ln in result.splitlines() if ln.startswith("- ")]
+    assert len(header_lines) == 1
+    # The escape representation is visible in the cell.
+    assert "evil\\nINJECTED" in header_lines[0]
+    # No bare newline leaked.
+    assert "evil\nINJECTED" not in result
+
+
+def test_text_location_with_carriage_return_escaped() -> None:
+    change = _change(
+        kind=ChangeKind.POLICY_ADDED_PERMISSIVE,
+        classification="dangerous",
+        location="public.a\rhidden",
+        message="m",
+    )
+    result = format_diff_text([change])
+    assert "\\r" in result
+    # The raw CR is gone.
+    assert "\rhidden" not in result
+
+
+def test_text_location_with_tab_escaped() -> None:
+    change = _change(
+        kind=ChangeKind.RLS_FLIPPED,
+        classification="requires_review",
+        location="public.a\tcol",
+        message="m",
+    )
+    result = format_diff_text([change])
+    # RLS_FLIPPED → `!` marker. Header line carries the escape,
+    # not a raw tab.
+    header_lines = [ln for ln in result.splitlines() if ln.startswith("! ")]
+    assert len(header_lines) == 1
+    assert "public.a\\tcol" in header_lines[0]
+    assert "\t" not in header_lines[0]
+
+
+def test_text_location_zero_width_only_uses_sentinel() -> None:
+    # A location composed entirely of zero-width formatting chars
+    # (e.g. ZWSP + ZWNJ) collapses to "" after `safe_location`
+    # drops them. Surface the `(empty-or-zero-width)` sentinel
+    # instead of leaving the marker line with a bare trailing
+    # space — operators reading the diff need to know there WAS
+    # something there.
+    change = _change(
+        kind=ChangeKind.TABLE_DROPPED,
+        classification="breaking",
+        location="\u200b\u200c",
+        message="m",
+    )
+    result = format_diff_text([change])
+    assert "(empty-or-zero-width)" in result
+    # And the zero-width chars are gone.
+    assert "\u200b" not in result
+    assert "\u200c" not in result
+
+
+def test_text_location_well_formed_passes_through_unchanged() -> None:
+    # Fast-path regression: a well-formed location renders
+    # byte-identical to pre-hardening output (no perf hit on
+    # the common case).
+    change = _change(
+        kind=ChangeKind.TABLE_DROPPED,
+        classification="breaking",
+        location="public.invoices",
+        message="m",
+    )
+    result = format_diff_text([change])
+    assert "- public.invoices" in result
+    # No escape chars introduced.
+    header = [ln for ln in result.splitlines() if ln.startswith("- ")][0]
+    assert "\\" not in header

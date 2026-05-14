@@ -10,6 +10,25 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`pgrls diff --format text` now applies the same hostile-input
+  hardening to `Change.location` that v0.5.10's lint formatters
+  apply to `Violation.location`.** Extends the v0.5.10 "Text and
+  Markdown formatters harden `Violation.location` rendering"
+  fix: `_render_stanza` in `pgrls.diff.formatters` now routes
+  `change.location` through `safe_location` before emitting the
+  stanza header marker line (`+ <loc>`, `- <loc>`, `~ <loc>`,
+  `! <loc>`). Without this, a Postgres identifier containing
+  `\n` / `\r` / `\t` / zero-width chars splits the stanza header
+  into multiple lines that a `^- (\S+)$` CI grep can't
+  distinguish from a legitimate second stanza. The `before_sql` /
+  `after_sql` predicate blocks are deliberately NOT sanitized —
+  those are operator-supplied SQL text and multi-line clauses
+  (e.g. `USING (\n  tenant_id = …\n)`) are legitimate diff
+  output. JSON and SARIF diff paths were already safe — they
+  route through `format_violations` / `format_sarif` which
+  serialize via `json.dumps`.
+
 ## [0.7.0] - 2026-05-13
 
 The Python core (`pgrls` package) version stays at 0.5.10 — v0.7.0 is

@@ -17,6 +17,10 @@ from typing import get_args
 
 from pgrls.diff.differ import Change, ChangeKind, Classification
 from pgrls.formatters import format_violations
+from pgrls.formatters._common import (
+    EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    safe_location,
+)
 from pgrls.formatters.sarif import format_sarif
 from pgrls.violations import Severity, Violation
 
@@ -203,8 +207,32 @@ def _render_stanza(change: Change) -> list[str]:
     marker = _marker(change.kind)
     lines: list[str] = []
 
-    # Header line: marker + location
-    lines.append(f"{marker} {change.location}")
+    # Header line: marker + location. `safe_location` keeps the
+    # line single — operator-supplied identifiers (introspected
+    # from `pg_catalog`) can legally contain `\n` / `\r` / `\t` /
+    # zero-width chars inside a quoted Postgres identifier, and
+    # without escaping those split the stanza header into multiple
+    # lines that a `^- (\S+)$` CI grep can't distinguish from a
+    # legitimate second stanza. Mirrors the `pgrls lint --format
+    # text` hardening from v0.5.10. Zero-width-only locations
+    # collapse to "" after sanitization; surface the
+    # `(empty-or-zero-width)` sentinel instead of a bare marker
+    # so the reader sees that there WAS something there. An
+    # all-empty `change.location` (in practice never produced by
+    # the differ, but defensively handled) gets the same
+    # treatment.
+    #
+    # The `before_sql` / `after_sql` predicate blocks below are
+    # NOT sanitized — those are operator-supplied SQL text and
+    # multi-line clauses (e.g. `USING (\n  tenant_id = ...\n)`)
+    # are legitimate diff output.
+    raw_loc = change.location
+    if not raw_loc:
+        loc = EMPTY_OR_ZERO_WIDTH_SENTINEL
+    else:
+        cleaned = safe_location(raw_loc)
+        loc = cleaned if cleaned else EMPTY_OR_ZERO_WIDTH_SENTINEL
+    lines.append(f"{marker} {loc}")
 
     # Summary line (2-space indent)
     summary = _SUMMARY_BY_KIND.get(change.kind, "change")
