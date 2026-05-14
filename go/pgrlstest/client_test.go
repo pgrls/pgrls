@@ -67,21 +67,19 @@ func (d *recordingDriver) Close(_ context.Context) error {
 	return d.closeErr
 }
 
-// noCloserDriver wraps recordingDriver but explicitly does NOT
-// implement Closer (by having a different method set). Used to
-// exercise Client.Close when the underlying driver is a
-// caller-owned single-conn adapter.
-type noCloserDriver struct {
-	queries []string
-}
+// noCloserDriver is a minimal Driver that explicitly does NOT
+// implement Closer. Used to exercise Client.Close when the
+// underlying driver is a caller-owned single-conn adapter
+// (the Client.Close path that type-asserts to Closer and
+// falls through to a no-op).
+type noCloserDriver struct{}
 
-func (d *noCloserDriver) Query(_ context.Context, sqlText string, _ ...any) (QueryResult, error) {
-	d.queries = append(d.queries, sqlText)
+func (d *noCloserDriver) Query(_ context.Context, _ string, _ ...any) (QueryResult, error) {
 	return QueryResult{}, nil
 }
 
-func (d *noCloserDriver) Rollback(_ context.Context) error { return nil }
-func (d *noCloserDriver) IsInsufficientPrivilege(error) bool { return false }
+func (d *noCloserDriver) Rollback(_ context.Context) error      { return nil }
+func (d *noCloserDriver) IsInsufficientPrivilege(_ error) bool { return false }
 
 func TestClient_Transaction_BeginAndRollback(t *testing.T) {
 	d := &recordingDriver{}
@@ -685,12 +683,40 @@ func TestClient_Driver_ReturnsUnderlying(t *testing.T) {
 	}
 }
 
-// TestClient_AsRole_SavepointNameStableAcrossCallSites pins that
+func TestClient_AsRole_ReleaseSavepointErrorOnCleanExitSurfacedToCaller(t *testing.T) {
+	// Defensive: if the RELEASE SAVEPOINT call fails on clean
+	// exit, the error must reach the caller — without this, a
+	// leaked savepoint would silently accumulate (PostgreSQL
+	// allows nested savepoints, but the transaction-wide
+	// state-bloat is a real problem).
+	d := &recordingDriver{
+		respondQueue: []QueryResult{
+			{Rows: []map[string]any{{"current_user": "postgres", "claims": nil}}, Command: "SELECT"},
+		},
+		// Call indices: 0=SELECT capture, 1=SAVEPOINT,
+		// 2=SET LOCAL ROLE, 3=RELEASE SAVEPOINT (fails here),
+		// then we never reach 4 (restore SET LOCAL).
+		failAt: map[int]error{3: errors.New("release failed")},
+	}
+	c := NewClient(d)
+
+	err := c.AsRole(context.Background(), "app", nil, func(_ context.Context) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected RELEASE SAVEPOINT error to surface")
+	}
+	if !strings.Contains(err.Error(), "release failed") {
+		t.Errorf("error %v does not mention release failure", err)
+	}
+}
+
+// TestClient_AsRole_SavepointNamesFreshAcrossCalls pins that
 // each AsRole invocation uses a fresh savepoint name. Without
 // fresh names, nested AsRole calls would step on each other (the
 // inner RELEASE would close the outer's savepoint scope, or
 // PostgreSQL would reject the duplicate name).
-func TestClient_AsRole_SavepointNameStableAcrossCallSites(t *testing.T) {
+func TestClient_AsRole_SavepointNamesFreshAcrossCalls(t *testing.T) {
 	d := &recordingDriver{
 		respondQueue: []QueryResult{
 			{Rows: []map[string]any{{"current_user": "postgres", "claims": nil}}, Command: "SELECT"},

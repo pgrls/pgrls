@@ -21,7 +21,9 @@ import (
 // owns) or a pool (in which case the adapter pins one connection
 // for the client's lifetime and releases it via `Close`).
 //
-// Example with pgx:
+// Example with pgx (the pool variant releases the pinned conn on
+// Client.Close; for a caller-owned single conn use `pgxdriver.Conn`
+// instead):
 //
 //	import (
 //	    "context"
@@ -32,18 +34,19 @@ import (
 //
 //	pool, _ := pgxpool.New(ctx, dsn)
 //	defer pool.Close()
-//	client := pgrlstest.NewClient(pgxdriver.FromPool(pool))
+//	client := pgrlstest.NewClient(pgxdriver.Pool(pool))
 //	defer client.Close(ctx)
 //
 //	err := client.Transaction(ctx, func(ctx context.Context) error {
 //	    if err := client.Seed(ctx, "app.invoices", []map[string]any{
 //	        {"tenant_id": "t1", "amount": 100},
 //	    }); err != nil { return err }
-//	    return client.AsRole(ctx, "app_authenticated", &AsRoleOptions{
+//	    return client.AsRole(ctx, "app_authenticated", &pgrlstest.AsRoleOptions{
 //	        Claims: map[string]any{"sub": "user-a", "tenant_id": "t1"},
 //	    }, func(ctx context.Context) error {
 //	        rows, err := client.FetchAll(ctx, "SELECT id FROM app.invoices")
-//	        ...
+//	        _ = rows
+//	        return err
 //	    })
 //	})
 //
@@ -51,9 +54,10 @@ import (
 // to the Python and TypeScript ports. The conformance suite (step
 // 6 / v0.7.5) pins this against a shared fixture.
 type Client struct {
-	// driver is the underlying connection adapter. Exposed for
-	// the assertion helpers in `assertions.go` (added in
-	// v0.7.4); not part of the stable public API.
+	// driver is the underlying connection adapter. Used by the
+	// package-internal assertion helpers in `assertions.go`
+	// (added in v0.7.4) and read by external callers via the
+	// `Driver()` accessor.
 	driver Driver
 }
 
@@ -334,11 +338,15 @@ func (c *Client) AsRole(
 			// restores SET LOCAL state from before the
 			// savepoint — role and GUC both revert
 			// automatically. If the rollback itself fails the
-			// body's error is the meaningful one; we surface
-			// the rollback error only if the body didn't set
-			// one. (Reachable when err is nil but bodyOK is
-			// false: body returned nil but we got past it via
-			// the panic path — unlikely in practice; defensive.)
+			// body's error is the meaningful one; the rollback
+			// error is surfaced only if no body error already
+			// set `err`. (The `err == nil` branch is reachable
+			// in principle if `body` panics: bodyOK is still
+			// false, err is still nil. The named-return update
+			// is ineffective in that case — the panic
+			// propagates past this defer without converting to
+			// an error — but the rollback itself still runs and
+			// reverts state.)
 			if _, rbErr := c.driver.Query(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); rbErr != nil {
 				if err == nil {
 					err = rbErr
@@ -423,22 +431,29 @@ func (c *Client) Seed(ctx context.Context, table string, rows []map[string]any) 
 	}
 	for i := 1; i < len(rows); i++ {
 		row := rows[i]
-		if len(row) != len(keys) {
-			return &Error{
-				Msg: fmt.Sprintf(
-					"Seed: rows must all have the same keys; row 0 has %d keys, row %d has %d",
-					len(keys), i, len(row),
-				),
+		matches := len(row) == len(keys)
+		if matches {
+			for k := range row {
+				if _, ok := keySet[k]; !ok {
+					matches = false
+					break
+				}
 			}
 		}
-		for k := range row {
-			if _, ok := keySet[k]; !ok {
-				return &Error{
-					Msg: fmt.Sprintf(
-						"Seed: rows must all have the same keys; row %d has unexpected key %q",
-						i, k,
-					),
-				}
+		if !matches {
+			// Match the Python/TS error shape so cross-language
+			// debugging output stays comparable: include both
+			// sorted key lists in the message.
+			rowKeys := make([]string, 0, len(row))
+			for k := range row {
+				rowKeys = append(rowKeys, k)
+			}
+			sort.Strings(rowKeys)
+			return &Error{
+				Msg: fmt.Sprintf(
+					"Seed: rows must all have the same keys; row 0 has %v, row %d has %v",
+					keys, i, rowKeys,
+				),
 			}
 		}
 	}
@@ -527,13 +542,13 @@ func (c *Client) Seed(ctx context.Context, table string, rows []map[string]any) 
 //
 // Forwards to the driver's optional `Close(ctx)` (the `Closer`
 // interface). Adapters that pin a pool connection
-// (`drivers/pgx.FromPool`, `drivers/pq.FromDB`) use this to
+// (`drivers/pgx.Pool`, `drivers/pq.DB`) use this to
 // release the pinned connection back to the pool — without
 // `Close`, the connection stays held until the pool itself
 // shuts down, which leaks one connection per Client instance.
 //
 // Adapters that wrap a caller-owned single connection
-// (`drivers/pgx.FromConn`, `drivers/pq.FromConn`) don't
+// (`drivers/pgx.Conn`, `drivers/pq.Conn`) don't
 // implement `Closer`: the caller already owns the connection and
 // releases it through their own lifecycle. For those, this
 // method is a no-op.
@@ -545,7 +560,7 @@ func (c *Client) Seed(ctx context.Context, table string, rows []map[string]any) 
 //
 // Typical usage:
 //
-//	client := pgrlstest.NewClient(pgxdriver.FromPool(pool))
+//	client := pgrlstest.NewClient(pgxdriver.Pool(pool))
 //	defer client.Close(ctx)
 func (c *Client) Close(ctx context.Context) error {
 	if closer, ok := c.driver.(Closer); ok {

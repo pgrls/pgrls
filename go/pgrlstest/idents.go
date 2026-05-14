@@ -157,10 +157,9 @@ func QuoteIdent(name string) (string, error) {
 }
 
 // QuoteQualified quotes a `schema.name` pair, each component
-// independently. Used by `Client.Seed` to handle
-// `schema-qualified table names; `pq` would otherwise reject an
-// unquoted `"app"."invoices"` form when the schema or table is
-// a reserved word.
+// independently. Used by `Client.Seed` to handle schema-qualified
+// table names like `app.invoices`; without this, an unquoted
+// `order.user` (both reserved) would parse-fail on the server.
 func QuoteQualified(schema, name string) (string, error) {
 	qs, err := QuoteIdent(schema)
 	if err != nil {

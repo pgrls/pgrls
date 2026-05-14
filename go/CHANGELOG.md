@@ -21,8 +21,8 @@ a shared fixture once testcontainers-go is wired up.
 - **`Client` struct** at `pgrlstest/client.go` with six public
   methods:
   - `NewClient(driver)` builds a client from any `Driver`-shaped
-    adapter (typically `pgxdriver.FromConn/FromPool` or
-    `pqdriver.FromConn/FromDB`).
+    adapter (typically `pgxdriver.Conn` / `pgxdriver.Pool` or
+    `pqdriver.Conn` / `pqdriver.DB`).
   - `Client.Transaction(ctx, body)` issues an explicit `BEGIN`,
     runs `body`, ROLLBACKs in a `defer` regardless of body
     outcome. Body errors shadow rollback errors (the doomed
@@ -74,26 +74,28 @@ a shared fixture once testcontainers-go is wired up.
   `crypto.getRandomValues` wire shape exactly.
 
 - **35+ unit-test functions** covering the wire sequence (clean
-  exit, error path, nested claims restore, reserved-keyword
+  exit, error path, outer-claims restore, reserved-keyword
   quoting), the seed helper's quoting and key-consistency
   checks, the savepoint-name format and entropy, the identifier-
   quoting matrix (plain names, reserved keywords, non-plain
   needing quotes, embedded quotes, control-char rejection),
   and the `Close` type-assertion contract (forwards when
   driver is a `Closer`, no-op otherwise). Tests use a
-  `fakeDriver` recorder so the wire-level SQL ordering is
+  `recordingDriver` so the wire-level SQL ordering is
   asserted directly — real-Postgres conformance lands in
   v0.7.5 step 6.
 
 ### Changed
 
 - **`protocol.go` status comment** advanced to step 4 of 7.
-- **Module surface** grows by three new public exports —
-  `Client`, `AsRoleOptions`, `NewClient`, plus the helper
-  functions `QuoteIdent`, `QuoteQualified`, `NewSavepointName`,
-  and `ReservedKeywords` (the keyword map, exported so callers
-  can verify their custom role names against the same wire
-  rules pgrls-test uses).
+- **Module surface** grows by seven new public exports: the
+  `Client` struct (with `NewClient` constructor and
+  `Transaction` / `Exec` / `FetchAll` / `AsRole` / `Seed` /
+  `Close` / `Driver` methods), the `AsRoleOptions` config
+  struct, and the four helpers `QuoteIdent`, `QuoteQualified`,
+  `NewSavepointName`, and `ReservedKeywords` (the keyword map,
+  exported so callers can verify their custom role names
+  against the same wire rules pgrls-test uses).
 
 ## [0.7.2] - 2026-05-13
 

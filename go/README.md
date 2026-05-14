@@ -36,7 +36,7 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 
 ## Cross-language guarantee
 
-The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) is byte-identical across the three.
+The Python, TypeScript, and Go clients all implement the same Layer 1 protocol. A fixture set written for one client interoperates with the others — the wire sequence (`SAVEPOINT pgrls_actor_<rand>`, `SET LOCAL ROLE …`, `set_config('request.jwt.claims', $1, true)`, rollback to savepoint) is identical across the three. Two language-driven knobs aren't byte-equal: the JWT claims JSON-encoding uses each language's stock JSON encoder (Python `json.dumps` and TS `JSON.stringify` both preserve insertion order; Go `encoding/json` sorts keys alphabetically), and Go's `Seed` emits sorted column order in the generated SQL while Python and TS preserve dict / object insertion order. Neither affects RLS evaluation; both are noted in the protocol spec.
 
 See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent directory) for the full spec.
 
