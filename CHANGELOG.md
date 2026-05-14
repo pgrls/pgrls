@@ -29,6 +29,12 @@ breaking changes — they will be called out in this file.
   route through `format_violations` / `format_sarif` which
   serialize via `json.dumps`.
 
+## [0.7.2] - 2026-05-13
+
+Go port step 3 of 7 — pgx + lib/pq driver adapters. Python core stays at
+0.5.10, TS port stays at 0.6.2. Per-port details in
+[`go/CHANGELOG.md`](go/CHANGELOG.md).
+
 ## [0.7.1] - 2026-05-13
 
 Go port step 2 of 7 — `Driver` interface, `Closer` optional interface,

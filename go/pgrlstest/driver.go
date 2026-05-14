@@ -7,7 +7,7 @@ import "context"
 // Mirrors the union of what pgx's `pgx.Rows` + command tag and
 // lib/pq's `database/sql.Rows` + result expose, but reduced to
 // the three fields the test client actually needs. Adapters
-// (`drivers/pgx`, `drivers/lib_pq` — step 3 / v0.7.2) translate
+// (`drivers/pgx`, `drivers/pq` — step 3 / v0.7.2) translate
 // their native types into this shape so the client code stays
 // driver-agnostic.
 //
@@ -82,7 +82,7 @@ type QueryResult struct {
 // to Postgres without coupling to a specific Go database driver.
 //
 // One adapter per supported driver lives under `drivers/`
-// (`drivers/pgx`, `drivers/lib_pq` — step 3 / v0.7.2); each
+// (`drivers/pgx`, `drivers/pq` — step 3 / v0.7.2); each
 // exports a factory that wraps a user-supplied connection /
 // pool into this interface so callers keep their existing
 // connection management (pools, hooks, instrumentation,
