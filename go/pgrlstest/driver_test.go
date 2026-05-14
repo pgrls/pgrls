@@ -74,20 +74,35 @@ func TestDriver_QueryResultCanHoldRows(t *testing.T) {
 	// future API change that constrains the value type
 	// (e.g. to `string`) would silently break user code; the
 	// `any` shape matches what the TS and Python ports
-	// expose.
+	// expose. Real adapter rows carry heterogeneous types
+	// (int / string / time.Time / []byte / nil / json maps),
+	// so the test pins all the realistic shapes — not just
+	// the most boring two.
 	qr := QueryResult{
 		Rows: []map[string]any{
-			{"id": 1, "name": "alice"},
-			{"id": 2, "name": "bob"},
+			{
+				"id":       1,
+				"name":     "alice",
+				"tags":     []string{"admin", "owner"},
+				"deleted":  false,
+				"metadata": nil,
+				"score":    3.14,
+			},
 		},
 		Command:  "SELECT",
-		RowCount: 2,
+		RowCount: 1,
 	}
-	if len(qr.Rows) != 2 {
-		t.Fatalf("expected 2 rows, got %d", len(qr.Rows))
+	if len(qr.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(qr.Rows))
 	}
 	if qr.Rows[0]["name"] != "alice" {
 		t.Errorf("Rows[0][name] = %v, want alice", qr.Rows[0]["name"])
+	}
+	if qr.Rows[0]["metadata"] != nil {
+		t.Errorf("nil-valued column lost its nil-ness: %v", qr.Rows[0]["metadata"])
+	}
+	if qr.Rows[0]["deleted"] != false {
+		t.Errorf("bool value not preserved: %v", qr.Rows[0]["deleted"])
 	}
 }
 
@@ -134,23 +149,30 @@ func TestDriver_QueryCalledWithContextAndParams(t *testing.T) {
 	// Pin the variadic shape so a future refactor to
 	// `params []any` (slice, not variadic) breaks this test
 	// rather than silently changing the call sites in steps 4/5.
+	// Also pin context propagation via a context-value round-
+	// trip — adapters use ctx for cancellation and tracing, so
+	// the value must reach the impl unchanged.
+	type key string
 	captured := struct {
-		ctx    context.Context
-		sql    string
-		params []any
+		ctxValue any
+		sql      string
+		params   []any
 	}{}
 	d := &fakeDriver{
 		queryFn: func(ctx context.Context, sql string, params ...any) (QueryResult, error) {
-			captured.ctx = ctx
+			captured.ctxValue = ctx.Value(key("trace"))
 			captured.sql = sql
 			captured.params = params
 			return QueryResult{Command: "SELECT"}, nil
 		},
 	}
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), key("trace"), "v0.7.1")
 	_, err := d.Query(ctx, "SELECT $1::int, $2::text", 42, "x")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured.ctxValue != "v0.7.1" {
+		t.Errorf("ctx value not propagated: %v", captured.ctxValue)
 	}
 	if captured.sql != "SELECT $1::int, $2::text" {
 		t.Errorf("sql captured incorrectly: %q", captured.sql)

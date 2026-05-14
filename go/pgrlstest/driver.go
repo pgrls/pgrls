@@ -33,6 +33,16 @@ type QueryResult struct {
 	// generic `FetchAll[T]` wrapper, planned for v0.7.3 step
 	// 4); the Driver interface stays untyped so adapters
 	// don't have to carry generic plumbing.
+	//
+	// **Mutation contract**: callers MUST treat Rows as read-
+	// only. Adapter implementations are free to reuse backing
+	// allocations between calls — pgx in particular may
+	// hand back rows that share buffers with its row-iteration
+	// state. Go has no `readonly slice` analogue (unlike the
+	// TS port's `readonly Record<string, unknown>[]`), so the
+	// contract is documented, not enforced. If a caller needs
+	// to mutate (rare), copy first via `slices.Clone` /
+	// `maps.Clone`.
 	Rows []map[string]any
 
 	// Command is the verb returned by Postgres in the command
@@ -175,6 +185,15 @@ type Driver interface {
 // pattern as an optional `close?` method on the `Driver`
 // interface; in Go the idiomatic equivalent is a separate
 // interface that callers type-assert to.
+//
+// Signature divergence from TS: `Close` here takes a `ctx
+// context.Context`, while the TS counterpart is `close():
+// Promise<void>`. Go's pervasive context convention applies to
+// teardown too — `Client.Close()` (step 4) typically receives a
+// short-deadline ctx so a hung pool drain doesn't block test
+// shutdown indefinitely. Callers without a meaningful ctx
+// (panic-recovery defers, test-teardown calls without
+// per-test context wiring) can pass `context.Background()`.
 type Closer interface {
 	Close(ctx context.Context) error
 }
