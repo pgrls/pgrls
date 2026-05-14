@@ -29,6 +29,14 @@ breaking changes — they will be called out in this file.
   route through `format_violations` / `format_sarif` which
   serialize via `json.dumps`.
 
+## [0.7.3] - 2026-05-14
+
+Go port step 4 of 7 — Client API (`Transaction`, `AsRole`, `Exec`,
+`FetchAll`, `Seed`, `Close`) plus `QuoteIdent` / `QuoteQualified` /
+`NewSavepointName` helpers. The Python core (`pgrls` package) stays
+at 0.5.10 and the TypeScript port stays at 0.6.2. Per-port details
+in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+
 ## [0.7.2] - 2026-05-13
 
 Go port step 3 of 7 — pgx + lib/pq driver adapters. Python core stays at

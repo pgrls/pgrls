@@ -91,17 +91,17 @@ func TestIsInsufficientPrivilege_WalksWrappedChain(t *testing.T) {
 
 func TestFirstWord_ParsesCommandTag(t *testing.T) {
 	cases := map[string]string{
-		"SELECT 5":              "SELECT",
-		"UPDATE 3":              "UPDATE",
-		"INSERT 0 12":           "INSERT",
-		"DELETE 0":              "DELETE",
-		"BEGIN":                 "BEGIN",
-		"ROLLBACK":              "ROLLBACK",
-		"SAVEPOINT":             "SAVEPOINT",
+		"SELECT 5":             "SELECT",
+		"UPDATE 3":             "UPDATE",
+		"INSERT 0 12":          "INSERT",
+		"DELETE 0":             "DELETE",
+		"BEGIN":                "BEGIN",
+		"ROLLBACK":             "ROLLBACK",
+		"SAVEPOINT":            "SAVEPOINT",
 		"  select  *  from t ": "SELECT", // leading whitespace, mixed case
-		"":                      "",
-		"   ":                   "",
-		"select\tfrom":          "SELECT", // tab separator
+		"":                     "",
+		"   ":                  "",
+		"select\tfrom":         "SELECT", // tab separator
 	}
 	for input, want := range cases {
 		got := firstWord(input)
@@ -113,15 +113,15 @@ func TestFirstWord_ParsesCommandTag(t *testing.T) {
 
 func TestHasReturning_DetectsKeyword(t *testing.T) {
 	cases := map[string]bool{
-		"UPDATE t SET x = 1 RETURNING id":         true,
-		"UPDATE t SET x = 1 returning id":         true,         // case-insensitive
-		"DELETE FROM t RETURNING *":               true,
+		"UPDATE t SET x = 1 RETURNING id":           true,
+		"UPDATE t SET x = 1 returning id":           true, // case-insensitive
+		"DELETE FROM t RETURNING *":                 true,
 		"INSERT INTO t (x) VALUES (1) RETURNING id": true,
-		"UPDATE t SET x = 1":                      false,       // no RETURNING
-		"SELECT * FROM t":                         false,
-		"UPDATE t SET returning_col = 1":          false,       // word boundary: returning_col is not RETURNING
-		"UPDATE t SET preturning = 1":             false,       // prefix
-		"":                                        false,
+		"UPDATE t SET x = 1":                        false, // no RETURNING
+		"SELECT * FROM t":                           false,
+		"UPDATE t SET returning_col = 1":            false, // word boundary: returning_col is not RETURNING
+		"UPDATE t SET preturning = 1":               false, // prefix
+		"":                                          false,
 	}
 	for sql, want := range cases {
 		got := hasReturning(sql)

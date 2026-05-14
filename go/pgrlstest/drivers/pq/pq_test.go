@@ -86,17 +86,17 @@ func TestIsInsufficientPrivilege_WalksWrappedChain(t *testing.T) {
 
 func TestFirstWord_ParsesSQL(t *testing.T) {
 	cases := map[string]string{
-		"SELECT * FROM t":     "SELECT",
-		"UPDATE t SET x = 1":  "UPDATE",
-		"INSERT INTO t (x)":   "INSERT",
-		"DELETE FROM t":       "DELETE",
-		"BEGIN":               "BEGIN",
-		"ROLLBACK":            "ROLLBACK",
-		"SAVEPOINT sp1":       "SAVEPOINT",
-		" select id ":         "SELECT", // leading whitespace
-		"":                    "",
-		"   ":                 "",
-		"select\tfrom":        "SELECT", // tab separator
+		"SELECT * FROM t":    "SELECT",
+		"UPDATE t SET x = 1": "UPDATE",
+		"INSERT INTO t (x)":  "INSERT",
+		"DELETE FROM t":      "DELETE",
+		"BEGIN":              "BEGIN",
+		"ROLLBACK":           "ROLLBACK",
+		"SAVEPOINT sp1":      "SAVEPOINT",
+		" select id ":        "SELECT", // leading whitespace
+		"":                   "",
+		"   ":                "",
+		"select\tfrom":       "SELECT", // tab separator
 	}
 	for input, want := range cases {
 		got := firstWord(input)
