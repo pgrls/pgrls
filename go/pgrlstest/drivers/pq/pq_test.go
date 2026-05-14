@@ -1,6 +1,7 @@
 package pq
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -131,17 +132,18 @@ func TestDBDriver_CloseIsIdempotentSerial(t *testing.T) {
 	// Pin idempotency: a dbDriver with no pinned conn yet
 	// MUST treat Close as a no-op (acquired == nil branch).
 	d := &dbDriver{}
-	if err := d.Close(nil); err != nil { //nolint:staticcheck // nil ctx test
+	ctx := context.Background()
+	if err := d.Close(ctx); err != nil {
 		t.Errorf("first Close on never-used driver: %v", err)
 	}
-	if err := d.Close(nil); err != nil { //nolint:staticcheck
+	if err := d.Close(ctx); err != nil {
 		t.Errorf("second Close on never-used driver: %v", err)
 	}
 }
 
 func TestDBDriver_CloseOnlyReleasesWhenAcquired(t *testing.T) {
 	d := &dbDriver{}
-	if err := d.Close(nil); err != nil { //nolint:staticcheck
+	if err := d.Close(context.Background()); err != nil {
 		t.Errorf("Close on zero-value dbDriver: %v", err)
 	}
 }

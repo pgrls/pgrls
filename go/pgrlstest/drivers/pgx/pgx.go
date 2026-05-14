@@ -88,12 +88,19 @@ func Conn(c *pgxlib.Conn) pgrlstest.Driver {
 // re-acquire from the pool (useful for test harnesses that
 // recycle the driver across test cases).
 //
-// Mirrors the postgres.js adapter's `sql.reserve()` pattern
-// from `pgrls-test` v0.6.2 (TypeScript port). Same race-safety
-// considerations: concurrent first-queries share one
-// reservation via promise-style memoization, and a rejected
-// `Acquire` clears the cached promise so the next call
-// retries.
+// Race-safety model (v0.7.2): a single `sync.Mutex` serializes
+// every `Query` / `Rollback` / `Close` end-to-end. Concurrent
+// first-queries do NOT share one acquire — they queue, the
+// first wins the race to call `pool.Acquire`, subsequent
+// callers see the pinned conn and proceed. This is simpler
+// than the TS port's promise-memoization pattern; the test-
+// client use case has serial driver calls so the serialization
+// cost is nil. A failed `pool.Acquire` leaves `d.acquired ==
+// nil`, so the next call retries — no jam on transient
+// failures. The more elaborate identity-guarded promise pattern
+// from `pgrls-test` v0.6.2 (postgres.js adapter) is unnecessary
+// here because Go's mutex gives us the same race guarantees
+// for free.
 func Pool(p *pgxpool.Pool) pgrlstest.Driver {
 	return &poolDriver{pool: p}
 }

@@ -1,6 +1,7 @@
 package pgx
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -137,10 +138,11 @@ func TestPoolDriver_CloseIsIdempotentSerial(t *testing.T) {
 	// Without the mutex'd nil-check, the second Close could
 	// double-call Release on a stale pointer.
 	d := &poolDriver{}
-	if err := d.Close(nil); err != nil { //nolint:staticcheck // nil ctx test
+	ctx := context.Background()
+	if err := d.Close(ctx); err != nil {
 		t.Errorf("first Close on never-used driver: %v", err)
 	}
-	if err := d.Close(nil); err != nil { //nolint:staticcheck
+	if err := d.Close(ctx); err != nil {
 		t.Errorf("second Close on never-used driver: %v", err)
 	}
 }
@@ -156,7 +158,7 @@ func TestPoolDriver_CloseOnlyReleasesWhenAcquired(t *testing.T) {
 	d := &poolDriver{}
 	// d.acquired is the zero value (nil). Close must NOT
 	// crash and MUST return nil.
-	if err := d.Close(nil); err != nil { //nolint:staticcheck
+	if err := d.Close(context.Background()); err != nil {
 		t.Errorf("Close on zero-value poolDriver: %v", err)
 	}
 }

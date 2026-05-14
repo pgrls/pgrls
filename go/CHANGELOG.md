@@ -24,11 +24,13 @@ one for the pool variant that lazily acquires + releases via `Closer`.
     `*pgxpool.Pool`; lazily calls `pool.Acquire(ctx)` on first
     query, pins the connection for every subsequent call,
     releases via `Close(ctx)` (implements `pgrlstest.Closer`).
-    Mirrors the postgres.js adapter's `sql.reserve()` pattern
-    from `pgrls-test` v0.6.2 — same race-safety design (cached
-    promise, identity-guarded clear-on-reject) goes in step 6
-    once the conformance suite exercises concurrency against
-    a real Postgres.
+    Race-safety model: a single `sync.Mutex` serializes every
+    `Query` / `Rollback` / `Close` end-to-end (mirrors the
+    intent of the postgres.js adapter's `sql.reserve()`
+    pattern from `pgrls-test` v0.6.2, simpler implementation
+    because Go's mutex gives us the race guarantees for free
+    — no need for the TS port's promise-memoization +
+    identity-guarded clear-on-reject gymnastics).
   - SQLSTATE 42501 classification via `errors.As(err,
     &pgconn.PgError)` + `pgerrcode.InsufficientPrivilege`.
 
