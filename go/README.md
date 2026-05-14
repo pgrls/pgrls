@@ -46,8 +46,13 @@ See [docs/pgrls-test-protocol.md](../docs/pgrls-test-protocol.md) (in the parent
 | Error base | `PgrlsTestError` | `PgrlsTestError` | `*pgrlstest.Error` |
 | Assertion error | `PgrlsTestAssertionError` | `PgrlsTestAssertionError` | `*pgrlstest.AssertionError` |
 | Protocol version | `PROTOCOL_VERSION = 1` | `PROTOCOL_VERSION = 1` | `ProtocolVersion = 1` |
+| Driver abstraction | (inlined psycopg cursor) | `Driver` interface | `Driver` interface |
+| Row shape | `Cursor.fetchall()` tuples | `readonly Record<string, unknown>[]` | `[]map[string]any` |
+| Driver teardown | caller-owned connection | optional `close?()` method | separate `Closer` interface |
 
 The Go type names use Go's idiomatic short form (just `Error`, `AssertionError`) since they're already namespaced under the `pgrlstest` package. The `errors.Is` machinery exposes two sentinel values — `ErrAPIError` and `ErrAssertion` — for callers that want to route errors without type-asserting.
+
+The `Driver` and `Closer` interfaces are structurally aligned with the TypeScript `Driver` — semantically identical operations (parameterized query, rollback, error classification, optional teardown) with Go-idiomatic adaptations (`ctx context.Context` first arg, variadic `params ...any`, error return alongside the result, separate `Closer` interface for the optional-teardown method).
 
 ## License
 

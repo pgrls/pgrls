@@ -22,8 +22,11 @@ ships in step 3 / v0.7.2; this release pins the contract.
   (must be safe even when the transaction is in aborted state);
   `IsInsufficientPrivilege(err)` classifies a driver error as a
   SQLSTATE 42501 RLS rejection. Cross-language guarantee:
-  byte-equivalent semantics to the TypeScript `Driver` interface
-  and the Python client's reach-into-psycopg pattern.
+  structurally aligned with the TypeScript `Driver` interface
+  and the Python client's reach-into-psycopg pattern — same
+  three operations, same Layer 1 wire output, with Go-idiomatic
+  adaptations (`ctx context.Context` first arg, variadic
+  `params ...any`, error return alongside the result).
 
 - **`QueryResult` struct** with `Rows []map[string]any`, `Command
   string`, `RowCount int64`. Matches the union of what pgx

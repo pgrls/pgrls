@@ -11,11 +11,14 @@ import "context"
 // their native types into this shape so the client code stays
 // driver-agnostic.
 //
-// Cross-language guarantee: byte-equivalent to the TypeScript
-// `QueryResult` interface (`ts/src/drivers/types.ts`) and the
-// Python `psycopg.Cursor.description + fetchall()` tuple — the
-// same three concepts (rows, command verb, row count) reach the
-// assertion helpers from any of the three ports.
+// Cross-language guarantee: structurally aligned with the
+// TypeScript `QueryResult` interface (`ts/src/drivers/types.ts`)
+// and the Python `psycopg.Cursor.description + fetchall()`
+// tuple — the same three concepts (rows, command verb, row
+// count) reach the assertion helpers from any of the three
+// ports, with Go-idiomatic adaptations (plain `string` for
+// `Command` instead of TS's `(string & {})` union widening;
+// `int64` for `RowCount` to match pgx + database/sql).
 type QueryResult struct {
 	// Rows returned by the query, as plain string-keyed maps.
 	//
@@ -104,9 +107,14 @@ type QueryResult struct {
 // TS port) issues savepoint SQL via `Query` so the driver
 // doesn't need a separate savepoint API.
 //
-// Cross-language guarantee: byte-equivalent to the TypeScript
-// `Driver` interface. All three ports issue the same Layer 1
-// wire sequence (BEGIN → optional setup → per-scenario
+// Cross-language guarantee: structurally aligned with the
+// TypeScript `Driver` interface — same operations, same Layer 1
+// wire output, with Go-idiomatic adaptations (`ctx
+// context.Context` first arg per Go convention, variadic
+// `params ...any` for direct call ergonomics, error return
+// alongside the result, separate `Closer` interface for the
+// optional teardown method). All three ports issue the same
+// Layer 1 wire sequence (BEGIN → optional setup → per-scenario
 // SAVEPOINT pgrls_actor_<rand> → SET LOCAL ROLE → set_config →
 // assertions → ROLLBACK TO SAVEPOINT → final ROLLBACK).
 type Driver interface {
