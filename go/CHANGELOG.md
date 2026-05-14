@@ -7,11 +7,85 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.2] - 2026-05-13
+
+**Step 3 of 7 — pgx + lib/pq driver adapters.** Implements the `Driver`
+interface (v0.7.1) against the two dominant Go Postgres drivers. Each
+adapter ships two constructors: one for a caller-owned pinned connection,
+one for the pool variant that lazily acquires + releases via `Closer`.
+
+### Added
+
+- **`drivers/pgx` package** at `pgrlstest/drivers/pgx/pgx.go` —
+  jackc/pgx adapter.
+  - `pgx.Conn(c *pgx.Conn) pgrlstest.Driver` wraps a single
+    `*pgx.Conn` directly; caller owns the connection lifecycle.
+  - `pgx.Pool(p *pgxpool.Pool) pgrlstest.Driver` wraps a
+    `*pgxpool.Pool`; lazily calls `pool.Acquire(ctx)` on first
+    query, pins the connection for every subsequent call,
+    releases via `Close(ctx)` (implements `pgrlstest.Closer`).
+    Race-safety model: a single `sync.Mutex` serializes every
+    `Query` / `Rollback` / `Close` end-to-end (mirrors the
+    intent of the postgres.js adapter's `sql.reserve()`
+    pattern from `pgrls-test` v0.6.2, simpler implementation
+    because Go's mutex gives us the race guarantees for free
+    — no need for the TS port's promise-memoization +
+    identity-guarded clear-on-reject gymnastics).
+  - SQLSTATE 42501 classification via `errors.As(err,
+    &pgconn.PgError)` + `pgerrcode.InsufficientPrivilege`.
+
+- **`drivers/pq` package** at `pgrlstest/drivers/pq/pq.go` —
+  lib/pq + database/sql adapter.
+  - `pq.Conn(c *sql.Conn) pgrlstest.Driver` wraps a single
+    pinned `*sql.Conn`; caller owns the lifecycle.
+  - `pq.DB(d *sql.DB) pgrlstest.Driver` wraps a `*sql.DB`;
+    lazily calls `db.Conn(ctx)` on first query, pins the
+    connection, releases via `Close(ctx)` (implements
+    `pgrlstest.Closer`).
+  - SQLSTATE 42501 classification via `errors.As(err,
+    &pq.Error)` + string equality against `"42501"` (lib/pq
+    doesn't ship a centralized SQLSTATE constants package).
+
+- **Shared routing logic** in both adapters: SELECT / WITH /
+  VALUES / SHOW / EXPLAIN plus any SQL containing a top-level
+  `RETURNING` keyword (case-insensitive, word-boundary
+  matched) routes through the rows-returning path
+  (`pgx.Rows` / `*sql.Rows` iteration into
+  `[]map[string]any`); everything else uses the command-tag
+  / exec path. `Command` is normalized to upper-case via the
+  shared `firstWord` helper. `hasReturning` is conservatively
+  word-boundaried so a literal column named `returning_col`
+  doesn't accidentally route as a returning DML.
+
+- **20 unit-test functions** (10 per adapter package,
+  parametrized so the actual test-case count is higher) pinning
+  SQLSTATE classification correctness against both wrapped and
+  direct error chains, `firstWord` / `hasReturning` /
+  `isIdentChar` helper behavior (including the underscore-
+  boundary case — `returning_col` must NOT match RETURNING;
+  earlier letters-only boundary was a real bug caught during
+  local testing), pool / DB driver `Close` idempotency on
+  never-used drivers, and compile-time interface-satisfaction
+  (`var _ pgrlstest.Driver = (*…)(nil)` + `var _
+  pgrlstest.Closer = (*…)(nil)`). Real-Postgres integration
+  tests land in v0.7.5 step 6 via testcontainers-go; this
+  release verifies what can be verified without a database.
+
+### Changed
+
+- **go.mod gains driver-library deps**: `pgx/v5 v5.7.1`,
+  `lib/pq v1.10.9`, `pgerrcode v0.0.0-20240316143900`, plus
+  pgx's transitive deps (pgpassfile, pgservicefile, puddle,
+  golang.org/x/crypto, x/sync, x/text). All are runtime deps
+  (the adapter packages import them directly). Test-time
+  deps (testcontainers-go, etc.) come in v0.7.5 step 6 for
+  the conformance suite.
+
 ## [0.7.1] - 2026-05-13
 
 **Step 2 of 7 — Driver interface.** Adds the abstraction the test client
 (step 4) will use to talk to Postgres without coupling to a specific driver
-library. One adapter per supported driver (`drivers/pgx`, `drivers/lib_pq`)
+library. One adapter per supported driver (`drivers/pgx`, `drivers/pq`)
 ships in step 3 / v0.7.2; this release pins the contract.
 
 ### Added
@@ -67,7 +141,7 @@ the Go port follows the same staged release pattern.
   monorepo. Module path `github.com/pgrls/pgrls/go`; import path for the
   package is `github.com/pgrls/pgrls/go/pgrlstest`. Tag convention:
   `go/v0.7.0`, `go/v0.7.1`, etc. — distinct from the Python (`v0.5.10`)
-  and TypeScript (`ts-v0.6.1`) release tracks so the three ports can
+  and TypeScript (`ts-v0.6.2`) release tracks so the three ports can
   ship independently.
 
 - **`ProtocolVersion = 1` constant.** Cross-language contract: the
@@ -92,7 +166,7 @@ the Go port follows the same staged release pattern.
   `IsInsufficientPrivilege`, optional `Close`). Mirrors the TypeScript
   `Driver` shape that the pgx and lib/pq adapters will implement.
 - **v0.7.2** — Step 3: pgx adapter (`pgrlstest/drivers/pgx`) + lib/pq
-  adapter (`pgrlstest/drivers/lib_pq`). The two cover the dominant Go
+  adapter (`pgrlstest/drivers/pq`). The two cover the dominant Go
   Postgres drivers; both expose a single `*pgxpool.Conn` / `*sql.Conn`
   for the pinned-connection semantics the protocol needs.
 - **v0.7.3** — Step 4: `Client` struct with `Transaction`, `AsRole`,

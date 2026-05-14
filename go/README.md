@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.1 — step 2 of 7 (Driver interface).** This release adds the `Driver` interface and the `Closer` optional secondary interface alongside the v0.7.0 scaffold (module + protocol-version constant + error types). Subsequent steps add the [pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq) adapters, the `Client` API (transactions, role-switching, seed), the five assertion helpers, and the cross-language conformance suite. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.2 — step 3 of 7 (pgx + lib/pq adapters).** This release adds adapter packages for the two dominant Go Postgres drivers ([pgx](https://github.com/jackc/pgx) and [lib/pq](https://github.com/lib/pq)). Each ships two constructors: one for a caller-owned pinned connection, one for the pool variant that lazily acquires + releases via `Closer`. Subsequent steps add the `Client` API (transactions, role-switching, seed), the five assertion helpers, the cross-language conformance suite, and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -25,8 +25,8 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 | `ProtocolVersion` constant | 1 | ✅ shipped (v0.7.0) |
 | `Error` + `AssertionError` types | 1 | ✅ shipped (v0.7.0) |
 | `Driver` + `Closer` interfaces + `QueryResult` | 2 | ✅ shipped (v0.7.1) |
-| pgx adapter | 3 | planned (v0.7.2) |
-| lib/pq adapter | 3 | planned (v0.7.2) |
+| pgx adapter (`drivers/pgx`: `Conn` + `Pool`) | 3 | ✅ shipped (v0.7.2) |
+| lib/pq adapter (`drivers/pq`: `Conn` + `DB`) | 3 | ✅ shipped (v0.7.2) |
 | `Client` (Transaction, AsRole, Exec, FetchAll, Seed) | 4 | planned (v0.7.3) |
 | Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | planned (v0.7.4) |
 | Cross-language conformance suite | 6 | planned (v0.7.5) |
@@ -62,4 +62,4 @@ MIT — same as the main pgrls project. See `LICENSE`.
 
 - Repo: [github.com/pgrls/pgrls](https://github.com/pgrls/pgrls)
 - Module: `github.com/pgrls/pgrls/go`
-- Tag convention: `go/v0.7.0`, `go/v0.7.1`, … (distinct from `v0.5.10` Python tags and `ts-v0.6.1` TypeScript tags so the three ports ship independently)
+- Tag convention: `go/v0.7.0`, `go/v0.7.1`, … (distinct from `v0.5.10` Python tags and `ts-v0.6.2` TypeScript tags so the three ports ship independently)
