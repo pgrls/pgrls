@@ -7,6 +7,50 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.1] - 2026-05-13
+
+**Step 2 of 7 — Driver interface.** Adds the abstraction the test client
+(step 4) will use to talk to Postgres without coupling to a specific driver
+library. One adapter per supported driver (`drivers/pgx`, `drivers/lib_pq`)
+ships in step 3 / v0.7.2; this release pins the contract.
+
+### Added
+
+- **`Driver` interface** at `pgrlstest/driver.go` with three required
+  methods: `Query(ctx, sql, params...)` returns a normalized
+  `QueryResult`; `Rollback(ctx)` discards the current transaction
+  (must be safe even when the transaction is in aborted state);
+  `IsInsufficientPrivilege(err)` classifies a driver error as a
+  SQLSTATE 42501 RLS rejection. Cross-language guarantee:
+  structurally aligned with the TypeScript `Driver` interface
+  and the Python client's reach-into-psycopg pattern — same
+  three operations, same Layer 1 wire output, with Go-idiomatic
+  adaptations (`ctx context.Context` first arg, variadic
+  `params ...any`, error return alongside the result).
+
+- **`QueryResult` struct** with `Rows []map[string]any`, `Command
+  string`, `RowCount int64`. Matches the union of what pgx
+  (`pgx.Rows` + command tag) and lib/pq (`database/sql.Rows` +
+  `Result`) expose, reduced to the three fields the assertion
+  helpers (step 5 / v0.7.4) actually read.
+
+- **`Closer` optional interface** at the same file. Adapters whose
+  underlying client needs explicit teardown (pgx's `*pgxpool.Conn`,
+  lib/pq's `*sql.Conn`) implement it; the test client (step 4 /
+  v0.7.3) will type-assert and call `Close(ctx)` if present.
+  `*sql.DB`-backed adapters that don't need teardown just omit
+  the method — Go's idiomatic "optional method via type assertion"
+  pattern.
+
+- **8 unit tests** at `pgrlstest/driver_test.go` pinning the
+  interface shape, the `QueryResult` zero-value behavior, the
+  type-assertion contract for `Closer`, context propagation
+  through `Query` and `Rollback`, the `IsInsufficientPrivilege`
+  nil-input contract, and `QueryResult.Rows` heterogeneous value
+  types. Includes a compile-time `var _ Driver =
+  (*fakeDriver)(nil)` assertion so a future signature change
+  breaks the build, not just the tests.
+
 ## [0.7.0] - 2026-05-13
 
 **Step 1 of 7 — scaffold.** Establishes the module path, the Layer 1 protocol-
@@ -14,7 +58,7 @@ version constant, and the error types. Subsequent steps ship as their own
 minor versions (v0.7.1 = Driver interface; v0.7.2 = pgx + lib/pq adapters;
 v0.7.3 = Client API; v0.7.4 = assertion helpers; v0.7.5 = conformance suite;
 v0.7.6 = CI hardening + release plumbing). Each step ships as a separately-
-reviewable PR. The TypeScript port took seven steps from v0.6.0 → v0.6.2;
+reviewable PR. The TypeScript port took seven steps to ship v0.6.0;
 the Go port follows the same staged release pattern.
 
 ### Added
