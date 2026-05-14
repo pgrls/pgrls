@@ -28,11 +28,13 @@ port leads with its idiomatic helper-name prefix —
   `Client.AssertRejected`, `Client.AssertSilentlyDropped`) AND
   as exported package-level functions (`pgrlstest.AssertRows`,
   etc.) taking a `*Client` argument. The methods are thin
-  forwarders; both forms have identical wire output. Mirrors
-  the TS port's `assertRows(client, sql, options)` and Python's
-  `assert_rows(conn, sql, *, count=N)` callable shapes so
-  callers building their own assertion suites can reach the
-  helpers without going through `Client`.
+  forwarders; both forms have identical wire output. Matches
+  the TS port's `assertRows(client, sql, options)` callable
+  shape exactly (same `PgrlsTestClient` / `*Client` wrapper as
+  the first arg). Python's `assert_rows(conn, sql, count=N)`
+  takes a lower-level `psycopg.Connection` directly — that's a
+  layer-of-abstraction divergence Go inherits from the TS port,
+  not a wire-protocol difference.
   - `AssertRows(ctx, sql, &AssertRowsOptions{Count: N})` —
     exact row-count match. Returns `*AssertionError` (matches
     `ErrAssertion`) on mismatch.

@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.4 — step 5 of 7 (assertion helpers).** This release adds the five RLS-shape assertion helpers — `AssertRows`, `AssertVisible`, `AssertInvisible`, `AssertRejected` (savepoint-wrapped via `pgrls_check_<rand>`), and `AssertSilentlyDropped` (UPDATE/DELETE … RETURNING with the row-count check) — each exposed as a `Client` method and matching the Python / TypeScript wire sequence byte-for-byte. Subsequent steps add the cross-language conformance suite and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.4 — step 5 of 7 (assertion helpers).** This release adds the five RLS-shape assertion helpers — `AssertRows`, `AssertVisible`, `AssertInvisible`, `AssertRejected` (savepoint-wrapped via `pgrls_check_<rand>`), and `AssertSilentlyDropped` (UPDATE/DELETE … RETURNING with the row-count check) — each exposed as a `Client` method AND as an exported package-level function taking `*Client`, matching the Python / TypeScript wire sequence byte-for-byte. Subsequent steps add the cross-language conformance suite and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 

@@ -21,8 +21,10 @@
 // (`AssertRows`, `AssertVisible`, `AssertInvisible`,
 // `AssertRejected`, `AssertSilentlyDropped`) — both as `Client`
 // methods and as exported package-level functions taking a
-// `*Client` (matching the TS port's `assertRows(client, ...)`
-// and Python's `assert_rows(conn, ...)` callable shapes).
+// `*Client` (matches the TS port's `assertRows(client, ...)`
+// callable shape — Python's `assert_rows(conn, ...)` takes the
+// lower-level psycopg.Connection, a layer-of-abstraction
+// divergence the TS and Go ports share).
 // Subsequent steps add the conformance suite (v0.7.5) and CI
 // hardening + release plumbing (v0.7.6). See CHANGELOG.md for
 // the per-step plan.
