@@ -33,7 +33,7 @@ type QueryResult struct {
 	// — `result.Rows[0]["tenant_id"]` reads naturally — and
 	// matches the row shape the TS / Python clients return.
 	// `Client.FetchAll` (v0.7.3) returns this shape directly;
-	// the TS port carries a `FetchAll<TRow>` generic cast for
+	// the TS port carries a `fetchAll<TRow>` generic cast for
 	// ergonomics, but Go's type system doesn't permit a free
 	// generic over `map[string]any` without forcing a
 	// conversion step, so callers wrap with their own typed-

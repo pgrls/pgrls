@@ -242,7 +242,15 @@ func (c *Client) AsRole(
 		}
 	}
 	captureRow := captured.Rows[0]
-	prevUser, ok := captureRow["current_user"].(string)
+	// pgx returns `current_user` as Go string. lib/pq scans into
+	// `*any` and surfaces unknown OIDs (including Postgres's
+	// `name` type, OID 19, which `current_user` returns) as raw
+	// `[]byte`. Coerce both shapes so AsRole works against both
+	// adapters without forcing each one to special-case the
+	// column. The same coercion applies to claims (text type,
+	// today handled as string by lib/pq — but defending against
+	// future bytes-shaped GUC values is cheap and uniform).
+	prevUser, ok := stringOrBytes(captureRow["current_user"])
 	if !ok {
 		return &Error{
 			Msg: fmt.Sprintf(
@@ -257,7 +265,7 @@ func (c *Client) AsRole(
 	// means the outer transaction had claims to restore.
 	var prevClaims string
 	if rawClaims, present := captureRow["claims"]; present && rawClaims != nil {
-		if s, isString := rawClaims.(string); isString && s != "" {
+		if s, isString := stringOrBytes(rawClaims); isString && s != "" {
 			prevClaims = s
 		}
 	}
@@ -284,7 +292,7 @@ func (c *Client) AsRole(
 	bodyOK := false
 	defer func() {
 		if bodyOK {
-			// 6a. Clean exit. RELEASE SAVEPOINT, then
+			// 6. Clean exit. RELEASE SAVEPOINT, then
 			// explicitly restore prior role + claims. RELEASE
 			// keeps SET LOCAL changes merged into the outer
 			// transaction; without restoration, nested AsRole
@@ -335,7 +343,7 @@ func (c *Client) AsRole(
 			// any — the GUC was never touched, no restore
 			// needed.
 		} else {
-			// 6b. Exception path. ROLLBACK TO SAVEPOINT
+			// 7. Exception path. ROLLBACK TO SAVEPOINT
 			// restores SET LOCAL state from before the
 			// savepoint — role and GUC both revert
 			// automatically. If the rollback itself fails the
@@ -579,4 +587,21 @@ func (c *Client) Close(ctx context.Context) error {
 		return closer.Close(ctx)
 	}
 	return nil
+}
+
+// stringOrBytes coerces a row-map value to a Go string, accepting
+// either a native string (pgx, native Postgres text types) or a
+// raw byte slice (lib/pq's fallback for unknown / non-text OIDs
+// like `name`, which `current_user` returns). Returns false for
+// any other type so callers can distinguish the column-mistyped
+// case from the column-bytes case.
+func stringOrBytes(v any) (string, bool) {
+	switch t := v.(type) {
+	case string:
+		return t, true
+	case []byte:
+		return string(t), true
+	default:
+		return "", false
+	}
 }

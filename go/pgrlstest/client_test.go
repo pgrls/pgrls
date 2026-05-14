@@ -492,6 +492,77 @@ func TestClient_AsRole_EmptyClaimsMapIsSent(t *testing.T) {
 	}
 }
 
+func TestClient_AsRole_AcceptsBytesShapedCaptureColumns(t *testing.T) {
+	// Defensive: lib/pq surfaces Postgres `name`-typed columns
+	// (`SELECT current_user` returns OID 19 `name`) as raw
+	// `[]byte` rather than Go `string`, because database/sql's
+	// `Scan(*any)` path falls through lib/pq's encode.go
+	// `textDecode` switch for unknown OIDs. AsRole must accept
+	// both shapes so the same code path works against both
+	// adapters without each one carrying a normalization layer.
+	d := &recordingDriver{
+		respondQueue: []QueryResult{
+			{Rows: []map[string]any{
+				{"current_user": []byte("alice"), "claims": []byte(`{"sub":"outer"}`)},
+			}, Command: "SELECT", RowCount: 1},
+		},
+	}
+	c := NewClient(d)
+
+	err := c.AsRole(context.Background(), "app", nil, func(_ context.Context) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("AsRole returned error: %v", err)
+	}
+
+	// Restore must quote "alice" and pass outer claims back to
+	// set_config — i.e. the []byte was successfully coerced to
+	// "alice" / `{"sub":"outer"}`.
+	var sawRestoreRole, sawRestoreClaims bool
+	for _, call := range d.calls {
+		if call.sql == "SET LOCAL ROLE alice" {
+			sawRestoreRole = true
+		}
+		if strings.HasPrefix(call.sql, "SELECT set_config('request.jwt.claims', $1, true)") {
+			if got, _ := call.params[0].(string); got == `{"sub":"outer"}` {
+				sawRestoreClaims = true
+			}
+		}
+	}
+	if !sawRestoreRole {
+		t.Errorf("did not see SET LOCAL ROLE alice; calls = %#v", d.calls)
+	}
+	if !sawRestoreClaims {
+		t.Errorf("did not see restore set_config with outer claims; calls = %#v", d.calls)
+	}
+}
+
+func TestClient_AsRole_RejectsNonStringNonBytesCaptureColumn(t *testing.T) {
+	// If a custom Driver returns a column with a non-string,
+	// non-bytes type (e.g. int64), AsRole must reject with a
+	// clear error rather than silently coercing it.
+	d := &recordingDriver{
+		respondQueue: []QueryResult{
+			{Rows: []map[string]any{
+				{"current_user": int64(42), "claims": nil},
+			}, Command: "SELECT", RowCount: 1},
+		},
+	}
+	c := NewClient(d)
+
+	err := c.AsRole(context.Background(), "app", nil, func(_ context.Context) error {
+		t.Error("body must not run on type-mismatched capture")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected error for non-string non-bytes current_user")
+	}
+	if !errors.Is(err, ErrAPIError) {
+		t.Errorf("error %v does not match ErrAPIError sentinel", err)
+	}
+}
+
 func TestClient_AsRole_NoCaptureRowIsError(t *testing.T) {
 	d := &recordingDriver{
 		respondQueue: []QueryResult{
