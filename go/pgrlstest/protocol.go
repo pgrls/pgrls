@@ -7,15 +7,19 @@
 // sequence (savepoint-bracketed `SET LOCAL ROLE` + `set_config`
 // for the JWT claims, rollback to savepoint on scenario exit).
 //
-// **Status: step 3 of 7 (v0.7.2 — pgx + lib/pq adapters).**
+// **Status: step 4 of 7 (v0.7.3 — Client API).**
 // v0.7.0 shipped the scaffold + ProtocolVersion + error types;
 // v0.7.1 added the Driver and Closer interfaces alongside the
-// QueryResult struct; v0.7.2 adds the pgx and lib/pq driver
-// adapters (each with a single-conn + pool-backed constructor).
-// Subsequent steps add the Client API (v0.7.3), the assertion
-// helpers (v0.7.4), the conformance suite (v0.7.5), and CI
-// hardening + release plumbing (v0.7.6). See CHANGELOG.md
-// for the per-step plan.
+// QueryResult struct; v0.7.2 added the pgx and lib/pq driver
+// adapters (each with a single-conn + pool-backed constructor);
+// v0.7.3 adds the Client API (`Client.Transaction`, `Client.AsRole`,
+// `Client.Exec`, `Client.FetchAll`, `Client.Seed`, `Client.Close`)
+// alongside `QuoteIdent` / `QuoteQualified` (identifier quoting
+// with reserved-keyword handling) and `NewSavepointName`
+// (crypto/rand-backed savepoint suffix generator). Subsequent
+// steps add the assertion helpers (v0.7.4), the conformance
+// suite (v0.7.5), and CI hardening + release plumbing (v0.7.6).
+// See CHANGELOG.md for the per-step plan.
 package pgrlstest
 
 // ProtocolVersion is the wire-protocol version this client

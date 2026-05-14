@@ -7,6 +7,94 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.3] - 2026-05-14
+
+**Step 4 of 7 — Client API.** Wires the `Driver` adapters (v0.7.2)
+behind a stable API: per-test transactions, role+claims switching,
+simple seeding, optional pinned-conn teardown. The wire-level
+Layer 1 sequence is byte-equivalent to the Python and TypeScript
+ports — the conformance suite (step 6 / v0.7.5) pins this against
+a shared fixture once testcontainers-go is wired up.
+
+### Added
+
+- **`Client` struct** at `pgrlstest/client.go` with six public
+  methods:
+  - `NewClient(driver)` builds a client from any `Driver`-shaped
+    adapter (typically `pgxdriver.FromConn/FromPool` or
+    `pqdriver.FromConn/FromDB`).
+  - `Client.Transaction(ctx, body)` issues an explicit `BEGIN`,
+    runs `body`, ROLLBACKs in a `defer` regardless of body
+    outcome. Body errors shadow rollback errors (the doomed
+    transaction's rollback failure isn't the meaningful one).
+  - `Client.Exec(ctx, sql, params...)` runs a single statement,
+    discards rows. For SELECT / RETURNING-bearing DML, use
+    `FetchAll` instead.
+  - `Client.FetchAll(ctx, sql, params...)` returns
+    `[]map[string]any` — same row shape as `QueryResult.Rows`.
+    The TS port carries a generic `<TRow>` type cast for
+    ergonomics; Go's type system doesn't permit a free generic
+    over `map[string]any` without forcing a conversion step, so
+    callers wrap with their own typed-row helper if desired.
+  - `Client.AsRole(ctx, role, options, body)` implements the
+    full Layer 1 scenario-block protocol — capture current
+    role+claims, SAVEPOINT, SET LOCAL ROLE (quoted), set_config
+    of claims JSON (when non-nil), run body, then on clean
+    exit RELEASE SAVEPOINT + restore prior role + restore (or
+    clear) prior claims, or on body error ROLLBACK TO
+    SAVEPOINT. `AsRoleOptions.Claims` distinguishes the three
+    cases the protocol cares about: `nil` (don't touch GUC),
+    `map[string]any{}` (set GUC to JSON `"{}"`), and a
+    populated map.
+  - `Client.Seed(ctx, table, rows)` bulk-inserts rows. All rows
+    must share the same keys; columns are sorted
+    alphabetically for deterministic SQL output (Go's randomized
+    map iteration would otherwise produce different SQL between
+    runs). Schema-qualified `app.invoices` is supported via
+    right-split-on-`.`; multi-dot names are rejected as
+    cross-database refs aren't supported.
+  - `Client.Close(ctx)` type-asserts the underlying driver
+    against `Closer` and forwards if present; a no-op for
+    caller-owned single-conn drivers.
+
+- **`QuoteIdent` / `QuoteQualified`** at `pgrlstest/idents.go`
+  with the Postgres 16 reserved-keyword set (78 entries —
+  byte-equivalent to the Python `_RESERVED_KEYWORDS` and the
+  TypeScript `RESERVED_KEYWORDS`). Reserved keywords match
+  case-insensitively; embedded double quotes are escaped via
+  doubling; C0 control characters and DEL are rejected
+  outright with a clear error rather than emitting confusing
+  SQL.
+
+- **`NewSavepointName`** at `pgrlstest/savepoint.go` —
+  crypto/rand-backed 8-hex-char suffix generator shared between
+  `Client.AsRole` (prefix `pgrls_actor`) and the assertion
+  helpers (prefix `pgrls_check`, added in v0.7.4). Mirrors
+  Python's `secrets.token_hex(4)` and TypeScript's
+  `crypto.getRandomValues` wire shape exactly.
+
+- **35+ unit-test functions** covering the wire sequence (clean
+  exit, error path, nested claims restore, reserved-keyword
+  quoting), the seed helper's quoting and key-consistency
+  checks, the savepoint-name format and entropy, the identifier-
+  quoting matrix (plain names, reserved keywords, non-plain
+  needing quotes, embedded quotes, control-char rejection),
+  and the `Close` type-assertion contract (forwards when
+  driver is a `Closer`, no-op otherwise). Tests use a
+  `fakeDriver` recorder so the wire-level SQL ordering is
+  asserted directly — real-Postgres conformance lands in
+  v0.7.5 step 6.
+
+### Changed
+
+- **`protocol.go` status comment** advanced to step 4 of 7.
+- **Module surface** grows by three new public exports —
+  `Client`, `AsRoleOptions`, `NewClient`, plus the helper
+  functions `QuoteIdent`, `QuoteQualified`, `NewSavepointName`,
+  and `ReservedKeywords` (the keyword map, exported so callers
+  can verify their custom role names against the same wire
+  rules pgrls-test uses).
+
 ## [0.7.2] - 2026-05-13
 
 **Step 3 of 7 — pgx + lib/pq driver adapters.** Implements the `Driver`
