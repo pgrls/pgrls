@@ -141,7 +141,7 @@ the Go port follows the same staged release pattern.
   monorepo. Module path `github.com/pgrls/pgrls/go`; import path for the
   package is `github.com/pgrls/pgrls/go/pgrlstest`. Tag convention:
   `go/v0.7.0`, `go/v0.7.1`, etc. — distinct from the Python (`v0.5.10`)
-  and TypeScript (`ts-v0.6.1`) release tracks so the three ports can
+  and TypeScript (`ts-v0.6.2`) release tracks so the three ports can
   ship independently.
 
 - **`ProtocolVersion = 1` constant.** Cross-language contract: the
