@@ -62,4 +62,4 @@ MIT — same as the main pgrls project. See `LICENSE`.
 
 - Repo: [github.com/pgrls/pgrls](https://github.com/pgrls/pgrls)
 - Module: `github.com/pgrls/pgrls/go`
-- Tag convention: `go/v0.7.0`, `go/v0.7.1`, … (distinct from `v0.5.10` Python tags and `ts-v0.6.1` TypeScript tags so the three ports ship independently)
+- Tag convention: `go/v0.7.0`, `go/v0.7.1`, … (distinct from `v0.5.10` Python tags and `ts-v0.6.2` TypeScript tags so the three ports ship independently)
