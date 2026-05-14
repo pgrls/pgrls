@@ -1332,8 +1332,9 @@ Three layers, the bottom one is a documented contract not code:
   PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). The TypeScript
   port ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
   this same contract; a Go port at [`go/`](go/) shipped its scaffold +
-  protocol-version constant + error types in v0.7.0 (step 1 of 7 — subsequent
-  steps add the Driver interface, pgx + lib/pq adapters, Client API,
+  protocol-version constant + error types in v0.7.0, with the Driver +
+  Closer interfaces + QueryResult shape added in v0.7.1 (step 2 of 7 —
+  subsequent steps add the pgx + lib/pq adapters, Client API,
   assertion helpers, and conformance suite). Python is the reference
   implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
@@ -1691,9 +1692,10 @@ These are intentional in the current release. Do not invent capabilities.
   package, following the Layer 1 protocol. The Go port lives in
   [`go/`](go/) at module path `github.com/pgrls/pgrls/go` — its
   scaffold + protocol-version constant + error types shipped in
-  v0.7.0 (step 1 of 7), and subsequent v0.7.x steps add the
-  Driver interface, pgx + lib/pq adapters, Client API, assertion
-  helpers, and conformance suite. The `pgrls lint / fix /
+  v0.7.0; the Driver + Closer interfaces + QueryResult shape
+  shipped in v0.7.1 (step 2 of 7). Subsequent v0.7.x steps add
+  the pgx + lib/pq adapters, Client API, assertion helpers, and
+  conformance suite. The `pgrls lint / fix /
   snapshot / diff` CLIs stay Python — they depend on pglast
   (no drop-in TS/Go equivalent).
 
