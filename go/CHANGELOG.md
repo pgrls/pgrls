@@ -42,11 +42,12 @@ ships in step 3 / v0.7.2; this release pins the contract.
   the method — Go's idiomatic "optional method via type assertion"
   pattern.
 
-- **7 unit tests** at `pgrlstest/driver_test.go` pinning the
+- **8 unit tests** at `pgrlstest/driver_test.go` pinning the
   interface shape, the `QueryResult` zero-value behavior, the
   type-assertion contract for `Closer`, context propagation
-  through `Query` and `Rollback`, and the `IsInsufficientPrivilege`
-  nil-input contract. Includes a compile-time `var _ Driver =
+  through `Query` and `Rollback`, the `IsInsufficientPrivilege`
+  nil-input contract, and `QueryResult.Rows` heterogeneous value
+  types. Includes a compile-time `var _ Driver =
   (*fakeDriver)(nil)` assertion so a future signature change
   breaks the build, not just the tests.
 
@@ -57,7 +58,7 @@ version constant, and the error types. Subsequent steps ship as their own
 minor versions (v0.7.1 = Driver interface; v0.7.2 = pgx + lib/pq adapters;
 v0.7.3 = Client API; v0.7.4 = assertion helpers; v0.7.5 = conformance suite;
 v0.7.6 = CI hardening + release plumbing). Each step ships as a separately-
-reviewable PR. The TypeScript port took seven steps from v0.6.0 → v0.6.2;
+reviewable PR. The TypeScript port took seven steps culminating in v0.6.1;
 the Go port follows the same staged release pattern.
 
 ### Added
