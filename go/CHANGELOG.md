@@ -85,7 +85,7 @@ one for the pool variant that lazily acquires + releases via `Closer`.
 
 **Step 2 of 7 — Driver interface.** Adds the abstraction the test client
 (step 4) will use to talk to Postgres without coupling to a specific driver
-library. One adapter per supported driver (`drivers/pgx`, `drivers/lib_pq`)
+library. One adapter per supported driver (`drivers/pgx`, `drivers/pq`)
 ships in step 3 / v0.7.2; this release pins the contract.
 
 ### Added
@@ -166,7 +166,7 @@ the Go port follows the same staged release pattern.
   `IsInsufficientPrivilege`, optional `Close`). Mirrors the TypeScript
   `Driver` shape that the pgx and lib/pq adapters will implement.
 - **v0.7.2** — Step 3: pgx adapter (`pgrlstest/drivers/pgx`) + lib/pq
-  adapter (`pgrlstest/drivers/lib_pq`). The two cover the dominant Go
+  adapter (`pgrlstest/drivers/pq`). The two cover the dominant Go
   Postgres drivers; both expose a single `*pgxpool.Conn` / `*sql.Conn`
   for the pinned-connection semantics the protocol needs.
 - **v0.7.3** — Step 4: `Client` struct with `Transaction`, `AsRole`,
