@@ -49,8 +49,8 @@ func TestNewSavepointName_HighEntropy(t *testing.T) {
 }
 
 func TestNewSavepointName_DifferentPrefixes(t *testing.T) {
-	// The same generator backs both the asRole scope
-	// (`pgrls_actor`) and the assertRejected scope
+	// The same generator backs both the AsRole scope
+	// (`pgrls_actor`) and the AssertRejected scope
 	// (`pgrls_check`, added in v0.7.4). Pin that the prefix is
 	// passed through verbatim.
 	cases := []string{"pgrls_actor", "pgrls_check", "anything"}

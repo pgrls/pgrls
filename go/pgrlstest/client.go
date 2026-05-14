@@ -254,7 +254,7 @@ func (c *Client) AsRole(
 	if !ok {
 		return &Error{
 			Msg: fmt.Sprintf(
-				"AsRole: SELECT current_user returned non-string %T for current_user",
+				"AsRole: SELECT current_user returned non-string non-bytes %T for current_user",
 				captureRow["current_user"],
 			),
 		}
