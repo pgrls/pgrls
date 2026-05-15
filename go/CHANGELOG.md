@@ -59,7 +59,9 @@ port leads with its idiomatic helper-name prefix —
   future optional knobs (partial-match, regex over a column,
   etc.) extend without churning callers.
 
-- **24 unit tests** in `assertions_test.go` covering the
+- **26 unit tests** in `assertions_test.go` (plus one
+  cross-file invariant pin `TestAssertionError_NoUnwrapChain`
+  in `errors_test.go`) covering the
   pass/fail branches of each helper, the savepoint wire
   sequence in `AssertRejected` (success → RELEASE,
   42501-rejection → ROLLBACK TO SAVEPOINT, wrong-shape error →
