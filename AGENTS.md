@@ -1415,8 +1415,17 @@ v1-conformance both work:
    four criteria from the protocol doc. Equivalent conformance proof, more
    idiomatic to the host ecosystem.
 
-Either path satisfies v1. New ports should reach for whichever pattern fits
-the host language's testing idiom better.
+A **hybrid** is also valid — and is what the Go port chose
+(`go/pgrlstest/conformance_test.go`). The Go suite reads
+`tests/protocol/{schema,seed}.sql` directly (Python ↔ Go fixture
+sharing: a single edit to the SQL files propagates to both runs)
+but skips the `manifest.json` indirection in favor of an in-Go
+scenario harness covering the same four criteria. Useful when the
+fixture SQL is worth reusing across languages but a JSON-driven
+scenario list adds more abstraction than the test runner wants.
+
+Any of the three paths satisfies v1. New ports should reach for
+whichever pattern fits the host language's testing idiom better.
 
 <a id="diff-rules"></a>
 
