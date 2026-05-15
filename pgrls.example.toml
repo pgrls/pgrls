@@ -132,6 +132,27 @@ allowlist = []
 # a wider tenant_id column or different ownership).
 allowlist = []
 
+[lint.rules.SEC014]
+# Free-standing SECURITY DEFINER function audit. Every SECDEF
+# function in the introspected schemas is flagged — the rule
+# surfaces the full SECDEF surface so each function gets an
+# explicit audit decision (rewrite as INVOKER, or documented
+# allowlist). SEC013 covers the trigger-mediated bypass path;
+# VIEW004 covers the view-mediated bypass path; SEC014 closes
+# the gap for SECDEF functions called directly from
+# application code (`SELECT my_secdef(...)`, JDBC, ORM
+# bindings). Entries are fully-qualified function names of
+# the form "schema.function". Bare function names are
+# rejected because two same-named functions in different
+# schemas would otherwise both be silenced.
+#
+# Note: argument signatures are NOT part of the allowlist
+# shape. A function with two overloads (e.g. `do_thing(int)`
+# vs `do_thing(text)`) is flagged once and allowlisted once.
+# Operators needing per-overload granularity should
+# `ALTER FUNCTION` one of them to a different name.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
