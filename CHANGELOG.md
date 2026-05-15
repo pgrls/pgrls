@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.11] - 2026-05-15
+
 ### Fixed
 - **`pgrls diff --format text` now applies the same hostile-input
   hardening to `Change.location` that v0.5.10's lint formatters
