@@ -75,12 +75,13 @@ criteria.
 ### Changed
 
 - **`go.mod` gains test-time deps**: `testcontainers-go v0.34.0`
-  and `testcontainers-go/modules/postgres v0.34.0` (one of the
-  last releases compatible with the module's `go 1.22` floor;
-  v0.35.0 still works on 1.22, v0.36.0 raises the floor to
-  1.23, v0.41.0+ to 1.25 — when this module bumps its Go
-  floor in v0.7.6, the testcontainers pin can bump in lockstep),
-  plus transitive Docker / OpenTelemetry / mux deps.
+  and `testcontainers-go/modules/postgres v0.34.0` (compatible
+  with the module's `go 1.22` floor). Upstream cutover points:
+  v0.34/v0.35 → `go 1.22`, v0.36–v0.38 → `go 1.23`, v0.39/v0.40 →
+  `go 1.24`, v0.41+ → `go 1.25`. When this module bumps its Go
+  floor in v0.7.6, the testcontainers pin can bump in lockstep
+  with whichever cutover-bucket matches the new floor. Also
+  pulls transitive Docker / OpenTelemetry / mux deps.
 - **`protocol.go` status comment** advanced to step 6 of 7.
 - **`.github/workflows/go.yml`** now triggers on changes to
   `tests/protocol/**` (the cross-port fixture directory — both
