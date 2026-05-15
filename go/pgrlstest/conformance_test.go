@@ -10,10 +10,12 @@ package pgrlstest_test
 // and `TestConformance_PqAdapter`, applies the cross-language
 // fixture, then dispatches both adapter tests. Each subtest
 // opens its own `Client.Transaction` and rolls back at the
-// end, so the fixture is preserved across tests and the per-
-// test isolation lives at the savepoint layer (matches the TS
-// `beforeAll` strategy and amortizes the ~3-5s container
-// startup over the conformance matrix).
+// end, so the fixture is preserved across tests; per-subtest
+// isolation lives at the `BEGIN`/`ROLLBACK` boundary, and
+// per-`AsRole` nesting layered on top of that lives at the
+// savepoint layer (matches the TS `beforeAll` strategy and
+// amortizes the ~3-5s container startup over the conformance
+// matrix).
 //
 // Subtest coverage per adapter:
 //   - 4 Layer 1 criteria (`SET LOCAL ROLE` reset on rollback,
@@ -43,10 +45,11 @@ package pgrlstest_test
 // divergence is documented in `AGENTS.md` as a deliberate
 // two-approaches choice for the cross-language conformance.
 //
-// Docker availability: when Docker isn't reachable (or the
-// image pull / port-allocation fails), `TestMain` swallows the
-// `tcpostgres.Run` error, leaves `containerDSN` empty, and
-// every conformance subtest calls `t.Skip` via
+// Docker availability: when any setup step fails (Docker not
+// reachable, image pull / port-allocation rejection, DSN
+// derivation, `sql.Open`, or fixture install), `TestMain`
+// swallows the error to stderr, leaves `containerDSN` empty,
+// and both `TestConformance_*` parent tests Skip on entry via
 // `skipUnlessDocker`. The package's other unit tests stay
 // runnable in Docker-less environments — only this file's
 // tests opt out.
@@ -222,10 +225,12 @@ END $$;
 
 // applyFixtureSQL installs the protocol-conformance schema +
 // seed against the freshly-booted container. The shared
-// fixture lives at `tests/protocol/{schema,seed}.sql`. The Go
-// suite reads the files at runtime rather than embedding them
-// so a single edit propagates to all three port suites without
-// recompilation.
+// fixture lives at `tests/protocol/{schema,seed}.sql` — the
+// same files the Python conformance suite reads. The Go suite
+// reads the files at runtime rather than embedding them so a
+// single edit propagates to both Python and Go conformance
+// runs without recompilation; the TypeScript port maintains
+// its own `FIXTURE_SQL` in `ts/test/conformance/_helpers.ts`.
 func applyFixtureSQL(ctx context.Context, db *sql.DB) error {
 	// Make the install idempotent for the env-var path; a
 	// no-op (no existing schema) for the testcontainers path.

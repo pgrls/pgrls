@@ -63,10 +63,13 @@ harness covering the same four Layer 1 criteria.
 
 - **Docker-availability fallback** — when testcontainers can't
   start a container (Docker not reachable, image pull failed,
-  port allocation rejected) every conformance subtest calls
-  `t.Skip()` with the actual failure reason. The rest of the
-  package's unit-test suite stays runnable in Docker-less
-  environments. `-short` also skips the conformance suite.
+  port allocation rejected — or fixture install fails),
+  `TestMain` leaves `containerDSN` empty and `TestConformance_*`
+  parent tests both `t.Skip` on entry with a generic message
+  pointing the reader at the TestMain stderr output (where the
+  actual failure reason is logged). The rest of the package's
+  unit-test suite stays runnable in Docker-less environments.
+  `-short` also skips the conformance suite.
 
 ### Changed
 
