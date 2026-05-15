@@ -5,10 +5,55 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from pgrls.introspect import introspect
+from pgrls.introspect import _extract_search_path, introspect
 from pgrls.model import Schema
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+# --- _extract_search_path (pure helper, no DB) ---------------------------
+#
+# `pg_proc.proconfig` is a text[] of `name=value` GUC-override strings;
+# psycopg surfaces it as list[str] or None. `_extract_search_path`
+# decodes the `search_path` entry for SEC015.
+
+
+def test_extract_search_path_none_when_proconfig_null() -> None:
+    # A function that overrides no GUCs has proconfig = NULL.
+    assert _extract_search_path(None) is None
+
+
+def test_extract_search_path_none_when_no_search_path_entry() -> None:
+    # proconfig present but only carries other GUCs.
+    assert _extract_search_path(["statement_timeout=5000"]) is None
+
+
+def test_extract_search_path_returns_value() -> None:
+    # The comma inside the value is already un-escaped by psycopg's
+    # array parser by the time it reaches this helper.
+    assert (
+        _extract_search_path(["search_path=pg_catalog, public, pg_temp"])
+        == "pg_catalog, public, pg_temp"
+    )
+
+
+def test_extract_search_path_picks_search_path_among_multiple_gucs() -> None:
+    config = [
+        "statement_timeout=5000",
+        "search_path=public, pg_temp",
+        "work_mem=64MB",
+    ]
+    assert _extract_search_path(config) == "public, pg_temp"
+
+
+def test_extract_search_path_case_insensitive_guc_name() -> None:
+    # GUC names are case-insensitive in Postgres.
+    assert _extract_search_path(["Search_Path=public"]) == "public"
+
+
+def test_extract_search_path_empty_value() -> None:
+    # `SET search_path = ''` round-trips as an empty value string.
+    assert _extract_search_path(["search_path="]) == ""
 
 
 def test_returns_empty_schema_when_no_tables(pg_conn: psycopg.Connection) -> None:

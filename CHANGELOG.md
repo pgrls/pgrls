@@ -10,6 +10,62 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.13] - 2026-05-15
+
+### Added
+- **SEC015 — SECURITY DEFINER function exposed to `pg_temp`
+  search-path shadowing** (severity: warning). Flags every
+  SECDEF function whose effective `search_path` lets the
+  per-session temporary schema (`pg_temp`) be searched before
+  the legitimate schemas.
+
+  A SECDEF function runs as its owner. When the body references
+  an object by an *unqualified* name, Postgres resolves it
+  against the function's `search_path`. Postgres searches
+  `pg_temp` **first** — ahead of even `pg_catalog` — for
+  relation and type names *unless* `pg_temp` is named
+  explicitly in `search_path`. An attacker creates a same-named
+  table/view/type in their session's `pg_temp`; the privileged
+  function silently resolves to the attacker's object and runs
+  attacker-controlled SQL with the owner's privileges. This is
+  the CVE-2018-1058 search-path privilege-escalation class.
+
+  The rule fires when the effective search_path does not end
+  with an explicit `pg_temp` token:
+  - **No `SET search_path` clause** — the function inherits the
+    caller's (attacker-controlled, `pg_temp`-first) path.
+  - **`SET search_path` present but `pg_temp` absent** — e.g.
+    the common `SET search_path = pg_catalog, public`; `pg_temp`
+    is still implicitly first because it isn't named.
+  - **`pg_temp` named but not last** — searched at the written
+    (early) position.
+
+  The only structurally-safe shape — `pg_temp` named as the
+  **last** entry — passes. The fix is mechanical (`ALTER
+  FUNCTION … SET search_path = …, pg_temp`) but not auto-applied:
+  rewriting the clause needs the function's full argument
+  signature, which introspection doesn't capture. Allowlist by
+  qualified function name (`schema.function`) after confirming
+  the body fully-qualifies every object reference.
+
+  SEC015 is the sharp companion to SEC014: where SEC014 says
+  "audit this SECDEF function," SEC015 says "this specific
+  function has an exploitable search_path, here's the one-line
+  fix." VIEW004 and SEC013 cover the view- and trigger-mediated
+  SECDEF bypass paths respectively.
+
+### Changed
+- **Snapshot format v7 → v8.** `SecdefFunction` snapshot entries
+  gain a `search_path` field (the value of the function's
+  `SET search_path` clause, decoded from `pg_proc.proconfig`,
+  or `null` when no clause is pinned). v3–v7 snapshots still
+  load — their SECDEF functions get `search_path = null`, which
+  SEC015 treats as unsafe; re-snapshot against a live database
+  to capture real values. `Schema.from_snapshot` accepts
+  versions 3–8.
+- **Rule count: twenty-three → twenty-four** (`SEC001`–`SEC015`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`).
+
 ## [0.5.12] - 2026-05-15
 
 ### Added

@@ -385,12 +385,12 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_seven():
-    # Bumped 6 → 7 in v0.5.10 to add per-table `indexes` for PERF003
-    # (additive — Schema.to_sql() does not emit CREATE INDEX DDL,
-    # so the bump is orthogonal to this file's coverage). Pin so a
-    # future bump is deliberate.
-    assert SNAPSHOT_VERSION == 7
+def test_snapshot_version_is_eight():
+    # Bumped 7 → 8 in v0.5.13 to add `search_path` to SecdefFunction
+    # for SEC015 (additive — Schema.to_sql() does not emit CREATE
+    # FUNCTION DDL, so the bump is orthogonal to this file's
+    # coverage). Pin so a future bump is deliberate.
+    assert SNAPSHOT_VERSION == 8
 
 
 def test_to_snapshot_emits_column_details_array():

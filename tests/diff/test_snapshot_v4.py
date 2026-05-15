@@ -15,11 +15,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_7() -> None:
-    # Bumped 6 → 7 in v0.5.10 to add per-table `indexes` for PERF003.
-    # v3 / v4 / v5 / v6 baselines still load (Schema.from_snapshot
-    # accepts 3, 4, 5, 6, 7).
-    assert SNAPSHOT_VERSION == 7
+def test_snapshot_version_is_8() -> None:
+    # Bumped 7 → 8 in v0.5.13 to add `search_path` to
+    # SecdefFunction for SEC015. v3–v7 baselines still load
+    # (Schema.from_snapshot accepts 3 through 8).
+    assert SNAPSHOT_VERSION == 8
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -40,9 +40,10 @@ def test_to_snapshot_emits_views_field() -> None:
     )
     snap = schema.to_snapshot()
     # views added at v4; v5 added column_details; v6 added triggers;
-    # v7 added indexes (all additive and orthogonal to the views
-    # field this test exercises).
-    assert snap["version"] == 7
+    # v7 added indexes; v8 added SecdefFunction.search_path (all
+    # additive and orthogonal to the views field this test
+    # exercises).
+    assert snap["version"] == 8
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -113,11 +114,14 @@ def test_to_snapshot_emits_security_definer_functions_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "security_definer_functions" in snap
+    # `search_path` is the v8 addition — defaults to None when the
+    # SecdefFunction is constructed without it (as here).
     assert snap["security_definer_functions"] == [
         {
             "qualified_name": "public.read_secret",
             "body": "SELECT * FROM public.secret",
             "language": "sql",
+            "search_path": None,
         }
     ]
 
@@ -341,3 +345,59 @@ def test_from_snapshot_v6_yields_empty_indexes() -> None:
     }
     loaded = Schema.from_snapshot(v6)
     assert loaded.tables[0].indexes == ()
+
+
+def test_from_snapshot_round_trips_v8_with_search_path() -> None:
+    # SEC015 reads `SecdefFunction.search_path` from the snapshot.
+    # Round-trip through `json.dumps` so the JSON shape matches a
+    # file-persisted snapshot — the same contract `pgrls diff`
+    # exercises. Covers both the pinned and the None (no-clause)
+    # case.
+    import json
+
+    original = Schema(
+        tables=(),
+        views=(),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.pinned_fn",
+                body="SELECT 1",
+                language="sql",
+                search_path="pg_catalog, pg_temp",
+            ),
+            SecdefFunction(
+                qualified_name="public.unpinned_fn",
+                body="SELECT 2",
+                language="sql",
+                search_path=None,
+            ),
+        ),
+    )
+    snap_json = json.dumps(original.to_snapshot())
+    loaded = Schema.from_snapshot(json.loads(snap_json))
+    assert loaded.security_definer_functions == original.security_definer_functions
+    assert loaded.security_definer_functions[0].search_path == "pg_catalog, pg_temp"
+    assert loaded.security_definer_functions[1].search_path is None
+
+
+def test_from_snapshot_v7_yields_none_search_path() -> None:
+    # A v7 snapshot (v0.5.10–v0.5.12) carries `security_definer_functions`
+    # entries with no `search_path` key — the v8 addition. Loading
+    # must succeed and default the field to None. SEC015 then
+    # conservatively flags every such function until the snapshot
+    # is re-captured against a live database (v8).
+    v7 = {
+        "version": 7,
+        "tables": [],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [
+            {
+                "qualified_name": "public.legacy_fn",
+                "body": "SELECT 1",
+                "language": "sql",
+            }
+        ],
+    }
+    loaded = Schema.from_snapshot(v7)
+    assert loaded.security_definer_functions[0].search_path is None
