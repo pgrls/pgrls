@@ -10,10 +10,12 @@ on:
     branches: [main]
     paths:
       - "go/**"
+      - "tests/protocol/**"
       - ".github/workflows/go.yml"
   pull_request:
     paths:
       - "go/**"
+      - "tests/protocol/**"
       - ".github/workflows/go.yml"
 
 # Defense-in-depth: this workflow only reads the repo and reports
@@ -58,6 +60,17 @@ jobs:
             git diff --exit-code go.mod
           fi
 
+      - name: gofmt
+        # Pinning gofmt at CI gates a formatting regression. Local
+        # `go fmt ./...` produces the same result.
+        run: |
+          fmt_diff=$(gofmt -l .)
+          if [ -n "$fmt_diff" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$fmt_diff"
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
 
@@ -66,4 +79,11 @@ jobs:
         # postgres.js adapter had (cached promise overwriting a
         # newer reservation). The Go race detector is the standard
         # tool for that class of bug.
+        #
+        # The v0.7.5 conformance suite (`conformance_test.go`)
+        # uses testcontainers-go to spin up a real Postgres
+        # container; the GitHub-hosted Linux runners have Docker
+        # so the conformance tests run automatically. Local devs
+        # without Docker get a graceful skip (the testcontainer
+        # init fails, every conformance test calls `t.Skip`).
         run: go test -race -v ./...

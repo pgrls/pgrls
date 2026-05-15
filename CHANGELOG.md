@@ -29,6 +29,17 @@ breaking changes — they will be called out in this file.
   route through `format_violations` / `format_sarif` which
   serialize via `json.dumps`.
 
+## [0.7.5] - 2026-05-14
+
+Go port step 6 of 7 — cross-language conformance suite. Both
+adapter packages (pgx and lib/pq) now run against a real
+Postgres container via testcontainers-go, exercising the four
+Layer 1 protocol criteria from `docs/pgrls-test-protocol.md`
+plus end-to-end public-API tests, against the shared
+`tests/protocol/{schema,seed}.sql` fixture. The Python core
+(`pgrls` package) stays at 0.5.10 and the TypeScript port stays
+at 0.6.2. Per-port details in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+
 ## [0.7.4] - 2026-05-14
 
 Go port step 5 of 7 — five RLS assertion helpers (`AssertRows`,

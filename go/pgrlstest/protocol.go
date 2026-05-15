@@ -7,7 +7,7 @@
 // sequence (savepoint-bracketed `SET LOCAL ROLE` + `set_config`
 // for the JWT claims, rollback to savepoint on scenario exit).
 //
-// **Status: step 5 of 7 (v0.7.4 — assertion helpers).**
+// **Status: step 6 of 7 (v0.7.5 — conformance suite).**
 // v0.7.0 shipped the scaffold + ProtocolVersion + error types;
 // v0.7.1 added the Driver and Closer interfaces alongside the
 // QueryResult struct; v0.7.2 added the pgx and lib/pq driver
@@ -24,10 +24,16 @@
 // `*Client` (matches the TS port's `assertRows(client, ...)`
 // callable shape — Python's `assert_rows(conn, ...)` takes the
 // lower-level psycopg.Connection, a layer-of-abstraction
-// divergence the TS and Go ports share).
-// Subsequent steps add the conformance suite (v0.7.5) and CI
-// hardening + release plumbing (v0.7.6). See CHANGELOG.md for
-// the per-step plan.
+// divergence the TS and Go ports share); v0.7.5 added the
+// cross-language conformance suite (`conformance_test.go`),
+// running both adapters (pgx + lib/pq) against a real Postgres
+// container via testcontainers-go and exercising the four
+// Layer 1 protocol criteria from `docs/pgrls-test-protocol.md`
+// plus end-to-end public-API tests, against the same fixture
+// the Python and TS conformance suites use
+// (`tests/protocol/{schema,seed}.sql`).
+// The final step adds CI hardening + release plumbing (v0.7.6).
+// See CHANGELOG.md for the per-step plan.
 package pgrlstest
 
 // ProtocolVersion is the wire-protocol version this client

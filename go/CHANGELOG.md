@@ -7,6 +7,67 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.5] - 2026-05-14
+
+**Step 6 of 7 — cross-language conformance suite.** Wires both
+adapter packages (pgx and lib/pq) into a single conformance
+suite that runs against a real Postgres container, exercising
+the four Layer 1 protocol criteria from
+`docs/pgrls-test-protocol.md` plus end-to-end tests of the
+public API. Uses the same shared fixture
+(`tests/protocol/{schema,seed}.sql`) the Python and TypeScript
+conformance suites consume, so a single edit to the fixture
+propagates across all three ports.
+
+### Added
+
+- **`pgrlstest/conformance_test.go`** — package-scoped
+  `TestMain` boots one Postgres testcontainer
+  (`postgres:17-alpine`) shared across all conformance tests,
+  applies the shared fixture, then runs
+  `TestConformance_PgxAdapter` and `TestConformance_PqAdapter`.
+  Each adapter test runs 10 subtests:
+  - Four Layer 1 protocol criteria: SET LOCAL ROLE resets on
+    rollback, set_config(..., true) resets on rollback,
+    InsufficientPrivilege (SQLSTATE 42501) for WITH CHECK
+    violations, silent-drop for UPDATE ... RETURNING when
+    USING filters every row.
+  - Six end-to-end public-API tests: tenant-isolation under
+    AsRole, nested AsRole restoring outer claims, AsRole with
+    `Claims: nil` skipping set_config, Seed + AssertRows, the
+    AssertSilentlyDropped verb-gate on a real driver, and
+    AssertRejected returning *AssertionError when the query
+    succeeds.
+  - 20 conformance subtests pass against real Postgres 17.
+
+- **`PGRLS_CONFORMANCE_DSN` env-var fallback** — local
+  developers can point the conformance suite at a pre-running
+  Postgres instead of using testcontainers (useful when running
+  `go test` inside a Docker harness where testcontainers'
+  default host-bridge address doesn't route between sibling
+  containers). The env-var path runs the same fixture install
+  with an idempotent teardown so reruns against a persistent
+  database don't fail with "role already exists".
+
+- **Docker-availability fallback** — when testcontainers can't
+  start a container (Docker not reachable, image pull failed,
+  port allocation rejected) every conformance subtest calls
+  `t.Skip()` with the actual failure reason. The rest of the
+  package's unit-test suite stays runnable in Docker-less
+  environments. `-short` also skips the conformance suite.
+
+### Changed
+
+- **`go.mod` gains test-time deps**: `testcontainers-go v0.34.0`
+  (pinned to the last release compatible with the module's
+  `go 1.22` floor — v0.35.0+ requires `go 1.25`),
+  `testcontainers-go/modules/postgres v0.34.0`, plus transitive
+  Docker / OpenTelemetry / mux deps.
+- **`protocol.go` status comment** advanced to step 6 of 7.
+- **`.github/workflows/go.yml`** now triggers on changes to
+  `tests/protocol/**` (the shared fixture) and gates a `gofmt`
+  check at CI alongside `go vet` and `go test -race -v ./...`.
+
 ## [0.7.4] - 2026-05-14
 
 **Step 5 of 7 — assertion helpers.** Wires the Layer 1 wire

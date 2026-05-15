@@ -1337,11 +1337,14 @@ Three layers, the bottom one is a documented contract not code:
   pgx + lib/pq adapter packages added in v0.7.2, the Client
   API (`Transaction`, `AsRole`, `Exec`, `FetchAll`, `Seed`, `Close`)
   added in v0.7.3 alongside `QuoteIdent` / `QuoteQualified` and
-  `NewSavepointName`, and the five assertion helpers (`AssertRows`,
+  `NewSavepointName`, the five assertion helpers (`AssertRows`,
   `AssertVisible`, `AssertInvisible`, `AssertRejected`,
-  `AssertSilentlyDropped`) added in v0.7.4 (step 5 of 7 — subsequent
-  steps add the conformance suite and CI hardening). Python is the
-  reference implementation. `PROTOCOL_VERSION = 1`.
+  `AssertSilentlyDropped`) added in v0.7.4, and the cross-language
+  conformance suite (testcontainers-driven Postgres + both adapter
+  packages exercising the same `tests/protocol/` fixture as the
+  Python and TS suites) added in v0.7.5 (step 6 of 7 — final step
+  adds CI hardening and release plumbing). Python is the reference
+  implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
@@ -1703,11 +1706,13 @@ These are intentional in the current release. Do not invent capabilities.
   `FetchAll`, `Seed`, `Close`) plus `QuoteIdent` / `QuoteQualified`
   / `NewSavepointName` shipped in v0.7.3; the five assertion
   helpers (`AssertRows`, `AssertVisible`, `AssertInvisible`,
-  `AssertRejected`, `AssertSilentlyDropped`) shipped in v0.7.4
-  (step 5 of 7). Subsequent v0.7.x steps add the conformance suite
-  and CI hardening. The `pgrls lint / fix / snapshot / diff` CLIs
-  stay Python — they depend on pglast (no drop-in TS/Go
-  equivalent).
+  `AssertRejected`, `AssertSilentlyDropped`) shipped in v0.7.4;
+  the cross-language conformance suite (testcontainers-driven
+  Postgres + both adapter packages against the shared
+  `tests/protocol/` fixture) shipped in v0.7.5 (step 6 of 7).
+  Final v0.7.x step adds CI hardening + release plumbing. The
+  `pgrls lint / fix / snapshot / diff` CLIs stay Python — they
+  depend on pglast (no drop-in TS/Go equivalent).
 
 ## Where to learn more
 

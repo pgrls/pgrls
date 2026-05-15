@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.4 — step 5 of 7 (assertion helpers).** This release adds the five RLS-shape assertion helpers — `AssertRows`, `AssertVisible`, `AssertInvisible`, `AssertRejected` (savepoint-wrapped via `pgrls_check_<rand>`), and `AssertSilentlyDropped` (UPDATE/DELETE … RETURNING with the row-count check) — each exposed as a `Client` method AND as an exported package-level function taking `*Client`, matching the Python / TypeScript wire sequence byte-for-byte. Subsequent steps add the cross-language conformance suite and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.5 — step 6 of 7 (cross-language conformance suite).** This release adds `pgrlstest/conformance_test.go`, which spins up a real Postgres container via [testcontainers-go](https://golang.testcontainers.org/) and runs both the pgx and lib/pq adapters against the same fixture the Python and TypeScript conformance suites consume (`tests/protocol/{schema,seed}.sql`). Tests cover the four Layer 1 protocol criteria — SET LOCAL ROLE / set_config rollback resets, InsufficientPrivilege on policy violation, UPDATE … RETURNING silent drop — plus end-to-end public-API exercises. Docker-less environments get a graceful skip; `-short` also skips. Final step adds CI hardening + release plumbing. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -31,7 +31,7 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 | `QuoteIdent` + `QuoteQualified` + `ReservedKeywords` (78 entries) | 4 | ✅ shipped (v0.7.3) |
 | `NewSavepointName` (crypto/rand 4-byte → 8-hex) | 4 | ✅ shipped (v0.7.3) |
 | Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | ✅ shipped (v0.7.4) |
-| Cross-language conformance suite | 6 | planned (v0.7.5) |
+| Cross-language conformance suite (pgx + lib/pq against testcontainers Postgres) | 6 | ✅ shipped (v0.7.5) |
 | CI hardening + release plumbing | 7 | planned (v0.7.6) |
 
 ## Assertion helper semantics
