@@ -9,9 +9,9 @@ import (
 
 // assertionDriver is a minimal Driver tailored to assertion-
 // helper tests. It augments recordingDriver semantics with a
-// query-failure injector keyed by SQL substring (so a test can
-// say "the assertion's body SQL fails with a 42501-shaped
-// error" without coupling to a numeric call index).
+// query-failure injector keyed by exact SQL match (so a test
+// can say "the assertion's body SQL fails with a 42501-shaped
+// error" by SQL string rather than by call index).
 type assertionDriver struct {
 	calls         []recordedCall
 	failBySQL     map[string]error
@@ -125,6 +125,28 @@ func TestAssertVisible_FailsOnZeroRows(t *testing.T) {
 	}
 	if !errors.Is(err, ErrAssertion) {
 		t.Errorf("error %v does not match ErrAssertion sentinel", err)
+	}
+}
+
+func TestAssertVisible_PropagatesDriverError(t *testing.T) {
+	want := errors.New("driver oops")
+	d := &assertionDriver{failBySQL: map[string]error{"SELECT 1": want}}
+	c := NewClient(d)
+
+	got := c.AssertVisible(context.Background(), "SELECT 1")
+	if !errors.Is(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestAssertInvisible_PropagatesDriverError(t *testing.T) {
+	want := errors.New("driver oops")
+	d := &assertionDriver{failBySQL: map[string]error{"SELECT 1": want}}
+	c := NewClient(d)
+
+	got := c.AssertInvisible(context.Background(), "SELECT 1")
+	if !errors.Is(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 

@@ -63,8 +63,10 @@ port leads with its idiomatic helper-name prefix —
   pass/fail branches of each helper, the savepoint wire
   sequence in `AssertRejected` (success → RELEASE,
   42501-rejection → ROLLBACK TO SAVEPOINT, wrong-shape error →
-  ROLLBACK TO SAVEPOINT + AssertionError wrapping the underlying
-  error), savepoint-call failure paths (SAVEPOINT-on-entry,
+  ROLLBACK TO SAVEPOINT + AssertionError carrying the underlying
+  error's type and message in `Msg` — no `Unwrap` chain, pinned
+  by `TestAssertionError_NoUnwrapChain`), savepoint-call failure
+  paths (SAVEPOINT-on-entry,
   ROLLBACK after wrong-shape body error, RELEASE on success),
   the misuse-error branches in `AssertSilentlyDropped` (SELECT,
   INSERT, missing RETURNING, RETURNING inside a column name,

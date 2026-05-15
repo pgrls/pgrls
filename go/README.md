@@ -46,7 +46,7 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 
 `AssertRejected` and `AssertSilentlyDropped` distinguish two distinct Postgres failure modes — `WITH CHECK` violations raise (catch with the first); `USING` filtering of `UPDATE`/`DELETE` returns silently empty (catch with the second).
 
-`AssertSilentlyDropped` rejects mis-shaped SQL via the result's command-tag verb, which means the SQL is fully executed (and any side-effects committed within the current transaction) before the verb-gate rejects it. Pass only the UPDATE/DELETE you actually want to execute.
+`AssertSilentlyDropped` rejects mis-shaped SQL via the result's command-tag verb, which means the SQL is fully executed (any side-effects land in the current transaction — they'll be rolled back when `Client.Transaction` exits, but they're real while it's open) before the verb-gate rejects it. Pass only the UPDATE/DELETE you actually want to execute.
 
 Each helper is exposed both as a `Client` method (`client.AssertRows(ctx, sql, opts)`) AND as a package-level function (`pgrlstest.AssertRows(ctx, client, sql, opts)`). The two forms have identical wire output — the methods are thin forwarders.
 
