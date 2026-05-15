@@ -32,8 +32,9 @@
 // plus end-to-end public-API tests, against the same SQL
 // fixture the Python conformance suite uses
 // (`tests/protocol/{schema,seed}.sql`) — the TS port hand-rolls
-// its own equivalent fixture, a deliberate two-approaches
-// choice documented in `AGENTS.md`.
+// its own equivalent fixture, a deliberate fork-in-the-road
+// documented in `AGENTS.md` (which lists three valid patterns:
+// manifest reuse, full hand-roll, and the Go hybrid).
 // The final step adds CI hardening + release plumbing (v0.7.6).
 // See CHANGELOG.md for the per-step plan.
 package pgrlstest

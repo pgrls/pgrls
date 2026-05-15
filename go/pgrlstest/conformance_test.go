@@ -43,7 +43,9 @@ package pgrlstest_test
 // hand-rolls its own `FIXTURE_SQL` in `ts/test/conformance/
 // _helpers.ts` covering the same four Layer 1 criteria; that
 // divergence is documented in `AGENTS.md` as a deliberate
-// two-approaches choice for the cross-language conformance.
+// fork-in-the-road documented in `AGENTS.md` (which lists
+// three valid patterns: manifest reuse, full hand-roll, and
+// this Go hybrid).
 //
 // Docker availability: when any setup step fails (Docker not
 // reachable, image pull / port-allocation rejection, DSN

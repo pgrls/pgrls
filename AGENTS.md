@@ -1345,7 +1345,7 @@ Three layers, the bottom one is a documented contract not code:
   fixture used by the Python conformance suite; the TS port
   hand-rolls its own `FIXTURE_SQL` covering the same Layer 1
   criteria — see the "Writing additional language ports"
-  section's two-approaches list below) added in v0.7.5 (step 6 of 7
+  section's pattern list below) added in v0.7.5 (step 6 of 7
   — final step adds CI hardening and release plumbing). Python is
   the reference implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest

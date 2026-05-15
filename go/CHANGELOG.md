@@ -19,8 +19,9 @@ public API. Reuses the same SQL fixture
 suite (`tests/protocol/test_protocol_conformance.py`) consumes,
 so a single edit to the fixture propagates Python ↔ Go. The
 TypeScript port hand-rolls its own `FIXTURE_SQL` covering the
-same four Layer 1 criteria — a deliberate two-approaches choice
-documented in `AGENTS.md`. The Go suite is a hybrid: it
+same four Layer 1 criteria — a deliberate fork-in-the-road
+documented in `AGENTS.md`, which lists three valid patterns
+(manifest reuse, full hand-roll, and the Go hybrid). The Go suite is a hybrid: it
 consumes Approach 1's `schema.sql` + `seed.sql` files (so a
 single edit propagates to the Python run unchanged) but skips
 the rest of Approach 1's `manifest.json` indirection in favor
