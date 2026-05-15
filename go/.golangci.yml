@@ -8,8 +8,9 @@
 # easier than removing one.
 #
 # Cross-language analogue: TypeScript has ESLint + Prettier wired
-# at `ts/eslint.config.js` + `ts/.prettierrc.json`; Python has
-# ruff at the repo root. This file plays the same role for Go.
+# at `ts/eslint.config.js` + `ts/.prettierrc.json`; Python uses
+# ruff with built-in defaults (no project-level config file).
+# This file plays the same role for Go.
 #
 # golangci-lint config schema: v1 (compatible with v1.62.x, the
 # last v1.x release). When bumping the linter to v2.x, the

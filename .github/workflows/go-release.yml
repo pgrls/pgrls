@@ -9,22 +9,25 @@ name: go-release
 # fresh tag is "published" as soon as someone runs
 # `go get github.com/pgrls/pgrls/go@<tag>`.
 #
-# This workflow does three things on `go/v*` tag push:
+# This workflow has four sequenced jobs on `go/v*` tag push:
 #
-#   1. Verify the tag's commit passes the same gates the PR
-#      branch passes (`tidy + gofmt + vet + race tests +
-#      golangci-lint + govulncheck`) plus a cross-check that
-#      the tag version has a matching `## [X.Y.Z]` stanza in
-#      `go/CHANGELOG.md`. A tag pointing at a broken commit is
-#      exactly the case Go's "immutable module versions"
-#      semantics make hard to recall.
-#   2. Force-warm the module proxy by issuing a synthetic
-#      `go list -m` against the tag, so the proxy fetches +
+#   1. `verify` — re-runs the PR-branch gates against the tag's
+#      commit (`tidy + gofmt + vet + race tests +
+#      golangci-lint`) plus a cross-check that the tag version
+#      has a matching `## [X.Y.Z]` stanza in `go/CHANGELOG.md`.
+#      A tag pointing at a broken commit is exactly the case
+#      Go's "immutable module versions" semantics make hard to
+#      recall.
+#   2. `vuln` — runs `govulncheck` against the tag's import
+#      graph. Split from `verify` so the failure profile stays
+#      legible per-job in the workflow run summary.
+#   3. `warm-proxy` — issues a synthetic `go list -m` against
+#      the tag, so the public Go module proxy fetches +
 #      caches before downstream users hit it cold (one ~10s
 #      latency vs. several over the first hour after release).
-#   3. Cut a GitHub Release with the changelog stanza for the
-#      tagged version, so the release page becomes the
-#      canonical reference for what shipped.
+#   4. `release` — cuts a GitHub Release with the changelog
+#      stanza for the tagged version, so the release page
+#      becomes the canonical reference for what shipped.
 #
 # Tag convention: `go/v0.7.6`, `go/v0.8.0`, etc. (the
 # `go/`-prefixed module-versioning Go expects for a
@@ -103,7 +106,11 @@ jobs:
 
       - name: golangci-lint
         # Re-run the lint gate against the tag commit. Same
-        # version + config as the PR workflow's lint job.
+        # version + config as the PR workflow's lint job;
+        # `--verbose` is intentionally dropped here since the
+        # release-noise channel is the GitHub Release body,
+        # not the workflow logs (verbose only helps when
+        # triaging a failure, which is the PR-workflow's job).
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.62.2
@@ -243,10 +250,10 @@ jobs:
 
       - name: Create GitHub Release
         # `gh release create` errors when a Release already
-        # exists for the tag — the prior `gh release view`
-        # gate makes the call idempotent across re-runs of
-        # this workflow (e.g. the `workflow_dispatch` retry
-        # path).
+        # exists for the tag — the inline `gh release view`
+        # check at the top of this script makes the call
+        # idempotent across re-runs of this workflow (e.g.
+        # the `workflow_dispatch` retry path).
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ inputs.tag || github.ref_name }}

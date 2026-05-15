@@ -12,11 +12,12 @@ on wire-level breaking changes shared with the Python and TypeScript clients.
 **Step 7 of 7 — CI hardening + release plumbing.** Wraps the
 v0.7.x staged rollout: every PR / push to `go/**` or
 `tests/protocol/**` now runs the test matrix + a separate
-golangci-lint job + a govulncheck job; tag pushes (`go/v0.7.x`)
-trigger a release workflow that verifies the tag's commit
-passes every gate, warms the public Go module proxy via
-`go list -m`, and cuts a GitHub Release with the changelog
-stanza extracted from this file. The v0.7.x sequence is
+golangci-lint job + a govulncheck job; tag pushes matching
+`go/v*` (e.g. `go/v0.7.6`, `go/v0.8.0`) trigger a release
+workflow that verifies the tag's commit passes every gate,
+warms the public Go module proxy via `go list -m`, and cuts a
+GitHub Release with the changelog stanza extracted from this
+file. The v0.7.x sequence is
 complete with this release; future pgrls-test-go releases ship
 as `go/v0.8.x` tags.
 
