@@ -166,14 +166,16 @@ class SEC015:
                 "unqualified reference to the attacker's object and "
                 "executes attacker-controlled SQL with the owner's "
                 "privileges. Fix: append pg_temp as the last entry of "
-                "the function's search_path, e.g. `ALTER FUNCTION "
+                "the function's search_path — keep every schema the "
+                "function already needs and add pg_temp after them, "
+                "e.g. `ALTER FUNCTION "
                 f"{fn.qualified_name}(<args>) SET search_path = "
-                "pg_catalog, pg_temp` — naming pg_temp explicitly "
-                "last forces it to be searched last. If the function "
-                "body already fully-qualifies every object reference, "
-                "the search_path is moot; audit the body and "
-                f"allowlist this function as {fn.qualified_name!r} in "
-                "[lint.rules.SEC015]."
+                "<existing schemas>, pg_temp` — naming pg_temp "
+                "explicitly last forces it to be searched last. If "
+                "the function body already fully-qualifies every "
+                "object reference, the search_path is moot; audit "
+                "the body and allowlist this function as "
+                f"{fn.qualified_name!r} in [lint.rules.SEC015]."
             ),
             location=fn.qualified_name,
         )
