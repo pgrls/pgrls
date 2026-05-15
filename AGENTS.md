@@ -917,7 +917,7 @@ The allowlist key is `schema.function` (two parts). Bare
 ```toml
 [lint.rules.SEC015]
 allowlist = [
-    "audit.refresh_cache",  # reviewed yyyy-mm-dd — body fully-
+    "audit.refresh_cache",  # reviewed 2026-05-15 — body fully-
                             # qualifies every table reference, so
                             # search_path is moot.
 ]

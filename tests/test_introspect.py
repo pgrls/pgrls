@@ -804,6 +804,38 @@ def test_introspect_skips_invoker_function_in_security_definer_functions(
     assert "public.invoker_count" not in qnames
 
 
+def test_introspect_captures_secdef_function_search_path(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC015 reads `SecdefFunction.search_path`, decoded from
+    # `pg_proc.proconfig`. This is the end-to-end check that a
+    # `CREATE FUNCTION ... SET search_path = ...` round-trips
+    # through real psycopg `text[]` array parsing into the model
+    # field — the pure `_extract_search_path` unit tests assume
+    # psycopg surfaces proconfig as an un-escaped `list[str]`;
+    # this test pins the assumption against a live database.
+    apply_sql(
+        """
+        CREATE FUNCTION public.sp_pinned() RETURNS INT
+            LANGUAGE sql SECURITY DEFINER
+            SET search_path = pg_catalog, pg_temp
+            AS $$ SELECT 1 $$;
+        CREATE FUNCTION public.sp_unpinned() RETURNS INT
+            LANGUAGE sql SECURITY DEFINER
+            AS $$ SELECT 2 $$;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    by_name = {
+        f.qualified_name: f for f in schema.security_definer_functions
+    }
+    # A pinned `SET search_path` decodes to the GUC value string.
+    assert by_name["public.sp_pinned"].search_path == "pg_catalog, pg_temp"
+    # No `SET search_path` clause → proconfig has no search_path
+    # entry → field is None.
+    assert by_name["public.sp_unpinned"].search_path is None
+
+
 def test_introspect_resolves_view_to_table_references(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

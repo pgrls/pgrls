@@ -156,8 +156,8 @@ allowlist = []
 [lint.rules.SEC015]
 # SECURITY DEFINER `pg_temp` search-path shadowing. A SECDEF
 # function whose effective search_path lets pg_temp (the
-# per-session temp schema, writable by every role) be searched
-# before the legitimate schemas is exploitable: an attacker
+# per-session temp schema, writable by every connected role) be
+# searched before the legitimate schemas is exploitable: an attacker
 # shadows an unqualified object reference with a same-named
 # pg_temp object and the function runs attacker SQL as its
 # owner (the CVE-2018-1058 privesc class). The rule fires

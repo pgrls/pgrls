@@ -497,7 +497,9 @@ class Schema:
         """Reconstruct a Schema from a v3-v8 snapshot dict.
 
         v8 (current): adds ``search_path`` to each SECDEF function
-        for SEC015. v3-v7 snapshots load with ``search_path=None``.
+        for SEC015. v4-v7 snapshots' SECDEF functions load with
+        ``search_path=None`` (v3 has no SECDEF functions at all —
+        ``security_definer_functions`` is a v4+ field).
         v7: adds per-table ``indexes`` for PERF003.
         v6: adds per-table ``triggers`` for SEC013.
         v5: adds per-column type info via the new ``column_details``

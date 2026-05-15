@@ -58,11 +58,14 @@ breaking changes — they will be called out in this file.
 - **Snapshot format v7 → v8.** `SecdefFunction` snapshot entries
   gain a `search_path` field (the value of the function's
   `SET search_path` clause, decoded from `pg_proc.proconfig`,
-  or `null` when no clause is pinned). v3–v7 snapshots still
-  load — their SECDEF functions get `search_path = null`, which
-  SEC015 treats as unsafe; re-snapshot against a live database
-  to capture real values. `Schema.from_snapshot` accepts
-  versions 3–8.
+  or `null` when no clause is pinned). `Schema.from_snapshot`
+  still accepts versions 3–8. A v4–v7 snapshot's SECDEF
+  functions load with `search_path = null` (v3 snapshots have
+  no SECDEF functions — `security_definer_functions` is a v4+
+  field). SEC015 treats `null` as unsafe, so it conservatively
+  flags every SECDEF function loaded from a pre-v8 snapshot;
+  re-snapshot against a live database to capture real
+  `search_path` values.
 - **Rule count: twenty-three → twenty-four** (`SEC001`–`SEC015`,
   `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`).
 
