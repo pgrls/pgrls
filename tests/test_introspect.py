@@ -52,8 +52,21 @@ def test_extract_search_path_case_insensitive_guc_name() -> None:
 
 
 def test_extract_search_path_empty_value() -> None:
-    # `SET search_path = ''` round-trips as an empty value string.
+    # `_extract_search_path` returns everything after the first
+    # `=`, so a value-less `search_path=` entry decodes to "".
+    # This is a decoder-robustness case — `_extract_search_path`
+    # must not choke on a malformed/value-less GUC entry.
     assert _extract_search_path(["search_path="]) == ""
+
+
+def test_extract_search_path_empty_string_value() -> None:
+    # The real `SET search_path = ''` shape: Postgres quotes the
+    # empty value, so `pg_proc.proconfig` stores the element as
+    # `search_path=""` (the value is two literal double-quote
+    # chars). The decoder returns that raw `""` string;
+    # SEC015's `_search_path_tokens` then strips the quotes to an
+    # empty token list, which `_is_pg_temp_safe` treats as unsafe.
+    assert _extract_search_path(['search_path=""']) == '""'
 
 
 def test_returns_empty_schema_when_no_tables(pg_conn: psycopg.Connection) -> None:
