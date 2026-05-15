@@ -86,6 +86,6 @@ jobs:
         # so the conformance tests run automatically. Local devs
         # without Docker get a graceful skip (when testcontainer
         # init fails, both `TestConformance_*` parent tests call
-        # `t.Skip` on entry; the 13 subtests below each are
-        # never reached).
+        # `t.Skip` on entry; the 13 subtests nested under them
+        # are never reached).
         run: go test -race -v ./...
