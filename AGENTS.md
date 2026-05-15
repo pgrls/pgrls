@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-two rules across four
+In the current release it ships **twenty-three rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -24,6 +24,8 @@ silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 `SEC012` (table has only RESTRICTIVE policies — silent deny-all),
 `SEC013` (trigger on RLS-protected table can bypass policies —
 triggers fire as table owner),
+`SEC014` (SECURITY DEFINER function bypasses caller's RLS —
+audit every SECDEF function),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -769,6 +771,74 @@ The allowlist key is `schema.table.trigger_name` (three parts).
 Bare `trigger_name` is rejected because two tables can carry
 identically-named triggers — Postgres scopes trigger names per
 table, and a name-only allowlist would silence both.
+
+<a id="rule-sec014"></a>
+
+### SEC014 — SECURITY DEFINER function bypasses caller's RLS
+
+**Severity:** warning. **Auto-fix:** no (architectural choice
+needs human intent).
+
+A `SECURITY DEFINER` function runs with the privileges of the
+function owner, not the calling role. Every
+SELECT/INSERT/UPDATE/DELETE inside the body sees the owner's
+view of the database — RLS bypassed, GRANT/REVOKE differences
+flattened, the entire row set readable and mutable. A role
+with EXECUTE permission on the function effectively inherits
+the owner's reach into RLS-protected tables.
+
+Two existing rules cover the SECDEF risk for *indirect* paths:
+
+* **VIEW004** flags views whose body calls a SECDEF function
+  that reads an RLS-protected table — view-mediated bypass.
+* **SEC013** flags triggers on RLS-protected tables, which
+  fire as the table owner regardless of the trigger function's
+  `prosecdef` flag — trigger-mediated bypass.
+
+SEC014 closes the gap for SECDEF functions called *directly*
+from application code (`SELECT my_secdef(...)`, JDBC, ORM
+function bindings). The rule flags *every* SECDEF function in
+the introspected schemas, regardless of how it's invoked. The
+intent isn't to detect free-standing-vs-trigger-vs-view via
+call-graph analysis (which would require app-level context
+pgrls doesn't have) — it's to surface the full SECDEF surface
+to the operator so each function gets an explicit audit
+decision: either rewrite as `SECURITY INVOKER` (so RLS applies
+to the caller), or document why the bypass is intentional and
+allowlist the function.
+
+Detection is structural: walk
+`Schema.security_definer_functions` (captured by introspection
+from `pg_proc.prosecdef = TRUE` since snapshot v4). No body
+parsing — VIEW004 already does that for the view-mediated path,
+and re-doing it here would either duplicate work or under-report
+(e.g. a function that writes to an RLS table via dynamic SQL
+pglast can't parse).
+
+The allowlist key is `schema.function` (two parts).
+Bare `function_name` is rejected because two same-named
+functions in different schemas would otherwise both be silenced
+— Postgres allows the cross-schema collision, and a
+name-only allowlist would mask it.
+
+Out of scope (intentional):
+
+* **Argument signatures** are not part of the allowlist shape.
+  A function with two overloads (e.g. `do_thing(int)` vs
+  `do_thing(text)`) is flagged once and allowlisted once —
+  introspection captures `proname` only. Operators who need
+  per-overload granularity should `ALTER FUNCTION` one of
+  them to a different name.
+* **Function-body reachability of RLS tables** is not gated
+  here. VIEW004 already analyses bodies for RLS-table reads;
+  SEC014 is the "audit every SECDEF surface" prompt, not a
+  proof-of-leak.
+* **Per-language behavior.** SEC014 flags `plpgsql`, `sql`,
+  `c`, etc. equally. The language is included in the message
+  so the operator's triage can prioritize parseable bodies
+  (where VIEW004 may already have flagged the leak via
+  view path) over opaque ones (where SEC014 is the only
+  signal).
 
 <a id="rule-perf001"></a>
 
@@ -1684,13 +1754,14 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-two rules across four categories.** SEC001–SEC013,
+- **Twenty-three rules across four categories.** SEC001–SEC014,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
-  There is no `pg_temp` shadowing detection, and SECURITY DEFINER
-  function audit is currently scoped to the view-leak path
-  (VIEW004) and the trigger-bypass path (SEC013); a free-standing
-  function audit independent of those entry points remains on the
-  roadmap.
+  There is no `pg_temp` shadowing detection. SECURITY DEFINER
+  function audit is now triple-coverage: VIEW004 catches the
+  view-mediated bypass, SEC013 the trigger-mediated bypass, and
+  SEC014 (added in v0.5.12) flags every SECDEF function as the
+  free-standing audit surface for application-callable functions
+  (`SELECT my_secdef(...)`, JDBC, etc.).
 - **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
   fix` rewrites the mechanically-fixable subset; other rules need
   human intent.

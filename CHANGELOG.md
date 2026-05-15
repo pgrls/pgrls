@@ -10,6 +10,53 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.12] - 2026-05-15
+
+### Added
+- **SEC014 — SECURITY DEFINER function audit (free-standing)**
+  (severity: warning). Flags every SECDEF function in the
+  introspected schemas. SECDEF functions run with the function
+  owner's privileges, so any SELECT/INSERT/UPDATE/DELETE inside
+  the body bypasses the caller's RLS policies, GRANT/REVOKE
+  differences, and other privilege checks. A role with EXECUTE
+  on the function effectively inherits the owner's reach into
+  RLS-protected tables.
+
+  Two existing rules already cover the SECDEF risk for
+  *indirect* paths: **VIEW004** flags views whose body calls a
+  SECDEF function that reads an RLS-protected table (view-
+  mediated bypass); **SEC013** flags triggers on RLS-protected
+  tables (which fire as the table owner regardless of the
+  trigger function's `prosecdef` flag). SEC014 closes the gap
+  for SECDEF functions called *directly* from application code
+  (`SELECT my_secdef(...)`, JDBC, etc.) — the audit surface
+  neither VIEW004 nor SEC013 reaches.
+
+  Detection is structural: walk
+  `Schema.security_definer_functions` (captured by
+  introspection from `pg_proc.prosecdef = TRUE` since snapshot
+  v4). Allowlist by qualified function name (`schema.function`)
+  once the operator has audited the function body and confirmed
+  it doesn't expose data the caller couldn't read directly.
+  Bare function name is rejected — two same-named functions in
+  different schemas would otherwise both be silenced.
+
+  Out of scope (intentional): per-overload signatures (a
+  function with two overloads is flagged + allowlisted once);
+  body-reachability of RLS tables (VIEW004 already does that
+  for the view-mediated path; SEC014 is "audit every SECDEF
+  surface" not "prove leak").
+
+  Severity: warning. No auto-fix — the choice between rewriting
+  as `SECURITY INVOKER` (RLS applies to caller) or documented
+  allowlist needs human intent.
+
+### Changed
+- **Rule count: twenty-two → twenty-three** (`SEC001`–`SEC014`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`).
+  `README.md` status banner + rule table updated; `AGENTS.md`
+  rule overview reflects the new count.
+
 ## [0.5.11] - 2026-05-15
 
 ### Fixed
