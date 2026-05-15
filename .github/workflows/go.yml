@@ -61,8 +61,8 @@ jobs:
           fi
 
       - name: gofmt
-        # Pinning gofmt at CI gates a formatting regression. Local
-        # `go fmt ./...` produces the same result.
+        # Running gofmt in CI gates formatting regressions. Local
+        # `go fmt ./...` (or `gofmt -w .`) produces the same result.
         run: |
           fmt_diff=$(gofmt -l .)
           if [ -n "$fmt_diff" ]; then
@@ -84,6 +84,7 @@ jobs:
         # uses testcontainers-go to spin up a real Postgres
         # container; the GitHub-hosted Linux runners have Docker
         # so the conformance tests run automatically. Local devs
-        # without Docker get a graceful skip (the testcontainer
-        # init fails, every conformance test calls `t.Skip`).
+        # without Docker get a graceful skip (when the
+        # testcontainer init fails, every conformance test calls
+        # `t.Skip`).
         run: go test -race -v ./...

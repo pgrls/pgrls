@@ -35,10 +35,12 @@ Go port step 6 of 7 — cross-language conformance suite. Both
 adapter packages (pgx and lib/pq) now run against a real
 Postgres container via testcontainers-go, exercising the four
 Layer 1 protocol criteria from `docs/pgrls-test-protocol.md`
-plus end-to-end public-API tests, against the shared
-`tests/protocol/{schema,seed}.sql` fixture. The Python core
-(`pgrls` package) stays at 0.5.10 and the TypeScript port stays
-at 0.6.2. Per-port details in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+plus end-to-end public-API tests, against the same
+`tests/protocol/{schema,seed}.sql` SQL fixture the Python
+conformance suite consumes (Python ↔ Go fixture sharing; the
+TS port hand-rolls its own equivalent fixture). The Python
+core (`pgrls` package) stays at 0.5.10 and the TypeScript port
+stays at 0.6.2. Per-port details in [`go/CHANGELOG.md`](go/CHANGELOG.md).
 
 ## [0.7.4] - 2026-05-14
 

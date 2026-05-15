@@ -14,10 +14,14 @@ adapter packages (pgx and lib/pq) into a single conformance
 suite that runs against a real Postgres container, exercising
 the four Layer 1 protocol criteria from
 `docs/pgrls-test-protocol.md` plus end-to-end tests of the
-public API. Uses the same shared fixture
-(`tests/protocol/{schema,seed}.sql`) the Python and TypeScript
-conformance suites consume, so a single edit to the fixture
-propagates across all three ports.
+public API. Reuses the same SQL fixture
+(`tests/protocol/{schema,seed}.sql`) the Python conformance
+suite (`tests/protocol/test_protocol_conformance.py`) consumes,
+so a single edit to the fixture propagates Python ↔ Go. The
+TypeScript port hand-rolls its own `FIXTURE_SQL` covering the
+same four Layer 1 criteria — a deliberate two-approaches choice
+documented in `AGENTS.md` (Approach 2: shared SQL files + each
+port's own driver wiring).
 
 ### Added
 
@@ -27,18 +31,23 @@ propagates across all three ports.
   applies the shared fixture, then runs
   `TestConformance_PgxAdapter` and `TestConformance_PqAdapter`.
   Each adapter test runs 10 subtests:
-  - Four Layer 1 protocol criteria: SET LOCAL ROLE resets on
-    rollback, set_config(..., true) resets on rollback,
-    InsufficientPrivilege (SQLSTATE 42501) for WITH CHECK
-    violations, silent-drop for UPDATE ... RETURNING when
-    USING filters every row.
+  - Four Layer 1 protocol criteria: `SET LOCAL ROLE` resets on
+    rollback, `set_config(..., true)` resets on rollback,
+    `InsufficientPrivilege` (SQLSTATE 42501) for WITH CHECK
+    violations, silent-drop for `UPDATE … RETURNING` when
+    `USING` filters the targeted rows out.
   - Six end-to-end public-API tests: tenant-isolation under
     AsRole, nested AsRole restoring outer claims, AsRole with
     `Claims: nil` skipping set_config, Seed + AssertRows, the
-    AssertSilentlyDropped verb-gate on a real driver, and
+    AssertSilentlyDropped verb-gate on a real driver,
     AssertRejected returning *AssertionError when the query
-    succeeds.
-  - 20 conformance subtests pass against real Postgres 17.
+    succeeds, AssertVisible / AssertInvisible against the
+    tenant-isolation fixture, and two additional AsRole
+    nested-restore cases (case 4 — inner-no-claims preserves
+    outer; case 2 — inner-on-empty-outer clears on exit via
+    explicit `set_config(NULL, true)`).
+  - 26 conformance subtests pass against real Postgres 17
+    (13 per adapter × 2 adapters).
 
 - **`PGRLS_CONFORMANCE_DSN` env-var fallback** — local
   developers can point the conformance suite at a pre-running
@@ -65,8 +74,10 @@ propagates across all three ports.
   Docker / OpenTelemetry / mux deps.
 - **`protocol.go` status comment** advanced to step 6 of 7.
 - **`.github/workflows/go.yml`** now triggers on changes to
-  `tests/protocol/**` (the shared fixture) and gates a `gofmt`
-  check at CI alongside `go vet` and `go test -race -v ./...`.
+  `tests/protocol/**` (the cross-port fixture directory — both
+  the Python and Go conformance suites read these files) and
+  gates a `gofmt` check at CI alongside `go vet` and
+  `go test -race -v ./...`.
 
 ## [0.7.4] - 2026-05-14
 

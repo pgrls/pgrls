@@ -1341,9 +1341,12 @@ Three layers, the bottom one is a documented contract not code:
   `AssertVisible`, `AssertInvisible`, `AssertRejected`,
   `AssertSilentlyDropped`) added in v0.7.4, and the cross-language
   conformance suite (testcontainers-driven Postgres + both adapter
-  packages exercising the same `tests/protocol/` fixture as the
-  Python and TS suites) added in v0.7.5 (step 6 of 7 — final step
-  adds CI hardening and release plumbing). Python is the reference
+  packages exercising the shared `tests/protocol/{schema,seed}.sql`
+  fixture used by the Python conformance suite; the TS port
+  hand-rolls its own `FIXTURE_SQL` covering the same Layer 1
+  criteria — see "Approach 2" below) added in v0.7.5 (step 6 of 7
+  — final step adds CI hardening and release plumbing). Python is
+  the reference
   implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
@@ -1709,7 +1712,9 @@ These are intentional in the current release. Do not invent capabilities.
   `AssertRejected`, `AssertSilentlyDropped`) shipped in v0.7.4;
   the cross-language conformance suite (testcontainers-driven
   Postgres + both adapter packages against the shared
-  `tests/protocol/` fixture) shipped in v0.7.5 (step 6 of 7).
+  `tests/protocol/` SQL fixture used by the Python suite — the
+  TS port hand-rolls its own `FIXTURE_SQL` covering the same
+  Layer 1 criteria) shipped in v0.7.5 (step 6 of 7).
   Final v0.7.x step adds CI hardening + release plumbing. The
   `pgrls lint / fix / snapshot / diff` CLIs stay Python — they
   depend on pglast (no drop-in TS/Go equivalent).

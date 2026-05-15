@@ -5,29 +5,42 @@ package pgrlstest_test
 // and the Python `tests/protocol/test_protocol_conformance.py`
 // suite.
 //
-// Each test spins up a per-test Postgres testcontainer
-// (`postgres:17-alpine`) and exercises both the pgx and lib/pq
-// adapters against the shared fixture from
-// `tests/protocol/{schema,seed}.sql` plus the same Layer 1
-// criteria the TS port covers (`SET LOCAL ROLE` reset on
-// rollback, `set_config(..., true)` reset on rollback,
-// `InsufficientPrivilege` for `AssertRejected`, silent-drop
-// for `AssertSilentlyDropped`) and end-to-end exercises of the
-// public API (Seed, AssertRows, AssertVisible, AssertInvisible,
-// AsRole's nested-claims restore cases).
-//
-// Test isolation strategy: the package-scoped `TestMain`
-// boots one container shared across all tests (matches the TS
+// `TestMain` boots one Postgres testcontainer
+// (`postgres:17-alpine`) shared by `TestConformance_PgxAdapter`
+// and `TestConformance_PqAdapter`, applies the cross-language
+// fixture, then dispatches both adapter tests. Each subtest
+// opens its own `Client.Transaction` and rolls back at the
+// end, so the fixture is preserved across tests and the per-
+// test isolation lives at the savepoint layer (matches the TS
 // `beforeAll` strategy and amortizes the ~3-5s container
-// startup over the conformance matrix). Each individual test
-// uses its own `Client.Transaction` which rolls back at the
-// end, so the fixture is preserved across tests.
+// startup over the conformance matrix).
 //
-// Docker-availability: the suite skips gracefully when Docker
-// isn't reachable (returns a typed sentinel error from
-// `testcontainers.GenericContainer`). The package's other unit
-// tests stay runnable in Docker-less environments — only this
-// file's tests opt out.
+// Subtest coverage per adapter:
+//   - 4 Layer 1 criteria (`SET LOCAL ROLE` reset on rollback,
+//     `set_config(..., true)` reset on rollback,
+//     `InsufficientPrivilege` for `AssertRejected`, silent-drop
+//     for `AssertSilentlyDropped`).
+//   - 6 end-to-end public-API exercises (Seed + AssertRows,
+//     AsRole's nested-claims restore, AsRole with nil claims,
+//     AssertSilentlyDropped verb-gate, AssertRejected
+//     success-path, multi-tenant isolation).
+//
+// Fixture source: the Go port reads the same
+// `tests/protocol/{schema,seed}.sql` files the Python
+// conformance suite (`tests/protocol/test_protocol_conformance.py`)
+// consumes — Python-↔-Go fixture sharing. The TypeScript port
+// hand-rolls its own `FIXTURE_SQL` in `ts/test/conformance/
+// _helpers.ts` covering the same four Layer 1 criteria; that
+// divergence is documented in `AGENTS.md` as a deliberate
+// two-approaches choice for the cross-language conformance.
+//
+// Docker availability: when Docker isn't reachable (or the
+// image pull / port-allocation fails), `TestMain` swallows the
+// `tcpostgres.Run` error, leaves `containerDSN` empty, and
+// every conformance subtest calls `t.Skip` via
+// `skipUnlessDocker`. The package's other unit tests stay
+// runnable in Docker-less environments — only this file's
+// tests opt out.
 
 import (
 	"context"
@@ -42,7 +55,6 @@ import (
 	"testing"
 	"time"
 
-	pgxlib "github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
@@ -59,19 +71,27 @@ import (
 var containerDSN string
 
 func TestMain(m *testing.M) {
+	os.Exit(runTestMain(m))
+}
+
+// runTestMain is the body of TestMain extracted so deferred
+// cleanups (container terminate, sql.DB close, context
+// cancel) actually run — os.Exit terminates without invoking
+// deferred functions, so the cleanup has to happen before the
+// final `return code`.
+func runTestMain(m *testing.M) int {
 	// `testing.Short()` reads a flag that must be parsed first;
 	// in TestMain the parse hasn't happened yet, so call it
-	// explicitly. `testing.Init()` is the right primitive — it
-	// registers the testing flags (idempotent) — but `go test`
-	// at this stage has already registered them via testdeps,
-	// so `flag.Parse()` alone is enough.
+	// explicitly. `go test` at this stage has already
+	// registered the testing flags via testdeps; `flag.Parse()`
+	// alone is enough.
 	flag.Parse()
 
 	if testing.Short() {
 		// `-short` skips the conformance suite even when Docker
 		// is available — useful for local iteration where you
 		// don't want to wait for the testcontainer startup.
-		os.Exit(m.Run())
+		return m.Run()
 	}
 
 	// Local-dev shortcut: if `PGRLS_CONFORMANCE_DSN` is set,
@@ -85,10 +105,14 @@ func TestMain(m *testing.M) {
 		if err := setupConformanceFromDSN(dsn); err != nil {
 			fmt.Fprintf(os.Stderr, "[conformance] fixture install from PGRLS_CONFORMANCE_DSN failed; "+
 				"conformance tests will skip: %v\n", err)
-			os.Exit(m.Run())
+			return m.Run()
 		}
+		// Set containerDSN only AFTER successful fixture
+		// install; if install fails we leave it empty so
+		// `skipUnlessDocker` routes the subtests to t.Skip
+		// instead of running them against an unprepared DB.
 		containerDSN = dsn
-		os.Exit(m.Run())
+		return m.Run()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -107,26 +131,27 @@ func TestMain(m *testing.M) {
 		),
 	)
 	if err != nil {
-		// Docker unavailable or container start failed; record
-		// the reason so each test can Skip with the actual
-		// error. We still call m.Run so the rest of the suite
-		// runs even when conformance tests are skipped.
+		// Docker unavailable or container start failed; the
+		// rest of the suite still runs with conformance tests
+		// skipping individually (containerDSN stays empty).
 		fmt.Fprintf(os.Stderr, "[conformance] testcontainer startup failed; "+
 			"conformance tests will skip: %v\n", err)
-		os.Exit(m.Run())
+		return m.Run()
 	}
 	defer func() {
-		// Best-effort teardown — a leak here is the host
-		// docker runtime's problem to surface.
+		// Explicit teardown — Ryuk reaps leaked containers in
+		// the default config, but disabling Ryuk (some Docker-
+		// in-Docker harnesses) requires us to terminate
+		// ourselves. Deferred so a failure later in setup still
+		// runs the cleanup.
 		_ = pg.Terminate(context.Background())
 	}()
 
 	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[conformance] could not derive DSN: %v\n", err)
-		os.Exit(m.Run())
+		return m.Run()
 	}
-	containerDSN = dsn
 
 	// Apply the cross-language fixture schema before any test
 	// runs so every conformance test sees the same starting
@@ -135,16 +160,21 @@ func TestMain(m *testing.M) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[conformance] sql.Open failed: %v\n", err)
-		os.Exit(m.Run())
+		return m.Run()
 	}
 	defer db.Close()
 
 	if err := applyFixtureSQL(ctx, db); err != nil {
 		fmt.Fprintf(os.Stderr, "[conformance] fixture install failed: %v\n", err)
-		os.Exit(m.Run())
+		// containerDSN stays empty so subtests skip rather
+		// than run against an unprepared DB.
+		return m.Run()
 	}
+	// Set containerDSN only AFTER successful fixture install
+	// (same rationale as the env-var path above).
+	containerDSN = dsn
 
-	os.Exit(m.Run())
+	return m.Run()
 }
 
 // setupConformanceFromDSN installs the protocol-conformance
@@ -194,13 +224,13 @@ func applyFixtureSQL(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("teardown stale fixture: %w", err)
 	}
 	// Locate the fixture relative to this file's location
-	// rather than the test process cwd — `go test` runs with
-	// cwd = package dir, so the fixture at
-	// `<repo>/tests/protocol/` is three levels up
-	// (pgrlstest → go → repo-root → tests/protocol). Using
-	// `runtime.Caller(0)` here also makes the suite robust
-	// against re-locating the test file or running it from a
-	// different working directory.
+	// rather than the test process cwd. `go test` runs with
+	// cwd = package dir; the fixture at
+	// `<repo>/tests/protocol/` is reached by two `..` segments
+	// (pgrlstest → go → repo-root, then into tests/protocol).
+	// `runtime.Caller(0)` keeps the suite robust against
+	// re-locating the test file or running it from a different
+	// working directory.
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		return errors.New("runtime.Caller(0) unavailable; can't locate fixture files")
@@ -208,13 +238,13 @@ func applyFixtureSQL(ctx context.Context, db *sql.DB) error {
 	thisDir := filepath.Dir(thisFile)
 	fixtureDir := filepath.Join(thisDir, "..", "..", "tests", "protocol")
 	for _, name := range []string{"schema.sql", "seed.sql"} {
-		path := filepath.Join(fixtureDir, name)
-		bytes, err := os.ReadFile(path)
+		fixturePath := filepath.Join(fixtureDir, name)
+		data, err := os.ReadFile(fixturePath)
 		if err != nil {
-			return fmt.Errorf("read %s: %w", path, err)
+			return fmt.Errorf("read %s: %w", fixturePath, err)
 		}
-		if _, err := db.ExecContext(ctx, string(bytes)); err != nil {
-			return fmt.Errorf("apply %s: %w", path, err)
+		if _, err := db.ExecContext(ctx, string(data)); err != nil {
+			return fmt.Errorf("apply %s: %w", fixturePath, err)
 		}
 	}
 	return nil
@@ -567,6 +597,118 @@ func runConformance(t *testing.T, c *pgrlstest.Client) {
 			t.Errorf("Transaction: %v", err)
 		}
 	})
+
+	t.Run("PublicAPI_AssertVisibleAndAssertInvisible", func(t *testing.T) {
+		// End-to-end exercise of AssertVisible + AssertInvisible
+		// on real Postgres under tenant isolation. tenant-a sees
+		// its own row (Visible); tenant-a does NOT see a
+		// tenant-b row (Invisible).
+		err := c.Transaction(ctx, func(ctx context.Context) error {
+			return c.AsRole(ctx, "pgrls_protocol_actor",
+				&pgrlstest.AsRoleOptions{Claims: map[string]any{"tenant_id": "tenant-a"}},
+				func(ctx context.Context) error {
+					if err := c.AssertVisible(
+						ctx,
+						"SELECT id FROM protocol_invoices WHERE tenant_id = 'tenant-a'",
+					); err != nil {
+						return fmt.Errorf("AssertVisible on tenant-a: %w", err)
+					}
+					return c.AssertInvisible(
+						ctx,
+						"SELECT id FROM protocol_invoices WHERE tenant_id = 'tenant-b'",
+					)
+				})
+		})
+		if err != nil {
+			t.Errorf("Transaction: %v", err)
+		}
+	})
+
+	t.Run("PublicAPI_NestedAsRoleInnerNoClaimsPreservesOuter", func(t *testing.T) {
+		// AsRole restore case 4 (TS parity): outer sets claims,
+		// inner passes nil claims. On inner exit, outer claims
+		// must still be active — the protocol doesn't issue
+		// set_config(NULL, true) on the inner-no-claims path, so
+		// the outer's set_config value persists (set_config
+		// scope is transaction-local).
+		err := c.Transaction(ctx, func(ctx context.Context) error {
+			return c.AsRole(ctx, "pgrls_protocol_actor",
+				&pgrlstest.AsRoleOptions{Claims: map[string]any{"tenant_id": "outer"}},
+				func(ctx context.Context) error {
+					if err := c.AsRole(ctx, "pgrls_protocol_actor", nil,
+						func(ctx context.Context) error {
+							// Inner didn't set claims; outer value
+							// persists because set_config is
+							// transaction-local.
+							rows, err := c.FetchAll(ctx, "SELECT current_setting('request.jwt.claims', true) AS claims")
+							if err != nil {
+								return err
+							}
+							got := coerceString(t, rows[0]["claims"])
+							if !strings.Contains(got, "outer") {
+								t.Errorf("inner-no-claims block sees claims = %q, want to contain outer", got)
+							}
+							return nil
+						}); err != nil {
+						return err
+					}
+					rows, err := c.FetchAll(ctx, "SELECT current_setting('request.jwt.claims', true) AS claims")
+					if err != nil {
+						return err
+					}
+					got := coerceString(t, rows[0]["claims"])
+					if !strings.Contains(got, "outer") {
+						t.Errorf("post-inner outer claims = %q, want to contain outer", got)
+					}
+					return nil
+				})
+		})
+		if err != nil {
+			t.Errorf("Transaction: %v", err)
+		}
+	})
+
+	t.Run("PublicAPI_InnerSetsClaimsOnEmptyOuterClearsOnExit", func(t *testing.T) {
+		// AsRole restore case 2 (TS parity): no outer AsRole
+		// (claims unset), inner sets claims. On inner exit,
+		// set_config('request.jwt.claims', NULL, true) is
+		// issued to clear the GUC — without it, the inner's
+		// claims would leak to the outer scope (RELEASE
+		// SAVEPOINT merges the inner's SET LOCAL into the
+		// outer transaction).
+		err := c.Transaction(ctx, func(ctx context.Context) error {
+			// No outer AsRole — claims start unset.
+			if err := c.AsRole(ctx, "pgrls_protocol_actor",
+				&pgrlstest.AsRoleOptions{Claims: map[string]any{"tenant_id": "inner-only"}},
+				func(ctx context.Context) error {
+					rows, err := c.FetchAll(ctx, "SELECT current_setting('request.jwt.claims', true) AS claims")
+					if err != nil {
+						return err
+					}
+					got := coerceString(t, rows[0]["claims"])
+					if !strings.Contains(got, "inner-only") {
+						t.Errorf("inner claims = %q, want to contain inner-only", got)
+					}
+					return nil
+				}); err != nil {
+				return err
+			}
+			rows, err := c.FetchAll(ctx, "SELECT current_setting('request.jwt.claims', true) AS claims")
+			if err != nil {
+				return err
+			}
+			got := coerceString(t, rows[0]["claims"])
+			// set_config(NULL, true) collapses to "" on a
+			// touched GUC; nil pre-touch also possible.
+			if got != "" {
+				t.Errorf("post-inner claims = %q, want empty (set_config NULL clear)", got)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("Transaction: %v", err)
+		}
+	})
 }
 
 // coerceString reads a row-map cell as a string, accepting
@@ -609,9 +751,3 @@ var (
 	_ pgrlstest.Driver = (pgxdriver.Conn(nil))
 	_ pgrlstest.Driver = (pqdriver.Conn(nil))
 )
-
-// Compile-time pin: pgxlib import isn't directly used (we use
-// pgxdriver which wraps pgx), but the import-line keeps the
-// dependency visible in this file's locality. Using a blank
-// usage rather than a `_ "..."` import side-effect anchor.
-var _ = pgxlib.ErrNoRows

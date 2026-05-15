@@ -29,9 +29,11 @@
 // running both adapters (pgx + lib/pq) against a real Postgres
 // container via testcontainers-go and exercising the four
 // Layer 1 protocol criteria from `docs/pgrls-test-protocol.md`
-// plus end-to-end public-API tests, against the same fixture
-// the Python and TS conformance suites use
-// (`tests/protocol/{schema,seed}.sql`).
+// plus end-to-end public-API tests, against the same SQL
+// fixture the Python conformance suite uses
+// (`tests/protocol/{schema,seed}.sql`) — the TS port hand-rolls
+// its own equivalent fixture, a deliberate two-approaches
+// choice documented in `AGENTS.md`.
 // The final step adds CI hardening + release plumbing (v0.7.6).
 // See CHANGELOG.md for the per-step plan.
 package pgrlstest
