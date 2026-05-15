@@ -139,17 +139,6 @@ func TestAssertVisible_PropagatesDriverError(t *testing.T) {
 	}
 }
 
-func TestAssertInvisible_PropagatesDriverError(t *testing.T) {
-	want := errors.New("driver oops")
-	d := &assertionDriver{failBySQL: map[string]error{"SELECT 1": want}}
-	c := NewClient(d)
-
-	got := c.AssertInvisible(context.Background(), "SELECT 1")
-	if !errors.Is(got, want) {
-		t.Errorf("got %v, want %v", got, want)
-	}
-}
-
 func TestAssertInvisible_Pass(t *testing.T) {
 	d := &assertionDriver{
 		rowsBySQL: map[string]QueryResult{
@@ -180,6 +169,17 @@ func TestAssertInvisible_FailsOnAnyRows(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "expected 0 rows, got 1") {
 		t.Errorf("error %q missing expected message", err.Error())
+	}
+}
+
+func TestAssertInvisible_PropagatesDriverError(t *testing.T) {
+	want := errors.New("driver oops")
+	d := &assertionDriver{failBySQL: map[string]error{"SELECT 1": want}}
+	c := NewClient(d)
+
+	got := c.AssertInvisible(context.Background(), "SELECT 1")
+	if !errors.Is(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
