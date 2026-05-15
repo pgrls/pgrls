@@ -76,7 +76,6 @@ def test_subprocess_clean_db_exits_zero(
     # SEC001-SEC002. SEC014 is exercised by absence — the fixture
     # creates no SECURITY DEFINER functions, so SEC014 has nothing
     # to flag. The table needs policies that:
-    # table needs policies that:
     #   - are scoped to a non-PUBLIC role (SEC003)
     #   - reference an own column (SEC005)
     #   - cover write-side commands with WITH CHECK (SEC006)
