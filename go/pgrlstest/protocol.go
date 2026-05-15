@@ -37,8 +37,8 @@
 // manifest reuse, full hand-roll, and the Go hybrid).
 // v0.7.6 wraps the v0.7.x staged rollout with CI hardening
 // (`golangci-lint` v1.62.2 against a small high-signal linter
-// set, `govulncheck` v1.1.4 against the module's import graph
-// + Go 1.23 runner stdlib) and release plumbing (a
+// set, `govulncheck`@latest against the module's import graph
+// + a latest-stable-Go runner stdlib) and release plumbing (a
 // tag-triggered workflow at `.github/workflows/go-release.yml`
 // that re-runs the PR-branch gates against the tag commit —
 // tidy + gofmt + vet + race tests + golangci-lint +

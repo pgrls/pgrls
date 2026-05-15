@@ -42,13 +42,14 @@ as `go/v0.8.x` tags.
   working directory.
 
 - **`govulncheck` CI job** at
-  `.github/workflows/go.yml` runs `govulncheck@v1.1.4` against
-  `./...`. Pinned to Go 1.23 for the run (Go 1.22 stdlib
-  carries unpatched CVEs that govulncheck reports as
-  "your code is affected by" — they aren't bugs in this
-  module's code but in the Go release line itself, and the
-  test matrix already exercises both Go versions for
-  compatibility).
+  `.github/workflows/go.yml` runs `govulncheck@latest` against
+  `./...`. Pinned to the current latest stable Go (1.25) for
+  the run; any older Go release line accrues stdlib CVEs
+  govulncheck reports as "your code is affected by" — those
+  aren't bugs in this module's code but in the Go release line
+  itself, fixed by upgrading Go. The test matrix already
+  exercises both Go 1.22 and 1.23 for compatibility, so the
+  vuln job's newer-stdlib pin only affects the vuln scan.
 
 - **`.github/workflows/go-release.yml`** — tag-triggered
   release workflow firing on `go/v*` tag push (and via
@@ -61,7 +62,7 @@ as `go/v0.8.x` tags.
     aren't interpreted as regex wildcards). A mismatch
     (missing entry, typo'd version) is a release-process bug
     worth blocking on.
-  - **`vuln`** runs govulncheck v1.1.4 (Go 1.23 runner, same
+  - **`vuln`** runs `govulncheck@latest` (Go 1.25 runner, same
     rationale as `go.yml`'s vuln job) against the tag commit.
     Separate from `verify` so its failure profile is legible
     in the workflow run summary.
@@ -98,8 +99,8 @@ as `go/v0.8.x` tags.
 
 - The next pgrls-test-go release ships as `go/v0.8.x`. v0.8.0
   is the natural place to bump the module's `go 1.22` floor
-  to 1.23 (so `govulncheck` no longer needs the 1.23-runner
-  workaround) and pick up the still-go-1.22-compatible
+  to 1.23 (so `govulncheck` no longer needs the latest-stable-
+  Go runner pin) and pick up the still-go-1.22-compatible
   testcontainers-go v0.35.0 (or jump to v0.41.x if the floor
   bump targets 1.25). No protocol-version (`ProtocolVersion`)
   bump is planned for v0.8.x — the Layer 1 wire contract

@@ -138,32 +138,29 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Go
-        # Pin to the newest Go version in the test matrix
-        # rather than `go-version-file: go/go.mod`. Reason:
+        # Pin to the current latest stable Go (1.25) rather
+        # than `go-version-file: go/go.mod`. Rationale:
         # govulncheck scans the *runner's* stdlib alongside
-        # the module's deps, and the older Go version that
-        # `go.mod` declares as a floor often carries patched-
-        # in-newer-releases stdlib CVEs that aren't actually
-        # bugs in this module's code — they're bugs in the
-        # Go release line itself, fixed by upgrading Go. The
-        # test job above already exercises the module against
-        # both 1.22 and 1.23 to catch compatibility issues;
-        # govulncheck only needs to gate against vulnerable
-        # *deps*, so a newer toolchain produces fewer
-        # false-positives on a stdlib CVE backlog.
+        # the module's deps, and any Go release line older
+        # than the latest stable accrues patched-in-newer-
+        # releases stdlib CVEs that aren't bugs in this
+        # module's code — they're bugs in the Go release line
+        # itself, fixed by upgrading Go. The test job above
+        # already exercises the module against 1.22 and 1.23
+        # to catch compatibility issues; govulncheck only
+        # needs to gate against vulnerable *deps*, so picking
+        # the latest stable Go for this job alone minimizes
+        # stdlib-CVE false positives that block CI without
+        # giving us code to actually fix.
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
           cache-dependency-path: go/go.sum
 
       - name: Install govulncheck
-        # Pinned to v1.1.4 — the last release that installs
-        # under the Go 1.23 runner toolchain above
-        # (govulncheck v1.3.0+ requires the install toolchain
-        # to be Go 1.25+). The pin moves forward when both
-        # the runner Go version and the module's go.mod floor
-        # bump together in a future release.
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+        # Use the latest govulncheck — its install toolchain
+        # requirement (Go 1.25+) matches the runner pin above.
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Run govulncheck
         # Default behavior: exit non-zero if any vuln applies to
