@@ -92,6 +92,19 @@ def test_is_pg_temp_safe_false_when_empty_string() -> None:
     assert _is_pg_temp_safe("") is False
 
 
+def test_is_pg_temp_safe_false_when_pg_temp_duplicated() -> None:
+    # `pg_temp, public, pg_temp` ends with pg_temp but ALSO has an
+    # earlier pg_temp. Postgres resolves search_path in
+    # first-occurrence order, so the leading pg_temp wins — the
+    # path is still pg_temp-first and exploitable. A last-token-
+    # only check would mis-report this as safe.
+    assert _is_pg_temp_safe("pg_temp, public, pg_temp") is False
+    # Even a duplicate where neither is first is unsafe — any
+    # pg_temp that isn't the sole, final entry leaves an earlier
+    # occurrence governing resolution.
+    assert _is_pg_temp_safe("public, pg_temp, audit, pg_temp") is False
+
+
 # --- SEC015 rule ---------------------------------------------------------
 
 

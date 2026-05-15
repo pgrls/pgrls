@@ -108,18 +108,24 @@ def _search_path_tokens(search_path: str) -> list[str]:
 def _is_pg_temp_safe(search_path: str | None) -> bool:
     """True iff `search_path` forces `pg_temp` to be searched last.
 
-    The only structurally-safe shape: a pinned search_path whose
-    final token is an explicit `pg_temp`. `None` (no clause) and
-    any pinned path that doesn't end with `pg_temp` (including the
-    empty string `''`) leave `pg_temp` implicitly first for relation
-    lookups — unsafe.
+    The only structurally-safe shape: a pinned search_path in which
+    `pg_temp` appears *exactly once*, as the *final* token. `None`
+    (no clause) and any pinned path that doesn't end with `pg_temp`
+    (including the empty string `''`) leave `pg_temp` implicitly
+    first for relation lookups — unsafe.
+
+    The exactly-once requirement matters: Postgres resolves
+    search_path entries in *first-occurrence* order, so a path like
+    `pg_temp, public, pg_temp` is searched `pg_temp`-first despite
+    the trailing duplicate — still exploitable. Checking only the
+    last token would mis-report that as safe.
     """
     if search_path is None:
         return False
     tokens = _search_path_tokens(search_path)
     if not tokens:
         return False
-    return tokens[-1] == "pg_temp"
+    return tokens[-1] == "pg_temp" and tokens.count("pg_temp") == 1
 
 
 class SEC015:
