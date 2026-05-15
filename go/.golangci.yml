@@ -40,9 +40,9 @@ linters:
     - ineffassign # Catches assignments whose value is never
                   # read — usually a typo or refactoring
                   # leftover.
-    - staticcheck # Wide-coverage analyzer; replaces several
-                  # older linters (gosimple, stylecheck,
-                  # deadcode, etc. all rolled in).
+    - staticcheck # Wide-coverage analyzer; subsumes several
+                  # historical linters (gosimple, stylecheck
+                  # rolled in upstream from dominikh/go-tools).
     - unused      # Detects unused exported and unexported
                   # identifiers — a deliberate redundancy with
                   # staticcheck, but the unused-linter's
