@@ -869,15 +869,17 @@ SET search_path` rewrite needs the function's full argument
 signature, which introspection doesn't capture).
 
 A `SECURITY DEFINER` function runs as its owner. When the body
-references an object — table, view, type, operator — by an
-**unqualified** name, Postgres resolves that name against the
-function's effective `search_path`. The danger is the default:
-Postgres searches `pg_temp`, the per-session temporary schema
-that **every** connected role can write to, *first* — ahead of
-even `pg_catalog` — for relation and type names, *unless*
-`pg_temp` is named explicitly in `search_path`. An attacker
-creates a same-named object in their session's `pg_temp`; the
-privileged function silently resolves the unqualified reference
+references a relation or data type — a table, view, sequence,
+or type — by an **unqualified** name, Postgres resolves that
+name against the function's effective `search_path`. The danger
+is the default: Postgres searches `pg_temp`, the per-session
+temporary schema that **every** connected role can write to,
+*first* — ahead of even `pg_catalog` — for relation and data
+type names (it is never searched for function or operator
+names), *unless* `pg_temp` is named explicitly in
+`search_path`. An attacker creates a same-named object in their
+session's `pg_temp`; the privileged function silently resolves
+the unqualified reference
 to the attacker's object and executes attacker-controlled SQL
 with the owner's privileges. This is the CVE-2018-1058
 search-path privilege-escalation class.

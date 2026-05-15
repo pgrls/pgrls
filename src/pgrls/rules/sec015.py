@@ -1,11 +1,12 @@
 """SEC015 — SECURITY DEFINER function exposed to pg_temp shadowing.
 
 A `SECURITY DEFINER` function runs as its owner. When the function
-body references an object (table, view, type, operator) by an
-*unqualified* name, Postgres resolves that name against the
-function's effective `search_path`. If `pg_temp` — the per-session
-temporary schema, writable by every connected role — can be searched
-*before* the schema the legitimate object lives in, an attacker
+body references a relation or data type (a table, view, sequence,
+or type) by an *unqualified* name, Postgres resolves that name
+against the function's effective `search_path`. If `pg_temp` — the
+per-session temporary schema, writable by every connected role —
+can be searched *before* the schema the legitimate object lives in,
+an attacker
 creates a same-named object in their session's `pg_temp` and the
 privileged function silently resolves to the attacker's object
 instead. The function then executes attacker-controlled SQL with the
