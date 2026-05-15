@@ -1346,8 +1346,7 @@ Three layers, the bottom one is a documented contract not code:
   hand-rolls its own `FIXTURE_SQL` covering the same Layer 1
   criteria — see "Approach 2" below) added in v0.7.5 (step 6 of 7
   — final step adds CI hardening and release plumbing). Python is
-  the reference
-  implementation. `PROTOCOL_VERSION = 1`.
+  the reference implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,

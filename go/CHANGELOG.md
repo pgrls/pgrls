@@ -20,8 +20,11 @@ suite (`tests/protocol/test_protocol_conformance.py`) consumes,
 so a single edit to the fixture propagates Python ↔ Go. The
 TypeScript port hand-rolls its own `FIXTURE_SQL` covering the
 same four Layer 1 criteria — a deliberate two-approaches choice
-documented in `AGENTS.md` (Approach 2: shared SQL files + each
-port's own driver wiring).
+documented in `AGENTS.md`. The Go suite is a hybrid: it
+consumes the Approach 1 shared SQL fixture (so a single edit
+propagates to the Python run unchanged) but skips the
+`manifest.json` indirection in favor of an in-Go scenario
+harness covering the same four Layer 1 criteria.
 
 ### Added
 
@@ -30,19 +33,19 @@ port's own driver wiring).
   (`postgres:17-alpine`) shared across all conformance tests,
   applies the shared fixture, then runs
   `TestConformance_PgxAdapter` and `TestConformance_PqAdapter`.
-  Each adapter test runs 10 subtests:
+  Each adapter test runs 13 subtests:
   - Four Layer 1 protocol criteria: `SET LOCAL ROLE` resets on
     rollback, `set_config(..., true)` resets on rollback,
     `InsufficientPrivilege` (SQLSTATE 42501) for WITH CHECK
     violations, silent-drop for `UPDATE … RETURNING` when
     `USING` filters the targeted rows out.
-  - Six end-to-end public-API tests: tenant-isolation under
+  - Nine end-to-end public-API tests: tenant-isolation under
     AsRole, nested AsRole restoring outer claims, AsRole with
     `Claims: nil` skipping set_config, Seed + AssertRows, the
     AssertSilentlyDropped verb-gate on a real driver,
     AssertRejected returning *AssertionError when the query
     succeeds, AssertVisible / AssertInvisible against the
-    tenant-isolation fixture, and two additional AsRole
+    tenant-isolation fixture, plus two additional AsRole
     nested-restore cases (case 4 — inner-no-claims preserves
     outer; case 2 — inner-on-empty-outer clears on exit via
     explicit `set_config(NULL, true)`).

@@ -20,10 +20,19 @@ package pgrlstest_test
 //     `set_config(..., true)` reset on rollback,
 //     `InsufficientPrivilege` for `AssertRejected`, silent-drop
 //     for `AssertSilentlyDropped`).
-//   - 6 end-to-end public-API exercises (Seed + AssertRows,
-//     AsRole's nested-claims restore, AsRole with nil claims,
-//     AssertSilentlyDropped verb-gate, AssertRejected
-//     success-path, multi-tenant isolation).
+//   - 9 end-to-end public-API exercises (multi-tenant isolation,
+//     nested AsRole restoring outer claims, AsRole with nil
+//     claims skipping set_config, Seed + AssertRows, the
+//     AssertSilentlyDropped verb-gate on a real driver,
+//     AssertRejected returning *AssertionError on success,
+//     AssertVisible + AssertInvisible against the
+//     tenant-isolation fixture, plus two additional AsRole
+//     nested-restore cases — case 4 (inner-no-claims preserves
+//     outer) and case 2 (inner-on-empty-outer clears on exit
+//     via explicit `set_config(NULL, true)`)).
+//
+// Total: 13 subtests per adapter × 2 adapters = 26 conformance
+// subtests against real Postgres.
 //
 // Fixture source: the Go port reads the same
 // `tests/protocol/{schema,seed}.sql` files the Python
