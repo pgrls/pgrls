@@ -89,3 +89,82 @@ jobs:
         # `t.Skip` on entry; the 13 subtests nested under them
         # are never reached).
         run: go test -race -v ./...
+
+  lint:
+    name: golangci-lint
+    # Lint runs once (not per-Go-version) since the lint config
+    # is version-agnostic — checking it against 2 Gos doubles
+    # CI minutes without catching new bugs. Picks the
+    # `go-version` declared in go.mod via setup-go's
+    # `go-version-file: go/go.mod` directive (see step below).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: golangci-lint
+        # Pinned to action v6 + linter v1.62.2 — the last v1.x
+        # release of the linter, matching the v1-schema config
+        # at `go/.golangci.yml`. When bumping to v2.x, both
+        # this version and the config file need to migrate.
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62.2
+          working-directory: go
+          # `--config` is implicit (golangci-lint picks up
+          # .golangci.yml in working-directory); --verbose helps
+          # when triaging a failure in CI logs.
+          args: --timeout=5m --verbose
+
+  vuln:
+    name: govulncheck
+    # govulncheck scans the module's import graph against
+    # https://pkg.go.dev/vuln/ — catches known-CVE'd transitive
+    # deps before they ship. Runs once (matching the lint job's
+    # rationale — vuln DB is version-agnostic).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        # Pin to the current latest stable Go (1.25) rather
+        # than `go-version-file: go/go.mod`. Rationale:
+        # govulncheck scans the *runner's* stdlib alongside
+        # the module's deps, and any Go release line older
+        # than the latest stable accrues patched-in-newer-
+        # releases stdlib CVEs that aren't bugs in this
+        # module's code — they're bugs in the Go release line
+        # itself, fixed by upgrading Go. The test job above
+        # already exercises the module against 1.22 and 1.23
+        # to catch compatibility issues; govulncheck only
+        # needs to gate against vulnerable *deps*, so picking
+        # the latest stable Go for this job alone minimizes
+        # stdlib-CVE false positives that block CI without
+        # giving us code to actually fix.
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go/go.sum
+
+      - name: Install govulncheck
+        # Use the latest govulncheck — its install toolchain
+        # requirement (Go 1.25+) matches the runner pin above.
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        # Default behavior: exit non-zero if any vuln applies to
+        # imported symbols (vs. just present in go.sum). That
+        # filtering is what makes govulncheck practical — it
+        # only fails CI on vulns the code actually reaches.
+        run: govulncheck ./...

@@ -1,0 +1,76 @@
+# golangci-lint configuration for the pgrls-test-go module.
+#
+# This file is consumed both by CI (`.github/workflows/go.yml`)
+# and by local runs of `golangci-lint run ./...` from the `go/`
+# directory. Pinned to a small, opinionated set of linters that
+# catch real bugs without churn — every enabled linter has caught
+# something during the v0.7.x staged rollout, so adding more is
+# easier than removing one.
+#
+# Cross-language analogue: TypeScript has ESLint + Prettier wired
+# at `ts/eslint.config.js` + `ts/.prettierrc.json`; Python uses
+# ruff with built-in defaults (no project-level config file).
+# This file plays the same role for Go.
+#
+# golangci-lint config schema: v1 (compatible with v1.62.x, the
+# last v1.x release). When bumping the linter to v2.x, the
+# top-level `version: "2"` field and the `linters.default`
+# selector replace the current shape — see
+# https://golangci-lint.run/usage/configuration/ for v2 syntax.
+
+run:
+  # Allow tests to be parsed alongside the main package. The
+  # conformance suite uses runtime gating (`testing.Short()` +
+  # an env-var fallback) rather than build tags; the linter
+  # shouldn't trip on the testing-only imports.
+  timeout: 5m
+
+linters:
+  # Start from disable-all, then enable specifically. Avoids
+  # opt-out drift when golangci-lint adds new linters in a
+  # future release.
+  disable-all: true
+  enable:
+    # Small high-signal linter set (five entries below — each
+    # has caught a real bug during the v0.7.x staged rollout).
+    - errcheck    # Catches unchecked errors — the #1 source
+                  # of "silent failures" in Go code.
+    - govet       # Bundled with the Go toolchain; catches
+                  # printf mismatches, unreachable code, etc.
+    - ineffassign # Catches assignments whose value is never
+                  # read — usually a typo or refactoring
+                  # leftover.
+    - staticcheck # Wide-coverage analyzer; subsumes several
+                  # historical linters (gosimple, stylecheck
+                  # rolled in upstream from dominikh/go-tools).
+    - unused      # Detects unused exported and unexported
+                  # identifiers — a deliberate redundancy with
+                  # staticcheck, but the unused-linter's
+                  # whole-program analysis catches more.
+
+linters-settings:
+  errcheck:
+    # The `_ = something()` pattern is intentional — used in
+    # deferred cleanups where errors aren't actionable
+    # (defer pg.Terminate, defer pool.Close). The
+    # `exclude-functions` list below documents functions
+    # where ignoring the error is conventionally fine.
+    exclude-functions:
+      # Standard library deferred-cleanup pattern.
+      - (*database/sql.DB).Close
+      - (*database/sql.Conn).Close
+      - (*database/sql.Rows).Close
+      # pgx pool teardown.
+      - (*github.com/jackc/pgx/v5/pgxpool.Pool).Close
+      # testcontainers teardown.
+      - (github.com/testcontainers/testcontainers-go.Container).Terminate
+
+issues:
+  # `_test.go` files are allowed to have some patterns that
+  # main code shouldn't — explicit nolint comments cover the
+  # rare cases where this isn't enough.
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+      text: "Error return value of"

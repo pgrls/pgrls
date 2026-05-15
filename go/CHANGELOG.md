@@ -7,6 +7,105 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.6] - 2026-05-14
+
+**Step 7 of 7 — CI hardening + release plumbing.** Wraps the
+v0.7.x staged rollout: every PR / push to `go/**` or
+`tests/protocol/**` now runs the test matrix + a separate
+golangci-lint job + a govulncheck job; tag pushes matching
+`go/v*` (e.g. `go/v0.7.6`, `go/v0.8.0`) trigger a release
+workflow that verifies the tag's commit passes every gate,
+warms the public Go module proxy via `go list -m`, and cuts a
+GitHub Release with the changelog stanza extracted from this
+file. The v0.7.x sequence is
+complete with this release; future pgrls-test-go releases ship
+as `go/v0.8.x` tags.
+
+### Added
+
+- **`go/.golangci.yml`** — v1-schema config selecting a small
+  high-signal linter set (`errcheck`, `govet`, `ineffassign`,
+  `staticcheck`, `unused`). `disable-all: true` + explicit
+  enable avoids opt-out drift when golangci-lint adds new
+  linters. `errcheck.exclude-functions` documents the
+  cleanup-call sites (`sql.DB.Close`, `pgxpool.Pool.Close`,
+  `testcontainers.Container.Terminate`) where ignoring an error
+  is the deliberate pattern. Test files are exempt from the
+  `errcheck` "Error return value of" message via
+  `issues.exclude-rules`.
+
+- **`golangci-lint` CI job** (`.github/workflows/go.yml`)
+  pinned to `golangci/golangci-lint-action@v6` running the
+  v1.62.2 linter (last v1.x release; matches the v1 config
+  schema). Runs once per push / PR (not per-Go-version since
+  the config is version-agnostic), against the `go/`
+  working directory.
+
+- **`govulncheck` CI job** at
+  `.github/workflows/go.yml` runs `govulncheck@latest` against
+  `./...`. Pinned to the current latest stable Go (1.25) for
+  the run; any older Go release line accrues stdlib CVEs
+  govulncheck reports as "your code is affected by" — those
+  aren't bugs in this module's code but in the Go release line
+  itself, fixed by upgrading Go. The test matrix already
+  exercises both Go 1.22 and 1.23 for compatibility, so the
+  vuln job's newer-stdlib pin only affects the vuln scan.
+
+- **`.github/workflows/go-release.yml`** — tag-triggered
+  release workflow firing on `go/v*` tag push (and via
+  `workflow_dispatch` for manual cuts). Four sequenced jobs:
+  - **`verify`** re-checks out the tag's commit and runs every
+    gate from the PR workflow's `test` + `lint` jobs (tidy,
+    gofmt, vet, race tests, golangci-lint) plus a cross-check
+    that the tag's version has a matching `## [X.Y.Z]` entry
+    in `go/CHANGELOG.md` (literal-prefix match — version dots
+    aren't interpreted as regex wildcards). A mismatch
+    (missing entry, typo'd version) is a release-process bug
+    worth blocking on.
+  - **`vuln`** runs `govulncheck@latest` (Go 1.25 runner, same
+    rationale as `go.yml`'s vuln job) against the tag commit.
+    Separate from `verify` so its failure profile is legible
+    in the workflow run summary.
+  - **`warm-proxy`** issues `go list -m
+    github.com/pgrls/pgrls/go@<version>` so the default
+    `proxy.golang.org` fetches and caches the tag, avoiding a
+    cold-cache stall the first time a user runs
+    `go get github.com/pgrls/pgrls/go@<tag>`.
+  - **`release`** extracts the version's stanza from
+    `go/CHANGELOG.md` via awk (literal-prefix `index()` match
+    plus the trailing-blank-line trim), writes it to
+    `release-notes.md`, and calls
+    `gh release create … --notes-file release-notes.md
+    --verify-tag`. The notes-file path is critical — CHANGELOG
+    stanzas contain backticks (e.g. `` `errcheck` ``), and
+    splicing them into the shell `--notes` argument would let
+    bash interpret each backtick-delimited span as a command
+    substitution. `gh release view` gates the create so re-
+    runs (workflow_dispatch retry) don't error on
+    "release already exists".
+
+  All shell `run:` steps route user-controlled inputs
+  (`workflow_dispatch.inputs.tag`, `github.ref_name`) through
+  `env:` declarations rather than direct `${{ … }}`
+  interpolation, so a malformed dispatch input can't smuggle
+  shell metacharacters into the script body.
+
+### Changed
+
+- **`protocol.go` status comment** advanced to step 7 of 7
+  (the final step of the v0.7.x sequence).
+
+### Future
+
+- The next pgrls-test-go release ships as `go/v0.8.x`. v0.8.0
+  is the natural place to bump the module's `go 1.22` floor
+  to 1.23 (so `govulncheck` no longer needs the latest-stable-
+  Go runner pin) and pick up the still-go-1.22-compatible
+  testcontainers-go v0.35.0 (or jump to v0.41.x if the floor
+  bump targets 1.25). No protocol-version (`ProtocolVersion`)
+  bump is planned for v0.8.x — the Layer 1 wire contract
+  stays at v1.
+
 ## [0.7.5] - 2026-05-14
 
 **Step 6 of 7 — cross-language conformance suite.** Wires both
