@@ -1,6 +1,6 @@
 """Shared allowlist parsers for rule options.
 
-Allowlist entries fall into four shapes:
+Allowlist entries fall into five shapes:
 
 * **Policy ID** (`schema.table.policy_name`) — used by every per-policy
   rule (SEC003, SEC005, SEC006, SEC008, SEC010, SEC011, PERF001,
