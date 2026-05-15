@@ -70,9 +70,14 @@ func NewClient(driver Driver) *Client {
 	return &Client{driver: driver}
 }
 
-// Driver returns the underlying driver. Exposed for the assertion
-// helpers (added in v0.7.4) to issue their own `SAVEPOINT` /
-// `ROLLBACK TO SAVEPOINT` wire sequence inside `AssertRejected`.
+// Driver returns the underlying driver. Provided as an escape
+// hatch for callers wiring custom assertions or other
+// driver-level operations the Client API doesn't surface
+// directly — the package-level assertion helpers
+// (`pgrlstest.AssertRows`, etc.) read `c.driver` package-
+// internally, so external callers building their own assertion
+// helpers reach the driver via this method.
+//
 // Not part of the stable public API — subject to change between
 // minor versions.
 func (c *Client) Driver() Driver { return c.driver }

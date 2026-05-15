@@ -7,20 +7,27 @@
 // sequence (savepoint-bracketed `SET LOCAL ROLE` + `set_config`
 // for the JWT claims, rollback to savepoint on scenario exit).
 //
-// **Status: step 4 of 7 (v0.7.3 — Client API).**
+// **Status: step 5 of 7 (v0.7.4 — assertion helpers).**
 // v0.7.0 shipped the scaffold + ProtocolVersion + error types;
 // v0.7.1 added the Driver and Closer interfaces alongside the
 // QueryResult struct; v0.7.2 added the pgx and lib/pq driver
 // adapters (each with a single-conn + pool-backed constructor);
 // v0.7.3 added the Client API (`Client.Transaction`, `Client.Exec`,
 // `Client.FetchAll`, `Client.AsRole`, `Client.Seed`, `Client.Close`,
-// plus a `Client.Driver` accessor for the v0.7.4 assertion
-// helpers) alongside `QuoteIdent` / `QuoteQualified` (identifier
-// quoting with reserved-keyword handling) and `NewSavepointName`
-// (crypto/rand-backed savepoint suffix generator). Subsequent
-// steps add the assertion helpers (v0.7.4), the conformance
-// suite (v0.7.5), and CI hardening + release plumbing (v0.7.6).
-// See CHANGELOG.md for the per-step plan.
+// plus a `Client.Driver` accessor) alongside `QuoteIdent` /
+// `QuoteQualified` (identifier quoting with reserved-keyword
+// handling) and `NewSavepointName` (crypto/rand-backed savepoint
+// suffix generator); v0.7.4 added the five assertion helpers
+// (`AssertRows`, `AssertVisible`, `AssertInvisible`,
+// `AssertRejected`, `AssertSilentlyDropped`) — both as `Client`
+// methods and as exported package-level functions taking a
+// `*Client` (matches the TS port's `assertRows(client, ...)`
+// callable shape — Python's `assert_rows(conn, ...)` takes the
+// lower-level psycopg.Connection, a layer-of-abstraction
+// divergence the TS and Go ports share).
+// Subsequent steps add the conformance suite (v0.7.5) and CI
+// hardening + release plumbing (v0.7.6). See CHANGELOG.md for
+// the per-step plan.
 package pgrlstest
 
 // ProtocolVersion is the wire-protocol version this client

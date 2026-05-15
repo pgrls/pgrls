@@ -4,7 +4,7 @@ Go port of [`pgrls.testing`](https://pypi.org/project/pgrls/) — code-first RLS
 
 Implements the cross-language Layer 1 protocol (`ProtocolVersion = 1`) shared with the Python (`pgrls.testing`) and TypeScript ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) clients. Fixtures roundtrip across all three; the same RLS-protected schema can be exercised from any language.
 
-> **Status: v0.7.3 — step 4 of 7 (Client API).** This release adds the `Client` struct that wires the Driver adapters (v0.7.2) behind a stable API: `Transaction`, `AsRole` (role + JWT claims switching via `SAVEPOINT pgrls_actor_<rand>`), `Exec`, `FetchAll`, `Seed`, and `Close`. The wire sequence is byte-equivalent to the Python and TypeScript ports. Also ships `QuoteIdent` / `QuoteQualified` (Postgres 16 reserved-keyword aware) and `NewSavepointName` (crypto/rand-backed savepoint suffix). Subsequent steps add the five assertion helpers, the cross-language conformance suite, and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.7.4 — step 5 of 7 (assertion helpers).** This release adds the five RLS-shape assertion helpers — `AssertRows`, `AssertVisible`, `AssertInvisible`, `AssertRejected` (savepoint-wrapped via `pgrls_check_<rand>`), and `AssertSilentlyDropped` (UPDATE/DELETE … RETURNING with the row-count check) — each exposed as a `Client` method AND as an exported package-level function taking `*Client`, matching the Python / TypeScript wire sequence byte-for-byte. Subsequent steps add the cross-language conformance suite and CI hardening. Track progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -30,9 +30,25 @@ import "github.com/pgrls/pgrls/go/pgrlstest"
 | `Client` (Transaction, AsRole, Exec, FetchAll, Seed, Close, Driver) | 4 | ✅ shipped (v0.7.3) |
 | `QuoteIdent` + `QuoteQualified` + `ReservedKeywords` (78 entries) | 4 | ✅ shipped (v0.7.3) |
 | `NewSavepointName` (crypto/rand 4-byte → 8-hex) | 4 | ✅ shipped (v0.7.3) |
-| Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | planned (v0.7.4) |
+| Assertion helpers (AssertRows, AssertVisible, AssertInvisible, AssertRejected, AssertSilentlyDropped) | 5 | ✅ shipped (v0.7.4) |
 | Cross-language conformance suite | 6 | planned (v0.7.5) |
 | CI hardening + release plumbing | 7 | planned (v0.7.6) |
+
+## Assertion helper semantics
+
+| Helper | Passes when | Fails when |
+|---|---|---|
+| `AssertRows(ctx, sql, &AssertRowsOptions{Count: N})` | query returns exactly N rows | row count differs (`*AssertionError`) |
+| `AssertVisible(ctx, sql)` | query returns ≥ 1 row | zero rows (`*AssertionError`) |
+| `AssertInvisible(ctx, sql)` | query returns 0 rows | any rows (`*AssertionError`) |
+| `AssertRejected(ctx, sql)` | Postgres raises `InsufficientPrivilege` (SQLSTATE `42501`) | query succeeded OR raised a different error (`*AssertionError`) |
+| `AssertSilentlyDropped(ctx, sql)` | `UPDATE/DELETE … RETURNING` succeeds but `USING` filters the row out before the write; `RETURNING` is empty | DML raises (driver error propagates) OR `RETURNING` returns rows (`*AssertionError`). Non-UPDATE/DELETE SQL (SELECT, INSERT, …) and UPDATE/DELETE missing `RETURNING` both return `*Error` (matches `ErrAPIError`) — caller-error, distinct from RLS-misbehavior. |
+
+`AssertRejected` and `AssertSilentlyDropped` distinguish two distinct Postgres failure modes — `WITH CHECK` violations raise (catch with the first); `USING` filtering of `UPDATE`/`DELETE` returns silently empty (catch with the second).
+
+`AssertSilentlyDropped` rejects mis-shaped SQL via the result's command-tag verb, which means the SQL is fully executed (any side-effects land in the current transaction — they'll be rolled back when `Client.Transaction` exits, but they're real while it's open) before the verb-gate rejects it. Pass only the UPDATE/DELETE you actually want to execute.
+
+Each helper is exposed both as a `Client` method (`client.AssertRows(ctx, sql, opts)`) AND as a package-level function (`pgrlstest.AssertRows(ctx, client, sql, opts)`). The two forms have identical wire output — the methods are thin forwarders.
 
 ## Cross-language guarantee
 
