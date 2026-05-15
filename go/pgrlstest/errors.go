@@ -68,7 +68,7 @@ func (e *Error) Is(target error) bool {
 // includes `%T: %s` of the underlying error in the message).
 // The Go-side parity is with the TS port, which constructs the
 // message at throw time rather than chaining a `from exc`
-// (Python's idiom); Go callers `errors.Is(err, ErrAssertion)`
+// (Python's idiom); Go callers use `errors.Is(err, ErrAssertion)`
 // to route assertion failures, and read `err.Error()` for the
 // underlying error's text when present.
 type AssertionError struct {

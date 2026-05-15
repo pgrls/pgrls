@@ -80,6 +80,29 @@ func TestAssertionError_DoesNotMatchAPISentinel(t *testing.T) {
 	}
 }
 
+func TestAssertionError_NoUnwrapChain(t *testing.T) {
+	// Cross-language invariant: AssertionError must NOT carry an
+	// Unwrap chain. Wrong-shape errors from AssertRejected are
+	// stringified into Msg at throw time (matches the TS port;
+	// Python uses `raise … from exc` but the Go-side surface is
+	// intentionally no-chain so `errors.Is(err, driverErr)`
+	// against an unrelated driver error stays false).
+	//
+	// Pin this so a future refactor that adds an Unwrap method
+	// breaks the build, not just a runtime assertion in a
+	// real-Postgres conformance run.
+	driverErr := errors.New("23505 unique_violation")
+	asserted := &AssertionError{
+		Msg: fmt.Sprintf("AssertRejected: expected InsufficientPrivilege, got %T: %s", driverErr, driverErr.Error()),
+	}
+	if errors.Unwrap(asserted) != nil {
+		t.Error("AssertionError must not have an Unwrap chain")
+	}
+	if errors.Is(asserted, driverErr) {
+		t.Error("AssertionError must not transitively match the underlying driver error via errors.Is")
+	}
+}
+
 // Pin the documented exported names against the cross-language
 // contract — Python uses `PgrlsTestError` / `PgrlsTestAssertionError`,
 // TS the same, Go uses the shorter `Error` / `AssertionError`

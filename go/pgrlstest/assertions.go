@@ -193,7 +193,7 @@ var returningKeywordRe = regexp.MustCompile(`(?i)\bRETURNING\b`)
 // yields zero rows — the Postgres RLS shape where the policy's
 // USING expression filters every row out before the write. The
 // helper rejects non-UPDATE/DELETE verbs (SELECT, INSERT, etc.)
-// and SQL missing RETURNING as misuse — both raise `*Error`
+// and SQL missing RETURNING as misuse — both return `*Error`
 // (matches `ErrAPIError`), distinct from `*AssertionError`.
 //
 // Note on INSERT: Postgres's INSERT … RETURNING does NOT
