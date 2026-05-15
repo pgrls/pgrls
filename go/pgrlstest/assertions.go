@@ -108,7 +108,9 @@ func AssertInvisible(ctx context.Context, c *Client, sqlText string) error {
 //     SQLSTATE 42501 (`Driver.IsInsufficientPrivilege` returns
 //     true): ROLLBACK TO SAVEPOINT, return nil.
 //     - If it raises with any other error: ROLLBACK TO SAVEPOINT,
-//     return `*AssertionError` wrapping the wrong-shape error.
+//     return `*AssertionError` whose `Msg` carries the wrong-
+//     shape error's type and message (no `Unwrap` chain — see
+//     `AssertionError`'s docs in `errors.go`).
 //     - If it succeeds: RELEASE SAVEPOINT, return
 //     `*AssertionError` (succeeded but expected rejection). The
 //     RELEASE keeps any side-effects within the outer
@@ -146,10 +148,11 @@ func AssertRejected(ctx context.Context, c *Client, sqlText string) error {
 	// Always roll back or release the savepoint. On the
 	// rejection-as-expected path the transaction is in aborted
 	// state and ROLLBACK TO is the only way to recover. On
-	// success, RELEASE keeps the side-effect committed within
+	// success, RELEASE merges the savepoint's side-effects into
 	// the outer transaction (which Transaction() will ROLLBACK
-	// anyway); this matches Python's exact sequence and makes
-	// the intent clear.
+	// anyway — Postgres' RELEASE doesn't "commit," it merges
+	// pending state into the enclosing scope); this matches
+	// Python's exact sequence and makes the intent clear.
 	if rejectedAsExpected || unexpectedError != nil {
 		if _, rbErr := c.driver.Query(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); rbErr != nil {
 			return rbErr
