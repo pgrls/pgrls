@@ -21,10 +21,11 @@ so a single edit to the fixture propagates Python ↔ Go. The
 TypeScript port hand-rolls its own `FIXTURE_SQL` covering the
 same four Layer 1 criteria — a deliberate two-approaches choice
 documented in `AGENTS.md`. The Go suite is a hybrid: it
-consumes the Approach 1 shared SQL fixture (so a single edit
-propagates to the Python run unchanged) but skips the
-`manifest.json` indirection in favor of an in-Go scenario
-harness covering the same four Layer 1 criteria.
+consumes Approach 1's `schema.sql` + `seed.sql` files (so a
+single edit propagates to the Python run unchanged) but skips
+the rest of Approach 1's `manifest.json` indirection in favor
+of an in-Go scenario harness covering the same four Layer 1
+criteria.
 
 ### Added
 
@@ -74,10 +75,12 @@ harness covering the same four Layer 1 criteria.
 ### Changed
 
 - **`go.mod` gains test-time deps**: `testcontainers-go v0.34.0`
-  (pinned to the last release compatible with the module's
-  `go 1.22` floor — v0.35.0+ requires `go 1.25`),
-  `testcontainers-go/modules/postgres v0.34.0`, plus transitive
-  Docker / OpenTelemetry / mux deps.
+  and `testcontainers-go/modules/postgres v0.34.0` (one of the
+  last releases compatible with the module's `go 1.22` floor;
+  v0.35.0 still works on 1.22, v0.36.0 raises the floor to
+  1.23, v0.41.0+ to 1.25 — when this module bumps its Go
+  floor in v0.7.6, the testcontainers pin can bump in lockstep),
+  plus transitive Docker / OpenTelemetry / mux deps.
 - **`protocol.go` status comment** advanced to step 6 of 7.
 - **`.github/workflows/go.yml`** now triggers on changes to
   `tests/protocol/**` (the cross-port fixture directory — both
