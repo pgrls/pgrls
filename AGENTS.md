@@ -1337,11 +1337,17 @@ Three layers, the bottom one is a documented contract not code:
   pgx + lib/pq adapter packages added in v0.7.2, the Client
   API (`Transaction`, `AsRole`, `Exec`, `FetchAll`, `Seed`, `Close`)
   added in v0.7.3 alongside `QuoteIdent` / `QuoteQualified` and
-  `NewSavepointName`, and the five assertion helpers (`AssertRows`,
+  `NewSavepointName`, the five assertion helpers (`AssertRows`,
   `AssertVisible`, `AssertInvisible`, `AssertRejected`,
-  `AssertSilentlyDropped`) added in v0.7.4 (step 5 of 7 — subsequent
-  steps add the conformance suite and CI hardening). Python is the
-  reference implementation. `PROTOCOL_VERSION = 1`.
+  `AssertSilentlyDropped`) added in v0.7.4, and the cross-language
+  conformance suite (testcontainers-driven Postgres + both adapter
+  packages exercising the shared `tests/protocol/{schema,seed}.sql`
+  fixture used by the Python conformance suite; the TS port
+  hand-rolls its own `FIXTURE_SQL` covering the same Layer 1
+  criteria — see the "Writing additional language ports"
+  section's pattern list below) added in v0.7.5 (step 6 of 7
+  — final step adds CI hardening and release plumbing). Python is
+  the reference implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
@@ -1391,8 +1397,8 @@ the UPDATE/DELETE you actually want to execute.
 
 The protocol contract at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md)
 specifies what every conformant client must do — wire sequence, error class
-mapping, savepoint semantics, conformance criteria. Two approaches to
-v1-conformance both work:
+mapping, savepoint semantics, conformance criteria. Three patterns
+satisfy v1-conformance:
 
 1. **Reuse the language-agnostic manifest.** The
    [`tests/protocol/`](tests/protocol/) directory contains a SQL schema, seed
@@ -1409,8 +1415,17 @@ v1-conformance both work:
    four criteria from the protocol doc. Equivalent conformance proof, more
    idiomatic to the host ecosystem.
 
-Either path satisfies v1. New ports should reach for whichever pattern fits
-the host language's testing idiom better.
+A **hybrid** is also valid — and is what the Go port chose
+(`go/pgrlstest/conformance_test.go`). The Go suite reads
+`tests/protocol/{schema,seed}.sql` directly (Python ↔ Go fixture
+sharing: a single edit to the SQL files propagates to both runs)
+but skips the `manifest.json` indirection in favor of an in-Go
+scenario harness covering the same four criteria. Useful when the
+fixture SQL is worth reusing across languages but a JSON-driven
+scenario list adds more abstraction than the test runner wants.
+
+Any of the three paths satisfies v1. New ports should reach for
+whichever pattern fits the host language's testing idiom better.
 
 <a id="diff-rules"></a>
 
@@ -1703,11 +1718,15 @@ These are intentional in the current release. Do not invent capabilities.
   `FetchAll`, `Seed`, `Close`) plus `QuoteIdent` / `QuoteQualified`
   / `NewSavepointName` shipped in v0.7.3; the five assertion
   helpers (`AssertRows`, `AssertVisible`, `AssertInvisible`,
-  `AssertRejected`, `AssertSilentlyDropped`) shipped in v0.7.4
-  (step 5 of 7). Subsequent v0.7.x steps add the conformance suite
-  and CI hardening. The `pgrls lint / fix / snapshot / diff` CLIs
-  stay Python — they depend on pglast (no drop-in TS/Go
-  equivalent).
+  `AssertRejected`, `AssertSilentlyDropped`) shipped in v0.7.4;
+  the cross-language conformance suite (testcontainers-driven
+  Postgres + both adapter packages against the shared
+  `tests/protocol/` SQL fixture used by the Python suite — the
+  TS port hand-rolls its own `FIXTURE_SQL` covering the same
+  Layer 1 criteria) shipped in v0.7.5 (step 6 of 7).
+  Final v0.7.x step adds CI hardening + release plumbing. The
+  `pgrls lint / fix / snapshot / diff` CLIs stay Python — they
+  depend on pglast (no drop-in TS/Go equivalent).
 
 ## Where to learn more
 

@@ -7,6 +7,89 @@ module adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `ProtocolVersion` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python and TypeScript clients.
 
+## [0.7.5] - 2026-05-14
+
+**Step 6 of 7 — cross-language conformance suite.** Wires both
+adapter packages (pgx and lib/pq) into a single conformance
+suite that runs against a real Postgres container, exercising
+the four Layer 1 protocol criteria from
+`docs/pgrls-test-protocol.md` plus end-to-end tests of the
+public API. Reuses the same SQL fixture
+(`tests/protocol/{schema,seed}.sql`) the Python conformance
+suite (`tests/protocol/test_protocol_conformance.py`) consumes,
+so a single edit to the fixture propagates Python ↔ Go. The
+TypeScript port hand-rolls its own `FIXTURE_SQL` covering the
+same four Layer 1 criteria — a deliberate fork-in-the-road
+documented in `AGENTS.md`, which lists three valid patterns
+(manifest reuse, full hand-roll, and the Go hybrid). The Go suite is a hybrid: it
+consumes Approach 1's `schema.sql` + `seed.sql` files (so a
+single edit propagates to the Python run unchanged) but skips
+the rest of Approach 1's `manifest.json` indirection in favor
+of an in-Go scenario harness covering the same four Layer 1
+criteria.
+
+### Added
+
+- **`pgrlstest/conformance_test.go`** — package-scoped
+  `TestMain` boots one Postgres testcontainer
+  (`postgres:17-alpine`) shared across all conformance tests,
+  applies the shared fixture, then runs
+  `TestConformance_PgxAdapter` and `TestConformance_PqAdapter`.
+  Each adapter test runs 13 subtests:
+  - Four Layer 1 protocol criteria: `SET LOCAL ROLE` resets on
+    rollback, `set_config(..., true)` resets on rollback,
+    `InsufficientPrivilege` (SQLSTATE 42501) for WITH CHECK
+    violations, silent-drop for `UPDATE … RETURNING` when
+    `USING` filters the targeted rows out.
+  - Nine end-to-end public-API tests: tenant-isolation under
+    AsRole, nested AsRole restoring outer claims, AsRole with
+    `Claims: nil` skipping set_config, Seed + AssertRows, the
+    AssertSilentlyDropped verb-gate on a real driver,
+    AssertRejected returning *AssertionError when the query
+    succeeds, AssertVisible / AssertInvisible against the
+    tenant-isolation fixture, plus two additional AsRole
+    nested-restore cases (case 4 — inner-no-claims preserves
+    outer; case 2 — inner-on-empty-outer clears on exit via
+    explicit `set_config(NULL, true)`).
+  - 26 conformance subtests pass against real Postgres 17
+    (13 per adapter × 2 adapters).
+
+- **`PGRLS_CONFORMANCE_DSN` env-var fallback** — local
+  developers can point the conformance suite at a pre-running
+  Postgres instead of using testcontainers (useful when running
+  `go test` inside a Docker harness where testcontainers'
+  default host-bridge address doesn't route between sibling
+  containers). The env-var path runs the same fixture install
+  with an idempotent teardown so reruns against a persistent
+  database don't fail with "role already exists".
+
+- **Docker-availability fallback** — when testcontainers can't
+  start a container (Docker not reachable, image pull failed,
+  port allocation rejected — or fixture install fails),
+  `TestMain` leaves `containerDSN` empty and `TestConformance_*`
+  parent tests both `t.Skip` on entry with a generic message
+  pointing the reader at the TestMain stderr output (where the
+  actual failure reason is logged). The rest of the package's
+  unit-test suite stays runnable in Docker-less environments.
+  `-short` also skips the conformance suite.
+
+### Changed
+
+- **`go.mod` gains test-time deps**: `testcontainers-go v0.34.0`
+  and `testcontainers-go/modules/postgres v0.34.0` (compatible
+  with the module's `go 1.22` floor). Upstream cutover points:
+  v0.34/v0.35 → `go 1.22`, v0.36–v0.38 → `go 1.23`, v0.39/v0.40 →
+  `go 1.24`, v0.41+ → `go 1.25`. When this module bumps its Go
+  floor in v0.7.6, the testcontainers pin can bump in lockstep
+  with whichever cutover-bucket matches the new floor. Also
+  pulls transitive Docker / OpenTelemetry / mux deps.
+- **`protocol.go` status comment** advanced to step 6 of 7.
+- **`.github/workflows/go.yml`** now triggers on changes to
+  `tests/protocol/**` (the cross-port fixture directory — both
+  the Python and Go conformance suites read these files) and
+  gates a `gofmt` check at CI alongside `go vet` and
+  `go test -race -v ./...`.
+
 ## [0.7.4] - 2026-05-14
 
 **Step 5 of 7 — assertion helpers.** Wires the Layer 1 wire
