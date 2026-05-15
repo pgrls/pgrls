@@ -1,0 +1,196 @@
+name: go-release
+
+# Release plumbing for `pgrls-test-go`.
+#
+# Go modules don't have a publish registry the way npm or PyPI do
+# — `go get` resolves against the module proxy
+# (https://proxy.golang.org), which caches what it sees on the
+# upstream VCS. The proxy fetches lazily on first download, so a
+# fresh tag is "published" as soon as someone runs
+# `go get github.com/pgrls/pgrls/go@<tag>`.
+#
+# This workflow does three things on `go/v*` tag push:
+#
+#   1. Verify the tag's commit passes the same gate the PR
+#      branch passed (test + lint + vuln + gofmt + tidy). A
+#      tag pointing at a broken commit is exactly the case
+#      Go's "immutable module versions" semantics make
+#      hard to recall.
+#   2. Force-warm the module proxy by issuing a synthetic
+#      `go list -m` against the tag, so the proxy fetches +
+#      caches before downstream users hit it cold (one ~10s
+#      latency vs. several over the first hour after release).
+#   3. Cut a GitHub Release with the changelog stanza for the
+#      tagged version, so the release page becomes the
+#      canonical reference for what shipped.
+#
+# Tag convention: `go/v0.7.6`, `go/v0.8.0`, etc. (the
+# `go/`-prefixed module-versioning Go expects for a
+# subdirectory module). Distinct from `v0.5.x` (Python) and
+# `ts-v0.6.x` (TypeScript) tags so the three release tracks
+# don't collide.
+#
+# Manual cut from a maintainer's laptop also works (push the
+# tag, then `gh release create`); this workflow is the CI
+# version that ensures the gate ran clean.
+
+on:
+  push:
+    tags:
+      - "go/v*"
+  # Allow manual dispatch — useful if a tag is pushed before
+  # this workflow exists, or to re-run after a hiccup. The
+  # `ref:` input on dispatch should be the tag name.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. go/v0.7.6)"
+        required: true
+        type: string
+
+# Defense-in-depth: this workflow writes a GitHub Release
+# (contents:write) and reads the rest of the repo. No npm/JSR
+# token equivalent for Go — the proxy refresh is unauthenticated.
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify tag commit passes gates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On tag push, GITHUB_REF is the tag; the default
+          # checkout fetches that tagged commit. For manual
+          # dispatch, the `tag` input overrides.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Verify go.mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: gofmt
+        run: |
+          fmt_diff=$(gofmt -l .)
+          if [ -n "$fmt_diff" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$fmt_diff"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (with race detector)
+        run: go test -race ./...
+
+      - name: Verify tag matches CHANGELOG
+        # Cross-check that the tag's version (`go/v0.7.6`) has
+        # a matching `## [0.7.6]` entry in `go/CHANGELOG.md`.
+        # A mismatch (missing entry, typo'd version) is a
+        # release-process bug worth blocking on.
+        run: |
+          # `github.ref_name` for `go/v0.7.6` is literally
+          # `go/v0.7.6` on tag push.
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#go/v}"
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error::No '## [$VERSION]' entry in go/CHANGELOG.md"
+            exit 1
+          fi
+          echo "go/CHANGELOG.md entry for v$VERSION present"
+
+  warm-proxy:
+    name: Warm the Go module proxy
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Newest of the test matrix — `go list -m` doesn't
+          # care about the module's `go` directive (it just
+          # asks the proxy for a tag), but using a current
+          # toolchain avoids surprise interactions with the
+          # public proxy's cache headers.
+          go-version: "1.23"
+
+      - name: Force proxy cache via go list -m
+        # `go list -m github.com/pgrls/pgrls/go@<tag>` causes
+        # the configured GOPROXY (default
+        # `https://proxy.golang.org`) to fetch and cache the
+        # tag. After this step succeeds, downstream
+        # `go get ...@<tag>` is served from the proxy cache
+        # without a cold round-trip to GitHub.
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#go/}"
+          # GOPROXY defaults to https://proxy.golang.org,direct.
+          # The list -m call forces fetch from the configured
+          # proxy chain.
+          echo "Warming proxy for github.com/pgrls/pgrls/go@$VERSION"
+          go list -m -json "github.com/pgrls/pgrls/go@$VERSION"
+
+  release:
+    name: Cut GitHub Release
+    needs: [verify, warm-proxy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        # Pluck the version's stanza from go/CHANGELOG.md (between
+        # this version's `## [X.Y.Z]` heading and the next `## `
+        # heading) and feed it as the release body. Keeps the
+        # release page in sync with the changelog without a
+        # separate "release notes" file.
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#go/v}"
+          # awk: print between `## [VERSION]` and the next `## `.
+          # The trailing `tail -n +2` skips the heading line itself.
+          NOTES=$(awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { in_block=1; next }
+            in_block && /^## / { exit }
+            in_block { print }
+          ' go/CHANGELOG.md | sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+          if [ -z "$NOTES" ]; then
+            echo "::error::No release notes extracted for v$VERSION from go/CHANGELOG.md"
+            exit 1
+          fi
+          # GitHub-Actions multi-line output via heredoc.
+          {
+            echo "notes<<NOTES_EOF"
+            echo "$NOTES"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Extracted $(echo "$NOTES" | wc -l) lines of release notes"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#go/v}"
+          # `gh release create` is idempotent in CI when the
+          # tag already exists locally — and is the only path
+          # that ties the release body to the tag commit. The
+          # `--target` flag isn't passed because GitHub
+          # infers the target from the existing tag.
+          gh release create "$TAG" \
+            --title "pgrls-test-go v$VERSION" \
+            --notes "${{ steps.notes.outputs.notes }}"

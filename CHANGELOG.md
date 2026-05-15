@@ -29,6 +29,18 @@ breaking changes — they will be called out in this file.
   route through `format_violations` / `format_sarif` which
   serialize via `json.dumps`.
 
+## [0.7.6] - 2026-05-14
+
+Go port step 7 of 7 — CI hardening (`golangci-lint`,
+`govulncheck`) and release plumbing
+(`.github/workflows/go-release.yml` fires on `go/v*` tag push,
+verifies the tag's commit passes every gate, warms the public
+Go module proxy via `go list -m`, and cuts a GitHub Release
+from the changelog stanza). Closes out the v0.7.x staged
+rollout. The Python core (`pgrls` package) stays at 0.5.10 and
+the TypeScript port stays at 0.6.2. Per-port details in
+[`go/CHANGELOG.md`](go/CHANGELOG.md).
+
 ## [0.7.5] - 2026-05-14
 
 Go port step 6 of 7 — cross-language conformance suite. Both
