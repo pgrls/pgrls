@@ -1345,9 +1345,14 @@ Three layers, the bottom one is a documented contract not code:
   fixture used by the Python conformance suite; the TS port
   hand-rolls its own `FIXTURE_SQL` covering the same Layer 1
   criteria — see the "Writing additional language ports"
-  section's pattern list below) added in v0.7.5 (step 6 of 7
-  — final step adds CI hardening and release plumbing). Python is
-  the reference implementation. `PROTOCOL_VERSION = 1`.
+  section's pattern list below) added in v0.7.5, and CI
+  hardening (`golangci-lint`, `govulncheck`) + release plumbing
+  (`.github/workflows/go-release.yml` warms the Go module proxy
+  and cuts a GitHub Release from the `go/CHANGELOG.md` stanza
+  on `go/v*` tag push) added in v0.7.6 (step 7 of 7 — final
+  step in the v0.7.x staged rollout; future Go-port releases
+  ship as `go/v0.8.x`). Python is the reference
+  implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
   dependency. Exposes `as_role()` (context manager), `seed()`, `exec()`,
   `fetchall()`, and five assertion helpers (`assert_rows`, `assert_visible`,
@@ -1723,10 +1728,15 @@ These are intentional in the current release. Do not invent capabilities.
   Postgres + both adapter packages against the shared
   `tests/protocol/` SQL fixture used by the Python suite — the
   TS port hand-rolls its own `FIXTURE_SQL` covering the same
-  Layer 1 criteria) shipped in v0.7.5 (step 6 of 7).
-  Final v0.7.x step adds CI hardening + release plumbing. The
-  `pgrls lint / fix / snapshot / diff` CLIs stay Python — they
-  depend on pglast (no drop-in TS/Go equivalent).
+  Layer 1 criteria) shipped in v0.7.5; CI hardening
+  (`golangci-lint`, `govulncheck`) and release plumbing (a
+  tag-triggered `.github/workflows/go-release.yml` that warms
+  the Go module proxy and cuts a GitHub Release from the
+  `go/CHANGELOG.md` stanza) shipped in v0.7.6 (step 7 of 7,
+  closing out the v0.7.x staged rollout; future Go-port
+  releases ship as `go/v0.8.x`). The
+  `pgrls lint / fix / snapshot / diff` CLIs stay Python —
+  they depend on pglast (no drop-in TS/Go equivalent).
 
 ## Where to learn more
 

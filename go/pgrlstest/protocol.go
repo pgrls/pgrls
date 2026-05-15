@@ -7,7 +7,7 @@
 // sequence (savepoint-bracketed `SET LOCAL ROLE` + `set_config`
 // for the JWT claims, rollback to savepoint on scenario exit).
 //
-// **Status: step 6 of 7 (v0.7.5 — conformance suite).**
+// **Status: step 7 of 7 (v0.7.6 — CI hardening + release plumbing).**
 // v0.7.0 shipped the scaffold + ProtocolVersion + error types;
 // v0.7.1 added the Driver and Closer interfaces alongside the
 // QueryResult struct; v0.7.2 added the pgx and lib/pq driver
@@ -35,7 +35,18 @@
 // its own equivalent fixture, a deliberate fork-in-the-road
 // documented in `AGENTS.md` (which lists three valid patterns:
 // manifest reuse, full hand-roll, and the Go hybrid).
-// The final step adds CI hardening + release plumbing (v0.7.6).
+// v0.7.6 wraps the v0.7.x staged rollout with CI hardening
+// (`golangci-lint` v1.62.2 against a small high-signal linter
+// set, `govulncheck`@latest against the module's import graph
+// + a latest-stable-Go runner stdlib) and release plumbing (a
+// tag-triggered workflow at `.github/workflows/go-release.yml`
+// that re-runs the PR-branch gates against the tag commit —
+// tidy + gofmt + vet + race tests + golangci-lint +
+// govulncheck — plus a CHANGELOG-stanza cross-check, warms the
+// public Go module proxy via `go list -m`, and cuts a GitHub
+// Release from the changelog stanza extracted from
+// `go/CHANGELOG.md`). The v0.7.x sequence is complete; future
+// pgrls-test-go releases ship as `go/v0.8.x` tags.
 // See CHANGELOG.md for the per-step plan.
 package pgrlstest
 
