@@ -1,6 +1,6 @@
 """Shared allowlist parsers for rule options.
 
-Allowlist entries fall into three shapes:
+Allowlist entries fall into four shapes:
 
 * **Policy ID** (`schema.table.policy_name`) — used by every per-policy
   rule (SEC003, SEC005, SEC006, SEC008, SEC010, SEC011, PERF001,
@@ -12,6 +12,12 @@ Allowlist entries fall into three shapes:
 
 * **Qualified table ID** (`schema.table` only) — used by rules whose
   scope is the qualified table object specifically (SEC007).
+
+* **Qualified view ID** (`schema.view` only) — used by view-scoped
+  rules (VIEW001-VIEW004).
+
+* **Qualified function ID** (`schema.function` only) — used by
+  function-scoped rules (SEC014).
 
 Earlier versions had every rule do the bare list-of-strings check
 (`isinstance(raw, list) and all(isinstance(s, str))`) and accepted any
@@ -165,5 +171,38 @@ def parse_qualified_view_allowlist(
                 f"[lint.rules.{rule_id}].allowlist entry {entry!r} is "
                 f"not a valid qualified view ID. Expected "
                 f"'schema.view' (e.g. 'public.user_summary')."
+            )
+    return set(items)
+
+
+def parse_qualified_function_allowlist(
+    rule_id: str, options: dict[str, Any]
+) -> set[str]:
+    """Validate that every entry is `schema.function` (exactly two parts).
+
+    Used by SEC014 — the rule scope is the qualified function object.
+    Argument signatures are deliberately not part of the shape: an
+    overloaded function (same `schema.function` qname, different
+    arg types) is flagged once and allowlisted once; introspection
+    captures `pg_proc.proname` without signature.
+
+    Bare function name is rejected for the same reason
+    `parse_qualified_view_allowlist` rejects bare view names — two
+    same-named functions in different schemas would otherwise both
+    be silenced by a name-only entry.
+    """
+    raw = options.get("allowlist", [])
+    items = _list_of_strings(
+        rule_id,
+        raw,
+        "of the form 'schema.function'",
+    )
+    for entry in items:
+        parts = entry.split(".")
+        if len(parts) != 2 or not all(parts):
+            raise TypeError(
+                f"[lint.rules.{rule_id}].allowlist entry {entry!r} is "
+                f"not a valid qualified function ID. Expected "
+                f"'schema.function' (e.g. 'public.refresh_cache')."
             )
     return set(items)

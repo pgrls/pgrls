@@ -51,12 +51,6 @@ breaking changes — they will be called out in this file.
   as `SECURITY INVOKER` (RLS applies to caller) or documented
   allowlist needs human intent.
 
-### Changed
-- **Rule count: twenty-two → twenty-three** (`SEC001`–`SEC014`,
-  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`).
-  `README.md` status banner + rule table updated; `AGENTS.md`
-  rule overview reflects the new count.
-
 ## [0.5.11] - 2026-05-15
 
 ### Fixed

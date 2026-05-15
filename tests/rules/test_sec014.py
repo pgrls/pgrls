@@ -1,7 +1,7 @@
 """Unit tests for SEC014 — SECURITY DEFINER function audit (free-standing).
 
 The rule's scope is *every* SECDEF function in the introspected schemas
-— SEC014 is a "audit-every-SECDEF-surface" prompt, not a proof-of-leak.
+— SEC014 is an "audit every SECDEF surface" prompt, not a proof-of-leak.
 VIEW004 already analyses bodies for RLS-table reads; SEC013 catches
 trigger-mediated bypass paths. SEC014 fills the gap for functions
 called directly from application code.
@@ -35,9 +35,10 @@ def test_sec014_fires_on_every_secdef_function() -> None:
         ),
     )
     violations = SEC014().check(schema, options={})
-    # Order matches Schema.security_definer_functions iteration order
-    # (introspection-captured alphabetical (schema, name)). The
-    # fixture here just preserves the construction order.
+    # Rule preserves the input tuple's iteration order. (Real runs
+    # see introspection-sorted-by-qname tuples; this fixture
+    # deliberately uses construction order to pin "rule doesn't
+    # re-sort" rather than testing introspection's ordering.)
     assert [v.location for v in violations] == [
         "public.do_thing",
         "audit.log_change",

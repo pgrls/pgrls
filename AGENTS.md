@@ -821,6 +821,25 @@ functions in different schemas would otherwise both be silenced
 — Postgres allows the cross-schema collision, and a
 name-only allowlist would mask it.
 
+```toml
+[lint.rules.SEC014]
+allowlist = [
+    "audit.refresh_cache",      # reviewed 2026-05-15 — owner is a
+                                # restricted audit role, no RLS-table
+                                # reads in the body.
+    "public.tenant_signup",     # legitimate cross-tenant write under
+                                # admin approval; documented in
+                                # docs/runbooks/signup.md.
+]
+```
+
+**Language coverage.** SEC014 flags every SECDEF function
+regardless of `pg_proc.prolang` (`sql`, `plpgsql`, `c`, etc.).
+The language is included in the violation message so the
+operator's triage can prioritize parseable bodies (where
+VIEW004 may already have flagged the leak via view path) over
+opaque ones (where SEC014 is the only signal).
+
 Out of scope (intentional):
 
 * **Argument signatures** are not part of the allowlist shape.
@@ -831,14 +850,13 @@ Out of scope (intentional):
   them to a different name.
 * **Function-body reachability of RLS tables** is not gated
   here. VIEW004 already analyses bodies for RLS-table reads;
-  SEC014 is the "audit every SECDEF surface" prompt, not a
+  SEC014 is an "audit every SECDEF surface" prompt, not a
   proof-of-leak.
-* **Per-language behavior.** SEC014 flags `plpgsql`, `sql`,
-  `c`, etc. equally. The language is included in the message
-  so the operator's triage can prioritize parseable bodies
-  (where VIEW004 may already have flagged the leak via
-  view path) over opaque ones (where SEC014 is the only
-  signal).
+* **Cross-scope SECDEF functions.** A SECDEF function in a
+  schema outside `--schemas` is invisible to SEC014 (same
+  false-negative path VIEW004 documents). To audit such
+  functions, expand `--schemas` to include the function's
+  home schema.
 
 <a id="rule-perf001"></a>
 

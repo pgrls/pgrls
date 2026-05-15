@@ -49,42 +49,26 @@ Out of scope (intentional):
   already analyses bodies for RLS-table reads; doing it again in SEC014
   would either duplicate the analysis or under-report (e.g. a SECDEF
   function that writes to an RLS table via dynamic SQL pglast can't
-  parse). The rule is a "audit every SECDEF surface" prompt, not a
+  parse). The rule is an "audit every SECDEF surface" prompt, not a
   proof-of-leak.
+* **Cross-scope SECDEF functions.** A SECDEF function defined in a
+  schema outside the introspector's ``--schemas`` set is invisible to
+  SEC014 — `Schema.security_definer_functions` only carries what
+  introspection captured. Same false-negative path VIEW004 documents
+  for cross-scope calls. To audit such functions, expand
+  ``--schemas`` to include the function's home schema.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from pgrls.model import Schema, SecdefFunction
-from pgrls.rules._allowlist import _list_of_strings
+from pgrls.rules._allowlist import parse_qualified_function_allowlist
 from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
-    # `schema.function` form. Reuse the existing shape validator for
-    # consistency with VIEW004's `parse_qualified_view_allowlist` —
-    # both rules need exactly two non-empty `.`-separated parts.
-    # Function names in Postgres can contain `.` only when quoted
-    # (`"odd.name"`), which `pg_catalog.pg_proc.proname` introspection
-    # already normalizes, so a literal `split('.')` is unambiguous
-    # here. The hint string is rule-specific so a typo'd entry's
-    # error message names "function" rather than "view".
-    raw = options.get("allowlist", [])
-    items = _list_of_strings(
-        "SEC014",
-        raw,
-        "of the form 'schema.function'",
-    )
-    for entry in items:
-        parts = entry.split(".")
-        if len(parts) != 2 or not all(parts):
-            raise TypeError(
-                f"[lint.rules.SEC014].allowlist entry {entry!r} is "
-                f"not a valid qualified function ID. Expected "
-                f"'schema.function' (e.g. 'public.refresh_cache')."
-            )
-    return set(items)
+    return parse_qualified_function_allowlist("SEC014", options)
 
 
 class SEC014:
