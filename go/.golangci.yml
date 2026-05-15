@@ -8,7 +8,7 @@
 # easier than removing one.
 #
 # Cross-language analogue: TypeScript has ESLint + Prettier wired
-# at `ts/eslint.config.js` + `ts/.prettierrc.cjs`; Python has
+# at `ts/eslint.config.js` + `ts/.prettierrc.json`; Python has
 # ruff at the repo root. This file plays the same role for Go.
 #
 # golangci-lint config schema: v1 (compatible with v1.62.x, the
@@ -19,9 +19,9 @@
 
 run:
   # Allow tests to be parsed alongside the main package. The
-  # conformance suite intentionally uses build tags via testing
-  # (`-short` skip path); the linter shouldn't trip on the
-  # testing-only imports.
+  # conformance suite uses runtime gating (`testing.Short()` +
+  # an env-var fallback) rather than build tags; the linter
+  # shouldn't trip on the testing-only imports.
   timeout: 5m
 
 linters:
@@ -30,8 +30,8 @@ linters:
   # future release.
   disable-all: true
   enable:
-    # The four high-signal core linters every Go project should
-    # have on.
+    # Small high-signal linter set (five entries below — each
+    # has caught a real bug during the v0.7.x staged rollout).
     - errcheck    # Catches unchecked errors — the #1 source
                   # of "silent failures" in Go code.
     - govet       # Bundled with the Go toolchain; catches

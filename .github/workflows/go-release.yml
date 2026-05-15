@@ -11,11 +11,13 @@ name: go-release
 #
 # This workflow does three things on `go/v*` tag push:
 #
-#   1. Verify the tag's commit passes the same gate the PR
-#      branch passed (test + lint + vuln + gofmt + tidy). A
-#      tag pointing at a broken commit is exactly the case
-#      Go's "immutable module versions" semantics make
-#      hard to recall.
+#   1. Verify the tag's commit passes the same gates the PR
+#      branch passes (`tidy + gofmt + vet + race tests +
+#      golangci-lint + govulncheck`) plus a cross-check that
+#      the tag version has a matching `## [X.Y.Z]` stanza in
+#      `go/CHANGELOG.md`. A tag pointing at a broken commit is
+#      exactly the case Go's "immutable module versions"
+#      semantics make hard to recall.
 #   2. Force-warm the module proxy by issuing a synthetic
 #      `go list -m` against the tag, so the proxy fetches +
 #      caches before downstream users hit it cold (one ~10s
@@ -40,7 +42,7 @@ on:
       - "go/v*"
   # Allow manual dispatch — useful if a tag is pushed before
   # this workflow exists, or to re-run after a hiccup. The
-  # `ref:` input on dispatch should be the tag name.
+  # `tag` input should be the tag name (e.g. `go/v0.7.6`).
   workflow_dispatch:
     inputs:
       tag:
@@ -49,7 +51,7 @@ on:
         type: string
 
 # Defense-in-depth: this workflow writes a GitHub Release
-# (contents:write) and reads the rest of the repo. No npm/JSR
+# (contents: write) and reads the rest of the repo. No npm/JSR
 # token equivalent for Go — the proxy refresh is unauthenticated.
 permissions:
   contents: write
@@ -93,29 +95,82 @@ jobs:
         run: go vet ./...
 
       - name: Test (with race detector)
+        # The PR workflow runs with `-v` for log-readability;
+        # the release workflow keeps the run terse since the
+        # release-noise channel is the GitHub Release body,
+        # not the workflow logs.
         run: go test -race ./...
+
+      - name: golangci-lint
+        # Re-run the lint gate against the tag commit. Same
+        # version + config as the PR workflow's lint job.
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62.2
+          working-directory: go
+          args: --timeout=5m
 
       - name: Verify tag matches CHANGELOG
         # Cross-check that the tag's version (`go/v0.7.6`) has
         # a matching `## [0.7.6]` entry in `go/CHANGELOG.md`.
         # A mismatch (missing entry, typo'd version) is a
-        # release-process bug worth blocking on.
+        # release-process bug worth blocking on. Tag is
+        # routed through `env:` so the workflow stays safe
+        # against shell metacharacters in user-controlled
+        # `workflow_dispatch.inputs.tag`.
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
         run: |
-          # `github.ref_name` for `go/v0.7.6` is literally
-          # `go/v0.7.6` on tag push.
-          TAG="${{ inputs.tag || github.ref_name }}"
-          VERSION="${TAG#go/v}"
-          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+          # `github.ref_name` for `go/v0.7.6` push is literally
+          # `go/v0.7.6`; strip the `go/v` prefix.
+          VERSION="${TAG_NAME#go/v}"
+          # Use a literal-prefix match (not a regex) so version
+          # dots aren't interpreted as wildcards. `grep -F`
+          # would also work; awk's `index()` keeps the script
+          # self-contained.
+          if ! awk -v v="$VERSION" 'BEGIN{ok=1} {if (index($0, "## [" v "]") == 1) {ok=0; exit}} END{exit ok}' CHANGELOG.md; then
             echo "::error::No '## [$VERSION]' entry in go/CHANGELOG.md"
             exit 1
           fi
           echo "go/CHANGELOG.md entry for v$VERSION present"
 
-  warm-proxy:
-    name: Warm the Go module proxy
+  vuln:
+    name: govulncheck against tag commit
     needs: verify
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Go
+        # See the rationale in `go.yml`'s vuln job: pin to Go
+        # 1.23 (newest in the test matrix) so the runner's
+        # stdlib doesn't surface unpatched-in-older-line CVEs
+        # that aren't bugs in this module's code.
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go/go.sum
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  warm-proxy:
+    name: Warm the Go module proxy
+    needs: [verify, vuln]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -125,6 +180,7 @@ jobs:
           # toolchain avoids surprise interactions with the
           # public proxy's cache headers.
           go-version: "1.23"
+          cache-dependency-path: go/go.sum
 
       - name: Force proxy cache via go list -m
         # `go list -m github.com/pgrls/pgrls/go@<tag>` causes
@@ -132,19 +188,21 @@ jobs:
         # `https://proxy.golang.org`) to fetch and cache the
         # tag. After this step succeeds, downstream
         # `go get ...@<tag>` is served from the proxy cache
-        # without a cold round-trip to GitHub.
+        # without a cold round-trip to GitHub. Tag routed via
+        # env so workflow_dispatch input is shell-safe.
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          VERSION="${TAG#go/}"
+          VERSION="${TAG_NAME#go/}"
+          echo "Warming proxy for github.com/pgrls/pgrls/go@$VERSION"
           # GOPROXY defaults to https://proxy.golang.org,direct.
           # The list -m call forces fetch from the configured
           # proxy chain.
-          echo "Warming proxy for github.com/pgrls/pgrls/go@$VERSION"
           go list -m -json "github.com/pgrls/pgrls/go@$VERSION"
 
   release:
     name: Cut GitHub Release
-    needs: [verify, warm-proxy]
+    needs: [verify, vuln, warm-proxy]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -152,45 +210,59 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Extract release notes from CHANGELOG
-        id: notes
-        # Pluck the version's stanza from go/CHANGELOG.md (between
-        # this version's `## [X.Y.Z]` heading and the next `## `
-        # heading) and feed it as the release body. Keeps the
-        # release page in sync with the changelog without a
-        # separate "release notes" file.
+        # Pluck the version's stanza from go/CHANGELOG.md
+        # (between this version's `## [X.Y.Z]` heading and the
+        # next `## ` heading) and write it to a file. The
+        # subsequent step feeds the file to `gh release
+        # create --notes-file` rather than splicing the
+        # multi-line content into the `gh` shell command —
+        # CHANGELOG bodies contain backticks (`go list -m`,
+        # `errcheck`, etc.), and a literal interpolation into
+        # a double-quoted shell argument would let bash treat
+        # those as command-substitution boundaries.
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          VERSION="${TAG#go/v}"
-          # awk: print between `## [VERSION]` and the next `## `.
-          # The trailing `tail -n +2` skips the heading line itself.
-          NOTES=$(awk -v v="$VERSION" '
-            $0 ~ "^## \\[" v "\\]" { in_block=1; next }
+          VERSION="${TAG_NAME#go/v}"
+          # awk script with literal-prefix matching via
+          # `index()` so version dots aren't interpreted as
+          # regex wildcards. `next` skips the heading line so
+          # the file starts with the stanza body.
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { in_block=1; next }
             in_block && /^## / { exit }
             in_block { print }
-          ' go/CHANGELOG.md | sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
-          if [ -z "$NOTES" ]; then
+          ' go/CHANGELOG.md \
+            | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' \
+            > release-notes.md
+          if [ ! -s release-notes.md ]; then
             echo "::error::No release notes extracted for v$VERSION from go/CHANGELOG.md"
             exit 1
           fi
-          # GitHub-Actions multi-line output via heredoc.
-          {
-            echo "notes<<NOTES_EOF"
-            echo "$NOTES"
-            echo "NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "Extracted $(echo "$NOTES" | wc -l) lines of release notes"
+          echo "Extracted $(wc -l < release-notes.md) lines of release notes"
 
       - name: Create GitHub Release
+        # `gh release create` errors when a Release already
+        # exists for the tag — the prior `gh release view`
+        # gate makes the call idempotent across re-runs of
+        # this workflow (e.g. the `workflow_dispatch` retry
+        # path).
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          VERSION="${TAG#go/v}"
-          # `gh release create` is idempotent in CI when the
-          # tag already exists locally — and is the only path
-          # that ties the release body to the tag commit. The
-          # `--target` flag isn't passed because GitHub
-          # infers the target from the existing tag.
-          gh release create "$TAG" \
+          VERSION="${TAG_NAME#go/v}"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists; skipping create (re-run / dispatch retry)"
+            exit 0
+          fi
+          # `--verify-tag` makes gh fail-fast with a clear
+          # error if the tag doesn't exist on the remote (e.g.
+          # a typo'd workflow_dispatch input). `--notes-file`
+          # routes the backtick-bearing CHANGELOG content
+          # through a file, not the shell — see the
+          # extraction step's comment.
+          gh release create "$TAG_NAME" \
             --title "pgrls-test-go v$VERSION" \
-            --notes "${{ steps.notes.outputs.notes }}"
+            --notes-file release-notes.md \
+            --verify-tag

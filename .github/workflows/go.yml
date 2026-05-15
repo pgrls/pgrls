@@ -94,8 +94,9 @@ jobs:
     name: golangci-lint
     # Lint runs once (not per-Go-version) since the lint config
     # is version-agnostic — checking it against 2 Gos doubles
-    # CI minutes without catching new bugs. Pinned to the
-    # `go-version` declared in go.mod via setup-go's auto-detect.
+    # CI minutes without catching new bugs. Picks the
+    # `go-version` declared in go.mod via setup-go's
+    # `go-version-file: go/go.mod` directive (see step below).
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -145,7 +146,7 @@ jobs:
         # in-newer-releases stdlib CVEs that aren't actually
         # bugs in this module's code — they're bugs in the
         # Go release line itself, fixed by upgrading Go. The
-        # test job below already exercises the module against
+        # test job above already exercises the module against
         # both 1.22 and 1.23 to catch compatibility issues;
         # govulncheck only needs to gate against vulnerable
         # *deps*, so a newer toolchain produces fewer
@@ -156,10 +157,12 @@ jobs:
           cache-dependency-path: go/go.sum
 
       - name: Install govulncheck
-        # Pinned to v1.1.4 — the last release compatible with
-        # the `go 1.22` toolchain target (govulncheck v1.3.0+
-        # requires `go 1.25`). Once go.mod bumps its floor in
-        # a future release the pin can move.
+        # Pinned to v1.1.4 — the last release that installs
+        # under the Go 1.23 runner toolchain above
+        # (govulncheck v1.3.0+ requires the install toolchain
+        # to be Go 1.25+). The pin moves forward when both
+        # the runner Go version and the module's go.mod floor
+        # bump together in a future release.
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
 
       - name: Run govulncheck

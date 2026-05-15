@@ -40,9 +40,11 @@
 // set, `govulncheck` v1.1.4 against the module's import graph
 // + Go 1.23 runner stdlib) and release plumbing (a
 // tag-triggered workflow at `.github/workflows/go-release.yml`
-// that verifies the tag's commit passes every gate, warms the
+// that re-runs the PR-branch gates against the tag commit —
+// tidy + gofmt + vet + race tests + golangci-lint +
+// govulncheck — plus a CHANGELOG-stanza cross-check, warms the
 // public Go module proxy via `go list -m`, and cuts a GitHub
-// Release with the changelog stanza extracted from
+// Release from the changelog stanza extracted from
 // `go/CHANGELOG.md`). The v0.7.x sequence is complete; future
 // pgrls-test-go releases ship as `go/v0.8.x` tags.
 // See CHANGELOG.md for the per-step plan.

@@ -51,22 +51,42 @@ as `go/v0.8.x` tags.
 
 - **`.github/workflows/go-release.yml`** — tag-triggered
   release workflow firing on `go/v*` tag push (and via
-  `workflow_dispatch` for manual cuts):
-  - **`verify`** job: re-checks out the tag's commit and runs
-    the same gates as the PR workflow (`go mod tidy`, gofmt,
-    `go vet`, `go test -race`) plus a cross-check that the
-    tag's version has a matching `## [X.Y.Z]` entry in
-    `go/CHANGELOG.md`. A mismatch (missing entry, typo'd
-    version) is a release-process bug worth blocking on.
-  - **`warm-proxy`** job: issues `go list -m
+  `workflow_dispatch` for manual cuts). Four sequenced jobs:
+  - **`verify`** re-checks out the tag's commit and runs every
+    gate from the PR workflow's `test` + `lint` jobs (tidy,
+    gofmt, vet, race tests, golangci-lint) plus a cross-check
+    that the tag's version has a matching `## [X.Y.Z]` entry
+    in `go/CHANGELOG.md` (literal-prefix match — version dots
+    aren't interpreted as regex wildcards). A mismatch
+    (missing entry, typo'd version) is a release-process bug
+    worth blocking on.
+  - **`vuln`** runs govulncheck v1.1.4 (Go 1.23 runner, same
+    rationale as `go.yml`'s vuln job) against the tag commit.
+    Separate from `verify` so its failure profile is legible
+    in the workflow run summary.
+  - **`warm-proxy`** issues `go list -m
     github.com/pgrls/pgrls/go@<version>` so the default
     `proxy.golang.org` fetches and caches the tag, avoiding a
     cold-cache stall the first time a user runs
     `go get github.com/pgrls/pgrls/go@<tag>`.
-  - **`release`** job: extracts the version's stanza from
-    `go/CHANGELOG.md` via awk (between `## [X.Y.Z]` and the
-    next `## ` heading), writes the result as the GitHub
-    Release body, and calls `gh release create`.
+  - **`release`** extracts the version's stanza from
+    `go/CHANGELOG.md` via awk (literal-prefix `index()` match
+    plus the trailing-blank-line trim), writes it to
+    `release-notes.md`, and calls
+    `gh release create … --notes-file release-notes.md
+    --verify-tag`. The notes-file path is critical — CHANGELOG
+    stanzas contain backticks (e.g. `` `errcheck` ``), and
+    splicing them into the shell `--notes` argument would let
+    bash interpret each backtick-delimited span as a command
+    substitution. `gh release view` gates the create so re-
+    runs (workflow_dispatch retry) don't error on
+    "release already exists".
+
+  All shell `run:` steps route user-controlled inputs
+  (`workflow_dispatch.inputs.tag`, `github.ref_name`) through
+  `env:` declarations rather than direct `${{ … }}`
+  interpolation, so a malformed dispatch input can't smuggle
+  shell metacharacters into the script body.
 
 ### Changed
 

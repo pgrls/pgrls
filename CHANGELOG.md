@@ -34,12 +34,15 @@ breaking changes — they will be called out in this file.
 Go port step 7 of 7 — CI hardening (`golangci-lint`,
 `govulncheck`) and release plumbing
 (`.github/workflows/go-release.yml` fires on `go/v*` tag push,
-verifies the tag's commit passes every gate, warms the public
-Go module proxy via `go list -m`, and cuts a GitHub Release
-from the changelog stanza). Closes out the v0.7.x staged
-rollout. The Python core (`pgrls` package) stays at 0.5.10 and
-the TypeScript port stays at 0.6.2. Per-port details in
-[`go/CHANGELOG.md`](go/CHANGELOG.md).
+re-runs the PR-branch gates against the tag commit —
+tidy + gofmt + vet + race tests + golangci-lint + govulncheck
+— plus a CHANGELOG-stanza cross-check, warms the public Go
+module proxy via `go list -m`, and cuts a GitHub Release from
+the changelog stanza via `--notes-file` so backtick-bearing
+CHANGELOG content survives the shell intact). Closes out the
+v0.7.x staged rollout. The Python core (`pgrls` package) stays
+at 0.5.10 and the TypeScript port stays at 0.6.2. Per-port
+details in [`go/CHANGELOG.md`](go/CHANGELOG.md).
 
 ## [0.7.5] - 2026-05-14
 
