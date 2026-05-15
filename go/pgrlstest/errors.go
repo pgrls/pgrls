@@ -62,12 +62,15 @@ func (e *Error) Is(target error) bool {
 // "the test framework itself broke" from "the schema's RLS is
 // wrong" can match on `errors.Is(err, pgrlstest.ErrAssertion)`.
 //
-// `AssertionError` does NOT wrap a driver error — the driver
-// either succeeded with surprising rows (assert-rows or assert-
-// visible failure) or threw the wrong error (assert-rejected
-// failure with a non-42501 SQLSTATE, which becomes a
-// `*pgrlstest.Error` with `Cause` set to the original driver
-// error, not an AssertionError).
+// `AssertionError` does NOT carry an `Unwrap` chain — its `Msg`
+// includes the underlying driver error's type and message when
+// applicable (the `AssertRejected` wrong-shape-error case
+// includes `%T: %s` of the underlying error in the message).
+// The Go-side parity is with the TS port, which constructs the
+// message at throw time rather than chaining a `from exc`
+// (Python's idiom); Go callers use `errors.Is(err, ErrAssertion)`
+// to route assertion failures, and read `err.Error()` for the
+// underlying error's text when present.
 type AssertionError struct {
 	Msg string
 }
