@@ -1397,8 +1397,8 @@ the UPDATE/DELETE you actually want to execute.
 
 The protocol contract at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md)
 specifies what every conformant client must do — wire sequence, error class
-mapping, savepoint semantics, conformance criteria. Two approaches to
-v1-conformance both work:
+mapping, savepoint semantics, conformance criteria. Three patterns
+satisfy v1-conformance:
 
 1. **Reuse the language-agnostic manifest.** The
    [`tests/protocol/`](tests/protocol/) directory contains a SQL schema, seed

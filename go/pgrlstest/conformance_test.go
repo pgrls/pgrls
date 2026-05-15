@@ -39,13 +39,12 @@ package pgrlstest_test
 // Fixture source: the Go port reads the same
 // `tests/protocol/{schema,seed}.sql` files the Python
 // conformance suite (`tests/protocol/test_protocol_conformance.py`)
-// consumes — Python-↔-Go fixture sharing. The TypeScript port
+// consumes — Python ↔ Go fixture sharing. The TypeScript port
 // hand-rolls its own `FIXTURE_SQL` in `ts/test/conformance/
 // _helpers.ts` covering the same four Layer 1 criteria; that
-// divergence is documented in `AGENTS.md` as a deliberate
-// fork-in-the-road documented in `AGENTS.md` (which lists
-// three valid patterns: manifest reuse, full hand-roll, and
-// this Go hybrid).
+// divergence is a deliberate fork-in-the-road documented in
+// `AGENTS.md` (which lists three valid patterns: manifest reuse,
+// full hand-roll, and this Go hybrid).
 //
 // Docker availability: when any setup step fails (Docker not
 // reachable, image pull / port-allocation rejection, DSN
