@@ -2,7 +2,8 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 9 (v9 added top-level ``bypassrls_roles`` for SEC016;
+Currently version 10 (v10 added top-level ``leakproof_functions`` for
+SEC017; v9 added top-level ``bypassrls_roles`` for SEC016;
 v8 added ``search_path`` to ``SecdefFunction``
 for SEC015; v7 added per-table ``indexes`` for PERF003; v6
 added per-table ``triggers`` for SEC013; v5 added per-column type
@@ -22,6 +23,7 @@ __all__ = [
     "Column",
     "Grant",
     "Index",
+    "LeakproofFunction",
     "Policy",
     "PolicyCommand",
     "SNAPSHOT_VERSION",
@@ -36,7 +38,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 9
+SNAPSHOT_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -378,6 +380,42 @@ class BypassRlsRole:
 
 
 @dataclass(frozen=True)
+class LeakproofFunction:
+    """A function carrying the LEAKPROOF attribute.
+
+    Captured in snapshot v10+ for SEC017. A ``LEAKPROOF`` function
+    asserts to the planner that it has no side channels — it will
+    not leak information about its arguments through error messages,
+    timing, or any other observable behaviour. On that promise the
+    planner is permitted to evaluate the function *below* a security
+    barrier: ahead of the row-level security qual, ahead of a
+    ``security_barrier`` view's filter. A function wrongly marked
+    ``LEAKPROOF`` therefore becomes a data-leak vector — applied to a
+    column of an RLS-protected table, it runs on rows the caller
+    cannot see, and any error it raises (or timing it exhibits)
+    discloses those rows' contents.
+
+    Introspection captures only functions whose
+    ``pg_proc.proleakproof`` is true, within the introspected
+    schemas — the audit-relevant subset, mirroring how
+    ``security_definer_functions`` captures only SECDEF functions.
+    Postgres's own built-in leakproof functions live in
+    ``pg_catalog``, outside the linted schemas, so they never appear
+    here; what remains is the user-defined functions a superuser
+    deliberately marked ``LEAKPROOF`` (only a superuser can).
+
+    Only the qualified name is captured: SEC017 is an audit prompt,
+    not a body analysis. Proving a function actually is — or is
+    not — leakproof would require inspecting every error path and
+    timing characteristic of its body, exactly the brittle analysis
+    the rule deliberately does not attempt. The operator confirms
+    the ``LEAKPROOF`` claim by hand, or removes the marking.
+    """
+
+    qualified_name: str
+
+
+@dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
     views: tuple[View, ...] = ()
@@ -390,6 +428,15 @@ class Schema:
     # round-trip with `bypassrls_roles=()` so SEC016 finds nothing to
     # flag against a pre-v9 snapshot until it is re-captured.
     bypassrls_roles: tuple[BypassRlsRole, ...] = ()
+    # Functions carrying the LEAKPROOF attribute — populated in
+    # snapshot v10+. SEC017 walks this; introspection captures only
+    # functions WHERE `pg_proc.proleakproof` in the introspected
+    # schemas (the audit-relevant subset). Default `()` keeps callers
+    # that construct `Schema(...)` without functions (unit tests,
+    # older snapshots) working unchanged; v3-v9 baselines round-trip
+    # with `leakproof_functions=()` so SEC017 finds nothing to flag
+    # against a pre-v10 snapshot until it is re-captured.
+    leakproof_functions: tuple[LeakproofFunction, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -559,13 +606,28 @@ class Schema:
                 }
                 for r in self.bypassrls_roles
             ],
+            # v10 extension — emit functions carrying the LEAKPROOF
+            # attribute. SEC017 reads this. Order matches
+            # `Schema.leakproof_functions` (sorted by qualified name
+            # at introspection time) for snapshot determinism. v3-v9
+            # baselines round-trip with `leakproof_functions=()` →
+            # empty array.
+            "leakproof_functions": [
+                {"qualified_name": f.qualified_name}
+                for f in self.leakproof_functions
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v9 snapshot dict.
+        """Reconstruct a Schema from a v3-v10 snapshot dict.
 
-        v9 (current): adds top-level ``bypassrls_roles`` for SEC016.
+        v10 (current): adds top-level ``leakproof_functions`` for
+        SEC017. v3-v9 snapshots have no ``leakproof_functions`` key;
+        they load with ``leakproof_functions=()`` — SEC017 finds
+        nothing to flag until the snapshot is re-captured against a
+        live database.
+        v9: adds top-level ``bypassrls_roles`` for SEC016.
         v3-v8 snapshots have no ``bypassrls_roles`` key; they load
         with ``bypassrls_roles=()`` — SEC016 finds nothing to flag
         until the snapshot is re-captured against a live database.
@@ -600,12 +662,12 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9. "
-                "v1 / v2 snapshots must be regenerated against the current "
-                "schema."
+                f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
+                "10. v1 / v2 snapshots must be regenerated against the "
+                "current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -772,11 +834,23 @@ class Schema:
             for r in raw_roles
         )
 
+        # `leakproof_functions` is a v10+ field. v3-v9 snapshots have
+        # no `leakproof_functions` key; `.get(..., [])` loads them
+        # with an empty tuple — SEC017 then finds nothing to flag
+        # (correct, since the snapshot didn't capture functions).
+        # Re-snapshot against a live database (v10) to populate it.
+        raw_leakproof = payload.get("leakproof_functions", [])
+        leakproof_functions = tuple(
+            LeakproofFunction(qualified_name=f["qualified_name"])
+            for f in raw_leakproof
+        )
+
         return cls(
             tables=tuple(tables),
             views=views,
             security_definer_functions=secdef_funcs,
             bypassrls_roles=bypassrls_roles,
+            leakproof_functions=leakproof_functions,
         )
 
     def to_sql(self) -> str:

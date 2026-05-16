@@ -10,6 +10,60 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.15] - 2026-05-15
+
+### Added
+- **SEC017 — function with the `LEAKPROOF` attribute is evaluated
+  below the RLS barrier** (severity: warning). Flags every
+  function in the introspected schemas carrying the `LEAKPROOF`
+  attribute.
+
+  A `LEAKPROOF` function promises the planner it has no side
+  channels — no information about its arguments escapes via error
+  messages, timing, or any other observable behaviour. On that
+  promise the planner may evaluate the function *below* a security
+  barrier: ahead of a table's row-level security qual, ahead of a
+  `security_barrier` view's `WHERE`. A non-leakproof function is
+  held above the barrier and only ever sees rows the caller is
+  entitled to.
+
+  A function *marked* `LEAKPROOF` but not actually leak-free is a
+  data-leak vector. Applied to a column of an RLS-protected table
+  it runs on every row — including rows the caller's policy would
+  hide — and an error it raises (or argument-dependent timing) can
+  disclose those rows. The classic shape:
+  `SELECT * FROM rls_table WHERE leaky_fn(secret_col) = 'probe'` —
+  the planner pushes `leaky_fn` below the RLS qual and the attacker
+  reads `secret_col` from the error text or response time.
+
+  Marking a function `LEAKPROOF` requires superuser, so it is
+  always deliberate. SEC017 surfaces every such function for an
+  explicit audit decision: confirm no error path and no timing
+  channel exposes an argument, or remove the marking with
+  `ALTER FUNCTION name(argtypes) NOT LEAKPROOF`. pgrls does not
+  parse the body to prove leakproofness (the brittle analysis the
+  rule deliberately avoids). Postgres's built-in leakproof
+  functions live in `pg_catalog`, outside the linted schemas, so
+  they never surface. Allowlist by qualified function name
+  (`schema.function`); overloads collapse to one finding.
+
+  SEC017 is the third attribute-level audit rule: SEC014/SEC015
+  flag `SECURITY DEFINER` functions, SEC016 flags `BYPASSRLS`
+  roles, and SEC017 flags `LEAKPROOF` functions.
+
+### Changed
+- **Snapshot format v9 → v10.** Snapshots gain a top-level
+  `leakproof_functions` array — the qualified names of functions
+  carrying the `LEAKPROOF` attribute, introspected from
+  `pg_proc.proleakproof` (only functions `WHERE proleakproof` in
+  the introspected schemas are captured; overloads are collapsed).
+  `Schema.from_snapshot` still accepts versions 3–10. A v3–v9
+  snapshot loads with `leakproof_functions = []` (the field did
+  not exist), so SEC017 finds nothing to flag against it —
+  re-snapshot against a live database to capture the functions.
+- **Rule count: twenty-five → twenty-six** (`SEC001`–`SEC017`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`).
+
 ## [0.5.14] - 2026-05-15
 
 ### Added

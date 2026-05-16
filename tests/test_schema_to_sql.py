@@ -385,12 +385,13 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_nine():
-    # Bumped 8 → 9 in v0.5.14 to add the top-level `bypassrls_roles`
-    # array for SEC016 (additive — Schema.to_sql() does not emit
-    # CREATE ROLE DDL, so the bump is orthogonal to this file's
-    # coverage). Pin so a future bump is deliberate.
-    assert SNAPSHOT_VERSION == 9
+def test_snapshot_version_is_ten():
+    # Bumped 9 → 10 in v0.5.15 to add the top-level
+    # `leakproof_functions` array for SEC017 (additive —
+    # Schema.to_sql() does not emit CREATE FUNCTION DDL, so the bump
+    # is orthogonal to this file's coverage). Pin so a future bump
+    # is deliberate.
+    assert SNAPSHOT_VERSION == 10
 
 
 def test_to_snapshot_emits_column_details_array():

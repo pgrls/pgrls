@@ -241,3 +241,16 @@ CREATE POLICY tenant_unindexed ON public.allbad_perf003
 -- non-superuser BYPASSRLS role regardless of login capability.
 DROP ROLE IF EXISTS allbad_sec016_role;
 CREATE ROLE allbad_sec016_role BYPASSRLS;
+
+-- SEC017: a function carrying the LEAKPROOF attribute. The planner
+-- may evaluate a LEAKPROOF function below a security barrier (the
+-- RLS qual, or a security_barrier view filter). If it is not
+-- genuinely side-channel-free it leaks RLS-protected rows. It is
+-- created SECURITY INVOKER (the CREATE FUNCTION default) so that
+-- SEC014 and SEC015 — which flag SECURITY DEFINER functions — stay
+-- silent on it, leaving only SEC017 to fire here. Unlike the
+-- SEC016 role above, a function is schema-scoped, so the per-test
+-- `DROP SCHEMA public CASCADE` reset cleans it up with no manual
+-- teardown needed.
+CREATE FUNCTION public.allbad_sec017_leaky(int) RETURNS boolean
+    LANGUAGE sql LEAKPROOF AS 'SELECT $1 > 0';
