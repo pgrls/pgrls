@@ -62,7 +62,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 8,
+        "version": 9,
         "tables": [
             {
                 "schema": "public",
@@ -92,6 +92,7 @@ def test_schema_to_snapshot_shape() -> None:
         ],
         "views": [],
         "security_definer_functions": [],
+        "bypassrls_roles": [],
     }
 
 
@@ -217,13 +218,13 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_eight_after_search_path_addition() -> None:
-    # `SecdefFunction.search_path` was added for v0.5.13 (SEC015) —
-    # SNAPSHOT_VERSION bumped from 7 → 8 per the model.py docstring
-    # contract that additive structural changes bump the version.
-    # Pin the new version so a future bump is deliberate.
+def test_snapshot_version_is_nine_after_bypassrls_roles_addition() -> None:
+    # The top-level `bypassrls_roles` array was added for v0.5.14
+    # (SEC016) — SNAPSHOT_VERSION bumped from 8 → 9 per the model.py
+    # docstring contract that additive structural changes bump the
+    # version. Pin the new version so a future bump is deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 8
+    assert snap["version"] == 9
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -431,15 +432,16 @@ def test_schema_by_qname_is_cached_across_calls() -> None:
     assert first is second  # pragma: no mutate
 
 
-def test_snapshot_v7_top_level_keys_are_stable_contract() -> None:
+def test_snapshot_v9_top_level_keys_are_stable_contract() -> None:
     # Snapshot top-level keys are part of the public surface (any
     # consumer reading the JSON depends on these names). Pin
     # `version`, `tables`, `policies`, `views`,
-    # `security_definer_functions` so a quiet refactor that renames
-    # or drops a key fails this test rather than slipping past CI.
-    # The v6 bump (SEC013 triggers) and v7 bump (PERF003 indexes)
-    # both added per-table fields, not top-level keys — top-level
-    # set is unchanged from v5.
+    # `security_definer_functions`, `bypassrls_roles` so a quiet
+    # refactor that renames or drops a key fails this test rather
+    # than slipping past CI. The v6 (SEC013 triggers), v7 (PERF003
+    # indexes), and v8 (SEC015 search_path) bumps all added
+    # per-table or per-function fields, not top-level keys; the v9
+    # bump (SEC016) adds the top-level `bypassrls_roles` array.
     snap = Schema(tables=()).to_snapshot()
     assert set(snap.keys()) == {
         "version",
@@ -447,8 +449,9 @@ def test_snapshot_v7_top_level_keys_are_stable_contract() -> None:
         "policies",
         "views",
         "security_definer_functions",
+        "bypassrls_roles",
     }
-    assert snap["version"] == 8
+    assert snap["version"] == 9
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:

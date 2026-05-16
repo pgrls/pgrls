@@ -2,7 +2,8 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 8 (v8 added ``search_path`` to ``SecdefFunction``
+Currently version 9 (v9 added top-level ``bypassrls_roles`` for SEC016;
+v8 added ``search_path`` to ``SecdefFunction``
 for SEC015; v7 added per-table ``indexes`` for PERF003; v6
 added per-table ``triggers`` for SEC013; v5 added per-column type
 info via the new ``column_details`` per table; v4 added top-level
@@ -17,6 +18,7 @@ from functools import cached_property
 from typing import Any, Literal
 
 __all__ = [
+    "BypassRlsRole",
     "Column",
     "Grant",
     "Index",
@@ -34,7 +36,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 8
+SNAPSHOT_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -331,10 +333,63 @@ class SecdefFunction:
 
 
 @dataclass(frozen=True)
+class BypassRlsRole:
+    """A Postgres role carrying the BYPASSRLS attribute.
+
+    Captured in snapshot v9+ for SEC016. A role with BYPASSRLS skips
+    *every* row-level security policy on *every* table — RLS is
+    effectively off for any session whose current role holds the
+    attribute. Unlike a table owner (who bypasses RLS only until
+    ``FORCE ROW LEVEL SECURITY`` is set — see SEC002), a BYPASSRLS
+    role's bypass is unconditional and cluster-wide.
+
+    Introspection captures only roles whose ``pg_roles.rolbypassrls``
+    is true — the audit-relevant subset, mirroring how
+    ``security_definer_functions`` captures only SECDEF functions.
+    Every ``BypassRlsRole`` instance therefore represents a role that
+    holds BYPASSRLS; the attribute is not a field because it is
+    constant across the captured set.
+
+    Roles are cluster-global, not schema-scoped: this capture is
+    independent of the introspector's ``--schemas`` set, so SEC016 —
+    unlike the schema-scoped rules — has no out-of-scope blind spot.
+
+    Captured fields are the minimum SEC016 needs:
+
+    * ``name`` — ``pg_roles.rolname``. Identifies the role in the
+      violation message and is the SEC016 allowlist key (roles are
+      unqualified — there is no schema component).
+    * ``superuser`` — ``pg_roles.rolsuper``. A superuser bypasses RLS
+      unconditionally regardless of BYPASSRLS, so the attribute is
+      redundant noise on one; SEC016 skips superuser roles and flags
+      only the *ordinary-looking* roles whose RLS bypass is
+      surprising.
+    * ``can_login`` — ``pg_roles.rolcanlogin``. Tailors the SEC016
+      message: a LOGIN role can be connected to directly (an
+      application authenticating as it gets no RLS isolation); a
+      NOLOGIN role is reached only via ``SET ROLE`` by a member.
+      Both bypass RLS — ``can_login`` shapes the message, not the
+      verdict.
+    """
+
+    name: str
+    superuser: bool
+    can_login: bool
+
+
+@dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
     views: tuple[View, ...] = ()
     security_definer_functions: tuple[SecdefFunction, ...] = ()
+    # Roles carrying the BYPASSRLS attribute — populated in snapshot
+    # v9+. SEC016 walks this; introspection captures only roles WHERE
+    # `pg_roles.rolbypassrls` (the audit-relevant subset). Default `()`
+    # keeps callers that construct `Schema(...)` without roles (unit
+    # tests, older snapshots) working unchanged; v3-v8 baselines
+    # round-trip with `bypassrls_roles=()` so SEC016 finds nothing to
+    # flag against a pre-v9 snapshot until it is re-captured.
+    bypassrls_roles: tuple[BypassRlsRole, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -490,13 +545,31 @@ class Schema:
                 }
                 for f in self.security_definer_functions
             ],
+            # v9 extension — emit roles carrying the BYPASSRLS
+            # attribute. SEC016 reads this. Order matches
+            # `Schema.bypassrls_roles` (sorted by role name at
+            # introspection time) for snapshot determinism. v3-v8
+            # baselines round-trip with `bypassrls_roles=()` → empty
+            # array.
+            "bypassrls_roles": [
+                {
+                    "name": r.name,
+                    "superuser": r.superuser,
+                    "can_login": r.can_login,
+                }
+                for r in self.bypassrls_roles
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v8 snapshot dict.
+        """Reconstruct a Schema from a v3-v9 snapshot dict.
 
-        v8 (current): adds ``search_path`` to each SECDEF function
+        v9 (current): adds top-level ``bypassrls_roles`` for SEC016.
+        v3-v8 snapshots have no ``bypassrls_roles`` key; they load
+        with ``bypassrls_roles=()`` — SEC016 finds nothing to flag
+        until the snapshot is re-captured against a live database.
+        v8: adds ``search_path`` to each SECDEF function
         for SEC015. v4-v7 snapshots' SECDEF functions load with
         ``search_path=None`` (v3 has no SECDEF functions at all —
         ``security_definer_functions`` is a v4+ field).
@@ -527,10 +600,10 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8):
+        if version not in (3, 4, 5, 6, 7, 8, 9):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8. "
+                f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
@@ -684,10 +757,26 @@ class Schema:
             for f in raw_secdef_funcs
         )
 
+        # `bypassrls_roles` is a v9+ field. v3-v8 snapshots have no
+        # `bypassrls_roles` key; `.get(..., [])` loads them with an
+        # empty tuple — SEC016 then finds nothing to flag (correct,
+        # since the snapshot didn't capture roles). Re-snapshot
+        # against a live database (v9) to populate it.
+        raw_roles = payload.get("bypassrls_roles", [])
+        bypassrls_roles = tuple(
+            BypassRlsRole(
+                name=r["name"],
+                superuser=r["superuser"],
+                can_login=r["can_login"],
+            )
+            for r in raw_roles
+        )
+
         return cls(
             tables=tuple(tables),
             views=views,
             security_definer_functions=secdef_funcs,
+            bypassrls_roles=bypassrls_roles,
         )
 
     def to_sql(self) -> str:

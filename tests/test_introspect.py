@@ -849,6 +849,51 @@ def test_introspect_captures_secdef_function_search_path(
     assert by_name["public.sp_unpinned"].search_path is None
 
 
+def test_introspect_captures_bypassrls_roles(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC016 reads `Schema.bypassrls_roles`. Roles are cluster-
+    # global, so this end-to-end check confirms `_fetch_bypassrls_
+    # roles` decodes `pg_roles` (rolbypassrls / rolsuper /
+    # rolcanlogin) correctly against a live database, and that the
+    # `WHERE rolbypassrls` filter excludes a plain role. The
+    # DROP ... IF EXISTS bookends keep the cluster-global role
+    # namespace clean — the container is shared across tests, so a
+    # leaked BYPASSRLS role would make the e2e clean-DB check fail.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS pgrls_sec016_login;
+        DROP ROLE IF EXISTS pgrls_sec016_nologin;
+        DROP ROLE IF EXISTS pgrls_sec016_plain;
+        CREATE ROLE pgrls_sec016_login BYPASSRLS LOGIN;
+        CREATE ROLE pgrls_sec016_nologin BYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec016_plain NOBYPASSRLS;
+        """
+    )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        by_name = {r.name: r for r in schema.bypassrls_roles}
+        # Both BYPASSRLS roles are captured; the plain role —
+        # filtered out by `WHERE rolbypassrls` — is not.
+        assert "pgrls_sec016_login" in by_name
+        assert "pgrls_sec016_nologin" in by_name
+        assert "pgrls_sec016_plain" not in by_name
+        login = by_name["pgrls_sec016_login"]
+        assert login.superuser is False
+        assert login.can_login is True
+        nologin = by_name["pgrls_sec016_nologin"]
+        assert nologin.superuser is False
+        assert nologin.can_login is False
+    finally:
+        apply_sql(
+            """
+            DROP ROLE IF EXISTS pgrls_sec016_login;
+            DROP ROLE IF EXISTS pgrls_sec016_nologin;
+            DROP ROLE IF EXISTS pgrls_sec016_plain;
+            """
+        )
+
+
 def test_introspect_resolves_view_to_table_references(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

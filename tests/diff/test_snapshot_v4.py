@@ -5,6 +5,7 @@ import pytest
 
 from pgrls.model import (
     SNAPSHOT_VERSION,
+    BypassRlsRole,
     Index,
     Policy,
     Schema,
@@ -15,11 +16,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_8() -> None:
-    # Bumped 7 → 8 in v0.5.13 to add `search_path` to
-    # SecdefFunction for SEC015. v3–v7 baselines still load
-    # (Schema.from_snapshot accepts 3 through 8).
-    assert SNAPSHOT_VERSION == 8
+def test_snapshot_version_is_9() -> None:
+    # Bumped 8 → 9 in v0.5.14 to add top-level `bypassrls_roles`
+    # for SEC016. v3–v8 baselines still load (Schema.from_snapshot
+    # accepts 3 through 9).
+    assert SNAPSHOT_VERSION == 9
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -40,10 +41,10 @@ def test_to_snapshot_emits_views_field() -> None:
     )
     snap = schema.to_snapshot()
     # views added at v4; v5 added column_details; v6 added triggers;
-    # v7 added indexes; v8 added SecdefFunction.search_path (all
-    # additive and orthogonal to the views field this test
-    # exercises).
-    assert snap["version"] == 8
+    # v7 added indexes; v8 added SecdefFunction.search_path; v9
+    # added bypassrls_roles (all additive and orthogonal to the
+    # views field this test exercises).
+    assert snap["version"] == 9
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -401,3 +402,64 @@ def test_from_snapshot_v7_yields_none_search_path() -> None:
     }
     loaded = Schema.from_snapshot(v7)
     assert loaded.security_definer_functions[0].search_path is None
+
+
+def test_to_snapshot_emits_bypassrls_roles_field() -> None:
+    schema = Schema(
+        tables=(),
+        views=(),
+        bypassrls_roles=(
+            BypassRlsRole(
+                name="etl_worker", superuser=False, can_login=True
+            ),
+        ),
+    )
+    snap = schema.to_snapshot()
+    assert "bypassrls_roles" in snap
+    assert snap["version"] == 9
+    assert snap["bypassrls_roles"] == [
+        {"name": "etl_worker", "superuser": False, "can_login": True}
+    ]
+
+
+def test_from_snapshot_round_trips_v9_with_bypassrls_roles() -> None:
+    # SEC016 reads `Schema.bypassrls_roles` from the snapshot.
+    # Round-trip through `json.dumps` so the JSON shape matches a
+    # file-persisted snapshot — the same contract `pgrls diff`
+    # exercises. Mirrors the v6/v7/v8 round-trip tests.
+    import json
+
+    original = Schema(
+        tables=(),
+        views=(),
+        bypassrls_roles=(
+            BypassRlsRole(
+                name="admin_role", superuser=True, can_login=True
+            ),
+            BypassRlsRole(
+                name="replication_worker",
+                superuser=False,
+                can_login=False,
+            ),
+        ),
+    )
+    snap_json = json.dumps(original.to_snapshot())
+    loaded = Schema.from_snapshot(json.loads(snap_json))
+    assert loaded.bypassrls_roles == original.bypassrls_roles
+    assert loaded == original
+
+
+def test_from_snapshot_v8_yields_empty_bypassrls_roles() -> None:
+    # A v8 snapshot (v0.5.13) carries no `bypassrls_roles` key — the
+    # v9 addition. Loading must succeed and default the field to
+    # `()`. SEC016 then finds nothing to flag against the older
+    # snapshot until it's re-captured against a live database (v9).
+    v8 = {
+        "version": 8,
+        "tables": [],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [],
+    }
+    loaded = Schema.from_snapshot(v8)
+    assert loaded.bypassrls_roles == ()

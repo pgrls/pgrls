@@ -176,6 +176,22 @@ allowlist = []
 # separately.
 allowlist = []
 
+[lint.rules.SEC016]
+# Roles carrying the BYPASSRLS attribute. A role with BYPASSRLS
+# skips every row-level security policy on every table — RLS is
+# effectively off for it, unconditionally and cluster-wide. The
+# rule flags every non-superuser BYPASSRLS role (a superuser
+# bypasses RLS regardless, so the attribute is redundant noise
+# on one and SEC016 skips it). Fix: `ALTER ROLE name
+# NOBYPASSRLS`.
+#
+# Allowlist after confirming the role genuinely needs to bypass
+# RLS — typically only backup, logical-replication, or ETL
+# roles do. Entries are bare role names: Postgres roles are
+# cluster-global and have no schema component, so — unlike the
+# function/view/policy rules — there is nothing to qualify.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is

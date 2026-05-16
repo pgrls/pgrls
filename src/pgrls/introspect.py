@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 
 from pgrls.ast_utils import find_func_calls, parse_expr
 from pgrls.model import (
+    BypassRlsRole,
     Column,
     Grant,
     Index,
@@ -472,6 +473,37 @@ WHERE p.prosecdef = TRUE
 ORDER BY qname
 """
 
+# Roles carrying the BYPASSRLS attribute. A role with BYPASSRLS skips
+# every row-level security policy on every table — SEC016 surfaces
+# these so each one gets an explicit audit decision.
+#
+# `pg_catalog.pg_roles` is the catalog VIEW (not `pg_authid`): it is
+# readable by every connected role, so introspection works without
+# superuser. It exposes `rolbypassrls` / `rolsuper` / `rolcanlogin`
+# directly. The existing `_POLICIES_SQL` already joins `pg_roles` for
+# the same readability reason.
+#
+# `WHERE r.rolbypassrls` filters to the audit-relevant subset
+# (mirroring `_SECDEF_FUNCS_SQL`'s `WHERE p.prosecdef = TRUE`): the
+# captured set is exactly the roles SEC016 might flag, and a default
+# cluster — where no role has been granted BYPASSRLS — captures zero
+# rows. The Postgres-predefined `pg_*` roles (`pg_read_all_data`
+# etc.) do not carry `rolbypassrls`, so they never appear here.
+#
+# Roles are cluster-global — this query takes no schema parameter and
+# is independent of the introspector's `--schemas` set.
+#
+# ORDER BY rolname for snapshot determinism.
+_BYPASSRLS_ROLES_SQL = """
+SELECT
+    r.rolname AS name,
+    r.rolsuper AS superuser,
+    r.rolcanlogin AS can_login
+FROM pg_catalog.pg_roles r
+WHERE r.rolbypassrls
+ORDER BY r.rolname
+"""
+
 
 def _extract_search_path(config: list[str] | None) -> str | None:
     """Pull the `search_path` value out of a `pg_proc.proconfig` array.
@@ -520,6 +552,25 @@ def _fetch_secdef_functions(
             body=row["body"],
             language=row["lang"],
             search_path=_extract_search_path(row["config"]),
+        )
+        for row in cur.fetchall()
+    )
+
+
+def _fetch_bypassrls_roles(cur: Any) -> tuple[BypassRlsRole, ...]:
+    """Fetch every role carrying the BYPASSRLS attribute.
+
+    Returns a tuple of `BypassRlsRole` records sorted by role name
+    (the SQL `ORDER BY r.rolname` provides the determinism). Takes no
+    schema list — roles are cluster-global, so the captured set is the
+    same regardless of which schemas are being introspected.
+    """
+    cur.execute(_BYPASSRLS_ROLES_SQL)
+    return tuple(
+        BypassRlsRole(
+            name=row["name"],
+            superuser=row["superuser"],
+            can_login=row["can_login"],
         )
         for row in cur.fetchall()
     )
@@ -636,6 +687,11 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             available = _list_user_schemas(cur)
             raise ValueError(_missing_schema_message(missing, available))
 
+        # Roles are cluster-global — fetch once here so both the
+        # no-tables early return and the main path below see the
+        # same set without re-querying.
+        bypassrls_roles = _fetch_bypassrls_roles(cur)
+
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
         if not table_rows:
@@ -676,6 +732,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 tables=(),
                 views=views_early,
                 security_definer_functions=secdef_funcs_early,
+                bypassrls_roles=bypassrls_roles,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -867,4 +924,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         tables=tuple(tables),
         views=views,
         security_definer_functions=secdef_funcs,
+        bypassrls_roles=bypassrls_roles,
     )
