@@ -17,7 +17,7 @@ Allowlist entries fall into five shapes:
   rules (VIEW001-VIEW004).
 
 * **Qualified function ID** (`schema.function` only) — used by
-  function-scoped rules (SEC014).
+  function-scoped rules (SEC014, SEC015).
 
 Earlier versions had every rule do the bare list-of-strings check
 (`isinstance(raw, list) and all(isinstance(s, str))`) and accepted any
@@ -180,7 +180,8 @@ def parse_qualified_function_allowlist(
 ) -> set[str]:
     """Validate that every entry is `schema.function` (exactly two parts).
 
-    Used by SEC014 — the rule scope is the qualified function object.
+    Used by SEC014 and SEC015 — the rule scope is the qualified
+    function object.
     Argument signatures are deliberately not part of the shape: an
     overloaded function (same `schema.function` qname, different
     arg types) is flagged once and allowlisted once; introspection

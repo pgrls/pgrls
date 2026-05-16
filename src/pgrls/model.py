@@ -2,7 +2,8 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 7 (v7 added per-table ``indexes`` for PERF003; v6
+Currently version 8 (v8 added ``search_path`` to ``SecdefFunction``
+for SEC015; v7 added per-table ``indexes`` for PERF003; v6
 added per-table ``triggers`` for SEC013; v5 added per-column type
 info via the new ``column_details`` per table; v4 added top-level
 ``views``; v3 added ``grants`` to each table entry; v2 added
@@ -33,7 +34,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 7
+SNAPSHOT_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -307,11 +308,26 @@ class SecdefFunction:
     `sql` bodies; PL/pgSQL bodies start with `DECLARE`/`BEGIN`
     which pglast can't parse as a top-level statement, so they're
     skipped explicitly with a stderr warning.
+
+    `search_path` is the value of the function's `SET search_path`
+    clause (`pg_proc.proconfig`'s `search_path=` entry), or `None`
+    when the function pins no search_path at all. SEC015 (snapshot
+    v8+) reads this: a SECDEF function whose effective search_path
+    lets `pg_temp` be searched before the legitimate schemas is
+    exploitable via temp-object shadowing. `None` means the
+    function inherits the caller's search_path — attacker-
+    controlled, `pg_temp`-first — which is the unsafe default.
+    A non-`None` value is the raw GUC string as Postgres stores
+    it (e.g. `"pg_catalog, public, pg_temp"`); SEC015 tokenizes
+    it to check whether `pg_temp` is pinned last.
     """
 
     qualified_name: str
     body: str
     language: str
+    # None = no `SET search_path` clause (inherits caller's path).
+    # Snapshot v8+; v4–v7 snapshots load with search_path=None.
+    search_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -470,6 +486,7 @@ class Schema:
                     "qualified_name": f.qualified_name,
                     "body": f.body,
                     "language": f.language,
+                    "search_path": f.search_path,
                 }
                 for f in self.security_definer_functions
             ],
@@ -477,9 +494,13 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v7 snapshot dict.
+        """Reconstruct a Schema from a v3-v8 snapshot dict.
 
-        v7 (current): adds per-table ``indexes`` for PERF003.
+        v8 (current): adds ``search_path`` to each SECDEF function
+        for SEC015. v4-v7 snapshots' SECDEF functions load with
+        ``search_path=None`` (v3 has no SECDEF functions at all —
+        ``security_definer_functions`` is a v4+ field).
+        v7: adds per-table ``indexes`` for PERF003.
         v6: adds per-table ``triggers`` for SEC013.
         v5: adds per-column type info via the new ``column_details``
         array on each table. Required for ``Schema.to_sql()`` and
@@ -506,11 +527,11 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7):
+        if version not in (3, 4, 5, 6, 7, 8):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
-                f"pgrls release. Supported versions: 3, 4, 5, 6, 7. v1 / "
-                "v2 snapshots must be regenerated against the current "
+                f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8. "
+                "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
 
@@ -636,14 +657,20 @@ class Schema:
             )
             for v in raw_views
         )
-        # `security_definer_functions` is an additive v4 extension
-        # added after the initial v4 release of `views`. `.get(...,
-        # [])` keeps older v4 snapshots written before this extension
-        # loadable — they get an empty tuple, which means VIEW004
-        # finds nothing to flag (correct, since the snapshot didn't
-        # capture the bodies). Snapshot version stays at 4 because v4
-        # has not shipped externally yet; this is an in-development
-        # extension to v4, not a v5 bump.
+        # `security_definer_functions` is a v4+ field. `.get(..., [])`
+        # keeps older snapshots loadable — they get an empty tuple,
+        # which means VIEW004 / SEC014 / SEC015 find nothing to flag
+        # (correct, since the snapshot didn't capture the functions).
+        #
+        # `search_path` on each function is a v8 addition for SEC015.
+        # v4–v7 snapshots have no `search_path` key; `.get(...,
+        # None)` loads them with `search_path=None`. That maps to
+        # "no SET search_path clause" — which SEC015 treats as
+        # unsafe. A pre-v8 snapshot can't distinguish "function
+        # pinned a safe search_path" from "function pinned nothing",
+        # so SEC015 on a stale snapshot conservatively flags every
+        # SECDEF function. Re-snapshot against a live database (v8)
+        # to get the real search_path values.
         raw_secdef_funcs = (
             payload.get("security_definer_functions", []) if version >= 4 else []
         )
@@ -652,6 +679,7 @@ class Schema:
                 qualified_name=f["qualified_name"],
                 body=f["body"],
                 language=f["language"],
+                search_path=f.get("search_path"),
             )
             for f in raw_secdef_funcs
         )

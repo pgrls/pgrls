@@ -87,7 +87,7 @@ def test_snapshot_writes_to_stdout(pg_url: str, apply_sql) -> None:
     result = runner.invoke(main, ["snapshot", "--database-url", pg_url])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["version"] == 7
+    assert payload["version"] == 8
     assert any(t["name"] == "t" for t in payload["tables"])
 
 
@@ -103,7 +103,7 @@ def test_snapshot_writes_to_output_file(
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert payload["version"] == 7
+    assert payload["version"] == 8
     # File ends with newline (POSIX-friendly).
     assert out.read_text(encoding="utf-8").endswith("\n")
 
