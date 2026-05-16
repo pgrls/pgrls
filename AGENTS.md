@@ -911,7 +911,8 @@ add the clause) — but `pgrls fix` doesn't apply it: the
 needs the function's argument types, and introspection captures
 `proname` without `proargtypes`. Run the `ALTER FUNCTION` by
 hand, or allowlist the function after confirming its body
-fully-qualifies every object reference.
+fully-qualifies every object reference (in which case
+`search_path` is moot).
 
 The allowlist key is `schema.function` (two parts). Bare
 `function_name` is rejected for the same reason as SEC014.
