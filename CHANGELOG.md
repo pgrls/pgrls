@@ -10,6 +10,57 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-05-15
+
+### Added
+- **SEC016 — role with the `BYPASSRLS` attribute bypasses all
+  RLS** (severity: warning). Flags every non-superuser role
+  carrying the `BYPASSRLS` attribute.
+
+  A role granted `BYPASSRLS` skips *every* row-level security
+  policy on *every* table — RLS is not weakened for it, it is
+  simply off. The bypass is invisible: nothing in a table, a
+  policy, or a `GRANT` reveals that a particular role ignores
+  all of them, so an application connecting as a `BYPASSRLS`
+  role gets zero tenant isolation while every policy in the
+  schema still reads as airtight.
+
+  `BYPASSRLS` is unconditional and cluster-wide. It is not the
+  table-owner bypass SEC003 covers — `FORCE ROW LEVEL SECURITY`
+  does not touch a `BYPASSRLS` role. And it is not the
+  code-mediated `SECURITY DEFINER` bypass SEC013/SEC014/SEC015
+  cover — no function or ownership is involved; the role itself
+  is exempt.
+
+  SEC016 skips superuser roles: a superuser bypasses RLS via
+  `rolsuper` regardless, so the attribute is redundant noise on
+  one. The rule flags only the non-superuser roles, where an
+  RLS bypass is genuinely surprising. The fix is one
+  statement — `ALTER ROLE <name> NOBYPASSRLS` — but it is not
+  auto-applied: pgrls cannot tell a misconfigured application
+  role from a backup / logical-replication / ETL role that
+  legitimately needs the attribute. Allowlist by bare role
+  name (roles have no schema component) once the bypass is
+  confirmed intentional.
+
+  Roles are cluster-global, so SEC016 — unlike the
+  schema-scoped rules — has no out-of-scope blind spot: it sees
+  every `BYPASSRLS` role in the cluster regardless of the
+  introspected `--schemas` set.
+
+### Changed
+- **Snapshot format v8 → v9.** Snapshots gain a top-level
+  `bypassrls_roles` array — the roles carrying the `BYPASSRLS`
+  attribute, each with its `superuser` / `can_login` flags,
+  introspected from `pg_roles` (only roles `WHERE rolbypassrls`
+  are captured). `Schema.from_snapshot` still accepts versions
+  3–9. A v3–v8 snapshot loads with `bypassrls_roles = []` (the
+  field did not exist), so SEC016 finds nothing to flag against
+  it — re-snapshot against a live database to capture the
+  roles.
+- **Rule count: twenty-four → twenty-five** (`SEC001`–`SEC016`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`).
+
 ## [0.5.13] - 2026-05-15
 
 ### Added

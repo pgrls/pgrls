@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-four rules across four
+In the current release it ships **twenty-five rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -28,6 +28,8 @@ triggers fire as table owner),
 audit every SECDEF function),
 `SEC015` (SECURITY DEFINER function exposed to `pg_temp`
 search-path shadowing),
+`SEC016` (role with the `BYPASSRLS` attribute bypasses every
+RLS policy),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -224,7 +226,8 @@ ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
 
 If a specific role legitimately needs to bypass (e.g. a maintenance role
 that runs vacuum-style work), grant `BYPASSRLS` on that role rather than
-turning `FORCE` off table-wide.
+turning `FORCE` off table-wide. SEC016 then flags that role; allowlist it
+in `[lint.rules.SEC016]` once the need is confirmed.
 
 <a id="rule-sec003"></a>
 
@@ -948,6 +951,99 @@ Out of scope (intentional):
 * **Cross-scope functions.** A SECDEF function in a schema
   outside `--schemas` is invisible to SEC015. Expand
   `--schemas` to audit it.
+
+<a id="rule-sec016"></a>
+
+### SEC016 — Role with the BYPASSRLS attribute bypasses all RLS
+
+**Severity:** warning. **Auto-fix:** no (`pgrls` cannot tell a
+misconfigured application role from a backup / logical-replication
+/ ETL role that legitimately needs the attribute — the
+`ALTER ROLE … NOBYPASSRLS` decision needs human intent).
+
+A Postgres role granted the `BYPASSRLS` attribute skips **every**
+row-level security policy on **every** table. RLS is not weakened
+for that role — it is simply off. Any session whose current role
+holds the attribute reads and writes every row in every
+RLS-protected table as if no policy existed.
+
+The danger is that a `BYPASSRLS` role looks ordinary. Nothing in
+a table definition, a policy, or a `GRANT` reveals that a
+particular role ignores all of them. An application that connects
+as a `BYPASSRLS` role gets zero tenant isolation while every
+policy in the schema still reads as airtight — the bypass is
+invisible at every layer SEC001–SEC015 inspect.
+
+`BYPASSRLS` is unconditional and cluster-wide. Contrast the two
+other ways a session can end up not subject to RLS:
+
+* A **table owner** implicitly bypasses RLS on its own tables —
+  but only until `ALTER TABLE … FORCE ROW LEVEL SECURITY` is set,
+  which is exactly what SEC003 flags. `FORCE` does **not** touch a
+  `BYPASSRLS` role: it bypasses a FORCE'd table just the same.
+* A **superuser** bypasses RLS via `rolsuper`, also
+  unconditionally. A superuser additionally carrying `BYPASSRLS`
+  gains nothing — the attribute is redundant noise on one. SEC016
+  therefore **skips superuser roles** and flags only the
+  non-superuser roles, where an RLS bypass is genuinely
+  surprising.
+
+SEC016 fires on every non-superuser role with `BYPASSRLS`. The
+introspector reads the role's `rolbypassrls` / `rolsuper` /
+`rolcanlogin` flags from `pg_roles` (snapshot v9+); only roles
+`WHERE rolbypassrls` are captured, so a default cluster — where
+no role has been granted the attribute — produces no findings.
+The fix is one statement, `ALTER ROLE <name> NOBYPASSRLS`, but it
+is not auto-applied (see **Auto-fix** above).
+
+The violation message is tailored by the role's login status: a
+`LOGIN` role can be authenticated as directly (an application
+connecting as it gets no isolation); a `NOLOGIN` role is reached
+only via `SET ROLE` by a member. Both bypass RLS — login status
+shapes the message, not the verdict.
+
+Roles are cluster-global, so SEC016 — unlike the schema-scoped
+rules — has no out-of-scope blind spot: it sees every
+`BYPASSRLS` role in the cluster regardless of `--schemas`.
+
+The allowlist key is the bare role name (roles have no schema
+component — there is nothing to qualify). Allowlist a role after
+confirming its bypass is intentional.
+
+```toml
+[lint.rules.SEC016]
+allowlist = [
+    "logical_replication",  # reviewed 2026-05-15 — replication
+                            # role legitimately needs BYPASSRLS.
+]
+```
+
+Relationship to the other bypass rules: SEC003 covers the
+table-owner bypass (mechanism: ownership; remedy: `FORCE`).
+SEC013 / SEC014 / SEC015 cover code-mediated bypass through
+`SECURITY DEFINER` triggers and functions (mechanism: a function
+running as its owner). SEC016 covers the attribute-mediated
+bypass — the role itself is exempt, no code or ownership
+involved. It is the bluntest of the family: where the others
+need a specific object to be misconfigured, SEC016 needs only a
+role attribute to be set.
+
+Out of scope (intentional):
+
+* **Superuser roles.** Skipped — a superuser bypasses RLS via
+  `rolsuper` regardless, and is a far larger finding than
+  "bypasses RLS" anyway.
+* **Role membership / `SET ROLE` reachability.** SEC016 flags the
+  role that *holds* `BYPASSRLS`, not every role that could reach
+  it. `BYPASSRLS` is a role attribute, not an inheritable
+  privilege — a member of a `BYPASSRLS` group role does not
+  bypass RLS unless it actually `SET ROLE`s to that role. The
+  holder is the precise and complete audit target.
+* **The `row_security` session GUC.** `SET row_security = off` is
+  a different mechanism, and not a silent one: a query that
+  *would* return RLS-filtered rows raises an error instead of
+  quietly widening, unless the role already owns the table or
+  holds `BYPASSRLS`. SEC016 covers the attribute, not the GUC.
 
 <a id="rule-perf001"></a>
 
@@ -1852,7 +1948,8 @@ any of these shortcuts:
   scoping and is rarely what the project actually wants.
 - **Removing `FORCE ROW LEVEL SECURITY` so migrations or seeders work.** Fix
   the seeder to set the tenant context instead, or run it as a role that is
-  explicitly exempted via `BYPASSRLS`.
+  explicitly exempted via `BYPASSRLS` (SEC016 will flag that role — allowlist
+  it once the bypass is confirmed deliberate).
 
 If you are tempted to do any of the above to make `pgrls lint` pass, stop and
 ask the human user — the lint failure is signalling a real design question.
@@ -1863,15 +1960,18 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-four rules across four categories.** SEC001–SEC015,
+- **Twenty-five rules across four categories.** SEC001–SEC016,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
-  SECURITY DEFINER coverage is now four rules deep: VIEW004
+  SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
   trigger-mediated bypass, SEC014 (v0.5.12) flags every SECDEF
   function as the free-standing audit surface for
   application-callable functions, and SEC015 (v0.5.13) flags
   SECDEF functions whose `search_path` exposes them to
   `pg_temp` object shadowing (the CVE-2018-1058 privesc class).
+  SEC016 (v0.5.14) covers the remaining bypass surface — a role
+  carrying the `BYPASSRLS` attribute, which skips every policy
+  unconditionally and cluster-wide.
 - **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
   fix` rewrites the mechanically-fixable subset; other rules need
   human intent.
