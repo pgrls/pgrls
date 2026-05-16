@@ -106,6 +106,15 @@ def test_sec018_silent_on_plain_column_predicate() -> None:
     assert SEC018().check(schema, {}) == []
 
 
+def test_sec018_silent_when_policy_has_no_clauses() -> None:
+    # A policy whose USING and WITH CHECK both parsed to None — an
+    # empty clause, or a parse failure that left the AST unset —
+    # has nothing for SEC018 to walk. check() must handle the
+    # both-None case without error and emit nothing.
+    schema = _wrap(_policy(using=None, with_check=None))
+    assert SEC018().check(schema, {}) == []
+
+
 def test_sec018_allowlist_exempts_qualified_policy_id() -> None:
     # Role-per-tenant deployments legitimately key off current_user;
     # the allowlist is how they silence SEC018 after confirming the
