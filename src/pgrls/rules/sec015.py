@@ -87,12 +87,15 @@ def _search_path_tokens(search_path: str) -> list[str]:
 
     Known limitation: a quoted schema name containing a literal
     comma (`"My, Schema"`) is shredded by the naive comma split.
-    This does not affect SEC015's verdict — the rule only inspects
-    the *last* token to check for `pg_temp`, and a comma can't
-    appear inside the bare `pg_temp` identifier — but the
-    intermediate tokens for such a path are unreliable. Comma-in-
-    schema-name is rare enough that a full quote-aware tokenizer
-    isn't worth the complexity here.
+    This does not affect SEC015's verdict — the rule checks
+    whether `pg_temp` is the sole, final token (see
+    `_is_pg_temp_safe`), and a comma can't appear inside the bare
+    `pg_temp` identifier, so a shredded quoted name can never
+    spuriously become — or duplicate — a `pg_temp` token. The
+    intermediate tokens for such a path are unreliable, but the
+    safe/unsafe decision is not. Comma-in-schema-name is rare
+    enough that a full quote-aware tokenizer isn't worth the
+    complexity here.
     """
     out: list[str] = []
     for raw in search_path.split(","):
