@@ -255,16 +255,16 @@ CREATE ROLE allbad_sec016_role BYPASSRLS;
 CREATE FUNCTION public.allbad_sec017_leaky(int) RETURNS boolean
     LANGUAGE sql LEAKPROOF AS 'SELECT $1 > 0';
 
--- SEC018: policy keyed off current_user. current_user identifies
--- the session's Postgres role, which is a constant under a shared
--- application pool role — so the policy gives no per-tenant
--- isolation. The base table mirrors the other RLS-on blocks (a
--- RESTRICTIVE policy with an own-column reference and an indexed
--- predicate column) so SEC001/SEC002/SEC005/SEC006/SEC008/SEC009/
--- PERF003 stay silent on it and only SEC018 fires. SEC012 also
--- fires here (RESTRICTIVE-only policy set, like the VIEW and SEC013
--- base tables) and carries no rule_loc pin, so that extra firing
--- is silent-by-design.
+-- SEC018: policy compares a column against current_user.
+-- current_user identifies the session's Postgres role, a constant
+-- under a shared application pool role — so `owner_role =
+-- current_user` gives no per-tenant isolation. The base table
+-- mirrors the other RLS-on blocks (a RESTRICTIVE policy with an
+-- own-column reference and an indexed predicate column) so
+-- SEC001/SEC002/SEC005/SEC006/SEC008/SEC009/PERF003 stay silent on
+-- it and only SEC018 fires. SEC012 also fires here (RESTRICTIVE-
+-- only policy set, like the VIEW and SEC013 base tables) and
+-- carries no rule_loc pin, so that extra firing is silent-by-design.
 CREATE TABLE public.allbad_sec018 (id INT, owner_role TEXT);
 ALTER TABLE public.allbad_sec018 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.allbad_sec018 FORCE ROW LEVEL SECURITY;

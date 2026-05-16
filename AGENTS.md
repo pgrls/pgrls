@@ -32,8 +32,8 @@ search-path shadowing),
 RLS policy),
 `SEC017` (function with the `LEAKPROOF` attribute is evaluated
 below the RLS barrier),
-`SEC018` (policy keys off `current_user` / `session_user` — no
-isolation under a shared pool role),
+`SEC018` (policy compares a column against `current_user` /
+`session_user` — no isolation under a shared pool role),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1135,18 +1135,19 @@ Out of scope (intentional):
 
 <a id="rule-sec018"></a>
 
-### SEC018 — Policy expression uses current_user / session_user
+### SEC018 — Policy compares a column against current_user / session_user
 
-**Severity:** warning. **Auto-fix:** no (replacing `current_user`
-with a session-GUC predicate needs the application's tenant-key
-name and is an architectural decision, not a mechanical rewrite).
+**Severity:** warning. **Auto-fix:** no (replacing the
+`current_user` comparison with a session-GUC predicate needs the
+application's tenant-key name and is an architectural decision, not
+a mechanical rewrite).
 
-A policy whose `USING` or `WITH CHECK` expression keys off
-`current_user` — or its aliases `current_role` and `user` — or
-`session_user` is asserting that *the Postgres role the session
-runs as* identifies the tenant. That isolates tenants only when
-every tenant connects as, or `SET ROLE`s to, a **distinct**
-Postgres role.
+A policy whose `USING` or `WITH CHECK` expression compares a table
+**column** against `current_user` — or its aliases `current_role`
+and `user` — or `session_user` is using *the Postgres role the
+session runs as* as the row-matching key. That isolates tenants
+only when every tenant connects as, or `SET ROLE`s to, a
+**distinct** Postgres role.
 
 Application architectures almost never do that. A connection pool
 authenticates as one shared database role and serves every
@@ -1158,19 +1159,34 @@ CREATE POLICY p ON documents
     USING (owner_role = current_user);
 ```
 
-provides **no** isolation — every pooled request sees every row.
-The policy looks like access control and passes every other pgrls
-check, but the discriminator is a constant. `session_user` (the
-login role, unchanged by `SET ROLE`) is the same trap, and worse:
-it stays pinned to the pool's login role even when the application
-does `SET ROLE` per request.
+matches the same way for every tenant and provides **no**
+isolation. The policy looks like access control and passes every
+other pgrls check, but the discriminator is a constant.
+`session_user` (the login role, unchanged by `SET ROLE`) is the
+same trap, and worse: it stays pinned to the pool's login role even
+when the application does `SET ROLE` per request.
 
-SEC018 flags every policy whose `USING` or `WITH CHECK` expression
-references any of `current_user`, `current_role`, `user`, or
-`session_user`. Detection is structural — the rule walks the
-parsed policy AST (the `SQLValueFunction` nodes Postgres emits for
-these grammar-special identifiers), including references nested in
-sub-selects.
+Detection is structural — the rule walks the parsed policy AST for
+an `A_Expr` (comparison) node with a role-identity `SQLValueFunction`
+on one operand and a `ColumnRef` on the other, anywhere in the tree
+(including inside sub-selects).
+
+**What SEC018 deliberately does not flag.** A `current_user`
+reference is only an isolation problem when it is the *row-matching
+key*. Two common, legitimate uses are left alone:
+
+* `current_user` passed to a role/privilege function —
+  `pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')`,
+  `has_table_privilege(current_user, …)`. This is the standard
+  "admin escape" branch of a policy, a role-membership check, not
+  a tenant key.
+* `current_user` compared only to a literal — `current_user =
+  'postgres'`. That checks for one specific role (a superuser /
+  admin escape); under a shared pool role it is simply false and
+  the rest of the policy governs.
+
+Both require a column on the other side of the comparison to fire,
+which neither has — so SEC018 stays silent on them.
 
 The correct discriminator for pooled application code is a
 *session-scoped* value the application sets per request: a GUC
@@ -1197,7 +1213,7 @@ allowlist = [
 
 Relationship to SEC004: SEC004 catches the *inverted* auth check
 (`current_setting(...) IS NULL OR …`) — a predicate that fails
-open. SEC018 catches a predicate that is simply keyed off the
+open. SEC018 catches a predicate that matches row data against the
 wrong identity. Both are policy-expression rules, but SEC004 is an
 error (always wrong) while SEC018 is a warning (wrong only under a
 shared pool role).

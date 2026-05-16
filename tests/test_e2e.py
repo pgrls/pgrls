@@ -85,7 +85,8 @@ def test_subprocess_clean_db_exits_zero(
     #   - don't use placeholder names (HYG002)
     #   - don't have `OR true` branches (SEC011)
     #   - include at least one RESTRICTIVE policy (SEC007 info)
-    #   - key off a column, not current_user/session_user (SEC018)
+    #   - don't compare a column against current_user/session_user
+    #     (SEC018)
     #   - reference indexed columns (PERF003) — PRIMARY KEY on
     #     `id` creates the implicit B-tree the policy uses
     # `DROP ROLE IF EXISTS` first because pg_conn resets schemas

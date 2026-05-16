@@ -220,7 +220,7 @@ pattern documentation.
 | [SEC015](AGENTS.md#rule-sec015) | warning | SECURITY DEFINER function exposed to `pg_temp` search-path shadowing |
 | [SEC016](AGENTS.md#rule-sec016) | warning | Role with the `BYPASSRLS` attribute bypasses every RLS policy |
 | [SEC017](AGENTS.md#rule-sec017) | warning | Function with the `LEAKPROOF` attribute is evaluated below the RLS barrier |
-| [SEC018](AGENTS.md#rule-sec018) | warning | Policy keys off `current_user` / `session_user` (no isolation under a shared pool role) |
+| [SEC018](AGENTS.md#rule-sec018) | warning | Policy compares a column against `current_user` / `session_user` (no isolation under a shared pool role) |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](AGENTS.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |

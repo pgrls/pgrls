@@ -13,20 +13,30 @@ breaking changes — they will be called out in this file.
 ## [0.5.16] - 2026-05-16
 
 ### Added
-- **SEC018 — policy expression uses `current_user` /
+- **SEC018 — policy compares a column against `current_user` /
   `session_user`** (severity: warning). Flags every policy whose
-  `USING` or `WITH CHECK` expression keys off `current_user` (or
-  its `current_role` / `user` aliases) or `session_user`.
+  `USING` or `WITH CHECK` expression compares a table column
+  against `current_user` (or its `current_role` / `user` aliases)
+  or `session_user` — `owner_role = current_user`,
+  `current_user = ANY(member_roles)`, and so on.
 
-  These identify the Postgres role the session runs as. They
-  isolate tenants only when every tenant connects as — or
-  `SET ROLE`s to — a distinct Postgres role. Application code
-  almost always serves every tenant over one shared connection-pool
-  role; `current_user` is then a constant, and a policy like
-  `USING (owner_role = current_user)` provides no per-tenant
-  isolation while still looking like access control. `session_user`
-  is the same trap and worse — it stays pinned to the pool's login
-  role even when the application does `SET ROLE` per request.
+  These identify the Postgres role the session runs as. Using one
+  as a row-matching key isolates tenants only when every tenant
+  connects as — or `SET ROLE`s to — a distinct Postgres role.
+  Application code almost always serves every tenant over one
+  shared connection-pool role; `current_user` is then a constant,
+  and a policy like `USING (owner_role = current_user)` matches
+  the same way for every tenant — no per-tenant isolation, while
+  still looking like access control. `session_user` is the same
+  trap and worse — it stays pinned to the pool's login role even
+  when the application does `SET ROLE` per request.
+
+  The rule deliberately does **not** flag `current_user` passed to
+  a role/privilege function (`pg_has_role(current_user, …)` — the
+  standard admin escape) or compared only to a literal
+  (`current_user = 'postgres'` — a superuser check): those are not
+  row-matching keys. Firing requires a column on the other side of
+  the comparison.
 
   The correct discriminator for pooled application code is a
   per-request session value: a GUC read with
@@ -36,8 +46,9 @@ breaking changes — they will be called out in this file.
   legitimate design where `current_user` is the right
   discriminator — pgrls cannot tell which deployment model is in
   use. Detection is structural (the rule walks the parsed policy
-  AST, including sub-selects); allowlist by qualified policy ID
-  after confirming a role-per-tenant deployment.
+  AST for the comparison, including sub-selects); allowlist by
+  qualified policy ID after confirming a role-per-tenant
+  deployment.
 
 ### Changed
 - **Rule count: twenty-six → twenty-seven** (`SEC001`–`SEC018`,
