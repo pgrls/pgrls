@@ -108,8 +108,8 @@ class SEC016:
         else:
             reach = (
                 "This role cannot log in directly, but any role that "
-                "can SET ROLE to it bypasses RLS for the duration of "
-                "that session"
+                "can SET ROLE to it bypasses RLS for as long as that "
+                "SET ROLE is in effect"
             )
         return Violation(
             rule_id=self.id,
