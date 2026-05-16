@@ -1113,10 +1113,9 @@ allowlist = [
 Relationship to the other attribute/audit rules: SEC014 and SEC015
 flag `SECURITY DEFINER` functions (which run as their owner); SEC016
 flags roles with the `BYPASSRLS` attribute (which skip RLS
-entirely). SEC017 is the third attribute-level audit — `LEAKPROOF`
-relaxes *where in the plan* a function runs. All four surface a
-privileged attribute and ask the operator to confirm it is
-intended.
+entirely). SEC017 is the fourth such rule — `LEAKPROOF` relaxes
+*where in the plan* a function runs. All four surface a privileged
+attribute and ask the operator to confirm it is intended.
 
 Out of scope (intentional):
 

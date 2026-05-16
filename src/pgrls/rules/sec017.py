@@ -24,9 +24,7 @@ exhibits) discloses those hidden rows' contents. The classic shape:
 If `leaky_fn` is `LEAKPROOF`, the planner may push `leaky_fn(
 secret_column)` below the RLS qual; an attacker who cannot see those
 rows still learns `secret_column` from the error text or response
-time. This is the row-security analogue of the `LEAKPROOF`-related
-advisories Postgres has issued for `pg_stats` and the planner's
-qual-pushdown rules.
+time.
 
 Marking a function `LEAKPROOF` requires superuser — it is always a
 deliberate act, never a default. SEC017 flags **every** function in
@@ -58,20 +56,20 @@ review; pgrls will not blindly emit `ALTER FUNCTION … NOT LEAKPROOF`.
 Relationship to the other attribute/audit rules: SEC014 and SEC015
 flag `SECURITY DEFINER` functions (which run as their owner); SEC016
 flags roles with the `BYPASSRLS` attribute (which skip RLS
-entirely). SEC017 is the third attribute-level audit — a function
-attribute, `LEAKPROOF`, that relaxes *where* in the plan a function
-runs. All four say "a privileged attribute is set here; confirm it
-is intended."
+entirely). SEC017 is the fourth such rule — `LEAKPROOF` is a
+function attribute that relaxes *where* in the plan a function runs.
+All four say "a privileged attribute is set here; confirm it is
+intended."
 
 Out of scope (intentional):
 
 * **Body-level leak analysis.** SEC017 does not parse the function
   body to decide whether it actually leaks. A proof would have to
   enumerate every `RAISE`/error path and every data-dependent code
-  path — brittle, and defeated by dynamic SQL and PL/pgSQL the same
-  way VIEW004's body analysis is. The rule flags on the
-  `proleakproof` flag alone and lets the operator allowlist the
-  audited-safe functions.
+  path — brittle, and defeated by dynamic SQL the same way the
+  body analysis VIEW004 documents false-negatives for is. The rule
+  flags on the `proleakproof` flag alone and lets the operator
+  allowlist the audited-safe functions.
 * **Argument signatures.** The allowlist key is `schema.function`
   with no signature. Overloaded functions (`public.f(int)` vs
   `public.f(text)`) are collapsed to one finding and one allowlist

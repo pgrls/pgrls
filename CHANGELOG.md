@@ -47,7 +47,7 @@ breaking changes — they will be called out in this file.
   they never surface. Allowlist by qualified function name
   (`schema.function`); overloads collapse to one finding.
 
-  SEC017 is the third attribute-level audit rule: SEC014/SEC015
+  SEC017 is the fourth attribute-level audit rule: SEC014/SEC015
   flag `SECURITY DEFINER` functions, SEC016 flags `BYPASSRLS`
   roles, and SEC017 flags `LEAKPROOF` functions.
 
