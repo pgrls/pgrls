@@ -730,47 +730,58 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
     # of silent under-coverage drift (e.g., when SEC011, PERF002,
     # HYG002 were added to the registry but missing from the
     # then-current fixture).
-    apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
-    runner = CliRunner()
-    result = runner.invoke(main, ["lint", "--database-url", pg_url])
-    assert result.exit_code == 1, result.output
-    from pgrls.rules import all_rules
+    #
+    # all_bad.sql's SEC016 block creates a cluster-global BYPASSRLS
+    # role (roles are not reset by the per-test schema teardown); the
+    # `finally` drops it so it can't leak into the shared container
+    # and trip SEC016 in the clean-DB e2e test.
+    try:
+        apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", "--database-url", pg_url])
+        assert result.exit_code == 1, result.output
+        from pgrls.rules import all_rules
 
-    expected = {r.id for r in all_rules()}
-    _assert_rules_fire_exactly(result.output, expected)
-    # Pin each (rule, location) pair to its intended target. Substring
-    # plus trailing newline anchors against the output's `RULE  LOC\n`
-    # shape (formatters/text.py) so a rule drifting onto the wrong
-    # policy fails loudly instead of silently slipping by.
-    for rule_loc in (
-        "SEC001  public.allbad_sec001\n",
-        "SEC002  public.allbad_sec002\n",
-        "SEC003  public.allbad_sec003.public_perm\n",
-        "SEC004  public.allbad_sec004.inverted\n",
-        "SEC005  public.allbad_sec003.public_perm\n",
-        "SEC005  public.allbad_hyg001.orphan\n",
-        "SEC005  public.allbad_sec010.block_all\n",
-        "SEC006  public.allbad_sec006.update_no_check\n",
-        "SEC007  public.allbad_sec003\n",
-        "SEC008  public.allbad_sec003.public_perm\n",
-        "SEC009  public.allbad_sec002\n",
-        "SEC010  public.allbad_sec010.block_all\n",
-        "SEC011  public.allbad_sec011.or_true_bypass\n",
-        "SEC013  public.allbad_sec013.audit_writes\n",
-        "PERF001  public.allbad_sec004.inverted\n",
-        "PERF003  public.allbad_perf003.tenant_unindexed\n",
-        "PERF001  public.allbad_sec006.update_no_check\n",
-        "PERF002  public.allbad_perf002.randomized\n",
-        "HYG001  public.allbad_hyg001.orphan\n",
-        "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
-        "VIEW001  public.allbad_view001\n",
-        "VIEW002  public.allbad_view002\n",
-        "VIEW003  public.allbad_view003\n",
-        "VIEW004  public.allbad_view004\n",
-    ):
-        assert rule_loc in result.output, (
-            f"{rule_loc!r} missing from output:\n{result.output}"
-        )
+        expected = {r.id for r in all_rules()}
+        _assert_rules_fire_exactly(result.output, expected)
+        # Pin each (rule, location) pair to its intended target.
+        # Substring plus trailing newline anchors against the
+        # output's `RULE  LOC\n` shape (formatters/text.py) so a
+        # rule drifting onto the wrong policy fails loudly instead
+        # of silently slipping by. SEC016's location is a bare role
+        # name — roles have no schema, so no `public.` prefix.
+        for rule_loc in (
+            "SEC001  public.allbad_sec001\n",
+            "SEC002  public.allbad_sec002\n",
+            "SEC003  public.allbad_sec003.public_perm\n",
+            "SEC004  public.allbad_sec004.inverted\n",
+            "SEC005  public.allbad_sec003.public_perm\n",
+            "SEC005  public.allbad_hyg001.orphan\n",
+            "SEC005  public.allbad_sec010.block_all\n",
+            "SEC006  public.allbad_sec006.update_no_check\n",
+            "SEC007  public.allbad_sec003\n",
+            "SEC008  public.allbad_sec003.public_perm\n",
+            "SEC009  public.allbad_sec002\n",
+            "SEC010  public.allbad_sec010.block_all\n",
+            "SEC011  public.allbad_sec011.or_true_bypass\n",
+            "SEC013  public.allbad_sec013.audit_writes\n",
+            "SEC016  allbad_sec016_role\n",
+            "PERF001  public.allbad_sec004.inverted\n",
+            "PERF003  public.allbad_perf003.tenant_unindexed\n",
+            "PERF001  public.allbad_sec006.update_no_check\n",
+            "PERF002  public.allbad_perf002.randomized\n",
+            "HYG001  public.allbad_hyg001.orphan\n",
+            "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
+            "VIEW001  public.allbad_view001\n",
+            "VIEW002  public.allbad_view002\n",
+            "VIEW003  public.allbad_view003\n",
+            "VIEW004  public.allbad_view004\n",
+        ):
+            assert rule_loc in result.output, (
+                f"{rule_loc!r} missing from output:\n{result.output}"
+            )
+    finally:
+        apply_sql("DROP ROLE IF EXISTS allbad_sec016_role")
 
 
 # ============================================================

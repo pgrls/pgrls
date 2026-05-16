@@ -228,3 +228,16 @@ ALTER TABLE public.allbad_perf003 FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_unindexed ON public.allbad_perf003
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+
+-- SEC016: a non-superuser role carrying the BYPASSRLS attribute.
+-- Such a role skips every RLS policy on every table. Unlike every
+-- other block in this fixture, this one creates a *role* — roles
+-- are cluster-global and are NOT reset by the per-test schema
+-- teardown. `DROP ROLE IF EXISTS` makes a re-run idempotent, and
+-- the test that applies this fixture drops the role in a `finally`
+-- so a stray BYPASSRLS role can't leak into the shared container
+-- and trip SEC016 in the clean-DB e2e test. The role is left
+-- NOLOGIN (the CREATE ROLE default) — SEC016 fires on any
+-- non-superuser BYPASSRLS role regardless of login capability.
+DROP ROLE IF EXISTS allbad_sec016_role;
+CREATE ROLE allbad_sec016_role BYPASSRLS;
