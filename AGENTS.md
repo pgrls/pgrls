@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-six rules across four
+In the current release it ships **twenty-seven rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -32,6 +32,8 @@ search-path shadowing),
 RLS policy),
 `SEC017` (function with the `LEAKPROOF` attribute is evaluated
 below the RLS barrier),
+`SEC018` (policy keys off `current_user` / `session_user` — no
+isolation under a shared pool role),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1131,6 +1133,75 @@ Out of scope (intentional):
   outside ``--schemas`` is invisible to SEC017. Expand
   ``--schemas`` to audit it.
 
+<a id="rule-sec018"></a>
+
+### SEC018 — Policy expression uses current_user / session_user
+
+**Severity:** warning. **Auto-fix:** no (replacing `current_user`
+with a session-GUC predicate needs the application's tenant-key
+name and is an architectural decision, not a mechanical rewrite).
+
+A policy whose `USING` or `WITH CHECK` expression keys off
+`current_user` — or its aliases `current_role` and `user` — or
+`session_user` is asserting that *the Postgres role the session
+runs as* identifies the tenant. That isolates tenants only when
+every tenant connects as, or `SET ROLE`s to, a **distinct**
+Postgres role.
+
+Application architectures almost never do that. A connection pool
+authenticates as one shared database role and serves every
+tenant's requests over it. `current_user` is then identical for
+tenant A and tenant B, and a policy like
+
+```sql
+CREATE POLICY p ON documents
+    USING (owner_role = current_user);
+```
+
+provides **no** isolation — every pooled request sees every row.
+The policy looks like access control and passes every other pgrls
+check, but the discriminator is a constant. `session_user` (the
+login role, unchanged by `SET ROLE`) is the same trap, and worse:
+it stays pinned to the pool's login role even when the application
+does `SET ROLE` per request.
+
+SEC018 flags every policy whose `USING` or `WITH CHECK` expression
+references any of `current_user`, `current_role`, `user`, or
+`session_user`. Detection is structural — the rule walks the
+parsed policy AST (the `SQLValueFunction` nodes Postgres emits for
+these grammar-special identifiers), including references nested in
+sub-selects.
+
+The correct discriminator for pooled application code is a
+*session-scoped* value the application sets per request: a GUC
+read with `current_setting('app.tenant_id')`, or a JWT claim.
+Those vary per request over a shared connection; the role identity
+does not.
+
+`current_user`-based policies are **not** universally wrong. The
+"role-per-tenant" RLS pattern — one Postgres role per tenant, the
+application `SET ROLE`s to the tenant's role per request — is a
+legitimate, documented design, and there `current_user` is exactly
+the right discriminator. pgrls cannot tell which deployment model
+is in use, so SEC018 is a `warning`: a role-per-tenant project
+allowlists the affected policies (by qualified policy ID
+`schema.table.policy_name`) after confirming the model.
+
+```toml
+[lint.rules.SEC018]
+allowlist = [
+    # role-per-tenant deployment — current_user IS the tenant key.
+    "public.documents.owner_is_current_user",
+]
+```
+
+Relationship to SEC004: SEC004 catches the *inverted* auth check
+(`current_setting(...) IS NULL OR …`) — a predicate that fails
+open. SEC018 catches a predicate that is simply keyed off the
+wrong identity. Both are policy-expression rules, but SEC004 is an
+error (always wrong) while SEC018 is a warning (wrong only under a
+shared pool role).
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2046,7 +2117,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-six rules across four categories.** SEC001–SEC017,
+- **Twenty-seven rules across four categories.** SEC001–SEC018,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

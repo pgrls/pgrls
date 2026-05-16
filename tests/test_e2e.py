@@ -71,7 +71,7 @@ def test_subprocess_known_bad_exits_nonzero(
 def test_subprocess_clean_db_exits_zero(
     pg_url: str, apply_sql
 ) -> None:
-    # "Clean" means: every rule (SEC001-SEC017, PERF001-PERF003,
+    # "Clean" means: every rule (SEC001-SEC018, PERF001-PERF003,
     # HYG001-HYG002, VIEW001-VIEW004) is satisfied, not just
     # SEC001-SEC002. SEC014, SEC015, and SEC017 are exercised by
     # absence — the fixture creates no SECURITY DEFINER functions
@@ -85,6 +85,7 @@ def test_subprocess_clean_db_exits_zero(
     #   - don't use placeholder names (HYG002)
     #   - don't have `OR true` branches (SEC011)
     #   - include at least one RESTRICTIVE policy (SEC007 info)
+    #   - key off a column, not current_user/session_user (SEC018)
     #   - reference indexed columns (PERF003) — PRIMARY KEY on
     #     `id` creates the implicit B-tree the policy uses
     # `DROP ROLE IF EXISTS` first because pg_conn resets schemas
