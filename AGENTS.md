@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-five rules across four
+In the current release it ships **twenty-six rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -30,6 +30,8 @@ audit every SECDEF function),
 search-path shadowing),
 `SEC016` (role with the `BYPASSRLS` attribute bypasses every
 RLS policy),
+`SEC017` (function with the `LEAKPROOF` attribute is evaluated
+below the RLS barrier),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1045,6 +1047,90 @@ Out of scope (intentional):
   quietly widening, unless the role already owns the table or
   holds `BYPASSRLS`. SEC016 covers the attribute, not the GUC.
 
+<a id="rule-sec017"></a>
+
+### SEC017 — Function with the LEAKPROOF attribute bypasses the RLS barrier
+
+**Severity:** warning. **Auto-fix:** no (whether the `LEAKPROOF`
+claim actually holds is a judgement about the function's runtime
+behaviour — error paths, timing — that needs human review; pgrls
+will not blindly emit `ALTER FUNCTION … NOT LEAKPROOF`).
+
+A function marked `LEAKPROOF` carries a promise to the query
+planner: it has **no side channels** — it will not reveal anything
+about its arguments through an error message, through how long it
+runs, or through any other observable behaviour. On the strength of
+that promise the planner is allowed to evaluate the function
+*below* a security barrier — ahead of a table's row-level security
+qual, ahead of a `security_barrier` view's `WHERE`. A non-leakproof
+function is held *above* the barrier and only ever sees rows the
+caller is already entitled to.
+
+For a genuinely side-channel-free function that is a safe, useful
+optimization. The danger is a function *marked* `LEAKPROOF` that is
+not actually leak-free. Applied to a column of an RLS-protected
+table it runs on **every** row — including rows the caller's policy
+would have hidden — and any error it raises (or argument-dependent
+timing it exhibits) discloses those hidden rows' contents:
+
+```sql
+SELECT * FROM rls_protected
+WHERE leaky_fn(secret_column) = 'probe';
+```
+
+If `leaky_fn` is `LEAKPROOF`, the planner may push
+`leaky_fn(secret_column)` below the RLS qual; an attacker who
+cannot see those rows still learns `secret_column` from the error
+text or the response time.
+
+Marking a function `LEAKPROOF` requires superuser — it is always a
+deliberate act. SEC017 flags every function in the introspected
+schemas whose `pg_proc.proleakproof` is true (snapshot v10+), so
+each gets an explicit audit decision: confirm no error path and no
+timing channel can expose an argument, or remove the marking with
+`ALTER FUNCTION name(argtypes) NOT LEAKPROOF`. pgrls does not parse
+the body to prove leakproofness — that is the brittle analysis the
+rule deliberately avoids (the stance SEC014 takes on SECDEF
+bodies). Postgres's own built-in leakproof functions live in
+`pg_catalog`, outside the linted schemas, so they never surface
+here.
+
+The allowlist key is `schema.function` (two parts). Bare
+`function_name` is rejected for the same reason as SEC014/SEC015.
+Overloads collapse: `public.f(int)` and `public.f(text)` both
+marked `LEAKPROOF` are one finding and one allowlist entry —
+introspection's `SELECT DISTINCT` on the qualified name does this,
+matching the signature-free allowlist shape.
+
+```toml
+[lint.rules.SEC017]
+allowlist = [
+    "public.fast_eq",  # reviewed 2026-05-15 — no error path or
+                       # timing channel exposes an argument.
+]
+```
+
+Relationship to the other attribute/audit rules: SEC014 and SEC015
+flag `SECURITY DEFINER` functions (which run as their owner); SEC016
+flags roles with the `BYPASSRLS` attribute (which skip RLS
+entirely). SEC017 is the fourth such rule — `LEAKPROOF` relaxes
+*where in the plan* a function runs. All four surface a privileged
+attribute and ask the operator to confirm it is intended.
+
+Out of scope (intentional):
+
+* **Body-level leak analysis.** SEC017 does not parse the body to
+  decide whether the function actually leaks — a proof would have
+  to enumerate every error path and data-dependent branch, brittle
+  and defeated by dynamic SQL the same way VIEW004's body analysis
+  is. The rule flags on the `proleakproof` flag alone.
+* **Argument signatures.** The allowlist key carries no signature;
+  overloads of a qualified name are flagged once and allowlisted
+  once.
+* **Cross-scope functions.** A `LEAKPROOF` function in a schema
+  outside ``--schemas`` is invisible to SEC017. Expand
+  ``--schemas`` to audit it.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -1960,7 +2046,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-five rules across four categories.** SEC001–SEC016,
+- **Twenty-six rules across four categories.** SEC001–SEC017,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
@@ -1969,9 +2055,11 @@ These are intentional in the current release. Do not invent capabilities.
   application-callable functions, and SEC015 (v0.5.13) flags
   SECDEF functions whose `search_path` exposes them to
   `pg_temp` object shadowing (the CVE-2018-1058 privesc class).
-  SEC016 (v0.5.14) covers the remaining bypass surface — a role
+  SEC016 (v0.5.14) covers the role-attribute bypass — a role
   carrying the `BYPASSRLS` attribute, which skips every policy
-  unconditionally and cluster-wide.
+  unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
+  function-attribute bypass — a function marked `LEAKPROOF`, which
+  the planner may evaluate below the RLS barrier.
 - **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
   fix` rewrites the mechanically-fixable subset; other rules need
   human intent.

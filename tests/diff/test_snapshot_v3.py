@@ -32,9 +32,10 @@ def test_to_snapshot_emits_grants_field() -> None:
     # bumped 4 → 5 in v0.5 (column_details); 5 → 6 in v0.5.8
     # (triggers); 6 → 7 in v0.5.10 (indexes); 7 → 8 in v0.5.13
     # (SecdefFunction.search_path); 8 → 9 in v0.5.14
-    # (bypassrls_roles). The grants test is about content, not
-    # version — pin the latest so a future bump is deliberate.
-    assert snap["version"] == 9
+    # (bypassrls_roles); 9 → 10 in v0.5.15 (leakproof_functions).
+    # The grants test is about content, not version — pin the latest
+    # so a future bump is deliberate.
+    assert snap["version"] == 10
     table = snap["tables"][0]
     assert table["grants"] == [
         {"role": "authenticated", "privileges": ["SELECT", "INSERT"]}

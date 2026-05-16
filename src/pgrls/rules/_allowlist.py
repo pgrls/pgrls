@@ -17,7 +17,7 @@ Allowlist entries fall into six shapes:
   rules (VIEW001-VIEW004).
 
 * **Qualified function ID** (`schema.function` only) — used by
-  function-scoped rules (SEC014, SEC015).
+  function-scoped rules (SEC014, SEC015, SEC017).
 
 * **Role name** (bare `name` only) — used by role-scoped rules
   (SEC016). Postgres roles are cluster-global and have no schema
@@ -184,8 +184,8 @@ def parse_qualified_function_allowlist(
 ) -> set[str]:
     """Validate that every entry is `schema.function` (exactly two parts).
 
-    Used by SEC014 and SEC015 — the rule scope is the qualified
-    function object.
+    Used by SEC014, SEC015, and SEC017 — the rule scope is the
+    qualified function object.
     Argument signatures are deliberately not part of the shape: an
     overloaded function (same `schema.function` qname, different
     arg types) is flagged once and allowlisted once; introspection

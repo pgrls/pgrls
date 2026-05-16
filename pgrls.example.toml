@@ -192,6 +192,24 @@ allowlist = []
 # function/view/policy rules — there is nothing to qualify.
 allowlist = []
 
+[lint.rules.SEC017]
+# Functions carrying the LEAKPROOF attribute. A LEAKPROOF
+# function promises the planner it has no side channels, so the
+# planner may evaluate it below a security barrier — ahead of a
+# table's row-level security qual, ahead of a security_barrier
+# view's WHERE. A function wrongly marked LEAKPROOF then runs on
+# rows the caller can't see; an error it raises (or its timing)
+# leaks those rows. Marking LEAKPROOF requires superuser, so the
+# rule flags every such function for an explicit audit. Fix:
+# `ALTER FUNCTION name(argtypes) NOT LEAKPROOF`.
+#
+# Allowlist after confirming no error path and no timing channel
+# exposes an argument. Entries are fully-qualified function names
+# of the form "schema.function"; bare names are rejected
+# (cross-schema collision). Overloads collapse — one entry covers
+# every overload of a qualified name.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
