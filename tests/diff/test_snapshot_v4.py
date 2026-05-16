@@ -7,6 +7,7 @@ from pgrls.model import (
     SNAPSHOT_VERSION,
     BypassRlsRole,
     Index,
+    LeakproofFunction,
     Policy,
     Schema,
     SecdefFunction,
@@ -16,11 +17,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_9() -> None:
-    # Bumped 8 → 9 in v0.5.14 to add top-level `bypassrls_roles`
-    # for SEC016. v3–v8 baselines still load (Schema.from_snapshot
-    # accepts 3 through 9).
-    assert SNAPSHOT_VERSION == 9
+def test_snapshot_version_is_10() -> None:
+    # Bumped 9 → 10 in v0.5.15 to add top-level `leakproof_functions`
+    # for SEC017. v3–v9 baselines still load (Schema.from_snapshot
+    # accepts 3 through 10).
+    assert SNAPSHOT_VERSION == 10
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -42,9 +43,10 @@ def test_to_snapshot_emits_views_field() -> None:
     snap = schema.to_snapshot()
     # views added at v4; v5 added column_details; v6 added triggers;
     # v7 added indexes; v8 added SecdefFunction.search_path; v9
-    # added bypassrls_roles (all additive and orthogonal to the
-    # views field this test exercises).
-    assert snap["version"] == 9
+    # added bypassrls_roles; v10 added leakproof_functions (all
+    # additive and orthogonal to the views field this test
+    # exercises).
+    assert snap["version"] == 10
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -416,7 +418,7 @@ def test_to_snapshot_emits_bypassrls_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_roles" in snap
-    assert snap["version"] == 9
+    assert snap["version"] == 10
     assert snap["bypassrls_roles"] == [
         {"name": "etl_worker", "superuser": False, "can_login": True}
     ]
@@ -463,3 +465,57 @@ def test_from_snapshot_v8_yields_empty_bypassrls_roles() -> None:
     }
     loaded = Schema.from_snapshot(v8)
     assert loaded.bypassrls_roles == ()
+
+
+def test_to_snapshot_emits_leakproof_functions_field() -> None:
+    schema = Schema(
+        tables=(),
+        views=(),
+        leakproof_functions=(
+            LeakproofFunction(qualified_name="public.fast_eq"),
+        ),
+    )
+    snap = schema.to_snapshot()
+    assert "leakproof_functions" in snap
+    assert snap["version"] == 10
+    assert snap["leakproof_functions"] == [
+        {"qualified_name": "public.fast_eq"}
+    ]
+
+
+def test_from_snapshot_round_trips_v10_with_leakproof_functions() -> None:
+    # SEC017 reads `Schema.leakproof_functions` from the snapshot.
+    # Round-trip through `json.dumps` so the JSON shape matches a
+    # file-persisted snapshot — the same contract `pgrls diff`
+    # exercises. Mirrors the v6/v7/v8/v9 round-trip tests.
+    import json
+
+    original = Schema(
+        tables=(),
+        views=(),
+        leakproof_functions=(
+            LeakproofFunction(qualified_name="public.fast_eq"),
+            LeakproofFunction(qualified_name="audit.redact"),
+        ),
+    )
+    snap_json = json.dumps(original.to_snapshot())
+    loaded = Schema.from_snapshot(json.loads(snap_json))
+    assert loaded.leakproof_functions == original.leakproof_functions
+    assert loaded == original
+
+
+def test_from_snapshot_v9_yields_empty_leakproof_functions() -> None:
+    # A v9 snapshot (v0.5.14) carries no `leakproof_functions` key —
+    # the v10 addition. Loading must succeed and default the field
+    # to `()`. SEC017 then finds nothing to flag against the older
+    # snapshot until it's re-captured against a live database (v10).
+    v9 = {
+        "version": 9,
+        "tables": [],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [],
+        "bypassrls_roles": [],
+    }
+    loaded = Schema.from_snapshot(v9)
+    assert loaded.leakproof_functions == ()

@@ -14,6 +14,7 @@ from pgrls.model import (
     Column,
     Grant,
     Index,
+    LeakproofFunction,
     Policy,
     Schema,
     SecdefFunction,
@@ -504,6 +505,41 @@ WHERE r.rolbypassrls
 ORDER BY r.rolname
 """
 
+# Functions carrying the LEAKPROOF attribute in the configured
+# schemas. A LEAKPROOF function tells the planner it has no side
+# channels, so the planner may evaluate it below a security barrier
+# (the RLS qual, a security_barrier view). SEC017 surfaces these so
+# the operator confirms the leakproof claim actually holds.
+#
+# `WHERE p.proleakproof = TRUE` filters to the audit-relevant subset
+# (mirroring `_SECDEF_FUNCS_SQL`'s `WHERE p.prosecdef = TRUE`).
+# Postgres's own built-in leakproof functions live in `pg_catalog`,
+# which is never in the linted `--schemas`, so they never appear —
+# what remains is user-defined functions a superuser deliberately
+# marked LEAKPROOF (only a superuser can).
+#
+# `SELECT DISTINCT` collapses overloads: `public.f(int)` and
+# `public.f(text)` both marked LEAKPROOF yield a single `public.f`
+# row. This matches SEC017's allowlist granularity — the allowlist
+# key is the qualified name with no signature, so one allowlist
+# entry already covers every overload; one finding per qualified
+# name keeps the report aligned with that.
+#
+# Only the qualified name is selected — SEC017 is an audit prompt,
+# it does not parse the body (unlike `_SECDEF_FUNCS_SQL`, which
+# also fetches `prosrc`/`lanname` for VIEW004).
+#
+# ORDER BY qname for snapshot determinism.
+_LEAKPROOF_FUNCS_SQL = """
+SELECT DISTINCT
+    n.nspname || '.' || p.proname AS qname
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE p.proleakproof = TRUE
+  AND n.nspname = ANY(%s)
+ORDER BY qname
+"""
+
 
 def _extract_search_path(config: list[str] | None) -> str | None:
     """Pull the `search_path` value out of a `pg_proc.proconfig` array.
@@ -572,6 +608,23 @@ def _fetch_bypassrls_roles(cur: Any) -> tuple[BypassRlsRole, ...]:
             superuser=row["superuser"],
             can_login=row["can_login"],
         )
+        for row in cur.fetchall()
+    )
+
+
+def _fetch_leakproof_functions(
+    cur: Any, schemas: list[str]
+) -> tuple[LeakproofFunction, ...]:
+    """Fetch every LEAKPROOF function in `schemas`.
+
+    Returns a tuple of `LeakproofFunction` records sorted by
+    qualified name (the SQL `ORDER BY qname` provides the
+    determinism), with overloads collapsed to a single entry per
+    qualified name (`SELECT DISTINCT`).
+    """
+    cur.execute(_LEAKPROOF_FUNCS_SQL, [list(schemas)])
+    return tuple(
+        LeakproofFunction(qualified_name=row["qname"])
         for row in cur.fetchall()
     )
 
@@ -689,8 +742,11 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
 
         # Roles are cluster-global — fetch once here so both the
         # no-tables early return and the main path below see the
-        # same set without re-querying.
+        # same set without re-querying. LEAKPROOF functions are
+        # schema-scoped but likewise independent of the table set,
+        # so fetch them here too and share across both paths.
         bypassrls_roles = _fetch_bypassrls_roles(cur)
+        leakproof_funcs = _fetch_leakproof_functions(cur, schemas)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -733,6 +789,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 views=views_early,
                 security_definer_functions=secdef_funcs_early,
                 bypassrls_roles=bypassrls_roles,
+                leakproof_functions=leakproof_funcs,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -925,4 +982,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         views=views,
         security_definer_functions=secdef_funcs,
         bypassrls_roles=bypassrls_roles,
+        leakproof_functions=leakproof_funcs,
     )

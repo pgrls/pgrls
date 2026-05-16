@@ -894,6 +894,55 @@ def test_introspect_captures_bypassrls_roles(
         )
 
 
+def test_introspect_captures_leakproof_functions(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC017 reads `Schema.leakproof_functions`. This confirms
+    # `_fetch_leakproof_functions` decodes `pg_proc.proleakproof`
+    # correctly against a live database, and that the
+    # `WHERE proleakproof = TRUE` filter excludes a plain function.
+    # Functions are schema-scoped, so the per-test `DROP SCHEMA
+    # public CASCADE` reset cleans them up — no manual teardown
+    # needed (unlike the cluster-global BYPASSRLS roles above).
+    apply_sql(
+        """
+        CREATE FUNCTION public.lp_marked(int) RETURNS bool
+            LANGUAGE sql LEAKPROOF AS 'SELECT $1 > 0';
+        CREATE FUNCTION public.lp_plain(int) RETURNS bool
+            LANGUAGE sql AS 'SELECT $1 > 0';
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    qnames = {f.qualified_name for f in schema.leakproof_functions}
+    assert "public.lp_marked" in qnames
+    # A function without the LEAKPROOF attribute is filtered out.
+    assert "public.lp_plain" not in qnames
+
+
+def test_introspect_collapses_leakproof_function_overloads(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Two LEAKPROOF overloads of the same qualified name collapse to
+    # a single entry (introspection's SELECT DISTINCT), matching
+    # SEC017's allowlist granularity — the allowlist key is the
+    # qualified name with no signature.
+    apply_sql(
+        """
+        CREATE FUNCTION public.lp_over(int) RETURNS bool
+            LANGUAGE sql LEAKPROOF AS 'SELECT $1 > 0';
+        CREATE FUNCTION public.lp_over(text) RETURNS bool
+            LANGUAGE sql LEAKPROOF AS 'SELECT length($1) > 0';
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    matches = [
+        f
+        for f in schema.leakproof_functions
+        if f.qualified_name == "public.lp_over"
+    ]
+    assert len(matches) == 1
+
+
 def test_introspect_resolves_view_to_table_references(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
