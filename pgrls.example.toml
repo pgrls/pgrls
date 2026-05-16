@@ -153,6 +153,29 @@ allowlist = []
 # `ALTER FUNCTION` one of them to a different name.
 allowlist = []
 
+[lint.rules.SEC015]
+# SECURITY DEFINER `pg_temp` search-path shadowing. A SECDEF
+# function whose effective search_path lets pg_temp (the
+# per-session temp schema, writable by every connected role) be
+# searched before the legitimate schemas is exploitable: an attacker
+# shadows an unqualified object reference with a same-named
+# pg_temp object and the function runs attacker SQL as its
+# owner (the CVE-2018-1058 privesc class). The rule fires
+# unless the function pins `search_path` with `pg_temp` named
+# explicitly LAST — the only shape that forces the temp schema
+# to be searched last. Fix: `ALTER FUNCTION name(args) SET
+# search_path = <existing>, pg_temp`.
+#
+# Allowlist after confirming the function body fully-qualifies
+# every object reference (in which case search_path is moot).
+# Entries are fully-qualified function names of the form
+# "schema.function"; bare names are rejected (cross-schema
+# collision). SEC015 is the sharp companion to SEC014 — a
+# function flagged by both is the common case; allowlist it
+# here after the search_path fix, clear the SEC014 finding
+# separately.
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is

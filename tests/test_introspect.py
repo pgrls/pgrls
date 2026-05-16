@@ -5,10 +5,68 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from pgrls.introspect import introspect
+from pgrls.introspect import _extract_search_path, introspect
 from pgrls.model import Schema
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+# --- _extract_search_path (pure helper, no DB) ---------------------------
+#
+# `pg_proc.proconfig` is a text[] of `name=value` GUC-override strings;
+# psycopg surfaces it as list[str] or None. `_extract_search_path`
+# decodes the `search_path` entry for SEC015.
+
+
+def test_extract_search_path_none_when_proconfig_null() -> None:
+    # A function that overrides no GUCs has proconfig = NULL.
+    assert _extract_search_path(None) is None
+
+
+def test_extract_search_path_none_when_no_search_path_entry() -> None:
+    # proconfig present but only carries other GUCs.
+    assert _extract_search_path(["statement_timeout=5000"]) is None
+
+
+def test_extract_search_path_returns_value() -> None:
+    # The comma inside the value is already un-escaped by psycopg's
+    # array parser by the time it reaches this helper.
+    assert (
+        _extract_search_path(["search_path=pg_catalog, public, pg_temp"])
+        == "pg_catalog, public, pg_temp"
+    )
+
+
+def test_extract_search_path_picks_search_path_among_multiple_gucs() -> None:
+    config = [
+        "statement_timeout=5000",
+        "search_path=public, pg_temp",
+        "work_mem=64MB",
+    ]
+    assert _extract_search_path(config) == "public, pg_temp"
+
+
+def test_extract_search_path_case_insensitive_guc_name() -> None:
+    # GUC names are case-insensitive in Postgres.
+    assert _extract_search_path(["Search_Path=public"]) == "public"
+
+
+def test_extract_search_path_empty_value() -> None:
+    # `_extract_search_path` returns everything after the first
+    # `=`, so a value-less `search_path=` entry decodes to "".
+    # This is a decoder-robustness case — `_extract_search_path`
+    # must not choke on a malformed/value-less GUC entry.
+    assert _extract_search_path(["search_path="]) == ""
+
+
+def test_extract_search_path_empty_string_value() -> None:
+    # The real `SET search_path = ''` shape: Postgres quotes the
+    # empty value, so `pg_proc.proconfig` stores the element as
+    # `search_path=""` (the value is two literal double-quote
+    # chars). The decoder returns that raw `""` string;
+    # SEC015's `_search_path_tokens` then strips the quotes to an
+    # empty token list, which `_is_pg_temp_safe` treats as unsafe.
+    assert _extract_search_path(['search_path=""']) == '""'
 
 
 def test_returns_empty_schema_when_no_tables(pg_conn: psycopg.Connection) -> None:
@@ -757,6 +815,38 @@ def test_introspect_skips_invoker_function_in_security_definer_functions(
     schema = introspect(pg_conn, schemas=["public"])
     qnames = {f.qualified_name for f in schema.security_definer_functions}
     assert "public.invoker_count" not in qnames
+
+
+def test_introspect_captures_secdef_function_search_path(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC015 reads `SecdefFunction.search_path`, decoded from
+    # `pg_proc.proconfig`. This is the end-to-end check that a
+    # `CREATE FUNCTION ... SET search_path = ...` round-trips
+    # through real psycopg `text[]` array parsing into the model
+    # field — the pure `_extract_search_path` unit tests assume
+    # psycopg surfaces proconfig as an un-escaped `list[str]`;
+    # this test pins the assumption against a live database.
+    apply_sql(
+        """
+        CREATE FUNCTION public.sp_pinned() RETURNS INT
+            LANGUAGE sql SECURITY DEFINER
+            SET search_path = pg_catalog, pg_temp
+            AS $$ SELECT 1 $$;
+        CREATE FUNCTION public.sp_unpinned() RETURNS INT
+            LANGUAGE sql SECURITY DEFINER
+            AS $$ SELECT 2 $$;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    by_name = {
+        f.qualified_name: f for f in schema.security_definer_functions
+    }
+    # A pinned `SET search_path` decodes to the GUC value string.
+    assert by_name["public.sp_pinned"].search_path == "pg_catalog, pg_temp"
+    # No `SET search_path` clause → proconfig has no search_path
+    # entry → field is None.
+    assert by_name["public.sp_unpinned"].search_path is None
 
 
 def test_introspect_resolves_view_to_table_references(

@@ -462,7 +462,8 @@ _SECDEF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
     p.prosrc AS body,
-    l.lanname AS lang
+    l.lanname AS lang,
+    p.proconfig AS config
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_language l ON l.oid = p.prolang
@@ -472,10 +473,34 @@ ORDER BY qname
 """
 
 
+def _extract_search_path(config: list[str] | None) -> str | None:
+    """Pull the `search_path` value out of a `pg_proc.proconfig` array.
+
+    `proconfig` is a `text[]` of `name=value` GUC-override strings —
+    `{search_path=pg_catalog\\, public\\, pg_temp, statement_timeout=5000}`
+    — or NULL when the function overrides no GUCs. psycopg surfaces it
+    as a Python `list[str]` (commas already un-escaped) or `None`.
+
+    Returns the raw `search_path` value string (everything after the
+    first `=`), or `None` when the function pins no search_path. GUC
+    names are case-insensitive in Postgres, so the `search_path=`
+    prefix is matched case-insensitively; the stored form is normally
+    lowercase but a `SET "Search_Path" = ...` would round-trip
+    differently.
+    """
+    if not config:
+        return None
+    for entry in config:
+        name, sep, value = entry.partition("=")
+        if sep and name.strip().lower() == "search_path":
+            return value
+    return None
+
+
 def _fetch_secdef_functions(
     cur: Any, schemas: list[str]
 ) -> tuple[SecdefFunction, ...]:
-    """Fetch every SECURITY DEFINER function in `schemas` with body + lang.
+    """Fetch every SECURITY DEFINER function in `schemas`.
 
     Returns a tuple of `SecdefFunction` records sorted by qualified name
     (the SQL `ORDER BY qname` provides the determinism). Used by both
@@ -483,6 +508,10 @@ def _fetch_secdef_functions(
     bare-call detection in `_build_secdef_calls_index` — sharing the
     fetch lets both consumers see the same set without an extra round
     trip.
+
+    Each record carries `body` + `language` (for VIEW004's body
+    parsing) and `search_path` (for SEC015's pg_temp-shadowing
+    check, decoded from `pg_proc.proconfig`).
     """
     cur.execute(_SECDEF_FUNCS_SQL, [list(schemas)])
     return tuple(
@@ -490,6 +519,7 @@ def _fetch_secdef_functions(
             qualified_name=row["qname"],
             body=row["body"],
             language=row["lang"],
+            search_path=_extract_search_path(row["config"]),
         )
         for row in cur.fetchall()
     )

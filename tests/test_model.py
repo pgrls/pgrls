@@ -62,7 +62,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 7,
+        "version": 8,
         "tables": [
             {
                 "schema": "public",
@@ -217,13 +217,13 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_seven_after_indexes_addition() -> None:
-    # `indexes` was added for v0.5.10 — SNAPSHOT_VERSION bumped
-    # from 6 → 7 per the model.py docstring contract that additive
-    # structural changes bump the version. Pin the new version so
-    # a future bump is deliberate.
+def test_snapshot_version_is_eight_after_search_path_addition() -> None:
+    # `SecdefFunction.search_path` was added for v0.5.13 (SEC015) —
+    # SNAPSHOT_VERSION bumped from 7 → 8 per the model.py docstring
+    # contract that additive structural changes bump the version.
+    # Pin the new version so a future bump is deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 7
+    assert snap["version"] == 8
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -448,7 +448,7 @@ def test_snapshot_v7_top_level_keys_are_stable_contract() -> None:
         "views",
         "security_definer_functions",
     }
-    assert snap["version"] == 7
+    assert snap["version"] == 8
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:

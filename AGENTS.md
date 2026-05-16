@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-three rules across four
+In the current release it ships **twenty-four rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -26,6 +26,8 @@ silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 triggers fire as table owner),
 `SEC014` (SECURITY DEFINER function bypasses caller's RLS —
 audit every SECDEF function),
+`SEC015` (SECURITY DEFINER function exposed to `pg_temp`
+search-path shadowing),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -857,6 +859,95 @@ Out of scope (intentional):
   false-negative path VIEW004 documents). To audit such
   functions, expand `--schemas` to include the function's
   home schema.
+
+<a id="rule-sec015"></a>
+
+### SEC015 — SECURITY DEFINER function exposed to pg_temp shadowing
+
+**Severity:** warning. **Auto-fix:** no (the `ALTER FUNCTION …
+SET search_path` rewrite needs the function's full argument
+signature, which introspection doesn't capture).
+
+A `SECURITY DEFINER` function runs as its owner. When the body
+references a relation or data type — a table, view, sequence,
+or type — by an **unqualified** name, Postgres resolves that
+name against the function's effective `search_path`. The danger
+is the default: Postgres searches `pg_temp`, the per-session
+temporary schema that **every** connected role can write to,
+*first* — ahead of even `pg_catalog` — for relation and data
+type names (it is never searched for function or operator
+names), *unless* `pg_temp` is named explicitly in
+`search_path`. An attacker creates a same-named object in their
+session's `pg_temp`; the privileged function silently resolves
+the unqualified reference
+to the attacker's object and executes attacker-controlled SQL
+with the owner's privileges. This is the CVE-2018-1058
+search-path privilege-escalation class.
+
+SEC015 fires when a SECDEF function's effective `search_path`
+does not end with an explicit `pg_temp` token:
+
+* **No `SET search_path` clause** — the function inherits the
+  *caller's* search_path. The caller is the attacker; `pg_temp`
+  is implicitly first.
+* **`SET search_path` present but `pg_temp` absent** — e.g. the
+  common `SET search_path = pg_catalog, public`. `pg_temp` isn't
+  named, so the default (searched first) still applies.
+* **`pg_temp` named but not last** — e.g.
+  `SET search_path = pg_temp, public`. It's searched at the
+  written position, ahead of the legitimate schemas.
+
+The only structurally-safe shape — `pg_temp` named as the
+**last** entry of a pinned `search_path` — passes. This is the
+pattern the Postgres documentation prescribes for SECURITY
+DEFINER functions: naming `pg_temp` last forces the temp schema
+to be searched last.
+
+The introspector decodes the function's `search_path` from
+`pg_proc.proconfig` (snapshot v8+). The fix is mechanical —
+append `pg_temp` to the function's `SET search_path` clause (or
+add the clause) — but `pgrls fix` doesn't apply it: the
+`ALTER FUNCTION name(argtypes) SET search_path = …` statement
+needs the function's argument types, and introspection captures
+`proname` without `proargtypes`. Run the `ALTER FUNCTION` by
+hand, or allowlist the function after confirming its body
+fully-qualifies every object reference (in which case
+`search_path` is moot).
+
+The allowlist key is `schema.function` (two parts). Bare
+`function_name` is rejected for the same reason as SEC014.
+
+```toml
+[lint.rules.SEC015]
+allowlist = [
+    "audit.refresh_cache",  # reviewed 2026-05-15 — body fully-
+                            # qualifies every table reference, so
+                            # search_path is moot.
+]
+```
+
+Relationship to the other SECDEF rules: SEC014 flags every
+SECDEF function as a generic audit surface; SEC015 is narrower
+and sharper — it doesn't say "audit this," it says "this
+function has an exploitable `search_path` and here is the
+one-line fix." A function flagged by both SEC014 and SEC015 is
+the common case; allowlisting it in SEC015 (after the fix)
+still leaves the SEC014 audit-surface finding, which the
+operator clears separately.
+
+Out of scope (intentional):
+
+* **Body-level qualification analysis.** A SECDEF function with
+  an unsafe `search_path` but a body that fully-qualifies every
+  object reference is not actually exploitable. SEC015 doesn't
+  parse the body to prove that — it flags on the `search_path`
+  shape alone and lets the operator allowlist the audited-safe
+  cases. A body-qualification proof is exactly the brittle AST
+  analysis VIEW004 documents false-negatives for; the
+  structural `search_path` check has no false negatives.
+* **Cross-scope functions.** A SECDEF function in a schema
+  outside `--schemas` is invisible to SEC015. Expand
+  `--schemas` to audit it.
 
 <a id="rule-perf001"></a>
 
@@ -1772,14 +1863,15 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-three rules across four categories.** SEC001–SEC014,
+- **Twenty-four rules across four categories.** SEC001–SEC015,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
-  There is no `pg_temp` shadowing detection. SECURITY DEFINER
-  function audit is now triple-coverage: VIEW004 catches the
-  view-mediated bypass, SEC013 the trigger-mediated bypass, and
-  SEC014 (added in v0.5.12) flags every SECDEF function as the
-  free-standing audit surface for application-callable functions
-  (`SELECT my_secdef(...)`, JDBC, etc.).
+  SECURITY DEFINER coverage is now four rules deep: VIEW004
+  catches the view-mediated RLS bypass, SEC013 the
+  trigger-mediated bypass, SEC014 (v0.5.12) flags every SECDEF
+  function as the free-standing audit surface for
+  application-callable functions, and SEC015 (v0.5.13) flags
+  SECDEF functions whose `search_path` exposes them to
+  `pg_temp` object shadowing (the CVE-2018-1058 privesc class).
 - **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
   fix` rewrites the mechanically-fixable subset; other rules need
   human intent.
