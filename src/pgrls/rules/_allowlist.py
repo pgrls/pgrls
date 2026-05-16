@@ -1,6 +1,6 @@
 """Shared allowlist parsers for rule options.
 
-Allowlist entries fall into five shapes:
+Allowlist entries fall into six shapes:
 
 * **Policy ID** (`schema.table.policy_name`) — used by every per-policy
   rule (SEC003, SEC005, SEC006, SEC008, SEC010, SEC011, PERF001,
@@ -18,6 +18,10 @@ Allowlist entries fall into five shapes:
 
 * **Qualified function ID** (`schema.function` only) — used by
   function-scoped rules (SEC014, SEC015).
+
+* **Role name** (bare `name` only) — used by role-scoped rules
+  (SEC016). Postgres roles are cluster-global and have no schema
+  component, so the entry is an unqualified role name.
 
 Earlier versions had every rule do the bare list-of-strings check
 (`isinstance(raw, list) and all(isinstance(s, str))`) and accepted any
@@ -205,5 +209,37 @@ def parse_qualified_function_allowlist(
                 f"[lint.rules.{rule_id}].allowlist entry {entry!r} is "
                 f"not a valid qualified function ID. Expected "
                 f"'schema.function' (e.g. 'public.refresh_cache')."
+            )
+    return set(items)
+
+
+def parse_role_name_allowlist(
+    rule_id: str, options: dict[str, Any]
+) -> set[str]:
+    """Validate that every entry is a non-empty role name.
+
+    Used by SEC016. Postgres roles are cluster-global and
+    unqualified — there is no schema component — so an allowlist
+    entry is a bare role name, matched byte-exactly against
+    ``pg_roles.rolname``.
+
+    Unlike the schema-qualified shapes, a role name is not split on
+    ``.``: Postgres permits a literal dot inside a quoted role name
+    (``CREATE ROLE "my.role"``), and with no schema component there
+    is nothing to disambiguate. Beyond the shared list-of-strings
+    and surrounding-whitespace checks in ``_list_of_strings``, the
+    only shape this validator additionally rejects is the empty
+    string — an entry that could never match a real role and almost
+    always signals a malformed config (a stray comma, a blank line
+    copy-pasted into the list).
+    """
+    raw = options.get("allowlist", [])
+    items = _list_of_strings(rule_id, raw, "role names")
+    for entry in items:
+        if not entry:
+            raise TypeError(
+                f"[lint.rules.{rule_id}].allowlist entry {entry!r} is "
+                f"not a valid role name. Expected a non-empty role "
+                f"name (e.g. 'replication_worker')."
             )
     return set(items)
