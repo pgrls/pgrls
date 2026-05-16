@@ -226,7 +226,9 @@ def parse_role_name_allowlist(
     Unlike the schema-qualified shapes, a role name is not split on
     ``.``: Postgres permits a literal dot inside a quoted role name
     (``CREATE ROLE "my.role"``), and with no schema component there
-    is nothing to disambiguate. The only rejected shape is the empty
+    is nothing to disambiguate. Beyond the shared list-of-strings
+    and surrounding-whitespace checks in ``_list_of_strings``, the
+    only shape this validator additionally rejects is the empty
     string — an entry that could never match a real role and almost
     always signals a malformed config (a stray comma, a blank line
     copy-pasted into the list).

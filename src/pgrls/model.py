@@ -340,7 +340,7 @@ class BypassRlsRole:
     *every* row-level security policy on *every* table — RLS is
     effectively off for any session whose current role holds the
     attribute. Unlike a table owner (who bypasses RLS only until
-    ``FORCE ROW LEVEL SECURITY`` is set — see SEC003), a BYPASSRLS
+    ``FORCE ROW LEVEL SECURITY`` is set — see SEC002), a BYPASSRLS
     role's bypass is unconditional and cluster-wide.
 
     Introspection captures only roles whose ``pg_roles.rolbypassrls``

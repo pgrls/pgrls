@@ -26,11 +26,12 @@ breaking changes — they will be called out in this file.
   schema still reads as airtight.
 
   `BYPASSRLS` is unconditional and cluster-wide. It is not the
-  table-owner bypass SEC003 covers — `FORCE ROW LEVEL SECURITY`
+  table-owner bypass SEC002 covers — `FORCE ROW LEVEL SECURITY`
   does not touch a `BYPASSRLS` role. And it is not the
-  code-mediated `SECURITY DEFINER` bypass SEC013/SEC014/SEC015
-  cover — no function or ownership is involved; the role itself
-  is exempt.
+  code-mediated bypass SEC013/SEC014/SEC015 cover — a trigger
+  firing as the table owner, or a `SECURITY DEFINER` function
+  running as the function owner. The role itself is exempt; no
+  code or ownership is involved.
 
   SEC016 skips superuser roles: a superuser bypasses RLS via
   `rolsuper` regardless, so the attribute is redundant noise on

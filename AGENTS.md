@@ -979,7 +979,7 @@ other ways a session can end up not subject to RLS:
 
 * A **table owner** implicitly bypasses RLS on its own tables —
   but only until `ALTER TABLE … FORCE ROW LEVEL SECURITY` is set,
-  which is exactly what SEC003 flags. `FORCE` does **not** touch a
+  which is exactly what SEC002 flags. `FORCE` does **not** touch a
   `BYPASSRLS` role: it bypasses a FORCE'd table just the same.
 * A **superuser** bypasses RLS via `rolsuper`, also
   unconditionally. A superuser additionally carrying `BYPASSRLS`
@@ -1018,15 +1018,15 @@ allowlist = [
 ]
 ```
 
-Relationship to the other bypass rules: SEC003 covers the
+Relationship to the other bypass rules: SEC002 covers the
 table-owner bypass (mechanism: ownership; remedy: `FORCE`).
-SEC013 / SEC014 / SEC015 cover code-mediated bypass through
-`SECURITY DEFINER` triggers and functions (mechanism: a function
-running as its owner). SEC016 covers the attribute-mediated
-bypass — the role itself is exempt, no code or ownership
-involved. It is the bluntest of the family: where the others
-need a specific object to be misconfigured, SEC016 needs only a
-role attribute to be set.
+SEC013 / SEC014 / SEC015 cover code-mediated bypass: triggers
+fire as the table owner (SEC013), and `SECURITY DEFINER`
+functions run as the function owner (SEC014 / SEC015). SEC016
+covers the attribute-mediated bypass — the role itself is exempt,
+no code or ownership involved. It is the bluntest of the family:
+where the others need a specific object to be misconfigured,
+SEC016 needs only a role attribute to be set.
 
 Out of scope (intentional):
 
