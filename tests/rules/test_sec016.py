@@ -157,7 +157,7 @@ def test_sec016_message_includes_allowlist_hint() -> None:
 def test_sec016_message_contrasts_force_rls() -> None:
     # The message contrasts BYPASSRLS (unconditional) with the
     # table-owner bypass (stops at FORCE ROW LEVEL SECURITY) so an
-    # operator who knows SEC003 doesn't assume FORCE fixes this.
+    # operator who knows SEC002 doesn't assume FORCE fixes this.
     schema = Schema(bypassrls_roles=(_role("app_role"),))
     [v] = SEC016().check(schema, options={})
     assert "FORCE ROW LEVEL SECURITY" in v.message
