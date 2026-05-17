@@ -10,6 +10,41 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-05-17
+
+### Added
+- **SEC019 — policy calls `current_setting()` without the
+  `missing_ok` argument** (severity: info). Flags every policy
+  whose `USING` or `WITH CHECK` expression contains a
+  `current_setting` call with exactly one argument.
+
+  `current_setting(name)` raises `unrecognized configuration
+  parameter` when the GUC is unset; `current_setting(name, true)`
+  (passing the `missing_ok` argument) returns NULL instead. RLS
+  policies read the per-request tenant context from a custom GUC,
+  so with the one-argument form a request that reaches the
+  database before its session context is set makes *every* query
+  against the table error. The two-argument form yields NULL,
+  which in a `column = current_setting(...)` predicate simply
+  matches no rows — the query succeeds, empty.
+
+  Neither is a security hole: the one-argument form fails closed
+  (it raises, never silently widens). SEC019 is therefore
+  **info**-level — a robustness nudge so the choice between
+  "raise" and "return NULL on an unset GUC" is deliberate, not an
+  accident of which overload was reached for. It is unrelated to
+  SEC004, which catches the genuinely dangerous *fail-open*
+  `current_setting(...) IS NULL OR …` shape. Detection is
+  structural (the parsed policy AST, including sub-selects);
+  allowlist by qualified policy ID when raise-on-unset is the
+  intended behaviour.
+
+### Changed
+- **Rule count: twenty-seven → twenty-eight** (`SEC001`–`SEC019`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC019 reads policy expressions already
+  captured since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.16] - 2026-05-16
 
 ### Added

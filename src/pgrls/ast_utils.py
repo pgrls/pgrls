@@ -19,7 +19,8 @@ from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 _LINT_AST_RULES_TAIL = (
     "AST-based rules (SEC004, SEC005, SEC008, SEC010, SEC011, "
-    "SEC018, HYG001, PERF001, PERF002) skipped for this clause."
+    "SEC018, SEC019, HYG001, PERF001, PERF002) skipped for this "
+    "clause."
 )
 
 

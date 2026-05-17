@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-seven rules across four
+In the current release it ships **twenty-eight rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -43,7 +43,9 @@ sequential scan per query), `HYG002`
 data at REFRESH time), and `VIEW004` (view calls a SECURITY
 DEFINER function reading an RLS-protected table). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
-floor). A `pgrls fix` subcommand auto-remediates SEC002, PERF001,
+floor) and `SEC019` (policy calls one-argument `current_setting()`,
+which raises on an unset GUC). A `pgrls fix` subcommand
+auto-remediates SEC002, PERF001,
 VIEW001, and VIEW002; other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -1228,6 +1230,61 @@ wrong identity. Both are policy-expression rules, but SEC004 is an
 error (always wrong) while SEC018 is a warning (wrong only under a
 shared pool role).
 
+<a id="rule-sec019"></a>
+
+### SEC019 — Policy calls current_setting() without the missing_ok argument
+
+**Severity:** info. **Auto-fix:** no (whether an unset GUC should
+raise or return NULL is a deliberate behaviour choice — pgrls
+surfaces the one-argument form but will not rewrite it).
+
+`current_setting(name)` — the one-argument form — raises
+`ERROR: unrecognized configuration parameter "name"` when `name` is
+a GUC that has never been set in the session.
+`current_setting(name, missing_ok)` — the two-argument form —
+returns NULL instead when `missing_ok` is true.
+
+RLS policies routinely read the tenant/session context from a
+custom GUC the application sets per request:
+
+```sql
+CREATE POLICY p ON documents
+    USING (tenant_id = current_setting('app.tenant_id'));
+```
+
+With the one-argument form, a request that reaches the database
+*without* having run `SET app.tenant_id = …` does not get a quiet,
+empty result — the policy expression itself raises, so **every**
+query against the table errors until the GUC is set. The two-arg
+form `current_setting('app.tenant_id', true)` instead yields NULL;
+in the typical `column = current_setting(...)` predicate that NULL
+makes the comparison match no rows — the query succeeds and returns
+nothing.
+
+Which behaviour is better is a genuine judgement call — a loud
+error surfaces the missing-context bug immediately, a quiet empty
+result is friendlier but can mask it. SEC019 does not assert one is
+wrong. It is **info**-level: it surfaces the one-argument form so
+the choice between "raise" and "return NULL on an unset GUC" is
+deliberate rather than an accident of which overload the author
+reached for. (The two-arg form is also what a typical policy set
+converges on, so a lone one-arg call is often just an oversight.)
+
+SEC019 fires when a policy's `USING` or `WITH CHECK` expression
+contains a `current_setting` call with exactly one argument —
+anywhere in the tree, including inside a `(SELECT current_setting
+(...))` wrapper. It does not inspect the GUC name. Allowlist by
+qualified policy ID when the raise-on-unset behaviour is the
+intended, documented choice.
+
+Relationship to SEC004: SEC004 catches the genuinely dangerous
+`current_setting(...) IS NULL OR …` shape — a *fail-open* predicate
+that admits every row when the GUC is unset — and is an error.
+SEC019 is unrelated to fail-open: the one-arg form fails *closed*
+(it raises). SEC019 only nudges toward the more robust overload; it
+is info, not a security finding. A policy can trip both rules
+independently.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2143,7 +2200,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-seven rules across four categories.** SEC001–SEC018,
+- **Twenty-eight rules across four categories.** SEC001–SEC019,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
