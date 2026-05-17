@@ -10,6 +10,55 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.16] - 2026-05-16
+
+### Added
+- **SEC018 — policy compares a column against `current_user` /
+  `session_user`** (severity: warning). Flags every policy whose
+  `USING` or `WITH CHECK` expression compares one of its own
+  table's columns against `current_user` (or its `current_role` /
+  `user` aliases) or `session_user` — `owner_role = current_user`,
+  `current_user = ANY(member_roles)`, and so on.
+
+  These identify the Postgres role the session runs as. Using one
+  as a row-matching key isolates tenants only when every tenant
+  connects as — or `SET ROLE`s to — a distinct Postgres role.
+  Application code almost always serves every tenant over one
+  shared connection-pool role; `current_user` is then a constant,
+  and a policy like `USING (owner_role = current_user)` matches
+  the same way for every tenant — no per-tenant isolation, while
+  still looking like access control. `session_user` is the same
+  trap and worse — it stays pinned to the pool's login role even
+  when the application does `SET ROLE` per request.
+
+  The rule deliberately leaves three legitimate uses alone: a
+  `current_user` *function argument* (`pg_has_role(current_user,
+  …)` — the standard admin escape, not a comparison operand);
+  `current_user` compared only to a *literal* (`current_user =
+  'postgres'` — a superuser check, no column operand); and
+  `current_user` compared to a column of *another* table (a
+  `pg_roles` catalog lookup — also an admin escape). Firing
+  requires a column of the policy's own table on the other side of
+  the comparison (the same own-column scoping SEC005 uses).
+
+  The correct discriminator for pooled application code is a
+  per-request session value: a GUC read with
+  `current_setting('app.tenant_id')`, or a JWT claim. SEC018 is a
+  warning, not an error, because the role-per-tenant RLS pattern
+  (one Postgres role per tenant, `SET ROLE` per request) is a
+  legitimate design where `current_user` is the right
+  discriminator — pgrls cannot tell which deployment model is in
+  use. Detection is structural (the rule walks the parsed policy
+  AST for the comparison, including sub-selects); allowlist by
+  qualified policy ID after confirming a role-per-tenant
+  deployment.
+
+### Changed
+- **Rule count: twenty-six → twenty-seven** (`SEC001`–`SEC018`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC018 reads the policy expressions
+  already captured since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.15] - 2026-05-15
 
 ### Added
