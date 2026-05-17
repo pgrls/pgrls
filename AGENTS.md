@@ -1142,12 +1142,12 @@ Out of scope (intentional):
 application's tenant-key name and is an architectural decision, not
 a mechanical rewrite).
 
-A policy whose `USING` or `WITH CHECK` expression compares a table
-**column** against `current_user` — or its aliases `current_role`
-and `user` — or `session_user` is using *the Postgres role the
-session runs as* as the row-matching key. That isolates tenants
-only when every tenant connects as, or `SET ROLE`s to, a
-**distinct** Postgres role.
+A policy whose `USING` or `WITH CHECK` expression compares one of
+its **own table's columns** against `current_user` — or its aliases
+`current_role` and `user` — or `session_user` is using *the
+Postgres role the session runs as* as the row-matching key. That
+isolates tenants only when every tenant connects as, or `SET ROLE`s
+to, a **distinct** Postgres role.
 
 Application architectures almost never do that. A connection pool
 authenticates as one shared database role and serves every
@@ -1168,25 +1168,29 @@ when the application does `SET ROLE` per request.
 
 Detection is structural — the rule walks the parsed policy AST for
 an `A_Expr` (comparison) node with a role-identity `SQLValueFunction`
-on one operand and a `ColumnRef` on the other, anywhere in the tree
-(including inside sub-selects).
+on one operand and a reference to a column of the policy's own
+table on the other (the same own-column scoping SEC005 uses),
+anywhere in the tree.
 
 **What SEC018 deliberately does not flag.** A `current_user`
 reference is only an isolation problem when it is the *row-matching
-key*. Two common, legitimate uses are left alone:
+key* — compared against the table's own data. Three legitimate
+uses are left alone:
 
 * `current_user` passed to a role/privilege function —
   `pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')`,
-  `has_table_privilege(current_user, …)`. This is the standard
-  "admin escape" branch of a policy, a role-membership check, not
-  a tenant key.
+  `has_table_privilege(current_user, …)`. Here `current_user` is a
+  function argument, not a comparison operand: it feeds a
+  role/privilege check, the standard "admin escape" branch of a
+  policy, not a tenant key.
 * `current_user` compared only to a literal — `current_user =
   'postgres'`. That checks for one specific role (a superuser /
-  admin escape); under a shared pool role it is simply false and
-  the rest of the policy governs.
-
-Both require a column on the other side of the comparison to fire,
-which neither has — so SEC018 stays silent on them.
+  admin escape); there is no column operand at all.
+* `current_user` compared to a column of *another* table — a
+  catalog lookup like `EXISTS (SELECT 1 FROM pg_roles WHERE
+  rolname = current_user AND rolsuper)`. `pg_roles.rolname` is a
+  catalog column, not a tenant key; restricting the column operand
+  to the policy's own table excludes this whole family.
 
 The correct discriminator for pooled application code is a
 *session-scoped* value the application sets per request: a GUC

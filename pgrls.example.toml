@@ -211,20 +211,21 @@ allowlist = []
 allowlist = []
 
 [lint.rules.SEC018]
-# Policies that compare a table column against current_user /
-# session_user (e.g. `owner_role = current_user`). These name the
-# Postgres role the session runs as — using one as a row-matching
-# key isolates tenants only when each tenant connects as a
-# distinct role. Pooled application code shares one role, so
-# current_user becomes a constant and the comparison stops
-# isolating anything. Fix: key the policy off a per-request
+# Policies that compare one of the table's own columns against
+# current_user / session_user (e.g. `owner_role = current_user`).
+# These name the Postgres role the session runs as — using one as
+# a row-matching key isolates tenants only when each tenant
+# connects as a distinct role. Pooled application code shares one
+# role, so current_user becomes a constant and the comparison
+# stops isolating anything. Fix: key the policy off a per-request
 # session value instead — current_setting('app.tenant_id') or a
 # JWT claim.
 #
 # Not flagged: current_user passed to a role/privilege function
-# (pg_has_role(current_user, ...) — an admin escape) or compared
-# only to a literal (current_user = 'postgres') — those are not
-# row-matching keys.
+# (pg_has_role(current_user, ...) — an admin escape), compared
+# only to a literal (current_user = 'postgres'), or compared to a
+# column of another table (a pg_roles catalog lookup) — those are
+# admin/role checks, not row-matching tenant keys.
 #
 # Allowlist only if this project genuinely uses the
 # role-per-tenant pattern (one Postgres role per tenant, SET ROLE

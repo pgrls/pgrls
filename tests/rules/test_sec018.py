@@ -1,12 +1,14 @@
-"""Unit tests for SEC018 — column compared against current_user.
+"""Unit tests for SEC018 — own column compared against current_user.
 
 SEC018 fires when a policy's USING / WITH CHECK expression compares
-a table column against `current_user` (or its `current_role` /
-`user` aliases) or `session_user` — the tenant-discriminator
-anti-pattern. It deliberately does NOT fire when `current_user` is
-passed to a role/privilege function (`pg_has_role(current_user, …)`)
-or compared only to a literal (`current_user = 'postgres'`), which
-are legitimate admin/role checks.
+a column of the policy's OWN table against `current_user` (or its
+`current_role` / `user` aliases) or `session_user` — the
+tenant-discriminator anti-pattern. It deliberately does NOT fire
+when `current_user` is passed to a role/privilege function
+(`pg_has_role(current_user, …)`), compared only to a literal
+(`current_user = 'postgres'`), or compared to a non-own-table
+column (a `pg_roles` catalog lookup) — all legitimate admin/role
+checks.
 """
 from __future__ import annotations
 
@@ -36,7 +38,9 @@ def _policy(
     )
 
 
-def _wrap(policy: Policy) -> Schema:
+def _wrap(
+    policy: Policy, *, columns: tuple[str, ...] = ("id", "owner_role", "member_roles")
+) -> Schema:
     return Schema(
         tables=(
             Table(
@@ -45,13 +49,13 @@ def _wrap(policy: Policy) -> Schema:
                 rls_enabled=True,
                 force_rls=True,
                 policies=(policy,),
-                columns=("id", "owner_role", "member_roles"),
+                columns=columns,
             ),
         )
     )
 
 
-# --- fires: column compared against a role-identity function -------------
+# --- fires: own column compared against a role-identity function ---------
 
 
 def test_sec018_fires_on_column_eq_current_user() -> None:
@@ -84,7 +88,7 @@ def test_sec018_fires_with_role_identity_on_the_left() -> None:
 
 
 def test_sec018_fires_on_any_against_array_column() -> None:
-    # `current_user = ANY(<array column>)` is still a column
+    # `current_user = ANY(<own array column>)` is still an own-column
     # comparison — the role identity is matched against row data.
     schema = _wrap(_policy("current_user = ANY(member_roles)"))
     assert len(SEC018().check(schema, {})) == 1
@@ -95,12 +99,15 @@ def test_sec018_fires_when_only_in_with_check() -> None:
     assert len(SEC018().check(_wrap(p), {})) == 1
 
 
-def test_sec018_fires_on_column_comparison_inside_subquery() -> None:
-    # The `member = current_user` comparison nested in the sub-select
-    # is still a column-vs-role-identity A_Expr — the walk recurses
-    # into sub-selects, so SEC018 catches it.
+def test_sec018_fires_on_correlated_own_column_in_subquery() -> None:
+    # An own-table column compared to current_user, reached through
+    # correlation from inside a sub-select, still fires — the walk
+    # recurses and `t.owner_role` resolves to the policy's table.
     schema = _wrap(
-        _policy("id IN (SELECT doc_id FROM acl WHERE member = current_user)")
+        _policy(
+            "EXISTS (SELECT 1 FROM acl a "
+            "WHERE a.doc_id = t.id AND t.owner_role = current_user)"
+        )
     )
     assert len(SEC018().check(schema, {})) == 1
 
@@ -120,17 +127,40 @@ def test_sec018_silent_on_pg_has_role_admin_escape() -> None:
 
 def test_sec018_silent_on_current_user_compared_to_literal() -> None:
     # `current_user = 'postgres'` checks for one specific role (a
-    # superuser/admin escape), not a per-row data match. No column
-    # is involved — SEC018 must NOT fire.
+    # superuser/admin escape). No column operand — SEC018 silent.
     schema = _wrap(_policy("current_user = 'postgres'"))
+    assert SEC018().check(schema, {}) == []
+
+
+def test_sec018_silent_on_catalog_role_lookup() -> None:
+    # A superuser check written as a pg_roles catalog lookup —
+    # `pg_roles.rolname` is a catalog column, not the policy table's
+    # own column, so the own-column scoping leaves it alone. This is
+    # the same admin-escape family as the literal/pg_has_role cases.
+    schema = _wrap(
+        _policy(
+            "EXISTS (SELECT 1 FROM pg_roles "
+            "WHERE rolname = current_user AND rolsuper)"
+        )
+    )
+    assert SEC018().check(schema, {}) == []
+
+
+def test_sec018_silent_on_cross_table_subquery_comparison() -> None:
+    # `current_user` compared to a column of ANOTHER table inside a
+    # sub-select (a membership lookup) is a known false negative:
+    # only the policy's own-table columns are in scope. Pin the
+    # documented behavior so a future scoping change is deliberate.
+    schema = _wrap(
+        _policy("id IN (SELECT doc_id FROM acl WHERE acl_member = current_user)")
+    )
     assert SEC018().check(schema, {}) == []
 
 
 def test_sec018_silent_on_tenant_guc_with_pg_has_role_escape() -> None:
     # The real-world pattern: tenant isolation via a session GUC,
-    # plus a pg_has_role admin escape. No column is compared against
-    # current_user, so SEC018 stays silent — only the GUC and the
-    # role-membership check are involved.
+    # plus a pg_has_role admin escape. No own column is compared
+    # against current_user, so SEC018 stays silent.
     schema = _wrap(
         _policy(
             "tenant_id = current_setting('app.tenant', true) "
@@ -156,9 +186,16 @@ def test_sec018_silent_on_plain_column_predicate() -> None:
 def test_sec018_silent_when_policy_has_no_clauses() -> None:
     # A policy whose USING and WITH CHECK both parsed to None — an
     # empty clause, or a parse failure that left the AST unset —
-    # has nothing for SEC018 to walk. check() must handle it
-    # cleanly and emit nothing.
+    # has nothing for SEC018 to walk.
     schema = _wrap(_policy(using=None, with_check=None))
+    assert SEC018().check(schema, {}) == []
+
+
+def test_sec018_silent_when_table_columns_unknown() -> None:
+    # Without a captured column list (a pre-v5 snapshot), SEC018
+    # cannot resolve own-table columns and skips the table —
+    # the same degradation SEC005 has.
+    schema = _wrap(_policy("owner_role = current_user"), columns=())
     assert SEC018().check(schema, {}) == []
 
 

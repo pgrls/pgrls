@@ -15,9 +15,9 @@ breaking changes — they will be called out in this file.
 ### Added
 - **SEC018 — policy compares a column against `current_user` /
   `session_user`** (severity: warning). Flags every policy whose
-  `USING` or `WITH CHECK` expression compares a table column
-  against `current_user` (or its `current_role` / `user` aliases)
-  or `session_user` — `owner_role = current_user`,
+  `USING` or `WITH CHECK` expression compares one of its own
+  table's columns against `current_user` (or its `current_role` /
+  `user` aliases) or `session_user` — `owner_role = current_user`,
   `current_user = ANY(member_roles)`, and so on.
 
   These identify the Postgres role the session runs as. Using one
@@ -31,12 +31,15 @@ breaking changes — they will be called out in this file.
   trap and worse — it stays pinned to the pool's login role even
   when the application does `SET ROLE` per request.
 
-  The rule deliberately does **not** flag `current_user` passed to
-  a role/privilege function (`pg_has_role(current_user, …)` — the
-  standard admin escape) or compared only to a literal
-  (`current_user = 'postgres'` — a superuser check): those are not
-  row-matching keys. Firing requires a column on the other side of
-  the comparison.
+  The rule deliberately leaves three legitimate uses alone: a
+  `current_user` *function argument* (`pg_has_role(current_user,
+  …)` — the standard admin escape, not a comparison operand);
+  `current_user` compared only to a *literal* (`current_user =
+  'postgres'` — a superuser check, no column operand); and
+  `current_user` compared to a column of *another* table (a
+  `pg_roles` catalog lookup — also an admin escape). Firing
+  requires a column of the policy's own table on the other side of
+  the comparison (the same own-column scoping SEC005 uses).
 
   The correct discriminator for pooled application code is a
   per-request session value: a GUC read with
