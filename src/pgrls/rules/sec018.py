@@ -55,9 +55,10 @@ What SEC018 flags — and what it deliberately does not:
   `EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND
   rolsuper)` is *also* an admin/superuser escape — `pg_roles.rolname`
   is a catalog column, not a tenant key. Restricting the column
-  operand to the policy's own table excludes this whole family
-  (catalog lookups, joins to unrelated tables) without a brittle
-  per-table semantic analysis.
+  operand to the policy's own table excludes this family (catalog
+  lookups, joins to unrelated tables) without a brittle per-table
+  semantic analysis — with one imprecision, the bare-name collision
+  noted under "Out of scope" below.
 
 Detection is structural: the rule walks the parsed policy AST and
 looks for an `A_Expr` (comparison) node with a role-identity
@@ -96,10 +97,21 @@ Out of scope (intentional):
   the cost of missing the membership-table variant of the
   anti-pattern (a known false negative); the dominant shape, a
   direct own-column comparison, is caught.
-* **Tables with no captured column list.** When `Table.columns` is
-  empty (a pre-v5 snapshot, a hand-built fixture), SEC018 cannot
-  resolve own-table columns and skips the table — same degradation
-  as SEC005.
+* **Bare-name collisions.** Own-table membership is resolved by
+  column *name* — `extract_column_refs` cannot tell an unqualified
+  column inside a sub-select from a same-named column of the
+  policy's own table. So a catalog/membership lookup
+  `… WHERE col = current_user` where `col` is unqualified *and* the
+  policy's own table also has a column named `col` is
+  (mis-)flagged. This is the same bare-name imprecision SEC005
+  documents — there a false negative, here a false positive.
+  Qualifying the sub-select column avoids it; an operator who hits
+  it allowlists the policy.
+* **Tables with no captured column list.** `Table.columns` is
+  populated by introspection for every real table; when it is
+  empty — a hand-built `Table` constructed without a column list —
+  SEC018 cannot resolve own-table columns and skips the table, the
+  same degradation as SEC005.
 * **`current_user` outside policies.** A reference in a view body,
   a function, or a `DEFAULT` expression is not in scope — SEC018
   inspects policy `USING` / `WITH CHECK` clauses only.
@@ -237,8 +249,8 @@ class SEC018:
             title=self.title,
             message=(
                 f"Policy {policy.name!r} on {table.qualified_name} "
-                "compares one of the table's own columns directly "
-                "against current_user / session_user (or the "
+                "compares one of the table's own columns against "
+                "current_user / session_user (or the "
                 "current_role / user aliases). That uses the "
                 "session's Postgres role identity as the row-matching "
                 "key — it isolates tenants only when each tenant "

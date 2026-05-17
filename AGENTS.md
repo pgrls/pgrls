@@ -1190,7 +1190,11 @@ uses are left alone:
   catalog lookup like `EXISTS (SELECT 1 FROM pg_roles WHERE
   rolname = current_user AND rolsuper)`. `pg_roles.rolname` is a
   catalog column, not a tenant key; restricting the column operand
-  to the policy's own table excludes this whole family.
+  to the policy's own table excludes this family. (One imprecision:
+  own-table membership is resolved by column *name*, so an
+  unqualified sub-select column that collides with an own-table
+  column name is still flagged — the same bare-name imprecision
+  SEC005 carries. Qualify the sub-select column, or allowlist.)
 
 The correct discriminator for pooled application code is a
 *session-scoped* value the application sets per request: a GUC

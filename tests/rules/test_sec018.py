@@ -192,11 +192,26 @@ def test_sec018_silent_when_policy_has_no_clauses() -> None:
 
 
 def test_sec018_silent_when_table_columns_unknown() -> None:
-    # Without a captured column list (a pre-v5 snapshot), SEC018
-    # cannot resolve own-table columns and skips the table —
+    # Without a column list — a `Table` constructed without one —
+    # SEC018 cannot resolve own-table columns and skips the table,
     # the same degradation SEC005 has.
     schema = _wrap(_policy("owner_role = current_user"), columns=())
     assert SEC018().check(schema, {}) == []
+
+
+def test_sec018_bare_name_collision_is_a_known_false_positive() -> None:
+    # Own-table membership is resolved by column NAME. When a
+    # sub-select's unqualified column collides with an own-table
+    # column name, SEC018 (mis-)flags it. Here the policy table has
+    # its own `rolname` column, so the pg_roles catalog lookup's
+    # bare `rolname` is treated as own-table — a documented false
+    # positive (the bare-name imprecision SEC005 also carries).
+    # Pin it so a future scope-resolution change is deliberate.
+    schema = _wrap(
+        _policy("EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user)"),
+        columns=("id", "rolname"),
+    )
+    assert len(SEC018().check(schema, {})) == 1
 
 
 # --- allowlist / multiplicity / metadata ---------------------------------
