@@ -157,6 +157,23 @@ def test_sec018_silent_on_cross_table_subquery_comparison() -> None:
     assert SEC018().check(schema, {}) == []
 
 
+def test_sec018_silent_on_own_column_eq_subquery_using_current_user() -> None:
+    # `owner_role = (SELECT … WHERE m = current_user)` is NOT an
+    # own-column-vs-current_user comparison: current_user is buried
+    # in the sub-select, compared there to another table's column,
+    # and the sub-select's *result* is what `owner_role` is matched
+    # against. The per-operand checks use exclude_sublinks, so the
+    # outer A_Expr does not pair `owner_role` with that nested
+    # current_user. SEC018 must stay silent.
+    schema = _wrap(
+        _policy(
+            "owner_role = (SELECT r FROM tenant_defaults "
+            "WHERE created_by = current_user)"
+        )
+    )
+    assert SEC018().check(schema, {}) == []
+
+
 def test_sec018_silent_on_tenant_guc_with_pg_has_role_escape() -> None:
     # The real-world pattern: tenant isolation via a session GUC,
     # plus a pg_has_role admin escape. No own column is compared

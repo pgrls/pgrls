@@ -61,10 +61,12 @@ What SEC018 flags — and what it deliberately does not:
   noted under "Out of scope" below.
 
 Detection is structural: the rule walks the parsed policy AST and
-looks for an `A_Expr` (comparison) node with a role-identity
+looks for an `A_Expr` (operator) node with a role-identity
 `SQLValueFunction` on one operand and a reference to a column of
 the policy's own table on the other — including a column reached
-through correlation from inside a sub-select.
+through correlation from inside a sub-select. (`A_Expr` is the
+generic operator node; in practice the operator pairing a role
+identity with a column is `=` or another comparison.)
 
 `current_user`-based policies are **not** universally wrong. The
 "role-per-tenant" RLS pattern — one Postgres role per tenant, the
@@ -156,23 +158,36 @@ def _is_own_column_ref(ref: tuple[str, ...], table: Table) -> bool:
     return False
 
 
+# The per-operand checks use `exclude_sublinks=True`: a
+# `current_user` or column buried inside a sub-select is not an
+# operand *value* of the enclosing A_Expr (it belongs to the
+# sub-select's own predicate). `owner = (SELECT r FROM other WHERE
+# m = current_user)` must not pair `owner` with that nested
+# `current_user`. The tree walk below still recurses into
+# sub-selects separately, so an A_Expr *inside* a sub-select —
+# e.g. a correlated `t.owner = current_user` — is still examined
+# on its own.
 def _side_has_role_identity(side: Any) -> bool:
-    return bool(find_func_calls(side, set(_ROLE_IDENTITY_FUNCTIONS)))
+    return bool(
+        find_func_calls(
+            side, set(_ROLE_IDENTITY_FUNCTIONS), exclude_sublinks=True
+        )
+    )
 
 
 def _side_has_own_column(side: Any, table: Table) -> bool:
     return any(
         _is_own_column_ref(ref, table)
-        for ref in extract_column_refs(side)
+        for ref in extract_column_refs(side, exclude_sublinks=True)
     )
 
 
 def _compares_role_identity_to_own_column(node: Any, table: Table) -> bool:
     """True if the tree compares a role-identity function with an own column.
 
-    Walks every `A_Expr` (comparison) node and fires when one
-    operand subtree carries a role-identity `SQLValueFunction` and
-    the *other* carries a column of `table`. Requiring the two on
+    Walks every `A_Expr` (operator) node and fires when one
+    operand carries a role-identity `SQLValueFunction` and the
+    *other* carries a column of `table`. Requiring the two on
     opposite operands distinguishes a data-matching predicate
     (`owner = current_user`) from an admin/role check
     (`current_user = 'postgres'`, `pg_has_role(current_user, …)`).
@@ -197,7 +212,7 @@ def _compares_role_identity_to_own_column(node: Any, table: Table) -> bool:
             ):
                 return True
             # fall through — A_Expr is a Node; keep walking its
-            # operands for nested comparisons.
+            # operands for nested A_Expr nodes (and sub-selects).
         if isinstance(n, Node):
             for field_name in n:
                 if walk(getattr(n, field_name, None)):
@@ -218,9 +233,10 @@ class SEC018:
         allowlist = parse_policy_id_allowlist("SEC018", options)
         out: list[Violation] = []
         for table in schema.tables:
-            # Own-column resolution needs the captured column list;
-            # without it (pre-v5 snapshot, bare fixture) skip the
-            # table — mirrors SEC005.
+            # Own-column resolution needs the captured column list.
+            # Introspection populates it for every real table; an
+            # empty list means a hand-built `Table` fixture — skip
+            # it, mirroring SEC005.
             if not table.columns:
                 continue
             for policy in table.policies:
