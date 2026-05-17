@@ -767,6 +767,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC013  public.allbad_sec013.audit_writes\n",
             "SEC016  allbad_sec016_role\n",
             "SEC017  public.allbad_sec017_leaky\n",
+            "SEC018  public.allbad_sec018.owner_is_current_user\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",

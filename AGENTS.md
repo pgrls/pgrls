@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-six rules across four
+In the current release it ships **twenty-seven rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -32,6 +32,8 @@ search-path shadowing),
 RLS policy),
 `SEC017` (function with the `LEAKPROOF` attribute is evaluated
 below the RLS barrier),
+`SEC018` (policy compares a column against `current_user` /
+`session_user` — no isolation under a shared pool role),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1131,6 +1133,101 @@ Out of scope (intentional):
   outside ``--schemas`` is invisible to SEC017. Expand
   ``--schemas`` to audit it.
 
+<a id="rule-sec018"></a>
+
+### SEC018 — Policy compares a column against current_user / session_user
+
+**Severity:** warning. **Auto-fix:** no (replacing the
+`current_user` comparison with a session-GUC predicate needs the
+application's tenant-key name and is an architectural decision, not
+a mechanical rewrite).
+
+A policy whose `USING` or `WITH CHECK` expression compares one of
+its **own table's columns** against `current_user` — or its aliases
+`current_role` and `user` — or `session_user` is using *the
+Postgres role the session runs as* as the row-matching key. That
+isolates tenants only when every tenant connects as, or `SET ROLE`s
+to, a **distinct** Postgres role.
+
+Application architectures almost never do that. A connection pool
+authenticates as one shared database role and serves every
+tenant's requests over it. `current_user` is then identical for
+tenant A and tenant B, and a policy like
+
+```sql
+CREATE POLICY p ON documents
+    USING (owner_role = current_user);
+```
+
+matches the same way for every tenant and provides **no**
+isolation. The policy looks like access control and passes every
+other pgrls check, but the discriminator is a constant.
+`session_user` (the login role, unchanged by `SET ROLE`) is the
+same trap, and worse: it stays pinned to the pool's login role even
+when the application does `SET ROLE` per request.
+
+Detection is structural — the rule walks the parsed policy AST for
+an `A_Expr` (operator) node with a role-identity `SQLValueFunction`
+on one operand and a reference to a column of the policy's own
+table on the other (the same own-column scoping SEC005 uses),
+anywhere in the tree. (`A_Expr` is pglast's generic operator node;
+in practice the operator pairing a role identity with a column is
+`=` or another comparison.)
+
+**What SEC018 deliberately does not flag.** A `current_user`
+reference is only an isolation problem when it is the *row-matching
+key* — compared against the table's own data. Three legitimate
+uses are left alone:
+
+* `current_user` passed to a role/privilege function —
+  `pg_has_role(current_user, 'pg_read_all_data', 'MEMBER')`,
+  `has_table_privilege(current_user, …)`. Here `current_user` is a
+  function argument, not a comparison operand: it feeds a
+  role/privilege check, the standard "admin escape" branch of a
+  policy, not a tenant key.
+* `current_user` compared only to a literal — `current_user =
+  'postgres'`. That checks for one specific role (a superuser /
+  admin escape); there is no column operand at all.
+* `current_user` compared to a column of *another* table — a
+  catalog lookup like `EXISTS (SELECT 1 FROM pg_roles WHERE
+  rolname = current_user AND rolsuper)`. `pg_roles.rolname` is a
+  catalog column, not a tenant key; restricting the column operand
+  to the policy's own table excludes this family. (One imprecision:
+  own-table membership is resolved by column *name*, so an
+  unqualified sub-select column that collides with an own-table
+  column name is still flagged — the same bare-name imprecision
+  SEC005 carries. Qualify the sub-select column, or allowlist.)
+
+The correct discriminator for pooled application code is a
+*session-scoped* value the application sets per request: a GUC
+read with `current_setting('app.tenant_id')`, or a JWT claim.
+Those vary per request over a shared connection; the role identity
+does not.
+
+`current_user`-based policies are **not** universally wrong. The
+"role-per-tenant" RLS pattern — one Postgres role per tenant, the
+application `SET ROLE`s to the tenant's role per request — is a
+legitimate, documented design, and there `current_user` is exactly
+the right discriminator. pgrls cannot tell which deployment model
+is in use, so SEC018 is a `warning`: a role-per-tenant project
+allowlists the affected policies (by qualified policy ID
+`schema.table.policy_name`) after confirming the model.
+
+```toml
+[lint.rules.SEC018]
+allowlist = [
+    # role-per-tenant deployment — current_user IS the tenant key.
+    "public.documents.owner_is_current_user",
+]
+```
+
+Relationship to SEC004: SEC004 catches the *inverted* auth check
+(`current_setting(...) IS NULL OR …`) — a predicate that fails
+open. SEC018 catches a predicate that matches row data against the
+wrong identity. Both are policy-expression rules, but SEC004 is an
+error (always wrong) while SEC018 is a warning (wrong only under a
+shared pool role).
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2046,7 +2143,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-six rules across four categories.** SEC001–SEC017,
+- **Twenty-seven rules across four categories.** SEC001–SEC018,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
