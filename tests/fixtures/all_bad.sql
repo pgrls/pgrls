@@ -273,3 +273,23 @@ CREATE POLICY owner_is_current_user ON public.allbad_sec018
     USING (owner_role = current_user);
 CREATE INDEX allbad_sec018_owner_idx
     ON public.allbad_sec018 (owner_role);
+
+-- SEC019: policy reads tenant context via one-argument
+-- current_setting(). The one-arg form raises on an unset GUC. The
+-- two-arg current_setting('app.tenant', true) form returns NULL
+-- instead. SEC019 is info-severity. The current_setting call is
+-- wrapped in (SELECT ...) so PERF001 stays silent (it flags only
+-- UNWRAPPED auth calls). The base table mirrors the other RLS-on
+-- blocks (RESTRICTIVE policy, own-column reference, indexed
+-- predicate column) so SEC001/SEC002/SEC005/SEC006/SEC007/SEC008/
+-- SEC009/PERF003 stay silent and only SEC019 fires. SEC012 also
+-- fires (RESTRICTIVE-only set) and carries no rule_loc pin, so
+-- that extra firing is silent-by-design.
+CREATE TABLE public.allbad_sec019 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_sec019 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec019 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec019
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant')));
+CREATE INDEX allbad_sec019_tenant_idx
+    ON public.allbad_sec019 (tenant_id);
