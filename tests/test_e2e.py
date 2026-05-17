@@ -71,14 +71,16 @@ def test_subprocess_known_bad_exits_nonzero(
 def test_subprocess_clean_db_exits_zero(
     pg_url: str, apply_sql
 ) -> None:
-    # "Clean" means: every rule (SEC001-SEC018, PERF001-PERF003,
+    # "Clean" means: every rule (SEC001-SEC019, PERF001-PERF003,
     # HYG001-HYG002, VIEW001-VIEW004) is satisfied, not just
     # SEC001-SEC002. SEC014, SEC015, and SEC017 are exercised by
     # absence — the fixture creates no SECURITY DEFINER functions
     # and no LEAKPROOF functions, so none of them has anything to
     # flag. SEC016 likewise: the fixture's `pgrls_test_role` is
     # created without BYPASSRLS, so there is no non-superuser
-    # BYPASSRLS role to flag. The table needs policies that:
+    # BYPASSRLS role to flag. SEC019 too: the policies use no
+    # current_setting() call at all, so its one-arg form can't
+    # appear. The table needs policies that:
     #   - are scoped to a non-PUBLIC role (SEC003)
     #   - reference an own column (SEC005)
     #   - cover write-side commands with WITH CHECK (SEC006)

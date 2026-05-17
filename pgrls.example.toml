@@ -234,6 +234,23 @@ allowlist = []
 # "schema.table.policy_name".
 allowlist = []
 
+[lint.rules.SEC019]
+# Policies that call current_setting() with a single argument.
+# The one-arg form raises `unrecognized configuration parameter`
+# when the GUC is unset, so a request that reaches the DB before
+# its session context is set makes every query against the table
+# error. The two-arg form, current_setting('app.x', true), passes
+# the missing_ok argument and returns NULL instead (in a
+# `column = current_setting(...)` predicate that NULL matches no
+# rows — the query succeeds, empty).
+#
+# This is info-severity: the one-arg form fails closed (it raises,
+# never silently widens), so it is a robustness nudge, not a
+# security finding. Allowlist a policy when the raise-on-unset
+# behaviour is the intended, documented choice. Entries are
+# fully-qualified policy IDs of the form "schema.table.policy_name".
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
