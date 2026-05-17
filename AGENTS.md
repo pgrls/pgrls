@@ -1167,10 +1167,12 @@ same trap, and worse: it stays pinned to the pool's login role even
 when the application does `SET ROLE` per request.
 
 Detection is structural — the rule walks the parsed policy AST for
-an `A_Expr` (comparison) node with a role-identity `SQLValueFunction`
+an `A_Expr` (operator) node with a role-identity `SQLValueFunction`
 on one operand and a reference to a column of the policy's own
 table on the other (the same own-column scoping SEC005 uses),
-anywhere in the tree.
+anywhere in the tree. (`A_Expr` is pglast's generic operator node;
+in practice the operator pairing a role identity with a column is
+`=` or another comparison.)
 
 **What SEC018 deliberately does not flag.** A `current_user`
 reference is only an isolation problem when it is the *row-matching
