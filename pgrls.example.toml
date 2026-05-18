@@ -347,3 +347,15 @@ allowlist = []
 # disables the rule entirely (no placeholder words to match
 # against). The override REPLACES the default list.
 # placeholder_words = ["todo", "fixme", "scratch"]
+
+[lint.rules.HYG003]
+# Policy IDs allowed to keep an exact-duplicate policy. HYG003
+# flags two policies on one table that are identical in command,
+# role set, permissive kind, and USING / WITH CHECK predicates —
+# a copy-paste or migration leftover. It is info-severity. For
+# each duplicate group the name-sorted-first policy is the
+# "original" and the rest are flagged; allowlist a flagged
+# (redundant) policy ID here if keeping both is intended. Entries
+# are fully-qualified policy IDs of the form
+# "schema.table.policy_name".
+allowlist = []
