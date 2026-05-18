@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.23] - 2026-05-18
+
+### Added
+- **`pgrls fix` now auto-remediates SEC006** ("write-side policy
+  missing WITH CHECK"). The fixer emits `ALTER POLICY <name> ON
+  <schema>.<table> WITH CHECK (<the USING predicate>);` — copying
+  the policy's `USING` clause into a `WITH CHECK` so writes are
+  constrained the same way reads are (which is what Postgres does
+  implicitly when `WITH CHECK` is omitted on a permissive policy,
+  made explicit). `pgrls fix` now covers SEC001, SEC002, SEC006,
+  PERF001, VIEW001, and VIEW002.
+
+  The fixer only emits when the policy has a `USING` clause to
+  mirror. A `FOR INSERT` policy has none (Postgres forbids `FOR
+  INSERT … USING`), and a `FOR UPDATE` / `FOR ALL` policy can be
+  written without one; in those cases the right `WITH CHECK`
+  needs human intent, so the fixer skips them and leaves the
+  SEC006 finding for the operator. The `USING` predicate is
+  round-tripped through pglast (not echoed verbatim), consistent
+  with the PERF001 fixer.
+
 ## [0.5.22] - 2026-05-18
 
 ### Changed

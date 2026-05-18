@@ -1119,6 +1119,27 @@ def test_fix_emits_sec001_enable_rls(pg_url: str, apply_sql) -> None:
     assert "dry-run" in result.output
 
 
+def test_fix_emits_sec006_with_check(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` picks up the SEC006 fixer and emits an
+    # ALTER POLICY … WITH CHECK mirroring the USING predicate of a
+    # write-side policy that has no WITH CHECK.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec006 (id INT);
+        ALTER TABLE public.fix_sec006 ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec006 FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec006
+            FOR ALL TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert "ALTER POLICY p ON public.fix_sec006" in result.output
+    assert "WITH CHECK (id > 0)" in result.output
+    assert "dry-run" in result.output
+
+
 def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
     # First --apply executes; second --apply finds nothing to do.
     apply_sql(

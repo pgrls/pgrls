@@ -52,12 +52,14 @@ def default_fixers() -> list[Fixer]:
     from pgrls.fixers.perf001 import PERF001Fixer
     from pgrls.fixers.sec001 import SEC001Fixer
     from pgrls.fixers.sec002 import SEC002Fixer
+    from pgrls.fixers.sec006 import SEC006Fixer
     from pgrls.fixers.view001 import VIEW001Fixer
     from pgrls.fixers.view002 import VIEW002Fixer
 
     return [
         SEC001Fixer(),
         SEC002Fixer(),
+        SEC006Fixer(),
         PERF001Fixer(),
         VIEW001Fixer(),
         VIEW002Fixer(),

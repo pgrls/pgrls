@@ -8,6 +8,7 @@ from pgrls.fixers import Fix, default_fixers, generate_fixes
 from pgrls.fixers.perf001 import PERF001Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
+from pgrls.fixers.sec006 import SEC006Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
 from pgrls.model import Policy, Schema, Table, View
@@ -779,6 +780,128 @@ def test_perf001_fix_uses_custom_auth_functions_replaces_default() -> None:
     assert "(SELECT my.custom())" in fixes2[0].sql
 
 
+# ---------- SEC006 fixer ----------
+
+
+def test_sec006_fix_emits_with_check_mirroring_using() -> None:
+    schema = _wrap_policy(_policy("user_id = 1", command="ALL"))
+    fixes = SEC006Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC006"
+    assert f.location == "public.t.p"
+    assert "ALTER POLICY p ON public.t" in f.sql
+    assert "WITH CHECK (user_id = 1)" in f.sql
+
+
+def test_sec006_fix_silent_when_with_check_already_present() -> None:
+    p = _policy("user_id = 1", command="ALL", with_check="user_id = 1")
+    assert SEC006Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec006_fix_silent_on_select_policy() -> None:
+    # SELECT is not a write command — WITH CHECK does not apply.
+    schema = _wrap_policy(_policy("user_id = 1", command="SELECT"))
+    assert SEC006Fixer().fix(schema, {}) == []
+
+
+def test_sec006_fix_fires_on_for_update_policy() -> None:
+    schema = _wrap_policy(_policy("user_id = 1", command="UPDATE"))
+    fixes = SEC006Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert "WITH CHECK (user_id = 1)" in fixes[0].sql
+
+
+def test_sec006_fix_skips_insert_policy_with_no_using() -> None:
+    # A FOR INSERT policy has no USING to mirror — Postgres forbids
+    # `FOR INSERT … USING`. SEC006 fires, but the fixer cannot
+    # mechanically derive a WITH CHECK, so it skips.
+    p = _policy(None, command="INSERT")
+    assert SEC006Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec006_fix_skips_write_policy_with_no_using() -> None:
+    # A FOR UPDATE / FOR ALL policy can omit USING too — there is
+    # then no predicate to copy into WITH CHECK.
+    p = _policy(None, command="UPDATE")
+    assert SEC006Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec006_fix_respects_allowlist() -> None:
+    schema = _wrap_policy(_policy("user_id = 1", command="ALL"))
+    assert SEC006Fixer().fix(schema, {"allowlist": ["public.t.p"]}) == []
+
+
+def test_sec006_fix_emits_one_per_offending_policy() -> None:
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                columns=("id", "user_id"),
+                policies=(
+                    _policy("user_id = 1", name="bad_a", command="ALL"),
+                    _policy(
+                        "user_id = 1",
+                        name="ok",
+                        command="ALL",
+                        with_check="user_id = 1",
+                    ),
+                    _policy(
+                        "user_id = 2", name="bad_b", command="UPDATE"
+                    ),
+                ),
+            ),
+        )
+    )
+    fixes = SEC006Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.t.bad_a",
+        "public.t.bad_b",
+    ]
+
+
+def test_sec006_fix_quotes_policy_and_table_when_required() -> None:
+    p = _policy("user_id = 1", name="My Policy", command="ALL")
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="MixedCase Table",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(p,),
+                columns=("id", "user_id"),
+            ),
+        )
+    )
+    sql = SEC006Fixer().fix(schema, {})[0].sql
+    assert 'ALTER POLICY "My Policy"' in sql
+    assert 'ON public."MixedCase Table"' in sql
+
+
+def test_sec006_fix_round_trips_using_through_pglast() -> None:
+    # The USING predicate is re-emitted via RawStream, not echoed
+    # verbatim — pin a shape pglast normalizes.
+    schema = _wrap_policy(
+        _policy("user_id = 1 AND deleted_at IS NULL", command="ALL")
+    )
+    sql = SEC006Fixer().fix(schema, {})[0].sql
+    assert "WITH CHECK (" in sql
+    assert "deleted_at" in sql
+    assert "IS NULL" in sql
+
+
+def test_sec006_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Bad config type → fail closed (no exemption) → fix still emitted.
+    schema = _wrap_policy(_policy("user_id = 1", command="ALL"))
+    fixes = SEC006Fixer().fix(schema, {"allowlist": "public.t.p"})
+    assert len(fixes) == 1
+    assert fixes[0].location == "public.t.p"
+
+
 # ---------- generate_fixes / registry ----------
 
 
@@ -844,7 +967,14 @@ def test_generate_fixes_passes_rule_options() -> None:
 
 def test_default_fixers_registers_every_shipping_fixer() -> None:
     rule_ids = {fixer.rule_id for fixer in default_fixers()}
-    assert {"SEC001", "SEC002", "PERF001", "VIEW001", "VIEW002"} <= rule_ids
+    assert {
+        "SEC001",
+        "SEC002",
+        "SEC006",
+        "PERF001",
+        "VIEW001",
+        "VIEW002",
+    } <= rule_ids
 
 
 def test_fix_dataclass_is_frozen() -> None:
