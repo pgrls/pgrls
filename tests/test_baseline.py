@@ -12,6 +12,7 @@ from pgrls.baseline import (
     finding_key,
     load_baseline,
     partition,
+    stale_keys,
     write_baseline,
 )
 from pgrls.violations import Violation
@@ -189,3 +190,18 @@ def test_partition_preserves_order() -> None:
 def test_finding_key() -> None:
     assert finding_key(_v("SEC001", "public.a")) == ("SEC001", "public.a")
     assert finding_key(_v("SEC001", None)) == ("SEC001", None)
+
+
+def test_stale_keys_finds_unmatched_baseline_entries() -> None:
+    # `public.gone.p` is in the baseline but no current finding
+    # matches it — the issue was fixed (or the policy renamed).
+    violations = [_v("SEC001", "public.a")]
+    baseline = {("SEC001", "public.a"), ("SEC005", "public.gone.p")}
+    assert stale_keys(violations, baseline) == {
+        ("SEC005", "public.gone.p")
+    }
+
+
+def test_stale_keys_empty_when_all_baseline_entries_match() -> None:
+    violations = [_v("SEC001", "public.a")]
+    assert stale_keys(violations, {("SEC001", "public.a")}) == set()

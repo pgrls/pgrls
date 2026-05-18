@@ -1045,6 +1045,38 @@ def test_lint_baseline_fails_on_new_finding(
     assert "public.legacy" not in result.output
 
 
+def test_lint_baseline_notes_stale_entries(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A baseline entry that matches no current finding is stale —
+    # the run notes it on stderr so the operator can regenerate.
+    apply_sql("CREATE TABLE public.legacy (id INT);")
+    baseline = tmp_path / "b.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "generated_by": "pgrls test",
+                "findings": [
+                    {"rule_id": "SEC001", "location": "public.legacy"},
+                    {
+                        "rule_id": "SEC001",
+                        "location": "public.long_gone",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no longer match" in result.output
+
+
 def test_lint_baseline_malformed_file_errors_clearly(
     pg_url: str, apply_sql, tmp_path
 ) -> None:

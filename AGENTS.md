@@ -1988,7 +1988,10 @@ legacy database without fixing every pre-existing finding first.
   finding already in the baseline and reports — and exit-codes —
   only on findings absent from it. A new RLS issue fails CI; the
   grandfathered backlog does not. The suppressed count is noted
-  on stderr.
+  on stderr, as is the count of *stale* entries — baseline keys
+  that match no current finding because the issue was fixed or
+  the policy renamed — a cue that the baseline has drifted and is
+  worth regenerating.
 
 A finding is matched by `(rule_id, location)`; the message text
 is deliberately not part of the key, so a wording change between

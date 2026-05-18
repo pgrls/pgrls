@@ -127,3 +127,18 @@ def partition(
     for v in violations:
         (baselined if finding_key(v) in baseline else new).append(v)
     return new, baselined
+
+
+def stale_keys(
+    violations: list[Violation], baseline: set[_Key]
+) -> set[_Key]:
+    """Baseline keys that no current finding matches.
+
+    A stale entry means a baselined finding was fixed — or its
+    policy / table renamed — since the baseline was recorded.
+    Because the file is only ever written wholesale (on the first
+    run, or a manual delete-and-regenerate), stale entries
+    otherwise accumulate silently; surfacing the count lets an
+    operator regenerate a tighter baseline.
+    """
+    return baseline - {finding_key(v) for v in violations}

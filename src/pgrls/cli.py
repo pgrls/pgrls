@@ -34,6 +34,7 @@ from pgrls.baseline import (
     BaselineError,
     load_baseline,
     partition,
+    stale_keys,
     write_baseline,
 )
 from pgrls.config import (
@@ -284,6 +285,15 @@ def _apply_baseline(
         click.echo(
             f"pgrls: {len(baselined)} finding(s) suppressed by "
             f"baseline {path}.",
+            err=True,
+        )
+    stale = stale_keys(violations, baseline)
+    if stale:
+        click.echo(
+            f"pgrls: {len(stale)} baseline entry(ies) no longer "
+            "match a finding (fixed, or the policy/table renamed). "
+            f"Delete {path} and re-run to regenerate a tighter "
+            "baseline.",
             err=True,
         )
     return new
