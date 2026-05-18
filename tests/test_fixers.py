@@ -664,11 +664,12 @@ def _policy(
     name: str = "p",
     command: str = "SELECT",
     with_check: str | None = None,
+    permissive: bool = True,
 ) -> Policy:
     return Policy(
         name=name,
         command=command,  # type: ignore[arg-type]
-        permissive=True,
+        permissive=permissive,
         roles=("PUBLIC",),
         using_sql=using,
         with_check_sql=with_check,
@@ -827,6 +828,15 @@ def test_sec006_fix_skips_write_policy_with_no_using() -> None:
     assert SEC006Fixer().fix(_wrap_policy(p), {}) == []
 
 
+def test_sec006_fix_skips_restrictive_policy() -> None:
+    # A restrictive write-side policy with no WITH CHECK is a dead
+    # policy; SEC006's remediation there ("express the intended
+    # predicate, or remove the policy") needs human intent, so the
+    # fixer skips it — only permissive write policies are fixed.
+    p = _policy("user_id = 1", command="ALL", permissive=False)
+    assert SEC006Fixer().fix(_wrap_policy(p), {}) == []
+
+
 def test_sec006_fix_respects_allowlist() -> None:
     schema = _wrap_policy(_policy("user_id = 1", command="ALL"))
     assert SEC006Fixer().fix(schema, {"allowlist": ["public.t.p"]}) == []
@@ -884,14 +894,12 @@ def test_sec006_fix_quotes_policy_and_table_when_required() -> None:
 
 def test_sec006_fix_round_trips_using_through_pglast() -> None:
     # The USING predicate is re-emitted via RawStream, not echoed
-    # verbatim — pin a shape pglast normalizes.
-    schema = _wrap_policy(
-        _policy("user_id = 1 AND deleted_at IS NULL", command="ALL")
-    )
+    # verbatim. Feed a non-canonical form (no spaces around `=`)
+    # and assert pglast's normalized spacing appears — a verbatim
+    # echo of the raw `using_sql` would keep `user_id=1`.
+    schema = _wrap_policy(_policy("user_id=1", command="ALL"))
     sql = SEC006Fixer().fix(schema, {})[0].sql
-    assert "WITH CHECK (" in sql
-    assert "deleted_at" in sql
-    assert "IS NULL" in sql
+    assert "WITH CHECK (user_id = 1)" in sql
 
 
 def test_sec006_fix_silent_when_allowlist_is_bad_type() -> None:

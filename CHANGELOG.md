@@ -16,18 +16,20 @@ breaking changes — they will be called out in this file.
 - **`pgrls fix` now auto-remediates SEC006** ("write-side policy
   missing WITH CHECK"). The fixer emits `ALTER POLICY <name> ON
   <schema>.<table> WITH CHECK (<the USING predicate>);` — copying
-  the policy's `USING` clause into a `WITH CHECK` so writes are
-  constrained the same way reads are (which is what Postgres does
-  implicitly when `WITH CHECK` is omitted on a permissive policy,
-  made explicit). `pgrls fix` now covers SEC001, SEC002, SEC006,
-  PERF001, VIEW001, and VIEW002.
+  the policy's `USING` clause into a `WITH CHECK` so the write
+  side enforces the same predicate as the read side, the
+  remediation SEC006 recommends for a permissive policy. `pgrls
+  fix` now covers SEC001, SEC002, SEC006, PERF001, VIEW001, and
+  VIEW002.
 
-  The fixer only emits when the policy has a `USING` clause to
-  mirror. A `FOR INSERT` policy has none (Postgres forbids `FOR
-  INSERT … USING`), and a `FOR UPDATE` / `FOR ALL` policy can be
-  written without one; in those cases the right `WITH CHECK`
-  needs human intent, so the fixer skips them and leaves the
-  SEC006 finding for the operator. The `USING` predicate is
+  The fixer is deliberately narrow — it emits only for a
+  **permissive** policy that has a `USING` clause to mirror. A
+  restrictive write-side policy with no `WITH CHECK` is a dead
+  policy whose remediation ("express the intended predicate, or
+  remove the policy") needs human intent, and a `FOR INSERT`
+  policy — or any write policy written without a `USING` — has
+  no predicate to copy. In those cases the fixer skips and leaves
+  the SEC006 finding for the operator. The `USING` predicate is
   round-tripped through pglast (not echoed verbatim), consistent
   with the PERF001 fixer.
 

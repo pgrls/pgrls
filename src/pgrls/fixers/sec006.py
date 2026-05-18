@@ -1,26 +1,30 @@
 """SEC006 fixer — emit `ALTER POLICY … WITH CHECK (…)` mirroring USING.
 
 SEC006 fires on a write-side policy (`FOR INSERT` / `FOR UPDATE` /
-`FOR ALL`) that has no `WITH CHECK` clause. The standard
-remediation is to add a `WITH CHECK` matching the policy's `USING`
-predicate — which is what Postgres does implicitly when `WITH
-CHECK` is omitted on a permissive policy, made explicit so the
-write-side constraint is visible and intentional. For a restrictive
-policy the implicit default is `true` (a dead write-side rule), and
-mirroring `USING` turns it back into a real constraint.
-
-The fixer emits:
+`FOR ALL`) that has no `WITH CHECK` clause. For a **permissive**
+policy the standard remediation is to add a `WITH CHECK` matching
+the policy's `USING` predicate — exactly what SEC006's own message
+recommends — so the write side enforces the same constraint as the
+read side. The fixer emits:
 
     ALTER POLICY <name> ON <schema>.<table>
         WITH CHECK (<the USING predicate>);
 
-It can only do this when the policy HAS a `USING` clause to mirror.
-A `FOR INSERT` policy has none — Postgres forbids `FOR INSERT …
-USING (…)` — and a `FOR UPDATE` / `FOR ALL` policy can also be
-written without one. In those cases there is no predicate to copy
-and the right `WITH CHECK` needs human intent (which predicate
-should the write side enforce?), so the fixer skips them and leaves
-the SEC006 finding for the operator.
+The fixer is deliberately narrow. It emits only when **both**:
+
+* the policy is **permissive**. A restrictive write-side policy
+  with no `WITH CHECK` is a *dead policy* — Postgres defaults the
+  missing clause to `true`, so the policy constrains nothing.
+  SEC006's rule frames the fix as "express the predicate the
+  policy is meant to enforce, or remove the policy" — a
+  human-intent decision, not a mechanical `USING` copy — so the
+  fixer skips restrictive policies.
+* the policy has a `USING` clause to mirror. A `FOR INSERT`
+  policy has none (Postgres forbids `FOR INSERT … USING (…)`),
+  and a `FOR UPDATE` / `FOR ALL` policy can also be written
+  without one; with no `USING` there is no predicate to copy.
+
+In the skipped cases the SEC006 finding stays for the operator.
 
 The `USING` predicate is round-tripped through
 `pglast.stream.RawStream` rather than echoed verbatim — symmetric
@@ -63,6 +67,15 @@ class SEC006Fixer:
                 if policy.command not in _WRITE_COMMANDS:
                     continue
                 if policy.with_check_sql:
+                    continue
+                # Only permissive policies are auto-fixed. A
+                # restrictive write-side policy with no WITH CHECK
+                # is a dead policy (Postgres defaults the missing
+                # clause to `true`); SEC006's rule frames the fix
+                # as "express the intended predicate, or remove the
+                # policy" — human intent, not a mechanical USING
+                # copy. Skip it and leave the finding.
+                if not policy.permissive:
                     continue
                 # The fix mirrors USING into WITH CHECK, so there
                 # must be a USING to mirror. A FOR INSERT policy has

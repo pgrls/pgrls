@@ -1906,12 +1906,15 @@ Currently fixable:
 * **SEC002** — emits `ALTER TABLE <schema>.<table> FORCE ROW
   LEVEL SECURITY;` for every table with RLS but no FORCE.
 * **SEC006** — emits `ALTER POLICY <name> ON <schema>.<table>
-  WITH CHECK (<the USING predicate>);` for a write-side policy
-  (`FOR UPDATE` / `FOR ALL`) that has a `USING` clause but no
-  `WITH CHECK`, mirroring USING into the write-side check. A
-  `FOR INSERT` policy — or any write policy with no `USING` —
-  has no predicate to mirror, so the fixer skips it and leaves
-  the SEC006 finding for human review.
+  WITH CHECK (<the USING predicate>);` for a permissive `FOR
+  UPDATE` / `FOR ALL` policy that has a `USING` clause but no
+  `WITH CHECK`, mirroring USING into the write-side check.
+  Skipped, with the SEC006 finding left for human review:
+  restrictive policies (a missing `WITH CHECK` there is a dead
+  policy needing intent, not a mechanical copy), `FOR INSERT`
+  policies (Postgres forbids `FOR INSERT … USING`, so there is
+  no predicate to mirror), and any write policy written without
+  a `USING`.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
