@@ -10,6 +10,35 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.18] - 2026-05-17
+
+### Added
+- **Per-rule severity override in `pgrls.toml`.** Each
+  `[lint.rules.<ID>]` table now accepts a reserved `severity` key —
+  `"error"`, `"warning"`, or `"info"` — that remaps the reported
+  severity of every violation that rule emits:
+
+  ```toml
+  [lint.rules.SEC005]
+  severity = "error"   # promote — now fails CI under fail_on = "warning"
+  ```
+
+  An operator can promote an advisory rule so it gates CI, or
+  demote a noisy one below the `fail_on` threshold, without
+  disabling it (`disable` silences the rule entirely; the
+  allowlist exempts specific objects; this re-tiers the rule
+  while keeping all of its findings visible). The remap is
+  applied in the lint pipeline before the exit-code decision and
+  before output, so the `fail_on` gate, the severity counts, and
+  the printed label all reflect the override.
+
+  `severity` is case-insensitive (matching `[lint].fail_on` and
+  `--fail-on`) and is validated at config load — an invalid value
+  or a non-string raises a clear `ConfigError`. It is a reserved
+  key: it sits in the same `[lint.rules.<ID>]` table as
+  `allowlist` and other options but is consumed by pgrls itself,
+  not passed to the rule's `check()`.
+
 ## [0.5.17] - 2026-05-17
 
 ### Added

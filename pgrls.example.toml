@@ -28,6 +28,18 @@ fail_on = "dangerous"
 # are case-insensitive (`[lint.rules.sec001]` is equivalent to
 # `[lint.rules.SEC001]`), and a typo'd section is rejected at
 # config load with the rule catalog in the error.
+#
+# Every `[lint.rules.<ID>]` table also accepts a reserved
+# `severity` key — "error" | "warning" | "info" — that remaps the
+# rule's reported severity. Promote a rule so it fails CI, e.g.
+#     [lint.rules.SEC005]
+#     severity = "error"
+# or demote a noisy one below `fail_on` without disabling it. The
+# remap is applied before the exit-code decision and before
+# output, so the `fail_on` gate, severity counts, and the printed
+# label all reflect it. `severity` is not passed to the rule — it
+# sits alongside `allowlist` and other options but is consumed by
+# pgrls itself.
 
 [lint.rules.SEC001]
 # Tables where missing RLS is acceptable. Entries can be unqualified
