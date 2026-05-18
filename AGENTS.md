@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-nine rules across four
+In the current release it ships **thirty rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -45,8 +45,10 @@ sequential scan per query), `HYG002`
 data at REFRESH time), and `VIEW004` (view calls a SECURITY
 DEFINER function reading an RLS-protected table). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
-floor) and `SEC019` (policy calls one-argument `current_setting()`,
-which raises on an unset GUC). A `pgrls fix` subcommand
+floor), `SEC019` (policy calls one-argument `current_setting()`,
+which raises on an unset GUC), and `SEC021` (policy compares an
+identity column against a hardcoded literal). A `pgrls fix`
+subcommand
 auto-remediates SEC001, SEC002,
 PERF001, VIEW001, and VIEW002; other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
@@ -1345,6 +1347,54 @@ SEC020's; a `USING` that is itself constant-true is SEC008's.
 SEC020 does not attempt to prove a non-trivial `WITH CHECK` is
 weaker than `USING` — only the unambiguous constant-true case.
 
+<a id="rule-sec021"></a>
+
+### SEC021 — Policy compares an identity column against a hardcoded literal
+
+**Severity:** info. **Auto-fix:** no (keying the policy off session
+context needs the application's tenant-key name — an architectural
+decision, not a mechanical rewrite).
+
+A row-level security policy isolates tenants by keying row
+visibility off a *per-request* value the application sets on every
+connection — `current_setting('app.tenant_id')`, a JWT claim.
+SEC021 flags a policy that instead compares the identity column
+against a **literal constant**:
+
+```sql
+CREATE POLICY p ON documents
+    USING (tenant_id = 1);
+```
+
+A literal pins the policy to one specific tenant: every session —
+tenant A, tenant B, an anonymous request — is handed the same fixed
+slice of rows, so the policy does no per-tenant scoping at all. It
+is almost always a scaffolding value (`tenant_id = 1` against a
+seed tenant during development) that was never swapped for the real
+session lookup.
+
+Detection is a **name heuristic**. SEC021 walks the parsed policy
+AST for a plain `=` comparison where one operand is a column whose
+name is in a configurable identity-column set — `tenant_id`,
+`org_id`, `account_id`, `user_id`, `owner`, … — and the other
+operand is a literal (`A_Const`, optionally cast: `'…'::uuid`). The
+literal is the signal; the identity-ish column *name* separates the
+anti-pattern from a legitimate `column = literal` policy such as
+`USING (is_public = true)` or `USING (status = 'published')`, which
+compare an *attribute* column to a constant on purpose.
+
+Because the discriminator is a name heuristic, SEC021 is **info**
+severity — a review nudge, not a hard finding. Override the column
+set per project with `[lint.rules.SEC021].identity_columns` (the
+configured list replaces the default set). Allowlist by qualified
+policy ID when comparing the column to a fixed value is intentional
+(a global table pinned to one tenant, an admin-only policy).
+
+SEC021 is equality-only (`tenant_id IN (1, 2)` and `<>` are not
+flagged) and does not require the column to be on the policy's own
+table — a hardcoded identity comparison inside a sub-select is
+worth surfacing too.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2269,7 +2319,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-nine rules across four categories.** SEC001–SEC020,
+- **Thirty rules across four categories.** SEC001–SEC021,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

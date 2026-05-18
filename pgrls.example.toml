@@ -278,6 +278,24 @@ allowlist = []
 # IDs of the form "schema.table.policy_name".
 allowlist = []
 
+[lint.rules.SEC021]
+# Policies that compare an identity column against a hardcoded
+# literal — USING (tenant_id = 1). A literal pins the policy to one
+# tenant: every session gets the same fixed rows instead of being
+# scoped to its own tenant. SEC021 is info-severity (it uses a
+# column-name heuristic).
+#
+# `identity_columns` overrides the set of column names treated as
+# tenant/owner discriminators. The list REPLACES the default
+# (tenant_id, org_id, account_id, user_id, owner, ...).
+# identity_columns = ["tenant_id", "org_id", "site_id"]
+#
+# Allowlist a policy when comparing the column to a fixed value is
+# intentional (a table pinned to one tenant, an admin-only policy).
+# Entries are fully-qualified policy IDs of the form
+# "schema.table.policy_name".
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
