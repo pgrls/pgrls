@@ -5,6 +5,8 @@ from pgrls.ast_utils import (
     extract_column_refs,
     extract_range_vars,
     find_func_calls,
+    is_literal_false,
+    is_literal_true,
     match_is_null,
     parse_expr,
     top_level_disjuncts,
@@ -450,3 +452,47 @@ def test_extract_range_vars_returns_empty_when_no_tables() -> None:
     parsed = pglast.parse_sql("SELECT 1")
     refs = extract_range_vars(parsed[0].stmt)
     assert refs == []
+
+
+# --- is_literal_true / is_literal_false ----------------------------------
+
+
+def test_is_literal_true_matches_literal_true() -> None:
+    assert is_literal_true(parse_expr("true")) is True
+
+
+def test_is_literal_true_matches_uppercase_and_double_paren() -> None:
+    # Postgres/pglast normalize casing and elide redundant parens.
+    assert is_literal_true(parse_expr("TRUE")) is True
+    assert is_literal_true(parse_expr("((true))")) is True
+
+
+def test_is_literal_true_rejects_false() -> None:
+    assert is_literal_true(parse_expr("false")) is False
+
+
+def test_is_literal_true_rejects_non_literal_and_tautology() -> None:
+    # Deliberately narrow — only the literal `true`, never `1 = 1`,
+    # a column ref, or an integer constant.
+    assert is_literal_true(parse_expr("1 = 1")) is False
+    assert is_literal_true(parse_expr("id")) is False
+    assert is_literal_true(parse_expr("1")) is False
+
+
+def test_is_literal_true_rejects_none() -> None:
+    assert is_literal_true(None) is False
+
+
+def test_is_literal_false_matches_literal_false() -> None:
+    assert is_literal_false(parse_expr("false")) is True
+    assert is_literal_false(parse_expr("FALSE")) is True
+
+
+def test_is_literal_false_rejects_true() -> None:
+    assert is_literal_false(parse_expr("true")) is False
+
+
+def test_is_literal_false_rejects_non_literal_and_none() -> None:
+    assert is_literal_false(parse_expr("1 = 0")) is False
+    assert is_literal_false(parse_expr("id")) is False
+    assert is_literal_false(None) is False

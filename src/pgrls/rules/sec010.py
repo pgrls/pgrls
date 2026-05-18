@@ -30,8 +30,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, Boolean
-
+from pgrls.ast_utils import is_literal_false
 from pgrls.model import Policy, Schema, Table
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -39,14 +38,6 @@ from pgrls.violations import Severity, Violation
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     return parse_policy_id_allowlist('SEC010', options)
-
-
-def _is_literal_false(node: Any) -> bool:
-    return (
-        isinstance(node, A_Const)
-        and isinstance(node.val, Boolean)
-        and node.val.boolval is False
-    )
 
 
 class SEC010:
@@ -87,11 +78,11 @@ class SEC010:
         # `USING (false) WITH CHECK (false)` — the USING phrasing
         # is the older / more familiar one and the message is
         # marginally clearer that way).
-        if policy.using_ast is not None and _is_literal_false(
+        if policy.using_ast is not None and is_literal_false(
             policy.using_ast
         ):
             return "USING"
-        if policy.with_check_ast is not None and _is_literal_false(
+        if policy.with_check_ast is not None and is_literal_false(
             policy.with_check_ast
         ):
             return "WITH CHECK"

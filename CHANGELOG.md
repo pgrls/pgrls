@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.22] - 2026-05-18
+
+### Changed
+- **Internal: shared the literal-boolean AST detector.** The
+  narrow "is this node the literal `true` / `false`" check was
+  copy-pasted across four rule modules — `SEC008` (`USING
+  (true)`), `SEC010` (`USING`/`WITH CHECK (false)`), `SEC011`
+  (`OR true` branch), and `SEC020` (`WITH CHECK (true)`). It now
+  lives once in `pgrls.ast_utils` as `is_literal_true` /
+  `is_literal_false`, and the four rules import it. No behavior
+  change — detection stays exactly as narrow as before (only the
+  literal constant matches, never `1 = 1` or other semantic
+  tautologies). `pgrls.ast_utils` is an internal module with no
+  API-stability promise.
+
 ## [0.5.21] - 2026-05-18
 
 ### Added
