@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty rules across four
+In the current release it ships **thirty-one rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -46,9 +46,10 @@ data at REFRESH time), and `VIEW004` (view calls a SECURITY
 DEFINER function reading an RLS-protected table). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
 floor), `SEC019` (policy calls one-argument `current_setting()`,
-which raises on an unset GUC), and `SEC021` (policy compares an
-identity column against a hardcoded literal). A `pgrls fix`
-subcommand
+which raises on an unset GUC), `SEC021` (policy compares an
+identity column against a hardcoded literal), and `HYG003`
+(policy is an exact duplicate of another on the same table). A
+`pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
 SEC006, PERF001, VIEW001, and VIEW002; other rules need human
 intent. A
@@ -1639,6 +1640,42 @@ allowlist = ["public.tickets.todo_replace_me_later"]
 # placeholder_words = ["scratch", "draft"]
 ```
 
+<a id="rule-hyg003"></a>
+
+### HYG003 — Policy duplicates another policy on the same table
+
+**Severity:** info. **Auto-fix:** no (which of the duplicate pair
+to drop, and whether they were meant to diverge, is a judgement
+call).
+
+Two policies on one table that are identical in everything but
+their name — same command, same role list, same permissive /
+restrictive kind, same `USING` and `WITH CHECK` predicates — are
+redundant. Permissive policies are OR-combined (`p OR p` is `p`);
+restrictive policies are AND-combined (`p AND p` is `p`). The
+extra policy changes nothing — almost always a copy-paste
+leftover (`policy_v1` / `policy_v2`) or a migration that
+re-created a policy it never dropped.
+
+The redundancy is also a maintenance hazard: an operator who
+edits "the" policy may touch only one of the pair and leave the
+other stale, so the table's effective rule silently diverges from
+the policy the operator believes is authoritative.
+
+Detection is an EXACT match. HYG003 groups a table's policies by
+`(command, role set, permissive flag, USING text, WITH CHECK
+text)`; any group of two or more is a duplicate set. The `USING`
+/ `WITH CHECK` strings are Postgres's own `pg_get_expr` rendering,
+so two genuinely-identical predicates compare equal. Semantic
+equivalence is out of scope — `USING (a = 1)` and `USING (1 = a)`
+are different texts and are not flagged. The role list is
+compared as a set, so `TO a, b` and `TO b, a` match.
+
+For each duplicate group HYG003 keeps the name-sorted-first
+policy as the "original" and flags the rest. Severity is **info**
+— a duplicate is redundant, not unsafe. Allowlist the redundant
+policy's qualified ID if keeping both is genuinely intended.
+
 <a id="rule-view001"></a>
 
 ### VIEW001 — View bypasses RLS without `security_invoker`
@@ -2330,8 +2367,8 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty rules across four categories.** SEC001–SEC021,
-  PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
+- **Thirty-one rules across four categories.** SEC001–SEC021,
+  PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
   trigger-mediated bypass, SEC014 (v0.5.12) flags every SECDEF

@@ -10,6 +10,35 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.24] - 2026-05-18
+
+### Added
+- **HYG003 — policy duplicates another policy on the same
+  table** (severity: info). Flags two policies on one table that
+  are identical in everything but their name — same command,
+  role set, permissive / restrictive kind, and `USING` /
+  `WITH CHECK` predicates.
+
+  Such a duplicate is redundant: permissive policies are
+  OR-combined and restrictive ones AND-combined, so a second
+  identical policy changes nothing. It is almost always a
+  copy-paste leftover or a migration that re-created a policy it
+  never dropped — and a maintenance hazard, since editing one of
+  the pair leaves the other silently stale.
+
+  Detection is an exact match (the `USING` / `WITH CHECK`
+  comparison uses Postgres's canonical `pg_get_expr` text;
+  semantic equivalence is out of scope) with the role list
+  compared as a set. For each duplicate group HYG003 keeps the
+  name-sorted-first policy and flags the rest; allowlist a
+  redundant policy's qualified ID if keeping both is intended.
+
+### Changed
+- **Rule count: thirty → thirty-one** (`SEC001`–`SEC021`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — HYG003 reads policy metadata already
+  captured since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.23] - 2026-05-18
 
 ### Added

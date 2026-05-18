@@ -924,6 +924,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "PERF002  public.allbad_perf002.randomized\n",
             "HYG001  public.allbad_hyg001.orphan\n",
             "HYG002  public.allbad_hyg002.todo_replace_me_later\n",
+            "HYG003  public.allbad_hyg003.tenant_scope_b\n",
             "VIEW001  public.allbad_view001\n",
             "VIEW002  public.allbad_view002\n",
             "VIEW003  public.allbad_view003\n",
