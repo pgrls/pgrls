@@ -50,11 +50,18 @@ class Fixer(Protocol):
 def default_fixers() -> list[Fixer]:
     """Every fixer the project ships."""
     from pgrls.fixers.perf001 import PERF001Fixer
+    from pgrls.fixers.sec001 import SEC001Fixer
     from pgrls.fixers.sec002 import SEC002Fixer
     from pgrls.fixers.view001 import VIEW001Fixer
     from pgrls.fixers.view002 import VIEW002Fixer
 
-    return [SEC002Fixer(), PERF001Fixer(), VIEW001Fixer(), VIEW002Fixer()]
+    return [
+        SEC001Fixer(),
+        SEC002Fixer(),
+        PERF001Fixer(),
+        VIEW001Fixer(),
+        VIEW002Fixer(),
+    ]
 
 
 def generate_fixes(
@@ -67,8 +74,8 @@ def generate_fixes(
     return the union of Fix objects, ordered by (rule_id, location).
 
     Sort is alphabetical by `rule_id` then `location`. Today's
-    fixers (PERF001 ALTER POLICY + SEC002 ALTER TABLE FORCE) are
-    independent in Postgres, so the ordering is correctness-
+    fixers emit independent statements (`ALTER TABLE`, `ALTER
+    VIEW`, `ALTER POLICY`), so the ordering is correctness-
     irrelevant. A future fixer that depends on order (e.g. CREATE
     POLICY before its referenced table is forced) will need
     explicit dependency-based ordering — the alphabetical sort is

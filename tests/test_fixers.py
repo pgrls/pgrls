@@ -6,6 +6,7 @@ import pytest
 from pgrls.ast_utils import parse_expr
 from pgrls.fixers import Fix, default_fixers, generate_fixes
 from pgrls.fixers.perf001 import PERF001Fixer
+from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
@@ -83,6 +84,129 @@ def test_sec002_fix_emits_one_per_offending_table() -> None:
     )
     fixes = SEC002Fixer().fix(schema, {})
     assert sorted(f.location for f in fixes) == ["public.a", "public.c"]
+
+
+# ---------- SEC001 fixer ----------
+
+
+def test_sec001_fix_emits_alter_table_enable() -> None:
+    schema = Schema(tables=(_table(rls=False, force=False),))
+    fixes = SEC001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC001"
+    assert f.location == "public.t"
+    assert f.sql == "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;"
+
+
+def test_sec001_fix_silent_when_rls_already_enabled() -> None:
+    # SEC002's territory (FORCE missing), not SEC001's.
+    schema = Schema(tables=(_table(rls=True, force=False),))
+    assert SEC001Fixer().fix(schema, {}) == []
+
+
+def test_sec001_fix_respects_allowlist_qualified() -> None:
+    schema = Schema(
+        tables=(
+            _table(name="a", rls=False, force=False),
+            _table(name="b", rls=False, force=False),
+        )
+    )
+    fixes = SEC001Fixer().fix(schema, {"allowlist": ["public.a"]})
+    assert [f.location for f in fixes] == ["public.b"]
+
+
+def test_sec001_fix_respects_allowlist_unqualified() -> None:
+    schema = Schema(
+        tables=(_table(name="countries", rls=False, force=False),)
+    )
+    assert SEC001Fixer().fix(schema, {"allowlist": ["countries"]}) == []
+
+
+def test_sec001_fix_emits_one_per_offending_table() -> None:
+    schema = Schema(
+        tables=(
+            _table(name="a", rls=False, force=False),
+            _table(name="b", rls=True, force=True),
+            _table(name="c", rls=False, force=False),
+        )
+    )
+    fixes = SEC001Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == ["public.a", "public.c"]
+
+
+def test_sec001_fix_skips_partition_child() -> None:
+    # SEC001 flags an RLS-less partition child, but the remediation
+    # is a judgement call (parent vs each child) — the fixer skips
+    # children and emits the single correct fix for the parent.
+    parent = _table(name="events", rls=False, force=False)
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    schema = Schema(tables=(parent, child))
+    fixes = SEC001Fixer().fix(schema, {})
+    assert [f.location for f in fixes] == ["public.events"]
+
+
+def test_sec001_fix_skips_partition_child_with_unscanned_parent() -> None:
+    # A partition child whose parent lives in a schema that was not
+    # scanned: no in-scope parent exists to fix, and pgrls cannot
+    # verify RLS coverage upstream. The fixer still skips the child
+    # — widening `--schemas` or designing a child policy is a
+    # judgement call, not a mechanical fix.
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("private", "events"),  # 'private' not scanned
+    )
+    schema = Schema(tables=(child,))
+    assert SEC001Fixer().fix(schema, {}) == []
+
+
+def test_sec001_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Bad config type → fail closed (no exemption) → fix still emitted.
+    schema = Schema(tables=(_table(rls=False, force=False),))
+    fixes = SEC001Fixer().fix(schema, {"allowlist": "public.t"})
+    assert len(fixes) == 1
+    assert fixes[0].location == "public.t"
+
+
+def test_sec001_fix_quotes_table_name_when_required() -> None:
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="MixedCase Table",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    fixes = SEC001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert (
+        fixes[0].sql
+        == 'ALTER TABLE public."MixedCase Table" '
+        "ENABLE ROW LEVEL SECURITY;"
+    )
+
+
+def test_sec001_fix_description_warns_about_deny_all() -> None:
+    # Enabling RLS with no policy makes the table deny-all for
+    # non-owner roles — the description must surface that follow-up.
+    schema = Schema(tables=(_table(rls=False, force=False),))
+    [f] = SEC001Fixer().fix(schema, {})
+    assert "public.t" in f.description
+    assert "policy" in f.description
 
 
 # ---------- VIEW001 fixer ----------
@@ -720,7 +844,7 @@ def test_generate_fixes_passes_rule_options() -> None:
 
 def test_default_fixers_registers_every_shipping_fixer() -> None:
     rule_ids = {fixer.rule_id for fixer in default_fixers()}
-    assert {"SEC002", "PERF001", "VIEW001", "VIEW002"} <= rule_ids
+    assert {"SEC001", "SEC002", "PERF001", "VIEW001", "VIEW002"} <= rule_ids
 
 
 def test_fix_dataclass_is_frozen() -> None:
