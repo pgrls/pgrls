@@ -313,3 +313,22 @@ CREATE POLICY open_write_check ON public.allbad_sec020
     WITH CHECK (true);
 CREATE INDEX allbad_sec020_tenant_idx
     ON public.allbad_sec020 (tenant_id);
+
+-- SEC021: policy compares an identity column against a hardcoded
+-- literal. USING (tenant_id = 1) pins the policy to one tenant, so
+-- every session gets the same fixed rows instead of being scoped
+-- to its own tenant. SEC021 is info-severity (it uses a column-
+-- name heuristic). The base table mirrors the other RLS-on blocks
+-- (RESTRICTIVE policy, own-column USING, indexed predicate column)
+-- so SEC001/SEC002/SEC005/SEC006/SEC007/SEC008/SEC009/PERF003 stay
+-- silent and only SEC021 fires. SEC012 also fires (RESTRICTIVE-only
+-- set) and carries no rule_loc pin, so that extra firing is
+-- silent-by-design.
+CREATE TABLE public.allbad_sec021 (id INT, tenant_id INT);
+ALTER TABLE public.allbad_sec021 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec021 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_pinned ON public.allbad_sec021
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = 1);
+CREATE INDEX allbad_sec021_tenant_idx
+    ON public.allbad_sec021 (tenant_id);

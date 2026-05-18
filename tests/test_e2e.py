@@ -71,7 +71,7 @@ def test_subprocess_known_bad_exits_nonzero(
 def test_subprocess_clean_db_exits_zero(
     pg_url: str, apply_sql
 ) -> None:
-    # "Clean" means: every rule (SEC001-SEC020, PERF001-PERF003,
+    # "Clean" means: every rule (SEC001-SEC021, PERF001-PERF003,
     # HYG001-HYG002, VIEW001-VIEW004) is satisfied, not just
     # SEC001-SEC002. SEC014, SEC015, and SEC017 are exercised by
     # absence — the fixture creates no SECURITY DEFINER functions
