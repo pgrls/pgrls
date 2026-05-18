@@ -103,6 +103,7 @@ def _build_default_registry() -> RuleRegistry:
     from pgrls.rules.sec017 import SEC017
     from pgrls.rules.sec018 import SEC018
     from pgrls.rules.sec019 import SEC019
+    from pgrls.rules.sec020 import SEC020
     from pgrls.rules.view001 import VIEW001
     from pgrls.rules.view002 import VIEW002
     from pgrls.rules.view003 import VIEW003
@@ -128,6 +129,7 @@ def _build_default_registry() -> RuleRegistry:
     registry.register(SEC017())
     registry.register(SEC018())
     registry.register(SEC019())
+    registry.register(SEC020())
     registry.register(PERF001())
     registry.register(PERF002())
     registry.register(PERF003())

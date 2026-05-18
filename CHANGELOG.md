@@ -10,6 +10,36 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.19] - 2026-05-17
+
+### Added
+- **SEC020 — policy `WITH CHECK` clause is constant `true` but
+  `USING` is not** (severity: warning). Flags a policy that has
+  both clauses present, a real `USING` predicate, and a `WITH
+  CHECK` clause that is the literal `true`.
+
+  `USING` filters the rows a caller may read; `WITH CHECK`
+  validates the rows it may write. An explicit `WITH CHECK (true)`
+  alongside a restrictive `USING` means the read side is locked
+  down while the write side is wide open — the caller can INSERT a
+  row stamped with another tenant's id, or UPDATE one of its own
+  rows to reassign it, even though it can only read its own. The
+  fix is to mirror the `USING` predicate into `WITH CHECK`, or to
+  drop the `WITH CHECK` clause so Postgres reuses `USING` for it.
+
+  Detection matches the literal `true` only — the same
+  deliberately narrow scope as SEC008, so `1 = 1` and other
+  semantic tautologies are out of scope. A policy with no `WITH
+  CHECK` at all is SEC006's concern, not SEC020's. Allowlist by
+  qualified policy ID when an intentionally open write side is the
+  design (e.g. an append-only audit table).
+
+### Changed
+- **Rule count: twenty-eight → twenty-nine** (`SEC001`–`SEC020`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC020 reads policy expressions already
+  captured since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.18] - 2026-05-17
 
 ### Added
