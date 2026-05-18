@@ -1296,6 +1296,68 @@ def test_fix_emits_sec006_with_check(pg_url: str, apply_sql) -> None:
     assert "dry-run" in result.output
 
 
+def test_fix_emits_hyg003_drop_policy(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` picks up the HYG003 fixer and emits a DROP POLICY
+    # for a policy that exactly duplicates another on the same
+    # table. The name-sorted-first policy ('p_a') is kept as the
+    # original; the redundant twin ('p_b') is dropped.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_hyg003 (id INT);
+        ALTER TABLE public.fix_hyg003 ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_hyg003 FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p_a ON public.fix_hyg003
+            FOR SELECT TO postgres USING (id > 0);
+        CREATE POLICY p_b ON public.fix_hyg003
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert "DROP POLICY p_b ON public.fix_hyg003;" in result.output
+    # The kept original is never dropped.
+    assert "DROP POLICY p_a" not in result.output
+    assert "dry-run" in result.output
+
+
+def test_fix_apply_drops_duplicate_hyg003_policy(
+    pg_url: str, apply_sql
+) -> None:
+    # HYG003 is the first DROP-emitting fixer — verify --apply
+    # actually removes the redundant policy from the live catalog
+    # and leaves the original in place.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_hyg003_apply (id INT);
+        ALTER TABLE public.fix_hyg003_apply ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_hyg003_apply FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p_a ON public.fix_hyg003_apply
+            FOR SELECT TO postgres USING (id > 0);
+        CREATE POLICY p_b ON public.fix_hyg003_apply
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--apply"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 1 fix" in result.output
+
+    # Exactly the duplicate is gone; the original survives.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT policyname FROM pg_catalog.pg_policies "
+                "WHERE schemaname = 'public' "
+                "AND tablename = 'fix_hyg003_apply' "
+                "ORDER BY policyname"
+            )
+            assert [r[0] for r in cur.fetchall()] == ["p_a"]
+
+
 def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
     # First --apply executes; second --apply finds nothing to do.
     apply_sql(

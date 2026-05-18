@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.26] - 2026-05-18
+
+### Added
+- **`pgrls fix` now auto-remediates HYG003** ("policy duplicates
+  another policy on the same table"). The fixer emits `DROP
+  POLICY <redundant> ON <schema>.<table>;` for a policy that is
+  an exact duplicate of another on the same table. Because the
+  two are identical, dropping one leaves the table's effective
+  RLS unchanged — permissive policies are OR-combined (`p OR p`
+  is `p`) and restrictive ones AND-combined. `pgrls fix` now
+  covers SEC001, SEC002, SEC006, PERF001, HYG003, VIEW001, and
+  VIEW002.
+
+  This is the first `pgrls fix` statement that DROPs an object
+  rather than adding or altering one. It is safe — the dropped
+  policy has an exact twin that remains — but, like every fixer,
+  it is dry-run by default; review the SQL before `--apply`. The
+  fixer mirrors HYG003's detection exactly (it reuses the rule's
+  duplicate-signature function), keeps the name-sorted-first
+  policy of each duplicate group and drops the rest, and honors
+  the same `allowlist` of qualified policy IDs.
+
 ## [0.5.25] - 2026-05-18
 
 ### Added

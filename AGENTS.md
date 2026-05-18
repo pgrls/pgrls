@@ -51,8 +51,8 @@ identity column against a hardcoded literal), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC006, PERF001, VIEW001, and VIEW002; other rules need human
-intent. A
+SEC006, PERF001, HYG003, VIEW001, and VIEW002; other rules need
+human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
 "Testing your RLS" and "Diff" sections below for when to suggest
@@ -1957,6 +1957,15 @@ Currently fixable:
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
   verbatim — PERF001 is USING-only, the fix doesn't touch what
   it wasn't asked to fix.
+* **HYG003** — emits `DROP POLICY <redundant> ON
+  <schema>.<table>;` for a policy that is an exact duplicate of
+  another on the same table. The fixer groups a table's policies
+  by the same signature HYG003 reports on, keeps the
+  name-sorted-first policy of each duplicate group as the
+  original, and drops the rest. This is the only `pgrls fix`
+  statement that DROPs an object — safe, since the dropped
+  policy has an exact twin that remains, but dry-run by default
+  like every fixer.
 * **VIEW001** — emits `ALTER VIEW <schema>.<view> SET
   (security_invoker = true);` for every regular view that reads
   RLS-protected tables and lacks the flag. Mirrors VIEW001's
@@ -2411,7 +2420,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC006, PERF001, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, PERF001, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, and Markdown output.** `--format text`
