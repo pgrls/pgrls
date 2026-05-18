@@ -5,6 +5,7 @@ import pytest
 
 from pgrls.ast_utils import parse_expr
 from pgrls.fixers import Fix, default_fixers, generate_fixes
+from pgrls.fixers.hyg003 import HYG003Fixer
 from pgrls.fixers.perf001 import PERF001Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
@@ -910,6 +911,154 @@ def test_sec006_fix_silent_when_allowlist_is_bad_type() -> None:
     assert fixes[0].location == "public.t.p"
 
 
+# ---------- HYG003 fixer ----------
+
+
+def _dup_table(
+    *policies: Policy, name: str = "t", schema: str = "public"
+) -> Schema:
+    """A single RLS-forced table holding `policies` — HYG003 setup."""
+    return Schema(
+        tables=(
+            Table(
+                schema=schema,
+                name=name,
+                rls_enabled=True,
+                force_rls=True,
+                policies=policies,
+            ),
+        )
+    )
+
+
+def test_hyg003_fix_emits_drop_policy_for_duplicate() -> None:
+    schema = _dup_table(
+        _policy("user_id = 1", name="p_a"),
+        _policy("user_id = 1", name="p_b"),
+    )
+    fixes = HYG003Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "HYG003"
+    # Name-sorted first ('p_a') is kept; 'p_b' is the redundant drop.
+    assert f.location == "public.t.p_b"
+    assert f.sql == "DROP POLICY p_b ON public.t;"
+
+
+def test_hyg003_fix_keeps_name_sorted_first_policy() -> None:
+    # Input order is reversed — the fixer still keeps the
+    # name-sorted-first policy and drops the other, so output is
+    # deterministic regardless of how the snapshot ordered policies.
+    schema = _dup_table(
+        _policy("user_id = 1", name="z_policy"),
+        _policy("user_id = 1", name="a_policy"),
+    )
+    fixes = HYG003Fixer().fix(schema, {})
+    assert [f.location for f in fixes] == ["public.t.z_policy"]
+
+
+def test_hyg003_fix_silent_on_distinct_policies() -> None:
+    # Different USING text → different signature → not duplicates.
+    schema = _dup_table(
+        _policy("user_id = 1", name="p_a"),
+        _policy("user_id = 2", name="p_b"),
+    )
+    assert HYG003Fixer().fix(schema, {}) == []
+
+
+def test_hyg003_fix_silent_on_policies_differing_only_by_command() -> None:
+    # Same predicate, different command — a FOR SELECT and a FOR
+    # UPDATE policy are not duplicates even with identical USING.
+    schema = _dup_table(
+        _policy("user_id = 1", name="p_a", command="SELECT"),
+        _policy("user_id = 1", name="p_b", command="UPDATE"),
+    )
+    assert HYG003Fixer().fix(schema, {}) == []
+
+
+def test_hyg003_fix_silent_on_single_policy() -> None:
+    # Nothing to dedupe — one policy is never its own duplicate.
+    assert HYG003Fixer().fix(_wrap_policy(_policy("user_id = 1")), {}) == []
+
+
+def test_hyg003_fix_emits_one_drop_per_redundant_copy() -> None:
+    # Three identical policies — keep one, drop the other two.
+    schema = _dup_table(
+        _policy("user_id = 1", name="p_a"),
+        _policy("user_id = 1", name="p_b"),
+        _policy("user_id = 1", name="p_c"),
+    )
+    fixes = HYG003Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.t.p_b",
+        "public.t.p_c",
+    ]
+
+
+def test_hyg003_fix_handles_multiple_duplicate_groups() -> None:
+    # Two independent duplicate groups on one table — each
+    # contributes one DROP for its redundant copy.
+    schema = _dup_table(
+        _policy("user_id = 1", name="a1"),
+        _policy("user_id = 1", name="a2"),
+        _policy("tenant_id = 9", name="b1"),
+        _policy("tenant_id = 9", name="b2"),
+    )
+    fixes = HYG003Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.t.a2",
+        "public.t.b2",
+    ]
+
+
+def test_hyg003_fix_respects_allowlist() -> None:
+    # The redundant policy's qualified ID is allowlisted — keeping
+    # the duplicate is intentional, so no DROP is emitted.
+    schema = _dup_table(
+        _policy("user_id = 1", name="p_a"),
+        _policy("user_id = 1", name="p_b"),
+    )
+    assert (
+        HYG003Fixer().fix(schema, {"allowlist": ["public.t.p_b"]}) == []
+    )
+
+
+def test_hyg003_fix_quotes_policy_and_table_when_required() -> None:
+    # Mixed-case / spaced identifiers must be double-quoted in the
+    # emitted DROP POLICY statement.
+    schema = _dup_table(
+        _policy("user_id = 1", name="a policy"),
+        _policy("user_id = 1", name="z policy"),
+        name="MixedCase Table",
+    )
+    sql = HYG003Fixer().fix(schema, {})[0].sql
+    assert sql == 'DROP POLICY "z policy" ON public."MixedCase Table";'
+
+
+def test_hyg003_fix_description_names_the_original() -> None:
+    # The description must name both the dropped duplicate and the
+    # surviving original so a reviewer can confirm the pairing.
+    schema = _dup_table(
+        _policy("user_id = 1", name="keeper"),
+        _policy("user_id = 1", name="redundant"),
+    )
+    [f] = HYG003Fixer().fix(schema, {})
+    assert f.location == "public.t.redundant"
+    assert "keeper" in f.description
+    assert "redundant" in f.description
+
+
+def test_hyg003_fix_silent_when_allowlist_is_bad_type() -> None:
+    # Bad config type → fail closed (no exemption) → DROP still emitted.
+    schema = _dup_table(
+        _policy("user_id = 1", name="p_a"),
+        _policy("user_id = 1", name="p_b"),
+    )
+    fixes = HYG003Fixer().fix(schema, {"allowlist": "public.t.p_b"})
+    assert len(fixes) == 1
+    assert fixes[0].location == "public.t.p_b"
+
+
 # ---------- generate_fixes / registry ----------
 
 
@@ -980,6 +1129,7 @@ def test_default_fixers_registers_every_shipping_fixer() -> None:
         "SEC002",
         "SEC006",
         "PERF001",
+        "HYG003",
         "VIEW001",
         "VIEW002",
     } <= rule_ids

@@ -371,7 +371,9 @@ def fix(
     SECURITY`), SEC002 (`ALTER TABLE … FORCE ROW LEVEL
     SECURITY`), SEC006 (`ALTER POLICY … WITH CHECK` mirroring
     USING), PERF001 (wrap unwrapped auth calls in
-    `(SELECT …)` and emit `ALTER POLICY`), VIEW001
+    `(SELECT …)` and emit `ALTER POLICY`), HYG003 (`DROP
+    POLICY` for a policy that exactly duplicates another on
+    the same table), VIEW001
     (`ALTER VIEW … SET (security_invoker = true)`), and
     VIEW002 (`ALTER VIEW … SET (security_barrier = true)`).
     Other rules require human intent (which role to grant
