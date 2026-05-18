@@ -332,3 +332,25 @@ CREATE POLICY tenant_pinned ON public.allbad_sec021
     USING (tenant_id = 1);
 CREATE INDEX allbad_sec021_tenant_idx
     ON public.allbad_sec021 (tenant_id);
+
+-- HYG003: two policies on the table are exact duplicates of each
+-- other, identical in command, roles, and USING predicate and
+-- differing only in name. A copy-paste or migration leftover: the
+-- second policy is dead weight. HYG003 is info-severity. The base
+-- table mirrors the other RLS-on blocks (RESTRICTIVE policies,
+-- own-column USING, indexed predicate column) so SEC001/SEC002/
+-- SEC005/SEC006/SEC007/SEC008/SEC009/PERF003 stay silent and only
+-- HYG003 fires. SEC012 also fires (the policy set is
+-- RESTRICTIVE-only) and carries no rule_loc pin, so that extra
+-- firing is silent-by-design.
+CREATE TABLE public.allbad_hyg003 (id INT, tenant_id INT);
+ALTER TABLE public.allbad_hyg003 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_hyg003 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope_a ON public.allbad_hyg003
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id IS NOT NULL);
+CREATE POLICY tenant_scope_b ON public.allbad_hyg003
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id IS NOT NULL);
+CREATE INDEX allbad_hyg003_tenant_idx
+    ON public.allbad_hyg003 (tenant_id);
