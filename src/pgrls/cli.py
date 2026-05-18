@@ -22,6 +22,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -180,6 +181,7 @@ def _merge_overrides(
         disable=list(config.disable),
         fail_on=effective_fail_on,
         rule_options=dict(config.rule_options),
+        severity_overrides=dict(config.severity_overrides),
         diff_fail_on=config.diff_fail_on,
     )
 
@@ -190,9 +192,7 @@ def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
     out: list[Violation] = []
     for rule in rules:
         try:
-            out.extend(
-                rule.check(schema, config.rule_options.get(rule.id, {}))
-            )
+            found = rule.check(schema, config.rule_options.get(rule.id, {}))
         except RecursionError as exc:
             # Pathologically deep policy AST (thousands of nested
             # ANDs/ORs) blows the default Python recursion limit
@@ -205,6 +205,15 @@ def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
                 "(RecursionError in rule check). Increase "
                 "sys.setrecursionlimit or simplify the policy."
             ) from exc
+        # Apply a per-rule severity override, if configured. The
+        # rule stamps its own declared severity on every Violation;
+        # the override remaps them here, before exit-code (`_should_
+        # fail`) and output, so a promoted/demoted rule counts and
+        # displays at the configured severity.
+        override = config.severity_overrides.get(rule.id)
+        if override is not None:
+            found = [replace(v, severity=override) for v in found]
+        out.extend(found)
     return out
 
 

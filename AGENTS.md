@@ -128,6 +128,15 @@ Notes:
 - `[lint.rules.<RULE>].allowlist` accepts unqualified names (`countries`) or
   qualified names (`public.countries`). Use qualified names whenever the same
   table name exists in more than one schema.
+- `[lint.rules.<RULE>].severity` (`"error"` | `"warning"` | `"info"`) remaps
+  that rule's reported severity. Use it to promote a rule so it fails CI —
+  e.g. lifting the info-level `SEC019` to `severity = "error"` — or to demote
+  a noisy one below the `fail_on` threshold without disabling it. The remap is
+  applied before the exit-code decision and before output, so counts, the
+  `fail_on` gate, and the printed severity all reflect the override.
+  `severity` is a reserved key — it sits alongside `allowlist` and other
+  options in the same `[lint.rules.<RULE>]` table but is not passed to the
+  rule itself.
 
 ## Rules reference
 

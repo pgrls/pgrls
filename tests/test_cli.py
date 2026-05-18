@@ -2,8 +2,9 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from pgrls.cli import _merge_overrides, _should_fail, main
+from pgrls.cli import _merge_overrides, _run_rules, _should_fail, main
 from pgrls.config import Config
+from pgrls.model import Schema, Table
 from pgrls.rules import all_rules
 from pgrls.violations import Violation
 
@@ -158,6 +159,152 @@ def test_lint_disable_skips_rule(pg_url: str, apply_sql, tmp_path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "SEC001" not in result.output
+
+
+def test_run_rules_applies_severity_override() -> None:
+    # An RLS-disabled table trips SEC001 (declared severity: error)
+    # and nothing else. `_run_rules` must remap every SEC001
+    # violation to the configured override severity.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    base = _run_rules(schema, config=Config())
+    assert [(v.rule_id, v.severity) for v in base] == [("SEC001", "error")]
+
+    demoted = _run_rules(
+        schema, config=Config(severity_overrides={"SEC001": "info"})
+    )
+    assert [(v.rule_id, v.severity) for v in demoted] == [
+        ("SEC001", "info")
+    ]
+    # The remap is direction-agnostic — a non-overridden run is
+    # unaffected, an overridden run takes the configured value
+    # verbatim. The violation's other fields are preserved.
+    assert demoted[0].location == base[0].location
+    assert demoted[0].message == base[0].message
+
+
+def test_run_rules_severity_override_remaps_every_violation() -> None:
+    # Two RLS-disabled tables trip SEC001 twice. The remap is
+    # per-violation — every finding must land at the override
+    # severity, not just the first.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="a",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+            Table(
+                schema="public",
+                name="b",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    found = _run_rules(
+        schema, config=Config(severity_overrides={"SEC001": "info"})
+    )
+    assert {v.rule_id for v in found} == {"SEC001"}
+    assert [v.severity for v in found] == ["info", "info"]
+
+
+def test_run_rules_severity_override_inert_when_rule_disabled() -> None:
+    # `disable` wins over `severity`: a disabled rule never runs, so
+    # its override has nothing to remap. Pins the contrast the
+    # feature draws — `severity` re-tiers, `disable` silences.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    found = _run_rules(
+        schema,
+        config=Config(
+            disable=["SEC001"],
+            severity_overrides={"SEC001": "info"},
+        ),
+    )
+    assert found == []
+
+
+def test_run_rules_severity_override_remaps_what_survives_allowlist() -> None:
+    # The allowlist filters inside the rule's check(); the override
+    # remaps whatever survives. Table `a` is allowlisted out, `b` is
+    # not — the single surviving SEC001 finding is remapped.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="a",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+            Table(
+                schema="public",
+                name="b",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    surviving = schema.tables[1]  # "public.b"
+    found = _run_rules(
+        schema,
+        config=Config(
+            rule_options={"SEC001": {"allowlist": ["a"]}},
+            severity_overrides={"SEC001": "info"},
+        ),
+    )
+    assert [(v.rule_id, v.location, v.severity) for v in found] == [
+        ("SEC001", surviving.qualified_name, "info")
+    ]
+
+
+def test_lint_severity_override_changes_exit_code(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # An RLS-disabled table trips SEC001 (error). With the default
+    # fail_on=warning that is exit 1. A `[lint.rules.SEC001]
+    # severity = "info"` override demotes it below the threshold —
+    # exit 0 — while the finding still prints, now at info.
+    apply_sql("CREATE TABLE public.t (id INT);")
+    runner = CliRunner()
+
+    base = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert base.exit_code == 1, base.output
+    assert "SEC001" in base.output
+    assert "ERROR" in base.output
+
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[lint.rules.SEC001]\nseverity = "info"\n')
+    overridden = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    assert overridden.exit_code == 0, overridden.output
+    # Still reported — the override demotes, it does not silence.
+    assert "SEC001" in overridden.output
+    assert "INFO" in overridden.output
 
 
 def test_lint_schemas_flag_overrides_config(pg_url: str, apply_sql) -> None:
