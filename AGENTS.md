@@ -1644,9 +1644,7 @@ allowlist = ["public.tickets.todo_replace_me_later"]
 
 ### HYG003 — Policy duplicates another policy on the same table
 
-**Severity:** info. **Auto-fix:** no (which of the duplicate pair
-to drop, and whether they were meant to diverge, is a judgement
-call).
+**Severity:** info.
 
 Two policies on one table that are identical in everything but
 their name — same command, same role list, same permissive /
