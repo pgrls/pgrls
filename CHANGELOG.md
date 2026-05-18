@@ -10,6 +10,36 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.21] - 2026-05-18
+
+### Added
+- **SEC021 — policy compares an identity column against a
+  hardcoded literal** (severity: info). Flags an `=` comparison
+  between an identity-named column (`tenant_id`, `org_id`,
+  `account_id`, `user_id`, `owner`, …) and a literal constant —
+  `USING (tenant_id = 1)`.
+
+  A literal pins the policy to one specific tenant: every session
+  is handed the same fixed slice of rows instead of being scoped
+  to its own tenant. It is almost always a scaffolding value left
+  in place of the per-request session lookup
+  (`current_setting('app.tenant_id')`, a JWT claim).
+
+  Detection is a name heuristic — the identity-ish column name is
+  what separates the anti-pattern from a legitimate `column =
+  literal` policy such as `is_public = true` or `status =
+  'published'`. Because the heuristic cannot know a project's
+  column conventions, SEC021 is **info** severity. Override the
+  column set with `[lint.rules.SEC021].identity_columns` (the list
+  replaces the default); allowlist by qualified policy ID when the
+  fixed comparison is intentional.
+
+### Changed
+- **Rule count: twenty-nine → thirty** (`SEC001`–`SEC021`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG002`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC021 reads policy expressions already
+  captured since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.20] - 2026-05-17
 
 ### Added
