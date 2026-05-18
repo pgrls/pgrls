@@ -293,3 +293,23 @@ CREATE POLICY tenant_scope ON public.allbad_sec019
     USING (tenant_id = (SELECT current_setting('app.tenant')));
 CREATE INDEX allbad_sec019_tenant_idx
     ON public.allbad_sec019 (tenant_id);
+
+-- SEC020: policy pairs a restrictive USING with WITH CHECK (true).
+-- USING limits which rows the caller can read, but WITH CHECK
+-- (true) accepts every row it writes, so the caller can write rows
+-- it could never read back (an INSERT or UPDATE into another
+-- tenant's space). The base table mirrors the other RLS-on blocks
+-- (RESTRICTIVE policy, own-column USING, indexed predicate column)
+-- so SEC001/SEC002/SEC005/SEC006/SEC007/SEC008/SEC009/PERF003 stay
+-- silent and only SEC020 fires. SEC012 also fires here (the policy
+-- set is RESTRICTIVE-only, like the SEC018/SEC019 base tables) and
+-- carries no rule_loc pin, so that extra firing is silent-by-design.
+CREATE TABLE public.allbad_sec020 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_sec020 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec020 FORCE ROW LEVEL SECURITY;
+CREATE POLICY open_write_check ON public.allbad_sec020
+    AS RESTRICTIVE FOR ALL TO PUBLIC
+    USING (tenant_id IS NOT NULL)
+    WITH CHECK (true);
+CREATE INDEX allbad_sec020_tenant_idx
+    ON public.allbad_sec020 (tenant_id);

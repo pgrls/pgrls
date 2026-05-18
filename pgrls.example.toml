@@ -264,6 +264,20 @@ allowlist = []
 # fully-qualified policy IDs of the form "schema.table.policy_name".
 allowlist = []
 
+[lint.rules.SEC020]
+# Policies that pair a restrictive USING with WITH CHECK (true).
+# USING filters which rows the caller can read; WITH CHECK (true)
+# accepts every row it writes, so the caller can write rows it
+# could never read back (an INSERT or UPDATE into another tenant's
+# space). The fix is to mirror the USING predicate in WITH CHECK,
+# or drop the WITH CHECK clause so Postgres reuses USING for it.
+#
+# Allowlist a policy when an intentionally open write side is the
+# design (e.g. an append-only audit table any tenant may write but
+# only an admin policy reads). Entries are fully-qualified policy
+# IDs of the form "schema.table.policy_name".
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
