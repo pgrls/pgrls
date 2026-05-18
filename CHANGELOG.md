@@ -19,8 +19,8 @@ breaking changes — they will be called out in this file.
   severity of every violation that rule emits:
 
   ```toml
-  [lint.rules.SEC005]
-  severity = "error"   # promote — now fails CI under fail_on = "warning"
+  [lint.rules.SEC019]
+  severity = "error"   # promote info-level SEC019 — now fails CI
   ```
 
   An operator can promote an advisory rule so it gates CI, or

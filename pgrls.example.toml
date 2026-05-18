@@ -32,7 +32,8 @@ fail_on = "dangerous"
 # Every `[lint.rules.<ID>]` table also accepts a reserved
 # `severity` key — "error" | "warning" | "info" — that remaps the
 # rule's reported severity. Promote a rule so it fails CI, e.g.
-#     [lint.rules.SEC005]
+# lifting the info-level SEC019 to error:
+#     [lint.rules.SEC019]
 #     severity = "error"
 # or demote a noisy one below `fail_on` without disabling it. The
 # remap is applied before the exit-code decision and before

@@ -117,9 +117,10 @@ fail_on = "warning"
 [lint.rules.SEC001]
 allowlist = ["countries", "currencies"]
 
-# Promote a rule so it fails CI, or demote a noisy one — without
-# disabling it. `severity` is "error" | "warning" | "info".
-[lint.rules.SEC005]
+# `severity` re-tiers a rule's findings without disabling it —
+# "error" | "warning" | "info". SEC019 is an info rule; promoting
+# it to error makes a one-arg current_setting() call fail CI.
+[lint.rules.SEC019]
 severity = "error"
 ```
 

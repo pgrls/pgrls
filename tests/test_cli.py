@@ -192,6 +192,95 @@ def test_run_rules_applies_severity_override() -> None:
     assert demoted[0].message == base[0].message
 
 
+def test_run_rules_severity_override_remaps_every_violation() -> None:
+    # Two RLS-disabled tables trip SEC001 twice. The remap is
+    # per-violation — every finding must land at the override
+    # severity, not just the first.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="a",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+            Table(
+                schema="public",
+                name="b",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    found = _run_rules(
+        schema, config=Config(severity_overrides={"SEC001": "info"})
+    )
+    assert {v.rule_id for v in found} == {"SEC001"}
+    assert [v.severity for v in found] == ["info", "info"]
+
+
+def test_run_rules_severity_override_inert_when_rule_disabled() -> None:
+    # `disable` wins over `severity`: a disabled rule never runs, so
+    # its override has nothing to remap. Pins the contrast the
+    # feature draws — `severity` re-tiers, `disable` silences.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    found = _run_rules(
+        schema,
+        config=Config(
+            disable=["SEC001"],
+            severity_overrides={"SEC001": "info"},
+        ),
+    )
+    assert found == []
+
+
+def test_run_rules_severity_override_remaps_what_survives_allowlist() -> None:
+    # The allowlist filters inside the rule's check(); the override
+    # remaps whatever survives. Table `a` is allowlisted out, `b` is
+    # not — the single surviving SEC001 finding is remapped.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="a",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+            Table(
+                schema="public",
+                name="b",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+            ),
+        )
+    )
+    surviving = schema.tables[1]  # "public.b"
+    found = _run_rules(
+        schema,
+        config=Config(
+            rule_options={"SEC001": {"allowlist": ["a"]}},
+            severity_overrides={"SEC001": "info"},
+        ),
+    )
+    assert [(v.rule_id, v.location, v.severity) for v in found] == [
+        ("SEC001", surviving.qualified_name, "info")
+    ]
+
+
 def test_lint_severity_override_changes_exit_code(
     pg_url: str, apply_sql, tmp_path
 ) -> None:
