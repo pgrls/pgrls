@@ -29,15 +29,17 @@ class SEC001Fixer:
             if _is_allowlisted(table, options):
                 continue
             # Skip partition children. SEC001 flags a child only
-            # because an ancestor lacks RLS, and the remediation is
-            # a documented judgement call — enable RLS on the parent
-            # (covers query-through-parent for the whole family, and
-            # this fixer already emits that when the parent is also
-            # flagged) versus on each child for direct-access
-            # defence. The bare-table and partitioned-parent cases
-            # (`partition_of is None`) have a single correct fix;
-            # emit only those, and let a re-lint clear the children
-            # once the parent is enabled.
+            # because an ancestor lacks RLS — or, when the parent
+            # is in an unscanned schema, has RLS that pgrls cannot
+            # verify. Neither case has one mechanical fix. When the
+            # parent is in scope the right move is to enable RLS on
+            # the parent (this fixer emits that — a single ALTER
+            # covers the whole family via query-through-parent).
+            # When the parent is out of scan there is no in-scope
+            # table to fix: the remediation is to widen `--schemas`
+            # or design a child policy. So emit only the standalone
+            # and partitioned-parent cases (`partition_of is None`)
+            # and leave every child for human review.
             if table.partition_of is not None:
                 continue
             sql = (

@@ -153,6 +153,24 @@ def test_sec001_fix_skips_partition_child() -> None:
     assert [f.location for f in fixes] == ["public.events"]
 
 
+def test_sec001_fix_skips_partition_child_with_unscanned_parent() -> None:
+    # A partition child whose parent lives in a schema that was not
+    # scanned: no in-scope parent exists to fix, and pgrls cannot
+    # verify RLS coverage upstream. The fixer still skips the child
+    # — widening `--schemas` or designing a child policy is a
+    # judgement call, not a mechanical fix.
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("private", "events"),  # 'private' not scanned
+    )
+    schema = Schema(tables=(child,))
+    assert SEC001Fixer().fix(schema, {}) == []
+
+
 def test_sec001_fix_silent_when_allowlist_is_bad_type() -> None:
     # Bad config type → fail closed (no exemption) → fix still emitted.
     schema = Schema(tables=(_table(rls=False, force=False),))

@@ -20,11 +20,13 @@ breaking changes — they will be called out in this file.
   now covers SEC001, SEC002, PERF001, VIEW001, and VIEW002.
 
   Partition children are skipped: SEC001 flags a child only
-  because an ancestor lacks RLS, and the remediation there is a
-  judgement call (enable RLS on the parent vs. on each child for
-  direct-access defence). The fixer emits only the unambiguous
-  bare-table and partitioned-parent cases; once the parent is
-  enabled, a re-lint clears the children.
+  because an ancestor lacks RLS — or, when the parent is in an
+  unscanned schema, has RLS pgrls cannot verify. Neither case has
+  one mechanical fix (enable RLS on an in-scope parent; or widen
+  `--schemas` / design a child policy when the parent is out of
+  scan), so the fixer emits only the unambiguous standalone-table
+  and partitioned-parent cases (`partition_of is None`) and leaves
+  every child for human review.
 
   A table with RLS enabled and no policy denies all rows to
   non-owner roles — the generated `Fix.description` says so, so an

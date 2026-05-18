@@ -1845,11 +1845,13 @@ Currently fixable:
 
 * **SEC001** — emits `ALTER TABLE <schema>.<table> ENABLE ROW
   LEVEL SECURITY;` for every table with RLS off (not allowlisted).
-  Partition children are skipped — enabling RLS there is a
-  judgement call (parent vs. each child), so the fixer emits only
-  the bare-table and partitioned-parent cases. A table with RLS
-  on and no policy denies all rows to non-owner roles, so the fix
-  description points the operator to add policies next.
+  Partition children are skipped — there is no single mechanical
+  fix for them (enable RLS on an in-scope parent, or widen
+  `--schemas` / design a child policy when the parent is in an
+  unscanned schema), so the fixer emits only the standalone and
+  partitioned-parent cases. A table with RLS on and no policy
+  denies all rows to non-owner roles, so the fix description
+  points the operator to add policies next.
 * **SEC002** — emits `ALTER TABLE <schema>.<table> FORCE ROW
   LEVEL SECURITY;` for every table with RLS but no FORCE.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
