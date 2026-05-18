@@ -64,7 +64,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import extract_column_refs
-from pgrls.model import Index, Schema, Table
+from pgrls.model import Schema, Table
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 

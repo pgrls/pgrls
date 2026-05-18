@@ -36,8 +36,8 @@ class Config:
     """Loaded configuration.
 
     `frozen=True` prevents field reassignment but does NOT freeze the list and
-    dict fields. Callers must treat `schemas`, `disable`, and `rule_options` as
-    read-only — do not mutate them in place.
+    dict fields. Callers must treat `schemas`, `disable`, `rule_options`, and
+    `severity_overrides` as read-only — do not mutate them in place.
     """
 
     database_url: str | None = None
@@ -45,6 +45,13 @@ class Config:
     disable: list[str] = field(default_factory=list)
     fail_on: Severity = "warning"
     rule_options: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Per-rule severity overrides — `{rule_id: Severity}` parsed from
+    # the `severity` key of each `[lint.rules.<ID>]` table. A rule
+    # whose id is present here has every violation it emits remapped
+    # to the override severity before exit-code and output handling,
+    # letting an operator promote a warning to error (or demote one)
+    # without disabling the rule. Empty when no override is set.
+    severity_overrides: dict[str, Severity] = field(default_factory=dict)
     # `[diff].fail_on` default — the threshold below which `pgrls
     # diff` exits 0 even when changes are detected. CLI flag takes
     # precedence when supplied. Defaults to "dangerous" (only
@@ -179,6 +186,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
     if not isinstance(rules_raw, dict):
         raise ConfigError("[lint.rules] must be a table")
     rule_options: dict[str, dict[str, Any]] = {}
+    severity_overrides: dict[str, Severity] = {}
     for rule_id, opts in rules_raw.items():
         if not isinstance(opts, dict):
             raise ConfigError(f"[lint.rules.{rule_id}] must be a table")
@@ -205,7 +213,29 @@ def _build_config(raw: dict[str, Any]) -> Config:
                 f"[lint.rules.{normalized_id}] (rule ids are "
                 "case-insensitive)"
             )
-        rule_options[normalized_id] = dict(opts)
+        # `severity` is a reserved key inside a `[lint.rules.<ID>]`
+        # table — a meta-directive that remaps the rule's emitted
+        # severity, NOT an option passed to the rule's `check()`.
+        # Extract it into `severity_overrides` and keep `rule_options`
+        # for genuine rule options (allowlist, auth_functions, ...).
+        opts_remaining = dict(opts)
+        severity_raw = opts_remaining.pop("severity", None)
+        if severity_raw is not None:
+            if not isinstance(severity_raw, str):
+                raise ConfigError(
+                    f"[lint.rules.{rule_id}].severity must be a string, "
+                    f"got {type(severity_raw).__name__}"
+                )
+            try:
+                severity_overrides[normalized_id] = coerce_severity(
+                    severity_raw
+                )
+            except ValueError as exc:
+                raise ConfigError(
+                    f"[lint.rules.{rule_id}].severity must be one of "
+                    f"{ALL_SEVERITIES}, got {severity_raw!r}"
+                ) from exc
+        rule_options[normalized_id] = opts_remaining
 
     diff = raw.get("diff", {})
     if not isinstance(diff, dict):
@@ -232,6 +262,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
         disable=list(disable),
         fail_on=fail_on,
         rule_options=rule_options,
+        severity_overrides=severity_overrides,
         diff_fail_on=diff_fail_on,
     )
 

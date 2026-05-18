@@ -1318,7 +1318,6 @@ def test_indexes_captures_unique_constraint(
     )
     schema = introspect(pg_conn, schemas=["public"])
     t = next(x for x in schema.tables if x.name == "t")
-    by_name = {i.name: i for i in t.indexes}
     # Two implicit indexes: the PK on `id` and the unique on `email`.
     pk = next(i for i in t.indexes if i.columns == ("id",))
     email_uniq = next(i for i in t.indexes if i.columns == ("email",))

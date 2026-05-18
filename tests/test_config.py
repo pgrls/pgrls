@@ -488,3 +488,80 @@ def test_diff_section_must_be_a_table(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match=r"\[diff\] must be a table"):
         load_config(cfg)
+
+
+# --- per-rule severity override ------------------------------------------
+
+
+def test_severity_override_is_parsed(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint.rules.SEC005]\nseverity = "error"\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.severity_overrides == {"SEC005": "error"}
+
+
+def test_severity_override_default_is_empty(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint.rules.SEC005]\nallowlist = ["public.t.p"]\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.severity_overrides == {}
+
+
+def test_severity_override_is_extracted_from_rule_options(
+    tmp_path: Path,
+) -> None:
+    # `severity` is a meta-directive, not an option passed to the
+    # rule's check() — it must NOT leak into rule_options alongside
+    # the genuine options.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text(
+        "[lint.rules.SEC005]\n"
+        'severity = "error"\n'
+        'allowlist = ["public.t.p"]\n'
+    )
+    cfg = load_config(path=cfg_file)
+    assert cfg.severity_overrides == {"SEC005": "error"}
+    assert cfg.rule_options == {"SEC005": {"allowlist": ["public.t.p"]}}
+
+
+def test_severity_override_is_case_insensitive_in_value(
+    tmp_path: Path,
+) -> None:
+    # Mirrors the `--fail-on ERROR` / `[lint].fail_on` contract.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint.rules.SEC005]\nseverity = "ERROR"\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.severity_overrides == {"SEC005": "error"}
+
+
+def test_severity_override_normalizes_rule_id_case(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint.rules.sec005]\nseverity = "info"\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.severity_overrides == {"SEC005": "info"}
+
+
+def test_severity_override_rejects_invalid_value(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint.rules.SEC005]\nseverity = "critical"\n')
+    with pytest.raises(ConfigError, match="severity") as excinfo:
+        load_config(path=cfg_file)
+    assert "critical" in str(excinfo.value)
+
+
+def test_severity_override_rejects_non_string(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text("[lint.rules.SEC005]\nseverity = 3\n")
+    with pytest.raises(ConfigError, match="severity"):
+        load_config(path=cfg_file)
+
+
+def test_severity_override_on_unknown_rule_id_rejected(
+    tmp_path: Path,
+) -> None:
+    # The existing unknown-rule-id guard fires before severity is
+    # parsed — a `[lint.rules.<bad>]` section is rejected outright.
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint.rules.SEC9999]\nseverity = "error"\n')
+    with pytest.raises(ConfigError, match="unknown rule id"):
+        load_config(path=cfg_file)
