@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.25] - 2026-05-18
+
+### Added
+- **`pgrls lint --baseline <file>`.** A baseline file lets a
+  project adopt pgrls on a legacy database without fixing every
+  pre-existing finding first. On the first run (file absent)
+  pgrls records the current findings into the file and exits
+  `0`; on every later run it suppresses findings already in the
+  baseline and reports — and exit-codes — only on findings
+  absent from it. A new RLS issue fails CI; the grandfathered
+  backlog does not.
+
+  A finding is keyed by `(rule_id, location)` — the message text
+  is deliberately excluded, so a harmless wording change between
+  releases doesn't spuriously un-baseline a finding. The baseline
+  is JSON (commit it to the repo). The model is
+  auto-create-on-first-run: to re-baseline after deliberately
+  accepting new findings, delete the file and run again.
+  `--baseline` is applied before formatting and the exit-code
+  decision, so it composes with `--format` and `--fail-on`.
+
 ## [0.5.24] - 2026-05-18
 
 ### Added

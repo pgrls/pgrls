@@ -2,7 +2,7 @@
 
 Framework-agnostic linter and testing toolkit for Postgres Row-Level Security.
 
-> **Status: 0.5.24** — thirty-one rules (SEC001–SEC021, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC001, SEC002, SEC006, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification). v0.4+ adds optional Z3-based semantic predicate analysis (`pip install pgrls[diff-z3]`). v0.5+ adds **migration-as-input** — `pgrls diff base.json --apply migration.sql` spins up an ephemeral Postgres, restores the baseline, applies the migration, and diffs the result (`pip install pgrls[diff-apply]`). v0.5.1 auto-detects `CREATE EXTENSION` statements in the migration and pre-installs them in the testcontainer; `--extension <name>` (repeatable) supplements the auto-detect when the baseline assumes an extension is already present. v0.5.2 caches the restored baseline as a tagged Docker image so subsequent `--apply` runs with the same baseline boot directly from the cached state, skipping role + extension + DDL setup. v0.5.3 adds `pgrls diff -v / --verbose` (cache hit/miss + per-step timings on stderr) and a `pgrls cache list / prune` subcommand group for managing the local image cache.
+> **Status: 0.5.25** — thirty-one rules (SEC001–SEC021, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) and a `pgrls fix` subcommand that auto-remediates SEC001, SEC002, SEC006, PERF001, VIEW001, and VIEW002. Text, JSON, SARIF, and Markdown output for CI integrations. Includes the `pgrls.testing` pytest plugin (v0.1+) and `pgrls snapshot` / `pgrls diff` (v0.2+ — semantic RLS policy diff with SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS classification). v0.4+ adds optional Z3-based semantic predicate analysis (`pip install pgrls[diff-z3]`). v0.5+ adds **migration-as-input** — `pgrls diff base.json --apply migration.sql` spins up an ephemeral Postgres, restores the baseline, applies the migration, and diffs the result (`pip install pgrls[diff-apply]`). v0.5.1 auto-detects `CREATE EXTENSION` statements in the migration and pre-installs them in the testcontainer; `--extension <name>` (repeatable) supplements the auto-detect when the baseline assumes an extension is already present. v0.5.2 caches the restored baseline as a tagged Docker image so subsequent `--apply` runs with the same baseline boot directly from the cached state, skipping role + extension + DDL setup. v0.5.3 adds `pgrls diff -v / --verbose` (cache hit/miss + per-step timings on stderr) and a `pgrls cache list / prune` subcommand group for managing the local image cache. v0.5.25 adds `pgrls lint --baseline` — record the current findings to a file so later runs report and fail only on new ones (legacy-database adoption / ratcheting).
 >
 > **TypeScript port**: [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm (v0.6.0+) implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
 
@@ -83,6 +83,20 @@ Exit codes follow the standard linter convention:
 - `0` — clean (or findings below `fail_on`)
 - `1` — findings met or exceeded `fail_on` (default `warning`); your schema has an RLS issue
 - `2` — `pgrls` itself failed to run (bad config, DB unreachable, fixer SQL rolled back, etc.). Distinct from `1` so CI alerts can route "schema bug" differently from "tool error."
+
+### Baseline — adopt pgrls on a legacy database
+
+Running pgrls against an existing database for the first time often surfaces a backlog of pre-existing findings. `--baseline` lets you ratchet: record today's findings and have CI fail only on *new* ones.
+
+```bash
+# First run (file absent): records every current finding, exits 0.
+pgrls lint --database-url "$DATABASE_URL" --baseline pgrls-baseline.json
+
+# Later runs: report and fail only on findings NOT in the baseline.
+pgrls lint --database-url "$DATABASE_URL" --baseline pgrls-baseline.json
+```
+
+The first run writes the baseline file and exits `0`. Every later run suppresses findings already recorded and exits nonzero only when a *new* finding appears — so a team can adopt pgrls without fixing the whole backlog up front, then chip away at the baseline over time. Commit the baseline file to the repo. To re-baseline after deliberately accepting changes, delete the file and run again.
 
 ### Auto-remediation: `pgrls fix`
 
