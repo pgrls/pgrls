@@ -1104,6 +1104,20 @@ def test_fix_apply_handles_multiple_fixes(
             ]
 
 
+def test_fix_emits_sec001_enable_rls(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` with no --rule filter picks up the SEC001 fixer
+    # and emits ENABLE ROW LEVEL SECURITY for an RLS-less table.
+    apply_sql("CREATE TABLE public.fix_sec001 (id INT);")
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert (
+        "ALTER TABLE public.fix_sec001 ENABLE ROW LEVEL SECURITY;"
+        in result.output
+    )
+    assert "dry-run" in result.output
+
+
 def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
     # First --apply executes; second --apply finds nothing to do.
     apply_sql(

@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.20] - 2026-05-17
+
+### Added
+- **`pgrls fix` now auto-remediates SEC001** ("RLS not enabled").
+  The fixer emits `ALTER TABLE <schema>.<table> ENABLE ROW LEVEL
+  SECURITY;` for every table SEC001 flags. `pgrls fix` is dry-run
+  by default (prints the SQL); `--apply` executes it. `pgrls fix`
+  now covers SEC001, SEC002, PERF001, VIEW001, and VIEW002.
+
+  Partition children are skipped: SEC001 flags a child only
+  because an ancestor lacks RLS, and the remediation there is a
+  judgement call (enable RLS on the parent vs. on each child for
+  direct-access defence). The fixer emits only the unambiguous
+  bare-table and partitioned-parent cases; once the parent is
+  enabled, a re-lint clears the children.
+
+  A table with RLS enabled and no policy denies all rows to
+  non-owner roles — the generated `Fix.description` says so, so an
+  operator reviewing the dry-run output knows to add policies
+  next. The fixer honours `[lint.rules.SEC001].allowlist`, the
+  same allowlist the rule reads.
+
 ## [0.5.19] - 2026-05-17
 
 ### Added
