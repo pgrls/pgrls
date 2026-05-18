@@ -10,7 +10,7 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
-## [0.5.21] - 2026-05-17
+## [0.5.21] - 2026-05-18
 
 ### Added
 - **SEC021 — policy compares an identity column against a
