@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **twenty-eight rules across four
+In the current release it ships **twenty-nine rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -34,6 +34,8 @@ RLS policy),
 below the RLS barrier),
 `SEC018` (policy compares a column against `current_user` /
 `session_user` — no isolation under a shared pool role),
+`SEC020` (policy `WITH CHECK` is constant `true` while `USING`
+restricts — writes accept rows reads never would),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1294,6 +1296,55 @@ SEC019 is unrelated to fail-open: the one-arg form fails *closed*
 is info, not a security finding. A policy can trip both rules
 independently.
 
+<a id="rule-sec020"></a>
+
+### SEC020 — Policy WITH CHECK clause is constant true but USING is not
+
+**Severity:** warning. **Auto-fix:** no (whether an open write side
+is intentional — e.g. an append-only audit table — is a design
+choice; pgrls surfaces the asymmetry but will not rewrite the
+policy).
+
+A policy that governs writes — a `FOR ALL` or `FOR UPDATE` policy —
+carries two predicates. `USING` filters the rows the caller may
+*see* (and, for UPDATE, the existing rows it may target).
+`WITH CHECK` validates the rows the caller may *write* — the new
+row an INSERT produces, or the post-image of an UPDATE. When
+`WITH CHECK` is omitted Postgres reuses `USING` for it, so the two
+sides stay in lock-step by default.
+
+The footgun is an explicit `WITH CHECK (true)` paired with a
+restrictive `USING`:
+
+```sql
+CREATE POLICY p ON documents
+    FOR ALL TO app
+    USING (tenant_id = current_setting('app.tenant_id')::int)
+    WITH CHECK (true);
+```
+
+The caller can only *read* its own tenant's rows, but it may
+*write* any row at all — it can INSERT a row stamped with another
+tenant's id, or UPDATE one of its own rows to reassign it. The
+read-side isolation looks airtight while the write side is wide
+open.
+
+SEC020 fires when a policy has both clauses present, its `USING`
+clause is a real predicate, and its `WITH CHECK` clause is the
+literal `true`. The fix is almost always to mirror the `USING`
+predicate into `WITH CHECK` — or to drop the `WITH CHECK` clause,
+which makes Postgres reuse `USING` automatically. Allowlist by
+qualified policy ID when an intentionally open write side is the
+design.
+
+Scope: detection matches the literal `true` only, exactly as SEC008
+("USING clause is constant true") does — `1 = 1` and other semantic
+tautologies are out of scope. A policy with no `WITH CHECK` at all
+is SEC006's concern (write-side policy missing WITH CHECK), not
+SEC020's; a `USING` that is itself constant-true is SEC008's.
+SEC020 does not attempt to prove a non-trivial `WITH CHECK` is
+weaker than `USING` — only the unambiguous constant-true case.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2209,7 +2260,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Twenty-eight rules across four categories.** SEC001–SEC019,
+- **Twenty-nine rules across four categories.** SEC001–SEC020,
   PERF001–PERF003, HYG001–HYG002, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
