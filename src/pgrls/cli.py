@@ -289,7 +289,8 @@ def fix(
 ) -> None:
     """Auto-remediate violations whose fix is mechanical.
 
-    Currently fixes SEC002 (`ALTER TABLE … FORCE ROW LEVEL
+    Currently fixes SEC001 (`ALTER TABLE … ENABLE ROW LEVEL
+    SECURITY`), SEC002 (`ALTER TABLE … FORCE ROW LEVEL
     SECURITY`), PERF001 (wrap unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), VIEW001
     (`ALTER VIEW … SET (security_invoker = true)`), and

@@ -47,8 +47,8 @@ DEFINER function reading an RLS-protected table). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
 floor) and `SEC019` (policy calls one-argument `current_setting()`,
 which raises on an unset GUC). A `pgrls fix` subcommand
-auto-remediates SEC002, PERF001,
-VIEW001, and VIEW002; other rules need human intent. A
+auto-remediates SEC001, SEC002,
+PERF001, VIEW001, and VIEW002; other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
 "Testing your RLS" and "Diff" sections below for when to suggest
@@ -1843,6 +1843,15 @@ pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
 
 Currently fixable:
 
+* **SEC001** — emits `ALTER TABLE <schema>.<table> ENABLE ROW
+  LEVEL SECURITY;` for every table with RLS off (not allowlisted).
+  Partition children are skipped — there is no single mechanical
+  fix for them (enable RLS on an in-scope parent, or widen
+  `--schemas` / design a child policy when the parent is in an
+  unscanned schema), so the fixer emits only the standalone and
+  partitioned-parent cases. A table with RLS on and no policy
+  denies all rows to non-owner roles, so the fix description
+  points the operator to add policies next.
 * **SEC002** — emits `ALTER TABLE <schema>.<table> FORCE ROW
   LEVEL SECURITY;` for every table with RLS but no FORCE.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
@@ -2274,9 +2283,9 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC002, PERF001, VIEW001, and VIEW002.** `pgrls
-  fix` rewrites the mechanically-fixable subset; other rules need
-  human intent.
+- **Auto-fix for SEC001, SEC002, PERF001, VIEW001, and VIEW002.**
+  `pgrls fix` rewrites the mechanically-fixable subset; other
+  rules need human intent.
 - **Text, JSON, SARIF, and Markdown output.** `--format text`
   (human-readable, default), `--format json` (machine-readable,
   stable CI contract), `--format sarif` (SARIF v2.1.0 for GitHub
