@@ -30,6 +30,13 @@ import click
 import psycopg
 
 from pgrls import __version__
+from pgrls.baseline import (
+    BaselineError,
+    load_baseline,
+    partition,
+    stale_keys,
+    write_baseline,
+)
 from pgrls.config import (
     DIFF_FAIL_ON_VALUES,
     Config,
@@ -108,12 +115,24 @@ def main() -> None:
     show_default=True,
     help="Output format.",
 )
+@click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Baseline file. On the first run (file absent) records the "
+        "current findings and exits 0; on later runs reports and "
+        "fails only on findings not in the baseline."
+    ),
+)
 def lint(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
     fail_on: str | None,
     output_format: str,
+    baseline_path: Path | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
     try:
@@ -145,6 +164,9 @@ def lint(
         violations = _run_rules(schema, config=effective)
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
+
+    if baseline_path is not None:
+        violations = _apply_baseline(violations, baseline_path)
 
     click.echo(format_violations(violations, format=output_format), nl=False)
 
@@ -219,6 +241,62 @@ def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
 
 def _should_fail(violations: list[Violation], *, threshold: Severity) -> bool:
     return any(is_at_or_above(v.severity, threshold) for v in violations)
+
+
+def _apply_baseline(
+    violations: list[Violation], path: Path
+) -> list[Violation]:
+    """Apply a `--baseline` file to `violations`; return the findings
+    the caller should report.
+
+    First run (file absent): write the baseline, note it on
+    stderr, and return an empty list — the run's job was to
+    *record* the baseline, and once recorded there are no new
+    findings to report. Later runs: return only the findings
+    absent from the baseline, noting the suppressed count on
+    stderr.
+
+    Either way the caller still runs `format_violations` and
+    `_should_fail` on the returned list, so `--baseline` composes
+    with `--format` (a first run under `--format json` / `sarif`
+    emits a valid empty document) and with `--fail-on`.
+    """
+    if not path.exists():
+        try:
+            count = write_baseline(
+                path, violations, tool_version=__version__
+            )
+        except BaselineError as exc:
+            raise ToolError(str(exc)) from exc
+        click.echo(
+            f"pgrls: wrote baseline with {count} finding(s) to "
+            f"{path}. Future `pgrls lint --baseline` runs report "
+            "only findings not recorded in it.",
+            err=True,
+        )
+        return []
+
+    try:
+        baseline = load_baseline(path)
+    except BaselineError as exc:
+        raise ToolError(str(exc)) from exc
+    new, baselined = partition(violations, baseline)
+    if baselined:
+        click.echo(
+            f"pgrls: {len(baselined)} finding(s) suppressed by "
+            f"baseline {path}.",
+            err=True,
+        )
+    stale = stale_keys(violations, baseline)
+    if stale:
+        click.echo(
+            f"pgrls: {len(stale)} baseline entry(ies) no longer "
+            "match a finding (fixed, or the policy/table renamed). "
+            f"Delete {path} and re-run to regenerate a tighter "
+            "baseline.",
+            err=True,
+        )
+    return new
 
 
 def _fix_apply_failure_message(
