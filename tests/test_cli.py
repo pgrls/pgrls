@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -935,6 +936,100 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             )
     finally:
         apply_sql("DROP ROLE IF EXISTS allbad_sec016_role")
+
+
+# ============================================================
+# `pgrls lint --baseline` integration tests
+# ============================================================
+
+def test_lint_baseline_first_run_writes_file(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # An RLS-disabled table trips SEC001. The first --baseline run
+    # records the finding and exits 0; the file is created.
+    apply_sql("CREATE TABLE public.legacy (id INT);")
+    baseline = tmp_path / "pgrls-baseline.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert result.exit_code == 0, result.output
+    assert baseline.exists()
+    payload = json.loads(baseline.read_text(encoding="utf-8"))
+    assert any(f["rule_id"] == "SEC001" for f in payload["findings"])
+
+
+def test_lint_baseline_suppresses_recorded_findings(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # First run records the SEC001 finding; a second run against
+    # the same database suppresses it — exit 0, nothing reported.
+    apply_sql("CREATE TABLE public.legacy (id INT);")
+    baseline = tmp_path / "b.json"
+    runner = CliRunner()
+    first = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert second.exit_code == 0, second.output
+    assert "SEC001" not in second.output
+
+
+def test_lint_baseline_fails_on_new_finding(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # Two RLS-disabled tables both trip SEC001. The baseline records
+    # only `public.legacy`; `public.fresh` is a NEW finding and must
+    # fail the run.
+    apply_sql(
+        """
+        CREATE TABLE public.legacy (id INT);
+        CREATE TABLE public.fresh (id INT);
+        """
+    )
+    baseline = tmp_path / "b.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "generated_by": "pgrls test",
+                "findings": [
+                    {"rule_id": "SEC001", "location": "public.legacy"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert result.exit_code == 1, result.output
+    assert "public.fresh" in result.output
+    # `public.legacy` is baselined — suppressed from the report.
+    assert "public.legacy" not in result.output
+
+
+def test_lint_baseline_malformed_file_errors_clearly(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    apply_sql("CREATE TABLE public.legacy (id INT);")
+    baseline = tmp_path / "b.json"
+    baseline.write_text("{ not json", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert result.exit_code != 0
+    assert "baseline" in result.output.lower()
 
 
 # ============================================================

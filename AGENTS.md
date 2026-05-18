@@ -1973,6 +1973,30 @@ matview as per-tenant or drop SECURITY DEFINER from a function) and
 are not auto-fixed. Suggest the canonical fix from the rule's
 section above.
 
+## Baseline — `pgrls lint --baseline`
+
+`pgrls lint --baseline <file>` lets a project adopt pgrls on a
+legacy database without fixing every pre-existing finding first.
+
+* **First run** — the file does not exist. pgrls records every
+  current finding into it and exits `0`. Nothing is reported on
+  stdout; the run's job is to capture the baseline.
+* **Later runs** — the file exists. pgrls suppresses every
+  finding already in the baseline and reports — and exit-codes —
+  only on findings absent from it. A new RLS issue fails CI; the
+  grandfathered backlog does not. The suppressed count is noted
+  on stderr.
+
+A finding is matched by `(rule_id, location)`; the message text
+is deliberately not part of the key, so a wording change between
+releases does not spuriously un-baseline a finding. The baseline
+is JSON — commit it to the repo. The model is
+auto-create-on-first-run: to re-baseline after deliberately
+accepting new findings, delete the file and re-run (there is no
+separate write flag). `--baseline` is applied before formatting
+and the exit-code decision, so it composes with `--format` and
+`--fail-on` — both see only the new findings.
+
 ## Testing your RLS — `pgrls.testing`
 
 Install with `pip install pgrls[testing]` to pull in pytest alongside pgrls.
