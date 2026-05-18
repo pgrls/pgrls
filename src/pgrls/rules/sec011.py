@@ -22,9 +22,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, BoolExpr, Boolean, Node, SubLink
+from pglast.ast import BoolExpr, Node, SubLink
 from pglast.enums import BoolExprType
 
+from pgrls.ast_utils import is_literal_true
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -32,14 +33,6 @@ from pgrls.violations import Severity, Violation
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     return parse_policy_id_allowlist('SEC011', options)
-
-
-def _is_literal_true(node: Any) -> bool:
-    return (
-        isinstance(node, A_Const)
-        and isinstance(node.val, Boolean)
-        and node.val.boolval is True
-    )
 
 
 def _has_or_true(node: Any) -> bool:
@@ -61,7 +54,7 @@ def _has_or_true(node: Any) -> bool:
         return _has_or_true(node.testexpr)
     if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
         for arg in node.args or ():
-            if _is_literal_true(arg):
+            if is_literal_true(arg):
                 return True
     if isinstance(node, Node):
         for field_name in node:

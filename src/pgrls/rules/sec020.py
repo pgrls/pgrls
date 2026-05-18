@@ -56,24 +56,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, Boolean
-
+from pgrls.ast_utils import is_literal_true
 from pgrls.model import Policy, Schema, Table
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
-
-
-def _is_literal_true(node: Any) -> bool:
-    """True iff `node` is the literal boolean constant `true`.
-
-    Mirrors SEC008's detector — deliberately narrow: only the literal
-    `true` matches, not `1 = 1` or other semantic tautologies.
-    """
-    return (
-        isinstance(node, A_Const)
-        and isinstance(node.val, Boolean)
-        and node.val.boolval is True
-    )
 
 
 class SEC020:
@@ -97,9 +83,9 @@ class SEC020:
                 # The footgun is the *asymmetry*: USING must be a real
                 # predicate. A USING that is itself constant-true is a
                 # fully-open policy — SEC008's concern, not SEC020's.
-                if _is_literal_true(policy.using_ast):
+                if is_literal_true(policy.using_ast):
                     continue
-                if not _is_literal_true(policy.with_check_ast):
+                if not is_literal_true(policy.with_check_ast):
                     continue
                 policy_id = f"{table.schema}.{table.name}.{policy.name}"
                 if policy_id in allowlist:

@@ -12,8 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, Boolean
-
+from pgrls.ast_utils import is_literal_true
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -21,14 +20,6 @@ from pgrls.violations import Severity, Violation
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     return parse_policy_id_allowlist('SEC008', options)
-
-
-def _is_literal_true(node: Any) -> bool:
-    return (
-        isinstance(node, A_Const)
-        and isinstance(node.val, Boolean)
-        and node.val.boolval is True
-    )
 
 
 class SEC008:
@@ -45,7 +36,7 @@ class SEC008:
             for policy in table.policies:
                 if policy.using_ast is None:
                     continue
-                if not _is_literal_true(policy.using_ast):
+                if not is_literal_true(policy.using_ast):
                     continue
                 policy_id = (
                     f"{table.schema}.{table.name}.{policy.name}"

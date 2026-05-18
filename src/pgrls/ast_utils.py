@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 import pglast
-from pglast.ast import A_Star, BoolExpr, ColumnRef, FuncCall, Node, NullTest, RangeVar, SQLValueFunction, String, SubLink
+from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, FuncCall, Node, NullTest, RangeVar, SQLValueFunction, String, SubLink
 from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
@@ -278,3 +278,35 @@ def match_is_null(node: Any) -> tuple[Any, bool] | None:
         is_null = node.nulltesttype == NullTestType.IS_NULL
         return (node.arg, is_null)
     return None
+
+
+def _is_literal_bool(node: Any, *, value: bool) -> bool:
+    return (
+        isinstance(node, A_Const)
+        and isinstance(node.val, Boolean)
+        and node.val.boolval is value
+    )
+
+
+def is_literal_true(node: Any) -> bool:
+    """True iff `node` is the literal boolean constant `true`.
+
+    Deliberately narrow — only the literal `true` matches, not
+    `1 = 1` or other semantic tautologies. Shared by SEC008
+    (`USING (true)`), SEC011 (`OR true` branch), and SEC020
+    (`WITH CHECK (true)`): a real tautology checker is significant
+    infrastructure for marginal real-world value, so every
+    constant-true rule keeps the same lexical scope.
+    """
+    return _is_literal_bool(node, value=True)
+
+
+def is_literal_false(node: Any) -> bool:
+    """True iff `node` is the literal boolean constant `false`.
+
+    The mirror of `is_literal_true` — SEC010 (`USING (false)` /
+    `WITH CHECK (false)`) uses it. Only the literal `false`
+    matches, not `NOT true`, `1 = 0`, or other semantic
+    equivalents.
+    """
+    return _is_literal_bool(node, value=False)
