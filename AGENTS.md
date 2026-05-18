@@ -1979,8 +1979,11 @@ section above.
 legacy database without fixing every pre-existing finding first.
 
 * **First run** — the file does not exist. pgrls records every
-  current finding into it and exits `0`. Nothing is reported on
-  stdout; the run's job is to capture the baseline.
+  current finding into the file and exits `0`, reporting no
+  findings (they have all just been baselined). A stderr line
+  notes how many were recorded; under `--format json` / `sarif`
+  stdout is still a valid empty document, so a first run does not
+  break a machine-readable pipeline.
 * **Later runs** — the file exists. pgrls suppresses every
   finding already in the baseline and reports — and exit-codes —
   only on findings absent from it. A new RLS issue fails CI; the

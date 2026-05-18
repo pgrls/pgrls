@@ -960,6 +960,34 @@ def test_lint_baseline_first_run_writes_file(
     assert any(f["rule_id"] == "SEC001" for f in payload["findings"])
 
 
+def test_lint_baseline_first_run_json_format_emits_valid_json(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A first --baseline run under --format json must still emit a
+    # valid (empty-findings) JSON document to stdout — a `| jq`
+    # pipeline must not choke on the run that creates the baseline.
+    apply_sql("CREATE TABLE public.legacy (id INT);")
+    baseline = tmp_path / "b.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url",
+            pg_url,
+            "--baseline",
+            str(baseline),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # stdout (only) parses as JSON — the new-findings view, empty
+    # on the first run since every finding was just baselined.
+    # `result.stdout` excludes the stderr "wrote baseline" note.
+    json.loads(result.stdout)
+
+
 def test_lint_baseline_suppresses_recorded_findings(
     pg_url: str, apply_sql, tmp_path
 ) -> None:

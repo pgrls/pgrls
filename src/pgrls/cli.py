@@ -165,10 +165,7 @@ def lint(
         raise ToolError(str(exc)) from exc
 
     if baseline_path is not None:
-        filtered = _apply_baseline(violations, baseline_path)
-        if filtered is None:
-            return  # first run — baseline written, nothing to report
-        violations = filtered
+        violations = _apply_baseline(violations, baseline_path)
 
     click.echo(format_violations(violations, format=output_format), nl=False)
 
@@ -247,15 +244,21 @@ def _should_fail(violations: list[Violation], *, threshold: Severity) -> bool:
 
 def _apply_baseline(
     violations: list[Violation], path: Path
-) -> list[Violation] | None:
-    """Apply a `--baseline` file to `violations`.
+) -> list[Violation]:
+    """Apply a `--baseline` file to `violations`; return the findings
+    the caller should report.
 
-    First run (file absent): write the baseline, report it on
-    stderr, and return None — the caller exits 0 without printing
-    findings (the run's job was to record the baseline). Later
-    runs: return only the findings absent from the baseline,
-    reporting the suppressed count on stderr so the operator can
-    see the baseline is in effect.
+    First run (file absent): write the baseline, note it on
+    stderr, and return an empty list — the run's job was to
+    *record* the baseline, and once recorded there are no new
+    findings to report. Later runs: return only the findings
+    absent from the baseline, noting the suppressed count on
+    stderr.
+
+    Either way the caller still runs `format_violations` and
+    `_should_fail` on the returned list, so `--baseline` composes
+    with `--format` (a first run under `--format json` / `sarif`
+    emits a valid empty document) and with `--fail-on`.
     """
     if not path.exists():
         try:
@@ -270,7 +273,7 @@ def _apply_baseline(
             "only findings not recorded in it.",
             err=True,
         )
-        return None
+        return []
 
     try:
         baseline = load_baseline(path)
