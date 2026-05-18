@@ -50,7 +50,8 @@ which raises on an unset GUC), and `SEC021` (policy compares an
 identity column against a hardcoded literal). A `pgrls fix`
 subcommand
 auto-remediates SEC001, SEC002,
-PERF001, VIEW001, and VIEW002; other rules need human intent. A
+SEC006, PERF001, VIEW001, and VIEW002; other rules need human
+intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
 "Testing your RLS" and "Diff" sections below for when to suggest
@@ -1904,6 +1905,16 @@ Currently fixable:
   points the operator to add policies next.
 * **SEC002** — emits `ALTER TABLE <schema>.<table> FORCE ROW
   LEVEL SECURITY;` for every table with RLS but no FORCE.
+* **SEC006** — emits `ALTER POLICY <name> ON <schema>.<table>
+  WITH CHECK (<the USING predicate>);` for a permissive `FOR
+  UPDATE` / `FOR ALL` policy that has a `USING` clause but no
+  `WITH CHECK`, mirroring USING into the write-side check.
+  Skipped, with the SEC006 finding left for human review:
+  restrictive policies (a missing `WITH CHECK` there is a dead
+  policy needing intent, not a mechanical copy), `FOR INSERT`
+  policies (Postgres forbids `FOR INSERT … USING`, so there is
+  no predicate to mirror), and any write policy written without
+  a `USING`.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
@@ -2333,7 +2344,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, PERF001, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, PERF001, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, and Markdown output.** `--format text`
