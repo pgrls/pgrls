@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.27] - 2026-05-18
+
+### Added
+- **SEC022 — RLS-enabled table has no write-side policy**
+  (severity: info). Flags a table with RLS enabled whose every
+  policy is `FOR SELECT`: the table has working read coverage but
+  no policy covering INSERT, UPDATE, or DELETE, so for every
+  non-owner role `INSERT` raises a row-violates-policy error
+  while `UPDATE` and `DELETE` silently affect zero rows — an
+  asymmetry that makes a forgotten write policy easy to miss.
+
+  This is often a genuine mistake, but a read-only table (writes
+  performed by a table-owning or `BYPASSRLS` role) is a valid
+  intentional design pgrls cannot distinguish — so SEC022 is info
+  severity. It fires only when the table has at least one
+  *permissive* policy: a restrictive-only table denies reads too
+  and is SEC012's "restrictive-only policy set" surface, not a
+  read-only one. A `FOR ALL` policy counts as write coverage and
+  silences the rule. Allowlist the table by name or
+  `schema.table` when the read-only surface is intentional.
+
+### Changed
+- **Rule count: thirty-one → thirty-two** (`SEC001`–`SEC022`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC022 reads table and policy metadata
+  already captured since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.26] - 2026-05-18
 
 ### Added
