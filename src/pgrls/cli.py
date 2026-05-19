@@ -387,7 +387,9 @@ def fix(
     Currently fixes SEC001 (`ALTER TABLE … ENABLE ROW LEVEL
     SECURITY`), SEC002 (`ALTER TABLE … FORCE ROW LEVEL
     SECURITY`), SEC006 (`ALTER POLICY … WITH CHECK` mirroring
-    USING), PERF001 (wrap unwrapped auth calls in
+    USING), SEC020 (`ALTER POLICY … WITH CHECK` replacing a
+    constant-true write check with USING), PERF001 (wrap
+    unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), PERF003 (`CREATE
     INDEX` for an unindexed policy-predicate column), HYG003
     (`DROP POLICY` for a policy that exactly duplicates

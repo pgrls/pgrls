@@ -55,8 +55,8 @@ write-side policy, so writes are denied), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC006, PERF001, PERF003, HYG003, VIEW001, and VIEW002; other
-rules need human intent. A
+SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
+other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
 "Testing your RLS" and "Diff" sections below for when to suggest
@@ -2082,6 +2082,17 @@ Currently fixable:
   policies (Postgres forbids `FOR INSERT … USING`, so there is
   no predicate to mirror), and any write policy written without
   a `USING`.
+* **SEC020** — emits `ALTER POLICY <name> ON <schema>.<table>
+  WITH CHECK (<the USING predicate>);` for a policy that pairs a
+  real `USING` predicate with an explicit `WITH CHECK (true)`,
+  replacing the constant-true write check with USING. Unlike the
+  SEC006 fixer it fixes restrictive policies too: a SEC020
+  finding always has an explicit `WITH CHECK (true)` to replace,
+  so mirroring USING is a meaningful tightening whether the
+  policy is permissive (the open write side becomes scoped) or
+  restrictive (its no-op `… AND true` write check becomes real).
+  SEC006 and SEC020 never fire on the same policy — one needs
+  `WITH CHECK` absent, the other needs it present.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
@@ -2561,7 +2572,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC006, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, and Markdown output.** `--format text`

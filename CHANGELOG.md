@@ -10,6 +10,29 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.33] - 2026-05-19
+
+### Added
+- **`pgrls fix` now auto-remediates SEC020** ("policy WITH CHECK
+  is constant true but USING is not"). The fixer emits `ALTER
+  POLICY <name> ON <schema>.<table> WITH CHECK (<the USING
+  predicate>);`, replacing a wide-open `WITH CHECK (true)` with
+  the policy's own read predicate so writes are constrained the
+  same way reads are. `pgrls fix` now covers SEC001, SEC002,
+  SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.
+
+  Unlike the SEC006 fixer, the SEC020 fixer also remediates
+  restrictive policies: a SEC020 finding always carries an
+  explicit `WITH CHECK (true)` and a real `USING`, so mirroring
+  USING is a meaningful tightening either way — a permissive
+  policy's open write side becomes scoped, and a restrictive
+  policy's no-op `… AND true` write check becomes a real
+  constraint. SEC006 (missing `WITH CHECK`) and SEC020 (`WITH
+  CHECK` present and constant-true) never fire on the same
+  policy. Detection is shared with the SEC020 rule via
+  `_is_open_write_asymmetry`, so the fixer remediates exactly
+  what the rule reports.
+
 ## [0.5.32] - 2026-05-19
 
 ### Added

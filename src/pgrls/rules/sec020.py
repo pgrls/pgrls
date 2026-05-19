@@ -62,6 +62,27 @@ from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 
+def _is_open_write_asymmetry(policy: Policy) -> bool:
+    """True if `policy` is the asymmetry SEC020 flags.
+
+    Both clauses must be present — a policy with no USING (a
+    `FOR INSERT` policy) has no read side to be more restrictive
+    than, and a policy with no explicit WITH CHECK reuses USING,
+    so the two sides cannot diverge. The footgun is the
+    *asymmetry*: USING must be a real predicate (a USING that is
+    itself constant-true is a fully-open policy — SEC008's
+    concern), while WITH CHECK is the literal `true`.
+
+    Shared with the SEC020 fixer so the rule and the fix agree on
+    a single definition of the finding.
+    """
+    if policy.using_ast is None or policy.with_check_ast is None:
+        return False
+    if is_literal_true(policy.using_ast):
+        return False
+    return is_literal_true(policy.with_check_ast)
+
+
 class SEC020:
     id: str = "SEC020"
     severity: Severity = "warning"
@@ -74,18 +95,7 @@ class SEC020:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                # Both clauses must be present. A policy with no USING
-                # (a FOR INSERT policy) has no read side to be more
-                # restrictive than; a policy with no explicit WITH
-                # CHECK reuses USING, so the two sides cannot diverge.
-                if policy.using_ast is None or policy.with_check_ast is None:
-                    continue
-                # The footgun is the *asymmetry*: USING must be a real
-                # predicate. A USING that is itself constant-true is a
-                # fully-open policy — SEC008's concern, not SEC020's.
-                if is_literal_true(policy.using_ast):
-                    continue
-                if not is_literal_true(policy.with_check_ast):
+                if not _is_open_write_asymmetry(policy):
                     continue
                 policy_id = f"{table.schema}.{table.name}.{policy.name}"
                 if policy_id in allowlist:
