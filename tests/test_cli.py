@@ -1718,3 +1718,23 @@ def test_fix_output_file_is_deterministic_and_honors_short_flag(
     assert first.read_text(encoding="utf-8") == second.read_text(
         encoding="utf-8"
     )
+
+
+def test_fix_dry_run_stdout_ends_without_a_trailing_blank_line(
+    pg_url: str, apply_sql
+) -> None:
+    # The dry-run stdout is the rendered fix blocks plus a single
+    # newline — no trailing blank line — so `pgrls fix >
+    # migration.sql` produces a tidy file. Pins the deliberate
+    # single-trailing-newline shape.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_tail (id INT);
+        ALTER TABLE public.fix_tail ENABLE ROW LEVEL SECURITY;
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.endswith(";\n")
+    assert not result.stdout.endswith(";\n\n")

@@ -1639,3 +1639,14 @@ def test_render_migration_header_lines_are_sql_comments() -> None:
     assert all(
         line.startswith("--") for line in header.splitlines()
     )
+
+
+def test_render_migration_handles_empty_fixes() -> None:
+    # `render_migration` is a public function. The CLI guards
+    # against calling it with no fixes (it reports "no auto-fixable
+    # violations" and writes nothing), but a programmatic caller
+    # may still pass an empty list — pin that it returns the header
+    # alone, reports "0 fixes", and does not crash.
+    out = render_migration([], tool_version="1.0")
+    assert "0 fixes." in out
+    assert out.endswith("\n")
