@@ -20,10 +20,13 @@ breaking changes — they will be called out in this file.
   covers SEC001, SEC002, SEC006, PERF001, PERF003, HYG003,
   VIEW001, and VIEW002.
 
-  One index resolves the finding for every policy that filters on
-  that column, so the fixer deduplicates: two policies filtering
-  the same unindexed column produce two PERF003 violations but a
-  single `CREATE INDEX`. The statement is a plain `CREATE INDEX`,
+  One index on a table resolves the finding for every policy on
+  that table that filters on that column, so the fixer
+  deduplicates per table + column: two policies on one table
+  filtering the same unindexed column produce two PERF003
+  violations but a single `CREATE INDEX`. The same column on two
+  different tables is two distinct findings and yields one index
+  each. The statement is a plain `CREATE INDEX`,
   not `CREATE INDEX CONCURRENTLY` — a plain build composes with
   `pgrls fix --apply`'s single all-or-nothing transaction, which
   `CONCURRENTLY` cannot run inside. A plain build locks writes on

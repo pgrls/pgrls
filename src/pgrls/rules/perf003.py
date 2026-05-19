@@ -157,6 +157,9 @@ class PERF003:
                 ))
         return out
 
+    # A staticmethod (not an instance method) so PERF003Fixer can
+    # reuse it as `PERF003._unindexed_columns(table, policy)` —
+    # the fixer indexes exactly the columns this rule flags.
     @staticmethod
     def _unindexed_columns(
         table: Table, policy: Any
