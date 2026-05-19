@@ -1384,9 +1384,7 @@ def explain(rule_id: str) -> None:
     rule = next((r for r in rules if r.id == normalized), None)
     if rule is None:
         known = ", ".join(r.id for r in rules)
-        raise ToolError(
-            f"Unknown rule {rule_id!r}. Known rules: {known}."
-        )
+        raise ToolError(f"Unknown rule {rule_id!r}. Known rules: {known}.")
 
     click.echo(f"{rule.id}  [{rule.severity}]  {rule.title}")
 
