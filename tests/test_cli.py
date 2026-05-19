@@ -1045,6 +1045,152 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
 
 
 # ============================================================
+# `pgrls lint --rule` integration tests
+# ============================================================
+
+
+def test_lint_rule_filter_limits_to_requested_rule(
+    pg_url: str, apply_sql
+) -> None:
+    # Two RLS issues on two tables: SEC001 (RLS off) on one,
+    # SEC003 (permissive PUBLIC policy) on the other. `--rule
+    # SEC001` runs SEC001 only — SEC003 is filtered out.
+    apply_sql(
+        """
+        CREATE TABLE public.lint_filter_a (id INT);
+        -- ^ SEC001: RLS not enabled
+
+        CREATE TABLE public.lint_filter_b (id INT);
+        ALTER TABLE public.lint_filter_b ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.lint_filter_b FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.lint_filter_b
+            FOR SELECT TO PUBLIC USING (id > 0);
+        -- ^ SEC003: permissive policy granted to PUBLIC
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--rule", "SEC001"]
+    )
+    assert "SEC001" in result.output
+    assert "lint_filter_a" in result.output
+    # SEC003 was filtered out — neither the rule ID nor the
+    # offending table appears in the output.
+    assert "SEC003" not in result.output
+    assert "lint_filter_b" not in result.output
+
+
+def test_lint_rule_filter_is_case_insensitive(
+    pg_url: str, apply_sql
+) -> None:
+    # `--rule sec001` resolves the same as `--rule SEC001`.
+    apply_sql("CREATE TABLE public.lint_filter_case (id INT);")
+    runner = CliRunner()
+    lower = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--rule", "sec001"]
+    )
+    upper = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--rule", "SEC001"]
+    )
+    # Both runs find SEC001 on the same table, exit code identical.
+    assert lower.exit_code == upper.exit_code
+    assert "SEC001" in lower.output
+
+
+def test_lint_rule_filter_unknown_rule_errors_clearly(
+    pg_url: str, apply_sql
+) -> None:
+    # `--rule SEC999` is a typo. Validate eagerly so the user sees
+    # the typo rather than a quiet empty result. Mirrors
+    # `pgrls fix --rule`'s validation.
+    apply_sql("CREATE TABLE public.lint_filter_unknown (id INT);")
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--rule", "SEC999"]
+    )
+    assert result.exit_code == 2
+    assert "unknown rule" in result.output.lower()
+    assert "SEC999" in result.output
+
+    # A known rule alongside an unknown does not mask the typo,
+    # and the error lists every unknown ID so a multi-typo command
+    # doesn't need multiple rounds to fix.
+    multi = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--rule", "SEC001", "--rule", "SEC999", "--rule", "BOGUS",
+        ],
+    )
+    assert multi.exit_code == 2
+    assert "SEC999" in multi.output
+    assert "BOGUS" in multi.output
+
+
+def test_lint_rule_filter_repeatable(
+    pg_url: str, apply_sql
+) -> None:
+    # `--rule X --rule Y` runs both rules; everything else is
+    # filtered out.
+    apply_sql(
+        """
+        CREATE TABLE public.lint_filter_multi_a (id INT);
+        -- ^ SEC001
+        CREATE TABLE public.lint_filter_multi_b (id INT);
+        ALTER TABLE public.lint_filter_multi_b ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.lint_filter_multi_b FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.lint_filter_multi_b
+            FOR SELECT TO PUBLIC USING (id > 0);
+        -- ^ SEC003
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--rule", "SEC001", "--rule", "SEC003",
+        ],
+    )
+    assert "SEC001" in result.output
+    assert "SEC003" in result.output
+
+
+def test_lint_rule_filter_overrides_disable(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # `--rule` is an explicit "run only these" — it overrides
+    # `[lint] disable` so an operator can pull a disabled rule
+    # back in for one run without editing the config.
+    apply_sql("CREATE TABLE public.lint_filter_override (id INT);")
+    config = tmp_path / "pgrls.toml"
+    config.write_text('[lint]\ndisable = ["SEC001"]\n')
+
+    runner = CliRunner()
+    # Without `--rule`, the disabled SEC001 stays silent.
+    silent = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--config", str(config),
+        ],
+    )
+    assert "SEC001" not in silent.output
+
+    # `--rule SEC001` overrides the disable — SEC001 runs and
+    # fires on the table.
+    forced = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--config", str(config), "--rule", "SEC001",
+        ],
+    )
+    assert "SEC001" in forced.output
+    assert "lint_filter_override" in forced.output
+
+
+# ============================================================
 # `pgrls lint --baseline` integration tests
 # ============================================================
 
