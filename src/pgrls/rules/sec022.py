@@ -50,11 +50,13 @@ Out of scope (intentional):
 * **Restrictive-only tables.** No permissive policy means reads
   are denied too; that is SEC012's surface (see above).
 * **RLS-disabled tables.** SEC001's surface.
-* **Partition children.** A child's writes normally route through
-  the partitioned parent, whose policies govern them; flagging a
-  child for missing write policies it is not expected to carry
-  would be a false positive. SEC022 evaluates standalone tables
-  and partition parents only.
+* **Partition members.** Any table that is itself a partition —
+  at any level of a multi-level partition hierarchy — is skipped.
+  A partition's writes normally route through the partition root,
+  whose policies govern them; flagging a partition for missing
+  write policies it is not expected to carry would be a false
+  positive. Only tables that are not themselves partitions
+  (standalone tables and partition roots) are evaluated.
 """
 from __future__ import annotations
 
@@ -88,9 +90,12 @@ class SEC022:
         for table in schema.tables:
             if not table.rls_enabled:
                 continue
-            # A partition child's writes route through the parent;
-            # the parent's policies govern them. Evaluating the
-            # child for its own write policies would false-positive.
+            # Any table that is itself a partition — at any level —
+            # has its writes route through the partition root, whose
+            # policies govern them. Flagging it for a missing write
+            # policy it is not expected to carry would false-positive.
+            # `partition_of` is set for every partition, leaf or
+            # mid-level, so this skips the whole hierarchy below root.
             if table.partition_of is not None:
                 continue
             if not table.policies:

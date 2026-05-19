@@ -182,6 +182,27 @@ def test_sec022_evaluates_partition_parent_but_skips_child() -> None:
     assert locations == ["public.events"]
 
 
+def test_sec022_skips_partitions_at_every_level() -> None:
+    # Multi-level hierarchy root -> mid -> leaf. `partition_of` is
+    # set on both the mid-level partition and the leaf, so both are
+    # skipped — a partition's writes route through the root whatever
+    # its depth. Only the root (not itself a partition) is evaluated.
+    root = _table("events", _policy("read"))
+    mid = _table(
+        "events_2026",
+        _policy("read"),
+        partition_of=("public", "events"),
+    )
+    leaf = _table(
+        "events_2026_q1",
+        _policy("read"),
+        partition_of=("public", "events_2026"),
+    )
+    schema = Schema(tables=(root, mid, leaf))
+    locations = [v.location for v in SEC022().check(schema, {})]
+    assert locations == ["public.events"]
+
+
 # --- allowlist / metadata ------------------------------------------------
 
 
