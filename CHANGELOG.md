@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.35] - 2026-05-19
+
+### Added
+- **`pgrls lint --rule <ID>`.** A repeatable flag that scopes a
+  lint run to specific rule IDs (case-insensitive). Handy when
+  scoping a SARIF report in CI to a subset of the catalog, or
+  while investigating one rule in isolation. The flag mirrors
+  `pgrls fix --rule` for CLI consistency:
+
+  ```
+  pgrls lint --rule SEC001 --rule SEC003
+  ```
+
+  `--rule` is an explicit "run only these" — it **overrides**
+  `[lint] disable` in the config, so an operator can pull a
+  disabled rule back in for one run without editing the config.
+  Per-rule allowlists and severity overrides still apply. An
+  unknown rule ID is a tool error (exit 2) with the list of
+  every known rule, matching the validation `pgrls fix --rule`
+  already does.
+
 ## [0.5.34] - 2026-05-19
 
 ### Added

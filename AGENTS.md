@@ -111,7 +111,9 @@ pgrls lint
 
 The connection string can also be passed as `--database-url`. Schemas to scan
 default to `public` and can be overridden with `--schemas a,b,c` or in
-`pgrls.toml`.
+`pgrls.toml`. To run only a subset of the catalog — for a scoped CI report
+or while investigating one rule — pass `--rule SEC001 --rule SEC003`
+(case-insensitive, repeatable; overrides `[lint] disable` in the config).
 
 ## Configuration
 

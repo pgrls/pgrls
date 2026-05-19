@@ -108,6 +108,15 @@ def main() -> None:
     help="Comma-separated schemas to lint (overrides config).",
 )
 @click.option(
+    "--rule",
+    "rules",
+    multiple=True,
+    help=(
+        "Only run these rules (repeat for multiple). "
+        "Case-insensitive. Overrides `[lint] disable` in the config."
+    ),
+)
+@click.option(
     "--fail-on",
     type=click.Choice(list(ALL_SEVERITIES), case_sensitive=False),
     default=None,
@@ -136,6 +145,7 @@ def lint(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    rules: tuple[str, ...],
     fail_on: str | None,
     output_format: str,
     baseline_path: Path | None,
@@ -145,6 +155,19 @@ def lint(
         config = load_config(config_path)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
+
+    # Validate `--rule` early — a typo silently producing zero
+    # findings is hard to debug. Mirrors `pgrls fix --rule`.
+    if rules:
+        known = {r.id for r in all_rules()}
+        normalized_rules = {r.upper() for r in rules}
+        unknown = sorted(normalized_rules - known)
+        if unknown:
+            raise ToolError(
+                f"unknown rule(s): {', '.join(unknown)}. "
+                f"Available: {', '.join(sorted(known))}."
+            )
+        rules = tuple(sorted(normalized_rules))
 
     effective = _merge_overrides(
         config,
@@ -167,7 +190,11 @@ def lint(
         raise ToolError(str(exc)) from exc
 
     try:
-        violations = _run_rules(schema, config=effective)
+        violations = _run_rules(
+            schema,
+            config=effective,
+            rule_filter=set(rules) if rules else None,
+        )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
 
@@ -214,9 +241,25 @@ def _merge_overrides(
     )
 
 
-def _run_rules(schema: Schema, *, config: Config) -> list[Violation]:
+def _run_rules(
+    schema: Schema,
+    *,
+    config: Config,
+    rule_filter: set[str] | None = None,
+) -> list[Violation]:
     registry = default_registry()
-    rules = registry.enabled(disabled_ids=config.disable)
+    if rule_filter is not None:
+        # `--rule` is an explicit "run only these rules" — it
+        # overrides `[lint] disable` so an operator investigating a
+        # disabled rule can pull it back in for one run without
+        # editing the config. Per-rule allowlists and severity
+        # overrides still apply.
+        rules = [
+            r for r in registry.enabled(disabled_ids=[])
+            if r.id in rule_filter
+        ]
+    else:
+        rules = registry.enabled(disabled_ids=config.disable)
     out: list[Violation] = []
     for rule in rules:
         try:
