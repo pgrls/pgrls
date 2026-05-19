@@ -43,11 +43,11 @@ resolves to.
 
 Severity: info. The discriminator is whether the name is
 qualified, not whether it is *correct*: a policy that genuinely
-keys off a built-in parameter (`current_setting('application_
-name')` used as a coarse tenant tag, say) is unqualified yet
-intentional. pgrls cannot tell a dropped prefix from a deliberate
-built-in read, so SEC024 surfaces the unqualified name as a
-review nudge rather than a hard finding. Allowlist by qualified
+keys off a built-in parameter — `application_name` used as a
+coarse tenant tag, say — is unqualified yet intentional. pgrls
+cannot tell a dropped prefix from a deliberate built-in read, so
+SEC024 surfaces the unqualified name as a review nudge rather
+than a hard finding. Allowlist by qualified
 policy ID (`schema.table.policy_name`) when the built-in read is
 intentional.
 
