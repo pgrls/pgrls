@@ -61,6 +61,10 @@ Out of scope (intentional):
 * **Dynamic parameter names.** `current_setting(<non-literal>)` —
   a name assembled from a column or an expression — is not
   inspected; SEC024 only reads string-literal arguments.
+* **Empty parameter names.** `current_setting('')` is a malformed
+  call — Postgres raises `invalid configuration parameter name:
+  ""` at query time. SEC024's signal is an *unqualified* name (a
+  real name that lacks the required prefix), not an absent one.
 * **GUC-value analysis.** SEC024 does not check whether a
   *qualified* name is one the application actually sets, nor what
   the parameter resolves to. It checks the *shape* of the name
@@ -115,8 +119,16 @@ def _unqualified_setting_names(node: Any) -> set[str]:
         value = first.val
         if not isinstance(value, String):
             continue
-        if "." not in value.sval:
-            names.add(value.sval)
+        sval = value.sval
+        # An empty name is a malformed call (Postgres raises
+        # `invalid configuration parameter name: ""` at query time)
+        # — a different class of bug, not SEC024's signal. SEC024
+        # flags an *unqualified* name: a real name that lacks the
+        # required `prefix.` namespace.
+        if not sval:
+            continue
+        if "." not in sval:
+            names.add(sval)
     return names
 
 

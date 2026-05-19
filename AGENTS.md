@@ -1573,6 +1573,10 @@ Out of scope (intentional):
 * **Dynamic parameter names.** `current_setting(<non-literal>)`
   — a name built from a column or an expression — is not
   inspected. SEC024 reads string-literal arguments only.
+* **Empty parameter names.** `current_setting('')` is a
+  malformed call — Postgres errors at query time. That is a
+  different class of bug from a dropped prefix; SEC024 flags an
+  *unqualified* (real-but-prefix-less) name, not an absent one.
 * **Parameter-value analysis.** SEC024 does not check whether a
   *qualified* name is one the application actually sets, nor
   what the value resolves to. It checks the *shape* of the name

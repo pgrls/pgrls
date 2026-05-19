@@ -128,6 +128,15 @@ def test_sec024_silent_when_no_current_setting() -> None:
     ) == []
 
 
+def test_sec024_silent_on_empty_parameter_name() -> None:
+    # current_setting('') is a malformed call — Postgres errors at
+    # query time. That is a different class of bug from "dropped
+    # prefix", so SEC024 stays silent rather than reporting an
+    # `unqualified parameter name ''` finding.
+    schema = _schema(_policy(using="tenant_id = current_setting('')"))
+    assert SEC024().check(schema, options={}) == []
+
+
 def test_sec024_silent_on_dynamic_parameter_name() -> None:
     # A name assembled from an expression rather than a string
     # literal — SEC024 cannot know what it resolves to, so it does

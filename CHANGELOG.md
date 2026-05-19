@@ -46,9 +46,9 @@ breaking changes — they will be called out in this file.
 ### Changed
 - **Rule count: thirty-three → thirty-four** (`SEC001`–`SEC024`,
   `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
-  snapshot-format change — SEC024 reads the policy's parsed
-  `USING` / `WITH CHECK` expression, which has been part of the
-  snapshot format since v1, so `SNAPSHOT_VERSION` stays at 10.
+  snapshot-format change — SEC024 reads the policy's `USING` /
+  `WITH CHECK` SQL text (part of the snapshot format since v1)
+  and re-parses it on demand, so `SNAPSHOT_VERSION` stays at 10.
 
 ## [0.5.33] - 2026-05-19
 
