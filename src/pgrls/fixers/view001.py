@@ -23,18 +23,11 @@ from typing import Any
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, View
+from pgrls.rules._allowlist import parse_qualified_view_allowlist
 
 
-def _is_allowlisted(view: View, options: dict[str, Any]) -> bool:
-    # Mirror SEC002Fixer's pattern: trust the rule's check() has
-    # already validated the allowlist shape (the rule uses
-    # `parse_qualified_view_allowlist`, which raises on bad input).
-    # If config is bad, we conservatively treat nothing as
-    # allowlisted so the fixer still emits a Fix the user can act on.
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
-        return False
-    return view.qualified_name in raw
+def _is_allowlisted(view: View, allowlist: set[str]) -> bool:
+    return view.qualified_name in allowlist
 
 
 class VIEW001Fixer:
@@ -43,6 +36,9 @@ class VIEW001Fixer:
     def fix(
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Fix]:
+        # Strict allowlist parsing (the same parser VIEW001 uses):
+        # a malformed allowlist raises, surfaced by the `fix` CLI.
+        allowlist = parse_qualified_view_allowlist("VIEW001", options)
         rls_tables: set[tuple[str, str]] = {
             (t.schema, t.name) for t in schema.tables if t.rls_enabled
         }
@@ -53,7 +49,7 @@ class VIEW001Fixer:
                 continue
             if view.security_invoker:
                 continue
-            if _is_allowlisted(view, options):
+            if _is_allowlisted(view, allowlist):
                 continue
             leaked = sorted(
                 ref for ref in view.references if ref in rls_tables

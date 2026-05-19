@@ -27,16 +27,10 @@ from typing import Any
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Policy, Schema
+from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse the rule's signature so the fixer groups duplicates exactly
 # as HYG003 reports them — single source of truth.
 from pgrls.rules.hyg003 import _Signature, _signature
-
-
-def _allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
-        return set()
-    return {s for s in raw if isinstance(s, str)}
 
 
 class HYG003Fixer:
@@ -45,7 +39,9 @@ class HYG003Fixer:
     def fix(
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Fix]:
-        skip = _allowlist(options)
+        # Strict allowlist parsing (the same parser HYG003 uses):
+        # a malformed allowlist raises, surfaced by the `fix` CLI.
+        skip = parse_policy_id_allowlist("HYG003", options)
         out: list[Fix] = []
         for table in schema.tables:
             groups: dict[_Signature, list[Policy]] = {}
