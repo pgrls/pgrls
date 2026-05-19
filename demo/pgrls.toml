@@ -28,6 +28,15 @@ disable = ["PERF003"]
 # `app.countries` is world-readable reference data by design.
 allowlist = ["app.countries"]
 
+[lint.rules.SEC022]
+# `app.gen_cols` (use case 46) is intentionally read-only — its
+# policies are FOR SELECT only because they key off a GENERATED
+# column, and that case demonstrates generated-column handling,
+# not write coverage. Allowlist it so SEC022's read-only-table
+# nudge does not confound uc46. SEC022 itself is shown firing on
+# `app.read_replica` (use case 50).
+allowlist = ["app.gen_cols"]
+
 # Issue #11 fully closed in v0.5.7 — every demo fixture that used
 # RESTRICTIVE-only has been rewritten to the canonical
 # PERMISSIVE+RESTRICTIVE pattern, so the SEC012 allowlist is no

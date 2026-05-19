@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-one rules across four
+In the current release it ships **thirty-two rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -47,7 +47,9 @@ DEFINER function reading an RLS-protected table). Info:
 `SEC007` (table has only permissive policies — no `RESTRICTIVE`
 floor), `SEC019` (policy calls one-argument `current_setting()`,
 which raises on an unset GUC), `SEC021` (policy compares an
-identity column against a hardcoded literal), and `HYG003`
+identity column against a hardcoded literal), `SEC022`
+(RLS-enabled table whose policies are all `FOR SELECT` — no
+write-side policy, so writes are denied), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
@@ -1397,6 +1399,47 @@ flagged) and does not require the column to be on the policy's own
 table — a hardcoded identity comparison inside a sub-select is
 worth surfacing too.
 
+<a id="rule-sec022"></a>
+
+### SEC022 — RLS-enabled table has no write-side policy
+
+**Severity:** info. **Auto-fix:** no (the missing write policy's
+predicate is an application decision — what may a caller INSERT,
+UPDATE, or DELETE? — not a mechanical rewrite).
+
+Postgres's RLS model is deny-by-default per command: a command is
+permitted only if some policy's command list includes it. When a
+table has RLS enabled and every policy is `FOR SELECT`, the write
+commands have no policy at all, so for every non-owner role
+`INSERT` raises `new row violates row-level security policy` and
+`UPDATE` / `DELETE` silently match zero rows — no error, no
+effect. That asymmetry (INSERT failing loudly, UPDATE / DELETE
+failing silently) makes a forgotten write policy easy to miss in
+development and painful to diagnose in production.
+
+This is often a genuine mistake — the author wrote the read
+policies and never added the write ones. But it is also a valid
+intentional design: a table that is read-only for the
+RLS-controlled roles, with writes performed by a privileged role
+that owns the table or carries `BYPASSRLS`. pgrls cannot tell the
+two apart, so SEC022 is **info** — a "did you mean this?" nudge.
+Allowlist the table (bare name or `schema.table`) when the
+read-only surface is intentional.
+
+SEC022 fires only when the table also has a *permissive* policy.
+A table whose policies are all restrictive denies reads too — the
+permissive group is empty, so every row is filtered out and even
+`SELECT` returns nothing. That is a different finding (SEC012's
+"restrictive-only policy set"), and flagging it as a read-only
+table would be redundant and mis-framed, so SEC022 stays quiet
+and leaves it to SEC012. A single `FOR ALL` policy of any kind
+counts as write coverage and silences the rule.
+
+Out of scope (intentional): zero-policy tables (deny-by-default,
+not read-only coverage), RLS-disabled tables (SEC001's surface),
+and partition children (a child's writes route through the
+partitioned parent, whose policies govern them).
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2404,7 +2447,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-one rules across four categories.** SEC001–SEC021,
+- **Thirty-two rules across four categories.** SEC001–SEC022,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

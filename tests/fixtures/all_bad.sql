@@ -13,7 +13,10 @@ ALTER TABLE public.allbad_sec002 ENABLE ROW LEVEL SECURITY;
 -- SEC003 + SEC005 + SEC007 + SEC008: permissive policy granted to PUBLIC
 -- with USING (true). One block, four rules — true has no own-col ref
 -- (SEC005), the table has only permissive policies (SEC007), and the
--- USING is a literal true (SEC008).
+-- USING is a literal true (SEC008). SEC022 also fires here — the lone
+-- policy is FOR SELECT, so the table has read coverage but no
+-- write-side policy. SEC022's rule_loc pin targets the dedicated
+-- allbad_sec022 block below, so this extra firing is silent-by-design.
 CREATE TABLE public.allbad_sec003 (id INT);
 ALTER TABLE public.allbad_sec003 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.allbad_sec003 FORCE ROW LEVEL SECURITY;
@@ -354,3 +357,28 @@ CREATE POLICY tenant_scope_b ON public.allbad_hyg003
     USING (tenant_id IS NOT NULL);
 CREATE INDEX allbad_hyg003_tenant_idx
     ON public.allbad_hyg003 (tenant_id);
+
+-- SEC022: every policy on an RLS-enabled table is FOR SELECT, so the
+-- table has working read coverage but no write-side policy — INSERT
+-- is denied and UPDATE / DELETE silently affect zero rows. SEC022 is
+-- info-severity. The table pairs a PERMISSIVE FOR SELECT policy (so
+-- reads actually work and SEC022's premise holds — a restrictive-only
+-- table denies reads too and is SEC012's surface instead) with a
+-- RESTRICTIVE FOR SELECT floor (so SEC007 stays silent). Both
+-- predicates reference an indexed own column through a wrapped
+-- current_setting, so SEC001/SEC002/SEC005/SEC008/SEC009/PERF001/
+-- PERF003 stay silent, and the two policies differ in permissive kind
+-- so HYG003 sees no duplicate. SEC003 also fires here (the permissive
+-- policy is granted TO PUBLIC) — its rule_loc pin targets the
+-- allbad_sec003 block, so that extra firing is silent-by-design.
+CREATE TABLE public.allbad_sec022 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_sec022 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec022 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_read ON public.allbad_sec022
+    FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE POLICY tenant_floor ON public.allbad_sec022
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_sec022_tenant_idx
+    ON public.allbad_sec022 (tenant_id);
