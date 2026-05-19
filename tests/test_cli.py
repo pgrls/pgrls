@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -36,6 +37,77 @@ def test_root_version_flag():
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
     assert __version__ in result.output
+
+
+def test_explain_prints_rule_rationale() -> None:
+    # `explain` needs no database — it reads only pgrls's own rule
+    # catalog. The output is a header line plus the rule's
+    # module-doc rationale.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC023"])
+    assert result.exit_code == 0, result.output
+    assert "SEC023" in result.output
+    assert "[warning]" in result.output
+    assert "Policy applies to a role that bypasses RLS" in result.output
+    # A substring unique to SEC023's rationale body — proves the
+    # docstring, not just the header, reached the output.
+    assert "BYPASSRLS" in result.output
+
+
+def test_explain_is_case_insensitive() -> None:
+    # `explain sec001` and `explain SEC001` resolve the same rule
+    # and produce byte-identical output.
+    runner = CliRunner()
+    lower = runner.invoke(main, ["explain", "sec001"])
+    upper = runner.invoke(main, ["explain", "SEC001"])
+    assert lower.exit_code == 0, lower.output
+    assert lower.output == upper.output
+
+
+def test_explain_unknown_rule_exits_two() -> None:
+    # An unknown rule is a tool error (exit 2), not a lint finding
+    # (exit 1) — the same three-tier convention the other commands
+    # follow.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC999"])
+    assert result.exit_code == 2
+    assert "Unknown rule" in result.output
+    assert "SEC999" in result.output
+
+
+def test_explain_requires_a_rule_argument() -> None:
+    # RULE is a required argument; the bare command is a usage
+    # error, not a silent success.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain"])
+    assert result.exit_code != 0
+
+
+def test_explain_covers_every_registered_rule() -> None:
+    # Every registered rule must be explainable: exit 0, a header
+    # naming the rule and its title, and a rationale body. Catches
+    # a rule shipped without a module docstring — `explain` would
+    # then print only the bare header line.
+    runner = CliRunner()
+    for rule in all_rules():
+        result = runner.invoke(main, ["explain", rule.id])
+        assert result.exit_code == 0, f"{rule.id}: {result.output}"
+        assert rule.id in result.output
+        assert rule.title in result.output
+        assert len(result.output.strip().splitlines()) > 2, (
+            f"{rule.id} printed no rationale body"
+        )
+        # `explain` drops the docstring's leading "<ID> — <title>."
+        # line so the printed header is not immediately restated.
+        # Pin that strip: the exact first line must be absent from
+        # the output, or a silent strip regression would go unseen.
+        module = inspect.getmodule(type(rule))
+        first_line = (
+            (module.__doc__ if module else None) or ""
+        ).strip().splitlines()[0]
+        assert first_line not in result.output, (
+            f"{rule.id}: docstring title line was not stripped"
+        )
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"

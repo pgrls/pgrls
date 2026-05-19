@@ -18,6 +18,7 @@ Exit codes:
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -59,7 +60,7 @@ from pgrls.fixers import (
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
-from pgrls.rules import default_registry
+from pgrls.rules import all_rules, default_registry
 from pgrls.violations import (
     ALL_SEVERITIES,
     Severity,
@@ -1361,3 +1362,52 @@ def cache_prune(assume_yes: bool) -> None:
                 err=True,
             )
     click.echo(f"pgrls cache: removed {removed} image(s).")
+
+
+@main.command()
+@click.argument("rule_id", metavar="RULE")
+def explain(rule_id: str) -> None:
+    """Print a lint rule's rationale, severity, and detection logic.
+
+    RULE is a rule ID, matched case-insensitively — `pgrls explain
+    SEC023`, `pgrls explain perf001`. The explanation is the rule's
+    own reference documentation: what it flags, why that is a
+    problem, how detection works, what is deliberately out of
+    scope, and how to allowlist an intentional case.
+
+    Reads nothing but pgrls's own rule catalog — no database
+    connection and no config file, so it works anywhere. Exits 2
+    if RULE is not a known rule.
+    """
+    rules = all_rules()
+    normalized = rule_id.strip().upper()
+    rule = next((r for r in rules if r.id == normalized), None)
+    if rule is None:
+        known = ", ".join(r.id for r in rules)
+        raise ToolError(f"Unknown rule {rule_id!r}. Known rules: {known}.")
+
+    click.echo(f"{rule.id}  [{rule.severity}]  {rule.title}")
+
+    # The explanation is the rule module's docstring. It is empty
+    # when the module can't be resolved or when `python -OO`
+    # stripped docstrings; the header line above is still a useful
+    # one-line answer in that case.
+    module = inspect.getmodule(type(rule))
+    doc = ((module.__doc__ if module else None) or "").strip()
+    if not doc:
+        return
+
+    lines = doc.splitlines()
+    # A rule module's docstring opens, by convention, with a
+    # "<ID> — <title>." line. Drop it (and the blank line after)
+    # so the header just printed is not immediately restated; a
+    # docstring that breaks the convention is shown whole. The
+    # trailing space pins the match to the whole ID token.
+    if lines and lines[0].lstrip().startswith(rule.id + " "):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    body = "\n".join(lines).strip()
+    if body:
+        click.echo()
+        click.echo(body)

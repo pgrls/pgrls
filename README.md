@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.31.** Thirty-three lint rules (SEC001–SEC023, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.32.** Thirty-three lint rules (SEC001–SEC023, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-three rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -262,6 +262,11 @@ pattern documentation.
 | [VIEW002](AGENTS.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
 | [VIEW003](AGENTS.md#rule-view003) | warning | Materialized view over RLS-protected table (RLS not honored at query time) |
 | [VIEW004](AGENTS.md#rule-view004) | warning | View calls SECURITY DEFINER function that reads an RLS-protected table |
+
+Run `pgrls explain <RULE>` (for example `pgrls explain SEC023`) to print any
+rule's full rationale — what it flags, why it matters, how detection works,
+and how to allowlist a false positive — on the command line. It reads only
+pgrls's built-in rule catalog, so it needs no database connection.
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.

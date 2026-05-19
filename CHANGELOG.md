@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.32] - 2026-05-19
+
+### Added
+- **`pgrls explain <RULE>`.** A new subcommand that prints a lint
+  rule's full reference — its severity, what it flags, why that is
+  a problem, how detection works, what is deliberately out of
+  scope, and how to allowlist an intentional case — straight to
+  the terminal. `pgrls explain SEC023`, `pgrls explain perf001`;
+  the rule ID is matched case-insensitively.
+
+  The explanation is the rule's own in-tree documentation, so it
+  cannot drift from the implementation. `explain` reads only
+  pgrls's built-in rule catalog — no database connection and no
+  config file — so it works offline, anywhere. An unrecognized
+  rule ID is a tool error (exit 2) and the message lists every
+  known rule.
+
 ## [0.5.31] - 2026-05-19
 
 ### Added
