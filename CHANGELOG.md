@@ -10,6 +10,38 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.31] - 2026-05-19
+
+### Added
+- **SEC023 — policy applies to a role that bypasses RLS**
+  (severity: warning). Flags a policy whose `TO` clause names a
+  role carrying the `BYPASSRLS` attribute. A `BYPASSRLS` role
+  skips every row-level security policy on every table, so the
+  policy's `USING` / `WITH CHECK` predicate is never evaluated for
+  it — the `TO` clause is inert. The policy looks like it scopes
+  that role's access; it does not constrain it at all, a quiet
+  false sense of security.
+
+  Detection is a cross-reference between each policy's `TO` list
+  and the schema's set of `BYPASSRLS` roles — no predicate
+  analysis. `TO PUBLIC` is not flagged: `PUBLIC` is the
+  pseudo-role meaning "every role", not a bypassing role, and
+  firing on every public policy in a schema that contains a
+  `BYPASSRLS` role would be noise — SEC023 fires only when a
+  policy names the bypassing role outright. Superuser roles are
+  skipped, mirroring SEC016. Allowlist by qualified policy ID
+  (`schema.table.policy_name`) when naming a bypassing role is
+  intentional. SEC016 flags the role itself; SEC023 flags each
+  policy that names it.
+
+### Changed
+- **Rule count: thirty-two → thirty-three** (`SEC001`–`SEC023`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC023 reads the policy `roles` list
+  and the top-level `bypassrls_roles` set, both already part of
+  the snapshot format (`bypassrls_roles` since v9, added with
+  SEC016), so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.30] - 2026-05-18
 
 ### Added

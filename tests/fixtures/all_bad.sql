@@ -382,3 +382,28 @@ CREATE POLICY tenant_floor ON public.allbad_sec022
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
 CREATE INDEX allbad_sec022_tenant_idx
     ON public.allbad_sec022 (tenant_id);
+
+-- SEC023: a policy whose TO clause names a role carrying the
+-- BYPASSRLS attribute (allbad_sec016_role, created in the SEC016
+-- block above). A BYPASSRLS role skips every RLS policy, so the
+-- policy's USING predicate is never evaluated for it — the TO
+-- reference is inert. The base table mirrors the other RLS-on
+-- blocks (a RESTRICTIVE policy with an own-column USING through a
+-- wrapped current_setting, and an indexed predicate column) so
+-- SEC001/SEC002/SEC005/SEC008/SEC009/PERF001/PERF003 stay silent
+-- and only SEC023 fires here. SEC012 also fires (the policy set is
+-- RESTRICTIVE-only, like the other base tables) and carries no
+-- rule_loc pin, so that extra firing is silent-by-design.
+--
+-- Granting a policy TO a role records a SHARED_DEPENDENCY_POLICY
+-- entry, so DROP ROLE is blocked while this policy exists — the
+-- combined-fixture test's `finally` drops the public schema
+-- (cascading this policy away) before dropping the role.
+CREATE TABLE public.allbad_sec023 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_sec023 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec023 FORCE ROW LEVEL SECURITY;
+CREATE POLICY bypassed_grant ON public.allbad_sec023
+    AS RESTRICTIVE FOR SELECT TO allbad_sec016_role
+    USING (tenant_id = (SELECT current_setting('app.tenant', true)));
+CREATE INDEX allbad_sec023_tenant_idx
+    ON public.allbad_sec023 (tenant_id);

@@ -902,7 +902,10 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
     # all_bad.sql's SEC016 block creates a cluster-global BYPASSRLS
     # role (roles are not reset by the per-test schema teardown); the
     # `finally` drops it so it can't leak into the shared container
-    # and trip SEC016 in the clean-DB e2e test.
+    # and trip SEC016 in the clean-DB e2e test. The SEC023 block
+    # grants a policy TO that role, recording a
+    # SHARED_DEPENDENCY_POLICY entry that blocks DROP ROLE — so the
+    # `finally` drops the public schema (cascading the policy) first.
     try:
         apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
         runner = CliRunner()
@@ -940,6 +943,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC020  public.allbad_sec020.open_write_check\n",
             "SEC021  public.allbad_sec021.tenant_pinned\n",
             "SEC022  public.allbad_sec022\n",
+            "SEC023  public.allbad_sec023.bypassed_grant\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",
@@ -956,7 +960,15 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
                 f"{rule_loc!r} missing from output:\n{result.output}"
             )
     finally:
-        apply_sql("DROP ROLE IF EXISTS allbad_sec016_role")
+        # Drop the schema before the role: the SEC023 policy's
+        # TO clause makes the role undroppable until its policy is
+        # gone. The next test's pg_conn fixture resets the schema
+        # anyway; recreating it here just leaves a sane state.
+        apply_sql(
+            "DROP SCHEMA IF EXISTS public CASCADE; "
+            "CREATE SCHEMA public; "
+            "DROP ROLE IF EXISTS allbad_sec016_role"
+        )
 
 
 # ============================================================

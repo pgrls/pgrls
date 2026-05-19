@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-two rules across four
+In the current release it ships **thirty-three rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -36,6 +36,8 @@ below the RLS barrier),
 `session_user` — no isolation under a shared pool role),
 `SEC020` (policy `WITH CHECK` is constant `true` while `USING`
 restricts — writes accept rows reads never would),
+`SEC023` (policy applies to a role that bypasses RLS — the role's
+`BYPASSRLS` attribute makes the policy's `TO` clause inert),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1440,6 +1442,70 @@ not read-only coverage), RLS-disabled tables (SEC001's surface),
 and partition children (a child's writes route through the
 partitioned parent, whose policies govern them).
 
+<a id="rule-sec023"></a>
+
+### SEC023 — Policy applies to a role that bypasses RLS
+
+**Severity:** warning. **Auto-fix:** no (the remedy is either to
+strip `BYPASSRLS` from the role or to drop the dead `TO` clause —
+which one depends on the author's intent, which pgrls cannot
+infer).
+
+A `CREATE POLICY ... TO <role>` clause names the roles a policy
+governs. SEC023 fires when one of those named roles carries the
+`BYPASSRLS` attribute — because a `BYPASSRLS` role skips every
+row-level security policy on every table. The `TO` clause is inert
+for it:
+
+```sql
+CREATE ROLE etl_worker BYPASSRLS;
+
+CREATE POLICY tenant_scope ON documents
+    FOR SELECT TO etl_worker
+    USING (tenant_id = current_setting('app.tenant_id'));
+```
+
+`etl_worker` reads every row of `documents` regardless of
+`tenant_scope`'s predicate. The policy looks like it scopes that
+role to one tenant; it does not constrain it at all.
+
+The danger is a false sense of security. The author named the role
+deliberately and wrote a predicate to scope it — nothing in the
+policy reveals that the role ignores it, because the bypass lives
+in a role attribute the policy never mentions. The milder reading
+is that the author wanted the role unconstrained and the `TO`
+clause is redundant noise; pgrls cannot tell the two apart, and
+both are worth surfacing.
+
+Detection is a cross-reference, not an AST walk: SEC023 intersects
+each policy's `TO` list with the schema's set of `BYPASSRLS`
+roles. The policy's `USING` / `WITH CHECK` predicate is irrelevant
+— a `BYPASSRLS` role never evaluates it.
+
+`TO PUBLIC` is not flagged: `PUBLIC` is the pseudo-role meaning
+"every role", not a role that bypasses RLS, and firing on every
+`TO PUBLIC` policy in any schema that contains a `BYPASSRLS` role
+would be noise. SEC023 fires only when a policy *names* the
+bypassing role outright. Superuser roles are skipped, mirroring
+SEC016 — a policy targeting a superuser would restate a far
+larger, separate finding.
+
+Allowlist by qualified policy ID (`schema.table.policy_name`) when
+naming a bypassing role in a `TO` clause is intentional.
+
+Out of scope (intentional): role-membership reachability (a role
+whose members can `SET ROLE` to a bypassing role is not flagged —
+`BYPASSRLS` is a role attribute, not an inheritable privilege) and
+plain superusers (a role that bypasses RLS only through `rolsuper`,
+with no explicit `BYPASSRLS`, is not in the schema's `BYPASSRLS`
+set).
+
+Relationship to SEC016: SEC016 flags the *role* ("this role
+carries `BYPASSRLS`"); SEC023 flags the *policy* ("this policy
+tries to govern a role the attribute exempts"). The two are
+complementary — a schema can trip SEC016 once on the role and
+SEC023 on every policy that names it.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2475,7 +2541,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-two rules across four categories.** SEC001–SEC022,
+- **Thirty-three rules across four categories.** SEC001–SEC023,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
