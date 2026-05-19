@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-three rules across four
+In the current release it ships **thirty-four rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -51,7 +51,9 @@ floor), `SEC019` (policy calls one-argument `current_setting()`,
 which raises on an unset GUC), `SEC021` (policy compares an
 identity column against a hardcoded literal), `SEC022`
 (RLS-enabled table whose policies are all `FOR SELECT` — no
-write-side policy, so writes are denied), and `HYG003`
+write-side policy, so writes are denied), `SEC024` (policy calls
+`current_setting()` with an unqualified parameter name — a
+dropped prefix the application cannot `SET`), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
@@ -1512,6 +1514,77 @@ tries to govern a role the attribute exempts"). The two are
 complementary — a schema can trip SEC016 once on the role and
 SEC023 on every policy that names it.
 
+<a id="rule-sec024"></a>
+
+### SEC024 — Policy calls current_setting() with an unqualified parameter name
+
+**Severity:** info. **Auto-fix:** no (the correct qualified
+name — typically `app.<something>` — is application context
+pgrls cannot know).
+
+An RLS policy reads the per-request tenant/session context from a
+*customized* run-time parameter the application `SET`s on every
+connection. Postgres requires the name of such a parameter to be
+**qualified** — `prefix.name`, containing a period — to
+namespace it away from the server's own settings. An unqualified
+name cannot be `SET` as a customized parameter at all, so a
+policy that reads one either gets a built-in server setting or
+silently gets nothing:
+
+```sql
+CREATE POLICY p ON documents
+    USING (tenant_id = current_setting('tenant_id', true));
+    --                                 ^^^^^^^^^^^ no prefix
+```
+
+This is almost always a dropped prefix — the application sets
+`app.tenant_id` but the policy reads `tenant_id`. The failure is
+quiet: with the two-argument form (`missing_ok = true`) the
+unset parameter yields NULL, `tenant_id = NULL` matches no rows,
+and the table simply looks empty. The one-argument form raises
+on every query instead, which SEC019 separately flags.
+
+Detection walks the parsed policy expression for
+`current_setting` calls (including those inside `(SELECT
+current_setting(...))`) and inspects the first argument. SEC024
+fires when that argument is a string literal with no period.
+Dynamic names — a column reference, a concatenation — are not
+inspected. Postgres deparses a string-literal argument with an
+explicit `::text` cast (`current_setting('app.x'::text, true)`),
+so the introspected node is a `TypeCast` wrapping the `A_Const`;
+SEC024 unwraps it before reading the literal.
+
+Severity is **info** because a policy may genuinely key off a
+built-in server parameter (e.g. `application_name`), which is
+unqualified by definition. pgrls cannot tell a dropped prefix
+from a deliberate built-in read, so SEC024 surfaces the
+unqualified name as a review nudge rather than a hard finding.
+Allowlist by qualified policy ID (`schema.table.policy_name`)
+when the built-in read is intentional.
+
+Relationship to SEC019: SEC019 flags the *arity* of a
+`current_setting` call (the one-argument form raises on an
+unset parameter); SEC024 flags the *name shape* (unqualified).
+The two are orthogonal — a single policy can carry one without
+the other, or trip both.
+
+Out of scope (intentional):
+
+* **Dynamic parameter names.** `current_setting(<non-literal>)`
+  — a name built from a column or an expression — is not
+  inspected. SEC024 reads string-literal arguments only.
+* **Empty parameter names.** `current_setting('')` is a
+  malformed call — Postgres errors at query time. That is a
+  different class of bug from a dropped prefix; SEC024 flags an
+  *unqualified* (real-but-prefix-less) name, not an absent one.
+* **Parameter-value analysis.** SEC024 does not check whether a
+  *qualified* name is one the application actually sets, nor
+  what the value resolves to. It checks the *shape* of the name
+  only.
+* **`current_setting` outside policies.** A call in a view body,
+  a function, or a column `DEFAULT` is not in scope — SEC024
+  inspects policy `USING` / `WITH CHECK` clauses only.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2558,7 +2631,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-three rules across four categories.** SEC001–SEC023,
+- **Thirty-four rules across four categories.** SEC001–SEC024,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

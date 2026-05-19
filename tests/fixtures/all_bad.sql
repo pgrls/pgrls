@@ -407,3 +407,25 @@ CREATE POLICY bypassed_grant ON public.allbad_sec023
     USING (tenant_id = (SELECT current_setting('app.tenant', true)));
 CREATE INDEX allbad_sec023_tenant_idx
     ON public.allbad_sec023 (tenant_id);
+
+-- SEC024: policy reads tenant context via an unqualified
+-- current_setting() parameter name. A customized run-time
+-- parameter must be qualified (`app.tenant`) — the unqualified
+-- `tenant` here can never be SET, so the policy silently matches
+-- no rows. The two-argument current_setting form keeps SEC019
+-- silent (SEC019 flags the one-argument overload), and the call
+-- is wrapped in (SELECT ...) so PERF001 stays silent. The base
+-- table mirrors the other RLS-on blocks (RESTRICTIVE policy,
+-- own-column reference, indexed predicate column) so SEC001/
+-- SEC002/SEC005/SEC007/SEC008/SEC009/PERF003 stay silent and only
+-- SEC024 fires. SEC012 also fires (RESTRICTIVE-only policy set)
+-- and carries no rule_loc pin, so that extra firing is
+-- silent-by-design.
+CREATE TABLE public.allbad_sec024 (id INT, tenant_id TEXT);
+ALTER TABLE public.allbad_sec024 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec024 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec024
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('tenant', true)));
+CREATE INDEX allbad_sec024_tenant_idx
+    ON public.allbad_sec024 (tenant_id);
