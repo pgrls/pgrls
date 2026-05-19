@@ -179,12 +179,18 @@ def test_sec001_fix_skips_partition_child_with_unscanned_parent() -> None:
     assert SEC001Fixer().fix(schema, {}) == []
 
 
-def test_sec001_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Bad config type → fail closed (no exemption) → fix still emitted.
+def test_sec001_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with SEC001's strict parser
+    # (parse_table_ref_allowlist), so a malformed allowlist raises
+    # TypeError — `pgrls fix` surfaces it as a ToolError, exactly
+    # as `pgrls lint` rejects the same config.
     schema = Schema(tables=(_table(rls=False, force=False),))
-    fixes = SEC001Fixer().fix(schema, {"allowlist": "public.t"})
-    assert len(fixes) == 1
-    assert fixes[0].location == "public.t"
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC001Fixer().fix(schema, {"allowlist": "public.t"})
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC001Fixer().fix(schema, {"allowlist": [" public.t "]})
 
 
 def test_sec001_fix_quotes_table_name_when_required() -> None:
@@ -422,12 +428,11 @@ def test_view001_fix_quotes_view_name_when_required() -> None:
     )
 
 
-def test_view001_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Mirror SEC002's pattern: bad config types fail closed (no
-    # exemption applied), so the view still fires. The rule's
-    # check() raises on bad allowlist shape; the fixer trusts the
-    # rule has already validated and uses an inline shim, so a
-    # non-list allowlist resolves to "nothing exempt".
+def test_view001_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with VIEW001's strict parser
+    # (parse_qualified_view_allowlist), so a malformed allowlist
+    # raises TypeError — `pgrls fix` surfaces it as a ToolError,
+    # exactly as `pgrls lint` rejects the same config.
     schema = Schema(
         tables=(_table(name="users", rls=True, force=True),),
         views=(
@@ -438,11 +443,16 @@ def test_view001_fix_silent_when_allowlist_is_bad_type() -> None:
             ),
         ),
     )
-    fixes = VIEW001Fixer().fix(
-        schema, {"allowlist": "public.user_summary"}
-    )
-    assert len(fixes) == 1
-    assert fixes[0].location == "public.user_summary"
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        VIEW001Fixer().fix(
+            schema, {"allowlist": "public.user_summary"}
+        )
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        VIEW001Fixer().fix(
+            schema, {"allowlist": [" public.user_summary "]}
+        )
 
 
 # ---------- VIEW002 fixer ----------
@@ -638,12 +648,11 @@ def test_view002_fix_quotes_view_name_when_required() -> None:
     )
 
 
-def test_view002_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Mirror SEC002/VIEW001: bad config types fail closed (no
-    # exemption applied), so the view still fires. The rule's
-    # check() raises on bad allowlist shape; the fixer trusts the
-    # rule has already validated and uses an inline shim, so a
-    # non-list allowlist resolves to "nothing exempt".
+def test_view002_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with VIEW002's strict parser
+    # (parse_qualified_view_allowlist), so a malformed allowlist
+    # raises TypeError — `pgrls fix` surfaces it as a ToolError,
+    # exactly as `pgrls lint` rejects the same config.
     schema = Schema(
         tables=(_table(name="users", rls=True, force=True),),
         views=(
@@ -655,11 +664,16 @@ def test_view002_fix_silent_when_allowlist_is_bad_type() -> None:
             ),
         ),
     )
-    fixes = VIEW002Fixer().fix(
-        schema, {"allowlist": "public.user_summary"}
-    )
-    assert len(fixes) == 1
-    assert fixes[0].location == "public.user_summary"
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        VIEW002Fixer().fix(
+            schema, {"allowlist": "public.user_summary"}
+        )
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        VIEW002Fixer().fix(
+            schema, {"allowlist": [" public.user_summary "]}
+        )
 
 
 # ---------- PERF001 fixer ----------
@@ -909,12 +923,18 @@ def test_sec006_fix_round_trips_using_through_pglast() -> None:
     assert "WITH CHECK (user_id = 1)" in sql
 
 
-def test_sec006_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Bad config type → fail closed (no exemption) → fix still emitted.
+def test_sec006_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with SEC006's strict parser
+    # (parse_policy_id_allowlist), so a malformed allowlist raises
+    # TypeError — `pgrls fix` surfaces it as a ToolError, exactly
+    # as `pgrls lint` rejects the same config.
     schema = _wrap_policy(_policy("user_id = 1", command="ALL"))
-    fixes = SEC006Fixer().fix(schema, {"allowlist": "public.t.p"})
-    assert len(fixes) == 1
-    assert fixes[0].location == "public.t.p"
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC006Fixer().fix(schema, {"allowlist": "public.t.p"})
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC006Fixer().fix(schema, {"allowlist": [" public.t.p "]})
 
 
 # ---------- HYG003 fixer ----------
@@ -1054,15 +1074,21 @@ def test_hyg003_fix_description_names_the_original() -> None:
     assert "redundant" in f.description
 
 
-def test_hyg003_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Bad config type → fail closed (no exemption) → DROP still emitted.
+def test_hyg003_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with HYG003's strict parser
+    # (parse_policy_id_allowlist), so a malformed allowlist raises
+    # TypeError — `pgrls fix` surfaces it as a ToolError, exactly
+    # as `pgrls lint` rejects the same config.
     schema = _dup_table(
         _policy("user_id = 1", name="p_a"),
         _policy("user_id = 1", name="p_b"),
     )
-    fixes = HYG003Fixer().fix(schema, {"allowlist": "public.t.p_b"})
-    assert len(fixes) == 1
-    assert fixes[0].location == "public.t.p_b"
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        HYG003Fixer().fix(schema, {"allowlist": "public.t.p_b"})
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        HYG003Fixer().fix(schema, {"allowlist": [" public.t.p_b "]})
 
 
 # ---------- generate_fixes / registry ----------
@@ -1155,24 +1181,32 @@ def test_fix_dataclass_is_frozen() -> None:
 # Edge cases — fixer robustness
 # ============================================================
 
-def test_sec002_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Bad config types should fail closed: don't crash, don't
-    # apply mystery fixes. SEC002Fixer's `_is_allowlisted` checks
-    # the type and returns False on a non-list — so bad config
-    # means "nothing is allowlisted", which means the table fires
-    # as expected. Pin the conservative behavior.
+def test_sec002_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with SEC002's strict parser
+    # (parse_table_ref_allowlist), so a malformed allowlist raises
+    # TypeError — `pgrls fix` surfaces it as a ToolError, exactly
+    # as `pgrls lint` rejects the same config.
     schema = Schema(tables=(_table(rls=True, force=False),))
-    fixes = SEC002Fixer().fix(schema, {"allowlist": "public.t"})
-    assert len(fixes) == 1
-    assert fixes[0].location == "public.t"
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC002Fixer().fix(schema, {"allowlist": "public.t"})
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC002Fixer().fix(schema, {"allowlist": [" public.t "]})
 
 
-def test_perf001_fix_silent_when_allowlist_is_bad_type() -> None:
-    # Same shape: bad allowlist type → conservatively no
-    # exemption applied → fix still emitted.
+def test_perf001_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with PERF001's strict parser
+    # (parse_policy_id_allowlist), so a malformed allowlist raises
+    # TypeError — `pgrls fix` surfaces it as a ToolError, exactly
+    # as `pgrls lint` rejects the same config.
     schema = _wrap_policy(_policy("user_id = auth.uid()"))
-    fixes = PERF001Fixer().fix(schema, {"allowlist": "public.t.p"})
-    assert len(fixes) == 1
+    # Bad type — not a list.
+    with pytest.raises(TypeError, match="allowlist"):
+        PERF001Fixer().fix(schema, {"allowlist": "public.t.p"})
+    # Malformed entry — surrounding whitespace.
+    with pytest.raises(TypeError, match="allowlist"):
+        PERF001Fixer().fix(schema, {"allowlist": [" public.t.p "]})
 
 
 def test_perf001_fix_falls_back_to_default_on_bad_auth_functions() -> None:

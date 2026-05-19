@@ -6,13 +6,11 @@ from typing import Any
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table
+from pgrls.rules._allowlist import parse_table_ref_allowlist
 
 
-def _is_allowlisted(table: Table, options: dict[str, Any]) -> bool:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
-        return False
-    return table.name in raw or table.qualified_name in raw
+def _is_allowlisted(table: Table, allowlist: set[str]) -> bool:
+    return table.name in allowlist or table.qualified_name in allowlist
 
 
 class SEC002Fixer:
@@ -21,13 +19,16 @@ class SEC002Fixer:
     def fix(
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Fix]:
+        # Strict allowlist parsing (the same parser SEC002 uses):
+        # a malformed allowlist raises, surfaced by the `fix` CLI.
+        allowlist = parse_table_ref_allowlist("SEC002", options)
         out: list[Fix] = []
         for table in schema.tables:
             # Mirror SEC002's detection: rls enabled but force off,
             # not in allowlist.
             if not table.rls_enabled or table.force_rls:
                 continue
-            if _is_allowlisted(table, options):
+            if _is_allowlisted(table, allowlist):
                 continue
             sql = (
                 "ALTER TABLE "

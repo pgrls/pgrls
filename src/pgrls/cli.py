@@ -475,6 +475,10 @@ def fix(
                     rule_filter=set(rules) if rules else None,
                 )
             except (TypeError, ValueError) as exc:
+                # A fixer raises TypeError on a malformed allowlist
+                # — the same strict validation the rules apply — so
+                # `pgrls fix` rejects bad config with a clear tool
+                # error, exactly as `pgrls lint` does.
                 raise ToolError(str(exc)) from exc
 
             if not fixes:
