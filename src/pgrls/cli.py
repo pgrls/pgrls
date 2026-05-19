@@ -1388,11 +1388,12 @@ def explain(rule_id: str) -> None:
 
     click.echo(f"{rule.id}  [{rule.severity}]  {rule.title}")
 
-    # The explanation is the rule module's docstring. Docstrings
-    # are stripped under `python -OO`; the header line above is
-    # still a useful one-line answer when that happens.
+    # The explanation is the rule module's docstring. It is empty
+    # when the module can't be resolved or when `python -OO`
+    # stripped docstrings; the header line above is still a useful
+    # one-line answer in that case.
     module = inspect.getmodule(type(rule))
-    doc = (getattr(module, "__doc__", None) or "").strip()
+    doc = ((module.__doc__ if module else None) or "").strip()
     if not doc:
         return
 
@@ -1400,8 +1401,9 @@ def explain(rule_id: str) -> None:
     # A rule module's docstring opens, by convention, with a
     # "<ID> — <title>." line. Drop it (and the blank line after)
     # so the header just printed is not immediately restated; a
-    # docstring that breaks the convention is shown whole.
-    if lines and lines[0].lstrip().startswith(rule.id):
+    # docstring that breaks the convention is shown whole. The
+    # trailing space pins the match to the whole ID token.
+    if lines and lines[0].lstrip().startswith(rule.id + " "):
         lines = lines[1:]
         while lines and not lines[0].strip():
             lines.pop(0)
