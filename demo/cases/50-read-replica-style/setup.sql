@@ -1,11 +1,15 @@
 -- ============================================================
--- Use case 50: Read-replica style — SELECT-only policies clean
+-- Use case 50: Read-replica style — SEC022 flags read-only RLS
 -- A read-only mirror of canonical data. Two SELECT policies
 -- (one tenant floor RESTRICTIVE, one role-specific PERMISSIVE
 -- granted to a non-PUBLIC role) and zero write policies.
--- Demonstrates that pgrls is silent on a clean read-only shape
--- — neither SEC006 (no writes to validate) nor SEC003 (the
--- permissive grant is to a specific role) fires.
+-- Demonstrates SEC022 (info): the table has working read
+-- coverage but no write-side policy, so INSERT/UPDATE/DELETE are
+-- denied for non-owner roles. SEC006 stays silent (no write
+-- policy to validate) and SEC003 stays silent (the permissive
+-- grant is to a specific role, not PUBLIC). For a deliberate
+-- read replica this is expected — allowlist the table when the
+-- read-only surface is intentional.
 -- ============================================================
 
 DO $$

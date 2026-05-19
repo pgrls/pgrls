@@ -69,6 +69,11 @@ _BASE_CONFIG = (
     # ruleset the demo's pgrls.toml runs with.
     '[lint]\ndisable = ["PERF003"]\n'
     '[lint.rules.SEC001]\nallowlist = ["app.countries"]\n'
+    # Mirror pgrls.toml's SEC022 allowlist: `app.gen_cols` (uc46)
+    # is an intentionally read-only table, so SEC022 is allowlisted
+    # there. Embedding it keeps `_BASE_CONFIG`-based tests (uc72)
+    # seeing the same rule set as the pgrls.toml-based ones.
+    '[lint.rules.SEC022]\nallowlist = ["app.gen_cols"]\n'
     + _SEC012_ALLOWLIST_BLOCK
 )
 

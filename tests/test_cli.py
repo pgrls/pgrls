@@ -67,9 +67,11 @@ def test_lint_against_known_bad_db_exits_nonzero(pg_url: str, apply_sql) -> None
     assert result.exit_code == 1, result.output
     assert "public.users" in result.output
     # users → SEC001. orders.orders_owner is permissive PUBLIC → SEC003.
-    # orders has only that one permissive policy → SEC007 (info).
+    # orders has only that one permissive policy → SEC007 (info), and
+    # that policy is FOR SELECT, so orders has no write-side policy →
+    # SEC022 (info).
     _assert_rules_fire_exactly(
-        result.output, {"SEC001", "SEC003", "SEC007"}
+        result.output, {"SEC001", "SEC003", "SEC007", "SEC022"}
     )
 
 
@@ -80,10 +82,12 @@ def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
     #   - SEC002: FORCE on
     #   - SEC003: PERMISSIVE is to postgres, not PUBLIC
     #   - SEC005: USING references the own column `id`
-    #   - SEC006: SELECT-only policies, no WITH CHECK needed
+    #   - SEC006: the FOR ALL policies each carry a WITH CHECK
     #   - SEC007: at least one RESTRICTIVE → not all-permissive
     #   - SEC009: at least one policy → not RLS-without-policies
     #   - SEC012: at least one PERMISSIVE → not silent deny-all
+    #   - SEC020: WITH CHECK is `id > 0`, not a constant `true`
+    #   - SEC022: the FOR ALL policies cover writes → not read-only
     #   - PERF003: PRIMARY KEY creates an implicit B-tree on `id`,
     #     so the `id > 0` predicate has a leading-column index
     apply_sql(
@@ -92,9 +96,10 @@ def test_lint_clean_db_exits_zero(pg_url: str, apply_sql) -> None:
         ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.t FORCE ROW LEVEL SECURITY;
         CREATE POLICY t_permit ON public.t
-            FOR SELECT TO postgres USING (id > 0);
+            FOR ALL TO postgres USING (id > 0) WITH CHECK (id > 0);
         CREATE POLICY t_lock ON public.t
-            AS RESTRICTIVE FOR SELECT TO postgres USING (id > 0);
+            AS RESTRICTIVE FOR ALL TO postgres
+            USING (id > 0) WITH CHECK (id > 0);
         """
     )
     runner = CliRunner()
@@ -534,7 +539,9 @@ def test_lint_fires_sec002_on_missing_force(pg_url: str, apply_sql) -> None:
     assert result.exit_code == 1, result.output
     assert "SEC002" in result.output
     assert "public.sec002_target" in result.output
-    assert "public.sec002_clean" not in result.output
+    # Both tables are RLS-on with FOR SELECT-only policies, so SEC022
+    # fires on each — anchor the clean-table check to SEC002 itself.
+    assert "SEC002  public.sec002_clean" not in result.output
 
 
 def test_lint_sec002_allowlist_via_config_exempts(
@@ -591,10 +598,15 @@ def test_lint_fires_sec003_on_permissive_public_policy(
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
     assert "public.sec003_target.public_read" in result.output
-    assert "sec003_clean" not in result.output
+    # Both tables are RLS-on with FOR SELECT-only policies, so SEC022
+    # fires on each — anchor the clean-table check to SEC003 itself.
+    assert "SEC003  public.sec003_clean" not in result.output
     # sec003_target has only one permissive PUBLIC policy → SEC003 +
-    # SEC007 (info: no RESTRICTIVE floor). sec003_clean is RESTRICTIVE.
-    _assert_rules_fire_exactly(result.output, {"SEC003", "SEC007"})
+    # SEC007 (info: no RESTRICTIVE floor). Both tables have only
+    # FOR SELECT policies → SEC022 (info). sec003_clean is RESTRICTIVE.
+    _assert_rules_fire_exactly(
+        result.output, {"SEC003", "SEC007", "SEC022"}
+    )
 
 
 def test_lint_sec003_allowlist_via_config_exempts(
@@ -657,13 +669,17 @@ def test_lint_fires_sec004_on_lovable_cve_pattern(
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
     assert "public.sec004_target.inverted_auth" in result.output
-    assert "sec004_clean" not in result.output
+    # Both tables are RLS-on with FOR SELECT-only policies, so SEC022
+    # fires on each — anchor the clean-table check to SEC004 itself.
+    assert "SEC004  public.sec004_clean" not in result.output
     # inverted_auth is permissive PUBLIC → SEC003 + SEC007 (only
     # permissive on the table). USING has unwrapped current_setting →
-    # PERF001. sec004_clean policy is RESTRICTIVE so SEC003/SEC007
+    # PERF001. Both tables have only FOR SELECT policies → SEC022
+    # (info). sec004_clean policy is RESTRICTIVE so SEC003/SEC007
     # don't fire on that table.
     _assert_rules_fire_exactly(
-        result.output, {"SEC003", "SEC004", "SEC007", "PERF001"}
+        result.output,
+        {"SEC003", "SEC004", "SEC007", "PERF001", "SEC022"},
     )
 
 
@@ -695,13 +711,17 @@ def test_lint_fires_hyg001_on_orphaned_column_ref(
     assert result.exit_code == 1, result.output
     assert "public.hyg001_target.orphaned" in result.output
     assert "?dropped?column?" in result.output
-    assert "hyg001_clean" not in result.output
+    # Both tables are RLS-on with FOR SELECT-only policies, so SEC022
+    # fires on each — anchor the clean-table check to HYG001 itself.
+    assert "HYG001  public.hyg001_clean" not in result.output
     # `orphaned` is permissive PUBLIC → SEC003 + SEC007 (only permissive
     # on the table). The dropped column is excluded from table.columns,
     # so SEC005 fires too — the policy has no live own-col ref. HYG001
-    # is the headline. hyg001_clean is RESTRICTIVE.
+    # is the headline. Both tables have only FOR SELECT policies →
+    # SEC022 (info). hyg001_clean is RESTRICTIVE.
     _assert_rules_fire_exactly(
-        result.output, {"SEC003", "SEC005", "SEC007", "HYG001"}
+        result.output,
+        {"SEC003", "SEC005", "SEC007", "HYG001", "SEC022"},
     )
 
 
@@ -919,6 +939,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC019  public.allbad_sec019.tenant_scope\n",
             "SEC020  public.allbad_sec020.open_write_check\n",
             "SEC021  public.allbad_sec021.tenant_pinned\n",
+            "SEC022  public.allbad_sec022\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",

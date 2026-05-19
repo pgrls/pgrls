@@ -296,6 +296,19 @@ allowlist = []
 # "schema.table.policy_name".
 allowlist = []
 
+[lint.rules.SEC022]
+# RLS-enabled tables whose policies are all FOR SELECT — the table
+# has working read coverage but no write-side policy, so INSERT is
+# denied and UPDATE / DELETE silently affect zero rows. SEC022 is
+# info-severity: a read-only table (writes done by a table-owning or
+# BYPASSRLS role) is a valid intentional design pgrls cannot tell
+# apart from a forgotten write policy.
+#
+# Allowlist a table when the read-only surface is intentional.
+# Entries are table references — a bare name ("audit_log") or
+# schema-qualified ("reporting.audit_log").
+allowlist = []
+
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
