@@ -32,10 +32,11 @@ errors instead (which SEC019 separately flags). Either way the
 policy never sees the context it was written to read.
 
 Detection is structural: SEC024 walks the parsed policy `USING` /
-`WITH CHECK` expression for `current_setting` calls (`find_func_
-calls`, so a call wrapped in `(SELECT current_setting(...))` is
-found too) and inspects the first argument. It fires when that
-argument is a **string literal with no period**. A call whose
+`WITH CHECK` expression for `current_setting` calls (via
+`find_func_calls`, so a call wrapped in
+`(SELECT current_setting(...))` is found too) and inspects the
+first argument. It fires when that argument is a **string literal
+with no period**. A call whose
 name is built dynamically — a column reference, a concatenation —
 is not a literal and is left alone; SEC024 cannot know what it
 resolves to.
@@ -65,7 +66,7 @@ Out of scope (intentional):
   call — Postgres raises `invalid configuration parameter name:
   ""` at query time. SEC024's signal is an *unqualified* name (a
   real name that lacks the required prefix), not an absent one.
-* **GUC-value analysis.** SEC024 does not check whether a
+* **Parameter-value analysis.** SEC024 does not check whether a
   *qualified* name is one the application actually sets, nor what
   the parameter resolves to. It checks the *shape* of the name
   only.
