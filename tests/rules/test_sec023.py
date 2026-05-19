@@ -100,6 +100,16 @@ def test_sec023_silent_on_to_public_policy() -> None:
     assert SEC023().check(schema, options={}) == []
 
 
+def test_sec023_silent_when_policy_has_no_roles() -> None:
+    # A policy with an empty TO list names no role at all, so the
+    # intersection with the BYPASSRLS set is empty.
+    schema = Schema(
+        tables=(_table(_policy(roles=())),),
+        bypassrls_roles=(_role("etl_worker"),),
+    )
+    assert SEC023().check(schema, options={}) == []
+
+
 def test_sec023_skips_superuser_bypassrls_role() -> None:
     # A superuser bypasses RLS via rolsuper regardless of the
     # BYPASSRLS attribute; SEC023 skips it exactly as SEC016 does,

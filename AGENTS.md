@@ -36,6 +36,8 @@ below the RLS barrier),
 `session_user` — no isolation under a shared pool role),
 `SEC020` (policy `WITH CHECK` is constant `true` while `USING`
 restricts — writes accept rows reads never would),
+`SEC023` (policy applies to a role that bypasses RLS — the role's
+`BYPASSRLS` attribute makes the policy's `TO` clause inert),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —

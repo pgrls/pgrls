@@ -149,9 +149,7 @@ class SEC023:
         if len(targeted) == 1:
             roles_phrase = f"role {targeted[0]}, which carries"
         else:
-            roles_phrase = (
-                f"roles {', '.join(targeted)}, which carry"
-            )
+            roles_phrase = f"roles {', '.join(targeted)}, which carry"
         return Violation(
             rule_id=self.id,
             severity=self.severity,
