@@ -50,7 +50,12 @@ from pgrls.diff.formatters import (
     format_diff_sarif,
     format_diff_text,
 )
-from pgrls.fixers import default_fixers, generate_fixes
+from pgrls.fixers import (
+    default_fixers,
+    generate_fixes,
+    render_fixes,
+    render_migration,
+)
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
@@ -358,12 +363,23 @@ def _fix_apply_failure_message(
     default=False,
     help="Execute the fixes. Default: dry-run (print SQL only).",
 )
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the remediation SQL to this file (a migration-"
+    "ready .sql script) instead of stdout. Cannot be combined "
+    "with --apply.",
+)
 def fix(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
     rules: tuple[str, ...],
     apply: bool,
+    output_path: str | None,
 ) -> None:
     """Auto-remediate violations whose fix is mechanical.
 
@@ -388,9 +404,19 @@ def fix(
     is rolled back and the database is unchanged. The failing
     fix's `(rule_id, location)` is reported in the error message.
 
+    `--output <file>` writes the remediation SQL to a file — a
+    migration-ready `.sql` script with a header and one
+    `-- [rule] description` comment per statement — instead of
+    printing it to stdout. The file is deterministic (no
+    timestamp), so regenerating against an unchanged schema
+    produces a byte-identical result. `--output` cannot be
+    combined with `--apply`: one writes a migration to run later,
+    the other executes immediately.
+
     Output channels: SQL bodies go to stdout (so `pgrls fix >
-    migration.sql` produces a usable script). Status / progress /
-    error messages go to stderr.
+    migration.sql` produces a usable script) unless `--output`
+    redirects them to a file. Status / progress / error messages
+    go to stderr.
 
     The Schema is captured by introspection at the start of the
     command and the generated fixes reflect that snapshot. A
@@ -398,6 +424,13 @@ def fix(
     cause individual statements to fail; the all-or-nothing rollback
     keeps the database consistent in that case.
     """
+    if output_path is not None and apply:
+        raise ToolError(
+            "--output and --apply cannot be combined: --output "
+            "writes a migration file to apply later, --apply "
+            "executes the fixes immediately. Choose one."
+        )
+
     try:
         config = load_config(config_path)
     except ConfigError as exc:
@@ -451,13 +484,34 @@ def fix(
                 )
                 return
 
-            # SQL bodies + their `-- [rule] description` comments
-            # go to stdout so `pgrls fix > migration.sql` produces
-            # a clean, paste-able script.
-            for f in fixes:
-                click.echo(f"-- [{f.rule_id}] {f.description}")
-                click.echo(f.sql)
-                click.echo()
+            # `--output` writes the migration file and stops here.
+            # `--apply` is already rejected alongside `--output`, so
+            # reaching this branch means a pure dry-run-to-file.
+            if output_path is not None:
+                migration = render_migration(
+                    fixes, tool_version=__version__
+                )
+                try:
+                    Path(output_path).write_text(
+                        migration, encoding="utf-8"
+                    )
+                except OSError as exc:
+                    raise ToolError(
+                        f"cannot write fixes to {output_path}: {exc}"
+                    ) from exc
+                click.echo(
+                    f"pgrls: wrote {len(fixes)} "
+                    f"fix{'es' if len(fixes) != 1 else ''} to "
+                    f"{output_path}.",
+                    err=True,
+                )
+                return
+
+            # Otherwise the SQL bodies + their `-- [rule]
+            # description` comments go to stdout so `pgrls fix >
+            # migration.sql` still produces a clean, paste-able
+            # script.
+            click.echo(render_fixes(fixes))
 
             if apply:
                 with conn.cursor() as cur:

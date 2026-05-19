@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.28] - 2026-05-18
+
+### Added
+- **`pgrls fix --output <file>`.** Writes the remediation SQL to
+  a migration-ready `.sql` script — a header naming the
+  generating pgrls version and the fix count, followed by one
+  `-- [rule] description` comment per statement — instead of
+  printing it to stdout. Hand the file to your migration tool,
+  or review it and run it with `psql -f`.
+
+  The file is deterministic: the header carries no timestamp, so
+  regenerating `pgrls fix --output` against an unchanged schema
+  produces a byte-identical file — a committed migration diffs
+  cleanly. `--output` cannot be combined with `--apply` (one
+  writes a migration to apply later, the other executes
+  immediately); pgrls rejects the pair with a clear error. When
+  there are no auto-fixable findings, no file is written.
+
 ## [0.5.27] - 2026-05-18
 
 ### Added

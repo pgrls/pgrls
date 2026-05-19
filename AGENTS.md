@@ -1962,13 +1962,25 @@ Same `schema.view` shape as VIEW001 / VIEW002 / VIEW003.
 
 `pgrls fix` generates remediation SQL for the rules whose fix is
 mechanical. Default mode is dry-run — it prints the SQL but does
-not modify the database. Pass `--apply` to execute.
+not modify the database. Pass `--apply` to execute, or `--output
+<file>` to write the SQL to a file instead of stdout.
 
 ```bash
 pgrls fix --database-url "$DATABASE_URL"               # dry-run
 pgrls fix --database-url "$DATABASE_URL" --apply       # execute
 pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
+pgrls fix --database-url "$DATABASE_URL" --output migration.sql
 ```
+
+`--output <file>` writes the remediation SQL to a migration-ready
+`.sql` script — a header naming the pgrls version and the fix
+count, then one `-- [rule] description` comment per statement —
+instead of printing to stdout. The file is deterministic (no
+timestamp), so regenerating against an unchanged schema produces
+a byte-identical result; a committed migration diffs cleanly.
+`--output` cannot be combined with `--apply`: one writes a
+migration to run later, the other executes immediately. When
+there are no fixes, no file is written.
 
 Currently fixable:
 
