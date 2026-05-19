@@ -82,12 +82,15 @@ def test_explain_no_argument_lists_the_rule_catalog() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["explain"])
     assert result.exit_code == 0, result.output
-    # Every registered rule must appear in the catalog — both its
-    # ID and its title. Mirrors the every-rule contract test
-    # below for the per-rule path.
+    # Every registered rule must appear in the catalog — ID,
+    # bracketed severity, and title. Mirrors the every-rule
+    # contract test below for the per-rule path.
     for rule in all_rules():
         assert rule.id in result.output, f"{rule.id} missing"
         assert rule.title in result.output, f"{rule.id} title missing"
+        assert f"[{rule.severity}]" in result.output, (
+            f"{rule.id} severity missing"
+        )
     # And a pointer to the per-rule path.
     assert "pgrls explain <RULE>" in result.output
 

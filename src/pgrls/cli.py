@@ -1422,11 +1422,11 @@ def explain(rule_id: str | None) -> None:
     SEC023`, `pgrls explain perf001`), prints the rule's own
     reference documentation: what it flags, why that is a
     problem, how detection works, what is deliberately out of
-    scope, and how to allowlist an intentional case.
+    scope, and how to allowlist an intentional case. Exits 2 if
+    RULE is not a known rule.
 
     Reads nothing but pgrls's own rule catalog — no database
-    connection and no config file, so it works anywhere. Exits 2
-    if RULE is not a known rule.
+    connection and no config file, so it works anywhere.
     """
     rules = all_rules()
     if rule_id is None:
