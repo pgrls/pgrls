@@ -157,8 +157,9 @@ class PERF003:
                 ))
         return out
 
+    @staticmethod
     def _unindexed_columns(
-        self, table: Table, policy: Any
+        table: Table, policy: Any
     ) -> list[str]:
         """Collect own-table columns referenced by the policy that
         lack a leading-column index.

@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.30] - 2026-05-18
+
+### Added
+- **`pgrls fix` now auto-remediates PERF003** ("policy predicate
+  column without a leading-column index"). The fixer emits
+  `CREATE INDEX ON <schema>.<table> (<column>);` for each policy-
+  predicate column the rule flags as unindexed. `pgrls fix` now
+  covers SEC001, SEC002, SEC006, PERF001, PERF003, HYG003,
+  VIEW001, and VIEW002.
+
+  One index resolves the finding for every policy that filters on
+  that column, so the fixer deduplicates: two policies filtering
+  the same unindexed column produce two PERF003 violations but a
+  single `CREATE INDEX`. The statement is a plain `CREATE INDEX`,
+  not `CREATE INDEX CONCURRENTLY` — a plain build composes with
+  `pgrls fix --apply`'s single all-or-nothing transaction, which
+  `CONCURRENTLY` cannot run inside. A plain build locks writes on
+  the table while the index builds; each Fix's description says
+  so and points at `CREATE INDEX CONCURRENTLY` (via `pgrls fix
+  --output`) as the production-safe path for a large, busy table.
+
 ## [0.5.29] - 2026-05-18
 
 ### Changed

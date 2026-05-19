@@ -58,6 +58,7 @@ def default_fixers() -> list[Fixer]:
     """Every fixer the project ships."""
     from pgrls.fixers.hyg003 import HYG003Fixer
     from pgrls.fixers.perf001 import PERF001Fixer
+    from pgrls.fixers.perf003 import PERF003Fixer
     from pgrls.fixers.sec001 import SEC001Fixer
     from pgrls.fixers.sec002 import SEC002Fixer
     from pgrls.fixers.sec006 import SEC006Fixer
@@ -69,6 +70,7 @@ def default_fixers() -> list[Fixer]:
         SEC002Fixer(),
         SEC006Fixer(),
         PERF001Fixer(),
+        PERF003Fixer(),
         HYG003Fixer(),
         VIEW001Fixer(),
         VIEW002Fixer(),

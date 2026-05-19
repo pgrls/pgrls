@@ -35,7 +35,7 @@ from pgrls.diff import (
     diff_schemas,
 )
 
-__version__ = "0.5.29"
+__version__ = "0.5.30"
 
 __all__ = [
     "Change",
