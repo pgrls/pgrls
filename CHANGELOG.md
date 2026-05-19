@@ -10,6 +10,46 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.34] - 2026-05-19
+
+### Added
+- **SEC024 — policy calls current_setting() with an unqualified
+  parameter name** (severity: info). Flags a policy whose
+  `USING` / `WITH CHECK` calls `current_setting()` with a
+  string-literal parameter name containing no `.`. A customized
+  run-time parameter (the per-request context an RLS policy
+  reads) must be **qualified** — `prefix.name` — to namespace it
+  away from Postgres's own settings; an unqualified name cannot
+  be `SET` as a customized parameter at all. So the policy reads
+  either a built-in server setting or a name that can never be
+  set, and the predicate quietly matches no rows (two-argument
+  form) or errors on every query (one-argument, which SEC019
+  separately flags). This is almost always a dropped prefix:
+  the application sets `app.tenant_id` but the policy reads
+  `tenant_id`.
+
+  Detection walks the parsed policy expression for
+  `current_setting` calls (including those wrapped in `(SELECT
+  current_setting(...))`) and inspects the first argument.
+  Postgres deparses a string-literal argument with an explicit
+  `::text` cast, so the introspected node is a `TypeCast`
+  wrapping the `A_Const`; SEC024 unwraps it before reading the
+  literal. Dynamic names — a column reference, a concatenation
+  — are not inspected. Severity is **info**: a policy may key
+  off a built-in parameter (e.g. `application_name`), which is
+  unqualified by definition, so SEC024 surfaces the unqualified
+  shape as a review nudge rather than a hard finding. Allowlist
+  by qualified policy ID (`schema.table.policy_name`). SEC019
+  (arity) and SEC024 (name shape) are orthogonal; a single
+  policy can carry one without the other or trip both.
+
+### Changed
+- **Rule count: thirty-three → thirty-four** (`SEC001`–`SEC024`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC024 reads the policy's parsed
+  `USING` / `WITH CHECK` expression, which has been part of the
+  snapshot format since v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.33] - 2026-05-19
 
 ### Added
