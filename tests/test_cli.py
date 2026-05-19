@@ -75,12 +75,24 @@ def test_explain_unknown_rule_exits_two() -> None:
     assert "SEC999" in result.output
 
 
-def test_explain_requires_a_rule_argument() -> None:
-    # RULE is a required argument; the bare command is a usage
-    # error, not a silent success.
+def test_explain_no_argument_lists_the_rule_catalog() -> None:
+    # Bare `pgrls explain` lists every registered rule (ID,
+    # severity, title) as a quick at-a-glance catalog. RULE is
+    # optional; the per-rule reference is one argument away.
     runner = CliRunner()
     result = runner.invoke(main, ["explain"])
-    assert result.exit_code != 0
+    assert result.exit_code == 0, result.output
+    # Every registered rule must appear in the catalog — ID,
+    # bracketed severity, and title. Mirrors the every-rule
+    # contract test below for the per-rule path.
+    for rule in all_rules():
+        assert rule.id in result.output, f"{rule.id} missing"
+        assert rule.title in result.output, f"{rule.id} title missing"
+        assert f"[{rule.severity}]" in result.output, (
+            f"{rule.id} severity missing"
+        )
+    # And a pointer to the per-rule path.
+    assert "pgrls explain <RULE>" in result.output
 
 
 def test_explain_covers_every_registered_rule() -> None:

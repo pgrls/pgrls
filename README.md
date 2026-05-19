@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.35.** Thirty-four lint rules (SEC001–SEC024, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.36.** Thirty-four lint rules (SEC001–SEC024, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-four rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -275,8 +275,10 @@ pattern documentation.
 
 Run `pgrls explain <RULE>` (for example `pgrls explain SEC023`) to print any
 rule's full rationale — what it flags, why it matters, how detection works,
-and how to allowlist a false positive — on the command line. It reads only
-pgrls's built-in rule catalog, so it needs no database connection.
+and how to allowlist a false positive — on the command line. Bare
+`pgrls explain` (no argument) lists the catalog: one line per rule with its
+severity and title. Both forms read only pgrls's built-in rule catalog, so
+they need no database connection.
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.

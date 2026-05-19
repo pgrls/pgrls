@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.36] - 2026-05-19
+
+### Added
+- **`pgrls explain` (no argument) lists the rule catalog.** A
+  one-line-per-rule view of the shipping rule set — ID,
+  severity, and title, padded into columns — handy for scanning
+  what pgrls covers at a glance. The per-rule reference is one
+  argument away (`pgrls explain SEC023`). Both forms read only
+  pgrls's built-in rule catalog, so they work offline anywhere.
+
+  Previously bare `pgrls explain` was a usage error (the RULE
+  argument was required); the argument is now optional and
+  defaults to "list the catalog".
+
 ## [0.5.35] - 2026-05-19
 
 ### Added
