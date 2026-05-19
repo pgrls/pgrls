@@ -38,8 +38,9 @@ breaking changes — they will be called out in this file.
 - **Rule count: thirty-two → thirty-three** (`SEC001`–`SEC023`,
   `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
   snapshot-format change — SEC023 reads the policy `roles` list
-  and the `BYPASSRLS` role set, both already captured since v1, so
-  `SNAPSHOT_VERSION` stays at 10.
+  and the top-level `bypassrls_roles` set, both already part of
+  the snapshot format (`bypassrls_roles` since v9, added with
+  SEC016), so `SNAPSHOT_VERSION` stays at 10.
 
 ## [0.5.30] - 2026-05-18
 

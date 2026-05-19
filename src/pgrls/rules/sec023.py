@@ -21,9 +21,8 @@ The danger is a **false sense of security**. The author named the
 role deliberately — they were thinking about that role's access —
 and wrote a predicate to scope it. Nothing in the policy reveals
 that the role ignores the predicate; the bypass lives in a role
-attribute SEC023's siblings (SEC001–SEC015) never inspect. The
-policy passes review, and the role silently sees every tenant's
-rows. The other reading is milder — the author *wanted* the role
+attribute the policy text never mentions. The policy passes
+review, and the role silently sees every tenant's rows. The other reading is milder — the author *wanted* the role
 unconstrained and the `TO` clause is simply redundant noise — but
 pgrls cannot tell the two apart, and both are worth surfacing.
 
