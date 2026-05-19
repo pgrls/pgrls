@@ -22,7 +22,9 @@ role deliberately — they were thinking about that role's access —
 and wrote a predicate to scope it. Nothing in the policy reveals
 that the role ignores the predicate; the bypass lives in a role
 attribute the policy text never mentions. The policy passes
-review, and the role silently sees every tenant's rows. The other reading is milder — the author *wanted* the role
+review, and the role silently sees every tenant's rows.
+
+The other reading is milder — the author *wanted* the role
 unconstrained and the `TO` clause is simply redundant noise — but
 pgrls cannot tell the two apart, and both are worth surfacing.
 
