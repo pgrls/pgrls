@@ -158,7 +158,8 @@ Every rule below is also available from the command line:
 `pgrls explain <RULE>` (e.g. `pgrls explain SEC023`, case-insensitive)
 prints that rule's severity, rationale, detection logic, and
 allowlisting guidance — the same reference, with no database
-connection required.
+connection required. Bare `pgrls explain` (no argument) lists the
+catalog: one line per rule with its severity and title.
 
 <a id="rule-sec001"></a>
 

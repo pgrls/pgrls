@@ -1410,13 +1410,17 @@ def cache_prune(assume_yes: bool) -> None:
 
 
 @main.command()
-@click.argument("rule_id", metavar="RULE")
-def explain(rule_id: str) -> None:
-    """Print a lint rule's rationale, severity, and detection logic.
+@click.argument("rule_id", metavar="RULE", required=False, default=None)
+def explain(rule_id: str | None) -> None:
+    """Print a lint rule's reference, or list the rule catalog.
 
-    RULE is a rule ID, matched case-insensitively — `pgrls explain
-    SEC023`, `pgrls explain perf001`. The explanation is the rule's
-    own reference documentation: what it flags, why that is a
+    With no argument, `pgrls explain` prints the catalog — one
+    line per rule (ID, severity, title) — so you can scan the
+    shipping rule set at a glance.
+
+    With a RULE argument (case-insensitive — `pgrls explain
+    SEC023`, `pgrls explain perf001`), prints the rule's own
+    reference documentation: what it flags, why that is a
     problem, how detection works, what is deliberately out of
     scope, and how to allowlist an intentional case.
 
@@ -1425,6 +1429,17 @@ def explain(rule_id: str) -> None:
     if RULE is not a known rule.
     """
     rules = all_rules()
+    if rule_id is None:
+        # Catalog mode — one line per rule. Severity is padded so
+        # IDs and titles line up across the 34 rows.
+        for r in rules:
+            sev = f"[{r.severity}]"
+            click.echo(f"{r.id:<8} {sev:<9} {r.title}")
+        click.echo()
+        click.echo(
+            "Run `pgrls explain <RULE>` for the full reference of any rule."
+        )
+        return
     normalized = rule_id.strip().upper()
     rule = next((r for r in rules if r.id == normalized), None)
     if rule is None:
