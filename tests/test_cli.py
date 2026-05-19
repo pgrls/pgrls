@@ -1401,6 +1401,64 @@ def test_fix_emits_sec006_with_check(pg_url: str, apply_sql) -> None:
     assert "dry-run" in result.output
 
 
+def test_fix_emits_sec020_with_check(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` picks up the SEC020 fixer and emits an
+    # ALTER POLICY … WITH CHECK that replaces a constant-true
+    # WITH CHECK with the policy's own USING predicate.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec020 (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_sec020 ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec020 FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec020
+            FOR ALL TO postgres USING (id > 0) WITH CHECK (true);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert "ALTER POLICY p ON public.fix_sec020" in result.output
+    assert "WITH CHECK (id > 0)" in result.output
+    assert "dry-run" in result.output
+
+
+def test_fix_apply_executes_sec020_with_check(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec020_apply (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_sec020_apply ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec020_apply FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec020_apply
+            FOR ALL TO postgres USING (id > 0) WITH CHECK (true);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "SEC020", "--apply"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 1 fix" in result.output
+
+    # The constant-true WITH CHECK was replaced by the USING
+    # predicate — pg_policies.with_check now carries `id > 0`.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT with_check FROM pg_catalog.pg_policies "
+                "WHERE schemaname = 'public' "
+                "AND tablename = 'fix_sec020_apply' "
+                "AND policyname = 'p'"
+            )
+            (with_check,) = cur.fetchone()
+    assert with_check is not None
+    assert "id > 0" in with_check
+    assert "true" not in with_check.lower()
+
+
 def test_fix_emits_hyg003_drop_policy(pg_url: str, apply_sql) -> None:
     # `pgrls fix` picks up the HYG003 fixer and emits a DROP POLICY
     # for a policy that exactly duplicates another on the same

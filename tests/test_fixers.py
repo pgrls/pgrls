@@ -17,6 +17,7 @@ from pgrls.fixers.perf003 import PERF003Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
 from pgrls.fixers.sec006 import SEC006Fixer
+from pgrls.fixers.sec020 import SEC020Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
 from pgrls.model import Index, Policy, Schema, Table, View
@@ -945,6 +946,159 @@ def test_sec006_fix_raises_on_malformed_allowlist() -> None:
         SEC006Fixer().fix(schema, {"allowlist": [" public.t.p "]})
 
 
+# ---------- SEC020 fixer ----------
+
+
+def test_sec020_fix_replaces_constant_true_with_check() -> None:
+    schema = _wrap_policy(
+        _policy("user_id = 1", command="ALL", with_check="true")
+    )
+    fixes = SEC020Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC020"
+    assert f.location == "public.t.p"
+    assert "ALTER POLICY p ON public.t" in f.sql
+    assert "WITH CHECK (user_id = 1)" in f.sql
+
+
+def test_sec020_fix_silent_when_with_check_is_a_real_predicate() -> None:
+    # WITH CHECK already mirrors a real predicate — nothing to fix.
+    p = _policy("user_id = 1", command="ALL", with_check="user_id = 1")
+    assert SEC020Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec020_fix_silent_when_with_check_absent() -> None:
+    # A missing WITH CHECK is SEC006's surface, not SEC020's.
+    schema = _wrap_policy(_policy("user_id = 1", command="ALL"))
+    assert SEC020Fixer().fix(schema, {}) == []
+
+
+def test_sec020_fix_silent_when_using_is_constant_true() -> None:
+    # USING (true) is a fully-open policy — SEC008's concern. With
+    # no real read predicate there is no asymmetry to remediate.
+    p = _policy("true", command="ALL", with_check="true")
+    assert SEC020Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec020_fix_silent_when_using_absent() -> None:
+    # A FOR INSERT policy has no USING to mirror into WITH CHECK.
+    p = _policy(None, command="INSERT", with_check="true")
+    assert SEC020Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec020_fix_fires_on_for_update_policy() -> None:
+    schema = _wrap_policy(
+        _policy("user_id = 1", command="UPDATE", with_check="true")
+    )
+    fixes = SEC020Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert "WITH CHECK (user_id = 1)" in fixes[0].sql
+
+
+def test_sec020_fix_fixes_restrictive_policy() -> None:
+    # Unlike the SEC006 fixer, SEC020's fixes restrictive policies
+    # too: a restrictive policy's WITH CHECK (true) is a no-op
+    # write check (restrictive AND true), and mirroring USING turns
+    # it into a real constraint — a meaningful, correct fix.
+    p = _policy(
+        "user_id = 1", command="ALL", with_check="true", permissive=False
+    )
+    fixes = SEC020Fixer().fix(_wrap_policy(p), {})
+    assert len(fixes) == 1
+    assert "WITH CHECK (user_id = 1)" in fixes[0].sql
+
+
+def test_sec020_fix_respects_allowlist() -> None:
+    schema = _wrap_policy(
+        _policy("user_id = 1", command="ALL", with_check="true")
+    )
+    assert SEC020Fixer().fix(schema, {"allowlist": ["public.t.p"]}) == []
+
+
+def test_sec020_fix_emits_one_per_offending_policy() -> None:
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                columns=("id", "user_id"),
+                policies=(
+                    _policy(
+                        "user_id = 1",
+                        name="bad_a",
+                        command="ALL",
+                        with_check="true",
+                    ),
+                    _policy(
+                        "user_id = 1",
+                        name="ok",
+                        command="ALL",
+                        with_check="user_id = 1",
+                    ),
+                    _policy(
+                        "user_id = 2",
+                        name="bad_b",
+                        command="UPDATE",
+                        with_check="true",
+                    ),
+                ),
+            ),
+        )
+    )
+    fixes = SEC020Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.t.bad_a",
+        "public.t.bad_b",
+    ]
+
+
+def test_sec020_fix_quotes_policy_and_table_when_required() -> None:
+    p = _policy(
+        "user_id = 1", name="My Policy", command="ALL", with_check="true"
+    )
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="MixedCase Table",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(p,),
+                columns=("id", "user_id"),
+            ),
+        )
+    )
+    sql = SEC020Fixer().fix(schema, {})[0].sql
+    assert 'ALTER POLICY "My Policy"' in sql
+    assert 'ON public."MixedCase Table"' in sql
+
+
+def test_sec020_fix_round_trips_using_through_pglast() -> None:
+    # The USING predicate is re-emitted via RawStream, not echoed
+    # verbatim — a non-canonical `user_id=1` comes back normalized.
+    schema = _wrap_policy(
+        _policy("user_id=1", command="ALL", with_check="true")
+    )
+    sql = SEC020Fixer().fix(schema, {})[0].sql
+    assert "WITH CHECK (user_id = 1)" in sql
+
+
+def test_sec020_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with SEC020's strict parser, so a
+    # malformed allowlist raises TypeError — `pgrls fix` surfaces
+    # it as a ToolError, exactly as `pgrls lint` rejects it.
+    schema = _wrap_policy(
+        _policy("user_id = 1", command="ALL", with_check="true")
+    )
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC020Fixer().fix(schema, {"allowlist": "public.t.p"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC020Fixer().fix(schema, {"allowlist": [" public.t.p "]})
+
+
 # ---------- HYG003 fixer ----------
 
 
@@ -1171,6 +1325,7 @@ def test_default_fixers_registers_every_shipping_fixer() -> None:
         "SEC001",
         "SEC002",
         "SEC006",
+        "SEC020",
         "PERF001",
         "PERF003",
         "HYG003",
