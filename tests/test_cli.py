@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 
@@ -95,6 +96,17 @@ def test_explain_covers_every_registered_rule() -> None:
         assert rule.title in result.output
         assert len(result.output.strip().splitlines()) > 2, (
             f"{rule.id} printed no rationale body"
+        )
+        # `explain` drops the docstring's leading "<ID> — <title>."
+        # line so the printed header is not immediately restated.
+        # Pin that strip: the exact first line must be absent from
+        # the output, or a silent strip regression would go unseen.
+        module = inspect.getmodule(type(rule))
+        first_line = (
+            (module.__doc__ if module else None) or ""
+        ).strip().splitlines()[0]
+        assert first_line not in result.output, (
+            f"{rule.id}: docstring title line was not stripped"
         )
 
 
