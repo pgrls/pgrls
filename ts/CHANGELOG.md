@@ -169,5 +169,4 @@ Implements the cross-language Layer 1 protocol at `PROTOCOL_VERSION = 1`.
 
 ### See also
 
-- Design doc: [`docs/v0.6.0-typescript-port-design.md`](https://github.com/pgrls/pgrls/blob/main/docs/v0.6.0-typescript-port-design.md)
 - Layer 1 protocol: [`docs/pgrls-test-protocol.md`](https://github.com/pgrls/pgrls/blob/main/docs/pgrls-test-protocol.md)
