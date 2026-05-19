@@ -13,12 +13,13 @@ from pgrls.fixers import (
 )
 from pgrls.fixers.hyg003 import HYG003Fixer
 from pgrls.fixers.perf001 import PERF001Fixer
+from pgrls.fixers.perf003 import PERF003Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
 from pgrls.fixers.sec006 import SEC006Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
-from pgrls.model import Policy, Schema, Table, View
+from pgrls.model import Index, Policy, Schema, Table, View
 
 
 # ---------- SEC002 fixer ----------
@@ -709,6 +710,13 @@ def _wrap_policy(policy: Policy) -> Schema:
                 force_rls=True,
                 policies=(policy,),
                 columns=("id", "user_id"),
+                # Index the candidate policy columns so the PERF003
+                # fixer stays silent here — PERF003 is exercised in
+                # its own section, not incidentally via _wrap_policy.
+                indexes=(
+                    _idx("id", name="t_id_idx"),
+                    _idx("user_id", name="t_user_id_idx"),
+                ),
             ),
         )
     )
@@ -1104,6 +1112,9 @@ def test_generate_fixes_returns_union_sorted_by_rule_id_and_location() -> None:
                 force_rls=False,  # SEC002
                 policies=(_policy("user_id = auth.uid()"),),  # PERF001
                 columns=("id", "user_id"),
+                # `user_id` indexed so PERF003 stays silent — this
+                # test pins generate_fixes' union/sort, not PERF003.
+                indexes=(_idx("user_id", name="z_user_id_idx"),),
             ),
             _table(name="a_table", rls=True, force=False),  # SEC002
         )
@@ -1161,6 +1172,7 @@ def test_default_fixers_registers_every_shipping_fixer() -> None:
         "SEC002",
         "SEC006",
         "PERF001",
+        "PERF003",
         "HYG003",
         "VIEW001",
         "VIEW002",
@@ -1684,3 +1696,203 @@ def test_render_migration_handles_empty_fixes() -> None:
     out = render_migration([], tool_version="1.0")
     assert "0 fixes." in out
     assert out.endswith("\n")
+
+
+# ---------- PERF003 fixer ----------
+
+
+def _idx(*columns: str, name: str = "i") -> Index:
+    return Index(
+        name=name,
+        access_method="btree",
+        columns=columns,
+        is_unique=False,
+        is_partial=False,
+    )
+
+
+def _perf_table(
+    *policies: Policy,
+    name: str = "t",
+    schema: str = "public",
+    rls: bool = True,
+    indexes: tuple[Index, ...] = (),
+) -> Table:
+    return Table(
+        schema=schema,
+        name=name,
+        rls_enabled=rls,
+        force_rls=True,
+        policies=policies,
+        indexes=indexes,
+        columns=("id", "tenant_id", "owner"),
+    )
+
+
+def test_perf003_fix_emits_create_index_for_unindexed_column() -> None:
+    schema = Schema(tables=(_perf_table(
+        _policy("tenant_id = current_setting('app.t', true)", name="p"),
+    ),))
+    fixes = PERF003Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "PERF003"
+    assert f.sql == "CREATE INDEX ON public.t (tenant_id);"
+    assert f.location == "public.t (tenant_id)"
+
+
+def test_perf003_fix_silent_when_column_has_leading_index() -> None:
+    schema = Schema(tables=(_perf_table(
+        _policy("tenant_id = current_setting('app.t', true)"),
+        indexes=(_idx("tenant_id"),),
+    ),))
+    assert PERF003Fixer().fix(schema, {}) == []
+
+
+def test_perf003_fix_silent_when_rls_disabled() -> None:
+    # PERF003's domain is policy-driven filtering — RLS off, no fix.
+    schema = Schema(tables=(_perf_table(
+        _policy("tenant_id = current_setting('app.t', true)"),
+        rls=False,
+    ),))
+    assert PERF003Fixer().fix(schema, {}) == []
+
+
+def test_perf003_fix_silent_when_rls_enabled_but_no_policies() -> None:
+    # RLS on but no policies — nothing filters through a predicate,
+    # so there is no column to index. Mirrors the rule: the
+    # per-policy loop is empty and no Fix is emitted.
+    schema = Schema(tables=(_perf_table(),))
+    assert PERF003Fixer().fix(schema, {}) == []
+
+
+def test_perf003_fix_emits_per_table_for_same_column_on_two_tables() -> None:
+    # The same unindexed column on two tables is two separate
+    # findings — the fixer keys fixes on (table, column), so it
+    # emits one CREATE INDEX per table, not a single dedup'd one.
+    pred = "tenant_id = current_setting('app.t', true)"
+    schema = Schema(tables=(
+        _perf_table(_policy(pred), name="a"),
+        _perf_table(_policy(pred), name="b"),
+    ))
+    fixes = PERF003Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "CREATE INDEX ON public.a (tenant_id);",
+        "CREATE INDEX ON public.b (tenant_id);",
+    ]
+
+
+def test_perf003_fix_dedupes_column_across_policies() -> None:
+    # Two policies filter the same unindexed column — the rule fires
+    # twice but one index resolves both, so the fixer emits one Fix.
+    schema = Schema(tables=(_perf_table(
+        _policy(
+            "tenant_id = current_setting('app.t', true)", name="read"
+        ),
+        _policy(
+            "tenant_id = current_setting('app.t', true)",
+            name="write",
+            command="ALL",
+            with_check="tenant_id = current_setting('app.t', true)",
+        ),
+    ),))
+    fixes = PERF003Fixer().fix(schema, {})
+    assert [f.sql for f in fixes] == [
+        "CREATE INDEX ON public.t (tenant_id);"
+    ]
+
+
+def test_perf003_fix_emits_one_index_per_unindexed_column() -> None:
+    # A composite predicate over two unindexed columns → two indexes.
+    schema = Schema(tables=(_perf_table(
+        _policy(
+            "tenant_id = current_setting('a', true) "
+            "AND owner = current_setting('u', true)"
+        ),
+    ),))
+    fixes = PERF003Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "CREATE INDEX ON public.t (owner);",
+        "CREATE INDEX ON public.t (tenant_id);",
+    ]
+
+
+def test_perf003_fix_skips_the_already_indexed_column() -> None:
+    schema = Schema(tables=(_perf_table(
+        _policy(
+            "tenant_id = current_setting('a', true) "
+            "AND owner = current_setting('u', true)"
+        ),
+        indexes=(_idx("tenant_id"),),
+    ),))
+    fixes = PERF003Fixer().fix(schema, {})
+    assert [f.sql for f in fixes] == ["CREATE INDEX ON public.t (owner);"]
+
+
+def test_perf003_fix_respects_allowlist() -> None:
+    schema = Schema(tables=(_perf_table(
+        _policy("tenant_id = current_setting('a', true)", name="p"),
+    ),))
+    assert PERF003Fixer().fix(
+        schema, {"allowlist": ["public.t.p"]}
+    ) == []
+
+
+def test_perf003_fix_indexes_column_kept_in_scope_by_a_live_policy() -> None:
+    # `tenant_id` is referenced by an allowlisted policy AND a
+    # non-allowlisted one — the live policy keeps it in scope, so
+    # the index is still emitted.
+    schema = Schema(tables=(_perf_table(
+        _policy(
+            "tenant_id = current_setting('a', true)", name="exempt"
+        ),
+        _policy(
+            "tenant_id = current_setting('a', true)", name="active"
+        ),
+    ),))
+    fixes = PERF003Fixer().fix(
+        schema, {"allowlist": ["public.t.exempt"]}
+    )
+    assert [f.sql for f in fixes] == [
+        "CREATE INDEX ON public.t (tenant_id);"
+    ]
+
+
+def test_perf003_fix_quotes_table_name_when_required() -> None:
+    schema = Schema(tables=(
+        Table(
+            schema="public",
+            name="MixedCase",
+            rls_enabled=True,
+            force_rls=True,
+            columns=("id", "tenant_id"),
+            policies=(
+                _policy("tenant_id = current_setting('a', true)"),
+            ),
+            indexes=(),
+        ),
+    ))
+    sql = PERF003Fixer().fix(schema, {})[0].sql
+    assert sql == 'CREATE INDEX ON public."MixedCase" (tenant_id);'
+
+
+def test_perf003_fix_description_flags_lock_and_concurrently() -> None:
+    schema = Schema(tables=(_perf_table(
+        _policy("tenant_id = current_setting('a', true)"),
+    ),))
+    [f] = PERF003Fixer().fix(schema, {})
+    assert "CONCURRENTLY" in f.description
+    assert "tenant_id" in f.description
+
+
+def test_perf003_fix_raises_on_malformed_allowlist() -> None:
+    # The fixer validates with PERF003's strict parser
+    # (parse_policy_id_allowlist) — a malformed allowlist raises,
+    # surfaced by the `fix` CLI exactly as `pgrls lint` rejects it.
+    schema = Schema(tables=(_perf_table(
+        _policy("tenant_id = current_setting('a', true)", name="p"),
+    ),))
+    with pytest.raises(TypeError, match="allowlist"):
+        PERF003Fixer().fix(schema, {"allowlist": "public.t.p"})
+    with pytest.raises(TypeError, match="allowlist"):
+        PERF003Fixer().fix(schema, {"allowlist": [" public.t.p "]})

@@ -1155,7 +1155,7 @@ def test_fix_apply_executes_sec002_sql(
 ) -> None:
     apply_sql(
         """
-        CREATE TABLE public.fix_apply_target (id INT);
+        CREATE TABLE public.fix_apply_target (id INT PRIMARY KEY);
         ALTER TABLE public.fix_apply_target ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_apply_target
             FOR SELECT TO postgres USING (id > 0);
@@ -1218,7 +1218,7 @@ def test_fix_no_violations_emits_clear_message(
 ) -> None:
     apply_sql(
         """
-        CREATE TABLE public.fix_clean (id INT);
+        CREATE TABLE public.fix_clean (id INT PRIMARY KEY);
         ALTER TABLE public.fix_clean ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.fix_clean FORCE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_clean
@@ -1350,7 +1350,7 @@ def test_fix_apply_drops_duplicate_hyg003_policy(
     # and leaves the original in place.
     apply_sql(
         """
-        CREATE TABLE public.fix_hyg003_apply (id INT);
+        CREATE TABLE public.fix_hyg003_apply (id INT PRIMARY KEY);
         ALTER TABLE public.fix_hyg003_apply ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.fix_hyg003_apply FORCE ROW LEVEL SECURITY;
         CREATE POLICY p_a ON public.fix_hyg003_apply
@@ -1379,11 +1379,71 @@ def test_fix_apply_drops_duplicate_hyg003_policy(
             assert [r[0] for r in cur.fetchall()] == ["p_a"]
 
 
+def test_fix_emits_perf003_create_index(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` picks up the PERF003 fixer and emits a plain
+    # CREATE INDEX for a policy-predicate column that has no
+    # leading-column index.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_perf003 (id INT, tenant_id TEXT);
+        ALTER TABLE public.fix_perf003 ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_perf003 FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_perf003
+            FOR ALL TO postgres
+            USING (tenant_id = (SELECT current_setting('app.t', true)))
+            WITH CHECK (tenant_id = (SELECT current_setting('app.t', true)));
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert (
+        "CREATE INDEX ON public.fix_perf003 (tenant_id);"
+        in result.output
+    )
+    assert "dry-run" in result.output
+
+
+def test_fix_apply_creates_perf003_index(pg_url: str, apply_sql) -> None:
+    # The PERF003 fixer emits a plain (non-CONCURRENT) CREATE INDEX,
+    # so it runs inside `--apply`'s single transaction. Verify the
+    # index actually lands on the table.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_perf003_apply (id INT, tenant_id TEXT);
+        ALTER TABLE public.fix_perf003_apply ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_perf003_apply FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_perf003_apply
+            FOR ALL TO postgres
+            USING (tenant_id = (SELECT current_setting('app.t', true)))
+            WITH CHECK (tenant_id = (SELECT current_setting('app.t', true)));
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--apply"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 1 fix" in result.output
+
+    # The index now exists on the table.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname = 'public' "
+                "AND tablename = 'fix_perf003_apply'"
+            )
+            defs = [r[0] for r in cur.fetchall()]
+    assert any("tenant_id" in d for d in defs), defs
+
+
 def test_fix_apply_is_idempotent(pg_url: str, apply_sql) -> None:
     # First --apply executes; second --apply finds nothing to do.
     apply_sql(
         """
-        CREATE TABLE public.fix_idempotent (id INT);
+        CREATE TABLE public.fix_idempotent (id INT PRIMARY KEY);
         ALTER TABLE public.fix_idempotent ENABLE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_idempotent
             FOR SELECT TO postgres USING (id > 0);
