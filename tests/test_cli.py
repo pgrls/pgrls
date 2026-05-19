@@ -1112,6 +1112,20 @@ def test_lint_rule_filter_unknown_rule_errors_clearly(
     assert "unknown rule" in result.output.lower()
     assert "SEC999" in result.output
 
+    # A known rule alongside an unknown does not mask the typo,
+    # and the error lists every unknown ID so a multi-typo command
+    # doesn't need multiple rounds to fix.
+    multi = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--rule", "SEC001", "--rule", "SEC999", "--rule", "BOGUS",
+        ],
+    )
+    assert multi.exit_code == 2
+    assert "SEC999" in multi.output
+    assert "BOGUS" in multi.output
+
 
 def test_lint_rule_filter_repeatable(
     pg_url: str, apply_sql

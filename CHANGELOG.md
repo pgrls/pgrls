@@ -19,7 +19,7 @@ breaking changes — they will be called out in this file.
   while investigating one rule in isolation. The flag mirrors
   `pgrls fix --rule` for CLI consistency:
 
-  ```
+  ```bash
   pgrls lint --rule SEC001 --rule SEC003
   ```
 
