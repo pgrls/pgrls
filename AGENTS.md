@@ -2086,7 +2086,7 @@ Currently fixable:
   WITH CHECK (<the USING predicate>);` for a policy that pairs a
   real `USING` predicate with an explicit `WITH CHECK (true)`,
   replacing the constant-true write check with USING. Unlike the
-  SEC006 fixer it fixes restrictive policies too: a SEC020
+  SEC006 fixer, it also fixes restrictive policies: a SEC020
   finding always has an explicit `WITH CHECK (true)` to replace,
   so mirroring USING is a meaningful tightening whether the
   policy is permissive (the open write side becomes scoped) or

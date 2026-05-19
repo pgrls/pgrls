@@ -66,6 +66,9 @@ class SEC020Fixer:
                 )
                 if policy_id in skip:
                     continue
+                # `_is_open_write_asymmetry` already established that
+                # using_ast is not None, so RawStream has a real
+                # node to render.
                 using_sql = RawStream()(policy.using_ast)
                 sql = (
                     f"ALTER POLICY {quote_ident(policy.name)} "
