@@ -1738,3 +1738,37 @@ def test_fix_dry_run_stdout_ends_without_a_trailing_blank_line(
     assert result.exit_code == 0, result.output
     assert result.stdout.endswith(";\n")
     assert not result.stdout.endswith(";\n\n")
+
+
+def test_fix_rejects_malformed_allowlist_like_lint(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A malformed allowlist must fail `pgrls fix` exactly as it
+    # fails `pgrls lint` — a clear tool error (exit 2), not a
+    # silent "nothing exempt" that could emit (or --apply) more
+    # SQL than the user intended. The fixers validate the
+    # allowlist with the same strict parser the rules use.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_bad_allow (id INT);
+        ALTER TABLE public.fix_bad_allow ENABLE ROW LEVEL SECURITY;
+        """
+    )
+    cfg = tmp_path / "pgrls.toml"
+    # Surrounding whitespace — a malformed SEC002 allowlist entry.
+    cfg.write_text(
+        "[lint.rules.SEC002]\n"
+        'allowlist = [" public.fix_bad_allow "]\n'
+    )
+    runner = CliRunner()
+    lint_result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    fix_result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--config", str(cfg)]
+    )
+    # Both reject it as a tool error (exit 2) and name the allowlist.
+    assert lint_result.exit_code == 2, lint_result.output
+    assert fix_result.exit_code == 2, fix_result.output
+    assert "allowlist" in lint_result.output
+    assert "allowlist" in fix_result.output

@@ -6,13 +6,11 @@ from typing import Any
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table
+from pgrls.rules._allowlist import parse_table_ref_allowlist
 
 
-def _is_allowlisted(table: Table, options: dict[str, Any]) -> bool:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
-        return False
-    return table.name in raw or table.qualified_name in raw
+def _is_allowlisted(table: Table, allowlist: set[str]) -> bool:
+    return table.name in allowlist or table.qualified_name in allowlist
 
 
 class SEC001Fixer:
@@ -21,12 +19,15 @@ class SEC001Fixer:
     def fix(
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Fix]:
+        # Strict allowlist parsing (the same parser SEC001 uses):
+        # a malformed allowlist raises, surfaced by the `fix` CLI.
+        allowlist = parse_table_ref_allowlist("SEC001", options)
         out: list[Fix] = []
         for table in schema.tables:
             # Mirror SEC001's detection: RLS off, not allowlisted.
             if table.rls_enabled:
                 continue
-            if _is_allowlisted(table, options):
+            if _is_allowlisted(table, allowlist):
                 continue
             # Skip partition children. SEC001 flags a child only
             # because an ancestor lacks RLS — or, when the parent

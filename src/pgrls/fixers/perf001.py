@@ -42,6 +42,7 @@ from pglast.stream import RawStream
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the default auth-function set —
 # imported from the rule so a future addition (e.g.
 # `app.current_user_id`) to the rule's defaults can't silently
@@ -56,13 +57,6 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
         # Match PERF001's check; fall back to default rather than fix.
         return set(_DEFAULT_AUTH_FUNCTIONS)
     return set(raw)
-
-
-def _allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
-        return set()
-    return {s for s in raw if isinstance(s, str)}
 
 
 def _funccall_matches(node: Any, names: set[str]) -> bool:
@@ -169,7 +163,9 @@ class PERF001Fixer:
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Fix]:
         names = _parse_auth_functions(options)
-        skip = _allowlist(options)
+        # Strict allowlist parsing (the same parser PERF001 uses):
+        # a malformed allowlist raises, surfaced by the `fix` CLI.
+        skip = parse_policy_id_allowlist("PERF001", options)
 
         out: list[Fix] = []
         for table in schema.tables:

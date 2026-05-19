@@ -40,16 +40,10 @@ from pglast.stream import RawStream
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the write-side command set — imported
 # from the rule so the fixer flags exactly what the rule reports.
 from pgrls.rules.sec006 import _WRITE_COMMANDS
-
-
-def _allowlist(options: dict[str, Any]) -> set[str]:
-    raw = options.get("allowlist", [])
-    if not isinstance(raw, list):
-        return set()
-    return {s for s in raw if isinstance(s, str)}
 
 
 class SEC006Fixer:
@@ -58,7 +52,9 @@ class SEC006Fixer:
     def fix(
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Fix]:
-        skip = _allowlist(options)
+        # Strict allowlist parsing (the same parser SEC006 uses):
+        # a malformed allowlist raises, surfaced by the `fix` CLI.
+        skip = parse_policy_id_allowlist("SEC006", options)
         out: list[Fix] = []
         for table in schema.tables:
             for policy in table.policies:

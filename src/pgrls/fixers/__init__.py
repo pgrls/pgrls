@@ -84,6 +84,11 @@ def generate_fixes(
     """Run every fixer (or just the ones in `rule_filter`) and
     return the union of Fix objects, ordered by (rule_id, location).
 
+    Each fixer validates its rule's `allowlist` option with the
+    rule's strict parser; a malformed allowlist raises `TypeError`,
+    which `pgrls fix` surfaces as a tool error — the same failure
+    `pgrls lint` produces for the same config.
+
     Sort is alphabetical by `rule_id` then `location`. Today's
     fixers emit independent statements (`ALTER TABLE`, `ALTER
     VIEW`, `ALTER POLICY`), so the ordering is correctness-

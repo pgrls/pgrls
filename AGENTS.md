@@ -1982,6 +1982,11 @@ a byte-identical result; a committed migration diffs cleanly.
 migration to run later, the other executes immediately. When
 there are no fixes, no file is written.
 
+Like `pgrls lint`, `pgrls fix` rejects a malformed `allowlist` in
+a `[lint.rules.<ID>]` block with a clear error — the fixers
+validate it with the same strict parser the rules use, so neither
+command silently treats bad config as "nothing exempt".
+
 Currently fixable:
 
 * **SEC001** — emits `ALTER TABLE <schema>.<table> ENABLE ROW

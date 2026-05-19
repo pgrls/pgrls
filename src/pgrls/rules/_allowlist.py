@@ -29,6 +29,11 @@ shape silently. A user copy-pasting an unqualified `users` into
 `[lint.rules.SEC003].allowlist` got no error and no exemption — the
 mismatch was invisible. Centralizing the shape validation here closes
 that footgun for every per-policy rule.
+
+The `pgrls fix` fixers reuse these same parsers, so a malformed
+allowlist fails `pgrls fix` with the same clear error it raises for
+`pgrls lint` — neither command silently treats bad config as
+"nothing exempt".
 """
 from __future__ import annotations
 

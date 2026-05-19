@@ -10,6 +10,25 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.29] - 2026-05-18
+
+### Changed
+- **`pgrls fix` now validates an `allowlist` exactly as `pgrls
+  lint` does.** Each fixer parsed its `[lint.rules.<ID>].allowlist`
+  with a lenient local helper that silently dropped a malformed
+  entry and fell back to "nothing exempt" — so a typo such as a
+  stray-whitespace entry (`" public.t.p "`) or a bare-string
+  `allowlist` made `pgrls lint` hard-error but let `pgrls fix`
+  proceed, emitting (or `--apply`-ing) remediation SQL for an
+  object the user believed was exempt.
+
+  The seven fixers (SEC001, SEC002, SEC006, PERF001, HYG003,
+  VIEW001, VIEW002) now parse the allowlist with the same strict
+  parser their rule uses. A malformed allowlist raises, and
+  `pgrls fix` surfaces it as a clear tool error (exit code 2) —
+  identical to `pgrls lint`. A well-formed allowlist behaves
+  exactly as before; only malformed config is affected.
+
 ## [0.5.28] - 2026-05-18
 
 ### Added
