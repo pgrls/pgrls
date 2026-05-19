@@ -150,6 +150,12 @@ Notes:
 
 ## Rules reference
 
+Every rule below is also available from the command line:
+`pgrls explain <RULE>` (e.g. `pgrls explain SEC023`, case-insensitive)
+prints that rule's severity, rationale, detection logic, and
+allowlisting guidance — the same reference, with no database
+connection required.
+
 <a id="rule-sec001"></a>
 
 ### SEC001 — RLS not enabled on table
