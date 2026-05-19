@@ -2022,9 +2022,10 @@ Currently fixable:
   unindexed column produce two PERF003 findings but a single
   fix. It is a plain `CREATE INDEX`, not `CREATE INDEX
   CONCURRENTLY`: a plain build runs inside `pgrls fix --apply`'s
-  transaction but locks writes on the table while it builds. The
-  Fix description flags that and points to `CONCURRENTLY` (via
-  `pgrls fix --output`) for a large, busy table.
+  transaction — which `CONCURRENTLY` cannot — but locks writes on
+  the table while it builds. The Fix description flags that and
+  points to `CONCURRENTLY` (via `pgrls fix --output`) for a large,
+  busy table.
 * **HYG003** — emits `DROP POLICY <redundant> ON
   <schema>.<table>;` for a policy that is an exact duplicate of
   another on the same table. The fixer groups a table's policies

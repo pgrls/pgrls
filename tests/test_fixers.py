@@ -1758,6 +1758,30 @@ def test_perf003_fix_silent_when_rls_disabled() -> None:
     assert PERF003Fixer().fix(schema, {}) == []
 
 
+def test_perf003_fix_silent_when_rls_enabled_but_no_policies() -> None:
+    # RLS on but no policies — nothing filters through a predicate,
+    # so there is no column to index. Mirrors the rule: the
+    # per-policy loop is empty and no Fix is emitted.
+    schema = Schema(tables=(_perf_table(),))
+    assert PERF003Fixer().fix(schema, {}) == []
+
+
+def test_perf003_fix_emits_per_table_for_same_column_on_two_tables() -> None:
+    # The same unindexed column on two tables is two separate
+    # findings — the fixer keys fixes on (table, column), so it
+    # emits one CREATE INDEX per table, not a single dedup'd one.
+    pred = "tenant_id = current_setting('app.t', true)"
+    schema = Schema(tables=(
+        _perf_table(_policy(pred), name="a"),
+        _perf_table(_policy(pred), name="b"),
+    ))
+    fixes = PERF003Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "CREATE INDEX ON public.a (tenant_id);",
+        "CREATE INDEX ON public.b (tenant_id);",
+    ]
+
+
 def test_perf003_fix_dedupes_column_across_policies() -> None:
     # Two policies filter the same unindexed column — the rule fires
     # twice but one index resolves both, so the fixer emits one Fix.
