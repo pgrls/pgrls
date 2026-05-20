@@ -10,6 +10,39 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.42] - 2026-05-19
+
+### Added
+- **`pgrls fix` now auto-remediates SEC019** ("policy calls
+  current_setting() without the missing_ok argument"). The
+  fixer emits `ALTER POLICY <name> ON <schema>.<table>` with
+  `USING (…)` and/or `WITH CHECK (…)`, rewriting each
+  one-argument `current_setting('x')` call to `current_setting
+  ('x', true)`. The two-argument overload returns NULL on an
+  unset GUC instead of erroring; the rewrite picks the
+  quiet-NULL side, matching the overload most policy sets
+  converge on. `pgrls fix` now covers SEC001, SEC002, SEC006,
+  SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and
+  VIEW002 — ten fixers.
+
+  Only the clause(s) that actually contained a one-argument
+  call are re-emitted in the `ALTER POLICY`, so the produced
+  migration is the minimal diff (USING-only when only USING
+  changed; WITH CHECK-only when only that side changed; both
+  when both changed). The pg_catalog-qualified
+  `pg_catalog.current_setting(...)` form is matched too. The
+  AST mutation happens on a deep-copy of the policy's AST so
+  the rule's `Schema` view stays read-only — fixer invariant.
+
+  SEC019 is **info** severity precisely because the choice
+  between overloads is judgement: the loud raise surfaces a
+  missing-context bug immediately, while the quiet empty
+  result is friendlier but can mask it. The Fix description
+  spells out that the rewrite picks the quiet-NULL side and
+  points operators who genuinely want raise-on-unset at
+  `[lint.rules.SEC019].allowlist`. Run `pgrls fix --check
+  --rule SEC019` first to preview the affected policies.
+
 ## [0.5.41] - 2026-05-19
 
 ### Added
