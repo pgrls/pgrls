@@ -1267,9 +1267,7 @@ shared pool role).
 
 ### SEC019 — Policy calls current_setting() without the missing_ok argument
 
-**Severity:** info. **Auto-fix:** no (whether an unset GUC should
-raise or return NULL is a deliberate behaviour choice — pgrls
-surfaces the one-argument form but will not rewrite it).
+**Severity:** info.
 
 `current_setting(name)` — the one-argument form — raises
 `ERROR: unrecognized configuration parameter "name"` when `name` is
