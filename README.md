@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.40.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.41.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-five rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -113,7 +113,9 @@ pgrls lint --database-url "$DATABASE_URL" --baseline pgrls-baseline.json
 pgrls lint --database-url "$DATABASE_URL" --baseline pgrls-baseline.json
 ```
 
-The first run writes the baseline file and exits `0`. Every later run suppresses findings already recorded and exits nonzero only when a *new* finding appears — so a team can adopt pgrls without fixing the whole backlog up front, then chip away at the baseline over time. Commit the baseline file to the repo. To re-baseline after deliberately accepting changes, delete the file and run again.
+The first run writes the baseline file and exits `0`. Every later run suppresses findings already recorded and exits nonzero only when a *new* finding appears — so a team can adopt pgrls without fixing the whole backlog up front, then chip away at the baseline over time. Commit the baseline file to the repo.
+
+To re-baseline after deliberately accepting new findings, pass `--update-baseline` alongside `--baseline FILE`; the baseline is refreshed in place with the current findings (replace, not merge — stale entries for findings that no longer fire are dropped). No need to delete the file first.
 
 ### Auto-remediation: `pgrls fix`
 

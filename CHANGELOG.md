@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.41] - 2026-05-19
+
+### Added
+- **`pgrls lint --update-baseline`.** Refresh the baseline file
+  in place with the current findings — accept every current
+  finding as the new baseline, without the "delete the file and
+  re-run" two-step dance the previous workflow required. Pair
+  with `--baseline FILE` to name the target. Suppresses normal
+  lint output, prints a `pgrls: updated baseline at <file> with
+  N finding(s).` status line to stderr, and exits 0 on success.
+
+  Semantics are **replace, not merge**: the baseline reflects
+  the current state of the database, so entries for findings
+  that no longer fire (a rule fixed, a table renamed, an
+  allowlist added in config) naturally drop. That makes the
+  flag suitable as the pre-commit / CI gesture for "I've
+  audited the new findings and accept them all" — one
+  invocation that's idempotent against a clean DB and a
+  full-rewrite against a stale baseline. Without `--baseline`
+  to name the file, `--update-baseline` is a tool error.
+
 ## [0.5.40] - 2026-05-19
 
 ### Added
