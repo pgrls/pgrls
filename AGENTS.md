@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-five rules across four
+In the current release it ships **thirty-six rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -41,6 +41,9 @@ restricts — writes accept rows reads never would),
 `SEC025` (policy predicate references a table that has RLS
 disabled — the cross-table read is only as strong as the
 referenced table's isolation),
+`SEC026` (policy uses LIKE / ILIKE / SIMILAR TO / POSIX regex
+against an auth-context value — a wildcard-shape GUC matches
+every row),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1670,6 +1673,97 @@ Out of scope (intentional):
   too, or whether writes to `T'` are locked down via `GRANT` /
   a separate workflow.
 
+<a id="rule-sec026"></a>
+
+### SEC026 — Policy uses LIKE / regex pattern matching against an auth context
+
+**Severity:** warning.
+
+A policy whose `USING` or `WITH CHECK` expression compares a value
+against an **auth-context function** (`current_setting`, `auth.uid`,
+`current_user`, ...) using a **pattern-matching operator** — `LIKE`,
+`ILIKE`, `SIMILAR TO`, or a POSIX regex operator (`~`, `~*`, `!~`,
+`!~*`) — makes the predicate's tightness depend on the *shape* of
+the auth-context value rather than on its identity. A GUC set to
+`%` (the empty `LIKE` pattern) or `.*` (regex match-everything)
+matches every row, defeating the per-row isolation entirely.
+
+```sql
+CREATE POLICY p ON documents
+    USING (user_email ILIKE current_setting('app.email'));
+```
+
+The author wanted case-insensitive email matching. But `ILIKE`
+interprets `%` and `_` as wildcards. If the application ever sets
+`app.email` to `%`, every row matches. The same hole opens with
+POSIX regex (`user_email ~ current_setting('app.pattern')`) where
+`.*` is the all-matching pattern.
+
+**Detection** matches by *operator name* rather than `A_Expr.kind`,
+so a literal `LIKE` source (`AEXPR_LIKE` with name `~~`) and a
+deparsed policy from `pg_get_expr` (`AEXPR_OP` with the same `~~`
+name) trip the rule the same way — pgrls introspects via
+`pg_get_expr`, so name-based detection is the round-trip-stable
+path. The full operator-name set is `~~`, `~~*`, `!~~`, `!~~*`,
+`~`, `~*`, `!~`, `!~*`. SIMILAR TO emits as `AEXPR_SIMILAR` with
+operator name `~`, identical to POSIX regex `~`; SEC026 treats them
+the same.
+
+**Auth function set.** Default mirrors PERF001's
+(`auth.uid`, `auth.role`, `auth.jwt`, `current_setting`) plus the
+role-identity grammar-specials (`current_user`, `current_role`,
+`user`, `session_user`). Replace with a custom helper:
+
+```toml
+[lint.rules.SEC026]
+auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]
+```
+
+The list *replaces* the default — name every function you want
+covered, including the stock ones if you still use them.
+
+**Both operand directions fire.** `col LIKE current_setting(...)`
+and `current_setting(...) LIKE col` are the same vulnerability;
+whichever side carries the auth value, that side's *shape* now
+drives the predicate.
+
+**SubLink-wrapped auth values still fire.** `col LIKE (SELECT
+current_setting('app.email', true))` is semantically identical to
+the un-wrapped form — Postgres evaluates the scalar SubLink to a
+value and feeds it to `LIKE` — so SEC026 inspects operand subtrees
+including SubLink contents. The same outer walk reaches A_Expr
+nodes inside a sub-select on its own (e.g. `EXISTS (SELECT 1 FROM
+members WHERE m.email LIKE current_setting(...))` fires on the
+inner LIKE); each policy is reported once, no double-firing.
+
+**Allowlist by qualified policy ID** when the pattern semantics are
+deliberate (an intentional wildcard query that runs only via a
+specific allowlisted route):
+
+```toml
+[lint.rules.SEC026]
+allowlist = ["public.deliberate_pattern_table.policy_name"]
+```
+
+**Remedy.** Switch to `=` (exact match) or normalize both sides
+before comparing — `lower(email) = lower(current_setting('app.email'))`
+for case-insensitive equality, not `ILIKE`. The pattern wildcards
+have no place in an isolation predicate.
+
+**No auto-fix.** Picking the right exact-match shape (case-sensitive
+`=`, `lower()`-wrapped, or a different scoping column entirely) is
+a design choice, not a mechanical rewrite.
+
+**Out of scope (intentional):**
+
+* **Pattern operator without an auth context.**
+  `email LIKE '%@example.com'` is hard-coded — the predicate
+  isolates by a fixed pattern, not by an attacker-controllable
+  value.
+* **Auth context with non-pattern operator.**
+  `tenant_id = current_setting('app.tenant_id')::uuid` is a plain
+  `=`; the auth value is interpreted as a UUID, not a pattern.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2761,7 +2855,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-five rules across four categories.** SEC001–SEC025,
+- **Thirty-six rules across four categories.** SEC001–SEC026,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
