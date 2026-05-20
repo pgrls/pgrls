@@ -51,6 +51,16 @@ What SEC026 catches:
   and `current_setting(...) LIKE column` both fire; the
   vulnerability is symmetric — whichever side carries the auth
   value, that side's *shape* now drives the predicate.
+* **SubLink-wrapped auth values.**
+  `user_email LIKE (SELECT current_setting('app.email', true))` is
+  semantically identical to the un-wrapped form — Postgres evaluates
+  the scalar SubLink to a value and feeds it to `LIKE` — so SEC026
+  inspects operand subtrees including SubLink contents. The PERF001
+  wrap idiom does not close this hole. The same outer walk also
+  reaches A_Expr nodes inside a sub-select on its own (e.g.
+  `EXISTS (SELECT 1 FROM members WHERE m.email LIKE
+  current_setting(...))` fires on the inner LIKE), but each policy
+  is reported once — `check` short-circuits on the first match.
 
 What SEC026 deliberately does not catch:
 
@@ -62,16 +72,6 @@ What SEC026 deliberately does not catch:
   `tenant_id = current_setting('app.tenant_id')::uuid` is a plain
   `=` comparison; the auth value is interpreted as a UUID, not a
   pattern. SEC026 only fires on pattern operators.
-* **SubLink-wrapped auth values still fire.**
-  `user_email LIKE (SELECT current_setting('app.email', true))` is
-  semantically identical to the un-wrapped form — Postgres evaluates
-  the scalar SubLink to a value and feeds it to `LIKE` — so SEC026
-  inspects operand subtrees including SubLink contents. The same
-  outer walk reaches A_Expr nodes inside a sub-select on its own
-  (e.g. `EXISTS (SELECT 1 FROM members WHERE m.email LIKE
-  current_setting(...))` fires on the inner LIKE), but the policy
-  is reported once — `check` short-circuits on the first match per
-  policy.
 
 Configuring the auth function set. If your stack uses a custom
 helper, replace the default:
@@ -169,8 +169,8 @@ def _expr_name(node: A_Expr) -> str | None:
     `A_Expr.name` is a list of `String` AST nodes representing the
     schema-qualified operator (`pg_catalog.~` becomes
     `["pg_catalog", "~"]`). Return the trailing element — the bare
-    operator — so a schema-qualified regex operator still matches
-    against `_REGEX_OP_NAMES`. Returns None when the name list is
+    operator — so a schema-qualified pattern operator still matches
+    against `_PATTERN_OP_NAMES`. Returns None when the name list is
     empty (defensive; pglast emits at least one element).
     """
     parts: list[str] = []
