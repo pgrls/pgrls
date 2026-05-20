@@ -60,7 +60,7 @@ from pgrls.fixers import (
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
-from pgrls.rules import all_rules, default_registry
+from pgrls.rules import Rule, all_rules, default_registry
 from pgrls.violations import (
     ALL_SEVERITIES,
     Severity,
@@ -117,6 +117,16 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--explain",
+    is_flag=True,
+    default=False,
+    help=(
+        "Append each rule's reference paragraph to its finding in "
+        "the text output, for in-line rationale without a separate "
+        "`pgrls explain <RULE>` lookup. Text format only."
+    ),
+)
+@click.option(
     "--fail-on",
     type=click.Choice(list(ALL_SEVERITIES), case_sensitive=False),
     default=None,
@@ -146,6 +156,7 @@ def lint(
     config_path: str | None,
     schemas: str | None,
     rules: tuple[str, ...],
+    explain: bool,
     fail_on: str | None,
     output_format: str,
     baseline_path: Path | None,
@@ -201,7 +212,27 @@ def lint(
     if baseline_path is not None:
         violations = _apply_baseline(violations, baseline_path)
 
-    click.echo(format_violations(violations, format=output_format), nl=False)
+    rationale_map: dict[str, str] | None = None
+    if explain:
+        # Build a `{rule_id: rationale}` map for every rule that
+        # produced a finding, so the text formatter can append the
+        # rule's reference paragraph beneath each line. Other
+        # formats ignore the map; --explain is text-only.
+        rules_in_use = {v.rule_id for v in violations}
+        rationale_map = {
+            r.id: _rule_rationale_paragraph(r)
+            for r in all_rules()
+            if r.id in rules_in_use
+        }
+
+    click.echo(
+        format_violations(
+            violations,
+            format=output_format,
+            rationale_map=rationale_map,
+        ),
+        nl=False,
+    )
 
     if _should_fail(violations, threshold=effective.fail_on):
         sys.exit(1)
@@ -239,6 +270,42 @@ def _merge_overrides(
         severity_overrides=dict(config.severity_overrides),
         diff_fail_on=config.diff_fail_on,
     )
+
+
+def _rule_docstring(rule: Rule) -> str:
+    """Return the rule module's docstring, stripped, or '' if absent.
+
+    Shared by `pgrls explain` (which surfaces the whole docstring)
+    and `pgrls lint --explain` (which surfaces just its first
+    non-title paragraph) so the two paths read the same source
+    via the same lookup — no chance of one rule's docstring
+    showing up in one command but not the other.
+    """
+    module = inspect.getmodule(type(rule))
+    return ((module.__doc__ if module else None) or "").strip()
+
+
+def _rule_rationale_paragraph(rule: Rule) -> str:
+    """First non-title paragraph of the rule's module docstring.
+
+    Used by `pgrls lint --explain` to append a concise reference
+    blurb beneath each finding. The full module docstring is much
+    longer and would bury the lint output; one paragraph hits the
+    sweet spot between "more than the message already says" and
+    "still readable in a CI log."
+
+    Falls back to an empty string for any rule whose docstring is
+    absent (e.g. `python -OO`) or doesn't follow the two-paragraph
+    convention (title line + reference para). `pgrls lint
+    --explain` then quietly degrades to the un-augmented message.
+    """
+    doc = _rule_docstring(rule)
+    if not doc:
+        return ""
+    paragraphs = doc.split("\n\n")
+    if len(paragraphs) < 2:
+        return ""
+    return paragraphs[1].strip()
 
 
 def _run_rules(
@@ -1508,9 +1575,10 @@ def explain(rule_id: str | None) -> None:
     # The explanation is the rule module's docstring. It is empty
     # when the module can't be resolved or when `python -OO`
     # stripped docstrings; the header line above is still a useful
-    # one-line answer in that case.
-    module = inspect.getmodule(type(rule))
-    doc = ((module.__doc__ if module else None) or "").strip()
+    # one-line answer in that case. `_rule_docstring` centralises
+    # the lookup so `pgrls lint --explain` reads from the same
+    # source.
+    doc = _rule_docstring(rule)
     if not doc:
         return
 

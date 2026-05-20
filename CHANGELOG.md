@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.39] - 2026-05-19
+
+### Added
+- **`pgrls lint --explain`.** Appends each rule's reference
+  paragraph beneath its finding in the text output, so a CI log
+  carries the *why* next to the *where* without a separate
+  `pgrls explain <RULE>` lookup. The rationale is the first
+  paragraph of the rule's module docstring (the same source
+  `pgrls explain` uses), indented to align with the finding's
+  message so the block reads as one continuous note.
+
+  Text format only. JSON / SARIF / Markdown keep their schemas
+  stable — `--explain` is a no-op there. A rule whose docstring
+  is absent (e.g. `python -OO` stripped them) or doesn't follow
+  the two-paragraph convention degrades gracefully: the finding
+  renders without an added block.
+
+  The implementation extends `format_violations` with an
+  optional `rationale_map: dict[str, str]` kwarg; the lint
+  command builds the map only for rule IDs that produced a
+  finding, so the work scales with the output, not the catalog.
+
 ## [0.5.38] - 2026-05-19
 
 ### Added

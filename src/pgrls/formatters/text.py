@@ -16,7 +16,11 @@ _SEVERITY_LABEL: dict[Severity, str] = {
 }
 
 
-def format_text(violations: list[Violation]) -> str:
+def format_text(
+    violations: list[Violation],
+    *,
+    rationale_map: dict[str, str] | None = None,
+) -> str:
     if not violations:
         return "pgrls: no issues found.\n"
 
@@ -40,10 +44,23 @@ def format_text(violations: list[Violation]) -> str:
         else:
             cleaned = safe_location(v.location)
             loc = cleaned if cleaned else EMPTY_OR_ZERO_WIDTH_SENTINEL
-        lines.append(
+        block = (
             f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
             f"         {v.message}"
         )
+        # `pgrls lint --explain` passes a `{rule_id: rationale}`
+        # map; append the rule's reference paragraph beneath the
+        # finding, indented to the same column as the message so
+        # the block reads as one continuous note.
+        if rationale_map:
+            rationale = rationale_map.get(v.rule_id, "").strip()
+            if rationale:
+                indented = "\n".join(
+                    f"         {ln}" if ln else ""
+                    for ln in rationale.split("\n")
+                )
+                block += f"\n\n{indented}"
+        lines.append(block)
 
     counts: Counter[Severity] = Counter(v.severity for v in violations)
     parts: list[str] = []
