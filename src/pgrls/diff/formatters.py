@@ -168,6 +168,272 @@ del _classification_values, _missing_labels, _missing_order
 
 
 # ---------------------------------------------------------------------------
+# Rationale text — `pgrls diff --explain`
+# ---------------------------------------------------------------------------
+
+# Keyed by `(ChangeKind, Classification)` rather than just `ChangeKind`
+# because RLS_FLIPPED and FORCE_RLS_FLIPPED reuse one kind for both
+# directions (on→off and off→on) but emit different classifications.
+# A future direction-dependent kind doesn't need special-casing —
+# add the new `(kind, classification)` entry and the import-time
+# exhaustiveness check below confirms coverage.
+#
+# Rationales answer the "why does this Change carry this
+# classification" question one layer deeper than the per-Change
+# `message` field (which describes *what* changed). One paragraph
+# each — long enough to be useful in a CI log without burying the
+# diff payload.
+_RATIONALE_BY_KIND_AND_CLASSIFICATION: dict[
+    tuple[ChangeKind, Classification], str
+] = {
+    # ---------- Table presence ----------
+    (ChangeKind.TABLE_ADDED_WITH_RLS, "safe"): (
+        "New table ships with RLS enabled. With no policies yet, "
+        "Postgres denies non-owner reads and writes by default, so "
+        "the table is closed by construction until a policy is added."
+    ),
+    (ChangeKind.TABLE_ADDED_WITHOUT_RLS, "dangerous"): (
+        "New table has no RLS. Every role with table privileges can "
+        "see every row — no tenant isolation, no default-deny shape. "
+        "Add `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` and at least "
+        "one policy before granting access."
+    ),
+    (ChangeKind.TABLE_DROPPED, "breaking"): (
+        "Table dropped. Reads and writes that referenced it will fail "
+        "until callers are updated. Classified BREAKING (access "
+        "narrows to nothing) rather than DANGEROUS (which is reserved "
+        "for changes that widen access)."
+    ),
+    # ---------- RLS state ----------
+    (ChangeKind.RLS_FLIPPED, "safe"): (
+        "RLS was enabled on a table that previously had it off. "
+        "Existing policies (if any) now apply; with no policies, "
+        "Postgres denies non-owner access by default."
+    ),
+    (ChangeKind.RLS_FLIPPED, "dangerous"): (
+        "RLS was disabled on a table that previously had it on. "
+        "Every policy on the table stops applying — every row becomes "
+        "reachable to any role with table privileges. This is the "
+        "single most dangerous diff signal pgrls reports."
+    ),
+    (ChangeKind.FORCE_RLS_FLIPPED, "safe"): (
+        "FORCE ROW LEVEL SECURITY was newly enabled. Policies now "
+        "apply to the table owner too, closing the bypass that "
+        "default RLS leaves open for the owning role."
+    ),
+    (ChangeKind.FORCE_RLS_FLIPPED, "dangerous"): (
+        "FORCE ROW LEVEL SECURITY was disabled. The table owner now "
+        "bypasses every policy, regaining full-table access — the "
+        "exact bypass FORCE RLS was added in PostgreSQL 9.5 to close."
+    ),
+    # ---------- Policy add / drop ----------
+    (ChangeKind.POLICY_ADDED_RESTRICTIVE, "safe"): (
+        "A RESTRICTIVE policy was added. Restrictive policies "
+        "AND-combine into the access predicate — adding one can only "
+        "narrow access, never widen it."
+    ),
+    (ChangeKind.POLICY_ADDED_PERMISSIVE, "dangerous"): (
+        "A PERMISSIVE policy was added. Permissive policies "
+        "OR-combine into the access predicate — adding one widens "
+        "access by including its rows in the visible set. Review "
+        "whether the new disjunct is the intended access shape."
+    ),
+    (ChangeKind.POLICY_DROPPED_RESTRICTIVE, "dangerous"): (
+        "A RESTRICTIVE policy was dropped. Restrictive policies "
+        "AND-combine — removing one removes a tightening conjunct, "
+        "so rows it previously blocked are now reachable through "
+        "the remaining policies."
+    ),
+    (ChangeKind.POLICY_DROPPED_PERMISSIVE, "breaking"): (
+        "A PERMISSIVE policy was dropped. Permissive policies "
+        "OR-combine — removing one removes a disjunct, so rows it "
+        "previously made visible may no longer be. Classified "
+        "BREAKING (access narrows, callers may see empty result "
+        "sets) rather than DANGEROUS."
+    ),
+    # ---------- Policy shape ----------
+    (ChangeKind.PERMISSIVE_FLAG_TIGHTENED, "safe"): (
+        "Policy switched from PERMISSIVE to RESTRICTIVE. Its "
+        "predicate now AND-combines with the other policies instead "
+        "of OR-combining — the access set can only shrink."
+    ),
+    (ChangeKind.PERMISSIVE_FLAG_LOOSENED, "dangerous"): (
+        "Policy switched from RESTRICTIVE to PERMISSIVE. Its "
+        "predicate now OR-combines with the other policies instead "
+        "of AND-combining — the access set can only grow."
+    ),
+    (ChangeKind.COMMAND_BROADENED, "dangerous"): (
+        "Policy command was broadened (narrow command → ALL). The "
+        "policy now authorizes additional verbs against the table; "
+        "operations that previously fell back to default-deny are "
+        "now gated only by this policy's predicate."
+    ),
+    (ChangeKind.COMMAND_NARROWED, "breaking"): (
+        "Policy command was narrowed (ALL → narrow, or one narrow "
+        "command swapped for another). Operations previously "
+        "authorized by this policy now fall back to default-deny — "
+        "callers performing the dropped verbs against this table "
+        "will start failing."
+    ),
+    (ChangeKind.ROLES_WIDENED, "dangerous"): (
+        "Policy applies to a wider role set than before. Principals "
+        "that did not match the policy's role list previously now "
+        "do, gaining access through its predicate."
+    ),
+    (ChangeKind.ROLES_NARROWED, "safe"): (
+        "Policy applies to a narrower role set than before. Some "
+        "principals lose access through this policy; the new role "
+        "set is a strict subset of the old."
+    ),
+    (ChangeKind.ROLES_DISJOINT_REPLACED, "requires_review"): (
+        "Policy role set was replaced with a disjoint set — old "
+        "principals lost access, new ones gained it. Whether the "
+        "swap matches intent depends on the migration; pgrls cannot "
+        "decide automatically."
+    ),
+    # POLICY_RENAMED is reserved in ChangeKind but no detection rule
+    # through v0.5.42 emits it (a rename surfaces as drop+add). The
+    # entry is here for forward compatibility — a future emitter
+    # picking this kind doesn't crash --explain.
+    (ChangeKind.POLICY_RENAMED, "requires_review"): (
+        "Policy was renamed. Through v0.5.42 the differ never emits "
+        "this kind (a rename surfaces as a drop + add with their "
+        "independent classifications); the entry exists for forward "
+        "compatibility when rename detection ships."
+    ),
+    # ---------- Predicate changes ----------
+    (ChangeKind.USING_TIGHTENED, "safe"): (
+        "USING predicate added a conjunct (AND-tighten) or dropped "
+        "a disjunct (OR-tighten-drop). Fewer rows pass — the head "
+        "is strictly more restrictive than the base."
+    ),
+    (ChangeKind.USING_LOOSENED, "dangerous"): (
+        "USING predicate added a disjunct (OR-loosen) or dropped a "
+        "conjunct (AND-loosen-drop). More rows pass — the head is "
+        "strictly less restrictive than the base."
+    ),
+    (ChangeKind.USING_REQUIRES_REVIEW, "requires_review"): (
+        "USING predicate changed in a shape that is not a simple "
+        "AND/OR shift. pgrls cannot mechanically prove whether the "
+        "new predicate is more or less permissive than the old. "
+        "Install `pgrls[diff-z3]` for SAT-assisted classification, "
+        "or review manually."
+    ),
+    (ChangeKind.WITH_CHECK_TIGHTENED, "safe"): (
+        "WITH CHECK predicate added a conjunct or dropped a "
+        "disjunct. Fewer writes pass — the head's write validation "
+        "is strictly tighter than the base's."
+    ),
+    (ChangeKind.WITH_CHECK_LOOSENED, "dangerous"): (
+        "WITH CHECK predicate added a disjunct or dropped a "
+        "conjunct. More writes pass — the head accepts writes the "
+        "base would have rejected."
+    ),
+    (ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review"): (
+        "WITH CHECK predicate changed in a shape that is not a "
+        "simple AND/OR shift. Install `pgrls[diff-z3]` for "
+        "SAT-assisted classification, or review manually."
+    ),
+    # ---------- Columns ----------
+    (ChangeKind.COLUMN_DROPPED_REFERENCED, "requires_review"): (
+        "A column was dropped while still referenced by at least "
+        "one policy's USING or WITH CHECK predicate. The policy is "
+        "now invalid; review whether to rewrite the policy or "
+        "re-add the column."
+    ),
+    # ---------- Grants ----------
+    (ChangeKind.GRANT_REVOKED, "safe"): (
+        "A privilege was revoked from a role. The role can no "
+        "longer perform the corresponding operation through that "
+        "grant."
+    ),
+    (ChangeKind.GRANT_ADDED, "requires_review"): (
+        "A privilege was granted to a role. Verify the role is "
+        "supposed to have this access — pgrls cannot tell intent "
+        "from shape, so every grant addition is REQUIRES_REVIEW "
+        "by default."
+    ),
+    (ChangeKind.GRANT_PUBLIC_NO_RLS, "dangerous"): (
+        "A privilege was granted to PUBLIC on a table with no RLS. "
+        "Every authenticated role can now perform the operation, "
+        "with no per-row scoping — the canonical accidental-"
+        "exposure shape pgrls diff watches for."
+    ),
+}
+
+# Import-time exhaustiveness check — every ChangeKind that the
+# differ emits MUST have at least one `(kind, classification)`
+# entry in the rationale table. The differ doesn't currently
+# expose its emission set as data, so the canonical list below is
+# the contract. A new ChangeKind added without a rationale would
+# silently degrade `pgrls diff --explain` to "no rationale shown"
+# for that kind — fail at import instead.
+_EXPECTED_RATIONALE_KEYS: frozenset[tuple[ChangeKind, Classification]] = (
+    frozenset(
+        {
+            (ChangeKind.TABLE_ADDED_WITH_RLS, "safe"),
+            (ChangeKind.TABLE_ADDED_WITHOUT_RLS, "dangerous"),
+            (ChangeKind.TABLE_DROPPED, "breaking"),
+            (ChangeKind.RLS_FLIPPED, "safe"),
+            (ChangeKind.RLS_FLIPPED, "dangerous"),
+            (ChangeKind.FORCE_RLS_FLIPPED, "safe"),
+            (ChangeKind.FORCE_RLS_FLIPPED, "dangerous"),
+            (ChangeKind.POLICY_ADDED_RESTRICTIVE, "safe"),
+            (ChangeKind.POLICY_ADDED_PERMISSIVE, "dangerous"),
+            (ChangeKind.POLICY_DROPPED_RESTRICTIVE, "dangerous"),
+            (ChangeKind.POLICY_DROPPED_PERMISSIVE, "breaking"),
+            (ChangeKind.PERMISSIVE_FLAG_TIGHTENED, "safe"),
+            (ChangeKind.PERMISSIVE_FLAG_LOOSENED, "dangerous"),
+            (ChangeKind.COMMAND_BROADENED, "dangerous"),
+            (ChangeKind.COMMAND_NARROWED, "breaking"),
+            (ChangeKind.ROLES_WIDENED, "dangerous"),
+            (ChangeKind.ROLES_NARROWED, "safe"),
+            (ChangeKind.ROLES_DISJOINT_REPLACED, "requires_review"),
+            (ChangeKind.POLICY_RENAMED, "requires_review"),
+            (ChangeKind.USING_TIGHTENED, "safe"),
+            (ChangeKind.USING_LOOSENED, "dangerous"),
+            (ChangeKind.USING_REQUIRES_REVIEW, "requires_review"),
+            (ChangeKind.WITH_CHECK_TIGHTENED, "safe"),
+            (ChangeKind.WITH_CHECK_LOOSENED, "dangerous"),
+            (ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review"),
+            (ChangeKind.COLUMN_DROPPED_REFERENCED, "requires_review"),
+            (ChangeKind.GRANT_REVOKED, "safe"),
+            (ChangeKind.GRANT_ADDED, "requires_review"),
+            (ChangeKind.GRANT_PUBLIC_NO_RLS, "dangerous"),
+        }
+    )
+)
+
+_missing_rationale = _EXPECTED_RATIONALE_KEYS - set(
+    _RATIONALE_BY_KIND_AND_CLASSIFICATION
+)
+_unexpected_rationale = set(_RATIONALE_BY_KIND_AND_CLASSIFICATION) - _EXPECTED_RATIONALE_KEYS
+if _missing_rationale or _unexpected_rationale:
+    raise RuntimeError(  # pragma: no cover — import-time invariant
+        "pgrls.diff.formatters._RATIONALE_BY_KIND_AND_CLASSIFICATION "
+        "drifted from _EXPECTED_RATIONALE_KEYS. Missing: "
+        f"{sorted(repr(p) for p in _missing_rationale)}; Unexpected: "
+        f"{sorted(repr(p) for p in _unexpected_rationale)}."
+    )
+del _missing_rationale, _unexpected_rationale
+
+# Verify every ChangeKind that the differ can emit has at least one
+# rationale entry (one entry suffices — covers the kinds that emit
+# a single classification; the flip kinds emit two and have both).
+_kinds_with_rationale = {k for k, _ in _RATIONALE_BY_KIND_AND_CLASSIFICATION}
+_kinds_without_rationale = set(ChangeKind) - _kinds_with_rationale
+if _kinds_without_rationale:
+    raise RuntimeError(  # pragma: no cover — import-time invariant
+        "pgrls.diff.formatters is missing rationale entries for "
+        f"ChangeKind member(s): "
+        f"{sorted(k.name for k in _kinds_without_rationale)}. "
+        "Add a (kind, classification) entry to "
+        "_RATIONALE_BY_KIND_AND_CLASSIFICATION."
+    )
+del _kinds_with_rationale, _kinds_without_rationale
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -202,8 +468,15 @@ if _missing_kinds:
 del _missing_kinds, _all_marker_kinds
 
 
-def _render_stanza(change: Change) -> list[str]:
-    """Return lines (no trailing newline) for one Change stanza."""
+def _render_stanza(change: Change, *, explain: bool = False) -> list[str]:
+    """Return lines (no trailing newline) for one Change stanza.
+
+    When ``explain=True``, append a `  -> <rationale>` line below
+    the classification line, explaining why this kind carries the
+    classification it does. A `(kind, classification)` pair with no
+    rationale entry degrades silently (no suffix) — same approach
+    `pgrls lint --explain` takes when a rule's docstring is absent.
+    """
     marker = _marker(change.kind)
     lines: list[str] = []
 
@@ -249,6 +522,17 @@ def _render_stanza(change: Change) -> list[str]:
     tag = change.classification.upper()
     lines.append(f"  [{tag}] {change.message}")
 
+    # Optional rationale line — `pgrls diff --explain`. Indented to
+    # match the classification line and prefixed with `-> ` so the
+    # rationale is visually distinct from the classification message
+    # while staying in the same stanza block.
+    if explain:
+        rationale = _RATIONALE_BY_KIND_AND_CLASSIFICATION.get(
+            (change.kind, change.classification)
+        )
+        if rationale:
+            lines.append(f"  -> {rationale}")
+
     return lines
 
 
@@ -279,12 +563,21 @@ def _trailing_summary(changes: list[Change]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def format_diff_text(changes: list[Change]) -> str:
-    """Render a list of Changes in git-diff style for human consumption."""
+def format_diff_text(changes: list[Change], *, explain: bool = False) -> str:
+    """Render a list of Changes in git-diff style for human consumption.
+
+    When ``explain=True``, each stanza grows a `  -> <rationale>`
+    line below the classification line explaining the reason
+    behind the classification — `pgrls diff --explain`'s text-only
+    mode. JSON / SARIF output ignore the flag (rationale lives in
+    the per-Change classification tag those formats already carry).
+    """
     if not changes:
         return "pgrls diff: no changes."
 
-    stanzas: list[list[str]] = [_render_stanza(c) for c in changes]
+    stanzas: list[list[str]] = [
+        _render_stanza(c, explain=explain) for c in changes
+    ]
 
     # Join stanzas with a single blank line between them
     body_lines: list[str] = []

@@ -598,3 +598,86 @@ def test_diff_picks_up_database_url_env_when_no_pgrls_toml(
     # regression we're guarding against is exit_code == 2 with
     # "set DATABASE_URL" — the env-var path was never reached.
     assert result.exit_code != 2, result.output
+
+
+# ---------------------------------------------------------------------------
+# pgrls diff — --explain
+# ---------------------------------------------------------------------------
+
+
+def test_diff_explain_appends_rationale_to_text_output(tmp_path: Path) -> None:
+    # Adding a table without RLS produces a TABLE_ADDED_WITHOUT_RLS
+    # DANGEROUS Change. With --explain the stanza grows a rationale
+    # line that lives ONLY in the rationale text — not the per-Change
+    # message — so a substring lookup pins the wiring end-to-end.
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(
+        json.dumps(_TABLE_WITHOUT_RLS),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    plain = runner.invoke(main, ["diff", str(base), str(head)])
+    explained = runner.invoke(
+        main, ["diff", str(base), str(head), "--explain"]
+    )
+
+    # Both runs trip the DANGEROUS threshold (default --fail-on
+    # dangerous), so both exit 1; the test pins the OUTPUT shape.
+    assert plain.exit_code == 1, plain.output
+    assert explained.exit_code == 1, explained.output
+
+    # The rationale-only substring is the "default-deny shape"
+    # phrase, which lives in the TABLE_ADDED_WITHOUT_RLS rationale
+    # paragraph but nowhere in the per-Change message text.
+    assert "default-deny shape" in explained.output
+    assert "default-deny shape" not in plain.output
+    assert "  -> " in explained.output
+    assert "  -> " not in plain.output
+
+
+def test_diff_explain_with_json_format_is_silent_no_op(tmp_path: Path) -> None:
+    # `--explain` is text-only — JSON output already carries the
+    # classification tag, so the flag is a silent no-op (mirrors
+    # how `pgrls lint --explain --format json` behaves).
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_TABLE_WITHOUT_RLS), encoding="utf-8")
+
+    runner = CliRunner()
+    json_plain = runner.invoke(
+        main,
+        ["diff", str(base), str(head), "--format", "json"],
+    )
+    json_explain = runner.invoke(
+        main,
+        ["diff", str(base), str(head), "--format", "json", "--explain"],
+    )
+
+    # Both are valid JSON, and the payloads must be byte-identical.
+    assert json_plain.exit_code == 1, json_plain.output
+    assert json_explain.exit_code == 1, json_explain.output
+    assert json.loads(json_plain.output) == json.loads(json_explain.output)
+
+
+def test_diff_explain_no_changes_emits_only_no_changes_summary(
+    tmp_path: Path,
+) -> None:
+    # Empty diff → no stanzas → no rationale lines, regardless of
+    # --explain. Same single-line summary as the un-explained path.
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["diff", str(base), str(head), "--explain"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "  -> " not in result.output
+    assert result.output.rstrip("\n").endswith("pgrls diff: no changes.")

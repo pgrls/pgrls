@@ -1279,6 +1279,18 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
         "machine-parsable."
     ),
 )
+@click.option(
+    "--explain",
+    is_flag=True,
+    default=False,
+    help=(
+        "Append a one-paragraph rationale to each Change in the "
+        "text output, explaining why the kind carries the "
+        "classification it does (e.g. why dropping a PERMISSIVE "
+        "policy is BREAKING rather than DANGEROUS). Text format "
+        "only — JSON / SARIF already carry the classification tag."
+    ),
+)
 def diff(
     base: str,
     head: str | None,
@@ -1290,6 +1302,7 @@ def diff(
     migration_path: str | None,
     extensions: tuple[str, ...],
     verbose: bool,
+    explain: bool,
 ) -> None:
     """Diff two RLS schema snapshots — report semantic changes with classification."""
     try:
@@ -1403,8 +1416,16 @@ def diff(
 
     # Format and emit. Single dispatch via _DIFF_FORMATTERS keeps
     # the format list in lockstep with DIFF_SUPPORTED_FORMATS.
+    # `--explain` only meaningfully applies to the text format —
+    # JSON / SARIF already carry the classification tag, and the
+    # diff rationale is human-prose rather than a structured field.
+    # Mirrors `pgrls lint --explain`'s text-only behavior.
     formatter, append_newline = _DIFF_FORMATTERS[output_format]
-    click.echo(formatter(changes), nl=append_newline)
+    if output_format == "text":
+        rendered = format_diff_text(changes, explain=explain)
+    else:
+        rendered = formatter(changes)
+    click.echo(rendered, nl=append_newline)
 
     if failing:
         sys.exit(1)

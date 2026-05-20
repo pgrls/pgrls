@@ -10,6 +10,37 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.43] - 2026-05-19
+
+### Added
+- **`pgrls diff --explain`.** Append a one-paragraph rationale
+  beneath each classified Change in the text output, explaining
+  why the kind carries the classification it does — why dropping
+  a PERMISSIVE policy is BREAKING (access narrows) rather than
+  DANGEROUS, why disabling RLS is the single most dangerous diff
+  signal pgrls reports, why a column drop while still referenced
+  is REQUIRES_REVIEW. Each rationale is one sentence to one short
+  paragraph — long enough to stand alone in a CI log without
+  burying the diff payload.
+
+  The rationale table lives in
+  `src/pgrls/diff/formatters.py` keyed by
+  `(ChangeKind, Classification)` — RLS_FLIPPED and
+  FORCE_RLS_FLIPPED reuse one kind for both directions (on→off
+  DANGEROUS, off→on SAFE), but the two directions get different
+  rationales. An import-time check verifies every `ChangeKind`
+  the differ can emit has at least one rationale entry, so a
+  future kind added without a rationale fails the test suite
+  rather than silently degrading `--explain`.
+
+  Text format only — JSON / SARIF already carry the
+  classification tag as a structured field, so the flag is a
+  silent no-op for those formats (mirrors how
+  `pgrls lint --explain` behaves). A `(kind, classification)`
+  pair with no rationale entry degrades silently in the same
+  way `pgrls lint --explain` degrades for rules whose docstring
+  is missing.
+
 ## [0.5.42] - 2026-05-19
 
 ### Added
