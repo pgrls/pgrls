@@ -2248,6 +2248,68 @@ def test_fix_check_rejects_output(tmp_path) -> None:
     assert "--output" in result.output
 
 
+def test_fix_check_rejects_malformed_allowlist_as_tool_error(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A malformed allowlist must still surface as a tool error
+    # (exit 2) under `--check` — not exit 1 (violations found).
+    # The check branch sits *after* `generate_fixes`, so a fixer
+    # raising on a bad allowlist propagates before `--check`
+    # decides to gate.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_bad_allow (id INT);
+        ALTER TABLE public.fix_check_bad_allow ENABLE ROW LEVEL SECURITY;
+        """
+    )
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        "[lint.rules.SEC002]\n"
+        'allowlist = [" public.fix_check_bad_allow "]\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--config", str(cfg), "--check",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "allowlist" in result.output
+
+
+def test_fix_check_with_rule_filter_to_clean_subset_exits_zero(
+    pg_url: str, apply_sql
+) -> None:
+    # Two fixable violations: SEC001 on table_a, SEC002 on table_b.
+    # `--check --rule SEC020` filters to a rule that fires on
+    # NEITHER table — `--check` then sees zero in-scope fixes and
+    # exits 0 (clean), even though the DB has violations the
+    # filter excluded. Confirms the filter narrows the gate.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_clean_filter_a (id INT);
+        -- ^ SEC001 (RLS off) — fixable, but not SEC020.
+        CREATE TABLE public.fix_check_clean_filter_b (id INT);
+        ALTER TABLE public.fix_check_clean_filter_b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_clean_filter_b
+            FOR SELECT TO postgres USING (id > 0);
+        -- ^ SEC002 (FORCE missing) — also not SEC020.
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--check", "--rule", "SEC020",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no auto-fixable" in result.output
+
+
 def test_fix_check_composes_with_rule_filter(
     pg_url: str, apply_sql
 ) -> None:

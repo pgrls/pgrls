@@ -475,10 +475,11 @@ def fix(
     `--check` is a CI gate: it exits 1 if any auto-fixable
     violations would be emitted (and 0 otherwise), without
     writing SQL or changing database state. The offending
-    `(rule_id, location)` pairs go to stderr, so a pre-commit-
-    style hook output is self-documenting. Mirrors `ruff format
-    --check` / `prettier --check`. Cannot be combined with
-    `--apply` or `--output`.
+    `(rule_id, location)` pairs go to stdout (so `pgrls fix
+    --check > violations.log` captures them as a CI artefact);
+    the summary count and next-step hint go to stderr. Mirrors
+    `ruff format --check` / `prettier --check`. Cannot be
+    combined with `--apply` or `--output`.
 
     Output channels: SQL bodies go to stdout (so `pgrls fix >
     migration.sql` produces a usable script) unless `--output`
@@ -566,6 +567,13 @@ def fix(
             # (rule, location) pairs and exit 1 without emitting
             # SQL. The actionable next step is named so a
             # pre-commit-style hook output is self-documenting.
+            #
+            # Output split: the violation listing goes to *stdout*
+            # so `pgrls fix --check > violations.log` captures it
+            # for CI artefacts; the summary and next-step hint go
+            # to stderr so they don't pollute parseable output.
+            # Matches `pgrls lint` (findings on stdout, status on
+            # stderr) and `ruff --check`.
             if check:
                 count = len(fixes)
                 plural = "" if count == 1 else "s"
@@ -575,9 +583,7 @@ def fix(
                     err=True,
                 )
                 for f in fixes:
-                    click.echo(
-                        f"  {f.rule_id}  {f.location}", err=True
-                    )
+                    click.echo(f"  {f.rule_id}  {f.location}")
                 click.echo(
                     "Run `pgrls fix --apply` to apply them, or "
                     "`pgrls fix --output migration.sql` to write a "
