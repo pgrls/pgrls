@@ -1990,6 +1990,85 @@ def test_fix_apply_executes_sec020_with_check(
     assert "true" not in with_check.lower()
 
 
+def test_fix_emits_sec019_missing_ok(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` picks up the SEC019 fixer and emits an
+    # ALTER POLICY that adds `, true` to a one-argument
+    # current_setting() call. The call is wrapped in
+    # `(SELECT …)` so PERF001 stays silent and SEC019 is the
+    # only fixer that fires on this fixture.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec019 (id INT PRIMARY KEY, tenant_id TEXT);
+        ALTER TABLE public.fix_sec019 ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec019 FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec019
+            FOR SELECT TO postgres
+            USING (
+                tenant_id = (SELECT current_setting('app.tenant'))
+            );
+        CREATE INDEX fix_sec019_t_idx ON public.fix_sec019 (tenant_id);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", pg_url])
+    assert result.exit_code == 0, result.output
+    assert "[SEC019]" in result.output
+    assert "ALTER POLICY p ON public.fix_sec019" in result.output
+    # The rewrite added `, TRUE` as the second arg. (pglast
+    # renders the literal in uppercase; the deparsed string
+    # literal uses CAST(...) rather than the `::text` shorthand,
+    # so just pin the comma + TRUE pair as the marker.)
+    assert ", TRUE)" in result.output
+    assert "dry-run" in result.output
+
+
+def test_fix_apply_executes_sec019_missing_ok(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec019_apply (id INT PRIMARY KEY, tenant_id TEXT);
+        ALTER TABLE public.fix_sec019_apply ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec019_apply FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec019_apply
+            FOR SELECT TO postgres
+            USING (
+                tenant_id = (SELECT current_setting('app.tenant'))
+            );
+        CREATE INDEX fix_sec019_apply_t_idx
+            ON public.fix_sec019_apply (tenant_id);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "SEC019", "--apply"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 1 fix" in result.output
+
+    # The policy's qual (USING) now carries the two-argument
+    # current_setting form. `pg_policies.qual` is deparsed by
+    # Postgres itself; both args must appear, separated by a
+    # comma, with the boolean second arg.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT qual FROM pg_catalog.pg_policies "
+                "WHERE schemaname = 'public' "
+                "AND tablename = 'fix_sec019_apply' "
+                "AND policyname = 'p'"
+            )
+            (qual,) = cur.fetchone()
+    assert qual is not None
+    assert "current_setting" in qual
+    assert "'app.tenant'" in qual
+    # Before fix: one-arg call (no `true` in the qual).
+    # After fix: two-arg with `true` as the missing_ok argument.
+    assert "true" in qual.lower()
+
+
 def test_fix_emits_hyg003_drop_policy(pg_url: str, apply_sql) -> None:
     # `pgrls fix` picks up the HYG003 fixer and emits a DROP POLICY
     # for a policy that exactly duplicates another on the same

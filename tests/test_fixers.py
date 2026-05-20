@@ -17,6 +17,7 @@ from pgrls.fixers.perf003 import PERF003Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
 from pgrls.fixers.sec006 import SEC006Fixer
+from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
@@ -946,6 +947,179 @@ def test_sec006_fix_raises_on_malformed_allowlist() -> None:
         SEC006Fixer().fix(schema, {"allowlist": [" public.t.p "]})
 
 
+# ---------- SEC019 fixer ----------
+
+
+def test_sec019_fix_adds_missing_ok_to_one_arg_current_setting() -> None:
+    schema = _wrap_policy(
+        _policy("user_id = current_setting('app.user')")
+    )
+    fixes = SEC019Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC019"
+    assert f.location == "public.t.p"
+    assert "ALTER POLICY p ON public.t" in f.sql
+    # pglast normalizes the boolean to uppercase; the rewrite is
+    # semantically `current_setting(..., true)`.
+    assert "current_setting('app.user', TRUE)" in f.sql
+
+
+def test_sec019_fix_silent_when_already_two_arg() -> None:
+    # `current_setting('x', true)` is already in the safe form;
+    # SEC019 the rule stays silent, and so does the fixer.
+    schema = _wrap_policy(
+        _policy("user_id = current_setting('app.user', true)")
+    )
+    assert SEC019Fixer().fix(schema, {}) == []
+
+
+def test_sec019_fix_silent_when_no_current_setting() -> None:
+    schema = _wrap_policy(_policy("user_id = 1"))
+    assert SEC019Fixer().fix(schema, {}) == []
+
+
+def test_sec019_fix_handles_pg_catalog_qualified_form() -> None:
+    # Matches SEC019's detection — both bare and pg_catalog-
+    # qualified `current_setting` calls get the rewrite.
+    schema = _wrap_policy(
+        _policy("user_id = pg_catalog.current_setting('app.user')")
+    )
+    sql = SEC019Fixer().fix(schema, {})[0].sql
+    assert "pg_catalog.current_setting('app.user', TRUE)" in sql
+
+
+def test_sec019_fix_rewrites_call_in_with_check() -> None:
+    # WITH CHECK side also gets rewritten; SEC019 fires on either
+    # clause, so the fixer covers both.
+    p = _policy(
+        "user_id = 1",
+        command="ALL",
+        with_check="user_id = current_setting('app.user')",
+    )
+    sql = SEC019Fixer().fix(_wrap_policy(p), {})[0].sql
+    assert "WITH CHECK (user_id = current_setting('app.user', TRUE))" in sql
+    # USING is unchanged, so it must NOT appear in the ALTER:
+    # the fixer emits only the changed clause(s).
+    assert "USING (" not in sql
+
+
+def test_sec019_fix_emits_only_changed_clauses() -> None:
+    # USING has the one-arg form; WITH CHECK already has two args.
+    # The fixer rewrites USING and emits an ALTER POLICY with
+    # USING only — leaving WITH CHECK alone for a minimal diff.
+    p = _policy(
+        "user_id = current_setting('app.user')",
+        command="ALL",
+        with_check="user_id = current_setting('app.user', true)",
+    )
+    sql = SEC019Fixer().fix(_wrap_policy(p), {})[0].sql
+    assert "USING (user_id = current_setting('app.user', TRUE))" in sql
+    assert "WITH CHECK" not in sql
+
+
+def test_sec019_fix_emits_both_clauses_when_both_have_one_arg() -> None:
+    # Both sides have the one-arg form — both get rewritten and
+    # both appear in the ALTER POLICY.
+    p = _policy(
+        "user_id = current_setting('app.user')",
+        command="ALL",
+        with_check="user_id = current_setting('app.user')",
+    )
+    sql = SEC019Fixer().fix(_wrap_policy(p), {})[0].sql
+    assert "USING (user_id = current_setting('app.user', TRUE))" in sql
+    assert "WITH CHECK (user_id = current_setting('app.user', TRUE))" in sql
+
+
+def test_sec019_fix_rewrites_call_wrapped_in_subselect() -> None:
+    # PERF001's wrapped form `(SELECT current_setting('x'))` — the
+    # inner call is still one-arg, so SEC019 fires and the fixer
+    # walks into the SubLink.
+    schema = _wrap_policy(
+        _policy("user_id = (SELECT current_setting('app.user'))")
+    )
+    sql = SEC019Fixer().fix(schema, {})[0].sql
+    assert "(SELECT current_setting('app.user', TRUE))" in sql
+
+
+def test_sec019_fix_respects_allowlist() -> None:
+    schema = _wrap_policy(
+        _policy("user_id = current_setting('app.user')")
+    )
+    assert SEC019Fixer().fix(
+        schema, {"allowlist": ["public.t.p"]}
+    ) == []
+
+
+def test_sec019_fix_emits_one_per_offending_policy() -> None:
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                columns=("id", "user_id"),
+                policies=(
+                    _policy(
+                        "user_id = current_setting('app.user')",
+                        name="bad_a",
+                    ),
+                    _policy(
+                        "user_id = current_setting('app.user', true)",
+                        name="ok",
+                    ),
+                    _policy(
+                        "user_id = current_setting('app.team')",
+                        name="bad_b",
+                    ),
+                ),
+            ),
+        )
+    )
+    fixes = SEC019Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.t.bad_a",
+        "public.t.bad_b",
+    ]
+
+
+def test_sec019_fix_does_not_mutate_input_schema() -> None:
+    # PERF001's fixer deepcopies the AST before mutating; SEC019
+    # must do the same so the rule's view of the policy isn't
+    # silently rewritten as a side effect of `pgrls fix`.
+    p = _policy("user_id = current_setting('app.user')")
+    schema = _wrap_policy(p)
+    SEC019Fixer().fix(schema, {})
+    # The original AST still renders as the one-arg form.
+    from pglast.stream import RawStream
+    assert "TRUE" not in RawStream()(p.using_ast)
+
+
+def test_sec019_fix_description_explains_the_tradeoff() -> None:
+    # SEC019 is info severity precisely because the choice
+    # between the two overloads is judgement; the description
+    # must spell out that the rewrite picks the quiet-NULL side
+    # and point at the allowlist for users who wanted the loud
+    # raise.
+    schema = _wrap_policy(
+        _policy("user_id = current_setting('app.user')")
+    )
+    [f] = SEC019Fixer().fix(schema, {})
+    assert "missing_ok" in f.description
+    assert "[lint.rules.SEC019]" in f.description
+
+
+def test_sec019_fix_raises_on_malformed_allowlist() -> None:
+    schema = _wrap_policy(
+        _policy("user_id = current_setting('app.user')")
+    )
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC019Fixer().fix(schema, {"allowlist": "public.t.p"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC019Fixer().fix(schema, {"allowlist": [" public.t.p "]})
+
+
 # ---------- SEC020 fixer ----------
 
 
@@ -1325,6 +1499,7 @@ def test_default_fixers_registers_every_shipping_fixer() -> None:
         "SEC001",
         "SEC002",
         "SEC006",
+        "SEC019",
         "SEC020",
         "PERF001",
         "PERF003",
