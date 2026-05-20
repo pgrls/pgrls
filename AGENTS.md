@@ -2318,12 +2318,18 @@ legacy database without fixing every pre-existing finding first.
 A finding is matched by `(rule_id, location)`; the message text
 is deliberately not part of the key, so a wording change between
 releases does not spuriously un-baseline a finding. The baseline
-is JSON — commit it to the repo. The model is
-auto-create-on-first-run: to re-baseline after deliberately
-accepting new findings, delete the file and re-run (there is no
-separate write flag). `--baseline` is applied before formatting
-and the exit-code decision, so it composes with `--format` and
-`--fail-on` — both see only the new findings.
+is JSON — commit it to the repo. To re-baseline after
+deliberately accepting new findings, pair `--baseline FILE` with
+`--update-baseline`: the file is rewritten in place with the
+current findings (replace semantics — stale entries for findings
+that no longer fire are dropped, no merge). The flag suppresses
+normal lint output, prints a `pgrls: updated baseline at <file>
+with N finding(s).` status line on stderr, and exits 0; it
+requires `--baseline` (without a file to refresh,
+`--update-baseline` is a tool error). `--baseline` itself is
+applied before formatting and the exit-code decision, so it
+composes with `--format` and `--fail-on` — both see only the new
+findings.
 
 ## Testing your RLS — `pgrls.testing`
 

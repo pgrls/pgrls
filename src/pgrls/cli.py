@@ -127,6 +127,17 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--update-baseline",
+    is_flag=True,
+    default=False,
+    help=(
+        "Refresh the baseline file (named by --baseline) in place "
+        "with the current findings — accept every current finding "
+        "as the new baseline. Suppresses normal lint output and "
+        "exits 0 on success. Requires --baseline."
+    ),
+)
+@click.option(
     "--fail-on",
     type=click.Choice(list(ALL_SEVERITIES), case_sensitive=False),
     default=None,
@@ -157,11 +168,17 @@ def lint(
     schemas: str | None,
     rules: tuple[str, ...],
     explain: bool,
+    update_baseline: bool,
     fail_on: str | None,
     output_format: str,
     baseline_path: Path | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
+    if update_baseline and baseline_path is None:
+        raise ToolError(
+            "--update-baseline requires --baseline FILE to name "
+            "the file to refresh."
+        )
     try:
         config = load_config(config_path)
     except ConfigError as exc:
@@ -208,6 +225,28 @@ def lint(
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
+
+    if update_baseline:
+        # `--update-baseline` makes the current findings the new
+        # baseline (replace, not merge) — the baseline reflects
+        # current state; entries for findings that no longer fire
+        # naturally drop. The lint run's job here is to record,
+        # not report, so the normal format / fail-on path is
+        # skipped and the exit code is 0 on success.
+        assert baseline_path is not None  # guarded at the top.
+        try:
+            count = write_baseline(
+                baseline_path, violations, tool_version=__version__
+            )
+        except BaselineError as exc:
+            raise ToolError(str(exc)) from exc
+        plural = "" if count == 1 else "s"
+        click.echo(
+            f"pgrls: updated baseline at {baseline_path} with "
+            f"{count} finding{plural}.",
+            err=True,
+        )
+        return
 
     if baseline_path is not None:
         violations = _apply_baseline(violations, baseline_path)
