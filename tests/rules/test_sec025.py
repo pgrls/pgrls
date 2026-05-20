@@ -294,24 +294,15 @@ def test_sec025_fires_on_with_check_reference() -> None:
 
 
 def test_sec025_allowlist_skips_named_policy() -> None:
+    # Two policies on the same table, both reading the unprotected
+    # `members`. Allowlisting `ok` silences only that one; `fire`
+    # still trips.
+    using = "tenant_id IN (SELECT tenant_id FROM public.members)"
     schema = Schema(
         tables=(
             _docs(
-                _policy(
-                    name="ok",
-                    using=(
-                        "tenant_id IN (SELECT tenant_id FROM public.members)"
-                    ),
-                ),
-                _docs(
-                    _policy(
-                        name="fire",
-                        using=(
-                            "tenant_id IN (SELECT tenant_id FROM public.members)"
-                        ),
-                    ),
-                    name="docs2",
-                ).policies[0],
+                _policy(name="ok", using=using),
+                _policy(name="fire", using=using),
             ),
             _members(rls_enabled=False),
         )
