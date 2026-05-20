@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.46] - 2026-05-20
+
+### Changed
+- **PyPI / README polish (cosmetic).** Tightened the `description`
+  field in `pyproject.toml` so the PyPI search summary and
+  `pip show` output read as "Static analyzer for Postgres
+  Row-Level Security — 36 lint rules across security,
+  performance, and hygiene; 10 mechanically auto-fixable;
+  semantic policy-diff command for CI gating; pytest plugin for
+  RLS isolation tests." rather than the prior generic
+  "Framework-agnostic linter and testing toolkit ..." Added a
+  hero badge block to the README (PyPI version, supported Python
+  versions, license, CI status, monthly downloads) and a
+  punchier one-paragraph lede so the README — which PyPI renders
+  as the project description — leads with the value proposition
+  before the feature list. No functional changes.
+
 ## [0.5.45] - 2026-05-20
 
 ### Fixed
