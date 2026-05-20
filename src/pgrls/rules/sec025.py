@@ -8,7 +8,7 @@ table reached through a sub-select:
         USING (
             tenant_id IN (
                 SELECT tenant_id FROM public.team_members
-                WHERE user_id = current_setting('app.user_id')::int
+                WHERE user_id = current_setting('app.user_id', true)::int
             )
         );
 
@@ -40,10 +40,11 @@ What SEC025 flags — and what it deliberately does not:
 * **Not flagged — self-references.** A policy on `t` that
   references `t` itself inherits the same RLS gate (its own
   policies apply transitively), so self-references are skipped.
-* **Not flagged — views.** A `VIEW001` / `VIEW002` finding
-  surfaces a view-mediated bypass; SEC025 stops at the table
-  surface so the two rules do not double-fire on the same
-  reference.
+* **Not flagged — views.** Views do not carry an `rls_enabled`
+  flag — their security model is `security_invoker` /
+  `security_barrier`, which is VIEW001 / VIEW002's surface —
+  so SEC025 stops at the table boundary rather than guess at a
+  view's effective isolation.
 * **Not flagged — out-of-scope references.** A reference to a
   table outside `--schemas` is not in the introspected set;
   pgrls cannot know its RLS state and would not have a
