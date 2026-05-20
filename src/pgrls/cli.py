@@ -1533,9 +1533,83 @@ def cache_prune(assume_yes: bool) -> None:
     click.echo(f"pgrls cache: removed {removed} image(s).")
 
 
+def _rule_docstring_body(rule: Rule) -> str:
+    """Module docstring with the leading "<ID> — <title>." line
+    stripped, so the surrounding renderer can place its own header
+    without restating the title. Returns "" when the rule has no
+    docstring (graceful degrade for both `text` and `markdown`).
+    """
+    doc = _rule_docstring(rule)
+    if not doc:
+        return ""
+    lines = doc.splitlines()
+    # The trailing space pins the match to the whole ID token.
+    if lines and lines[0].lstrip().startswith(rule.id + " "):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _render_rule_markdown(rule: Rule) -> str:
+    """A single rule rendered as Markdown for embedding in user docs.
+
+    `## <ID> — <title>` heading, a `**Severity:**` line, then the
+    rule's reference body (docstring minus its title line). Rule
+    docstrings already use Markdown-friendly conventions —
+    fenced ``` blocks, `**bold**`, `*` bullets — so they render
+    cleanly without further transformation.
+    """
+    parts = [
+        f"## {rule.id} — {rule.title}",
+        "",
+        f"**Severity:** {rule.severity}",
+    ]
+    body = _rule_docstring_body(rule)
+    if body:
+        parts.append("")
+        parts.append(body)
+    return "\n".join(parts) + "\n"
+
+
+def _render_catalog_markdown(rules: list[Rule]) -> str:
+    """The rule catalog rendered as a Markdown table."""
+    header = (
+        f"`pgrls {__version__}` ships {len(rules)} rules. Run "
+        "`pgrls explain <RULE>` for any rule's full reference."
+    )
+    lines = [
+        "# pgrls rule catalog",
+        "",
+        header,
+        "",
+        "| ID | Severity | Title |",
+        "|---|---|---|",
+    ]
+    for r in rules:
+        # Defensive: a `|` in a title would break the table row.
+        # No rule title carries one today, but the escape costs
+        # nothing and pins the contract.
+        title = r.title.replace("|", "\\|")
+        lines.append(f"| {r.id} | {r.severity} | {title} |")
+    return "\n".join(lines) + "\n"
+
+
 @main.command()
 @click.argument("rule_id", metavar="RULE", required=False, default=None)
-def explain(rule_id: str | None) -> None:
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["text", "markdown"]),
+    default="text",
+    show_default=True,
+    help=(
+        "Output format. `text` (default, human-readable) or "
+        "`markdown` (embeddable in runbooks, wikis, or generated "
+        "docs)."
+    ),
+)
+def explain(rule_id: str | None, output_format: str) -> None:
     """Print a lint rule's reference, or list the rule catalog.
 
     With no argument, `pgrls explain` prints the catalog — one
@@ -1551,11 +1625,20 @@ def explain(rule_id: str | None) -> None:
 
     Reads nothing but pgrls's own rule catalog — no database
     connection and no config file, so it works anywhere.
+
+    `--format markdown` emits the same content as a Markdown
+    document (`##` heading + `**Severity:**` line + the rule's
+    reference body, or a Markdown table for the catalog) so the
+    output is paste-ready for a project runbook or wiki.
     """
     rules = all_rules()
     if rule_id is None:
-        # Catalog mode — one line per rule. Severity is padded so
-        # IDs and titles line up across the 34 rows.
+        # Catalog mode.
+        if output_format == "markdown":
+            click.echo(_render_catalog_markdown(rules), nl=False)
+            return
+        # Text catalog — one line per rule, padded so IDs and
+        # titles line up across the rows.
         for r in rules:
             sev = f"[{r.severity}]"
             click.echo(f"{r.id:<8} {sev:<9} {r.title}")
@@ -1570,29 +1653,16 @@ def explain(rule_id: str | None) -> None:
         known = ", ".join(r.id for r in rules)
         raise ToolError(f"Unknown rule {rule_id!r}. Known rules: {known}.")
 
-    click.echo(f"{rule.id}  [{rule.severity}]  {rule.title}")
-
-    # The explanation is the rule module's docstring. It is empty
-    # when the module can't be resolved or when `python -OO`
-    # stripped docstrings; the header line above is still a useful
-    # one-line answer in that case. `_rule_docstring` centralises
-    # the lookup so `pgrls lint --explain` reads from the same
-    # source.
-    doc = _rule_docstring(rule)
-    if not doc:
+    if output_format == "markdown":
+        click.echo(_render_rule_markdown(rule), nl=False)
         return
 
-    lines = doc.splitlines()
-    # A rule module's docstring opens, by convention, with a
-    # "<ID> — <title>." line. Drop it (and the blank line after)
-    # so the header just printed is not immediately restated; a
-    # docstring that breaks the convention is shown whole. The
-    # trailing space pins the match to the whole ID token.
-    if lines and lines[0].lstrip().startswith(rule.id + " "):
-        lines = lines[1:]
-        while lines and not lines[0].strip():
-            lines.pop(0)
-    body = "\n".join(lines).strip()
+    click.echo(f"{rule.id}  [{rule.severity}]  {rule.title}")
+    # The explanation is the rule module's docstring (minus its
+    # title line, which the header just printed). `_rule_docstring_body`
+    # centralises the strip so `--format markdown` and the default
+    # text path stay in sync.
+    body = _rule_docstring_body(rule)
     if body:
         click.echo()
         click.echo(body)

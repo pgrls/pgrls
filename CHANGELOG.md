@@ -10,6 +10,25 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.40] - 2026-05-19
+
+### Added
+- **`pgrls explain --format markdown`.** Emit the rule reference
+  (or the catalog) as a Markdown document instead of plain text,
+  so the output is paste-ready for a project runbook, wiki, or
+  generated docs site. Per-rule: `## <ID> — <title>` heading,
+  a `**Severity:**` line, then the rule's reference body
+  (docstring minus its title line — already in the heading).
+  Catalog: an `# pgrls rule catalog` header, a one-line
+  description naming the pgrls version and rule count, then a
+  Markdown table with ID / Severity / Title columns.
+
+  Rule docstrings already use Markdown-friendly conventions
+  (fenced ``` blocks, `**bold**`, `*` bullets), so they render
+  cleanly without further transformation. Default remains
+  `text`; `--format` accepts `text` or `markdown`, anything else
+  is a Click usage error.
+
 ## [0.5.39] - 2026-05-19
 
 ### Added

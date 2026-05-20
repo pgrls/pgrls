@@ -122,6 +122,82 @@ def test_explain_covers_every_registered_rule() -> None:
         )
 
 
+def test_explain_format_markdown_per_rule_renders_heading_and_body() -> None:
+    # `pgrls explain SEC001 --format markdown` emits an H2 heading,
+    # a `**Severity:**` line, then the rule's reference body — the
+    # paste-ready shape for a project runbook or wiki.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC001", "--format", "markdown"]
+    )
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "## SEC001 — RLS not enabled on table" in out
+    assert "**Severity:** error" in out
+    # Substring from the rule's docstring body (not the message
+    # template) proves the body was appended.
+    assert "pg_class.relrowsecurity" in out
+
+
+def test_explain_format_markdown_strips_docstring_title_line() -> None:
+    # The Markdown heading replaces the docstring's leading
+    # "<ID> — <title>." line; the body must not restate it.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC001", "--format", "markdown"]
+    )
+    # The exact docstring first line is absent from the body
+    # (the H2 carries the same information).
+    import inspect
+    from pgrls.rules.sec001 import SEC001
+    module = inspect.getmodule(SEC001)
+    docstring_first_line = (
+        (module.__doc__ if module else None) or ""
+    ).strip().splitlines()[0]
+    assert docstring_first_line not in result.output
+
+
+def test_explain_format_markdown_catalog_renders_table() -> None:
+    # Bare `pgrls explain --format markdown` lists every rule as
+    # a Markdown table. The table header and at least one rule
+    # row must appear; the H1 anchors the document.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "--format", "markdown"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "# pgrls rule catalog" in out
+    assert "| ID | Severity | Title |" in out
+    assert "|---|---|---|" in out
+    # Every registered rule has a row.
+    for rule in all_rules():
+        assert f"| {rule.id} |" in out
+        assert rule.title in out
+
+
+def test_explain_format_text_remains_the_default() -> None:
+    # Omitting --format gives the existing text shape (no leading
+    # `##` heading, no `**Severity:**` line). The text path is
+    # the regression check for everything that doesn't use the
+    # new flag.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC001"])
+    assert result.exit_code == 0
+    # Text header is `SEC001  [error]  ...`, not the Markdown H2.
+    assert "## SEC001" not in result.output
+    assert "**Severity:**" not in result.output
+    assert "SEC001  [error]  " in result.output
+
+
+def test_explain_format_unknown_value_errors() -> None:
+    # `--format xml` is not a supported choice; Click rejects it.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC001", "--format", "xml"]
+    )
+    assert result.exit_code != 0
+    assert "xml" in result.output
+
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # Derive from the rule registry so a new rule lands without the
