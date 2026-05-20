@@ -21,7 +21,7 @@
   a feature ships.
 -->
 <p align="center">
-  <a href="https://github.com/pgrls/pgrls/blob/main/docs/screencast.svg">
+  <a href="https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg">
     <img src="https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg" alt="pgrls 60-second tour" width="780">
   </a>
 </p>
