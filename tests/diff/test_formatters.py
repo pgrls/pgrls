@@ -292,6 +292,218 @@ def test_using_loosened_renders_tilde_marker():
     assert lines[0] == "~ public.t.policy"
 
 
+# ---------------------------------------------------------------------------
+# 13. --explain — per-stanza rationale line
+# ---------------------------------------------------------------------------
+
+
+def test_explain_false_does_not_emit_rationale_line():
+    # Default behavior: no `-> ` line, output identical to a
+    # caller who never set the flag at all.
+    changes = [
+        _change(
+            ChangeKind.TABLE_DROPPED,
+            "breaking",
+            location="public.dropped",
+            message="Table public.dropped removed.",
+        )
+    ]
+    without = format_diff_text(changes)
+    explicit_false = format_diff_text(changes, explain=False)
+    assert without == explicit_false
+    assert "-> " not in without
+
+
+def test_explain_true_appends_rationale_for_table_dropped():
+    changes = [
+        _change(
+            ChangeKind.TABLE_DROPPED,
+            "breaking",
+            location="public.dropped",
+            message="Table public.dropped removed.",
+        )
+    ]
+    result = format_diff_text(changes, explain=True)
+    # The rationale line lives below the classification line,
+    # indented to match it, prefixed with `-> `.
+    lines = result.split("\n")
+    classification_idx = next(
+        i for i, ln in enumerate(lines) if ln.startswith("  [BREAKING]")
+    )
+    rationale_line = lines[classification_idx + 1]
+    assert rationale_line.startswith("  -> ")
+    assert "BREAKING" in rationale_line
+    assert "narrows" in rationale_line.lower()
+
+
+def test_explain_true_picks_correct_text_for_rls_flipped_directions():
+    # RLS_FLIPPED uses one ChangeKind but two classifications (safe
+    # for off→on, dangerous for on→off). The rationale must read
+    # differently per direction — this pins the (kind, classification)
+    # keying.
+    on_to_off = [
+        _change(
+            ChangeKind.RLS_FLIPPED,
+            "dangerous",
+            location="public.t",
+            message="Table public.t RLS disabled.",
+        )
+    ]
+    off_to_on = [
+        _change(
+            ChangeKind.RLS_FLIPPED,
+            "safe",
+            location="public.t",
+            message="Table public.t RLS enabled.",
+        )
+    ]
+
+    dangerous_out = format_diff_text(on_to_off, explain=True)
+    safe_out = format_diff_text(off_to_on, explain=True)
+
+    # The "single most dangerous diff signal" framing lives ONLY in
+    # the on→off rationale; the off→on rationale uses different
+    # wording. Verifies the table is keyed by (kind, classification),
+    # not just kind.
+    assert "most dangerous diff signal" in dangerous_out
+    assert "most dangerous diff signal" not in safe_out
+    assert "denies non-owner access" in safe_out
+    assert "denies non-owner access" not in dangerous_out
+
+
+def test_explain_true_on_predicate_change_appends_after_predicate_block():
+    # USING/WITH CHECK kinds have a before/after SQL block between
+    # the summary and classification lines. The rationale must
+    # still appear immediately below the classification line —
+    # NOT inside the predicate block.
+    changes = [
+        _change(
+            ChangeKind.USING_LOOSENED,
+            "dangerous",
+            location="public.t.p",
+            message="USING loosened.",
+            before_sql="a = 1",
+            after_sql="a = 1 OR b = 2",
+        )
+    ]
+    result = format_diff_text(changes, explain=True)
+    lines = result.split("\n")
+    # Expected sequence:
+    #   ~ public.t.p
+    #     USING predicate loosened
+    #   - a = 1
+    #   + a = 1 OR b = 2
+    #     [DANGEROUS] USING loosened.
+    #     -> ...
+    assert any(ln.startswith("  -> ") for ln in lines)
+    classification_idx = next(
+        i for i, ln in enumerate(lines) if ln.startswith("  [DANGEROUS]")
+    )
+    assert lines[classification_idx + 1].startswith("  -> ")
+    # Before/after SQL block stays above the classification line —
+    # not below the rationale.
+    assert any(ln.startswith("- a = 1") for ln in lines)
+    assert any(ln.startswith("+ a = 1 OR b = 2") for ln in lines)
+
+
+def test_explain_emits_one_rationale_line_per_change():
+    # Multiple stanzas → one rationale line each, attached to the
+    # correct classification line.
+    changes = [
+        _change(
+            ChangeKind.TABLE_ADDED_WITH_RLS,
+            "safe",
+            location="public.a",
+            message="Added with RLS.",
+        ),
+        _change(
+            ChangeKind.TABLE_ADDED_WITHOUT_RLS,
+            "dangerous",
+            location="public.b",
+            message="Added without RLS.",
+        ),
+    ]
+    result = format_diff_text(changes, explain=True)
+    rationale_lines = [
+        ln for ln in result.split("\n") if ln.startswith("  -> ")
+    ]
+    assert len(rationale_lines) == 2
+    # First stanza → safe rationale; second → dangerous.
+    assert "closed by construction" in rationale_lines[0]
+    assert "default-deny" in rationale_lines[1]
+
+
+def test_explain_does_not_change_summary_line():
+    # The trailing `pgrls diff: N changes — ...` line lives below
+    # all stanzas and must be unaffected by --explain.
+    changes = [
+        _change(
+            ChangeKind.GRANT_REVOKED,
+            "safe",
+            location="public.t",
+            message="Grant revoked.",
+        )
+    ]
+    summary_without = format_diff_text(changes).split("\n")[-1]
+    summary_with = format_diff_text(changes, explain=True).split("\n")[-1]
+    assert summary_without == summary_with
+
+
+def test_explain_empty_changes_returns_no_changes_string():
+    # The empty path bypasses the stanza loop entirely; --explain
+    # has nothing to attach to. Output must match the un-explained
+    # empty form.
+    assert (
+        format_diff_text([], explain=True)
+        == format_diff_text([])
+        == "pgrls diff: no changes."
+    )
+
+
+def test_explain_unknown_kind_classification_pair_degrades_silently():
+    # The rationale table covers every (kind, classification) the
+    # differ emits today (pinned by an import-time check). A
+    # hypothetical NEW combination — e.g. someone constructs a
+    # Change programmatically with TABLE_DROPPED + "safe" — has no
+    # rationale entry and must silently degrade rather than crash.
+    # Mirrors `pgrls lint --explain` for rules without a docstring.
+    changes = [
+        _change(
+            ChangeKind.TABLE_DROPPED,
+            "safe",  # not a real differ emission for this kind
+            location="public.t",
+            message="Synthetic.",
+        )
+    ]
+    result = format_diff_text(changes, explain=True)
+    # No `-> ` line for this stanza; rest of the rendering intact.
+    assert "-> " not in result
+    assert "  [SAFE] Synthetic." in result
+
+
+def test_explain_rationale_table_covers_every_kind_classification_pair():
+    # Test-side mirror of the import-time exhaustiveness check —
+    # makes the failure mode visible to reviewers rather than only
+    # to the import system. Also covers the case where a new
+    # ChangeKind ships without a rationale entry (would crash at
+    # import, so the test itself catches the regression).
+    from pgrls.diff.formatters import (
+        _EXPECTED_RATIONALE_KEYS,
+        _RATIONALE_BY_KIND_AND_CLASSIFICATION,
+    )
+
+    assert set(_RATIONALE_BY_KIND_AND_CLASSIFICATION) == _EXPECTED_RATIONALE_KEYS
+
+    # Each rationale is non-empty and ends with a period — the
+    # paragraph reads as a complete sentence.
+    for key, text in _RATIONALE_BY_KIND_AND_CLASSIFICATION.items():
+        assert text, f"Empty rationale for {key!r}"
+        assert text.rstrip().endswith("."), (
+            f"Rationale for {key!r} doesn't end with a period: "
+            f"{text!r}"
+        )
+
+
 def test_every_change_kind_has_marker_classification():
     # Exhaustive contract: every ChangeKind value lands in one of
     # _ADD_KINDS / _DROP_KINDS / _MOD_KINDS / _STATE_KINDS, so the

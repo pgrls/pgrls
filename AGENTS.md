@@ -2499,6 +2499,25 @@ migrations — RLS disabled, permissive policies added, predicates widened —
 without blocking safe schema changes. Both `pgrls snapshot` (capture) and
 `pgrls diff` (compare) ship as CLI subcommands in v0.2+.
 
+Pass `--explain` to append a one-paragraph rationale beneath each
+classified Change in the text output, so the *why* sits next to the
+*where* without a separate `AGENTS.md` lookup. The rationale answers
+"why does this kind carry this classification" one layer deeper than
+the per-Change message field — for example, why a dropped PERMISSIVE
+policy is BREAKING (access narrows) rather than DANGEROUS (which is
+reserved for changes that widen access). Text format only; JSON /
+SARIF already carry the classification tag as a structured field.
+
+The rationale table lives in
+`src/pgrls/diff/formatters.py::_RATIONALE_BY_KIND_AND_CLASSIFICATION`
+and is keyed by `(ChangeKind, Classification)` — `RLS_FLIPPED` and
+`FORCE_RLS_FLIPPED` each reuse one kind for both directions (on→off
+DANGEROUS, off→on SAFE) but the two directions get different
+rationales. An import-time check verifies every `ChangeKind` the
+differ can emit has at least one rationale entry, so adding a new
+kind without a rationale fails at module import rather than silently
+degrading `--explain`.
+
 ### Exit codes
 
 Same three-tier convention as `pgrls lint`:

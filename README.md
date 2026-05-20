@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.42.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.43.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-five rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -226,6 +226,12 @@ the choice persistent (CLI flag → `[diff].fail_on` → built-in
 use `--format json` or `--format sarif` for CI integrations that
 already parse `pgrls lint` output — the same `Violation` shape is
 reused.
+
+Pass `--explain` to append a one-paragraph rationale beneath each
+classified Change in the text output — why a dropped PERMISSIVE
+policy is BREAKING rather than DANGEROUS, why a column drop is
+REQUIRES_REVIEW, etc. Text format only; JSON / SARIF already carry
+the classification tag.
 
 | Change category                        | Default classification |
 |----------------------------------------|------------------------|
