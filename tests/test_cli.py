@@ -147,8 +147,8 @@ def test_explain_format_markdown_strips_docstring_title_line() -> None:
         main, ["explain", "SEC001", "--format", "markdown"]
     )
     # The exact docstring first line is absent from the body
-    # (the H2 carries the same information).
-    import inspect
+    # (the H2 carries the same information). `inspect` is already
+    # imported at module top.
     from pgrls.rules.sec001 import SEC001
     module = inspect.getmodule(SEC001)
     docstring_first_line = (
@@ -166,6 +166,11 @@ def test_explain_format_markdown_catalog_renders_table() -> None:
     assert result.exit_code == 0, result.output
     out = result.output
     assert "# pgrls rule catalog" in out
+    # The summary line names the pgrls version and the rule
+    # count and points at the per-rule lookup.
+    from pgrls import __version__
+    assert __version__ in out
+    assert "pgrls explain <RULE>" in out
     assert "| ID | Severity | Title |" in out
     assert "|---|---|---|" in out
     # Every registered rule has a row.
