@@ -23,24 +23,38 @@ docker run -d --name pgrls-demo -p 55432:5432 \
   postgres:17 >/dev/null
 until docker exec pgrls-demo pg_isready -U demo >/dev/null 2>&1; do sleep 0.5; done
 
-# 2) Apply a deliberately broken schema (five real bugs in five tables)
-cat <<'SQL' | docker exec -i pgrls-demo psql -U demo -d demo -q
+# 2) Apply a deliberately broken schema. The auth schema/function are
+#    created FIRST so the documents policy can reference auth.uid()
+#    when it's defined below.
+cat <<'SQL' | docker exec -i pgrls-demo psql -U demo -d demo -v ON_ERROR_STOP=1 -q
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE
+    AS $$ SELECT NULL::uuid $$;
+
+-- public.users: no RLS → SEC001 fires.
 CREATE TABLE public.users (id uuid primary key, email text);
+
+-- public.documents: RLS on, but USING has the Lovable CVE shape
+-- (`auth.uid() IS NULL` short-circuits the OR to true for any
+-- anonymous connection — auth.uid() returns NULL when no JWT is
+-- present). SEC004 fires (marquee CVE pattern); the unwrapped
+-- auth.uid() calls also trip PERF001 (per-row evaluation).
 CREATE TABLE public.documents (id uuid primary key, owner uuid, content text);
 ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_read ON public.documents
     FOR SELECT TO public
-    USING (auth.uid() = 'admin');                    -- SEC004: inverted auth check
+    USING (auth.uid() IS NULL OR owner = auth.uid());
+
+-- public.audit_log: no RLS → second SEC001 finding.
 CREATE TABLE public.audit_log (id bigserial primary key, actor text);
-                                                     -- SEC001: RLS not enabled
+
+-- public.events: RLS on, but USING calls one-argument current_setting
+-- (raises on an unset GUC instead of returning NULL) → SEC019 fires.
+-- The unwrapped current_setting also trips PERF001.
 CREATE TABLE public.events (id bigserial, tenant_id int);
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_filter ON public.events
     USING (tenant_id = current_setting('app.tenant')::int);
-                                                     -- SEC019: missing missing_ok arg
-CREATE SCHEMA IF NOT EXISTS auth;
-CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE
-    AS $$ SELECT NULL::uuid $$;
 SQL
 
 # 3) Point pgrls at it
@@ -76,8 +90,11 @@ pip show pgrls | grep -E '^(Name|Version|Summary)'
 pgrls lint
 ```
 
-Output shows five findings (SEC001, SEC004, SEC009 silent-deny,
-SEC019, PERF001 per-row auth call) in red/yellow.
+Output shows several findings across the four tables — most
+prominently **SEC004** (inverted auth check on `documents`),
+**SEC001** (RLS off on `users` and `audit_log`), **SEC019**
+(one-arg `current_setting` on `events`), and **PERF001** (the
+unwrapped `auth.uid()` / `current_setting()` calls).
 
 ### Scene 3 — explain the marquee finding (≈10s)
 
@@ -85,8 +102,8 @@ SEC019, PERF001 per-row auth call) in red/yellow.
 pgrls lint --rule SEC004 --explain
 ```
 
-Inline rationale: the Lovable CVE pattern. One paragraph under the
-finding.
+Inline rationale appears under the finding: the Lovable CVE pattern,
+why `auth.uid() IS NULL OR …` admits every anonymous read.
 
 ### Scene 4 — auto-fix (≈15s)
 
@@ -96,11 +113,19 @@ pgrls fix --rule SEC001 --apply
 ```
 
 First call prints the proposed `ALTER TABLE … ENABLE ROW LEVEL
-SECURITY;`. Second call applies it; SEC001 now silent on re-lint:
+SECURITY;`. Second call applies it. Re-lint the same rule to show
+it's now silent:
 
 ```
 pgrls lint --rule SEC001
 ```
+
+(Re-running the full `pgrls lint` here would surface a fresh
+SEC009 — "RLS enabled but no policies" — on the tables we just
+enabled RLS on. That's a real follow-on finding pgrls is designed
+to nag about, but for the screencast we keep the focus on the
+one rule the fix actually addressed; `--rule SEC001` keeps the
+output tight.)
 
 ### Scene 5 — diff catches a regression (≈15s)
 
