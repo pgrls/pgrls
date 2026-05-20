@@ -108,13 +108,15 @@ why `auth.uid() IS NULL OR …` admits every anonymous read.
 ### Scene 4 — auto-fix (≈15s)
 
 ```
-pgrls fix --rule SEC001 --check
+pgrls fix --rule SEC001
 pgrls fix --rule SEC001 --apply
 ```
 
-First call prints the proposed `ALTER TABLE … ENABLE ROW LEVEL
-SECURITY;`. Second call applies it. Re-lint the same rule to show
-it's now silent:
+The first call is the default dry-run — it prints the proposed
+`ALTER TABLE … ENABLE ROW LEVEL SECURITY;` statements to stdout
+without touching the database (so `pgrls fix > migration.sql`
+works as a script generator). The second call applies them.
+Re-lint the same rule to show it's now silent:
 
 ```
 pgrls lint --rule SEC001
