@@ -6,9 +6,23 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/pgrls/pgrls/test.yml?branch=main&label=tests)](https://github.com/pgrls/pgrls/actions/workflows/test.yml)
 [![Downloads](https://img.shields.io/pypi/dm/pgrls.svg)](https://pypistats.org/packages/pgrls)
 
-**Static analyzer for Postgres Row-Level Security.** pgrls inspects a live database — `pg_policy`, `pg_class`, the parsed AST of every policy predicate — and reports auth bugs, predicate logic flaws, and per-row performance traps that eyeball-review misses. It's framework-agnostic (Supabase, PostgREST, Hasura, Prisma, Django, raw SQL — all the same), MIT-licensed, and CI-native: text / JSON / SARIF / Markdown output, exit codes that gate merges, and a `pgrls diff` command that classifies every migration as SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS so safe schema changes don't block review while real regressions do.
+> **Static analyzer for Postgres Row-Level Security.**
+> Finds the auth-bug shapes and predicate logic flaws eyeball-review misses; 10 of 36 rules mechanically auto-fixable.
+> `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
+> MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown).
 
-> **Status: 0.5.46.** Thirty-six lint rules (SEC001–SEC026, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+<!--
+  Screencast placeholder. Record with the recipe in docs/screencast.md
+  (≈5 minutes end-to-end), then replace REPLACE_AFTER_UPLOAD with the
+  asciinema cast ID.
+-->
+<p align="center">
+  <a href="https://asciinema.org/a/REPLACE_AFTER_UPLOAD">
+    <img src="docs/screencast.svg" alt="pgrls 60-second tour" width="780">
+  </a>
+</p>
+
+> **Status: 0.5.47.** Thirty-six lint rules (SEC001–SEC026, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-six rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 360" role="img"
+     aria-label="pgrls screencast — pending recording">
+  <style>
+    .bg { fill: #0d1117; }
+    .border { fill: none; stroke: #30363d; stroke-width: 2; }
+    .title { fill: #c9d1d9; font: 600 24px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .subtitle { fill: #8b949e; font: 400 16px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .prompt { fill: #7ee787; font: 600 18px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .cmd { fill: #c9d1d9; font: 400 18px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  </style>
+  <rect class="bg" x="0" y="0" width="780" height="360" rx="8" />
+  <rect class="border" x="1" y="1" width="778" height="358" rx="7" />
+  <circle cx="22" cy="22" r="6" fill="#ff5f56" />
+  <circle cx="42" cy="22" r="6" fill="#ffbd2e" />
+  <circle cx="62" cy="22" r="6" fill="#27c93f" />
+  <text x="40" y="120" class="title">pgrls 60-second tour</text>
+  <text x="40" y="148" class="subtitle">screencast pending — record with docs/screencast.md</text>
+  <text x="40" y="220" class="prompt">$</text>
+  <text x="62" y="220" class="cmd">pgrls lint</text>
+  <text x="40" y="252" class="prompt">$</text>
+  <text x="62" y="252" class="cmd">pgrls fix --rule SEC001 --apply</text>
+  <text x="40" y="284" class="prompt">$</text>
+  <text x="62" y="284" class="cmd">pgrls diff base.json --fail-on dangerous</text>
+</svg>

@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.47] - 2026-05-20
+
+### Changed
+- **README hero rewrite (cosmetic).** Replaced the prior
+  single-paragraph hero with a tighter four-line lede that leads
+  with the value prop, names the diff-classification axis, and
+  closes with the framework/output-format range — the four lines
+  the reader needs before deciding to scroll. Added a centered
+  screencast placeholder (`docs/screencast.svg`) above the
+  status blockquote so the hero now reads as *lede → demo →
+  release status*. The placeholder links to an asciinema cast ID
+  that's filled in after the actual recording lands; see
+  `docs/screencast.md` for the recording recipe (Docker fixture,
+  asciinema commands, upload-and-embed steps).
+- **New: `docs/screencast.md`.** Copy-paste-able recording
+  recipe: prereqs, throwaway-Postgres fixture, five scene
+  scripts (install / lint / explain / fix / diff), upload and
+  embed steps. Target cast length 60–75 seconds. The recipe
+  exists in the repo so future re-records (after every major
+  feature) follow the same shape.
+
 ## [0.5.46] - 2026-05-20
 
 ### Changed
