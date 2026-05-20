@@ -2189,6 +2189,39 @@ def test_fix_check_exits_zero_on_clean_database(
     assert "no auto-fixable" in result.output
 
 
+def test_fix_check_routes_violations_to_stdout_and_summary_to_stderr(
+    pg_url: str, apply_sql
+) -> None:
+    # Pin the documented output split: per-fix (rule, location)
+    # lines go to STDOUT (so `pgrls fix --check > violations.log`
+    # captures them as a CI artefact); the summary count and the
+    # next-step hint go to STDERR. The earlier tests inspect
+    # `result.output`, which merges the streams and so cannot
+    # tell the two apart.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_split (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_check_split ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_split
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--check"]
+    )
+    assert result.exit_code == 1, result.output
+    # Stdout — actionable, parseable violation listing.
+    assert "SEC002" in result.stdout
+    assert "public.fix_check_split" in result.stdout
+    assert "auto-fixable" not in result.stdout
+    assert "pgrls fix --apply" not in result.stdout
+    # Stderr — diagnostic summary and next-step hint.
+    assert "auto-fixable" in result.stderr
+    assert "pgrls fix --apply" in result.stderr
+    assert "SEC002" not in result.stderr
+
+
 def test_fix_check_does_not_modify_database(
     pg_url: str, apply_sql
 ) -> None:
