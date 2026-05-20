@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.36.** Thirty-four lint rules (SEC001–SEC024, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.37.** Thirty-four lint rules (SEC001–SEC024, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-four rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -126,6 +126,9 @@ pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
 
 # Write the SQL to a migration-ready file instead of stdout.
 pgrls fix --database-url "$DATABASE_URL" --output migration.sql
+
+# CI gate: exit 1 if any auto-fixable violations exist (no SQL emitted).
+pgrls fix --database-url "$DATABASE_URL" --check
 ```
 
 Currently fixable: **SEC001** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`), **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **SEC006** (emits `ALTER POLICY … WITH CHECK (…)` mirroring the policy's `USING`), **SEC020** (emits `ALTER POLICY … WITH CHECK (…)` replacing a constant-`true` `WITH CHECK` with the policy's `USING`), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`), **PERF003** (emits `CREATE INDEX ON … (…);` for a policy-predicate column with no leading-column index), **HYG003** (emits `DROP POLICY … ON …;` for a policy that exactly duplicates another on the same table), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
