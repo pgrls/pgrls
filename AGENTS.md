@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-four rules across four
+In the current release it ships **thirty-five rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -38,6 +38,9 @@ below the RLS barrier),
 restricts — writes accept rows reads never would),
 `SEC023` (policy applies to a role that bypasses RLS — the role's
 `BYPASSRLS` attribute makes the policy's `TO` clause inert),
+`SEC025` (policy predicate references a table that has RLS
+disabled — the cross-table read is only as strong as the
+referenced table's isolation),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1588,6 +1591,87 @@ Out of scope (intentional):
   a function, or a column `DEFAULT` is not in scope — SEC024
   inspects policy `USING` / `WITH CHECK` clauses only.
 
+<a id="rule-sec025"></a>
+
+### SEC025 — Policy predicate references a table that has RLS disabled
+
+**Severity:** warning. **Auto-fix:** no (the remedy is either to
+enable RLS on the referenced table — an application-design
+decision — or to drop the cross-table read; pgrls cannot infer
+which is right).
+
+A row-level security policy on table `T` often gates row
+visibility on *another* table `T'` — typically a membership /
+ACL / lookup table reached through a sub-select:
+
+```sql
+CREATE POLICY tenant_scope ON public.documents
+    USING (
+        tenant_id IN (
+            SELECT tenant_id FROM public.team_members
+            WHERE user_id = current_setting('app.user_id', true)::int
+        )
+    );
+```
+
+The row-level isolation on `documents` is only as strong as the
+isolation on `team_members`. If `team_members` itself does **not**
+have RLS enabled, every column of it is freely readable (and, if
+the role has INSERT, freely writable) by the same role. An
+attacker who can write to `team_members` can grant themselves
+access to `documents` — the policy honours the row they planted.
+
+Detection is structural cross-reference, not an AST pattern.
+SEC025 walks the parsed policy `USING` / `WITH CHECK` for
+`RangeVar` nodes (table references in sub-selects / `FROM`
+clauses), resolves each against the introspected schema, and
+fires when the referenced table is in scope and has
+`rls_enabled = false`. The pattern is sometimes intentional —
+a read-only reference table (countries, currencies, plan types,
+feature flags) that every tenant is meant to read — so SEC025
+is **warning** severity and allowlistable by qualified policy
+ID (`schema.table.policy_name`).
+
+What SEC025 flags — and what it deliberately does not:
+
+* **Flagged:** a policy whose `USING` / `WITH CHECK` references
+  — in a sub-select, a JOIN, anywhere `RangeVar` reaches — a
+  table whose `rls_enabled` is false within the introspected
+  schema set.
+* **Not flagged — self-references.** A policy on `T` that
+  references `T` itself in a sub-select inherits the same RLS
+  gate (its own policies apply transitively), so self-references
+  are skipped.
+* **Not flagged — views.** Views do not carry an `rls_enabled`
+  flag — their security model is `security_invoker` /
+  `security_barrier`, which is VIEW001 / VIEW002's surface —
+  so SEC025 stops at the table boundary rather than guess at a
+  view's effective isolation.
+* **Not flagged — out-of-scope references.** A reference to a
+  table outside `--schemas` is not in the introspected set;
+  pgrls cannot know its RLS state and would not have a reliable
+  signal. The conservative call is silence — widen `--schemas`
+  to include the dependent schema for SEC025 to see it. System
+  catalogs (`pg_catalog.*`) are similarly skipped: they are
+  never introspected.
+
+Out of scope (intentional):
+
+* **Predicate-implication analysis.** SEC025 does not try to
+  prove the sub-select's `WHERE` clause already constrains `T'`
+  to the same tenant. The structural reference is the signal;
+  allowlist a policy whose cross-table read is intentionally
+  safe.
+* **Function references.** A policy that calls a `SECURITY
+  DEFINER` function reading another RLS-off table is a separate
+  surface (SEC014 / VIEW004). SEC025 inspects table references
+  only.
+* **Write-side enforcement.** SEC025 does not gate against an
+  attacker writing to `T'`; it surfaces the structural
+  dependency so the operator can decide whether `T'` needs RLS
+  too, or whether writes to `T'` are locked down via `GRANT` /
+  a separate workflow.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2635,7 +2719,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-four rules across four categories.** SEC001–SEC024,
+- **Thirty-five rules across four categories.** SEC001–SEC025,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
