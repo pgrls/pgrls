@@ -272,6 +272,19 @@ def _merge_overrides(
     )
 
 
+def _rule_docstring(rule: Any) -> str:
+    """Return the rule module's docstring, stripped, or '' if absent.
+
+    Shared by `pgrls explain` (which surfaces the whole docstring)
+    and `pgrls lint --explain` (which surfaces just its first
+    non-title paragraph) so the two paths read the same source
+    via the same lookup — no chance of one rule's docstring
+    showing up in one command but not the other.
+    """
+    module = inspect.getmodule(type(rule))
+    return ((module.__doc__ if module else None) or "").strip()
+
+
 def _rule_rationale_paragraph(rule: Any) -> str:
     """First non-title paragraph of the rule's module docstring.
 
@@ -286,8 +299,7 @@ def _rule_rationale_paragraph(rule: Any) -> str:
     convention (title line + reference para). `pgrls lint
     --explain` then quietly degrades to the un-augmented message.
     """
-    module = inspect.getmodule(type(rule))
-    doc = ((module.__doc__ if module else None) or "").strip()
+    doc = _rule_docstring(rule)
     if not doc:
         return ""
     paragraphs = doc.split("\n\n")
@@ -1563,9 +1575,10 @@ def explain(rule_id: str | None) -> None:
     # The explanation is the rule module's docstring. It is empty
     # when the module can't be resolved or when `python -OO`
     # stripped docstrings; the header line above is still a useful
-    # one-line answer in that case.
-    module = inspect.getmodule(type(rule))
-    doc = ((module.__doc__ if module else None) or "").strip()
+    # one-line answer in that case. `_rule_docstring` centralises
+    # the lookup so `pgrls lint --explain` reads from the same
+    # source.
+    doc = _rule_docstring(rule)
     if not doc:
         return
 

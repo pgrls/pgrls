@@ -1283,7 +1283,7 @@ def test_lint_explain_only_affects_text_format(
     )
     # The JSON outputs are byte-identical — --explain is ignored
     # for non-text formats.
-    assert plain.stdout == explained.stdout
+    assert plain.output == explained.output
 
 
 # ============================================================
