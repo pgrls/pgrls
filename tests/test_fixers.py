@@ -1120,6 +1120,41 @@ def test_sec019_fix_raises_on_malformed_allowlist() -> None:
         SEC019Fixer().fix(schema, {"allowlist": [" public.t.p "]})
 
 
+def test_sec019_and_perf001_both_fire_on_unwrapped_one_arg_current_setting() -> None:
+    # PERF001 (wrap auth calls in `(SELECT …)`) and SEC019 (add the
+    # `, true` second argument) both target the same shape — an
+    # unwrapped one-arg `current_setting` — and run independently.
+    # Both emit an `ALTER POLICY` for the same policy: PERF001
+    # wraps but leaves the arity at one; SEC019 adds the missing_ok
+    # argument but leaves the call unwrapped. Whichever runs last
+    # overwrites the prior clause, so `pgrls fix --apply` converges
+    # in TWO passes on a policy that triggers both rules.
+    #
+    # This regression test pins that contract — a future "smart
+    # composite fixer" that emitted a single combined ALTER would
+    # need to update this test deliberately rather than silently
+    # change `pgrls fix`'s convergence story.
+    schema = _wrap_policy(
+        _policy("user_id = current_setting('app.user')")
+    )
+    perf_fixes = PERF001Fixer().fix(schema, {})
+    sec_fixes = SEC019Fixer().fix(schema, {})
+
+    assert len(perf_fixes) == 1
+    assert len(sec_fixes) == 1
+    assert perf_fixes[0].location == sec_fixes[0].location == "public.t.p"
+
+    # PERF001's ALTER wraps in `(SELECT …)` but keeps the one-arg
+    # call — SEC019 still re-fires on its output.
+    assert "(SELECT current_setting('app.user'))" in perf_fixes[0].sql
+    assert ", TRUE)" not in perf_fixes[0].sql
+
+    # SEC019's ALTER adds the second argument but leaves the call
+    # unwrapped — PERF001 still re-fires on its output.
+    assert "current_setting('app.user', TRUE)" in sec_fixes[0].sql
+    assert "(SELECT" not in sec_fixes[0].sql
+
+
 # ---------- SEC020 fixer ----------
 
 

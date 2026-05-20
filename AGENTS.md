@@ -2254,7 +2254,14 @@ Currently fixable:
   because the choice is judgement — the Fix description spells
   out that the rewrite imposes the two-argument form and points
   operators who genuinely want raise-on-unset at the per-policy
-  allowlist.
+  allowlist. Note that a policy with an unwrapped one-argument
+  `current_setting()` call triggers BOTH SEC019 and PERF001
+  (which wants the call wrapped in `(SELECT …)`). The two
+  fixers run independently and each re-emits the whole clause
+  from its own deep-copy, so applying both in one `pgrls fix
+  --apply` pass leaves the predicate in whichever form ran
+  last — convergence requires a second pass. Pinned by
+  `tests/test_fixers.py::test_sec019_and_perf001_both_fire_on_unwrapped_one_arg_current_setting`.
 * **SEC020** — emits `ALTER POLICY <name> ON <schema>.<table>
   WITH CHECK (<the USING predicate>);` for a policy that pairs a
   real `USING` predicate with an explicit `WITH CHECK (true)`,
