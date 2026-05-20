@@ -2118,6 +2118,7 @@ pgrls fix --database-url "$DATABASE_URL"               # dry-run
 pgrls fix --database-url "$DATABASE_URL" --apply       # execute
 pgrls fix --database-url "$DATABASE_URL" --rule SEC002 --apply
 pgrls fix --database-url "$DATABASE_URL" --output migration.sql
+pgrls fix --database-url "$DATABASE_URL" --check       # CI gate
 ```
 
 `--output <file>` writes the remediation SQL to a migration-ready

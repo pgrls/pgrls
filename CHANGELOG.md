@@ -10,6 +10,29 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.37] - 2026-05-19
+
+### Added
+- **`pgrls fix --check`.** A CI gate: exits 1 if any auto-fixable
+  violations would be emitted, 0 otherwise. No SQL is emitted
+  and the database is unchanged — the run is read-only. The
+  pattern mirrors `ruff format --check` and `prettier --check`:
+  drop the flag into a pre-commit hook or a CI step and the
+  build fails when an auto-fixable violation creeps in, prompting
+  the author to run `pgrls fix --apply` (or `--output
+  migration.sql`) themselves.
+
+  The offending `(rule_id, location)` pairs go to **stdout** so
+  `pgrls fix --check > violations.log` captures them as a CI
+  artefact; the summary count and next-step hint go to stderr.
+  The same split `pgrls lint` (and `ruff --check`) use.
+
+  `--check` cannot be combined with `--apply` (which applies
+  the fixes) or `--output` (which writes a migration file) —
+  one gates, the others mutate. The flag composes with `--rule`
+  to gate on a subset of fixers and with `--config` and
+  `--schemas` like every other `fix` flag.
+
 ## [0.5.36] - 2026-05-19
 
 ### Added

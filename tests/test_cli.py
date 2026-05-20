@@ -2133,3 +2133,245 @@ def test_fix_rejects_malformed_allowlist_like_lint(
     assert fix_result.exit_code == 2, fix_result.output
     assert "allowlist" in lint_result.output
     assert "allowlist" in fix_result.output
+
+
+# ============================================================
+# `pgrls fix --check` (CI gate) integration tests
+# ============================================================
+
+
+def test_fix_check_exits_one_when_fixable_violations_exist(
+    pg_url: str, apply_sql
+) -> None:
+    # SEC002-fixable: RLS enabled, FORCE missing. `--check`
+    # should exit 1 and list the offending (rule, location).
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_a (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_check_a ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_a
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--check"]
+    )
+    assert result.exit_code == 1, result.output
+    assert "auto-fixable" in result.output
+    assert "SEC002" in result.output
+    assert "public.fix_check_a" in result.output
+    # No SQL is emitted — only the summary + the (rule, location)
+    # lines and the actionable next-step hint.
+    assert "ALTER TABLE" not in result.output
+
+
+def test_fix_check_exits_zero_on_clean_database(
+    pg_url: str, apply_sql
+) -> None:
+    # A clean fixture: RLS+FORCE on, primary-key index covers
+    # the predicate column, so no auto-fixer fires. `--check`
+    # exits 0 with the existing "no auto-fixable" message.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_clean (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_check_clean ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_check_clean FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_clean
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--check"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "no auto-fixable" in result.output
+
+
+def test_fix_check_routes_violations_to_stdout_and_summary_to_stderr(
+    pg_url: str, apply_sql
+) -> None:
+    # Pin the documented output split: per-fix (rule, location)
+    # lines go to STDOUT (so `pgrls fix --check > violations.log`
+    # captures them as a CI artefact); the summary count and the
+    # next-step hint go to STDERR. The earlier tests inspect
+    # `result.output`, which merges the streams and so cannot
+    # tell the two apart.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_split (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_check_split ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_split
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--check"]
+    )
+    assert result.exit_code == 1, result.output
+    # Stdout — actionable, parseable violation listing.
+    assert "SEC002" in result.stdout
+    assert "public.fix_check_split" in result.stdout
+    assert "auto-fixable" not in result.stdout
+    assert "pgrls fix --apply" not in result.stdout
+    # Stderr — diagnostic summary and next-step hint.
+    assert "auto-fixable" in result.stderr
+    assert "pgrls fix --apply" in result.stderr
+    assert "SEC002" not in result.stderr
+
+
+def test_fix_check_does_not_modify_database(
+    pg_url: str, apply_sql
+) -> None:
+    # `--check` is a gate, not an apply path — the DB must be
+    # byte-identical before and after the run.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_no_mut (id INT PRIMARY KEY);
+        ALTER TABLE public.fix_check_no_mut ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_no_mut
+            FOR SELECT TO postgres USING (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--check"]
+    )
+    assert result.exit_code == 1, result.output
+    # FORCE remains off — the SEC002 fix was NOT applied.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT relforcerowsecurity FROM pg_catalog.pg_class "
+                "WHERE oid = 'public.fix_check_no_mut'::regclass"
+            )
+            (force,) = cur.fetchone()
+            assert force is False
+
+
+def test_fix_check_rejects_apply() -> None:
+    # `--check` and `--apply` are semantically opposed (gate vs.
+    # mutation). The combination is a tool error (exit 2).
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--check", "--apply", "--database-url", "x"]
+    )
+    assert result.exit_code == 2
+    assert "--check" in result.output
+    assert "--apply" in result.output
+
+
+def test_fix_check_rejects_output(tmp_path) -> None:
+    # `--check` and `--output` are also exclusive — one gates,
+    # the other writes a migration file.
+    out = tmp_path / "m.sql"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--check", "--output", str(out),
+            "--database-url", "x",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--check" in result.output
+    assert "--output" in result.output
+
+
+def test_fix_check_rejects_malformed_allowlist_as_tool_error(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A malformed allowlist must still surface as a tool error
+    # (exit 2) under `--check` — not exit 1 (violations found).
+    # The check branch sits *after* `generate_fixes`, so a fixer
+    # raising on a bad allowlist propagates before `--check`
+    # decides to gate.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_bad_allow (id INT);
+        ALTER TABLE public.fix_check_bad_allow ENABLE ROW LEVEL SECURITY;
+        """
+    )
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        "[lint.rules.SEC002]\n"
+        'allowlist = [" public.fix_check_bad_allow "]\n'
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--config", str(cfg), "--check",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "allowlist" in result.output
+
+
+def test_fix_check_with_rule_filter_to_clean_subset_exits_zero(
+    pg_url: str, apply_sql
+) -> None:
+    # Two fixable violations: SEC001 on table_a, SEC002 on table_b.
+    # `--check --rule SEC020` filters to a rule that fires on
+    # NEITHER table — `--check` then sees zero in-scope fixes and
+    # exits 0 (clean), even though the DB has violations the
+    # filter excluded. Confirms the filter narrows the gate.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_clean_filter_a (id INT);
+        -- ^ SEC001 (RLS off) — fixable, but not SEC020.
+        CREATE TABLE public.fix_check_clean_filter_b (id INT);
+        ALTER TABLE public.fix_check_clean_filter_b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_clean_filter_b
+            FOR SELECT TO postgres USING (id > 0);
+        -- ^ SEC002 (FORCE missing) — also not SEC020.
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--check", "--rule", "SEC020",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no auto-fixable" in result.output
+
+
+def test_fix_check_composes_with_rule_filter(
+    pg_url: str, apply_sql
+) -> None:
+    # Two fixable violations, two different rules. `--check
+    # --rule SEC001` gates on SEC001 only — even though SEC002
+    # is also fixable, the filtered view reports just SEC001.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_check_filter_a (id INT);
+        -- ^ SEC001 (RLS off)
+        CREATE TABLE public.fix_check_filter_b (id INT);
+        ALTER TABLE public.fix_check_filter_b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_check_filter_b
+            FOR SELECT TO postgres USING (id > 0);
+        -- ^ SEC002 (FORCE missing)
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--check", "--rule", "SEC001",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert "SEC001" in result.output
+    assert "public.fix_check_filter_a" in result.output
+    # SEC002 is also fixable on the OTHER table, but --rule
+    # filtered it out — it must not appear.
+    assert "SEC002" not in result.output
+    assert "public.fix_check_filter_b" not in result.output

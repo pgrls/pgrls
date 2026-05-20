@@ -417,6 +417,17 @@ def _fix_apply_failure_message(
     "ready .sql script) instead of stdout. Cannot be combined "
     "with --apply.",
 )
+@click.option(
+    "--check",
+    is_flag=True,
+    default=False,
+    help=(
+        "Exit 1 if any auto-fixable violations would be emitted "
+        "(CI gate / pre-commit pattern). Lists the offending "
+        "(rule, location) pairs but emits no SQL and changes no "
+        "database state. Cannot be combined with --apply or --output."
+    ),
+)
 def fix(
     database_url: str | None,
     config_path: str | None,
@@ -424,6 +435,7 @@ def fix(
     rules: tuple[str, ...],
     apply: bool,
     output_path: str | None,
+    check: bool,
 ) -> None:
     """Auto-remediate violations whose fix is mechanical.
 
@@ -460,6 +472,15 @@ def fix(
     combined with `--apply`: one writes a migration to run later,
     the other executes immediately.
 
+    `--check` is a CI gate: it exits 1 if any auto-fixable
+    violations would be emitted (and 0 otherwise), without
+    writing SQL or changing database state. The offending
+    `(rule_id, location)` pairs go to stdout (so `pgrls fix
+    --check > violations.log` captures them as a CI artefact);
+    the summary count and next-step hint go to stderr. Mirrors
+    `ruff format --check` / `prettier --check`. Cannot be
+    combined with `--apply` or `--output`.
+
     Output channels: SQL bodies go to stdout (so `pgrls fix >
     migration.sql` produces a usable script) unless `--output`
     redirects them to a file. Status / progress / error messages
@@ -476,6 +497,13 @@ def fix(
             "--output and --apply cannot be combined: --output "
             "writes a migration file to apply later, --apply "
             "executes the fixes immediately. Choose one."
+        )
+    if check and (apply or output_path is not None):
+        raise ToolError(
+            "--check is a CI gate (exit 1 if any fixes would be "
+            "emitted) and cannot be combined with --apply (which "
+            "applies them) or --output (which writes them to a "
+            "file). Choose one."
         )
 
     try:
@@ -534,6 +562,35 @@ def fix(
                     err=True,
                 )
                 return
+
+            # `--check` is a CI gate — list the offending
+            # (rule, location) pairs and exit 1 without emitting
+            # SQL. The actionable next step is named so a
+            # pre-commit-style hook output is self-documenting.
+            #
+            # Output split: the violation listing goes to *stdout*
+            # so `pgrls fix --check > violations.log` captures it
+            # for CI artefacts; the summary and next-step hint go
+            # to stderr so they don't pollute parseable output.
+            # Matches `pgrls lint` (findings on stdout, status on
+            # stderr) and `ruff --check`.
+            if check:
+                count = len(fixes)
+                plural = "" if count == 1 else "s"
+                click.echo(
+                    f"pgrls fix --check: {count} auto-fixable "
+                    f"violation{plural} found.",
+                    err=True,
+                )
+                for f in fixes:
+                    click.echo(f"  {f.rule_id}  {f.location}")
+                click.echo(
+                    "Run `pgrls fix --apply` to apply them, or "
+                    "`pgrls fix --output migration.sql` to write a "
+                    "migration.",
+                    err=True,
+                )
+                sys.exit(1)
 
             # `--output` writes the migration file and stops here.
             # `--apply` is already rejected alongside `--output`, so
