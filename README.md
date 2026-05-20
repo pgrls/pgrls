@@ -6,6 +6,8 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/pgrls/pgrls/test.yml?branch=main&label=tests)](https://github.com/pgrls/pgrls/actions/workflows/test.yml)
 [![Downloads](https://img.shields.io/pypi/dm/pgrls.svg)](https://pypistats.org/packages/pgrls)
 
+**[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Rule reference](AGENTS.md)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
+
 > **Static analyzer for Postgres Row-Level Security.**
 > Finds the auth-bug shapes and predicate logic flaws eyeball-review misses; 10 of 36 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
@@ -26,7 +28,7 @@
   </a>
 </p>
 
-> **Status: 0.5.48.** Thirty-six lint rules (SEC001–SEC026, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Beta — actively maintained.** 36 lint rules, 10 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-six rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -40,6 +42,39 @@ pip install pgrls
 ```
 
 Requires Python 3.11+ and Postgres 15+. pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
+
+## Real-world bugs pgrls catches
+
+The kind of mistake that ships to prod despite policy review:
+
+```sql
+CREATE POLICY tenant_read ON public.documents
+    FOR SELECT TO authenticated
+    USING (auth.uid() IS NULL OR owner = auth.uid());
+```
+
+Looks fine — and is structured the way many RLS tutorials show it. But `auth.uid()` returns `NULL` for any connection without a session JWT. For those connections the `IS NULL` branch is `true`, the `OR` short-circuits, and the policy admits *every* row of `public.documents`. It's a recurring pattern in multi-tenant Supabase / PostgREST projects — the kind of thing a public CVE write-up names by hindsight.
+
+`pgrls` flags it as **SEC004** (severity `error`) in milliseconds. With `--explain`, the rule's reference paragraph is appended underneath the finding (lines hard-wrapped here for the README; the real output is one long line per paragraph):
+
+```
+$ pgrls lint --rule SEC004 --explain
+  ERROR  SEC004  public.documents.tenant_read
+         Policy 'tenant_read' on public.documents contains a top-level
+         `auth_func() IS NULL` disjunct in its USING clause. For anonymous
+         connections that disjunct evaluates to true, satisfying the policy
+         and exposing every row. Remove the IS NULL disjunct or replace with
+         an explicit deny.
+
+         The pattern: a policy with USING (auth_func() IS NULL OR <real check>).
+         auth_func() returns NULL for anonymous connections, so the IS NULL
+         disjunct is true and the OR is satisfied without ever evaluating the
+         real check. Anonymous clients see all rows.
+
+pgrls: 1 error.
+```
+
+[Browse the full rule catalogue in AGENTS.md](AGENTS.md#rule-sec004) for the other 35 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
 
 ## Usage
 
