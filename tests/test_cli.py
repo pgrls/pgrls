@@ -1222,16 +1222,16 @@ def test_lint_explain_appends_rule_rationale_to_text_output(
     )
     assert "SEC001" in plain.output
     assert "SEC001" in explained.output
-    # SEC001's docstring opens with the title line followed by a
-    # "Row-level security is..." paragraph (or similar); the
-    # explained output must be strictly longer (the paragraph was
-    # appended) and contain text the unexplained output does not.
+    # The explained output must be strictly longer (the rationale
+    # was appended) and contain a substring that lives ONLY in
+    # SEC001's docstring — not its message template. `pg_class
+    # .relrowsecurity` is the catalog column SEC001's detection
+    # paragraph describes; the violation message uses prose
+    # ("does not have row-level security enabled") and never
+    # mentions the catalog column.
     assert len(explained.output) > len(plain.output)
-    # SEC001's rule docstring starts (after the title) with a
-    # paragraph about RLS. The exact wording is in the module, so
-    # pin a substring that's stable across edits: the rule
-    # describes "row-level security" as a per-table mechanism.
-    assert "row-level security" in explained.output.lower()
+    assert "pg_class.relrowsecurity" in explained.output
+    assert "pg_class.relrowsecurity" not in plain.output
 
 
 def test_lint_explain_is_silent_when_no_findings(

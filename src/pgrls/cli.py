@@ -60,7 +60,7 @@ from pgrls.fixers import (
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
-from pgrls.rules import all_rules, default_registry
+from pgrls.rules import Rule, all_rules, default_registry
 from pgrls.violations import (
     ALL_SEVERITIES,
     Severity,
@@ -272,7 +272,7 @@ def _merge_overrides(
     )
 
 
-def _rule_docstring(rule: Any) -> str:
+def _rule_docstring(rule: Rule) -> str:
     """Return the rule module's docstring, stripped, or '' if absent.
 
     Shared by `pgrls explain` (which surfaces the whole docstring)
@@ -285,7 +285,7 @@ def _rule_docstring(rule: Any) -> str:
     return ((module.__doc__ if module else None) or "").strip()
 
 
-def _rule_rationale_paragraph(rule: Any) -> str:
+def _rule_rationale_paragraph(rule: Rule) -> str:
     """First non-title paragraph of the rule's module docstring.
 
     Used by `pgrls lint --explain` to append a concise reference
