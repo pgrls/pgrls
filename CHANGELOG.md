@@ -10,6 +10,41 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.38] - 2026-05-19
+
+### Added
+- **SEC025 — policy predicate references a table that has RLS
+  disabled** (severity: warning). Flags a policy whose `USING`
+  / `WITH CHECK` references another table — typically through
+  a sub-select — whose `rls_enabled` is false within the
+  introspected schema set. The row-level isolation on the
+  policy's own table is only as strong as the referenced
+  table's isolation: every column of it is freely readable
+  (and, if the role has INSERT, freely writable), so an
+  attacker who can write to the referenced table can grant
+  themselves access through the policy.
+
+  Detection is a structural cross-reference rather than an AST
+  pattern: walk the parsed policy expression for `RangeVar`
+  nodes, resolve each against the introspected schema, and fire
+  when the resolved table has `rls_enabled = false`.
+  Self-references (a policy on `T` reading `T`) are skipped —
+  they inherit the same RLS gate. Views are skipped — that is
+  VIEW001 / VIEW002's surface. Out-of-scope references (tables
+  outside `--schemas`, `pg_catalog.*`) are skipped — pgrls
+  cannot know their RLS state. The pattern is sometimes
+  intentional (a read-only reference table such as countries,
+  plan types, feature flags), so severity is **warning** and
+  allowlistable by qualified policy ID.
+
+### Changed
+- **Rule count: thirty-four → thirty-five** (`SEC001`–`SEC025`,
+  `PERF001`–`PERF003`, `HYG001`–`HYG003`, `VIEW001`–`VIEW004`). No
+  snapshot-format change — SEC025 reads the policy's `USING` /
+  `WITH CHECK` SQL text (re-parsed on demand) and the captured
+  `rls_enabled` flag, both part of the snapshot format since
+  v1, so `SNAPSHOT_VERSION` stays at 10.
+
 ## [0.5.37] - 2026-05-19
 
 ### Added

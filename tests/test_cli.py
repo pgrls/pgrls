@@ -1029,6 +1029,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC022  public.allbad_sec022\n",
             "SEC023  public.allbad_sec023.bypassed_grant\n",
             "SEC024  public.allbad_sec024.tenant_scope\n",
+            "SEC025  public.allbad_sec025.tenant_scope\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",

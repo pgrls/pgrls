@@ -429,3 +429,29 @@ CREATE POLICY tenant_scope ON public.allbad_sec024
     USING (tenant_id = (SELECT current_setting('tenant', true)));
 CREATE INDEX allbad_sec024_tenant_idx
     ON public.allbad_sec024 (tenant_id);
+
+-- SEC025: policy predicate references a table that has RLS
+-- disabled. The ACL table allbad_sec025_acl has no RLS enabled
+-- (SEC001 also fires on it — silent-by-design, the SEC001 pin
+-- targets allbad_sec001), and the policy on allbad_sec025 reads
+-- from it through a sub-select. An attacker who can write to
+-- allbad_sec025_acl can grant themselves access through this
+-- policy. The base RLS table mirrors the other RLS-on blocks
+-- (RESTRICTIVE policy, own-column USING, indexed predicate
+-- column) so SEC001/SEC002/SEC005/SEC008/SEC009/PERF001/PERF003
+-- stay silent and only SEC025 fires on the policy. SEC012 also
+-- fires (RESTRICTIVE-only policy set) and carries no rule_loc
+-- pin, so that extra firing is silent-by-design.
+CREATE TABLE public.allbad_sec025_acl (user_id INT, tenant_id INT);
+CREATE TABLE public.allbad_sec025 (id INT, tenant_id INT);
+ALTER TABLE public.allbad_sec025 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec025 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec025
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (
+        tenant_id IN (
+            SELECT tenant_id FROM public.allbad_sec025_acl
+        )
+    );
+CREATE INDEX allbad_sec025_tenant_idx
+    ON public.allbad_sec025 (tenant_id);
