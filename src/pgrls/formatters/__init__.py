@@ -34,10 +34,25 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
 SUPPORTED_FORMATS: tuple[str, ...] = tuple(_FORMATTERS.keys())
 
 
-def format_violations(violations: list[Violation], *, format: str) -> str:
+def format_violations(
+    violations: list[Violation],
+    *,
+    format: str,
+    rationale_map: dict[str, str] | None = None,
+) -> str:
+    """Render `violations` in the requested output `format`.
+
+    `rationale_map` is an optional `{rule_id: rationale_text}` dict
+    used by `pgrls lint --explain` to append each rule's reference
+    paragraph beneath its finding. Honoured by the text formatter
+    only; the structured formats (json, sarif, markdown) ignore
+    it to keep their schemas stable.
+    """
     if format not in _FORMATTERS:
         raise ValueError(
             f"Unknown output format {format!r}. "
             f"Supported: {', '.join(SUPPORTED_FORMATS)}"
         )
+    if format == "text":
+        return format_text(violations, rationale_map=rationale_map)
     return _FORMATTERS[format](violations)

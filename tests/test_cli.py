@@ -1204,6 +1204,89 @@ def test_lint_rule_filter_overrides_disable(
 
 
 # ============================================================
+# `pgrls lint --explain` integration tests
+# ============================================================
+
+
+def test_lint_explain_appends_rule_rationale_to_text_output(
+    pg_url: str, apply_sql
+) -> None:
+    # SEC001-tripping fixture. `--explain` should append the
+    # rule's reference paragraph beneath the finding so a CI log
+    # carries the why next to the where.
+    apply_sql("CREATE TABLE public.lint_explain_target (id INT);")
+    runner = CliRunner()
+    plain = runner.invoke(main, ["lint", "--database-url", pg_url])
+    explained = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--explain"]
+    )
+    assert "SEC001" in plain.output
+    assert "SEC001" in explained.output
+    # SEC001's docstring opens with the title line followed by a
+    # "Row-level security is..." paragraph (or similar); the
+    # explained output must be strictly longer (the paragraph was
+    # appended) and contain text the unexplained output does not.
+    assert len(explained.output) > len(plain.output)
+    # SEC001's rule docstring starts (after the title) with a
+    # paragraph about RLS. The exact wording is in the module, so
+    # pin a substring that's stable across edits: the rule
+    # describes "row-level security" as a per-table mechanism.
+    assert "row-level security" in explained.output.lower()
+
+
+def test_lint_explain_is_silent_when_no_findings(
+    pg_url: str, apply_sql
+) -> None:
+    # A clean fixture produces "no issues found." regardless of
+    # --explain — with no violations there's nothing to explain.
+    # Use the canonical clean shape (RLS+FORCE, a PERMISSIVE
+    # FOR ALL + a RESTRICTIVE floor, PRIMARY KEY) so SEC007 and
+    # SEC022 stay silent too.
+    apply_sql(
+        """
+        CREATE TABLE public.lint_explain_clean (id INT PRIMARY KEY);
+        ALTER TABLE public.lint_explain_clean ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.lint_explain_clean FORCE ROW LEVEL SECURITY;
+        CREATE POLICY perm ON public.lint_explain_clean
+            FOR ALL TO postgres USING (id > 0) WITH CHECK (id > 0);
+        CREATE POLICY restrict_floor ON public.lint_explain_clean
+            AS RESTRICTIVE FOR ALL TO PUBLIC
+            USING (id > 0) WITH CHECK (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--explain"]
+    )
+    assert result.exit_code == 0
+    assert "no issues" in result.output.lower()
+
+
+def test_lint_explain_only_affects_text_format(
+    pg_url: str, apply_sql
+) -> None:
+    # --explain is text-only — the structured formats keep their
+    # schemas stable so downstream parsers don't see a new field
+    # appear conditionally.
+    apply_sql("CREATE TABLE public.lint_explain_json (id INT);")
+    runner = CliRunner()
+    plain = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--format", "json"],
+    )
+    explained = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--format", "json", "--explain",
+        ],
+    )
+    # The JSON outputs are byte-identical — --explain is ignored
+    # for non-text formats.
+    assert plain.stdout == explained.stdout
+
+
+# ============================================================
 # `pgrls lint --baseline` integration tests
 # ============================================================
 

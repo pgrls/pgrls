@@ -353,3 +353,64 @@ def test_text_location_zero_width_only_uses_empty_sentinel() -> None:
     ]
     out = format_violations(vs, format="text")
     assert EMPTY_OR_ZERO_WIDTH_SENTINEL in out
+
+
+# ---------- rationale_map (pgrls lint --explain) -----------------------
+
+
+def test_text_rationale_map_appends_paragraph_to_finding() -> None:
+    # `pgrls lint --explain` passes a `{rule_id: rationale}` map.
+    # The text formatter appends the paragraph beneath the
+    # finding's message, indented to align with it.
+    rationale = (
+        "A row-level security policy on table T often gates row "
+        "visibility on another table T'."
+    )
+    out = format_violations(
+        [_v()],
+        format="text",
+        rationale_map={"SEC001": rationale},
+    )
+    assert "Table public.users does not have row-level security" in out
+    assert rationale in out
+    # The rationale is indented to the same column as the message
+    # (nine spaces). At minimum, the indented form is what's
+    # rendered — not the raw paragraph by itself at column zero.
+    assert f"         {rationale}" in out
+
+
+def test_text_rationale_map_silent_when_rule_id_missing() -> None:
+    # A `{rule_id: rationale}` map that doesn't include this
+    # violation's rule_id leaves the finding unchanged. Defensive
+    # case for a future rule shipping without a docstring.
+    out = format_violations(
+        [_v(rule_id="SEC001")],
+        format="text",
+        rationale_map={"SEC999": "irrelevant"},
+    )
+    assert "irrelevant" not in out
+
+
+def test_text_rationale_map_silent_when_value_empty() -> None:
+    # A present-but-empty rationale (e.g. a rule whose docstring
+    # had only the title line) also degrades gracefully — the
+    # finding renders without an added block.
+    out = format_violations(
+        [_v()],
+        format="text",
+        rationale_map={"SEC001": ""},
+    )
+    # Two consecutive newlines (one to separate findings) but not
+    # the three (`message\n\n         <rationale>`) that an
+    # appended block would introduce.
+    assert "\n\n\n" not in out
+
+
+def test_text_rationale_map_none_leaves_output_unchanged() -> None:
+    # The default path (`rationale_map=None`) produces the exact
+    # same output as before --explain existed.
+    baseline = format_violations([_v()], format="text")
+    augmented = format_violations(
+        [_v()], format="text", rationale_map=None
+    )
+    assert augmented == baseline

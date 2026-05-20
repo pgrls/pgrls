@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.38.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.39.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-five rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -55,6 +55,11 @@ disabled rule back in for one run without editing the config:
 ```bash
 pgrls lint --rule SEC001 --rule SEC003
 ```
+
+Pass `--explain` to append each rule's reference paragraph beneath its
+finding in the text output, so a CI log carries the *why* next to the
+*where* without a separate `pgrls explain <RULE>` lookup. Text format
+only — JSON / SARIF / Markdown keep their schemas stable.
 
 ### Example output
 
