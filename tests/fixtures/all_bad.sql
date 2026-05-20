@@ -455,3 +455,25 @@ CREATE POLICY tenant_scope ON public.allbad_sec025
     );
 CREATE INDEX allbad_sec025_tenant_idx
     ON public.allbad_sec025 (tenant_id);
+
+-- SEC026: policy predicate uses LIKE pattern matching against an
+-- auth-context value. A malicious GUC set to '%' would match every
+-- row, defeating the per-row isolation entirely. The standard fix
+-- is `lower(user_email) = lower(current_setting('app.email', true))`
+-- or just a plain `=`. Base RLS state mirrors the other RLS-on
+-- blocks (RESTRICTIVE policy, own-column USING, indexed predicate
+-- column, qualified GUC name, two-arg current_setting wrapped in a
+-- SELECT) so SEC001/SEC002/SEC005/SEC008/SEC009/SEC019/SEC024/
+-- PERF001/PERF003 stay silent and only SEC026 fires on the policy.
+-- SEC012 also fires (RESTRICTIVE-only policy set) and carries no
+-- rule_loc pin, so that extra firing is silent-by-design.
+CREATE TABLE public.allbad_sec026 (id INT, user_email TEXT);
+ALTER TABLE public.allbad_sec026 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec026 FORCE ROW LEVEL SECURITY;
+CREATE POLICY email_pattern ON public.allbad_sec026
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (
+        user_email LIKE (SELECT current_setting('app.email', true))
+    );
+CREATE INDEX allbad_sec026_email_idx
+    ON public.allbad_sec026 (user_email);

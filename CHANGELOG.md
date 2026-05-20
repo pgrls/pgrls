@@ -10,6 +10,43 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.44] - 2026-05-20
+
+### Added
+- **SEC026** — new lint rule (severity `warning`). Fires when a
+  policy's `USING` or `WITH CHECK` expression combines a
+  **pattern-matching operator** — `LIKE`, `ILIKE`, `SIMILAR TO`,
+  or POSIX regex (`~`, `~*`, `!~`, `!~*`) — with an
+  **auth-context function** (`current_setting`, `auth.uid`,
+  `current_user`, ...) on either operand. Pattern wildcards in
+  an attacker-controllable value make the predicate degenerate:
+  a GUC set to `%` (the empty LIKE pattern) or `.*` (regex
+  match-everything) matches every row, defeating per-row
+  isolation entirely.
+
+  Detection matches by **operator name** rather than
+  `A_Expr.kind`, so a literal `LIKE` source and a
+  `pg_get_expr`-deparsed policy (which renders `LIKE` as `~~`)
+  trip the rule the same way — pgrls introspects via
+  `pg_get_expr`, so name-based detection is the round-trip-stable
+  path. Both operand directions fire (`col LIKE auth`,
+  `auth LIKE col`). SubLink-wrapped auth values fire too —
+  `col LIKE (SELECT current_setting('app.email', true))` is
+  semantically identical to the un-wrapped form, and the PERF001
+  wrap pattern does not close this hole. Each policy is reported
+  once even when both clauses or both operand directions match.
+
+  The default auth-function set mirrors PERF001's
+  (`auth.uid`, `auth.role`, `auth.jwt`, `current_setting`) plus
+  the role-identity grammar-specials (`current_user`,
+  `current_role`, `user`, `session_user`). Replace via
+  `[lint.rules.SEC026].auth_functions`. Allowlist by qualified
+  policy ID via `[lint.rules.SEC026].allowlist`. No auto-fix —
+  the remedy (`lower(col) = lower(current_setting(...))` or
+  plain `=`) is a design choice, not mechanical.
+
+  Brings the shipped rule count to **thirty-six**.
+
 ## [0.5.43] - 2026-05-19
 
 ### Added

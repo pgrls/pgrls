@@ -2,7 +2,7 @@
 
 **pgrls** is a linter and testing toolkit for Postgres Row-Level Security (RLS). It is framework-agnostic — it inspects a live database directly, so it catches RLS mistakes the same way whether your project runs on Supabase, PostgREST, Hasura, Prisma, Django, or raw SQL.
 
-> **Status: 0.5.43.** Thirty-five lint rules (SEC001–SEC025, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
+> **Status: 0.5.44.** Thirty-six lint rules (SEC001–SEC026, PERF001–PERF003, HYG001–HYG003, VIEW001–VIEW004) plus a semantic policy-diff command and a pytest testing toolkit. The [CHANGELOG](CHANGELOG.md) has the full release history.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all thirty-five rules and reports findings as text, JSON, SARIF, or Markdown for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
@@ -279,6 +279,7 @@ pattern documentation.
 | [SEC023](AGENTS.md#rule-sec023) | warning | Policy granted to a role carrying `BYPASSRLS` — the role skips the policy entirely, so its `TO` clause is inert |
 | [SEC024](AGENTS.md#rule-sec024) | info | Policy calls `current_setting()` with an unqualified parameter name (a dropped prefix the application cannot `SET`) |
 | [SEC025](AGENTS.md#rule-sec025) | warning | Policy predicate references another table whose RLS is disabled — the cross-table read is only as strong as the referenced table's isolation |
+| [SEC026](AGENTS.md#rule-sec026) | warning | Policy predicate uses `LIKE` / `ILIKE` / `SIMILAR TO` / POSIX regex against an auth-context value (a wildcard-shape GUC matches every row) |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](AGENTS.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
