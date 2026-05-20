@@ -53,9 +53,9 @@ CREATE POLICY tenant_read ON public.documents
     USING (auth.uid() IS NULL OR owner = auth.uid());
 ```
 
-Looks fine — and is structured the way many RLS tutorials show it. But `auth.uid()` returns `NULL` for any connection without a session JWT. For those connections the `IS NULL` branch is `true`, the `OR` short-circuits, and the policy admits *every* row of `public.documents`. This is the shape behind the [Lovable RLS CVE](https://supabase.com/blog/lovable-rls-incident) and a recurring pattern in multi-tenant Supabase projects.
+Looks fine — and is structured the way many RLS tutorials show it. But `auth.uid()` returns `NULL` for any connection without a session JWT. For those connections the `IS NULL` branch is `true`, the `OR` short-circuits, and the policy admits *every* row of `public.documents`. It's a recurring pattern in multi-tenant Supabase / PostgREST projects — the kind of thing a public CVE write-up names by hindsight.
 
-`pgrls` flags it as **SEC004** (severity `error`) in milliseconds:
+`pgrls` flags it as **SEC004** (severity `error`) in milliseconds. With `--explain`, the rule's reference paragraph is appended underneath the finding (lines hard-wrapped here for the README; the real output is one long line per paragraph):
 
 ```
 $ pgrls lint --rule SEC004 --explain
@@ -63,7 +63,8 @@ $ pgrls lint --rule SEC004 --explain
          Policy 'tenant_read' on public.documents contains a top-level
          `auth_func() IS NULL` disjunct in its USING clause. For anonymous
          connections that disjunct evaluates to true, satisfying the policy
-         and exposing every row.
+         and exposing every row. Remove the IS NULL disjunct or replace with
+         an explicit deny.
 
          The pattern: a policy with USING (auth_func() IS NULL OR <real check>).
          auth_func() returns NULL for anonymous connections, so the IS NULL
