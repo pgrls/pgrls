@@ -2510,12 +2510,13 @@ SARIF already carry the classification tag as a structured field.
 
 The rationale table lives in
 `src/pgrls/diff/formatters.py::_RATIONALE_BY_KIND_AND_CLASSIFICATION`
-and is keyed by `(ChangeKind, Classification)` — RLS_FLIPPED reuses
-one kind for both directions (on→off DANGEROUS, off→on SAFE) but
-the two directions get different rationales. An import-time check
-verifies every `ChangeKind` the differ can emit has at least one
-rationale entry, so adding a new kind without a rationale fails
-the test suite rather than silently degrading `--explain`.
+and is keyed by `(ChangeKind, Classification)` — `RLS_FLIPPED` and
+`FORCE_RLS_FLIPPED` each reuse one kind for both directions (on→off
+DANGEROUS, off→on SAFE) but the two directions get different
+rationales. An import-time check verifies every `ChangeKind` the
+differ can emit has at least one rationale entry, so adding a new
+kind without a rationale fails at module import rather than silently
+degrading `--explain`.
 
 ### Exit codes
 

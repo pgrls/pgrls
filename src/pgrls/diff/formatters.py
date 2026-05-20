@@ -223,8 +223,9 @@ _RATIONALE_BY_KIND_AND_CLASSIFICATION: dict[
     ),
     (ChangeKind.FORCE_RLS_FLIPPED, "dangerous"): (
         "FORCE ROW LEVEL SECURITY was disabled. The table owner now "
-        "bypasses every policy, regaining full-table access — the "
-        "exact bypass FORCE RLS was added in PostgreSQL 9.5 to close."
+        "bypasses every policy, regaining full-table access — exactly "
+        "the owner-bypass that default RLS leaves open and FORCE RLS "
+        "exists to close."
     ),
     # ---------- Policy add / drop ----------
     (ChangeKind.POLICY_ADDED_RESTRICTIVE, "safe"): (

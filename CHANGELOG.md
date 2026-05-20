@@ -30,7 +30,7 @@ breaking changes — they will be called out in this file.
   DANGEROUS, off→on SAFE), but the two directions get different
   rationales. An import-time check verifies every `ChangeKind`
   the differ can emit has at least one rationale entry, so a
-  future kind added without a rationale fails the test suite
+  future kind added without a rationale fails at module import
   rather than silently degrading `--explain`.
 
   Text format only — JSON / SARIF already carry the
