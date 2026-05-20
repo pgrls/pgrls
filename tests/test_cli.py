@@ -1621,6 +1621,89 @@ def test_lint_update_baseline_exits_zero_even_with_findings(
     assert result.exit_code == 0, result.output
 
 
+def test_lint_update_baseline_composes_with_rule_filter(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # `--rule` narrows the lint scope; that scope flows through
+    # to `--update-baseline` too. The recorded baseline contains
+    # ONLY the rule(s) the user asked for — replace semantics
+    # mean other rules' findings are dropped from the file. Pin
+    # that behaviour: an operator who composes the two flags is
+    # explicitly asking for a scoped baseline.
+    apply_sql(
+        """
+        CREATE TABLE public.update_baseline_filter_a (id INT);
+        -- ^ SEC001 (RLS off)
+        CREATE TABLE public.update_baseline_filter_b (id INT);
+        ALTER TABLE public.update_baseline_filter_b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.update_baseline_filter_b
+            FOR SELECT TO PUBLIC USING (id > 0);
+        -- ^ SEC003 (permissive PUBLIC)
+        """
+    )
+    baseline = tmp_path / "scoped.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--baseline", str(baseline),
+            "--update-baseline",
+            "--rule", "SEC001",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(baseline.read_text(encoding="utf-8"))
+    rule_ids = {f["rule_id"] for f in payload["findings"]}
+    # Only the in-scope rule was recorded; SEC003's finding on
+    # the other table didn't make it.
+    assert rule_ids == {"SEC001"}
+
+
+def test_lint_update_baseline_unwritable_path_errors_clearly(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # `write_baseline` raises BaselineError when the target file
+    # can't be written; the lint command wraps that as a tool
+    # error (exit 2). A non-existent parent directory triggers
+    # the same path without depending on filesystem permissions.
+    apply_sql("CREATE TABLE public.update_baseline_unwritable (id INT);")
+    bad_path = tmp_path / "no" / "such" / "dir" / "b.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--baseline", str(bad_path), "--update-baseline",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+
+
+def test_lint_update_baseline_with_json_format_emits_no_stdout(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # The output suppression is format-agnostic — a user passing
+    # `--format json --update-baseline` should not see a stray
+    # JSON document on stdout (the run is recording, not
+    # formatting findings).
+    apply_sql("CREATE TABLE public.update_baseline_json (id INT);")
+    baseline = tmp_path / "b.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint", "--database-url", pg_url,
+            "--baseline", str(baseline),
+            "--update-baseline",
+            "--format", "json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    assert "updated baseline" in result.stderr
+
+
 def test_lint_update_baseline_suppresses_normal_lint_output(
     pg_url: str, apply_sql, tmp_path
 ) -> None:
