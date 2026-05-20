@@ -25,7 +25,7 @@ breaking changes — they will be called out in this file.
   The offending `(rule_id, location)` pairs go to **stdout** so
   `pgrls fix --check > violations.log` captures them as a CI
   artefact; the summary count and next-step hint go to stderr.
-  Same split `pgrls lint` (and `ruff --check`) use.
+  The same split `pgrls lint` (and `ruff --check`) use.
 
   `--check` cannot be combined with `--apply` (which applies
   the fixes) or `--output` (which writes a migration file) —
