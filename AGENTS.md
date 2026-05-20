@@ -1323,10 +1323,7 @@ independently.
 
 ### SEC020 — Policy WITH CHECK clause is constant true but USING is not
 
-**Severity:** warning. **Auto-fix:** no (whether an open write side
-is intentional — e.g. an append-only audit table — is a design
-choice; pgrls surfaces the asymmetry but will not rewrite the
-policy).
+**Severity:** warning.
 
 A policy that governs writes — a `FOR ALL` or `FOR UPDATE` policy —
 carries two predicates. `USING` filters the rows the caller may

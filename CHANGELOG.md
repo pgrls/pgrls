@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.45] - 2026-05-20
+
+### Fixed
+- **Docs.** The SEC020 per-rule section in AGENTS.md still
+  carried `**Auto-fix:** no (whether an open write side is
+  intentional — e.g. an append-only audit table — is a design
+  choice; pgrls surfaces the asymmetry but will not rewrite the
+  policy)` — wording inherited from the pre-fixer state. SEC020
+  has had a fixer since v0.5.33 (the `## Auto-fix: pgrls fix`
+  section enumerates it), so the per-rule line directly
+  contradicted the rest of the file. Drop the stale sentence so
+  the SEC020 header matches the convention every other
+  auto-fixable rule uses (`**Severity:** xxx.` only, no Auto-fix
+  marker — the canonical roster lives in the dedicated section).
+
 ## [0.5.44] - 2026-05-20
 
 ### Added
