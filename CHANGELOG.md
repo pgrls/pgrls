@@ -10,6 +10,46 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.49] - 2026-05-20
+
+### Changed
+- **Project maturity signals.** Several public-facing surfaces were
+  under-selling the project's actual state — 5 GitHub stars, an
+  "Alpha" classifier, and a "Status: 0.5.48" version-as-label
+  combined to read like a weekend hack despite ~2.4k monthly
+  PyPI downloads, 1,593 tests, and a stable JSON / SARIF schema
+  shipped across 49 releases. This release tightens the read:
+
+  - **`Development Status :: 3 - Alpha` → `4 - Beta`** in
+    `pyproject.toml` classifiers — PyPI's project page and search
+    listings now reflect the shipped surface.
+  - **README hero quick-link bar** under the badges
+    (`23-second demo · Rule reference · CHANGELOG · PyPI`) so
+    a first-time reader has one click to whatever they came for.
+  - **"Status:" blockquote replaced** with a "Beta — actively
+    maintained" line that names the version surface (36 rules,
+    10 auto-fixable, PG 15-17 tested, stable JSON/SARIF schema)
+    rather than a brittle version number.
+  - **New `## Real-world bugs pgrls catches` section** in the
+    README — opens with the Lovable RLS CVE shape walkthrough
+    and shows the actual `pgrls lint --rule SEC004 --explain`
+    output. Replaces "trust me, 36 rules" with one concrete
+    bug a reviewer can scan in 15 seconds.
+
+### Added
+- **`SECURITY.md`** — vulnerability disclosure policy
+  (`dmitrymaranik@gmail.com`, 5-business-day acknowledgement),
+  scope (rules, fixer output, diff classification, formatters,
+  pytest plugin), out-of-scope (upstream PostgreSQL / pglast).
+- **`CONTRIBUTING.md`** — local dev setup, rule-number
+  conventions (`SEC0NN` append-only, never reuse a deprecated
+  rule's number), what reviewers look for (AST traversal
+  correctness, `pg_get_expr` round-trip stability, test
+  coverage), no-Claude-attribution norm.
+
+No functional changes — schema, AST, rule behaviour, fixer
+output, diff classification are all identical to v0.5.48.
+
 ## [0.5.48] - 2026-05-20
 
 ### Changed
