@@ -158,8 +158,10 @@ def _own_column_names(side: Any, table: Table) -> set[str]:
 
     Resolves bare (`col`), table-qualified (`t.col`), and
     schema-qualified (`s.t.col`) refs against `table.columns`, the
-    same own-column resolution SEC005 / SEC018 use. `exclude_sublinks`
-    keeps a sub-select's columns out of the operand's name set.
+    same own-column resolution SEC005 / SEC018 use. Extraction passes
+    `exclude_sublinks=True` so a column inside a sub-select on this
+    operand is kept out of the name set — the discriminator must be a
+    direct operand of the comparison.
     """
     names: set[str] = set()
     for ref in extract_column_refs(side, exclude_sublinks=True):
