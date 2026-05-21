@@ -234,12 +234,23 @@ def _side_has_auth_call(side: Any, auth_functions: set[str]) -> bool:
 def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[str]:
     """Own columns compared with `=` against an auth-context value.
 
-    Walks every `A_Expr`; when the operator is `=` and one operand
-    carries an auth-context call while the *other* carries an own
-    column, the own column(s) on that other side are scoping keys.
-    Requiring the two on opposite operands distinguishes a scoping
-    predicate (`tenant_id = current_setting(…)`) from an auth call
-    used elsewhere.
+    Walks the policy predicate's `A_Expr` nodes; when the operator is
+    a scalar `=` and one operand carries an auth-context call while
+    the *other* carries an own column, the own column(s) on that other
+    side are scoping keys. Requiring the two on opposite operands
+    distinguishes a scoping predicate (`tenant_id = current_setting(…)`)
+    from an auth call used elsewhere.
+
+    The walk does NOT descend into a `SubLink` body: a
+    discriminator-equality must be a predicate of the policy itself,
+    not of a sub-query. The one wrapped form that matters —
+    `col = (SELECT current_setting())` — is recognised at the outer
+    `A_Expr` by `_side_has_auth_call` (which inspects the fromless
+    sub-select's projection), so descending is unnecessary. Skipping
+    sub-query bodies also avoids pairing an inner unqualified column
+    with a same-named own-table column (the bare-name collision SEC018
+    documents) inside a `(SELECT … FROM other WHERE col = auth())`
+    lookup.
     """
     found: set[str] = set()
 
@@ -249,6 +260,8 @@ def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[s
         if isinstance(n, (list, tuple)):
             for item in n:
                 walk(item)
+            return
+        if isinstance(n, SubLink):
             return
         if (
             isinstance(n, A_Expr)
@@ -261,7 +274,7 @@ def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[s
             if _side_has_auth_call(rhs, auth_functions):
                 found.update(_own_column_names(lhs, table))
             # fall through — keep walking operands for nested A_Expr
-            # nodes (and into sub-selects, examined on their own).
+            # nodes (boolean AND/OR chains), but not into sub-selects.
         if isinstance(n, Node):
             for field_name in n:
                 walk(getattr(n, field_name, None))

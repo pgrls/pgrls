@@ -297,6 +297,49 @@ def test_sec030_silent_on_scalar_subselect_with_from_clause() -> None:
     assert SEC030().check(schema, options={}) == []
 
 
+def test_sec030_silent_on_bare_name_collision_inside_subselect() -> None:
+    # `id = (SELECT doc_id FROM acl WHERE member = current_setting(...))`
+    # where the OWN table also has a nullable column named `member`.
+    # SQL resolves the inner unqualified `member` to acl.member, not
+    # documents.member. The walk must not descend into the sub-query
+    # body, so the inner `member = auth()` is never paired with the
+    # own column — no spurious fire on documents.member.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "id = (SELECT doc_id FROM acl "
+                        "WHERE member = current_setting('app.user'))"
+                    )
+                ),
+                cols=(
+                    ("id", "uuid", True),
+                    ("member", "text", True),  # nullable own-col collision
+                ),
+            ),
+        )
+    )
+    assert SEC030().check(schema, options={}) == []
+
+
+def test_sec030_fires_on_cast_outside_subselect() -> None:
+    # `tenant_id = (SELECT current_setting(...))::int` — the cast wraps
+    # the fromless sub-select on the OUTSIDE. `_fromless_subselects`
+    # must walk through the TypeCast to reach the SubLink. Fires.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="tenant_id = (SELECT current_setting('app.tenant'))::int"
+                ),
+            ),
+        )
+    )
+    [v] = SEC030().check(schema, options={})
+    assert "'tenant_id'" in v.message
+
+
 def test_sec030_silent_on_in_subquery_acl_join() -> None:
     # `id IN (SELECT ...)` is an IN-membership SubLink, not a scalar
     # `=` — out of scope regardless of any auth call inside the
