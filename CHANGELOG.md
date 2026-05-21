@@ -10,7 +10,7 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
-## [0.5.53] - 2026-05-20
+## [0.5.53] - 2026-05-21
 
 ### Added
 - **SEC028** — new lint rule (severity `warning`). Fires when a

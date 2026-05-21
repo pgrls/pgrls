@@ -1,6 +1,6 @@
 """Rule protocol and registry.
 
-Every built-in rule (SEC001-SEC027, PERF001-PERF003, HYG001-HYG003,
+Every built-in rule (SEC001-SEC028, PERF001-PERF003, HYG001-HYG003,
 VIEW001-VIEW004) is registered lazily on the first call to
 `default_registry()` or `all_rules()`. When a new rule lands, add its
 import + `registry.register(...)` call to `_build_default_registry()`
