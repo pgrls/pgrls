@@ -6,7 +6,9 @@ output for generic CI integrations (shape documented in
 Scanning and similar aggregators (shape documented in
 `formatters/sarif.py`). `markdown` is GitHub-flavored Markdown for
 PR comments and rendered CI reports (shape documented in
-`formatters/markdown.py`).
+`formatters/markdown.py`). `github` emits GitHub Actions workflow
+commands so findings show up as run annotations (shape documented
+in `formatters/github.py`).
 
 Adding a format = creating a sibling module and wiring it into
 `_FORMATTERS` here. The rule-link URL convention used by SARIF and
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from pgrls.formatters.github import format_github
 from pgrls.formatters.json import format_json
 from pgrls.formatters.markdown import format_markdown
 from pgrls.formatters.sarif import format_sarif
@@ -29,6 +32,7 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
     "json": format_json,
     "sarif": format_sarif,
     "markdown": format_markdown,
+    "github": format_github,
 }
 
 SUPPORTED_FORMATS: tuple[str, ...] = tuple(_FORMATTERS.keys())
@@ -45,8 +49,8 @@ def format_violations(
     `rationale_map` is an optional `{rule_id: rationale_text}` dict
     used by `pgrls lint --explain` to append each rule's reference
     paragraph beneath its finding. Honoured by the text formatter
-    only; the structured formats (json, sarif, markdown) ignore
-    it to keep their schemas stable.
+    only; every other format (json, sarif, markdown, github)
+    ignores it to keep their output stable.
     """
     if format not in _FORMATTERS:
         raise ValueError(

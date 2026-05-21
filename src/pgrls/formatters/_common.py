@@ -1,4 +1,5 @@
-"""Shared helpers for human-readable formatters (`text`, `markdown`).
+"""Shared helpers for human-readable formatters (`text`, `markdown`,
+`github`).
 
 JSON and SARIF formatters handle `Violation.location` safely via
 `json.dumps` escaping; they don't need anything from this module.
