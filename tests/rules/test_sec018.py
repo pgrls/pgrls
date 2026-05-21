@@ -99,6 +99,34 @@ def test_sec018_fires_when_only_in_with_check() -> None:
     assert len(SEC018().check(_wrap(p), {})) == 1
 
 
+def test_sec018_fires_on_table_qualified_own_column() -> None:
+    # `t.owner_role = current_user` — a table-qualified own-column
+    # reference. The 2-part form resolves against the policy's table
+    # (`t`) just like the bare form, so SEC018 still fires.
+    schema = _wrap(_policy("t.owner_role = current_user"))
+    [v] = SEC018().check(schema, {})
+    assert v.location == "public.t.p"
+
+
+def test_sec018_fires_on_schema_qualified_own_column() -> None:
+    # `public.t.owner_role = current_user` — a fully schema-qualified
+    # own-column reference. The 3-part form resolves against the
+    # policy's `schema.table` and SEC018 fires the same as the bare
+    # and table-qualified forms.
+    schema = _wrap(_policy("public.t.owner_role = current_user"))
+    [v] = SEC018().check(schema, {})
+    assert v.location == "public.t.p"
+
+
+def test_sec018_silent_on_schema_qualified_cross_table_column() -> None:
+    # `public.other.owner_role = current_user` — a 3-part ref whose
+    # table part is NOT the policy's table. The schema matches but the
+    # table doesn't, so `_is_own_column_ref` rejects it and SEC018
+    # stays silent (the column belongs to a different relation).
+    schema = _wrap(_policy("public.other.owner_role = current_user"))
+    assert SEC018().check(schema, {}) == []
+
+
 def test_sec018_fires_on_correlated_own_column_in_subquery() -> None:
     # An own-table column compared to current_user, reached through
     # correlation from inside a sub-select, still fires — the walk
