@@ -559,7 +559,7 @@ CREATE INDEX allbad_sec030_tenant_idx
 -- enforces none. The PERMISSIVE companion `perm_real` carries a real
 -- own-column predicate (`id > 0`) and is granted TO postgres, so it
 -- keeps SEC012 (restrictive-only deny-all) and SEC003 (permissive to
--- PUBLIC) quiet and is not itself a finding; its predicate column
+-- PUBLIC) quiet and is not itself a finding. Its predicate column
 -- `id` is indexed so PERF003 stays silent (matching the SEC030 block
 -- convention). Two extra firings are silent-by-design (each pinned on
 -- its own block): SEC005 (the constant-true restrictive policy
