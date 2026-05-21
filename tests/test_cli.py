@@ -1124,6 +1124,53 @@ def test_lint_output_writes_report_to_file(
     assert file_report == stdout_run.output
 
 
+def test_lint_output_unwritable_path_exits_two(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A path whose parent dir is missing surfaces a ToolError (exit 2)
+    # with a message, not a traceback.
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    out = tmp_path / "missing_dir" / "report.txt"
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--output", str(out)]
+    )
+    assert result.exit_code == 2
+    assert "Cannot write" in result.output
+
+
+def test_lint_output_honors_format_and_min_severity(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # --output composes with --format (the file gets SARIF) and with
+    # --min-severity (the file gets the filtered report).
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    out = tmp_path / "report.sarif"
+    result = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url",
+            pg_url,
+            "--format",
+            "sarif",
+            "--min-severity",
+            "warning",
+            "--output",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    # Valid SARIF, and the info-level rules were filtered out of the
+    # written report.
+    assert payload["version"].startswith("2.1")
+    flat = json.dumps(payload)
+    assert "SEC004" in flat  # error, kept
+    assert "SEC007" not in flat  # info, filtered
+
+
 def test_lint_output_with_update_baseline_exits_two(tmp_path) -> None:
     runner = CliRunner()
     result = runner.invoke(
