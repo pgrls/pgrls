@@ -26,6 +26,16 @@ breaking changes — they will be called out in this file.
   rules: SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001,
   PERF003, HYG003, VIEW001, VIEW002.
 
+  The strip happens only in *monotone* position — reachable from
+  the clause root through AND / OR chains, where `P OR true` is
+  absorbing and removing the `true` can only narrow the policy. The
+  fixer never descends past a `NOT`, a comparison, an `IS FALSE`
+  test, a function call, or a SubLink: under a negation, tightening
+  an OR would *broaden* access (`NOT (a OR true)` is deny-all,
+  `NOT a` is not), and a security fixer must never widen a policy.
+  The rule still flags `OR true` in those positions; the fixer
+  declines to rewrite them and leaves the finding for human review.
+
   Opinionated in the same way the SEC019 fixer is: removing
   `OR true` assumes the disjunct was a leftover debug bypass (the
   case SEC011 targets), not a deliberate "admit every row." A
