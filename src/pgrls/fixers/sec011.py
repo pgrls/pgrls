@@ -39,7 +39,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import BoolExpr, Node
+from pglast.ast import BoolExpr, Node, SubLink
 from pglast.enums import BoolExprType
 from pglast.stream import RawStream
 
@@ -64,9 +64,25 @@ def _strip_or_true(node: Any) -> tuple[Any, bool]:
     its parent is examined. An OR left with exactly one arg after
     stripping is unwrapped to that arg; an OR left with zero args
     raises `_CannotStrip`.
+
+    Mirrors the SEC011 rule's `_has_or_true` scope exactly: on a
+    `SubLink` only the `testexpr` (the policy's own LHS of an
+    `IN` / `ANY` / `ALL`) is in scope; the subquery's own
+    `subselect` is NOT descended into. An `OR true` inside a
+    subquery's WHERE doesn't make the outer policy admit every row
+    — it's the subquery's predicate, which the rule deliberately
+    ignores (`EXISTS (SELECT 1 FROM t WHERE flag OR true)` is a
+    legitimate shape). Rewriting it would mutate a policy the rule
+    calls clean and trip `pgrls fix --check` on zero violations.
     """
     if not isinstance(node, Node):
         return node, False
+
+    if isinstance(node, SubLink):
+        new_test, test_changed = _strip_or_true(node.testexpr)
+        if test_changed:
+            node.testexpr = new_test
+        return node, test_changed
 
     changed = False
     for field_name in node:

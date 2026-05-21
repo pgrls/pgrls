@@ -1602,6 +1602,35 @@ def test_sec011_fix_silent_when_no_or_true() -> None:
     assert SEC011Fixer().fix(schema, {}) == []
 
 
+def test_sec011_fix_leaves_or_true_inside_subquery_where() -> None:
+    # The SEC011 *rule* deliberately does not descend into a
+    # subquery's own WHERE (an `OR true` there is the subquery's
+    # predicate, not the policy admitting every row — e.g. the
+    # legitimate `EXISTS (SELECT 1 ... WHERE flag OR true)` shape).
+    # The fixer must mirror that scope exactly: rewriting the
+    # subquery would mutate a policy `pgrls lint` calls clean and
+    # trip `pgrls fix --check` on zero violations.
+    schema = _wrap_policy(
+        _policy(
+            "user_id IN (SELECT member_id FROM public.acl "
+            "WHERE active OR true)"
+        )
+    )
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
+def test_sec011_fix_strips_top_level_or_true_around_a_sublink() -> None:
+    # The opposite of the above: the `OR true` is at the policy's
+    # top level (not inside the subquery), so it IS stripped. The
+    # surviving SubLink comparison is left intact.
+    schema = _wrap_policy(
+        _policy("user_id IN (SELECT member_id FROM public.acl) OR true")
+    )
+    sql = SEC011Fixer().fix(schema, {})[0].sql
+    assert "SELECT member_id FROM public.acl" in sql
+    assert "TRUE" not in sql
+
+
 def test_sec011_fix_skips_vacuous_true_or_true() -> None:
     # `true OR true` has no real predicate to keep once the trues
     # are stripped — the fixer leaves it for human review rather
