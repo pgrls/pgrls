@@ -49,8 +49,8 @@ def format_violations(
     `rationale_map` is an optional `{rule_id: rationale_text}` dict
     used by `pgrls lint --explain` to append each rule's reference
     paragraph beneath its finding. Honoured by the text formatter
-    only; the structured formats (json, sarif, markdown) ignore
-    it to keep their schemas stable.
+    only; every other format (json, sarif, markdown, github)
+    ignores it to keep their output stable.
     """
     if format not in _FORMATTERS:
         raise ValueError(
