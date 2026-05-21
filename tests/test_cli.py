@@ -2071,6 +2071,84 @@ def test_fix_apply_executes_sec019_missing_ok(
     assert "true" in qual.lower()
 
 
+def test_fix_emits_sec011_strip_or_true(pg_url: str, apply_sql) -> None:
+    # `pgrls fix` picks up the SEC011 fixer and emits an ALTER
+    # POLICY that strips the `OR true` debug bypass. The remaining
+    # predicate (tenant_id = ...) references the table's own column,
+    # so the only thing that changed is the dropped disjunct.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec011 (id INT PRIMARY KEY, tenant_id TEXT);
+        ALTER TABLE public.fix_sec011 ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec011 FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec011
+            FOR SELECT TO postgres
+            USING (tenant_id = 'acme' OR true);
+        CREATE INDEX fix_sec011_t_idx ON public.fix_sec011 (tenant_id);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--rule", "SEC011"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "[SEC011]" in result.output
+    assert "ALTER POLICY p ON public.fix_sec011" in result.output
+    # The bypass disjunct is gone; the real predicate remains.
+    # Postgres deparses the string literal via pg_get_expr as
+    # `CAST('acme' AS text)`, so pin that form. The trailing
+    # `OR true);` would be present if the strip had not run — its
+    # absence (distinct from the description's "OR true`") confirms
+    # the rewrite.
+    assert "USING (tenant_id = CAST('acme' AS text))" in result.output
+    assert "OR true);" not in result.output
+    assert "dry-run" in result.output
+
+
+def test_fix_apply_executes_sec011_strip_or_true(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql(
+        """
+        CREATE TABLE public.fix_sec011_apply (id INT PRIMARY KEY, tenant_id TEXT);
+        ALTER TABLE public.fix_sec011_apply ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.fix_sec011_apply FORCE ROW LEVEL SECURITY;
+        CREATE POLICY p ON public.fix_sec011_apply
+            FOR SELECT TO postgres
+            USING (tenant_id = 'acme' OR true);
+        CREATE INDEX fix_sec011_apply_t_idx
+            ON public.fix_sec011_apply (tenant_id);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--rule", "SEC011", "--apply"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "applied 1 fix" in result.output
+
+    # The policy's qual no longer carries the constant-true bypass.
+    # `pg_policies.qual` is deparsed by Postgres itself.
+    import psycopg
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT qual FROM pg_catalog.pg_policies "
+                "WHERE schemaname = 'public' "
+                "AND tablename = 'fix_sec011_apply' "
+                "AND policyname = 'p'"
+            )
+            (qual,) = cur.fetchone()
+    assert qual is not None
+    assert "'acme'" in qual
+    # The OR-true disjunct is gone — Postgres would render a kept
+    # `OR true` as `OR true`; after the fix the qual is a bare
+    # equality with no disjunction.
+    assert "true" not in qual.lower()
+    assert " or " not in qual.lower()
+
+
 def test_fix_emits_hyg003_drop_policy(pg_url: str, apply_sql) -> None:
     # `pgrls fix` picks up the HYG003 fixer and emits a DROP POLICY
     # for a policy that exactly duplicates another on the same

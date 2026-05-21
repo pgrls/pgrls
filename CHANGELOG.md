@@ -10,6 +10,43 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.51] - 2026-05-20
+
+### Added
+- **`pgrls fix` now auto-remediates SEC011** ("policy expression
+  has an `OR true` branch"). The fixer emits `ALTER POLICY <name>
+  ON <schema>.<table>` with `USING (…)` and/or `WITH CHECK (…)`,
+  removing the literal-`true` disjunct from each OR `BoolExpr` and
+  unwrapping an OR that collapses to a single remaining arg
+  (`owner_id = current_setting('app.user') OR true` →
+  `owner_id = current_setting('app.user')`). Nested ORs are handled
+  bottom-up; only the clause(s) that actually changed are re-emitted
+  (minimal diff); the mutation runs on a deep-copy so the rule's
+  `Schema` view stays read-only. `pgrls fix` now covers eleven
+  rules: SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001,
+  PERF003, HYG003, VIEW001, VIEW002.
+
+  The strip happens only in *monotone* position — reachable from
+  the clause root through AND / OR chains, where `P OR true` is
+  absorbing and removing the `true` can only narrow the policy. The
+  fixer never descends past a `NOT`, a comparison, an `IS FALSE`
+  test, a function call, or a SubLink: under a negation, tightening
+  an OR would *broaden* access (`NOT (a OR true)` is deny-all,
+  `NOT a` is not), and a security fixer must never widen a policy.
+  The rule still flags `OR true` in those positions; the fixer
+  declines to rewrite them and leaves the finding for human review.
+
+  Opinionated in the same way the SEC019 fixer is: removing
+  `OR true` assumes the disjunct was a leftover debug bypass (the
+  case SEC011 targets), not a deliberate "admit every row." A
+  policy that genuinely means to admit every row should drop the
+  policy or disable RLS rather than bury a constant-true in the
+  predicate; an operator who wants to keep the literal allowlists
+  the policy in `[lint.rules.SEC011]`. A degenerate predicate that
+  is *only* literal-trues (`true OR true`) has no real predicate to
+  fall back on, so the fixer skips it and leaves the finding for
+  human review rather than emit an empty `USING ()`.
+
 ## [0.5.50] - 2026-05-20
 
 ### Added

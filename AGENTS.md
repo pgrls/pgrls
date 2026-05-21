@@ -65,7 +65,7 @@ visible between users within the same tenant), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC006, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
+SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -2408,6 +2408,30 @@ Currently fixable:
   policies (Postgres forbids `FOR INSERT … USING`, so there is
   no predicate to mirror), and any write policy written without
   a `USING`.
+* **SEC011** — emits `ALTER POLICY <name> ON <schema>.<table>
+  USING (…)` (and / or `WITH CHECK (…)`) with the `OR true`
+  debug-bypass disjunct removed. An OR left with a single arg is
+  unwrapped (`a OR true` → `a`), nested ORs are handled bottom-up,
+  and only the clause(s) that changed are re-emitted (minimal
+  diff). **The strip happens only in *monotone* position** —
+  reachable from the clause root through AND / OR chains, where
+  `P OR true` is absorbing and removing the `true` can only narrow
+  the policy. The fixer never descends past a `NOT`, a comparison,
+  an `IS FALSE` test, a function call, or a SubLink: under a
+  negation, tightening an OR would *broaden* access (`NOT (a OR
+  true)` is deny-all, but `NOT a` is not), and a security fixer
+  must never widen a policy. The rule still flags `OR true` in
+  those non-monotone positions; the fixer declines to rewrite them
+  and leaves the finding for human review. The rewrite assumes the
+  `OR true` was a leftover debug branch — the case SEC011 targets —
+  and is opinionated in the same way the SEC019 fixer is: a policy
+  that genuinely means "admit every row" should drop the policy or
+  disable RLS rather than bury a constant-true, and an operator who
+  wants to keep the literal allowlists the policy in
+  `[lint.rules.SEC011]`. A degenerate predicate that is *only*
+  literal-trues (`true OR true`) has no real predicate to keep, so
+  the fixer skips it and leaves the finding for human review rather
+  than emit an empty `USING ()`.
 * **SEC019** — emits `ALTER POLICY <name> ON <schema>.<table>
   USING (…)` (and / or `WITH CHECK (…)`) adding `, true` as the
   second argument to one-argument `current_setting()` calls.
@@ -2942,7 +2966,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC006, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, and Markdown output.** `--format text`
