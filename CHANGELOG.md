@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.60] - 2026-05-21
+
+### Added
+- **`pgrls.toml` `extends`.** A config can layer on top of a shared
+  base with a top-level `extends` key — a path, or a list of paths,
+  resolved relative to the file that declares it. Useful for a
+  monorepo or an org-wide ruleset. Tables deep-merge key-by-key (a
+  child can set `[lint.rules.SEC001].severity` while inheriting the
+  base's `allowlist`); scalars and arrays are *replaced*, not
+  appended (a child `disable` / `allowlist` list wins wholesale, so
+  there are no surprise accumulations). For a list, later entries
+  override earlier ones, and the declaring file overrides every base.
+  Env-var interpolation runs after the merge. A missing target, a
+  non-string/list value, and a cycle in the `extends` chain each
+  raise a clear config error; a base reached twice through different
+  paths (a diamond) is allowed.
+
 ## [0.5.59] - 2026-05-21
 
 ### Added

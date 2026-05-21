@@ -565,3 +565,174 @@ def test_severity_override_on_unknown_rule_id_rejected(
     cfg_file.write_text('[lint.rules.SEC9999]\nseverity = "error"\n')
     with pytest.raises(ConfigError, match="unknown rule id"):
         load_config(path=cfg_file)
+
+
+# --- extends (shared base config) ----------------------------------------
+
+
+def test_extends_inherits_and_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    (tmp_path / "base.toml").write_text(
+        '[database]\nschemas = ["public", "tenant"]\n'
+        '[lint]\nfail_on = "error"\ndisable = ["SEC022"]\n'
+    )
+    child = tmp_path / "pgrls.toml"
+    child.write_text(
+        'extends = "base.toml"\n[lint]\nfail_on = "warning"\n'
+    )
+    cfg = load_config(path=child)
+    # schemas inherited from base; fail_on overridden by child.
+    assert cfg.schemas == ["public", "tenant"]
+    assert cfg.fail_on == "warning"
+    # disable inherited (child didn't set it).
+    assert cfg.disable == ["SEC022"]
+
+
+def test_extends_deep_merges_rule_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A child can set one key of [lint.rules.SEC001] while inheriting
+    # the rest from the base (table-level deep merge).
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    (tmp_path / "base.toml").write_text(
+        '[lint.rules.SEC001]\nallowlist = ["public.countries"]\n'
+    )
+    child = tmp_path / "pgrls.toml"
+    child.write_text(
+        'extends = "base.toml"\n[lint.rules.SEC001]\nseverity = "error"\n'
+    )
+    cfg = load_config(path=child)
+    assert cfg.rule_options["SEC001"]["allowlist"] == ["public.countries"]
+    assert cfg.severity_overrides["SEC001"] == "error"
+
+
+def test_extends_arrays_replace_not_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    (tmp_path / "base.toml").write_text('[lint]\ndisable = ["SEC022"]\n')
+    child = tmp_path / "pgrls.toml"
+    child.write_text('extends = "base.toml"\n[lint]\ndisable = ["PERF002"]\n')
+    cfg = load_config(path=child)
+    # Replace, not union — the child list wins wholesale.
+    assert cfg.disable == ["PERF002"]
+
+
+def test_extends_list_later_entries_win(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    (tmp_path / "a.toml").write_text('[lint]\nfail_on = "error"\n')
+    (tmp_path / "b.toml").write_text('[lint]\nfail_on = "info"\n')
+    child = tmp_path / "pgrls.toml"
+    child.write_text('extends = ["a.toml", "b.toml"]\n')
+    cfg = load_config(path=child)
+    # b.toml is listed later, so it overrides a.toml.
+    assert cfg.fail_on == "info"
+
+
+def test_extends_resolves_relative_to_declaring_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The base path is relative to the file that declares `extends`,
+    # not the cwd. Put the base in a subdir and extend from there.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    sub = tmp_path / "configs"
+    sub.mkdir()
+    (sub / "base.toml").write_text('[database]\nschemas = ["fromsub"]\n')
+    child = sub / "pgrls.toml"
+    child.write_text('extends = "base.toml"\n')
+    monkeypatch.chdir(tmp_path)  # cwd != the config's dir
+    cfg = load_config(path=child)
+    assert cfg.schemas == ["fromsub"]
+
+
+def test_extends_env_interpolation_runs_after_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A base's `url = "$VAR"` interpolates after the merge.
+    monkeypatch.setenv("PGRLS_TEST_URL", "postgres://localhost/merged")
+    (tmp_path / "base.toml").write_text(
+        '[database]\nurl = "$PGRLS_TEST_URL"\n'
+    )
+    child = tmp_path / "pgrls.toml"
+    child.write_text('extends = "base.toml"\n')
+    cfg = load_config(path=child)
+    assert cfg.database_url == "postgres://localhost/merged"
+
+
+def test_extends_missing_target_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    child = tmp_path / "pgrls.toml"
+    child.write_text('extends = "nope.toml"\n')
+    with pytest.raises(ConfigError, match="not found"):
+        load_config(path=child)
+
+
+def test_extends_wrong_type_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    child = tmp_path / "pgrls.toml"
+    child.write_text("extends = 42\n")
+    with pytest.raises(ConfigError, match="must be a config path"):
+        load_config(path=child)
+
+
+def test_extends_cycle_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    (tmp_path / "a.toml").write_text('extends = "b.toml"\n')
+    (tmp_path / "b.toml").write_text('extends = "a.toml"\n')
+    with pytest.raises(ConfigError, match="cycle"):
+        load_config(path=tmp_path / "a.toml")
+
+
+def test_extends_self_cycle_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    child = tmp_path / "pgrls.toml"
+    child.write_text('extends = "pgrls.toml"\n')
+    with pytest.raises(ConfigError, match="cycle"):
+        load_config(path=child)
+
+
+def test_extends_diamond_is_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # top extends [l, r]; both l and r extend the same base. A base
+    # reached twice through different paths is NOT a cycle.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    (tmp_path / "base.toml").write_text('[database]\nschemas = ["b"]\n')
+    (tmp_path / "l.toml").write_text(
+        'extends = "base.toml"\n[lint]\nfail_on = "info"\n'
+    )
+    (tmp_path / "r.toml").write_text(
+        'extends = "base.toml"\n[lint]\ndisable = ["SEC001"]\n'
+    )
+    top = tmp_path / "pgrls.toml"
+    top.write_text('extends = ["l.toml", "r.toml"]\n')
+    cfg = load_config(path=top)
+    assert cfg.schemas == ["b"]  # inherited via the diamond
+    assert cfg.fail_on == "info"  # from l
+    assert cfg.disable == ["SEC001"]  # from r
+
+
+def test_extends_chain_too_deep_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pathologically deep (non-cyclic) chain raises a clean
+    # ConfigError, not a raw RecursionError.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    depth = 50  # > _MAX_EXTENDS_DEPTH
+    for i in range(depth):
+        nxt = f'extends = "c{i + 1}.toml"\n' if i < depth - 1 else ""
+        (tmp_path / f"c{i}.toml").write_text(nxt)
+    with pytest.raises(ConfigError, match="too deep"):
+        load_config(path=tmp_path / "c0.toml")

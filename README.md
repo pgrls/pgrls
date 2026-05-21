@@ -258,6 +258,25 @@ allowlist = ["countries", "currencies"]
 severity = "error"
 ```
 
+### Sharing config across projects — `extends`
+
+A config can layer on top of a shared base with a top-level `extends`
+(a path, or a list of paths resolved relative to the file that declares
+it) — handy for a monorepo or an org-wide ruleset:
+
+```toml
+extends = "../pgrls.base.toml"   # or ["../base.toml", "./team.toml"]
+
+[lint]
+fail_on = "error"                # override one key; inherit the rest
+```
+
+Tables deep-merge key-by-key (a child can set `[lint.rules.SEC001].severity`
+while inheriting the base's `allowlist`); scalars and arrays are *replaced*,
+not appended (a child `disable` list wins wholesale). For a list, later
+entries override earlier ones, and the declaring file overrides every base.
+A cycle in the `extends` chain is an error.
+
 ## Testing your RLS — `pgrls.testing`
 
 Install with `pip install pgrls[testing]` to pull in pytest alongside pgrls.

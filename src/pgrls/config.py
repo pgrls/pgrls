@@ -12,6 +12,11 @@ from pgrls.violations import ALL_SEVERITIES, Severity, coerce_severity
 
 _ENV_PATTERN = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
+# Guard rail for the `extends` chain depth. Real chains are 1-3 deep
+# (project → team → org); anything past this is a misconfiguration,
+# and capping it keeps a runaway from hitting the raw recursion limit.
+_MAX_EXTENDS_DEPTH = 32
+
 
 class ConfigError(Exception):
     """Raised when the user's config file is invalid or references missing env vars."""
@@ -63,13 +68,102 @@ def load_config(path: Path | str | None) -> Config:
     """Load config from `path`, or `./pgrls.toml` if `path` is None and the file exists.
 
     Returns a default Config when no file is found.
+
+    A config may pull in a shared base with a top-level `extends`
+    (a path string, or a list of them) — see `_read_raw` for the
+    merge semantics.
     """
     resolved = _resolve_path(path)
     if resolved is None:
         return Config()
 
-    raw = _read_toml(resolved)
+    raw = _read_raw(resolved, _stack=[])
     return _build_config(raw)
+
+
+def _deep_merge(
+    base: dict[str, Any], override: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge `override` onto `base`, recursing into nested tables.
+
+    Tables (dicts) merge key-by-key, so a child can set one key of a
+    `[lint.rules.SEC001]` table while inheriting the rest from the
+    base. Every non-table value — scalars AND arrays — is replaced
+    wholesale by the override: a child `disable`/`allowlist` list
+    *replaces* the base's, it does not append. Replace-not-append is
+    the predictable rule (no surprise accumulation); a child that
+    wants the base's entries plus more re-lists them.
+    """
+    out = dict(base)
+    for key, value in override.items():
+        existing = out.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            out[key] = _deep_merge(existing, value)
+        else:
+            out[key] = value
+    return out
+
+
+def _read_raw(path: Path, *, _stack: list[Path]) -> dict[str, Any]:
+    """Read a TOML config, resolving any top-level `extends` chain.
+
+    `extends` is a path (or list of paths) to base configs the current
+    file layers on top of. Bases are resolved relative to the file
+    that declares `extends`. For a list, later entries override
+    earlier ones, and the declaring file's own keys override every
+    base (`merge(merge(base1, base2), self)`).
+
+    `_stack` holds the configs currently being resolved (an ancestry
+    chain) so an `extends` cycle raises instead of recursing forever.
+    It is *not* a global visited set — a base reached twice through
+    different paths (a diamond) is allowed and merged each time.
+    """
+    resolved = path.resolve()
+    if resolved in _stack:
+        chain = " -> ".join(str(p) for p in [*_stack, resolved])
+        raise ConfigError(f"extends cycle detected: {chain}")
+    # A non-cyclic but pathologically deep chain would otherwise blow
+    # the Python recursion limit with a raw traceback. Surface a clean
+    # ConfigError instead — mirrors how the lint path converts a
+    # too-deep policy AST's RecursionError into a tidy message. No real
+    # `extends` chain is anywhere near this deep.
+    if len(_stack) > _MAX_EXTENDS_DEPTH:
+        raise ConfigError(
+            f"extends chain too deep (more than {_MAX_EXTENDS_DEPTH} "
+            f"levels) at {path} — likely a misconfiguration."
+        )
+
+    raw = _read_toml(path)
+    extends = raw.pop("extends", None)
+    if extends is None:
+        return raw
+
+    if isinstance(extends, str):
+        bases = [extends]
+    elif isinstance(extends, list) and all(
+        isinstance(s, str) for s in extends
+    ):
+        bases = extends
+    else:
+        raise ConfigError(
+            "`extends` must be a config path string or a list of "
+            f"path strings, got {type(extends).__name__}"
+        )
+
+    merged: dict[str, Any] = {}
+    for base in bases:
+        base_path = Path(base)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        if not base_path.is_file():
+            raise ConfigError(
+                f"`extends` target not found: {base!r} "
+                f"(resolved to {base_path}, referenced from {path})"
+            )
+        base_raw = _read_raw(base_path, _stack=[*_stack, resolved])
+        merged = _deep_merge(merged, base_raw)
+    # The declaring file's own keys win over every extended base.
+    return _deep_merge(merged, raw)
 
 
 def _resolve_path(path: Path | str | None) -> Path | None:
