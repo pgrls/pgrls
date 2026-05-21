@@ -6,7 +6,9 @@ output for generic CI integrations (shape documented in
 Scanning and similar aggregators (shape documented in
 `formatters/sarif.py`). `markdown` is GitHub-flavored Markdown for
 PR comments and rendered CI reports (shape documented in
-`formatters/markdown.py`).
+`formatters/markdown.py`). `github` emits GitHub Actions workflow
+commands so findings show up as run annotations (shape documented
+in `formatters/github.py`).
 
 Adding a format = creating a sibling module and wiring it into
 `_FORMATTERS` here. The rule-link URL convention used by SARIF and
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from pgrls.formatters.github import format_github
 from pgrls.formatters.json import format_json
 from pgrls.formatters.markdown import format_markdown
 from pgrls.formatters.sarif import format_sarif
@@ -29,6 +32,7 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
     "json": format_json,
     "sarif": format_sarif,
     "markdown": format_markdown,
+    "github": format_github,
 }
 
 SUPPORTED_FORMATS: tuple[str, ...] = tuple(_FORMATTERS.keys())

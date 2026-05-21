@@ -2969,11 +2969,18 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
-- **Text, JSON, SARIF, and Markdown output.** `--format text`
-  (human-readable, default), `--format json` (machine-readable,
-  stable CI contract), `--format sarif` (SARIF v2.1.0 for GitHub
-  Code Scanning and similar aggregators), and `--format markdown`
-  (PR comments / rendered CI reports).
+- **Text, JSON, SARIF, Markdown, and GitHub-annotation output.**
+  `--format text` (human-readable, default), `--format json`
+  (machine-readable, stable CI contract), `--format sarif` (SARIF
+  v2.1.0 for GitHub Code Scanning and similar aggregators),
+  `--format markdown` (PR comments / rendered CI reports), and
+  `--format github` (GitHub Actions workflow commands —
+  `::error` / `::warning` / `::notice` — so findings surface as
+  run annotations; severity maps error→error, warning→warning,
+  info→notice, and a clean run emits nothing). The github format
+  carries no `file=`/`line=` because pgrls lints a live database,
+  not source text, so annotations land in the run summary rather
+  than pinned to a diff hunk.
 - **Postgres only.** No support for other databases or for
   MySQL/MariaDB emulation layers.
 - **Postgres 15+.** Older PG releases (10–14) are no longer

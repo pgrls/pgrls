@@ -10,6 +10,31 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.52] - 2026-05-20
+
+### Added
+- **`pgrls lint --format github`.** Emit GitHub Actions workflow
+  commands — one `::error` / `::warning` / `::notice` per finding —
+  so lint results surface as **annotations** on a GitHub Actions
+  run. Severity maps error→`::error`, warning→`::warning`,
+  info→`::notice` (GitHub has no "info" level). The annotation
+  `title` carries the rule id and qualified location; the command
+  body is the violation message, escaped per GitHub's
+  workflow-command rules (`%`, CR, LF in the message; additionally
+  `:` and `,` in the title) so a percent sign, newline, or a
+  colon inside a quoted Postgres identifier can't terminate the
+  command early.
+
+  The format deliberately omits `file=` / `line=`: pgrls lints a
+  live database, not source text, and has no reliable mapping from
+  a policy back to the migration file/line that defined it, so the
+  annotations render in the run's annotation summary (surfaced on
+  the PR's Checks tab) rather than pinned to a diff hunk. A clean
+  run emits nothing — no annotations is the correct signal for "no
+  findings", and the exit code already distinguishes clean from
+  dirty. Lint-only for now (the `pgrls diff` formats are
+  unchanged).
+
 ## [0.5.51] - 2026-05-20
 
 ### Added

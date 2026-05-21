@@ -1369,6 +1369,51 @@ def test_lint_explain_only_affects_text_format(
     assert plain.output == explained.output
 
 
+def test_lint_format_github_emits_workflow_command(
+    pg_url: str, apply_sql
+) -> None:
+    # `--format github` emits a GitHub Actions workflow command per
+    # finding. An RLS-disabled table trips SEC001 (error severity),
+    # which maps to `::error` with the rule id + location in the
+    # title.
+    apply_sql("CREATE TABLE public.lint_github_target (id INT);")
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--format", "github"],
+    )
+    # Findings present ⇒ exit 1 under the default fail-on; the test
+    # pins the OUTPUT shape, not the code.
+    assert result.exit_code == 1, result.output
+    assert "::error title=SEC001 public.lint_github_target::" in result.output
+
+
+def test_lint_format_github_clean_db_emits_nothing(
+    pg_url: str, apply_sql
+) -> None:
+    # No findings ⇒ no annotations. The github format stays silent
+    # on a clean run (unlike text/markdown, which print a
+    # "no issues found" line).
+    apply_sql(
+        """
+        CREATE TABLE public.lint_github_clean (id INT PRIMARY KEY);
+        ALTER TABLE public.lint_github_clean ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.lint_github_clean FORCE ROW LEVEL SECURITY;
+        CREATE POLICY perm ON public.lint_github_clean
+            FOR ALL TO postgres USING (id > 0) WITH CHECK (id > 0);
+        CREATE POLICY restrict_floor ON public.lint_github_clean
+            AS RESTRICTIVE FOR ALL TO PUBLIC
+            USING (id > 0) WITH CHECK (id > 0);
+        """
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--format", "github"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "::" not in result.output
+
+
 # ============================================================
 # `pgrls lint --baseline` integration tests
 # ============================================================
