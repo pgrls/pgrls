@@ -3,8 +3,9 @@
 ## Reporting a vulnerability
 
 If you believe you've found a vulnerability in pgrls itself — the linter,
-the testing toolkit, the diff command, or the JSON / SARIF output that
-downstream CI parses — **please do not open a public issue.** Email the
+the testing toolkit, the diff command, or the JSON / SARIF / GitHub
+output that downstream CI parses — **please do not open a public
+issue.** Email the
 maintainer at **dmitrymaranik@gmail.com** with the details:
 
 - The pgrls version (`pgrls --version`) where you observed the issue.
@@ -26,8 +27,10 @@ the CHANGELOG, then the public disclosure.
   overwrites intended state, or that opens a new vulnerability).
 - The `pgrls diff` classification (any change incorrectly classified
   SAFE or downgraded).
-- The JSON / SARIF / Markdown formatters (any output that breaks
-  downstream parsers in ways that could mask a finding).
+- The JSON / SARIF / Markdown / GitHub-annotation formatters (any
+  output that breaks downstream parsers in ways that could mask a
+  finding — including escaping bugs that let a crafted policy name
+  or message forge or terminate a GitHub Actions workflow command).
 - The `pgrls.testing` pytest plugin (any pattern where a passing test
   doesn't reflect actual RLS isolation).
 
