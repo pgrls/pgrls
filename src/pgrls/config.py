@@ -12,6 +12,11 @@ from pgrls.violations import ALL_SEVERITIES, Severity, coerce_severity
 
 _ENV_PATTERN = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
+# Guard rail for the `extends` chain depth. Real chains are 1-3 deep
+# (project → team → org); anything past this is a misconfiguration,
+# and capping it keeps a runaway from hitting the raw recursion limit.
+_MAX_EXTENDS_DEPTH = 32
+
 
 class ConfigError(Exception):
     """Raised when the user's config file is invalid or references missing env vars."""
@@ -117,6 +122,16 @@ def _read_raw(path: Path, *, _stack: list[Path]) -> dict[str, Any]:
     if resolved in _stack:
         chain = " -> ".join(str(p) for p in [*_stack, resolved])
         raise ConfigError(f"extends cycle detected: {chain}")
+    # A non-cyclic but pathologically deep chain would otherwise blow
+    # the Python recursion limit with a raw traceback. Surface a clean
+    # ConfigError instead — mirrors how the lint path converts a
+    # too-deep policy AST's RecursionError into a tidy message. No real
+    # `extends` chain is anywhere near this deep.
+    if len(_stack) > _MAX_EXTENDS_DEPTH:
+        raise ConfigError(
+            f"extends chain too deep (more than {_MAX_EXTENDS_DEPTH} "
+            f"levels) at {path} — likely a misconfiguration."
+        )
 
     raw = _read_toml(path)
     extends = raw.pop("extends", None)

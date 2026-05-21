@@ -1,6 +1,13 @@
 # Copy this file to `pgrls.toml` and adjust.
 # Environment variables can be referenced as `$VAR` or `${VAR}`.
 
+# Optionally layer this config on top of one or more shared bases
+# (a path, or a list of paths, resolved relative to THIS file) — handy
+# for a monorepo or an org-wide ruleset. Tables deep-merge key-by-key;
+# scalars and arrays are replaced (not appended); for a list, later
+# entries win, and this file overrides every base. A cycle errors.
+# extends = "../pgrls.base.toml"   # or ["../base.toml", "./team.toml"]
+
 [database]
 url = "$DATABASE_URL"
 schemas = ["public"]

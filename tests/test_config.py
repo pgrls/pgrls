@@ -722,3 +722,17 @@ def test_extends_diamond_is_allowed(
     assert cfg.schemas == ["b"]  # inherited via the diamond
     assert cfg.fail_on == "info"  # from l
     assert cfg.disable == ["SEC001"]  # from r
+
+
+def test_extends_chain_too_deep_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pathologically deep (non-cyclic) chain raises a clean
+    # ConfigError, not a raw RecursionError.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    depth = 50  # > _MAX_EXTENDS_DEPTH
+    for i in range(depth):
+        nxt = f'extends = "c{i + 1}.toml"\n' if i < depth - 1 else ""
+        (tmp_path / f"c{i}.toml").write_text(nxt)
+    with pytest.raises(ConfigError, match="too deep"):
+        load_config(path=tmp_path / "c0.toml")
