@@ -894,6 +894,129 @@ def test_introspect_captures_bypassrls_roles(
         )
 
 
+def test_introspect_captures_bypassrls_escalation_roles(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC029 reads `Schema.bypassrls_escalation_roles` — the transitive
+    # `pg_auth_members` closure computed by `_BYPASSRLS_ESCALATION_SQL`.
+    # The combined fixture only exercises the *one-hop* case; this is
+    # the end-to-end check that the recursive CTE actually decodes a
+    # live catalog: a multi-HOP path (app -> mid -> bypass1), a member
+    # reaching MULTIPLE distinct targets (app also -> bypass2), the
+    # sorted `via` contract, the LOGIN flag, and both exclusions
+    # (superuser and a direct BYPASSRLS holder are SEC016's surface, not
+    # SEC029's). Roles are cluster-global, so the DROP bookends keep the
+    # shared container's namespace clean.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS pgrls_sec029_app;
+        DROP ROLE IF EXISTS pgrls_sec029_mid;
+        DROP ROLE IF EXISTS pgrls_sec029_super;
+        DROP ROLE IF EXISTS pgrls_sec029_direct;
+        DROP ROLE IF EXISTS pgrls_sec029_bypass1;
+        DROP ROLE IF EXISTS pgrls_sec029_bypass2;
+        CREATE ROLE pgrls_sec029_bypass1 BYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec029_bypass2 BYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec029_mid NOBYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec029_app NOBYPASSRLS LOGIN;
+        CREATE ROLE pgrls_sec029_super SUPERUSER LOGIN;
+        CREATE ROLE pgrls_sec029_direct BYPASSRLS LOGIN;
+        GRANT pgrls_sec029_bypass1 TO pgrls_sec029_mid;
+        GRANT pgrls_sec029_mid TO pgrls_sec029_app;
+        GRANT pgrls_sec029_bypass2 TO pgrls_sec029_app;
+        GRANT pgrls_sec029_bypass1 TO pgrls_sec029_super;
+        GRANT pgrls_sec029_bypass2 TO pgrls_sec029_direct;
+        """
+    )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        by_member = {
+            e.member: e for e in schema.bypassrls_escalation_roles
+        }
+        # `app` reaches bypass1 transitively (via mid) AND bypass2
+        # directly — two distinct targets, surfaced as a single sorted
+        # `via` tuple (the SQL `ORDER BY mem.rolname, tgt.rolname`
+        # feeding an order-preserving append).
+        assert "pgrls_sec029_app" in by_member
+        app = by_member["pgrls_sec029_app"]
+        assert app.via == (
+            "pgrls_sec029_bypass1",
+            "pgrls_sec029_bypass2",
+        )
+        assert app.member_can_login is True
+        # `mid` is the intermediate hop — itself a member of bypass1,
+        # and a NOLOGIN role.
+        assert "pgrls_sec029_mid" in by_member
+        mid = by_member["pgrls_sec029_mid"]
+        assert mid.via == ("pgrls_sec029_bypass1",)
+        assert mid.member_can_login is False
+        # Exclusions: a superuser bypasses unconditionally (so the
+        # SET ROLE path is moot) and a direct BYPASSRLS holder is
+        # SEC016's surface — neither is an SEC029 finding.
+        assert "pgrls_sec029_super" not in by_member
+        assert "pgrls_sec029_direct" not in by_member
+        # The BYPASSRLS targets themselves are not members-with-a-path.
+        assert "pgrls_sec029_bypass1" not in by_member
+        assert "pgrls_sec029_bypass2" not in by_member
+    finally:
+        apply_sql(
+            """
+            DROP ROLE IF EXISTS pgrls_sec029_app;
+            DROP ROLE IF EXISTS pgrls_sec029_mid;
+            DROP ROLE IF EXISTS pgrls_sec029_super;
+            DROP ROLE IF EXISTS pgrls_sec029_direct;
+            DROP ROLE IF EXISTS pgrls_sec029_bypass1;
+            DROP ROLE IF EXISTS pgrls_sec029_bypass2;
+            """
+        )
+
+
+def test_introspect_bypassrls_escalation_dedups_multipath(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Postgres forbids true membership *cycles* (GRANT raises "role
+    # membership loop detected"), so `pg_auth_members` is always a DAG
+    # and the recursion always terminates. The real dedup concern is a
+    # diamond: a member that reaches one BYPASSRLS target through TWO
+    # paths. The CTE's `UNION` (not `UNION ALL`) must collapse the
+    # duplicate reach so the target appears in `via` exactly once.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS pgrls_sec029_dia_app;
+        DROP ROLE IF EXISTS pgrls_sec029_dia_mid1;
+        DROP ROLE IF EXISTS pgrls_sec029_dia_mid2;
+        DROP ROLE IF EXISTS pgrls_sec029_dia_target;
+        CREATE ROLE pgrls_sec029_dia_target BYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec029_dia_mid1 NOBYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec029_dia_mid2 NOBYPASSRLS NOLOGIN;
+        CREATE ROLE pgrls_sec029_dia_app NOBYPASSRLS LOGIN;
+        GRANT pgrls_sec029_dia_target TO pgrls_sec029_dia_mid1;
+        GRANT pgrls_sec029_dia_target TO pgrls_sec029_dia_mid2;
+        GRANT pgrls_sec029_dia_mid1 TO pgrls_sec029_dia_app;
+        GRANT pgrls_sec029_dia_mid2 TO pgrls_sec029_dia_app;
+        """
+    )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        by_member = {
+            e.member: e for e in schema.bypassrls_escalation_roles
+        }
+        assert "pgrls_sec029_dia_app" in by_member
+        # Two paths to the same target collapse to a single `via` entry.
+        assert by_member["pgrls_sec029_dia_app"].via == (
+            "pgrls_sec029_dia_target",
+        )
+    finally:
+        apply_sql(
+            """
+            DROP ROLE IF EXISTS pgrls_sec029_dia_app;
+            DROP ROLE IF EXISTS pgrls_sec029_dia_mid1;
+            DROP ROLE IF EXISTS pgrls_sec029_dia_mid2;
+            DROP ROLE IF EXISTS pgrls_sec029_dia_target;
+            """
+        )
+
+
 def test_introspect_captures_leakproof_functions(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

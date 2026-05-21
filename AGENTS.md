@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-eight rules across four
+In the current release it ships **thirty-nine rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -46,6 +46,8 @@ against an auth-context value — a wildcard-shape GUC matches
 every row),
 `SEC028` (permissive write policy whose `WITH CHECK` is constant
 `true` — accepts every write),
+`SEC029` (role can `SET ROLE` to a `BYPASSRLS` role through
+membership — an escalation path that disables every policy),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1079,12 +1081,13 @@ Out of scope (intentional):
 * **Superuser roles.** Skipped — a superuser bypasses RLS via
   `rolsuper` regardless, and is a far larger finding than
   "bypasses RLS" anyway.
-* **Role membership / `SET ROLE` reachability.** SEC016 flags the
-  role that *holds* `BYPASSRLS`, not every role that could reach
+* **Role membership / `SET ROLE` reachability.** SEC016 flags only
+  the role that *holds* `BYPASSRLS`, not every role that could reach
   it. `BYPASSRLS` is a role attribute, not an inheritable
   privilege — a member of a `BYPASSRLS` group role does not
-  bypass RLS unless it actually `SET ROLE`s to that role. The
-  holder is the precise and complete audit target.
+  bypass RLS unless it actually `SET ROLE`s to that role. SEC016's
+  surface is deliberately just the holder; the `SET ROLE`
+  escalation path that reaches it is covered separately by SEC029.
 * **The `row_security` session GUC.** `SET row_security = off` is
   a different mechanism, and not a silent one: a query that
   *would* return RLS-filtered rows raises an error instead of
@@ -1509,12 +1512,14 @@ larger, separate finding.
 Allowlist by qualified policy ID (`schema.table.policy_name`) when
 naming a bypassing role in a `TO` clause is intentional.
 
-Out of scope (intentional): role-membership reachability (a role
-whose members can `SET ROLE` to a bypassing role is not flagged —
-`BYPASSRLS` is a role attribute, not an inheritable privilege) and
-plain superusers (a role that bypasses RLS only through `rolsuper`,
-with no explicit `BYPASSRLS`, is not in the schema's `BYPASSRLS`
-set).
+Out of scope for SEC023 (by design): role-membership reachability —
+a role whose members can `SET ROLE` to a bypassing role. `BYPASSRLS`
+is a role attribute, not an inheritable privilege, so membership
+grants no automatic bypass and SEC023's policy-level check stays
+silent; the deliberate `SET ROLE` escalation path that *does* reach
+it is covered separately by SEC029. Also out of scope: plain
+superusers (a role that bypasses RLS only through `rolsuper`, with no
+explicit `BYPASSRLS`, is not in the schema's `BYPASSRLS` set).
 
 Relationship to SEC016: SEC016 flags the *role* ("this role
 carries `BYPASSRLS`"); SEC023 flags the *policy* ("this policy
@@ -1885,6 +1890,59 @@ client may write but only an admin policy reads).
 
 **No auto-fix** — the correct write predicate is the application's
 tenant / ownership key, which pgrls can't infer.
+
+<a id="rule-sec029"></a>
+
+### SEC029 — Role can SET ROLE to a BYPASSRLS role (RLS-bypass path)
+
+**Severity:** warning.
+
+`BYPASSRLS` is a role *attribute*, and role attributes — unlike
+object privileges — are **never inherited** through membership, even
+with `INHERIT`. So being a member of a BYPASSRLS-carrying role does
+not make you bypass RLS automatically: SEC016 (which flags roles that
+hold BYPASSRLS *directly*) stays silent, and the member's own
+`pg_roles` row looks clean.
+
+But membership grants `SET ROLE`. A role that is a member — directly
+or transitively — of a BYPASSRLS role can switch into it and, from
+that point in the session, bypass every policy on every table:
+
+```sql
+CREATE ROLE admin BYPASSRLS NOLOGIN;
+CREATE ROLE app LOGIN;
+GRANT admin TO app;        -- app can `SET ROLE admin`, then bypass RLS
+```
+
+`app` has no BYPASSRLS of its own, yet a single `SET ROLE admin`
+turns RLS off for the rest of the session. SEC029 surfaces that
+route, naming the reachable BYPASSRLS role(s), so the membership gets
+an explicit audit decision. When the member is a `LOGIN` role the
+finding flags it: an application authenticating as it is one
+`SET ROLE` from a full bypass.
+
+SEC029 fires for each role that reaches a BYPASSRLS role through the
+transitive `pg_auth_members` closure, does not itself hold BYPASSRLS
+(SEC016's surface), and is not a superuser (superusers bypass
+unconditionally). It complements the other BYPASSRLS rules: SEC016
+flags the *holder* of the attribute, SEC023 flags a policy whose `TO`
+role holds it (an inert `TO` clause), and SEC029 flags the *path* a
+member can take to reach it.
+
+Detection treats every membership edge as `SET ROLE`-capable. On
+PostgreSQL 16+ a grant `WITH SET FALSE` does not permit `SET ROLE`,
+so SEC029 can over-report there — a deliberate bias toward surfacing
+a potential bypass route (allowlist a false positive) over missing
+one, and it keeps the introspection query identical across PG15-17.
+
+Allowlist the *member* role by name (roles are unqualified, as in
+SEC016's allowlist) when the membership is intentional and the member
+is trusted to bypass — for example an operator login expected to be
+able to escalate.
+
+**No auto-fix** — whether to revoke the membership, narrow what the
+BYPASSRLS role grants, or accept the route is an operational decision
+pgrls can't make.
 
 <a id="rule-perf001"></a>
 
@@ -3001,7 +3059,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-eight rules across four categories.** SEC001–SEC028,
+- **Thirty-nine rules across four categories.** SEC001–SEC029,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

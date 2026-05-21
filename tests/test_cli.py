@@ -1116,6 +1116,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC026  public.allbad_sec026.email_pattern\n",
             "SEC027  public.allbad_sec027\n",
             "SEC028  public.allbad_sec028.open_insert\n",
+            "SEC029  allbad_sec029_member\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",
@@ -1139,6 +1140,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         apply_sql(
             "DROP SCHEMA IF EXISTS public CASCADE; "
             "CREATE SCHEMA public; "
+            "DROP ROLE IF EXISTS allbad_sec029_member; "
             "DROP ROLE IF EXISTS allbad_sec016_role"
         )
 

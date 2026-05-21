@@ -10,6 +10,40 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.54] - 2026-05-21
+
+### Added
+- **SEC029** — new lint rule (severity `warning`). Fires when a role
+  can `SET ROLE` to a `BYPASSRLS` role through membership — an
+  RLS-bypass *path* that is invisible from the role's own attributes.
+  `BYPASSRLS` is a role attribute, and attributes (unlike object
+  privileges) are **never inherited** through membership, even with
+  `INHERIT`; SEC016, which flags the *holder* of the attribute, stays
+  silent on a mere member. But membership grants `SET ROLE`: a member
+  — directly or transitively — of a BYPASSRLS role can switch into it
+  and bypass every policy for the rest of the session. SEC029
+  computes the transitive `pg_auth_members` closure, skips roles that
+  already hold BYPASSRLS (SEC016's surface) and superusers, and names
+  the reachable BYPASSRLS target; `LOGIN` members are called out
+  specially since an application authenticating as one is a single
+  `SET ROLE` from a full bypass. Detection treats every membership
+  edge as `SET ROLE`-capable (it can over-report a PG16+ `WITH SET
+  FALSE` grant — a deliberate bias toward surfacing the route over
+  missing it, and it keeps the introspection query identical across
+  PG15-17). Allowlist the *member* role by name in
+  `[lint.rules.SEC029]` when the membership is intentional. No
+  auto-fix — revoking, narrowing, or accepting the route is an
+  operational decision. Brings the shipped rule count to
+  **thirty-nine**.
+
+### Changed
+- **Snapshot schema → version 11.** Adds a top-level
+  `bypassrls_escalation_roles` array (the transitive membership
+  closure SEC029 reads). The bump is additive: v3–v10 snapshots load
+  unchanged (the new field defaults empty), and a pre-v11 snapshot
+  produces no SEC029 findings until it is re-captured against a live
+  database.
+
 ## [0.5.53] - 2026-05-21
 
 ### Added

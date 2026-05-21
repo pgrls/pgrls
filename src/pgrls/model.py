@@ -2,7 +2,9 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 10 (v10 added top-level ``leakproof_functions`` for
+Currently version 11 (v11 added top-level
+``bypassrls_escalation_roles`` for SEC029;
+v10 added top-level ``leakproof_functions`` for
 SEC017; v9 added top-level ``bypassrls_roles`` for SEC016;
 v8 added ``search_path`` to ``SecdefFunction``
 for SEC015; v7 added per-table ``indexes`` for PERF003; v6
@@ -19,6 +21,7 @@ from functools import cached_property
 from typing import Any, Literal
 
 __all__ = [
+    "BypassRlsEscalation",
     "BypassRlsRole",
     "Column",
     "Grant",
@@ -38,7 +41,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 10
+SNAPSHOT_VERSION = 11
 
 
 @dataclass(frozen=True)
@@ -380,6 +383,49 @@ class BypassRlsRole:
 
 
 @dataclass(frozen=True)
+class BypassRlsEscalation:
+    """A role that can reach BYPASSRLS by SET ROLE-ing to another role.
+
+    Captured in snapshot v11+ for SEC029. BYPASSRLS is a role
+    *attribute*, and role attributes — unlike object privileges —
+    are **never inherited** through role membership, even with
+    ``INHERIT``. So a member of a BYPASSRLS-carrying role does not
+    bypass RLS automatically. But it can ``SET ROLE`` to the
+    BYPASSRLS role (membership grants that) and bypass every policy
+    from that point on. That is an RLS-bypass *path* that is
+    invisible from the member's own ``pg_roles`` row — SEC016 only
+    sees roles that hold BYPASSRLS directly; SEC029 sees the roles
+    one ``SET ROLE`` away from it.
+
+    Introspection captures the transitive membership closure of
+    ``pg_auth_members`` and keeps only the (member → BYPASSRLS role)
+    reachable pairs, grouped per member. Members that already hold
+    BYPASSRLS directly (SEC016's surface) or are superusers (which
+    bypass unconditionally) are excluded.
+
+    Roles are cluster-global, so this capture is independent of the
+    introspector's ``--schemas`` set.
+
+    Captured fields:
+
+    * ``member`` — ``pg_roles.rolname`` of the role that can escalate.
+      The SEC029 allowlist key (roles are unqualified).
+    * ``via`` — the BYPASSRLS role names reachable from ``member`` via
+      ``SET ROLE`` (sorted), so the finding names the escalation
+      target(s).
+    * ``member_can_login`` — ``pg_roles.rolcanlogin`` of the member.
+      A LOGIN member is directly connectable (an app authenticating
+      as it is one ``SET ROLE`` from full bypass); a NOLOGIN member
+      is reached only by something that can already become it. Shapes
+      the SEC029 message, not the verdict.
+    """
+
+    member: str
+    via: tuple[str, ...]
+    member_can_login: bool
+
+
+@dataclass(frozen=True)
 class LeakproofFunction:
     """A function carrying the LEAKPROOF attribute.
 
@@ -437,6 +483,17 @@ class Schema:
     # with `leakproof_functions=()` so SEC017 finds nothing to flag
     # against a pre-v10 snapshot until it is re-captured.
     leakproof_functions: tuple[LeakproofFunction, ...] = ()
+    # Roles that can SET ROLE to a BYPASSRLS role (transitively) but
+    # don't hold BYPASSRLS themselves — populated in snapshot v11+.
+    # SEC029 walks this; introspection computes the transitive
+    # `pg_auth_members` closure and keeps only the reachable
+    # (member → BYPASSRLS role) pairs, grouped per member. Default
+    # `()` keeps callers that construct `Schema(...)` without it
+    # (unit tests, older snapshots) working unchanged; v3-v10
+    # baselines round-trip with `bypassrls_escalation_roles=()` so
+    # SEC029 finds nothing to flag against a pre-v11 snapshot until
+    # it is re-captured.
+    bypassrls_escalation_roles: tuple[BypassRlsEscalation, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -616,13 +673,32 @@ class Schema:
                 {"qualified_name": f.qualified_name}
                 for f in self.leakproof_functions
             ],
+            # v11 extension — emit roles that can SET ROLE to a
+            # BYPASSRLS role transitively. SEC029 reads this. Order
+            # matches `Schema.bypassrls_escalation_roles` (sorted by
+            # member name at introspection time) for snapshot
+            # determinism. v3-v10 baselines round-trip with
+            # `bypassrls_escalation_roles=()` → empty array.
+            "bypassrls_escalation_roles": [
+                {
+                    "member": e.member,
+                    "via": list(e.via),
+                    "member_can_login": e.member_can_login,
+                }
+                for e in self.bypassrls_escalation_roles
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v10 snapshot dict.
+        """Reconstruct a Schema from a v3-v11 snapshot dict.
 
-        v10 (current): adds top-level ``leakproof_functions`` for
+        v11 (current): adds top-level ``bypassrls_escalation_roles``
+        for SEC029. v3-v10 snapshots have no key; they load with
+        ``bypassrls_escalation_roles=()`` — SEC029 finds nothing to
+        flag until the snapshot is re-captured against a live
+        database.
+        v10: adds top-level ``leakproof_functions`` for
         SEC017. v3-v9 snapshots have no ``leakproof_functions`` key;
         they load with ``leakproof_functions=()`` — SEC017 finds
         nothing to flag until the snapshot is re-captured against a
@@ -662,11 +738,11 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10. v1 / v2 snapshots must be regenerated against the "
+                "10, 11. v1 / v2 snapshots must be regenerated against the "
                 "current schema."
             )
 
@@ -845,12 +921,28 @@ class Schema:
             for f in raw_leakproof
         )
 
+        # `bypassrls_escalation_roles` is a v11+ field. v3-v10
+        # snapshots have no key; `.get(..., [])` loads them with an
+        # empty tuple — SEC029 then finds nothing to flag (correct,
+        # since the snapshot didn't capture the membership graph).
+        # Re-snapshot against a live database (v11) to populate it.
+        raw_escalation = payload.get("bypassrls_escalation_roles", [])
+        bypassrls_escalation_roles = tuple(
+            BypassRlsEscalation(
+                member=e["member"],
+                via=tuple(e["via"]),
+                member_can_login=e["member_can_login"],
+            )
+            for e in raw_escalation
+        )
+
         return cls(
             tables=tuple(tables),
             views=views,
             security_definer_functions=secdef_funcs,
             bypassrls_roles=bypassrls_roles,
             leakproof_functions=leakproof_functions,
+            bypassrls_escalation_roles=bypassrls_escalation_roles,
         )
 
     def to_sql(self) -> str:
