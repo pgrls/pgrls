@@ -10,6 +10,32 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.55] - 2026-05-21
+
+### Added
+- **SEC030** — new lint rule (severity `info`). Fires when a policy
+  scopes row access by a **nullable** discriminator column — a column
+  compared with a plain `=` against a per-request auth value
+  (`current_setting`, `auth.uid`, `auth.role`, `auth.jwt` by
+  default). Under standard `=` semantics a row whose discriminator is
+  `NULL` evaluates `NULL = <value>` → `NULL`, so it is silently
+  invisible to every tenant (a row that belongs to no one); and it
+  becomes a cross-tenant leak the moment any policy uses a
+  NULL-tolerant form (`IS NOT DISTINCT FROM`, `… OR col IS NULL`,
+  `COALESCE(col, …)`). The remedy is `SET NOT NULL` on the
+  discriminator (after backfilling). Detection is conservative: only
+  scalar `=` (not `<>`, range operators, or array-membership `=
+  ANY`); the column must be a direct operand, but the auth value is
+  detected even when wrapped in the `(SELECT current_setting(…))`
+  form PERF001 recommends; own-table columns only; tables without
+  captured column nullability (pre-v5 snapshots) are skipped.
+  Complements SEC018 (wrong discriminator *type*) and SEC027 (no
+  discriminator at all) — the three are disjoint. Configure the
+  auth-context set via `[lint.rules.SEC030].auth_functions`; allowlist
+  intentionally-nullable discriminators by table name. No auto-fix —
+  `SET NOT NULL` needs a backfill pgrls can't author. Brings the
+  shipped rule count to **forty**.
+
 ## [0.5.54] - 2026-05-21
 
 ### Added

@@ -8,7 +8,7 @@
 
 CREATE TABLE app.typecast_email (
     id BIGSERIAL PRIMARY KEY,
-    email VARCHAR(255)
+    email VARCHAR(255) NOT NULL
 );
 ALTER TABLE app.typecast_email ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app.typecast_email FORCE ROW LEVEL SECURITY;

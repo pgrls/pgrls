@@ -8,7 +8,7 @@
 
 CREATE TABLE app.todos_archive (
     id BIGSERIAL PRIMARY KEY,
-    user_id TEXT,
+    user_id TEXT NOT NULL,
     body TEXT
 );
 ALTER TABLE app.todos_archive ENABLE ROW LEVEL SECURITY;

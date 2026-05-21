@@ -27,7 +27,9 @@ UPDATE pg_catalog.pg_attribute
 -- Clean: policy refs only existing columns. RESTRICTIVE keeps
 -- SEC003 quiet, and the PERMISSIVE-postgres companion keeps
 -- SEC012 quiet.
-CREATE TABLE public.hyg001_clean (id INT, tenant_id TEXT);
+-- tenant_id is NOT NULL so the clean table's nullable-discriminator
+-- surface is empty — SEC030 stays silent here.
+CREATE TABLE public.hyg001_clean (id INT, tenant_id TEXT NOT NULL);
 ALTER TABLE public.hyg001_clean ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.hyg001_clean FORCE ROW LEVEL SECURITY;
 CREATE POLICY clean_ref ON public.hyg001_clean

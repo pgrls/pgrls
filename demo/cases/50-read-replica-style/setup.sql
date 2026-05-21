@@ -21,7 +21,7 @@ END $$;
 
 CREATE TABLE app.read_replica (
     id BIGSERIAL PRIMARY KEY,
-    tenant_id UUID,
+    tenant_id UUID NOT NULL,
     snapshot_at TIMESTAMPTZ DEFAULT now(),
     payload JSONB
 );

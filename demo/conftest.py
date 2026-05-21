@@ -80,6 +80,13 @@ _BASE_CONFIG = (
     # both configs so `_BASE_CONFIG`-based tests (uc72) see the same
     # rule set as the pgrls.toml-based ones.
     '[lint.rules.SEC027]\nallowlist = ["app.gen_cols"]\n'
+    # Mirror pgrls.toml's SEC030 allowlist: `app.kb_articles` (uc29,
+    # public-or-tenant mix where public rows legitimately have a NULL
+    # tenant_id) and `app.gen_cols` (uc46, scopes by a GENERATED
+    # column) intentionally use a nullable discriminator. Allowlisted
+    # in both configs so `_BASE_CONFIG`-based tests (uc72) see the same
+    # rule set as the pgrls.toml-based ones.
+    '[lint.rules.SEC030]\nallowlist = ["app.kb_articles", "app.gen_cols"]\n'
     + _SEC012_ALLOWLIST_BLOCK
 )
 

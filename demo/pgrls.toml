@@ -47,6 +47,17 @@ allowlist = ["app.gen_cols"]
 # pgrls just can't see through the generated-column derivation.
 allowlist = ["app.gen_cols"]
 
+[lint.rules.SEC030]
+# Two demo tables intentionally scope by a nullable discriminator.
+# `app.kb_articles` (use case 29) is a public-or-tenant mix: public
+# rows (`is_public = true`) legitimately carry a NULL tenant_id and the
+# `is_public OR tenant_id = ...` predicate admits them, so the nullable
+# discriminator is by design. `app.gen_cols` (use case 46) scopes by
+# the GENERATED column `user_id_norm`; the table is intentionally
+# per-user scoped. Both are the documented "intentional nullable
+# discriminator" allowlist case SEC030's message points to.
+allowlist = ["app.kb_articles", "app.gen_cols"]
+
 # Issue #11 fully closed in v0.5.7 — every demo fixture that used
 # RESTRICTIVE-only has been rewritten to the canonical
 # PERMISSIVE+RESTRICTIVE pattern, so the SEC012 allowlist is no

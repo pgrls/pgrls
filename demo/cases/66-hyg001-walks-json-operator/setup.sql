@@ -9,7 +9,7 @@
 
 CREATE TABLE app.json_access (
     id BIGSERIAL PRIMARY KEY,
-    user_id TEXT,
+    user_id TEXT NOT NULL,
     payload JSONB
 );
 ALTER TABLE app.json_access ENABLE ROW LEVEL SECURITY;
