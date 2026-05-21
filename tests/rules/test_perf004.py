@@ -197,6 +197,38 @@ def test_perf004_and_perf003_are_disjoint_on_wrapped_column() -> None:
     assert len(PERF003().check(bare, {})) == 1
 
 
+def test_perf004_composite_predicate_splits_by_column_with_perf003() -> None:
+    # `lower(email) = X AND tenant_id = Y` on a table where `email` has a
+    # plain index but `tenant_id` has none. The two rules split the single
+    # policy by column: PERF004 fires on the wrapped+indexed `email` (the
+    # plain index can't serve `lower(email)`), PERF003 on the
+    # bare-unindexed `tenant_id`. Same policy, different columns — this
+    # pins the per-column disjointness contract the docstrings rely on
+    # ("a column trips at most one"), which per-policy set membership in
+    # the combined-fixture test does not exercise.
+    schema = Schema(
+        tables=(
+            _table(
+                policies=(
+                    _policy(
+                        using_sql=(
+                            "lower(email) = current_setting('app.e') "
+                            "AND tenant_id = current_setting('app.t')"
+                        )
+                    ),
+                ),
+                indexes=(_index(("email",)),),
+            ),
+        )
+    )
+    [p4] = PERF004().check(schema, {})
+    assert "'email'" in p4.message
+    assert "'tenant_id'" not in p4.message
+    [p3] = PERF003().check(schema, {})
+    assert "'tenant_id'" in p3.message
+    assert "'email'" not in p3.message
+
+
 def test_perf004_bad_allowlist_type_raises() -> None:
     schema = Schema(
         tables=(_table(policies=(_policy(),), indexes=(_index(("email",)),)),)

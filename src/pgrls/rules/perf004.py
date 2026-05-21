@@ -76,9 +76,9 @@ from pgrls.violations import Severity, Violation
 def _function_wrapped_own_columns(node: Any, table: Table) -> set[str]:
     """Own-table columns that appear inside a `FuncCall` in `node`.
 
-    A column under any function call (`lower(email)`, `coalesce(tenant_id,
-    0)`, nested `lower(upper(x))`) is function-wrapped — a plain index on
-    the bare column cannot serve a predicate using it. `current_setting`
+    A column under any function call (`lower(email)`, `date_trunc('day',
+    created_at)`, nested `lower(upper(x))`) is function-wrapped — a plain
+    index on the bare column cannot serve a predicate using it. `current_setting`
     and other auth functions take string/literal arguments, not columns,
     so they contribute nothing here. Sub-select columns are excluded
     (`exclude_sublinks=True`) — they belong to other tables.
