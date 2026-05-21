@@ -115,6 +115,7 @@ pgrls lint --config ./config/pgrls.toml --format text     # human-readable (defa
 pgrls lint --config ./config/pgrls.toml --format json     # machine-readable for CI
 pgrls lint --config ./config/pgrls.toml --format sarif    # GitHub Code Scanning
 pgrls lint --config ./config/pgrls.toml --format markdown # PR comments / rendered CI reports
+pgrls lint --config ./config/pgrls.toml --format github   # GitHub Actions run annotations
 ```
 
 Or run only specific rules — handy when scoping a SARIF report in CI, or
@@ -129,7 +130,7 @@ pgrls lint --rule SEC001 --rule SEC003
 Pass `--explain` to append each rule's reference paragraph beneath its
 finding in the text output, so a CI log carries the *why* next to the
 *where* without a separate `pgrls explain <RULE>` lookup. Text format
-only — JSON / SARIF / Markdown keep their schemas stable.
+only — JSON / SARIF / Markdown / GitHub keep their schemas stable.
 
 ### Example output
 
