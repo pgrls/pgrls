@@ -9,7 +9,7 @@
 **[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Rule reference](AGENTS.md)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
-> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 11 of 37 rules mechanically auto-fixable.
+> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 11 of 38 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
 > MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown / GitHub annotations).
 
@@ -28,9 +28,9 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 37 lint rules, 11 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 38 lint rules, 11 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
-> - **Lint & fix** — `pgrls lint` checks a live database against all thirty-seven rules and reports findings as text, JSON, SARIF, Markdown, or GitHub Actions annotations (`--format github`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Lint & fix** — `pgrls lint` checks a live database against all thirty-eight rules and reports findings as text, JSON, SARIF, Markdown, or GitHub Actions annotations (`--format github`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
@@ -352,6 +352,7 @@ pattern documentation.
 | [SEC025](AGENTS.md#rule-sec025) | warning | Policy predicate references another table whose RLS is disabled — the cross-table read is only as strong as the referenced table's isolation |
 | [SEC026](AGENTS.md#rule-sec026) | warning | Policy predicate uses `LIKE` / `ILIKE` / `SIMILAR TO` / POSIX regex against an auth-context value (a wildcard-shape GUC matches every row) |
 | [SEC027](AGENTS.md#rule-sec027) | info | RLS table has an owner / user-identity column that no policy scopes by — rows may be visible across users within the same tenant |
+| [SEC028](AGENTS.md#rule-sec028) | warning | Permissive write policy (INSERT/UPDATE/ALL) whose `WITH CHECK` is constant `true` — accepts every write; the `TO` clause gates who, not what |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](AGENTS.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |

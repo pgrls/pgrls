@@ -498,3 +498,20 @@ CREATE POLICY tenant_scope ON public.allbad_sec027
     USING (tenant_id = (SELECT current_setting('app.tenant', true))::int);
 CREATE INDEX allbad_sec027_tenant_idx
     ON public.allbad_sec027 (tenant_id);
+
+-- SEC028: permissive write policy with WITH CHECK (true) accepts
+-- every write the command covers. FOR INSERT has no USING, so the
+-- write side is open with nothing to contrast — SEC020's asymmetry
+-- needs a real USING, SEC006 needs WITH CHECK absent. Granted TO
+-- postgres (not PUBLIC) so SEC003 stays quiet. Two extra firings
+-- are silent-by-design (each pinned on its own block): SEC005
+-- (the constant-true WITH CHECK references no own column) and
+-- SEC007 (the table's only policy is permissive — no RESTRICTIVE
+-- floor). Those shapes are intrinsic to the minimal SEC028 trigger
+-- (a literal-true WITH CHECK can't reference a column).
+CREATE TABLE public.allbad_sec028 (id INT, tenant_id INT);
+ALTER TABLE public.allbad_sec028 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec028 FORCE ROW LEVEL SECURITY;
+CREATE POLICY open_insert ON public.allbad_sec028
+    FOR INSERT TO postgres
+    WITH CHECK (true);

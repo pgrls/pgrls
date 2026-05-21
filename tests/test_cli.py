@@ -802,10 +802,12 @@ def test_lint_fires_sec006_on_update_and_all_without_with_check(
     assert "public.sec006_clean" not in result.output
     # The three bad policies are permissive PUBLIC → SEC003 + SEC007.
     # update_bad / all_bad have unwrapped current_setting → PERF001.
-    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005.
+    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005, and
+    # is a permissive write policy with a constant-true WITH CHECK →
+    # SEC028 (open write).
     _assert_rules_fire_exactly(
         result.output,
-        {"SEC003", "SEC005", "SEC006", "SEC007", "PERF001"},
+        {"SEC003", "SEC005", "SEC006", "SEC007", "PERF001", "SEC028"},
     )
 
 
@@ -1113,6 +1115,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC025  public.allbad_sec025.tenant_scope\n",
             "SEC026  public.allbad_sec026.email_pattern\n",
             "SEC027  public.allbad_sec027\n",
+            "SEC028  public.allbad_sec028.open_insert\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",
