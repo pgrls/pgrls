@@ -1651,6 +1651,24 @@ def test_sec011_fix_skips_negated_or_true_inside_and() -> None:
     assert SEC011Fixer().fix(schema, {}) == []
 
 
+def test_sec011_fix_skips_or_true_under_is_false_test() -> None:
+    # `(a OR true) IS FALSE` ≡ `true IS FALSE` ≡ deny-all. Stripping
+    # to `a IS FALSE` would BROADEN access. A `BooleanTest` is not a
+    # BoolExpr, so `_strip_or_true` stops at it — the OR-true under
+    # the IS FALSE test is non-monotone and left untouched.
+    schema = _wrap_policy(_policy("(user_id = 1 OR true) IS FALSE"))
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
+def test_sec011_fix_skips_or_true_under_negating_comparison() -> None:
+    # `(a OR true) = false` ≡ `true = false` ≡ deny-all. Rewriting
+    # to `a = false` would change the truth value and broaden access.
+    # The comparison (A_Expr) is non-monotone in its operand, so the
+    # fixer leaves it alone.
+    schema = _wrap_policy(_policy("(user_id = 1 OR true) = false"))
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
 def test_sec011_fix_skips_vacuous_true_or_true() -> None:
     # `true OR true` has no real predicate to keep once the trues
     # are stripped — the fixer leaves it for human review rather
