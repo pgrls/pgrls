@@ -66,7 +66,17 @@ def test_github_title_carries_rule_id_and_location() -> None:
 
 def test_github_message_is_the_command_body() -> None:
     out = format_github([_v(message="Anonymous clients see all rows.")])
-    assert out.endswith("::Anonymous clients see all rows.")
+    # rstrip the trailing terminator before checking the body tail.
+    assert out.rstrip("\n").endswith("::Anonymous clients see all rows.")
+
+
+def test_github_nonempty_output_ends_with_trailing_newline() -> None:
+    # The final workflow command must be newline-terminated on
+    # stdout — the CLI echoes with nl=False, matching the other
+    # formatters which all end in "\n".
+    out = format_github([_v()])
+    assert out.endswith("\n")
+    assert not out.endswith("\n\n")
 
 
 def test_github_one_line_per_violation() -> None:
@@ -77,7 +87,8 @@ def test_github_one_line_per_violation() -> None:
             _v(rule_id="SEC007", severity="info"),
         ]
     )
-    lines = out.split("\n")
+    # splitlines() ignores the trailing terminator newline.
+    lines = out.splitlines()
     assert len(lines) == 3
     assert lines[0].startswith("::error ")
     assert lines[1].startswith("::warning ")
@@ -94,8 +105,12 @@ def test_github_escapes_message_percent_and_newline() -> None:
     # then CR/LF. A raw newline would otherwise terminate the
     # command and dump the rest of the message as plain log text.
     out = format_github([_v(message="50% off\nsecond line\r")])
-    body = out.split("::", 2)[2]
+    # Strip the trailing terminator the formatter appends, then take
+    # the command body (everything after the second `::`).
+    body = out.rstrip("\n").split("::", 2)[2]
     assert body == "50%25 off%0Asecond line%0D"
+    # The message's own newline was escaped to %0A — no raw newline
+    # survives in the body.
     assert "\n" not in body
 
 

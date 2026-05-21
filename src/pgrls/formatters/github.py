@@ -95,8 +95,12 @@ def _location_for_title(location: str | None) -> str:
 def format_github(violations: list[Violation]) -> str:
     """Render violations as GitHub Actions workflow commands.
 
-    One command per violation, newline-separated. Empty input
-    returns the empty string (a clean run prints no annotations).
+    One command per violation, one per line. The non-empty output
+    ends with a trailing newline so the final workflow command is
+    terminated on stdout — matching the text / json / sarif /
+    markdown formatters (the CLI echoes all of them with
+    `nl=False`). Empty input returns the empty string so a clean
+    run prints nothing at all (not even a blank line).
     """
     lines: list[str] = []
     for v in violations:
@@ -106,4 +110,6 @@ def format_github(violations: list[Violation]) -> str:
         )
         message = _escape_data(v.message)
         lines.append(f"::{command} title={title}::{message}")
-    return "\n".join(lines)
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
