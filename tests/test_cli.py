@@ -1122,6 +1122,12 @@ def test_lint_output_writes_report_to_file(
     # File is byte-for-byte what stdout would have received.
     stdout_run = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert file_report == stdout_run.output
+    # Byte-level: no newline translation (the `newline=""` write).
+    # read_text would normalize \r\n→\n, so check raw bytes — this is
+    # what pins the cross-platform guarantee.
+    raw = out.read_bytes()
+    assert b"\r\n" not in raw
+    assert b"\n" in raw
 
 
 def test_lint_output_unwritable_path_exits_two(
