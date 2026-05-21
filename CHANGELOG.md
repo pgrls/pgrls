@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.57] - 2026-05-21
+
+### Added
+- **`pgrls lint --format junit`.** New JUnit XML output so lint
+  findings surface in a CI run's test-report UI (GitLab, Jenkins,
+  CircleCI, Buildkite, GitHub test-reporter actions). One
+  `<testcase>` per finding under a single `pgrls` suite — `classname`
+  is the rule id, `name` is `"<rule id> <location>"`, and each is a
+  `<failure>` whose `type` is the pgrls severity, `message` the rule
+  title, and element text the full finding message. A clean run emits
+  a well-formed empty suite (`tests="0"`). Warning- and info-level
+  findings are reported as failures too — the report shows everything
+  the lint found, and the process exit code (`--fail-on`), not the
+  report, gates the build. All values are XML-escaped and run through
+  the shared control-char sanitiser, so a crafted Postgres identifier
+  can't produce malformed XML.
+
 ## [0.5.56] - 2026-05-21
 
 ### Added

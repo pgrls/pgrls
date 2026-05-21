@@ -8,7 +8,9 @@ Scanning and similar aggregators (shape documented in
 PR comments and rendered CI reports (shape documented in
 `formatters/markdown.py`). `github` emits GitHub Actions workflow
 commands so findings show up as run annotations (shape documented
-in `formatters/github.py`).
+in `formatters/github.py`). `junit` emits a JUnit XML report so
+findings surface in a CI run's test-report UI (shape documented in
+`formatters/junit.py`).
 
 Adding a format = creating a sibling module and wiring it into
 `_FORMATTERS` here. The rule-link URL convention used by SARIF and
@@ -22,6 +24,7 @@ from collections.abc import Callable
 
 from pgrls.formatters.github import format_github
 from pgrls.formatters.json import format_json
+from pgrls.formatters.junit import format_junit
 from pgrls.formatters.markdown import format_markdown
 from pgrls.formatters.sarif import format_sarif
 from pgrls.formatters.text import format_text
@@ -33,6 +36,7 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
     "sarif": format_sarif,
     "markdown": format_markdown,
     "github": format_github,
+    "junit": format_junit,
 }
 
 SUPPORTED_FORMATS: tuple[str, ...] = tuple(_FORMATTERS.keys())

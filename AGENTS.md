@@ -3162,7 +3162,7 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
-- **Text, JSON, SARIF, Markdown, and GitHub-annotation output.**
+- **Text, JSON, SARIF, Markdown, GitHub-annotation, and JUnit output.**
   `--format text` (human-readable, default), `--format json`
   (machine-readable, stable CI contract), `--format sarif` (SARIF
   v2.1.0 for GitHub Code Scanning and similar aggregators),
@@ -3173,7 +3173,10 @@ These are intentional in the current release. Do not invent capabilities.
   info→notice, and a clean run emits nothing). The github format
   carries no `file=`/`line=` because pgrls lints a live database,
   not source text, so annotations land in the run summary rather
-  than pinned to a diff hunk.
+  than pinned to a diff hunk. `--format junit` emits a JUnit XML
+  report (one `<testcase>` per finding under a `pgrls` suite) so
+  findings show in a CI run's test-report UI; the process exit code
+  (`--fail-on`), not the report, gates the build.
 - **Postgres only.** No support for other databases or for
   MySQL/MariaDB emulation layers.
 - **Postgres 15+.** Older PG releases (10–14) are no longer
