@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-six rules across four
+In the current release it ships **thirty-seven rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -59,7 +59,9 @@ identity column against a hardcoded literal), `SEC022`
 (RLS-enabled table whose policies are all `FOR SELECT` — no
 write-side policy, so writes are denied), `SEC024` (policy calls
 `current_setting()` with an unqualified parameter name — a
-dropped prefix the application cannot `SET`), and `HYG003`
+dropped prefix the application cannot `SET`), `SEC027` (RLS table
+has an owner / user column that no policy scopes by — rows may be
+visible between users within the same tenant), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
@@ -1761,6 +1763,80 @@ a design choice, not a mechanical rewrite.
   `tenant_id = current_setting('app.tenant_id')::uuid` is a plain
   `=`; the auth value is interpreted as a UUID, not a pattern.
 
+<a id="rule-sec027"></a>
+
+### SEC027 — RLS table has a principal column no policy scopes by
+
+**Severity:** info.
+
+Row-Level Security isn't only about tenant isolation. Within a
+single tenant, rows are still often *per-user*: a user's drafts,
+private uploads, direct messages, personal settings. The
+discriminator there is an owner / user column, not `tenant_id`.
+
+SEC027 is the under-scoping nudge for that case. It fires when a
+table has RLS enabled, carries at least one policy, has a column
+whose name looks like a principal identity (`owner`, `owner_id`,
+`user_id` by default), and **no policy references that column** in
+its `USING` or `WITH CHECK`.
+
+```sql
+CREATE TABLE documents (id uuid, tenant_id int, owner_id uuid, body text);
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON documents
+    USING (tenant_id = current_setting('app.tenant')::int);
+```
+
+The policy scopes by tenant, so cross-tenant reads are blocked —
+but every user *within* a tenant can read every other user's rows,
+because nothing keys on `owner_id`. If `documents` holds
+per-user-private data, that's a leak; if it's a tenant-shared table
+(a catalogue, a settings table where `owner_id` is just audit
+provenance), it's intentional and you allowlist it.
+
+pgrls cannot read that intent, so SEC027 is **info** severity — it
+never fails CI by default. It's a "did you mean to scope this by
+user too?" prompt, deliberately conservative:
+
+* **Only flags tables that already have a policy.** A table with
+  RLS on and *no* policy is SEC009's silent-deny-all surface, not
+  this rule's.
+* **Treats a column as scoped if any policy references it
+  anywhere**, including inside a sub-select. This under-fires
+  rather than over-fires: a membership-table join
+  (`owner_id IN (SELECT … )`) counts as scoping, so the rule stays
+  quiet on the legitimate ACL pattern, at the cost of missing a
+  case where the sub-select's column merely shares the name.
+* **Default principal set is narrow** (`owner`, `owner_id`,
+  `user_id`). Audit-style columns (`created_by`, `updated_by`,
+  `author_id`) are deliberately NOT in the default set — they're
+  usually provenance, not access boundaries.
+
+Configure the principal-column set (replaces the default):
+
+```toml
+[lint.rules.SEC027]
+principal_columns = ["owner_id", "user_id", "created_by"]
+```
+
+Allowlist tables that are intentionally tenant-shared (by bare
+name or `schema.table`):
+
+```toml
+[lint.rules.SEC027]
+allowlist = ["public.catalogue", "tenant_settings"]
+```
+
+**No auto-fix.** The remedy — add a per-user predicate, or confirm
+the table is tenant-shared and allowlist it — is an intent decision
+pgrls can't make.
+
+Relationship to other rules: SEC005 ("no own-column reference")
+fires when a policy references *no* column of its table at all;
+SEC027 fires when the policy references *some* columns but not the
+principal one. A tenant-only table with no owner/user column never
+trips SEC027 (there's nothing to under-scope).
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2852,7 +2928,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-six rules across four categories.** SEC001–SEC026,
+- **Thirty-seven rules across four categories.** SEC001–SEC027,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

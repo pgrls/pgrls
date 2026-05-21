@@ -10,6 +10,49 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.50] - 2026-05-20
+
+### Added
+- **SEC027** — new lint rule (severity `info`). RLS isn't only
+  about tenant isolation; within a single tenant, rows are often
+  per-user (drafts, DMs, private uploads). SEC027 fires when a
+  table has RLS enabled, carries at least one policy, has a
+  principal-identity column (`owner`, `owner_id`, `user_id` by
+  default), and no policy references that column. The canonical
+  miss: a table scoped only by `tenant_id` while an `owner_id`
+  column goes unreferenced, so every user *within* a tenant reads
+  every other user's rows.
+
+  Deliberately conservative: only flags tables that already have a
+  policy (no-policy is SEC009's surface); treats a column as scoped
+  if any policy references it anywhere, including inside a
+  sub-select (under-fires on the legitimate membership-join ACL
+  pattern rather than over-firing); and the default principal set
+  excludes audit-style columns (`created_by`, `updated_by`,
+  `author_id`) since those are usually provenance, not access
+  boundaries. Configure via `[lint.rules.SEC027].principal_columns`
+  (replaces the default) and allowlist tenant-shared tables via
+  `[lint.rules.SEC027].allowlist`. Info severity, so it never fails
+  CI by default — it's a "did you mean to scope by user too?"
+  prompt, not an assertion. No auto-fix (the remedy is an intent
+  decision). Brings the shipped rule count to **thirty-seven**.
+
+### Changed
+- **Repositioned from "multi-tenant" to "per-principal" framing.**
+  The README hero, the "Real-world bugs" section, and the PyPI
+  description led with multi-tenant SaaS, which undersold the tool:
+  the same bug class (broken row scoping, missing WITH CHECK,
+  inverted auth) bites *within* a single tenant whenever rows are
+  per-user. The lede now leads with "broken row scoping (across
+  tenants and between users in the same tenant)", the Real-world
+  section gains a single-tenant user-leak example next to the
+  cross-tenant one, and the PyPI summary reads "tenant and per-user
+  row-scoping bugs". No behaviour change in any existing rule — the
+  engine was already principal-agnostic (it lints predicate
+  structure, not the specific discriminator column); this release
+  makes the framing match the coverage and adds SEC027 to catch the
+  under-scoping case explicitly.
+
 ## [0.5.49] - 2026-05-20
 
 ### Changed
