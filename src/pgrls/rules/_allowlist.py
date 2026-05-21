@@ -9,7 +9,7 @@ Allowlist entries fall into six shapes:
 
 * **Table reference** (`name` OR `schema.name`) — used by table-scoped
   rules that allow either form (SEC001, SEC002, SEC009, SEC012, SEC022,
-  SEC027, SEC032).
+  SEC027, SEC030, SEC032).
 
 * **Qualified table ID** (`schema.table` only) — used by rules whose
   scope is the qualified table object specifically (SEC007).
@@ -112,7 +112,7 @@ def parse_table_ref_allowlist(
 
     Used by rules that accept both unqualified and qualified table
     references (SEC001, SEC002, SEC009, SEC012, SEC022, SEC027,
-    SEC032). Schema and table names cannot contain `.` from
+    SEC030, SEC032). Schema and table names cannot contain `.` from
     `pg_catalog`, so a literal `split('.')` is unambiguous here.
     """
     raw = options.get("allowlist", [])
