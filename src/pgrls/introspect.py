@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 
 from pgrls.ast_utils import find_func_calls, parse_expr
 from pgrls.model import (
+    BypassRlsEscalation,
     BypassRlsRole,
     Column,
     Grant,
@@ -505,6 +506,56 @@ WHERE r.rolbypassrls
 ORDER BY r.rolname
 """
 
+# Roles that can reach a BYPASSRLS role via SET ROLE — the SEC029
+# surface. BYPASSRLS is a role *attribute*, never inherited through
+# membership, so a member of a BYPASSRLS role doesn't bypass RLS
+# automatically; but it can `SET ROLE` to the BYPASSRLS role and
+# bypass from there. This computes the transitive closure of
+# `pg_auth_members` (member -> roleid edges) and keeps only the
+# (member, BYPASSRLS-target) pairs.
+#
+# `reach(member, target)` means "member is a transitive member of
+# target" — i.e. member can SET ROLE to target. Base case: direct
+# memberships. Recursive step: if member can reach R and R is a
+# member of target, member can reach target.
+#
+# All `pg_auth_members` edges are treated as SET ROLE-capable. On
+# PG15 every membership permits SET ROLE; on PG16+ a membership with
+# `set_option = false` does not, so this can over-approximate there —
+# acceptable for a warning that surfaces a bypass *path* (a false
+# positive is an allowlist entry; a false negative is a missed
+# escalation route). Using the raw edge set keeps the query
+# identical across PG15-17 with no version-specific catalog columns.
+#
+# Members that already hold BYPASSRLS directly are SEC016's surface,
+# not SEC029's; superusers bypass unconditionally. Both are excluded.
+# `pg_auth_members` and `pg_roles` are readable by every connected
+# role, so no superuser is needed. Roles are cluster-global — no
+# schema parameter. ORDER BY for snapshot determinism.
+_BYPASSRLS_ESCALATION_SQL = """
+WITH RECURSIVE memberships(member, roleid) AS (
+    SELECT member, roleid FROM pg_catalog.pg_auth_members
+),
+reach(member, roleid) AS (
+    SELECT member, roleid FROM memberships
+    UNION
+    SELECT r.member, m.roleid
+    FROM reach r
+    JOIN memberships m ON m.member = r.roleid
+)
+SELECT
+    mem.rolname AS member,
+    mem.rolcanlogin AS member_can_login,
+    tgt.rolname AS via
+FROM reach
+JOIN pg_catalog.pg_roles mem ON mem.oid = reach.member
+JOIN pg_catalog.pg_roles tgt ON tgt.oid = reach.roleid
+WHERE tgt.rolbypassrls
+  AND NOT mem.rolbypassrls
+  AND NOT mem.rolsuper
+ORDER BY mem.rolname, tgt.rolname
+"""
+
 # Functions carrying the LEAKPROOF attribute in the configured
 # schemas. A LEAKPROOF function tells the planner it has no side
 # channels, so the planner may evaluate it below a security barrier
@@ -609,6 +660,39 @@ def _fetch_bypassrls_roles(cur: Any) -> tuple[BypassRlsRole, ...]:
             can_login=row["can_login"],
         )
         for row in cur.fetchall()
+    )
+
+
+def _fetch_bypassrls_escalation_roles(
+    cur: Any,
+) -> tuple[BypassRlsEscalation, ...]:
+    """Fetch roles that can SET ROLE to a BYPASSRLS role transitively.
+
+    The SQL returns one (member, via) row per reachable BYPASSRLS
+    target, ordered by member then target. Group consecutive rows by
+    member into one `BypassRlsEscalation` each, preserving the
+    target ordering as the `via` tuple. Takes no schema list — roles
+    are cluster-global.
+    """
+    cur.execute(_BYPASSRLS_ESCALATION_SQL)
+    by_member: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in cur.fetchall():
+        member = row["member"]
+        if member not in by_member:
+            by_member[member] = {
+                "via": [],
+                "can_login": row["member_can_login"],
+            }
+            order.append(member)
+        by_member[member]["via"].append(row["via"])
+    return tuple(
+        BypassRlsEscalation(
+            member=member,
+            via=tuple(by_member[member]["via"]),
+            member_can_login=by_member[member]["can_login"],
+        )
+        for member in order
     )
 
 
@@ -747,6 +831,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # so fetch them here too and share across both paths.
         bypassrls_roles = _fetch_bypassrls_roles(cur)
         leakproof_funcs = _fetch_leakproof_functions(cur, schemas)
+        bypassrls_escalation = _fetch_bypassrls_escalation_roles(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -790,6 +875,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 security_definer_functions=secdef_funcs_early,
                 bypassrls_roles=bypassrls_roles,
                 leakproof_functions=leakproof_funcs,
+                bypassrls_escalation_roles=bypassrls_escalation,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -983,4 +1069,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         security_definer_functions=secdef_funcs,
         bypassrls_roles=bypassrls_roles,
         leakproof_functions=leakproof_funcs,
+        bypassrls_escalation_roles=bypassrls_escalation,
     )

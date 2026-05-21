@@ -515,3 +515,17 @@ ALTER TABLE public.allbad_sec028 FORCE ROW LEVEL SECURITY;
 CREATE POLICY open_insert ON public.allbad_sec028
     FOR INSERT TO postgres
     WITH CHECK (true);
+
+-- SEC029: a role that can SET ROLE to a BYPASSRLS role. BYPASSRLS
+-- is a role attribute and is NOT inherited through membership, so
+-- allbad_sec029_member does not bypass RLS automatically (SEC016
+-- stays quiet on it — it has no BYPASSRLS of its own). But it is a
+-- member of allbad_sec016_role (the BYPASSRLS role created in the
+-- SEC016 block above), so it can `SET ROLE allbad_sec016_role` and
+-- bypass every policy from there — an RLS-bypass path SEC029
+-- surfaces. The member role and the membership grant are dropped in
+-- the combined-fixture test's teardown alongside allbad_sec016_role
+-- (roles are cluster-global).
+DROP ROLE IF EXISTS allbad_sec029_member;
+CREATE ROLE allbad_sec029_member;
+GRANT allbad_sec016_role TO allbad_sec029_member;

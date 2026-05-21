@@ -17,11 +17,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_10() -> None:
-    # Bumped 9 → 10 in v0.5.15 to add top-level `leakproof_functions`
-    # for SEC017. v3–v9 baselines still load (Schema.from_snapshot
-    # accepts 3 through 10).
-    assert SNAPSHOT_VERSION == 10
+def test_snapshot_version_is_11() -> None:
+    # Bumped 10 → 11 to add top-level `bypassrls_escalation_roles`
+    # for SEC029. v3–v10 baselines still load (Schema.from_snapshot
+    # accepts 3 through 11).
+    assert SNAPSHOT_VERSION == 11
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -43,10 +43,10 @@ def test_to_snapshot_emits_views_field() -> None:
     snap = schema.to_snapshot()
     # views added at v4; v5 added column_details; v6 added triggers;
     # v7 added indexes; v8 added SecdefFunction.search_path; v9
-    # added bypassrls_roles; v10 added leakproof_functions (all
-    # additive and orthogonal to the views field this test
-    # exercises).
-    assert snap["version"] == 10
+    # added bypassrls_roles; v10 added leakproof_functions; v11
+    # added bypassrls_escalation_roles (all additive and orthogonal
+    # to the views field this test exercises).
+    assert snap["version"] == 11
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -418,7 +418,7 @@ def test_to_snapshot_emits_bypassrls_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_roles" in snap
-    assert snap["version"] == 10
+    assert snap["version"] == 11
     assert snap["bypassrls_roles"] == [
         {"name": "etl_worker", "superuser": False, "can_login": True}
     ]
@@ -477,7 +477,7 @@ def test_to_snapshot_emits_leakproof_functions_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "leakproof_functions" in snap
-    assert snap["version"] == 10
+    assert snap["version"] == 11
     assert snap["leakproof_functions"] == [
         {"qualified_name": "public.fast_eq"}
     ]
