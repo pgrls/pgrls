@@ -14,11 +14,12 @@ def _policy(
     name: str = "p",
     command: str = "SELECT",
     with_check: str | None = None,
+    permissive: bool = True,
 ) -> Policy:
     return Policy(
         name=name,
         command=command,  # type: ignore[arg-type]
-        permissive=True,
+        permissive=permissive,
         roles=("authenticated",),
         using_sql=using,
         with_check_sql=with_check,
@@ -48,6 +49,13 @@ def test_sec008_fires_on_using_true_lowercase() -> None:
     assert len(violations) == 1
     assert violations[0].rule_id == "SEC008"
     assert violations[0].location == "public.t.p"
+
+
+def test_sec008_does_not_fire_on_restrictive_using_true() -> None:
+    # A restrictive USING (true) is SEC031's no-op-floor case, not
+    # SEC008's "admits every row" — SEC008 is permissive-only.
+    schema = _wrap(_policy("true", permissive=False))
+    assert SEC008().check(schema, {}) == []
 
 
 def test_sec008_fires_on_using_true_uppercase() -> None:
