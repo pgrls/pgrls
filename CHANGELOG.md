@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.58] - 2026-05-21
+
+### Added
+- **`pgrls explain --format json`.** A third output format for the
+  rule-reference command (alongside `text` and `markdown`), emitting
+  machine-readable rule metadata for IDE / tooling integrations. A
+  single rule (`pgrls explain SEC023 --format json`) yields
+  `{id, severity, title, fixable, reference}` — `fixable` flags
+  whether `pgrls fix` can auto-remediate it, and `reference` carries
+  the full rule body so a consumer gets everything `--format text`
+  shows. The catalog (`pgrls explain --format json`) yields
+  `{pgrls_version, count, rules: [{id, severity, title, fixable}]}` —
+  compact per-rule entries, mirroring the text and Markdown catalogs.
+  Needs no database connection.
+
 ## [0.5.57] - 2026-05-21
 
 ### Added

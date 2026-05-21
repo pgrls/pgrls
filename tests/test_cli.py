@@ -250,6 +250,54 @@ def test_explain_format_markdown_catalog_renders_table() -> None:
         assert rule.title in out
 
 
+def test_explain_format_json_per_rule_has_metadata_and_reference() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC001", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["id"] == "SEC001"
+    assert payload["severity"] == "error"
+    assert payload["title"]
+    # SEC001 has an auto-fixer.
+    assert payload["fixable"] is True
+    # The reference body (rule docstring minus its title line) is
+    # included so JSON consumers get everything `--format text` shows.
+    assert isinstance(payload["reference"], str)
+    assert payload["reference"].strip()
+
+
+def test_explain_format_json_marks_unfixable_rule() -> None:
+    # SEC030 (nullable discriminator) has no auto-fixer.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC030", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["fixable"] is False
+
+
+def test_explain_format_json_is_case_insensitive() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "sec001", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["id"] == "SEC001"
+
+
+def test_explain_format_json_catalog_lists_every_rule() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    from pgrls import __version__
+
+    assert payload["pgrls_version"] == __version__
+    registered = {r.id for r in all_rules()}
+    assert payload["count"] == len(registered)
+    catalog_ids = {r["id"] for r in payload["rules"]}
+    assert catalog_ids == registered
+    # Every entry carries the compact metadata quartet.
+    for entry in payload["rules"]:
+        assert set(entry) == {"id", "severity", "title", "fixable"}
+
+
 def test_explain_format_text_remains_the_default() -> None:
     # Omitting --format gives the existing text shape (no leading
     # `##` heading, no `**Severity:**` line). The text path is
