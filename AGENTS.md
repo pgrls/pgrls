@@ -170,6 +170,11 @@ Notes:
   `severity` is a reserved key — it sits alongside `allowlist` and other
   options in the same `[lint.rules.<RULE>]` table but is not passed to the
   rule itself.
+- A top-level `extends` key (a path, or a list of paths resolved relative to
+  the declaring file) layers the config on top of one or more shared bases —
+  for a monorepo or org-wide ruleset. Tables deep-merge key-by-key; scalars
+  and arrays are replaced (not appended); for a list, later entries win, and
+  the declaring file overrides every base. A cycle in the chain is an error.
 
 ## Rules reference
 
