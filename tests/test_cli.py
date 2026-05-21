@@ -39,6 +39,66 @@ def test_root_version_flag():
     assert __version__ in result.output
 
 
+def test_init_writes_parseable_default_config(tmp_path) -> None:
+    # `init` needs no database. The file it writes must parse through
+    # load_config AND leave every setting at its default, so a fresh
+    # `pgrls lint` runs unchanged against it.
+    from pgrls.config import load_config
+
+    out = tmp_path / "pgrls.toml"
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.is_file()
+    cfg = load_config(str(out))
+    assert cfg.schemas == ["public"]
+    assert cfg.fail_on == "warning"
+    assert cfg.diff_fail_on == "dangerous"
+    # url is left commented, so no env-var interpolation fires on a
+    # fresh file with DATABASE_URL unset.
+    assert cfg.database_url is None
+    assert cfg.disable == []
+    assert cfg.severity_overrides == {}
+    assert cfg.rule_options == {}
+
+
+def test_init_defaults_to_pgrls_toml_in_cwd(tmp_path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(main, ["init"])
+        assert result.exit_code == 0, result.output
+        assert Path("pgrls.toml").is_file()
+
+
+def test_init_refuses_to_overwrite_without_force(tmp_path) -> None:
+    out = tmp_path / "pgrls.toml"
+    out.write_text("existing = true\n", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--output", str(out)])
+    # Exit 2 (ToolError) — and the existing file is left untouched.
+    assert result.exit_code == 2
+    assert "already exists" in result.output
+    assert out.read_text(encoding="utf-8") == "existing = true\n"
+
+
+def test_init_force_overwrites(tmp_path) -> None:
+    out = tmp_path / "pgrls.toml"
+    out.write_text("existing = true\n", encoding="utf-8")
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--output", str(out), "--force"])
+    assert result.exit_code == 0, result.output
+    written = out.read_text(encoding="utf-8")
+    assert "existing = true" not in written
+    assert "[lint]" in written
+
+
+def test_root_help_lists_init() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["--help"])
+    assert result.exit_code == 0
+    assert "init" in result.output
+
+
 def test_explain_prints_rule_rationale() -> None:
     # `explain` needs no database — it reads only pgrls's own rule
     # catalog. The output is a header line plus the rule's
