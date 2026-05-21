@@ -5,6 +5,7 @@ import pytest
 
 from pgrls.model import (
     SNAPSHOT_VERSION,
+    BypassRlsEscalation,
     BypassRlsRole,
     Index,
     LeakproofFunction,
@@ -519,3 +520,81 @@ def test_from_snapshot_v9_yields_empty_leakproof_functions() -> None:
     }
     loaded = Schema.from_snapshot(v9)
     assert loaded.leakproof_functions == ()
+
+
+def test_to_snapshot_emits_bypassrls_escalation_roles_field() -> None:
+    schema = Schema(
+        tables=(),
+        views=(),
+        bypassrls_escalation_roles=(
+            BypassRlsEscalation(
+                member="app",
+                via=("admin", "ops"),
+                member_can_login=True,
+            ),
+        ),
+    )
+    snap = schema.to_snapshot()
+    assert "bypassrls_escalation_roles" in snap
+    assert snap["version"] == 11
+    assert snap["bypassrls_escalation_roles"] == [
+        {
+            "member": "app",
+            "via": ["admin", "ops"],
+            "member_can_login": True,
+        }
+    ]
+
+
+def test_from_snapshot_round_trips_v11_with_bypassrls_escalation_roles() -> (
+    None
+):
+    # SEC029 reads `Schema.bypassrls_escalation_roles` from the
+    # snapshot. Round-trip through `json.dumps` so the JSON shape
+    # matches a file-persisted snapshot — the same contract `pgrls
+    # diff` exercises. The `via` tuple must survive the list↔tuple
+    # conversion. Mirrors the v6/v7/v8/v9/v10 round-trip tests.
+    import json
+
+    original = Schema(
+        tables=(),
+        views=(),
+        bypassrls_escalation_roles=(
+            BypassRlsEscalation(
+                member="app",
+                via=("admin", "ops"),
+                member_can_login=True,
+            ),
+            BypassRlsEscalation(
+                member="batch",
+                via=("admin",),
+                member_can_login=False,
+            ),
+        ),
+    )
+    snap_json = json.dumps(original.to_snapshot())
+    loaded = Schema.from_snapshot(json.loads(snap_json))
+    assert (
+        loaded.bypassrls_escalation_roles
+        == original.bypassrls_escalation_roles
+    )
+    assert loaded == original
+
+
+def test_from_snapshot_v10_yields_empty_bypassrls_escalation_roles() -> None:
+    # A v10 snapshot (v0.5.15) carries no `bypassrls_escalation_roles`
+    # key — the v11 addition. Loading must succeed and default the
+    # field to `()`. SEC029 then finds nothing to flag against the
+    # older snapshot until it's re-captured against a live database
+    # (v11).
+    v10 = {
+        "version": 10,
+        "tables": [],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [],
+        "bypassrls_roles": [],
+        "leakproof_functions": [],
+    }
+    loaded = Schema.from_snapshot(v10)
+    assert loaded.bypassrls_escalation_roles == ()
