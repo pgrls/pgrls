@@ -254,9 +254,53 @@ def test_sec030_fires_on_subselect_wrapped_auth_value() -> None:
     assert "'tenant_id'" in v.message
 
 
-def test_sec030_silent_on_non_own_column() -> None:
-    # The column operand must belong to the policy's own table. A
-    # sub-select join column with the same name is not the table's.
+def test_sec030_silent_on_non_own_column_in_equality() -> None:
+    # The column operand must belong to the policy's own table. Here
+    # the auth value is compared (at the scalar `=` path) to a column
+    # qualified to another table — never documents' own column — so
+    # nothing is treated as a discriminator.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="acl.tenant_id = current_setting('app.tenant')::int"
+                ),
+            ),
+        )
+    )
+    assert SEC030().check(schema, options={}) == []
+
+
+def test_sec030_silent_on_scalar_subselect_with_from_clause() -> None:
+    # `id = (SELECT x FROM acl WHERE m = current_setting(...))`: the
+    # auth call scopes the *lookup* (acl.m), not the outer column
+    # `id`. A sub-select WITH a from clause is not the compared value,
+    # so SEC030 must NOT fire on `id` even though `id` is nullable.
+    # (Contrast the fromless `(SELECT current_setting())` form, which
+    # IS the compared value and DOES fire.)
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "id = (SELECT acl.doc_id FROM acl "
+                        "WHERE acl.member = current_setting('app.user'))"
+                    )
+                ),
+                cols=(
+                    ("id", "uuid", True),  # nullable, but must not fire
+                    ("body", "text", True),
+                ),
+            ),
+        )
+    )
+    assert SEC030().check(schema, options={}) == []
+
+
+def test_sec030_silent_on_in_subquery_acl_join() -> None:
+    # `id IN (SELECT ...)` is an IN-membership SubLink, not a scalar
+    # `=` — out of scope regardless of any auth call inside the
+    # sub-select's predicate.
     schema = Schema(
         tables=(
             _table(
@@ -269,8 +313,6 @@ def test_sec030_silent_on_non_own_column() -> None:
             ),
         )
     )
-    # `acl.tenant_id` is not documents' column; documents.tenant_id is
-    # never compared to an auth value here.
     assert SEC030().check(schema, options={}) == []
 
 

@@ -60,15 +60,18 @@ Detection is structural and deliberately conservative:
   policy's own table (same resolution SEC005 / SEC018 use), so a
   sub-select join column or catalog lookup is not mistaken for the
   discriminator.
-* **Column is a direct operand; the auth value may be wrapped.**
-  The discriminator column must be a direct operand of the `=`
-  (column extraction excludes sub-selects), but the auth value is
-  detected even inside a scalar sub-select — `tenant_id = (SELECT
-  current_setting('app.tenant'))` fires. That wrapped form is the
-  one PERF001 *recommends* (evaluated once per statement, not per
-  row), so missing it would blind the rule to the best-written
-  policies. A column reached only through a correlated sub-select
-  is not treated as the operand.
+* **Column is a direct operand; the auth value may be wrapped in a
+  fromless sub-select.** The discriminator column must be a direct
+  operand of the `=` (column extraction excludes sub-selects), but
+  the auth value is detected even inside a scalar sub-select that has
+  no `FROM` clause — `tenant_id = (SELECT current_setting('app.tenant'))`
+  fires. That wrapped form is the one PERF001 *recommends* (evaluated
+  once per statement, not per row), so missing it would blind the
+  rule to the best-written policies. A sub-select *with* a `FROM`
+  clause is a lookup whose internal predicates are not the value the
+  column is compared to, so `id = (SELECT x FROM acl WHERE m =
+  current_setting(…))` does **not** fire on `id` — the auth call
+  scopes the lookup, not the outer column.
 * **Needs captured nullability.** A table whose `column_details`
   weren't captured (a hand-built fixture, or a pre-v5 snapshot) is
   skipped — nullability is unknowable, so the rule stays silent
@@ -98,7 +101,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, Node, String
+from pglast.ast import A_Expr, Node, SelectStmt, String, SubLink
 from pglast.enums import A_Expr_Kind
 
 from pgrls.ast_utils import extract_column_refs, find_func_calls
@@ -174,15 +177,58 @@ def _own_column_names(side: Any, table: Table) -> set[str]:
     return names
 
 
+def _fromless_subselects(side: Any) -> list[SelectStmt]:
+    """Scalar sub-selects in `side` that have NO from clause.
+
+    A `(SELECT current_setting('app.tenant'))` — no FROM — carries the
+    compared value in its target list; that is the wrapped form
+    PERF001 recommends. A sub-select WITH a from clause (`(SELECT x
+    FROM acl WHERE m = current_setting(…))`) is a lookup whose
+    internal predicates are not the value the outer column is compared
+    to, so it must NOT be treated as the auth operand. The walk does
+    not descend into sub-select bodies — only their fromless-ness is
+    inspected at this level.
+    """
+    out: list[SelectStmt] = []
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, SubLink):
+            sub = n.subselect
+            if isinstance(sub, SelectStmt) and not sub.fromClause:
+                out.append(sub)
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(side)
+    return out
+
+
 def _side_has_auth_call(side: Any, auth_functions: set[str]) -> bool:
-    # NOT exclude_sublinks: the auth value is frequently wrapped in a
-    # scalar sub-select — `tenant_id = (SELECT current_setting(…))` —
-    # which is the form PERF001 *recommends* (one evaluation per
-    # statement, not per row). Excluding sub-selects would blind
-    # SEC030 to the best-written policies. The column side
-    # (`_own_column_names`) still excludes sub-selects, so the
-    # discriminator must be a direct operand of the comparison.
-    return bool(find_func_calls(side, auth_functions))
+    # The auth value is the operand the column is compared to. Count
+    # it when it is a *direct* call (`col = current_setting()`) or
+    # lives in the projection of a fromless scalar sub-select
+    # (`col = (SELECT current_setting())`, the form PERF001
+    # recommends — one evaluation per statement, not per row).
+    # `exclude_sublinks=True` on the direct pass keeps a sub-select's
+    # internal predicate out of the operand's value; the fromless
+    # branch then re-adds the wrapped recommended form. A sub-select
+    # WITH a from clause is a lookup, not the compared value, so it is
+    # excluded — avoiding a false positive on
+    # `id = (SELECT x FROM acl WHERE m = current_setting(…))`.
+    if find_func_calls(side, auth_functions, exclude_sublinks=True):
+        return True
+    return any(
+        find_func_calls(sub.targetList, auth_functions, exclude_sublinks=True)
+        for sub in _fromless_subselects(side)
+    )
 
 
 def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[str]:

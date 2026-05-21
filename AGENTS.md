@@ -2001,12 +2001,16 @@ Detection is structural and conservative:
   non-tenant use of `current_setting`), and array-membership
   `<auth value> = ANY(tags)` (a different access model) are all out
   of scope.
-* **Column is a direct operand; the auth value may be wrapped.** The
-  discriminator must be a direct operand of the `=`, but the auth
-  value is detected even inside a scalar sub-select — `tenant_id =
-  (SELECT current_setting('app.tenant'))` fires. That wrapped form is
-  the one PERF001 *recommends* (evaluated once per statement), so
-  missing it would blind the rule to the best-written policies.
+* **Column is a direct operand; the auth value may be wrapped in a
+  fromless sub-select.** The discriminator must be a direct operand
+  of the `=`, but the auth value is detected even inside a scalar
+  sub-select with no `FROM` clause — `tenant_id = (SELECT
+  current_setting('app.tenant'))` fires. That wrapped form is the one
+  PERF001 *recommends* (evaluated once per statement), so missing it
+  would blind the rule to the best-written policies. A sub-select
+  *with* a `FROM` clause is a lookup whose internal predicates are
+  not the compared value, so `id = (SELECT x FROM acl WHERE m =
+  current_setting(…))` does not fire on `id`.
 * **Own-table columns only.** The column operand must belong to the
   policy's own table (the same resolution SEC005 / SEC018 use), so a
   sub-select join column or catalog lookup is not mistaken for the
