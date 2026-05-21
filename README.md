@@ -380,8 +380,10 @@ and how to allowlist a false positive — on the command line. Bare
 severity and title. Pass `--format markdown` to either form (`pgrls explain
 SEC023 --format markdown`, `pgrls explain --format markdown`) for a
 paste-ready Markdown document — an `## SEC023 — …` heading + the body, or a
-Markdown table of the catalog. Both forms read only pgrls's built-in rule
-catalog, so they need no database connection.
+Markdown table of the catalog. `--format json` emits machine-readable rule
+metadata (id, severity, title, a `fixable` flag, and — for a single rule —
+the full reference body) for IDE / tooling integrations. All forms read only
+pgrls's built-in rule catalog, so they need no database connection.
 
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.

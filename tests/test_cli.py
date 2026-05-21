@@ -250,6 +250,87 @@ def test_explain_format_markdown_catalog_renders_table() -> None:
         assert rule.title in out
 
 
+def test_explain_format_json_per_rule_has_metadata_and_reference() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC001", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["id"] == "SEC001"
+    assert payload["severity"] == "error"
+    assert payload["title"]
+    # SEC001 has an auto-fixer.
+    assert payload["fixable"] is True
+    # The reference body (rule docstring minus its title line) is
+    # included so JSON consumers get everything `--format text` shows.
+    assert isinstance(payload["reference"], str)
+    assert payload["reference"].strip()
+
+
+def test_explain_format_json_marks_unfixable_rule() -> None:
+    # SEC030 (nullable discriminator) has no auto-fixer.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC030", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["fixable"] is False
+
+
+def test_explain_format_json_is_case_insensitive() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "sec001", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["id"] == "SEC001"
+
+
+def test_explain_format_json_catalog_lists_every_rule() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    from pgrls import __version__
+
+    assert payload["pgrls_version"] == __version__
+    registered = {r.id for r in all_rules()}
+    assert payload["count"] == len(registered)
+    catalog_ids = {r["id"] for r in payload["rules"]}
+    assert catalog_ids == registered
+    # Every entry carries the compact metadata quartet.
+    for entry in payload["rules"]:
+        assert set(entry) == {"id", "severity", "title", "fixable"}
+
+
+def test_explain_json_reference_equals_text_body_for_every_rule() -> None:
+    # The strongest invariant: the json `reference` is the SAME body
+    # `--format text` prints (both call `_rule_docstring_body`), and
+    # severity/title mirror the Rule. Locks the shared-source contract
+    # so text and json can't drift.
+    from pgrls.cli import (
+        _fixable_rule_ids,
+        _render_rule_json,
+        _rule_docstring_body,
+    )
+
+    fixable = _fixable_rule_ids()
+    for rule in all_rules():
+        payload = json.loads(_render_rule_json(rule, fixable_ids=fixable))
+        assert payload["reference"] == _rule_docstring_body(rule)
+        assert payload["severity"] == rule.severity
+        assert payload["title"] == rule.title
+        assert payload["fixable"] == (rule.id in fixable)
+
+
+def test_explain_json_catalog_fixable_matches_fixer_registry() -> None:
+    # The catalog's `fixable` flags must be exactly the set `pgrls fix`
+    # can remediate — no hand-maintained drift.
+    from pgrls.cli import _fixable_rule_ids, _render_catalog_json
+
+    fixable = _fixable_rule_ids()
+    payload = json.loads(
+        _render_catalog_json(all_rules(), fixable_ids=fixable)
+    )
+    flagged = {r["id"] for r in payload["rules"] if r["fixable"]}
+    assert flagged == fixable
+
+
 def test_explain_format_text_remains_the_default() -> None:
     # Omitting --format gives the existing text shape (no leading
     # `##` heading, no `**Severity:**` line). The text path is

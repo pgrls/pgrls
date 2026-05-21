@@ -1743,18 +1743,68 @@ def _render_catalog_markdown(rules: list[Rule]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _fixable_rule_ids() -> set[str]:
+    """Rule ids that `pgrls fix` can auto-remediate.
+
+    Surfaced as the `fixable` flag in the JSON catalog so tooling
+    (IDE integrations, dashboards) can show a "fix available" badge
+    without hard-coding the list.
+    """
+    return {fixer.rule_id for fixer in default_fixers()}
+
+
+def _render_rule_json(rule: Rule, *, fixable_ids: set[str]) -> str:
+    """A single rule as a machine-readable JSON object.
+
+    Includes the full reference body (the rule's docstring minus its
+    title line) so a consumer gets everything `--format text` shows.
+    """
+    payload = {
+        "id": rule.id,
+        "severity": rule.severity,
+        "title": rule.title,
+        "fixable": rule.id in fixable_ids,
+        "reference": _rule_docstring_body(rule),
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _render_catalog_json(rules: list[Rule], *, fixable_ids: set[str]) -> str:
+    """The rule catalog as a JSON document.
+
+    Compact per-rule entries (id / severity / title / fixable) to
+    mirror the text and Markdown catalogs; call `pgrls explain <RULE>
+    --format json` for a single rule's full reference body.
+    """
+    payload = {
+        "pgrls_version": __version__,
+        "count": len(rules),
+        "rules": [
+            {
+                "id": r.id,
+                "severity": r.severity,
+                "title": r.title,
+                "fixable": r.id in fixable_ids,
+            }
+            for r in rules
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 @main.command()
 @click.argument("rule_id", metavar="RULE", required=False, default=None)
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["text", "markdown"]),
+    type=click.Choice(["text", "markdown", "json"]),
     default="text",
     show_default=True,
     help=(
-        "Output format. `text` (default, human-readable) or "
+        "Output format. `text` (default, human-readable), "
         "`markdown` (embeddable in runbooks, wikis, or generated "
-        "docs)."
+        "docs), or `json` (machine-readable rule metadata for "
+        "tooling / IDE integrations)."
     ),
 )
 def explain(rule_id: str | None, output_format: str) -> None:
@@ -1777,11 +1827,19 @@ def explain(rule_id: str | None, output_format: str) -> None:
     `--format markdown` emits the same content as a Markdown
     document (`##` heading + `**Severity:**` line + the rule's
     reference body, or a Markdown table for the catalog) so the
-    output is paste-ready for a project runbook or wiki.
+    output is paste-ready for a project runbook or wiki. `--format
+    json` emits machine-readable rule metadata (id, severity, title,
+    `fixable` flag, and — for a single rule — the full reference
+    body) for IDE / tooling integrations.
     """
     rules = all_rules()
     if rule_id is None:
         # Catalog mode.
+        if output_format == "json":
+            click.echo(
+                _render_catalog_json(rules, fixable_ids=_fixable_rule_ids())
+            )
+            return
         if output_format == "markdown":
             click.echo(_render_catalog_markdown(rules), nl=False)
             return
@@ -1800,6 +1858,12 @@ def explain(rule_id: str | None, output_format: str) -> None:
     if rule is None:
         known = ", ".join(r.id for r in rules)
         raise ToolError(f"Unknown rule {rule_id!r}. Known rules: {known}.")
+
+    if output_format == "json":
+        click.echo(
+            _render_rule_json(rule, fixable_ids=_fixable_rule_ids())
+        )
+        return
 
     if output_format == "markdown":
         click.echo(_render_rule_markdown(rule), nl=False)
