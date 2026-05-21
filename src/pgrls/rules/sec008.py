@@ -34,7 +34,7 @@ def _parse_allowlist(options: dict[str, Any]) -> set[str]:
 class SEC008:
     id: str = "SEC008"
     severity: Severity = "warning"
-    title: str = "Policy USING clause is constant true"
+    title: str = "Permissive policy USING clause is constant true"
 
     def check(
         self, schema: Schema, options: dict[str, Any]
