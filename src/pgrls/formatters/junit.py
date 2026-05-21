@@ -19,11 +19,14 @@ found, and the process exit code (`--fail-on`) — not the report —
 decides whether the build blocks.
 
 All attribute values go through `xml.sax.saxutils.quoteattr` and text
-through `escape`, and every string is first run through
-`safe_location` to strip control characters that are illegal in XML
-1.0 (a quoted Postgres identifier can legally contain a newline or
-NUL). So a hostile or unusual table / policy name can't produce
-malformed XML.
+through `escape`, and every interpolated string — location, rule id,
+title, severity, message — is first run through `safe_location`.
+`quoteattr`/`escape` entity-encode `" & < >` but leave raw C0 control
+characters (NUL, BEL, …) intact, and those are illegal in XML 1.0; a
+quoted Postgres identifier can legally contain one. `safe_location`
+rewrites them to visible escapes, so a newline, NUL, or other control
+char in any field can't terminate an attribute or otherwise produce
+an unparseable document.
 """
 from __future__ import annotations
 
@@ -66,10 +69,18 @@ def format_junit(violations: list[Violation]) -> str:
         f'failures="{count}" errors="0">\n',
     ]
     for v in violations:
-        name = quoteattr(f"{v.rule_id} {_location(v.location)}")
-        classname = quoteattr(v.rule_id)
+        # Every interpolated string — including rule_id and severity,
+        # which are first-party constants today but free-form `str` on
+        # the public `Violation` — goes through safe_location first.
+        # quoteattr/escape entity-encode " & < >, but leave raw C0
+        # control chars (NUL, BEL, …) intact, and those are illegal in
+        # XML 1.0; safe_location rewrites them to visible escapes so no
+        # input can yield an unparseable document.
+        rule_id = safe_location(v.rule_id)
+        name = quoteattr(f"{rule_id} {_location(v.location)}")
+        classname = quoteattr(rule_id)
         message = quoteattr(safe_location(v.title))
-        severity = quoteattr(v.severity)
+        severity = quoteattr(safe_location(v.severity))
         detail = escape(safe_location(v.message))
         parts.append(
             f"    <testcase classname={classname} name={name}>\n"

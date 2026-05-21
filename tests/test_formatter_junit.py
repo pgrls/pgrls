@@ -131,6 +131,23 @@ def test_junit_hostile_identifiers_stay_well_formed() -> None:
     assert case.attrib["name"].startswith("SEC001 ")
 
 
+def test_junit_control_chars_in_message_and_location_stay_well_formed() -> None:
+    # Raw C0 control chars (NUL, BEL) are illegal in XML 1.0 and
+    # quoteattr/escape do NOT remove them — safe_location must.
+    out = format_junit(
+        [_v(message="bad\x00msg\x07", location="public.t\x08bl")]
+    )
+    ET.fromstring(out)  # raises if a control char leaked into the XML
+
+
+def test_junit_control_chars_in_rule_id_and_severity_stay_well_formed() -> None:
+    # rule_id and severity are first-party constants today but are
+    # free-form `str` on the public Violation; a control char in
+    # either must not break classname / name / type.
+    out = format_junit([_v(rule_id="SEC001\x07", severity="error\x00")])
+    ET.fromstring(out)  # raises if either field leaked a control char
+
+
 def test_junit_trailing_newline() -> None:
     assert format_junit([_v()]).endswith("</testsuites>\n")
     assert format_junit([]).endswith("</testsuites>\n")
