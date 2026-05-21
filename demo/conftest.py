@@ -74,6 +74,12 @@ _BASE_CONFIG = (
     # there. Embedding it keeps `_BASE_CONFIG`-based tests (uc72)
     # seeing the same rule set as the pgrls.toml-based ones.
     '[lint.rules.SEC022]\nallowlist = ["app.gen_cols"]\n'
+    # Mirror pgrls.toml's SEC027 allowlist: `app.gen_cols` (uc46)
+    # scopes by the generated column `user_id_norm`, so SEC027 sees
+    # the raw `user_id` as unreferenced and nudges. Allowlisted in
+    # both configs so `_BASE_CONFIG`-based tests (uc72) see the same
+    # rule set as the pgrls.toml-based ones.
+    '[lint.rules.SEC027]\nallowlist = ["app.gen_cols"]\n'
     + _SEC012_ALLOWLIST_BLOCK
 )
 

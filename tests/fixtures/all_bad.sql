@@ -477,3 +477,24 @@ CREATE POLICY email_pattern ON public.allbad_sec026
     );
 CREATE INDEX allbad_sec026_email_idx
     ON public.allbad_sec026 (user_email);
+
+-- SEC027: RLS table has a principal column (owner_id) that no
+-- policy scopes by. The policy keys on tenant_id only, so every
+-- user within a tenant can read every other user's rows — a
+-- per-user leak inside a single tenant. owner_id is present on the
+-- table but referenced by no policy. Base RLS state mirrors the
+-- other RLS-on blocks (RESTRICTIVE policy, own-column USING on
+-- tenant_id, indexed predicate column, qualified GUC name, two-arg
+-- current_setting wrapped in a SELECT) so SEC001/SEC002/SEC005/
+-- SEC008/SEC009/SEC019/SEC024/PERF001/PERF003 stay silent and only
+-- SEC027 fires on the table. SEC012 also fires (RESTRICTIVE-only
+-- policy set) and carries no rule_loc pin, so that extra firing is
+-- silent-by-design.
+CREATE TABLE public.allbad_sec027 (id INT, tenant_id INT, owner_id INT);
+ALTER TABLE public.allbad_sec027 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec027 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec027
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true))::int);
+CREATE INDEX allbad_sec027_tenant_idx
+    ON public.allbad_sec027 (tenant_id);
