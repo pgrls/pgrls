@@ -345,9 +345,15 @@ def lint(
     )
     if output_path is not None:
         # Write byte-for-byte what stdout would have received, so a
-        # file report is identical to a piped one.
+        # file report is identical to a piped one. `newline=""`
+        # disables universal-newline translation on write — without
+        # it, the formatter's `\n` would become `\r\n` on Windows
+        # while `click.echo` keeps `\n`, breaking the equivalence the
+        # parser-stability tests rely on.
         try:
-            Path(output_path).write_text(report, encoding="utf-8")
+            Path(output_path).write_text(
+                report, encoding="utf-8", newline=""
+            )
         except OSError as exc:
             raise ToolError(f"Cannot write {output_path}: {exc}") from exc
     else:
