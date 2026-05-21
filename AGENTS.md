@@ -1511,12 +1511,14 @@ larger, separate finding.
 Allowlist by qualified policy ID (`schema.table.policy_name`) when
 naming a bypassing role in a `TO` clause is intentional.
 
-Out of scope (intentional): role-membership reachability (a role
-whose members can `SET ROLE` to a bypassing role is not flagged —
-`BYPASSRLS` is a role attribute, not an inheritable privilege) and
-plain superusers (a role that bypasses RLS only through `rolsuper`,
-with no explicit `BYPASSRLS`, is not in the schema's `BYPASSRLS`
-set).
+Out of scope for SEC023 (by design): role-membership reachability —
+a role whose members can `SET ROLE` to a bypassing role. `BYPASSRLS`
+is a role attribute, not an inheritable privilege, so membership
+grants no automatic bypass and SEC023's policy-level check stays
+silent; the deliberate `SET ROLE` escalation path that *does* reach
+it is covered separately by SEC029. Also out of scope: plain
+superusers (a role that bypasses RLS only through `rolsuper`, with no
+explicit `BYPASSRLS`, is not in the schema's `BYPASSRLS` set).
 
 Relationship to SEC016: SEC016 flags the *role* ("this role
 carries `BYPASSRLS`"); SEC023 flags the *policy* ("this policy
