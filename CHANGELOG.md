@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.63] - 2026-05-21
+
+### Added
+- **PERF004** — new lint rule (severity `warning`). Fires when a
+  policy's `USING` / `WITH CHECK` clause wraps an own-table column in
+  a function call (`lower(email) = current_setting('app.email')`)
+  **and** the table carries an ordinary plain index on that column.
+  Postgres can only use an index whose indexed expression matches the
+  query expression, so the `lower(...)` wrapper makes the plain index
+  unusable and the planner falls back to a sequential scan. The fix
+  is an expression index matching the predicate (`CREATE INDEX ON
+  users (lower(email))`) or rewriting the policy to compare the bare
+  column. Scope is `FuncCall` wrapping only (the textbook
+  functional-index case); `COALESCE`/`CASE`, operator expressions,
+  and casts are deliberately out of scope. PERF004 is the precise
+  complement of **PERF003** and disjoint from it on the index
+  condition: PERF003 owns the *no index at all* case, PERF004 owns
+  the *plain index exists but a function defeats it* case, so a
+  column trips at most one. Allowlist by qualified policy ID under
+  `[lint.rules.PERF004]`. Brings the shipped rule count to
+  **forty-three**.
+
 ## [0.5.62] - 2026-05-21
 
 ### Added
