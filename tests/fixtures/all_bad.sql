@@ -590,3 +590,21 @@ CREATE POLICY dormant ON public.allbad_sec032
     FOR SELECT TO postgres
     USING (id > 0);
 CREATE INDEX allbad_sec032_id_idx ON public.allbad_sec032 (id);
+
+-- PERF004: a policy filters on a function-wrapped column (lower(email))
+-- while the table has only a PLAIN index on email — the plain index
+-- cannot serve lower(email), so Postgres seq-scans. PERF003 stays
+-- silent here (it sees the plain index on email and cannot tell the
+-- wrapper defeats it) — that false negative is exactly PERF004's
+-- niche. email is NOT NULL so SEC030 stays quiet, the GUC is two-arg
+-- and SELECT-wrapped so SEC019/SEC024/PERF001 stay quiet, and email is
+-- an own-column ref so SEC005 stays quiet. SEC012 (RESTRICTIVE-only)
+-- and SEC022 (FOR SELECT-only) fire silently-by-design, each pinned on
+-- its own block.
+CREATE TABLE public.allbad_perf004 (id INT, email TEXT NOT NULL);
+ALTER TABLE public.allbad_perf004 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_perf004 FORCE ROW LEVEL SECURITY;
+CREATE POLICY by_email ON public.allbad_perf004
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (lower(email) = (SELECT current_setting('app.email', true)));
+CREATE INDEX allbad_perf004_email_idx ON public.allbad_perf004 (email);

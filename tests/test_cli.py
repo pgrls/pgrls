@@ -1468,6 +1468,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC032  public.allbad_sec032\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
+            "PERF004  public.allbad_perf004.by_email\n",
             "PERF001  public.allbad_sec006.update_no_check\n",
             "PERF002  public.allbad_perf002.randomized\n",
             "HYG001  public.allbad_hyg001.orphan\n",

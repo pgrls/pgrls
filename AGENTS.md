@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-two rules across four
+In the current release it ships **forty-three rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -55,7 +55,9 @@ membership — an escalation path that disables every policy),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
-sequential scan per query), `HYG002`
+sequential scan per query), `PERF004` (policy predicate wraps an
+indexed column in a function — `lower(email)` — so the plain index
+can't serve it), `HYG002`
 (placeholder-named policy), `VIEW002` (view is not a
 `security_barrier`), `VIEW003` (matview captures RLS-protected
 data at REFRESH time), and `VIEW004` (view calls a SECURITY
@@ -2324,6 +2326,69 @@ is built to demonstrate. Real production schemas should KEEP
 PERF003 enabled — it catches a load-bearing perf bug that's
 invisible until traffic hits.
 
+<a id="rule-perf004"></a>
+
+### PERF004 — Policy filters on a function-wrapped column, defeating a plain index
+
+**Severity:** warning.
+
+**What it catches:** policies whose `USING` or `WITH CHECK` clause
+wraps an own-table column in a function call — `lower(email) =
+current_setting('app.email')` — while the table carries an ordinary
+plain index on that column (`CREATE INDEX ON users (email)`).
+Postgres can only use an index whose indexed expression matches the
+query expression, so the `lower(...)` wrapper makes the plain index
+unusable and the planner falls back to a sequential scan. The fix is
+an *expression* index matching the predicate:
+
+```sql
+CREATE INDEX users_lower_email_idx ON public.users (lower(email));
+```
+
+…or rewrite the policy to compare the bare column.
+
+PERF004 is the precise complement of [PERF003](#rule-perf003).
+PERF003 owns the *no index at all* case; PERF004 owns the *plain
+index exists but a function defeats it* case. They are disjoint on
+the index condition, so a column trips at most one:
+
+* No plain index on the wrapped column → PERF003 fires (the column
+  is un-indexed), PERF004 stays silent.
+* A plain leading-column index exists → PERF003 is satisfied and
+  can't tell the wrapper defeats it, so it stays silent. That
+  false-negative is exactly what PERF004 catches.
+
+Detection is structural: the policy AST is walked for `FuncCall`
+nodes, and any own-table column appearing inside one is
+"function-wrapped". A wrapped column is flagged only when the table
+has a plain leading-column index on it (the index being wasted).
+Sub-select columns are excluded — they live on other tables. The
+value-side case (`tenant_id = lower(current_setting(…))`) does not
+fire: `tenant_id` is a bare operand and its index is usable; the
+function wraps the *value*, not the column.
+
+**Scope is `FuncCall` wrapping only** — the textbook
+functional-index case (`lower(col)`, `upper(col)`,
+`date_trunc(…, col)`, custom functions). Other expression forms that
+also defeat a plain index — `COALESCE`/`CASE` (their own AST node
+types, not `FuncCall`), operator expressions (`col || …`), and casts
+(`col::text`) — are deliberately out of scope: catching every
+wrapper shape is a rabbit hole, and the function-call form is the
+common, high-signal one. A column wrapped only in those other forms
+is not flagged.
+
+**Known limitation** (shared with PERF003): pgrls does not decode
+expression indexes (`pg_index.indexprs`), so it cannot confirm a
+matching expression index already exists. In the rare case a table
+has *both* a plain `(email)` index and the correct `(lower(email))`
+expression index, PERF004 will fire a false positive — allowlist the
+policy ID:
+
+```toml
+[lint.rules.PERF004]
+allowlist = ["public.users.by_email"]
+```
+
 <a id="rule-hyg001"></a>
 
 ### HYG001 — Policy references a column that doesn't exist
@@ -3259,8 +3324,8 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Forty-two rules across four categories.** SEC001–SEC032,
-  PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
+- **Forty-three rules across four categories.** SEC001–SEC032,
+  PERF001–PERF004, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
   trigger-mediated bypass, SEC014 (v0.5.12) flags every SECDEF
