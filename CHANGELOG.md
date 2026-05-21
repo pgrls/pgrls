@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.59] - 2026-05-21
+
+### Added
+- **`pgrls lint --exclude-rule`.** The complement of `--rule`: run
+  every rule *except* the named ones (repeatable, case-insensitive).
+  Applied after `--rule`, so the two cannot name the same rule (that
+  errors), and unknown ids are rejected like `--rule`'s.
+- **`pgrls lint --min-severity {error|warning|info}`.** Trims the
+  printed report to findings at or above the given severity — useful
+  for hiding info-level nudges from CI logs. Display-only: the exit
+  code still evaluates *every* finding against `--fail-on`, so a
+  hidden finding can never silently flip CI green.
+- **`pgrls lint --output FILE` / `-o`.** Write the report (in any
+  `--format`) to a file instead of stdout — byte-for-byte what stdout
+  would have received. Cannot be combined with `--update-baseline`
+  (which prints no report).
+
 ## [0.5.58] - 2026-05-21
 
 ### Added

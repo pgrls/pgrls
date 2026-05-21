@@ -134,6 +134,23 @@ disabled rule back in for one run without editing the config:
 pgrls lint --rule SEC001 --rule SEC003
 ```
 
+Or run everything *except* certain rules with `--exclude-rule` (the
+complement of `--rule`; case-insensitive, repeatable):
+
+```bash
+pgrls lint --exclude-rule SEC022 --exclude-rule PERF002
+```
+
+Trim the printed report to the findings you care about with
+`--min-severity` (display-only — the exit code still reflects every finding
+per `--fail-on`, so hiding info noise can't flip CI green), and write the
+report to a file instead of stdout with `--output`/`-o`:
+
+```bash
+pgrls lint --min-severity warning            # hide info-level nudges from output
+pgrls lint --format sarif --output pgrls.sarif
+```
+
 Pass `--explain` to append each rule's reference paragraph beneath its
 finding in the text output, so a CI log carries the *why* next to the
 *where* without a separate `pgrls explain <RULE>` lookup. Text format

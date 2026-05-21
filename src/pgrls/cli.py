@@ -117,6 +117,37 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--exclude-rule",
+    "exclude_rules",
+    multiple=True,
+    help=(
+        "Skip these rules (repeat for multiple). Case-insensitive. "
+        "The complement of --rule: runs everything else. Applied "
+        "after --rule, so the two cannot name the same rule."
+    ),
+)
+@click.option(
+    "--min-severity",
+    type=click.Choice(list(ALL_SEVERITIES), case_sensitive=False),
+    default=None,
+    help=(
+        "Only display findings at or above this severity (error | "
+        "warning | info). Affects the printed report only — the exit "
+        "code still reflects every finding per --fail-on."
+    ),
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Write the report to this file instead of stdout "
+        "(any --format). Cannot be combined with --update-baseline."
+    ),
+)
+@click.option(
     "--explain",
     is_flag=True,
     default=False,
@@ -167,6 +198,9 @@ def lint(
     config_path: str | None,
     schemas: str | None,
     rules: tuple[str, ...],
+    exclude_rules: tuple[str, ...],
+    min_severity: str | None,
+    output_path: str | None,
     explain: bool,
     update_baseline: bool,
     fail_on: str | None,
@@ -179,15 +213,23 @@ def lint(
             "--update-baseline requires --baseline FILE to name "
             "the file to refresh."
         )
+    if update_baseline and output_path is not None:
+        raise ToolError(
+            "--output and --update-baseline cannot be combined: "
+            "--update-baseline records findings into the baseline "
+            "file and prints no report, so there is nothing for "
+            "--output to write."
+        )
     try:
         config = load_config(config_path)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
 
+    known = {r.id for r in all_rules()}
+
     # Validate `--rule` early — a typo silently producing zero
     # findings is hard to debug. Mirrors `pgrls fix --rule`.
     if rules:
-        known = {r.id for r in all_rules()}
         normalized_rules = {r.upper() for r in rules}
         unknown = sorted(normalized_rules - known)
         if unknown:
@@ -196,6 +238,26 @@ def lint(
                 f"Available: {', '.join(sorted(known))}."
             )
         rules = tuple(sorted(normalized_rules))
+
+    # `--exclude-rule` — same typo validation, plus a contradiction
+    # check against --rule (naming a rule in both is incoherent).
+    exclude_ids: set[str] = set()
+    if exclude_rules:
+        exclude_ids = {r.upper() for r in exclude_rules}
+        unknown = sorted(exclude_ids - known)
+        if unknown:
+            raise ToolError(
+                f"unknown rule(s) in --exclude-rule: "
+                f"{', '.join(unknown)}. "
+                f"Available: {', '.join(sorted(known))}."
+            )
+        both = sorted(set(rules) & exclude_ids)
+        if both:
+            raise ToolError(
+                f"rule(s) named in both --rule and --exclude-rule: "
+                f"{', '.join(both)}. A rule cannot be selected and "
+                "excluded at once."
+            )
 
     effective = _merge_overrides(
         config,
@@ -222,6 +284,7 @@ def lint(
             schema,
             config=effective,
             rule_filter=set(rules) if rules else None,
+            exclude_filter=exclude_ids or None,
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
@@ -251,27 +314,50 @@ def lint(
     if baseline_path is not None:
         violations = _apply_baseline(violations, baseline_path)
 
+    # `--min-severity` filters the DISPLAYED findings only; the exit
+    # code below still evaluates the full set against --fail-on, so a
+    # hidden finding can never silently flip CI green. `displayed` is
+    # what the report (and --explain rationale) is built from.
+    displayed = violations
+    if min_severity is not None:
+        floor = coerce_severity(min_severity)
+        displayed = [
+            v for v in violations if is_at_or_above(v.severity, floor)
+        ]
+
     rationale_map: dict[str, str] | None = None
     if explain:
         # Build a `{rule_id: rationale}` map for every rule that
-        # produced a finding, so the text formatter can append the
-        # rule's reference paragraph beneath each line. Other
-        # formats ignore the map; --explain is text-only.
-        rules_in_use = {v.rule_id for v in violations}
+        # produced a (displayed) finding, so the text formatter can
+        # append the rule's reference paragraph beneath each line.
+        # Other formats ignore the map; --explain is text-only.
+        rules_in_use = {v.rule_id for v in displayed}
         rationale_map = {
             r.id: _rule_rationale_paragraph(r)
             for r in all_rules()
             if r.id in rules_in_use
         }
 
-    click.echo(
-        format_violations(
-            violations,
-            format=output_format,
-            rationale_map=rationale_map,
-        ),
-        nl=False,
+    report = format_violations(
+        displayed,
+        format=output_format,
+        rationale_map=rationale_map,
     )
+    if output_path is not None:
+        # Write byte-for-byte what stdout would have received, so a
+        # file report is identical to a piped one. `newline=""`
+        # disables universal-newline translation on write — without
+        # it, the formatter's `\n` would become `\r\n` on Windows
+        # while `click.echo` keeps `\n`, breaking the equivalence the
+        # parser-stability tests rely on.
+        try:
+            Path(output_path).write_text(
+                report, encoding="utf-8", newline=""
+            )
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
+    else:
+        click.echo(report, nl=False)
 
     if _should_fail(violations, threshold=effective.fail_on):
         sys.exit(1)
@@ -352,6 +438,7 @@ def _run_rules(
     *,
     config: Config,
     rule_filter: set[str] | None = None,
+    exclude_filter: set[str] | None = None,
 ) -> list[Violation]:
     registry = default_registry()
     if rule_filter is not None:
@@ -366,6 +453,11 @@ def _run_rules(
         ]
     else:
         rules = registry.enabled(disabled_ids=config.disable)
+    if exclude_filter:
+        # `--exclude-rule` subtracts from whatever set would run —
+        # the all-enabled set, or the `--rule` selection. The
+        # incoherent "same id in both" case is rejected upstream.
+        rules = [r for r in rules if r.id not in exclude_filter]
     out: list[Violation] = []
     for rule in rules:
         try:

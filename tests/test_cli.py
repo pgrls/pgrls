@@ -1014,6 +1014,188 @@ def test_lint_fires_sec004_on_lovable_cve_pattern(
     )
 
 
+# --- --exclude-rule / --min-severity / --output --------------------------
+
+
+def test_lint_exclude_rule_skips_named_rule(pg_url: str, apply_sql) -> None:
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--exclude-rule", "SEC003"],
+    )
+    # SEC003 is excluded; the rest of sec004_bad's findings remain.
+    _assert_rules_fire_exactly(
+        result.output,
+        {"SEC004", "SEC007", "PERF001", "SEC022", "SEC030"},
+    )
+
+
+def test_lint_exclude_rule_unknown_id_exits_two() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", "x", "--exclude-rule", "SEC999"],
+    )
+    assert result.exit_code == 2
+    assert "SEC999" in result.output
+
+
+def test_lint_rule_and_exclude_rule_overlap_exits_two() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url",
+            "x",
+            "--rule",
+            "SEC003",
+            "--exclude-rule",
+            "SEC003",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "both --rule and --exclude-rule" in result.output
+
+
+def test_lint_min_severity_warning_hides_info(
+    pg_url: str, apply_sql
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--min-severity", "warning"],
+    )
+    # Errors + the warning are shown; the info findings are hidden.
+    assert "SEC004" in result.output  # error
+    assert "PERF001" in result.output  # warning
+    assert "SEC007" not in result.output  # info
+    assert "SEC022" not in result.output  # info
+    assert "SEC030" not in result.output  # info
+    # Errors present → still exit 1.
+    assert result.exit_code == 1
+
+
+def test_lint_min_severity_filters_display_not_exit(
+    pg_url: str, apply_sql
+) -> None:
+    # Scope to PERF001 (a warning) only, then hide warnings with
+    # --min-severity error. The report shows nothing, but the run
+    # still fails: the exit code evaluates the FULL finding set
+    # against --fail-on (default warning), so a hidden finding can't
+    # silently flip CI green.
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url",
+            pg_url,
+            "--rule",
+            "PERF001",
+            "--min-severity",
+            "error",
+        ],
+    )
+    assert "PERF001" not in result.output
+    assert result.exit_code == 1
+
+
+def test_lint_output_writes_report_to_file(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    out = tmp_path / "report.txt"
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--output", str(out)]
+    )
+    assert result.exit_code == 1
+    assert out.is_file()
+    file_report = out.read_text(encoding="utf-8")
+    assert "SEC004" in file_report
+    # The report went to the file, not stdout.
+    assert "SEC004" not in result.output
+    # File is byte-for-byte what stdout would have received.
+    stdout_run = runner.invoke(main, ["lint", "--database-url", pg_url])
+    assert file_report == stdout_run.output
+    # Byte-level: no newline translation (the `newline=""` write).
+    # read_text would normalize \r\n→\n, so check raw bytes — this is
+    # what pins the cross-platform guarantee.
+    raw = out.read_bytes()
+    assert b"\r\n" not in raw
+    assert b"\n" in raw
+
+
+def test_lint_output_unwritable_path_exits_two(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A path whose parent dir is missing surfaces a ToolError (exit 2)
+    # with a message, not a traceback.
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    out = tmp_path / "missing_dir" / "report.txt"
+    result = runner.invoke(
+        main, ["lint", "--database-url", pg_url, "--output", str(out)]
+    )
+    assert result.exit_code == 2
+    assert "Cannot write" in result.output
+
+
+def test_lint_output_honors_format_and_min_severity(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # --output composes with --format (the file gets SARIF) and with
+    # --min-severity (the file gets the filtered report).
+    apply_sql((FIXTURES_DIR / "sec004_bad.sql").read_text())
+    runner = CliRunner()
+    out = tmp_path / "report.sarif"
+    result = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url",
+            pg_url,
+            "--format",
+            "sarif",
+            "--min-severity",
+            "warning",
+            "--output",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    # Valid SARIF, and the info-level rules were filtered out of the
+    # written report.
+    assert payload["version"].startswith("2.1")
+    flat = json.dumps(payload)
+    assert "SEC004" in flat  # error, kept
+    assert "SEC007" not in flat  # info, filtered
+
+
+def test_lint_output_with_update_baseline_exits_two(tmp_path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "lint",
+            "--database-url",
+            "x",
+            "--output",
+            str(tmp_path / "r.txt"),
+            "--update-baseline",
+            "--baseline",
+            str(tmp_path / "b.json"),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--output and --update-baseline cannot be combined" in result.output
+
+
 def test_lint_sec004_auth_functions_override_suppresses(
     pg_url: str, apply_sql, tmp_path
 ) -> None:

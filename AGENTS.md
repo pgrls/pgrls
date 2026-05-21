@@ -127,7 +127,12 @@ The connection string can also be passed as `--database-url`. Schemas to scan
 default to `public` and can be overridden with `--schemas a,b,c` or in
 `pgrls.toml`. To run only a subset of the catalog — for a scoped CI report
 or while investigating one rule — pass `--rule SEC001 --rule SEC003`
-(case-insensitive, repeatable; overrides `[lint] disable` in the config).
+(case-insensitive, repeatable; overrides `[lint] disable` in the config),
+or its complement `--exclude-rule SEC022` to run everything else.
+`--min-severity warning` trims the printed report to findings at or above
+a severity (display-only — the exit code still reflects every finding per
+`--fail-on`), and `--output FILE` / `-o` writes the report to a file in any
+format instead of stdout.
 
 ## Configuration
 
