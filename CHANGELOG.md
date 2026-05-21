@@ -10,6 +10,32 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.53] - 2026-05-21
+
+### Added
+- **SEC028** — new lint rule (severity `warning`). Fires when a
+  **permissive** write policy (`FOR INSERT` / `FOR UPDATE` /
+  `FOR ALL`) has a `WITH CHECK` clause of literal `true` and no
+  restrictive `USING` to contrast with — the open-write footgun
+  the existing rules miss. A `FOR INSERT ... WITH CHECK (true)`
+  policy accepts every write the command covers: the `TO` clause
+  gates *who* may write, never *what*, so any applicable role can
+  insert a row with any tenant id, owner, or value.
+
+  The gap: SEC006 fires on a *missing* `WITH CHECK`; SEC008 flags a
+  constant-true `USING` (and never inspects the write side); SEC020
+  flags the *asymmetry* of `WITH CHECK (true)` alongside a real
+  restrictive `USING`. SEC028 is the complement — there's no
+  restrictive `USING` (absent on `FOR INSERT`, or itself
+  constant-true), so the write side is open outright. The
+  asymmetry case is explicitly ceded to SEC020; restrictive
+  policies are out of scope (a restrictive `WITH CHECK (true)` is a
+  dead clause, not an exposure). Allowlist by qualified policy ID
+  for an intentional open write side (append-only audit/event
+  table). No auto-fix — the correct write predicate is the
+  application's tenant/ownership key. Brings the shipped rule count
+  to **thirty-eight**.
+
 ## [0.5.52] - 2026-05-20
 
 ### Added

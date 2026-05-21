@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-seven rules across four
+In the current release it ships **thirty-eight rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -44,6 +44,8 @@ referenced table's isolation),
 `SEC026` (policy uses LIKE / ILIKE / SIMILAR TO / POSIX regex
 against an auth-context value — a wildcard-shape GUC matches
 every row),
+`SEC028` (permissive write policy whose `WITH CHECK` is constant
+`true` — accepts every write),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -1837,6 +1839,53 @@ SEC027 fires when the policy references *some* columns but not the
 principal one. A tenant-only table with no owner/user column never
 trips SEC027 (there's nothing to under-scope).
 
+<a id="rule-sec028"></a>
+
+### SEC028 — Write-side policy WITH CHECK is constant true (open write)
+
+**Severity:** warning.
+
+A **permissive** policy that governs writes — `FOR INSERT`,
+`FOR UPDATE`, or `FOR ALL` — with a `WITH CHECK` clause of literal
+`true` accepts every write the command covers. Any row the caller
+submits passes the check; the `TO` clause limits *who* may write,
+never *what*:
+
+```sql
+CREATE POLICY ins ON documents
+    FOR INSERT TO authenticated
+    WITH CHECK (true);   -- any authenticated row, any tenant, any owner
+```
+
+This is the open-write gap the other write-side rules miss:
+
+* **SEC006** fires when `WITH CHECK` is *absent*; here it's present
+  and wide open.
+* **SEC008** flags a constant-true `USING`; a `FOR INSERT` policy
+  has no `USING`, and SEC008 never inspects the write side.
+* **SEC020** flags the *asymmetry* `WITH CHECK (true)` alongside a
+  real restrictive `USING` ("reads scoped, writes open"). SEC028 is
+  the complement — there's no restrictive `USING` to contrast with
+  (it's absent on `FOR INSERT`, or itself constant-true), so the
+  write side is open outright.
+
+SEC028 fires when a permissive policy whose command is `INSERT`,
+`UPDATE`, or `ALL` has `WITH CHECK` = literal `true` and its `USING`
+is absent or itself constant-true (the asymmetry case is ceded to
+SEC020). Restrictive policies are out of scope: a restrictive
+`WITH CHECK (true)` is a dead clause (restrictive policies
+AND-combine, so it opens nothing on its own), SEC006's restrictive
+framing rather than an open-write hole.
+
+The fix is to replace `WITH CHECK (true)` with a predicate that
+validates the written row — usually the same tenant / ownership key
+the read side uses. Allowlist by qualified policy ID when an open
+write side is the design (an append-only audit or event table any
+client may write but only an admin policy reads).
+
+**No auto-fix** — the correct write predicate is the application's
+tenant / ownership key, which pgrls can't infer.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -2952,7 +3001,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-seven rules across four categories.** SEC001–SEC027,
+- **Thirty-eight rules across four categories.** SEC001–SEC028,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
