@@ -1631,6 +1631,26 @@ def test_sec011_fix_strips_top_level_or_true_around_a_sublink() -> None:
     assert "TRUE" not in sql
 
 
+def test_sec011_fix_skips_or_true_under_not() -> None:
+    # `NOT (a OR true)` is deny-all (NOT of always-true). Stripping
+    # the `OR true` would leave `NOT a`, which BROADENS the policy —
+    # a security regression. The fixer must not touch an OR-true in
+    # non-monotone (negated) position; the SEC011 finding stays for
+    # human review.
+    schema = _wrap_policy(_policy("NOT (user_id = 1 OR true)"))
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
+def test_sec011_fix_skips_negated_or_true_inside_and() -> None:
+    # `id = 1 AND NOT (user_id = 2 OR true)` — the AND chain is
+    # monotone, but the OR-true sits under a NOT, so it must be left
+    # alone. No clause changes ⇒ no fix.
+    schema = _wrap_policy(
+        _policy("id = 1 AND NOT (user_id = 2 OR true)", command="ALL")
+    )
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
 def test_sec011_fix_skips_vacuous_true_or_true() -> None:
     # `true OR true` has no real predicate to keep once the trues
     # are stripped — the fixer leaves it for human review rather

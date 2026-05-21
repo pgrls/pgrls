@@ -10,14 +10,27 @@ remaining predicate stand:
     owner_id = current_setting('app.user')  OR true
     →  owner_id = current_setting('app.user')
 
-The fixer walks the policy AST, removes every literal-`true` arg
-from each OR `BoolExpr`, and unwraps an OR that collapses to a
-single remaining arg (`a OR true` → `a`, not `(a)`). Nested ORs
-are handled bottom-up. Both `USING` and `WITH CHECK` are
-inspected; only the clause(s) that actually changed are re-emitted
-in the `ALTER POLICY`, so the produced migration is the minimal
-diff. The mutation happens on a deep-copy of the policy ASTs so
-the rule's `Schema` view stays read-only.
+The fixer removes literal-`true` args from each OR `BoolExpr`
+reachable from the clause root through AND / OR chains, and
+unwraps an OR that collapses to a single remaining arg
+(`a OR true` → `a`, not `(a)`). Nested ORs are handled bottom-up.
+Both `USING` and `WITH CHECK` are inspected; only the clause(s)
+that actually changed are re-emitted in the `ALTER POLICY`, so the
+produced migration is the minimal diff. The mutation happens on a
+deep-copy of the policy ASTs so the rule's `Schema` view stays
+read-only.
+
+Crucially, the fixer only strips `OR true` in **monotone
+position** — under AND / OR operators where `P OR true` is
+absorbing and removing the `true` can only *narrow* the policy.
+It never descends past a `NOT`, a comparison, an `IS FALSE` test,
+a function call, or a SubLink, because tightening an OR in a
+non-monotone position would *broaden* access: `NOT (a OR true)` is
+deny-all, but `NOT a` is not. A security fixer must never widen a
+policy. SEC011's rule still flags `OR true` in those positions —
+the fixer just declines to auto-rewrite them and leaves the
+finding for human review (the same conservative stance it takes on
+the degenerate case below).
 
 This fix is opinionated in the same way SEC019's is. Removing
 `OR true` assumes the disjunct was a debug bypass, not a
@@ -39,7 +52,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import BoolExpr, Node, SubLink
+from pglast.ast import BoolExpr
 from pglast.enums import BoolExprType
 from pglast.stream import RawStream
 
@@ -57,64 +70,60 @@ class _CannotStrip(Exception):
 
 
 def _strip_or_true(node: Any) -> tuple[Any, bool]:
-    """Walk the tree; remove literal-`true` args from OR BoolExprs.
+    """Remove literal-`true` disjuncts from OR BoolExprs reachable
+    from the clause root through AND / OR chains only.
 
-    Returns `(node, changed)`. Children are processed first so a
-    nested OR that unwraps to a single arg is already reduced when
-    its parent is examined. An OR left with exactly one arg after
-    stripping is unwrapped to that arg; an OR left with zero args
+    Returns `(node, changed)`. Recurses through `AND_EXPR` and
+    `OR_EXPR` BoolExpr args — and **only** those — stripping
+    literal-`true` from the OR nodes. An OR left with a single arg
+    is unwrapped (`a OR true` → `a`); an OR left with zero args
     raises `_CannotStrip`.
 
-    Mirrors the SEC011 rule's `_has_or_true` scope exactly: on a
-    `SubLink` only the `testexpr` (the policy's own LHS of an
-    `IN` / `ANY` / `ALL`) is in scope; the subquery's own
-    `subselect` is NOT descended into. An `OR true` inside a
-    subquery's WHERE doesn't make the outer policy admit every row
-    — it's the subquery's predicate, which the rule deliberately
-    ignores (`EXISTS (SELECT 1 FROM t WHERE flag OR true)` is a
-    legitimate shape). Rewriting it would mutate a policy the rule
-    calls clean and trip `pgrls fix --check` on zero violations.
+    **Why AND/OR only — this is a security boundary, not an
+    optimization.** `P OR true` is absorbing (≡ `true`) only in
+    *monotone* position, where tightening it to `P` can only
+    *narrow* the policy. The moment the OR sits under a `NOT`, a
+    comparison, an `IS FALSE` test, a function call, or a SubLink,
+    monotonicity is gone and removing the `true` can *broaden*
+    access — `NOT (a OR true)` is deny-all, but `NOT a` is not. A
+    security fixer must never broaden a policy, so anything that
+    isn't an AND/OR chain from the root is left untouched. SEC011's
+    rule still *flags* `OR true` in those positions; the safe action
+    is to leave the finding for human review, not to auto-rewrite.
+
+    Stopping at every non-AND/OR node also subsumes the SubLink
+    case: an `OR true` inside a subquery's own WHERE (the
+    legitimate `EXISTS (SELECT 1 FROM t WHERE flag OR true)` shape)
+    is never reached, so the fixer can't mutate a policy the rule
+    calls clean.
     """
-    if not isinstance(node, Node):
+    if not isinstance(node, BoolExpr):
+        return node, False
+    if node.boolop not in (BoolExprType.AND_EXPR, BoolExprType.OR_EXPR):
+        # NOT_EXPR (or any future boolop) is non-monotone — do not
+        # descend; stripping below a negation could broaden access.
         return node, False
 
-    if isinstance(node, SubLink):
-        new_test, test_changed = _strip_or_true(node.testexpr)
-        if test_changed:
-            node.testexpr = new_test
-        return node, test_changed
-
     changed = False
-    for field_name in node:
-        value = getattr(node, field_name, None)
-        if isinstance(value, (list, tuple)):
-            new_items: list[Any] = []
-            list_changed = False
-            for item in value:
-                new_item, item_changed = _strip_or_true(item)
-                new_items.append(new_item)
-                list_changed = list_changed or item_changed
-            if list_changed:
-                setattr(node, field_name, type(value)(new_items))
-                changed = True
-        elif isinstance(value, Node):
-            new_v, v_changed = _strip_or_true(value)
-            if v_changed:
-                setattr(node, field_name, new_v)
-                changed = True
+    new_args: list[Any] = []
+    for arg in node.args or ():
+        new_arg, arg_changed = _strip_or_true(arg)
+        new_args.append(new_arg)
+        changed = changed or arg_changed
 
-    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
-        args = list(node.args or ())
-        kept = [a for a in args if not is_literal_true(a)]
-        if len(kept) != len(args):
-            changed = True
+    if node.boolop == BoolExprType.OR_EXPR:
+        kept = [a for a in new_args if not is_literal_true(a)]
+        if len(kept) != len(new_args):
             if not kept:
                 raise _CannotStrip()
             if len(kept) == 1:
                 # `a OR true` → `a` — unwrap the now-singleton OR.
                 return kept[0], True
             node.args = tuple(kept)
+            return node, True
 
+    if changed:
+        node.args = tuple(new_args)
     return node, changed
 
 
