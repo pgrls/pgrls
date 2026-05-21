@@ -548,7 +548,8 @@ def fix(
     Currently fixes SEC001 (`ALTER TABLE … ENABLE ROW LEVEL
     SECURITY`), SEC002 (`ALTER TABLE … FORCE ROW LEVEL
     SECURITY`), SEC006 (`ALTER POLICY … WITH CHECK` mirroring
-    USING), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
+    USING), SEC011 (`ALTER POLICY … USING/WITH CHECK` stripping
+    an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
     `, true` to one-arg `current_setting()` calls), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
     check with USING), PERF001 (wrap

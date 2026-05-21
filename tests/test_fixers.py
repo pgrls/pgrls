@@ -17,6 +17,7 @@ from pgrls.fixers.perf003 import PERF003Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
 from pgrls.fixers.sec006 import SEC006Fixer
+from pgrls.fixers.sec011 import SEC011Fixer
 from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
@@ -1528,12 +1529,125 @@ def test_generate_fixes_passes_rule_options() -> None:
     assert fixes == []
 
 
+# ---------- SEC011 fixer ----------
+
+
+def test_sec011_fix_strips_or_true_and_unwraps() -> None:
+    schema = _wrap_policy(_policy("user_id = 1 OR true"))
+    fixes = SEC011Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC011"
+    assert f.location == "public.t.p"
+    assert "ALTER POLICY p ON public.t" in f.sql
+    assert "USING (user_id = 1)" in f.sql
+    # The bypass disjunct is gone — no literal true in any case.
+    assert "TRUE" not in f.sql
+    assert "true" not in f.sql
+
+
+def test_sec011_fix_keeps_remaining_disjuncts_when_three_args() -> None:
+    # `a OR b OR true` keeps `a OR b` (no unwrap — two real args).
+    schema = _wrap_policy(_policy("user_id = 1 OR user_id = 2 OR true"))
+    sql = SEC011Fixer().fix(schema, {})[0].sql
+    assert "USING (user_id = 1 OR user_id = 2)" in sql
+    assert "TRUE" not in sql
+
+
+def test_sec011_fix_strips_true_on_left_side() -> None:
+    schema = _wrap_policy(_policy("true OR user_id = 1"))
+    sql = SEC011Fixer().fix(schema, {})[0].sql
+    assert "USING (user_id = 1)" in sql
+    assert "TRUE" not in sql
+
+
+def test_sec011_fix_strips_or_true_nested_in_and() -> None:
+    # `a AND (b OR true)` → `a AND b`. The inner OR unwraps; the
+    # AND is left with its two real conjuncts.
+    schema = _wrap_policy(
+        _policy("user_id = 1 AND (user_id = 2 OR true)", command="ALL")
+    )
+    sql = SEC011Fixer().fix(schema, {})[0].sql
+    assert "user_id = 1 AND user_id = 2" in sql
+    assert "TRUE" not in sql
+
+
+def test_sec011_fix_rewrites_with_check_side() -> None:
+    p = _policy(
+        "user_id = 1",
+        command="ALL",
+        with_check="user_id = 2 OR true",
+    )
+    sql = SEC011Fixer().fix(_wrap_policy(p), {})[0].sql
+    assert "WITH CHECK (user_id = 2)" in sql
+    # USING was clean, so it must not appear in the minimal-diff ALTER.
+    assert "USING (" not in sql
+
+
+def test_sec011_fix_emits_only_changed_clauses() -> None:
+    # USING has the bypass; WITH CHECK is already clean → only USING
+    # is re-emitted.
+    p = _policy(
+        "user_id = 1 OR true",
+        command="ALL",
+        with_check="user_id = 1",
+    )
+    sql = SEC011Fixer().fix(_wrap_policy(p), {})[0].sql
+    assert "USING (user_id = 1)" in sql
+    assert "WITH CHECK" not in sql
+
+
+def test_sec011_fix_silent_when_no_or_true() -> None:
+    schema = _wrap_policy(_policy("user_id = 1 OR user_id = 2"))
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
+def test_sec011_fix_skips_vacuous_true_or_true() -> None:
+    # `true OR true` has no real predicate to keep once the trues
+    # are stripped — the fixer leaves it for human review rather
+    # than emit an empty `USING ()`.
+    schema = _wrap_policy(_policy("true OR true"))
+    assert SEC011Fixer().fix(schema, {}) == []
+
+
+def test_sec011_fix_respects_allowlist() -> None:
+    schema = _wrap_policy(_policy("user_id = 1 OR true"))
+    assert (
+        SEC011Fixer().fix(schema, {"allowlist": ["public.t.p"]}) == []
+    )
+
+
+def test_sec011_fix_does_not_mutate_input_schema() -> None:
+    p = _policy("user_id = 1 OR true")
+    schema = _wrap_policy(p)
+    SEC011Fixer().fix(schema, {})
+    # The original AST still renders with the OR-true intact.
+    from pglast.stream import RawStream
+
+    rendered = RawStream()(p.using_ast)
+    assert "TRUE" in rendered or "true" in rendered
+
+
+def test_sec011_fix_description_explains_bypass_and_allowlist() -> None:
+    schema = _wrap_policy(_policy("user_id = 1 OR true"))
+    [f] = SEC011Fixer().fix(schema, {})
+    assert "OR true" in f.description
+    assert "[lint.rules.SEC011]" in f.description
+
+
+def test_sec011_fix_raises_on_malformed_allowlist() -> None:
+    schema = _wrap_policy(_policy("user_id = 1 OR true"))
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC011Fixer().fix(schema, {"allowlist": "public.t.p"})
+
+
 def test_default_fixers_registers_every_shipping_fixer() -> None:
     rule_ids = {fixer.rule_id for fixer in default_fixers()}
     assert {
         "SEC001",
         "SEC002",
         "SEC006",
+        "SEC011",
         "SEC019",
         "SEC020",
         "PERF001",
