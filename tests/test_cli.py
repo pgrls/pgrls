@@ -92,6 +92,17 @@ def test_init_force_overwrites(tmp_path) -> None:
     assert "[lint]" in written
 
 
+def test_init_unwritable_path_exits_two_cleanly(tmp_path) -> None:
+    # A path whose parent directory doesn't exist is an OSError, which
+    # must surface as a ToolError (exit 2) with a message — not a
+    # traceback. Pins the clean-error contract for the write path.
+    out = tmp_path / "missing_dir" / "pgrls.toml"
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--output", str(out)])
+    assert result.exit_code == 2
+    assert "Cannot write" in result.output
+
+
 def test_root_help_lists_init() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["--help"])
