@@ -89,6 +89,12 @@ Cross-tenant reads are blocked, so this passes a tenant-isolation review. But th
 
 ## Usage
 
+Scaffold a config (optional — `pgrls` runs with zero config):
+
+```bash
+pgrls init          # writes a commented pgrls.toml; --force to overwrite
+```
+
 Point `pgrls` at any Postgres database:
 
 ```bash

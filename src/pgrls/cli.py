@@ -858,6 +858,91 @@ def snapshot(
         click.echo(payload)
 
 
+# The starter config `pgrls init` writes. Every active key is a no-op
+# default (so the file parses and `pgrls lint` runs unchanged); the
+# illustrative knobs — connection string, disable list, per-rule
+# allowlist / severity override — are commented examples. `[database].url`
+# is deliberately left commented so a fresh file doesn't fail with an
+# env-var error before the user has wired up DATABASE_URL.
+_INIT_TEMPLATE = """\
+# pgrls configuration. Rule reference:
+# https://github.com/pgrls/pgrls/blob/main/AGENTS.md
+# Every key is optional; this file documents the common knobs.
+
+[database]
+# Connection string. Prefer leaving this unset and passing
+# --database-url (or $DATABASE_URL) at runtime so secrets stay out of
+# version control. When set, $VAR / ${VAR} are interpolated from the
+# environment, e.g. url = "$DATABASE_URL".
+# url = "postgres://user:pass@localhost:5432/app"
+
+# Schemas to lint. Defaults to ["public"].
+schemas = ["public"]
+
+[lint]
+# Severity that makes `pgrls lint` exit non-zero: error | warning | info.
+# CI gates on this. Default: "warning".
+fail_on = "warning"
+
+# Turn rules off entirely, by id (case-insensitive):
+# disable = ["SEC022", "PERF002"]
+
+# Per-rule settings live under [lint.rules.<ID>].
+# `allowlist` exempts specific objects from a rule:
+# [lint.rules.SEC001]
+# allowlist = ["public.countries"]   # reference data, intentionally public
+
+# `severity` remaps a rule's level without disabling it — promote an
+# info nudge to a CI-blocking error, or demote a noisy warning:
+# [lint.rules.SEC030]
+# severity = "error"
+
+[diff]
+# Threshold that makes `pgrls diff` exit non-zero:
+# safe | breaking | requires-review | dangerous. Default: "dangerous".
+fail_on = "dangerous"
+"""
+
+
+@main.command()
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default="pgrls.toml",
+    show_default=True,
+    help="Path to write the config.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite the file if it already exists.",
+)
+def init(output_path: str, force: bool) -> None:
+    """Write a starter pgrls.toml with the common options documented.
+
+    The generated file parses as-is and leaves every rule at its
+    default — `pgrls lint` runs unchanged against it. Connection
+    string, disable list, and per-rule allowlist / severity overrides
+    are included as commented examples to edit. Refuses to clobber an
+    existing file unless `--force` is given.
+    """
+    path = Path(output_path)
+    if path.exists() and not force:
+        raise ToolError(
+            f"{path} already exists. Pass --force to overwrite it."
+        )
+    try:
+        path.write_text(_INIT_TEMPLATE, encoding="utf-8")
+    except OSError as exc:
+        raise ToolError(f"Cannot write {path}: {exc}") from exc
+    click.echo(
+        f"Wrote {path}. Set [database].url (or pass --database-url / "
+        "$DATABASE_URL), then run `pgrls lint`."
+    )
+
+
 # ---------------------------------------------------------------------------
 # diff helpers
 # ---------------------------------------------------------------------------

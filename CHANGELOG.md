@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.56] - 2026-05-21
+
+### Added
+- **`pgrls init`.** New command that writes a commented starter
+  `pgrls.toml` documenting the common knobs — `[database]` url /
+  schemas, `[lint]` fail_on / disable, a per-rule `allowlist` and
+  `severity` override example, and `[diff]` fail_on. The generated
+  file parses as-is and leaves every setting at its default, so
+  `pgrls lint` runs unchanged against it; `[database].url` is left
+  commented so a fresh file doesn't trip an env-var error before
+  `DATABASE_URL` is wired up. Refuses to clobber an existing file
+  unless `--force`; `--output` chooses the path (default
+  `./pgrls.toml`).
+
 ## [0.5.55] - 2026-05-21
 
 ### Added
