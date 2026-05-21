@@ -37,6 +37,13 @@ class SEC001:
         for table in schema.tables:
             if table.rls_enabled:
                 continue
+            if table.policies:
+                # A table with policies but RLS off has *dormant*
+                # policies — a higher-confidence, more specific finding
+                # than the generic "RLS off". Cede it to SEC032 so the
+                # two don't double-fire; a bare RLS-off table (no
+                # policies) stays SEC001's.
+                continue
             if self._is_allowlisted(table, allowlist):
                 continue
             ancestors = list(schema.ancestors_of(table))

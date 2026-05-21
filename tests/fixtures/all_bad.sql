@@ -576,3 +576,17 @@ CREATE POLICY restrictive_noop ON public.allbad_sec031
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (true);
 CREATE INDEX allbad_sec031_id_idx ON public.allbad_sec031 (id);
+
+-- SEC032: a table with a policy but NO `ENABLE ROW LEVEL SECURITY`.
+-- The policy sits dormant in pg_policy and enforces nothing — the
+-- table is wide open despite looking RLS-managed. SEC001 cedes this
+-- table to SEC032 (it has policies), so only SEC032 fires here. The
+-- policy is granted TO postgres (not PUBLIC) so SEC003 stays quiet,
+-- references the own column `id` so SEC005 stays quiet, and `id` is
+-- indexed so PERF003 stays quiet. RLS being off keeps SEC022 / SEC009
+-- silent too.
+CREATE TABLE public.allbad_sec032 (id INT);
+CREATE POLICY dormant ON public.allbad_sec032
+    FOR SELECT TO postgres
+    USING (id > 0);
+CREATE INDEX allbad_sec032_id_idx ON public.allbad_sec032 (id);

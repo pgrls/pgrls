@@ -1465,6 +1465,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC029  allbad_sec029_member\n",
             "SEC030  public.allbad_sec030\n",
             "SEC031  public.allbad_sec031.restrictive_noop\n",
+            "SEC032  public.allbad_sec032\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",

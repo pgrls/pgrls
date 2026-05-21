@@ -10,11 +10,13 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-one rules across four
+In the current release it ships **forty-two rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
-(write-side policies missing `WITH CHECK`), `HYG001`
+(write-side policies missing `WITH CHECK`), `SEC032` (table has
+policies but RLS is off — the policies are dormant and the table is
+wide open), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
@@ -193,10 +195,13 @@ catalog: one line per rule with its severity and title.
 
 **Severity:** error.
 
-**What it catches:** any table in a scanned schema where `pg_class.relrowsecurity`
-is false. This is the single most common RLS misconfiguration: someone wrote
-`CREATE POLICY` clauses but forgot to flip the table-level switch, so the
-policies are dormant and every row is visible to every connected role.
+**What it catches:** a table in a scanned schema where
+`pg_class.relrowsecurity` is false **and the table has no policies** —
+a table with RLS simply never turned on. The closely related case
+where a table *does* carry policies but RLS is off (the policies are
+dormant and the table is wide open) is ceded to **SEC032**, which
+gives that higher-confidence footgun its own pointed message; SEC001
+and SEC032 are disjoint, so a given RLS-off table trips exactly one.
 
 **Standard fix.** For a tenant-scoped table:
 
@@ -2095,6 +2100,50 @@ constant-true restrictive policy is deliberate scaffolding.
 **No auto-fix** — the intended predicate is the application's tenant /
 ownership key, which pgrls can't infer.
 
+<a id="rule-sec032"></a>
+
+### SEC032 — Table has policies but RLS is not enabled
+
+**Severity:** error.
+
+Postgres stores `CREATE POLICY` rows in `pg_policy` independently of
+whether the table has RLS turned on. A policy only takes effect once
+the table is switched on with `ALTER TABLE ... ENABLE ROW LEVEL
+SECURITY`. Until then the policies are **dormant** — they sit in the
+catalog enforcing nothing, and the table is readable by every role
+that holds the table-level privilege:
+
+```sql
+CREATE TABLE documents (id uuid, tenant_id int, body text);
+CREATE POLICY tenant_isolation ON documents
+    USING (tenant_id = current_setting('app.tenant')::int);
+-- ⚠ no ENABLE ROW LEVEL SECURITY → the policy is inert, table wide open
+```
+
+This is a high-confidence footgun. A table with RLS simply *off* and
+no policies might be intentional (public reference data — SEC001's
+allowlist case). But a table that carries hand-written policies
+**clearly intends** RLS; the missing `ENABLE` is almost certainly a
+forgotten step, and the result is a table that *looks* RLS-managed in
+code review while enforcing nothing.
+
+SEC032 is the policy-bearing complement of **SEC001** (RLS off with no
+policies). SEC001 cedes any table that has policies to SEC032, so the
+two are disjoint and a table trips exactly one — each with the message
+that fits. Like SEC001 it skips a partition child whose ancestor chain
+already has RLS enabled (the child is covered for parent-routed
+queries upstream, so its own dormant policies are dead weight, not a
+hole).
+
+The fix is `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` (add `FORCE` if
+owner access must also be governed), or dropping the policies if RLS
+was never intended. Allowlist by table name (bare or `schema.table`)
+when an RLS-off-with-policies table is deliberate.
+
+**No auto-fix** — enabling RLS on a live table is an operational
+decision (it immediately changes who sees what), not a mechanical
+edit pgrls should make unprompted.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -3210,7 +3259,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Forty-one rules across four categories.** SEC001–SEC031,
+- **Forty-two rules across four categories.** SEC001–SEC032,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

@@ -248,3 +248,28 @@ def test_mid_chain_leaves_scope_emits_unscoped_message() -> None:
     assert "leaves the scanned schemas" in by_loc[
         "public.events_t1"
     ].message
+
+
+def test_sec001_cedes_table_with_policies_to_sec032() -> None:
+    # A table with RLS off but carrying policies is SEC032's
+    # (dormant-policies) surface — SEC001 must not double-fire on it.
+    from pgrls.model import Policy
+
+    policy = Policy(
+        name="p",
+        command="ALL",
+        permissive=True,
+        roles=("PUBLIC",),
+        using_sql="true",
+        with_check_sql=None,
+        using_ast=None,
+        with_check_ast=None,
+    )
+    table = Table(
+        schema="public",
+        name="documents",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(policy,),
+    )
+    assert SEC001().check(Schema(tables=(table,)), options={}) == []

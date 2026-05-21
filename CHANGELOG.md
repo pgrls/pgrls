@@ -10,6 +10,31 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.62] - 2026-05-21
+
+### Added
+- **SEC032** — new lint rule (severity `error`). Fires for a table
+  that has policies but has **not** been switched on with `ALTER
+  TABLE ... ENABLE ROW LEVEL SECURITY`. Postgres keeps `pg_policy`
+  rows independently of the table-level switch, so the policies sit
+  **dormant** — they enforce nothing and the table is readable by
+  every role with the table-level privilege, despite *looking*
+  RLS-managed in code review. The classic "forgot `ENABLE ROW LEVEL
+  SECURITY`" footgun, and a high-confidence one (a table carrying
+  hand-written policies clearly intends RLS). The fix is `ALTER TABLE
+  ... ENABLE ROW LEVEL SECURITY` (add `FORCE` if owner access must be
+  governed). Allowlist by table name. No auto-fix. Like SEC001 it
+  skips a partition child already covered by an RLS-enabled ancestor.
+  Brings the shipped rule count to **forty-two**.
+
+### Changed
+- **SEC001 now cedes policy-bearing tables to SEC032.** It previously
+  fired on *every* RLS-disabled table; a table with RLS off **and**
+  policies is now SEC032's (dormant policies — a higher-confidence,
+  more specific finding), while a bare RLS-off table with no policies
+  stays SEC001's. The two are disjoint, so a given RLS-off table
+  trips exactly one. No detection coverage is lost.
+
 ## [0.5.61] - 2026-05-21
 
 ### Added
