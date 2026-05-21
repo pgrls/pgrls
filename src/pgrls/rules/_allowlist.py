@@ -20,8 +20,8 @@ Allowlist entries fall into six shapes:
   function-scoped rules (SEC014, SEC015, SEC017).
 
 * **Role name** (bare `name` only) — used by role-scoped rules
-  (SEC016). Postgres roles are cluster-global and have no schema
-  component, so the entry is an unqualified role name.
+  (SEC016, SEC029). Postgres roles are cluster-global and have no
+  schema component, so the entry is an unqualified role name.
 
 Earlier versions had every rule do the bare list-of-strings check
 (`isinstance(raw, list) and all(isinstance(s, str))`) and accepted any
@@ -223,7 +223,7 @@ def parse_role_name_allowlist(
 ) -> set[str]:
     """Validate that every entry is a non-empty role name.
 
-    Used by SEC016. Postgres roles are cluster-global and
+    Used by SEC016 and SEC029. Postgres roles are cluster-global and
     unqualified — there is no schema component — so an allowlist
     entry is a bare role name, matched byte-exactly against
     ``pg_roles.rolname``.

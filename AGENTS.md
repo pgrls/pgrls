@@ -1081,12 +1081,13 @@ Out of scope (intentional):
 * **Superuser roles.** Skipped — a superuser bypasses RLS via
   `rolsuper` regardless, and is a far larger finding than
   "bypasses RLS" anyway.
-* **Role membership / `SET ROLE` reachability.** SEC016 flags the
-  role that *holds* `BYPASSRLS`, not every role that could reach
+* **Role membership / `SET ROLE` reachability.** SEC016 flags only
+  the role that *holds* `BYPASSRLS`, not every role that could reach
   it. `BYPASSRLS` is a role attribute, not an inheritable
   privilege — a member of a `BYPASSRLS` group role does not
-  bypass RLS unless it actually `SET ROLE`s to that role. The
-  holder is the precise and complete audit target.
+  bypass RLS unless it actually `SET ROLE`s to that role. SEC016's
+  surface is deliberately just the holder; the `SET ROLE`
+  escalation path that reaches it is covered separately by SEC029.
 * **The `row_security` session GUC.** `SET row_security = off` is
   a different mechanism, and not a silent one: a query that
   *would* return RLS-filtered rows raises an error instead of
