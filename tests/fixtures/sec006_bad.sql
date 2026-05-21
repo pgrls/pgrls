@@ -35,7 +35,9 @@ CREATE INDEX sec006_all_tenant_idx ON public.sec006_all (tenant_id);
 -- Clean: RESTRICTIVE UPDATE policy with WITH CHECK present —
 -- SEC006 does not fire. RESTRICTIVE type keeps SEC003 from
 -- firing, and a PERMISSIVE-postgres companion keeps SEC012 quiet.
-CREATE TABLE public.sec006_clean (id INT, tenant_id TEXT);
+-- tenant_id is NOT NULL: a genuinely clean RLS table scopes by a
+-- non-nullable discriminator, so SEC030 stays silent here.
+CREATE TABLE public.sec006_clean (id INT, tenant_id TEXT NOT NULL);
 ALTER TABLE public.sec006_clean ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec006_clean FORCE ROW LEVEL SECURITY;
 CREATE POLICY update_ok ON public.sec006_clean

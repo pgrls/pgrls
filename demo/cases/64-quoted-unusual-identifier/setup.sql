@@ -9,7 +9,7 @@
 
 CREATE TABLE app."MixedCase Table" (
     id BIGSERIAL PRIMARY KEY,
-    user_id TEXT
+    user_id TEXT NOT NULL
 );
 ALTER TABLE app."MixedCase Table" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app."MixedCase Table" FORCE ROW LEVEL SECURITY;

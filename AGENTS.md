@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **thirty-nine rules across four
+In the current release it ships **forty rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -65,7 +65,9 @@ write-side policy, so writes are denied), `SEC024` (policy calls
 `current_setting()` with an unqualified parameter name — a
 dropped prefix the application cannot `SET`), `SEC027` (RLS table
 has an owner / user column that no policy scopes by — rows may be
-visible between users within the same tenant), and `HYG003`
+visible between users within the same tenant), `SEC030` (policy
+scopes by a nullable discriminator column — a NULL row escapes
+scoping and is a latent cross-tenant leak), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
@@ -1944,6 +1946,90 @@ able to escalate.
 BYPASSRLS role grants, or accept the route is an operational decision
 pgrls can't make.
 
+<a id="rule-sec030"></a>
+
+### SEC030 — Policy scopes by a nullable discriminator column
+
+**Severity:** info.
+
+A row-scoping policy keys visibility off a column compared to a
+per-request auth value — the tenant or user discriminator. If that
+column is **nullable**, two things go wrong:
+
+```sql
+CREATE TABLE documents (id uuid, tenant_id int, body text);   -- nullable!
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON documents
+    USING (tenant_id = current_setting('app.tenant')::int);
+```
+
+1. **Silent row-hiding (today).** Under plain `=`, a row whose
+   `tenant_id` is `NULL` evaluates `NULL = <setting>` → `NULL`, which
+   RLS treats as *not* matching. The row is invisible to every
+   tenant — not leaked, but unreachable. A row that should belong to
+   someone belongs to no one.
+2. **Latent cross-tenant leak (one edit away).** The moment any
+   policy uses a NULL-tolerant form of the same key — `tenant_id IS
+   NOT DISTINCT FROM <setting>`, `tenant_id = <setting> OR tenant_id
+   IS NULL`, `COALESCE(tenant_id, <setting>) = <setting>` — every
+   `NULL` row becomes visible to **every** tenant at once. A `NOT
+   NULL` discriminator makes that whole failure mode unreachable.
+
+SEC030 fires when a table has RLS enabled, a policy, captured column
+nullability, and a **nullable** column that some policy compares with
+a plain `=` against an auth-context value (`current_setting`,
+`auth.uid`, `auth.role`, `auth.jwt` by default). The remedy is
+usually `ALTER TABLE … ALTER COLUMN … SET NOT NULL` (after
+backfilling any existing `NULL`s), plus a `DEFAULT` or trigger so the
+column is always populated.
+
+pgrls can't know whether the `NULL`s are intentional, so SEC030 is
+**info** severity — it never fails CI by default. It is the
+nullable-discriminator companion to two warning-level neighbours:
+**SEC018** flags the wrong *type* of discriminator (a column compared
+to `current_user` / `session_user`, constant under a shared pool);
+SEC030 assumes the right type (a session-GUC / JWT value) and flags
+it being nullable. **SEC027** flags a principal column *no* policy
+scopes by; SEC030 flags a column a policy *does* scope by, but that
+is nullable. The three are disjoint.
+
+Detection is structural and conservative:
+
+* **Scalar equality only.** Only a plain binary `col = <auth value>`
+  (`A_Expr` kind `AEXPR_OP`) counts. `col <> …`, `col > …`
+  (`created_at > current_setting('app.cutoff')` is a legitimate
+  non-tenant use of `current_setting`), and array-membership
+  `<auth value> = ANY(tags)` (a different access model) are all out
+  of scope.
+* **Column is a direct operand; the auth value may be wrapped in a
+  fromless sub-select.** The discriminator must be a direct operand
+  of the `=`, but the auth value is detected even inside a scalar
+  sub-select with no `FROM` clause — `tenant_id = (SELECT
+  current_setting('app.tenant'))` fires. That wrapped form is the one
+  PERF001 *recommends* (evaluated once per statement), so missing it
+  would blind the rule to the best-written policies. A sub-select
+  *with* a `FROM` clause is a lookup whose internal predicates are
+  not the compared value, so `id = (SELECT x FROM acl WHERE m =
+  current_setting(…))` does not fire on `id`.
+* **Own-table columns only.** The column operand must belong to the
+  policy's own table (the same resolution SEC005 / SEC018 use), so a
+  sub-select join column or catalog lookup is not mistaken for the
+  discriminator.
+* **Needs captured nullability.** A table whose `column_details`
+  weren't captured (a hand-built fixture, or a pre-v5 snapshot) is
+  skipped — nullability is unknowable, so the rule stays silent until
+  the schema is re-introspected.
+
+Configure the auth-context function set (replaces the default) via
+`[lint.rules.SEC030].auth_functions`. Allowlist tables where a
+nullable discriminator is intentional — a public-or-tenant table
+whose public rows legitimately have a `NULL` tenant, say — by table
+name (bare or `schema.table`) in `[lint.rules.SEC030].allowlist`.
+
+**No auto-fix** — `SET NOT NULL` fails on a column that already holds
+`NULL`s, so the remedy needs a backfill and a population strategy
+pgrls can't author.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -3059,7 +3145,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Thirty-nine rules across four categories.** SEC001–SEC029,
+- **Forty rules across four categories.** SEC001–SEC030,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

@@ -7,7 +7,7 @@
 
 CREATE TABLE app.case_policy (
     id BIGSERIAL PRIMARY KEY,
-    user_id TEXT,
+    user_id TEXT NOT NULL,
     visibility TEXT
 );
 ALTER TABLE app.case_policy ENABLE ROW LEVEL SECURITY;

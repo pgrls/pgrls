@@ -9,7 +9,7 @@
 
 CREATE TABLE app.admin_overrides (
     id BIGSERIAL PRIMARY KEY,
-    tenant_id UUID,
+    tenant_id UUID NOT NULL,
     note TEXT
 );
 ALTER TABLE app.admin_overrides ENABLE ROW LEVEL SECURITY;

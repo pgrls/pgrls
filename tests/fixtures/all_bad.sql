@@ -529,3 +529,26 @@ CREATE POLICY open_insert ON public.allbad_sec028
 DROP ROLE IF EXISTS allbad_sec029_member;
 CREATE ROLE allbad_sec029_member;
 GRANT allbad_sec016_role TO allbad_sec029_member;
+
+-- SEC030: a policy scopes row access by a NULLABLE discriminator
+-- column. tenant_id has no NOT NULL constraint, so a row with a NULL
+-- tenant_id is invisible to every tenant under `=` today and is a
+-- latent cross-tenant leak the moment a NULL-tolerant predicate
+-- appears. The auth value is wrapped in `(SELECT current_setting())`
+-- (PERF001's recommended form) — SEC030 detects it through the scalar
+-- sub-select while keeping tenant_id as the direct operand. Base RLS
+-- state mirrors the other RLS-on blocks (RESTRICTIVE policy, own-column
+-- USING, indexed predicate column, qualified GUC name, two-arg
+-- current_setting wrapped in a SELECT) so SEC001/SEC002/SEC005/SEC008/
+-- SEC009/SEC019/SEC024/PERF001/PERF003 stay silent and only SEC030
+-- fires here. SEC012 also fires (RESTRICTIVE-only policy set) and
+-- SEC022 (FOR SELECT-only) — neither carries a rule_loc pin, so those
+-- extra firings are silent-by-design.
+CREATE TABLE public.allbad_sec030 (id INT, tenant_id INT);
+ALTER TABLE public.allbad_sec030 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec030 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec030
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (tenant_id = (SELECT current_setting('app.tenant', true))::int);
+CREATE INDEX allbad_sec030_tenant_idx
+    ON public.allbad_sec030 (tenant_id);

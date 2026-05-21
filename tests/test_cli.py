@@ -804,10 +804,19 @@ def test_lint_fires_sec006_on_update_and_all_without_with_check(
     # update_bad / all_bad have unwrapped current_setting → PERF001.
     # insert_bad's WITH CHECK (true) has no own-col ref → SEC005, and
     # is a permissive write policy with a constant-true WITH CHECK →
-    # SEC028 (open write).
+    # SEC028 (open write). update_bad / all_bad scope by a nullable
+    # `tenant_id` (TEXT, no NOT NULL) against current_setting → SEC030.
     _assert_rules_fire_exactly(
         result.output,
-        {"SEC003", "SEC005", "SEC006", "SEC007", "PERF001", "SEC028"},
+        {
+            "SEC003",
+            "SEC005",
+            "SEC006",
+            "SEC007",
+            "PERF001",
+            "SEC028",
+            "SEC030",
+        },
     )
 
 
@@ -843,10 +852,13 @@ def test_lint_fires_sec004_on_lovable_cve_pattern(
     # permissive on the table). USING has unwrapped current_setting →
     # PERF001. Both tables have only FOR SELECT policies → SEC022
     # (info). sec004_clean policy is RESTRICTIVE so SEC003/SEC007
-    # don't fire on that table.
+    # don't fire on that table. Both tables scope by a nullable
+    # `user_id` (TEXT) against current_setting → SEC030 (the rule
+    # detects the auth value whether bare on sec004_target or wrapped
+    # in a sub-select on sec004_clean).
     _assert_rules_fire_exactly(
         result.output,
-        {"SEC003", "SEC004", "SEC007", "PERF001", "SEC022"},
+        {"SEC003", "SEC004", "SEC007", "PERF001", "SEC022", "SEC030"},
     )
 
 
@@ -1117,6 +1129,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC027  public.allbad_sec027\n",
             "SEC028  public.allbad_sec028.open_insert\n",
             "SEC029  allbad_sec029_member\n",
+            "SEC030  public.allbad_sec030\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF001  public.allbad_sec006.update_no_check\n",
