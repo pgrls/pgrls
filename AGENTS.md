@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty rules across four
+In the current release it ships **forty-one rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -18,7 +18,9 @@ categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
-`SEC008` (`USING (true)`), `SEC009` (RLS enabled but no policies —
+`SEC008` (permissive `USING (true)` — admits every row),
+`SEC031` (restrictive `USING (true)` — a no-op floor that enforces
+nothing), `SEC009` (RLS enabled but no policies —
 silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 `SEC011` (`OR true` debug branch hidden inside a policy),
 `SEC012` (table has only RESTRICTIVE policies — silent deny-all),
@@ -520,19 +522,23 @@ allowlist = ["public.countries", "public.feature_flags"]
 
 <a id="rule-sec008"></a>
 
-### SEC008 — Policy USING clause is constant true
+### SEC008 — Permissive policy USING clause is constant true
 
 **Severity:** warning.
 
-**What it catches:** policies whose `USING` clause is a literal
-`true`. Detection is intentionally narrow — only the AST pattern
-`A_Const(Boolean(true))` matches. Semantic tautologies like `1 = 1`
-are not detected (a real tautology checker is significant
+**What it catches:** **permissive** policies whose `USING` clause is a
+literal `true`. Detection is intentionally narrow — only the AST
+pattern `A_Const(Boolean(true))` matches. Semantic tautologies like
+`1 = 1` are not detected (a real tautology checker is significant
 infrastructure for marginal value, and most disguised tautologies
 also fail SEC005).
 
-`USING (true)` admits every row to every caller in the policy's role
-list. It is almost always scaffolding left in by accident.
+A permissive `USING (true)` admits every row to every caller in the
+policy's role list (permissive policies OR-combine, so a constant-true
+branch passes everything). It is almost always scaffolding left in by
+accident. A *restrictive* `USING (true)` is the opposite failure — it
+AND-combines to a no-op floor — and is covered by **SEC031** with an
+accurate message, so SEC008 is scoped to permissive policies only.
 
 **Standard fix.** Replace the literal with a real predicate, or drop
 the policy:
@@ -2040,6 +2046,55 @@ name (bare or `schema.table`) in `[lint.rules.SEC030].allowlist`.
 `NULL`s, so the remedy needs a backfill and a population strategy
 pgrls can't author.
 
+<a id="rule-sec031"></a>
+
+### SEC031 — Restrictive policy USING clause is constant true
+
+**Severity:** warning.
+
+A `RESTRICTIVE` policy is meant to be a *hard floor*: a row is visible
+only if it passes **every** restrictive policy (they AND-combine) on
+top of passing at least one permissive policy. It is how you add a
+tenant boundary no permissive `OR` branch can widen.
+
+A restrictive policy whose `USING` is the literal `true` adds
+`AND true` to that conjunction — which restricts **nothing**:
+
+```sql
+CREATE POLICY tenant_floor ON documents
+    AS RESTRICTIVE FOR SELECT TO PUBLIC
+    USING (true);          -- looks like a floor, enforces nothing
+```
+
+The policy is inert: every row a permissive policy admits sails
+through. The danger is the *false sense of security* — a reviewer
+sees a restrictive policy named `tenant_floor` and assumes a hard
+boundary the table doesn't have.
+
+SEC031 is the restrictive counterpart of **SEC008**, which flags a
+**permissive** `USING (true)`. There the constant-true *admits* every
+row (permissive policies OR-combine); here it *fails to restrict* — the
+opposite failure, so "admits every row" would mislead. The two are
+disjoint by policy kind: SEC008 handles permissive, SEC031
+restrictive, and a given policy trips at most one. The constant-true
+`WITH CHECK` space is SEC020's (asymmetric write) and SEC028's (open
+write) territory.
+
+Detection mirrors SEC008: only the literal `true` matches (a real
+tautology checker — `1 = 1`, `x OR NOT x` — is out of scope; those
+surface as SEC005, no own-column reference). A restrictive policy with
+a real `USING` and a `WITH CHECK (true)` is not flagged here — a
+restrictive `WITH CHECK (true)` is a dead clause (SEC006's framing),
+not a missing read floor.
+
+The fix is to give the restrictive policy the real predicate it was
+meant to enforce — the tenant / ownership key — or to drop it if it
+was never needed. Allowlist by qualified policy ID when a
+constant-true restrictive policy is deliberate scaffolding.
+
+**No auto-fix** — the intended predicate is the application's tenant /
+ownership key, which pgrls can't infer.
+
 <a id="rule-perf001"></a>
 
 ### PERF001 — Auth function called per-row in policy USING
@@ -3155,7 +3210,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Forty rules across four categories.** SEC001–SEC030,
+- **Forty-one rules across four categories.** SEC001–SEC031,
   PERF001–PERF003, HYG001–HYG003, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

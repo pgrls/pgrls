@@ -10,6 +10,32 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.61] - 2026-05-21
+
+### Added
+- **SEC031** — new lint rule (severity `warning`). Fires for a
+  **RESTRICTIVE** policy whose `USING` is the literal `true`.
+  Restrictive policies AND-combine, so `USING (true)` adds `AND true`
+  to the conjunction and restricts **nothing** — the policy looks
+  like a security floor (someone added it to tighten access) but is
+  inert; every row a permissive policy admits sails through. The
+  danger is the false sense of security. The fix is to give the
+  policy the real predicate it was meant to enforce, or drop it.
+  Allowlist by qualified policy ID. No auto-fix. Brings the shipped
+  rule count to **forty-one**.
+
+### Changed
+- **SEC008 is now scoped to permissive policies.** It previously
+  fired on *any* `USING (true)` policy, but its message ("admits
+  every row to every caller") is only accurate for a **permissive**
+  policy — a restrictive `USING (true)` fails to *restrict* rather
+  than admitting everything. The restrictive case now belongs to the
+  new SEC031 with an accurate "no-op floor" message; SEC008 and
+  SEC031 are disjoint by policy kind, so a given policy still trips
+  exactly one. No detection coverage is lost — a restrictive
+  `USING (true)` that previously surfaced as SEC008 now surfaces as
+  SEC031.
+
 ## [0.5.60] - 2026-05-21
 
 ### Added

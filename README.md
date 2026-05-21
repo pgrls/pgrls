@@ -9,7 +9,7 @@
 **[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Rule reference](AGENTS.md)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
-> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 11 of 40 rules mechanically auto-fixable.
+> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 11 of 41 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
 > MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown / GitHub annotations / JUnit XML).
 
@@ -28,9 +28,9 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 40 lint rules, 11 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 41 lint rules, 11 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
-> - **Lint & fix** — `pgrls lint` checks a live database against all forty rules and reports findings as text, JSON, SARIF, Markdown, GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Lint & fix** — `pgrls lint` checks a live database against all forty-one rules and reports findings as text, JSON, SARIF, Markdown, GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
@@ -85,7 +85,7 @@ CREATE POLICY tenant_scope ON documents
 
 Cross-tenant reads are blocked, so this passes a tenant-isolation review. But there's an `owner_id` column and nothing keys on it, so every user *in* a tenant reads every other user's documents. If that table holds drafts, DMs, or private uploads, it's a leak. **SEC027** (info) flags the table so you decide: add a per-user predicate, or confirm it's intentionally tenant-shared and allowlist it.
 
-[Browse the full rule catalogue in AGENTS.md](AGENTS.md#rule-sec004) for the other 38 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
+[Browse the full rule catalogue in AGENTS.md](AGENTS.md#rule-sec004) for the other 39 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
 
 ## Usage
 
@@ -375,7 +375,7 @@ pattern documentation.
 | [SEC005](AGENTS.md#rule-sec005) | warning | Policy expression has no own-column reference |
 | [SEC006](AGENTS.md#rule-sec006) | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
 | [SEC007](AGENTS.md#rule-sec007) | info | All policies on a table are permissive (no RESTRICTIVE floor) |
-| [SEC008](AGENTS.md#rule-sec008) | warning | Policy USING clause is constant `true` |
+| [SEC008](AGENTS.md#rule-sec008) | warning | Permissive policy USING clause is constant `true` (admits every row) |
 | [SEC009](AGENTS.md#rule-sec009) | warning | RLS enabled but no policies defined (silent deny-all) |
 | [SEC010](AGENTS.md#rule-sec010) | warning | Policy `USING`/`WITH CHECK` clause is constant `false` (deny-all anti-pattern) |
 | [SEC011](AGENTS.md#rule-sec011) | warning | Policy expression has an `OR true` branch (debug bypass left in) |
@@ -398,6 +398,7 @@ pattern documentation.
 | [SEC028](AGENTS.md#rule-sec028) | warning | Permissive write policy (INSERT/UPDATE/ALL) whose `WITH CHECK` is constant `true` — accepts every write; the `TO` clause gates who, not what |
 | [SEC029](AGENTS.md#rule-sec029) | warning | Role can `SET ROLE` to a `BYPASSRLS` role through membership — escalation path that silently disables every policy (BYPASSRLS is not inherited, but reachable) |
 | [SEC030](AGENTS.md#rule-sec030) | info | Policy scopes by a nullable discriminator column (`tenant_id = current_setting(…)` where the column allows NULL) — NULL rows escape scoping today and leak the moment a NULL-tolerant predicate appears |
+| [SEC031](AGENTS.md#rule-sec031) | warning | RESTRICTIVE policy whose `USING` is constant `true` — AND-combines to a no-op, so it looks like a security floor but enforces none |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](AGENTS.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
