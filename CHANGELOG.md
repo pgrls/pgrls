@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-22
+
+Milestone release. **No functional or breaking changes since 0.5.67.**
+0.6.0 marks the 0.5.x line as a complete, stable RLS workflow
+(find → fix → gate → test → adopt) and serves as the baseline for the
+public launch. Pin `0.6.x` for the current CLI, snapshot-JSON, and
+`pgrls.toml` surface.
+
+For reference, what the 0.5.x line built up to (each shipped in its own
+release listed below — nothing here is new in 0.6.0):
+- **43 lint rules**, 12 mechanically auto-fixable.
+- `pgrls report` — read-only RLS posture summary for audits and onboarding.
+- Semantic `pgrls diff` CI gating (SAFE / BREAKING / REQUIRES_REVIEW /
+  DANGEROUS), with optional Z3 predicate analysis and migration-as-input.
+- CI-native output: text / JSON / SARIF / Markdown / GitHub annotations /
+  JUnit XML.
+- JSON Schema for `pgrls.toml`; zero-config `pgrls init` scaffolding.
+- The `pgrls.testing` pytest plugin for RLS isolation tests.
+- PyPI Trusted Publishing, plus a documented GitHub Actions CI recipe
+  (`pgrls lint` with SARIF upload to code scanning).
+
 ## [0.5.67] - 2026-05-21
 
 ### Added

@@ -3394,9 +3394,10 @@ These are intentional in the current release. Do not invent capabilities.
   v0.4 as the optional `pip install pgrls[diff-z3]` extra; without
   it, the diff classifier falls back to syntactic patterns only.
 - **Go port shipping in stages.** The TypeScript port of
-  `pgrls.testing` shipped in v0.6.0 as the
+  `pgrls.testing` shipped as the
   [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm
-  package, following the Layer 1 protocol. The Go port lives in
+  package (tagged `ts-v0.6.0`, versioned independently of the
+  Python package), following the Layer 1 protocol. The Go port lives in
   [`go/`](go/) at module path `github.com/pgrls/pgrls/go` — its
   scaffold + protocol-version constant + error types shipped in
   v0.7.0; the Driver + Closer interfaces + QueryResult shape

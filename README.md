@@ -523,7 +523,7 @@ dashboard, or keep the report as a build artifact.
 ## Roadmap
 
 - **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Polished error messages.
-- ~~**TypeScript port of `pgrls.testing`**~~ — landed in v0.6.0 as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test). Source: [`ts/`](ts/).
+- ~~**TypeScript port of `pgrls.testing`**~~ — shipped as the [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm package, versioned independently of the Python package (tagged `ts-v0.6.0`). Source: [`ts/`](ts/).
 - **Go port** of `pgrls.testing` following the same Layer 1 protocol — step 1 (scaffold + protocol-version constant + error types) landed in v0.7.0; subsequent steps (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
 - ~~**SAT-based predicate implication checking.**~~ Z3-driven semantic predicate analysis landed in v0.4.x.
 - ~~**Migration-as-input.**~~ `pgrls diff --apply migration.sql` shipped in v0.5.0; baseline cache + extension auto-detect in v0.5.1–v0.5.2.
