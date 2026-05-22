@@ -10,6 +10,18 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.65] - 2026-05-21
+
+### Added
+- **SEC031 auto-fix** — `pgrls fix` now remediates SEC031 (restrictive
+  policy whose `USING` is constant `true`). It emits `DROP POLICY` for
+  the no-op floor: `USING (true)` AND-combines to nothing, so dropping
+  it leaves access unchanged (the same reasoning that makes HYG003's
+  drop safe). SEC031's other remedy — giving the policy the real
+  tenant / ownership predicate — needs human intent and is not
+  auto-fixed; the fix description points the operator at it. Brings
+  the mechanically-fixable rule count to **12**.
+
 ## [0.5.64] - 2026-05-21
 
 ### Added

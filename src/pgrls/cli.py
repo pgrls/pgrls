@@ -644,7 +644,8 @@ def fix(
     an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
     `, true` to one-arg `current_setting()` calls), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
-    check with USING), PERF001 (wrap
+    check with USING), SEC031 (`DROP POLICY` for a no-op
+    restrictive `USING (true)` floor), PERF001 (wrap
     unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), PERF003 (`CREATE
     INDEX` for an unindexed policy-predicate column), HYG003

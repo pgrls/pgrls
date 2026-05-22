@@ -77,7 +77,7 @@ scoping and is a latent cross-tenant leak), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
+SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -2099,8 +2099,15 @@ meant to enforce — the tenant / ownership key — or to drop it if it
 was never needed. Allowlist by qualified policy ID when a
 constant-true restrictive policy is deliberate scaffolding.
 
-**No auto-fix** — the intended predicate is the application's tenant /
-ownership key, which pgrls can't infer.
+**Auto-fix.** `pgrls fix` emits `DROP POLICY` for the no-op floor: its
+`USING (true)` AND-combines to nothing, so dropping it leaves access
+unchanged (the same reasoning that makes HYG003's drop safe). The
+fixer drops only *genuinely inert* policies: it abstains when the
+policy also carries a real `WITH CHECK`, because a restrictive `WITH
+CHECK` is a load-bearing write floor (it AND-combines for writes) and
+dropping it WOULD change write access — that case is left for human
+review. The *other* remedy — giving the read floor the real tenant /
+ownership predicate — needs human intent and is not auto-fixed either.
 
 <a id="rule-sec032"></a>
 
@@ -2834,6 +2841,15 @@ Currently fixable:
   restrictive (its no-op `… AND true` write check becomes real).
   SEC006 and SEC020 never fire on the same policy — one needs
   `WITH CHECK` absent, the other needs it present.
+* **SEC031** — emits `DROP POLICY <name> ON <schema>.<table>;` for a
+  restrictive policy whose `USING` is constant `true`. The
+  constant-true clause AND-combines to the identity, so dropping the
+  policy leaves access unchanged — the second `pgrls fix` statement
+  that DROPs an object, safe for the same reason as HYG003's. The
+  fixer abstains when the policy carries a real `WITH CHECK` (a
+  load-bearing write floor whose drop WOULD change write access), so
+  it only drops genuinely inert policies. SEC031's other remedy (a
+  real tenant / ownership predicate) needs human intent.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
@@ -3338,7 +3354,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, Markdown, GitHub-annotation, and JUnit output.**
