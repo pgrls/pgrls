@@ -486,8 +486,8 @@ def test_perf003_skips_two_part_ref_with_non_matching_qualifier() -> None:
     # neither the table's bare name nor a schema. It's a cross-table
     # ref (a JOIN alias for another relation), so PERF003 leaves it
     # alone: the index health of that other table isn't this policy's
-    # concern. The own column `id` IS indexed (PRIMARY-key style), so
-    # nothing fires.
+    # concern. There's no own-column reference to check, so nothing
+    # fires (the table has no indexes either — `indexes=()`).
     schema = Schema(
         tables=(
             _table(
