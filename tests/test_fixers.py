@@ -1534,6 +1534,8 @@ def test_sec031_fix_description_explains_noop_and_alternative() -> None:
     # needs human intent — the description must point at it.
     schema = _dup_table(_policy("true", name="floor", permissive=False))
     [f] = SEC031Fixer().fix(schema, {})
+    assert "floor" in f.description  # names the dropped policy
+    assert "public.t" in f.description  # and its qualified table
     assert "no-op" in f.description
     assert "predicate" in f.description
 
