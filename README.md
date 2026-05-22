@@ -235,6 +235,18 @@ pgrls fix --database-url "$DATABASE_URL" --check
 
 Currently fixable: **SEC001** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`), **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **SEC006** (emits `ALTER POLICY … WITH CHECK (…)` mirroring the policy's `USING`), **SEC011** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` stripping an `OR true` debug bypass), **SEC019** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` adding the `missing_ok = true` second argument to one-argument `current_setting()` calls), **SEC020** (emits `ALTER POLICY … WITH CHECK (…)` replacing a constant-`true` `WITH CHECK` with the policy's `USING`), **SEC031** (emits `DROP POLICY … ON …;` for a no-op restrictive `USING (true)` floor — it AND-combines to nothing, so dropping it leaves access unchanged), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`), **PERF003** (emits `CREATE INDEX ON … (…);` for a policy-predicate column with no leading-column index), **HYG003** (emits `DROP POLICY … ON …;` for a policy that exactly duplicates another on the same table), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
 
+## RLS posture — `pgrls report`
+
+`pgrls lint` answers *"what's wrong?"*; `pgrls report` answers *"what's the posture overall?"* — a factual, rule-free snapshot of every table's row-level-security state, for audits and onboarding.
+
+```bash
+pgrls report --database-url "$DATABASE_URL"            # text table + summary
+pgrls report --database-url "$DATABASE_URL" --format json      # machine-readable
+pgrls report --database-url "$DATABASE_URL" --format markdown  # paste into an audit doc
+```
+
+Each table gets a coarse status — `protected` (RLS on, FORCE'd, ≥1 permissive policy), `not-forced` (RLS on with a permissive policy, but owner bypasses), `no-policies` (RLS on but no permissive policy → default-deny; covers zero policies *and* restrictive-only tables), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it — credited when that parent is among the scanned schemas), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
+
 ## Configuration
 
 Drop a `pgrls.toml` next to your project. See `pgrls.example.toml` in the repo for a fully commented version.
