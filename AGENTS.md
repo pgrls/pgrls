@@ -77,7 +77,7 @@ scoping and is a latent cross-tenant leak), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
+SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -2838,6 +2838,13 @@ Currently fixable:
   restrictive (its no-op `… AND true` write check becomes real).
   SEC006 and SEC020 never fire on the same policy — one needs
   `WITH CHECK` absent, the other needs it present.
+* **SEC031** — emits `DROP POLICY <name> ON <schema>.<table>;` for a
+  restrictive policy whose `USING` is constant `true`. The
+  constant-true clause AND-combines to the identity, so dropping the
+  policy leaves access unchanged — the second `pgrls fix` statement
+  that DROPs an object, safe for the same reason as HYG003's. SEC031's
+  other remedy (giving it a real tenant / ownership predicate) needs
+  human intent and is not auto-fixed.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
