@@ -1,3 +1,4 @@
+#:schema https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json
 # Copy this file to `pgrls.toml` and adjust.
 # Environment variables can be referenced as `$VAR` or `${VAR}`.
 

@@ -277,6 +277,16 @@ not appended (a child `disable` list wins wholesale). For a list, later
 entries override earlier ones, and the declaring file overrides every base.
 A cycle in the `extends` chain is an error.
 
+### Editor support — JSON Schema
+
+pgrls ships a JSON Schema for `pgrls.toml` ([`pgrls.schema.json`](pgrls.schema.json)) so editors autocomplete keys and flag typos and invalid values (a misspelled `[lint.rles]`, a bad `fail_on`). `pgrls init` writes a `#:schema` directive on the first line, which the [Even Better TOML](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml) VS Code extension applies automatically:
+
+```toml
+#:schema https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json
+```
+
+Point any JSON-Schema-aware TOML tooling at that URL for the same validation.
+
 ## Testing your RLS — `pgrls.testing`
 
 Install with `pip install pgrls[testing]` to pull in pytest alongside pgrls.

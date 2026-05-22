@@ -957,6 +957,7 @@ def snapshot(
 # is deliberately left commented so a fresh file doesn't fail with an
 # env-var error before the user has wired up DATABASE_URL.
 _INIT_TEMPLATE = """\
+#:schema https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json
 # pgrls configuration. Rule reference:
 # https://github.com/pgrls/pgrls/blob/main/AGENTS.md
 # Every key is optional; this file documents the common knobs.

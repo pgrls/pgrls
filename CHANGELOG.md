@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.64] - 2026-05-21
+
+### Added
+- **JSON Schema for `pgrls.toml`** (`pgrls.schema.json`) — describes
+  every config table (`extends`, `[database]`, `[lint]`,
+  `[lint.rules.<ID>]` with `severity` + `allowlist`, `[diff]`) with
+  descriptions, enums, and strict `additionalProperties` so editors
+  autocomplete keys and flag typos / invalid values. `pgrls init` now
+  writes a `#:schema` directive on the first line of the generated
+  `pgrls.toml` (and `pgrls.example.toml` carries it too), which the
+  Even Better TOML VS Code extension applies automatically. Point any
+  JSON-Schema-aware TOML tooling at the published schema URL for the
+  same validation.
+
 ## [0.5.63] - 2026-05-21
 
 ### Added

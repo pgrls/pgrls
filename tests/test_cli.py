@@ -62,6 +62,21 @@ def test_init_writes_parseable_default_config(tmp_path) -> None:
     assert cfg.rule_options == {}
 
 
+def test_init_emits_schema_directive(tmp_path) -> None:
+    # The first line is an Even Better TOML `#:schema` directive pointing
+    # at the published JSON Schema, so editors validate / autocomplete the
+    # generated pgrls.toml. It is a comment, so it must not affect parsing
+    # (covered by test_init_writes_parseable_default_config).
+    out = tmp_path / "pgrls.toml"
+    result = CliRunner().invoke(main, ["init", "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    first_line = out.read_text(encoding="utf-8").splitlines()[0]
+    assert first_line == (
+        "#:schema https://raw.githubusercontent.com/pgrls/pgrls/main/"
+        "pgrls.schema.json"
+    )
+
+
 def test_init_defaults_to_pgrls_toml_in_cwd(tmp_path) -> None:
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path):
