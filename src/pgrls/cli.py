@@ -2013,10 +2013,10 @@ def report(
 
     A factual snapshot for audits and onboarding: per-table RLS
     enabled / FORCE'd / policy counts plus a coarse status
-    (`protected` / `not-forced` / `no-policies` / `rls-off`) and an
-    aggregate summary. Reads a live database and runs NO lint rules —
-    use `pgrls lint` for findings. `--format json` / `markdown` emit
-    machine-readable / paste-ready output.
+    (`protected` / `not-forced` / `no-policies` / `covered-by-parent`
+    / `rls-off`) and an aggregate summary. Reads a live database and
+    runs NO lint rules — use `pgrls lint` for findings. `--format
+    json` / `markdown` emit machine-readable / paste-ready output.
     """
     try:
         config = load_config(config_path)
