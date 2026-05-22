@@ -1500,6 +1500,42 @@ def test_sec031_fix_silent_when_using_absent() -> None:
     assert SEC031Fixer().fix(schema, {}) == []
 
 
+def test_sec031_fix_silent_when_with_check_is_a_real_predicate() -> None:
+    # USING (true) is a no-op read floor, but a real WITH CHECK is a
+    # load-bearing write floor (restrictive WITH CHECK AND-combines for
+    # writes). Dropping the policy would let through writes the floor
+    # rejected — a behavior change — so the fixer ABSTAINS even though
+    # SEC031 the rule still fires on the no-op USING.
+    schema = _dup_table(
+        _policy(
+            "true",
+            name="write_floor",
+            command="ALL",
+            with_check="tenant_id = 1",
+            permissive=False,
+        )
+    )
+    assert SEC031Fixer().fix(schema, {}) == []
+
+
+def test_sec031_fix_drops_when_with_check_is_also_constant_true() -> None:
+    # Both USING and WITH CHECK are constant-true → the policy is
+    # genuinely inert on the read AND write sides → the drop is
+    # behavior-preserving, so the fixer emits it.
+    schema = _dup_table(
+        _policy(
+            "true",
+            name="floor",
+            command="ALL",
+            with_check="true",
+            permissive=False,
+        )
+    )
+    fixes = SEC031Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql == "DROP POLICY floor ON public.t;"
+
+
 def test_sec031_fix_respects_allowlist() -> None:
     schema = _dup_table(_policy("true", name="floor", permissive=False))
     assert (

@@ -2102,9 +2102,12 @@ constant-true restrictive policy is deliberate scaffolding.
 **Auto-fix.** `pgrls fix` emits `DROP POLICY` for the no-op floor: its
 `USING (true)` AND-combines to nothing, so dropping it leaves access
 unchanged (the same reasoning that makes HYG003's drop safe). The
-*other* remedy — giving it the real tenant / ownership predicate —
-needs human intent and is not auto-fixed; if a real floor was
-intended, write the predicate instead of dropping.
+fixer drops only *genuinely inert* policies: it abstains when the
+policy also carries a real `WITH CHECK`, because a restrictive `WITH
+CHECK` is a load-bearing write floor (it AND-combines for writes) and
+dropping it WOULD change write access — that case is left for human
+review. The *other* remedy — giving the read floor the real tenant /
+ownership predicate — needs human intent and is not auto-fixed either.
 
 <a id="rule-sec032"></a>
 
@@ -2842,9 +2845,11 @@ Currently fixable:
   restrictive policy whose `USING` is constant `true`. The
   constant-true clause AND-combines to the identity, so dropping the
   policy leaves access unchanged — the second `pgrls fix` statement
-  that DROPs an object, safe for the same reason as HYG003's. SEC031's
-  other remedy (giving it a real tenant / ownership predicate) needs
-  human intent and is not auto-fixed.
+  that DROPs an object, safe for the same reason as HYG003's. The
+  fixer abstains when the policy carries a real `WITH CHECK` (a
+  load-bearing write floor whose drop WOULD change write access), so
+  it only drops genuinely inert policies. SEC031's other remedy (a
+  real tenant / ownership predicate) needs human intent.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
