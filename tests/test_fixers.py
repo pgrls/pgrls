@@ -20,6 +20,7 @@ from pgrls.fixers.sec006 import SEC006Fixer
 from pgrls.fixers.sec011 import SEC011Fixer
 from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
+from pgrls.fixers.sec031 import SEC031Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
 from pgrls.model import Index, Policy, Schema, Table, View
@@ -1463,6 +1464,88 @@ def test_hyg003_fix_raises_on_malformed_allowlist() -> None:
         HYG003Fixer().fix(schema, {"allowlist": [" public.t.p_b "]})
 
 
+# ---------- SEC031 fixer ----------
+
+
+def test_sec031_fix_emits_drop_policy_for_restrictive_true() -> None:
+    schema = _dup_table(_policy("true", name="floor", permissive=False))
+    fixes = SEC031Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC031"
+    assert f.location == "public.t.floor"
+    assert f.sql == "DROP POLICY floor ON public.t;"
+
+
+def test_sec031_fix_silent_on_permissive_true() -> None:
+    # Permissive USING (true) is SEC008's territory (admits every row);
+    # dropping it would CHANGE access, so the SEC031 fixer skips it.
+    schema = _dup_table(_policy("true", name="open", permissive=True))
+    assert SEC031Fixer().fix(schema, {}) == []
+
+
+def test_sec031_fix_silent_on_restrictive_with_real_predicate() -> None:
+    # A restrictive policy with a real USING is a genuine floor — keep it.
+    schema = _dup_table(
+        _policy("tenant_id = 1", name="floor", permissive=False)
+    )
+    assert SEC031Fixer().fix(schema, {}) == []
+
+
+def test_sec031_fix_silent_when_using_absent() -> None:
+    # No USING clause → nothing constant-true to drop.
+    schema = _dup_table(
+        _policy(None, name="floor", command="INSERT", permissive=False)
+    )
+    assert SEC031Fixer().fix(schema, {}) == []
+
+
+def test_sec031_fix_respects_allowlist() -> None:
+    schema = _dup_table(_policy("true", name="floor", permissive=False))
+    assert (
+        SEC031Fixer().fix(schema, {"allowlist": ["public.t.floor"]}) == []
+    )
+
+
+def test_sec031_fix_emits_one_per_offending_policy() -> None:
+    schema = _dup_table(
+        _policy("true", name="floor_a", permissive=False),
+        _policy("tenant_id = 1", name="real", permissive=False),
+        _policy("true", name="floor_b", permissive=False),
+    )
+    fixes = SEC031Fixer().fix(schema, {})
+    assert sorted(f.location for f in fixes) == [
+        "public.t.floor_a",
+        "public.t.floor_b",
+    ]
+
+
+def test_sec031_fix_quotes_policy_and_table_when_required() -> None:
+    schema = _dup_table(
+        _policy("true", name="my floor", permissive=False),
+        name="MixedCase Table",
+    )
+    sql = SEC031Fixer().fix(schema, {})[0].sql
+    assert sql == 'DROP POLICY "my floor" ON public."MixedCase Table";'
+
+
+def test_sec031_fix_description_explains_noop_and_alternative() -> None:
+    # The fixer DROPs, but SEC031's other remedy (a real predicate)
+    # needs human intent — the description must point at it.
+    schema = _dup_table(_policy("true", name="floor", permissive=False))
+    [f] = SEC031Fixer().fix(schema, {})
+    assert "no-op" in f.description
+    assert "predicate" in f.description
+
+
+def test_sec031_fix_raises_on_malformed_allowlist() -> None:
+    schema = _dup_table(_policy("true", name="floor", permissive=False))
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC031Fixer().fix(schema, {"allowlist": "public.t.floor"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC031Fixer().fix(schema, {"allowlist": [" public.t.floor "]})
+
+
 # ---------- generate_fixes / registry ----------
 
 
@@ -1717,6 +1800,7 @@ def test_default_fixers_registers_every_shipping_fixer() -> None:
         "SEC011",
         "SEC019",
         "SEC020",
+        "SEC031",
         "PERF001",
         "PERF003",
         "HYG003",

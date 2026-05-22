@@ -2099,8 +2099,12 @@ meant to enforce — the tenant / ownership key — or to drop it if it
 was never needed. Allowlist by qualified policy ID when a
 constant-true restrictive policy is deliberate scaffolding.
 
-**No auto-fix** — the intended predicate is the application's tenant /
-ownership key, which pgrls can't infer.
+**Auto-fix.** `pgrls fix` emits `DROP POLICY` for the no-op floor: its
+`USING (true)` AND-combines to nothing, so dropping it leaves access
+unchanged (the same reasoning that makes HYG003's drop safe). The
+*other* remedy — giving it the real tenant / ownership predicate —
+needs human intent and is not auto-fixed; if a real floor was
+intended, write the predicate instead of dropping.
 
 <a id="rule-sec032"></a>
 
@@ -3338,7 +3342,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, Markdown, GitHub-annotation, and JUnit output.**
