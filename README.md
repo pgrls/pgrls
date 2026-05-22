@@ -245,7 +245,7 @@ pgrls report --database-url "$DATABASE_URL" --format json      # machine-readabl
 pgrls report --database-url "$DATABASE_URL" --format markdown  # paste into an audit doc
 ```
 
-Each table gets a coarse status derived purely from `relrowsecurity`, `relforcerowsecurity`, and policy counts — `protected` (RLS on, FORCE'd, has policies), `not-forced` (RLS on, policies, owner bypasses), `no-policies` (RLS on, default-deny), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
+Each table gets a coarse status — `protected` (RLS on, FORCE'd, has policies), `not-forced` (RLS on, policies, owner bypasses), `no-policies` (RLS on, default-deny for non-owners), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it, mirroring SEC001), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
 
 ## Configuration
 

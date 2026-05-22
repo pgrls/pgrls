@@ -59,6 +59,45 @@ def test_status_precedence() -> None:
     assert statuses["public.good"] == "protected"
 
 
+def test_partition_child_covered_by_rls_parent() -> None:
+    # Postgres doesn't propagate relrowsecurity to partition children,
+    # but queries through the parent apply its policies — so a child of
+    # an RLS-enabled parent is "covered-by-parent", not "rls-off"
+    # (mirrors how SEC001 skips such children).
+    parent = _table("events", rls=True, force=True, policies=(_policy(),))
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    rep = build_report(Schema(tables=(parent, child)))
+    statuses = {t.qualified_name: t.status for t in rep.tables}
+    assert statuses["public.events"] == "protected"
+    assert statuses["public.events_2026"] == "covered-by-parent"
+    assert rep.summary["status_covered_by_parent"] == 1
+
+
+def test_partition_child_rls_off_when_parent_has_no_rls() -> None:
+    # No RLS-enabled ancestor → the child is genuinely "rls-off".
+    parent = _table("events", rls=False, force=False)
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "events"),
+    )
+    statuses = {
+        t.qualified_name: t.status
+        for t in build_report(Schema(tables=(parent, child))).tables
+    }
+    assert statuses["public.events_2026"] == "rls-off"
+
+
 def test_permissive_restrictive_counts() -> None:
     schema = Schema(
         tables=(
@@ -115,7 +154,7 @@ def test_render_text_has_headers_rows_and_summary() -> None:
     assert "TABLE" in out and "STATUS" in out and "POLICIES" in out
     assert "public.good" in out
     assert "protected" in out
-    assert "1 tables:" in out
+    assert "1 table: 1 protected." in out  # pluralized, non-zero only
 
 
 def test_render_text_empty_schema() -> None:

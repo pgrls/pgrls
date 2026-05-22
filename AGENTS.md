@@ -193,9 +193,11 @@ catalog: one line per rule with its severity and title.
 
 `pgrls report` is the rule-free counterpart: it prints each table's
 RLS posture — RLS enabled / `FORCE`'d / policy counts plus a coarse
-`protected` / `not-forced` / `no-policies` / `rls-off` status — and an
-aggregate summary, in text / JSON / Markdown. A snapshot for audits
-and onboarding; it runs no rules and emits no findings.
+`protected` / `not-forced` / `no-policies` / `covered-by-parent` /
+`rls-off` status (the `covered-by-parent` case credits a partition
+child whose RLS-enabled ancestor covers it, mirroring SEC001's skip) —
+and an aggregate summary, in text / JSON / Markdown. A snapshot for
+audits and onboarding; it runs no rules and emits no findings.
 
 <a id="rule-sec001"></a>
 

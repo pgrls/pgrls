@@ -6,11 +6,20 @@ table's row-level-security state, for audits and onboarding. It runs no
 rules and emits no findings; it summarizes `relrowsecurity`,
 `relforcerowsecurity`, and policy counts as introspected.
 
-Each table gets a coarse `status` derived purely from those three
-facts (not from any rule), in precedence order:
+Each table gets a coarse `status` derived from those facts (plus
+declarative-partition ancestry — see ``covered-by-parent``), in
+precedence order:
 
-* ``rls-off``      — RLS not enabled (the table is wide open to anyone
-  with table privileges; if it also has policies they are dormant).
+* ``covered-by-parent`` — RLS not enabled on this table, but it is a
+  declarative-partition child of a table that *does* have RLS. Postgres
+  does not propagate ``relrowsecurity`` to children, but queries routed
+  through the parent apply the parent's policies, so the child is
+  covered (this mirrors how SEC001 skips such children). Direct queries
+  against the child still bypass the parent's policies — a documented
+  caveat.
+* ``rls-off``      — RLS not enabled and no RLS-enabled ancestor (the
+  table is wide open to anyone with table privileges; if it also has
+  policies they are dormant).
 * ``no-policies``  — RLS on but zero policies: Postgres default-denies,
   so the table is locked to non-owners.
 * ``not-forced``   — RLS on with policies, but not ``FORCE``d, so the
@@ -24,7 +33,28 @@ from dataclasses import dataclass
 
 from pgrls.model import Schema
 
-STATUSES = ("rls-off", "no-policies", "not-forced", "protected")
+# Ordered best → worst, which is also the order the summary line lists
+# non-zero counts. (The `status` property's precedence is independent of
+# this tuple; this only drives summary display and the count keys.)
+STATUSES = (
+    "protected",
+    "not-forced",
+    "no-policies",
+    "covered-by-parent",
+    "rls-off",
+)
+
+_STATUS_LABELS = {
+    "protected": "protected",
+    "not-forced": "not forced",
+    "no-policies": "no policies",
+    "covered-by-parent": "covered by parent",
+    "rls-off": "RLS off",
+}
+
+
+def _status_key(status: str) -> str:
+    return f"status_{status.replace('-', '_')}"
 
 
 @dataclass(frozen=True)
@@ -35,11 +65,15 @@ class TablePosture:
     policy_count: int
     permissive_count: int
     restrictive_count: int
+    # True when this table is a partition child whose ancestor chain
+    # reaches a table with RLS enabled — it is covered via the parent
+    # even though its own `relrowsecurity` is false.
+    covered_by_ancestor: bool = False
 
     @property
     def status(self) -> str:
         if not self.rls_enabled:
-            return "rls-off"
+            return "covered-by-parent" if self.covered_by_ancestor else "rls-off"
         if self.policy_count == 0:
             return "no-policies"
         if not self.force_rls:
@@ -63,7 +97,7 @@ class Report:
             "with_policies": sum(
                 1 for t in self.tables if t.policy_count > 0
             ),
-            **{f"status_{s.replace('-', '_')}": counts[s] for s in STATUSES},
+            **{_status_key(s): counts[s] for s in STATUSES},
         }
 
 
@@ -71,11 +105,17 @@ def build_report(schema: Schema) -> Report:
     """Build the posture report from an introspected `schema`.
 
     Tables are sorted by qualified name so the output is deterministic.
+    A partition child whose ancestor chain reaches an RLS-enabled table
+    is marked `covered_by_ancestor` (same coverage logic SEC001 uses to
+    skip such children).
     """
     postures = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         permissive = sum(1 for p in table.policies if p.permissive)
         restrictive = len(table.policies) - permissive
+        covered = any(
+            ancestor.rls_enabled for ancestor in schema.ancestors_of(table)
+        )
         postures.append(
             TablePosture(
                 qualified_name=table.qualified_name,
@@ -84,9 +124,25 @@ def build_report(schema: Schema) -> Report:
                 policy_count=len(table.policies),
                 permissive_count=permissive,
                 restrictive_count=restrictive,
+                covered_by_ancestor=covered,
             )
         )
     return Report(tables=tuple(postures))
+
+
+def _summary_line(report: Report) -> str:
+    """`N table(s): X protected, Y not forced, …` — non-zero statuses
+    only, pluralized, in STATUSES order."""
+    n = len(report.tables)
+    noun = "table" if n == 1 else "tables"
+    s = report.summary
+    parts = [
+        f"{s[_status_key(st)]} {_STATUS_LABELS[st]}"
+        for st in STATUSES
+        if s[_status_key(st)]
+    ]
+    detail = ", ".join(parts) if parts else "none"
+    return f"{n} {noun}: {detail}."
 
 
 def render_text(report: Report) -> str:
@@ -112,14 +168,8 @@ def render_text(report: Report) -> str:
     out = [line]
     for r in rows:
         out.append("  ".join(r[i].ljust(widths[i]) for i in range(len(r))))
-    s = report.summary
     out.append("")
-    out.append(
-        f"{s['tables']} tables: {s['status_protected']} protected, "
-        f"{s['status_not_forced']} not forced, "
-        f"{s['status_no_policies']} no policies, "
-        f"{s['status_rls_off']} RLS off."
-    )
+    out.append(_summary_line(report))
     return "\n".join(out)
 
 
@@ -145,14 +195,10 @@ def render_json(report: Report) -> str:
 
 def render_markdown(report: Report) -> str:
     """Markdown table + summary, paste-ready for an audit doc / PR."""
-    s = report.summary
     out = [
         "# RLS posture",
         "",
-        f"{s['tables']} tables — **{s['status_protected']}** protected, "
-        f"{s['status_not_forced']} not forced, "
-        f"{s['status_no_policies']} no policies, "
-        f"{s['status_rls_off']} RLS off.",
+        _summary_line(report),
         "",
         "| Table | Status | RLS | FORCE | Policies |",
         "|---|---|---|---|---|",

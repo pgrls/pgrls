@@ -16,8 +16,10 @@ breaking changes — they will be called out in this file.
 - **`pgrls report`** — a new read-only command that summarizes the
   RLS posture of every table: per-table RLS enabled / `FORCE`'d /
   policy counts (permissive + restrictive) plus a coarse status
-  (`protected` / `not-forced` / `no-policies` / `rls-off`) derived
-  purely from those facts, and an aggregate summary. The rule-free
+  (`protected` / `not-forced` / `no-policies` / `covered-by-parent` /
+  `rls-off`) — where `covered-by-parent` credits a declarative-partition
+  child whose RLS-enabled ancestor covers it (mirroring SEC001) rather
+  than mislabeling it `rls-off` — and an aggregate summary. The rule-free
   counterpart to `pgrls lint` — a snapshot for audits and onboarding;
   it runs no rules and emits no findings. `--format text` (default) /
   `json` / `markdown`, reading a live database (or `$DATABASE_URL`).
