@@ -28,8 +28,8 @@ release listed below — nothing here is new in 0.6.0):
   JUnit XML.
 - JSON Schema for `pgrls.toml`; zero-config `pgrls init` scaffolding.
 - The `pgrls.testing` pytest plugin for RLS isolation tests.
-- GitHub Action (`pgrls/pgrls-action`) on the Marketplace; PyPI Trusted
-  Publishing.
+- PyPI Trusted Publishing, plus a documented GitHub Actions CI recipe
+  (`pgrls lint` with SARIF upload to code scanning).
 
 ## [0.5.67] - 2026-05-21
 
