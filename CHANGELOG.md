@@ -17,9 +17,11 @@ breaking changes — they will be called out in this file.
   RLS posture of every table: per-table RLS enabled / `FORCE`'d /
   policy counts (permissive + restrictive) plus a coarse status
   (`protected` / `not-forced` / `no-policies` / `covered-by-parent` /
-  `rls-off`) — where `covered-by-parent` credits a declarative-partition
-  child whose RLS-enabled ancestor covers it (mirroring SEC001) rather
-  than mislabeling it `rls-off` — and an aggregate summary. The rule-free
+  `rls-off`) — `covered-by-parent` credits a declarative-partition child
+  whose RLS-enabled ancestor is among the scanned schemas (rather than
+  mislabeling it `rls-off`), and `no-policies` covers both zero-policy
+  and restrictive-only (default-deny) tables — plus an aggregate
+  summary. The rule-free
   counterpart to `pgrls lint` — a snapshot for audits and onboarding;
   it runs no rules and emits no findings. `--format text` (default) /
   `json` / `markdown`, reading a live database (or `$DATABASE_URL`).

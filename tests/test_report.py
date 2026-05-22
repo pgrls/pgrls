@@ -98,6 +98,25 @@ def test_partition_child_rls_off_when_parent_has_no_rls() -> None:
     assert statuses["public.events_2026"] == "rls-off"
 
 
+def test_restrictive_only_forced_is_no_policies_not_protected() -> None:
+    # RLS on + FORCE but only RESTRICTIVE policies → no permissive policy
+    # grants visibility, so it's default-deny, NOT the green "protected".
+    schema = Schema(
+        tables=(
+            _table(
+                "locked",
+                rls=True,
+                force=True,
+                policies=(_policy(permissive=False),),
+            ),
+        )
+    )
+    [t] = build_report(schema).tables
+    assert t.permissive_count == 0
+    assert t.restrictive_count == 1
+    assert t.status == "no-policies"
+
+
 def test_permissive_restrictive_counts() -> None:
     schema = Schema(
         tables=(

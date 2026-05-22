@@ -14,17 +14,23 @@ precedence order:
   declarative-partition child of a table that *does* have RLS. Postgres
   does not propagate ``relrowsecurity`` to children, but queries routed
   through the parent apply the parent's policies, so the child is
-  covered (this mirrors how SEC001 skips such children). Direct queries
-  against the child still bypass the parent's policies — a documented
-  caveat.
+  covered. (This is credited only when an RLS-enabled ancestor is among
+  the *scanned* schemas; if the partition chain leaves the scanned set,
+  coverage can't be confirmed and the child shows ``rls-off`` — note
+  SEC001 instead fires a distinct "cannot verify" finding there, so the
+  two aren't identical for that edge.) Direct queries against the child
+  still bypass the parent's policies — a documented caveat.
 * ``rls-off``      — RLS not enabled and no RLS-enabled ancestor (the
   table is wide open to anyone with table privileges; if it also has
   policies they are dormant).
-* ``no-policies``  — RLS on but zero policies: Postgres default-denies,
-  so the table is locked to non-owners.
-* ``not-forced``   — RLS on with policies, but not ``FORCE``d, so the
-  table owner bypasses every policy.
-* ``protected``    — RLS on, ``FORCE``d, and at least one policy.
+* ``no-policies``  — RLS on but no *permissive* policy: Postgres
+  default-denies, so the table is locked to non-owners. Covers both a
+  table with zero policies and one with only RESTRICTIVE policies
+  (which AND-combine and grant nothing on their own).
+* ``not-forced``   — RLS on with a permissive policy, but not ``FORCE``d,
+  so the table owner bypasses every policy.
+* ``protected``    — RLS on, ``FORCE``d, and at least one *permissive*
+  policy.
 """
 from __future__ import annotations
 
@@ -74,7 +80,13 @@ class TablePosture:
     def status(self) -> str:
         if not self.rls_enabled:
             return "covered-by-parent" if self.covered_by_ancestor else "rls-off"
-        if self.policy_count == 0:
+        # Visibility is granted only by PERMISSIVE policies; with none,
+        # Postgres default-denies every row to non-owners — whether the
+        # table has zero policies or only RESTRICTIVE ones (which
+        # AND-combine and grant nothing on their own). Both are the same
+        # "no permissive policy → deny-all" posture, so a restrictive-only
+        # table is NOT reported as the green `protected`.
+        if self.permissive_count == 0:
             return "no-policies"
         if not self.force_rls:
             return "not-forced"

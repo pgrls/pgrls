@@ -245,7 +245,7 @@ pgrls report --database-url "$DATABASE_URL" --format json      # machine-readabl
 pgrls report --database-url "$DATABASE_URL" --format markdown  # paste into an audit doc
 ```
 
-Each table gets a coarse status — `protected` (RLS on, FORCE'd, has policies), `not-forced` (RLS on, policies, owner bypasses), `no-policies` (RLS on, default-deny for non-owners), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it, mirroring SEC001), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
+Each table gets a coarse status — `protected` (RLS on, FORCE'd, ≥1 permissive policy), `not-forced` (RLS on with a permissive policy, but owner bypasses), `no-policies` (RLS on but no permissive policy → default-deny; covers zero policies *and* restrictive-only tables), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it — credited when that parent is among the scanned schemas), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
 
 ## Configuration
 
