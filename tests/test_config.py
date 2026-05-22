@@ -206,6 +206,27 @@ def test_invalid_toml_syntax_raises_config_error(tmp_path: Path) -> None:
         load_config(path=cfg_file)
 
 
+def test_unreadable_config_file_raises_config_error(tmp_path: Path) -> None:
+    # A config file that exists (so `_resolve_path`'s `is_file()` check
+    # passes) but cannot be opened for reading surfaces the OSError as a
+    # clean ConfigError, not a raw traceback. `chmod 000` revokes read
+    # permission; root bypasses file permissions, so skip there.
+    import os
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("file permissions do not apply to root")
+
+    cfg_file = tmp_path / "pgrls.toml"
+    cfg_file.write_text('[lint]\nfail_on = "warning"\n')
+    cfg_file.chmod(0o000)
+    try:
+        with pytest.raises(ConfigError, match="Cannot read config"):
+            load_config(path=cfg_file)
+    finally:
+        # Restore permissions so tmp_path cleanup can remove the file.
+        cfg_file.chmod(0o644)
+
+
 def test_empty_toml_yields_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     cfg_file = tmp_path / "pgrls.toml"
@@ -468,6 +489,24 @@ def test_diff_fail_on_invalid_value_raises(tmp_path: Path) -> None:
         '[diff]\nfail_on = "super-extra-dangerous"\n'
     )
     with pytest.raises(ConfigError, match=r"\[diff\]\.fail_on"):
+        load_config(cfg)
+
+
+def test_diff_fail_on_rejects_non_string(tmp_path: Path) -> None:
+    import pytest
+
+    from pgrls.config import ConfigError
+
+    # `[diff].fail_on = 3` is the wrong TYPE (an integer). The string
+    # check fires before the value-membership check, so the error
+    # names the field and the offending type rather than listing the
+    # valid string choices.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text(
+        '[database]\nurl = "postgres://x/"\n'
+        "[diff]\nfail_on = 3\n"
+    )
+    with pytest.raises(ConfigError, match=r"\[diff\]\.fail_on must be a string"):
         load_config(cfg)
 
 

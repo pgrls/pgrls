@@ -4,7 +4,11 @@ from __future__ import annotations
 import pytest
 
 from pgrls.diff.differ import Change, ChangeKind
-from pgrls.diff.formatters import format_diff_text
+from pgrls.diff.formatters import (
+    EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    _trailing_summary,
+    format_diff_text,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +40,30 @@ def _change(
 def test_empty_changes_renders_no_changes_summary():
     result = format_diff_text([])
     assert result == "pgrls diff: no changes."
+
+
+def test_trailing_summary_handles_empty_change_list_directly():
+    # `format_diff_text` short-circuits empty input before the summary,
+    # but `_trailing_summary` is a standalone helper that must produce
+    # the same "no changes" line when handed an empty list — pins the
+    # helper's empty-input branch independent of its public caller.
+    assert _trailing_summary([]) == "pgrls diff: no changes."
+
+
+def test_stanza_with_empty_location_renders_sentinel():
+    # A Change whose `location` is the empty string (defensively
+    # handled — the differ doesn't emit one today) must not produce a
+    # bare `- ` header. The renderer substitutes the
+    # `(empty-or-zero-width)` sentinel so the reader sees that there
+    # WAS a location slot, kept on a single line for CI greps.
+    change = _change(
+        ChangeKind.TABLE_DROPPED,
+        "breaking",
+        location="",
+        message="Table dropped.",
+    )
+    header = format_diff_text([change]).split("\n")[0]
+    assert header == f"- {EMPTY_OR_ZERO_WIDTH_SENTINEL}"
 
 
 # ---------------------------------------------------------------------------

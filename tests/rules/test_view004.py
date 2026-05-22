@@ -443,6 +443,28 @@ def test_view004_bare_name_collision_reports_all_rls_candidates() -> None:
     assert "staging.user" in msg
 
 
+def test_view004_skips_secdef_function_with_empty_body() -> None:
+    # A SECDEF function whose body parses to zero statements (empty,
+    # whitespace, or comment-only) yields no range vars to inspect.
+    # `pglast.parse_sql` returns an empty list — VIEW004 must skip it
+    # cleanly (the `if not parsed: continue` guard) rather than index
+    # into `parsed[0]`.
+    schema = Schema(
+        tables=(_table("public", "secret", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="secret_view",
+                security_definer_calls=("public.empty_fn",),
+            ),
+        ),
+        security_definer_functions=(
+            _secdef("public.empty_fn", "  -- nothing here\n"),
+        ),
+    )
+    assert VIEW004().check(schema, options={}) == []
+
+
 def test_view004_does_not_fire_when_function_reads_no_table() -> None:
     # SECDEF function exists, view calls it, but the function body
     # doesn't read any table (e.g. a pure scalar computation).

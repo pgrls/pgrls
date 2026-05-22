@@ -39,6 +39,25 @@ def test_root_version_flag():
     assert __version__ in result.output
 
 
+def test_python_dash_m_pgrls_invokes_cli(monkeypatch, capsys) -> None:
+    # `python -m pgrls` runs `src/pgrls/__main__.py`, whose
+    # `if __name__ == "__main__": main()` block dispatches to the CLI.
+    # `runpy.run_module(run_name="__main__")` executes that block
+    # in-process (so it's the same entry the documented subprocess form
+    # uses). `--version` exits 0 after printing the version.
+    import runpy
+
+    import pytest
+
+    from pgrls import __version__
+
+    monkeypatch.setattr("sys.argv", ["pgrls", "--version"])
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_module("pgrls", run_name="__main__")
+    assert exc_info.value.code == 0
+    assert __version__ in capsys.readouterr().out
+
+
 def test_init_writes_parseable_default_config(tmp_path) -> None:
     # `init` needs no database. The file it writes must parse through
     # load_config AND leave every setting at its default, so a fresh
@@ -370,7 +389,99 @@ def test_explain_format_unknown_value_errors() -> None:
     assert "xml" in result.output
 
 
+# --- docstring-degradation helpers ---------------------------------------
+#
+# Every SHIPPED rule has a two-paragraph module docstring (title line +
+# reference paragraph), enforced by test_explain_covers_every_registered_rule.
+# These tests pin the graceful-degradation paths the helpers take for a
+# rule whose docstring is absent (e.g. under `python -OO`) or doesn't
+# follow the two-paragraph convention — paths no shipped rule reaches.
+
+
+def _fake_rule(monkeypatch, *, module_doc: str | None):
+    """Build a Rule whose class module has the given `__doc__`.
+
+    `_rule_docstring` reads `inspect.getmodule(type(rule)).__doc__`, so
+    the docstring is controlled by registering a throwaway module in
+    `sys.modules` (auto-restored by monkeypatch) and pointing the fake
+    rule class's `__module__` at it.
+    """
+    import sys
+    import types
+
+    mod_name = "pgrls_fake_rule_module_for_test"
+    mod = types.ModuleType(mod_name)
+    mod.__doc__ = module_doc
+    monkeypatch.setitem(sys.modules, mod_name, mod)
+
+    class _FakeRule:
+        id = "FAKE001"
+        severity = "info"
+        title = "Fake rule"
+
+        def check(self, schema, options):  # pragma: no cover - never run
+            return []
+
+    _FakeRule.__module__ = mod_name
+    return _FakeRule()
+
+
+def test_rule_rationale_paragraph_empty_when_docstring_absent(
+    monkeypatch,
+) -> None:
+    # No module docstring → `pgrls lint --explain` degrades to the
+    # un-augmented message (empty rationale).
+    from pgrls.cli import _rule_rationale_paragraph
+
+    rule = _fake_rule(monkeypatch, module_doc=None)
+    assert _rule_rationale_paragraph(rule) == ""
+
+
+def test_rule_rationale_paragraph_empty_when_single_paragraph(
+    monkeypatch,
+) -> None:
+    # A docstring with only the title line (no blank-line-separated
+    # reference paragraph) has nothing to surface as a rationale.
+    from pgrls.cli import _rule_rationale_paragraph
+
+    rule = _fake_rule(
+        monkeypatch, module_doc="FAKE001 — Fake rule. One line only."
+    )
+    assert _rule_rationale_paragraph(rule) == ""
+
+
+def test_rule_docstring_body_empty_when_docstring_absent(
+    monkeypatch,
+) -> None:
+    # `explain` (text + json + markdown) shows an empty reference body
+    # for a rule with no docstring rather than crashing.
+    from pgrls.cli import _rule_docstring_body
+
+    rule = _fake_rule(monkeypatch, module_doc=None)
+    assert _rule_docstring_body(rule) == ""
+
+
+def test_human_bytes_renders_petabytes() -> None:
+    # `_human_bytes` walks B → kB → MB → GB → TB and, for sizes that
+    # exceed every named unit, falls through the loop to the PB suffix.
+    # Cache images never reach this scale, but the final return must be
+    # exercised so the unit ladder has no dead rung.
+    from pgrls.cli import _human_bytes
+
+    # 2000 TB = 2 PB (decimal, 1000-based — matching `docker images`).
+    assert _human_bytes(2 * 1000**5) == "2.0PB"
+    # Just over 1 PB stays in the PB rung too.
+    assert _human_bytes(1500 * 1000**4).endswith("PB")
+
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+# A connection string that fails instantly with a psycopg.Error: it
+# dials a Unix socket in a directory that cannot exist, so psycopg
+# raises OperationalError synchronously — no DNS/TCP timeout, no
+# network. Drives the "Database error" ToolError paths deterministically
+# without needing (or reaching) a real server.
+_BAD_SOCKET_URL = "postgresql://u@/db?host=/nonexistent_pgrls_socket_dir"
 
 # Derive from the rule registry so a new rule lands without the
 # tuple drifting silently. `all_rules()` itself is covered by
@@ -485,6 +596,18 @@ def test_lint_bad_toml_exits_2_not_1(tmp_path) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--config", str(cfg)])
     assert result.exit_code == 2
+
+
+def test_lint_database_connection_error_exits_2_cleanly() -> None:
+    # A connection that fails at the psycopg layer (bad conninfo)
+    # surfaces as a ToolError (exit 2) with a "Database error" prefix,
+    # not exit 1 (findings) and not a raw traceback. Pins lint's
+    # `except psycopg.Error` branch.
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--database-url", _BAD_SOCKET_URL])
+    assert result.exit_code == 2, result.output
+    assert "Database error" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_lint_disable_skips_rule(pg_url: str, apply_sql, tmp_path) -> None:
@@ -617,6 +740,34 @@ def test_run_rules_severity_override_remaps_what_survives_allowlist() -> None:
     assert [(v.rule_id, v.location, v.severity) for v in found] == [
         ("SEC001", surviving.qualified_name, "info")
     ]
+
+
+def test_run_rules_recursion_error_becomes_runtime_error(monkeypatch) -> None:
+    # A rule whose check() blows the recursion limit (a pathologically
+    # deep policy AST) must surface as a clean RuntimeError naming the
+    # rule, not crash the whole lint run with a raw RecursionError.
+    # Inject a registry with one rule that raises RecursionError so the
+    # path is exercised without hand-crafting a thousand-deep AST.
+    import pytest
+
+    import pgrls.cli as cli_mod
+    from pgrls.rules import RuleRegistry
+
+    class _DeepRule:
+        id = "DEEP001"
+        severity = "error"
+        title = "Always recurses"
+
+        def check(self, schema, options):
+            raise RecursionError("simulated deep AST")
+
+    registry = RuleRegistry()
+    registry.register(_DeepRule())
+    monkeypatch.setattr(cli_mod, "default_registry", lambda: registry)
+
+    schema = Schema(tables=())
+    with pytest.raises(RuntimeError, match="DEEP001: policy AST too deep"):
+        _run_rules(schema, config=Config())
 
 
 def test_lint_severity_override_changes_exit_code(
@@ -1938,6 +2089,27 @@ def test_lint_baseline_malformed_file_errors_clearly(
     assert "baseline" in result.output.lower()
 
 
+def test_lint_baseline_first_run_unwritable_path_errors_clearly(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # First `--baseline` run (file absent) tries to WRITE the baseline.
+    # When the target path is unwritable (parent dir doesn't exist),
+    # `write_baseline` raises BaselineError, which `_apply_baseline`
+    # turns into a ToolError (exit 2) with a clear message — not a
+    # traceback. Distinct from the `--update-baseline` write path
+    # (already covered): this is the auto-create-on-first-run write.
+    apply_sql("CREATE TABLE public.legacy (id INT);")
+    baseline = tmp_path / "missing_dir" / "b.json"
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["lint", "--database-url", pg_url, "--baseline", str(baseline)],
+    )
+    assert result.exit_code == 2, result.output
+    assert "baseline" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
 def test_lint_update_baseline_requires_baseline_flag() -> None:
     # --update-baseline names the *action*; --baseline names the
     # *file*. Without the latter there is no target — surface a
@@ -2271,6 +2443,44 @@ def test_fix_missing_database_url_errors_clearly(monkeypatch) -> None:
     result = runner.invoke(main, ["fix"])
     assert result.exit_code != 0
     assert "DATABASE_URL" in result.output or "database-url" in result.output
+
+
+def test_fix_database_connection_error_exits_2_cleanly() -> None:
+    # A connection that fails at the psycopg layer surfaces as a
+    # ToolError (exit 2) with a "Database error" prefix, not a raw
+    # traceback. Pins the `except psycopg.Error` branch in `fix`.
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--database-url", _BAD_SOCKET_URL])
+    assert result.exit_code == 2, result.output
+    assert "Database error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_fix_unknown_schema_exits_2_cleanly(pg_url: str) -> None:
+    # An unknown schema makes `introspect` raise ValueError inside the
+    # connection block; `fix` converts it to a ToolError (exit 2) via
+    # its `except ValueError` branch — not a traceback.
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--schemas", "no_such_schema"],
+    )
+    assert result.exit_code == 2, result.output
+    assert "no_such_schema" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_fix_bad_toml_exits_2_not_1(tmp_path) -> None:
+    # A malformed config file is a ConfigError, surfaced as a ToolError
+    # (exit 2) before any DB connection — the same clean-error contract
+    # `pgrls lint` follows for bad TOML. Pins `fix`'s `except
+    # ConfigError` branch.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text("[database\n")  # malformed TOML
+    runner = CliRunner()
+    result = runner.invoke(main, ["fix", "--config", str(cfg)])
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
 
 
 def test_fix_apply_handles_multiple_fixes(

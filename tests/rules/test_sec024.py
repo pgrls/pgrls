@@ -147,6 +147,26 @@ def test_sec024_silent_on_dynamic_parameter_name() -> None:
     assert SEC024().check(schema, options={}) == []
 
 
+def test_sec024_silent_on_non_string_literal_argument() -> None:
+    # `current_setting(42)` — the first argument is an A_Const whose
+    # `.val` is an Integer, not a String. SEC024 only inspects
+    # string-literal names (a real parameter name is a string), so a
+    # numeric literal is left alone rather than flagged. The call is
+    # itself nonsensical (Postgres would error on it), but the rule
+    # must not crash trying to read `.sval` off a non-String.
+    schema = _schema(_policy(using="tenant_id = current_setting(42)"))
+    assert SEC024().check(schema, options={}) == []
+
+
+def test_sec024_silent_on_zero_argument_call() -> None:
+    # `current_setting()` with no arguments at all — `find_func_calls`
+    # still matches the name, but there is no first argument to read.
+    # SEC024 skips it (the `args` list is empty) rather than indexing
+    # into nothing.
+    schema = _schema(_policy(using="tenant_id::text = current_setting()"))
+    assert SEC024().check(schema, options={}) == []
+
+
 # --- message / multiple --------------------------------------------------
 
 

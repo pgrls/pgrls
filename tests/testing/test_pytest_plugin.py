@@ -60,6 +60,47 @@ def test_pgrls_test_database_url_raises_when_unconfigured(
     assert "pgrls_test_database_url" in msg
 
 
+def test_pgrls_test_database_url_fixture_returns_resolved_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The `pgrls_test_database_url` fixture's body simply returns
+    # `_resolve_database_url()`. Call the undecorated function directly
+    # (the resolution logic is unit-tested above; this pins the fixture
+    # wrapper actually delegates to it).
+    from pgrls.testing.pytest_plugin import pgrls_test_database_url
+
+    monkeypatch.setenv(
+        "PGRLS_TEST_DATABASE_URL", "postgresql://from-fixture"
+    )
+    assert (
+        pgrls_test_database_url.__wrapped__()
+        == "postgresql://from-fixture"
+    )
+
+
+def test_pgrls_db_fixture_yields_working_client(pg_url: str) -> None:
+    # Drive the `pgrls_db` fixture's generator body in-process against
+    # the session testcontainer: it opens a connection, starts a
+    # transaction, yields a usable PgrlsTestClient, and rolls back on
+    # exit. The synthetic-session test below also exercises this via
+    # the pytest11 entrypoint, but that runs in a subprocess (so the
+    # fixture body isn't seen by this process). Driving the generator
+    # here pins the open/transaction/yield/rollback wiring directly.
+    from pgrls.testing.client import PgrlsTestClient
+    from pgrls.testing.pytest_plugin import pgrls_db
+
+    gen = pgrls_db.__wrapped__(pg_url)
+    client = next(gen)
+    try:
+        assert isinstance(client, PgrlsTestClient)
+        assert client.fetchall("SELECT 1 AS x") == [{"x": 1}]
+    finally:
+        # Exhaust the generator so the transaction rollback + connection
+        # close (the post-yield teardown) runs.
+        with pytest.raises(StopIteration):
+            next(gen)
+
+
 def test_plugin_registered_via_entrypoint() -> None:
     # Reading the installed distribution metadata is the most
     # reliable check that the pytest11 entrypoint is wired —

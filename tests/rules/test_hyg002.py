@@ -159,6 +159,16 @@ def test_hyg002_custom_words_replaces_default() -> None:
     ) == 1
 
 
+def test_hyg002_empty_placeholder_words_silences_every_policy() -> None:
+    # An explicit empty `placeholder_words = []` REPLACES the default
+    # vocabulary with nothing — there are no words to match, so even a
+    # blatantly-placeholder name like `todo` never fires. Pins that an
+    # empty override is accepted (a list of all-strings, vacuously) and
+    # disables the rule rather than falling back to the default list.
+    schema = _wrap(_policy(name="todo"))
+    assert HYG002().check(schema, {"placeholder_words": []}) == []
+
+
 def test_hyg002_bad_allowlist_type_raises_clearly() -> None:
     schema = _wrap(_policy(name="todo"))
     with pytest.raises(TypeError, match="allowlist"):

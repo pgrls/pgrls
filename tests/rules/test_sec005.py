@@ -96,6 +96,17 @@ def test_sec005_fires_when_three_part_ref_targets_a_different_schema() -> None:
     assert len(SEC005().check(schema, {})) == 1
 
 
+def test_sec005_fires_when_only_ref_is_four_part_qualified() -> None:
+    # A four-part `db.schema.table.column` ref (Postgres accepts the
+    # database-qualified spelling) doesn't match SEC005's 1/2/3-part
+    # own-column shapes, so it counts as "no own-column reference" and
+    # the rule fires. Pins the final `return False` of the resolver.
+    schema = _wrap(
+        _policy(using="mydb.public.t.tenant_id = current_setting('app.t')")
+    )
+    assert len(SEC005().check(schema, {})) == 1
+
+
 def test_sec005_does_not_fire_when_with_check_has_own_column() -> None:
     # Combined USING + WITH CHECK — coverage from either is enough.
     schema = _wrap(

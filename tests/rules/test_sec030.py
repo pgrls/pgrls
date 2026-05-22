@@ -129,6 +129,47 @@ def test_sec030_fires_on_with_check_predicate() -> None:
     assert len(SEC030().check(schema, options={})) == 1
 
 
+def test_sec030_fires_on_table_qualified_discriminator() -> None:
+    # `documents.tenant_id = current_setting(...)` — the nullable
+    # discriminator is written table-qualified. The 2-part own-column
+    # resolution must recognize it (qualifier == table name) so the
+    # nullable-scoping finding still fires.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "documents.tenant_id = "
+                        "current_setting('app.tenant')::int"
+                    ),
+                ),
+            ),
+        )
+    )
+    [v] = SEC030().check(schema, options={})
+    assert "'tenant_id'" in v.message
+
+
+def test_sec030_fires_on_schema_qualified_discriminator() -> None:
+    # `public.documents.tenant_id = current_setting(...)` — fully
+    # schema-qualified discriminator. The 3-part own-column resolution
+    # (schema + table both match) recognizes it and SEC030 fires.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "public.documents.tenant_id = "
+                        "current_setting('app.tenant')::int"
+                    ),
+                ),
+            ),
+        )
+    )
+    [v] = SEC030().check(schema, options={})
+    assert "'tenant_id'" in v.message
+
+
 def test_sec030_fires_on_column_wrapped_in_function() -> None:
     # lower(name) = current_setting(...) still scopes by `name`.
     schema = Schema(

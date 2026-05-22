@@ -454,6 +454,14 @@ def test_extract_range_vars_returns_empty_when_no_tables() -> None:
     assert refs == []
 
 
+def test_extract_range_vars_handles_none_node() -> None:
+    # A `None` node (e.g. an absent `with_check_ast`, or a `None` item
+    # encountered while walking a children list) must be handled by the
+    # walker's guard and yield no refs rather than raising. Pins the
+    # `if n is None: return` branch.
+    assert extract_range_vars(None) == []
+
+
 # --- is_literal_true / is_literal_false ----------------------------------
 
 

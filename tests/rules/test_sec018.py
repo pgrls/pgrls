@@ -127,6 +127,16 @@ def test_sec018_silent_on_schema_qualified_cross_table_column() -> None:
     assert SEC018().check(schema, {}) == []
 
 
+def test_sec018_silent_on_four_part_qualified_column() -> None:
+    # `mydb.public.t.owner_role = current_user` — a four-part
+    # database-qualified ref. SEC018 resolves only 1/2/3-part own-column
+    # shapes; a 4-part ref falls through to the resolver's final
+    # `return False`, so the comparison isn't treated as an own-column
+    # vs. role-identity pairing and SEC018 stays silent.
+    schema = _wrap(_policy("mydb.public.t.owner_role = current_user"))
+    assert SEC018().check(schema, {}) == []
+
+
 def test_sec018_fires_on_correlated_own_column_in_subquery() -> None:
     # An own-table column compared to current_user, reached through
     # correlation from inside a sub-select, still fires — the walk

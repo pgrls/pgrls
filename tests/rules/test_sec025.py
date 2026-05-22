@@ -212,6 +212,24 @@ def test_sec025_resolves_unqualified_name_against_own_schema() -> None:
     assert "public.members" in v.message
 
 
+def test_sec025_silent_on_unqualified_name_not_in_own_schema() -> None:
+    # `ledger` (no schema) does NOT resolve to any table in the
+    # policy's own schema (`public`) — it might live in another schema
+    # not passed to `--schemas`. SEC025 can't see its RLS state, so it
+    # stays silent rather than guessing. Pins the bare-name "not found
+    # in own schema → skip" branch.
+    schema = Schema(
+        tables=(
+            _docs(
+                _policy(
+                    using="tenant_id IN (SELECT tenant_id FROM ledger)"
+                )
+            ),
+        )
+    )
+    assert SEC025().check(schema, options={}) == []
+
+
 def test_sec025_fires_on_cross_schema_reference() -> None:
     schema = Schema(
         tables=(
