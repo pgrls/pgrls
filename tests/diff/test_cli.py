@@ -57,6 +57,13 @@ _TABLE_WITHOUT_RLS = {
     ],
 }
 
+# A connection string that fails instantly with a psycopg.Error: it
+# dials a Unix socket in a directory that cannot exist, so psycopg
+# raises OperationalError synchronously without any network round-trip
+# or DNS/TCP timeout. Used to drive the "Database error" ToolError
+# paths deterministically.
+_BAD_SOCKET_URL = "postgresql://u@/db?host=/nonexistent_pgrls_socket_dir"
+
 # A table added with RLS already enabled — TABLE_ADDED_WITH_RLS is "safe".
 _TABLE_ADDED_WITH_RLS = {
     "version": 3,
@@ -131,6 +138,46 @@ def test_snapshot_missing_database_url_exits_2(monkeypatch) -> None:
     result = runner.invoke(main, ["snapshot"])
     assert result.exit_code == 2
     assert "DATABASE_URL" in result.output
+
+
+def test_snapshot_database_error_exits_2_cleanly() -> None:
+    # A connection that fails at the psycopg layer surfaces as a
+    # ToolError (exit 2) with a "Database error" message, not a raw
+    # traceback. Pins the `except psycopg.Error` branch in `snapshot`.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["snapshot", "--database-url", _BAD_SOCKET_URL]
+    )
+    assert result.exit_code == 2, result.output
+    assert "Database error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_snapshot_unknown_schema_exits_2_cleanly(pg_url: str) -> None:
+    # An unknown schema makes `introspect` raise ValueError; `snapshot`
+    # converts it to a ToolError (exit 2). Pins the `except ValueError`
+    # branch alongside the psycopg one above.
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["snapshot", "--database-url", pg_url, "--schemas", "no_such_schema"],
+    )
+    assert result.exit_code == 2, result.output
+    assert "no_such_schema" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_snapshot_bad_toml_exits_2_cleanly(tmp_path: Path) -> None:
+    # A malformed config file is a ConfigError surfaced as a ToolError
+    # (exit 2) before any DB connection — the clean-error contract the
+    # other commands share. Pins `snapshot`'s `except ConfigError`
+    # branch.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text("[database\n")  # malformed TOML
+    runner = CliRunner()
+    result = runner.invoke(main, ["snapshot", "--config", str(cfg)])
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
 
 
 def test_snapshot_filters_by_schemas(
@@ -281,6 +328,61 @@ def test_diff_nonexistent_file_exits_2(tmp_path: Path) -> None:
     # Message should explain both URL and file possibilities.
     assert "://" in result.output
     assert "file" in result.output.lower()
+
+
+def test_diff_database_url_source_connection_error_exits_2(
+    tmp_path: Path,
+) -> None:
+    # A base argument that looks like a DB URL (contains '://') but
+    # fails to connect surfaces as a ToolError (exit 2) naming the URL
+    # and the database error — not a traceback. Pins the
+    # `except psycopg.Error` branch in `_resolve_diff_source`.
+    head = tmp_path / "head.json"
+    head.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["diff", _BAD_SOCKET_URL, str(head)])
+
+    assert result.exit_code == 2, result.output
+    assert "Database error connecting to" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_diff_database_url_source_unknown_schema_exits_2(
+    pg_url: str,
+) -> None:
+    # A base that IS a reachable DB URL but names an unknown schema:
+    # `introspect` raises ValueError inside `_resolve_diff_source`,
+    # surfaced as a ToolError (exit 2) — the `except ValueError` branch
+    # next to the connection-error one. Both base and head point at the
+    # same live DB so resolution gets past the connect step to
+    # introspection.
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["diff", pg_url, pg_url, "--schemas", "no_such_schema"],
+    )
+    assert result.exit_code == 2, result.output
+    assert "no_such_schema" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_diff_empty_schemas_list_exits_2(tmp_path: Path) -> None:
+    # `--schemas ,,,` collapses to an empty list after splitting and
+    # stripping — a setup error surfaced as a ToolError (exit 2), the
+    # diff-side mirror of `pgrls lint --schemas ,,,`.
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+    head.write_text(json.dumps(_EMPTY_SNAP), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["diff", str(base), str(head), "--schemas", ",,,"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "empty list" in result.output
 
 
 def test_diff_invalid_json_file_exits_2(tmp_path: Path) -> None:

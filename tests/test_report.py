@@ -219,6 +219,48 @@ def test_report_cli_errors_without_database_url() -> None:
     assert "No database connection" in result.output
 
 
+# A conninfo that fails instantly at the psycopg layer (a Unix socket
+# in a directory that cannot exist) — no DNS/TCP timeout, deterministic.
+_BAD_SOCKET_URL = "postgresql://u@/db?host=/nonexistent_pgrls_socket_dir"
+
+
+def test_report_cli_database_error_exits_2_cleanly() -> None:
+    # A connection failing at the psycopg layer surfaces as a ToolError
+    # (exit 2) with a "Database error" prefix, not a raw traceback.
+    # Pins `report`'s `except psycopg.Error` branch.
+    result = CliRunner().invoke(
+        main, ["report", "--database-url", _BAD_SOCKET_URL]
+    )
+    assert result.exit_code == 2, result.output
+    assert "Database error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_report_cli_unknown_schema_exits_2_cleanly(pg_url: str) -> None:
+    # An unknown schema makes `introspect` raise ValueError; `report`
+    # converts it to a ToolError (exit 2). Pins the `except ValueError`
+    # branch alongside the psycopg one.
+    result = CliRunner().invoke(
+        main,
+        ["report", "--database-url", pg_url, "--schemas", "no_such_schema"],
+    )
+    assert result.exit_code == 2, result.output
+    assert "no_such_schema" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_report_cli_bad_toml_exits_2_cleanly(tmp_path) -> None:
+    # A malformed config file is a ConfigError surfaced as a ToolError
+    # (exit 2) before any DB connection — the clean-error contract
+    # `pgrls lint` / `fix` also follow. Pins `report`'s `except
+    # ConfigError` branch.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text("[database\n")  # malformed TOML
+    result = CliRunner().invoke(main, ["report", "--config", str(cfg)])
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+
+
 def test_report_output_writes_file_matching_stdout(
     pg_url: str, apply_sql, tmp_path
 ) -> None:

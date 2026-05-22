@@ -269,6 +269,24 @@ def test_assert_silently_dropped_passes_on_update_returning_empty(
         )
 
 
+def test_assert_silently_dropped_update_without_returning_errors_at_fetch(
+    testing_pg_conn: psycopg.Connection,
+) -> None:
+    # An UPDATE (no RETURNING) passes the verb gate — the verb IS
+    # UPDATE — but then `cur.fetchall()` raises psycopg.ProgrammingError
+    # because the statement produced no result set. The helper must
+    # convert that into a clear PgrlsTestError telling the caller to add
+    # RETURNING, not leak the raw psycopg error.
+    from pgrls.testing.errors import PgrlsTestError
+
+    client = PgrlsTestClient(testing_pg_conn)
+    with client.transaction():
+        with pytest.raises(PgrlsTestError, match="RETURNING"):
+            client.assert_silently_dropped(
+                "UPDATE rls_audit SET event = 'modified'"
+            )
+
+
 def test_assert_silently_dropped_string_literal_returning_falls_through_verb_gate(
     testing_pg_conn: psycopg.Connection,
 ) -> None:

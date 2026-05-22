@@ -479,3 +479,66 @@ def test_perf003_skips_three_part_cross_schema_ref() -> None:
         )
     )
     assert PERF003().check(schema, {}) == []
+
+
+def test_perf003_skips_two_part_ref_with_non_matching_qualifier() -> None:
+    # `acct.tenant_id` — a two-part ref whose qualifier (`acct`) is
+    # neither the table's bare name nor a schema. It's a cross-table
+    # ref (a JOIN alias for another relation), so PERF003 leaves it
+    # alone: the index health of that other table isn't this policy's
+    # concern. There's no own-column reference to check, so nothing
+    # fires (the table has no indexes either — `indexes=()`).
+    schema = Schema(
+        tables=(
+            _table(
+                "invoices",
+                policies=(_policy(
+                    "p",
+                    using_sql="acct.tenant_id = current_setting('a')",
+                ),),
+                indexes=(),
+            ),
+        )
+    )
+    assert PERF003().check(schema, {}) == []
+
+
+def test_perf003_skips_four_part_qualified_ref() -> None:
+    # A four-part `db.schema.table.column` ref (Postgres accepts the
+    # database-qualified form) doesn't match the 1/2/3-part shapes
+    # PERF003 resolves, so it's skipped rather than mis-attributed to
+    # the policy's own table.
+    schema = Schema(
+        tables=(
+            _table(
+                "invoices",
+                policies=(_policy(
+                    "p",
+                    using_sql=(
+                        "mydb.public.invoices.tenant_id "
+                        "= current_setting('a')"
+                    ),
+                ),),
+                indexes=(),
+            ),
+        )
+    )
+    assert PERF003().check(schema, {}) == []
+
+
+def test_perf003_skips_index_with_empty_columns_tuple() -> None:
+    # An index whose `columns` is an empty tuple (no key columns at
+    # all — a degenerate / not-yet-populated index shape) can never be
+    # a leading-column match. PERF003 skips it and still fires for the
+    # unindexed policy column.
+    schema = Schema(
+        tables=(
+            _table(
+                "invoices",
+                policies=(_policy("tenant_read"),),
+                indexes=(_index("empty_idx", columns=()),),
+            ),
+        )
+    )
+    [v] = PERF003().check(schema, {})
+    assert "'tenant_id'" in v.message

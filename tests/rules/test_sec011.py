@@ -164,6 +164,16 @@ def test_sec011_fires_on_deeply_nested_or_true() -> None:
     assert len(SEC011().check(schema, {})) == 1
 
 
+def test_sec011_fires_on_or_true_wrapped_in_typecast() -> None:
+    # `(id = 1 OR true)::boolean` — the OR-true disjunct is reached
+    # only through `TypeCast.arg`, a single Node-typed field rather
+    # than a list of children. Pins the walker's single-child
+    # recursion branch (distinct from the BoolExpr.args list branch
+    # the other nested cases exercise).
+    schema = _wrap(_policy("(id = 1 OR true)::boolean"))
+    assert len(SEC011().check(schema, {})) == 1
+
+
 def test_sec011_silent_on_or_false_branch() -> None:
     # `OR false` is a no-op branch, not the OR-true smell. SEC011
     # specifically detects the literal-true case.
