@@ -10,6 +10,18 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.66] - 2026-05-21
+
+### Added
+- **`pgrls report`** — a new read-only command that summarizes the
+  RLS posture of every table: per-table RLS enabled / `FORCE`'d /
+  policy counts (permissive + restrictive) plus a coarse status
+  (`protected` / `not-forced` / `no-policies` / `rls-off`) derived
+  purely from those facts, and an aggregate summary. The rule-free
+  counterpart to `pgrls lint` — a snapshot for audits and onboarding;
+  it runs no rules and emits no findings. `--format text` (default) /
+  `json` / `markdown`, reading a live database (or `$DATABASE_URL`).
+
 ## [0.5.65] - 2026-05-21
 
 ### Added

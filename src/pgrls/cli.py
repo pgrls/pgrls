@@ -60,6 +60,8 @@ from pgrls.fixers import (
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
 from pgrls.introspect import introspect
 from pgrls.model import Schema
+from pgrls.report import REPORT_FORMATS, build_report
+from pgrls.report import render as render_report
 from pgrls.rules import Rule, all_rules, default_registry
 from pgrls.violations import (
     ALL_SEVERITIES,
@@ -1972,3 +1974,72 @@ def explain(rule_id: str | None, output_format: str) -> None:
     if body:
         click.echo()
         click.echo(body)
+
+
+@main.command()
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    default=None,
+    help="Postgres connection string. Falls back to $DATABASE_URL.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to report on (overrides config).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(list(REPORT_FORMATS), case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def report(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    output_format: str,
+) -> None:
+    """Summarize the RLS posture of every table — no rules, no findings.
+
+    A factual snapshot for audits and onboarding: per-table RLS
+    enabled / FORCE'd / policy counts plus a coarse status
+    (`protected` / `not-forced` / `no-policies` / `rls-off`) and an
+    aggregate summary. Reads a live database and runs NO lint rules —
+    use `pgrls lint` for findings. `--format json` / `markdown` emit
+    machine-readable / paste-ready output.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=None,
+    )
+    if effective.database_url is None:
+        raise ToolError(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+    click.echo(render_report(build_report(schema), output_format))

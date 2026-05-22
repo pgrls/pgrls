@@ -191,6 +191,12 @@ allowlisting guidance — the same reference, with no database
 connection required. Bare `pgrls explain` (no argument) lists the
 catalog: one line per rule with its severity and title.
 
+`pgrls report` is the rule-free counterpart: it prints each table's
+RLS posture — RLS enabled / `FORCE`'d / policy counts plus a coarse
+`protected` / `not-forced` / `no-policies` / `rls-off` status — and an
+aggregate summary, in text / JSON / Markdown. A snapshot for audits
+and onboarding; it runs no rules and emits no findings.
+
 <a id="rule-sec001"></a>
 
 ### SEC001 — RLS not enabled on table
