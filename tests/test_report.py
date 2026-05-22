@@ -217,3 +217,37 @@ def test_report_cli_errors_without_database_url() -> None:
     )
     assert result.exit_code == 2
     assert "No database connection" in result.output
+
+
+def test_report_output_writes_file_matching_stdout(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # --output writes byte-for-byte what stdout would have shown, and
+    # suppresses stdout — same contract as `lint --output`.
+    apply_sql("CREATE TABLE public.t (id INT);")
+    runner = CliRunner()
+    args = ["report", "--database-url", pg_url, "--format", "json"]
+    stdout_res = runner.invoke(main, args)
+    assert stdout_res.exit_code == 0, stdout_res.output
+
+    out = tmp_path / "posture.json"
+    file_res = runner.invoke(main, [*args, "--output", str(out)])
+    assert file_res.exit_code == 0, file_res.output
+    assert file_res.output == ""  # --output suppresses stdout
+    assert out.read_text(encoding="utf-8") == stdout_res.output
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert any(t["table"] == "public.t" for t in payload["tables"])
+
+
+def test_report_output_unwritable_path_errors(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # A path whose parent dir is missing → OSError surfaced as a clean
+    # ToolError (exit 2), not a traceback. Mirrors `pgrls init`.
+    apply_sql("CREATE TABLE public.t (id INT);")
+    out = tmp_path / "missing_dir" / "posture.json"
+    result = CliRunner().invoke(
+        main, ["report", "--database-url", pg_url, "--output", str(out)]
+    )
+    assert result.exit_code == 2
+    assert "Cannot write" in result.output

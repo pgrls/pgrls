@@ -10,6 +10,15 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.5.67] - 2026-05-21
+
+### Added
+- **`pgrls report --output FILE`** — write the posture report to a file
+  (any `--format`) instead of stdout, byte-for-byte identical to the
+  piped output, mirroring `pgrls lint --output`. Handy for saving a
+  Markdown posture snapshot into an audit doc. A missing parent
+  directory surfaces as a clean error, not a traceback.
+
 ## [0.5.66] - 2026-05-21
 
 ### Added

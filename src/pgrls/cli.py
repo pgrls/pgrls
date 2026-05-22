@@ -1996,6 +1996,14 @@ def explain(rule_id: str | None, output_format: str) -> None:
     help="Comma-separated schemas to report on (overrides config).",
 )
 @click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the report to this file instead of stdout (any --format).",
+)
+@click.option(
     "--format",
     "output_format",
     type=click.Choice(list(REPORT_FORMATS), case_sensitive=False),
@@ -2007,6 +2015,7 @@ def report(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    output_path: str | None,
     output_format: str,
 ) -> None:
     """Summarize the RLS posture of every table — no rules, no findings.
@@ -2016,7 +2025,9 @@ def report(
     (`protected` / `not-forced` / `no-policies` / `covered-by-parent`
     / `rls-off`) and an aggregate summary. Reads a live database and
     runs NO lint rules — use `pgrls lint` for findings. `--format
-    json` / `markdown` emit machine-readable / paste-ready output.
+    json` / `markdown` emit machine-readable / paste-ready output;
+    `--output FILE` writes it to a file (e.g. an audit doc) instead of
+    stdout.
     """
     try:
         config = load_config(config_path)
@@ -2042,4 +2053,19 @@ def report(
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
 
-    click.echo(render_report(build_report(schema), output_format))
+    rendered = render_report(build_report(schema), output_format)
+    # Normalize a single trailing newline so file and stdout output are
+    # byte-identical (text/json renderers don't add one; markdown does).
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    if output_path is not None:
+        # `newline=""` disables universal-newline translation so the
+        # file matches stdout byte-for-byte (no `\n`→`\r\n` on Windows).
+        try:
+            Path(output_path).write_text(
+                rendered, encoding="utf-8", newline=""
+            )
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
+    else:
+        click.echo(rendered, nl=False)
