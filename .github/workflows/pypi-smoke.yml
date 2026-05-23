@@ -9,6 +9,17 @@
 # instead of in someone's launch demo.
 name: pypi-smoke
 
+# Least-privilege: this workflow does not check out the repo and does
+# not write back to GitHub — it only pip-installs from PyPI and runs
+# pgrls against a Postgres service container. Without an explicit
+# `permissions:` block, jobs inherit the repo's default scope (often
+# `contents: write`), which is a large blast radius if a transitive
+# PyPI dep is compromised. `contents: read` matches the sibling
+# workflows' defense-in-depth convention (test.yml, go.yml,
+# ts-publish.yml, go-release.yml all set the same).
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
