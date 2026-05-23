@@ -14,15 +14,19 @@ The recurring footgun is the policy that uses `auth.uid()` (or another
 
 ```sql
 CREATE POLICY tenant_read ON public.documents
-    FOR SELECT TO authenticated
+    FOR SELECT
     USING (auth.uid() IS NULL OR owner_id = auth.uid());
 ```
 
 Reads like English: *"unauthenticated users see nothing, signed-in
 users see their own rows."* But `auth.uid()` returns `NULL` for any
-request without a session JWT, so the `IS NULL` branch is `true`, the
-`OR` short-circuits, and the policy admits **every row** to exactly the
-anonymous clients you meant to keep out.
+request without a valid session JWT, so the `IS NULL` branch is
+`true`, the `OR` short-circuits, and the policy admits **every row**
+to exactly the unauthenticated clients you meant to keep out. (If
+this policy is instead bound `TO authenticated`, the same failure mode
+applies to authenticated callers whose JWT lacks a `sub` claim — the
+role binding narrows *who* the policy applies to, not *what the
+policy means*.)
 
 pgrls flags this as **SEC004** (severity `error`) — its default
 auth-function set includes `auth.uid`, `auth.role`, `auth.jwt`, and
@@ -130,9 +134,9 @@ clean-up pass.
 Other Supabase-relevant rules to know about (see
 [AGENTS.md](../../AGENTS.md) for the full reference paragraph on each):
 
-- **SEC001** — RLS not enabled on a table in scope (any table that
-  isn't `ALTER TABLE … ENABLE ROW LEVEL SECURITY`-ed, regardless of
-  whether policies are defined for it).
+- **SEC001** — RLS not enabled on a table in scope (a table that's
+  never had `ALTER TABLE … ENABLE ROW LEVEL SECURITY`, with no
+  policies defined on it; the policy-bearing variant is **SEC032**).
 - **SEC002** — `FORCE ROW LEVEL SECURITY` missing; without it the
   *owner* of the table can bypass RLS, which on Supabase means
   `service_role`-owned queries skip the policies.
