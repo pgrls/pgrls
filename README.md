@@ -6,7 +6,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/pgrls/pgrls/test.yml?branch=main&label=tests)](https://github.com/pgrls/pgrls/actions/workflows/test.yml)
 [![Downloads](https://img.shields.io/pypi/dm/pgrls.svg)](https://pypistats.org/packages/pgrls)
 
-**[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Rule reference](AGENTS.md)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
+**[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
 > Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 12 of 43 rules mechanically auto-fixable.
