@@ -1,0 +1,111 @@
+# Installs pgrls from PyPI (NOT from this checkout) and runs through the
+# documented happy path against a real Postgres. Hard-prevents the
+# regression that bit us once: PyPI was 14 versions behind the source
+# tree for a long stretch, and nobody noticed until a `pgrls lint
+# --format github` demo failed for someone running the published build.
+# This job catches the same class of regression on every push to main
+# AND on a daily schedule — so PyPI staleness, a broken sdist, an
+# entry-point misconfiguration, or a transitive-dep break surfaces here
+# instead of in someone's launch demo.
+name: pypi-smoke
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 12:00 UTC daily — catches PyPI / transitive-dep regressions that
+    # land outside a push window. The exact hour is arbitrary.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Matrix across every supported Python so a 3.11-only or
+        # 3.13-only break is caught here, not by a user.
+        python: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: smoke
+          POSTGRES_DB: smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:smoke@localhost:5432/smoke
+    steps:
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install pgrls from PyPI
+        # No --editable, no local checkout — this MUST exercise the
+        # published artifact end-to-end.
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check pgrls
+          pgrls --version
+
+      - name: Sanity — explain catalog enumerates rules
+        run: |
+          set -eo pipefail
+          count=$(pgrls explain | grep -cE '^(SEC|PERF|HYG|VIEW)[0-9]')
+          echo "Rule count from explain catalog: $count"
+          # Generous floor: the catalog grows over time. The smoke test
+          # only cares that the catalog isn't broken / empty, not that
+          # it matches a specific number (the latter would be brittle).
+          test "$count" -ge 40
+
+      - name: Sanity — init scaffolds pgrls.toml with #:schema directive
+        run: |
+          set -eo pipefail
+          mkdir scaffold && cd scaffold
+          pgrls init
+          head -1 pgrls.toml | grep -q '#:schema'
+
+      - name: Seed demo schema with a deliberately-broken RLS policy
+        # The classic SEC004 footgun: `auth_func() IS NULL OR …` admits
+        # every row to anonymous (un-set GUC) clients.
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE documents (id SERIAL PRIMARY KEY, owner_id uuid, body text);
+          ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+          CREATE POLICY tenant_read ON documents
+              FOR SELECT
+              USING (current_setting('app.uid', true) IS NULL
+                     OR owner_id::text = current_setting('app.uid'));
+          SQL
+
+      - name: pgrls lint — must fire SEC004 on the demo policy
+        # `pgrls lint --rule SEC004` scopes to just SEC004; exit code
+        # is non-zero when the rule fires (default --fail-on=warning,
+        # SEC004 is error). The grep checks confirm the finding is
+        # actually emitted (not just that pgrls exited non-zero for
+        # some other reason).
+        run: |
+          set +e
+          out=$(pgrls lint --rule SEC004 2>&1)
+          rc=$?
+          echo "$out"
+          test "$rc" -ne 0
+          echo "$out" | grep -qE "SEC004"
+          echo "$out" | grep -qE "public\.documents\.tenant_read"
+
+      - name: pgrls report — read-only posture summary works
+        run: |
+          set -eo pipefail
+          pgrls report --schemas public | grep -q "public.documents"
+
+      - name: pgrls explain SEC004 — rule reference renders
+        run: |
+          set -eo pipefail
+          pgrls explain SEC004 | head -5 | grep -q "SEC004"
