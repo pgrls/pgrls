@@ -29,7 +29,7 @@ Postgres GUC for the lifetime of the request:
 
 ```python
 # myapp/middleware.py
-from django.db import connection
+from django.db import connection, transaction
 
 class RLSContextMiddleware:
     def __init__(self, get_response):
@@ -41,14 +41,26 @@ class RLSContextMiddleware:
             if request.user.is_authenticated
             else ''
         )
-        with connection.cursor() as cur:
-            cur.execute("SELECT set_config('app.user_id', %s, true)", [user_id])
-        return self.get_response(request)
+        # Wrap the whole request in a transaction so SET LOCAL's
+        # scope extends across every query the view issues. Django
+        # does NOT do this by default (`ATOMIC_REQUESTS = False`
+        # out of the box), so `set_config(..., true)` outside an
+        # explicit `transaction.atomic()` would only persist for
+        # the single statement that set it.
+        with transaction.atomic():
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('app.user_id', %s, true)",
+                    [user_id],
+                )
+            return self.get_response(request)
 ```
 
-`set_config(..., true)` is `SET LOCAL` — the value lasts only for the
-current transaction. Django wraps each request in a transaction by
-default (`ATOMIC_REQUESTS = True`), so the GUC scopes naturally.
+`set_config(..., true)` is the procedural form of `SET LOCAL` — the
+value lasts only for the current transaction. The `transaction.atomic()`
+wrapper guarantees the request body runs inside that transaction; if
+you set `ATOMIC_REQUESTS = True` for the database alias in `settings.py`
+instead, the explicit wrapper becomes redundant but doesn't hurt.
 
 ## The signature Django + RLS bug
 
@@ -146,17 +158,28 @@ already uses pytest. The `pgrls_db` fixture opens a connection and
 per-test transaction, switches roles, asserts visibility, and rolls
 back at end:
 
+The example below assumes the project has a non-superuser application
+role (here `app_user`) — create it once in a migration:
+
+```sql
+CREATE ROLE app_user NOLOGIN;
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.app_document TO app_user;
+```
+
+Then the test switches into it so RLS actually enforces:
+
 ```python
 def test_user_cant_see_other_users_documents(pgrls_db):
     pgrls_db.seed("public.app_document", [
         {"id": 1, "owner_id": "alice", "body": "A"},
         {"id": 2, "owner_id": "bob",   "body": "B"},
     ])
-    # The fixture connects as a privileged role; switch to a
-    # non-superuser role so RLS actually enforces, then mirror what
+    # The fixture connects as a privileged role (which bypasses RLS);
+    # switch to the app role so the policies engage, then mirror what
     # the Django middleware would do (set the app.user_id GUC for
     # this "request").
-    with pgrls_db.as_role("authenticated"):
+    with pgrls_db.as_role("app_user"):
         pgrls_db.exec(
             "SELECT set_config('app.user_id', %s, true)",
             params=["alice"],

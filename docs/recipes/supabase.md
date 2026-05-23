@@ -130,12 +130,23 @@ clean-up pass.
 Other Supabase-relevant rules to know about (see
 [AGENTS.md](../../AGENTS.md) for the full reference paragraph on each):
 
-- **SEC001** — table has policies but RLS is disabled (the policies
-  do nothing; classic when ALTER TABLE … ENABLE ROW LEVEL SECURITY is
-  forgotten after CREATE POLICY).
-- **SEC002** — table has RLS enabled but no policies (default-deny;
-  the table is invisible to non-owner roles).
-- **SEC011** — policy with `USING (true)`: no scoping at all.
+- **SEC001** — RLS not enabled on a table in scope (any table that
+  isn't `ALTER TABLE … ENABLE ROW LEVEL SECURITY`-ed, regardless of
+  whether policies are defined for it).
+- **SEC002** — `FORCE ROW LEVEL SECURITY` missing; without it the
+  *owner* of the table can bypass RLS, which on Supabase means
+  `service_role`-owned queries skip the policies.
+- **SEC008** — policy with literal `USING (true)`: no scoping at all
+  (the top-level constant-true case).
+- **SEC009** — table has RLS enabled but **no policies** defined
+  (default-deny; the table is invisible to non-owner roles, which
+  is sometimes intentional and often a silent deny-all that
+  surprises in production).
+- **SEC011** — same effect as SEC008, but the `OR true` branch is
+  buried inside an otherwise-scoped policy (`tenant_id = X OR true`).
+- **SEC032** — table has policies but RLS is disabled — the
+  policies are dormant and do nothing (the
+  `CREATE POLICY`-without-`ENABLE ROW LEVEL SECURITY` case).
 - **PERF001** — `auth.uid()` evaluated per row instead of once per
   query (wrap in a sub-select: `(SELECT auth.uid())`).
 - **PERF003** — policy filters on a column with no leading-column
