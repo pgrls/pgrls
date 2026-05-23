@@ -142,18 +142,29 @@ inline on the PR.
 
 The `pgrls.testing` pytest plugin (`pip install pgrls[testing]`) lets
 you write per-test RLS isolation assertions in a Django project that
-already uses pytest:
+already uses pytest. The `pgrls_db` fixture opens a connection and
+per-test transaction, switches roles, asserts visibility, and rolls
+back at end:
 
 ```python
-from pgrls.testing import PgrlsTestClient
-
-def test_user_cant_see_other_users_documents(pgrls_db: PgrlsTestClient):
-    with pgrls_db.transaction():
-        pgrls_db.exec("SELECT set_config('app.user_id', %s, true)", ['alice'])
-        pgrls_db.exec("INSERT INTO app_document(owner_id, body) VALUES('alice', 'A')")
-        pgrls_db.exec("INSERT INTO app_document(owner_id, body) VALUES('bob', 'B')")
-        rows = pgrls_db.fetchall("SELECT body FROM app_document")
-        assert {r['body'] for r in rows} == {'A'}
+def test_user_cant_see_other_users_documents(pgrls_db):
+    pgrls_db.seed("public.app_document", [
+        {"id": 1, "owner_id": "alice", "body": "A"},
+        {"id": 2, "owner_id": "bob",   "body": "B"},
+    ])
+    # The fixture connects as a privileged role; switch to a
+    # non-superuser role so RLS actually enforces, then mirror what
+    # the Django middleware would do (set the app.user_id GUC for
+    # this "request").
+    with pgrls_db.as_role("authenticated"):
+        pgrls_db.exec(
+            "SELECT set_config('app.user_id', %s, true)",
+            params=["alice"],
+        )
+        pgrls_db.assert_rows("SELECT body FROM app_document", count=1)
+        pgrls_db.assert_invisible(
+            "SELECT body FROM app_document WHERE owner_id = 'bob'"
+        )
 ```
 
 It plays well alongside Django's own `TestCase` — RLS tests live in

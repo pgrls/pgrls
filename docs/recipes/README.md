@@ -10,8 +10,10 @@ self-contained and assumes you've read the
   dominates Supabase RLS bugs, and CI against either your migration
   database or a local `supabase start` stack.
 - **[PostgREST](postgrest.md)** — the JWT-claim GUC pattern, the
-  `role-as-discriminator` pitfall, and the `db-pre-request` gotcha that
-  silently widens policies when claims aren't set.
+  `role-as-discriminator` pitfall (SEC018), nullable-discriminator
+  columns (SEC030), and the `db-pre-request` gotcha that silently
+  hides rows when claims aren't set (or, via the mirror `IS NULL OR …`
+  shape, exposes them all — SEC004).
 - **[Django](django.md)** — defense-in-depth on top of ORM filtering,
   the session-GUC middleware pattern, the `pgrls.testing` pytest plugin
   for RLS isolation tests alongside your existing test suite.

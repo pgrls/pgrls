@@ -37,25 +37,29 @@ pgrls flags this as **SEC004** (severity `error`); its default
 auth-function set includes `current_setting`, so this exact shape
 trips the rule regardless of the column name or schema.
 
-## NULL-coalescing the JWT claim
+## Nullable discriminator columns
 
-A pattern that *looks* safe but isn't, also common in PostgREST setups:
+A `tenant_id` column on a multi-tenant PostgREST table is often
+declared without `NOT NULL`. Under the canonical scoping shape
 
 ```sql
-USING (tenant_id = COALESCE(
-    current_setting('request.jwt.claim.tenant_id', true),
-    ''
-)::uuid)
+USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true))
 ```
 
-The intent: if the claim is missing, default to `''` (an empty string
-that won't match any tenant). The problem: a `tenant_id` column that's
-nullable will match the empty fallback under any form that handles
-`NULL`s, and the policy quietly widens.
+a row whose `tenant_id` is `NULL` evaluates `NULL = <value>` to `NULL`
+(not `true`), so the row is invisible to every tenant. That's already
+a bug — the row belongs to no one. The worse failure mode is one
+edit away: the moment any policy on the table uses a NULL-tolerant
+form of the same key (`tenant_id IS NOT DISTINCT FROM …`,
+`… OR tenant_id IS NULL`, `COALESCE(tenant_id, …)`), every NULL row
+becomes visible to **every** tenant at once. A `NOT NULL`
+discriminator makes that whole failure mode unreachable.
 
-pgrls flags the nullable-discriminator class as **SEC030** (info).
-The fix is `ALTER COLUMN tenant_id SET NOT NULL` after backfilling
-existing `NULL`s.
+pgrls flags this as **SEC030** (severity `info`) — *"policy scopes
+by a nullable discriminator column"*. The remedy is
+`ALTER COLUMN tenant_id SET NOT NULL` after backfilling existing
+`NULL`s, plus a `DEFAULT` or trigger so the column is always
+populated.
 
 ## The role-as-discriminator pitfall
 

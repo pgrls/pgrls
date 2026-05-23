@@ -1,12 +1,11 @@
 # pgrls + Supabase
 
-Supabase is the highest-volume Row-Level Security deployment surface in
-the Postgres ecosystem — RLS is enabled per-table from the dashboard,
-policies are authored against `auth.uid()` / `auth.role()` /
-`auth.jwt()`, and the anon / authenticated / service_role roles do the
-heavy lifting. The bugs that ship past code review are remarkably
-consistent. This recipe shows the patterns pgrls catches and how to put
-it in CI.
+Supabase projects enable RLS per-table from the dashboard, author
+policies against `auth.uid()` / `auth.role()` / `auth.jwt()`, and lean
+on the anon / authenticated / service_role roles for the heavy
+lifting. The bugs that ship past code review are remarkably
+consistent across projects. This recipe shows the patterns pgrls
+catches and how to put it in CI.
 
 ## The signature Supabase bug
 
