@@ -332,7 +332,7 @@ The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `reque
 
 Setting none of the three causes `pgrls_db` to raise `PgrlsTestConfigError`.
 
-The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). The **TypeScript port** ships as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm — same Layer 1 protocol, same wire-level behaviour, idiomatic JS/TS surface (camelCase API, `pg` and `postgres.js` adapters). Source under [`ts/`](ts/) in this repo. The **Go port** is shipping in stages at [`go/`](go/) (module `github.com/pgrls/pgrls/go`); step 1 (scaffold + `ProtocolVersion` constant + error types) shipped in v0.7.0, with steps 2–7 (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite, release tag) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). The **TypeScript port** ships as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm — same Layer 1 protocol, same wire-level behaviour, idiomatic JS/TS surface (camelCase API, `pg` and `postgres.js` adapters). Source under [`ts/`](ts/) in this repo. The **Go port** is shipping in stages at [`go/`](go/) (module `github.com/pgrls/pgrls/go`, versioned independently as `go/v0.7.x`); step 1 (scaffold + `ProtocolVersion` constant + error types) shipped in `go/v0.7.0`, with steps 2–7 (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite, release tag) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
 
 ## Diff — `pgrls snapshot` + `pgrls diff`
 
@@ -477,6 +477,20 @@ repos:
 
 ### GitHub Actions
 
+The quickest path is the published Action ([`pgrls/pgrls-action`](https://github.com/marketplace/actions/pgrls-postgres-rls-linter) on the GitHub Marketplace) — it installs `pgrls` from PyPI and runs `pgrls lint` against a reachable database:
+
+```yaml
+- uses: pgrls/pgrls-action@v1
+  with:
+    database-url: ${{ secrets.PGRLS_DATABASE_URL }}
+    schemas: public
+    fail-on: error
+```
+
+It exposes every flag `pgrls lint` does (`--format`, `--rule`, `--exclude-rule`, `--baseline`, `--output`, `--min-severity`, …); see the [Marketplace listing](https://github.com/marketplace/actions/pgrls-postgres-rls-linter) for the full input table.
+
+Or run `pgrls` directly — useful when you want to spin up an ephemeral Postgres as a job service:
+
 ```yaml
 # .github/workflows/pgrls.yml
 name: pgrls
@@ -524,7 +538,7 @@ dashboard, or keep the report as a build artifact.
 
 - **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Polished error messages.
 - ~~**TypeScript port of `pgrls.testing`**~~ — shipped as the [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm package, versioned independently of the Python package (tagged `ts-v0.6.0`). Source: [`ts/`](ts/).
-- **Go port** of `pgrls.testing` following the same Layer 1 protocol — step 1 (scaffold + protocol-version constant + error types) landed in v0.7.0; subsequent steps (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+- **Go port** of `pgrls.testing` following the same Layer 1 protocol — versioned independently of the Python package as the `go/v0.7.x` sequence (Go module tag prefix `go/`, distinct from the Python package's tags). Step 1 (scaffold + protocol-version constant + error types) landed in `go/v0.7.0`; subsequent steps (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
 - ~~**SAT-based predicate implication checking.**~~ Z3-driven semantic predicate analysis landed in v0.4.x.
 - ~~**Migration-as-input.**~~ `pgrls diff --apply migration.sql` shipped in v0.5.0; baseline cache + extension auto-detect in v0.5.1–v0.5.2.
 
