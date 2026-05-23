@@ -2977,25 +2977,25 @@ Three layers, the bottom one is a documented contract not code:
   PostgREST `request.jwt.claims` GUC, savepoint-per-scenario). The TypeScript
   port ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
   this same contract; a Go port at [`go/`](go/) shipped its scaffold +
-  protocol-version constant + error types in v0.7.0, with the Driver +
-  Closer interfaces + QueryResult shape added in v0.7.1, the
-  pgx + lib/pq adapter packages added in v0.7.2, the Client
+  protocol-version constant + error types in `go/v0.7.0`, with the Driver +
+  Closer interfaces + QueryResult shape added in `go/v0.7.1`, the
+  pgx + lib/pq adapter packages added in `go/v0.7.2`, the Client
   API (`Transaction`, `AsRole`, `Exec`, `FetchAll`, `Seed`, `Close`)
-  added in v0.7.3 alongside `QuoteIdent` / `QuoteQualified` and
+  added in `go/v0.7.3` alongside `QuoteIdent` / `QuoteQualified` and
   `NewSavepointName`, the five assertion helpers (`AssertRows`,
   `AssertVisible`, `AssertInvisible`, `AssertRejected`,
-  `AssertSilentlyDropped`) added in v0.7.4, and the cross-language
+  `AssertSilentlyDropped`) added in `go/v0.7.4`, and the cross-language
   conformance suite (testcontainers-driven Postgres + both adapter
   packages exercising the shared `tests/protocol/{schema,seed}.sql`
   fixture used by the Python conformance suite; the TS port
   hand-rolls its own `FIXTURE_SQL` covering the same Layer 1
   criteria — see the "Writing additional language ports"
-  section's pattern list below) added in v0.7.5, and CI
+  section's pattern list below) added in `go/v0.7.5`, and CI
   hardening (`golangci-lint`, `govulncheck`) + release plumbing
   (`.github/workflows/go-release.yml` warms the Go module proxy
   and cuts a GitHub Release from the `go/CHANGELOG.md` stanza
-  on `go/v*` tag push) added in v0.7.6 (step 7 of 7 — final
-  step in the v0.7.x staged rollout; future Go-port releases
+  on `go/v*` tag push) added in `go/v0.7.6` (step 7 of 7 — final
+  step in the `go/v0.7.x` staged rollout; future Go-port releases
   ship as `go/v0.8.x`). Python is the reference
   implementation. `PROTOCOL_VERSION = 1`.
 - **Layer 2** — `pgrls.testing.PgrlsTestClient`: pure psycopg, no pytest
@@ -3398,25 +3398,27 @@ These are intentional in the current release. Do not invent capabilities.
   [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm
   package (tagged `ts-v0.6.0`, versioned independently of the
   Python package), following the Layer 1 protocol. The Go port lives in
-  [`go/`](go/) at module path `github.com/pgrls/pgrls/go` — its
+  [`go/`](go/) at module path `github.com/pgrls/pgrls/go`, versioned
+  independently of the Python package as the `go/v0.7.x` sequence
+  (Go module tag prefix `go/`). Its
   scaffold + protocol-version constant + error types shipped in
-  v0.7.0; the Driver + Closer interfaces + QueryResult shape
-  shipped in v0.7.1; the pgx + lib/pq driver adapters shipped
-  in v0.7.2; the Client API (`Transaction`, `AsRole`, `Exec`,
+  `go/v0.7.0`; the Driver + Closer interfaces + QueryResult shape
+  shipped in `go/v0.7.1`; the pgx + lib/pq driver adapters shipped
+  in `go/v0.7.2`; the Client API (`Transaction`, `AsRole`, `Exec`,
   `FetchAll`, `Seed`, `Close`) plus `QuoteIdent` / `QuoteQualified`
-  / `NewSavepointName` shipped in v0.7.3; the five assertion
+  / `NewSavepointName` shipped in `go/v0.7.3`; the five assertion
   helpers (`AssertRows`, `AssertVisible`, `AssertInvisible`,
-  `AssertRejected`, `AssertSilentlyDropped`) shipped in v0.7.4;
+  `AssertRejected`, `AssertSilentlyDropped`) shipped in `go/v0.7.4`;
   the cross-language conformance suite (testcontainers-driven
   Postgres + both adapter packages against the shared
   `tests/protocol/` SQL fixture used by the Python suite — the
   TS port hand-rolls its own `FIXTURE_SQL` covering the same
-  Layer 1 criteria) shipped in v0.7.5; CI hardening
+  Layer 1 criteria) shipped in `go/v0.7.5`; CI hardening
   (`golangci-lint`, `govulncheck`) and release plumbing (a
   tag-triggered `.github/workflows/go-release.yml` that warms
   the Go module proxy and cuts a GitHub Release from the
-  `go/CHANGELOG.md` stanza) shipped in v0.7.6 (step 7 of 7,
-  closing out the v0.7.x staged rollout; future Go-port
+  `go/CHANGELOG.md` stanza) shipped in `go/v0.7.6` (step 7 of 7,
+  closing out the `go/v0.7.x` staged rollout; future Go-port
   releases ship as `go/v0.8.x`). The
   `pgrls lint / fix / snapshot / diff` CLIs stay Python —
   they depend on pglast (no drop-in TS/Go equivalent).
