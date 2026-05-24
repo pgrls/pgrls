@@ -126,8 +126,11 @@ git add .pgrls-baseline.json
 git commit -m "pgrls: baseline current Supabase RLS findings"
 ```
 
-`pgrls lint --update-baseline` refreshes the file after an intentional
-clean-up pass.
+`pgrls lint --schemas public --baseline .pgrls-baseline.json
+--update-baseline` refreshes the file after an intentional clean-up
+pass. (`--update-baseline` requires `--baseline FILE` — without it the
+CLI raises `--update-baseline requires --baseline FILE to name the file
+to refresh.`)
 
 ## Beyond SEC004 / SEC027 / SEC030
 
