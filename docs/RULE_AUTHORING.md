@@ -4,7 +4,7 @@ A worked tutorial for contributors. By the end you'll have a complete
 rule (module + tests + fixture + docs) of the same shape as every
 SEC/PERF/HYG/VIEW rule already in the catalogue.
 
-For the user-facing rule reference, see [`AGENTS.md`](../AGENTS.md).
+For the per-rule reference (severity, detection logic, allowlist shape, fix template), see [`AGENTS.md`](../AGENTS.md).
 For the project-wide checklist of contribution conventions, see
 [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
@@ -114,15 +114,17 @@ Walk through what changes for a hypothetical new SEC033.
 Rule numbers are append-only. Find the next free number in the
 right family by looking at [`src/pgrls/rules/`](../src/pgrls/rules/):
 
-| Family   | Concern                                | Range used |
-| -------- | -------------------------------------- | ---------- |
-| `SEC`    | Security / correctness                 | 001–032    |
-| `PERF`   | Performance / index health             | 001–004    |
-| `HYG`    | Hygiene / naming                       | 001–003    |
-| `VIEW`   | View-mediated RLS bypasses             | 001–004    |
+| Family   | Concern                                | Current highest |
+| -------- | -------------------------------------- | --------------- |
+| `SEC`    | Security / correctness                 | 032             |
+| `PERF`   | Performance / index health             | 004             |
+| `HYG`    | Hygiene / naming                       | 003             |
+| `VIEW`   | View-mediated RLS bypasses             | 004             |
 
-Pick the next free integer in your family. Never reuse a deprecated
-rule's number — keep history clean.
+Pick the next free integer **above** the current highest in your
+family (e.g. `SEC033`, `PERF005`). The catalog is append-only — never
+reuse a deprecated rule's number, never start a new family below an
+existing one.
 
 ### 2. Write the rule module
 
@@ -337,14 +339,16 @@ against missing a doc spot.
 
 If your rule has a mechanical remediation, see
 [`src/pgrls/fixers/`](../src/pgrls/fixers/) for the protocol and
-existing examples (`sec031.py` is a short worked example, ~100 lines).
+existing examples (`sec031.py` is a small, self-contained worked example).
 The fixer emits `DROP POLICY` / `CREATE POLICY` / `CREATE INDEX` SQL
 ready for the next migration; register it in
 [`src/pgrls/fixers/__init__.py`](../src/pgrls/fixers/__init__.py)'s
 `default_fixers()` list.
 
 Bump the auto-fixable count (`12 mechanically auto-fixable`) in the
-same docs that cite the rule count.
+same docs that cite the rule count — README.md and pyproject.toml's
+`description` field both carry the explicit fixer list, and AGENTS.md
+opens with the count.
 
 ### 8. Verify
 
@@ -375,7 +379,8 @@ a 3-clean review loop before merging.
   unresolved (rules treat it as not-own-table).
   `pgrls.rules.perf003._own_table_column` is one such resolver
   (re-imported by PERF004); SEC005 / SEC018 / SEC030 carry their own
-  `_own_column_names`-style helpers (each rule's bug class needs
+  `_is_own_column_ref` (SEC005/SEC018) / `_own_column_names` (SEC030)
+  helpers (each rule's bug class needs
   slightly different resolution semantics).
 - **Sub-link handling.** A column reference inside a `SubLink` body
   belongs to a different table; pass `exclude_sublinks=True` to
