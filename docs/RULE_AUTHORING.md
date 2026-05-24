@@ -345,10 +345,11 @@ ready for the next migration; register it in
 [`src/pgrls/fixers/__init__.py`](../src/pgrls/fixers/__init__.py)'s
 `default_fixers()` list.
 
-Bump the auto-fixable count (`12 mechanically auto-fixable`) in the
-same docs that cite the rule count — README.md and pyproject.toml's
-`description` field both carry the explicit fixer list, and AGENTS.md
-opens with the count.
+Bump the auto-fixable count (`12 mechanically auto-fixable`) in
+README.md and `pyproject.toml`'s `description` field — both carry the
+count AND the explicit fixer list (`SEC001, SEC002, SEC006, ...`).
+AGENTS.md also enumerates the fixable rules — search for
+`Auto-fix for SEC001` and bump that list when shipping a new fixer.
 
 ### 8. Verify
 
