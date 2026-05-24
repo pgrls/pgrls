@@ -28,7 +28,7 @@ tutorial see [`docs/RULE_AUTHORING.md`](RULE_AUTHORING.md).
                 ┌────────────────┴────────────────┐
                 ▼                                  ▼
    ┌─────────────────────────┐       ┌────────────────────────────┐
-   │  Formatters             │       │  Fixers (12 of 43 rules)   │
+   │  Formatters             │       │  Fixers (subset of rules)  │
    │  text/json/sarif/...    │       │  emit remediation SQL      │
    └─────────────────────────┘       └────────────────────────────┘
 ```
@@ -174,10 +174,16 @@ class Fix:
     sql: str              # the remediation, with a trailing semicolon
     description: str      # a one-line human-facing summary
 
+@runtime_checkable
 class Fixer(Protocol):
     rule_id: str
-    def generate(self, schema: Schema, violations: list[Violation]) -> list[Fix]: ...
+    def fix(self, schema: Schema, options: dict[str, Any]) -> list[Fix]: ...
 ```
+
+Note `fix` takes the same `(schema, options)` shape as `Rule.check`, not
+a list of pre-computed violations — fixers re-walk the schema so they
+can emit precise remediation SQL even when the rule's aggregation
+boundary is different from the fixer's.
 
 `pgrls fix` runs the registered fixers against the active violations
 and concatenates the `Fix.sql` blocks into one migration-ready output
@@ -289,8 +295,6 @@ Postgres client. That trade-off is load-bearing for the CI story.
 - [`docs/RULE_AUTHORING.md`](RULE_AUTHORING.md) — the worked tutorial
   for adding a rule.
 - [`docs/QUICKSTART.md`](QUICKSTART.md) — 5-minute first-run.
-- [`docs/recipes/`](recipes/) — framework-specific guides
-  (Supabase / PostgREST / Django).
 - [`AGENTS.md`](../AGENTS.md) — every rule with its reference
   paragraph.
 - [`docs/pgrls-test-protocol.md`](pgrls-test-protocol.md) — the

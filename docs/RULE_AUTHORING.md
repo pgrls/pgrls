@@ -71,7 +71,9 @@ from pgrls.violations import Severity, Violation
 class SEC024:
     id: str = "SEC024"
     severity: Severity = "info"
-    title: str = "current_setting parameter name is unqualified"
+    title: str = (
+        "Policy calls current_setting() with an unqualified parameter name"
+    )
 
     def check(
         self,
@@ -209,8 +211,9 @@ Severity guidance:
 ### 3. Register the rule
 
 [`src/pgrls/rules/__init__.py`](../src/pgrls/rules/__init__.py) has a
-`_build_default_registry()` function that imports and registers every
-rule. Add yours:
+private `_build_default_registry()` function that imports and
+registers every rule lazily on the first call to `default_registry()`
+/ `all_rules()`. Add yours:
 
 ```python
 from pgrls.rules.sec033 import SEC033
@@ -326,6 +329,7 @@ Five files to touch:
 | [`pyproject.toml`](../pyproject.toml) | Same: the `description` field cites the rule count.                    |
 | [`CHANGELOG.md`](../CHANGELOG.md)     | An `### Added` bullet under `[Unreleased]` with the rule + severity + one-line summary. |
 | [`src/pgrls/cli.py`](../src/pgrls/cli.py) | If your rule has its own option name (`auth_functions`, `placeholder_words`, etc.) and you want it to surface in the JSON-schema example, the example in `pgrls.schema.json` may also need a touch. |
+| [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours. The `test_explain_lists_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
 count (`43 lint rules`, `42 of 43`, etc.) is a cheap insurance
@@ -335,10 +339,11 @@ against missing a doc spot.
 
 If your rule has a mechanical remediation, see
 [`src/pgrls/fixers/`](../src/pgrls/fixers/) for the protocol and
-existing examples (`sec031.py` is the smallest, ~30 lines). The
-fixer emits `DROP POLICY` / `CREATE POLICY` / `CREATE INDEX` SQL
+existing examples (`sec031.py` is a short worked example, ~100 lines).
+The fixer emits `DROP POLICY` / `CREATE POLICY` / `CREATE INDEX` SQL
 ready for the next migration; register it in
-[`src/pgrls/fixers/__init__.py`](../src/pgrls/fixers/__init__.py).
+[`src/pgrls/fixers/__init__.py`](../src/pgrls/fixers/__init__.py)'s
+`default_fixers()` list.
 
 Bump the auto-fixable count (`12 mechanically auto-fixable`) in the
 same docs that cite the rule count.
