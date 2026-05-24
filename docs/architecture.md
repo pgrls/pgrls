@@ -88,15 +88,17 @@ every other layer consumes:
 - **`Table(schema, name, rls_enabled, force_rls, policies, columns,
   column_details, indexes, triggers, partition_of=...)`** — every
   table in scope.
-- **`Policy(name, command, permissive, roles, using_sql, using_ast,
-  with_check_sql, with_check_ast)`** — one CREATE POLICY entry. The
-  `_ast` fields are the parsed expression trees (via `pglast`); the
-  `_sql` fields are the raw text from `pg_get_expr()`.
-- **`Index(name, columns, method, is_unique, is_partial, ...)`** —
-  one CREATE INDEX entry. `columns` is a tuple; expression-index
+- **`Policy(name, command, permissive, roles, using_sql,
+  with_check_sql, using_ast=..., with_check_ast=...)`** — one
+  CREATE POLICY entry. The `_ast` fields are the parsed expression
+  trees (via `pglast`); the `_sql` fields are the raw text from
+  `pg_get_expr()`.
+- **`Index(name, columns, access_method, is_unique, is_partial, ...)`**
+  — one CREATE INDEX entry. `columns` is a tuple; expression-index
   positions render as the empty string `""`.
-- **`Trigger(...)`, `View(...)`, `Role(...)`** — round out the
-  pieces some rules need.
+- **`Trigger(...)`, `View(...)`, `BypassRlsRole(...)`** — round out
+  the pieces some rules need (`BypassRlsRole` and `BypassRlsEscalation`
+  drive SEC005 / SEC029).
 
 All fields are kwargs-only by convention; positional order is not
 committed across releases.
@@ -187,8 +189,10 @@ boundary is different from the fixer's.
 
 `pgrls fix` runs the registered fixers against the active violations
 and concatenates the `Fix.sql` blocks into one migration-ready output
-(`--output 001_pgrls_fixes.sql` writes it; default is stdout).
-`pgrls fix --check` is the dry-run.
+(`--output 001_pgrls_fixes.sql` writes it; default is stdout — the
+default IS the dry-run). `pgrls fix --check` is the *CI gate*: it
+exits 1 if any auto-fixable findings would be emitted and writes no
+SQL, modelled on `ruff format --check` / `prettier --check`.
 
 A rule with no mechanical remediation does not have a fixer (e.g.
 SEC004 — pgrls can't author your real auth check). That's deliberate;

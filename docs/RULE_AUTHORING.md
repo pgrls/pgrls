@@ -276,7 +276,7 @@ def test_sec033_fires_on_canonical_shape() -> None:
     assert v.rule_id == "SEC033"
 
 
-def test_sec033_silent_on_<close-but-not-the-shape>() -> None:
+def test_sec033_silent_on_close_but_not_the_shape() -> None:
     schema = _wrap(_policy("<a shape that LOOKS similar but isn't>"))
     assert SEC033().check(schema, options={}) == []
 ```
@@ -320,7 +320,8 @@ to confirm.
 
 ### 6. Update the docs
 
-Five files to touch:
+Six files to touch (the last one is informational — no edit usually
+needed, but worth knowing the tests exist):
 
 | File                                  | Update                                                                 |
 | ------------------------------------- | ---------------------------------------------------------------------- |
