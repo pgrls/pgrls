@@ -4,10 +4,8 @@ A worked tutorial for contributors. By the end you'll have a complete
 rule (module + tests + fixture + docs) of the same shape as every
 SEC/PERF/HYG/VIEW rule already in the catalogue.
 
-For the higher-level "how does pgrls work?" see
-[`docs/architecture.md`](architecture.md). For the user-facing rule
-reference, see [`AGENTS.md`](../AGENTS.md). For the project-wide
-checklist of contribution conventions, see
+For the user-facing rule reference, see [`AGENTS.md`](../AGENTS.md).
+For the project-wide checklist of contribution conventions, see
 [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 ## The shape of a rule
@@ -329,7 +327,7 @@ needed, but worth knowing the tests exist):
 | [`README.md`](../README.md)           | Bump the rule count (`43 lint rules` → `44`) in the badges/intro/feature line. |
 | [`pyproject.toml`](../pyproject.toml) | Same: the `description` field cites the rule count.                    |
 | [`CHANGELOG.md`](../CHANGELOG.md)     | An `### Added` bullet under `[Unreleased]` with the rule + severity + one-line summary. |
-| [`src/pgrls/cli.py`](../src/pgrls/cli.py) | If your rule has its own option name (`auth_functions`, `placeholder_words`, etc.) and you want it to surface in the JSON-schema example, the example in `pgrls.schema.json` may also need a touch. |
+| [`pgrls.schema.json`](../pgrls.schema.json) | If your rule has its own option name (`auth_functions`, `placeholder_words`, etc.) and you want it to surface in the JSON-schema example, the example in `pgrls.schema.json` may also need a touch. |
 | [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours. The `test_explain_covers_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
@@ -372,11 +370,14 @@ a 3-clean review loop before merging.
   is specifically about one or the other. WITH CHECK is a real
   enforcement surface for INSERT/UPDATE; many rules need to flag
   the same condition there.
-- **Resolve own-table columns with care.** `_own_table_column` in
-  PERF003 / SEC005 / SEC018 / SEC030 is the canonical resolver:
-  bare (`col`), table-qualified (`t.col`), schema-qualified
+- **Resolve own-table columns with care.** The canonical resolution
+  pattern is: bare (`col`), table-qualified (`t.col`), schema-qualified
   (`s.t.col`); a 4-part `db.schema.table.col` reference is left
   unresolved (rules treat it as not-own-table).
+  `pgrls.rules.perf003._own_table_column` is one such resolver
+  (re-imported by PERF004); SEC005 / SEC018 / SEC030 carry their own
+  `_own_column_names`-style helpers (each rule's bug class needs
+  slightly different resolution semantics).
 - **Sub-link handling.** A column reference inside a `SubLink` body
   belongs to a different table; pass `exclude_sublinks=True` to
   `extract_column_refs` when you want only own-table refs. A
