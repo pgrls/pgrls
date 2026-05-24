@@ -1,7 +1,15 @@
-"""Property-based tests for the AST resolver helpers.
+"""Property-based tests for the canonical own-column resolver.
 
-Example-based tests (the SEC005/SEC018/SEC030/PERF003 fixtures)
-cover the *shapes* we've thought to enumerate. Hypothesis covers the
+`_own_table_column` is defined in `pgrls.rules.perf003` and shared
+with `pgrls.rules.perf004` (which imports it directly); both PERF
+rules treat its return value as the source of truth for "does this
+ref belong to the policy's own table?". The SEC rules (SEC005 /
+SEC018 / SEC030) have their own equivalent helpers
+(`_own_column_names` and similar) — those are separate fuzz targets
+a future PR may add.
+
+Example-based tests (`tests/rules/test_perf003.py`) cover the
+specific *shapes* we've thought to enumerate. Hypothesis covers the
 combinatorial space — random tuples of random strings against tables
 with random schema/name — and asserts the contract docstrings claim:
 
@@ -12,10 +20,8 @@ with random schema/name — and asserts the contract docstrings claim:
   - Any other shape (empty, ≥4-part) → returns `None`.
   - Never raises on any combination of input strings.
 
-The 4-part-ref pin in `tests/rules/test_perf003.py` covers one
-specific shape; this file is the comprehensive coverage that catches
-edge cases (empty strings, very long strings, unicode identifiers,
-schema collisions) the example fixtures don't enumerate.
+Catches edge cases (empty strings, very long strings, unicode
+identifiers, schema collisions) the example fixtures don't enumerate.
 """
 from __future__ import annotations
 
@@ -95,8 +101,9 @@ def test_resolver_never_raises_on_any_string_ref(parts: list[str]) -> None:
     assert result is None or isinstance(result, str)
 
 
-@given(parts=st.lists(ident, min_size=0, max_size=0))
-def test_empty_tuple_returns_none(parts: list[str]) -> None:
-    # An empty ref — extract_column_refs shouldn't produce one, but
-    # the resolver tolerates it (falls through to the final return).
-    assert _own_table_column(tuple(parts), _table()) is None
+def test_empty_tuple_returns_none() -> None:
+    # An empty ref — `extract_column_refs` shouldn't produce one,
+    # but the resolver tolerates it (falls through to the final
+    # `return None`). Plain pytest test — no Hypothesis needed for
+    # a single-input case.
+    assert _own_table_column((), _table()) is None
