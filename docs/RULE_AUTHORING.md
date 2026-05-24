@@ -329,7 +329,7 @@ Five files to touch:
 | [`pyproject.toml`](../pyproject.toml) | Same: the `description` field cites the rule count.                    |
 | [`CHANGELOG.md`](../CHANGELOG.md)     | An `### Added` bullet under `[Unreleased]` with the rule + severity + one-line summary. |
 | [`src/pgrls/cli.py`](../src/pgrls/cli.py) | If your rule has its own option name (`auth_functions`, `placeholder_words`, etc.) and you want it to surface in the JSON-schema example, the example in `pgrls.schema.json` may also need a touch. |
-| [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours. The `test_explain_lists_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
+| [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours. The `test_explain_covers_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
 count (`43 lint rules`, `42 of 43`, etc.) is a cheap insurance
