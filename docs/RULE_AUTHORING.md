@@ -236,8 +236,7 @@ cases.
 """Unit tests for SEC033."""
 from __future__ import annotations
 
-import pglast
-
+from pgrls.ast_utils import parse_expr
 from pgrls.model import Policy, Schema, Table
 from pgrls.rules.sec033 import SEC033
 
@@ -255,14 +254,13 @@ def _wrap(policy: Policy) -> Schema:
 
 
 def _policy(using: str, *, name: str = "p") -> Policy:
-    using_ast = pglast.parse_sql(f"SELECT {using}")[0].stmt.targetList[0].val
     return Policy(
         name=name,
         command="SELECT",
         permissive=True,
         roles=("public",),
         using_sql=using,
-        using_ast=using_ast,
+        using_ast=parse_expr(using),
         with_check_sql=None,
         with_check_ast=None,
     )
@@ -331,7 +329,8 @@ needed, but worth knowing the tests exist):
 | [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours. The `test_explain_covers_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
-count (`43 lint rules`, `42 of 43`, etc.) is a cheap insurance
+count (`43 lint rules`, `forty-three rules`, etc. — the phrasing
+that actually appears in README.md and AGENTS.md) is cheap insurance
 against missing a doc spot.
 
 ### 7. (Optional) Write a fixer
