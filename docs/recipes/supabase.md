@@ -138,8 +138,13 @@ Other Supabase-relevant rules to know about (see
   never had `ALTER TABLE … ENABLE ROW LEVEL SECURITY`, with no
   policies defined on it; the policy-bearing variant is **SEC032**).
 - **SEC002** — `FORCE ROW LEVEL SECURITY` missing; without it the
-  *owner* of the table can bypass RLS, which on Supabase means
-  `service_role`-owned queries skip the policies.
+  role that *owns* the table (typically your migration role —
+  `postgres` on a default Supabase setup, or whichever role your CI
+  applies migrations as) bypasses RLS when it queries the table.
+  Supabase's `service_role` bypasses RLS via the `BYPASSRLS` role
+  attribute, which is a different mechanism (caught by SEC016) — so
+  SEC002 is the rule for the *migration*-side bypass, not for
+  `service_role`.
 - **SEC008** — policy with literal `USING (true)`: no scoping at all
   (the top-level constant-true case).
 - **SEC009** — table has RLS enabled but **no policies** defined

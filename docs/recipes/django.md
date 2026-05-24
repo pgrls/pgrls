@@ -171,9 +171,11 @@ Then the test switches into it so RLS actually enforces:
 
 ```python
 def test_user_cant_see_other_users_documents(pgrls_db):
+    # Omit `id` so the SERIAL sequence assigns one — avoids
+    # mismatches with later inserts that use the sequence.
     pgrls_db.seed("public.app_document", [
-        {"id": 1, "owner_id": "alice", "body": "A"},
-        {"id": 2, "owner_id": "bob",   "body": "B"},
+        {"owner_id": "alice", "body": "A"},
+        {"owner_id": "bob",   "body": "B"},
     ])
     # The fixture connects as a privileged role (which bypasses RLS);
     # switch to the app role so the policies engage, then mirror what
