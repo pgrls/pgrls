@@ -608,3 +608,24 @@ CREATE POLICY by_email ON public.allbad_perf004
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (lower(email) = (SELECT current_setting('app.email', true)));
 CREATE INDEX allbad_perf004_email_idx ON public.allbad_perf004 (email);
+
+-- SEC033: the policy gates access on `user_metadata`, the Supabase
+-- JWT claim that the authenticated user can rewrite via the auth API
+-- (the `updateUser` data field). Any user can set role=admin in their
+-- own metadata and walk past the check. Other rules stay quiet here.
+-- RLS is on with FORCE so SEC001/SEC002/SEC032 stay silent. Policy is
+-- granted TO postgres (not PUBLIC) so SEC003/SEC007 stay silent. It
+-- walks `auth.jwt()` (in the SEC004 default set) but the IS-NULL
+-- inversion isn't there, so SEC004 stays silent. The predicate
+-- doesn't reference an own column, doesn't compare to an identity
+-- literal, has WITH CHECK matching USING, isn't NULL-tolerant — none
+-- of SEC005, SEC011, SEC021, or SEC030 engage.
+CREATE TABLE public.allbad_sec033 (id INT, body TEXT);
+ALTER TABLE public.allbad_sec033 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec033 FORCE ROW LEVEL SECURITY;
+CREATE POLICY user_metadata_admin ON public.allbad_sec033
+    FOR ALL TO postgres
+    USING ((current_setting('request.jwt.claims', true)::jsonb
+            -> 'user_metadata' ->> 'role') = 'admin')
+    WITH CHECK ((current_setting('request.jwt.claims', true)::jsonb
+                 -> 'user_metadata' ->> 'role') = 'admin');

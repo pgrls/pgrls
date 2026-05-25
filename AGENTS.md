@@ -10,13 +10,15 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-three rules across four
+In the current release it ships **forty-four rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
 (write-side policies missing `WITH CHECK`), `SEC032` (table has
 policies but RLS is off — the policies are dormant and the table is
-wide open), `HYG001`
+wide open), `SEC033` (policy scopes by a user-modifiable JWT claim
+like `user_metadata` — the authenticated user can rewrite the value
+the policy reads), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
@@ -2161,6 +2163,86 @@ when an RLS-off-with-policies table is deliberate.
 **No auto-fix** — enabling RLS on a live table is an operational
 decision (it immediately changes who sees what), not a mechanical
 edit pgrls should make unprompted.
+
+<a id="rule-sec033"></a>
+
+### SEC033 — Policy scopes by user-modifiable JWT claim (`user_metadata`)
+
+**Severity:** error.
+
+**The vulnerability:** In the Supabase / PostgREST auth model,
+`raw_user_meta_data` (a.k.a. the `user_metadata` JWT claim) is
+**end-user writable** via the standard auth API:
+
+```js
+supabase.auth.updateUser({ data: { role: "admin" } })
+```
+
+The next JWT carries the user-supplied value, so any RLS policy
+gating access on that field can be bypassed by the authenticated user
+themselves — they set the field, the next request carries it, the
+policy reads it, the check passes. This is the same hazard class as
+SEC004 (anonymous access via inverted auth check): a deterministic,
+single-step exploit available to any authenticated user.
+
+The safe counterpart is **`raw_app_meta_data`** (a.k.a.
+`app_metadata`), which is writable only via the service role.
+`app_metadata`-scoped policies are not flagged.
+
+**The bad pattern:**
+
+```sql
+CREATE POLICY admins_only ON public.documents
+    FOR ALL TO authenticated
+    USING (auth.jwt() -> 'user_metadata' ->> 'role' = 'admin');
+    --                  ^^^^^^^^^^^^^^^
+    -- User can set this themselves; check is self-bypassable.
+```
+
+The same shape with any JSON operator (`->`, `->>`, `#>`, `#>>`)
+trips the rule, and so does a direct column reference to
+`raw_user_meta_data` (typically via a `SELECT ... FROM auth.users`
+sub-link).
+
+**Standard fix.** Move the role gate into the admin-only claim:
+
+```sql
+CREATE POLICY admins_only ON public.documents
+    FOR ALL TO authenticated
+    USING (auth.jwt() -> 'app_metadata' ->> 'role' = 'admin');
+```
+
+Then set the claim via the service role (a server-only backend, an
+admin dashboard's elevated session, or a custom auth hook) — the
+end user can't write it through the client SDK.
+
+**Configuring the key set.** Default:
+
+```toml
+[lint.rules.SEC033]
+string_keys = ["user_metadata"]
+column_names = ["raw_user_meta_data"]
+```
+
+`string_keys` replaces the default JSON-key match list (case-
+sensitive — Postgres jsonb keys are case-sensitive). `column_names`
+replaces the default column-name match list (case-insensitive —
+Postgres lowercases unquoted identifiers). Both are list-replace, not
+list-merge: include all the names you want flagged.
+
+**Allowlist by `schema.table.policy`** when a policy intentionally
+reads `user_metadata` for a non-authorization side-effect (logging,
+display, etc.):
+
+```toml
+[lint.rules.SEC033]
+allowlist = ["public.audit_log.write_metadata_snapshot"]
+```
+
+**No auto-fix** — replacing `user_metadata` with `app_metadata`
+changes which claim the application writes too, not just which
+claim the policy reads. That's an application-side migration that
+pgrls can't make safely.
 
 <a id="rule-perf001"></a>
 

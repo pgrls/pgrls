@@ -10,6 +10,30 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-25
+
+### Added
+
+- **SEC033 — Policy scopes by user-modifiable JWT claim
+  (`user_metadata` / `raw_user_meta_data`).** Severity: error. In
+  the Supabase / PostgREST auth model `user_metadata` is end-user
+  writable via the auth API (`supabase.auth.updateUser`), so a
+  policy gating on a value pulled from it is self-bypassable: the
+  authenticated user sets the field, the next JWT carries it, the
+  policy reads it, the check passes. Same hazard class as SEC004
+  (anonymous access via inverted auth check). Detection walks
+  policy USING / WITH CHECK ASTs for `user_metadata` JSON keys (any
+  of the `->`, `->>`, `#>`, `#>>` operator shapes) and for
+  `raw_user_meta_data` column references. Configurable
+  `string_keys` / `column_names` / `allowlist`; no auto-fix
+  (rewriting to `app_metadata` requires application-side migration).
+  Surfaced by the May 2026 PostgREST RLS-with-JWT-claims advisory.
+
+### Changed
+
+- Rule catalog: **43 → 44 rules.** Bumped `pyproject.toml`
+  description and the README rule table.
+
 ## [0.6.0] - 2026-05-22
 
 Milestone release. **No functional or breaking changes since 0.5.67.**
