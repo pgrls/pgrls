@@ -3,9 +3,9 @@
 Spins up an ephemeral Postgres via testcontainers, applies a synthetic
 schema with a parametrized number of tables + policies, runs the lint
 in-process (introspect + walk every rule), and prints a single JSON
-record to stdout. No `pgrls.cli` Click machinery in the timed loop —
-we drive the library API directly so the numbers reflect the lint
-work itself, not Click setup.
+record to stdout. The CLI's argument-parser layer is bypassed in the
+timed loop — we drive the library API directly so the numbers reflect
+the lint work itself, not CLI-parser setup.
 
 Usage:
 
@@ -66,11 +66,11 @@ def _generate_schema_sql(*, tables: int, policies: int) -> str:
     if policies < 0:
         raise ValueError("policies must be >= 0")
 
-    stmts: list[str] = [
-        "CREATE OR REPLACE FUNCTION app_uid() RETURNS uuid "
-        "LANGUAGE sql STABLE AS $$ "
-        "SELECT nullif(current_setting('app.uid', true), '')::uuid $$;"
-    ]
+    # We don't need a user-defined function — the PERF001 rule
+    # recognizes `current_setting(...)` directly (it's in the rule's
+    # default `auth_functions` set). Using the stock helper keeps the
+    # bench's "this should trip these rules" claim honest.
+    stmts: list[str] = []
 
     for t in range(tables):
         name = f"t_{t:05d}"
@@ -93,18 +93,26 @@ def _generate_schema_sql(*, tables: int, policies: int) -> str:
         name = f"t_{t:05d}"
         pname = f"pol_{p:05d}"
         if p % 2 == 0:
-            # Trips PERF001 (function call without (SELECT …) wrap)
+            # `current_setting(...)` without `(SELECT …)` wrap trips
+            # PERF001. `current_setting` is in the rule's default
+            # `auth_functions` set (per src/pgrls/rules/perf001.py).
             stmts.append(
                 f"CREATE POLICY {pname} ON public.{name} "
                 "FOR SELECT TO public "
-                "USING (owner_id = app_uid());"
+                "USING (owner_id::text = "
+                "current_setting('app.uid', true));"
             )
         else:
-            # UPDATE without WITH CHECK — trips SEC006
+            # UPDATE without WITH CHECK trips SEC006. We wrap the
+            # GUC call in (SELECT …) here so the same shape does NOT
+            # also trip PERF001 — the bench should exercise each
+            # rule on a distinct policy so a per-rule cost change
+            # shows up as a per-shape regression, not a tangled mix.
             stmts.append(
                 f"CREATE POLICY {pname} ON public.{name} "
                 "FOR UPDATE TO public "
-                "USING (owner_id = (SELECT app_uid()));"
+                "USING (owner_id::text = "
+                "(SELECT current_setting('app.uid', true)));"
             )
 
     return "\n".join(stmts)
@@ -146,15 +154,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Spin up Postgres, apply schema, time the lint.
     with PostgresContainer(POSTGRES_IMAGE) as pg:
-        conn_str = pg.get_connection_url().replace(
-            "postgresql+psycopg2://", "postgres://"
-        )
+        # `driver=None` returns the bare `postgres://...` URL psycopg
+        # accepts; without it testcontainers prepends a SQLAlchemy
+        # driver prefix (`postgresql+psycopg2://`) which psycopg
+        # rejects. Same shape as `cli.py` and the test fixtures.
+        conn_str = pg.get_connection_url(driver=None)
 
         t0 = time.perf_counter()
         with psycopg.connect(conn_str) as apply_conn:
             with apply_conn.cursor() as cur:
                 cur.execute(schema_sql)
-            apply_conn.commit()
+            # The `with psycopg.connect(...)` block commits on
+            # successful exit, so no explicit `commit()` here.
         schema_apply_ms = int((time.perf_counter() - t0) * 1000)
 
         with psycopg.connect(conn_str) as lint_conn:
