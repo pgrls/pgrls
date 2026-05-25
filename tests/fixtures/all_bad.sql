@@ -612,14 +612,20 @@ CREATE INDEX allbad_perf004_email_idx ON public.allbad_perf004 (email);
 -- SEC033: the policy gates access on `user_metadata`, the Supabase
 -- JWT claim that the authenticated user can rewrite via the auth API
 -- (the `updateUser` data field). Any user can set role=admin in their
--- own metadata and walk past the check. Other rules stay quiet here.
--- RLS is on with FORCE so SEC001/SEC002/SEC032 stay silent. Policy is
--- granted TO postgres (not PUBLIC) so SEC003/SEC007 stay silent. It
--- walks `auth.jwt()` (in the SEC004 default set) but the IS-NULL
--- inversion isn't there, so SEC004 stays silent. The predicate
--- doesn't reference an own column, doesn't compare to an identity
--- literal, has WITH CHECK matching USING, isn't NULL-tolerant — none
--- of SEC005, SEC011, SEC021, or SEC030 engage.
+-- own metadata and walk past the check.
+--
+-- Pinned silences on this block: SEC001/SEC002/SEC032 (RLS is on with
+-- FORCE), SEC003 (policy is granted TO postgres, not PUBLIC), SEC004
+-- (no `auth_func() IS NULL` disjunct), SEC011 (no `OR true`), SEC021
+-- (no `identity_col = literal` comparison), SEC030 (no NULL-tolerant
+-- discriminator shape).
+--
+-- Co-fires by design: SEC005 (predicate references no own column),
+-- SEC007 (postgres is in SEC007's flagged set + policy is permissive),
+-- PERF001 (unwrapped `current_setting` in USING). Each of those rules
+-- is pinned to a different block elsewhere in this fixture so the
+-- combined-fixture test still associates them with their own block —
+-- the SEC033 block adds extra firings, not a re-association.
 CREATE TABLE public.allbad_sec033 (id INT, body TEXT);
 ALTER TABLE public.allbad_sec033 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.allbad_sec033 FORCE ROW LEVEL SECURITY;

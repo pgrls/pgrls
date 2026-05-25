@@ -136,7 +136,10 @@ def _contains_string_const(node: Any, keys: set[str]) -> bool:
       2. Array-element membership — `auth.jwt() #> '{user_metadata,...}'`
          produces a single `A_Const(String) sval='{user_metadata,...}'`
          (Postgres `text[]` literal syntax, NOT a JSON object). We
-         crack the array open and check each element.
+         crack the array open and check each element. The parser
+         doesn't unescape backslash sequences like `{"a\\"b"}` — the
+         realistic claim-key set doesn't contain quotes or backslashes,
+         so the omission is harmless here.
     """
 
     def walk(n: Any) -> bool:
@@ -153,7 +156,9 @@ def _contains_string_const(node: Any, keys: set[str]) -> bool:
                 for elem in _array_literal_keys(val.sval):
                     if elem in keys:
                         return True
-            # Fall through — A_Const has no children worth walking.
+            # A_Const wraps a single scalar (String/Integer/Float/etc.) —
+            # nothing more to walk inside, return early so we don't
+            # iterate the Node fields below pointlessly.
             return False
         if isinstance(n, Node):
             for field_name in n:
