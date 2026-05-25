@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-four rules across four
+In the current release it ships **forty-five rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -18,7 +18,10 @@ categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 policies but RLS is off — the policies are dormant and the table is
 wide open), `SEC033` (policy scopes by a user-modifiable JWT claim
 like `user_metadata` — the authenticated user can rewrite the value
-the policy reads), `HYG001`
+the policy reads), `SEC036` (policy `EXISTS (SELECT FROM auth.users
+WHERE …)` clause with no caller binding — evaluates to "is there
+any admin at all" instead of "is THIS user an admin", so every
+authenticated user passes once any matching row exists), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
@@ -2243,6 +2246,106 @@ allowlist = ["public.audit_log.write_metadata_snapshot"]
 changes which claim the application writes too, not just which
 claim the policy reads. That's an application-side migration that
 pgrls can't make safely.
+
+<a id="rule-sec036"></a>
+
+### SEC036 — Policy `EXISTS (SELECT FROM auth.users WHERE …)` clause has no caller binding
+
+**Severity:** error.
+
+**The vulnerability:** A common Supabase / PostgREST pattern is to
+authorize via an `EXISTS` sub-select against `auth.users`:
+
+```sql
+-- correct (intended): "is the calling user an admin?"
+CREATE POLICY admins_only ON public.documents
+    FOR ALL TO authenticated
+    USING (EXISTS (
+        SELECT 1 FROM auth.users
+        WHERE id = auth.uid()
+          AND raw_app_meta_data ->> 'role' = 'admin'
+    ));
+```
+
+Drop the `id = auth.uid()` clause and the policy silently degrades
+to a **system-wide** check — "is there ANY admin in the system" —
+that passes for every authenticated user as soon as a single admin
+row exists in `auth.users`:
+
+```sql
+-- BAD: missing the caller-binding `id = auth.uid()`.
+USING (EXISTS (
+    SELECT 1 FROM auth.users
+    WHERE raw_app_meta_data ->> 'role' = 'admin'
+));
+```
+
+The SQL still parses; the test passes when an admin is present in
+the test DB; the production exploit is silent. Same hazard class as
+SEC033 (`user_metadata` bypass) and SEC004 (anonymous access via
+inverted auth check) — deterministic, single-step, available to any
+authenticated user.
+
+**Detection.** Walks every `SubLink` node in policy USING / WITH
+CHECK ASTs whose `subLinkType` is `EXISTS_SUBLINK`. For each, the
+sub-select's `fromClause` is inspected for `RangeVar`s matching
+the configured target tables (default: `auth.users`). When a
+target matches, the sub-select's `whereClause` is searched for any
+FuncCall whose name is in the configured binding-functions set —
+absent any such reference, the rule fires. **One finding per
+policy**, even when the policy has multiple offending sub-links.
+
+**Standard fix.** Add the caller-binding clause to the sub-select's
+WHERE:
+
+```sql
+USING (EXISTS (
+    SELECT 1 FROM auth.users
+    WHERE id = auth.uid()  -- <-- this line
+      AND raw_app_meta_data ->> 'role' = 'admin'
+));
+```
+
+The column name on the inner table is usually `id` for `auth.users`;
+other user tables may use `user_id`, `sub`, etc.
+
+**Configuration.** `[lint.rules.SEC036]` accepts:
+
+```toml
+[lint.rules.SEC036]
+# `schema.table` references whose use in an EXISTS sub-select
+# triggers the user-binding check. Replaces the default
+# `["auth.users"]`. Schema-qualified — unqualified `users` would be
+# search-path-dependent and isn't covered.
+target_tables = ["auth.users", "public.profiles"]
+
+# Function names whose presence in the sub-select's WHERE counts as
+# a caller-binding signal. Replaces the default
+# `{auth.uid, auth.role, auth.jwt, current_user, session_user,
+# current_setting}`. Add any project-specific helper.
+binding_functions = ["auth.uid", "current_setting", "app.user_id"]
+
+# Per-policy escape hatch — `schema.table.policy_name` IDs that
+# intentionally assert "any matching row exists" rather than
+# "calling user matches" (rare, but legitimate for audit-trigger
+# policies that don't gate by caller).
+allowlist = ["public.audit_log.any_admin_exists"]
+```
+
+**No auto-fix.** The mechanical rewrite would be "add
+`<user_key_column> = auth.uid() AND` to the WHERE clause", but
+the user-key column name varies by schema (`id` on `auth.users`,
+`user_id` / `sub` / `account_id` elsewhere), and prepending to an
+arbitrary `BoolExpr` risks re-associating operator precedence. The
+finding message tells the operator what to add; the edit is one
+line.
+
+**Scope note.** SEC036 covers `EXISTS (SELECT … FROM <users> WHERE …)`
+specifically. The related `IN (SELECT id FROM auth.users WHERE …)` /
+`ANY (SELECT id FROM auth.users WHERE …)` shape is a *different*
+hazard — "show rows whose owner is any admin" rather than "show
+every row if any admin exists." That variant is tracked as a future
+rule; SEC036 stays silent on it.
 
 <a id="rule-perf001"></a>
 
