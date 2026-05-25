@@ -40,8 +40,7 @@ Output (real run on a stock M-series laptop):
   "lint_ms": 61,
   "violation_count": 415,
   "rules_fired_count": 8,
-  "rules_fired": ["HYG003", "PERF001", "PERF003", "SEC002",
-                  "SEC003", "SEC006", "SEC007", "SEC022"],
+  "rules_fired": ["HYG003", "PERF001", "PERF003", "SEC002", "SEC003", "SEC006", "SEC007", "SEC022"],
   "pgrls_version": "0.6.0",
   "postgres_image": "postgres:16-alpine"
 }
