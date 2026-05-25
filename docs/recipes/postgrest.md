@@ -43,10 +43,13 @@ A `tenant_id` column on a multi-tenant PostgREST table is often
 declared without `NOT NULL`. Under the canonical scoping shape
 
 ```sql
-USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true))
+USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true)::uuid)
 ```
 
-a row whose `tenant_id` is `NULL` evaluates `NULL = <value>` to `NULL`
+(`current_setting(...)` always returns `text`; if `tenant_id` is
+`uuid` / `int` / `bigint` you need a matching cast, or Postgres
+raises `operator does not exist: <coltype> = text` at query time.)
+A row whose `tenant_id` is `NULL` evaluates `NULL = <value>` to `NULL`
 (not `true`), so the row is invisible to every tenant. That's already
 a bug — the row belongs to no one. The worse failure mode is one
 edit away: the moment any policy on the table uses a NULL-tolerant

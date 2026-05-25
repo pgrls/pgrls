@@ -186,9 +186,11 @@ def test_user_cant_see_other_users_documents(pgrls_db):
             "SELECT set_config('app.user_id', %s, true)",
             params=["alice"],
         )
-        pgrls_db.assert_rows("SELECT body FROM app_document", count=1)
+        pgrls_db.assert_rows(
+            "SELECT body FROM public.app_document", count=1
+        )
         pgrls_db.assert_invisible(
-            "SELECT body FROM app_document WHERE owner_id = 'bob'"
+            "SELECT body FROM public.app_document WHERE owner_id = 'bob'"
         )
 ```
 

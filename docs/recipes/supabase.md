@@ -29,8 +29,11 @@ role binding narrows *who* the policy applies to, not *what the
 policy means*.)
 
 pgrls flags this as **SEC004** (severity `error`) — its default
-auth-function set includes `auth.uid`, `auth.role`, `auth.jwt`, and
-`current_setting`, so the same shape with any of them trips the rule.
+auth-function set is `auth.uid`, `auth.role`, `auth.jwt`,
+`current_setting`, `current_user`, and `session_user`, so the same
+shape with any of them trips the rule. (If you override `auth_functions`
+in `[lint.rules.SEC004]` the value *replaces* the default — include
+all six plus any project-specific helper.)
 
 ## Within-tenant leaks (the second-biggest Supabase pattern)
 
