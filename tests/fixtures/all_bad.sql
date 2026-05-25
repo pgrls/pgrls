@@ -608,3 +608,30 @@ CREATE POLICY by_email ON public.allbad_perf004
     AS RESTRICTIVE FOR SELECT TO PUBLIC
     USING (lower(email) = (SELECT current_setting('app.email', true)));
 CREATE INDEX allbad_perf004_email_idx ON public.allbad_perf004 (email);
+
+-- SEC033: the policy gates access on `user_metadata`, the Supabase
+-- JWT claim that the authenticated user can rewrite via the auth API
+-- (the `updateUser` data field). Any user can set role=admin in their
+-- own metadata and walk past the check.
+--
+-- Pinned silences on this block: SEC001/SEC002/SEC032 (RLS is on with
+-- FORCE), SEC003 (policy is granted TO postgres, not PUBLIC), SEC004
+-- (no `auth_func() IS NULL` disjunct), SEC011 (no `OR true`), SEC021
+-- (no `identity_col = literal` comparison), SEC030 (no NULL-tolerant
+-- discriminator shape).
+--
+-- Co-fires by design: SEC005 (predicate references no own column),
+-- SEC007 (postgres is in SEC007's flagged set + policy is permissive),
+-- PERF001 (unwrapped `current_setting` in USING). Each of those rules
+-- is pinned to a different block elsewhere in this fixture so the
+-- combined-fixture test still associates them with their own block —
+-- the SEC033 block adds extra firings, not a re-association.
+CREATE TABLE public.allbad_sec033 (id INT, body TEXT);
+ALTER TABLE public.allbad_sec033 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec033 FORCE ROW LEVEL SECURITY;
+CREATE POLICY user_metadata_admin ON public.allbad_sec033
+    FOR ALL TO postgres
+    USING ((current_setting('request.jwt.claims', true)::jsonb
+            -> 'user_metadata' ->> 'role') = 'admin')
+    WITH CHECK ((current_setting('request.jwt.claims', true)::jsonb
+                 -> 'user_metadata' ->> 'role') = 'admin');
