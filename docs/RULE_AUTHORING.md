@@ -216,17 +216,20 @@ registers every rule lazily on the first call to `default_registry()`
 / `all_rules()`. Add yours:
 
 ```python
-from pgrls.rules.sec033 import SEC033
-# ...
 def _build_default_registry() -> RuleRegistry:
+    # imports are kept inside the function so importing `pgrls.rules`
+    # doesn't drag in every rule module up-front (lazy registration).
+    from pgrls.rules.sec033 import SEC033
+    # ...
     registry = RuleRegistry()
     # ...
     registry.register(SEC033())
     return registry
 ```
 
-Keep the imports + registrations sorted by family then number — the
-file's existing pattern.
+Both the lazy imports and the `registry.register(...)` calls live
+inside `_build_default_registry()` — match the file's existing order
+within each block.
 
 ### 4. Write the tests
 
@@ -349,8 +352,11 @@ Bump the auto-fixable count (`12 mechanically auto-fixable`) in:
 * `pyproject.toml`'s `description` field — count only.
 * `README.md` — count plus the explicit fixer list
   (`SEC001, SEC002, SEC006, …`).
-* `AGENTS.md` — also enumerates the fixable rules; search for
-  `Auto-fix for SEC001` and bump that list when shipping a new fixer.
+* `AGENTS.md` — enumerates the fixable rules in **two** places.
+  Search for `Auto-fix for SEC001` (the catalog summary line) and
+  `Currently fixable:` (the per-fixer prose block, one bullet per
+  fixer with an `ALTER …` example) — both need a new entry when
+  shipping a new fixer.
 
 ### 8. Verify
 
@@ -365,7 +371,8 @@ All four green.
 
 ### 9. Submit
 
-Branch as `feat/sec033`, commit with `feat(rules): SEC033 — <title>`,
+Branch as `feat/rule-sec033` (matches `CONTRIBUTING.md`'s
+convention), commit with `feat(rules): SEC033 — <title>`,
 open a PR. Per the project's release procedure, the PR goes through
 a 3-clean review loop before merging.
 
