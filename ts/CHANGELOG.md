@@ -7,6 +7,18 @@ package adheres to [Semantic Versioning](https://semver.org/). Protocol
 versioning is independent — `PROTOCOL_VERSION` (currently `1`) only bumps
 on wire-level breaking changes shared with the Python client.
 
+## [0.6.3] - 2026-05-24
+
+First JSR publish of `@pgrls/test`. No code changes — same surface
+as 0.6.2 on npm. This release exists to push the package onto JSR
+(the `@pgrls` scope was claimed today) so Deno / Bun / cross-runtime
+consumers have a first-class install path.
+
+### Added
+
+- `@pgrls/test` is now resolvable via `jsr:@pgrls/test@0.6.3` (Deno,
+  Bun) in addition to `npm:pgrls-test@0.6.3` (Node, pnpm, npm, Yarn).
+
 ## [0.6.2] - 2026-05-13
 
 TS polish bundle. No protocol changes; `PROTOCOL_VERSION` stays at `1`.
