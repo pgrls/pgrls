@@ -635,3 +635,32 @@ CREATE POLICY user_metadata_admin ON public.allbad_sec033
             -> 'user_metadata' ->> 'role') = 'admin')
     WITH CHECK ((current_setting('request.jwt.claims', true)::jsonb
                  -> 'user_metadata' ->> 'role') = 'admin');
+
+-- SEC036: the policy gates access on an `EXISTS (SELECT FROM
+-- auth.users WHERE ...)` clause that does NOT bind the calling user.
+-- The intent is per-user admin check (is the calling user an admin),
+-- but the bug evaluates as is-there-any-admin-at-all — so every
+-- authenticated user passes as soon as one admin row exists. Fix is
+-- one line in the sub-select's WHERE: `id = auth.uid() AND ...`.
+--
+-- Pinned silences. SEC001/SEC002/SEC032 silent (RLS on with FORCE).
+-- SEC003/SEC007 silent (granted TO postgres, not PUBLIC). SEC004
+-- silent (no `IS NULL` disjunct). SEC011/SEC021/SEC030 silent (no
+-- OR-true / identity-literal / nullable-discriminator shapes). The
+-- auth schema stub mirrors the SEC033 block style: a minimal users
+-- table just so the EXISTS clause parses against a real RangeVar
+-- with the 'auth.users' qualification SEC036 looks for.
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE TABLE IF NOT EXISTS auth.users (
+    id uuid PRIMARY KEY,
+    raw_app_meta_data jsonb
+);
+CREATE TABLE public.allbad_sec036 (id INT);
+ALTER TABLE public.allbad_sec036 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec036 FORCE ROW LEVEL SECURITY;
+CREATE POLICY any_admin_exists ON public.allbad_sec036
+    FOR ALL TO postgres
+    USING (EXISTS (
+        SELECT 1 FROM auth.users
+        WHERE raw_app_meta_data ->> 'role' = 'admin'
+    ));

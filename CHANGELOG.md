@@ -10,6 +10,29 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-24
+
+### Added
+
+- **SEC036 — Policy `EXISTS (SELECT FROM auth.users WHERE …)`
+  clause has no caller binding.** Severity: error. Catches the
+  common Supabase auth-pattern bug where the per-user admin check
+  is missing the `id = auth.uid()` clause, silently degrading to
+  "is there ANY admin at all in the system" and passing for every
+  authenticated user once a single matching row exists. Detection
+  walks policy USING / WITH CHECK ASTs for `EXISTS_SUBLINK` nodes
+  whose sub-select reads a configured target table (default:
+  `auth.users`) without referencing any caller-binding function
+  (`auth.uid`, `current_user`, `current_setting`, etc.).
+  Configurable `target_tables` / `binding_functions` / `allowlist`;
+  no auto-fix (the inner user-key column varies per schema).
+  Same hazard class as SEC033 / SEC004 — deterministic, single-step,
+  any authenticated user.
+
+### Changed
+
+- Rule catalog: **44 → 45 rules.**
+
 ## [0.6.1] - 2026-05-24
 
 ### Added
