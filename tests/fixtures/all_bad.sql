@@ -664,3 +664,30 @@ CREATE POLICY any_admin_exists ON public.allbad_sec036
         SELECT 1 FROM auth.users
         WHERE raw_app_meta_data ->> 'role' = 'admin'
     ));
+
+-- SEC034: the policy gates rows by `auth.email()`. Email-based
+-- scoping has three silent failure modes (email change flow leaves
+-- users locked out, SQL = is case-sensitive while emails aren't,
+-- plus-addressing makes x+y@host and x@host compare unequal). None
+-- are CVE-class exploits — this is silent denial of service to
+-- self, hence warning rather than error severity. We stub the
+-- minimum auth.email() helper here so the policy parses. Same
+-- block-isolation principles as SEC033 / SEC036: TO postgres
+-- (silences SEC003/SEC007), RLS on with FORCE (silences SEC001 /
+-- SEC002 / SEC032), no IS NULL / OR-true / identity-literal /
+-- nullable-discriminator shapes (silences SEC004 / SEC011 /
+-- SEC021 / SEC030).
+-- Stub uses a single-quoted SQL body (with doubled quotes for the
+-- inner literal) instead of dollar-quoting. The fixture suite
+-- enforces a no-dollar-quoting hygiene check because the naive
+-- statement splitter in apply_sql cannot handle embedded statements
+-- inside dollar-quoted bodies.
+CREATE OR REPLACE FUNCTION auth.email() RETURNS text
+    LANGUAGE sql STABLE
+    AS 'SELECT ''stub@example.invalid''::text';
+CREATE TABLE public.allbad_sec034 (id INT, owner_email TEXT);
+ALTER TABLE public.allbad_sec034 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec034 FORCE ROW LEVEL SECURITY;
+CREATE POLICY email_scoped ON public.allbad_sec034
+    FOR ALL TO postgres
+    USING (owner_email = auth.email());
