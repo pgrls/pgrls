@@ -10,7 +10,7 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
-## [0.6.1] - 2026-05-25
+## [0.6.1] - 2026-05-24
 
 ### Added
 
