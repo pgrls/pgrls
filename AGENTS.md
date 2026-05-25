@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-five rules across four
+In the current release it ships **forty-six rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -25,6 +25,10 @@ authenticated user passes once any matching row exists), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
+`SEC034` (policy gates on `auth.email()` — silent denial of
+service to self when email changes, when SQL `=` is case-sensitive
+but emails aren't, or when plus-addressing means `x+y@host` and
+`x@host` compare unequal),
 `SEC008` (permissive `USING (true)` — admits every row),
 `SEC031` (restrictive `USING (true)` — a no-op floor that enforces
 nothing), `SEC009` (RLS enabled but no policies —
@@ -2246,6 +2250,93 @@ allowlist = ["public.audit_log.write_metadata_snapshot"]
 changes which claim the application writes too, not just which
 claim the policy reads. That's an application-side migration that
 pgrls can't make safely.
+
+<a id="rule-sec034"></a>
+
+### SEC034 — Policy gates on `auth.email()` (silent denial / lockout)
+
+**Severity:** warning.
+
+**The hazard.** A policy that scopes rows by email — typically:
+
+```sql
+USING (owner_email = auth.email())
+```
+
+— ships with three silent failure modes. None are exploits;
+combined they are silent denial-of-service to legitimate users.
+
+1. **Email change flow.** Supabase auth supports user-initiated
+   email change. The new email lands in the JWT after verification;
+   rows that were owned by the old email are now invisible to
+   the user who owns them. Repair requires a manual UPDATE on
+   every email-keyed table.
+2. **Case sensitivity.** SQL `=` is case-sensitive; conventional
+   email handling is case-insensitive for the local part on most
+   mail providers and case-insensitive for the domain part per
+   RFC. `User@Example.com` (stored) vs `user@example.com` (JWT)
+   never matches — silent deny.
+3. **Plus-addressing / aliasing.** `user+tag@gmail.com` and
+   `user@gmail.com` reach the same inbox but compare unequal.
+   Combined with apps that normalize one but not the other, rows
+   become orphaned from the user who created them.
+
+Hazard class differs from SEC033 / SEC036 (CVE-class privilege
+escalation): this one is silent denial. Hence `warning` instead of
+`error`, and a `--fail-on=warning` default still gates CI on it
+while letting `--fail-on=error` continue.
+
+**Standard fix.** Scope by `auth.uid()` (immutable per user, no
+case folding, no aliasing) and treat email as a display field. If
+the policy needs an email lookup (for example, "the row's
+`owner_email` must match the calling user's email"), derive it
+from `auth.users` via `auth.uid()` rather than calling
+`auth.email()` directly:
+
+```sql
+USING (owner_id = auth.uid())
+```
+
+Or, when the table genuinely needs an email-typed FK:
+
+```sql
+USING (owner_email = (
+    SELECT email FROM auth.users WHERE id = auth.uid()
+))
+```
+
+(The latter form trips SEC036's `EXISTS`-against-`auth.users`
+detection's adjacent class, but with `id = auth.uid()` binding
+the sub-select it stays silent — and the lockout-on-email-change
+hazard is now resolved in the application's email-update handler
+rather than every downstream policy.)
+
+**Detection.** Walks policy USING / WITH CHECK ASTs for FuncCall
+nodes whose qualified name matches any of the configured email-
+context functions (default: `auth.email`). One finding per policy
+regardless of how many `auth.email()` references it contains —
+the recommended fix is the same.
+
+**Configuration.** `[lint.rules.SEC034]` accepts:
+
+```toml
+[lint.rules.SEC034]
+# Function names whose call counts as an email-based-authz signal.
+# Replaces the default `["auth.email"]`. Add project-specific
+# helpers (e.g. an internal `app.user_email()`).
+email_functions = ["auth.email", "app.user_email"]
+
+# Per-policy escape hatch — `schema.table.policy_name` IDs that
+# legitimately reference email for audit logging or display.
+allowlist = ["public.audit_log.write_email_snapshot"]
+```
+
+**No auto-fix.** Rewriting `owner_email = auth.email()` to
+`owner_id = auth.uid()` changes the column the policy keys on —
+that's an application-side migration (the schema may not have an
+`owner_id` column; if it does, every INSERT needs to be checked
+to make sure both columns stay populated during the migration
+window).
 
 <a id="rule-sec036"></a>
 

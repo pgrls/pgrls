@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-05-25
+
+### Added
+
+- **SEC034 — Policy gates on `auth.email()` (silent denial /
+  lockout).** Severity: warning. Email-based row scoping has three
+  silent failure modes: (1) Supabase email-change flow leaves the
+  user locked out of their own data, (2) SQL `=` is case-sensitive
+  while emails conventionally aren't, (3) plus-addressing makes
+  `user+tag@host` and `user@host` compare unequal despite reaching
+  the same inbox. Not a CVE-class exploit — this is denial of
+  service to legitimate users — hence warning rather than error.
+  Walks policy USING / WITH CHECK ASTs for FuncCall nodes whose
+  name matches the configured email-context set (default:
+  `auth.email`). Configurable `email_functions` / `allowlist`; no
+  auto-fix (the column-key rewrite is application-side).
+
+### Changed
+
+- Rule catalog: **45 → 46 rules.**
+
 ## [0.6.2] - 2026-05-24
 
 ### Added
