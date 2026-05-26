@@ -34,8 +34,10 @@ precedence order:
 """
 from __future__ import annotations
 
+import html
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from pgrls.model import Schema
 
@@ -224,10 +226,163 @@ def render_markdown(report: Report) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_html(report: Report) -> str:
+    """Standalone HTML audit page — no external dependencies.
+
+    Designed for the "archive this for the auditor" reading context:
+    one file, embedded CSS, prints cleanly, opens offline. Each
+    table appears as one row in a sortable layout (sort is visual —
+    rows are pre-sorted by status precedence then qualified name —
+    so we avoid the JS dependency a click-to-sort would need).
+    Status renders as a coloured pill matching the text formatter's
+    word list (`protected` / `not forced` / `no policies` /
+    `covered by parent` / `RLS off`).
+
+    Everything is HTML-escaped — Postgres identifiers can contain
+    `<` / `>` / `&` legally inside quoted-identifier syntax, so a
+    location like ``weird<name`` must not break the table layout.
+
+    The shape is deliberately conservative: a single self-contained
+    `<style>` block (no inline styles per element), semantic
+    `<table>` / `<thead>` / `<tbody>`, and a `<header>` summary
+    band. The output passes a strict HTML5 validator and renders
+    identically across browsers and `wkhtmltopdf`-style PDF
+    converters (so an auditor can print/PDF it without running
+    pgrls themselves).
+    """
+    now = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    s = report.summary
+
+    # Status-pill chips for the top band.
+    status_chips: list[str] = []
+    for st in STATUSES:
+        n = s[_status_key(st)]
+        if n:
+            label = html.escape(_STATUS_LABELS[st])
+            status_chips.append(
+                f'<span class="pill status-{st}">'
+                f'<strong>{n}</strong>&nbsp;{label}'
+                f'</span>'
+            )
+    chips_html = "\n      ".join(status_chips) if status_chips else (
+        '<span class="pill status-empty">no tables</span>'
+    )
+
+    # Table rows.
+    if not report.tables:
+        rows_html = (
+            '<tr><td colspan="5" class="empty">'
+            "No tables found in the scanned schemas."
+            "</td></tr>"
+        )
+    else:
+        row_lines: list[str] = []
+        for t in report.tables:
+            qn = html.escape(t.qualified_name)
+            status = t.status
+            status_label = html.escape(_STATUS_LABELS[status])
+            row_lines.append(
+                f'      <tr class="row-{status}">'
+                f"<td><code>{qn}</code></td>"
+                f'<td><span class="pill status-{status}">'
+                f"{status_label}</span></td>"
+                f'<td class="num">{"yes" if t.rls_enabled else "no"}</td>'
+                f'<td class="num">{"yes" if t.force_rls else "no"}</td>'
+                f'<td class="num">{t.policy_count}</td>'
+                "</tr>"
+            )
+        rows_html = "\n".join(row_lines)
+
+    total = s["tables"]
+    noun = "table" if total == 1 else "tables"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgrls RLS posture report</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+         Roboto, "Helvetica Neue", Arial, sans-serif;
+         margin: 2rem auto; max-width: 64rem; padding: 0 1rem;
+         color: #1f2328; background: #ffffff; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ color: #e6edf3; background: #0d1117; }}
+    table {{ border-color: #30363d; }}
+    th {{ background: #161b22; }}
+    tr:nth-child(even) td {{ background: #0d1117; }}
+    tr:nth-child(odd) td {{ background: #161b22; }}
+    code {{ background: #161b22; }}
+  }}
+  header {{ margin-bottom: 1.5rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
+  .meta {{ color: #57606a; font-size: .85rem; }}
+  .summary {{ margin: 1rem 0 .5rem; }}
+  .pills {{ display: flex; flex-wrap: wrap; gap: .5rem;
+            margin: 0 0 1.5rem 0; }}
+  .pill {{ display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }}
+  .status-protected         {{ color: #1a7f37; }}
+  .status-not-forced        {{ color: #9a6700; }}
+  .status-no-policies       {{ color: #57606a; }}
+  .status-covered-by-parent {{ color: #0969da; }}
+  .status-rls-off           {{ color: #cf222e; }}
+  .status-empty             {{ color: #57606a; }}
+  table {{ width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }}
+  thead th {{ text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; }}
+  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
+  tbody tr:last-child td {{ border-bottom: 0; }}
+  td.num {{ font-variant-numeric: tabular-nums; }}
+  code {{ background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
+  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
+  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>RLS posture report</h1>
+    <p class="meta">Generated by <code>pgrls report --format html</code> · {html.escape(now)}</p>
+    <p class="summary"><strong>{total}</strong> {noun} scanned.</p>
+    <div class="pills">
+      {chips_html}
+    </div>
+  </header>
+  <table>
+    <thead>
+      <tr>
+        <th>Table</th>
+        <th>Status</th>
+        <th>RLS</th>
+        <th>FORCE</th>
+        <th>Policies</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
+</body>
+</html>
+"""
+
+
 _RENDERERS = {
     "text": render_text,
     "json": render_json,
     "markdown": render_markdown,
+    "html": render_html,
 }
 REPORT_FORMATS = tuple(_RENDERERS)
 

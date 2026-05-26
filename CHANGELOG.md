@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-05-26
+
+### Added
+
+- **`pgrls report --format html` — standalone HTML audit page.**
+  A self-contained HTML5 document (embedded CSS, no external
+  CSS/JS, no `<link>` / `<script>` tags) suitable for archiving as
+  an audit artefact, printing to PDF, or emailing to a reviewer
+  who doesn't run pgrls. Renders the same per-table posture rows
+  as the other formats with severity-coloured status pills, a
+  summary band, and an ISO-8601 UTC generation timestamp.
+  Identifiers are HTML-escaped — a malicious / quoted-identifier
+  table name (`weird<name>&"`) can't break the layout or inject
+  markup. Light / dark colour scheme via `prefers-color-scheme`.
+
 ## [0.6.6] - 2026-05-26
 
 ### Added

@@ -213,8 +213,11 @@ RLS posture — RLS enabled / `FORCE`'d / policy counts plus a coarse
 whose RLS-enabled ancestor is among the scanned schemas;
 `no-policies` covers zero policies *and* restrictive-only tables,
 both default-deny) — and an aggregate summary, in text / JSON /
-Markdown. A snapshot for audits and onboarding; it runs no rules
-and emits no findings.
+Markdown / HTML. The HTML format (`--format html`) is a self-
+contained page (embedded CSS, no external assets) for archiving
+as an audit artefact, printing to PDF, or emailing to a reviewer
+who doesn't run pgrls. A snapshot for audits and onboarding; it
+runs no rules and emits no findings.
 
 ## Auto-fix: `pgrls fix`
 
