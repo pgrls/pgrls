@@ -62,7 +62,13 @@ from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
-from pgrls.rules import Rule, all_rules, default_registry
+from pgrls.rules import (
+    Rule,
+    RuleRegistry,
+    all_rules,
+    default_registry,
+    load_extra_rules,
+)
 from pgrls.violations import (
     ALL_SEVERITIES,
     Severity,
@@ -227,7 +233,7 @@ def lint(
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
 
-    known = {r.id for r in all_rules()}
+    known = {r.id for r in _runtime_rules(config)}
 
     # Validate `--rule` early — a typo silently producing zero
     # findings is hard to debug. Mirrors `pgrls fix --rule`.
@@ -333,10 +339,13 @@ def lint(
         # produced a (displayed) finding, so the text formatter can
         # append the rule's reference paragraph beneath each line.
         # Other formats ignore the map; --explain is text-only.
+        # Use `_runtime_rules(config)` so extras' rationale lines
+        # appear too — without this an extra that fires a finding
+        # would be missing its reference paragraph.
         rules_in_use = {v.rule_id for v in displayed}
         rationale_map = {
             r.id: _rule_rationale_paragraph(r)
-            for r in all_rules()
+            for r in _runtime_rules(config)
             if r.id in rules_in_use
         }
 
@@ -435,6 +444,45 @@ def _rule_rationale_paragraph(rule: Rule) -> str:
     return paragraphs[1].strip()
 
 
+def _runtime_rules(config: Config) -> list[Rule]:
+    """Return the full rule set for a given config: built-ins + extras.
+
+    Use this anywhere the catalog needs to be aware of
+    `[lint].extra_rules` — `--rule` / `--exclude-rule` validation,
+    `pgrls explain` catalog listing, the per-rule rationale map
+    `pgrls lint --explain` builds for the text formatter.
+
+    Returns `all_rules()` unchanged when no extras are configured
+    (no extra imports, no registry rebuild — preserves the cached
+    fast path the existing call sites relied on).
+
+    ID collisions between an extra and a built-in (or between two
+    extras) raise `ToolError` here, mirroring `_run_rules`'s
+    `RuleRegistry.register()` rejection. Without this, the
+    read-only consumers (`pgrls explain --config`, `--rule`
+    validation) would silently show duplicate catalog rows for a
+    shadowed built-in while `pgrls lint` would error — divergent
+    behavior is the bug the iter-3 SHOULD-FIX surfaced.
+    """
+    if not config.extra_rules:
+        return list(all_rules())
+    # Python's import-module cache means repeated load_extra_rules
+    # calls in the same process don't re-import; only the RULES
+    # attribute read recurs (effectively free).
+    builtins = list(all_rules())
+    extras = load_extra_rules(config.extra_rules)
+    seen_ids = {r.id for r in builtins}
+    for r in extras:
+        if r.id in seen_ids:
+            raise ToolError(
+                f"[lint].extra_rules: Rule {r.id!r} is already "
+                "registered. Rule IDs must be unique across "
+                "built-ins and all extra modules."
+            )
+        seen_ids.add(r.id)
+    return [*builtins, *extras]
+
+
 def _run_rules(
     schema: Schema,
     *,
@@ -451,8 +499,6 @@ def _run_rules(
     # `register()` raises on duplicate IDs, so a collision between
     # an extra and a built-in surfaces here with a clear error
     # instead of silently shadowing.
-    from pgrls.rules import RuleRegistry, all_rules, load_extra_rules
-
     if config.extra_rules:
         registry = RuleRegistry()
         for r in all_rules():
@@ -1928,7 +1974,24 @@ def _render_catalog_json(rules: list[Rule], *, fixable_ids: set[str]) -> str:
         "tooling / IDE integrations)."
     ),
 )
-def explain(rule_id: str | None, output_format: str) -> None:
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to a pgrls.toml. When supplied, `[lint].extra_rules` "
+        "are loaded so `pgrls explain` lists / documents project-"
+        "specific rules alongside the built-ins. Without it, only "
+        "built-ins are shown — explain works anywhere with no "
+        "database, no config."
+    ),
+)
+def explain(
+    rule_id: str | None,
+    output_format: str,
+    config_path: str | None,
+) -> None:
     """Print a lint rule's reference, or list the rule catalog.
 
     With no argument, `pgrls explain` prints the catalog — one
@@ -1942,8 +2005,9 @@ def explain(rule_id: str | None, output_format: str) -> None:
     scope, and how to allowlist an intentional case. Exits 2 if
     RULE is not a known rule.
 
-    Reads nothing but pgrls's own rule catalog — no database
-    connection and no config file, so it works anywhere.
+    Reads pgrls's built-in rule catalog by default — no database
+    connection required. Pass `--config pgrls.toml` to also load
+    project-specific rules declared in `[lint].extra_rules`.
 
     `--format markdown` emits the same content as a Markdown
     document (`##` heading + `**Severity:**` line + the rule's
@@ -1953,7 +2017,14 @@ def explain(rule_id: str | None, output_format: str) -> None:
     `fixable` flag, and — for a single rule — the full reference
     body) for IDE / tooling integrations.
     """
-    rules = all_rules()
+    if config_path is not None:
+        try:
+            config = load_config(config_path)
+        except ConfigError as exc:
+            raise ToolError(str(exc)) from exc
+        rules = _runtime_rules(config)
+    else:
+        rules = list(all_rules())
     if rule_id is None:
         # Catalog mode.
         if output_format == "json":

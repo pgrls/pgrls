@@ -233,6 +233,50 @@ def _build_config(raw: dict[str, Any]) -> Config:
     from pgrls.rules import all_rules
 
     known_rule_ids = {rule.id for rule in all_rules()}
+
+    # [lint].extra_rules — load project-specific rule modules
+    # FIRST, so the disable / [lint.rules.<ID>] validation below
+    # can recognise extras' IDs. Without this, a config that
+    # references an extra's ID in disable or a [lint.rules.*]
+    # table would fail with "unknown rule id" — defeating the SDK.
+    # Shape validation: must be list[str], each entry non-empty
+    # (whitespace-only entries are rejected explicitly).
+    extra_rules_raw = lint.get("extra_rules", [])
+    if not isinstance(extra_rules_raw, list) or not all(
+        isinstance(s, str) for s in extra_rules_raw
+    ):
+        raise ConfigError(
+            "[lint].extra_rules must be a list of dotted Python "
+            'module paths, e.g. ["mycompany.pgrls_rules"]'
+        )
+    for entry in extra_rules_raw:
+        if not entry.strip():
+            raise ConfigError(
+                "[lint].extra_rules entries must be non-empty "
+                "strings (whitespace-only entry rejected)"
+            )
+    extra_rules = [p.strip() for p in extra_rules_raw]
+    if extra_rules:
+        # Lazy import — only needed when extras are actually
+        # configured. Re-raise the loader's ExtraRulesError as a
+        # ConfigError so the user sees one consistent error type
+        # for config-time failures (missing module, missing
+        # `RULES` attr, malformed rule shape, etc.).
+        from pgrls.rules import ExtraRulesError, load_extra_rules
+
+        try:
+            extra_rule_ids = {
+                r.id for r in load_extra_rules(extra_rules)
+            }
+        except ExtraRulesError as exc:
+            raise ConfigError(str(exc)) from exc
+        # Collisions between an extra and a built-in are detected
+        # later, at the per-invocation registry merge in
+        # `_run_rules` — we only need the union here so the
+        # disable / [lint.rules.<ID>] validation below recognises
+        # extras.
+        known_rule_ids = known_rule_ids | extra_rule_ids
+
     # Case-normalize so `[lint].disable = ["sec001"]` matches the
     # canonical uppercase rule id; mirrors the `[lint.rules.<ID>]`
     # case treatment below.
@@ -336,27 +380,6 @@ def _build_config(raw: dict[str, Any]) -> Config:
                     f"{ALL_SEVERITIES}, got {severity_raw!r}"
                 ) from exc
         rule_options[normalized_id] = opts_remaining
-
-    # [lint].extra_rules — module dotted-paths that ship project-
-    # specific rules via a `RULES` attribute. Validate the shape
-    # of the field here (must be list[str]); defer the actual
-    # import/discovery to `pgrls.rules.load_extra_rules` at lint
-    # time (config-load shouldn't trigger arbitrary user code).
-    extra_rules_raw = lint.get("extra_rules", [])
-    if not isinstance(extra_rules_raw, list) or not all(
-        isinstance(s, str) for s in extra_rules_raw
-    ):
-        raise ConfigError(
-            "[lint].extra_rules must be a list of dotted Python "
-            'module paths, e.g. ["mycompany.pgrls_rules"]'
-        )
-    extra_rules = [
-        p.strip() for p in extra_rules_raw if p.strip()
-    ]
-    if any(not p for p in extra_rules_raw):
-        raise ConfigError(
-            "[lint].extra_rules entries must be non-empty strings"
-        )
 
     diff = raw.get("diff", {})
     if not isinstance(diff, dict):
