@@ -718,8 +718,9 @@ def fix(
     `, true` to one-arg `current_setting()` calls), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
     check with USING), SEC031 (`DROP POLICY` for a no-op
-    restrictive `USING (true)` floor), PERF001 (wrap
-    unwrapped auth calls in
+    restrictive `USING (true)` floor), SEC032 (`ALTER TABLE …
+    ENABLE ROW LEVEL SECURITY` for a dormant-policies table),
+    PERF001 (wrap unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), PERF003 (`CREATE
     INDEX` for an unindexed policy-predicate column), HYG003
     (`DROP POLICY` for a policy that exactly duplicates
