@@ -88,7 +88,7 @@ scoping and is a latent cross-tenant leak), and `HYG003`
 (policy is an exact duplicate of another on the same table). A
 `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC006, SEC011, SEC019, SEC020, SEC031, SEC032, PERF001, PERF003, HYG003, VIEW001, and VIEW002;
+SEC006, SEC011, SEC019, SEC020, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -342,6 +342,19 @@ Currently fixable:
   immediately. Partition-child cases the rule itself cedes (a child
   whose ancestor already has RLS) are skipped by the fixer on the
   same grounds.
+* **PERF004** — emits `CREATE INDEX ON <schema>.<table>
+  (<function-expression>);` for a policy predicate that wraps an
+  indexed column in a function call (`lower(email)`,
+  `date_trunc(...)`, nested calls). Walks the policy AST, finds
+  the outermost `FuncCall` wrapping each flagged column, renders it
+  back to SQL via pglast's `RawStream`, and emits one CREATE INDEX
+  per distinct expression (deduped across policies that share the
+  same wrap). The existing plain index on the bare column stays in
+  place; the new expression index runs in parallel for the
+  function-wrapped form. Plain `CREATE INDEX` (not CONCURRENTLY)
+  for the same `pgrls fix --apply` transaction-safety reason
+  PERF003 documents; the description points at `pgrls fix --output`
+  + `CREATE INDEX CONCURRENTLY` for large tables.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
   and emits `ALTER POLICY <name> ON <schema>.<table> USING
   (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
@@ -846,7 +859,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, SEC032, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, and JUnit output.**

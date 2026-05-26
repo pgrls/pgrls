@@ -722,7 +722,9 @@ def fix(
     ENABLE ROW LEVEL SECURITY` for a dormant-policies table),
     PERF001 (wrap unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), PERF003 (`CREATE
-    INDEX` for an unindexed policy-predicate column), HYG003
+    INDEX` for an unindexed policy-predicate column), PERF004
+    (`CREATE INDEX` on the function expression that wraps an
+    indexed column), HYG003
     (`DROP POLICY` for a policy that exactly duplicates
     another on the same table), VIEW001
     (`ALTER VIEW … SET (security_invoker = true)`), and
