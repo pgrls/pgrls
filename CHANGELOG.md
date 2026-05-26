@@ -10,6 +10,32 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-05-25
+
+### Added
+
+- **SEC037 — Policy compares `auth.role()` to an unknown role
+  name.** Severity: warning. In the Supabase / PostgREST auth model
+  `auth.role()` returns one of a small fixed set (`anon`,
+  `authenticated`, `service_role`). A policy that compares
+  `auth.role()` to anything outside that set silently denies every
+  row — masking the broken policy because tests that seed admin
+  data see no rows, devs assume the policy works, the table becomes
+  inaccessible in prod. Walks policy USING / WITH CHECK ASTs for
+  `=` comparisons between a role-context function (default:
+  `auth.role`) and a string literal not in the configured
+  known-roles set (default: `{anon, authenticated, service_role}`).
+  Handles the `'admin'::text` form that Postgres normalizes
+  literals to when storing policy expressions. Recognizes
+  `SQLValueFunction` shapes (e.g., bare `current_user`) when
+  `role_functions` is extended to include them. Configurable
+  `known_roles` / `role_functions` / `allowlist`; no auto-fix
+  (the right replacement is application-intent-dependent).
+
+### Changed
+
+- Rule catalog: **46 → 47 rules.**
+
 ## [0.6.3] - 2026-05-25
 
 ### Added

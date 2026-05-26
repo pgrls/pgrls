@@ -9,7 +9,7 @@
 **[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[Docs site](https://pgrls.github.io/pgrls-docs/)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
-> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 12 of 46 rules mechanically auto-fixable.
+> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 12 of 47 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
 > MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown / GitHub annotations / JUnit XML).
 
@@ -28,9 +28,9 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 46 lint rules, 12 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 47 lint rules, 12 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
-> - **Lint & fix** — `pgrls lint` checks a live database against all forty-six rules and reports findings as text, JSON, SARIF, Markdown, GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Lint & fix** — `pgrls lint` checks a live database against all forty-seven rules and reports findings as text, JSON, SARIF, Markdown, GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
@@ -425,6 +425,7 @@ pattern documentation.
 | [SEC033](AGENTS.md#rule-sec033) | error | Policy scopes by a user-modifiable JWT claim (`user_metadata` / `raw_user_meta_data`) — the authenticated user can rewrite the value via the auth API, bypassing the check; use `app_metadata` (service-role-only) instead |
 | [SEC034](AGENTS.md#rule-sec034) | warning | Policy gates rows on `auth.email()` — silent denial-of-service-to-self when the user changes email, when SQL `=` is case-sensitive but emails aren't, or when plus-addressing means `x+y@host` ≠ `x@host`; scope by `auth.uid()` instead |
 | [SEC036](AGENTS.md#rule-sec036) | error | Policy `EXISTS (SELECT FROM auth.users WHERE …)` sub-select with no caller binding — checks "is there any admin at all" instead of "is THIS user an admin", so every authenticated user passes once any matching row exists |
+| [SEC037](AGENTS.md#rule-sec037) | warning | Policy compares `auth.role()` to a value outside the known role set (`anon` / `authenticated` / `service_role`) — comparison never matches and silently denies every row, masking the broken policy |
 | [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](AGENTS.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
