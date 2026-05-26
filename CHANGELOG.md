@@ -10,6 +10,36 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-05-26
+
+### Added
+
+- **`[lint].extra_rules` — project-specific rules SDK.** A project
+  can ship private rules without forking. List Python module dotted
+  paths in `[lint].extra_rules`; each module exposes a `RULES`
+  sequence of `Rule`-protocol objects. The loader (new
+  `pgrls.rules.load_extra_rules`) imports, validates the shape, and
+  merges into a per-invocation registry alongside built-ins. ID
+  collisions between an extra and a built-in (or two extras) are
+  caught at register time with a clear error. New `ExtraRulesError`
+  exception type for the load-time failures (missing module,
+  missing `RULES` attribute, non-iterable `RULES`, malformed rule
+  shape). Documented in [`docs/EXTRA_RULES.md`](docs/EXTRA_RULES.md)
+  — full consumer guide with a worked example.
+
+- **Pre-commit recipe documentation
+  ([`docs/recipes/precommit.md`](docs/recipes/precommit.md)).**
+  `.pre-commit-hooks.yaml` shipped in v0.5.x; the recipe doc now
+  makes the wiring discoverable. Covers the minimal config, the
+  Supabase-local variant, the CI-only variant, and when to prefer
+  the GitHub Action instead.
+
+### Notes
+
+- The `Rule` Protocol and `RuleRegistry` API are now formally
+  promised as the public extension surface. Future API breaks
+  here will be CHANGELOG-flagged.
+
 ## [0.6.4] - 2026-05-25
 
 ### Added
