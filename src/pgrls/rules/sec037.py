@@ -26,10 +26,13 @@ Detection: walks policy USING / WITH CHECK ASTs for binary `=`
 A_Expr comparisons where one side is a `FuncCall` to `auth.role`
 (configurable) and the other is a string literal not in the
 configured known-role set (default `{anon, authenticated,
-service_role}`). Fires once per offending comparison; multiple
-comparisons in the same policy can yield multiple findings (the
-fix for each is usually distinct — they were typos for *different*
-intended roles).
+service_role}`). Fires once per *distinct* unknown literal in the policy. Two
+comparisons in the same policy with the *same* unknown literal
+collapse to a single finding (same fix). Two comparisons with
+*different* unknown literals yield two findings (the fix for each
+is usually distinct — they were typos for different intended roles).
+A literal that appears in both USING and WITH CHECK clauses also
+dedupes to one finding.
 
 Configuration: `[lint.rules.SEC037]` accepts:
 

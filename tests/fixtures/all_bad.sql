@@ -699,8 +699,7 @@ CREATE POLICY email_scoped ON public.allbad_sec034
 -- read-through. Same block-isolation principles as the prior
 -- blocks: TO postgres (silences SEC003/SEC007), RLS on with FORCE
 -- (silences SEC001 / SEC002 / SEC032). The auth.role() stub is
--- already provided by the SEC033 block earlier in this fixture, so
--- no schema setup needed here.
+-- created in this block (no prior block defines it).
 CREATE OR REPLACE FUNCTION auth.role() RETURNS text
     LANGUAGE sql STABLE
     AS 'SELECT ''anon''::text';
