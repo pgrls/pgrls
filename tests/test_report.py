@@ -341,6 +341,24 @@ def test_render_html_normalizes_non_utc_generated_at_to_utc() -> None:
     assert "2026-01-15T10:30:45Z" in out  # CET 11:30 → UTC 10:30
 
 
+def test_render_html_rejects_naive_generated_at() -> None:
+    # A naive datetime (no tzinfo) would be silently coerced through
+    # the host's LOCAL timezone by `.astimezone(utc)` — producing a
+    # wrong audit timestamp that depends on which CI runner generated
+    # the report. The function refuses such input at the boundary
+    # rather than emitting wrong data.
+    import pytest
+    from datetime import datetime
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        render_html(
+            build_report(schema),
+            generated_at=datetime(2026, 1, 15, 10, 30),
+        )
+
+
 def test_render_html_row_class_per_status() -> None:
     # Every status emits its CSS row class so a downstream
     # stylesheet (or a future feature like "highlight bad rows in

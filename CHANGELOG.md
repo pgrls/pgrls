@@ -25,6 +25,14 @@ breaking changes — they will be called out in this file.
   table name (`weird<name>&"`) can't break the layout or inject
   markup. Light / dark colour scheme via `prefers-color-scheme`.
 
+- **API: `pgrls.report.render_html(report, *, generated_at=None)`.**
+  Programmatic consumers can pin the generation timestamp for
+  deterministic snapshot tests or to reflect the time of an
+  earlier introspection (when rendering offline from a cached
+  `Report`). Must be timezone-aware; a naive `datetime` raises
+  `ValueError` rather than being silently coerced through the
+  host's local zone.
+
 ## [0.6.6] - 2026-05-26
 
 ### Added

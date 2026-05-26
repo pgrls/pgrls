@@ -254,9 +254,21 @@ def render_html(
     `generated_at` is optional and defaults to `datetime.now(utc)` —
     pass an explicit value for deterministic snapshot tests, or to
     reflect the time of an earlier introspection (e.g. when the
-    HTML is rendered offline from a cached `Report`). It must be
-    timezone-aware; the renderer drops sub-second precision and
-    serialises to `Z`-suffixed ISO-8601.
+    HTML is rendered offline from a cached `Report`). It MUST be
+    timezone-aware; a naive `datetime` (no `tzinfo`) raises
+    `ValueError` rather than silently being coerced through the
+    host's local timezone — that would produce wrong audit
+    timestamps depending on which CI runner generated the report,
+    exactly the failure mode the explicit `Z`-suffix protocol is
+    meant to prevent. The renderer drops sub-second precision and
+    serialises non-UTC zones to UTC.
+
+    `render_html` is the only renderer with a kwarg because it's
+    the only format that embeds a generation timestamp — the text /
+    json / markdown formats are timestamp-free (a consumer that
+    needs a snapshot time pairs them with their own metadata). No
+    need to thread `generated_at` through the other `render_*`
+    functions for parity.
 
     The shape is deliberately conservative: a single self-contained
     `<style>` block (no inline styles per element), semantic
@@ -268,6 +280,14 @@ def render_html(
     """
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
+    elif generated_at.tzinfo is None:
+        raise ValueError(
+            "render_html: generated_at must be timezone-aware; "
+            "a naive datetime would be interpreted as local time, "
+            "producing a wrong audit timestamp depending on the "
+            "host. Pass `datetime.now(timezone.utc)` or attach an "
+            "explicit tzinfo."
+        )
     now = (
         generated_at
         .astimezone(timezone.utc)
