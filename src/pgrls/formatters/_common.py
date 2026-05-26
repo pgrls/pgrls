@@ -40,6 +40,7 @@ def gfm_inline_code(content: str) -> str:
     wrapper = "`" * (longest_run + 1)
     return f"{wrapper} {content} {wrapper}"
 
+
 # Sentinel shown by the text and markdown formatters when a
 # non-`None` location collapses to `""` after `safe_location` drops
 # every character (e.g. a location consisting entirely of zero-width

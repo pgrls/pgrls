@@ -227,6 +227,39 @@ def test_unknown_severity_degrades_to_neutral_bullet() -> None:
     assert "• <strong>SEC001</strong>" in out
 
 
+def test_unknown_severity_appears_in_top_line_summary() -> None:
+    # A `critical`-severity finding must NOT disappear from the
+    # top-line rollup just because it's outside `ALL_SEVERITIES`.
+    # The summary tally appends unknown severities last with the
+    # fallback bullet so the reader sees an accurate count.
+    out = format_pr_comment(
+        [_v(severity="error"), _v(severity="critical", rule_id="SEC002")]
+    )
+    assert "❌ 1 error" in out
+    assert "• 1 critical" in out
+
+
+def test_locations_render_with_comma_separator() -> None:
+    # Pin the chip separator at `, ` (changed from a non-wrapping
+    # middot in iter-1 so a wide finding set wraps cleanly inside
+    # GitHub's narrow PR-comment column).
+    out = format_pr_comment(
+        [_v(location="public.a"), _v(location="public.b")]
+    )
+    assert "`public.a`, `public.b`" in out
+
+
+def test_html_escape_is_not_idempotent_by_contract() -> None:
+    # Pins the documented contract in `_html_escape`: rule
+    # violation messages are RAW, not pre-encoded HTML. A message
+    # that already contains `&amp;` will get re-escaped to
+    # `&amp;amp;`. If a rule author wants a literal `&amp;` to
+    # render in a PR comment, that's a rule-author bug — the
+    # formatter's job is to make raw `&` safe.
+    out = format_pr_comment([_v(message="Pre-encoded: A &amp; B.")])
+    assert "A &amp;amp; B" in out
+
+
 # ──────────────────────────────────────────────────────────────────
 # Format dispatch wiring
 # ──────────────────────────────────────────────────────────────────

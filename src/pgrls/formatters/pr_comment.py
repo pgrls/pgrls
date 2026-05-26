@@ -68,7 +68,13 @@ def format_pr_comment(violations: list[Violation]) -> str:
     if not violations:
         return "## pgrls findings\n\n✅ No issues found.\n"
 
-    # Counts per severity for the top-line summary.
+    # Counts per severity for the top-line summary. Known severities
+    # render in `ALL_SEVERITIES` order with their canonical emoji;
+    # any unknown severities (an extra rule that emitted a
+    # non-`Severity`-Literal value, or a future fourth level that
+    # lands before this map is updated) render last, in insertion
+    # order, with `_UNKNOWN_SEVERITY_EMOJI` — so the rollup never
+    # silently drops their count.
     sev_counts: Counter[Severity] = Counter(v.severity for v in violations)
     sev_parts: list[str] = []
     for sev in ALL_SEVERITIES:
@@ -78,6 +84,13 @@ def format_pr_comment(violations: list[Violation]) -> str:
                 f"{_SEVERITY_EMOJI[sev]} {n} {sev}"
                 f"{'s' if n != 1 else ''}"
             )
+    for sev, n in sev_counts.items():
+        if sev in _SEVERITY_EMOJI:
+            continue
+        sev_parts.append(
+            f"{_UNKNOWN_SEVERITY_EMOJI} {n} {sev}"
+            f"{'s' if n != 1 else ''}"
+        )
     summary_severities = " · ".join(sev_parts)
     total = len(violations)
     rule_count = len({v.rule_id for v in violations})
@@ -224,6 +237,16 @@ def _html_escape(text: str) -> str:
     extra rule could emit `</details>` in a message and accidentally
     close the surrounding details block — render-safe escaping
     prevents both classes of bug.
+
+    This is NOT idempotent by design — a message that already
+    contains `&amp;` will get re-escaped to `&amp;amp;`. The
+    contract is "rule violation messages are raw, not pre-encoded
+    HTML." If a rule needs to embed pre-escaped content (rare —
+    rule messages are written by rule authors for English-prose
+    consumption), the rule must un-escape first or accept the
+    double-escape. The `_rule_block` consumer passes `first.message`
+    straight through with no pre-encoding step, so this contract
+    holds for every built-in rule.
 
     Order matters: `&` first so the subsequent `<` → `&lt;` and
     `>` → `&gt;` rewrites don't get re-escaped.
