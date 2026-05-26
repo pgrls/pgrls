@@ -31,11 +31,11 @@ a reader follows the link.
 """
 from __future__ import annotations
 
-import re
 from collections import Counter
 
 from pgrls.formatters._common import (
     EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    gfm_inline_code,
     safe_location,
 )
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
@@ -134,19 +134,10 @@ def _location_cell(location: str | None) -> str:
         # dropped every character (e.g. all zero-width). Surface
         # this fact rather than rendering a silent blank cell.
         return f"_{EMPTY_OR_ZERO_WIDTH_SENTINEL}_"
-    if "`" not in clean:
-        return f"`{clean}`"
-    # Compute the longest run of consecutive backticks inside the
-    # cleaned location, then pick a wrapper of (longest + 1)
-    # backticks. The space padding is the GFM idiom that lets the
-    # content start or end with a backtick — the renderer strips
-    # one space from each side before rendering literal content.
-    longest_run = max(
-        (len(m) for m in re.findall(r"`+", clean)),
-        default=0,
-    )
-    wrapper = "`" * (longest_run + 1)
-    return f"{wrapper} {clean} {wrapper}"
+    # Backtick-wrap delegated to the shared `gfm_inline_code` helper
+    # so the markdown table cell and the pr-comment inline-code chip
+    # produce identical output for identical input.
+    return gfm_inline_code(clean)
 
 
 def _rule_link(rule_id: str) -> str:

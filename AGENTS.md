@@ -839,11 +839,16 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC001, SEC002, SEC006, SEC011, SEC019, SEC020, SEC031, PERF001, PERF003, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
-- **Text, JSON, SARIF, Markdown, GitHub-annotation, and JUnit output.**
+- **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, and JUnit output.**
   `--format text` (human-readable, default), `--format json`
   (machine-readable, stable CI contract), `--format sarif` (SARIF
   v2.1.0 for GitHub Code Scanning and similar aggregators),
-  `--format markdown` (PR comments / rendered CI reports), and
+  `--format markdown` (rendered CI reports, wikis, runbooks),
+  `--format pr-comment` (GitHub-PR-comment-optimised Markdown:
+  collapsible `<details>` blocks grouped by rule, severity emoji
+  in the summary line, inline-code location chips — designed for
+  the PR review reading context where a reviewer skims then
+  expands what they care about), and
   `--format github` (GitHub Actions workflow commands —
   `::error` / `::warning` / `::notice` — so findings surface as
   run annotations; severity maps error→error, warning→warning,
