@@ -21,6 +21,7 @@ from pgrls.fixers.sec011 import SEC011Fixer
 from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
 from pgrls.fixers.sec031 import SEC031Fixer
+from pgrls.fixers.sec032 import SEC032Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
 from pgrls.model import Index, Policy, Schema, Table, View
@@ -1582,6 +1583,128 @@ def test_sec031_fix_raises_on_malformed_allowlist() -> None:
         SEC031Fixer().fix(schema, {"allowlist": "public.t.floor"})
     with pytest.raises(TypeError, match="allowlist"):
         SEC031Fixer().fix(schema, {"allowlist": [" public.t.floor "]})
+
+
+# ---------- SEC032 fixer ----------
+
+
+def test_sec032_fix_emits_alter_table_enable() -> None:
+    schema = Schema(
+        tables=(
+            _table(rls=False, force=False, policies=(_policy("user_id = auth.uid()"),)),
+        )
+    )
+    fixes = SEC032Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC032"
+    assert f.location == "public.t"
+    # SAME DDL as SEC001's fix — the difference is the prior state
+    # (RLS-off + has policies vs RLS-off + empty). Enabling RLS
+    # activates the dormant policies in one statement.
+    assert f.sql == "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;"
+
+
+def test_sec032_fix_silent_when_rls_already_enabled() -> None:
+    # SEC032 fires only when RLS is off; the fixer mirrors.
+    schema = Schema(
+        tables=(_table(rls=True, force=False, policies=(_policy("true"),)),)
+    )
+    assert SEC032Fixer().fix(schema, {}) == []
+
+
+def test_sec032_fix_silent_when_no_policies() -> None:
+    # RLS off + no policies is SEC001's domain — SEC032 cedes the
+    # case explicitly. The fixer must not double-emit.
+    schema = Schema(tables=(_table(rls=False, force=False),))
+    assert SEC032Fixer().fix(schema, {}) == []
+
+
+def test_sec032_fix_respects_allowlist_qualified() -> None:
+    pol = (_policy("user_id = auth.uid()"),)
+    schema = Schema(
+        tables=(
+            _table(name="a", rls=False, force=False, policies=pol),
+            _table(name="b", rls=False, force=False, policies=pol),
+        )
+    )
+    fixes = SEC032Fixer().fix(schema, {"allowlist": ["public.a"]})
+    assert [f.location for f in fixes] == ["public.b"]
+
+
+def test_sec032_fix_respects_allowlist_unqualified() -> None:
+    schema = Schema(
+        tables=(
+            _table(
+                name="snapshot",
+                rls=False,
+                force=False,
+                policies=(_policy("user_id = auth.uid()"),),
+            ),
+        )
+    )
+    assert SEC032Fixer().fix(schema, {"allowlist": ["snapshot"]}) == []
+
+
+def test_sec032_fix_skips_partition_child_covered_by_ancestor() -> None:
+    # SEC032 itself skips a child whose ancestor already has RLS:
+    # the child's dormant policies are dead weight, not a security
+    # hole, because parent-routed queries apply the parent's policies.
+    # The fixer mirrors — flipping RLS on the child alone could
+    # surprise direct-on-child queries.
+    parent = _table(
+        name="events",
+        rls=True,
+        force=False,
+        policies=(_policy("tenant_id = 1"),),
+    )
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(_policy("tenant_id = 1", name="child_p"),),
+        partition_of=("public", "events"),
+    )
+    schema = Schema(tables=(parent, child))
+    # Parent has RLS so SEC032 cedes the child to "covered by
+    # ancestor"; only the parent has nothing for SEC032 to do
+    # (it's already RLS-on). Expected: NO fixes.
+    assert SEC032Fixer().fix(schema, {}) == []
+
+
+def test_sec032_fix_description_explains_policy_count() -> None:
+    schema = Schema(
+        tables=(
+            _table(
+                rls=False,
+                force=False,
+                policies=(
+                    _policy("user_id = auth.uid()", name="a"),
+                    _policy("user_id = auth.uid()", name="b", command="INSERT"),
+                ),
+            ),
+        )
+    )
+    [f] = SEC032Fixer().fix(schema, {})
+    assert "public.t" in f.description
+    assert "2" in f.description  # policy count
+    assert "dormant" in f.description.lower()
+
+
+def test_sec032_fix_raises_on_malformed_allowlist() -> None:
+    schema = Schema(
+        tables=(
+            _table(
+                rls=False, force=False,
+                policies=(_policy("user_id = auth.uid()"),),
+            ),
+        )
+    )
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC032Fixer().fix(schema, {"allowlist": "public.t"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC032Fixer().fix(schema, {"allowlist": [" public.t "]})
 
 
 # ---------- generate_fixes / registry ----------

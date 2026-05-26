@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-05-26
+
+### Added
+
+- **`pgrls fix` now remediates SEC032** (table has policies but RLS
+  not enabled — the dormant-policies footgun). The fixer emits the
+  same `ALTER TABLE … ENABLE ROW LEVEL SECURITY` statement as
+  SEC001's fix; the difference is the prior state. SEC032 flags a
+  table whose policies are sitting in `pg_policy` doing nothing,
+  and enabling RLS activates them immediately. Partition-child
+  cases SEC032 itself cedes are skipped by the fixer on the same
+  grounds: a child whose ancestor has RLS is already covered for
+  parent-routed queries, and flipping RLS on the child alone could
+  surprise direct-on-child reads. `[lint.rules.SEC032].allowlist`
+  (qualified or bare table name) silences both the rule and the
+  fixer. Mechanically-fixable rule count: 12 → **13** of 47.
+
 ## [0.6.7] - 2026-05-26
 
 ### Added
