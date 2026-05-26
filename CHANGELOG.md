@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-05-26
+
+### Added
+
+- **`pgrls fix` now remediates PERF004** (policy filters on a
+  function-wrapped column, defeating the plain leading-column index).
+  The fixer walks the policy AST, finds each outermost `FuncCall`
+  wrapping a flagged column, renders it back to SQL via
+  `pglast.stream.RawStream`, and emits `CREATE INDEX ON
+  <schema>.<table> (<expression>);` — an expression index that
+  matches the predicate exactly. The existing plain index on the
+  bare column stays in place; this adds a parallel index for the
+  function-wrapped form. Two policies sharing the same
+  `lower(email)` predicate collapse to one CREATE INDEX (dedup by
+  rendered expression). For a large, busy table, the fix description
+  points at `CREATE INDEX CONCURRENTLY` and `pgrls fix --output`.
+  Mechanically-fixable rule count: 13 → **14** of 47.
+
 ## [0.6.8] - 2026-05-26
 
 ### Added
