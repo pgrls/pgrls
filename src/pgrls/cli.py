@@ -442,7 +442,32 @@ def _run_rules(
     rule_filter: set[str] | None = None,
     exclude_filter: set[str] | None = None,
 ) -> list[Violation]:
-    registry = default_registry()
+    # Build the per-invocation registry: built-ins + extras from
+    # `[lint].extra_rules`. A fresh RuleRegistry (not the cached
+    # `default_registry()`) avoids accumulating extras across
+    # successive `_run_rules` calls in the same process — important
+    # for the test suite, and for any future API consumer running
+    # multiple lints in one Python session. The registry's
+    # `register()` raises on duplicate IDs, so a collision between
+    # an extra and a built-in surfaces here with a clear error
+    # instead of silently shadowing.
+    from pgrls.rules import RuleRegistry, all_rules, load_extra_rules
+
+    if config.extra_rules:
+        registry = RuleRegistry()
+        for r in all_rules():
+            registry.register(r)
+        for r in load_extra_rules(config.extra_rules):
+            try:
+                registry.register(r)
+            except ValueError as exc:
+                # ID collision — rewrap with config-locus context
+                raise ToolError(
+                    f"[lint].extra_rules: {exc}. Rule IDs must be "
+                    "unique across built-ins and all extra modules."
+                ) from exc
+    else:
+        registry = default_registry()
     if rule_filter is not None:
         # `--rule` is an explicit "run only these rules" — it
         # overrides `[lint] disable` so an operator investigating a

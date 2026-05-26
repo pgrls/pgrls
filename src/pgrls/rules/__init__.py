@@ -5,20 +5,55 @@ VIEW001-VIEW004) is registered lazily on the first call to
 `default_registry()` or `all_rules()`. When a new rule lands, add its
 import + `registry.register(...)` call to `_build_default_registry()`
 below.
+
+## Extending pgrls with project-specific rules
+
+A project can ship additional rules — closed-source, internal, or
+just experimental — without forking. Add `[lint].extra_rules` to
+`pgrls.toml`:
+
+    [lint]
+    extra_rules = ["mycompany.pgrls_rules"]
+
+Each named module must expose a `RULES` sequence of `Rule`-protocol
+objects:
+
+    # mycompany/pgrls_rules/__init__.py
+    from .mycompany_001 import MyCompany001
+
+    RULES = [MyCompany001()]
+
+`load_extra_rules()` (below) is the loader — used by
+`pgrls.cli._run_rules` to merge extras into the per-invocation
+registry. See `docs/RULE_AUTHORING.md` for the rule-authoring
+walkthrough; the same Rule shape that built-ins use applies here.
 """
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+import importlib
+from typing import Any, Iterable, Protocol, runtime_checkable
 
 from pgrls.model import Schema
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
 
 __all__ = [
+    "ExtraRulesError",
     "Rule",
     "RuleRegistry",
     "all_rules",
     "default_registry",
+    "load_extra_rules",
 ]
+
+
+class ExtraRulesError(Exception):
+    """Raised when `[lint].extra_rules` fails to load.
+
+    Message names the failing entry and the specific failure mode
+    (import error, missing `RULES` attribute, non-Rule item, etc.)
+    so a config typo doesn't fail silently with rules just not
+    firing.
+    """
 
 
 @runtime_checkable
@@ -189,3 +224,102 @@ def default_registry() -> RuleRegistry:
 def all_rules() -> list[Rule]:
     """Return every rule shipped with pgrls."""
     return default_registry().enabled(disabled_ids=[])
+
+
+def load_extra_rules(module_paths: Iterable[str]) -> list[Rule]:
+    """Import the listed modules and return their declared `RULES`.
+
+    Each `module_paths` entry is a Python dotted module path
+    (e.g. `"mycompany.pgrls_rules"`). For each one:
+
+      1. The module is imported via `importlib.import_module`.
+         `ImportError` is wrapped in `ExtraRulesError` with the
+         offending dotted path included.
+      2. The module must expose a `RULES` attribute. The attribute
+         must be iterable; we accept lists, tuples, or any iterable.
+         Missing-attribute and non-iterable surfaces both raise
+         `ExtraRulesError` with the offending module named.
+      3. Each item in `RULES` must implement the `Rule` Protocol —
+         a non-empty string `id`, a valid `Severity` (`severity`),
+         a non-empty string `title`, and a callable `check`. The
+         per-item shape is validated here AND again at
+         registry-`register()` time so the same constraint applies
+         to built-ins and extras alike.
+
+    Returns an empty list if `module_paths` is empty. Does not
+    deduplicate: if the same module is listed twice, every rule
+    in its `RULES` list is returned twice — the downstream registry
+    will refuse the duplicate ID with a clear error.
+
+    Caller is responsible for handling the `Rule.id` collision case
+    (built-in vs extra, or extra-vs-extra) — typically by passing
+    the returned rules into a fresh `RuleRegistry` whose
+    `register()` raises on duplicate IDs.
+    """
+    out: list[Rule] = []
+    for dotted in module_paths:
+        if not isinstance(dotted, str) or not dotted:
+            raise ExtraRulesError(
+                f"[lint].extra_rules entry must be a non-empty "
+                f"string (got {dotted!r}); use a dotted Python "
+                f'module path like "mycompany.pgrls_rules"'
+            )
+        try:
+            module = importlib.import_module(dotted)
+        except ImportError as exc:
+            raise ExtraRulesError(
+                f"[lint].extra_rules: cannot import {dotted!r} "
+                f"({exc}). Verify the package is installed in the "
+                "same environment as pgrls."
+            ) from exc
+
+        rules_attr = getattr(module, "RULES", None)
+        if rules_attr is None:
+            raise ExtraRulesError(
+                f"[lint].extra_rules: module {dotted!r} does not "
+                "expose a `RULES` attribute. Define it as a "
+                "sequence of Rule-protocol objects — see "
+                "docs/RULE_AUTHORING.md for the rule shape."
+            )
+        try:
+            rules_iter = list(rules_attr)
+        except TypeError as exc:
+            raise ExtraRulesError(
+                f"[lint].extra_rules: {dotted!r}.RULES must be "
+                f"iterable (got {type(rules_attr).__name__})"
+            ) from exc
+
+        for index, rule in enumerate(rules_iter):
+            # `runtime_checkable` `isinstance` only verifies the
+            # attribute names exist; it does NOT check that they
+            # carry the right shape. Validate explicitly so a
+            # malformed extra fails at load time with a useful
+            # message rather than crashing inside the rule walk.
+            rid = getattr(rule, "id", None)
+            if not isinstance(rid, str) or not rid:
+                raise ExtraRulesError(
+                    f"[lint].extra_rules: {dotted!r}.RULES[{index}] "
+                    "is not a valid Rule — `id` must be a non-empty "
+                    f"string (got {rid!r})"
+                )
+            sev = getattr(rule, "severity", None)
+            if sev not in ALL_SEVERITIES:
+                raise ExtraRulesError(
+                    f"[lint].extra_rules: {dotted!r}.RULES[{index}] "
+                    f"({rid!r}) has invalid severity {sev!r}; expected "
+                    f"one of {ALL_SEVERITIES}"
+                )
+            title = getattr(rule, "title", None)
+            if not isinstance(title, str) or not title:
+                raise ExtraRulesError(
+                    f"[lint].extra_rules: {dotted!r}.RULES[{index}] "
+                    f"({rid!r}) has empty or non-string title"
+                )
+            if not callable(getattr(rule, "check", None)):
+                raise ExtraRulesError(
+                    f"[lint].extra_rules: {dotted!r}.RULES[{index}] "
+                    f"({rid!r}) must define a callable "
+                    "check(schema, options) method"
+                )
+            out.append(rule)
+    return out

@@ -62,6 +62,12 @@ class Config:
     # precedence when supplied. Defaults to "dangerous" (only
     # security regressions block CI).
     diff_fail_on: str = "dangerous"
+    # `[lint].extra_rules` — dotted Python module paths that expose
+    # additional Rule-protocol objects via a `RULES` attribute.
+    # See `pgrls.rules.load_extra_rules` for the loader contract
+    # and `docs/RULE_AUTHORING.md` for the per-rule shape. Empty
+    # list means "no extras"; built-ins always run regardless.
+    extra_rules: list[str] = field(default_factory=list)
 
 
 def load_config(path: Path | str | None) -> Config:
@@ -331,6 +337,27 @@ def _build_config(raw: dict[str, Any]) -> Config:
                 ) from exc
         rule_options[normalized_id] = opts_remaining
 
+    # [lint].extra_rules — module dotted-paths that ship project-
+    # specific rules via a `RULES` attribute. Validate the shape
+    # of the field here (must be list[str]); defer the actual
+    # import/discovery to `pgrls.rules.load_extra_rules` at lint
+    # time (config-load shouldn't trigger arbitrary user code).
+    extra_rules_raw = lint.get("extra_rules", [])
+    if not isinstance(extra_rules_raw, list) or not all(
+        isinstance(s, str) for s in extra_rules_raw
+    ):
+        raise ConfigError(
+            "[lint].extra_rules must be a list of dotted Python "
+            'module paths, e.g. ["mycompany.pgrls_rules"]'
+        )
+    extra_rules = [
+        p.strip() for p in extra_rules_raw if p.strip()
+    ]
+    if any(not p for p in extra_rules_raw):
+        raise ConfigError(
+            "[lint].extra_rules entries must be non-empty strings"
+        )
+
     diff = raw.get("diff", {})
     if not isinstance(diff, dict):
         raise ConfigError("[diff] must be a table")
@@ -358,6 +385,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
         rule_options=rule_options,
         severity_overrides=severity_overrides,
         diff_fail_on=diff_fail_on,
+        extra_rules=extra_rules,
     )
 
 
