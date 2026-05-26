@@ -85,7 +85,7 @@ CREATE POLICY tenant_scope ON documents
 
 Cross-tenant reads are blocked, so this passes a tenant-isolation review. But there's an `owner_id` column and nothing keys on it, so every user *in* a tenant reads every other user's documents. If that table holds drafts, DMs, or private uploads, it's a leak. **SEC027** (info) flags the table so you decide: add a per-user predicate, or confirm it's intentionally tenant-shared and allowlist it.
 
-[Browse the full rule catalogue in AGENTS.md](AGENTS.md#rule-sec004) for the other 41 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
+[Browse the full rule catalogue in AGENTS.md](docs/RULES.md#rule-sec004) for the other 41 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
 
 ## Usage
 
@@ -390,53 +390,53 @@ pattern documentation.
 
 | ID | Severity | Catches |
 |---|---|---|
-| [SEC001](AGENTS.md#rule-sec001) | error | Tables in scanned schemas with RLS disabled and no policies (a table with policies but RLS off is SEC032) |
-| [SEC002](AGENTS.md#rule-sec002) | error | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
-| [SEC003](AGENTS.md#rule-sec003) | error | Permissive policies granted to PUBLIC |
-| [SEC004](AGENTS.md#rule-sec004) | error | Inverted auth check (Lovable CVE pattern) in USING |
-| [SEC005](AGENTS.md#rule-sec005) | warning | Policy expression has no own-column reference |
-| [SEC006](AGENTS.md#rule-sec006) | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
-| [SEC007](AGENTS.md#rule-sec007) | info | All policies on a table are permissive (no RESTRICTIVE floor) |
-| [SEC008](AGENTS.md#rule-sec008) | warning | Permissive policy USING clause is constant `true` (admits every row) |
-| [SEC009](AGENTS.md#rule-sec009) | warning | RLS enabled but no policies defined (silent deny-all) |
-| [SEC010](AGENTS.md#rule-sec010) | warning | Policy `USING`/`WITH CHECK` clause is constant `false` (deny-all anti-pattern) |
-| [SEC011](AGENTS.md#rule-sec011) | warning | Policy expression has an `OR true` branch (debug bypass left in) |
-| [SEC012](AGENTS.md#rule-sec012) | warning | Table has only RESTRICTIVE policies (silent deny-all — needs at least one PERMISSIVE) |
-| [SEC013](AGENTS.md#rule-sec013) | warning | Trigger on RLS-protected table can bypass policies (triggers fire as table owner) |
-| [SEC014](AGENTS.md#rule-sec014) | warning | SECURITY DEFINER function bypasses caller's RLS (audit every SECDEF function) |
-| [SEC015](AGENTS.md#rule-sec015) | warning | SECURITY DEFINER function exposed to `pg_temp` search-path shadowing |
-| [SEC016](AGENTS.md#rule-sec016) | warning | Role with the `BYPASSRLS` attribute bypasses every RLS policy |
-| [SEC017](AGENTS.md#rule-sec017) | warning | Function with the `LEAKPROOF` attribute is evaluated below the RLS barrier |
-| [SEC018](AGENTS.md#rule-sec018) | warning | Policy compares a column against `current_user` / `session_user` (no isolation under a shared pool role) |
-| [SEC019](AGENTS.md#rule-sec019) | info | Policy calls `current_setting()` without the `missing_ok` argument (raises on an unset GUC) |
-| [SEC020](AGENTS.md#rule-sec020) | warning | Policy `WITH CHECK` is constant `true` while `USING` restricts (writes accept rows reads never would) |
-| [SEC021](AGENTS.md#rule-sec021) | info | Policy compares an identity column against a hardcoded literal (e.g. `tenant_id = 1`) |
-| [SEC022](AGENTS.md#rule-sec022) | info | RLS-enabled table whose policies are all `FOR SELECT` — no write-side policy, so INSERT/UPDATE/DELETE are denied |
-| [SEC023](AGENTS.md#rule-sec023) | warning | Policy granted to a role carrying `BYPASSRLS` — the role skips the policy entirely, so its `TO` clause is inert |
-| [SEC024](AGENTS.md#rule-sec024) | info | Policy calls `current_setting()` with an unqualified parameter name (a dropped prefix the application cannot `SET`) |
-| [SEC025](AGENTS.md#rule-sec025) | warning | Policy predicate references another table whose RLS is disabled — the cross-table read is only as strong as the referenced table's isolation |
-| [SEC026](AGENTS.md#rule-sec026) | warning | Policy predicate uses `LIKE` / `ILIKE` / `SIMILAR TO` / POSIX regex against an auth-context value (a wildcard-shape GUC matches every row) |
-| [SEC027](AGENTS.md#rule-sec027) | info | RLS table has an owner / user-identity column that no policy scopes by — rows may be visible across users within the same tenant |
-| [SEC028](AGENTS.md#rule-sec028) | warning | Permissive write policy (INSERT/UPDATE/ALL) whose `WITH CHECK` is constant `true` — accepts every write; the `TO` clause gates who, not what |
-| [SEC029](AGENTS.md#rule-sec029) | warning | Role can `SET ROLE` to a `BYPASSRLS` role through membership — escalation path that silently disables every policy (BYPASSRLS is not inherited, but reachable) |
-| [SEC030](AGENTS.md#rule-sec030) | info | Policy scopes by a nullable discriminator column (`tenant_id = current_setting(…)` where the column allows NULL) — NULL rows escape scoping today and leak the moment a NULL-tolerant predicate appears |
-| [SEC031](AGENTS.md#rule-sec031) | warning | RESTRICTIVE policy whose `USING` is constant `true` — AND-combines to a no-op, so it looks like a security floor but enforces none |
-| [SEC032](AGENTS.md#rule-sec032) | error | Table has policies but RLS is not enabled — the policies are dormant (Postgres ignores them) and the table is wide open despite looking RLS-managed |
-| [SEC033](AGENTS.md#rule-sec033) | error | Policy scopes by a user-modifiable JWT claim (`user_metadata` / `raw_user_meta_data`) — the authenticated user can rewrite the value via the auth API, bypassing the check; use `app_metadata` (service-role-only) instead |
-| [SEC034](AGENTS.md#rule-sec034) | warning | Policy gates rows on `auth.email()` — silent denial-of-service-to-self when the user changes email, when SQL `=` is case-sensitive but emails aren't, or when plus-addressing means `x+y@host` ≠ `x@host`; scope by `auth.uid()` instead |
-| [SEC036](AGENTS.md#rule-sec036) | error | Policy `EXISTS (SELECT FROM auth.users WHERE …)` sub-select with no caller binding — checks "is there any admin at all" instead of "is THIS user an admin", so every authenticated user passes once any matching row exists |
-| [SEC037](AGENTS.md#rule-sec037) | warning | Policy compares `auth.role()` to a value outside the known role set (`anon` / `authenticated` / `service_role`) — comparison never matches and silently denies every row, masking the broken policy |
-| [PERF001](AGENTS.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
-| [PERF002](AGENTS.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
-| [PERF003](AGENTS.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
-| [PERF004](AGENTS.md#rule-perf004) | warning | Policy predicate wraps an indexed column in a function (e.g. `lower(email)`) so the plain index can't serve it — Postgres seq-scans; needs an expression index |
-| [HYG001](AGENTS.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
-| [HYG002](AGENTS.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
-| [HYG003](AGENTS.md#rule-hyg003) | info | Policy is an exact duplicate of another policy on the same table |
-| [VIEW001](AGENTS.md#rule-view001) | error | View over RLS-protected table without `WITH (security_invoker = true)` |
-| [VIEW002](AGENTS.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
-| [VIEW003](AGENTS.md#rule-view003) | warning | Materialized view over RLS-protected table (RLS not honored at query time) |
-| [VIEW004](AGENTS.md#rule-view004) | warning | View calls SECURITY DEFINER function that reads an RLS-protected table |
+| [SEC001](docs/RULES.md#rule-sec001) | error | Tables in scanned schemas with RLS disabled and no policies (a table with policies but RLS off is SEC032) |
+| [SEC002](docs/RULES.md#rule-sec002) | error | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
+| [SEC003](docs/RULES.md#rule-sec003) | error | Permissive policies granted to PUBLIC |
+| [SEC004](docs/RULES.md#rule-sec004) | error | Inverted auth check (Lovable CVE pattern) in USING |
+| [SEC005](docs/RULES.md#rule-sec005) | warning | Policy expression has no own-column reference |
+| [SEC006](docs/RULES.md#rule-sec006) | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
+| [SEC007](docs/RULES.md#rule-sec007) | info | All policies on a table are permissive (no RESTRICTIVE floor) |
+| [SEC008](docs/RULES.md#rule-sec008) | warning | Permissive policy USING clause is constant `true` (admits every row) |
+| [SEC009](docs/RULES.md#rule-sec009) | warning | RLS enabled but no policies defined (silent deny-all) |
+| [SEC010](docs/RULES.md#rule-sec010) | warning | Policy `USING`/`WITH CHECK` clause is constant `false` (deny-all anti-pattern) |
+| [SEC011](docs/RULES.md#rule-sec011) | warning | Policy expression has an `OR true` branch (debug bypass left in) |
+| [SEC012](docs/RULES.md#rule-sec012) | warning | Table has only RESTRICTIVE policies (silent deny-all — needs at least one PERMISSIVE) |
+| [SEC013](docs/RULES.md#rule-sec013) | warning | Trigger on RLS-protected table can bypass policies (triggers fire as table owner) |
+| [SEC014](docs/RULES.md#rule-sec014) | warning | SECURITY DEFINER function bypasses caller's RLS (audit every SECDEF function) |
+| [SEC015](docs/RULES.md#rule-sec015) | warning | SECURITY DEFINER function exposed to `pg_temp` search-path shadowing |
+| [SEC016](docs/RULES.md#rule-sec016) | warning | Role with the `BYPASSRLS` attribute bypasses every RLS policy |
+| [SEC017](docs/RULES.md#rule-sec017) | warning | Function with the `LEAKPROOF` attribute is evaluated below the RLS barrier |
+| [SEC018](docs/RULES.md#rule-sec018) | warning | Policy compares a column against `current_user` / `session_user` (no isolation under a shared pool role) |
+| [SEC019](docs/RULES.md#rule-sec019) | info | Policy calls `current_setting()` without the `missing_ok` argument (raises on an unset GUC) |
+| [SEC020](docs/RULES.md#rule-sec020) | warning | Policy `WITH CHECK` is constant `true` while `USING` restricts (writes accept rows reads never would) |
+| [SEC021](docs/RULES.md#rule-sec021) | info | Policy compares an identity column against a hardcoded literal (e.g. `tenant_id = 1`) |
+| [SEC022](docs/RULES.md#rule-sec022) | info | RLS-enabled table whose policies are all `FOR SELECT` — no write-side policy, so INSERT/UPDATE/DELETE are denied |
+| [SEC023](docs/RULES.md#rule-sec023) | warning | Policy granted to a role carrying `BYPASSRLS` — the role skips the policy entirely, so its `TO` clause is inert |
+| [SEC024](docs/RULES.md#rule-sec024) | info | Policy calls `current_setting()` with an unqualified parameter name (a dropped prefix the application cannot `SET`) |
+| [SEC025](docs/RULES.md#rule-sec025) | warning | Policy predicate references another table whose RLS is disabled — the cross-table read is only as strong as the referenced table's isolation |
+| [SEC026](docs/RULES.md#rule-sec026) | warning | Policy predicate uses `LIKE` / `ILIKE` / `SIMILAR TO` / POSIX regex against an auth-context value (a wildcard-shape GUC matches every row) |
+| [SEC027](docs/RULES.md#rule-sec027) | info | RLS table has an owner / user-identity column that no policy scopes by — rows may be visible across users within the same tenant |
+| [SEC028](docs/RULES.md#rule-sec028) | warning | Permissive write policy (INSERT/UPDATE/ALL) whose `WITH CHECK` is constant `true` — accepts every write; the `TO` clause gates who, not what |
+| [SEC029](docs/RULES.md#rule-sec029) | warning | Role can `SET ROLE` to a `BYPASSRLS` role through membership — escalation path that silently disables every policy (BYPASSRLS is not inherited, but reachable) |
+| [SEC030](docs/RULES.md#rule-sec030) | info | Policy scopes by a nullable discriminator column (`tenant_id = current_setting(…)` where the column allows NULL) — NULL rows escape scoping today and leak the moment a NULL-tolerant predicate appears |
+| [SEC031](docs/RULES.md#rule-sec031) | warning | RESTRICTIVE policy whose `USING` is constant `true` — AND-combines to a no-op, so it looks like a security floor but enforces none |
+| [SEC032](docs/RULES.md#rule-sec032) | error | Table has policies but RLS is not enabled — the policies are dormant (Postgres ignores them) and the table is wide open despite looking RLS-managed |
+| [SEC033](docs/RULES.md#rule-sec033) | error | Policy scopes by a user-modifiable JWT claim (`user_metadata` / `raw_user_meta_data`) — the authenticated user can rewrite the value via the auth API, bypassing the check; use `app_metadata` (service-role-only) instead |
+| [SEC034](docs/RULES.md#rule-sec034) | warning | Policy gates rows on `auth.email()` — silent denial-of-service-to-self when the user changes email, when SQL `=` is case-sensitive but emails aren't, or when plus-addressing means `x+y@host` ≠ `x@host`; scope by `auth.uid()` instead |
+| [SEC036](docs/RULES.md#rule-sec036) | error | Policy `EXISTS (SELECT FROM auth.users WHERE …)` sub-select with no caller binding — checks "is there any admin at all" instead of "is THIS user an admin", so every authenticated user passes once any matching row exists |
+| [SEC037](docs/RULES.md#rule-sec037) | warning | Policy compares `auth.role()` to a value outside the known role set (`anon` / `authenticated` / `service_role`) — comparison never matches and silently denies every row, masking the broken policy |
+| [PERF001](docs/RULES.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
+| [PERF002](docs/RULES.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
+| [PERF003](docs/RULES.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
+| [PERF004](docs/RULES.md#rule-perf004) | warning | Policy predicate wraps an indexed column in a function (e.g. `lower(email)`) so the plain index can't serve it — Postgres seq-scans; needs an expression index |
+| [HYG001](docs/RULES.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
+| [HYG002](docs/RULES.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
+| [HYG003](docs/RULES.md#rule-hyg003) | info | Policy is an exact duplicate of another policy on the same table |
+| [VIEW001](docs/RULES.md#rule-view001) | error | View over RLS-protected table without `WITH (security_invoker = true)` |
+| [VIEW002](docs/RULES.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
+| [VIEW003](docs/RULES.md#rule-view003) | warning | Materialized view over RLS-protected table (RLS not honored at query time) |
+| [VIEW004](docs/RULES.md#rule-view004) | warning | View calls SECURITY DEFINER function that reads an RLS-protected table |
 
 Run `pgrls explain <RULE>` (for example `pgrls explain SEC023`) to print any
 rule's full rationale — what it flags, why it matters, how detection works,

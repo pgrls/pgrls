@@ -14,7 +14,7 @@ findings surface in a CI run's test-report UI (shape documented in
 
 Adding a format = creating a sibling module and wiring it into
 `_FORMATTERS` here. The rule-link URL convention used by SARIF and
-Markdown (the helpUri / table anchors that point into AGENTS.md)
+Markdown (the helpUri / table anchors that point into docs/RULES.md (lint rules) or AGENTS.md (DIFF_*))
 must stay synchronized — see the cross-reference comments in
 `sarif._help_uri_for` and `markdown._rule_link`.
 """

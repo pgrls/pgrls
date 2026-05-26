@@ -93,15 +93,16 @@ def _rule_descriptors(violations: list[Violation]) -> list[dict[str, Any]]:
 
 
 def _help_uri_for(rule_id: str) -> str:
-    """Map a rule_id to the AGENTS.md anchor that documents it.
+    """Map a rule_id to the docs anchor that documents it.
 
-    Lint rule_ids (`SEC###`, `PERF###`, `HYG###`) each have their own
-    `<a id="rule-sec001">`-style anchor in AGENTS.md's "Rules
-    reference" section, so they get a per-rule deep link.
+    Lint rule_ids (`SEC###`, `PERF###`, `HYG###`, `VIEW###`) each
+    have their own `<a id="rule-sec001">`-style anchor in the
+    canonical per-rule reference at `docs/RULES.md`, so they get a
+    per-rule deep link there.
 
     Diff rule_ids (`DIFF_*` — emitted by `pgrls diff`) don't have
-    per-kind anchors in AGENTS.md; the diff classification table
-    documents all of them under one section. Route them to the
+    per-kind anchors; the diff classification table documents all
+    of them under one section in AGENTS.md. Route them to the
     shared `#diff-rules` anchor (defined just above the
     "## Diff — `pgrls snapshot` + `pgrls diff`" heading) so a CI
     consumer clicking "View documentation" in GitHub Code Scanning
@@ -110,7 +111,7 @@ def _help_uri_for(rule_id: str) -> str:
     if rule_id.startswith("DIFF_"):
         return f"{_INFORMATION_URI}/blob/main/AGENTS.md#diff-rules"
     return (
-        f"{_INFORMATION_URI}/blob/main/AGENTS.md#"
+        f"{_INFORMATION_URI}/blob/main/docs/RULES.md#"
         f"rule-{rule_id.lower()}"
     )
 

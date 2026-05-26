@@ -142,9 +142,9 @@ def test_sarif_rule_descriptor_includes_short_description_and_help_uri() -> None
     parsed = json.loads(out)
     rule = parsed["runs"][0]["tool"]["driver"]["rules"][0]
     assert rule["shortDescription"]["text"] == "RLS not enabled on table"
-    assert "AGENTS.md" in rule["helpUri"]
+    assert "docs/RULES.md" in rule["helpUri"]
     # helpUri uses `rule-sec001` to match an explicit
-    # <a id="rule-sec001"></a> anchor in AGENTS.md, not the
+    # <a id="rule-sec001"></a> anchor in docs/RULES.md, not the
     # GitHub-slugified heading (which would include the title and
     # break on title rewording).
     assert rule["helpUri"].endswith("#rule-sec001")

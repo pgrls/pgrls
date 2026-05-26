@@ -90,7 +90,7 @@ def test_markdown_rule_id_links_to_per_rule_anchor_in_agents_md() -> None:
     # other (markdown.py and sarif.py both call this out).
     expected = (
         "[SEC001](https://github.com/pgrls/pgrls/blob/main/"
-        "AGENTS.md#rule-sec001)"
+        "docs/RULES.md#rule-sec001)"
     )
     assert expected in out
 

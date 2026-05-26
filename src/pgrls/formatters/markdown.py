@@ -8,7 +8,7 @@ The shape:
   larger document without leaking out of an existing H1 hierarchy.
 - A pipe table with one row per violation: severity (with a leading
   emoji for at-a-glance scanning), rule_id (linked to its
-  per-rule anchor in AGENTS.md), location, message. Pipes inside
+  per-rule anchor in docs/RULES.md), location, message. Pipes inside
   cells are escaped to `\\|` and embedded newlines become `<br>` so
   the table layout never breaks on adversarial message text.
 - A summary line below the table.
@@ -22,7 +22,7 @@ Stable between releases of the same major-zero series; adding new
 columns is a breaking change for consumers that parse the table, so
 do it with a CHANGELOG note.
 
-The rule-link URL convention (`/blob/main/AGENTS.md#rule-<lower>` for
+The rule-link URL convention (`/blob/main/docs/RULES.md#rule-<lower>` for
 lint rules, `#diff-rules` for `DIFF_*`) is shared with the SARIF
 formatter's `_help_uri_for`. Keep them in lockstep — a SARIF consumer
 and a Markdown consumer pointing at different anchors for the same
@@ -150,19 +150,24 @@ def _location_cell(location: str | None) -> str:
 
 
 def _rule_link(rule_id: str) -> str:
-    """Build the per-rule deep link to AGENTS.md.
+    """Build the per-rule deep link.
 
-    Mirrors the SARIF formatter's `_help_uri_for`: lint rule IDs get
-    their own per-rule anchor (`#rule-sec001`), `DIFF_*` rule IDs
-    share the `#diff-rules` heading anchor (the diff classification
-    table documents all of them under one section). A URL change
-    here MUST land in the SARIF helpUri at the same time.
+    Mirrors the SARIF formatter's `_help_uri_for`. Lint rule IDs
+    point at the canonical per-rule reference in `docs/RULES.md`;
+    `DIFF_*` rule IDs share the `#diff-rules` heading anchor in
+    `AGENTS.md` (the diff classification table documents all of
+    them under one section). A URL change here MUST land in the
+    SARIF helpUri at the same time.
     """
     if rule_id.startswith("DIFF_"):
-        anchor = "diff-rules"
-    else:
-        anchor = f"rule-{rule_id.lower()}"
-    return f"[{rule_id}]({_INFORMATION_URI}/blob/main/AGENTS.md#{anchor})"
+        return (
+            f"[{rule_id}]({_INFORMATION_URI}"
+            "/blob/main/AGENTS.md#diff-rules)"
+        )
+    return (
+        f"[{rule_id}]({_INFORMATION_URI}"
+        f"/blob/main/docs/RULES.md#rule-{rule_id.lower()})"
+    )
 
 
 def _escape_cell(text: str) -> str:
