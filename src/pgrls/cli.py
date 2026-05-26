@@ -2122,6 +2122,8 @@ def report(
     / `rls-off`) and an aggregate summary. Reads a live database and
     runs NO lint rules — use `pgrls lint` for findings. `--format
     json` / `markdown` emit machine-readable / paste-ready output;
+    `--format html` emits a standalone HTML audit page (embedded CSS,
+    no external dependencies — opens offline, prints/PDF cleanly).
     `--output FILE` writes it to a file (e.g. an audit doc) instead of
     stdout.
     """

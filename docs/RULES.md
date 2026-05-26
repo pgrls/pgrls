@@ -17,8 +17,11 @@ RLS posture — RLS enabled / `FORCE`'d / policy counts plus a coarse
 `rls-off` status (`covered-by-parent` credits a partition child whose
 RLS-enabled ancestor is among the scanned schemas; `no-policies` covers
 zero policies *and* restrictive-only tables, both default-deny) — and
-an aggregate summary, in text / JSON / Markdown. A snapshot for audits
-and onboarding; it runs no rules and emits no findings.
+an aggregate summary, in text / JSON / Markdown / HTML. The HTML
+format is self-contained (embedded CSS, no external assets) for
+archiving as an audit artefact, printing to PDF, or emailing to a
+reviewer who doesn't run pgrls. A snapshot for audits and onboarding;
+it runs no rules and emits no findings.
 
 <a id="rule-sec001"></a>
 

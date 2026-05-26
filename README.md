@@ -244,6 +244,7 @@ Currently fixable: **SEC001** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;
 pgrls report --database-url "$DATABASE_URL"                                  # text table + summary
 pgrls report --database-url "$DATABASE_URL" --format json                    # machine-readable
 pgrls report --database-url "$DATABASE_URL" --format markdown -o posture.md  # write an audit doc
+pgrls report --database-url "$DATABASE_URL" --format html -o posture.html    # standalone HTML page, print/PDF-ready
 ```
 
 Each table gets a coarse status — `protected` (RLS on, FORCE'd, ≥1 permissive policy), `not-forced` (RLS on with a permissive policy, but owner bypasses), `no-policies` (RLS on but no permissive policy → default-deny; covers zero policies *and* restrictive-only tables), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it — credited when that parent is among the scanned schemas), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.

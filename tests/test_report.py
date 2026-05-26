@@ -9,6 +9,7 @@ from pgrls.cli import main
 from pgrls.model import Policy, Schema, Table
 from pgrls.report import (
     build_report,
+    render_html,
     render_json,
     render_markdown,
     render_text,
@@ -202,6 +203,204 @@ def test_render_markdown_table() -> None:
     assert "# RLS posture" in out
     assert "| Table | Status | RLS | FORCE | Policies |" in out
     assert "| public.good | protected | yes | yes | 1 |" in out
+
+
+# ──────────────────────────────────────────────────────────────────
+# HTML format
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_render_html_is_self_contained_document() -> None:
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render_html(build_report(schema))
+    # Doctype + html/head/body skeleton
+    assert out.startswith("<!DOCTYPE html>")
+    assert "<html lang=\"en\">" in out
+    assert "</html>" in out
+    # Embedded style block — no external CSS/JS, so the page opens
+    # offline and renders identically in `wkhtmltopdf`-style tools.
+    assert "<style>" in out and "</style>" in out
+    assert "<link" not in out
+    assert "<script" not in out
+
+
+def test_render_html_table_carries_rows() -> None:
+    schema = Schema(
+        tables=(
+            _table("good", rls=True, force=True, policies=(_policy(),)),
+            _table("off", rls=False, force=False),
+        )
+    )
+    out = render_html(build_report(schema))
+    # Rows render with the row-class encoding their status — a CSS
+    # consumer (or a downstream tool that extends the stylesheet)
+    # can target them.
+    assert 'class="row-protected"' in out
+    assert 'class="row-rls-off"' in out
+    # Both qualified names appear; both yes/no toggles render.
+    assert "<code>public.good</code>" in out
+    assert "<code>public.off</code>" in out
+
+
+def test_render_html_summary_pills_show_nonzero_statuses_only() -> None:
+    schema = Schema(
+        tables=(
+            _table("good", rls=True, force=True, policies=(_policy(),)),
+            _table("off1", rls=False, force=False),
+            _table("off2", rls=False, force=False),
+        )
+    )
+    out = render_html(build_report(schema))
+    # Two chip spans render — one per status with a non-zero count.
+    # Assert on the full chip pattern (not just the word) so the
+    # `.status-not-forced` CSS class can't accidentally satisfy a
+    # `"not forced" in out` match.
+    assert '<span class="pill status-protected">' in out
+    assert '<span class="pill status-rls-off">' in out
+    assert '<span class="pill status-not-forced">' not in out
+    assert '<span class="pill status-no-policies">' not in out
+
+
+def test_render_html_escapes_special_chars_in_table_name() -> None:
+    # Postgres quoted identifiers permit `<`, `>`, `&`, `"` —
+    # leaving them unescaped would break the page layout (or worse,
+    # allow stored-XSS via a malicious table name in an audit
+    # report opened from email).
+    schema = Schema(
+        tables=(
+            _table('weird<name>&"', rls=True, force=True, policies=(_policy(),)),
+        )
+    )
+    out = render_html(build_report(schema))
+    # Raw special chars MUST NOT appear inside the rendered table
+    # cell. Find the row content (after the row open tag) and check.
+    assert "weird&lt;name&gt;&amp;&quot;" in out
+    # …and the literal `<name>` must not appear as a tag.
+    assert "<name>" not in out
+
+
+def test_render_html_empty_schema_renders_placeholder() -> None:
+    out = render_html(build_report(Schema(tables=())))
+    # Valid HTML page, no rows; an explicit empty-state message
+    # rather than a blank `<tbody>` that could look like a CSS bug.
+    assert "<!DOCTYPE html>" in out
+    # Total tables is interpolated as `<strong>0</strong> tables` —
+    # the `<strong>` tags split the visible substring, so the
+    # rendered form is what we pin.
+    assert "<strong>0</strong> tables scanned." in out
+    assert "No tables found" in out
+    assert '<span class="pill status-empty">no tables</span>' in out
+
+
+def test_render_html_carries_iso_utc_timestamp() -> None:
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render_html(build_report(schema))
+    import re
+    # Generated-at timestamp is ISO-8601 UTC with `Z` suffix so an
+    # auditor reading the printed page can pin "when was this run?".
+    # The regex is intentionally tight on the digit ranges so a
+    # malformed `9999-99-99T99:99:99Z` value doesn't pass.
+    assert re.search(
+        r"\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+        r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\dZ",
+        out,
+    ), "expected a well-formed ISO-8601 UTC timestamp"
+
+
+def test_render_html_accepts_injected_generated_at() -> None:
+    # Snapshot-friendly: an explicit `generated_at` makes the output
+    # deterministic across CI runs. Pins the contract that the
+    # injected value is rendered verbatim (modulo sub-second drop
+    # and UTC normalization).
+    from datetime import datetime, timezone
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    fixed = datetime(2026, 1, 15, 10, 30, 45, tzinfo=timezone.utc)
+    out = render_html(build_report(schema), generated_at=fixed)
+    assert "2026-01-15T10:30:45Z" in out
+
+
+def test_render_html_normalizes_non_utc_generated_at_to_utc() -> None:
+    # An explicit non-UTC `generated_at` is converted to UTC before
+    # serialisation so the auditor never reads a non-Z-suffixed
+    # timestamp out of the page.
+    from datetime import datetime, timedelta, timezone
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    cet = timezone(timedelta(hours=1))
+    out = render_html(
+        build_report(schema),
+        generated_at=datetime(2026, 1, 15, 11, 30, 45, tzinfo=cet),
+    )
+    assert "2026-01-15T10:30:45Z" in out  # CET 11:30 → UTC 10:30
+
+
+def test_render_html_rejects_naive_generated_at() -> None:
+    # A naive datetime (no tzinfo) would be silently coerced through
+    # the host's LOCAL timezone by `.astimezone(utc)` — producing a
+    # wrong audit timestamp that depends on which CI runner generated
+    # the report. The function refuses such input at the boundary
+    # rather than emitting wrong data.
+    import pytest
+    from datetime import datetime
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        render_html(
+            build_report(schema),
+            generated_at=datetime(2026, 1, 15, 10, 30),
+        )
+
+
+def test_render_html_row_class_per_status() -> None:
+    # Every status emits its CSS row class so a downstream
+    # stylesheet (or a future feature like "highlight bad rows in
+    # the printed audit") can target each status individually.
+    parent = _table("evt", rls=True, force=True, policies=(_policy(),))
+    child = Table(
+        schema="public",
+        name="evt_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "evt"),
+    )
+    schema = Schema(
+        tables=(
+            parent,
+            child,
+            _table("nopol", rls=True, force=True, policies=()),
+            _table("unforced", rls=True, force=False, policies=(_policy(),)),
+            _table("off", rls=False, force=False),
+        )
+    )
+    out = render_html(build_report(schema))
+    for cls in (
+        "row-protected",
+        "row-not-forced",
+        "row-no-policies",
+        "row-covered-by-parent",
+        "row-rls-off",
+    ):
+        assert f'class="{cls}"' in out, f"missing row class {cls}"
+
+
+def test_render_html_is_registered_format() -> None:
+    # Sanity: CLI dispatch table picks up `html`.
+    from pgrls.report import REPORT_FORMATS, render
+    assert "html" in REPORT_FORMATS
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render(build_report(schema), "html")
+    assert out.startswith("<!DOCTYPE html>")
 
 
 def test_report_cli_help() -> None:
