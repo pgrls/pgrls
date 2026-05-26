@@ -253,12 +253,14 @@ def test_render_html_summary_pills_show_nonzero_statuses_only() -> None:
         )
     )
     out = render_html(build_report(schema))
-    # 1 protected + 2 rls-off — both chips appear; no `0 not forced`
-    # noise in the summary band.
-    assert "status-protected" in out
-    assert "status-rls-off" in out
-    assert "not forced" not in out  # zero-count, suppressed
-    assert "no policies" not in out
+    # Two chip spans render — one per status with a non-zero count.
+    # Assert on the full chip pattern (not just the word) so the
+    # `.status-not-forced` CSS class can't accidentally satisfy a
+    # `"not forced" in out` match.
+    assert '<span class="pill status-protected">' in out
+    assert '<span class="pill status-rls-off">' in out
+    assert '<span class="pill status-not-forced">' not in out
+    assert '<span class="pill status-no-policies">' not in out
 
 
 def test_render_html_escapes_special_chars_in_table_name() -> None:
@@ -284,9 +286,12 @@ def test_render_html_empty_schema_renders_placeholder() -> None:
     # Valid HTML page, no rows; an explicit empty-state message
     # rather than a blank `<tbody>` that could look like a CSS bug.
     assert "<!DOCTYPE html>" in out
-    assert "0 tables scanned" in out or "<strong>0</strong> tables" in out
+    # Total tables is interpolated as `<strong>0</strong> tables` —
+    # the `<strong>` tags split the visible substring, so the
+    # rendered form is what we pin.
+    assert "<strong>0</strong> tables scanned." in out
     assert "No tables found" in out
-    assert "no tables" in out  # the chip
+    assert '<span class="pill status-empty">no tables</span>' in out
 
 
 def test_render_html_carries_iso_utc_timestamp() -> None:
@@ -296,10 +301,77 @@ def test_render_html_carries_iso_utc_timestamp() -> None:
     out = render_html(build_report(schema))
     import re
     # Generated-at timestamp is ISO-8601 UTC with `Z` suffix so an
-    # auditor reading the printed page can pin "when was this run?"
+    # auditor reading the printed page can pin "when was this run?".
+    # The regex is intentionally tight on the digit ranges so a
+    # malformed `9999-99-99T99:99:99Z` value doesn't pass.
     assert re.search(
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", out
-    ), "expected an ISO-8601 UTC timestamp"
+        r"\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+        r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\dZ",
+        out,
+    ), "expected a well-formed ISO-8601 UTC timestamp"
+
+
+def test_render_html_accepts_injected_generated_at() -> None:
+    # Snapshot-friendly: an explicit `generated_at` makes the output
+    # deterministic across CI runs. Pins the contract that the
+    # injected value is rendered verbatim (modulo sub-second drop
+    # and UTC normalization).
+    from datetime import datetime, timezone
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    fixed = datetime(2026, 1, 15, 10, 30, 45, tzinfo=timezone.utc)
+    out = render_html(build_report(schema), generated_at=fixed)
+    assert "2026-01-15T10:30:45Z" in out
+
+
+def test_render_html_normalizes_non_utc_generated_at_to_utc() -> None:
+    # An explicit non-UTC `generated_at` is converted to UTC before
+    # serialisation so the auditor never reads a non-Z-suffixed
+    # timestamp out of the page.
+    from datetime import datetime, timedelta, timezone
+    schema = Schema(
+        tables=(_table("good", rls=True, force=True, policies=(_policy(),)),)
+    )
+    cet = timezone(timedelta(hours=1))
+    out = render_html(
+        build_report(schema),
+        generated_at=datetime(2026, 1, 15, 11, 30, 45, tzinfo=cet),
+    )
+    assert "2026-01-15T10:30:45Z" in out  # CET 11:30 → UTC 10:30
+
+
+def test_render_html_row_class_per_status() -> None:
+    # Every status emits its CSS row class so a downstream
+    # stylesheet (or a future feature like "highlight bad rows in
+    # the printed audit") can target each status individually.
+    parent = _table("evt", rls=True, force=True, policies=(_policy(),))
+    child = Table(
+        schema="public",
+        name="evt_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        partition_of=("public", "evt"),
+    )
+    schema = Schema(
+        tables=(
+            parent,
+            child,
+            _table("nopol", rls=True, force=True, policies=()),
+            _table("unforced", rls=True, force=False, policies=(_policy(),)),
+            _table("off", rls=False, force=False),
+        )
+    )
+    out = render_html(build_report(schema))
+    for cls in (
+        "row-protected",
+        "row-not-forced",
+        "row-no-policies",
+        "row-covered-by-parent",
+        "row-rls-off",
+    ):
+        assert f'class="{cls}"' in out, f"missing row class {cls}"
 
 
 def test_render_html_is_registered_format() -> None:

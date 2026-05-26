@@ -226,7 +226,11 @@ def render_markdown(report: Report) -> str:
     return "\n".join(out) + "\n"
 
 
-def render_html(report: Report) -> str:
+def render_html(
+    report: Report,
+    *,
+    generated_at: datetime | None = None,
+) -> str:
     """Standalone HTML audit page — no external dependencies.
 
     Designed for the "archive this for the auditor" reading context:
@@ -238,9 +242,21 @@ def render_html(report: Report) -> str:
     word list (`protected` / `not forced` / `no policies` /
     `covered by parent` / `RLS off`).
 
-    Everything is HTML-escaped — Postgres identifiers can contain
-    `<` / `>` / `&` legally inside quoted-identifier syntax, so a
-    location like ``weird<name`` must not break the table layout.
+    Every cell value is `html.escape`-d — Postgres identifiers can
+    contain `<` / `>` / `&` / `"` legally inside quoted-identifier
+    syntax, so a name like ``weird<name>&"`` must not break the
+    layout or inject markup. `html.escape` keeps `'` as a literal
+    (cheap, no XSS risk here — user-influenced values appear inside
+    `<code>` text and inside `class="row-{status}"` where `status`
+    is from the closed `STATUSES` enum, never inside single-quoted
+    attributes that an apostrophe could escape).
+
+    `generated_at` is optional and defaults to `datetime.now(utc)` —
+    pass an explicit value for deterministic snapshot tests, or to
+    reflect the time of an earlier introspection (e.g. when the
+    HTML is rendered offline from a cached `Report`). It must be
+    timezone-aware; the renderer drops sub-second precision and
+    serialises to `Z`-suffixed ISO-8601.
 
     The shape is deliberately conservative: a single self-contained
     `<style>` block (no inline styles per element), semantic
@@ -250,8 +266,11 @@ def render_html(report: Report) -> str:
     converters (so an auditor can print/PDF it without running
     pgrls themselves).
     """
+    if generated_at is None:
+        generated_at = datetime.now(timezone.utc)
     now = (
-        datetime.now(timezone.utc)
+        generated_at
+        .astimezone(timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
