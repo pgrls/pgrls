@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-05-26
+
+### Added
+
+- **`pgrls lint --format pr-comment` — GitHub PR-comment formatter.**
+  A Markdown variant tuned for the GitHub pull-request review
+  reading context: findings group **by rule** (not by violation),
+  each rule renders as a collapsible `<details>` block, the summary
+  line carries a severity emoji + bold rule ID + count, and per-
+  finding locations render as inline-code chips inside the block.
+  A reviewer skims the top-line summary, expands the rule blocks
+  they care about, and jumps to the rule reference link inline
+  without leaving the PR. Existing `markdown` formatter stays the
+  recommended choice for runbooks / wikis / non-PR Markdown
+  surfaces — see the docstring of
+  [`formatters/pr_comment.py`](src/pgrls/formatters/pr_comment.py)
+  for when to prefer which.
+
 ## [0.6.5] - 2026-05-26
 
 ### Added

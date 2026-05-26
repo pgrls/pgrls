@@ -6,17 +6,22 @@ output for generic CI integrations (shape documented in
 Scanning and similar aggregators (shape documented in
 `formatters/sarif.py`). `markdown` is GitHub-flavored Markdown for
 PR comments and rendered CI reports (shape documented in
-`formatters/markdown.py`). `github` emits GitHub Actions workflow
-commands so findings show up as run annotations (shape documented
-in `formatters/github.py`). `junit` emits a JUnit XML report so
-findings surface in a CI run's test-report UI (shape documented in
-`formatters/junit.py`).
+`formatters/markdown.py`). `pr-comment` is a denser, grouped-by-
+rule Markdown variant tuned for the GitHub PR review reading
+context — collapsible blocks, severity emoji in the summary line
+(shape documented in `formatters/pr_comment.py`). `github` emits
+GitHub Actions workflow commands so findings show up as run
+annotations (shape documented in `formatters/github.py`). `junit`
+emits a JUnit XML report so findings surface in a CI run's test-
+report UI (shape documented in `formatters/junit.py`).
 
 Adding a format = creating a sibling module and wiring it into
-`_FORMATTERS` here. The rule-link URL convention used by SARIF and
-Markdown (the helpUri / table anchors that point into docs/RULES.md (lint rules) or AGENTS.md (DIFF_*))
-must stay synchronized — see the cross-reference comments in
-`sarif._help_uri_for` and `markdown._rule_link`.
+`_FORMATTERS` here. The rule-link URL convention used by SARIF,
+Markdown, and `pr-comment` (the helpUri / table anchors that point
+into docs/RULES.md (lint rules) or AGENTS.md (DIFF_*)) must stay
+synchronized — see the cross-reference comments in
+`sarif._help_uri_for`, `markdown._rule_link`, and
+`pr_comment._rule_link`.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ from pgrls.formatters.github import format_github
 from pgrls.formatters.json import format_json
 from pgrls.formatters.junit import format_junit
 from pgrls.formatters.markdown import format_markdown
+from pgrls.formatters.pr_comment import format_pr_comment
 from pgrls.formatters.sarif import format_sarif
 from pgrls.formatters.text import format_text
 from pgrls.violations import Violation
@@ -35,6 +41,7 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
     "json": format_json,
     "sarif": format_sarif,
     "markdown": format_markdown,
+    "pr-comment": format_pr_comment,
     "github": format_github,
     "junit": format_junit,
 }

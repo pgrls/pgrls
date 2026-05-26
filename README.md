@@ -120,8 +120,9 @@ Point at a non-default config file, or pick an output format:
 pgrls lint --config ./config/pgrls.toml --format text     # human-readable (default)
 pgrls lint --config ./config/pgrls.toml --format json     # machine-readable for CI
 pgrls lint --config ./config/pgrls.toml --format sarif    # GitHub Code Scanning
-pgrls lint --config ./config/pgrls.toml --format markdown # PR comments / rendered CI reports
-pgrls lint --config ./config/pgrls.toml --format github   # GitHub Actions run annotations
+pgrls lint --config ./config/pgrls.toml --format markdown   # rendered CI reports / runbooks
+pgrls lint --config ./config/pgrls.toml --format pr-comment # collapsible per-rule GitHub PR comment
+pgrls lint --config ./config/pgrls.toml --format github     # GitHub Actions run annotations
 pgrls lint --config ./config/pgrls.toml --format junit    # JUnit XML for CI test reports
 ```
 
