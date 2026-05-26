@@ -106,9 +106,10 @@ re-baseline after a clean-up pass.
 ## Where to go next
 
 - **[README.md](../README.md)** — the full feature tour: every output
-  format (text / JSON / SARIF / Markdown / GitHub annotations / JUnit),
-  `pgrls diff` for semantic CI gating, the `pgrls.testing` pytest plugin
-  for RLS isolation tests, the JSON Schema for `pgrls.toml`.
+  format (text / JSON / SARIF / Markdown / GitHub-PR-comment / GitHub
+  annotations / JUnit), `pgrls diff` for semantic CI gating, the
+  `pgrls.testing` pytest plugin for RLS isolation tests, the JSON
+  Schema for `pgrls.toml`.
 - **[AGENTS.md](../AGENTS.md)** — every rule with its full rationale,
   worked examples (bad / good), and remediation recipe.
 - **`pgrls explain <RULE>`** — print a rule's reference paragraph from

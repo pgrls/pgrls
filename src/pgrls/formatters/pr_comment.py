@@ -39,6 +39,7 @@ from collections import Counter, defaultdict
 
 from pgrls.formatters._common import (
     EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    gfm_inline_code,
     safe_location,
 )
 from pgrls.violations import ALL_SEVERITIES, Severity, Violation
@@ -48,6 +49,13 @@ _SEVERITY_EMOJI: dict[Severity, str] = {
     "warning": "⚠️",
     "info": "ℹ️",
 }
+
+# Fallback shown when a Violation arrives with a severity outside the
+# `Severity` Literal (e.g. via `# type: ignore[arg-type]` in extra-
+# rules user code, or a future fourth severity that lands before the
+# emoji map is updated). Neutral bullet so the rule block still
+# renders rather than crashing with KeyError.
+_UNKNOWN_SEVERITY_EMOJI = "•"
 
 # Used by the per-rule reference link. Mirrors `markdown._INFORMATION_URI`
 # and `sarif._INFORMATION_URI` deliberately — a URL bump must happen
@@ -105,10 +113,17 @@ def _rule_block(rule_id: str, group: list[Violation]) -> str:
     and `title`; only `message` and `location` vary. The block
     surfaces the count, the title, the locations, one example
     message, and a per-rule reference link.
+
+    `rule_id` is rendered verbatim in the summary line — pgrls's
+    `Violation.rule_id` contract is that IDs arrive in canonical
+    case (`SEC###`, `PERF###`, `HYG###`, `VIEW###`, `DIFF_*`), so
+    no display-time normalization is applied. An empty / `None`
+    `title` falls back to `rule_id` so the summary never collapses
+    to a dangling em-dash.
     """
     first = group[0]
     severity = first.severity
-    emoji = _SEVERITY_EMOJI[severity]
+    emoji = _SEVERITY_EMOJI.get(severity, _UNKNOWN_SEVERITY_EMOJI)
     title = first.title or rule_id
     count = len(group)
 
@@ -119,13 +134,14 @@ def _rule_block(rule_id: str, group: list[Violation]) -> str:
         f"{count_suffix}"
     )
 
-    # Locations — one inline-code chip per finding. Use a non-
-    # breaking space-equivalent (mid-dot) to separate so a
-    # very-wide finding set still wraps cleanly inside the
-    # comment's max-width.
-    location_chips = " · ".join(
-        f"`{_safe_chip(v.location)}`" for v in group
-    )
+    # Locations — one inline-code chip per finding. Findings
+    # within a group preserve insertion order; we deliberately do
+    # NOT deduplicate, so multiple findings on the same location
+    # (rare but possible — a rule that fires twice on different
+    # facets of one object) each get their own chip. Separator is
+    # `, ` rather than a mid-dot so the browser can wrap a wide
+    # finding set on a narrow PR-comment column.
+    location_chips = ", ".join(_safe_chip(v.location) for v in group)
 
     # One example message — usually the first. Long messages
     # (the rule docstring + a fix hint) carry the explanation; a
@@ -149,23 +165,27 @@ def _rule_block(rule_id: str, group: list[Violation]) -> str:
 
 
 def _safe_chip(location: str | None) -> str:
-    """Render a single Violation.location for inline-code display.
+    """Render a single `Violation.location` as a GFM inline-code chip.
 
-    Mirrors `markdown._location_cell` semantics but for the inline-
-    code context (no pipe-table escaping needed). Empty / zero-width
-    locations fall back to the schema-wide sentinel so the chip
-    isn't an empty backtick pair.
+    Returns the full backtick-wrapped span (including delimiters),
+    so the caller composes chips directly with `", ".join(...)`
+    rather than wrapping after the fact. Mirrors
+    `markdown._location_cell` for the table-cell context — both
+    delegate the backtick-run arithmetic to `gfm_inline_code` so
+    identical input yields identical output across formatters.
+
+    Empty / `None` locations render as `(schema-wide)`; a location
+    that collapses to `""` after `safe_location` (e.g. all zero-
+    width chars) renders as `EMPTY_OR_ZERO_WIDTH_SENTINEL` so a
+    reviewer sees there WAS something at that location, just
+    nothing displayable.
     """
     if not location:
-        return "(schema-wide)"
+        return gfm_inline_code("(schema-wide)")
     clean = safe_location(location)
     if not clean:
-        return EMPTY_OR_ZERO_WIDTH_SENTINEL
-    # GFM inline code can't contain a backtick of the same run
-    # length, but pgrls Violation.location is rarely backtick-heavy.
-    # If it ever is, escape by doubling. (Same conservative escape
-    # as the markdown formatter.)
-    return clean.replace("`", "``")
+        return gfm_inline_code(EMPTY_OR_ZERO_WIDTH_SENTINEL)
+    return gfm_inline_code(clean)
 
 
 def _rule_link(rule_id: str) -> str:
@@ -188,14 +208,25 @@ def _rule_link(rule_id: str) -> str:
 
 
 def _html_escape(text: str) -> str:
-    """Escape `<` and `>` for safe embedding in a `<details>` block.
+    """Escape `&`, `<`, and `>` for safe embedding in a `<details>` block.
 
-    `&` does NOT need escaping inside a `<details>` body (GFM
-    permits literal `&` in markdown), but `<` and `>` would be
-    interpreted as HTML tags. Pgrls violation messages today are
-    plain ASCII English, but a future rule could carry a SQL
-    fragment with `<`/`>` operators — render-safe escaping prevents
-    a comment from rendering as half-broken HTML.
+    A bare `&` inside an HTML element is a character-reference
+    introducer — GitHub's GFM renderer will parse `&amp;`, `&lt;`,
+    or any other named entity even when the source intends a
+    literal ampersand. So `&` MUST be escaped first (before the
+    `<`/`>` pass introduces additional `&` characters), otherwise
+    the rendered output would silently rewrite literal `&amp;`
+    text into the `&` character it represents.
+
+    `<` and `>` would be interpreted as HTML tags. Pgrls violation
+    messages today are plain ASCII English, but a future rule
+    could carry a SQL fragment with `<`/`>` operators, or a future
+    extra rule could emit `</details>` in a message and accidentally
+    close the surrounding details block — render-safe escaping
+    prevents both classes of bug.
+
+    Order matters: `&` first so the subsequent `<` → `&lt;` and
+    `>` → `&gt;` rewrites don't get re-escaped.
     """
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(
         ">", "&gt;"

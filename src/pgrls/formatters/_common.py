@@ -1,5 +1,5 @@
 """Shared helpers for human-readable formatters (`text`, `markdown`,
-`github`).
+`pr-comment`, `github`).
 
 JSON and SARIF formatters handle `Violation.location` safely via
 `json.dumps` escaping; they don't need anything from this module.
@@ -7,6 +7,38 @@ JSON and SARIF formatters handle `Violation.location` safely via
 from __future__ import annotations
 
 import re
+
+
+def gfm_inline_code(content: str) -> str:
+    """Wrap `content` as a GFM inline-code span using the shortest
+    delimiter run that can't be closed prematurely by backticks in
+    the content.
+
+    GFM rule (CommonMark 6.1): a backtick code span is delimited by
+    a run of N backticks; the matching closer is also N backticks,
+    and any shorter run inside the content renders as a literal
+    backtick. So `` `a` `` works for content with no backticks, ` ```a``` `
+    is needed for content containing two consecutive backticks, etc.
+    Space padding (`` ` foo ` ``) is the GFM idiom that lets content
+    start or end with a backtick — the renderer strips one space
+    from each side before rendering literal content.
+
+    Caller is responsible for any other escaping (pipe-table `|`,
+    HTML `<`/`>`, etc.) — this helper only handles the backtick-run
+    arithmetic.
+
+    Shared between `markdown._location_cell` (table cell) and
+    `pr_comment._safe_chip` (inline-code chip) so both formatters
+    produce the same GFM-safe output for the same input.
+    """
+    if "`" not in content:
+        return f"`{content}`"
+    longest_run = max(
+        (len(m) for m in re.findall(r"`+", content)),
+        default=0,
+    )
+    wrapper = "`" * (longest_run + 1)
+    return f"{wrapper} {content} {wrapper}"
 
 # Sentinel shown by the text and markdown formatters when a
 # non-`None` location collapses to `""` after `safe_location` drops
