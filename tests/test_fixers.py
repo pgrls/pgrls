@@ -14,6 +14,7 @@ from pgrls.fixers import (
 from pgrls.fixers.hyg003 import HYG003Fixer
 from pgrls.fixers.perf001 import PERF001Fixer
 from pgrls.fixers.perf003 import PERF003Fixer
+from pgrls.fixers.perf004 import PERF004Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
 from pgrls.fixers.sec006 import SEC006Fixer
@@ -2687,3 +2688,157 @@ def test_perf003_fix_raises_on_malformed_allowlist() -> None:
         PERF003Fixer().fix(schema, {"allowlist": "public.t.p"})
     with pytest.raises(TypeError, match="allowlist"):
         PERF003Fixer().fix(schema, {"allowlist": [" public.t.p "]})
+
+
+# ---------- PERF004 fixer ----------
+
+
+def _perf004_table(
+    *policies: Policy,
+    name: str = "users",
+    schema: str = "public",
+    rls: bool = True,
+    indexes: tuple[Index, ...] = (
+        _idx("email", name="users_email_idx"),
+    ),
+    columns: tuple[str, ...] = ("id", "email", "name"),
+) -> Table:
+    return Table(
+        schema=schema,
+        name=name,
+        rls_enabled=rls,
+        force_rls=True,
+        policies=policies,
+        indexes=indexes,
+        columns=columns,
+    )
+
+
+def test_perf004_fix_emits_expression_index_for_single_func_wrap() -> None:
+    # Canonical case: `lower(email) = X` against an existing
+    # plain `email` index → CREATE INDEX on `lower(email)`.
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.email')", name="p"),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "PERF004"
+    assert f.sql == "CREATE INDEX ON public.users (lower(email));"
+    assert "lower(email)" in f.location
+
+
+def test_perf004_fix_silent_when_no_plain_index_on_column() -> None:
+    # No plain index on `email` → PERF003 fires for the un-indexed
+    # column, not PERF004. The fixer mirrors and stays silent.
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.email')"),
+        indexes=(),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_when_rls_disabled() -> None:
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.email')"),
+        rls=False,
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_when_predicate_uses_bare_column() -> None:
+    # `email = X` already uses the plain index; PERF004 doesn't fire.
+    schema = Schema(tables=(_perf004_table(
+        _policy("email = current_setting('app.email')"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_when_func_wraps_value_side() -> None:
+    # PERF004 itself stays silent when the function wraps the VALUE
+    # (`email = lower(current_setting(...))`) — the column is bare,
+    # the plain index is usable. The fixer mirrors.
+    schema = Schema(tables=(_perf004_table(
+        _policy("email = lower(current_setting('app.email'))"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_emits_outermost_funccall_for_nested_wrap() -> None:
+    # `lower(upper(email))` — the planner needs an index matching
+    # the full predicate expression, not the inner `upper`. The
+    # fixer emits the outermost FuncCall.
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(upper(email)) = current_setting('app.x')"),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql == (
+        "CREATE INDEX ON public.users (lower(upper(email)));"
+    )
+
+
+def test_perf004_fix_dedupes_expression_across_policies() -> None:
+    # Two policies wrapping the same column in the same expression
+    # → one CREATE INDEX, not two duplicates.
+    pred = "lower(email) = current_setting('app.email')"
+    schema = Schema(tables=(_perf004_table(
+        _policy(pred, name="read"),
+        _policy(pred, name="write", command="ALL", with_check=pred),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert [f.sql for f in fixes] == [
+        "CREATE INDEX ON public.users (lower(email));"
+    ]
+
+
+def test_perf004_fix_emits_separate_index_per_distinct_expression() -> None:
+    # `lower(email)` and `upper(email)` are different expressions →
+    # the planner needs distinct indexes for each.
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.l')", name="lo"),
+        _policy("upper(email) = current_setting('app.u')", name="up"),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "CREATE INDEX ON public.users (lower(email));",
+        "CREATE INDEX ON public.users (upper(email));",
+    ]
+
+
+def test_perf004_fix_respects_allowlist() -> None:
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.x')", name="p"),
+    ),))
+    assert (
+        PERF004Fixer().fix(
+            schema, {"allowlist": ["public.users.p"]}
+        )
+        == []
+    )
+
+
+def test_perf004_fix_description_flags_lock_concurrently_and_alternative() -> None:
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.x')"),
+    ),))
+    [f] = PERF004Fixer().fix(schema, {})
+    # CONCURRENTLY is the production-safe alternative, named.
+    assert "CONCURRENTLY" in f.description
+    # The other remedy (rewrite predicate to bare column) is also
+    # surfaced so the operator doesn't think the index is the only
+    # path.
+    assert "bare column" in f.description
+    # The actual expression text appears in the description so the
+    # operator sees what's being indexed without reading SQL.
+    assert "lower(email)" in f.description
+
+
+def test_perf004_fix_raises_on_malformed_allowlist() -> None:
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.x')", name="p"),
+    ),))
+    with pytest.raises(TypeError, match="allowlist"):
+        PERF004Fixer().fix(schema, {"allowlist": "public.users.p"})
+    with pytest.raises(TypeError, match="allowlist"):
+        PERF004Fixer().fix(schema, {"allowlist": [" public.users.p "]})
