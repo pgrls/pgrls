@@ -691,3 +691,22 @@ ALTER TABLE public.allbad_sec034 FORCE ROW LEVEL SECURITY;
 CREATE POLICY email_scoped ON public.allbad_sec034
     FOR ALL TO postgres
     USING (owner_email = auth.email());
+
+-- SEC037: the policy compares auth.role() to 'admin', a value
+-- outside the known Supabase role set (anon / authenticated /
+-- service_role). The comparison never matches, the policy
+-- silently denies every row, the broken policy looks correct on
+-- read-through. Same block-isolation principles as the prior
+-- blocks: TO postgres (silences SEC003/SEC007), RLS on with FORCE
+-- (silences SEC001 / SEC002 / SEC032). The auth.role() stub is
+-- already provided by the SEC033 block earlier in this fixture, so
+-- no schema setup needed here.
+CREATE OR REPLACE FUNCTION auth.role() RETURNS text
+    LANGUAGE sql STABLE
+    AS 'SELECT ''anon''::text';
+CREATE TABLE public.allbad_sec037 (id INT);
+ALTER TABLE public.allbad_sec037 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec037 FORCE ROW LEVEL SECURITY;
+CREATE POLICY unknown_role_check ON public.allbad_sec037
+    FOR ALL TO postgres
+    USING (auth.role() = 'admin');

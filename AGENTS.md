@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-six rules across four
+In the current release it ships **forty-seven rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -29,6 +29,8 @@ authenticated user passes once any matching row exists), `HYG001`
 service to self when email changes, when SQL `=` is case-sensitive
 but emails aren't, or when plus-addressing means `x+y@host` and
 `x@host` compare unequal),
+`SEC037` (policy compares `auth.role()` to an unknown role name —
+silently denies every row because the equality never matches),
 `SEC008` (permissive `USING (true)` — admits every row),
 `SEC031` (restrictive `USING (true)` — a no-op floor that enforces
 nothing), `SEC009` (RLS enabled but no policies —
@@ -2437,6 +2439,83 @@ specifically. The related `IN (SELECT id FROM auth.users WHERE …)` /
 hazard — "show rows whose owner is any admin" rather than "show
 every row if any admin exists." That variant is tracked as a future
 rule; SEC036 stays silent on it.
+
+<a id="rule-sec037"></a>
+
+### SEC037 — Policy compares `auth.role()` to an unknown role name
+
+**Severity:** warning.
+
+**The hazard.** `auth.role()` in the Supabase / PostgREST auth
+model returns one of a small fixed set — `anon`, `authenticated`,
+or `service_role`. A policy that compares `auth.role()` to a
+string outside that set silently denies every row, because the
+equality never holds:
+
+```sql
+USING (auth.role() = 'admin')         -- never matches → policy denies
+USING (auth.role() = 'authenticted')  -- typo, silent deny
+USING (auth.role() = 'authorized')    -- wrong constant
+```
+
+The failure mode is a 100% empty result set — which masks the
+broken policy because tests that seed admin data see no rows, devs
+assume the policy works, the table becomes inaccessible in prod.
+
+Severity is `warning`: not a CVE-class exploit (no data leak), but
+a silent-deny footgun worth surfacing in CI.
+
+**Standard fix.** The intent is usually a custom role check. Gate
+on `app_metadata.role` instead — `app_metadata` is the
+service-role-set, admin-only channel for project-specific role
+attributes:
+
+```sql
+USING (auth.jwt() -> 'app_metadata' ->> 'role' = 'admin')
+```
+
+(Then promote users to admin server-side via the service role:
+`auth.admin.updateUserById(id, { app_metadata: { role: 'admin' }})`.)
+
+If you have an intentional override (e.g., a documented project
+convention where `auth.role()` is redefined to return a wider set
+of values), extend the known-roles list in config rather than
+relying on default Supabase semantics.
+
+**Detection.** Walks policy USING / WITH CHECK ASTs for `=`
+comparisons where one side is `auth.role()` (or any configured
+role-context function) and the other side is a string literal not
+in the configured known-role set. Handles the
+`'admin'::text` form that Postgres normalizes literals to when
+storing policy expressions. Multiple comparisons in the same
+policy with distinct literals yield one finding each (the fix for
+each typo is usually different).
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC037]
+# Role-name strings to consider valid. Replaces the default
+# ["anon", "authenticated", "service_role"]. Case-sensitive
+# (JWT claim values are not folded).
+known_roles = ["anon", "authenticated", "service_role", "guest"]
+
+# Function names whose call counts as an auth.role() reference.
+# Replaces the default ["auth.role"]. Add current_user / session_user
+# to extend the same silent-deny-typo check to the SQL keyword
+# forms (a different rule, SEC018, covers current_user as a
+# tenant key — orthogonal).
+role_functions = ["auth.role"]
+
+# Per-policy escape hatch
+allowlist = ["public.legacy.admin_check"]
+```
+
+**No auto-fix.** The right replacement depends on application
+intent — typo fix (`'authenticted'` → `'authenticated'`), shape
+migration (`auth.role() = 'admin'` → `app_metadata` lookup), or
+known-roles config extension. The finding message tells the
+operator what to do; the choice isn't mechanical.
 
 <a id="rule-perf001"></a>
 
