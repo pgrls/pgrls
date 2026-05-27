@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-05-27
+
+### Added
+
+- **`pgrls history --format html` — standalone HTML trend page.**
+  Mirrors `pgrls report --format html` for the same reading
+  context: archive as the weekly engineering-review artefact,
+  print to PDF for a quarterly compliance file, email to a
+  stakeholder. Embedded CSS, no external assets — opens offline,
+  renders identically in browsers and `wkhtmltopdf`-style PDF
+  converters. Per-snapshot row table with severity totals + the
+  NEW/FIXED delta vs. the prior snapshot; the NEW column highlights
+  red and the FIXED column highlights green when non-zero, so the
+  at-a-glance read of "are we gaining ground" doesn't require
+  parsing the trailing summary. Summary band shows
+  first→last totals with a coloured net-change badge
+  (green for `net -N`, red for `net +N`, grey for flat).
+  Light/dark color scheme via `prefers-color-scheme`. Filenames
+  are HTML-escaped — a directory contaminated with a filename
+  containing `<` / `&` can't break the layout or inject markup.
+
+- **API: `pgrls.history.render_html(rows, *, generated_at=None)`.**
+  Same shape `pgrls.report.render_html` exposes — optional
+  timezone-aware `datetime` for deterministic snapshot tests; a
+  naive `datetime` raises `ValueError` rather than being silently
+  coerced through the host's local timezone.
+
 ## [0.6.15] - 2026-05-27
 
 ### Added

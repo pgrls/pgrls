@@ -257,6 +257,7 @@ Pair a daily cron with `pgrls lint --format json -o snapshots/$(date -u +%FT%H%M
 ```bash
 pgrls history snapshots/                       # terminal table
 pgrls history snapshots/ --format markdown     # paste-ready GFM (for a weekly update / PR comment)
+pgrls history snapshots/ --format html -o trend.html   # standalone trend page, print/PDF-ready
 pgrls history snapshots/ --format json -o trend.json   # machine-readable for plotting
 ```
 
