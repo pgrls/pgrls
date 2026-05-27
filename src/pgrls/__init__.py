@@ -28,6 +28,8 @@ on internals.
 """
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
 from pgrls.diff import (
     Change,
     ChangeKind,
@@ -35,7 +37,13 @@ from pgrls.diff import (
     diff_schemas,
 )
 
-__version__ = "0.6.0"
+try:
+    __version__ = _pkg_version("pgrls")
+except PackageNotFoundError:
+    # Running from a source tree without the wheel installed (e.g. a
+    # fresh `git clone` before `pip install -e .`). Falls back to a
+    # dev sentinel rather than crashing every CLI invocation.
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "Change",
