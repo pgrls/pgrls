@@ -81,12 +81,28 @@ class SEC014:
     ) -> list[Violation]:
         allowlist = _parse_allowlist(options)
         out: list[Violation] = []
-        # `security_definer_functions` is captured in alphabetical
-        # (schema, name) order at introspection time, so iteration
-        # order is deterministic without a `sorted(...)` here.
+        # Snapshot v12+ captures one `SecdefFunction` entry per
+        # overload (the SECDEF SQL query never had a SELECT DISTINCT —
+        # this was the case pre-v12 too, just less explicit before the
+        # `signature` field landed). The rule reports per qualified
+        # name — the message names the function, not a specific
+        # overload signature — so dedupe by qualified_name as we walk.
+        # Pins the contract the docstring promises ("Two overloads of
+        # the same qualified name are flagged once and allowlisted
+        # once") which the pre-dedup loop did not enforce.
+        #
+        # `security_definer_functions` is captured in
+        # `(qname, signature)` order at introspection time, so the
+        # first-seen overload determines the captured entry's
+        # rendered language / body; the order is deterministic
+        # without a `sorted(...)` here.
+        seen: set[str] = set()
         for fn in schema.security_definer_functions:
             if fn.qualified_name in allowlist:
                 continue
+            if fn.qualified_name in seen:
+                continue
+            seen.add(fn.qualified_name)
             out.append(self._violation(fn))
         return out
 
