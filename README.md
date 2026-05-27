@@ -34,6 +34,7 @@
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
+> - **VS Code extension** — [`pgrls/pgrls-vscode`](https://github.com/pgrls/pgrls-vscode) wraps the CLI; `pgrls: Lint database` surfaces findings as diagnostics in the Problems panel, with hover documentation per rule.
 
 ## Install
 
