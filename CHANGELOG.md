@@ -35,7 +35,23 @@ breaking changes — they will be called out in this file.
   - HTML catalog's `pgrls {__version__}` meta line matches JSON's
     `pgrls_version` field.
 
-  Test-only release — no CLI, snapshot, or behavior change.
+### Fixed
+
+- **`pgrls --version` reported the wrong release**. `__version__`
+  in `src/pgrls/__init__.py` had been hard-coded to `"0.6.0"` since
+  the v0.6.0 milestone cut; the CLI's `--version` flag and the JSON
+  catalog's `pgrls_version` field both read from it, so users saw
+  the stale `0.6.0` after upgrading. Sourced from
+  `importlib.metadata.version("pgrls")` so the in-process value
+  tracks the pyproject `[project].version` automatically. New
+  `test_package_version_matches_pyproject` parses pyproject via
+  `tomllib` and pins the two sources to each other so the drift
+  can't recur silently — the prior `test_root_version_flag` compared
+  `__version__` to itself and passed for the wrong reason.
+
+  Source-tree imports without `pip install -e .` fall back to
+  `0.0.0.dev0` (PEP 440 dev release, parses cleanly via
+  `packaging.version.Version`) instead of crashing.
 
 ## [0.6.22] - 2026-05-27
 
