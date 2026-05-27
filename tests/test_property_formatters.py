@@ -204,13 +204,16 @@ def test_html_escape_is_not_idempotent_by_design(
     # the strings are equal.
     if not any(c in content for c in "&<>"):
         assert once == twice
-    # If content has any of the three, double-escape is strictly
-    # longer than single-escape (because each & in `once` gets
-    # rewritten to `&amp;` on the second pass).
+    # If content has any of the three, double-escape is STRICTLY
+    # longer than single-escape: every special char in `content`
+    # becomes a multi-char entity on pass 1 (e.g. `&` → `&amp;`),
+    # and the `&` introducing that entity gets re-expanded on
+    # pass 2 (`&amp;` → `&amp;amp;`). There's no edge case where
+    # the lengths can be equal.
     elif "&" in content or "<" in content or ">" in content:
-        assert len(twice) >= len(once), (
-            f"twice-escaped {twice!r} is shorter than once-"
-            f"escaped {once!r} (content was {content!r})"
+        assert len(twice) > len(once), (
+            f"twice-escaped {twice!r} is not strictly longer than "
+            f"once-escaped {once!r} (content was {content!r})"
         )
 
 
