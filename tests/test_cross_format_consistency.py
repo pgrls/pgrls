@@ -28,6 +28,7 @@ renderer tests; this file just asserts the numbers match).
 """
 from __future__ import annotations
 
+import html as _stdlib_html
 import json
 import re
 from datetime import datetime, timezone
@@ -455,6 +456,33 @@ def _parse_emdash_int(s: str) -> int:
     return 0 if s == "—" else int(s)
 
 
+def _html_catalog_rows_by_id(html_out: str) -> dict[str, str]:
+    """Index `<tbody>` rows from `pgrls explain --format html`'s
+    catalog page by rule id, so a per-rule severity/fixable assertion
+    can't drift across rows.
+
+    A lazy `<tr>.*?<code>SEC003</code>` regex would start at SEC001's
+    `<tr>` and span every row in between because of how non-greedy
+    matching anchors. Splitting on `</tr>` first sidesteps that.
+
+    Matches `<tr ...>` with optional attributes (currently bare `<tr>`
+    but future markup may add `class=`) so a renderer change adding
+    attributes doesn't silently drop every row.
+    """
+    body_match = re.search(
+        r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL
+    )
+    assert body_match is not None
+    rows_by_id: dict[str, str] = {}
+    for row in re.findall(
+        r"<tr[\s>].*?</tr>", body_match.group(1), flags=re.DOTALL
+    ):
+        id_match = re.search(r"<code>([A-Z]+\d+)</code>", row)
+        if id_match:
+            rows_by_id[id_match.group(1)] = row
+    return rows_by_id
+
+
 # ──────────────────────────────────────────────────────────────────
 # pgrls diff — five renderers agree on the numbers
 # ──────────────────────────────────────────────────────────────────
@@ -747,11 +775,11 @@ def test_explain_catalog_all_four_formats_agree_on_rule_count() -> None:
 
     # Text: one rule per line — count lines matching the
     # `<ID>      [<sev>]   <title>` shape via the leading rule-id
-    # token. The footer line ("Run `pgrls explain ...`") doesn't
-    # match this pattern.
+    # token. `\d+` (not `\d{3}`) so a future SEC1000 still counts.
+    # The footer line ("Run `pgrls explain ...`") doesn't match.
     text_rule_lines = [
         ln for ln in text_out.splitlines()
-        if re.match(r"^[A-Z]+\d{3}\s+\[", ln)
+        if re.match(r"^[A-Z]+\d+\s+\[", ln)
     ]
     assert len(text_rule_lines) == expected
 
@@ -763,10 +791,12 @@ def test_explain_catalog_all_four_formats_agree_on_rule_count() -> None:
     ]
     assert len(md_rows) == expected
 
-    # HTML: one `<tr>` per rule in tbody.
+    # HTML: one `<tr>` per rule in tbody. `<tr[\s>]` (not `<tr>`)
+    # so a future `<tr class="...">` doesn't silently drop the count
+    # to zero.
     body = re.search(r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL)
     assert body is not None
-    tr_opens = re.findall(r"<tr>", body.group(1))
+    tr_opens = re.findall(r"<tr[\s>]", body.group(1))
     assert len(tr_opens) == expected
 
 
@@ -817,17 +847,10 @@ def test_explain_catalog_every_rule_severity_surfaces_in_every_format() -> None:
     assert json_severity_by_id == {r.id: r.severity for r in rules}
 
     # In text catalog, severity sits next to ID as `<ID>      [<sev>]`.
-    # Index HTML rows by id once so the per-rule severity check can't
-    # drift across rows (see fixable-flag test for the same pattern).
-    body_match = re.search(
-        r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL
-    )
-    assert body_match is not None
-    rows_by_id: dict[str, str] = {}
-    for row in re.findall(r"<tr>.*?</tr>", body_match.group(1), flags=re.DOTALL):
-        id_match = re.search(r"<code>([A-Z]+\d+)</code>", row)
-        if id_match:
-            rows_by_id[id_match.group(1)] = row
+    # The 8-char left-pad is the contract — `cli.py`'s `f"{r.id:<8}"`
+    # in the explain text-catalog path. Changing column width is a
+    # deliberate format break that should land here too.
+    rows_by_id = _html_catalog_rows_by_id(html_out)
 
     for r in rules:
         assert f"{r.id:<8} [{r.severity}]" in text_out, (
@@ -858,18 +881,7 @@ def test_explain_catalog_json_and_html_agree_on_fixable_flag() -> None:
     json_fixable = {r["id"] for r in json_payload["rules"] if r["fixable"]}
     assert json_fixable == fixable
 
-    # Index each rule's row by ID. Split on row close so the regex
-    # can't drift across rules (a lazy `<tr>.*?<code>SEC003` will
-    # start at SEC001's `<tr>` and span every row in between).
-    body_match = re.search(
-        r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL
-    )
-    assert body_match is not None
-    rows_by_id: dict[str, str] = {}
-    for row in re.findall(r"<tr>.*?</tr>", body_match.group(1), flags=re.DOTALL):
-        id_match = re.search(r"<code>([A-Z]+\d+)</code>", row)
-        if id_match:
-            rows_by_id[id_match.group(1)] = row
+    rows_by_id = _html_catalog_rows_by_id(html_out)
 
     # HTML: locate each fixable rule's row and confirm the `fix` badge
     # is in its Fixable cell; non-fixable rules must NOT carry one.
@@ -920,9 +932,8 @@ def test_explain_single_rule_metadata_consistent_across_formats() -> None:
         # CLI hint. Title is `html.escape`d in the rendered page —
         # apostrophes in rule titles (e.g. SEC014's "caller's RLS")
         # become `&#x27;` — so escape the expected substring too.
-        import html as _html_consistency_inner
         expected_h1 = (
-            f"{rule.id} — {_html_consistency_inner.escape(rule.title)}"
+            f"{rule.id} — {_stdlib_html.escape(rule.title)}"
         )
         assert expected_h1 in html_out, (
             f"html missing h1 for {rule.id}"
@@ -972,8 +983,7 @@ def test_explain_single_rule_reference_body_consistent_across_formats() -> None:
         # HTML escapes `<`/`>`/`&` in the body — escape the
         # first line the same way so the assertion stays correct
         # for docstrings carrying any of those.
-        import html as _html_consistency
-        assert _html_consistency.escape(first_line) in html_out, (
+        assert _stdlib_html.escape(first_line) in html_out, (
             f"html missing reference body for {rule.id}"
         )
 
