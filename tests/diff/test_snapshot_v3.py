@@ -33,10 +33,11 @@ def test_to_snapshot_emits_grants_field() -> None:
     # (triggers); 6 → 7 in v0.5.10 (indexes); 7 → 8 in v0.5.13
     # (SecdefFunction.search_path); 8 → 9 in v0.5.14
     # (bypassrls_roles); 9 → 10 in v0.5.15 (leakproof_functions);
-    # 10 → 11 in v0.5.54 (bypassrls_escalation_roles).
-    # The grants test is about content, not version — pin the latest
-    # so a future bump is deliberate.
-    assert snap["version"] == 11
+    # 10 → 11 in v0.5.54 (bypassrls_escalation_roles); 11 → 12 in
+    # v0.6.11 (per-overload `signature` on SecdefFunction +
+    # LeakproofFunction). The grants test is about content, not
+    # version — pin the latest so a future bump is deliberate.
+    assert snap["version"] == 12
     table = snap["tables"][0]
     assert table["grants"] == [
         {"role": "authenticated", "privileges": ["SELECT", "INSERT"]}

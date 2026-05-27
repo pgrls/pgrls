@@ -18,11 +18,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_11() -> None:
-    # Bumped 10 → 11 to add top-level `bypassrls_escalation_roles`
-    # for SEC029. v3–v10 baselines still load (Schema.from_snapshot
-    # accepts 3 through 11).
-    assert SNAPSHOT_VERSION == 11
+def test_snapshot_version_is_12() -> None:
+    # Bumped 11 → 12 to add per-overload `signature` to SecdefFunction
+    # and LeakproofFunction. v3–v11 baselines still load (Schema.from_snapshot
+    # accepts 3 through 12).
+    assert SNAPSHOT_VERSION == 12
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -47,7 +47,7 @@ def test_to_snapshot_emits_views_field() -> None:
     # added bypassrls_roles; v10 added leakproof_functions; v11
     # added bypassrls_escalation_roles (all additive and orthogonal
     # to the views field this test exercises).
-    assert snap["version"] == 11
+    assert snap["version"] == 12
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -120,12 +120,14 @@ def test_to_snapshot_emits_security_definer_functions_field() -> None:
     assert "security_definer_functions" in snap
     # `search_path` is the v8 addition — defaults to None when the
     # SecdefFunction is constructed without it (as here).
+    # `signature` is the v12 addition — defaults to "" when omitted.
     assert snap["security_definer_functions"] == [
         {
             "qualified_name": "public.read_secret",
             "body": "SELECT * FROM public.secret",
             "language": "sql",
             "search_path": None,
+            "signature": "",
         }
     ]
 
@@ -419,7 +421,7 @@ def test_to_snapshot_emits_bypassrls_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_roles" in snap
-    assert snap["version"] == 11
+    assert snap["version"] == 12
     assert snap["bypassrls_roles"] == [
         {"name": "etl_worker", "superuser": False, "can_login": True}
     ]
@@ -478,9 +480,11 @@ def test_to_snapshot_emits_leakproof_functions_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "leakproof_functions" in snap
-    assert snap["version"] == 11
+    assert snap["version"] == 12
+    # `signature` is the v12 addition — defaults to "" when the
+    # LeakproofFunction is constructed without it (as here).
     assert snap["leakproof_functions"] == [
-        {"qualified_name": "public.fast_eq"}
+        {"qualified_name": "public.fast_eq", "signature": ""}
     ]
 
 
@@ -536,7 +540,7 @@ def test_to_snapshot_emits_bypassrls_escalation_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_escalation_roles" in snap
-    assert snap["version"] == 11
+    assert snap["version"] == 12
     assert snap["bypassrls_escalation_roles"] == [
         {
             "member": "app",

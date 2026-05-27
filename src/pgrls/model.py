@@ -2,7 +2,9 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 11 (v11 added top-level
+Currently version 12 (v12 added ``signature`` to ``SecdefFunction``
+and ``LeakproofFunction`` so per-overload `ALTER FUNCTION` fixes
+can target the right one; v11 added top-level
 ``bypassrls_escalation_roles`` for SEC029;
 v10 added top-level ``leakproof_functions`` for
 SEC017; v9 added top-level ``bypassrls_roles`` for SEC016;
@@ -41,7 +43,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 11
+SNAPSHOT_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -327,6 +329,19 @@ class SecdefFunction:
     A non-`None` value is the raw GUC string as Postgres stores
     it (e.g. `"pg_catalog, public, pg_temp"`); SEC015 tokenizes
     it to check whether `pg_temp` is pinned last.
+
+    `signature` is the function's argument-type signature as
+    `pg_get_function_identity_arguments(p.oid)` returns it — the
+    exact form `ALTER FUNCTION name(<signature>)` requires. Empty
+    string for a no-argument function. Captured in snapshot v12+;
+    v4–v11 snapshots load with `signature=""` (so the data is just
+    not available for those, never silently wrong). A function with
+    multiple overloads appears here as MULTIPLE `SecdefFunction`
+    entries with the same `qualified_name` but distinct
+    `signature`s — capture preserves overload identity so a fixer
+    can target each one individually with `ALTER FUNCTION`. Rules
+    that report by qualified name (the existing behaviour) should
+    dedupe across overloads.
     """
 
     qualified_name: str
@@ -335,6 +350,10 @@ class SecdefFunction:
     # None = no `SET search_path` clause (inherits caller's path).
     # Snapshot v8+; v4–v7 snapshots load with search_path=None.
     search_path: str | None = None
+    # `pg_get_function_identity_arguments` output. Empty for
+    # zero-arg functions; non-empty like `integer, text` for
+    # overloads. Snapshot v12+; older snapshots load with "".
+    signature: str = ""
 
 
 @dataclass(frozen=True)
@@ -450,15 +469,30 @@ class LeakproofFunction:
     here; what remains is the user-defined functions a superuser
     deliberately marked ``LEAKPROOF`` (only a superuser can).
 
-    Only the qualified name is captured: SEC017 is an audit prompt,
-    not a body analysis. Proving a function actually is — or is
-    not — leakproof would require inspecting every error path and
-    timing characteristic of its body, exactly the brittle analysis
-    the rule deliberately does not attempt. The operator confirms
-    the ``LEAKPROOF`` claim by hand, or removes the marking.
+    `qualified_name` and (since snapshot v12) `signature` together
+    identify a single overload — `pg_get_function_identity_arguments`
+    output, the exact form `ALTER FUNCTION name(<signature>) NOT
+    LEAKPROOF` requires. Overloads of the same qualified name
+    appear as separate `LeakproofFunction` entries; capture
+    preserves overload identity so a SEC017 fixer can target each
+    one individually. SEC017 itself reports per qualified name
+    (deduping across overloads) — the message says "function X is
+    LEAKPROOF" rather than singling out one overload.
+
+    Only the qualified name + signature are captured: SEC017 is an
+    audit prompt, not a body analysis. Proving a function actually
+    is — or is not — leakproof would require inspecting every
+    error path and timing characteristic of its body, exactly the
+    brittle analysis the rule deliberately does not attempt. The
+    operator confirms the ``LEAKPROOF`` claim by hand, or removes
+    the marking.
     """
 
     qualified_name: str
+    # `pg_get_function_identity_arguments` output. Empty for zero-
+    # arg functions; non-empty for overloads. Snapshot v12+; v10–v11
+    # snapshots load with "".
+    signature: str = ""
 
 
 @dataclass(frozen=True)
@@ -646,6 +680,10 @@ class Schema:
                     "body": f.body,
                     "language": f.language,
                     "search_path": f.search_path,
+                    # v12 — argument signature for per-overload
+                    # `ALTER FUNCTION` fixes. Empty for zero-arg
+                    # functions. v4-v11 snapshots load with "".
+                    "signature": f.signature,
                 }
                 for f in self.security_definer_functions
             ],
@@ -670,7 +708,14 @@ class Schema:
             # baselines round-trip with `leakproof_functions=()` →
             # empty array.
             "leakproof_functions": [
-                {"qualified_name": f.qualified_name}
+                {
+                    "qualified_name": f.qualified_name,
+                    # v12 — argument signature for per-overload
+                    # `ALTER FUNCTION` fixes. Overloads of the same
+                    # qualified_name appear here as separate entries
+                    # since v12; v10-v11 snapshots load with "".
+                    "signature": f.signature,
+                }
                 for f in self.leakproof_functions
             ],
             # v11 extension — emit roles that can SET ROLE to a
@@ -738,12 +783,12 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11. v1 / v2 snapshots must be regenerated against the "
-                "current schema."
+                "10, 11, 12. v1 / v2 snapshots must be regenerated against "
+                "the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -885,12 +930,19 @@ class Schema:
         raw_secdef_funcs = (
             payload.get("security_definer_functions", []) if version >= 4 else []
         )
+        # `signature` is a v12 addition (per-overload identity for
+        # the ALTER FUNCTION fixers). v4-v11 snapshots have no
+        # `signature` key; `.get(..., "")` loads them with the empty
+        # string — fixers that need the signature will see "" and
+        # abstain rather than emit a wrong ALTER FUNCTION (re-
+        # snapshot against a live v12 database to populate it).
         secdef_funcs = tuple(
             SecdefFunction(
                 qualified_name=f["qualified_name"],
                 body=f["body"],
                 language=f["language"],
                 search_path=f.get("search_path"),
+                signature=f.get("signature", ""),
             )
             for f in raw_secdef_funcs
         )
@@ -916,8 +968,17 @@ class Schema:
         # (correct, since the snapshot didn't capture functions).
         # Re-snapshot against a live database (v10) to populate it.
         raw_leakproof = payload.get("leakproof_functions", [])
+        # `signature` is a v12 addition (per-overload identity for
+        # the SEC017 fixer). v10-v11 snapshots have no `signature`
+        # key; `.get(..., "")` loads them with the empty string.
+        # Note overloads of the same qualified_name collapsed into
+        # a single entry pre-v12 (DISTINCT in the introspection
+        # query); v12 captures them separately.
         leakproof_functions = tuple(
-            LeakproofFunction(qualified_name=f["qualified_name"])
+            LeakproofFunction(
+                qualified_name=f["qualified_name"],
+                signature=f.get("signature", ""),
+            )
             for f in raw_leakproof
         )
 
