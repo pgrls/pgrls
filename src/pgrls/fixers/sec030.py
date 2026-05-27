@@ -14,14 +14,20 @@ The mechanical fix is one statement per flagged column:
 **Critical caveat — `--apply` will fail if NULLs already exist.**
 Postgres scans the column at the ALTER and rejects the statement
 with `ERROR: column "x" contains null values` if any row has NULL.
-The fix description names this explicitly so the operator either
-(a) backfills existing NULLs first (UPDATE with the intended
-default, then re-run the fix), (b) adds a DEFAULT and a backfill
-in a migration, or (c) decides the NULLs are intentional and
-allowlists the table. There is no "auto-backfill" — the right
-non-null sentinel for a tenant discriminator (the actual tenant
-id, a backstop tenant, an opaque marker) is application logic
-that pgrls cannot infer.
+And because `pgrls fix --apply` runs every Fix in a single all-or-
+nothing transaction, a SEC030 ALTER hitting a NULL rolls back the
+**entire batch** — every SEC001 / SEC002 / SEC031 / etc. Fix
+emitted alongside is undone. The Fix description names both the
+per-statement failure mode AND the batch-rollback consequence, so
+the operator chooses one of: (a) backfill existing NULLs first
+(UPDATE with the intended default), (b) add a DEFAULT in a
+migration and backfill there, (c) split the apply with `pgrls
+fix --output FILE` to materialize the SQL and run the ALTER
+separately after the backfill, or (d) decide the NULLs are
+intentional and allowlist the table. There is no "auto-backfill"
+— the right non-null sentinel for a tenant discriminator (the
+actual tenant id, a backstop tenant, an opaque marker) is
+application logic that pgrls cannot infer.
 
 One Fix per flagged column (mirrors SEC030's per-table-per-column
 report shape). A table flagged for two nullable scoping columns
@@ -111,12 +117,18 @@ class SEC030Fixer:
                 "**BACKFILL ANY EXISTING NULLs FIRST.** Postgres "
                 "scans the column at ALTER time and rejects this "
                 "statement with `ERROR: column contains null values` "
-                "if even one row has NULL — pgrls cannot infer the "
-                "right tenant-id / sentinel to backfill with, so "
-                "that's your decision. Common shape: `UPDATE "
+                "if even one row has NULL — and because `pgrls fix "
+                "--apply` runs every Fix in a single all-or-nothing "
+                "transaction, that failure ROLLS BACK THE ENTIRE "
+                "BATCH (every other SEC001 / SEC002 / etc. Fix "
+                "alongside is undone). pgrls cannot infer the right "
+                "tenant-id / sentinel to backfill with — that's your "
+                "decision. Common shape: `UPDATE "
                 f"{table.schema}.{table.name} SET {column} = <value> "
-                f"WHERE {column} IS NULL;` BEFORE running this fix. "
-                "If the NULLs are an intentional sentinel, allowlist "
+                f"WHERE {column} IS NULL;` BEFORE running this fix; "
+                "or use `pgrls fix --output FILE` to materialize the "
+                "SQL and run the backfill + ALTER separately. If "
+                "the NULLs are an intentional sentinel, allowlist "
                 f"`{table.schema}.{table.name}` under "
                 "[lint.rules.SEC030].allowlist instead."
             ),

@@ -1681,6 +1681,13 @@ def test_sec030_fix_description_warns_about_backfilling_nulls() -> None:
     # invent the backfill statement themselves.
     assert "UPDATE public.documents" in desc
     assert "IS NULL" in desc
+    # The all-or-nothing batch-rollback consequence MUST be named —
+    # operators reading the rendered SQL stream won't otherwise
+    # connect "one ALTER fails" to "every other fix rolls back".
+    assert "ROLLS BACK THE ENTIRE BATCH" in desc
+    # The escape hatch (--output FILE to materialize) must be
+    # surfaced too, so operators have a clear safer path.
+    assert "--output" in desc
     # The allowlist alternative is named.
     assert "[lint.rules.SEC030]" in desc
 
