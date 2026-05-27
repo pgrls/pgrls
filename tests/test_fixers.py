@@ -1712,6 +1712,35 @@ def test_sec017_fix_raises_on_malformed_allowlist() -> None:
         )
 
 
+def test_sec017_fix_quotes_mixed_case_function_name() -> None:
+    # `qualified_name` arrives raw from introspection (no Postgres-
+    # style quoting). A mixed-case function name or one matching
+    # a reserved keyword must be quoted in the emitted SQL or psql
+    # rejects the statement. Route through `quote_qualified` like
+    # SEC031 / SEC011 / SEC001 already do.
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("public.FastEq", "integer"),
+        ),
+    )
+    [f] = SEC017Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public."FastEq"(integer) NOT LEAKPROOF;'
+    )
+
+
+def test_sec017_fix_quotes_reserved_keyword_schema() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("order.fast_eq", "integer"),
+        ),
+    )
+    [f] = SEC017Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION "order".fast_eq(integer) NOT LEAKPROOF;'
+    )
+
+
 # ---------- SEC032 fixer ----------
 
 

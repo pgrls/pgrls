@@ -45,6 +45,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.fixers import Fix
+from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_qualified_function_allowlist
 
@@ -76,16 +77,23 @@ class SEC017Fixer:
 
     @staticmethod
     def _fix(qualified_name: str, signature: str) -> Fix:
+        # `qualified_name` is `n.nspname || '.' || p.proname` from
+        # introspection — raw, unquoted. Route through
+        # `quote_qualified` so a function or schema named `Order` /
+        # `"weird name"` / a reserved keyword still produces valid
+        # SQL on the server. The `signature` side already comes
+        # from `pg_get_function_identity_arguments` which is
+        # server-formatted with the right quoting.
+        schema_name, _, function_name = qualified_name.partition(".")
+        qident = quote_qualified(schema_name, function_name)
         return Fix(
             rule_id="SEC017",
-            # Location combines qname + signature so per-overload
-            # Fix objects sort deterministically and the dry-run
-            # report distinguishes them.
+            # Location keeps the un-quoted human form — the
+            # operator-facing dry-run report shouldn't grow ``"…"``
+            # noise unless a name actually needed it. The SQL is
+            # the source of truth for execution.
             location=f"{qualified_name}({signature})",
-            sql=(
-                f"ALTER FUNCTION {qualified_name}({signature}) "
-                "NOT LEAKPROOF;"
-            ),
+            sql=f"ALTER FUNCTION {qident}({signature}) NOT LEAKPROOF;",
             description=(
                 f"Remove the LEAKPROOF marking from "
                 f"{qualified_name}({signature}). The planner will "
