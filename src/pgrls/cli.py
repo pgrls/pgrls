@@ -727,7 +727,10 @@ def fix(
     = …, pg_temp` per overload, pinning pg_temp last to block
     pg_temp shadowing), SEC017 (`ALTER FUNCTION ... NOT LEAKPROOF`
     per overload, using the per-overload signature captured in
-    snapshot v12), SEC031 (`DROP POLICY` for a no-op
+    snapshot v12), SEC030 (`ALTER COLUMN … SET NOT NULL` for a
+    nullable discriminator — runtime fails if NULLs already exist;
+    the Fix description warns and supplies the backfill recipe),
+    SEC031 (`DROP POLICY` for a no-op
     restrictive `USING (true)` floor), SEC032 (`ALTER TABLE …
     ENABLE ROW LEVEL SECURITY` for a dormant-policies table),
     PERF001 (wrap unwrapped auth calls in
