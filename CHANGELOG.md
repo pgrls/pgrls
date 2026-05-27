@@ -10,6 +10,30 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-05-27
+
+### Added
+
+- **`pgrls explain --format html`** — standalone HTML pages for
+  both single-rule and full-catalog modes. Same self-contained
+  shape `pgrls report --format html`, `pgrls history --format
+  html`, and `pgrls diff --format html` established: embedded
+  CSS, no external assets, light/dark theme. Single-rule mode
+  renders the rule's reference body in a `<pre>` block (preserves
+  the rule-author's intended whitespace, code fences, bullet
+  alignment) with a severity-coloured pill and a green
+  `✦ auto-fixable` badge when applicable. Catalog mode renders
+  a per-rule table with the ID linking to the
+  `docs/RULES.md#rule-<id>` anchor on GitHub so a reviewer can
+  click through to canonical references. Useful as a shareable
+  rule reference for someone who doesn't run pgrls — paste into
+  internal wiki, print to PDF for a runbook attachment, email
+  to an auditor.
+
+  Every rendered string is `html.escape`-d (defence against any
+  future rule with a `<` / `>` / `&` in its title or body — even
+  though no shipped rule has them today).
+
 ## [0.6.20] - 2026-05-27
 
 ### Tests

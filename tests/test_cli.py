@@ -392,6 +392,119 @@ def test_explain_format_unknown_value_errors() -> None:
     assert "xml" in result.output
 
 
+# ----------------------------------------------------------------------------
+# `pgrls explain --format html` (v0.6.21)
+# ----------------------------------------------------------------------------
+
+
+def test_explain_format_html_per_rule_renders_standalone_page() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC001", "--format", "html"]
+    )
+    assert result.exit_code == 0, result.output
+    # Standalone HTML5 document, no external assets.
+    assert result.output.startswith("<!DOCTYPE html>")
+    assert '<html lang="en">' in result.output
+    assert "<title>pgrls explain — SEC001</title>" in result.output
+    assert "<style>" in result.output
+    assert "<link" not in result.output
+    assert "<script" not in result.output
+    # Rule ID + title appear in the H1.
+    assert "<h1>SEC001 —" in result.output
+    # Severity pill carries the right CSS class.
+    assert 'class="pill sev-error">error' in result.output
+    # SEC001 is auto-fixable → fixable badge present.
+    assert "auto-fixable" in result.output
+
+
+def test_explain_format_html_unfixable_rule_omits_fixable_badge() -> None:
+    # SEC003 has no auto-fixer.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC003", "--format", "html"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "<title>pgrls explain — SEC003</title>" in result.output
+    # Fixable badge is conditionally omitted.
+    assert "auto-fixable" not in result.output
+
+
+def test_explain_format_html_renders_reference_body_in_pre_block() -> None:
+    # The rule's docstring body lands in a `<pre>` element so the
+    # rule-author's intended whitespace/indentation/code-fences
+    # survive. (Future iteration may add full Markdown→HTML
+    # conversion; today the contract is "pre-formatted text".)
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC001", "--format", "html"]
+    )
+    assert "<pre>" in result.output
+    assert "</pre>" in result.output
+    # Verify part of SEC001's actual reference body lands in the pre.
+    assert "row-level security" in result.output.lower()
+
+
+def test_explain_format_html_escapes_rule_metadata() -> None:
+    # Even though no real rule has special chars in id/title/severity,
+    # the renderer html.escape-s them so a future test rule containing
+    # `<` / `>` / `&` can't break layout or inject markup.
+    from pgrls.cli import _render_rule_html
+
+    class _FakeRule:
+        id = "FOO<bar>"
+        severity = "warning"
+        title = "Has & in <title>"
+        __doc__ = "Has & < > in body."
+
+    out = _render_rule_html(_FakeRule(), fixable_ids=set())
+    # Raw `<bar>` must not survive as a literal tag.
+    assert "<bar>" not in out
+    assert "FOO&lt;bar&gt;" in out
+    assert "Has &amp; in &lt;title&gt;" in out
+
+
+def test_explain_format_html_catalog_renders_every_rule_row() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "--format", "html"])
+    assert result.exit_code == 0, result.output
+    assert "<title>pgrls rule catalog</title>" in result.output
+    # 47 rules ship today (catalog header should say so).
+    assert "<strong>47</strong> rules" in result.output
+    # Header carries the auto-fixable count (17 as of v0.6.20+).
+    # Use the actual value via the python API to avoid hard-coding.
+    from pgrls.cli import _fixable_rule_ids
+    fc = len(_fixable_rule_ids())
+    assert f"<strong class=\"sev-info\">{fc}</strong>" in result.output
+    # One row per rule.
+    from pgrls.rules import all_rules
+    for rule in all_rules():
+        assert f"<code>{rule.id}</code>" in result.output
+
+
+def test_explain_format_html_catalog_links_rule_ids_to_docs() -> None:
+    # Each rule ID in the catalog links to docs/RULES.md anchor
+    # so a reviewer can click through to the canonical reference.
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "--format", "html"])
+    assert (
+        "https://github.com/pgrls/pgrls/blob/main/docs/"
+        "RULES.md#rule-sec001" in result.output
+    )
+
+
+def test_explain_format_html_carries_no_trailing_double_newline() -> None:
+    # `nl=False` in the dispatch — the renderer ends in a trailing
+    # newline and click.echo shouldn't add another.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["explain", "SEC001", "--format", "html"]
+    )
+    # Exactly one trailing newline, no doubled blank line at EOF.
+    assert result.output.endswith("</html>\n")
+    assert not result.output.endswith("</html>\n\n")
+
+
 # --- docstring-degradation helpers ---------------------------------------
 #
 # Every SHIPPED rule has a two-paragraph module docstring (title line +

@@ -1986,19 +1986,217 @@ def _render_catalog_json(rules: list[Rule], *, fixable_ids: set[str]) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# HTML rendering for `pgrls explain` (v0.6.21)
+# ---------------------------------------------------------------------------
+
+import html as _html_module  # noqa: E402  (kept local to the explain block)
+
+# Severity → CSS color, matching the diff HTML and report HTML palettes.
+_EXPLAIN_SEVERITY_COLOR: dict[str, str] = {
+    "error": "#cf222e",    # red
+    "warning": "#9a6700",  # amber
+    "info": "#0969da",     # blue
+}
+
+
+def _explain_html_css() -> str:
+    """Shared CSS preamble for `pgrls explain` HTML renderings.
+
+    Same palette and dark-mode handling as `pgrls report --format
+    html`, `pgrls history --format html`, and `pgrls diff --format
+    html`. Returned as a single string so the per-rule and
+    catalog renderers don't drift.
+    """
+    return """
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+         Roboto, "Helvetica Neue", Arial, sans-serif;
+         margin: 2rem auto; max-width: 72rem; padding: 0 1rem;
+         color: #1f2328; background: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6edf3; background: #0d1117; }
+    table { border-color: #30363d; }
+    th { background: #161b22; }
+    tr td { background: #0d1117; }
+    tr:nth-child(even) td { background: #161b22; }
+    code { background: #161b22; }
+    pre { background: #161b22; }
+  }
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem 0; }
+  h2 { font-size: 1.25rem; margin: 1.5rem 0 .5rem 0;
+       padding-top: .5rem; border-top: 1px solid #d0d7de; }
+  .meta { color: #57606a; font-size: .85rem; }
+  .pill { display: inline-block; padding: .15rem .55rem;
+          border-radius: 999px; font-size: .85rem;
+          border: 1px solid currentColor; }
+  .sev-error   { color: #cf222e; }
+  .sev-warning { color: #9a6700; }
+  .sev-info    { color: #0969da; }
+  .fixable { display: inline-block; padding: .15rem .55rem;
+             border-radius: 999px; font-size: .85rem;
+             color: #1a7f37; border: 1px solid currentColor;
+             margin-left: .25rem; }
+  table { width: 100%; border-collapse: collapse;
+          border: 1px solid #d0d7de; }
+  thead th { text-align: left; padding: .5rem .75rem;
+             background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+             font-weight: 600; }
+  tbody td { padding: .5rem .75rem; border-bottom: 1px solid #d0d7de;
+             vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  code { background: #f6f8fa; padding: .1rem .35rem;
+         border-radius: 4px;
+         font: .9em ui-monospace, Menlo, monospace; }
+  pre { background: #f6f8fa; padding: .75rem 1rem;
+        border-radius: 6px; overflow-x: auto;
+        font: .9em ui-monospace, Menlo, monospace;
+        white-space: pre-wrap; word-break: break-word; }
+  .reference { line-height: 1.6; }
+  .reference p { margin: 0 0 .75rem 0; }
+  footer { margin-top: 2rem; color: #57606a; font-size: .8rem; }
+""".strip("\n")
+
+
+def _render_rule_html(rule: Rule, *, fixable_ids: set[str]) -> str:
+    """A single rule rendered as a standalone HTML page.
+
+    Mirrors the design of `pgrls report --format html`: embedded
+    CSS, no external assets, light/dark via `prefers-color-scheme`.
+    Designed for sharing a single rule reference with someone who
+    doesn't run pgrls — paste-into-Slack, print-to-PDF for a
+    runbook attachment, embed in an internal wiki.
+
+    The rule's docstring body is rendered as preformatted text
+    (`<pre>`) so the rule-author's intended whitespace, code
+    fences, and bullet alignment all survive. Future enhancement
+    could attempt full Markdown→HTML conversion, but the current
+    shape is robust to any docstring content.
+    """
+    fixable = rule.id in fixable_ids
+    body = _rule_docstring_body(rule)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgrls explain — {_html_module.escape(rule.id)}</title>
+<style>
+{_explain_html_css()}
+</style>
+</head>
+<body>
+  <header>
+    <h1>{_html_module.escape(rule.id)} — {_html_module.escape(rule.title)}</h1>
+    <p class="meta">
+      <span class="pill sev-{rule.severity}">{_html_module.escape(rule.severity)}</span>
+      {'<span class="fixable">✦ auto-fixable</span>' if fixable else ''}
+      &nbsp;·&nbsp; <code>pgrls explain {_html_module.escape(rule.id)}</code>
+    </p>
+  </header>
+  <section class="reference">
+    <pre>{_html_module.escape(body) if body else "(no extended reference for this rule)"}</pre>
+  </section>
+  <footer>pgrls {_html_module.escape(__version__)} — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
+</body>
+</html>
+"""
+
+
+def _render_catalog_html(rules: list[Rule], *, fixable_ids: set[str]) -> str:
+    """The whole rule catalog as a standalone HTML page.
+
+    Three things in one document: a header naming the pgrls version
+    and rule count; a per-rule table (ID / Severity / Fixable /
+    Title) so a reviewer can scan the catalog visually; and a
+    severity-grouped index for jumping to per-rule sections of the
+    docs site. Each rule row's ID links to the canonical
+    `docs/RULES.md#rule-<id>` anchor on GitHub — same convention
+    SARIF helpUri and the Markdown / pr-comment rule-link helpers
+    use. Auto-fixable rules carry a green badge so a reader scanning
+    "what's automatable" can see at a glance.
+    """
+    fixable_count = sum(1 for r in rules if r.id in fixable_ids)
+
+    rows: list[str] = []
+    for r in rules:
+        fixable_badge = (
+            '<span class="fixable">✦ fix</span>' if r.id in fixable_ids else ''
+        )
+        rule_id_e = _html_module.escape(r.id)
+        title_e = _html_module.escape(r.title)
+        sev_e = _html_module.escape(r.severity)
+        # Rule-link convention: DIFF_* go to AGENTS.md#diff-rules;
+        # lint rules to docs/RULES.md#rule-<lower>. Pgrls.explain
+        # only walks the lint registry today (no DIFF_* in
+        # all_rules()) so we use the lint convention unconditionally.
+        link = (
+            f"https://github.com/pgrls/pgrls/blob/main/docs/"
+            f"RULES.md#rule-{rule_id_e.lower()}"
+        )
+        rows.append(
+            f"      <tr>"
+            f'<td><a href="{link}"><code>{rule_id_e}</code></a></td>'
+            f'<td><span class="pill sev-{sev_e}">{sev_e}</span></td>'
+            f"<td>{fixable_badge}</td>"
+            f"<td>{title_e}</td>"
+            "</tr>"
+        )
+    rows_html = "\n".join(rows)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgrls rule catalog</title>
+<style>
+{_explain_html_css()}
+</style>
+</head>
+<body>
+  <header>
+    <h1>pgrls rule catalog</h1>
+    <p class="meta">
+      <code>pgrls {_html_module.escape(__version__)}</code>
+      &nbsp;·&nbsp; <strong>{len(rules)}</strong> rules
+      &nbsp;·&nbsp; <strong class="sev-info">{fixable_count}</strong> mechanically auto-fixable
+    </p>
+  </header>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Severity</th>
+        <th>Fixable</th>
+        <th>Title</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
+</body>
+</html>
+"""
+
+
 @main.command()
 @click.argument("rule_id", metavar="RULE", required=False, default=None)
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["text", "markdown", "json"]),
+    type=click.Choice(["text", "markdown", "json", "html"]),
     default="text",
     show_default=True,
     help=(
         "Output format. `text` (default, human-readable), "
         "`markdown` (embeddable in runbooks, wikis, or generated "
-        "docs), or `json` (machine-readable rule metadata for "
-        "tooling / IDE integrations)."
+        "docs), `json` (machine-readable rule metadata for "
+        "tooling / IDE integrations), or `html` (standalone page "
+        "with embedded CSS — shareable rule reference, no external "
+        "deps)."
     ),
 )
 @click.option(
@@ -2062,6 +2260,14 @@ def explain(
         if output_format == "markdown":
             click.echo(_render_catalog_markdown(rules), nl=False)
             return
+        if output_format == "html":
+            click.echo(
+                _render_catalog_html(
+                    rules, fixable_ids=_fixable_rule_ids()
+                ),
+                nl=False,
+            )
+            return
         # Text catalog — one line per rule, padded so IDs and
         # titles line up across the rows.
         for r in rules:
@@ -2086,6 +2292,13 @@ def explain(
 
     if output_format == "markdown":
         click.echo(_render_rule_markdown(rule), nl=False)
+        return
+
+    if output_format == "html":
+        click.echo(
+            _render_rule_html(rule, fixable_ids=_fixable_rule_ids()),
+            nl=False,
+        )
         return
 
     click.echo(f"{rule.id}  [{rule.severity}]  {rule.title}")
