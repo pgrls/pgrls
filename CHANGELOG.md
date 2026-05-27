@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.18] - 2026-05-27
+
+### Added
+
+- **`pgrls diff --format markdown`** — completes the diff
+  command's format set (text/json/sarif shipped earlier; markdown
+  now). Renders a GFM table with one row per Change:
+  Classification (emoji + uppercase label — `✅ SAFE`, `⚠️ REQUIRES
+  REVIEW`, `🚦 BREAKING`, `❌ DANGEROUS`) | Kind (humanized
+  ChangeKind name, e.g. `Using Tightened`, `RLS Flipped`) | Object
+  (qualified identifier through `gfm_inline_code`) | Summary
+  (per-Change message with `|` / `\n` escaping for the table).
+  Paste-ready for a PR review comment or a Markdown runbook.
+  Trailing summary line `**Summary:** N changes — A dangerous, B
+  breaking, C safe.` mirrors the text formatter's phrasing so
+  script consumers grepping either format see identical text.
+  Empty-changes case returns `pgrls diff: no changes.\n` verbatim.
+
 ## [0.6.17] - 2026-05-27
 
 ### Tests
