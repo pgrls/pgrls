@@ -101,12 +101,27 @@ class SEC017:
     ) -> list[Violation]:
         allowlist = parse_qualified_function_allowlist("SEC017", options)
         out: list[Violation] = []
-        # `leakproof_functions` is captured in alphabetical qualified-
-        # name order at introspection time, so iteration order is
+        # Snapshot v12+ captures one `LeakproofFunction` entry per
+        # overload (the `_LEAKPROOF_FUNCS_SQL` query dropped its
+        # SELECT DISTINCT so a SEC017 fixer can target each overload
+        # individually). The rule itself reports per qualified name
+        # — the message names the function, not a specific overload
+        # signature — so dedupe by qualified_name as we walk. This
+        # preserves the pre-v12 message surface exactly: two
+        # overloads of `public.fast_eq` produce ONE SEC017
+        # violation, not two with identical text.
+        #
+        # `leakproof_functions` is captured in `(qname, signature)`
+        # order at introspection time, so the first-seen overload
+        # determines the captured entry's location; the order is
         # deterministic without a `sorted(...)` here.
+        seen: set[str] = set()
         for fn in schema.leakproof_functions:
             if fn.qualified_name in allowlist:
                 continue
+            if fn.qualified_name in seen:
+                continue
+            seen.add(fn.qualified_name)
             out.append(self._violation(fn))
         return out
 
