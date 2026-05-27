@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.17] - 2026-05-27
+
+### Tests
+
+- **Cross-format consistency tests** for `pgrls history` and
+  `pgrls report` — pin that all four renderers (text / json /
+  markdown / html) agree on the underlying numbers for the same
+  input. Each renderer is hand-written; without these tests a
+  typo or off-by-one in one format wouldn't be caught by the
+  other format's tests. Six new tests across history (per-snapshot
+  totals, NEW/FIXED deltas, series summary, per-severity counts)
+  and report (status pill counts, every-table-row presence).
+
+- **Property-based tests for formatter helpers.** New
+  `test_property_formatters.py` covers `gfm_inline_code`
+  (shared by markdown + pr-comment formatters) and `_html_escape`
+  (used by pr-comment + history/report HTML formats). Hypothesis
+  exercises the combinatorial space the example tests don't —
+  random content strings biased toward the adversarial cases
+  (backtick runs of varying length, embedded `<`/`>`/`&`). Pins
+  three invariants for each helper: wrapper run strictly exceeds
+  inner run, opener/closer match, content survives the wrap;
+  no raw `<`/`>` in output, every `&` is the start of one of three
+  entities, the not-idempotent-by-design contract holds.
+
+  Test-only release — no source / behavior change.
+
 ## [0.6.16] - 2026-05-27
 
 ### Added
