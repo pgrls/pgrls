@@ -453,3 +453,245 @@ def _parse_dash_int(s: str) -> int:
 def _parse_emdash_int(s: str) -> int:
     """markdown format renders zero counts as `—` (em-dash); treat as 0."""
     return 0 if s == "—" else int(s)
+
+
+# ──────────────────────────────────────────────────────────────────
+# pgrls diff — five renderers agree on the numbers
+# ──────────────────────────────────────────────────────────────────
+
+import json as _json_diff  # avoid shadowing in case of future module-level json use
+from datetime import timezone as _tz_diff, datetime as _dt_diff  # noqa: E402
+
+from pgrls.diff.differ import Change, ChangeKind  # noqa: E402
+from pgrls.diff.formatters import (  # noqa: E402
+    format_diff_html,
+    format_diff_json,
+    format_diff_markdown,
+    format_diff_sarif,
+    format_diff_text,
+)
+
+
+def _diff_changes() -> list:
+    """A fixture exercising every classification value at least once
+    so every format must surface every bucket label."""
+    return [
+        Change(
+            kind=ChangeKind.TABLE_ADDED_WITH_RLS,
+            classification="safe",
+            location="public.a",
+            message="added with RLS",
+            before_sql=None,
+            after_sql=None,
+        ),
+        Change(
+            kind=ChangeKind.TABLE_ADDED_WITH_RLS,
+            classification="safe",
+            location="public.b",
+            message="added with RLS",
+            before_sql=None,
+            after_sql=None,
+        ),
+        Change(
+            kind=ChangeKind.USING_REQUIRES_REVIEW,
+            classification="requires_review",
+            location="public.c.p",
+            message="USING changed; review",
+            before_sql="(tenant_id = 1)",
+            after_sql="(tenant_id = current_setting('app.t'))",
+        ),
+        Change(
+            kind=ChangeKind.POLICY_DROPPED_PERMISSIVE,
+            classification="breaking",
+            location="public.d.admin_all",
+            message="dropped permissive ALL policy",
+            before_sql=None,
+            after_sql=None,
+        ),
+        Change(
+            kind=ChangeKind.GRANT_PUBLIC_NO_RLS,
+            classification="dangerous",
+            location="public.e",
+            message="granted SELECT to PUBLIC on RLS-disabled table",
+            before_sql=None,
+            after_sql=None,
+        ),
+    ]
+
+
+def test_diff_all_five_formats_agree_on_total_change_count() -> None:
+    """Every diff renderer must surface the same total count of
+    Change objects. A renderer that silently drops a row (e.g. by
+    filtering on classification) would fail this without affecting
+    the other format's tests.
+    """
+    changes = _diff_changes()
+    expected = len(changes)
+
+    # JSON: violations array length
+    text = format_diff_text(changes)
+    md = format_diff_markdown(changes)
+    html_out = format_diff_html(
+        changes,
+        generated_at=_dt_diff(2026, 5, 27, 16, 0, 0, tzinfo=_tz_diff.utc),
+    )
+    json_payload = _json_diff.loads(format_diff_json(changes))
+    sarif_payload = _json_diff.loads(format_diff_sarif(changes))
+
+    assert len(json_payload["violations"]) == expected
+    # SARIF: results array
+    assert (
+        len(sarif_payload["runs"][0]["results"]) == expected
+    )
+
+    # Text: count `[CLS]` classification tag lines — one per Change
+    # stanza. (Counting `+`/`-`/`~`/`!` marker lines would over-
+    # count: predicate-kind stanzas also have `- before` / `+
+    # after` SQL lines using the same marker prefixes.)
+    cls_tag_lines = [
+        ln for ln in text.splitlines()
+        if any(
+            f"[{tag}]" in ln
+            for tag in ("SAFE", "REQUIRES_REVIEW", "BREAKING", "DANGEROUS")
+        )
+    ]
+    assert len(cls_tag_lines) == expected
+
+    # Markdown: count data rows in the table body.
+    md_rows = [
+        ln for ln in md.splitlines()
+        if ln.startswith("|") and not ln.startswith("| Classification")
+        and not ln.startswith("|---")
+    ]
+    assert len(md_rows) == expected
+
+    # HTML: count `<tr class="row-...">` opens in tbody.
+    body = re.search(r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL)
+    assert body is not None
+    tr_opens = re.findall(r'<tr class="row-', body.group(1))
+    assert len(tr_opens) == expected
+
+
+def test_diff_all_five_formats_agree_on_per_classification_counts() -> None:
+    """The per-classification breakdown — the actual "is this safe?"
+    business answer the diff command exists to surface — must be
+    consistent across formats."""
+    from collections import Counter
+    changes = _diff_changes()
+    expected = Counter(c.classification for c in changes)
+    # _diff_changes: 2 safe + 1 requires_review + 1 breaking + 1 dangerous
+    assert expected == {
+        "safe": 2,
+        "requires_review": 1,
+        "breaking": 1,
+        "dangerous": 1,
+    }
+
+    text = format_diff_text(changes)
+    md = format_diff_markdown(changes)
+    html_out = format_diff_html(
+        changes,
+        generated_at=_dt_diff(2026, 5, 27, 16, 0, 0, tzinfo=_tz_diff.utc),
+    )
+
+    # Text format's trailing summary: "N changes — 1 dangerous, 1
+    # requires review, 1 breaking, 2 safe." (_BUCKET_ORDER).
+    assert "1 dangerous" in text
+    assert "1 requires-review" in text
+    assert "1 breaking" in text
+    assert "2 safe" in text
+
+    # Markdown summary line carries the same breakdown phrasing.
+    assert "1 dangerous" in md
+    assert "1 requires-review" in md
+    assert "1 breaking" in md
+    assert "2 safe" in md
+
+    # HTML summary band has one chip per non-zero bucket.
+    assert "<strong>2</strong>&nbsp;safe" in html_out
+    assert "<strong>1</strong>&nbsp;requires-review" in html_out
+    assert "<strong>1</strong>&nbsp;breaking" in html_out
+    assert "<strong>1</strong>&nbsp;dangerous" in html_out
+
+
+def test_diff_all_five_formats_carry_every_change_location() -> None:
+    """Each Change's location must surface in every format."""
+    changes = _diff_changes()
+    expected_locations = {c.location for c in changes}
+
+    text = format_diff_text(changes)
+    md = format_diff_markdown(changes)
+    html_out = format_diff_html(
+        changes,
+        generated_at=_dt_diff(2026, 5, 27, 16, 0, 0, tzinfo=_tz_diff.utc),
+    )
+    json_payload = _json_diff.loads(format_diff_json(changes))
+    sarif_payload = _json_diff.loads(format_diff_sarif(changes))
+
+    json_locations = {
+        v["location"] for v in json_payload["violations"]
+    }
+    assert json_locations == expected_locations
+
+    sarif_locations = {
+        r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+        for r in sarif_payload["runs"][0]["results"]
+    }
+    assert sarif_locations == expected_locations
+
+    for loc in expected_locations:
+        assert loc in text, f"text missing {loc}"
+        assert loc in md, f"markdown missing {loc}"
+        assert loc in html_out, f"html missing {loc}"
+
+
+def test_diff_predicate_block_renders_in_text_and_html_for_using_kinds() -> None:
+    """USING_* / WITH_CHECK_* changes carry before/after SQL the
+    reviewer needs to see what changed. Text and HTML both render
+    the predicate block; markdown surfaces just the summary text
+    (a 4-column table can't carry multi-line SQL cleanly without
+    layout pain). Pin the contract that text and HTML agree."""
+    [c] = [Change(
+        kind=ChangeKind.USING_TIGHTENED,
+        classification="safe",
+        location="public.docs.p",
+        message="USING tightened",
+        before_sql="(true)",
+        after_sql="(tenant_id = current_setting('app.t'))",
+    )]
+    text = format_diff_text([c])
+    html_out = format_diff_html(
+        [c],
+        generated_at=_dt_diff(2026, 5, 27, 16, 0, 0, tzinfo=_tz_diff.utc),
+    )
+
+    # Both formats show both before and after.
+    assert "(true)" in text
+    assert "tenant_id = current_setting" in text
+    assert "(true)" in html_out
+    assert "tenant_id = current_setting" in html_out
+    # HTML wraps in `pre.predicate` styled block.
+    assert "pred-minus" in html_out
+    assert "pred-plus" in html_out
+
+
+def test_diff_empty_changes_consistent_across_formats() -> None:
+    """Every format's empty-changes case must be identifiable as
+    "no changes" (the actual safe state the diff command exists
+    to confirm). JSON returns `violations: []`; SARIF returns
+    `results: []`; text/markdown emit the literal "no changes"
+    line; HTML emits a green banner."""
+    text = format_diff_text([])
+    md = format_diff_markdown([])
+    html_out = format_diff_html(
+        [],
+        generated_at=_dt_diff(2026, 5, 27, 16, 0, 0, tzinfo=_tz_diff.utc),
+    )
+    json_payload = _json_diff.loads(format_diff_json([]))
+    sarif_payload = _json_diff.loads(format_diff_sarif([]))
+
+    assert text == "pgrls diff: no changes."
+    assert md == "pgrls diff: no changes.\n"
+    assert "No changes in this diff" in html_out
+    assert json_payload["violations"] == []
+    assert sarif_payload["runs"][0]["results"] == []
