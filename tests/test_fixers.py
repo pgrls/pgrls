@@ -21,6 +21,7 @@ from pgrls.fixers.sec006 import SEC006Fixer
 from pgrls.fixers.sec011 import SEC011Fixer
 from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
+from pgrls.fixers.sec015 import SEC015Fixer
 from pgrls.fixers.sec017 import SEC017Fixer
 from pgrls.fixers.sec031 import SEC031Fixer
 from pgrls.fixers.sec032 import SEC032Fixer
@@ -1585,6 +1586,195 @@ def test_sec031_fix_raises_on_malformed_allowlist() -> None:
         SEC031Fixer().fix(schema, {"allowlist": "public.t.floor"})
     with pytest.raises(TypeError, match="allowlist"):
         SEC031Fixer().fix(schema, {"allowlist": [" public.t.floor "]})
+
+
+# ---------- SEC015 fixer ----------
+
+
+def _secdef(
+    qname: str,
+    *,
+    signature: str = "",
+    search_path: str | None = None,
+    body: str = "SELECT 1",
+    language: str = "sql",
+) -> Any:
+    from pgrls.model import SecdefFunction
+    return SecdefFunction(
+        qualified_name=qname,
+        body=body,
+        language=language,
+        search_path=search_path,
+        signature=signature,
+    )
+
+
+def test_sec015_fix_emits_minimal_safe_path_when_search_path_unset() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.read_secret", signature="integer"),
+        ),
+    )
+    fixes = SEC015Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC015"
+    assert f.sql == (
+        "ALTER FUNCTION public.read_secret(integer) "
+        "SET search_path = pg_catalog, pg_temp;"
+    )
+
+
+def test_sec015_fix_appends_pg_temp_when_path_set_but_unsafe() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "public.lookup",
+                signature="text",
+                search_path="pg_catalog, public",
+            ),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        "ALTER FUNCTION public.lookup(text) "
+        "SET search_path = pg_catalog, public, pg_temp;"
+    )
+
+
+def test_sec015_fix_strips_inner_pg_temp_and_repins_last() -> None:
+    # pg_temp earlier in the path is searched first (Postgres uses
+    # first-occurrence order); a trailing duplicate is irrelevant.
+    # The fix strips the inner pg_temp so it appears exactly once,
+    # at the end.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "public.f",
+                signature="integer",
+                search_path="pg_temp, public, audit",
+            ),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        "ALTER FUNCTION public.f(integer) "
+        "SET search_path = public, audit, pg_temp;"
+    )
+
+
+def test_sec015_fix_silent_when_path_already_safe() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "public.safe_fn",
+                signature="integer",
+                search_path="pg_catalog, public, pg_temp",
+            ),
+        ),
+    )
+    assert SEC015Fixer().fix(schema, {}) == []
+
+
+def test_sec015_fix_abstains_on_empty_signature_from_pre_v12_snapshot() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.legacy", signature=""),
+        ),
+    )
+    assert SEC015Fixer().fix(schema, {}) == []
+
+
+def test_sec015_fix_abstains_on_quoted_comma_search_path() -> None:
+    # The naive comma-split tokenizer can't safely rewrite a path
+    # containing both `"` and `,`. Abstain rather than emit a wrong
+    # rewrite.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "public.f",
+                signature="integer",
+                search_path='"weird, schema", public',
+            ),
+        ),
+    )
+    assert SEC015Fixer().fix(schema, {}) == []
+
+
+def test_sec015_fix_emits_per_overload() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer"),
+            _secdef("public.f", signature="text"),
+        ),
+    )
+    fixes = SEC015Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "ALTER FUNCTION public.f(integer) "
+        "SET search_path = pg_catalog, pg_temp;",
+        "ALTER FUNCTION public.f(text) "
+        "SET search_path = pg_catalog, pg_temp;",
+    ]
+
+
+def test_sec015_fix_respects_allowlist() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer"),
+            _secdef("audit.g", signature="text"),
+        ),
+    )
+    fixes = SEC015Fixer().fix(schema, {"allowlist": ["public.f"]})
+    assert [f.location for f in fixes] == ["audit.g(text)"]
+
+
+def test_sec015_fix_allowlist_silences_every_overload() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer"),
+            _secdef("public.f", signature="text"),
+        ),
+    )
+    assert SEC015Fixer().fix(
+        schema, {"allowlist": ["public.f"]}
+    ) == []
+
+
+def test_sec015_fix_quotes_mixed_case_function_name() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.FastEq", signature="integer"),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public."FastEq"(integer) '
+        "SET search_path = pg_catalog, pg_temp;"
+    )
+
+
+def test_sec015_fix_description_names_overload_and_alternative() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("audit.redact", signature="text"),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert "audit.redact(text)" in f.description
+    assert "[lint.rules.SEC015]" in f.description
+    assert "fully-qualifies" in f.description
+
+
+def test_sec015_fix_raises_on_malformed_allowlist() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer"),
+        ),
+    )
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC015Fixer().fix(schema, {"allowlist": "public.f"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC015Fixer().fix(schema, {"allowlist": [" public.f "]})
 
 
 # ---------- SEC017 fixer ----------

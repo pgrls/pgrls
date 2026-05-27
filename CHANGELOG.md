@@ -10,6 +10,43 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-05-27
+
+### Added
+
+- **`pgrls fix` now remediates SEC015** (SECURITY DEFINER function
+  whose `search_path` exposes it to `pg_temp` shadowing — the
+  CVE-2018-1058 escalation family). The fixer emits `ALTER
+  FUNCTION <schema>.<name>(<signature>) SET search_path = <safe>;`
+  per overload, where `<safe>` is either the minimal `pg_catalog,
+  pg_temp` default (when the function pinned no path at all) or
+  the existing tokens with any earlier `pg_temp` stripped and
+  `pg_temp` re-pinned as the final entry. Postgres resolves
+  `search_path` in first-occurrence order, so pinning `pg_temp`
+  last forces the temp schema to be searched last — the
+  structurally safe shape SEC015 requires. Abstains on pre-v12
+  snapshots (empty signature) and on the documented quoted-comma
+  edge case the naive tokenizer can't handle. Mechanically-
+  fixable rule count: 15 → **16** of 47.
+
+## [0.6.12] - 2026-05-26
+
+### Added
+
+- **`pgrls fix` now remediates SEC017** (function marked
+  `LEAKPROOF` — bypasses the RLS / security_barrier qual). The
+  fixer emits `ALTER FUNCTION <schema>.<name>(<signature>) NOT
+  LEAKPROOF;` per overload using the per-overload `signature`
+  field captured in snapshot v12. Distinct from how SEC017 itself
+  reports (per qualified name, deduped): each overload needs its
+  own ALTER FUNCTION since a bare `ALTER FUNCTION name()` would
+  target only the zero-arg overload. Abstains on pre-v12 snapshots
+  where `signature=""` (a wrong ALTER FUNCTION targeting the wrong
+  overload would be worse than no fix; re-snapshot to populate).
+  `[lint.rules.SEC017].allowlist` (qualified function name)
+  silences every overload — matches the rule's allowlist
+  semantics. Mechanically-fixable rule count: 14 → **15** of 47.
+
 ## [0.6.11] - 2026-05-26
 
 ### Changed

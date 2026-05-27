@@ -723,7 +723,9 @@ def fix(
     an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
     `, true` to one-arg `current_setting()` calls), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
-    check with USING), SEC017 (`ALTER FUNCTION ... NOT LEAKPROOF`
+    check with USING), SEC015 (`ALTER FUNCTION ... SET search_path
+    = …, pg_temp` per overload, pinning pg_temp last to block
+    pg_temp shadowing), SEC017 (`ALTER FUNCTION ... NOT LEAKPROOF`
     per overload, using the per-overload signature captured in
     snapshot v12), SEC031 (`DROP POLICY` for a no-op
     restrictive `USING (true)` floor), SEC032 (`ALTER TABLE …
