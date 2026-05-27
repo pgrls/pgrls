@@ -988,3 +988,185 @@ def test_markdown_dispatch_registered_for_cli() -> None:
     # would otherwise need a connection to introspect snapshots).
     from pgrls.diff.formatters import DIFF_SUPPORTED_FORMATS
     assert "markdown" in DIFF_SUPPORTED_FORMATS
+
+
+# ---------------------------------------------------------------------------
+# HTML formatter (v0.6.19)
+# ---------------------------------------------------------------------------
+
+
+from datetime import datetime, timezone, timedelta  # noqa: E402
+
+from pgrls.diff.formatters import format_diff_html  # noqa: E402
+
+
+_FIXED_GEN = datetime(2026, 5, 27, 16, 0, 0, tzinfo=timezone.utc)
+
+
+def test_html_empty_changes_renders_no_changes_banner() -> None:
+    out = format_diff_html([], generated_at=_FIXED_GEN)
+    # Standalone HTML5 document with no external assets.
+    assert out.startswith("<!DOCTYPE html>")
+    assert "<html lang=\"en\">" in out
+    assert "<title>pgrls diff</title>" in out
+    assert "<style>" in out
+    assert "<link" not in out
+    assert "<script" not in out
+    # Empty case shows a green "No changes" banner.
+    assert "No changes in this diff" in out
+    assert "net-good" in out
+
+
+def test_html_carries_iso_utc_timestamp() -> None:
+    out = format_diff_html([], generated_at=_FIXED_GEN)
+    assert "2026-05-27T16:00:00Z" in out
+
+
+def test_html_accepts_injected_generated_at() -> None:
+    fixed = datetime(2026, 1, 15, 10, 30, 45, tzinfo=timezone.utc)
+    out = format_diff_html([], generated_at=fixed)
+    assert "2026-01-15T10:30:45Z" in out
+
+
+def test_html_rejects_naive_generated_at() -> None:
+    # Mirrors report and history HTML — naive datetimes silently
+    # become wrong-by-host-timezone audit timestamps. Refuse at
+    # the boundary.
+    with pytest.raises(ValueError, match="timezone-aware"):
+        format_diff_html([], generated_at=datetime(2026, 1, 15, 10, 30))
+
+
+def test_html_normalizes_non_utc_generated_at_to_utc() -> None:
+    cet = timezone(timedelta(hours=1))
+    out = format_diff_html(
+        [], generated_at=datetime(2026, 1, 15, 11, 30, 45, tzinfo=cet)
+    )
+    assert "2026-01-15T10:30:45Z" in out  # CET 11:30 → UTC 10:30
+
+
+def test_html_carries_row_per_change_with_classification_color() -> None:
+    changes = [
+        _change(ChangeKind.TABLE_ADDED_WITH_RLS, "safe", location="public.a", message="added"),
+        _change(ChangeKind.USING_REQUIRES_REVIEW, "requires_review", location="public.b", message="review"),
+        _change(ChangeKind.POLICY_DROPPED_PERMISSIVE, "breaking", location="public.c", message="dropped"),
+        _change(ChangeKind.GRANT_PUBLIC_NO_RLS, "dangerous", location="public.d", message="grant"),
+    ]
+    out = format_diff_html(changes, generated_at=_FIXED_GEN)
+    # Each row's `<tr class="row-{cls}">` lets downstream CSS
+    # target individual classifications.
+    assert 'class="row-safe"' in out
+    assert 'class="row-requires_review"' in out
+    assert 'class="row-breaking"' in out
+    assert 'class="row-dangerous"' in out
+    # Each row also carries the classification pill chip.
+    assert 'class="pill class-safe">✅ SAFE' in out
+    assert 'class="pill class-requires_review">⚠️ REQUIRES REVIEW' in out
+    assert 'class="pill class-breaking">🚦 BREAKING' in out
+    assert 'class="pill class-dangerous">❌ DANGEROUS' in out
+
+
+def test_html_summary_band_shows_per_classification_chips() -> None:
+    changes = [
+        _change(ChangeKind.TABLE_ADDED_WITH_RLS, "safe", location="a"),
+        _change(ChangeKind.TABLE_DROPPED, "breaking", location="b"),
+        _change(ChangeKind.TABLE_DROPPED, "breaking", location="c"),
+    ]
+    out = format_diff_html(changes, generated_at=_FIXED_GEN)
+    # 1 safe + 2 breaking, both chips appear with their counts.
+    assert "<strong>1</strong>&nbsp;safe" in out
+    assert "<strong>2</strong>&nbsp;breaking" in out
+    # No "0 dangerous" noise.
+    assert "&nbsp;dangerous" not in out
+    assert "&nbsp;requires review" not in out
+
+
+def test_html_escapes_special_chars_in_location() -> None:
+    # Postgres quoted identifiers permit `<`, `>`, `&`, `"`. Without
+    # escaping, those would break the page (or worse — inject markup
+    # if the HTML is opened from an email attachment).
+    [c] = [_change(ChangeKind.TABLE_DROPPED, "breaking",
+                   location='weird<name>&"', message="dropped")]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "weird&lt;name&gt;&amp;&quot;" in out
+    # The literal `<name>` must not appear as a tag.
+    assert "<name>" not in out
+
+
+def test_html_escapes_special_chars_in_message() -> None:
+    # A future ChangeKind could route SQL into Change.message
+    # (today every message is plain English from `_SUMMARY_BY_KIND`,
+    # but defence-in-depth here). Operator-supplied SQL like
+    # `<script>` inside a quoted predicate fragment must not inject.
+    [c] = [_change(ChangeKind.TABLE_DROPPED, "breaking", location="x",
+                   message="<script>alert('xss')</script>")]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "&lt;script&gt;" in out
+    assert "<script>" not in out
+
+
+def test_html_collapses_message_newlines_to_br() -> None:
+    [c] = [_change(ChangeKind.USING_TIGHTENED, "safe", location="x",
+                   message="line one\nline two")]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "line one<br>line two" in out
+
+
+def test_html_is_registered_format() -> None:
+    from pgrls.diff.formatters import DIFF_SUPPORTED_FORMATS
+    assert "html" in DIFF_SUPPORTED_FORMATS
+
+
+def test_html_renders_predicate_block_for_using_kinds() -> None:
+    # The text formatter shows the before/after SQL for USING_* /
+    # WITH_CHECK_* changes (the most useful detail for a reviewer
+    # asking "is this migration safe?"). HTML mirrors that as a
+    # styled <pre> block beneath the message. Without it, an
+    # offline reviewer reading the archive sees "USING tightened"
+    # but not what it tightened to.
+    [c] = [_change(
+        ChangeKind.USING_TIGHTENED, "safe",
+        location="public.docs.tenant_scope",
+        message="USING tightened",
+        before_sql="(true)",
+        after_sql='(tenant_id = current_setting("app.t", true))',
+    )]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "tenant_id = current_setting" in out
+    assert "pred-plus" in out
+    assert "pred-minus" in out
+    # No-clause-on-one-side renders the sentinel.
+    [c2] = [_change(
+        ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review",
+        location="public.t.p",
+        message="WITH CHECK changed",
+        before_sql=None,
+        after_sql="(owner_id = auth.uid())",
+    )]
+    out2 = format_diff_html([c2], generated_at=_FIXED_GEN)
+    assert "(no clause)" in out2
+    assert "owner_id = auth.uid()" in out2
+
+
+def test_html_predicate_block_escapes_sql() -> None:
+    # before_sql / after_sql is operator-supplied SQL — must be
+    # html.escape-d so SQL operators (`<`, `>`) don't break the
+    # layout or inject markup.
+    [c] = [_change(
+        ChangeKind.USING_TIGHTENED, "safe", location="x",
+        message="m",
+        before_sql='(a < 5 AND b > 10)',
+        after_sql='(a <= 5 AND b >= 10)',
+    )]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "a &lt; 5" in out
+    assert "b &gt;= 10" in out
+    # Literal `<` / `>` (other than legitimate HTML tags) must not
+    # appear in the predicate block.
+    pred_start = out.index("pre class=\"predicate\"")
+    pred_end = out.index("</pre>", pred_start)
+    pred_block = out[pred_start:pred_end]
+    # Strip the legitimate <span> open/close tags so we only check
+    # the inner text content.
+    inner = pred_block.replace("<span", "").replace("</span>", "").replace(
+        'class="pred-minus">', "").replace('class="pred-plus">', "")
+    assert "<" not in inner.replace("&lt;", "")
