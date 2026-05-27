@@ -1114,3 +1114,59 @@ def test_html_collapses_message_newlines_to_br() -> None:
 def test_html_is_registered_format() -> None:
     from pgrls.diff.formatters import DIFF_SUPPORTED_FORMATS
     assert "html" in DIFF_SUPPORTED_FORMATS
+
+
+def test_html_renders_predicate_block_for_using_kinds() -> None:
+    # The text formatter shows the before/after SQL for USING_* /
+    # WITH_CHECK_* changes (the most useful detail for a reviewer
+    # asking "is this migration safe?"). HTML mirrors that as a
+    # styled <pre> block beneath the message. Without it, an
+    # offline reviewer reading the archive sees "USING tightened"
+    # but not what it tightened to.
+    [c] = [_change(
+        ChangeKind.USING_TIGHTENED, "safe",
+        location="public.docs.tenant_scope",
+        message="USING tightened",
+        before_sql="(true)",
+        after_sql='(tenant_id = current_setting("app.t", true))',
+    )]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "tenant_id = current_setting" in out
+    assert "pred-plus" in out
+    assert "pred-minus" in out
+    # No-clause-on-one-side renders the sentinel.
+    [c2] = [_change(
+        ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review",
+        location="public.t.p",
+        message="WITH CHECK changed",
+        before_sql=None,
+        after_sql="(owner_id = auth.uid())",
+    )]
+    out2 = format_diff_html([c2], generated_at=_FIXED_GEN)
+    assert "(no clause)" in out2
+    assert "owner_id = auth.uid()" in out2
+
+
+def test_html_predicate_block_escapes_sql() -> None:
+    # before_sql / after_sql is operator-supplied SQL — must be
+    # html.escape-d so SQL operators (`<`, `>`) don't break the
+    # layout or inject markup.
+    [c] = [_change(
+        ChangeKind.USING_TIGHTENED, "safe", location="x",
+        message="m",
+        before_sql='(a < 5 AND b > 10)',
+        after_sql='(a <= 5 AND b >= 10)',
+    )]
+    out = format_diff_html([c], generated_at=_FIXED_GEN)
+    assert "a &lt; 5" in out
+    assert "b &gt;= 10" in out
+    # Literal `<` / `>` (other than legitimate HTML tags) must not
+    # appear in the predicate block.
+    pred_start = out.index("pre class=\"predicate\"")
+    pred_end = out.index("</pre>", pred_start)
+    pred_block = out[pred_start:pred_end]
+    # Strip the legitimate <span> open/close tags so we only check
+    # the inner text content.
+    inner = pred_block.replace("<span", "").replace("</span>", "").replace(
+        'class="pred-minus">', "").replace('class="pred-plus">', "")
+    assert "<" not in inner.replace("&lt;", "")

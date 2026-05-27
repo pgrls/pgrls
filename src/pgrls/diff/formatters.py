@@ -947,6 +947,30 @@ def format_diff_html(
             message = html.escape(change.message).replace(
                 "\n", "<br>"
             ).replace("\r", "")
+            # For predicate kinds (USING_* / WITH_CHECK_*), append
+            # the before→after SQL diff inline below the message so
+            # an offline reviewer reading the archive sees what the
+            # predicate actually changed to — the single most
+            # useful detail for a "is this migration safe?" review.
+            # The text formatter has the same block (lines starting
+            # with `- before` / `+ after`); HTML renders it as a
+            # `<pre>` element so multi-line SQL displays correctly.
+            if change.kind in _PREDICATE_KINDS:
+                before = (
+                    change.before_sql if change.before_sql is not None
+                    else "(no clause)"
+                )
+                after = (
+                    change.after_sql if change.after_sql is not None
+                    else "(no clause)"
+                )
+                predicate_block = (
+                    '<pre class="predicate">'
+                    f"<span class=\"pred-minus\">- {html.escape(before)}</span>\n"
+                    f"<span class=\"pred-plus\">+ {html.escape(after)}</span>"
+                    "</pre>"
+                )
+                message = f"{message}{predicate_block}"
             row_lines.append(
                 f'      <tr class="row-{cls}">'
                 f'<td><span class="pill class-{cls}">'
@@ -1001,6 +1025,15 @@ def format_diff_html(
   tbody tr:last-child td {{ border-bottom: 0; }}
   code {{ background: #f6f8fa; padding: .1rem .35rem;
           border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
+  pre.predicate {{ background: #f6f8fa; padding: .5rem .75rem;
+                   border-radius: 4px; margin: .5rem 0 0 0;
+                   font: .9em ui-monospace, Menlo, monospace;
+                   white-space: pre-wrap; word-break: break-word; }}
+  @media (prefers-color-scheme: dark) {{
+    pre.predicate {{ background: #161b22; }}
+  }}
+  .pred-minus {{ color: #cf222e; display: block; }}
+  .pred-plus  {{ color: #1a7f37; display: block; }}
   .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
   footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
 </style>

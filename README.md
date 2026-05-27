@@ -376,9 +376,11 @@ for a stricter gate, or set `[diff].fail_on` in `pgrls.toml` to make
 the choice persistent (CLI flag → `[diff].fail_on` → built-in
 `dangerous`). Output is git-diff-style by default (`--format text`);
 use `--format json` or `--format sarif` for CI integrations that
-already parse `pgrls lint` output (same `Violation` shape), or
+already parse `pgrls lint` output (same `Violation` shape),
 `--format markdown` for a paste-ready PR-comment table with
-classification badges.
+classification badges, or `--format html` for a standalone audit
+page (embedded CSS, opens offline, prints to PDF) — same shape
+`pgrls report --format html` and `pgrls history --format html` use.
 
 Pass `--explain` to append a one-paragraph rationale beneath each
 classified Change in the text output — why a dropped PERMISSIVE
