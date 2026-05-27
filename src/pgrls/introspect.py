@@ -466,13 +466,14 @@ SELECT
     n.nspname || '.' || p.proname AS qname,
     p.prosrc AS body,
     l.lanname AS lang,
-    p.proconfig AS config
+    p.proconfig AS config,
+    pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_language l ON l.oid = p.prolang
 WHERE p.prosecdef = TRUE
   AND n.nspname = ANY(%s)
-ORDER BY qname
+ORDER BY qname, signature
 """
 
 # Roles carrying the BYPASSRLS attribute. A role with BYPASSRLS skips
@@ -582,13 +583,14 @@ ORDER BY mem.rolname, tgt.rolname
 #
 # ORDER BY qname for snapshot determinism.
 _LEAKPROOF_FUNCS_SQL = """
-SELECT DISTINCT
-    n.nspname || '.' || p.proname AS qname
+SELECT
+    n.nspname || '.' || p.proname AS qname,
+    pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 WHERE p.proleakproof = TRUE
   AND n.nspname = ANY(%s)
-ORDER BY qname
+ORDER BY qname, signature
 """
 
 
@@ -639,6 +641,7 @@ def _fetch_secdef_functions(
             body=row["body"],
             language=row["lang"],
             search_path=_extract_search_path(row["config"]),
+            signature=row["signature"] or "",
         )
         for row in cur.fetchall()
     )
@@ -702,13 +705,20 @@ def _fetch_leakproof_functions(
     """Fetch every LEAKPROOF function in `schemas`.
 
     Returns a tuple of `LeakproofFunction` records sorted by
-    qualified name (the SQL `ORDER BY qname` provides the
-    determinism), with overloads collapsed to a single entry per
-    qualified name (`SELECT DISTINCT`).
+    `(qualified_name, signature)` (the SQL `ORDER BY qname,
+    signature` provides the determinism). Since snapshot v12 each
+    overload of the same qualified name is a separate entry so a
+    SEC017 fixer can target each one with `ALTER FUNCTION
+    name(<signature>) NOT LEAKPROOF`; SEC017 itself reports per
+    qualified name (deduping across overloads) so the message
+    surface is unchanged.
     """
     cur.execute(_LEAKPROOF_FUNCS_SQL, [list(schemas)])
     return tuple(
-        LeakproofFunction(qualified_name=row["qname"])
+        LeakproofFunction(
+            qualified_name=row["qname"],
+            signature=row["signature"] or "",
+        )
         for row in cur.fetchall()
     )
 

@@ -1042,13 +1042,17 @@ def test_introspect_captures_leakproof_functions(
     assert "public.lp_plain" not in qnames
 
 
-def test_introspect_collapses_leakproof_function_overloads(
+def test_introspect_captures_leakproof_function_overloads_separately(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
-    # Two LEAKPROOF overloads of the same qualified name collapse to
-    # a single entry (introspection's SELECT DISTINCT), matching
-    # SEC017's allowlist granularity — the allowlist key is the
-    # qualified name with no signature.
+    # Two LEAKPROOF overloads of the same qualified name appear as
+    # SEPARATE entries since snapshot v12 (so the SEC017 fixer can
+    # emit `ALTER FUNCTION name(<signature>) NOT LEAKPROOF;` per
+    # overload). Pre-v12 the introspection query used SELECT DISTINCT
+    # and collapsed to one entry; the v12 query orders by
+    # `(qname, signature)` so both overloads show up. SEC017 itself
+    # still reports per qualified name (deduping across overloads)
+    # so the message surface is unchanged.
     apply_sql(
         """
         CREATE FUNCTION public.lp_over(int) RETURNS bool
@@ -1063,7 +1067,8 @@ def test_introspect_collapses_leakproof_function_overloads(
         for f in schema.leakproof_functions
         if f.qualified_name == "public.lp_over"
     ]
-    assert len(matches) == 1
+    signatures = sorted(f.signature for f in matches)
+    assert signatures == ["integer", "text"]
 
 
 def test_introspect_resolves_view_to_table_references(

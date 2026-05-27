@@ -10,6 +10,30 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-05-26
+
+### Changed
+
+- **Snapshot v12 — per-overload function `signature` captured.**
+  `SecdefFunction` and `LeakproofFunction` now carry a `signature`
+  field (`pg_get_function_identity_arguments(p.oid)` output —
+  empty for zero-arg functions, non-empty like `integer, text`
+  for overloads). Two overloads of the same qualified name appear
+  as separate entries (the `_LEAKPROOF_FUNCS_SQL` query dropped its
+  `SELECT DISTINCT`); SEC017's reporting still dedupes by
+  qualified name, so the message surface is unchanged.
+
+  This is the introspection-layer refactor the upcoming SEC014 /
+  SEC015 / SEC017 fixers need: `ALTER FUNCTION name(<signature>)
+  NOT LEAKPROOF` (and the SECDEF analogues) require the argument-
+  type signature, which earlier snapshot versions did not capture.
+
+  v3-v11 baselines still load. `SecdefFunction`/`LeakproofFunction`
+  parsed out of a pre-v12 snapshot default `signature` to `""`;
+  fixers that need the signature see empty and abstain (a wrong
+  ALTER FUNCTION would be worse than no fix). Re-snapshot against
+  a live database to populate the signatures.
+
 ## [0.6.10] - 2026-05-26
 
 ### Added

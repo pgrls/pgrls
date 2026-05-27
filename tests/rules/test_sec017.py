@@ -136,3 +136,49 @@ def test_sec017_message_includes_function_qname_in_allowlist_hint() -> None:
     assert "[lint.rules.SEC017]" in v.message
     # The fix names the function in the ALTER FUNCTION statement.
     assert "ALTER FUNCTION audit.redact" in v.message
+
+
+def test_sec017_dedupes_overloads_to_single_violation() -> None:
+    # Snapshot v12+ captures one `LeakproofFunction` entry per
+    # overload (so a SEC017 fixer can ALTER FUNCTION each one
+    # individually). The rule itself reports per qualified name —
+    # two overloads of the same function must produce ONE
+    # violation, not two with identical text. Pinning the contract
+    # the v12 refactor's CHANGELOG / docstrings repeatedly promise.
+    schema = Schema(
+        leakproof_functions=(
+            LeakproofFunction(
+                qualified_name="public.fast_eq",
+                signature="integer",
+            ),
+            LeakproofFunction(
+                qualified_name="public.fast_eq",
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC017().check(schema, options={})
+    assert len(violations) == 1
+    assert violations[0].location == "public.fast_eq"
+
+
+def test_sec017_dedupes_overloads_then_allowlist_silences_all() -> None:
+    # An allowlist entry for `public.fast_eq` silences every
+    # overload (the rule keys on qualified_name throughout — the
+    # signature is per-overload identity used only by the fixer).
+    schema = Schema(
+        leakproof_functions=(
+            LeakproofFunction(
+                qualified_name="public.fast_eq",
+                signature="integer",
+            ),
+            LeakproofFunction(
+                qualified_name="public.fast_eq",
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC017().check(
+        schema, options={"allowlist": ["public.fast_eq"]}
+    )
+    assert violations == []
