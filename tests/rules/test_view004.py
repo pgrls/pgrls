@@ -544,3 +544,169 @@ def test_view004_does_not_fire_on_schema_with_no_views() -> None:
         security_definer_functions=(),
     )
     assert VIEW004().check(schema, options={}) == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# Overload handling (snapshot v12+)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_view004_analyzes_every_overload_body_per_qname() -> None:
+    # Snapshot v12+ captures one `SecdefFunction` entry per overload.
+    # A previous dict-comprehension `{q: f for f in ...}` was last-
+    # wins on duplicate qnames, so VIEW004 only analyzed the
+    # lex-last overload's body. If two overloads share a qname and
+    # only the NON-last overload reads an RLS table, the rule would
+    # miss the leak. Pin the fix: walking every overload's body.
+    #
+    # In the v12 `ORDER BY qname, signature` order, `integer` sorts
+    # before `text` — so `text` is the "last" overload. The leak is
+    # in the `integer` (non-last) overload's body: pre-fix, VIEW004
+    # would NOT flag this; post-fix, it must.
+    schema = Schema(
+        tables=(_table("public", "secret", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="leaky",
+                security_definer_calls=("public.lookup",),
+            ),
+        ),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.lookup",
+                # The (integer) overload reads the RLS-protected
+                # table — the leak.
+                body="SELECT * FROM public.secret",
+                language="sql",
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.lookup",
+                # The (text) overload — the lex-last in v12 ordering
+                # — reads nothing protected. Pre-fix this would
+                # win the dict-comprehension last-wins and VIEW004
+                # would silently report no leak.
+                body="SELECT 1",
+                language="sql",
+                signature="text",
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    assert violations[0].location == "public.leaky"
+    assert "public.secret" in violations[0].message
+    # Function name appears in the message (not the signature — the
+    # rule reports per qualified name, the fixer per overload).
+    assert "public.lookup" in violations[0].message
+
+
+def test_view004_handles_overloads_with_different_languages(
+    capsys,
+) -> None:
+    # One overload is `sql` (parseable), one is `plpgsql` (skipped
+    # with stderr warning). The parseable one reads an RLS table —
+    # VIEW004 must flag the leak from the SQL overload even though
+    # the plpgsql one was skipped.
+    schema = Schema(
+        tables=(_table("public", "secret", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="leaky",
+                security_definer_calls=("public.lookup",),
+            ),
+        ),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.lookup",
+                body="SELECT * FROM public.secret",
+                language="sql",
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.lookup",
+                body="BEGIN PERFORM 1; END",
+                language="plpgsql",
+                signature="text",
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    assert violations[0].location == "public.leaky"
+    # The plpgsql overload's stderr warning names the specific
+    # overload so the operator knows which one wasn't analyzed.
+    err = capsys.readouterr().err
+    assert "public.lookup(text)" in err
+    assert "plpgsql" in err
+
+
+def test_view004_collapses_leaks_across_overloads_to_one_violation() -> None:
+    # If multiple overloads of the same qname each leak (different
+    # RLS tables, say), VIEW004 emits ONE violation per view —
+    # collapsing the per-overload leaks into the leaked-tables CSV
+    # in the message. The view-level granularity matches existing
+    # behavior; the new per-overload analysis only widens what's
+    # found.
+    schema = Schema(
+        tables=(
+            _table("public", "secret_a", rls=True),
+            _table("public", "secret_b", rls=True),
+        ),
+        views=(
+            _view(
+                schema="public",
+                name="leaky",
+                security_definer_calls=("public.lookup",),
+            ),
+        ),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.lookup",
+                body="SELECT * FROM public.secret_a",
+                language="sql",
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.lookup",
+                body="SELECT * FROM public.secret_b",
+                language="sql",
+                signature="text",
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    # Both leaked tables appear in the message (sorted CSV).
+    assert "public.secret_a" in violations[0].message
+    assert "public.secret_b" in violations[0].message
+
+
+def test_view004_unsignatured_pre_v12_overload_still_analyzed() -> None:
+    # A pre-v12 snapshot has `signature=""` (the older introspection
+    # didn't capture argument types). VIEW004 must still parse and
+    # analyze the body — the missing signature only affects how the
+    # stderr warning names the overload, not whether it's checked.
+    schema = Schema(
+        tables=(_table("public", "secret", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="leaky",
+                security_definer_calls=("public.lookup",),
+            ),
+        ),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.lookup",
+                body="SELECT * FROM public.secret",
+                language="sql",
+                signature="",
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    assert "public.secret" in violations[0].message

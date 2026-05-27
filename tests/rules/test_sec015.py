@@ -224,3 +224,91 @@ def test_sec015_fires_regardless_of_language() -> None:
     )
     [v] = SEC015().check(schema, options={})
     assert v.location == "public.plpgsql_fn"
+
+
+def test_sec015_dedupes_overloads_to_single_violation() -> None:
+    # Snapshot v12+ captures one `SecdefFunction` entry per overload.
+    # The rule reports per qualified name (matching SEC014 / SEC017's
+    # surface); two overloads with the same unsafe search_path produce
+    # ONE SEC015 violation, not two with identical messages.
+    schema = Schema(
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.fn",
+                body="SELECT 1",
+                language="sql",
+                search_path=None,
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.fn",
+                body="SELECT 1",
+                language="sql",
+                search_path=None,
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC015().check(schema, options={})
+    assert len(violations) == 1
+    assert violations[0].location == "public.fn"
+
+
+def test_sec015_allowlist_silences_every_overload() -> None:
+    # Allowlist keys on qualified name — silencing `public.fn` skips
+    # both overloads even though they are separate entries.
+    schema = Schema(
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.fn",
+                body="SELECT 1",
+                language="sql",
+                search_path=None,
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.fn",
+                body="SELECT 1",
+                language="sql",
+                search_path=None,
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC015().check(
+        schema, options={"allowlist": ["public.fn"]}
+    )
+    assert violations == []
+
+
+def test_sec015_safe_overload_doesnt_dedupe_unrelated_unsafe() -> None:
+    # If one function has only-unsafe overloads and ANOTHER function
+    # has a mix of safe and unsafe overloads, the rule reports the
+    # function with at least one unsafe overload — the safe one
+    # doesn't suppress the unsafe (the rule walks all entries, and
+    # the dedup is per-qname *after* the safe-check).
+    schema = Schema(
+        security_definer_functions=(
+            # mixed.fn: first overload safe (already has pg_temp
+            # pinned last), second unsafe (no search_path). The
+            # rule must flag mixed.fn because the second overload
+            # is exploitable.
+            SecdefFunction(
+                qualified_name="public.mixed",
+                body="SELECT 1",
+                language="sql",
+                search_path="pg_catalog, pg_temp",
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.mixed",
+                body="SELECT 1",
+                language="sql",
+                search_path=None,
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC015().check(schema, options={})
+    assert len(violations) == 1
+    assert violations[0].location == "public.mixed"

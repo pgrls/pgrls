@@ -72,12 +72,22 @@ class VIEW004:
             # Nothing to leak — early-exit before parsing function bodies.
             return []
 
-        # qname → SecdefFunction for body lookup. Empty when the view's
-        # `security_definer_calls` references a function we didn't
-        # introspect (e.g. lives in a schema outside `--schemas` scope).
-        secdef_bodies = {
-            f.qualified_name: f for f in schema.security_definer_functions
-        }
+        # qname → list[SecdefFunction] for body lookup. Snapshot v12+
+        # captures one entry per overload (the SECDEF SQL never had
+        # SELECT DISTINCT — overloads were always separate rows;
+        # v12 just made it explicit by adding the `signature` field).
+        # Two overloads of the same qualified name can have different
+        # bodies (one might read an RLS-protected table, another not);
+        # a previous dict-comprehension `{q: f for f in ...}` was
+        # last-wins on duplicate qnames, so VIEW004 would analyze only
+        # the lex-last overload's body and miss leaks in the others.
+        # Walking every overload's body per qname closes that gap.
+        # Empty when the view's `security_definer_calls` references a
+        # function we didn't introspect (e.g. lives in a schema outside
+        # `--schemas` scope).
+        secdef_bodies: dict[str, list[Any]] = {}
+        for f in schema.security_definer_functions:
+            secdef_bodies.setdefault(f.qualified_name, []).append(f)
 
         # Build bare-name → list-of-qualified mapping for table refs in
         # function bodies. `pg_proc.prosrc` may emit either form
@@ -104,68 +114,88 @@ class VIEW004:
                 continue
 
             # (function_qname, leaked_table_qname) pairs found for this
-            # view. A single function may leak multiple tables; each
-            # appears as its own pair so the message-format step can
-            # de-duplicate to a sorted-comma-joined list per axis.
+            # view. A single function (across all its overloads) may
+            # leak multiple tables; each appears as its own pair so
+            # the message-format step can de-duplicate to a sorted-
+            # comma-joined list per axis.
             leaked_fns: set[str] = set()
             leaked_tables: set[str] = set()
             for fn_qname in view.security_definer_calls:
-                secdef_fn = secdef_bodies.get(fn_qname)
-                if secdef_fn is None:
+                matching_fns = secdef_bodies.get(fn_qname, [])
+                if not matching_fns:
                     # Function not introspected — skip silently. (This
                     # happens when a view's SECDEF call resolves to a
                     # function in a schema outside `--schemas`.)
                     continue
-                if secdef_fn.language != "sql":
-                    # PL/pgSQL and other non-SQL languages aren't
-                    # parseable as a top-level pglast statement. Emit
-                    # a less-alarming "non-SQL language" warning so
-                    # the user knows the function wasn't analyzed,
-                    # then skip — the documented false-negative path.
-                    print(
-                        f"pgrls: warning: VIEW004 skipped SECURITY "
-                        f"DEFINER function {fn_qname} "
-                        f"(language={secdef_fn.language!r}). pglast "
-                        "cannot parse non-SQL bodies as top-level "
-                        "statements; rule may have false negatives "
-                        "for this function.",
-                        file=sys.stderr,
-                    )
-                    continue
-                try:
-                    parsed = pglast.parse_sql(secdef_fn.body)
-                except pglast.parser.ParseError:
-                    # Match `parse_expr`'s warning shape — name the
-                    # function so the user can grep `pg_proc` for the
-                    # actual SQL pglast couldn't handle.
-                    print(
-                        f"pgrls: warning: could not parse SECURITY "
-                        f"DEFINER function body for {fn_qname}. "
-                        "VIEW004 skipped for this function (likely "
-                        "PL/pgSQL with dynamic SQL or non-SQL "
-                        "language). Original body length: "
-                        f"{len(secdef_fn.body)} chars",
-                        file=sys.stderr,
-                    )
-                    continue
-                if not parsed:
-                    continue
-                # A SQL function body may have multiple statements
-                # (e.g. `SELECT 1; SELECT * FROM secret;`). Walk every
-                # parsed RawStmt — the leaking SELECT could be at any
-                # position.
+                # Walk EVERY overload's body for this qname (snapshot
+                # v12+ captures one entry per overload). Any overload
+                # that leaks an RLS table flags the function as a
+                # leak. The unsuppressable PL/pgSQL / parse-error
+                # warnings per overload are emitted once per
+                # (fn_qname, signature) so the operator sees which
+                # specific overload wasn't analyzed.
                 fn_leaks_a_table = False
-                for raw_stmt in parsed:
-                    range_vars = extract_range_vars(raw_stmt.stmt)
-                    for sname, tname in range_vars:
-                        if sname is not None:
-                            if (sname, tname) in rls_tables:
-                                leaked_tables.add(f"{sname}.{tname}")
+                for secdef_fn in matching_fns:
+                    # Build a per-overload display label: `fn(integer)`
+                    # for v12+ snapshots with `signature`, falling
+                    # back to bare `fn` for older snapshots where
+                    # `signature == ""`. Keeps stderr messages
+                    # informative when overload-many.
+                    fn_display = (
+                        f"{fn_qname}({secdef_fn.signature})"
+                        if secdef_fn.signature
+                        else fn_qname
+                    )
+                    if secdef_fn.language != "sql":
+                        # PL/pgSQL and other non-SQL languages aren't
+                        # parseable as a top-level pglast statement.
+                        # Emit a "non-SQL language" warning so the
+                        # user knows this overload wasn't analyzed,
+                        # then skip — the documented false-negative
+                        # path.
+                        print(
+                            f"pgrls: warning: VIEW004 skipped "
+                            f"SECURITY DEFINER function {fn_display} "
+                            f"(language={secdef_fn.language!r}). "
+                            "pglast cannot parse non-SQL bodies as "
+                            "top-level statements; rule may have "
+                            "false negatives for this overload.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    try:
+                        parsed = pglast.parse_sql(secdef_fn.body)
+                    except pglast.parser.ParseError:
+                        print(
+                            f"pgrls: warning: could not parse "
+                            f"SECURITY DEFINER function body for "
+                            f"{fn_display}. VIEW004 skipped for this "
+                            "overload (likely PL/pgSQL with dynamic "
+                            "SQL or non-SQL language). Original body "
+                            f"length: {len(secdef_fn.body)} chars",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if not parsed:
+                        continue
+                    # A SQL function body may have multiple
+                    # statements (e.g.
+                    # `SELECT 1; SELECT * FROM secret;`). Walk every
+                    # parsed RawStmt — the leaking SELECT could be at
+                    # any position.
+                    for raw_stmt in parsed:
+                        range_vars = extract_range_vars(raw_stmt.stmt)
+                        for sname, tname in range_vars:
+                            if sname is not None:
+                                if (sname, tname) in rls_tables:
+                                    leaked_tables.add(
+                                        f"{sname}.{tname}"
+                                    )
+                                    fn_leaks_a_table = True
+                            elif tname in bare_table_to_qual:
+                                for s, n in bare_table_to_qual[tname]:
+                                    leaked_tables.add(f"{s}.{n}")
                                 fn_leaks_a_table = True
-                        elif tname in bare_table_to_qual:
-                            for s, n in bare_table_to_qual[tname]:
-                                leaked_tables.add(f"{s}.{n}")
-                            fn_leaks_a_table = True
                 if fn_leaks_a_table:
                     leaked_fns.add(fn_qname)
 

@@ -141,11 +141,29 @@ class SEC015:
     ) -> list[Violation]:
         allowlist = parse_qualified_function_allowlist("SEC015", options)
         out: list[Violation] = []
+        # Snapshot v12+ captures one `SecdefFunction` entry per
+        # overload. The rule reports per qualified name — the message
+        # names the function, not a specific overload — so dedupe by
+        # qualified_name as we walk. Same shape as SEC014 / SEC017.
+        # In practice all overloads of a function share the same
+        # `proconfig` (search_path is set with `ALTER FUNCTION` per
+        # overload but is rarely set differently); the rare case
+        # where one overload is safe and another isn't reports the
+        # first-encountered unsafe overload — the allowlist (per
+        # qualified name) silences the whole function anyway, so the
+        # operator who hits this allowlists or hand-fixes both. The
+        # paired SEC015 fixer emits a per-overload ALTER FUNCTION,
+        # so the FIX surface retains overload granularity even
+        # though the rule surface dedupes.
+        seen: set[str] = set()
         for fn in schema.security_definer_functions:
             if fn.qualified_name in allowlist:
                 continue
             if _is_pg_temp_safe(fn.search_path):
                 continue
+            if fn.qualified_name in seen:
+                continue
+            seen.add(fn.qualified_name)
             out.append(self._violation(fn))
         return out
 

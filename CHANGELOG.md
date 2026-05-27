@@ -10,6 +10,49 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-05-27
+
+### Fixed
+
+- **SEC014 / SEC015 / VIEW004 — overload-handling.** Three rules
+  had pre-existing latent bugs surfaced by snapshot v12's
+  per-overload `signature` capture. The underlying SECDEF
+  introspection query (`_SECDEF_FUNCS_SQL`) never had a `SELECT
+  DISTINCT` — overloads were always separate rows. v12 just made
+  the contract explicit by adding the `signature` field.
+
+  * **SEC014** docstring promised "Two overloads of the same
+    qualified name are flagged once and allowlisted once" but the
+    code didn't enforce it — two overloads produced two
+    byte-identical violations. Added a `seen: set[str]` dedup by
+    qualified_name (same pattern SEC017 picked up in v0.6.11) so
+    the rule matches its documented contract.
+
+  * **SEC015** likewise emitted one violation per overload. Same
+    qname-keyed dedup added. In practice all overloads of a
+    function share a `proconfig` (search_path is per-function), so
+    the user-facing behavior is essentially unchanged; the rare
+    mixed-safe-and-unsafe-overload case reports the first
+    unsafe overload (the allowlist silences all, the paired
+    SEC015 fixer retains per-overload granularity).
+
+  * **VIEW004** built `secdef_bodies = {f.qualified_name: f for
+    f in ...}` — a dict comprehension that is last-wins on
+    duplicate qnames. Pre-v12 the "winner" was implementation-
+    defined; v12's `ORDER BY qname, signature` made it the
+    lex-last signature deterministically — but still only ONE
+    overload's body. If two overloads of the same function have
+    different bodies (one reading an RLS-protected table, one
+    not), VIEW004 only analyzed the lex-last and could miss the
+    leak. Now walks every overload's body per qname; per-overload
+    PL/pgSQL / parse-error stderr warnings name the specific
+    overload (e.g. `public.lookup(text)`) so the operator knows
+    which one wasn't analyzed.
+
+  9 new regression tests across the three rules pin the contracts.
+  No behavior change for schemas with no overloaded SECDEF /
+  LEAKPROOF functions (the common case).
+
 ## [0.6.13] - 2026-05-27
 
 ### Added

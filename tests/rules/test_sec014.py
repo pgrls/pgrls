@@ -194,3 +194,57 @@ def test_sec014_message_includes_function_qname_in_allowlist_hint() -> None:
     [v] = SEC014().check(schema, options={})
     assert "'audit.refresh_cache'" in v.message
     assert "[lint.rules.SEC014]" in v.message
+
+
+def test_sec014_dedupes_overloads_to_single_violation() -> None:
+    # Snapshot v12+ captures one `SecdefFunction` entry per overload
+    # (the SECDEF SQL never had SELECT DISTINCT — overloads were
+    # always separate rows; v12 just made it explicit by adding the
+    # `signature` field). The rule docstring promises "Two overloads
+    # of the same qualified name are flagged once and allowlisted
+    # once" — pin the contract so the dedup loop stays load-bearing.
+    schema = Schema(
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.do_thing",
+                body="SELECT 1",
+                language="sql",
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.do_thing",
+                body="SELECT 1",
+                language="sql",
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC014().check(schema, options={})
+    assert len(violations) == 1
+    assert violations[0].location == "public.do_thing"
+
+
+def test_sec014_allowlist_silences_every_overload() -> None:
+    # The allowlist key is the qualified name (the docstring
+    # explicitly cedes per-overload granularity). Silencing
+    # `public.do_thing` skips both overloads.
+    schema = Schema(
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.do_thing",
+                body="SELECT 1",
+                language="sql",
+                signature="integer",
+            ),
+            SecdefFunction(
+                qualified_name="public.do_thing",
+                body="SELECT 1",
+                language="sql",
+                signature="text",
+            ),
+        ),
+    )
+    violations = SEC014().check(
+        schema, options={"allowlist": ["public.do_thing"]}
+    )
+    assert violations == []
