@@ -10,6 +10,26 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-05-26
+
+### Added
+
+- **`pgrls history <dir>` — snapshot time-series.** New subcommand
+  that consumes a directory of JSON files written by `pgrls lint
+  --format json` and emits a chronological trend report: per-snapshot
+  totals by severity, plus the per-step **NEW** / **FIXED** delta
+  (findings keyed by `(rule_id, location)` — a schema-wide finding
+  with `location=None` is stable identity, classified PERSISTENT
+  rather than NEW+FIXED on every comparison). Pair with a daily
+  cron writing `snapshots/$(date -u +%FT%H%M%SZ).json` and answer
+  "are we gaining ground over time?" weekly. `--format text` (fixed-
+  width terminal table, default), `--format json` (`{snapshots,
+  summary}` machine-readable shape), `--format markdown` (paste-ready
+  GitHub table for a weekly update). `--output FILE` writes to a
+  file. Files that don't parse as the pgrls JSON shape are skipped
+  with a stderr warning; the report still renders for the readable
+  ones.
+
 ## [0.6.9] - 2026-05-26
 
 ### Added
