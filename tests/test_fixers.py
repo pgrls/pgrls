@@ -23,11 +23,12 @@ from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
 from pgrls.fixers.sec015 import SEC015Fixer
 from pgrls.fixers.sec017 import SEC017Fixer
+from pgrls.fixers.sec030 import SEC030Fixer
 from pgrls.fixers.sec031 import SEC031Fixer
 from pgrls.fixers.sec032 import SEC032Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
-from pgrls.model import Index, Policy, Schema, Table, View
+from pgrls.model import Column, Index, Policy, Schema, Table, View
 
 
 # ---------- SEC002 fixer ----------
@@ -1466,6 +1467,241 @@ def test_hyg003_fix_raises_on_malformed_allowlist() -> None:
     # Malformed entry — surrounding whitespace.
     with pytest.raises(TypeError, match="allowlist"):
         HYG003Fixer().fix(schema, {"allowlist": [" public.t.p_b "]})
+
+
+# ---------- SEC030 fixer ----------
+
+
+def _sec030_table(
+    *,
+    name: str = "documents",
+    schema: str = "public",
+    rls: bool = True,
+    policies: tuple[Policy, ...] = (),
+    column_details: tuple[Column, ...] = (
+        Column(name="id", data_type="uuid", is_nullable=False),
+        Column(name="tenant_id", data_type="integer", is_nullable=True),
+        Column(name="owner_id", data_type="uuid", is_nullable=False),
+    ),
+) -> Table:
+    return Table(
+        schema=schema,
+        name=name,
+        rls_enabled=rls,
+        force_rls=True,
+        policies=policies,
+        columns=tuple(c.name for c in column_details),
+        column_details=column_details,
+    )
+
+
+def _scoping_policy(
+    column: str = "tenant_id",
+    *,
+    name: str = "tenant_scope",
+    auth: str = "current_setting('app.tenant')::int",
+) -> Policy:
+    return _policy(f"{column} = {auth}", name=name)
+
+
+def test_sec030_fix_emits_alter_column_set_not_null() -> None:
+    schema = Schema(
+        tables=(_sec030_table(policies=(_scoping_policy(),)),),
+    )
+    fixes = SEC030Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC030"
+    assert f.location == "public.documents.tenant_id"
+    assert f.sql == (
+        "ALTER TABLE public.documents "
+        "ALTER COLUMN tenant_id SET NOT NULL;"
+    )
+
+
+def test_sec030_fix_silent_when_discriminator_already_not_null() -> None:
+    # SEC030 itself doesn't fire when the column is NOT NULL; the
+    # fixer mirrors.
+    schema = Schema(
+        tables=(
+            _sec030_table(
+                policies=(_scoping_policy(),),
+                column_details=(
+                    Column(name="id", data_type="uuid", is_nullable=False),
+                    Column(
+                        name="tenant_id",
+                        data_type="integer",
+                        is_nullable=False,
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert SEC030Fixer().fix(schema, {}) == []
+
+
+def test_sec030_fix_silent_when_rls_disabled() -> None:
+    # SEC030's domain is policy-driven scoping — RLS off, no fix.
+    schema = Schema(
+        tables=(
+            _sec030_table(rls=False, policies=(_scoping_policy(),)),
+        ),
+    )
+    assert SEC030Fixer().fix(schema, {}) == []
+
+
+def test_sec030_fix_silent_when_column_details_missing() -> None:
+    # Pre-v5 snapshots have no column_details — the rule and fixer
+    # can't tell nullable from NOT NULL, so both abstain.
+    table = Table(
+        schema="public",
+        name="documents",
+        rls_enabled=True,
+        force_rls=True,
+        policies=(_scoping_policy(),),
+        columns=("id", "tenant_id"),
+        # column_details intentionally omitted (defaults to ())
+    )
+    schema = Schema(tables=(table,))
+    assert SEC030Fixer().fix(schema, {}) == []
+
+
+def test_sec030_fix_emits_one_per_nullable_scoping_column() -> None:
+    # A table whose policies scope by TWO different nullable columns
+    # gets TWO Fix entries — each ALTER COLUMN is independent.
+    p1 = _scoping_policy("tenant_id", name="tenant")
+    p2 = _scoping_policy(
+        "owner_id",
+        name="owner",
+        auth="(SELECT auth.uid())",
+    )
+    schema = Schema(
+        tables=(
+            _sec030_table(
+                policies=(p1, p2),
+                column_details=(
+                    Column(name="id", data_type="uuid", is_nullable=False),
+                    Column(
+                        name="tenant_id",
+                        data_type="integer",
+                        is_nullable=True,
+                    ),
+                    Column(
+                        name="owner_id",
+                        data_type="uuid",
+                        is_nullable=True,
+                    ),
+                ),
+            ),
+        ),
+    )
+    fixes = SEC030Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "ALTER TABLE public.documents "
+        "ALTER COLUMN owner_id SET NOT NULL;",
+        "ALTER TABLE public.documents "
+        "ALTER COLUMN tenant_id SET NOT NULL;",
+    ]
+
+
+def test_sec030_fix_respects_allowlist_qualified() -> None:
+    a = _sec030_table(name="a", policies=(_scoping_policy(),))
+    b = _sec030_table(name="b", policies=(_scoping_policy(),))
+    schema = Schema(tables=(a, b))
+    fixes = SEC030Fixer().fix(
+        schema, {"allowlist": ["public.a"]}
+    )
+    assert [f.location for f in fixes] == ["public.b.tenant_id"]
+
+
+def test_sec030_fix_respects_allowlist_unqualified() -> None:
+    schema = Schema(
+        tables=(
+            _sec030_table(
+                name="snapshot_events",
+                policies=(_scoping_policy(),),
+            ),
+        ),
+    )
+    assert (
+        SEC030Fixer().fix(
+            schema, {"allowlist": ["snapshot_events"]}
+        )
+        == []
+    )
+
+
+def test_sec030_fix_quotes_mixed_case_column() -> None:
+    # Postgres identifiers like `TenantId` need double-quoting in
+    # ALTER COLUMN, otherwise the server lowercases and rejects.
+    table = _sec030_table(
+        column_details=(
+            Column(name="id", data_type="uuid", is_nullable=False),
+            Column(
+                name="TenantId",
+                data_type="integer",
+                is_nullable=True,
+            ),
+        ),
+    )
+    policy = _scoping_policy(
+        column='"TenantId"',  # quoted in policy SQL
+        name="tenant",
+    )
+    table = Table(
+        schema=table.schema,
+        name=table.name,
+        rls_enabled=table.rls_enabled,
+        force_rls=table.force_rls,
+        policies=(policy,),
+        columns=table.columns,
+        column_details=table.column_details,
+    )
+    schema = Schema(tables=(table,))
+    fixes = SEC030Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql == (
+        'ALTER TABLE public.documents '
+        'ALTER COLUMN "TenantId" SET NOT NULL;'
+    )
+
+
+def test_sec030_fix_description_warns_about_backfilling_nulls() -> None:
+    # The description MUST surface the runtime-failure risk
+    # prominently — emitting the ALTER without warning would
+    # silently lead operators into `--apply` errors.
+    schema = Schema(
+        tables=(_sec030_table(policies=(_scoping_policy(),)),),
+    )
+    [f] = SEC030Fixer().fix(schema, {})
+    desc = f.description
+    assert "BACKFILL" in desc  # all-caps emphasis
+    assert "null values" in desc.lower() or "NULL" in desc
+    # The UPDATE recipe must appear so operators don't have to
+    # invent the backfill statement themselves.
+    assert "UPDATE public.documents" in desc
+    assert "IS NULL" in desc
+    # The all-or-nothing batch-rollback consequence MUST be named —
+    # operators reading the rendered SQL stream won't otherwise
+    # connect "one ALTER fails" to "every other fix rolls back".
+    assert "ROLLS BACK THE ENTIRE BATCH" in desc
+    # The escape hatch (--output FILE to materialize) must be
+    # surfaced too, so operators have a clear safer path.
+    assert "--output" in desc
+    # The allowlist alternative is named.
+    assert "[lint.rules.SEC030]" in desc
+
+
+def test_sec030_fix_raises_on_malformed_allowlist() -> None:
+    schema = Schema(
+        tables=(_sec030_table(policies=(_scoping_policy(),)),),
+    )
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC030Fixer().fix(schema, {"allowlist": "public.documents"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC030Fixer().fix(
+            schema, {"allowlist": [" public.documents "]}
+        )
 
 
 # ---------- SEC031 fixer ----------

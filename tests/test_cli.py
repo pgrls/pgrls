@@ -301,9 +301,12 @@ def test_explain_format_json_per_rule_has_metadata_and_reference() -> None:
 
 
 def test_explain_format_json_marks_unfixable_rule() -> None:
-    # SEC030 (nullable discriminator) has no auto-fixer.
+    # SEC003 (permissive policy grants to PUBLIC) has no auto-fixer —
+    # the right role to replace PUBLIC with is application-specific
+    # (`authenticated`? a tenant role? a service role?) and pgrls
+    # can't infer it.
     runner = CliRunner()
-    result = runner.invoke(main, ["explain", "SEC030", "--format", "json"])
+    result = runner.invoke(main, ["explain", "SEC003", "--format", "json"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["fixable"] is False
 
@@ -2865,9 +2868,15 @@ def test_fix_apply_creates_perf003_index(pg_url: str, apply_sql) -> None:
     # The PERF003 fixer emits a plain (non-CONCURRENT) CREATE INDEX,
     # so it runs inside `--apply`'s single transaction. Verify the
     # index actually lands on the table.
+    #
+    # `tenant_id` is declared NOT NULL so the SEC030 fixer (added in
+    # v0.6.15) doesn't piggyback an ALTER COLUMN onto this test —
+    # the assertion below expects exactly one fix (the PERF003
+    # index) and the fixture is about PERF003 specifically.
     apply_sql(
         """
-        CREATE TABLE public.fix_perf003_apply (id INT, tenant_id TEXT);
+        CREATE TABLE public.fix_perf003_apply
+            (id INT, tenant_id TEXT NOT NULL);
         ALTER TABLE public.fix_perf003_apply ENABLE ROW LEVEL SECURITY;
         ALTER TABLE public.fix_perf003_apply FORCE ROW LEVEL SECURITY;
         CREATE POLICY p ON public.fix_perf003_apply

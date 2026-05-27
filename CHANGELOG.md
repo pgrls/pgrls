@@ -10,6 +10,35 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-05-27
+
+### Added
+
+- **`pgrls fix` now remediates SEC030** (policy scopes by a
+  nullable discriminator column — the silent-row-hiding-then-
+  cross-tenant-leak footgun). Emits `ALTER TABLE <schema>.<table>
+  ALTER COLUMN <column> SET NOT NULL;` per flagged column.
+  Mechanically-fixable rule count: 16 → **17** of 47.
+
+  **`--apply` will fail if existing NULLs are present** — Postgres
+  scans the column at ALTER time and rejects with
+  `ERROR: column contains null values` on any NULL row. The Fix
+  description names this prominently and supplies the backfill
+  `UPDATE` recipe: `UPDATE <schema>.<table> SET <column> = <value>
+  WHERE <column> IS NULL;` before running the fix. Pgrls can't
+  infer the right tenant id / sentinel to backfill with — that's
+  application logic — so the operator either backfills first,
+  adds a DEFAULT in a migration, or allowlists the table if the
+  NULLs are intentional. `--output FILE` writes the SQL to a
+  migration so the backfill + ALTER can be scripted together.
+
+  One Fix per flagged column (a table with two nullable scoping
+  columns gets two Fix entries — each ALTER COLUMN is independent
+  and may succeed independently). Mixed-case column names are
+  properly quoted (`"TenantId"`). Allowlist semantics mirror the
+  rule: `[lint.rules.SEC030].allowlist` keyed on table name
+  (qualified or bare); an entry silences the whole table.
+
 ## [0.6.14] - 2026-05-27
 
 ### Fixed
