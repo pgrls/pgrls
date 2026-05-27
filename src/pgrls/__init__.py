@@ -42,8 +42,10 @@ try:
 except PackageNotFoundError:
     # Running from a source tree without the wheel installed (e.g. a
     # fresh `git clone` before `pip install -e .`). Falls back to a
-    # dev sentinel rather than crashing every CLI invocation.
-    __version__ = "0.0.0+unknown"
+    # PEP 440 dev sentinel — parses cleanly via packaging.version.Version
+    # so downstream consumers (SARIF, PyPI tooling) don't reject it as
+    # an invalid local-version string.
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "Change",
