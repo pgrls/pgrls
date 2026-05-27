@@ -10,6 +10,26 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-05-27
+
+### Added
+
+- **`pgrls diff --format html`** — standalone HTML audit page,
+  the final format in the diff command's set. Same self-contained
+  shape `pgrls report --format html` (v0.6.7) and `pgrls history
+  --format html` (v0.6.16) established: embedded CSS, no external
+  `<link>` / `<script>` (opens offline, renders identically in
+  browsers and `wkhtmltopdf`-style PDF converters), light/dark
+  via `prefers-color-scheme`. Each Change renders as one row
+  with a coloured classification pill — green for SAFE, amber for
+  REQUIRES REVIEW, orange for BREAKING, red for DANGEROUS — so
+  the at-a-glance read of "is this migration safe?" doesn't
+  require parsing the summary band. ISO-8601 UTC generation
+  timestamp; `format_diff_html(changes, *, generated_at=None)`
+  exposes the timestamp-pinning API (naive datetime raises
+  `ValueError`). All cells `html.escape`-d — quoted-identifier
+  hazards like `weird<name>&"` can't break layout or inject markup.
+
 ## [0.6.18] - 2026-05-27
 
 ### Added

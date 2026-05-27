@@ -47,6 +47,7 @@ from pgrls.config import (
 from pgrls.diff import Change, diff_schemas
 from pgrls.diff.formatters import (
     DIFF_SUPPORTED_FORMATS,
+    format_diff_html,
     format_diff_json,
     format_diff_markdown,
     format_diff_sarif,
@@ -1465,6 +1466,10 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
     # The empty-changes case returns "pgrls diff: no changes.\n"
     # (matches text); pass nl=False so click doesn't double-newline.
     "markdown": (format_diff_markdown, False),
+    # html emits a standalone audit page mirroring report/history
+    # HTML — embedded CSS, no external assets. nl=False because the
+    # renderer already ends in a trailing newline.
+    "html": (format_diff_html, False),
 }
 
 

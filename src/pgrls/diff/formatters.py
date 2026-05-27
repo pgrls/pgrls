@@ -12,7 +12,9 @@ both feeds has no rule_id collisions by construction.
 """
 from __future__ import annotations
 
+import html
 from collections import Counter
+from datetime import datetime, timezone
 from typing import get_args
 
 from pgrls.diff.differ import Change, ChangeKind, Classification
@@ -824,6 +826,210 @@ def _markdown_row(change: Change) -> str:
     return f"| {emoji} {label} | {kind_title} | {obj} | {summary} |\n"
 
 
+# ---------------------------------------------------------------------------
+# HTML formatter
+# ---------------------------------------------------------------------------
+
+# CSS colours per classification — matches the markdown emoji
+# scheme's severity ordering (green / amber / orange / red).
+_CLASSIFICATION_COLOR: dict[Classification, str] = {
+    "safe": "#1a7f37",            # GitHub green
+    "requires_review": "#9a6700",  # amber
+    "breaking": "#bc4c00",         # orange
+    "dangerous": "#cf222e",        # GitHub red
+}
+
+
+def format_diff_html(
+    changes: list[Change],
+    *,
+    generated_at: datetime | None = None,
+) -> str:
+    """Standalone HTML page rendering a `pgrls diff` result.
+
+    Designed for the migration-review reading context: archive as
+    a PR attachment, print to PDF for a release-day artefact,
+    email to a reviewer who doesn't run pgrls. Embedded CSS, no
+    `<link>` or `<script>` — opens offline, renders identically in
+    browsers and `wkhtmltopdf`-style PDF converters. Mirrors the
+    shape of `pgrls report --format html` and `pgrls history
+    --format html`.
+
+    Each Change renders as one row with a coloured classification
+    pill (`✅ SAFE` green, `⚠️ REQUIRES REVIEW` amber, `🚦 BREAKING`
+    orange, `❌ DANGEROUS` red). A summary band on top shows the
+    total count and the per-classification breakdown.
+
+    `generated_at` is optional and defaults to `datetime.now(utc)`.
+    Pass an explicit timezone-aware datetime for deterministic
+    snapshot tests; naive datetimes raise `ValueError` rather than
+    being silently coerced through the host's local zone (same
+    contract `report.render_html` and `history.render_html` honour).
+
+    Every cell is `html.escape`-d — operator-supplied identifiers
+    can legally contain `<` / `>` / `&` / `"` inside quoted
+    Postgres identifier syntax, so a name like ``weird<name>&"``
+    must not break the layout or inject markup.
+
+    The summary message text is also escaped (a future ChangeKind
+    that routes operator SQL into `Change.message` couldn't inject
+    HTML via `<script>` in a quoted predicate).
+    """
+    if generated_at is None:
+        generated_at = datetime.now(timezone.utc)
+    elif generated_at.tzinfo is None:
+        raise ValueError(
+            "format_diff_html: generated_at must be timezone-aware; "
+            "a naive datetime would be interpreted as local time, "
+            "producing a wrong audit timestamp depending on the "
+            "host. Pass `datetime.now(timezone.utc)` or attach an "
+            "explicit tzinfo."
+        )
+    now = (
+        generated_at
+        .astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    counts: Counter[str] = Counter(c.classification for c in changes)
+    n = len(changes)
+
+    # Build the summary band content. Empty case gets a green
+    # "no changes" message; non-empty gets a per-classification
+    # breakdown that mirrors the text formatter's wording.
+    if n == 0:
+        band_html = (
+            '<p class="summary net-good">'
+            "✅ No changes in this diff.</p>"
+        )
+    else:
+        parts: list[str] = []
+        for bucket in _BUCKET_ORDER:
+            count = counts.get(bucket, 0)
+            if count:
+                label = _BUCKET_LABEL[bucket]
+                parts.append(
+                    f'<span class="pill class-{bucket}">'
+                    f"<strong>{count}</strong>&nbsp;{label}</span>"
+                )
+        chips = "\n      ".join(parts)
+        noun = "change" if n == 1 else "changes"
+        band_html = (
+            f'<p class="summary"><strong>{n}</strong> {noun} '
+            "across this diff:</p>\n"
+            f'    <div class="pills">\n      {chips}\n    </div>'
+        )
+
+    # Table body
+    if n == 0:
+        rows_html = (
+            '<tr><td colspan="4" class="empty">'
+            "No changes to display."
+            "</td></tr>"
+        )
+    else:
+        row_lines: list[str] = []
+        for change in changes:
+            cls = change.classification
+            cls_label = html.escape(_CLASSIFICATION_LABEL[cls])
+            emoji = _CLASSIFICATION_EMOJI[cls]
+            kind_title = html.escape(_humanize_kind_name(change.kind.name))
+            location = change.location or ""
+            cleaned = safe_location(location) if location else ""
+            obj_text = (
+                html.escape(cleaned) if cleaned
+                else html.escape(EMPTY_OR_ZERO_WIDTH_SENTINEL)
+            )
+            # Newlines in the message become `<br>` (same shape
+            # the markdown formatter uses).
+            message = html.escape(change.message).replace(
+                "\n", "<br>"
+            ).replace("\r", "")
+            row_lines.append(
+                f'      <tr class="row-{cls}">'
+                f'<td><span class="pill class-{cls}">'
+                f"{emoji} {cls_label}</span></td>"
+                f"<td>{kind_title}</td>"
+                f"<td><code>{obj_text}</code></td>"
+                f"<td>{message}</td>"
+                "</tr>"
+            )
+        rows_html = "\n".join(row_lines)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgrls diff</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+         Roboto, "Helvetica Neue", Arial, sans-serif;
+         margin: 2rem auto; max-width: 72rem; padding: 0 1rem;
+         color: #1f2328; background: #ffffff; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ color: #e6edf3; background: #0d1117; }}
+    table {{ border-color: #30363d; }}
+    th {{ background: #161b22; }}
+    tr td {{ background: #0d1117; }}
+    tr:nth-child(even) td {{ background: #161b22; }}
+    code {{ background: #161b22; }}
+  }}
+  header {{ margin-bottom: 1.5rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
+  .meta {{ color: #57606a; font-size: .85rem; }}
+  .summary {{ margin: 1rem 0 .5rem; font-size: 1rem; }}
+  .net-good {{ color: {_CLASSIFICATION_COLOR['safe']}; }}
+  .pills {{ display: flex; flex-wrap: wrap; gap: .5rem;
+            margin: 0 0 1.5rem 0; }}
+  .pill {{ display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }}
+  .class-safe            {{ color: {_CLASSIFICATION_COLOR['safe']}; }}
+  .class-requires_review {{ color: {_CLASSIFICATION_COLOR['requires_review']}; }}
+  .class-breaking        {{ color: {_CLASSIFICATION_COLOR['breaking']}; }}
+  .class-dangerous       {{ color: {_CLASSIFICATION_COLOR['dangerous']}; }}
+  table {{ width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }}
+  thead th {{ text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; white-space: nowrap; }}
+  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de;
+              vertical-align: top; }}
+  tbody tr:last-child td {{ border-bottom: 0; }}
+  code {{ background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
+  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
+  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>pgrls diff</h1>
+    <p class="meta">Generated by <code>pgrls diff --format html</code> · {html.escape(now)}</p>
+    {band_html}
+  </header>
+  <table>
+    <thead>
+      <tr>
+        <th>Classification</th>
+        <th>Kind</th>
+        <th>Object</th>
+        <th>Summary</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
+</body>
+</html>
+"""
+
+
 # Public constant for the CLI: the user-facing values for the
 # `pgrls diff --format` option. Mirrors `pgrls.formatters.
 # SUPPORTED_FORMATS` (the lint command's source of truth) and is
@@ -834,4 +1040,5 @@ DIFF_SUPPORTED_FORMATS: tuple[str, ...] = (
     "json",
     "sarif",
     "markdown",
+    "html",
 )
