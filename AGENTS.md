@@ -219,6 +219,16 @@ as an audit artefact, printing to PDF, or emailing to a reviewer
 who doesn't run pgrls. A snapshot for audits and onboarding; it
 runs no rules and emits no findings.
 
+`pgrls history <dir>` (v0.6.10+) reads a directory of JSON files
+written by `pgrls lint --format json` and emits a chronological
+trend: per-snapshot severity totals plus the **NEW / FIXED** delta
+between each pair of consecutive snapshots (findings keyed by
+`(rule_id, location)`, so a schema-wide finding with `location=None`
+is stable identity rather than NEW+FIXED on every comparison).
+Pair with a daily cron writing `snapshots/$(date -u +%FT%H%M%SZ).json`
+to track posture drift over time. text / JSON / Markdown output —
+the markdown form drops cleanly into a weekly engineering update.
+
 ## Auto-fix: `pgrls fix`
 
 `pgrls fix` generates remediation SQL for the rules whose fix is

@@ -250,6 +250,18 @@ pgrls report --database-url "$DATABASE_URL" --format html -o posture.html    # s
 
 Each table gets a coarse status — `protected` (RLS on, FORCE'd, ≥1 permissive policy), `not-forced` (RLS on with a permissive policy, but owner bypasses), `no-policies` (RLS on but no permissive policy → default-deny; covers zero policies *and* restrictive-only tables), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it — credited when that parent is among the scanned schemas), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
 
+## Tracking trends — `pgrls history`
+
+Pair a daily cron with `pgrls lint --format json -o snapshots/$(date -u +%FT%H%M%SZ).json` and ask `pgrls history snapshots/` weekly — "are we gaining ground over time, or is the findings count creeping up?"
+
+```bash
+pgrls history snapshots/                       # terminal table
+pgrls history snapshots/ --format markdown     # paste-ready GFM (for a weekly update / PR comment)
+pgrls history snapshots/ --format json -o trend.json   # machine-readable for plotting
+```
+
+Each row is one snapshot plus the **NEW** / **FIXED** delta vs. the prior snapshot in chronological order (findings keyed by `(rule_id, location)` so a schema-wide finding stays PERSISTENT rather than NEW+FIXED on every comparison). A trailing summary line names the net change over the full series.
+
 ## Configuration
 
 Drop a `pgrls.toml` next to your project. See `pgrls.example.toml` in the repo for a fully commented version.

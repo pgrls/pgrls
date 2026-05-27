@@ -58,6 +58,12 @@ from pgrls.fixers import (
     render_migration,
 )
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
+from pgrls.history import (
+    HISTORY_FORMATS,
+    build_rows,
+    load_snapshots,
+)
+from pgrls.history import render as render_history
 from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.report import REPORT_FORMATS, build_report
@@ -2162,6 +2168,71 @@ def report(
     if output_path is not None:
         # `newline=""` disables universal-newline translation so the
         # file matches stdout byte-for-byte (no `\n`→`\r\n` on Windows).
+        try:
+            Path(output_path).write_text(
+                rendered, encoding="utf-8", newline=""
+            )
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
+    else:
+        click.echo(rendered, nl=False)
+
+
+@main.command()
+@click.argument(
+    "directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the trend report to this file instead of stdout (any --format).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(list(HISTORY_FORMATS), case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def history(
+    directory: str,
+    output_path: str | None,
+    output_format: str,
+) -> None:
+    """Show the trend across a directory of `pgrls lint --format json` snapshots.
+
+    Each `*.json` file in DIRECTORY is parsed as a lint snapshot; the
+    file's mtime is its timestamp. Snapshots are ordered chronologically
+    and the per-snapshot delta — which findings are NEW vs FIXED relative
+    to the prior snapshot — is computed against `(rule_id, location)`
+    identity. The output is a per-snapshot row table plus a summary line
+    naming the net change over the full series.
+
+    Use it to answer "are we gaining ground over time?" — pair with a
+    cron job that runs `pgrls lint --format json -o snapshots/$(date
+    -u +%FT%H%M%SZ).json` daily and check `pgrls history snapshots/`
+    weekly. `--format json` / `markdown` emit machine-readable / paste-
+    ready output (the markdown form drops cleanly into a PR or weekly
+    update). `--output FILE` writes to a file instead of stdout.
+
+    Files that don't parse as the pgrls JSON shape are skipped with a
+    stderr warning; the report still renders for the readable ones.
+    """
+    try:
+        snapshots = load_snapshots(Path(directory))
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise ToolError(str(exc)) from exc
+
+    rows = build_rows(snapshots)
+    rendered = render_history(rows, output_format)  # type: ignore[arg-type]
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    if output_path is not None:
         try:
             Path(output_path).write_text(
                 rendered, encoding="utf-8", newline=""
