@@ -61,6 +61,7 @@ v0.6.10 baseline, mtime is enough.
 """
 from __future__ import annotations
 
+import html
 import json
 import sys
 from collections.abc import Iterable
@@ -97,8 +98,13 @@ class SnapshotRow:
     fixed_count: int
 
 
-HistoryFormat = Literal["text", "json", "markdown"]
-HISTORY_FORMATS: tuple[HistoryFormat, ...] = ("text", "json", "markdown")
+HistoryFormat = Literal["text", "json", "markdown", "html"]
+HISTORY_FORMATS: tuple[HistoryFormat, ...] = (
+    "text",
+    "json",
+    "markdown",
+    "html",
+)
 
 
 def _read_snapshot(path: Path) -> Snapshot | None:
@@ -341,10 +347,195 @@ def _summary_line(rows: list[SnapshotRow]) -> str:
     )
 
 
+def render_html(
+    rows: list[SnapshotRow],
+    *,
+    generated_at: datetime | None = None,
+) -> str:
+    """Standalone HTML trend page — no external dependencies.
+
+    Mirrors `pgrls report --format html` for the same reading
+    context: archive as the weekly engineering-review artefact,
+    print to PDF for a quarterly compliance file, email to a
+    stakeholder who doesn't run pgrls. Embedded CSS, no `<link>`
+    / `<script>` — opens offline, renders identically in browsers
+    and `wkhtmltopdf`-style PDF converters.
+
+    Each snapshot renders as one row with severity totals + the
+    NEW/FIXED delta vs. the prior snapshot. A summary band on top
+    surfaces the net change over the series at a glance. The
+    NEW / FIXED columns highlight by colour when non-zero
+    (red for new, green for fixed) so the at-a-glance read of
+    "are we gaining ground" doesn't require parsing the trailing
+    summary sentence.
+
+    `generated_at` is optional and defaults to `datetime.now(utc)`
+    — same contract `report.render_html` exposes, including the
+    naive-datetime rejection. Pass an explicit tz-aware datetime
+    for deterministic snapshot tests, or to reflect the time of
+    an earlier history-build (e.g. when the HTML is rendered
+    offline from a cached series).
+
+    Snapshot filenames are HTML-escaped — a directory contaminated
+    with a filename containing `<` or `&` can't break the layout
+    or inject markup. Same defence the report formatter applies
+    to qualified identifiers.
+    """
+    if generated_at is None:
+        generated_at = datetime.now(timezone.utc)
+    elif generated_at.tzinfo is None:
+        raise ValueError(
+            "render_html: generated_at must be timezone-aware; "
+            "a naive datetime would be interpreted as local time, "
+            "producing a wrong audit timestamp depending on the "
+            "host. Pass `datetime.now(timezone.utc)` or attach an "
+            "explicit tzinfo."
+        )
+    now = (
+        generated_at
+        .astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    summary = _summary_dict(rows)
+    summary_sentence = html.escape(_summary_line(rows))
+
+    if not rows:
+        rows_html = (
+            '<tr><td colspan="8" class="empty">'
+            "No snapshots found."
+            "</td></tr>"
+        )
+    else:
+        row_lines: list[str] = []
+        for row in rows:
+            snap = row.snapshot
+            ts = snap.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+            fn = html.escape(snap.path.name)
+            new_cls = " class=\"num new\"" if row.new_count else ' class="num"'
+            fix_cls = (
+                ' class="num fixed"' if row.fixed_count else ' class="num"'
+            )
+            new_cell = str(row.new_count) if row.new_count else "—"
+            fix_cell = (
+                str(row.fixed_count) if row.fixed_count else "—"
+            )
+            row_lines.append(
+                f"      <tr>"
+                f"<td>{ts}</td>"
+                f"<td><code>{fn}</code></td>"
+                f'<td class="num">{snap.raw_total}</td>'
+                f'<td class="num">{snap.counts.get("error", 0)}</td>'
+                f'<td class="num">{snap.counts.get("warning", 0)}</td>'
+                f'<td class="num">{snap.counts.get("info", 0)}</td>'
+                f"<td{new_cls}>{new_cell}</td>"
+                f"<td{fix_cls}>{fix_cell}</td>"
+                "</tr>"
+            )
+        rows_html = "\n".join(row_lines)
+
+    # Summary band — a one-row strip showing first→last totals
+    # and the net change. Coloured by sign so the at-a-glance
+    # read matches the table-row NEW/FIXED colours.
+    net = summary["net_change"]
+    if summary["snapshots"] == 0:
+        band_html = '<p class="summary">No snapshots in this directory.</p>'
+    elif summary["snapshots"] == 1:
+        n = summary["first_total"]
+        band_html = (
+            f'<p class="summary"><strong>{n}</strong> finding'
+            f"{'s' if n != 1 else ''} in the only snapshot.</p>"
+        )
+    else:
+        net_cls = "net-good" if net < 0 else ("net-bad" if net > 0 else "net-flat")
+        sign = "+" if net > 0 else ""
+        band_html = (
+            f'<p class="summary"><strong>{summary["first_total"]}</strong>'
+            f" → <strong>{summary['last_total']}</strong> findings across "
+            f"<strong>{summary['snapshots']}</strong> snapshots "
+            f'(<span class="{net_cls}">net {sign}{net}</span>; '
+            f"{summary['total_new']} new, {summary['total_fixed']} fixed).</p>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgrls history</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+         Roboto, "Helvetica Neue", Arial, sans-serif;
+         margin: 2rem auto; max-width: 72rem; padding: 0 1rem;
+         color: #1f2328; background: #ffffff; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ color: #e6edf3; background: #0d1117; }}
+    table {{ border-color: #30363d; }}
+    th {{ background: #161b22; }}
+    tr td {{ background: #0d1117; }}
+    tr:nth-child(even) td {{ background: #161b22; }}
+    code {{ background: #161b22; }}
+  }}
+  header {{ margin-bottom: 1.5rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
+  .meta {{ color: #57606a; font-size: .85rem; }}
+  .summary {{ margin: 1rem 0 1.5rem; font-size: 1rem; }}
+  .net-good {{ color: #1a7f37; font-weight: 600; }}
+  .net-bad  {{ color: #cf222e; font-weight: 600; }}
+  .net-flat {{ color: #57606a; font-weight: 600; }}
+  table {{ width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }}
+  thead th {{ text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; white-space: nowrap; }}
+  thead th.num {{ text-align: right; }}
+  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
+  tbody tr:last-child td {{ border-bottom: 0; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.new {{ color: #cf222e; font-weight: 600; }}
+  td.fixed {{ color: #1a7f37; font-weight: 600; }}
+  code {{ background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
+  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
+  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>pgrls history</h1>
+    <p class="meta">Generated by <code>pgrls history --format html</code> · {html.escape(now)}</p>
+    {band_html}
+  </header>
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>File</th>
+        <th class="num">Total</th>
+        <th class="num">Error</th>
+        <th class="num">Warn</th>
+        <th class="num">Info</th>
+        <th class="num">New</th>
+        <th class="num">Fixed</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a> · <em>{summary_sentence}</em></footer>
+</body>
+</html>
+"""
+
+
 _RENDERERS = {
     "text": render_text,
     "json": render_json,
     "markdown": render_markdown,
+    "html": render_html,
 }
 
 

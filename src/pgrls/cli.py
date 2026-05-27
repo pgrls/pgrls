@@ -2225,7 +2225,10 @@ def history(
     -u +%FT%H%M%SZ).json` daily and check `pgrls history snapshots/`
     weekly. `--format json` / `markdown` emit machine-readable / paste-
     ready output (the markdown form drops cleanly into a PR or weekly
-    update). `--output FILE` writes to a file instead of stdout.
+    update); `--format html` emits a standalone trend page (embedded
+    CSS, no external assets) suitable for archiving as a quarterly
+    review artefact or printing to PDF. `--output FILE` writes to a
+    file instead of stdout.
 
     Files that don't parse as the pgrls JSON shape are skipped with a
     stderr warning; the report still renders for the readable ones.

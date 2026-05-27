@@ -17,6 +17,7 @@ from pgrls.history import (
     build_rows,
     load_snapshots,
     render,
+    render_html,
     render_json,
     render_markdown,
     render_text,
@@ -385,3 +386,230 @@ def test_history_cli_empty_directory_renders_no_snapshots(
     result = CliRunner().invoke(main, ["history", str(tmp_path)])
     assert result.exit_code == 0, result.output
     assert "No snapshots" in result.output
+
+
+# ──────────────────────────────────────────────────────────────────
+# HTML format
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_render_html_is_self_contained_document() -> None:
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset({FindingKey("SEC001", "public.t1")}),
+            raw_total=1,
+            counts={"error": 1, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(rows)
+    assert out.startswith("<!DOCTYPE html>")
+    assert '<html lang="en">' in out
+    assert "</html>" in out
+    # Embedded style block — no external CSS/JS, so the page
+    # opens offline and renders identically in `wkhtmltopdf`-style
+    # tools (same constraint pgrls report --format html honours).
+    assert "<style>" in out and "</style>" in out
+    assert "<link" not in out
+    assert "<script" not in out
+
+
+def test_render_html_carries_iso_utc_timestamp() -> None:
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(rows)
+    import re
+    assert re.search(
+        r"\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+        r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\dZ",
+        out,
+    )
+
+
+def test_render_html_accepts_injected_generated_at() -> None:
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+    ])
+    fixed = datetime(2026, 1, 15, 10, 30, 45, tzinfo=timezone.utc)
+    out = render_html(rows, generated_at=fixed)
+    assert "2026-01-15T10:30:45Z" in out
+
+
+def test_render_html_rejects_naive_generated_at() -> None:
+    # Mirrors pgrls report --format html: naive datetimes silently
+    # become wrong-by-host-timezone audit timestamps, so the
+    # renderer refuses at the boundary.
+    import pytest
+    rows: list[SnapshotRow] = []
+    with pytest.raises(ValueError, match="timezone-aware"):
+        render_html(rows, generated_at=datetime(2026, 1, 15, 10, 30))
+
+
+def test_render_html_normalizes_non_utc_generated_at_to_utc() -> None:
+    from datetime import timedelta
+    cet = timezone(timedelta(hours=1))
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(
+        rows, generated_at=datetime(2026, 1, 15, 11, 30, 45, tzinfo=cet)
+    )
+    assert "2026-01-15T10:30:45Z" in out  # CET 11:30 → UTC 10:30
+
+
+def test_render_html_table_carries_per_snapshot_rows() -> None:
+    rows = build_rows([
+        Snapshot(
+            path=Path("2026-05-15.json"),
+            timestamp=datetime(2026, 5, 15, 8, tzinfo=timezone.utc),
+            findings=frozenset({
+                FindingKey("SEC001", "public.t1"),
+                FindingKey("SEC002", "public.t2"),
+            }),
+            raw_total=2,
+            counts={"error": 2, "warning": 0, "info": 0},
+        ),
+        Snapshot(
+            path=Path("2026-05-20.json"),
+            timestamp=datetime(2026, 5, 20, 8, tzinfo=timezone.utc),
+            findings=frozenset({FindingKey("SEC001", "public.t1")}),
+            raw_total=1,
+            counts={"error": 1, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(rows)
+    # Both filenames render (rendered as `<code>filename</code>`
+    # mirroring the report formatter's identifier shape).
+    assert "<code>2026-05-15.json</code>" in out
+    assert "<code>2026-05-20.json</code>" in out
+    # Both timestamps render in ISO-Z form.
+    assert "2026-05-15T08:00:00Z" in out
+    assert "2026-05-20T08:00:00Z" in out
+    # NEW/FIXED highlight by colour when non-zero — the
+    # `new` and `fixed` CSS classes carry the visual weight.
+    # 2nd snapshot fixed 1 (SEC002) and added 0.
+    assert "td class=\"num fixed\">1<" in out
+
+
+def test_render_html_summary_band_shows_net_change_for_multi_snapshot() -> None:
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset({FindingKey("SEC001", "t1"), FindingKey("SEC002", "t2")}),
+            raw_total=2,
+            counts={"error": 2, "warning": 0, "info": 0},
+        ),
+        Snapshot(
+            path=Path("b.json"),
+            timestamp=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(rows)
+    # Summary band renders 2 → 0 with a green "net -2" badge.
+    assert "<strong>2</strong>" in out
+    assert "<strong>0</strong>" in out
+    assert "net-good" in out  # net change is negative → good
+    assert "net -2" in out
+
+
+def test_render_html_summary_band_shows_negative_growth_as_bad() -> None:
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+        Snapshot(
+            path=Path("b.json"),
+            timestamp=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            findings=frozenset({FindingKey("SEC001", "t1")}),
+            raw_total=1,
+            counts={"error": 1, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(rows)
+    assert "net-bad" in out  # finding count grew → bad
+    assert "net +1" in out
+
+
+def test_render_html_empty_rows_renders_placeholder() -> None:
+    out = render_html([])
+    assert "<!DOCTYPE html>" in out
+    assert "No snapshots" in out
+    assert "No snapshots in this directory" in out
+
+
+def test_render_html_escapes_special_chars_in_filename() -> None:
+    # A directory could (rarely) contain a filename with `<`, `>`,
+    # `&` — Postgres backups dumped from scripts that templated the
+    # filename without sanitization. Escape to keep the layout
+    # intact and prevent script-injection if the HTML is opened in
+    # a browser from an untrusted source.
+    rows = build_rows([
+        Snapshot(
+            path=Path('weird<name>&.json'),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render_html(rows)
+    assert "weird&lt;name&gt;&amp;.json" in out
+    # The literal `<name>` must not appear as a tag.
+    assert "<name>" not in out
+
+
+def test_render_html_is_registered_format() -> None:
+    assert "html" in HISTORY_FORMATS
+    rows = build_rows([
+        Snapshot(
+            path=Path("a.json"),
+            timestamp=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=0,
+            counts={"error": 0, "warning": 0, "info": 0},
+        ),
+    ])
+    out = render(rows, "html")
+    assert out.startswith("<!DOCTYPE html>")
+
+
+def test_history_cli_html_format(tmp_path: Path) -> None:
+    _write_snapshot(
+        tmp_path / "only.json",
+        [_v("SEC001", "t1")],
+        mtime=datetime(2026, 5, 10, tzinfo=timezone.utc),
+    )
+    result = CliRunner().invoke(
+        main, ["history", str(tmp_path), "--format", "html"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "<!DOCTYPE html>" in result.output
+    assert "pgrls history" in result.output
