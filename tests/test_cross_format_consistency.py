@@ -695,3 +695,299 @@ def test_diff_empty_changes_consistent_across_formats() -> None:
     assert "No changes in this diff" in html_out
     assert json_payload["violations"] == []
     assert sarif_payload["runs"][0]["results"] == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# pgrls explain — four renderers agree on the catalog + per-rule
+# ──────────────────────────────────────────────────────────────────
+#
+# `pgrls explain` reached its full format set in v0.6.21 (text /
+# markdown / json / html). Each renderer is hand-written from the
+# same Rule registry; a hand-rolled formatter that silently drops a
+# rule (e.g. by misfiltering on an attribute) would only fail its
+# own test file. Pin the cross-format invariants explicitly.
+
+from click.testing import CliRunner  # noqa: E402
+
+from pgrls import __version__  # noqa: E402
+from pgrls.cli import (  # noqa: E402
+    _fixable_rule_ids,
+    _render_catalog_html,
+    _render_catalog_json,
+    _render_catalog_markdown,
+    _render_rule_html,
+    _render_rule_json,
+    _render_rule_markdown,
+    _rule_docstring_body,
+    main as cli_main,
+)
+from pgrls.rules import all_rules  # noqa: E402
+
+
+def test_explain_catalog_all_four_formats_agree_on_rule_count() -> None:
+    """The number of rules in the catalog must be the same regardless
+    of which renderer surfaces it. JSON exposes `count` explicitly;
+    text/markdown/html have one row per rule that we count via the
+    rendered markup."""
+    rules = list(all_rules())
+    fixable = _fixable_rule_ids()
+    expected = len(rules)
+
+    runner = CliRunner()
+    text_out = runner.invoke(cli_main, ["explain"]).output
+    md_out = _render_catalog_markdown(rules)
+    html_out = _render_catalog_html(rules, fixable_ids=fixable)
+    json_payload = json.loads(
+        _render_catalog_json(rules, fixable_ids=fixable)
+    )
+
+    # JSON: explicit count + array length
+    assert json_payload["count"] == expected
+    assert len(json_payload["rules"]) == expected
+
+    # Text: one rule per line — count lines matching the
+    # `<ID>      [<sev>]   <title>` shape via the leading rule-id
+    # token. The footer line ("Run `pgrls explain ...`") doesn't
+    # match this pattern.
+    text_rule_lines = [
+        ln for ln in text_out.splitlines()
+        if re.match(r"^[A-Z]+\d{3}\s+\[", ln)
+    ]
+    assert len(text_rule_lines) == expected
+
+    # Markdown: one data row per rule in the table body.
+    md_rows = [
+        ln for ln in md_out.splitlines()
+        if ln.startswith("| ") and not ln.startswith("| ID ")
+        and not ln.startswith("|---")
+    ]
+    assert len(md_rows) == expected
+
+    # HTML: one `<tr>` per rule in tbody.
+    body = re.search(r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL)
+    assert body is not None
+    tr_opens = re.findall(r"<tr>", body.group(1))
+    assert len(tr_opens) == expected
+
+
+def test_explain_catalog_every_rule_id_surfaces_in_every_format() -> None:
+    """A rule that's silently filtered out of one renderer (e.g. by a
+    severity guard the others don't share) would fail this without
+    affecting any per-renderer test."""
+    rules = list(all_rules())
+    fixable = _fixable_rule_ids()
+    expected_ids = {r.id for r in rules}
+
+    runner = CliRunner()
+    text_out = runner.invoke(cli_main, ["explain"]).output
+    md_out = _render_catalog_markdown(rules)
+    html_out = _render_catalog_html(rules, fixable_ids=fixable)
+    json_payload = json.loads(
+        _render_catalog_json(rules, fixable_ids=fixable)
+    )
+
+    json_ids = {r["id"] for r in json_payload["rules"]}
+    assert json_ids == expected_ids
+
+    for rid in expected_ids:
+        assert rid in text_out, f"text missing {rid}"
+        assert rid in md_out, f"markdown missing {rid}"
+        assert rid in html_out, f"html missing {rid}"
+
+
+def test_explain_catalog_every_rule_severity_surfaces_in_every_format() -> None:
+    """Per-rule severity must be consistent across formats.
+    A hand-rolled renderer that swapped error↔warning for one rule
+    would fail this test."""
+    rules = list(all_rules())
+    fixable = _fixable_rule_ids()
+
+    runner = CliRunner()
+    text_out = runner.invoke(cli_main, ["explain"]).output
+    md_out = _render_catalog_markdown(rules)
+    html_out = _render_catalog_html(rules, fixable_ids=fixable)
+    json_payload = json.loads(
+        _render_catalog_json(rules, fixable_ids=fixable)
+    )
+
+    # Index by rule id for fast lookup.
+    json_severity_by_id = {
+        r["id"]: r["severity"] for r in json_payload["rules"]
+    }
+    assert json_severity_by_id == {r.id: r.severity for r in rules}
+
+    # In text catalog, severity sits next to ID as `<ID>      [<sev>]`.
+    # Index HTML rows by id once so the per-rule severity check can't
+    # drift across rows (see fixable-flag test for the same pattern).
+    body_match = re.search(
+        r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL
+    )
+    assert body_match is not None
+    rows_by_id: dict[str, str] = {}
+    for row in re.findall(r"<tr>.*?</tr>", body_match.group(1), flags=re.DOTALL):
+        id_match = re.search(r"<code>([A-Z]+\d+)</code>", row)
+        if id_match:
+            rows_by_id[id_match.group(1)] = row
+
+    for r in rules:
+        assert f"{r.id:<8} [{r.severity}]" in text_out, (
+            f"text missing severity for {r.id}"
+        )
+        # Markdown table row: `| <ID> | <sev> | <title> |`.
+        assert f"| {r.id} | {r.severity} |" in md_out, (
+            f"markdown missing severity for {r.id}"
+        )
+        # HTML row: pill with `sev-<sev>` class on the row for that ID.
+        row_html = rows_by_id.get(r.id)
+        assert row_html is not None, f"html missing row for {r.id}"
+        assert f'class="pill sev-{r.severity}"' in row_html, (
+            f"html severity mismatch for {r.id}"
+        )
+
+
+def test_explain_catalog_json_and_html_agree_on_fixable_flag() -> None:
+    """JSON exposes `fixable` per rule; HTML renders a `✦ fix` badge
+    in the Fixable column. Both must agree with `_fixable_rule_ids()`."""
+    rules = list(all_rules())
+    fixable = _fixable_rule_ids()
+    json_payload = json.loads(
+        _render_catalog_json(rules, fixable_ids=fixable)
+    )
+    html_out = _render_catalog_html(rules, fixable_ids=fixable)
+
+    json_fixable = {r["id"] for r in json_payload["rules"] if r["fixable"]}
+    assert json_fixable == fixable
+
+    # Index each rule's row by ID. Split on row close so the regex
+    # can't drift across rules (a lazy `<tr>.*?<code>SEC003` will
+    # start at SEC001's `<tr>` and span every row in between).
+    body_match = re.search(
+        r"<tbody>(.*?)</tbody>", html_out, flags=re.DOTALL
+    )
+    assert body_match is not None
+    rows_by_id: dict[str, str] = {}
+    for row in re.findall(r"<tr>.*?</tr>", body_match.group(1), flags=re.DOTALL):
+        id_match = re.search(r"<code>([A-Z]+\d+)</code>", row)
+        if id_match:
+            rows_by_id[id_match.group(1)] = row
+
+    # HTML: locate each fixable rule's row and confirm the `fix` badge
+    # is in its Fixable cell; non-fixable rules must NOT carry one.
+    for r in rules:
+        row_html = rows_by_id.get(r.id)
+        assert row_html is not None, f"html missing row for {r.id}"
+        if r.id in fixable:
+            assert '<span class="fixable">' in row_html, (
+                f"html missing fix badge for fixable rule {r.id}"
+            )
+        else:
+            assert '<span class="fixable">' not in row_html, (
+                f"html has fix badge for non-fixable rule {r.id}"
+            )
+
+
+def test_explain_single_rule_metadata_consistent_across_formats() -> None:
+    """For a single-rule invocation, every format must surface the
+    same id + severity + title. Pinned for every registered rule —
+    a renderer drifting from the Rule object for one specific rule
+    would otherwise pass per-renderer tests that only sampled one
+    sentinel."""
+    fixable = _fixable_rule_ids()
+    runner = CliRunner()
+    for rule in all_rules():
+        text_out = runner.invoke(cli_main, ["explain", rule.id]).output
+        md = _render_rule_markdown(rule)
+        html_out = _render_rule_html(rule, fixable_ids=fixable)
+        payload = json.loads(
+            _render_rule_json(rule, fixable_ids=fixable)
+        )
+
+        # JSON: explicit fields.
+        assert payload["id"] == rule.id
+        assert payload["severity"] == rule.severity
+        assert payload["title"] == rule.title
+
+        # Text: `<ID>  [<sev>]  <title>` header line.
+        assert (
+            f"{rule.id}  [{rule.severity}]  {rule.title}" in text_out
+        )
+
+        # Markdown: `## <ID> — <title>` heading + `**Severity:**` line.
+        assert f"## {rule.id} — {rule.title}" in md
+        assert f"**Severity:** {rule.severity}" in md
+
+        # HTML: title in `<h1>`, severity in pill, ID in `<code>` in
+        # CLI hint. Title is `html.escape`d in the rendered page —
+        # apostrophes in rule titles (e.g. SEC014's "caller's RLS")
+        # become `&#x27;` — so escape the expected substring too.
+        import html as _html_consistency_inner
+        expected_h1 = (
+            f"{rule.id} — {_html_consistency_inner.escape(rule.title)}"
+        )
+        assert expected_h1 in html_out, (
+            f"html missing h1 for {rule.id}"
+        )
+        assert f'class="pill sev-{rule.severity}"' in html_out
+
+
+def test_explain_single_rule_reference_body_consistent_across_formats() -> None:
+    """The rule's reference body (docstring minus title line) must
+    surface verbatim in every renderer. The strongest of the explain
+    consistency invariants: pins that all four formats share
+    `_rule_docstring_body` as the source of truth."""
+    fixable = _fixable_rule_ids()
+    runner = CliRunner()
+    for rule in all_rules():
+        body = _rule_docstring_body(rule)
+        if not body:
+            # Rules with no extended reference have nothing to pin.
+            continue
+        # Use a stable substring — the body's first non-blank line —
+        # so the assertion isn't sensitive to surrounding whitespace
+        # / trailing newline differences across renderers.
+        first_line = next(
+            (ln for ln in body.splitlines() if ln.strip()),
+            None,
+        )
+        if first_line is None:
+            continue
+
+        text_out = runner.invoke(cli_main, ["explain", rule.id]).output
+        md = _render_rule_markdown(rule)
+        html_out = _render_rule_html(rule, fixable_ids=fixable)
+        payload = json.loads(
+            _render_rule_json(rule, fixable_ids=fixable)
+        )
+
+        # JSON: the explicit `reference` field equals the body.
+        assert payload["reference"] == body, (
+            f"json reference drift for {rule.id}"
+        )
+        assert first_line in text_out, (
+            f"text missing reference body for {rule.id}"
+        )
+        assert first_line in md, (
+            f"markdown missing reference body for {rule.id}"
+        )
+        # HTML escapes `<`/`>`/`&` in the body — escape the
+        # first line the same way so the assertion stays correct
+        # for docstrings carrying any of those.
+        import html as _html_consistency
+        assert _html_consistency.escape(first_line) in html_out, (
+            f"html missing reference body for {rule.id}"
+        )
+
+
+def test_explain_catalog_html_version_string_matches_json() -> None:
+    """`pgrls_version` is the source of truth for which release is
+    being documented. JSON exposes it explicitly; HTML embeds it in
+    the meta line. They must agree."""
+    rules = list(all_rules())
+    fixable = _fixable_rule_ids()
+    json_payload = json.loads(
+        _render_catalog_json(rules, fixable_ids=fixable)
+    )
+    html_out = _render_catalog_html(rules, fixable_ids=fixable)
+
+    assert json_payload["pgrls_version"] == __version__
+    assert f"pgrls {__version__}" in html_out

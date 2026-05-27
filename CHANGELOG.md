@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-05-27
+
+### Added
+
+- **Cross-format consistency tests for `pgrls explain`** — completes
+  the v0.6.17 / v0.6.20 pattern (lint, report, history, diff already
+  pinned). Seven new tests assert that all four explain renderers
+  (text / markdown / json / html) agree on:
+
+  - Catalog rule count (JSON `count`, text rule-line count, markdown
+    table-body row count, HTML tbody `<tr>` count all match
+    `len(all_rules())`).
+  - Every rule ID surfaces in every format.
+  - Per-rule severity is consistent (text `[<sev>]`, markdown column,
+    HTML `sev-<sev>` pill class, JSON field).
+  - JSON `fixable` flag and HTML `✦ fix` badge agree per rule.
+  - Single-rule mode: `id` / `severity` / `title` consistent across
+    text, markdown, JSON, and HTML (HTML title gets `html.escape`d
+    for apostrophe-bearing titles like SEC014's "caller's RLS").
+  - Rule reference body (docstring minus title) surfaces in every
+    format — first non-blank line is the stable anchor; HTML escapes
+    it the same way the renderer does.
+  - HTML catalog's `pgrls {__version__}` meta line matches JSON's
+    `pgrls_version` field.
+
+  Test-only release — no CLI, snapshot, or behavior change.
+
 ## [0.6.22] - 2026-05-27
 
 ### Added
