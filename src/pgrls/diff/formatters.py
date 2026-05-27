@@ -739,6 +739,14 @@ def _markdown_summary_cell(message: str) -> str:
     line-break GFM accepts). Backslashes pass through unchanged —
     diff messages today don't contain literal backslashes
     intended as escapes.
+
+    Forward-looking caveat: if a future ChangeKind routes
+    operator-supplied SQL into `Change.message` (today every
+    message is built from `_SUMMARY_BY_KIND` + plain ASCII
+    interpolation), add `.replace("\\\\", "\\\\\\\\")` here for
+    parity with the lint markdown `_escape_cell` — otherwise a
+    literal backslash in the message could render as an
+    unintended escape on the GFM consumer side.
     """
     return (
         message
