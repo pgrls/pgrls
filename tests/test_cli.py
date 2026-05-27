@@ -39,6 +39,31 @@ def test_root_version_flag():
     assert __version__ in result.output
 
 
+def test_package_version_matches_pyproject() -> None:
+    # `pgrls.__version__` is sourced from `importlib.metadata.version`,
+    # which reads the installed distribution's metadata. That metadata
+    # is written from `pyproject.toml`'s `[project].version` at install
+    # time. Without this assertion, a previous regression went silent
+    # for 22 patch releases: `__version__` was hard-coded to "0.6.0"
+    # while pyproject was bumped each release, so every test comparing
+    # `__version__` to itself passed for the wrong reason. Compare
+    # the two sources directly.
+    import tomllib
+    from pathlib import Path
+
+    from pgrls import __version__
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text())
+    assert __version__ == pyproject["project"]["version"], (
+        f"pgrls.__version__ ({__version__!r}) does not match "
+        f"pyproject [project].version "
+        f"({pyproject['project']['version']!r}); re-run "
+        "`pip install -e .` to refresh the editable install's "
+        "metadata."
+    )
+
+
 def test_python_dash_m_pgrls_invokes_cli(monkeypatch, capsys) -> None:
     # `python -m pgrls` runs `src/pgrls/__main__.py`, whose
     # `if __name__ == "__main__": main()` block dispatches to the CLI.
