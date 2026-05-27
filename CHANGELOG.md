@@ -10,6 +10,25 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-05-27
+
+### Tests
+
+- **Cross-format consistency tests for `pgrls diff`** — pin that
+  all five renderers (text / json / sarif / markdown / html) agree
+  on the same input. Caught a real label inconsistency in the
+  process: `_BUCKET_LABEL["requires_review"]` is `"requires-review"`
+  (with hyphen), and the consistency test made the wording explicit
+  in the contract rather than the implementation detail it had
+  been. Five new tests covering: total change count agreement
+  across all five formats; per-classification count agreement;
+  every Change.location surfaces in every format; predicate
+  before/after SQL renders consistently in text+html for
+  USING_*/WITH_CHECK_* kinds (markdown deliberately summary-only);
+  empty-changes case consistent across all five.
+
+  Test-only release — no source / behavior change.
+
 ## [0.6.19] - 2026-05-27
 
 ### Added
