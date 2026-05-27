@@ -21,6 +21,7 @@ from pgrls.fixers.sec006 import SEC006Fixer
 from pgrls.fixers.sec011 import SEC011Fixer
 from pgrls.fixers.sec019 import SEC019Fixer
 from pgrls.fixers.sec020 import SEC020Fixer
+from pgrls.fixers.sec017 import SEC017Fixer
 from pgrls.fixers.sec031 import SEC031Fixer
 from pgrls.fixers.sec032 import SEC032Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
@@ -1584,6 +1585,160 @@ def test_sec031_fix_raises_on_malformed_allowlist() -> None:
         SEC031Fixer().fix(schema, {"allowlist": "public.t.floor"})
     with pytest.raises(TypeError, match="allowlist"):
         SEC031Fixer().fix(schema, {"allowlist": [" public.t.floor "]})
+
+
+# ---------- SEC017 fixer ----------
+
+
+def _leakproof(qname: str, signature: str = "") -> Any:
+    """Local helper for SEC017Fixer tests. Inlined LeakproofFunction
+    constructor — duplicating the shape rather than importing the
+    one from `tests/rules/test_sec017.py` to keep the fixer-test
+    file self-contained (test_fixers.py never imports across the
+    `tests/rules/` directory)."""
+    from pgrls.model import LeakproofFunction
+    return LeakproofFunction(qualified_name=qname, signature=signature)
+
+
+def test_sec017_fix_emits_alter_function_not_leakproof() -> None:
+    schema = Schema(
+        leakproof_functions=(_leakproof("public.fast_eq", "integer"),),
+    )
+    fixes = SEC017Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC017"
+    assert f.location == "public.fast_eq(integer)"
+    assert f.sql == (
+        "ALTER FUNCTION public.fast_eq(integer) NOT LEAKPROOF;"
+    )
+
+
+def test_sec017_fix_emits_one_fix_per_overload() -> None:
+    # Snapshot v12+ captures one entry per overload, and each
+    # overload needs its own ALTER FUNCTION — distinct from how
+    # SEC017's rule reports per qualified name. Pinning the
+    # per-overload-fix contract.
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("public.fast_eq", "integer"),
+            _leakproof("public.fast_eq", "text"),
+        ),
+    )
+    fixes = SEC017Fixer().fix(schema, {})
+    assert sorted(f.sql for f in fixes) == [
+        "ALTER FUNCTION public.fast_eq(integer) NOT LEAKPROOF;",
+        "ALTER FUNCTION public.fast_eq(text) NOT LEAKPROOF;",
+    ]
+
+
+def test_sec017_fix_abstains_on_empty_signature_from_pre_v12_snapshot() -> None:
+    # A LeakproofFunction loaded from a pre-v12 snapshot has
+    # signature="" (the older introspection didn't capture it).
+    # Emitting `ALTER FUNCTION name() NOT LEAKPROOF` would target
+    # the zero-arg overload, wrong for every function with args.
+    # The fixer abstains — the operator re-snapshots to populate
+    # signatures, then re-runs `pgrls fix`.
+    schema = Schema(
+        leakproof_functions=(_leakproof("public.fast_eq", ""),),
+    )
+    assert SEC017Fixer().fix(schema, {}) == []
+
+
+def test_sec017_fix_mixed_pre_v12_and_v12_only_emits_for_v12_entries() -> None:
+    # A schema mixing pre-v12 (signature="") and v12+ (signature
+    # populated) entries — only the v12+ entries get a Fix.
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("public.legacy", ""),
+            _leakproof("public.fresh", "integer"),
+        ),
+    )
+    fixes = SEC017Fixer().fix(schema, {})
+    assert [f.location for f in fixes] == ["public.fresh(integer)"]
+
+
+def test_sec017_fix_respects_allowlist_qualified() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("public.fast_eq", "integer"),
+            _leakproof("audit.redact", "text"),
+        ),
+    )
+    fixes = SEC017Fixer().fix(
+        schema, {"allowlist": ["public.fast_eq"]}
+    )
+    assert [f.location for f in fixes] == ["audit.redact(text)"]
+
+
+def test_sec017_fix_allowlist_silences_every_overload() -> None:
+    # The allowlist key is the qualified name (matches SEC017's
+    # rule semantics) — silencing `public.fast_eq` skips both
+    # the (integer) and (text) overloads even though they are
+    # separate entries.
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("public.fast_eq", "integer"),
+            _leakproof("public.fast_eq", "text"),
+        ),
+    )
+    assert SEC017Fixer().fix(
+        schema, {"allowlist": ["public.fast_eq"]}
+    ) == []
+
+
+def test_sec017_fix_description_names_overload_and_alternative() -> None:
+    # The description must name the specific overload (so the
+    # operator sees what's being fixed) and surface SEC017's other
+    # remedy (audit + allowlist).
+    schema = Schema(
+        leakproof_functions=(_leakproof("audit.redact", "text"),),
+    )
+    [f] = SEC017Fixer().fix(schema, {})
+    assert "audit.redact(text)" in f.description
+    assert "allowlist" in f.description.lower()
+    assert "[lint.rules.SEC017]" in f.description
+
+
+def test_sec017_fix_raises_on_malformed_allowlist() -> None:
+    schema = Schema(
+        leakproof_functions=(_leakproof("public.fast_eq", "integer"),),
+    )
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC017Fixer().fix(schema, {"allowlist": "public.fast_eq"})
+    with pytest.raises(TypeError, match="allowlist"):
+        SEC017Fixer().fix(
+            schema, {"allowlist": [" public.fast_eq "]}
+        )
+
+
+def test_sec017_fix_quotes_mixed_case_function_name() -> None:
+    # `qualified_name` arrives raw from introspection (no Postgres-
+    # style quoting). A mixed-case function name or one matching
+    # a reserved keyword must be quoted in the emitted SQL or psql
+    # rejects the statement. Route through `quote_qualified` like
+    # SEC031 / SEC011 / SEC001 already do.
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("public.FastEq", "integer"),
+        ),
+    )
+    [f] = SEC017Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public."FastEq"(integer) NOT LEAKPROOF;'
+    )
+
+
+def test_sec017_fix_quotes_reserved_keyword_schema() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof("order.fast_eq", "integer"),
+        ),
+    )
+    [f] = SEC017Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION "order".fast_eq(integer) NOT LEAKPROOF;'
+    )
 
 
 # ---------- SEC032 fixer ----------

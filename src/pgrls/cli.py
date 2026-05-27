@@ -723,7 +723,9 @@ def fix(
     an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
     `, true` to one-arg `current_setting()` calls), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
-    check with USING), SEC031 (`DROP POLICY` for a no-op
+    check with USING), SEC017 (`ALTER FUNCTION ... NOT LEAKPROOF`
+    per overload, using the per-overload signature captured in
+    snapshot v12), SEC031 (`DROP POLICY` for a no-op
     restrictive `USING (true)` floor), SEC032 (`ALTER TABLE …
     ENABLE ROW LEVEL SECURITY` for a dormant-policies table),
     PERF001 (wrap unwrapped auth calls in
