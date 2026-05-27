@@ -10,6 +10,38 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-05-27
+
+### Added
+
+- **`pgrls lint --format html`** — standalone HTML page for lint
+  findings, distinct from `pr-comment` (which is Markdown + embedded
+  HTML `<details>` blocks for GitHub PR comments) and `markdown`
+  (pipe table for runbooks). Same self-contained shape every other
+  pgrls HTML formatter (`report` / `history` / `diff` / `explain`)
+  uses: embedded CSS, no external assets, light/dark via
+  `prefers-color-scheme`, ISO-Z generation timestamp.
+
+  Each violation renders as one row with severity emoji + coloured
+  pill, rule ID linked to `docs/RULES.md` anchor, location in a
+  `<code>` block, and the message body. Empty case gets a green
+  "No findings" banner instead of an empty table.
+
+  Every cell `html.escape`-d — quoted-identifier hazards (`weird<name>&"`)
+  and SQL operators in messages (`<>`, `<=`) can't break layout
+  or inject markup. Unknown severities (from extra rules emitting
+  unexpected values) degrade gracefully to a neutral bullet rather
+  than crashing.
+
+  API: `format_html(violations, *, generated_at=None)` — naive
+  datetimes raise `ValueError`, same contract every other pgrls
+  HTML formatter honours.
+
+  **Toolchain milestone:** with this release, every pgrls command
+  that produces structured output has a full standalone HTML
+  format. Same visual fingerprint across all five (`lint`,
+  `report`, `history`, `diff`, `explain`).
+
 ## [0.6.21] - 2026-05-27
 
 ### Added

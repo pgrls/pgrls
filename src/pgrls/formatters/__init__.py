@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from pgrls.formatters.github import format_github
+from pgrls.formatters.html import format_html
 from pgrls.formatters.json import format_json
 from pgrls.formatters.junit import format_junit
 from pgrls.formatters.markdown import format_markdown
@@ -44,6 +45,7 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
     "pr-comment": format_pr_comment,
     "github": format_github,
     "junit": format_junit,
+    "html": format_html,
 }
 
 SUPPORTED_FORMATS: tuple[str, ...] = tuple(_FORMATTERS.keys())
