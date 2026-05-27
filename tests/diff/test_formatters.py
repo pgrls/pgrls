@@ -845,3 +845,146 @@ def test_text_location_well_formed_passes_through_unchanged() -> None:
     # No escape chars introduced.
     header = [ln for ln in result.splitlines() if ln.startswith("- ")][0]
     assert "\\" not in header
+
+
+# ---------------------------------------------------------------------------
+# Markdown formatter (v0.6.18)
+# ---------------------------------------------------------------------------
+
+
+from pgrls.diff.formatters import format_diff_markdown  # noqa: E402
+
+
+def test_markdown_empty_changes_renders_no_changes_line() -> None:
+    # Empty input matches the text formatter's clean output verbatim
+    # so a one-liner CI script that greps for the string works
+    # against either format. Trailing newline is the conventional
+    # final-character contract every renderer here honours.
+    result = format_diff_markdown([])
+    assert result == "pgrls diff: no changes.\n"
+
+
+def test_markdown_emits_h2_header_and_table_skeleton() -> None:
+    [c] = [_change(ChangeKind.TABLE_DROPPED, "breaking", message="dropped")]
+    result = format_diff_markdown([c])
+    assert result.startswith("## pgrls diff\n")
+    assert "| Classification | Kind | Object | Summary |" in result
+    assert "|---|---|---|---|" in result
+
+
+def test_markdown_each_classification_renders_distinct_emoji() -> None:
+    # All four classifications must be visually distinguishable.
+    # The lint markdown uses only 3 emoji (one per severity); diff
+    # markdown uses 4 (one per classification) because the
+    # classification distinction is the whole point of diff output.
+    changes = [
+        _change(ChangeKind.TABLE_ADDED_WITH_RLS, "safe", location="public.a"),
+        _change(ChangeKind.USING_REQUIRES_REVIEW, "requires_review", location="public.b"),
+        _change(ChangeKind.POLICY_DROPPED_PERMISSIVE, "breaking", location="public.c"),
+        _change(ChangeKind.GRANT_PUBLIC_NO_RLS, "dangerous", location="public.d"),
+    ]
+    result = format_diff_markdown(changes)
+    # Each classification's row carries its dedicated emoji prefix.
+    assert "✅ SAFE" in result
+    assert "⚠️ REQUIRES REVIEW" in result
+    assert "🚦 BREAKING" in result
+    assert "❌ DANGEROUS" in result
+
+
+def test_markdown_kind_name_is_humanized() -> None:
+    # ChangeKind enum members are SCREAMING_SNAKE; the rendered Kind
+    # column is title-cased with whitespace separators. The acronym
+    # exception RLS stays uppercase (`Rls Flipped` would crush it
+    # to "Rls"; we want "RLS Flipped").
+    changes = [
+        _change(ChangeKind.USING_TIGHTENED, "safe"),
+        _change(ChangeKind.RLS_FLIPPED, "breaking"),
+    ]
+    result = format_diff_markdown(changes)
+    assert "| Using Tightened |" in result
+    assert "| RLS Flipped |" in result
+
+
+def test_markdown_object_cell_uses_gfm_inline_code() -> None:
+    # Object identifiers go through `gfm_inline_code` so backticks
+    # in the identifier don't close the code span prematurely.
+    result = format_diff_markdown([
+        _change(ChangeKind.TABLE_DROPPED, "breaking",
+                location="weird`name"),
+    ])
+    # Wrapper must be longer than the inner backtick run; space
+    # padding lets the content start/end with a backtick.
+    assert "`` weird`name ``" in result
+
+
+def test_markdown_object_cell_handles_none_location() -> None:
+    result = format_diff_markdown([
+        _change(ChangeKind.TABLE_DROPPED, "breaking", location=""),
+    ])
+    # Empty location falls back to the shared sentinel (same
+    # wording the text/markdown lint formatters use).
+    assert f"`{EMPTY_OR_ZERO_WIDTH_SENTINEL}`" in result
+
+
+def test_markdown_object_cell_handles_pipe_in_location() -> None:
+    # `|` would terminate the GFM table cell; escape to `\|`.
+    result = format_diff_markdown([
+        _change(ChangeKind.TABLE_DROPPED, "breaking",
+                location="public.weird|name"),
+    ])
+    # Inside an inline-code span pipes still need escaping for the
+    # GFM table parser (it scans for unescaped `|` before parsing
+    # inline content).
+    assert r"`public.weird\|name`" in result
+
+
+def test_markdown_summary_cell_escapes_pipe() -> None:
+    result = format_diff_markdown([
+        _change(ChangeKind.USING_TIGHTENED, "safe",
+                message="A | B in message"),
+    ])
+    assert r"A \| B in message" in result
+
+
+def test_markdown_summary_cell_collapses_newlines_to_br() -> None:
+    # Multi-line diff messages exist (the differ produces them for
+    # some kinds). Without escaping, `\n` ends the row early in GFM.
+    result = format_diff_markdown([
+        _change(ChangeKind.USING_TIGHTENED, "safe",
+                message="line one\nline two"),
+    ])
+    assert "line one<br>line two" in result
+
+
+def test_markdown_trailing_summary_matches_text_phrasing() -> None:
+    # The summary wording mirrors `_trailing_summary`'s line for
+    # `pgrls diff --format text` so a CI script that greps both
+    # formats sees identical breakdown text. The markdown variant
+    # wraps it in `**…**` for emphasis but the inner text matches.
+    changes = [
+        _change(ChangeKind.TABLE_ADDED_WITH_RLS, "safe", location="a"),
+        _change(ChangeKind.TABLE_DROPPED, "breaking", location="b"),
+        _change(ChangeKind.GRANT_PUBLIC_NO_RLS, "dangerous", location="c"),
+    ]
+    result = format_diff_markdown(changes)
+    # 3 changes; the breakdown follows _BUCKET_ORDER:
+    # dangerous, requires_review, breaking, safe — only non-zero.
+    assert "3 changes — 1 dangerous, 1 breaking, 1 safe." in result
+    # Wrapped in bold inside markdown.
+    assert "**Summary:** 3 changes" in result
+
+
+def test_markdown_trailing_summary_singular_when_one_change() -> None:
+    [c] = [_change(ChangeKind.TABLE_DROPPED, "breaking")]
+    result = format_diff_markdown([c])
+    # Singular noun agreement matches the text formatter.
+    assert "1 change — 1 breaking." in result
+    assert "1 changes" not in result
+
+
+def test_markdown_dispatch_registered_for_cli() -> None:
+    # `pgrls diff --format markdown` must reach the new renderer.
+    # Pins the wiring without spinning up a live database (the CLI
+    # would otherwise need a connection to introspect snapshots).
+    from pgrls.diff.formatters import DIFF_SUPPORTED_FORMATS
+    assert "markdown" in DIFF_SUPPORTED_FORMATS

@@ -19,6 +19,7 @@ from pgrls.diff.differ import Change, ChangeKind, Classification
 from pgrls.formatters import format_violations
 from pgrls.formatters._common import (
     EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    gfm_inline_code,
     safe_location,
 )
 from pgrls.formatters.sarif import format_sarif
@@ -668,9 +669,169 @@ def format_diff_sarif(changes: list[Change]) -> str:
     return format_sarif(violations)
 
 
+# ---------------------------------------------------------------------------
+# Markdown formatter
+# ---------------------------------------------------------------------------
+
+# Per-classification emoji prefix so a glance at the rendered table
+# tells the reader the row's severity. Distinct from
+# `_CLASSIFICATION_TO_SEVERITY` (which projects to the
+# Violation.severity ternary for JSON/SARIF) — Markdown can carry
+# the richer 4-way distinction.
+_CLASSIFICATION_EMOJI: dict[Classification, str] = {
+    "safe": "✅",
+    "requires_review": "⚠️",
+    "breaking": "🚦",
+    "dangerous": "❌",
+}
+
+# Display label per classification — uppercased so the reader's eye
+# catches the severity bucket at a glance.
+_CLASSIFICATION_LABEL: dict[Classification, str] = {
+    "safe": "SAFE",
+    "requires_review": "REQUIRES REVIEW",
+    "breaking": "BREAKING",
+    "dangerous": "DANGEROUS",
+}
+
+# Import-time exhaustiveness — every Classification literal must
+# have an emoji and a label. Mirrors the _CLASSIFICATION_TO_SEVERITY
+# check above so a new classification value fails fast at import.
+_missing_emoji = set(get_args(Classification)) - set(
+    _CLASSIFICATION_EMOJI
+)
+_missing_label = set(get_args(Classification)) - set(
+    _CLASSIFICATION_LABEL
+)
+if _missing_emoji or _missing_label:
+    raise RuntimeError(  # pragma: no cover — import-time invariant
+        "pgrls.diff.formatters Markdown maps are incomplete: "
+        f"missing emoji {sorted(_missing_emoji)}, "
+        f"missing label {sorted(_missing_label)}."
+    )
+del _missing_emoji, _missing_label
+
+
+def _markdown_object_cell(location: str | None) -> str:
+    """Render a Change.location for the Object column.
+
+    Pipes / newlines / zero-width chars are sanitised the same way
+    the text formatter handles them, then the result is wrapped in
+    a GFM inline-code span via `gfm_inline_code` so identifiers with
+    backticks still render correctly. Empty / zero-width-only
+    locations fall back to the shared
+    `EMPTY_OR_ZERO_WIDTH_SENTINEL` so the cell isn't a bare empty
+    code span.
+    """
+    if not location:
+        return f"`{EMPTY_OR_ZERO_WIDTH_SENTINEL}`"
+    clean = safe_location(location).replace("|", "\\|")
+    if not clean:
+        return f"`{EMPTY_OR_ZERO_WIDTH_SENTINEL}`"
+    return gfm_inline_code(clean)
+
+
+def _markdown_summary_cell(message: str) -> str:
+    """Escape the per-Change message for a GFM table cell.
+
+    Pipes break the row layout; newlines split it. Replace pipes
+    with `\\|` and collapse newlines to `<br>` (the table-cell
+    line-break GFM accepts). Backslashes pass through unchanged —
+    diff messages today don't contain literal backslashes
+    intended as escapes.
+
+    Forward-looking caveat: if a future ChangeKind routes
+    operator-supplied SQL into `Change.message` (today every
+    message is built from `_SUMMARY_BY_KIND` + plain ASCII
+    interpolation), add `.replace("\\\\", "\\\\\\\\")` here for
+    parity with the lint markdown `_escape_cell` — otherwise a
+    literal backslash in the message could render as an
+    unintended escape on the GFM consumer side.
+    """
+    return (
+        message
+        .replace("|", "\\|")
+        .replace("\n", "<br>")
+        .replace("\r", "")
+    )
+
+
+def format_diff_markdown(changes: list[Change]) -> str:
+    """Render a list of Changes as a GitHub-flavored Markdown table.
+
+    Designed to drop cleanly into a PR review comment or a Markdown
+    runbook — `pgrls diff` produces a migration's classification
+    breakdown that a reviewer can scan without opening the JSON.
+    Mirrors the lint `markdown` formatter's H2 heading + pipe-table
+    + trailing summary shape, but the columns are diff-specific
+    (Classification / Kind / Object / Summary) because the
+    classification carries information lint's severity doesn't.
+
+    Empty changes case: `pgrls diff: no changes.` — matches the
+    text formatter's clean output verbatim so a one-liner "if
+    'pgrls diff: no changes.' not in output, comment with the diff"
+    script works against either format.
+
+    Stable between releases of the same major-zero series; adding
+    columns is a breaking change for consumers that parse the
+    table, so do it with a CHANGELOG note. The rule_id link
+    convention used by lint markdown (`docs/RULES.md#rule-<id>`)
+    does NOT apply here — diff `Change.kind` values (`DIFF_*`)
+    point at `AGENTS.md#diff-rules`, the shared anchor.
+    """
+    if not changes:
+        return "pgrls diff: no changes.\n"
+
+    # `Counter[str]` (not `Counter[Classification]`) — matches the
+    # existing `_trailing_summary` annotation so the `_BUCKET_ORDER`
+    # iteration's `.get(bucket, 0)` typechecks. `_BUCKET_ORDER` is
+    # `list[str]` rather than `list[Classification]` to avoid a
+    # circular constraint when the bucket order is reordered.
+    counts: Counter[str] = Counter(c.classification for c in changes)
+    n = len(changes)
+
+    # Trailing summary line — mirror the text formatter's wording
+    # so script consumers that grep both formats see the same
+    # phrasing.
+    parts: list[str] = []
+    for bucket in _BUCKET_ORDER:
+        count = counts.get(bucket, 0)
+        if count:
+            label = _BUCKET_LABEL[bucket]
+            parts.append(f"{count} {label}")
+    breakdown = ", ".join(parts)
+    noun = "change" if n == 1 else "changes"
+    summary = f"{n} {noun} — {breakdown}"
+
+    rows = "".join(_markdown_row(c) for c in changes)
+    return (
+        "## pgrls diff\n"
+        "\n"
+        "| Classification | Kind | Object | Summary |\n"
+        "|---|---|---|---|\n"
+        f"{rows}"
+        "\n"
+        f"**Summary:** {summary}.\n"
+    )
+
+
+def _markdown_row(change: Change) -> str:
+    emoji = _CLASSIFICATION_EMOJI[change.classification]
+    label = _CLASSIFICATION_LABEL[change.classification]
+    kind_title = _humanize_kind_name(change.kind.name)
+    obj = _markdown_object_cell(change.location)
+    summary = _markdown_summary_cell(change.message)
+    return f"| {emoji} {label} | {kind_title} | {obj} | {summary} |\n"
+
+
 # Public constant for the CLI: the user-facing values for the
 # `pgrls diff --format` option. Mirrors `pgrls.formatters.
 # SUPPORTED_FORMATS` (the lint command's source of truth) and is
-# kept here so a future format addition (e.g. markdown) only
-# requires editing this module — the CLI consumes the constant.
-DIFF_SUPPORTED_FORMATS: tuple[str, ...] = ("text", "json", "sarif")
+# kept here so a future format addition only requires editing this
+# module — the CLI consumes the constant.
+DIFF_SUPPORTED_FORMATS: tuple[str, ...] = (
+    "text",
+    "json",
+    "sarif",
+    "markdown",
+)

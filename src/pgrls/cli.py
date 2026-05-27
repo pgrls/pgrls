@@ -48,6 +48,7 @@ from pgrls.diff import Change, diff_schemas
 from pgrls.diff.formatters import (
     DIFF_SUPPORTED_FORMATS,
     format_diff_json,
+    format_diff_markdown,
     format_diff_sarif,
     format_diff_text,
 )
@@ -1459,6 +1460,11 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
     "text": (format_diff_text, True),
     "json": (format_diff_json, False),
     "sarif": (format_diff_sarif, False),
+    # markdown emits an H2 + pipe table + trailing summary that's
+    # paste-ready for a PR review comment or a Markdown runbook.
+    # The empty-changes case returns "pgrls diff: no changes.\n"
+    # (matches text); pass nl=False so click doesn't double-newline.
+    "markdown": (format_diff_markdown, False),
 }
 
 
