@@ -70,6 +70,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from pgrls._html_common import resolve_generated_at, to_iso_z
+
 
 @dataclass(frozen=True)
 class FindingKey:
@@ -381,23 +383,8 @@ def render_html(
     or inject markup. Same defence the report formatter applies
     to qualified identifiers.
     """
-    if generated_at is None:
-        generated_at = datetime.now(timezone.utc)
-    elif generated_at.tzinfo is None:
-        raise ValueError(
-            "render_html: generated_at must be timezone-aware; "
-            "a naive datetime would be interpreted as local time, "
-            "producing a wrong audit timestamp depending on the "
-            "host. Pass `datetime.now(timezone.utc)` or attach an "
-            "explicit tzinfo."
-        )
-    now = (
-        generated_at
-        .astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    generated_at = resolve_generated_at(generated_at, caller_name="render_html")
+    now = to_iso_z(generated_at)
 
     summary = _summary_dict(rows)
     summary_sentence = html.escape(_summary_line(rows))

@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.6.24] - 2026-05-28
+
+### Changed
+
+- **Internal refactor — shared HTML datetime helpers.** The
+  `generated_at` handling (default-to-now, naive-datetime
+  `ValueError` guard, ISO-8601-UTC-with-`Z` formatting) was copy-
+  pasted verbatim across the four timestamped HTML formatters
+  (`lint`, `report`, `history`, `diff`). Extracted to
+  `pgrls._html_common` (`resolve_generated_at` + `to_iso_z`). Output
+  is byte-for-byte identical — the existing HTML snapshot tests pin
+  it — so there is no CLI or formatting change. The per-formatter
+  CSS is deliberately *not* centralised (the five renderers have
+  intentionally divergent stylesheets). Net −55 lines of duplication;
+  the naive-datetime contract now has a single definition.
+
 ## [0.6.23] - 2026-05-27
 
 ### Added
