@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import html
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import get_args
 
+from pgrls._html_common import resolve_generated_at, to_iso_z
 from pgrls.diff.differ import Change, ChangeKind, Classification
 from pgrls.formatters import format_violations
 from pgrls.formatters._common import (
@@ -875,23 +876,8 @@ def format_diff_html(
     that routes operator SQL into `Change.message` couldn't inject
     HTML via `<script>` in a quoted predicate).
     """
-    if generated_at is None:
-        generated_at = datetime.now(timezone.utc)
-    elif generated_at.tzinfo is None:
-        raise ValueError(
-            "format_diff_html: generated_at must be timezone-aware; "
-            "a naive datetime would be interpreted as local time, "
-            "producing a wrong audit timestamp depending on the "
-            "host. Pass `datetime.now(timezone.utc)` or attach an "
-            "explicit tzinfo."
-        )
-    now = (
-        generated_at
-        .astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    generated_at = resolve_generated_at(generated_at, caller_name="format_diff_html")
+    now = to_iso_z(generated_at)
 
     counts: Counter[str] = Counter(c.classification for c in changes)
     n = len(changes)

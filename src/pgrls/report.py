@@ -37,8 +37,9 @@ from __future__ import annotations
 import html
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
+from pgrls._html_common import resolve_generated_at, to_iso_z
 from pgrls.model import Schema
 
 # Ordered best → worst, which is also the order the summary line lists
@@ -278,23 +279,8 @@ def render_html(
     converters (so an auditor can print/PDF it without running
     pgrls themselves).
     """
-    if generated_at is None:
-        generated_at = datetime.now(timezone.utc)
-    elif generated_at.tzinfo is None:
-        raise ValueError(
-            "render_html: generated_at must be timezone-aware; "
-            "a naive datetime would be interpreted as local time, "
-            "producing a wrong audit timestamp depending on the "
-            "host. Pass `datetime.now(timezone.utc)` or attach an "
-            "explicit tzinfo."
-        )
-    now = (
-        generated_at
-        .astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    generated_at = resolve_generated_at(generated_at, caller_name="render_html")
+    now = to_iso_z(generated_at)
     s = report.summary
 
     # Status-pill chips for the top band.
