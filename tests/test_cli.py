@@ -494,8 +494,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 47 rules ship today (catalog header should say so).
-    assert "<strong>47</strong> rules" in result.output
+    # 48 rules ship today (catalog header should say so).
+    assert "<strong>48</strong> rules" in result.output
     # Header carries the auto-fixable count (17 as of v0.6.20+).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -1733,7 +1733,12 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         assert result.exit_code == 1, result.output
         from pgrls.rules import all_rules
 
-        expected = {r.id for r in all_rules()}
+        # HYG004 (policy has no behavioral test) is coverage-gated: it
+        # only fires when `pgrls lint --coverage` supplies a test-coverage
+        # artifact, which a plain lint of all_bad.sql doesn't. Exempt it
+        # from the "every rule fires" contract — its firing is covered by
+        # tests/rules/test_hyg004.py and the coverage integration tests.
+        expected = {r.id for r in all_rules()} - {"HYG004"}
         _assert_rules_fire_exactly(result.output, expected)
         # Pin each (rule, location) pair to its intended target.
         # Substring plus trailing newline anchors against the

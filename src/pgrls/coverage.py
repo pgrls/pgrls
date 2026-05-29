@@ -1,0 +1,423 @@
+"""RLS test coverage — which policies a `pgrls.testing` suite exercised.
+
+`pgrls lint` answers "is this policy *wrong*?"; coverage answers "did any
+test ever *exercise* this policy?" The `pgrls.testing` pytest plugin
+records, per test, the `(schema, relation, role, command)` tuples its
+queries touch and writes them to a coverage artifact (`.pgrls-coverage.json`)
+on session finish. This module loads that artifact, cross-references it
+against an introspected schema, and reports which policies were never
+covered. The same matching powers the `pgrls coverage` command and the
+HYG004 lint rule — `is_policy_covered` is the single source of truth.
+
+Coverage model (role + command + table): a policy is covered iff a test
+queried its table, under a role the policy targets (or PUBLIC), with a
+matching command. It under-credits rather than over-credits — role
+inheritance is not resolved, and an unqualified relation in test SQL is
+matched by bare name. Both are the safe direction: a missed match prompts
+a test rather than falsely claiming coverage.
+"""
+from __future__ import annotations
+
+import html
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Iterable
+
+import pglast
+
+from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls.ast_utils import extract_range_vars, statement_command
+from pgrls.model import Policy, Schema, Table
+
+ARTIFACT_VERSION = 1
+DEFAULT_ARTIFACT_PATH = ".pgrls-coverage.json"
+
+
+@dataclass(frozen=True)
+class ExercisedTuple:
+    """One (relation, role, command) access a test performed.
+
+    `schema` is None when the test SQL referenced the relation
+    without a schema qualifier; matching then falls back to bare
+    relation-name comparison.
+    """
+
+    schema: str | None
+    relation: str
+    role: str
+    command: str  # SELECT | INSERT | UPDATE | DELETE
+
+
+@dataclass(frozen=True)
+class CoverageData:
+    exercised: frozenset[ExercisedTuple]
+    generated_at: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "CoverageData":
+        # Everything that can go wrong with a hand-edited / truncated /
+        # wrong-shape artifact is funneled to ValueError so the CLI's
+        # load guards turn it into a clean ToolError, never a traceback.
+        if not isinstance(payload, dict):
+            raise ValueError("coverage artifact must be a JSON object")
+        version = payload.get("pgrls_coverage_version")
+        if version != ARTIFACT_VERSION:
+            raise ValueError(
+                f"unsupported coverage artifact version {version!r} "
+                f"(expected {ARTIFACT_VERSION})"
+            )
+        rows = payload.get("exercised") or []
+        try:
+            exercised = frozenset(
+                ExercisedTuple(
+                    schema=row.get("schema"),
+                    relation=row["relation"],
+                    role=row["role"],
+                    command=row["command"],
+                )
+                for row in rows
+            )
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(f"malformed coverage artifact: {exc}") from exc
+        return cls(exercised=exercised, generated_at=payload.get("generated_at"))
+
+
+def load_artifact(path: str) -> CoverageData:
+    """Read and validate a coverage artifact JSON file."""
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    return CoverageData.from_dict(payload)
+
+
+def write_artifact(
+    path: str,
+    exercised: Iterable[ExercisedTuple],
+    *,
+    generated_at: datetime,
+) -> None:
+    """Write the coverage artifact. `generated_at` must be tz-aware."""
+    rows = sorted(
+        (
+            {
+                "schema": t.schema,
+                "relation": t.relation,
+                "role": t.role,
+                "command": t.command,
+            }
+            for t in set(exercised)
+        ),
+        key=lambda r: (r["schema"] or "", r["relation"], r["role"], r["command"]),
+    )
+    payload = {
+        "pgrls_coverage_version": ARTIFACT_VERSION,
+        "generated_at": to_iso_z(generated_at),
+        "exercised": rows,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+
+
+def exercised_from_sql(sql: str) -> list[tuple[str | None, str, str]]:
+    """Parse a SQL statement into `(schema, relation, command)` accesses.
+
+    The statement's command credits its *target* relation
+    (`INSERT`/`UPDATE`/`DELETE` write target); every other relation it
+    references (joins, `FROM`/`USING` sources, sub-selects) is credited
+    as a `SELECT` read. A bare `SELECT` credits all referenced relations
+    as `SELECT`. Statements with no RLS command (DDL, SET, …) yield
+    nothing. Returns `[]` on a parse failure — coverage is best-effort
+    and must never break the test that issued the SQL.
+    """
+    try:
+        parsed = pglast.parse_sql(sql)
+    except pglast.parser.ParseError:
+        return []
+    out: list[tuple[str | None, str, str]] = []
+    for raw in parsed:
+        stmt = getattr(raw, "stmt", None)
+        command = statement_command(stmt)
+        if command is None:
+            continue
+        relations = extract_range_vars(stmt)
+        if command == "SELECT":
+            out.extend((s, r, "SELECT") for (s, r) in relations)
+            continue
+        target = getattr(stmt, "relation", None)
+        target_key: tuple[str | None, str] | None = None
+        target_relname = getattr(target, "relname", None)
+        if isinstance(target_relname, str) and target_relname:
+            target_key = (getattr(target, "schemaname", None), target_relname)
+        for (s, r) in relations:
+            out.append((s, r, command if (s, r) == target_key else "SELECT"))
+    return out
+
+
+def is_policy_covered(table: Table, policy: Policy, data: CoverageData) -> bool:
+    """True iff some exercised tuple matches this policy (role+command+table).
+
+    - relation: same name, and same schema when the tuple captured one
+      (an unqualified tuple matches by bare name);
+    - command: the policy's command equals the exercised command, or the
+      policy is `ALL` (which every command exercises);
+    - role: the exercised role is one the policy targets, or the policy
+      targets `PUBLIC` (which every role exercises).
+    """
+    for ex in data.exercised:
+        if ex.relation != table.name:
+            continue
+        if ex.schema is not None and ex.schema != table.schema:
+            continue
+        if not (policy.command == ex.command or policy.command == "ALL"):
+            continue
+        if ex.role in policy.roles or "PUBLIC" in policy.roles:
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class PolicyCoverage:
+    schema: str
+    table: str
+    policy: str
+    command: str
+    roles: tuple[str, ...]
+    covered: bool
+
+    @property
+    def location(self) -> str:
+        return f"{self.schema}.{self.table}.{self.policy}"
+
+
+@dataclass(frozen=True)
+class CoverageReport:
+    policies: tuple[PolicyCoverage, ...]
+
+    @property
+    def summary(self) -> dict[str, float | int]:
+        total = len(self.policies)
+        covered = sum(1 for p in self.policies if p.covered)
+        # No policies → nothing to cover → 100% (vacuously). Avoids a
+        # division-by-zero and reads as "no gaps" in CI gates.
+        pct = 100.0 if total == 0 else round(100.0 * covered / total, 1)
+        return {
+            "policies": total,
+            "covered": covered,
+            "uncovered": total - covered,
+            "coverage_pct": pct,
+        }
+
+
+def build_coverage(schema: Schema, data: CoverageData) -> CoverageReport:
+    """Cross-reference every policy in `schema` against `data`.
+
+    Policies are sorted by (table, policy name) for deterministic output.
+    """
+    rows: list[PolicyCoverage] = []
+    for table in sorted(schema.tables, key=lambda t: t.qualified_name):
+        for policy in sorted(table.policies, key=lambda p: p.name):
+            rows.append(
+                PolicyCoverage(
+                    schema=table.schema,
+                    table=table.name,
+                    policy=policy.name,
+                    command=policy.command,
+                    roles=policy.roles,
+                    covered=is_policy_covered(table, policy, data),
+                )
+            )
+    return CoverageReport(policies=tuple(rows))
+
+
+def _summary_line(report: CoverageReport) -> str:
+    s = report.summary
+    n = s["policies"]
+    noun = "policy" if n == 1 else "policies"
+    return (
+        f"{n} {noun}: {s['covered']} covered, "
+        f"{s['uncovered']} uncovered ({s['coverage_pct']}%)."
+    )
+
+
+def render_text(report: CoverageReport) -> str:
+    if not report.policies:
+        return "No policies found in the scanned schemas."
+    rows = [
+        (
+            p.location,
+            p.command,
+            ",".join(p.roles),
+            "yes" if p.covered else "no",
+        )
+        for p in report.policies
+    ]
+    headers = ("POLICY", "COMMAND", "ROLES", "COVERED")
+    widths = [
+        max(len(headers[i]), max(len(r[i]) for r in rows))
+        for i in range(len(headers))
+    ]
+    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    out = [line]
+    for r in rows:
+        out.append("  ".join(r[i].ljust(widths[i]) for i in range(len(r))))
+    out.append("")
+    out.append(_summary_line(report))
+    return "\n".join(out)
+
+
+def render_json(report: CoverageReport) -> str:
+    payload = {
+        "summary": report.summary,
+        "policies": [
+            {
+                "location": p.location,
+                "schema": p.schema,
+                "table": p.table,
+                "policy": p.policy,
+                "command": p.command,
+                "roles": list(p.roles),
+                "covered": p.covered,
+            }
+            for p in report.policies
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def render_markdown(report: CoverageReport) -> str:
+    out = [
+        "# RLS test coverage",
+        "",
+        _summary_line(report),
+        "",
+        "| Policy | Command | Roles | Covered |",
+        "|---|---|---|---|",
+    ]
+    for p in report.policies:
+        out.append(
+            f"| {p.location} | {p.command} | {','.join(p.roles)} | "
+            f"{'yes' if p.covered else 'no'} |"
+        )
+    return "\n".join(out) + "\n"
+
+
+def render_html(
+    report: CoverageReport,
+    *,
+    generated_at: datetime | None = None,
+) -> str:
+    """Standalone HTML coverage page — mirrors `report.render_html`.
+
+    Every user-influenced cell value is `html.escape`-d (Postgres
+    identifiers can legally contain markup characters). `generated_at`
+    must be timezone-aware; a naive datetime raises `ValueError` rather
+    than being coerced through the host's local zone (see
+    `pgrls._html_common`). Only the HTML renderer embeds a timestamp.
+    """
+    generated_at = resolve_generated_at(generated_at, caller_name="render_html")
+    now = to_iso_z(generated_at)
+    s = report.summary
+
+    if not report.policies:
+        rows_html = (
+            '<tr><td colspan="4" class="empty">'
+            "No policies found in the scanned schemas."
+            "</td></tr>"
+        )
+    else:
+        row_lines: list[str] = []
+        for p in report.policies:
+            state = "covered" if p.covered else "uncovered"
+            row_lines.append(
+                f'      <tr class="row-{state}">'
+                f"<td><code>{html.escape(p.location)}</code></td>"
+                f"<td>{html.escape(p.command)}</td>"
+                f"<td><code>{html.escape(','.join(p.roles))}</code></td>"
+                f'<td class="num"><span class="pill status-{state}">'
+                f"{'yes' if p.covered else 'no'}</span></td>"
+                "</tr>"
+            )
+        rows_html = "\n".join(row_lines)
+
+    total = s["policies"]
+    noun = "policy" if total == 1 else "policies"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pgrls RLS test coverage</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+         Roboto, "Helvetica Neue", Arial, sans-serif;
+         margin: 2rem auto; max-width: 64rem; padding: 0 1rem;
+         color: #1f2328; background: #ffffff; }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ color: #e6edf3; background: #0d1117; }}
+    table {{ border-color: #30363d; }}
+    th {{ background: #161b22; }}
+    tr:nth-child(even) td {{ background: #0d1117; }}
+    tr:nth-child(odd) td {{ background: #161b22; }}
+    code {{ background: #161b22; }}
+  }}
+  header {{ margin-bottom: 1.5rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
+  .meta {{ color: #57606a; font-size: .85rem; }}
+  .summary {{ margin: 1rem 0 .5rem; }}
+  .pill {{ display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }}
+  .status-covered   {{ color: #1a7f37; }}
+  .status-uncovered {{ color: #cf222e; }}
+  table {{ width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }}
+  thead th {{ text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; }}
+  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
+  tbody tr:last-child td {{ border-bottom: 0; }}
+  td.num {{ font-variant-numeric: tabular-nums; }}
+  code {{ background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
+  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
+  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>RLS test coverage</h1>
+    <p class="meta">Generated by <code>pgrls coverage --format html</code> · {html.escape(now)}</p>
+    <p class="summary"><strong>{s['covered']}</strong> of <strong>{total}</strong> {noun} covered ({s['coverage_pct']}%).</p>
+  </header>
+  <table>
+    <thead>
+      <tr>
+        <th>Policy</th>
+        <th>Command</th>
+        <th>Roles</th>
+        <th>Covered</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
+</body>
+</html>
+"""
+
+
+_RENDERERS = {
+    "text": render_text,
+    "json": render_json,
+    "markdown": render_markdown,
+    "html": render_html,
+}
+COVERAGE_FORMATS = tuple(_RENDERERS)
+
+
+def render(report: CoverageReport, output_format: str) -> str:
+    return _RENDERERS[output_format](report)

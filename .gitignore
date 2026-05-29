@@ -28,3 +28,7 @@ venv/
 .tox/
 .mypy_cache/
 .ruff_cache/
+
+# RLS test-coverage artifact written by the pgrls.testing pytest plugin
+# on every run (consumed by `pgrls coverage` / `pgrls lint --coverage`).
+.pgrls-coverage.json

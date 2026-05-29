@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 import pglast
-from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, FuncCall, Node, NullTest, RangeVar, SQLValueFunction, String, SubLink
+from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, Node, NullTest, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, UpdateStmt
 from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
@@ -267,6 +267,26 @@ def extract_range_vars(node: Any) -> list[tuple[str | None, str]]:
 
     walk(node)
     return refs
+
+
+def statement_command(stmt: Any) -> str | None:
+    """Map a parsed top-level statement node to its RLS command.
+
+    Returns "SELECT" / "INSERT" / "UPDATE" / "DELETE" for the four
+    DML statement shapes RLS policies govern, or None for anything
+    else (DDL, SET, transaction control, etc.) — the caller skips
+    statements with no command. Pass the statement node, i.e.
+    `pglast.parse_sql(sql)[i].stmt`.
+    """
+    if isinstance(stmt, SelectStmt):
+        return "SELECT"
+    if isinstance(stmt, InsertStmt):
+        return "INSERT"
+    if isinstance(stmt, UpdateStmt):
+        return "UPDATE"
+    if isinstance(stmt, DeleteStmt):
+        return "DELETE"
+    return None
 
 
 def match_is_null(node: Any) -> tuple[Any, bool] | None:

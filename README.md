@@ -9,7 +9,7 @@
 **[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[Docs site](https://pgrls.github.io/pgrls-docs/)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
-> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 17 of 47 rules mechanically auto-fixable.
+> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 17 of 48 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
 > MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown / GitHub-PR-comment / GitHub annotations / JUnit XML).
 
@@ -28,9 +28,9 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 47 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 48 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
-> - **Lint & fix** — `pgrls lint` checks a live database against all forty-seven rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Lint & fix** — `pgrls lint` checks a live database against all forty-eight rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
@@ -350,6 +350,25 @@ Setting none of the three causes `pgrls_db` to raise `PgrlsTestConfigError`.
 
 The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). The **TypeScript port** ships as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm — same Layer 1 protocol, same wire-level behaviour, idiomatic JS/TS surface (camelCase API, `pg` and `postgres.js` adapters). Source under [`ts/`](ts/) in this repo. The **Go port** is shipping in stages at [`go/`](go/) (module `github.com/pgrls/pgrls/go`, versioned independently as `go/v0.7.x`); step 1 (scaffold + `ProtocolVersion` constant + error types) shipped in `go/v0.7.0`, with steps 2–7 (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite, release tag) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
 
+### Coverage — which policies are actually tested
+
+When your `pgrls.testing` suite runs, the plugin records which
+`(table, role, command)` tuples each test exercised and writes them to
+`.pgrls-coverage.json` on session finish (gitignored; disable with
+`pgrls_coverage = false` in your pytest config or `PGRLS_COVERAGE=off`).
+
+`pgrls coverage` cross-references that artifact against the live schema
+and reports which policies a test exercised and which were never
+touched — the cross-tenant `DELETE` nobody wrote a test for. A policy
+is *covered* when a test queried its table, under a role it targets
+(or `PUBLIC`), with a matching command.
+
+```bash
+pgrls coverage                          # text report (text/json/markdown/html)
+pgrls coverage --fail-under 80          # exit 1 if coverage < 80% (CI gate)
+pgrls lint --coverage .pgrls-coverage.json   # enables HYG004 for uncovered policies
+```
+
 ## Diff — `pgrls snapshot` + `pgrls diff`
 
 `pgrls diff` is the semantic policy diff command. Point it at any two
@@ -452,6 +471,7 @@ pattern documentation.
 | [HYG001](docs/RULES.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
 | [HYG002](docs/RULES.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
 | [HYG003](docs/RULES.md#rule-hyg003) | info | Policy is an exact duplicate of another policy on the same table |
+| [HYG004](docs/RULES.md#rule-hyg004) | info | Policy has no behavioral test exercising it (needs `pgrls lint --coverage`) |
 | [VIEW001](docs/RULES.md#rule-view001) | error | View over RLS-protected table without `WITH (security_invoker = true)` |
 | [VIEW002](docs/RULES.md#rule-view002) | warning | View over RLS-protected table without `WITH (security_barrier = true)` |
 | [VIEW003](docs/RULES.md#rule-view003) | warning | Materialized view over RLS-protected table (RLS not honored at query time) |

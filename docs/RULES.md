@@ -2669,6 +2669,45 @@ policy as the "original" and flags the rest. Severity is **info**
 — a duplicate is redundant, not unsafe. Allowlist the redundant
 policy's qualified ID if keeping both is genuinely intended.
 
+<a id="rule-hyg004"></a>
+
+## HYG004 — Policy has no behavioral test
+
+**Severity:** info.
+
+`pgrls lint` proves a policy is well-*formed*; it cannot prove the
+policy enforces what you intend. That is what the `pgrls.testing`
+pytest plugin is for, and HYG004 closes the loop: it flags any policy
+your test suite never exercised. An untested policy is the one most
+likely to silently stop working — a migration narrows its `USING`
+clause, a role grant drifts, and nothing fails until a tenant sees
+another tenant's rows.
+
+HYG004 is **opt-in**. A normal `pgrls lint` run does nothing; the rule
+fires only when lint is given a coverage artifact:
+
+```bash
+pgrls lint --coverage .pgrls-coverage.json
+```
+
+The artifact (`.pgrls-coverage.json`) is written automatically when
+your `pgrls.testing` suite runs — it records the
+`(schema, relation, role, command)` tuples each test exercised. lint
+loads it and injects the data into the rule (rules can't read files
+themselves). A policy is **covered** when a test queried its table,
+under a role the policy targets (or `PUBLIC`), with a matching command
+(a `SELECT` query exercises `SELECT` and `ALL` policies; `INSERT`
+exercises `INSERT`/`ALL`; etc.). Anything else is uncovered.
+
+The model under-credits rather than over-credits: role inheritance is
+not resolved (a policy targeting role `A` tested only via a member
+role `B` reads as uncovered), and an unqualified relation in test SQL
+is matched by bare name. Both are the safe direction — a missed match
+prompts a test rather than a false "covered". Severity is **info** — an
+untested policy is a gap to close, not a live vulnerability. Allowlist
+a policy's qualified ID to accept it as intentionally untested. See
+`pgrls coverage` for the full per-policy report.
+
 <a id="rule-view001"></a>
 
 ## VIEW001 — View bypasses RLS without `security_invoker`
