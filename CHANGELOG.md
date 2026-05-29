@@ -10,6 +10,35 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-29
+
+### Fixed
+
+Three coverage over-credit ("false covered") bugs in 0.7.0 — each could
+report an RLS policy as tested when no test genuinely exercised it,
+contradicting the documented "never over-credit" guarantee. All affect
+`pgrls coverage` and HYG004.
+
+- **Same-named tables across schemas.** In a one-schema-per-tenant
+  database (`tenant_a.events` / `tenant_b.events`), a test that exercised
+  one tenant's table via an unqualified query (`FROM events`, resolved
+  through `search_path`) was marking *every* same-named table's policies
+  covered. An unqualified (schema-less) coverage tuple now credits a
+  table by bare name only when that name is unique across the scanned
+  schemas; for an ambiguous name, qualify the test query
+  (`FROM tenant_a.events`). Single-schema setups are unchanged.
+- **Data-modifying CTEs and `SELECT INTO`.** A writable CTE
+  (`WITH d AS (DELETE FROM secret RETURNING *) SELECT … FROM d`) credited
+  `secret` as a `SELECT` read — falsely covering its SELECT policy —
+  because the command was taken from the outer statement. The CTE's write
+  target now gets its real command (`DELETE`/`UPDATE`/`INSERT`), and a
+  `SELECT … INTO new_table` no longer credits the created table as a read.
+- **CTE alias names leaked as phantom relations.** A CTE name referenced
+  in the query (including from a sibling/nested CTE) was recorded as a
+  `SELECT` against a table of that name; aliases are now dropped across
+  the whole `WITH` scope. A real, schema-qualified table that happens to
+  share an alias name is still credited.
+
 ## [0.7.0] - 2026-05-29
 
 ### Added

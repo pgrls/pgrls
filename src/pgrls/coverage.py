@@ -12,9 +12,11 @@ HYG004 lint rule — `is_policy_covered` is the single source of truth.
 Coverage model (role + command + table): a policy is covered iff a test
 queried its table, under a role the policy targets (or PUBLIC), with a
 matching command. It under-credits rather than over-credits — role
-inheritance is not resolved, and an unqualified relation in test SQL is
-matched by bare name. Both are the safe direction: a missed match prompts
-a test rather than falsely claiming coverage.
+inheritance is not resolved, and an unqualified relation in test SQL
+credits a table by bare name only when that name is unique across the
+scanned schemas (a same-named table in another tenant's schema requires
+a schema-qualified query to credit). Both are the safe direction: a
+missed match prompts a test rather than falsely claiming coverage.
 """
 from __future__ import annotations
 
@@ -25,9 +27,10 @@ from datetime import datetime
 from typing import Any, Iterable
 
 import pglast
+from pglast.ast import Node, RangeVar
 
 from pgrls._html_common import resolve_generated_at, to_iso_z
-from pgrls.ast_utils import extract_range_vars, statement_command
+from pgrls.ast_utils import statement_command
 from pgrls.model import Policy, Schema, Table
 
 ARTIFACT_VERSION = 1
@@ -119,6 +122,91 @@ def write_artifact(
         fh.write("\n")
 
 
+def _own_range_vars(stmt: Any) -> list[tuple[str | None, str]]:
+    """RangeVars referenced *directly* by `stmt`, without descending into
+    its `WITH` clause (CTE bodies are attributed separately by
+    `_collect_accesses`) or its `INTO` target (a `SELECT INTO` creates a
+    table, it does not read one). Mirrors `ast_utils.extract_range_vars`'s
+    walk but skips those two fields on every node it visits."""
+    found: list[tuple[str | None, str]] = []
+
+    def walk(node: Any) -> None:
+        if node is None:
+            return
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+            return
+        if isinstance(node, RangeVar):
+            relname = getattr(node, "relname", None)
+            if isinstance(relname, str) and relname:
+                found.append((getattr(node, "schemaname", None), relname))
+            return
+        if isinstance(node, Node):
+            for field_name in node:
+                if field_name in ("withClause", "intoClause"):
+                    continue
+                walk(getattr(node, field_name, None))
+
+    walk(stmt)
+    return found
+
+
+def _collect_accesses(
+    stmt: Any, cte_scope: frozenset[str] = frozenset()
+) -> list[tuple[str | None, str, str]]:
+    """`(schema, relation, command)` accesses for one statement node.
+
+    Recurses into data-modifying CTEs (`WITH x AS (DELETE/UPDATE/INSERT
+    … )`) so the CTE's write target is credited with *its own* command,
+    not the outer query's — Postgres applies the write-command policies to
+    that table, so crediting it as a `SELECT` read would falsely mark the
+    table's SELECT policy covered. CTE names are dropped (they are query
+    aliases, not real relations): `cte_scope` carries the names visible
+    from enclosing WITH clauses, and a statement's own CTE names are added
+    to the scope passed to its bodies — so a sibling reference
+    (`WITH a AS (…), b AS (SELECT … FROM a)`) drops `a` too. The
+    statement's own write target gets the write command; every other
+    directly-referenced relation is a `SELECT` read.
+    """
+    command = statement_command(stmt)
+    if command is None:
+        return []
+    out: list[tuple[str | None, str, str]] = []
+
+    own_cte_names: set[str] = set()
+    with_clause = getattr(stmt, "withClause", None)
+    if with_clause is not None:
+        for cte in getattr(with_clause, "ctes", None) or ():
+            name = getattr(cte, "ctename", None)
+            if isinstance(name, str) and name:
+                own_cte_names.add(name)
+    # A WITH clause's CTEs can reference each other (and themselves, when
+    # RECURSIVE), so every name in this clause — plus any inherited from an
+    # enclosing query — is in scope for both this statement's body and its
+    # CTE bodies.
+    scope = cte_scope | own_cte_names
+    if with_clause is not None:
+        for cte in getattr(with_clause, "ctes", None) or ():
+            out.extend(
+                _collect_accesses(getattr(cte, "ctequery", None), scope)
+            )
+
+    target_key: tuple[str | None, str] | None = None
+    if command != "SELECT":
+        target = getattr(stmt, "relation", None)
+        target_relname = getattr(target, "relname", None)
+        if isinstance(target_relname, str) and target_relname:
+            target_key = (getattr(target, "schemaname", None), target_relname)
+
+    for (s, r) in _own_range_vars(stmt):
+        # A bare reference to a CTE name is a query alias, not a table.
+        if s is None and r in scope:
+            continue
+        out.append((s, r, command if (s, r) == target_key else "SELECT"))
+    return out
+
+
 def exercised_from_sql(sql: str) -> list[tuple[str | None, str, str]]:
     """Parse a SQL statement into `(schema, relation, command)` accesses.
 
@@ -126,9 +214,11 @@ def exercised_from_sql(sql: str) -> list[tuple[str | None, str, str]]:
     (`INSERT`/`UPDATE`/`DELETE` write target); every other relation it
     references (joins, `FROM`/`USING` sources, sub-selects) is credited
     as a `SELECT` read. A bare `SELECT` credits all referenced relations
-    as `SELECT`. Statements with no RLS command (DDL, SET, …) yield
-    nothing. Returns `[]` on a parse failure — coverage is best-effort
-    and must never break the test that issued the SQL.
+    as `SELECT`. Data-modifying CTEs are recursed into so their write
+    targets get the write command (not a spurious `SELECT`). Statements
+    with no RLS command (DDL, SET, …) yield nothing. Returns `[]` on a
+    parse failure — coverage is best-effort and must never break the test
+    that issued the SQL.
     """
     try:
         parsed = pglast.parse_sql(sql)
@@ -136,38 +226,64 @@ def exercised_from_sql(sql: str) -> list[tuple[str | None, str, str]]:
         return []
     out: list[tuple[str | None, str, str]] = []
     for raw in parsed:
-        stmt = getattr(raw, "stmt", None)
-        command = statement_command(stmt)
-        if command is None:
-            continue
-        relations = extract_range_vars(stmt)
-        if command == "SELECT":
-            out.extend((s, r, "SELECT") for (s, r) in relations)
-            continue
-        target = getattr(stmt, "relation", None)
-        target_key: tuple[str | None, str] | None = None
-        target_relname = getattr(target, "relname", None)
-        if isinstance(target_relname, str) and target_relname:
-            target_key = (getattr(target, "schemaname", None), target_relname)
-        for (s, r) in relations:
-            out.append((s, r, command if (s, r) == target_key else "SELECT"))
+        out.extend(_collect_accesses(getattr(raw, "stmt", None)))
     return out
 
 
-def is_policy_covered(table: Table, policy: Policy, data: CoverageData) -> bool:
+def ambiguous_relation_names(schema: Schema) -> frozenset[str]:
+    """Bare table names that occur in more than one scanned schema.
+
+    A coverage tuple whose ``schema is None`` (an unqualified relation in
+    the test SQL, resolved through ``search_path`` at run time) cannot
+    safely credit a table whose name is shared across schemas. In a
+    one-schema-per-tenant layout (``tenant_a.events`` / ``tenant_b.events``)
+    a single unqualified ``FROM events`` would otherwise mark *every*
+    tenant's same-named policy covered off one test — a false "covered",
+    the dangerous direction for a security-coverage tool. Names in this
+    set therefore require a schema-qualified match (see
+    `is_policy_covered`).
+    """
+    counts: dict[str, int] = {}
+    for table in schema.tables:
+        counts[table.name] = counts.get(table.name, 0) + 1
+    return frozenset(name for name, count in counts.items() if count > 1)
+
+
+def is_policy_covered(
+    table: Table,
+    policy: Policy,
+    data: CoverageData,
+    *,
+    ambiguous_relations: frozenset[str] = frozenset(),
+) -> bool:
     """True iff some exercised tuple matches this policy (role+command+table).
 
-    - relation: same name, and same schema when the tuple captured one
-      (an unqualified tuple matches by bare name);
+    - relation: same name, and same schema when the tuple captured one.
+      An unqualified tuple (``schema is None``) matches by bare name —
+      *unless* the name is in `ambiguous_relations` (shared across scanned
+      schemas), in which case only a schema-qualified tuple matching this
+      table's schema counts. This keeps the "never over-credit" guarantee
+      in one-schema-per-tenant databases: an unqualified test query can't
+      certify a same-named table in another tenant's schema as tested.
     - command: the policy's command equals the exercised command, or the
       policy is `ALL` (which every command exercises);
     - role: the exercised role is one the policy targets, or the policy
       targets `PUBLIC` (which every role exercises).
+
+    Pass `ambiguous_relations=ambiguous_relation_names(schema)` (both
+    `build_coverage` and HYG004 do); the default empty set treats every
+    name as unambiguous, which is correct for a single-table check.
     """
+    name_is_ambiguous = table.name in ambiguous_relations
     for ex in data.exercised:
         if ex.relation != table.name:
             continue
-        if ex.schema is not None and ex.schema != table.schema:
+        if ex.schema is None:
+            # Unqualified test query: safe to credit only when this bare
+            # name unambiguously identifies one table among scanned schemas.
+            if name_is_ambiguous:
+                continue
+        elif ex.schema != table.schema:
             continue
         if not (policy.command == ex.command or policy.command == "ALL"):
             continue
@@ -214,6 +330,7 @@ def build_coverage(schema: Schema, data: CoverageData) -> CoverageReport:
 
     Policies are sorted by (table, policy name) for deterministic output.
     """
+    ambiguous = ambiguous_relation_names(schema)
     rows: list[PolicyCoverage] = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         for policy in sorted(table.policies, key=lambda p: p.name):
@@ -224,7 +341,9 @@ def build_coverage(schema: Schema, data: CoverageData) -> CoverageReport:
                     policy=policy.name,
                     command=policy.command,
                     roles=policy.roles,
-                    covered=is_policy_covered(table, policy, data),
+                    covered=is_policy_covered(
+                        table, policy, data, ambiguous_relations=ambiguous
+                    ),
                 )
             )
     return CoverageReport(policies=tuple(rows))
