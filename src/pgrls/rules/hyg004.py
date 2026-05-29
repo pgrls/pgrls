@@ -26,7 +26,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.coverage import CoverageData, is_policy_covered
+from pgrls.coverage import (
+    CoverageData,
+    ambiguous_relation_names,
+    is_policy_covered,
+)
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -46,13 +50,16 @@ class HYG004:
             # --coverage). Stay silent rather than flag every policy.
             return []
         allowlist = parse_policy_id_allowlist("HYG004", options)
+        ambiguous = ambiguous_relation_names(schema)
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
                 policy_id = f"{table.schema}.{table.name}.{policy.name}"
                 if policy_id in allowlist:
                     continue
-                if is_policy_covered(table, policy, coverage):
+                if is_policy_covered(
+                    table, policy, coverage, ambiguous_relations=ambiguous
+                ):
                     continue
                 roles = ", ".join(policy.roles) or "(no roles)"
                 out.append(

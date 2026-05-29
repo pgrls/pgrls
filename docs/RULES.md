@@ -2699,14 +2699,20 @@ under a role the policy targets (or `PUBLIC`), with a matching command
 (a `SELECT` query exercises `SELECT` and `ALL` policies; `INSERT`
 exercises `INSERT`/`ALL`; etc.). Anything else is uncovered.
 
-The model under-credits rather than over-credits: role inheritance is
-not resolved (a policy targeting role `A` tested only via a member
-role `B` reads as uncovered), and an unqualified relation in test SQL
-is matched by bare name. Both are the safe direction — a missed match
-prompts a test rather than a false "covered". Severity is **info** — an
-untested policy is a gap to close, not a live vulnerability. Allowlist
-a policy's qualified ID to accept it as intentionally untested. See
-`pgrls coverage` for the full per-policy report.
+The model under-credits rather than over-credits — a missed match
+prompts a test rather than a false "covered". Two consequences:
+role inheritance is not resolved (a policy targeting role `A` tested
+only via a member role `B` reads as uncovered); and an unqualified
+relation in a test query (`FROM events`, resolved through
+`search_path`) credits a table by bare name **only when that name is
+unique across the scanned schemas**. In a one-schema-per-tenant layout
+(`tenant_a.events` / `tenant_b.events`) the bare name is ambiguous, so
+an unqualified query credits neither — qualify the test query
+(`FROM tenant_a.events`) to record coverage for a specific tenant's
+policy. Severity is **info** — an untested policy is a gap to close,
+not a live vulnerability. Allowlist a policy's qualified ID to accept
+it as intentionally untested. See `pgrls coverage` for the full
+per-policy report.
 
 <a id="rule-view001"></a>
 

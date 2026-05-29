@@ -12,6 +12,7 @@ from pgrls.coverage import (
     ARTIFACT_VERSION,
     CoverageData,
     ExercisedTuple,
+    ambiguous_relation_names,
     build_coverage,
     exercised_from_sql,
     is_policy_covered,
@@ -90,6 +91,60 @@ def test_exercised_from_sql_non_dml_and_parse_failure() -> None:
     assert exercised_from_sql("this is not valid sql ;;;") == []
 
 
+def test_exercised_from_sql_data_modifying_cte_credits_write_command() -> None:
+    # The 0.7.1 fix: a writable CTE's target gets its OWN command, not the
+    # outer SELECT — Postgres applies the write-command policy to it, so
+    # crediting it as a SELECT read would falsely cover the SELECT policy.
+    # The CTE alias (`d`) is not a real relation and is dropped.
+    assert set(
+        exercised_from_sql(
+            "WITH d AS (DELETE FROM secret RETURNING *) SELECT * FROM d"
+        )
+    ) == {(None, "secret", "DELETE")}
+    assert set(
+        exercised_from_sql(
+            "WITH u AS (UPDATE accts SET x = 1 RETURNING *) "
+            "SELECT count(*) FROM u"
+        )
+    ) == {(None, "accts", "UPDATE")}
+
+
+def test_exercised_from_sql_select_into_excludes_created_table() -> None:
+    # `SELECT … INTO newt` creates newt (a write), it does not read it;
+    # only the source is a SELECT read.
+    assert exercised_from_sql("SELECT * INTO newt FROM src") == [
+        (None, "src", "SELECT")
+    ]
+
+
+def test_exercised_from_sql_sibling_and_nested_cte_aliases_dropped() -> None:
+    # A CTE can reference an earlier sibling; that alias is not a real
+    # relation and must not leak as a phantom SELECT (it could otherwise
+    # false-cover a real table sharing the alias name).
+    assert (
+        exercised_from_sql(
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT * FROM a) SELECT * FROM b"
+        )
+        == []
+    )
+    assert exercised_from_sql(
+        "WITH a AS (DELETE FROM secret RETURNING id), "
+        "b AS (SELECT * FROM a) SELECT * FROM b"
+    ) == [(None, "secret", "DELETE")]
+    # Nested WITH inside a CTE body — inner alias dropped via inherited scope.
+    assert (
+        exercised_from_sql(
+            "WITH o AS (WITH i AS (SELECT 1) SELECT * FROM i) SELECT * FROM o"
+        )
+        == []
+    )
+    # A real, schema-qualified table that happens to share an alias name is
+    # NOT dropped (only bare references to alias names are).
+    assert exercised_from_sql("WITH a AS (SELECT 1) SELECT * FROM public.a") == [
+        ("public", "a", "SELECT")
+    ]
+
+
 # ---------- is_policy_covered ----------
 
 
@@ -127,6 +182,57 @@ def test_schema_qualifier_must_match_when_present() -> None:
     # A bare (schema-less) tuple matches by relation name.
     bare = _data(ExercisedTuple(None, "invoices", "r", "SELECT"))
     assert is_policy_covered(table, p, bare) is True
+
+
+# ---------- multi-tenant ambiguity (no false-covered) ----------
+
+
+def _two_tenant_schema() -> Schema:
+    def pol() -> Policy:
+        return _policy("isolation", "SELECT", ("app_user",))
+
+    return Schema(
+        tables=(
+            Table("tenant_a", "events", True, True, (pol(),)),  # type: ignore[arg-type]
+            Table("tenant_b", "events", True, True, (pol(),)),  # type: ignore[arg-type]
+        )
+    )
+
+
+def test_ambiguous_relation_names_detects_cross_schema_dupes() -> None:
+    assert ambiguous_relation_names(_two_tenant_schema()) == frozenset({"events"})
+    assert ambiguous_relation_names(_one_table_schema(_policy("p", "SELECT", ("r",)))) == frozenset()
+
+
+def test_unqualified_tuple_does_not_cross_credit_same_named_tables() -> None:
+    # The bug guard: a test that exercised only tenant_a.events via an
+    # unqualified `FROM events` (schema=None) must NOT mark tenant_b's
+    # same-named policy covered. Over-credit is the dangerous direction.
+    schema = _two_tenant_schema()
+    data = _data(ExercisedTuple(None, "events", "app_user", "SELECT"))
+    covered = {p.location: p.covered for p in build_coverage(schema, data).policies}
+    assert covered == {
+        "tenant_a.events.isolation": False,
+        "tenant_b.events.isolation": False,
+    }
+
+
+def test_qualified_tuple_credits_only_its_schema() -> None:
+    schema = _two_tenant_schema()
+    data = _data(ExercisedTuple("tenant_a", "events", "app_user", "SELECT"))
+    covered = {p.location: p.covered for p in build_coverage(schema, data).policies}
+    assert covered == {
+        "tenant_a.events.isolation": True,
+        "tenant_b.events.isolation": False,
+    }
+
+
+def test_unique_name_still_covered_by_unqualified_tuple() -> None:
+    # No regression for the common single-schema case: an unambiguous bare
+    # name is still credited by an unqualified tuple.
+    schema = _one_table_schema(_policy("sel", "SELECT", ("app_user",)))
+    data = _data(ExercisedTuple(None, "invoices", "app_user", "SELECT"))
+    assert build_coverage(schema, data).policies[0].covered is True
 
 
 # ---------- artifact round-trip ----------
