@@ -70,6 +70,9 @@ from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
+from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
+from pgrls.coverage import load_artifact as load_coverage_artifact
+from pgrls.coverage import render as render_coverage
 from pgrls.rules import (
     Rule,
     RuleRegistry,
@@ -209,6 +212,18 @@ def main() -> None:
         "fails only on findings not in the baseline."
     ),
 )
+@click.option(
+    "--coverage",
+    "coverage_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to a coverage artifact from your pgrls.testing run "
+        "(.pgrls-coverage.json). Enables HYG004 (policy has no "
+        "behavioral test), which is inert without it. See `pgrls "
+        "coverage` for the full report."
+    ),
+)
 def lint(
     database_url: str | None,
     config_path: str | None,
@@ -222,6 +237,7 @@ def lint(
     fail_on: str | None,
     output_format: str,
     baseline_path: Path | None,
+    coverage_path: str | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
     if update_baseline and baseline_path is None:
@@ -287,6 +303,24 @@ def lint(
             "No database connection: pass --database-url or set DATABASE_URL."
         )
 
+    # Load the RLS test-coverage artifact if `--coverage` was passed. It
+    # feeds HYG004 (policy has no behavioral test), inert otherwise.
+    # Loaded before connecting so a bad path fails fast.
+    coverage_data: CoverageData | None = None
+    if coverage_path is not None:
+        try:
+            coverage_data = load_coverage_artifact(coverage_path)
+        except FileNotFoundError as exc:
+            raise ToolError(
+                f"Coverage artifact {coverage_path!r} not found. Run your "
+                "pgrls.testing suite first — it writes .pgrls-coverage.json "
+                "on finish — or omit --coverage."
+            ) from exc
+        except (ValueError, OSError) as exc:
+            raise ToolError(
+                f"Cannot read coverage artifact {coverage_path!r}: {exc}"
+            ) from exc
+
     try:
         with psycopg.connect(effective.database_url) as conn:
             schema = introspect(conn, schemas=effective.schemas)
@@ -301,6 +335,7 @@ def lint(
             config=effective,
             rule_filter=set(rules) if rules else None,
             exclude_filter=exclude_ids or None,
+            coverage_data=coverage_data,
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
@@ -497,6 +532,7 @@ def _run_rules(
     config: Config,
     rule_filter: set[str] | None = None,
     exclude_filter: set[str] | None = None,
+    coverage_data: CoverageData | None = None,
 ) -> list[Violation]:
     # Build the per-invocation registry: built-ins + extras from
     # `[lint].extra_rules`. A fresh RuleRegistry (not the cached
@@ -539,10 +575,16 @@ def _run_rules(
         # the all-enabled set, or the `--rule` selection. The
         # incoherent "same id in both" case is rejected upstream.
         rules = [r for r in rules if r.id not in exclude_filter]
+
     out: list[Violation] = []
     for rule in rules:
+        rule_options = config.rule_options.get(rule.id, {})
+        # HYG004 can't read the coverage artifact itself (rules only see
+        # the schema + options), so lint injects the parsed data here.
+        if rule.id == "HYG004" and coverage_data is not None:
+            rule_options = {**rule_options, "_coverage": coverage_data}
         try:
-            found = rule.check(schema, config.rule_options.get(rule.id, {}))
+            found = rule.check(schema, rule_options)
         except RecursionError as exc:
             # Pathologically deep policy AST (thousands of nested
             # ANDs/ORs) blows the default Python recursion limit
@@ -2407,6 +2449,136 @@ def report(
             raise ToolError(f"Cannot write {output_path}: {exc}") from exc
     else:
         click.echo(rendered, nl=False)
+
+
+@main.command()
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    default=None,
+    help="Postgres connection string. Falls back to $DATABASE_URL.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to report on (overrides config).",
+)
+@click.option(
+    "--coverage",
+    "coverage_path",
+    type=click.Path(dir_okay=False),
+    default=DEFAULT_ARTIFACT_PATH,
+    show_default=True,
+    help="Coverage artifact written by your pgrls.testing run.",
+)
+@click.option(
+    "--fail-under",
+    "fail_under",
+    type=click.FloatRange(0, 100),
+    default=None,
+    help="Exit 1 if coverage %% is below this threshold (CI gate).",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the report to this file instead of stdout (any --format).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(list(COVERAGE_FORMATS), case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def coverage(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    coverage_path: str,
+    fail_under: float | None,
+    output_path: str | None,
+    output_format: str,
+) -> None:
+    """Report which RLS policies your test suite exercised.
+
+    Cross-references the coverage artifact (`.pgrls-coverage.json`,
+    written automatically when your `pgrls.testing` suite runs) against
+    the live schema. A policy is *covered* when a test queried its table,
+    under a role the policy targets (or PUBLIC), with a matching command;
+    everything else is *uncovered* — the cross-tenant DELETE nobody
+    tested. `--format json` / `markdown` / `html` emit machine-readable /
+    paste-ready / standalone-page output. `--fail-under N` exits 1 when
+    coverage falls below N% — drop it in CI next to `pgrls lint`.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=None,
+    )
+    if effective.database_url is None:
+        raise ToolError(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    try:
+        data = load_coverage_artifact(coverage_path)
+    except FileNotFoundError as exc:
+        raise ToolError(
+            f"Coverage artifact {coverage_path!r} not found. Run your "
+            "pgrls.testing suite first — it writes .pgrls-coverage.json on "
+            "finish — or pass --coverage PATH."
+        ) from exc
+    except (ValueError, OSError) as exc:
+        raise ToolError(
+            f"Cannot read coverage artifact {coverage_path!r}: {exc}"
+        ) from exc
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+    report = build_coverage(schema, data)
+    rendered = render_coverage(report, output_format)
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    if output_path is not None:
+        try:
+            Path(output_path).write_text(
+                rendered, encoding="utf-8", newline=""
+            )
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
+    else:
+        click.echo(rendered, nl=False)
+
+    pct = report.summary["coverage_pct"]
+    if fail_under is not None and pct < fail_under:
+        click.echo(
+            f"pgrls: coverage {pct}% is below --fail-under {fail_under}%.",
+            err=True,
+        )
+        sys.exit(1)
 
 
 @main.command()

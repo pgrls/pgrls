@@ -89,7 +89,13 @@ def test_pgrls_db_fixture_yields_working_client(pg_url: str) -> None:
     from pgrls.testing.client import PgrlsTestClient
     from pgrls.testing.pytest_plugin import pgrls_db
 
-    gen = pgrls_db.__wrapped__(pg_url)
+    # The fixture takes `request` (for the coverage accumulator) then the
+    # DB-url fixture. Pass a stand-in request whose config has no
+    # accumulator, so capture stays off for this direct-drive test.
+    from types import SimpleNamespace
+
+    fake_request = SimpleNamespace(config=SimpleNamespace())
+    gen = pgrls_db.__wrapped__(fake_request, pg_url)
     client = next(gen)
     try:
         assert isinstance(client, PgrlsTestClient)
@@ -134,3 +140,50 @@ def test_pgrls_db_fixture_in_synthetic_pytest_session(
     monkeypatch.setenv("PGRLS_TEST_DATABASE_URL", pg_url)
     result = pytester.runpytest_subprocess("-v")
     result.assert_outcomes(passed=1)
+
+
+def test_synthetic_session_writes_coverage_artifact(
+    pytester: pytest.Pytester,
+    pg_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The plugin writes .pgrls-coverage.json on session finish, recording
+    # the relations each test queried. A query against pg_class gives a
+    # real relation to capture.
+    import json
+
+    pytester.makepyfile(
+        """
+        def test_q(pgrls_db):
+            pgrls_db.fetchall("SELECT relname FROM pg_class LIMIT 1")
+        """
+    )
+    monkeypatch.setenv("PGRLS_TEST_DATABASE_URL", pg_url)
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+
+    artifact = pytester.path / ".pgrls-coverage.json"
+    assert artifact.exists(), "coverage artifact should be written on session finish"
+    data = json.loads(artifact.read_text())
+    assert data["pgrls_coverage_version"] == 1
+    relations = {row["relation"] for row in data["exercised"]}
+    assert "pg_class" in relations
+
+
+def test_coverage_artifact_opt_out_via_env(
+    pytester: pytest.Pytester,
+    pg_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PGRLS_COVERAGE=off suppresses the artifact even though a query ran.
+    pytester.makepyfile(
+        """
+        def test_q(pgrls_db):
+            pgrls_db.fetchall("SELECT relname FROM pg_class LIMIT 1")
+        """
+    )
+    monkeypatch.setenv("PGRLS_TEST_DATABASE_URL", pg_url)
+    monkeypatch.setenv("PGRLS_COVERAGE", "off")
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=1)
+    assert not (pytester.path / ".pgrls-coverage.json").exists()

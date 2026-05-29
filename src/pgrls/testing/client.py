@@ -42,6 +42,15 @@ class PgrlsTestClient:
         # contract.
         conn.autocommit = False
         self._conn = conn
+        # RLS test coverage capture. The pytest plugin attaches a sink
+        # (a callable taking a list of ExercisedTuple) when coverage is
+        # enabled; None disables capture entirely, so direct/non-pytest
+        # use pays nothing. `_current_role` follows `as_role`;
+        # `_login_role` caches the connection's role for queries run
+        # outside any `as_role` block (queried once, lazily).
+        self._coverage_sink: Any | None = None
+        self._current_role: str | None = None
+        self._login_role: str | None = None
 
     @classmethod
     @contextmanager
@@ -75,12 +84,46 @@ class PgrlsTestClient:
         finally:
             self._conn.rollback()
 
+    def _active_role(self) -> str:
+        """The role queries currently run as: the `as_role` role inside a
+        block, else the connection's login role (queried once, cached)."""
+        if self._current_role is not None:
+            return self._current_role
+        if self._login_role is None:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT current_user")
+                row = cur.fetchone()
+                self._login_role = row[0] if row else ""
+        return self._login_role
+
+    def _capture(self, sql: str) -> None:
+        """Best-effort record of the `(relation, role, command)` tuples
+        this SQL exercises, for RLS test coverage. No-op unless the pytest
+        plugin attached a sink. Never raises — coverage must not fail a
+        test, so a parse hiccup or sink error is swallowed."""
+        sink = self._coverage_sink
+        if sink is None:
+            return
+        try:
+            from pgrls.coverage import ExercisedTuple, exercised_from_sql
+
+            role = self._active_role()
+            tuples = [
+                ExercisedTuple(schema=s, relation=r, role=role, command=c)
+                for (s, r, c) in exercised_from_sql(sql)
+            ]
+            if tuples:
+                sink(tuples)
+        except Exception:
+            pass
+
     def exec(
         self, sql: str, *, params: Sequence[Any] = ()
     ) -> None:
         """Execute a single SQL statement with optional parameters."""
         with self._conn.cursor() as cur:
             cur.execute(sql, params)
+        self._capture(sql)
 
     def fetchall(
         self, sql: str, *, params: Sequence[Any] = ()
@@ -95,7 +138,9 @@ class PgrlsTestClient:
 
         with self._conn.cursor(row_factory=dict_row) as cur:
             cur.execute(sql, params)
-            return list(cur.fetchall())
+            result = list(cur.fetchall())
+        self._capture(sql)
+        return result
 
     @contextmanager
     def as_role(
@@ -135,6 +180,12 @@ class PgrlsTestClient:
         identifiers needing double-quoting (mixed case, spaces).
         """
         from pgrls.fixers._idents import quote_ident
+
+        # Track the active role in-memory for coverage capture; restored
+        # to the outer value on exit so nested blocks and post-block
+        # queries record the right role (mirrors the DB role's
+        # savepoint-scoped lifetime).
+        outer_role = self._current_role
 
         # Name is locally generated (token_hex), not user input —
         # safe to interpolate without quoting.
@@ -177,6 +228,7 @@ class PgrlsTestClient:
                         "'request.jwt.claims', %s, true)",
                         (json.dumps(claims),),
                     )
+            self._current_role = role
             yield
             ok = True
         finally:
@@ -224,6 +276,9 @@ class PgrlsTestClient:
                     # state from before the savepoint —
                     # role and GUC both revert automatically.
                     cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            # The DB role is restored above (RELEASE+restore) or by the
+            # rollback; bring the in-memory tracker back in step.
+            self._current_role = outer_role
 
     def seed(
         self,
@@ -302,23 +357,28 @@ class PgrlsTestClient:
         from pgrls.testing.assertions import assert_rows
 
         assert_rows(self._conn, sql, count=count)
+        self._capture(sql)
 
     def assert_visible(self, sql: str) -> None:
         from pgrls.testing.assertions import assert_visible
 
         assert_visible(self._conn, sql)
+        self._capture(sql)
 
     def assert_invisible(self, sql: str) -> None:
         from pgrls.testing.assertions import assert_invisible
 
         assert_invisible(self._conn, sql)
+        self._capture(sql)
 
     def assert_rejected(self, sql: str) -> None:
         from pgrls.testing.assertions import assert_rejected
 
         assert_rejected(self._conn, sql)
+        self._capture(sql)
 
     def assert_silently_dropped(self, sql: str) -> None:
         from pgrls.testing.assertions import assert_silently_dropped
 
         assert_silently_dropped(self._conn, sql)
+        self._capture(sql)

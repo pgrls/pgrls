@@ -10,6 +10,25 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-29
+
+### Added
+
+- **RLS test coverage.** A new `pgrls coverage` command reports which
+  RLS policies your `pgrls.testing` suite actually exercised, and which
+  were never touched — the cross-tenant `DELETE` nobody tested. The
+  pytest plugin now records the `(schema, relation, role, command)`
+  tuples each test runs and writes them to `.pgrls-coverage.json` on
+  session finish (best-effort; disable with `pgrls_coverage = false` or
+  `PGRLS_COVERAGE=off`). `pgrls coverage` renders text / json / markdown
+  / html and gates CI with `--fail-under N`. A policy is *covered* when
+  a test queried its table, under a role it targets (or `PUBLIC`), with
+  a matching command.
+- **HYG004 — policy has no behavioral test.** A new (info, opt-in) lint
+  rule that flags uncovered policies. Inert on a normal run; enable it
+  with `pgrls lint --coverage .pgrls-coverage.json`. Shares the coverage
+  matching with `pgrls coverage`. Brings the catalog to **48 rules**.
+
 ## [0.6.24] - 2026-05-28
 
 ### Changed
