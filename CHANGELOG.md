@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-30
+
+### Fixed
+
+- **`pgrls generate` no longer duplicates indexes on partitioned tables.**
+  For a declarative-partitioned tenant table, `generate` set up the parent
+  *and* every child, so each child got two identical discriminator indexes
+  (the parent's partitioned index cascades to children automatically, plus
+  `generate`'s own per-child `CREATE INDEX`). `generate` now sets up the
+  partitioned parent only and skips children (reported, pointing at the
+  parent) — mirroring how the SEC001 rule/fixer already treat partitions.
+  RLS on the parent covers parent-routed queries and its index cascades, so
+  the result still lints clean; each child carries exactly one index.
+
 ## [0.8.0] - 2026-05-29
 
 ### Added
