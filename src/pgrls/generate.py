@@ -223,6 +223,34 @@ def plan_generation(
             continue  # not a target
         seen.add(key)
 
+        if table.partition_of is not None:
+            # Declarative-partition child. Postgres does not propagate
+            # relrowsecurity to children, but RLS on the partitioned parent
+            # covers queries routed through it (SEC001 skips a covered child
+            # for the same reason), and a CREATE INDEX on the parent cascades
+            # to every child. Generating per-child policies + a per-child
+            # index would duplicate the parent's cascading index and is
+            # rarely what's wanted — so set up the parent and skip children.
+            # Point at the ROOT partitioned table (the one that actually
+            # gets the generated RLS), not the immediate parent — for a
+            # multi-level partition the immediate parent is itself a skipped
+            # child. Mirrors SEC001, which names `ancestors[-1]`.
+            ancestors = list(schema.ancestors_of(table))
+            if ancestors:
+                root_name = ancestors[-1].qualified_name
+            else:
+                root_name = f"{table.partition_of[0]}.{table.partition_of[1]}"
+            skipped.append(
+                (
+                    table.qualified_name,
+                    f"partition of {root_name} — generate RLS on the "
+                    "partitioned parent (it covers parent-routed queries and "
+                    "its index cascades to children); hand-write per-child "
+                    "policies only if you allow direct partition access",
+                )
+            )
+            continue
+
         if column not in table.columns:
             skipped.append(
                 (table.qualified_name, f"column {column!r} not found on table")

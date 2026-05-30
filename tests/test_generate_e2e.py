@@ -96,6 +96,54 @@ def test_generate_postgrest_convention_lints_clean(
     assert _lint_violations(pg_url) == []
 
 
+def test_generate_partitioned_table_no_dup_index_lints_clean(
+    pg_url: str, apply_sql, ensure_authenticated_role
+) -> None:
+    # A declarative-partitioned tenant table: generate must set up the
+    # PARENT only (its index cascades to children, its RLS covers
+    # parent-routed queries) and skip the children — so each child has
+    # exactly ONE tenant_id index (the cascaded one, not a duplicate), and
+    # the whole thing lints clean.
+    apply_sql(
+        """
+        CREATE TABLE public.events (
+            id uuid NOT NULL DEFAULT gen_random_uuid(),
+            tenant_id uuid NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        ) PARTITION BY RANGE (created_at);
+        CREATE TABLE public.events_2025 PARTITION OF public.events
+            FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+        CREATE TABLE public.events_2026 PARTITION OF public.events
+            FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')
+        """
+    )
+    gen = CliRunner().invoke(
+        main, ["generate", "--database-url", pg_url, "--apply"]
+    )
+    assert gen.exit_code == 0, gen.output
+    # Parent set up; children reported as skipped, pointing at the parent.
+    assert "skipped public.events_2025" in gen.output
+    assert "partition of public.events" in gen.output
+
+    # Gold-standard guarantee holds for the partitioned shape.
+    assert _lint_violations(pg_url) == []
+
+    # No duplicate index: each child carries exactly one tenant_id index
+    # (cascaded from the parent's partitioned index), not two.
+    with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
+        for child in ("events_2025", "events_2026"):
+            cur.execute(
+                "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' "
+                "AND tablename = %s AND indexdef LIKE '%%tenant_id%%'",
+                (child,),
+            )
+            row = cur.fetchone()
+            assert row is not None and row[0] == 1, (
+                f"{child} should have exactly one tenant_id index, "
+                f"got {row[0] if row else None}"
+            )
+
+
 def test_generate_is_idempotent(
     pg_url: str, apply_sql, ensure_authenticated_role
 ) -> None:

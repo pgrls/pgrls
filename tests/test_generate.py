@@ -118,6 +118,78 @@ def test_explicit_table_not_found_is_reported() -> None:
     assert ("public.ghost", "table not found in scanned schemas") in result.skipped
 
 
+def test_partition_child_skipped_parent_targeted() -> None:
+    # A partitioned parent gets the full setup; its children are skipped
+    # (the parent's index cascades and RLS on it covers parent-routed
+    # queries), so no per-child duplicate index is emitted.
+    parent = _table("events", (_ID, _TID))  # partition_of is None
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        columns=("id", "tenant_id"),
+        column_details=(_ID, _TID),
+        partition_of=("public", "events"),
+    )
+    result = plan_generation(Schema(tables=(parent, child)), GenerateOptions())
+    sqls = "\n".join(f.sql for f in result.statements)
+    # Parent set up (incl. its cascading index); no statement touches the child.
+    assert "CREATE INDEX ON public.events (tenant_id)" in sqls
+    assert "events_2026" not in sqls
+    # Child reported as skipped, pointing at the parent.
+    assert any(
+        q == "public.events_2026" and "partition of public.events" in r
+        for q, r in result.skipped
+    )
+
+
+def test_partition_skip_message_names_root_for_multilevel() -> None:
+    # root → mid → leaf. Only the root is generated; both mid and leaf are
+    # skipped and their reason names the ROOT (the table that gets the RLS),
+    # not the immediate parent (which is itself a skipped child).
+    root = _table("events", (_ID, _TID))  # partition_of is None
+    mid = Table(
+        schema="public", name="events_2026", rls_enabled=False, force_rls=False,
+        policies=(), columns=("id", "tenant_id"), column_details=(_ID, _TID),
+        partition_of=("public", "events"),
+    )
+    leaf = Table(
+        schema="public", name="events_2026_q1", rls_enabled=False, force_rls=False,
+        policies=(), columns=("id", "tenant_id"), column_details=(_ID, _TID),
+        partition_of=("public", "events_2026"),
+    )
+    result = plan_generation(Schema(tables=(root, mid, leaf)), GenerateOptions())
+    reasons = dict(result.skipped)
+    # Trailing space distinguishes "public.events " from "public.events_2026".
+    assert "partition of public.events " in reasons["public.events_2026"]
+    assert "partition of public.events " in reasons["public.events_2026_q1"]
+    assert "CREATE INDEX ON public.events (tenant_id)" in "\n".join(
+        f.sql for f in result.statements
+    )
+
+
+def test_explicit_table_targeting_partition_child_is_skipped() -> None:
+    child = Table(
+        schema="public",
+        name="events_2026",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        columns=("id", "tenant_id"),
+        column_details=(_ID, _TID),
+        partition_of=("public", "events"),
+    )
+    opts = GenerateOptions(tables=(("public", "events_2026", "tenant_id"),))
+    result = plan_generation(Schema(tables=(child,)), opts)
+    assert result.statements == ()
+    assert any(
+        q == "public.events_2026" and "partition of public.events" in r
+        for q, r in result.skipped
+    )
+
+
 def test_no_restrictive_omits_floor() -> None:
     schema = Schema(tables=(_table("posts", (_ID, _TID)),))
     sqls = "\n".join(
