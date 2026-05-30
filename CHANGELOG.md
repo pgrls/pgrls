@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-29
+
+### Added
+
+- **`pgrls generate` — scaffold gold-standard RLS.** pgrls lints, fixes,
+  tests, and diffs RLS; now it also *produces* it. For every table that
+  carries a tenant-discriminator column (default `tenant_id`,
+  `--tenant-column` / `--table schema.tbl:col`) and has no policies,
+  `generate` emits the complete correct setup — `ENABLE` + `FORCE` row
+  security, a permissive tenant-isolation policy, a `RESTRICTIVE` floor
+  (`--no-restrictive` to skip), and the supporting index — built so the
+  result **lints with zero findings** (an end-to-end test pins the
+  guarantee). The predicate compares the column to a session value
+  (`--convention app-guc` → `current_setting('app.<col>', true)`, or
+  `postgrest` → `request.jwt.claim.<col>`), wrapped in `(SELECT …)` for
+  per-statement caching and cast to the column's type. Dry-run by default;
+  `--output FILE` writes a migration, `--apply` runs it in one
+  all-or-nothing transaction. Tables that already have policies are
+  skipped and reported — `generate` never clobbers hand-written intent, so
+  re-runs are idempotent. Targets the common single-column tenant model;
+  per-CRUD / membership-join / row-owner shapes remain hand-written.
+
 ## [0.7.1] - 2026-05-29
 
 ### Fixed
