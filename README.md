@@ -31,6 +31,7 @@
 > **Beta — actively maintained.** 48 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all forty-eight rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tenant tables that lack it (ENABLE + FORCE, a permissive tenant-isolation policy, a restrictive floor, and the index) — output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
@@ -236,6 +237,52 @@ pgrls fix --database-url "$DATABASE_URL" --check
 ```
 
 Currently fixable: **SEC001** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`), **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **SEC006** (emits `ALTER POLICY … WITH CHECK (…)` mirroring the policy's `USING`), **SEC011** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` stripping an `OR true` debug bypass), **SEC019** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` adding the `missing_ok = true` second argument to one-argument `current_setting()` calls), **SEC020** (emits `ALTER POLICY … WITH CHECK (…)` replacing a constant-`true` `WITH CHECK` with the policy's `USING`), **SEC031** (emits `DROP POLICY … ON …;` for a no-op restrictive `USING (true)` floor — it AND-combines to nothing, so dropping it leaves access unchanged), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` and emits `ALTER POLICY … USING (…);`), **PERF003** (emits `CREATE INDEX ON … (…);` for a policy-predicate column with no leading-column index), **HYG003** (emits `DROP POLICY … ON …;` for a policy that exactly duplicates another on the same table), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
+
+## Scaffold RLS — `pgrls generate`
+
+`pgrls fix` repairs RLS you already have; `pgrls generate` writes it from
+scratch for tenant tables that have none. The shoot-out showed ORMs emit
+broken or absent row security — the counter is to generate correct RLS and
+lint it.
+
+For every table that carries a tenant-discriminator column (default
+`tenant_id`) and has **no** policies, `generate` emits the complete
+gold-standard setup — `ENABLE` + `FORCE` row security, a permissive
+tenant-isolation policy, a `RESTRICTIVE` floor, and the supporting index —
+**designed to lint clean**:
+
+```bash
+# Dry-run: print the SQL for every unprotected tenant_id table.
+pgrls generate --database-url "$DATABASE_URL"
+
+# Write a migration, or apply in one all-or-nothing transaction.
+pgrls generate --database-url "$DATABASE_URL" --output rls.sql
+pgrls generate --database-url "$DATABASE_URL" --apply
+
+# The round-trip the feature guarantees:
+pgrls generate --apply && pgrls lint   # → no findings
+```
+
+The predicate compares the column to a session value, wrapped in
+`(SELECT …)` for per-statement caching and cast to the column's type:
+
+```sql
+CREATE POLICY posts_tenant_isolation ON public.posts TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+```
+
+`--convention postgrest` switches the source to
+`current_setting('request.jwt.claim.tenant_id', true)`; `--setting-name`,
+`--role` (default `authenticated`), and `--no-restrictive` tune the rest.
+(The restrictive floor is what silences the SEC007 "all policies
+permissive" advisory — `--no-restrictive` trades it back for that info
+finding.)
+For a non-conventional column, name it explicitly:
+`--table public.orgs:org_id`. Tables that already have policies are
+**skipped** — `generate` never overwrites hand-written policy intent, so
+re-running it is a no-op. Scope is the common single-column tenant model;
+per-CRUD, membership-join, and row-owner shapes stay hand-written.
 
 ## RLS posture — `pgrls report`
 

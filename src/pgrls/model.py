@@ -1110,7 +1110,7 @@ class Schema:
                 f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
             )
             for p in t.policies:
-                out.append(_policy_to_sql(p, qname))
+                out.append(policy_to_sql(p, qname))
 
         # 5. Grants. PUBLIC pseudo-role keeps its bare-PUBLIC form;
         # named roles are quoted via quote_ident.
@@ -1132,8 +1132,12 @@ class Schema:
         return "\n".join(out) + "\n"
 
 
-def _policy_to_sql(p: Policy, qname: str) -> str:
-    """Render a single CREATE POLICY statement for `Schema.to_sql()`.
+def policy_to_sql(p: Policy, qname: str) -> str:
+    """Render a single CREATE POLICY statement.
+
+    Used by `Schema.to_sql()` and by `pgrls generate` to render the
+    policies it synthesizes — building a `Policy` object and rendering it
+    here guarantees generated DDL round-trips through pgrls's own model.
 
     Mirrors the canonical Postgres syntax: AS PERMISSIVE/RESTRICTIVE
     (omit if PERMISSIVE — that's the default), FOR <command> (omit

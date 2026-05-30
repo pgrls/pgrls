@@ -60,6 +60,7 @@ from pgrls.fixers import (
     render_migration,
 )
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
+from pgrls.generate import GenerateOptions, plan_generation
 from pgrls.history import (
     HISTORY_FORMATS,
     build_rows,
@@ -999,6 +1000,265 @@ def fix(
                     f"pgrls: {len(fixes)} "
                     f"fix{'es' if len(fixes) != 1 else ''} ready "
                     "(dry-run). Re-run with --apply to execute.",
+                    err=True,
+                )
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _parse_generate_tables(
+    raw: tuple[str, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    """Parse `--table schema.table:column` entries.
+
+    Each entry is `schema.table:column`. The schema/table split is on the
+    rightmost `.` before the `:` (Postgres names can't contain `.` from
+    introspection), so `app.events:org_id` → ('app','events','org_id').
+    """
+    out: list[tuple[str, str, str]] = []
+    for entry in raw:
+        if ":" not in entry:
+            raise ToolError(
+                f"--table {entry!r} must be 'schema.table:column' "
+                "(e.g. 'public.orgs:org_id')."
+            )
+        ref, _, column = entry.rpartition(":")
+        if "." not in ref or not column.strip():
+            raise ToolError(
+                f"--table {entry!r} must be 'schema.table:column' "
+                "(e.g. 'public.orgs:org_id')."
+            )
+        schema_name, _, table_name = ref.rpartition(".")
+        if not schema_name or not table_name:
+            raise ToolError(
+                f"--table {entry!r} must be 'schema.table:column' "
+                "(e.g. 'public.orgs:org_id')."
+            )
+        out.append((schema_name, table_name, column.strip()))
+    return tuple(out)
+
+
+@main.command()
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    default=None,
+    help="Postgres connection string. Falls back to $DATABASE_URL.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to scan (overrides config).",
+)
+@click.option(
+    "--tenant-column",
+    default="tenant_id",
+    show_default=True,
+    help="Discriminator column to auto-detect on tables lacking RLS.",
+)
+@click.option(
+    "--table",
+    "tables",
+    multiple=True,
+    help=(
+        "Generate for a specific table with an explicit discriminator "
+        "column: 'schema.table:column'. Repeatable. Use for tables whose "
+        "column isn't --tenant-column (e.g. 'public.orgs:org_id')."
+    ),
+)
+@click.option(
+    "--convention",
+    type=click.Choice(["app-guc", "postgrest"], case_sensitive=False),
+    default="app-guc",
+    show_default=True,
+    help=(
+        "Session-value source for the policy predicate: 'app-guc' uses "
+        "current_setting('app.<col>', true); 'postgrest' uses "
+        "current_setting('request.jwt.claim.<col>', true)."
+    ),
+)
+@click.option(
+    "--setting-name",
+    default=None,
+    help=(
+        "Override the setting name used in current_setting() for every "
+        "table (default derives 'app.<col>' / 'request.jwt.claim.<col>')."
+    ),
+)
+@click.option(
+    "--role",
+    default="authenticated",
+    show_default=True,
+    help="Role the generated policies target (TO <role>). Must exist.",
+)
+@click.option(
+    "--restrictive/--no-restrictive",
+    default=True,
+    show_default=True,
+    help="Also emit a RESTRICTIVE tenant floor (defense-in-depth).",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the generated SQL to this file instead of stdout.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite the --output file if it already exists.",
+)
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help="Execute the generated SQL. Default: dry-run (print SQL only).",
+)
+def generate(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    tenant_column: str,
+    tables: tuple[str, ...],
+    convention: str,
+    setting_name: str | None,
+    role: str,
+    restrictive: bool,
+    output_path: str | None,
+    force: bool,
+    apply: bool,
+) -> None:
+    """Scaffold gold-standard RLS for tenant tables that lack it.
+
+    For every table that carries the discriminator column (default
+    `tenant_id`, or a `--table schema.tbl:col` override) and has NO
+    policies, emit the complete correct setup: ENABLE + FORCE row
+    security, a permissive tenant-isolation policy, a RESTRICTIVE floor
+    (`--no-restrictive` to skip), and the supporting index. The output is
+    designed to lint clean — `pgrls generate --apply && pgrls lint` is the
+    intended round-trip. Tables that already have policies are skipped
+    (pgrls never clobbers hand-written policy intent — refine those with
+    `pgrls lint` / `fix`).
+
+    Default is a dry-run to stdout. `--output FILE` writes a
+    migration-ready script; `--apply` runs the SQL in one all-or-nothing
+    transaction against the resolved database.
+    """
+    if output_path is not None and apply:
+        raise ToolError(
+            "--output and --apply cannot be combined: --output writes a "
+            "migration file, --apply executes against the database."
+        )
+
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=None,
+    )
+    if effective.database_url is None:
+        raise ToolError(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    options = GenerateOptions(
+        tenant_column=tenant_column,
+        convention="postgrest" if convention.lower() == "postgrest" else "app-guc",
+        setting_name=setting_name,
+        role=role,
+        restrictive=restrictive,
+        tables=_parse_generate_tables(tables),
+    )
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+            result = plan_generation(schema, options)
+
+            # Advisory notes + skipped tables → stderr (never pollutes the
+            # SQL on stdout / in the migration file).
+            for note in result.notes:
+                click.echo(f"pgrls: note: {note}", err=True)
+            for qname, reason in result.skipped:
+                click.echo(f"pgrls: skipped {qname} — {reason}", err=True)
+
+            if not result.statements:
+                click.echo(
+                    "pgrls: nothing to generate (no unprotected tables with "
+                    "the discriminator column).",
+                    err=True,
+                )
+                return
+
+            stmts = list(result.statements)
+
+            if output_path is not None:
+                path = Path(output_path)
+                if path.exists() and not force:
+                    raise ToolError(
+                        f"{output_path} already exists. Pass --force to "
+                        "overwrite it."
+                    )
+                migration = render_migration(stmts, tool_version=__version__)
+                try:
+                    path.write_text(migration, encoding="utf-8", newline="")
+                except OSError as exc:
+                    raise ToolError(
+                        f"cannot write generated SQL to {output_path}: {exc}"
+                    ) from exc
+                click.echo(
+                    f"pgrls: wrote {len(stmts)} statement(s) to "
+                    f"{output_path}.",
+                    err=True,
+                )
+                return
+
+            click.echo(render_fixes(stmts))
+
+            if apply:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtext('pgrls.generate'))"
+                    )
+                    for i, f in enumerate(stmts, start=1):
+                        try:
+                            cur.execute(f.sql)
+                        except psycopg.Error as exc:
+                            conn.rollback()
+                            raise ToolError(
+                                _fix_apply_failure_message(
+                                    i, len(stmts), f, exc
+                                )
+                            ) from exc
+                conn.commit()
+                click.echo(
+                    f"pgrls: applied {len(stmts)} statement(s). "
+                    "Run `pgrls lint` to confirm a clean result.",
+                    err=True,
+                )
+            else:
+                click.echo(
+                    f"pgrls: {len(stmts)} statement(s) ready (dry-run). "
+                    "Re-run with --apply to execute, or --output FILE to "
+                    "write a migration.",
                     err=True,
                 )
     except psycopg.Error as exc:
