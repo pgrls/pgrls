@@ -1060,10 +1060,24 @@ def _parse_generate_tables(
     help="Comma-separated schemas to scan (overrides config).",
 )
 @click.option(
-    "--tenant-column",
-    default="tenant_id",
+    "--model",
+    type=click.Choice(["tenant", "owner"], case_sensitive=False),
+    default="tenant",
     show_default=True,
-    help="Discriminator column to auto-detect on tables lacking RLS.",
+    help=(
+        "What rows are scoped to: 'tenant' (per-tenant isolation) or 'owner' "
+        "(per-user ownership). Sets the default column (tenant_id / user_id), "
+        "the postgrest claim, and the policy names."
+    ),
+)
+@click.option(
+    "--tenant-column",
+    "column",
+    default=None,
+    help=(
+        "Discriminator column to auto-detect (default: tenant_id, or user_id "
+        "with --model owner)."
+    ),
 )
 @click.option(
     "--table",
@@ -1072,18 +1086,21 @@ def _parse_generate_tables(
     help=(
         "Generate for a specific table with an explicit discriminator "
         "column: 'schema.table:column'. Repeatable. Use for tables whose "
-        "column isn't --tenant-column (e.g. 'public.orgs:org_id')."
+        "column isn't the default (e.g. 'public.orgs:org_id')."
     ),
 )
 @click.option(
     "--convention",
-    type=click.Choice(["app-guc", "postgrest"], case_sensitive=False),
+    type=click.Choice(
+        ["app-guc", "postgrest", "supabase"], case_sensitive=False
+    ),
     default="app-guc",
     show_default=True,
     help=(
-        "Session-value source for the policy predicate: 'app-guc' uses "
+        "Session-value source for the predicate: 'app-guc' uses "
         "current_setting('app.<col>', true); 'postgrest' uses "
-        "current_setting('request.jwt.claim.<col>', true)."
+        "current_setting('request.jwt.claim.<claim>', true); 'supabase' uses "
+        "(SELECT auth.uid()) — owner model only."
     ),
 )
 @click.option(
@@ -1091,8 +1108,14 @@ def _parse_generate_tables(
     default=None,
     help=(
         "Override the setting name used in current_setting() for every "
-        "table (default derives 'app.<col>' / 'request.jwt.claim.<col>')."
+        "table (default derives from --convention and --model)."
     ),
+)
+@click.option(
+    "--auth-function",
+    default="auth.uid",
+    show_default=True,
+    help="Auth function for --convention supabase (compared as (SELECT fn())).",
 )
 @click.option(
     "--role",
@@ -1104,7 +1127,7 @@ def _parse_generate_tables(
     "--restrictive/--no-restrictive",
     default=True,
     show_default=True,
-    help="Also emit a RESTRICTIVE tenant floor (defense-in-depth).",
+    help="Also emit a RESTRICTIVE floor (defense-in-depth).",
 )
 @click.option(
     "--output",
@@ -1130,27 +1153,33 @@ def generate(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
-    tenant_column: str,
+    model: str,
+    column: str | None,
     tables: tuple[str, ...],
     convention: str,
     setting_name: str | None,
+    auth_function: str,
     role: str,
     restrictive: bool,
     output_path: str | None,
     force: bool,
     apply: bool,
 ) -> None:
-    """Scaffold gold-standard RLS for tenant tables that lack it.
+    """Scaffold gold-standard RLS for tables that lack it.
 
     For every table that carries the discriminator column (default
-    `tenant_id`, or a `--table schema.tbl:col` override) and has NO
-    policies, emit the complete correct setup: ENABLE + FORCE row
-    security, a permissive tenant-isolation policy, a RESTRICTIVE floor
-    (`--no-restrictive` to skip), and the supporting index. The output is
-    designed to lint clean — `pgrls generate --apply && pgrls lint` is the
-    intended round-trip. Tables that already have policies are skipped
-    (pgrls never clobbers hand-written policy intent — refine those with
-    `pgrls lint` / `fix`).
+    `tenant_id`, or `user_id` with `--model owner`, or a `--table
+    schema.tbl:col` override) and has NO policies, emit the complete correct
+    setup: ENABLE + FORCE row security, a permissive isolation policy, a
+    RESTRICTIVE floor (`--no-restrictive` to skip), and the supporting
+    index. The output is designed to lint clean — `pgrls generate --apply &&
+    pgrls lint` is the intended round-trip. Tables that already have
+    policies are skipped (pgrls never clobbers hand-written policy intent —
+    refine those with `pgrls lint` / `fix`).
+
+    `--model tenant` (default) scopes rows per tenant; `--model owner` scopes
+    per user (e.g. `user_id = (SELECT auth.uid())` with `--convention
+    supabase`).
 
     Default is a dry-run to stdout. `--output FILE` writes a
     migration-ready script; `--apply` runs the SQL in one all-or-nothing
@@ -1161,6 +1190,17 @@ def generate(
             "--output and --apply cannot be combined: --output writes a "
             "migration file, --apply executes against the database."
         )
+
+    model_norm = model.lower()
+    convention_norm = convention.lower()
+    if convention_norm == "supabase" and model_norm != "owner":
+        raise ToolError(
+            "--convention supabase is for --model owner (it emits "
+            "(SELECT auth.uid())). For tenant scoping use --convention "
+            "app-guc or postgrest."
+        )
+    # Column default depends on the model when not given explicitly.
+    resolved_column = column or ("user_id" if model_norm == "owner" else "tenant_id")
 
     try:
         config = load_config(config_path)
@@ -1179,9 +1219,11 @@ def generate(
         )
 
     options = GenerateOptions(
-        tenant_column=tenant_column,
-        convention="postgrest" if convention.lower() == "postgrest" else "app-guc",
+        tenant_column=resolved_column,
+        model="owner" if model_norm == "owner" else "tenant",
+        convention=convention_norm,  # type: ignore[arg-type]
         setting_name=setting_name,
+        auth_function=auth_function,
         role=role,
         restrictive=restrictive,
         tables=_parse_generate_tables(tables),
