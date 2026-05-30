@@ -71,6 +71,91 @@ def test_predicate_escapes_quote_in_setting_name() -> None:
     assert "(SELECT current_setting('weird''name', true))" in p
 
 
+# ---------- owner model ----------
+
+_UID = Column("user_id", "uuid", is_nullable=False)
+
+
+def test_predicate_owner_app_guc() -> None:
+    p = session_predicate(
+        "user_id", "uuid", GenerateOptions(model="owner")
+    )
+    assert p == "user_id = (SELECT current_setting('app.user_id', true)::uuid)"
+
+
+def test_predicate_owner_postgrest_uses_sub_claim() -> None:
+    p = session_predicate(
+        "user_id", "uuid", GenerateOptions(model="owner", convention="postgrest")
+    )
+    assert (
+        p == "user_id = (SELECT current_setting('request.jwt.claim.sub', true)::uuid)"
+    )
+
+
+def test_predicate_owner_supabase_uses_auth_uid() -> None:
+    p = session_predicate(
+        "user_id", "uuid", GenerateOptions(model="owner", convention="supabase")
+    )
+    assert p == "user_id = (SELECT auth.uid())"
+
+
+def test_predicate_supabase_custom_auth_function_quoted() -> None:
+    p = session_predicate(
+        "user_id",
+        "uuid",
+        GenerateOptions(model="owner", convention="supabase", auth_function="auth.user_id"),
+    )
+    assert p == "user_id = (SELECT auth.user_id())"
+
+
+def test_owner_model_uses_owner_policy_names() -> None:
+    schema = Schema(tables=(_table("posts", (_ID, _UID)),))
+    opts = GenerateOptions(model="owner", tenant_column="user_id", convention="supabase")
+    sqls = "\n".join(f.sql for f in plan_generation(schema, opts).statements)
+    assert "CREATE POLICY posts_owner_isolation ON public.posts" in sqls
+    assert "posts_owner_floor" in sqls
+    assert "tenant" not in sqls  # no tenant-model naming leaked
+    assert "user_id = (SELECT auth.uid())" in sqls
+
+
+def test_owner_via_table_override_and_no_restrictive() -> None:
+    # Owner model + explicit --table column override + supabase + no floor,
+    # all at once.
+    ownercol = Column("creator_id", "uuid", is_nullable=False)
+    schema = Schema(tables=(_table("docs", (_ID, ownercol)),))
+    opts = GenerateOptions(
+        model="owner",
+        restrictive=False,
+        convention="supabase",
+        tables=(("public", "docs", "creator_id"),),
+    )
+    sqls = "\n".join(f.sql for f in plan_generation(schema, opts).statements)
+    assert "CREATE POLICY docs_owner_isolation ON public.docs" in sqls
+    assert "creator_id = (SELECT auth.uid())" in sqls
+    assert "AS RESTRICTIVE" not in sqls and "docs_owner_floor" not in sqls
+    assert "CREATE INDEX ON public.docs (creator_id)" in sqls
+
+
+def test_cli_supabase_requires_owner_model() -> None:
+    res = _run(Schema(tables=()), ["--convention", "supabase"])  # default model=tenant
+    assert res.exit_code == 2
+    assert "supabase is for --model owner" in res.output
+
+
+def test_cli_model_owner_defaults_to_user_id_column() -> None:
+    # Auto-detect uses user_id (not tenant_id) under --model owner.
+    schema = Schema(
+        tables=(
+            _table("posts", (_ID, _UID)),  # has user_id
+            _table("orgs", (_ID, _TID)),   # has tenant_id (not a target in owner mode)
+        )
+    )
+    res = _run(schema, ["--model", "owner"])
+    assert res.exit_code == 0, res.output
+    assert "CREATE POLICY posts_owner_isolation" in res.output
+    assert "orgs" not in res.output  # tenant_id table not auto-detected in owner mode
+
+
 # ---------- plan_generation: targeting ----------
 
 

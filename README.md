@@ -31,7 +31,7 @@
 > **Beta — actively maintained.** 48 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all forty-eight rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
-> - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tenant tables that lack it (ENABLE + FORCE, a permissive tenant-isolation policy, a restrictive floor, and the index) — output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it.
+> - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tables that lack it — per-tenant (`tenant_id`) or per-user (`--model owner`, incl. the Supabase `auth.uid()` form): ENABLE + FORCE, an isolation policy, a restrictive floor, and the index, output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
@@ -281,8 +281,22 @@ finding.)
 For a non-conventional column, name it explicitly:
 `--table public.orgs:org_id`. Tables that already have policies are
 **skipped** — `generate` never overwrites hand-written policy intent, so
-re-running it is a no-op. Scope is the common single-column tenant model;
-per-CRUD, membership-join, and row-owner shapes stay hand-written.
+re-running it is a no-op.
+
+**Per-user ownership** — `--model owner` scaffolds the other canonical
+pattern (rows owned by a user, default column `user_id`) instead of
+per-tenant isolation. With `--convention supabase` it emits the idiomatic
+`user_id = (SELECT auth.uid())`:
+
+```bash
+pgrls generate --model owner --convention supabase --apply
+```
+
+`--convention app-guc` / `postgrest` use
+`current_setting('app.user_id', …)` /
+`current_setting('request.jwt.claim.sub', …)` instead. Scope is the common
+single-column case (tenant or owner); per-CRUD and membership-join shapes
+stay hand-written.
 
 ## RLS posture — `pgrls report`
 

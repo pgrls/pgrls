@@ -1,16 +1,18 @@
-"""`pgrls generate` — synthesize gold-standard RLS for tenant tables.
+"""`pgrls generate` — synthesize gold-standard RLS.
 
 pgrls lints, fixes, tests, and diffs RLS; this module *produces* it. For a
-table that carries a tenant-discriminator column but has no row-security
-policies, `generate` emits the complete correct setup — `ENABLE` + `FORCE`
-row security, a permissive tenant-isolation policy, a restrictive floor,
-and the supporting index — designed so the result lints with zero
-findings (the gold-standard guarantee, pinned by an end-to-end test).
+table that carries a discriminator column but has no row-security policies,
+`generate` emits the complete correct setup — `ENABLE` + `FORCE` row
+security, a permissive isolation policy, a restrictive floor, and the
+supporting index — designed so the result lints with zero findings (the
+gold-standard guarantee, pinned by end-to-end tests).
 
-Scope is the common single-column tenant-isolation case. The richer shapes
-(per-CRUD policies, membership-join `EXISTS`, row-owner `auth.uid()`) are
-out of scope; `generate` never touches a table that already has policies,
-so it can't clobber hand-written intent.
+Two scoping models (see `GenerateOptions.model`): `tenant` (per-tenant
+isolation on `tenant_id`) and `owner` (per-user ownership on `user_id`,
+incl. the Supabase `(SELECT auth.uid())` form). Scope is the common
+single-column case for each; the richer shapes (per-CRUD policies,
+membership-join `EXISTS`) stay hand-written. `generate` never touches a
+table that already has policies, so it can't clobber hand-written intent.
 
 The emitted policies are built as `model.Policy` objects and rendered via
 `model.policy_to_sql`, so generated DDL round-trips through pgrls's own
@@ -27,7 +29,11 @@ from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Policy, Schema, Table, policy_to_sql
 
-Convention = Literal["app-guc", "postgrest"]
+Convention = Literal["app-guc", "postgrest", "supabase"]
+# What the discriminator scopes rows to: a tenant (per-tenant isolation) or
+# the current user (per-row ownership). Drives the default column, the
+# postgrest claim, and the policy names.
+Model = Literal["tenant", "owner"]
 
 # Column types where casting `current_setting(...)` (which returns text) is
 # a no-op; for every other type the cast is required for the comparison to
@@ -40,21 +46,33 @@ class GenerateOptions:
     """How `generate` builds policies. Every field is CLI/config-overridable."""
 
     tenant_column: str = "tenant_id"
+    model: Model = "tenant"
     convention: Convention = "app-guc"
-    # Explicit session setting name; when None it is derived per column from
-    # the convention (`app.<col>` or `request.jwt.claim.<col>`).
+    # Explicit session setting name; when None it is derived from the
+    # convention + model (`app.<col>` / `request.jwt.claim.<claim>`).
     setting_name: str | None = None
+    # Auth function for the `supabase` convention (owner model): the policy
+    # compares the column to `(SELECT <auth_function>())`.
+    auth_function: str = "auth.uid"
     role: str = "authenticated"
     restrictive: bool = True
     # Explicit (schema, table) -> discriminator column overrides, for tables
-    # whose column isn't the conventional `tenant_column` (e.g. `org_id`).
+    # whose column isn't the conventional one (e.g. `org_id`).
     tables: tuple[tuple[str, str, str], ...] = ()
+
+    @property
+    def label(self) -> str:
+        """`tenant` / `owner` — used in policy names and descriptions."""
+        return "owner" if self.model == "owner" else "tenant"
 
     def resolved_setting(self, column: str) -> str:
         if self.setting_name:
             return self.setting_name
         if self.convention == "postgrest":
-            return f"request.jwt.claim.{column}"
+            # The owner model scopes to the JWT subject (`sub`), not a
+            # per-column claim; the tenant model reads the column's claim.
+            claim = "sub" if self.model == "owner" else column
+            return f"request.jwt.claim.{claim}"
         return f"app.{column}"
 
 
@@ -72,23 +90,37 @@ def session_predicate(
 ) -> str:
     """Build the policy predicate comparing the column to the session value.
 
-    Shape: `col = (SELECT current_setting('<setting>', true)::<type>)`.
+    Shape: `col = (SELECT current_setting('<setting>', true)::<type>)`, or
+    `col = (SELECT auth.uid())` under the `supabase` convention.
 
-    - The `(SELECT …)` wrapper forces Postgres to evaluate the setting once
-      per statement (a cached InitPlan) rather than per candidate row — the
-      same rewrite PERF001 flags, so an unwrapped form would not lint
-      clean. The column stays bare on the left, so the index is still used.
+    - The `(SELECT …)` wrapper forces Postgres to evaluate the read once per
+      statement (a cached InitPlan) rather than per candidate row — the same
+      rewrite PERF001 flags, so an unwrapped form would not lint clean. The
+      column stays bare on the left, so the index is still used.
     - A two-arg `current_setting(…, true)` returns NULL when the setting is
       unset, making `col = NULL` evaluate to NULL → the row is denied (the
       safe default; this is NOT the SEC004 `IS NULL OR …` expose footgun).
+      `auth.uid()` likewise returns NULL for an unauthenticated request.
     """
+    qcol = quote_ident(column)
+    if options.convention == "supabase":
+        # `col = (SELECT auth.uid())` — the canonical Supabase row-owner
+        # form. No cast: auth.uid() returns uuid (match a uuid column).
+        fn = options.auth_function
+        if "." in fn:
+            schema_part, _, name_part = fn.rpartition(".")
+            fn_sql = quote_qualified(schema_part, name_part)
+        else:
+            fn_sql = quote_ident(fn)
+        return f"{qcol} = (SELECT {fn_sql}())"
+
     setting = options.resolved_setting(column)
     # `setting` lands inside a single-quoted SQL string literal.
     escaped = setting.replace("'", "''")
     call = f"current_setting('{escaped}', true)"
     if coltype and coltype.lower() not in _TEXT_TYPES:
         call = f"{call}::{coltype}"
-    return f"{quote_ident(column)} = (SELECT {call})"
+    return f"{qcol} = (SELECT {call})"
 
 
 def _column_type(table: Table, column: str) -> str | None:
@@ -136,8 +168,9 @@ def _statements_for_table(
             )
         )
 
+    label = options.label
     permissive = Policy(
-        name=f"{table.name}_tenant_isolation",
+        name=f"{table.name}_{label}_isolation",
         command="ALL",
         permissive=True,
         roles=(options.role,),
@@ -150,16 +183,16 @@ def _statements_for_table(
             location=f"{table.qualified_name}.{permissive.name}",
             sql=policy_to_sql(permissive, qname),
             description=(
-                f"Permissive tenant-isolation policy on {table.qualified_name} "
-                f"scoping rows to the {column!r} discriminator for role "
-                f"{options.role!r}."
+                f"Permissive {label}-isolation policy on "
+                f"{table.qualified_name} scoping rows to the {column!r} "
+                f"discriminator for role {options.role!r}."
             ),
         )
     )
 
     if options.restrictive:
         floor = Policy(
-            name=f"{table.name}_tenant_floor",
+            name=f"{table.name}_{label}_floor",
             command="ALL",
             permissive=False,
             roles=(options.role,),
@@ -172,10 +205,10 @@ def _statements_for_table(
                 location=f"{table.qualified_name}.{floor.name}",
                 sql=policy_to_sql(floor, qname),
                 description=(
-                    f"Restrictive tenant floor on {table.qualified_name} — "
+                    f"Restrictive {label} floor on {table.qualified_name} — "
                     "defense-in-depth: AND-combines with every permissive "
-                    "policy so the tenant scope holds even if a broader "
-                    "policy is added later."
+                    "policy so the scope holds even if a broader policy is "
+                    "added later."
                 ),
             )
         )
@@ -269,7 +302,7 @@ def plan_generation(
         if _column_nullable(table, column):
             notes.append(
                 f"{table.qualified_name}.{column} is nullable — a NULL row "
-                "escapes tenant scoping; consider `ALTER TABLE "
+                f"escapes {options.label} scoping; consider `ALTER TABLE "
                 f"{quote_qualified(table.schema, table.name)} ALTER COLUMN "
                 f"{quote_ident(column)} SET NOT NULL;` (SEC030 flags this "
                 "otherwise)."

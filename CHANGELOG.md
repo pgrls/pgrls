@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-30
+
+### Added
+
+- **`pgrls generate --model owner` — per-user row ownership.** Alongside the
+  default tenant-isolation model, `generate` now scaffolds per-user RLS for
+  tables with an owner column (default `user_id`). `--convention supabase`
+  emits the canonical Supabase shape, `user_id = (SELECT auth.uid())`
+  (`--auth-function` overrides the function); `--convention app-guc` /
+  `postgrest` use `current_setting('app.user_id', …)` /
+  `current_setting('request.jwt.claim.sub', …)`. Policies are named
+  `<table>_owner_isolation` / `_owner_floor`. The output lints clean for
+  every convention (pinned by live-DB e2e tests, including the `auth.uid()`
+  form). `--convention supabase` requires `--model owner`. The tenant model
+  is unchanged.
+
 ## [0.8.1] - 2026-05-30
 
 ### Fixed

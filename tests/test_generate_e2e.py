@@ -70,6 +70,59 @@ def test_generate_then_lint_is_clean(
     assert remaining == [], remaining
 
 
+def test_generate_owner_model_app_guc_lints_clean(
+    pg_url: str, apply_sql, ensure_authenticated_role
+) -> None:
+    # The row-owner model (per-user) with the app-GUC convention.
+    apply_sql(
+        "CREATE TABLE public.documents ("
+        "id uuid PRIMARY KEY DEFAULT gen_random_uuid(), "
+        "user_id uuid NOT NULL)"
+    )
+    gen = CliRunner().invoke(
+        main, ["generate", "--database-url", pg_url, "--model", "owner", "--apply"]
+    )
+    assert gen.exit_code == 0, gen.output
+    assert "documents_owner_isolation" in gen.output
+    assert _lint_violations(pg_url) == []
+
+
+def test_generate_owner_model_supabase_lints_clean(
+    pg_url: str, apply_sql, ensure_authenticated_role
+) -> None:
+    # The canonical Supabase row-owner shape: user_id = (SELECT auth.uid()).
+    # Needs an auth.uid() stub for the policy to apply and lint.
+    apply_sql(
+        """
+        CREATE SCHEMA IF NOT EXISTS auth;
+        CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS
+            $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
+        CREATE TABLE public.documents (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id uuid NOT NULL,
+            body text
+        )
+        """
+    )
+    gen = CliRunner().invoke(
+        main,
+        [
+            "generate", "--database-url", pg_url,
+            "--model", "owner", "--convention", "supabase", "--apply",
+        ],
+    )
+    assert gen.exit_code == 0, gen.output
+    assert _lint_violations(pg_url) == []
+    # Confirm the policy actually uses auth.uid().
+    with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT qual FROM pg_policies WHERE schemaname='public' "
+            "AND tablename='documents' AND policyname='documents_owner_isolation'"
+        )
+        row = cur.fetchone()
+        assert row is not None and "auth.uid()" in row[0], row
+
+
 def test_generate_postgrest_convention_lints_clean(
     pg_url: str, apply_sql, ensure_authenticated_role
 ) -> None:
