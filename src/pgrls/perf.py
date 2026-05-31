@@ -43,7 +43,9 @@ from pgrls._html_common import resolve_generated_at, to_iso_z
 from pgrls.model import Schema
 
 __all__ = [
+    "ARTIFACT_VERSION",
     "CONFIRMED",
+    "DEFAULT_PERF_ARTIFACT_PATH",
     "INDEX_UNUSED",
     "PERF_FORMATS",
     "PerfFinding",
@@ -52,13 +54,22 @@ __all__ = [
     "TableStats",
     "build_perf_report",
     "collect_table_stats",
+    "load_perf_artifact",
     "render",
+    "under_seq_scan_pressure",
+    "write_perf_artifact",
 ]
 
 # Classification of a runtime seq-scan finding, by what the static
 # analysis said about the same table.
 CONFIRMED = "confirmed"  # PERF003 flagged it (no usable index) AND it seq-scans
 INDEX_UNUSED = "index-unused"  # PERF003 saw an index, but it seq-scans anyway
+
+# Runtime-stats artifact: a point-in-time `pg_stat_user_tables` snapshot that
+# `pgrls perf --snapshot` writes and `pgrls lint --perf` feeds to PERF005.
+# Bump on any change to the emitted shape.
+ARTIFACT_VERSION = 1
+DEFAULT_PERF_ARTIFACT_PATH = ".pgrls-perf.json"
 
 
 @dataclass(frozen=True)
@@ -137,6 +148,76 @@ def collect_table_stats(
     return out
 
 
+def write_perf_artifact(
+    path: str,
+    stats: dict[tuple[str, str], TableStats],
+    *,
+    generated_at: datetime,
+) -> None:
+    """Write a runtime-stats snapshot for `pgrls lint --perf` (PERF005).
+
+    `generated_at` must be tz-aware. Rows are sorted for deterministic
+    output. The artifact carries the *raw* counters, not computed findings,
+    so the rule applies its own thresholds against the live schema (the same
+    raw-data-plus-shared-analysis split coverage uses for HYG004).
+    """
+    rows = sorted(
+        (
+            {
+                "schema": ts.schema,
+                "table": ts.table,
+                "seq_scan": ts.seq_scan,
+                "seq_tup_read": ts.seq_tup_read,
+                "idx_scan": ts.idx_scan,
+                "n_live_tup": ts.n_live_tup,
+            }
+            for ts in stats.values()
+        ),
+        key=lambda r: (r["schema"], r["table"]),
+    )
+    payload = {
+        "pgrls_perf_version": ARTIFACT_VERSION,
+        "generated_at": to_iso_z(generated_at),
+        "tables": rows,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+
+
+def load_perf_artifact(path: str) -> dict[tuple[str, str], TableStats]:
+    """Read and validate a runtime-stats artifact.
+
+    Every malformed-input path funnels to ValueError so the CLI's load
+    guard turns it into a clean ToolError, never a traceback.
+    """
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError("perf artifact must be a JSON object")
+    version = payload.get("pgrls_perf_version")
+    if version != ARTIFACT_VERSION:
+        raise ValueError(
+            f"unsupported perf artifact version {version!r} "
+            f"(expected {ARTIFACT_VERSION})"
+        )
+    out: dict[tuple[str, str], TableStats] = {}
+    try:
+        for row in payload.get("tables") or []:
+            ts = TableStats(
+                schema=row["schema"],
+                table=row["table"],
+                seq_scan=row["seq_scan"],
+                seq_tup_read=row["seq_tup_read"],
+                idx_scan=row["idx_scan"],
+                n_live_tup=row["n_live_tup"],
+            )
+            out[(ts.schema, ts.table)] = ts
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"malformed perf artifact: {exc}") from exc
+    return out
+
+
 @dataclass(frozen=True)
 class PerfThresholds:
     """When an observed seq-scan is signal, not noise.
@@ -193,6 +274,22 @@ class PerfReport:
         }
 
 
+def under_seq_scan_pressure(
+    ts: TableStats, thresholds: PerfThresholds
+) -> bool:
+    """True when a table's stats clear every gate in ``thresholds``.
+
+    The single definition of "this seq-scan is signal, not noise", shared
+    by ``build_perf_report`` (the ``pgrls perf`` command) and the PERF005
+    lint rule so the two never drift.
+    """
+    return (
+        ts.n_live_tup >= thresholds.min_live_tup
+        and ts.seq_scan >= thresholds.min_seq_scans
+        and ts.seq_scan_pct >= thresholds.min_seq_pct
+    )
+
+
 def build_perf_report(
     schema: Schema,
     stats: dict[tuple[str, str], TableStats],
@@ -231,11 +328,7 @@ def build_perf_report(
             # outside the scanned schemas) — nothing observed to judge.
             continue
         considered += 1
-        if ts.n_live_tup < thresholds.min_live_tup:
-            continue
-        if ts.seq_scan < thresholds.min_seq_scans:
-            continue
-        if ts.seq_scan_pct < thresholds.min_seq_pct:
+        if not under_seq_scan_pressure(ts, thresholds):
             continue
         flagged = (table.schema, table.name) in statically_flagged
         findings.append(

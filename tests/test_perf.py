@@ -10,6 +10,7 @@ covered end-to-end in test_perf_e2e.py.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
@@ -17,7 +18,9 @@ from click.testing import CliRunner
 from pgrls.cli import main
 from pgrls.model import Policy, Schema, Table
 from pgrls.perf import (
+    ARTIFACT_VERSION,
     CONFIRMED,
+    DEFAULT_PERF_ARTIFACT_PATH,
     INDEX_UNUSED,
     PERF_FORMATS,
     PerfFinding,
@@ -25,7 +28,10 @@ from pgrls.perf import (
     PerfThresholds,
     TableStats,
     build_perf_report,
+    load_perf_artifact,
     render,
+    under_seq_scan_pressure,
+    write_perf_artifact,
 )
 
 
@@ -360,5 +366,143 @@ def test_cli_perf_rejects_unknown_format() -> None:
 def test_cli_help_lists_perf() -> None:
     res = CliRunner().invoke(main, ["perf", "--help"])
     assert res.exit_code == 0
-    for flag in ("--min-rows", "--min-seq-scans", "--min-seq-pct", "--fail-on-findings"):
+    for flag in (
+        "--min-rows",
+        "--min-seq-scans",
+        "--min-seq-pct",
+        "--fail-on-findings",
+        "--snapshot",
+    ):
         assert flag in res.output
+
+
+# ---------- threshold predicate ----------
+
+
+def test_under_seq_scan_pressure_gates() -> None:
+    th = PerfThresholds()
+    assert under_seq_scan_pressure(_big("posts"), th) is True
+    # Each individual gate, just under, fails the whole predicate.
+    assert under_seq_scan_pressure(
+        _stats("public", "posts", seq_scan=500, seq_tup_read=9, idx_scan=1, n_live_tup=100),
+        th,
+    ) is False  # too few rows
+    assert under_seq_scan_pressure(
+        _stats("public", "posts", seq_scan=2, seq_tup_read=9, idx_scan=1, n_live_tup=500_000),
+        th,
+    ) is False  # too few scans
+    assert under_seq_scan_pressure(
+        _stats("public", "posts", seq_scan=60, seq_tup_read=9, idx_scan=100_000, n_live_tup=500_000),
+        th,
+    ) is False  # mostly index-scanned
+
+
+# ---------- artifact round-trip + validation ----------
+
+_AWARE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_perf_artifact_round_trip(tmp_path) -> None:
+    stats = {
+        ("public", "posts"): _big("posts"),
+        ("public", "notes"): _stats("public", "notes", seq_scan=10, seq_tup_read=20, idx_scan=5, n_live_tup=30),
+    }
+    path = str(tmp_path / "perf.json")
+    write_perf_artifact(path, stats, generated_at=_AWARE)
+    loaded = load_perf_artifact(path)
+    assert set(loaded) == {("public", "posts"), ("public", "notes")}
+    assert loaded[("public", "posts")].seq_tup_read == 5_000_000
+    # The on-disk shape carries the version + tz-aware timestamp.
+    payload = json.loads((tmp_path / "perf.json").read_text(encoding="utf-8"))
+    assert payload["pgrls_perf_version"] == ARTIFACT_VERSION
+    assert payload["generated_at"].endswith("Z")
+
+
+def test_perf_artifact_rejects_bad_version(tmp_path) -> None:
+    path = tmp_path / "perf.json"
+    path.write_text('{"pgrls_perf_version": 999, "tables": []}', encoding="utf-8")
+    try:
+        load_perf_artifact(str(path))
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "version" in str(exc)
+
+
+def test_perf_artifact_rejects_malformed_row(tmp_path) -> None:
+    path = tmp_path / "perf.json"
+    path.write_text(
+        f'{{"pgrls_perf_version": {ARTIFACT_VERSION}, '
+        '"tables": [{"schema": "public"}]}',  # missing required keys
+        encoding="utf-8",
+    )
+    try:
+        load_perf_artifact(str(path))
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "malformed" in str(exc)
+
+
+# ---------- lint --perf wiring (PERF005) ----------
+
+
+def _lint_perf(args, *, schema: Schema):
+    cm = MagicMock()
+    cm.__enter__.return_value = MagicMock()
+    cm.__exit__.return_value = False
+    with patch("pgrls.cli.psycopg.connect", return_value=cm), patch(
+        "pgrls.cli.introspect", return_value=schema
+    ):
+        return CliRunner().invoke(
+            main, ["lint", "--database-url", "postgresql://x", *args]
+        )
+
+
+def test_cli_lint_perf_enables_perf005(tmp_path) -> None:
+    schema = Schema(tables=(_table("posts", rls=True),))
+    artifact = str(tmp_path / ".pgrls-perf.json")
+    write_perf_artifact(
+        artifact, {("public", "posts"): _big("posts")}, generated_at=_AWARE
+    )
+    # Without --perf, PERF005 is inert (no finding even though stats exist).
+    res_off = _lint_perf(["--rule", "PERF005", "--format", "json"], schema=schema)
+    assert res_off.exit_code == 0, res_off.output
+    assert json.loads(res_off.output)["violations"] == []
+    # With --perf, PERF005 fires.
+    res_on = _lint_perf(
+        ["--rule", "PERF005", "--perf", artifact, "--format", "json"],
+        schema=schema,
+    )
+    ids = [v["rule_id"] for v in json.loads(res_on.output)["violations"]]
+    assert ids == ["PERF005"], res_on.output
+
+
+def test_cli_lint_perf_missing_artifact_errors(tmp_path) -> None:
+    schema = Schema(tables=(_table("posts", rls=True),))
+    res = _lint_perf(
+        ["--perf", str(tmp_path / "nope.json"), "--rule", "PERF005"],
+        schema=schema,
+    )
+    assert res.exit_code == 2
+    assert "not found" in res.output
+
+
+def test_cli_perf_snapshot_writes_loadable_artifact(tmp_path) -> None:
+    schema = Schema(tables=(_table("posts", rls=True),))
+    stats = {("public", "posts"): _big("posts")}
+    out = tmp_path / "snap.json"
+    cm = MagicMock()
+    cm.__enter__.return_value = MagicMock()
+    cm.__exit__.return_value = False
+    with patch("pgrls.cli.psycopg.connect", return_value=cm), patch(
+        "pgrls.cli.introspect", return_value=schema
+    ), patch("pgrls.cli.collect_table_stats", return_value=stats), patch(
+        "pgrls.cli._perf003_flagged_tables", return_value=set()
+    ):
+        res = CliRunner().invoke(
+            main,
+            ["perf", "--database-url", "postgresql://x", "--snapshot", str(out)],
+        )
+    assert res.exit_code == 0, res.output
+    loaded = load_perf_artifact(str(out))
+    assert loaded[("public", "posts")].seq_scan == 500
+    assert DEFAULT_PERF_ARTIFACT_PATH == ".pgrls-perf.json"

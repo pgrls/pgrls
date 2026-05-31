@@ -24,6 +24,7 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -75,10 +76,14 @@ from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData
 from pgrls.coverage import load_artifact as load_coverage_artifact
 from pgrls.coverage import render as render_coverage
 from pgrls.perf import (
+    DEFAULT_PERF_ARTIFACT_PATH,
     PERF_FORMATS,
     PerfThresholds,
+    TableStats,
     build_perf_report,
     collect_table_stats,
+    load_perf_artifact,
+    write_perf_artifact,
 )
 from pgrls.perf import render as render_perf
 from pgrls.rules import (
@@ -232,6 +237,18 @@ def main() -> None:
         "coverage` for the full report."
     ),
 )
+@click.option(
+    "--perf",
+    "perf_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to a runtime-stats artifact from `pgrls perf --snapshot` "
+        "(.pgrls-perf.json). Enables PERF005 (RLS table observed to "
+        "seq-scan), which is inert without it. See `pgrls perf` for the "
+        "full report."
+    ),
+)
 def lint(
     database_url: str | None,
     config_path: str | None,
@@ -246,6 +263,7 @@ def lint(
     output_format: str,
     baseline_path: Path | None,
     coverage_path: str | None,
+    perf_path: str | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
     if update_baseline and baseline_path is None:
@@ -329,6 +347,22 @@ def lint(
                 f"Cannot read coverage artifact {coverage_path!r}: {exc}"
             ) from exc
 
+    # Load the runtime-stats artifact if `--perf` was passed. It feeds
+    # PERF005 (RLS table observed to seq-scan), inert otherwise.
+    perf_data: dict[tuple[str, str], TableStats] | None = None
+    if perf_path is not None:
+        try:
+            perf_data = load_perf_artifact(perf_path)
+        except FileNotFoundError as exc:
+            raise ToolError(
+                f"Perf artifact {perf_path!r} not found. Run `pgrls perf "
+                "--snapshot .pgrls-perf.json` first, or omit --perf."
+            ) from exc
+        except (ValueError, OSError) as exc:
+            raise ToolError(
+                f"Cannot read perf artifact {perf_path!r}: {exc}"
+            ) from exc
+
     try:
         with psycopg.connect(effective.database_url) as conn:
             schema = introspect(conn, schemas=effective.schemas)
@@ -344,6 +378,7 @@ def lint(
             rule_filter=set(rules) if rules else None,
             exclude_filter=exclude_ids or None,
             coverage_data=coverage_data,
+            perf_data=perf_data,
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
@@ -541,6 +576,7 @@ def _run_rules(
     rule_filter: set[str] | None = None,
     exclude_filter: set[str] | None = None,
     coverage_data: CoverageData | None = None,
+    perf_data: dict[tuple[str, str], TableStats] | None = None,
 ) -> list[Violation]:
     # Build the per-invocation registry: built-ins + extras from
     # `[lint].extra_rules`. A fresh RuleRegistry (not the cached
@@ -587,10 +623,13 @@ def _run_rules(
     out: list[Violation] = []
     for rule in rules:
         rule_options = config.rule_options.get(rule.id, {})
-        # HYG004 can't read the coverage artifact itself (rules only see
-        # the schema + options), so lint injects the parsed data here.
+        # HYG004 / PERF005 can't read their artifacts themselves (rules
+        # only see the schema + options), so lint injects the parsed data
+        # here under a private key each rule looks for.
         if rule.id == "HYG004" and coverage_data is not None:
             rule_options = {**rule_options, "_coverage": coverage_data}
+        if rule.id == "PERF005" and perf_data is not None:
+            rule_options = {**rule_options, "_perf": perf_data}
         try:
             found = rule.check(schema, rule_options)
         except RecursionError as exc:
@@ -3083,6 +3122,18 @@ def _perf003_flagged_tables(schema: Schema) -> set[tuple[str, str]]:
     help="Write the report to this file instead of stdout (any --format).",
 )
 @click.option(
+    "--snapshot",
+    "snapshot_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    is_flag=False,
+    flag_value=DEFAULT_PERF_ARTIFACT_PATH,
+    help=(
+        "Also write a raw runtime-stats artifact for `pgrls lint --perf` "
+        f"(PERF005). Bare --snapshot writes {DEFAULT_PERF_ARTIFACT_PATH}."
+    ),
+)
+@click.option(
     "--format",
     "output_format",
     type=click.Choice(list(PERF_FORMATS), case_sensitive=False),
@@ -3099,6 +3150,7 @@ def perf(
     min_seq_pct: float,
     fail_on_findings: bool,
     output_path: str | None,
+    snapshot_path: str | None,
     output_format: str,
 ) -> None:
     """Surface RLS-protected tables observed to seq-scan in production.
@@ -3155,6 +3207,21 @@ def perf(
         statically_flagged=_perf003_flagged_tables(schema),
         thresholds=thresholds,
     )
+
+    # `--snapshot` persists the raw counters for `pgrls lint --perf`
+    # (PERF005). Written before any --fail-on-findings exit so a gated run
+    # still produces the artifact.
+    if snapshot_path is not None:
+        try:
+            write_perf_artifact(
+                snapshot_path, stats, generated_at=datetime.now(timezone.utc)
+            )
+        except OSError as exc:
+            raise ToolError(
+                f"Cannot write perf artifact {snapshot_path}: {exc}"
+            ) from exc
+        click.echo(f"pgrls: wrote runtime-stats artifact {snapshot_path}.", err=True)
+
     rendered = render_perf(report, output_format)
     if not rendered.endswith("\n"):
         rendered += "\n"

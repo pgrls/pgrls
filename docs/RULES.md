@@ -2620,6 +2620,57 @@ policy ID:
 allowlist = ["public.users.by_email"]
 ```
 
+<a id="rule-perf005"></a>
+
+## PERF005 — RLS-protected table observed to sequentially scan in production
+
+**Severity:** info. **Opt-in** — fires only when lint is given a
+runtime-stats artifact.
+
+**What it catches:** [PERF003](#rule-perf003) and
+[PERF004](#rule-perf004) reason *statically* — they read the schema and
+*predict* a sequential scan. PERF005 reads what the database *actually
+did*. `pgrls perf --snapshot .pgrls-perf.json` captures Postgres's
+cumulative table statistics (`pg_stat_user_tables`); `pgrls lint --perf
+.pgrls-perf.json` then fires PERF005 for every RLS-enabled table the
+snapshot shows under sequential-scan pressure. It is the lint-gate face of
+the `pgrls perf` command — drop it in CI next to the static rules.
+
+Like [HYG004](#rule-hyg004) with its coverage artifact, PERF005 is inert
+on a normal `pgrls lint` run (no artifact wired in, nothing observed to
+judge) — it never guesses.
+
+A table is flagged when its snapshot stats clear all three thresholds —
+the same gate the `pgrls perf` command uses, so the rule and the command
+never disagree:
+
+* **`min_rows`** (default 10000 estimated live rows) — below this a
+  sequential scan is cheap and often the plan the planner *should* pick.
+* **`min_seq_scans`** (default 50) — a handful of scans (startup, a
+  migration, an ad-hoc query) isn't steady-state cost.
+* **`min_seq_pct`** (default 50) — the table must do most of its scanning
+  sequentially; a mostly-index-scanned table is healthy.
+
+Tune them per-rule, and allowlist a table whose full scans are intentional:
+
+```toml
+[lint.rules.PERF005]
+min_rows = 50000
+min_seq_scans = 100
+allowlist = ["public.audit_log"]
+```
+
+**Honest scope:** `pg_stat_user_tables` counts *every* sequential scan on
+a table, not only those an RLS policy predicate drove — a reporting query
+that legitimately full-scans inflates the same counter. So PERF005 points
+you at tables worth investigating; it does not *prove* RLS is the cause.
+Run `pgrls perf` for the confirmed-missing-index vs index-unused breakdown
+(it cross-references PERF003), and a later release will attribute scans to
+specific statements via `pg_stat_statements`. Partitioned tables are
+under-covered (a parent records no direct scans; children don't carry the
+parent's RLS flag). PERF005 has no auto-fix — choosing the right index
+needs human judgment about the query shape.
+
 <a id="rule-hyg001"></a>
 
 ## HYG001 — Policy references a column that doesn't exist

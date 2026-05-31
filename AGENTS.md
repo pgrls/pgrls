@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-nine rules across four
+In the current release it ships **fifty rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -858,8 +858,8 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Forty-three rules across four categories.** SEC001–SEC032,
-  PERF001–PERF004, HYG001–HYG003, and VIEW001–VIEW004 ship today.
+- **Fifty rules across four categories.** SEC001–SEC037,
+  PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
   trigger-mediated bypass, SEC014 (v0.5.12) flags every SECDEF
