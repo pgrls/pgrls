@@ -35,12 +35,12 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import FuncCall, Node, ResTarget, SelectStmt, String, SubLink
+from pglast.ast import FuncCall, ResTarget, SelectStmt, SubLink
 from pglast.enums import LimitOption, SetOperation, SubLinkType
-from pglast.stream import RawStream
 
+from pgrls.ast_utils import func_name_parts, transform_tree
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the default auth-function set —
@@ -71,16 +71,9 @@ def _funccall_matches(node: Any, names: set[str]) -> bool:
     see the rule fire but no fix emitted. Documented in the
     `pgrls fix` docstring; intentional asymmetry with the rule.
     """
-    if not isinstance(node, FuncCall):
+    qualified, bare = func_name_parts(node)
+    if qualified is None:
         return False
-    parts: list[str] = []
-    for f in node.funcname or ():
-        if isinstance(f, String):
-            parts.append(f.sval)
-    if not parts:
-        return False
-    qualified = ".".join(parts)
-    bare = parts[-1]
     return qualified in names or bare in names
 
 
@@ -120,40 +113,24 @@ def _wrap_unwrapped_calls(node: Any, names: set[str]) -> tuple[Any, bool]:
     parent's field is reassigned via `setattr`). The returned
     node is the SAME object — `did_change` is the caller's signal
     to re-emit the SQL, not an indication of replacement.
-    """
-    if node is None:
-        return node, False
-    if _funccall_matches(node, names):
-        return _wrap_funccall(node), True
-    if isinstance(node, SubLink):
-        # Already wrapped — leave the inside alone.
-        return node, False
-    if not isinstance(node, Node):
-        return node, False
 
-    changed = False
-    for field_name in node:
-        value = getattr(node, field_name, None)
-        if isinstance(value, (list, tuple)):
-            new_items: list[Any] = []
-            list_changed = False
-            for item in value:
-                new_item, item_changed = _wrap_unwrapped_calls(item, names)
-                new_items.append(new_item)
-                list_changed = list_changed or item_changed
-            if list_changed:
-                setattr(
-                    node,
-                    field_name,
-                    type(value)(new_items),
-                )
-                changed = True
-        elif isinstance(value, Node):
-            new_v, v_changed = _wrap_unwrapped_calls(value, names)
-            if v_changed:
-                setattr(node, field_name, new_v)
-                changed = True
-    return node, changed
+    The recursion is `ast_utils.transform_tree`; the leaf function
+    below carries the only PERF001-specific behaviour: a matching
+    FuncCall is replaced by its SubLink wrapper, and a `SubLink` is a
+    terminal "do not descend" (already-wrapped calls stay as they
+    are) — both expressed as terminal `(node, changed)` returns;
+    everything else returns `None` to recurse.
+    """
+
+    def leaf(n: Any) -> tuple[Any, bool] | None:
+        if _funccall_matches(n, names):
+            return _wrap_funccall(n), True
+        if isinstance(n, SubLink):
+            # Already wrapped — leave the inside alone.
+            return n, False
+        return None
+
+    return transform_tree(node, leaf)
 
 
 class PERF001Fixer:
@@ -195,23 +172,21 @@ class PERF001Fixer:
                 if not changed:
                     continue
 
-                new_using_sql = RawStream()(new_using_ast)
-                stmt = (
-                    f"ALTER POLICY {quote_ident(policy.name)} "
-                    f"ON {quote_qualified(table.schema, table.name)}\n"
-                    f"    USING ({new_using_sql})"
+                # `alter_policy` renders both clauses through
+                # RawStream so pglast's escaping is applied
+                # consistently — symmetric for USING and WITH CHECK.
+                # A future change that sources WITH CHECK from
+                # somewhere other than `pg_get_expr` (config override,
+                # snapshot file, hand-edited fixture) doesn't bypass
+                # the round-trip and become an injection vector.
+                # `with_check_ast` is None when the policy has no
+                # WITH CHECK; `alter_policy` then omits the clause.
+                stmt = alter_policy(
+                    table,
+                    policy.name,
+                    using_ast=new_using_ast,
+                    with_check_ast=policy.with_check_ast,
                 )
-                if policy.with_check_ast is not None:
-                    # Round-trip WITH CHECK through RawStream too so
-                    # the emission uses pglast's escaping consistently
-                    # — symmetric with USING. A future change that
-                    # sources `with_check_sql` from somewhere other
-                    # than `pg_get_expr` (config override, snapshot
-                    # file, hand-edited fixture) doesn't bypass the
-                    # round-trip and become an injection vector.
-                    new_with_check_sql = RawStream()(policy.with_check_ast)
-                    stmt += f"\n    WITH CHECK ({new_with_check_sql})"
-                stmt += ";"
 
                 out.append(
                     Fix(

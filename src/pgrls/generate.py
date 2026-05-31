@@ -16,9 +16,12 @@ table that already has policies, so it can't clobber hand-written intent.
 
 The emitted policies are built as `model.Policy` objects and rendered via
 `model.policy_to_sql`, so generated DDL round-trips through pgrls's own
-model. ENABLE/FORCE/index statements reuse the SEC001/SEC002/PERF003 fixer
-templates verbatim. Output is a list of `fixers.Fix`, so the command reuses
-`render_fixes` / `render_migration` and the `fix --apply` execution path.
+model. The ENABLE/FORCE/index statements are emitted with the shared
+`fixers._idents.enable_rls_sql` / `force_rls_sql` / `create_index_sql`
+builders — the same builders the SEC001/SEC002/PERF003 fixers use, so the
+generated DDL is byte-identical to what `pgrls fix` would emit. Output is a
+list of `fixers.Fix`, so the command reuses `render_fixes` /
+`render_migration` and the `fix --apply` execution path.
 """
 from __future__ import annotations
 
@@ -26,7 +29,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import (
+    create_index_sql,
+    enable_rls_sql,
+    force_rls_sql,
+    quote_ident,
+    quote_qualified,
+)
 from pgrls.model import Policy, Schema, Table, policy_to_sql
 
 Convention = Literal["app-guc", "postgrest", "supabase"]
@@ -151,7 +160,7 @@ def _statements_for_table(
             Fix(
                 rule_id="SEC001",
                 location=table.qualified_name,
-                sql=f"ALTER TABLE {qname} ENABLE ROW LEVEL SECURITY;",
+                sql=enable_rls_sql(qname),
                 description=f"Enable row-level security on {table.qualified_name}.",
             )
         )
@@ -160,7 +169,7 @@ def _statements_for_table(
             Fix(
                 rule_id="SEC002",
                 location=table.qualified_name,
-                sql=f"ALTER TABLE {qname} FORCE ROW LEVEL SECURITY;",
+                sql=force_rls_sql(qname),
                 description=(
                     f"Force row-level security on {table.qualified_name} so "
                     "the table owner is also subject to policies."
@@ -217,7 +226,7 @@ def _statements_for_table(
         Fix(
             rule_id="PERF003",
             location=f"{table.qualified_name} ({column})",
-            sql=f"CREATE INDEX ON {qname} ({quote_ident(column)});",
+            sql=create_index_sql(qname, column),
             description=(
                 f"Index {table.qualified_name}.{column} — the policies filter "
                 "on it, so without an index every row check is a seq scan."

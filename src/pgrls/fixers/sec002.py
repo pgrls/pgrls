@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_qualified
+from pgrls.fixers._idents import force_rls_sql, quote_qualified
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 
@@ -26,11 +26,7 @@ class SEC002Fixer:
                 continue
             if table_in_allowlist(table, allowlist):
                 continue
-            sql = (
-                "ALTER TABLE "
-                f"{quote_qualified(table.schema, table.name)} "
-                "FORCE ROW LEVEL SECURITY;"
-            )
+            sql = force_rls_sql(quote_qualified(table.schema, table.name))
             out.append(
                 Fix(
                     rule_id="SEC002",

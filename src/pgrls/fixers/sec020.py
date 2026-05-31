@@ -36,10 +36,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.stream import RawStream
-
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse the rule's detection so the fixer fixes exactly the
@@ -65,13 +63,12 @@ class SEC020Fixer:
                 if pid in skip:
                     continue
                 # `_is_open_write_asymmetry` already established that
-                # using_ast is not None, so RawStream has a real
-                # node to render.
-                using_sql = RawStream()(policy.using_ast)
-                sql = (
-                    f"ALTER POLICY {quote_ident(policy.name)} "
-                    f"ON {quote_qualified(table.schema, table.name)}\n"
-                    f"    WITH CHECK ({using_sql});"
+                # using_ast is not None, so `alter_policy` has a real
+                # node to render into the WITH CHECK clause (it
+                # round-trips through RawStream, symmetric with the
+                # SEC006 and PERF001 fixers).
+                sql = alter_policy(
+                    table, policy.name, with_check_ast=policy.using_ast
                 )
                 out.append(
                     Fix(

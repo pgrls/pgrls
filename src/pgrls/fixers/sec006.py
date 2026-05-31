@@ -35,10 +35,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.stream import RawStream
-
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the write-side command set — imported
@@ -84,11 +82,12 @@ class SEC006Fixer:
                 pid = policy_id(table, policy)
                 if pid in skip:
                     continue
-                using_sql = RawStream()(policy.using_ast)
-                sql = (
-                    f"ALTER POLICY {quote_ident(policy.name)} "
-                    f"ON {quote_qualified(table.schema, table.name)}\n"
-                    f"    WITH CHECK ({using_sql});"
+                # Mirror the USING predicate into WITH CHECK. The
+                # predicate is round-tripped through RawStream (inside
+                # `alter_policy`) rather than echoed verbatim, so
+                # pglast's escaping is applied consistently.
+                sql = alter_policy(
+                    table, policy.name, with_check_ast=policy.using_ast
                 )
                 out.append(
                     Fix(

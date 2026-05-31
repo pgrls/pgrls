@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_qualified
+from pgrls.fixers._idents import enable_rls_sql, quote_qualified
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 
@@ -39,11 +39,7 @@ class SEC001Fixer:
             # and leave every child for human review.
             if table.partition_of is not None:
                 continue
-            sql = (
-                "ALTER TABLE "
-                f"{quote_qualified(table.schema, table.name)} "
-                "ENABLE ROW LEVEL SECURITY;"
-            )
+            sql = enable_rls_sql(quote_qualified(table.schema, table.name))
             out.append(
                 Fix(
                     rule_id="SEC001",
