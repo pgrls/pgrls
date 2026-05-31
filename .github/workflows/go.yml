@@ -111,13 +111,14 @@ jobs:
           cache-dependency-path: go/go.sum
 
       - name: golangci-lint
-        # Pinned to action v6 + linter v1.62.2 — the last v1.x
-        # release of the linter, matching the v1-schema config
-        # at `go/.golangci.yml`. When bumping to v2.x, both
-        # this version and the config file need to migrate.
-        uses: golangci/golangci-lint-action@v6
+        # action v9 + golangci-lint v2.x, matching the v2-schema
+        # config at `go/.golangci.yml`. (v9 runs on Node 24; the
+        # v6 line was a Node 20 action GitHub force-migrates on
+        # 2026-06-16. v7+ requires golangci-lint v2, hence the
+        # paired config migration.)
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.62.2
+          version: v2.12.2
           working-directory: go
           # `--config` is implicit (golangci-lint picks up
           # .golangci.yml in working-directory); --verbose helps
