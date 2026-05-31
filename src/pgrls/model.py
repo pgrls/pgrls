@@ -502,6 +502,161 @@ class LeakproofFunction:
     signature: str = ""
 
 
+# --- Snapshot decoders -------------------------------------------------
+#
+# One per-entity decoder for each top-level array `to_snapshot` emits, so
+# `Schema.from_snapshot` reads as a short orchestrator that maps each
+# array through its decoder. Each decoder mirrors exactly the inline
+# construction the monolithic `from_snapshot` used to do — same required
+# keys, same `.get(..., default)` version-gated fallbacks — so the
+# round-trip behaviour is byte-identical to before the decomposition.
+# Keeping these symmetric with the `to_snapshot` field lists makes the
+# two halves auditable side by side.
+
+
+def _policy_from_dict(p: dict[str, Any]) -> Policy:
+    # Top-level format (what to_snapshot writes) uses "policy_name";
+    # the legacy / manual-fixture embedded format uses "name". ASTs are
+    # intentionally left None — the v0.2.1 contract documents that
+    # callers parse on demand (only pgrls.diff._diff_columns needs them,
+    # and it lazy-parses).
+    return Policy(
+        name=p.get("policy_name") or p["name"],
+        command=p["command"],
+        permissive=p["permissive"],
+        roles=tuple(p["roles"]),
+        using_sql=p.get("using_sql"),
+        with_check_sql=p.get("with_check_sql"),
+        using_ast=None,
+        with_check_ast=None,
+    )
+
+
+def _grant_from_dict(g: dict[str, Any]) -> Grant:
+    return Grant(role=g["role"], privileges=tuple(g["privileges"]))
+
+
+def _column_from_dict(c: dict[str, Any]) -> Column:
+    return Column(
+        name=c["name"],
+        data_type=c["data_type"],
+        is_nullable=c.get("is_nullable", True),
+    )
+
+
+def _trigger_from_dict(tr: dict[str, Any]) -> Trigger:
+    return Trigger(
+        name=tr["name"],
+        function_schema=tr["function_schema"],
+        function_name=tr["function_name"],
+        event=tr["event"],
+        timing=tr["timing"],
+        enabled=tr["enabled"],
+    )
+
+
+def _index_from_dict(idx: dict[str, Any]) -> Index:
+    # `is_primary` is a v13 addition; v3-v12 snapshots load it as False.
+    return Index(
+        name=idx["name"],
+        access_method=idx["access_method"],
+        columns=tuple(idx["columns"]),
+        is_unique=idx["is_unique"],
+        is_partial=idx["is_partial"],
+        is_primary=idx.get("is_primary", False),
+    )
+
+
+def _table_from_dict(
+    t: dict[str, Any],
+    top_level_policies: dict[tuple[str, str], list[dict[str, Any]]],
+) -> Table:
+    key = (t["schema"], t["name"])
+    # Prefer top-level policies (canonical format); fall back to
+    # per-table embedded policies (legacy / manual test fixtures).
+    # When BOTH paths have data, top-level wins (Python `or` short-
+    # circuits on the truthy first list); the embedded list is
+    # silently ignored. This is a defensive choice — to_snapshot only
+    # writes top-level — but a malformed snapshot mixing both should
+    # not silently merge them.
+    raw_policies = top_level_policies.get(key) or t.get("policies", [])
+    partition_of_raw = t.get("partition_of")
+    partition_of = tuple(partition_of_raw) if partition_of_raw else None
+    return Table(
+        schema=t["schema"],
+        name=t["name"],
+        rls_enabled=t["rls_enabled"],
+        force_rls=t["force_rls"],
+        policies=tuple(_policy_from_dict(p) for p in raw_policies),
+        columns=tuple(t.get("columns", ())),
+        partition_of=partition_of,
+        # v3+ grants; absent on a v2 baseline → ().
+        grants=tuple(_grant_from_dict(g) for g in t.get("grants", [])),
+        # v5+ column type info; v3/v4 baselines have it absent or empty,
+        # leaving column_details=() (Schema.to_sql() then raises if the
+        # user tries to restore from such a snapshot).
+        column_details=tuple(
+            _column_from_dict(c) for c in t.get("column_details", [])
+        ),
+        # v6+ triggers; v3/v4/v5 baselines round-trip to ().
+        triggers=tuple(
+            _trigger_from_dict(tr) for tr in t.get("triggers", [])
+        ),
+        # v7+ indexes; v3-v6 baselines round-trip to ().
+        indexes=tuple(_index_from_dict(idx) for idx in t.get("indexes", [])),
+    )
+
+
+def _view_from_dict(v: dict[str, Any]) -> View:
+    return View(
+        schema=v["schema"],
+        name=v["name"],
+        is_materialized=v["is_materialized"],
+        security_invoker=v["security_invoker"],
+        security_barrier=v["security_barrier"],
+        definition=v["definition"],
+        references=tuple(tuple(r) for r in v["references"]),
+        security_definer_calls=tuple(v["security_definer_calls"]),
+    )
+
+
+def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
+    # `search_path` is a v8 addition; v4-v7 snapshots have no key, so
+    # `.get(...)` yields None ("no SET search_path clause"). `signature`
+    # is a v12 addition; v4-v11 snapshots load it as "".
+    return SecdefFunction(
+        qualified_name=f["qualified_name"],
+        body=f["body"],
+        language=f["language"],
+        search_path=f.get("search_path"),
+        signature=f.get("signature", ""),
+    )
+
+
+def _bypassrls_role_from_dict(r: dict[str, Any]) -> BypassRlsRole:
+    return BypassRlsRole(
+        name=r["name"],
+        superuser=r["superuser"],
+        can_login=r["can_login"],
+    )
+
+
+def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
+    # `signature` is a v12 addition; v10-v11 snapshots load it as "".
+    return LeakproofFunction(
+        qualified_name=f["qualified_name"],
+        signature=f.get("signature", ""),
+    )
+
+
+def _escalation_from_dict(e: dict[str, Any]) -> BypassRlsEscalation:
+    return BypassRlsEscalation(
+        member=e["member"],
+        via=tuple(e["via"]),
+        member_can_login=e["member_can_login"],
+    )
+
+
 @dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
@@ -813,206 +968,45 @@ class Schema:
             key = (p["table_schema"], p["table_name"])
             top_level_policies.setdefault(key, []).append(p)
 
-        tables: list[Table] = []
-        for t in payload.get("tables", []):
-            key = (t["schema"], t["name"])
-            # Prefer top-level policies (canonical format); fall back to
-            # per-table embedded policies (legacy / manual test fixtures).
-            # When BOTH paths have data, top-level wins (Python `or` short-
-            # circuits on the truthy first list); the embedded list is
-            # silently ignored. This is a defensive choice — to_snapshot
-            # only writes top-level — but a malformed snapshot mixing
-            # both should not silently merge them.
-            raw_policies = top_level_policies.get(key) or t.get("policies", [])
-            # ASTs are intentionally left as None here — the v0.2.1
-            # contract documents that callers parse on demand. The
-            # only in-tree consumer that needs them is
-            # pgrls.diff._diff_columns, which now lazy-parses.
-            policies = tuple(
-                Policy(
-                    # Top-level format uses "policy_name"; embedded uses "name".
-                    name=p.get("policy_name") or p["name"],
-                    command=p["command"],
-                    permissive=p["permissive"],
-                    roles=tuple(p["roles"]),
-                    using_sql=p.get("using_sql"),
-                    with_check_sql=p.get("with_check_sql"),
-                    using_ast=None,
-                    with_check_ast=None,
-                )
-                for p in raw_policies
-            )
-            grants_raw = t.get("grants", [])
-            grants = tuple(
-                Grant(role=g["role"], privileges=tuple(g["privileges"]))
-                for g in grants_raw
-            )
-            partition_of_raw = t.get("partition_of")
-            partition_of = (
-                tuple(partition_of_raw) if partition_of_raw else None
-            )
-            # v5 extension — `column_details` gives full type info per
-            # column. v3/v4 baselines have it absent or empty; that
-            # path leaves `column_details=()` and `Schema.to_sql()`
-            # later raises ValueError if the user tries to restore.
-            column_details_raw = t.get("column_details", [])
-            column_details = tuple(
-                Column(
-                    name=c["name"],
-                    data_type=c["data_type"],
-                    is_nullable=c.get("is_nullable", True),
-                )
-                for c in column_details_raw
-            )
-            # v6 extension — `triggers` holds the user-authored triggers
-            # captured for SEC013. v3/v4/v5 baselines have the field
-            # absent (`.get(...) → []`), which round-trips into an empty
-            # tuple — SEC013 simply finds nothing to flag.
-            triggers_raw = t.get("triggers", [])
-            triggers = tuple(
-                Trigger(
-                    name=tr["name"],
-                    function_schema=tr["function_schema"],
-                    function_name=tr["function_name"],
-                    event=tr["event"],
-                    timing=tr["timing"],
-                    enabled=tr["enabled"],
-                )
-                for tr in triggers_raw
-            )
-            # v7 extension — `indexes` holds the valid+ready indexes
-            # captured for PERF003. v3-v6 baselines round-trip with
-            # the field absent (`.get(...) → []`), which yields an
-            # empty tuple — PERF003 finds nothing to flag against
-            # older snapshots until they're re-captured.
-            indexes_raw = t.get("indexes", [])
-            indexes = tuple(
-                Index(
-                    name=idx["name"],
-                    access_method=idx["access_method"],
-                    columns=tuple(idx["columns"]),
-                    is_unique=idx["is_unique"],
-                    is_partial=idx["is_partial"],
-                    is_primary=idx.get("is_primary", False),
-                )
-                for idx in indexes_raw
-            )
-            tables.append(
-                Table(
-                    schema=t["schema"],
-                    name=t["name"],
-                    rls_enabled=t["rls_enabled"],
-                    force_rls=t["force_rls"],
-                    policies=policies,
-                    columns=tuple(t.get("columns", ())),
-                    partition_of=partition_of,
-                    grants=grants,
-                    column_details=column_details,
-                    triggers=triggers,
-                    indexes=indexes,
-                )
-            )
-        # v3 has no "views" array; treat as empty tuple.
+        tables = tuple(
+            _table_from_dict(t, top_level_policies)
+            for t in payload.get("tables", [])
+        )
+
+        # v3 has no "views" / "security_definer_functions" arrays; gate
+        # both on version so a v3 payload yields empty tuples without a
+        # KeyError. v4+ payloads always carry the keys.
         raw_views = payload.get("views", []) if version >= 4 else []
-        views = tuple(
-            View(
-                schema=v["schema"],
-                name=v["name"],
-                is_materialized=v["is_materialized"],
-                security_invoker=v["security_invoker"],
-                security_barrier=v["security_barrier"],
-                definition=v["definition"],
-                references=tuple(tuple(r) for r in v["references"]),
-                security_definer_calls=tuple(v["security_definer_calls"]),
-            )
-            for v in raw_views
-        )
-        # `security_definer_functions` is a v4+ field. `.get(..., [])`
-        # keeps older snapshots loadable — they get an empty tuple,
-        # which means VIEW004 / SEC014 / SEC015 find nothing to flag
-        # (correct, since the snapshot didn't capture the functions).
-        #
-        # `search_path` on each function is a v8 addition for SEC015.
-        # v4–v7 snapshots have no `search_path` key; `.get(...,
-        # None)` loads them with `search_path=None`. That maps to
-        # "no SET search_path clause" — which SEC015 treats as
-        # unsafe. A pre-v8 snapshot can't distinguish "function
-        # pinned a safe search_path" from "function pinned nothing",
-        # so SEC015 on a stale snapshot conservatively flags every
-        # SECDEF function. Re-snapshot against a live database (v8)
-        # to get the real search_path values.
+        views = tuple(_view_from_dict(v) for v in raw_views)
         raw_secdef_funcs = (
-            payload.get("security_definer_functions", []) if version >= 4 else []
+            payload.get("security_definer_functions", [])
+            if version >= 4
+            else []
         )
-        # `signature` is a v12 addition (per-overload identity for
-        # the ALTER FUNCTION fixers). v4-v11 snapshots have no
-        # `signature` key; `.get(..., "")` loads them with the empty
-        # string — fixers that need the signature will see "" and
-        # abstain rather than emit a wrong ALTER FUNCTION (re-
-        # snapshot against a live v12 database to populate it).
         secdef_funcs = tuple(
-            SecdefFunction(
-                qualified_name=f["qualified_name"],
-                body=f["body"],
-                language=f["language"],
-                search_path=f.get("search_path"),
-                signature=f.get("signature", ""),
-            )
-            for f in raw_secdef_funcs
+            _secdef_from_dict(f) for f in raw_secdef_funcs
         )
 
-        # `bypassrls_roles` is a v9+ field. v3-v8 snapshots have no
-        # `bypassrls_roles` key; `.get(..., [])` loads them with an
-        # empty tuple — SEC016 then finds nothing to flag (correct,
-        # since the snapshot didn't capture roles). Re-snapshot
-        # against a live database (v9) to populate it.
-        raw_roles = payload.get("bypassrls_roles", [])
+        # The remaining top-level arrays (v9+ bypassrls_roles, v10+
+        # leakproof_functions, v11+ bypassrls_escalation_roles) are read
+        # with `.get(..., [])`: a snapshot predating each field has no key
+        # and loads as an empty tuple, so the corresponding rule finds
+        # nothing to flag until the snapshot is re-captured.
         bypassrls_roles = tuple(
-            BypassRlsRole(
-                name=r["name"],
-                superuser=r["superuser"],
-                can_login=r["can_login"],
-            )
-            for r in raw_roles
+            _bypassrls_role_from_dict(r)
+            for r in payload.get("bypassrls_roles", [])
         )
-
-        # `leakproof_functions` is a v10+ field. v3-v9 snapshots have
-        # no `leakproof_functions` key; `.get(..., [])` loads them
-        # with an empty tuple — SEC017 then finds nothing to flag
-        # (correct, since the snapshot didn't capture functions).
-        # Re-snapshot against a live database (v10) to populate it.
-        raw_leakproof = payload.get("leakproof_functions", [])
-        # `signature` is a v12 addition (per-overload identity for
-        # the SEC017 fixer). v10-v11 snapshots have no `signature`
-        # key; `.get(..., "")` loads them with the empty string.
-        # Note overloads of the same qualified_name collapsed into
-        # a single entry pre-v12 (DISTINCT in the introspection
-        # query); v12 captures them separately.
         leakproof_functions = tuple(
-            LeakproofFunction(
-                qualified_name=f["qualified_name"],
-                signature=f.get("signature", ""),
-            )
-            for f in raw_leakproof
+            _leakproof_from_dict(f)
+            for f in payload.get("leakproof_functions", [])
         )
-
-        # `bypassrls_escalation_roles` is a v11+ field. v3-v10
-        # snapshots have no key; `.get(..., [])` loads them with an
-        # empty tuple — SEC029 then finds nothing to flag (correct,
-        # since the snapshot didn't capture the membership graph).
-        # Re-snapshot against a live database (v11) to populate it.
-        raw_escalation = payload.get("bypassrls_escalation_roles", [])
         bypassrls_escalation_roles = tuple(
-            BypassRlsEscalation(
-                member=e["member"],
-                via=tuple(e["via"]),
-                member_can_login=e["member_can_login"],
-            )
-            for e in raw_escalation
+            _escalation_from_dict(e)
+            for e in payload.get("bypassrls_escalation_roles", [])
         )
 
         return cls(
-            tables=tuple(tables),
+            tables=tables,
             views=views,
             security_definer_functions=secdef_funcs,
             bypassrls_roles=bypassrls_roles,
