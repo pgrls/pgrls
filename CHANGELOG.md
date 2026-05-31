@@ -10,6 +10,26 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-30
+
+### Added
+
+- **PERF005 — RLS-protected table observed to sequentially scan in
+  production** (info, opt-in). The lint-gate face of `pgrls perf`: capture a
+  runtime-stats snapshot with `pgrls perf --snapshot .pgrls-perf.json`, then
+  `pgrls lint --perf .pgrls-perf.json` fires PERF005 for every RLS-enabled
+  table the snapshot shows under sequential-scan pressure — so observed
+  seq-scans gate CI next to the static rules. Inert on a normal lint run (no
+  artifact, like HYG004 and its coverage artifact). Thresholds are tunable
+  per-rule (`[lint.rules.PERF005]` `min_rows` / `min_seq_scans` /
+  `min_seq_pct`, sharing `pgrls perf`'s gate so the two never disagree), and
+  a table can be allowlisted. Brings the catalog to **50 rules**. Table-level
+  counters include every scan, not only RLS-driven ones, so PERF005
+  prioritises investigation rather than proving RLS is the cause.
+- **`pgrls perf --snapshot PATH`** writes the raw `pg_stat_user_tables`
+  artifact PERF005 consumes (bare `--snapshot` writes `.pgrls-perf.json`).
+- **`pgrls lint --perf PATH`** loads that artifact and enables PERF005.
+
 ## [0.12.0] - 2026-05-30
 
 ### Added

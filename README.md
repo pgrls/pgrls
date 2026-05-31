@@ -9,7 +9,7 @@
 **[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[Docs site](https://pgrls.github.io/pgrls-docs/)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
-> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 17 of 49 rules mechanically auto-fixable.
+> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 17 of 50 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
 > MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown / GitHub-PR-comment / GitHub annotations / JUnit XML).
 
@@ -28,9 +28,9 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 49 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 50 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
-> - **Lint & fix** — `pgrls lint` checks a live database against all forty-nine rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Lint & fix** — `pgrls lint` checks a live database against all fifty rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tables that lack it — per-tenant (`tenant_id`) or per-user (`--model owner`, incl. the Supabase `auth.uid()` form): ENABLE + FORCE, an isolation policy, a restrictive floor, and the index, output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
@@ -339,6 +339,8 @@ pgrls perf --database-url "$DATABASE_URL" --fail-on-findings   # CI gate
 
 A table PERF003 flagged that is *also* observed seq-scanning is a **confirmed** missing-index candidate; a table PERF003 thought was indexed that still seq-scans means the index **isn't being used** — poor selectivity or stale statistics, which no amount of schema reading would catch. Tune `--min-rows` / `--min-seq-scans` / `--min-seq-pct` to set what counts as pressure (defaults are conservative — small tables seq-scan by the planner's choice).
 
+To gate CI inside your normal lint run, persist a snapshot and point lint at it — `pgrls perf --snapshot .pgrls-perf.json` writes the raw counters, then `pgrls lint --perf .pgrls-perf.json` fires the opt-in [**PERF005**](docs/RULES.md#rule-perf005) rule for each RLS table under pressure (inert without the artifact, exactly like HYG004 with a coverage artifact).
+
 Honest scope: `pg_stat_user_tables` counts *every* sequential scan on a table, not only those an RLS predicate drove, so this prioritises where to look rather than proving RLS is the cause. Partitioned tables are under-covered in this release — a partitioned parent records no direct scans (queries hit the children) and partition children don't carry the parent's RLS flag — so their scans may not surface (a false negative, never a false positive). Warm the planner's statistics first (exercise the workload, then `ANALYZE`).
 
 ## Configuration
@@ -547,6 +549,7 @@ pattern documentation.
 | [PERF002](docs/RULES.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](docs/RULES.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
 | [PERF004](docs/RULES.md#rule-perf004) | warning | Policy predicate wraps an indexed column in a function (e.g. `lower(email)`) so the plain index can't serve it — Postgres seq-scans; needs an expression index |
+| [PERF005](docs/RULES.md#rule-perf005) | info | RLS table *observed* to sequentially scan in production (opt-in; fed by `pgrls perf --snapshot` via `pgrls lint --perf`) |
 | [HYG001](docs/RULES.md#rule-hyg001) | error | Policies referencing columns that don't exist on the table |
 | [HYG002](docs/RULES.md#rule-hyg002) | warning | Policy named like a placeholder (`todo`, `fixme`, `tmp`, …) |
 | [HYG003](docs/RULES.md#rule-hyg003) | info | Policy is an exact duplicate of another policy on the same table |
