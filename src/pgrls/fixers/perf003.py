@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import create_index_sql, quote_qualified
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse the rule's detection so the fixer indexes exactly the
@@ -75,7 +75,7 @@ class PERF003Fixer:
         return Fix(
             rule_id="PERF003",
             location=f"{schema}.{table} ({column})",
-            sql=f"CREATE INDEX ON {qtable} ({quote_ident(column)});",
+            sql=create_index_sql(qtable, column),
             description=(
                 f"Add a B-tree index on the {column!r} column of "
                 f"{schema}.{table} — an RLS policy filters on it "

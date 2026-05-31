@@ -54,11 +54,10 @@ from typing import Any
 
 from pglast.ast import BoolExpr
 from pglast.enums import BoolExprType
-from pglast.stream import RawStream
 
 from pgrls.ast_utils import is_literal_true
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 
@@ -211,18 +210,15 @@ class SEC011Fixer:
                 if not (using_changed or wc_changed):
                     continue
 
-                clauses: list[str] = []
-                if using_changed:
-                    clauses.append(f"    USING ({RawStream()(new_using_ast)})")
-                if wc_changed:
-                    clauses.append(
-                        f"    WITH CHECK ({RawStream()(new_wc_ast)})"
-                    )
-                stmt = (
-                    f"ALTER POLICY {quote_ident(policy.name)} "
-                    f"ON {quote_qualified(table.schema, table.name)}\n"
-                    + "\n".join(clauses)
-                    + ";"
+                # Only re-emit the clause(s) that actually changed, so
+                # the migration is the minimal diff. `alter_policy`
+                # renders each provided clause through RawStream and
+                # orders USING before WITH CHECK.
+                stmt = alter_policy(
+                    table,
+                    policy.name,
+                    using_ast=new_using_ast if using_changed else None,
+                    with_check_ast=new_wc_ast if wc_changed else None,
                 )
 
                 out.append(

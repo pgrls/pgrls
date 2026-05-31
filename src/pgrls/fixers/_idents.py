@@ -27,6 +27,9 @@ that parses confusingly on the server.
 from __future__ import annotations
 
 import re
+from typing import Any
+
+from pglast.stream import RawStream
 
 _PLAIN_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -91,3 +94,73 @@ def quote_ident(name: str) -> str:
 def quote_qualified(schema: str, name: str) -> str:
     """Quote a `schema.name` pair, each component independently."""
     return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+def alter_policy(
+    table: Any,
+    policy_name: str,
+    *,
+    using_ast: Any | None = None,
+    with_check_ast: Any | None = None,
+) -> str:
+    """Assemble an `ALTER POLICY` statement with optional clauses.
+
+    Single source of truth for the shape the PERF001 / SEC006 /
+    SEC011 / SEC019 / SEC020 fixers all emit:
+
+        ALTER POLICY <name> ON <schema>.<table>
+            [USING (<using_ast>)]
+            [WITH CHECK (<with_check_ast>)];
+
+    `USING` precedes `WITH CHECK`; each clause is 4-space indented
+    and only rendered when its AST is provided. Each clause AST is
+    round-tripped through `pglast.stream.RawStream` so pglast's
+    escaping is applied consistently regardless of where the SQL
+    originated. The identifier and qualified-name quoting is the
+    same `quote_ident` / `quote_qualified` this module owns.
+
+    At least one clause is expected; with neither, the result is a
+    bare `ALTER POLICY … ON …;` (no fixer emits that — they all
+    only call this after establishing a clause changed).
+    """
+    clauses: list[str] = []
+    if using_ast is not None:
+        clauses.append(f"    USING ({RawStream()(using_ast)})")
+    if with_check_ast is not None:
+        clauses.append(f"    WITH CHECK ({RawStream()(with_check_ast)})")
+    return (
+        f"ALTER POLICY {quote_ident(policy_name)} "
+        f"ON {quote_qualified(table.schema, table.name)}\n"
+        + "\n".join(clauses)
+        + ";"
+    )
+
+
+def enable_rls_sql(qname: str) -> str:
+    """`ALTER TABLE <qname> ENABLE ROW LEVEL SECURITY;` (SEC001 shape).
+
+    `qname` is already a quoted qualified name (`quote_qualified`).
+    Shared verbatim by the SEC001 fixer and `pgrls generate`.
+    """
+    return f"ALTER TABLE {qname} ENABLE ROW LEVEL SECURITY;"
+
+
+def force_rls_sql(qname: str) -> str:
+    """`ALTER TABLE <qname> FORCE ROW LEVEL SECURITY;` (SEC002 shape).
+
+    `qname` is already a quoted qualified name (`quote_qualified`).
+    Shared verbatim by the SEC002 fixer and `pgrls generate`.
+    """
+    return f"ALTER TABLE {qname} FORCE ROW LEVEL SECURITY;"
+
+
+def create_index_sql(qname: str, column: str) -> str:
+    """`CREATE INDEX ON <qname> (<column>);` (PERF003 shape).
+
+    `qname` is already a quoted qualified name; `column` is a raw
+    identifier and is quoted here via `quote_ident`. The index name
+    is left to Postgres (no explicit name), matching PERF003's
+    recommended remediation. Shared verbatim by the PERF003 fixer
+    and `pgrls generate`.
+    """
+    return f"CREATE INDEX ON {qname} ({quote_ident(column)});"
