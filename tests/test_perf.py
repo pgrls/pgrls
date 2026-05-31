@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import psycopg
 from click.testing import CliRunner
 
 from pgrls.cli import main
@@ -26,10 +27,14 @@ from pgrls.perf import (
     PerfFinding,
     PerfReport,
     PerfThresholds,
+    StatementStat,
     TableStats,
+    _relations_in,
     build_perf_report,
+    collect_statements,
     load_perf_artifact,
     render,
+    top_statements_for,
     under_seq_scan_pressure,
     write_perf_artifact,
 )
@@ -506,3 +511,186 @@ def test_cli_perf_snapshot_writes_loadable_artifact(tmp_path) -> None:
     loaded = load_perf_artifact(str(out))
     assert loaded[("public", "posts")].seq_scan == 500
     assert DEFAULT_PERF_ARTIFACT_PATH == ".pgrls-perf.json"
+
+
+# ---------- pg_stat_statements enrichment (--statements / PR3) ----------
+
+
+def _stmt(query, *, total_ms, mean_ms=1.0, calls=1, rows=0, tables=()):
+    return StatementStat(
+        query=query,
+        calls=calls,
+        total_exec_ms=total_ms,
+        mean_exec_ms=mean_ms,
+        rows=rows,
+        tables=frozenset(tables),
+    )
+
+
+def test_statement_references_qualified_and_bare() -> None:
+    s = _stmt("...", total_ms=1.0, tables={("public", "posts")})
+    assert s.references("public", "posts") is True
+    assert s.references("other", "posts") is False
+    bare = _stmt("...", total_ms=1.0, tables={(None, "posts")})
+    assert bare.references("public", "posts") is True  # unqualified matches any schema
+
+
+def test_statement_short_query_flattens_and_caps() -> None:
+    s = _stmt("SELECT\n  *\n  FROM   posts", total_ms=1.0)
+    assert s.short_query() == "SELECT * FROM posts"
+    long = _stmt("SELECT " + "x" * 200, total_ms=1.0)
+    assert len(long.short_query(width=40)) == 40 and long.short_query(width=40).endswith("…")
+
+
+def test_relations_in_parses_joins_and_tolerates_garbage() -> None:
+    rels = _relations_in(
+        "SELECT * FROM public.posts p JOIN notes n ON n.id = p.id WHERE p.tenant_id = $1"
+    )
+    assert ("public", "posts") in rels and (None, "notes") in rels
+    assert _relations_in("this is not valid sql ;;;") == frozenset()
+
+
+def test_top_statements_filters_to_pressured_and_ranks() -> None:
+    ts = _stats("public", "posts", seq_scan=500, seq_tup_read=5_000_000, idx_scan=1, n_live_tup=500_000)
+    report = PerfReport(findings=(PerfFinding(ts, CONFIRMED, "warning"),), rls_tables_considered=1)
+    stmts = [
+        _stmt("SELECT * FROM public.posts WHERE tenant_id=$1", total_ms=900, tables={("public", "posts")}),
+        _stmt("SELECT * FROM public.posts", total_ms=2500, tables={("public", "posts")}),
+        _stmt("SELECT * FROM unrelated", total_ms=9999, tables={(None, "unrelated")}),  # not pressured
+    ]
+    top = top_statements_for(report, stmts, limit=10)
+    # Only posts-touching, ranked by total_exec_ms desc; 'unrelated' excluded.
+    assert [round(s.total_exec_ms) for s in top] == [2500, 900]
+    assert top_statements_for(report, stmts, limit=1)[0].total_exec_ms == 2500
+
+
+class _FakeStmtCursor:
+    def __init__(self, ext_present, rows, raise_on_query=False):
+        self._ext_present, self._rows = ext_present, rows
+        self._raise_on_query = raise_on_query
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self._sql = sql
+        # The view query (not the pg_extension check) raises when the
+        # extension is registered but unreadable.
+        if self._raise_on_query and "FROM pg_stat_statements" in sql:
+            raise psycopg.OperationalError("permission denied")
+
+    def fetchone(self):
+        return (1,) if self._ext_present else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeStmtConn:
+    def __init__(self, ext_present, rows, raise_on_query=False):
+        self._cur = _FakeStmtCursor(ext_present, rows, raise_on_query)
+        self.rolled_back = False
+
+    def cursor(self, **kw):
+        return self._cur
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def test_collect_statements_none_when_extension_absent() -> None:
+    assert collect_statements(_FakeStmtConn(False, [])) is None
+
+
+def test_collect_statements_none_when_view_unreadable() -> None:
+    # Extension registered but the view query errors (search_path / perms):
+    # roll back and degrade to None rather than let the error escape.
+    conn = _FakeStmtConn(True, [], raise_on_query=True)
+    assert collect_statements(conn) is None
+    assert conn.rolled_back is True
+
+
+def test_collect_statements_parses_rows() -> None:
+    rows = [
+        {
+            "query": "SELECT * FROM public.posts WHERE tenant_id = $1",
+            "calls": 10,
+            "total_exec_time": 123.4,
+            "mean_exec_time": 12.34,
+            "rows": 10,
+        }
+    ]
+    out = collect_statements(_FakeStmtConn(True, rows))
+    assert out is not None and len(out) == 1
+    assert out[0].references("public", "posts") is True
+    assert out[0].total_exec_ms == 123.4
+
+
+def test_render_statements_section_tristate() -> None:
+    ts = _stats("public", "posts", seq_scan=500, seq_tup_read=5_000_000, idx_scan=1, n_live_tup=500_000)
+    base = PerfReport(findings=(PerfFinding(ts, CONFIRMED, "warning"),), rls_tables_considered=1)
+    # None → no statements section in any format.
+    for fmt in PERF_FORMATS:
+        assert "Top statements" not in render(base, fmt)
+    # populated
+    s = _stmt("SELECT * FROM public.posts WHERE tenant_id=$1", total_ms=999, calls=42, tables={("public", "posts")})
+    full = PerfReport(findings=base.findings, rls_tables_considered=1, statements=(s,))
+    assert "Top statements" in render(full, "text")
+    assert json.loads(render(full, "json"))["statements"][0]["calls"] == 42
+    assert "Top statements touching" in render(full, "markdown")
+    assert "<h2>Top statements" in render(full, "html")
+    # empty (collected, none relevant) → section present with a 'none' note.
+    empty = PerfReport(findings=base.findings, rls_tables_considered=1, statements=())
+    assert "none reference" in render(empty, "text").lower()
+
+
+def _run_perf_statements(*, schema, stats, stmts):
+    cm = MagicMock()
+    cm.__enter__.return_value = MagicMock()
+    cm.__exit__.return_value = False
+    with patch("pgrls.cli.psycopg.connect", return_value=cm), patch(
+        "pgrls.cli.introspect", return_value=schema
+    ), patch("pgrls.cli.collect_table_stats", return_value=stats), patch(
+        "pgrls.cli._perf003_flagged_tables", return_value=set()
+    ), patch("pgrls.cli.collect_statements", return_value=stmts):
+        return CliRunner().invoke(
+            main,
+            ["perf", "--database-url", "postgresql://x", "--statements", "--format", "json"],
+        )
+
+
+def test_cli_perf_statements_enriches_when_available() -> None:
+    schema = Schema(tables=(_table("posts", rls=True),))
+    stats = {("public", "posts"): _big("posts")}
+    stmts = [_stmt("SELECT * FROM public.posts", total_ms=500, calls=7, tables={("public", "posts")})]
+    res = _run_perf_statements(schema=schema, stats=stats, stmts=stmts)
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["statements"][0]["calls"] == 7
+
+
+def test_cli_perf_statements_degrades_when_absent() -> None:
+    schema = Schema(tables=(_table("posts", rls=True),))
+    stats = {("public", "posts"): _big("posts")}
+    # collect_statements returns None (extension absent) → note on stderr, no
+    # statements section. (CliRunner mixes the stderr note into output, so
+    # assert on substrings rather than json.loads the whole thing.)
+    res = _run_perf_statements(schema=schema, stats=stats, stmts=None)
+    assert res.exit_code == 0, res.output
+    assert "pg_stat_statements is unavailable" in res.output
+    assert '"statements"' not in res.output  # JSON report omits the key
+
+
+def test_cli_perf_statements_no_section_without_findings() -> None:
+    # --statements with stmts available but NO pressured tables: nothing to
+    # attribute, so the section is omitted (keeps every format consistent —
+    # text would otherwise diverge by early-returning before the section).
+    schema = Schema(tables=(_table("posts", rls=True),))
+    small = {("public", "posts"): _stats("public", "posts", seq_scan=1, seq_tup_read=1, idx_scan=0, n_live_tup=1)}
+    stmts = [_stmt("SELECT * FROM public.posts", total_ms=500, calls=7, tables={("public", "posts")})]
+    res = _run_perf_statements(schema=schema, stats=small, stmts=stmts)
+    assert res.exit_code == 0, res.output
+    assert '"statements"' not in res.output

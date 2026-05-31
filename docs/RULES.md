@@ -2665,8 +2665,8 @@ a table, not only those an RLS policy predicate drove — a reporting query
 that legitimately full-scans inflates the same counter. So PERF005 points
 you at tables worth investigating; it does not *prove* RLS is the cause.
 Run `pgrls perf` for the confirmed-missing-index vs index-unused breakdown
-(it cross-references PERF003), and a later release will attribute scans to
-specific statements via `pg_stat_statements`. Partitioned tables are
+(it cross-references PERF003), or `pgrls perf --statements` to attribute the
+cost to specific queries via `pg_stat_statements`. Partitioned tables are
 under-covered (a parent records no direct scans; children don't carry the
 parent's RLS flag). PERF005 has no auto-fix — choosing the right index
 needs human judgment about the query shape.

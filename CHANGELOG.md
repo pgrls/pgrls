@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-30
+
+### Added
+
+- **`pgrls perf --statements`** — attribute observed seq-scan cost to the
+  specific queries that drive it, via `pg_stat_statements`. It reads the
+  recorded statements, parses each normalized query for the tables it
+  references, keeps those touching a table under seq-scan pressure, and
+  lists the costliest by total execution time — turning "this table
+  seq-scans" into "*this query* seq-scans it" (text / JSON / Markdown / HTML).
+  Degrades cleanly when the extension isn't installed: a one-line note,
+  base report unchanged. Completes the runtime-PERF milestone — the
+  table-level caveat (`pg_stat_user_tables` counts every scan, not only
+  RLS-driven ones) is what statement-level attribution resolves.
+
 ## [0.13.0] - 2026-05-30
 
 ### Added

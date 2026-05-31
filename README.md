@@ -335,13 +335,16 @@ Each row is one snapshot plus the **NEW** / **FIXED** delta vs. the prior snapsh
 pgrls perf --database-url "$DATABASE_URL"                 # text table + summary
 pgrls perf --database-url "$DATABASE_URL" --format json   # also markdown / html
 pgrls perf --database-url "$DATABASE_URL" --fail-on-findings   # CI gate
+pgrls perf --database-url "$DATABASE_URL" --statements     # blame specific queries (pg_stat_statements)
 ```
 
 A table PERF003 flagged that is *also* observed seq-scanning is a **confirmed** missing-index candidate; a table PERF003 thought was indexed that still seq-scans means the index **isn't being used** — poor selectivity or stale statistics, which no amount of schema reading would catch. Tune `--min-rows` / `--min-seq-scans` / `--min-seq-pct` to set what counts as pressure (defaults are conservative — small tables seq-scan by the planner's choice).
 
 To gate CI inside your normal lint run, persist a snapshot and point lint at it — `pgrls perf --snapshot .pgrls-perf.json` writes the raw counters, then `pgrls lint --perf .pgrls-perf.json` fires the opt-in [**PERF005**](docs/RULES.md#rule-perf005) rule for each RLS table under pressure (inert without the artifact, exactly like HYG004 with a coverage artifact).
 
-Honest scope: `pg_stat_user_tables` counts *every* sequential scan on a table, not only those an RLS predicate drove, so this prioritises where to look rather than proving RLS is the cause. Partitioned tables are under-covered in this release — a partitioned parent records no direct scans (queries hit the children) and partition children don't carry the parent's RLS flag — so their scans may not surface (a false negative, never a false positive). Warm the planner's statistics first (exercise the workload, then `ANALYZE`).
+When `pg_stat_statements` is installed, **`--statements`** turns "this table seq-scans" into "*this query* seq-scans it": it parses each recorded statement, keeps those touching a pressured table, and lists the costliest by total execution time — the precise query to fix. It degrades cleanly (a note, base report unchanged) when the extension isn't available.
+
+Honest scope: `pg_stat_user_tables` counts *every* sequential scan on a table, not only those an RLS predicate drove, so the table-level view prioritises where to look rather than proving RLS is the cause (that's what `--statements` resolves). Partitioned tables are under-covered in this release — a partitioned parent records no direct scans (queries hit the children) and partition children don't carry the parent's RLS flag — so their scans may not surface (a false negative, never a false positive). Warm the planner's statistics first (exercise the workload, then `ANALYZE`).
 
 ## Configuration
 

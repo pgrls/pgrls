@@ -24,8 +24,9 @@ on a table, not only the ones an RLS policy predicate drove. A reporting
 query that legitimately full-scans inflates the same counter. So this is
 a *prioritisation* signal — "these RLS tables are doing real sequential
 work, look here first" — not proof that RLS is the cause. Attributing a
-scan to a specific statement needs ``pg_stat_statements`` (a later
-release). ``n_live_tup`` is the planner's estimate from the last
+scan to a specific statement needs ``pg_stat_statements``; ``pgrls perf
+--statements`` does exactly that (see ``collect_statements`` /
+``top_statements_for``). ``n_live_tup`` is the planner's estimate from the last
 ANALYZE/autovacuum, so run against a database whose statistics are warm
 (reset, exercise the workload, ANALYZE, then measure).
 """
@@ -36,10 +37,12 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import pglast
 import psycopg
 from psycopg.rows import dict_row
 
 from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls.ast_utils import extract_range_vars
 from pgrls.model import Schema
 
 __all__ = [
@@ -51,11 +54,14 @@ __all__ = [
     "PerfFinding",
     "PerfReport",
     "PerfThresholds",
+    "StatementStat",
     "TableStats",
     "build_perf_report",
+    "collect_statements",
     "collect_table_stats",
     "load_perf_artifact",
     "render",
+    "top_statements_for",
     "under_seq_scan_pressure",
     "write_perf_artifact",
 ]
@@ -110,6 +116,33 @@ class TableStats:
         )
 
 
+@dataclass(frozen=True)
+class StatementStat:
+    """One normalized statement from ``pg_stat_statements``.
+
+    ``tables`` is the set of ``(schema, relation)`` the statement
+    references (schema ``None`` for an unqualified name), parsed from the
+    normalized query text. ``total_exec_ms`` / ``mean_exec_ms`` are the
+    cumulative / average execution time in milliseconds.
+    """
+
+    query: str
+    calls: int
+    total_exec_ms: float
+    mean_exec_ms: float
+    rows: int
+    tables: frozenset[tuple[str | None, str]]
+
+    def references(self, schema: str, table: str) -> bool:
+        """True if this statement touches ``schema.table`` (qualified or not)."""
+        return (schema, table) in self.tables or (None, table) in self.tables
+
+    def short_query(self, width: int = 100) -> str:
+        """Single-line, length-capped query text for display."""
+        flat = " ".join(self.query.split())
+        return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
 _STATS_SQL = """
 SELECT
     schemaname AS schema_name,
@@ -146,6 +179,68 @@ def collect_table_stats(
             )
             out[(ts.schema, ts.table)] = ts
     return out
+
+
+_STATEMENTS_SQL = """
+SELECT query, calls, total_exec_time, mean_exec_time, rows
+FROM pg_stat_statements
+WHERE query IS NOT NULL
+ORDER BY total_exec_time DESC
+LIMIT %s
+"""
+
+
+def _relations_in(query: str) -> frozenset[tuple[str | None, str]]:
+    """Parse a normalized statement and return the relations it references.
+
+    Best-effort: a statement ``pg_stat_statements`` normalized into
+    something pglast can't parse (truncated, a utility command, a dialect
+    quirk) yields no relations rather than raising.
+    """
+    try:
+        parsed = pglast.parse_sql(query)
+    except pglast.parser.ParseError:
+        return frozenset()
+    rels: set[tuple[str | None, str]] = set()
+    for raw in parsed:
+        rels.update(extract_range_vars(getattr(raw, "stmt", None)))
+    return frozenset(rels)
+
+
+def collect_statements(
+    conn: psycopg.Connection, *, limit: int = 1000
+) -> list[StatementStat] | None:
+    """Read ``pg_stat_statements``, parsing each query for referenced tables.
+
+    Returns ``None`` when the extension isn't available — not installed, or
+    registered but unreadable (search_path / privileges). The caller treats
+    ``None`` as "no statement-level data" and degrades to the table-level
+    report; an empty list means the extension is present but recorded
+    nothing. Ordered by total execution time descending.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'"
+        )
+        if cur.fetchone() is None:
+            return None
+        try:
+            cur.execute(_STATEMENTS_SQL, (limit,))
+            rows = cur.fetchall()
+        except psycopg.Error:
+            conn.rollback()
+            return None
+    return [
+        StatementStat(
+            query=row["query"],
+            calls=row["calls"],
+            total_exec_ms=row["total_exec_time"],
+            mean_exec_ms=row["mean_exec_time"],
+            rows=row["rows"],
+            tables=_relations_in(row["query"]),
+        )
+        for row in rows
+    ]
 
 
 def write_perf_artifact(
@@ -259,6 +354,11 @@ class PerfReport:
     # thresholds (the denominator for "N of M RLS tables").
     rls_tables_considered: int
     thresholds: PerfThresholds = field(default_factory=PerfThresholds)
+    # Top pg_stat_statements entries touching a pressured table, when
+    # `--statements` collected them. ``None`` = not collected (extension
+    # absent or flag off); ``()`` = collected but none reference a pressured
+    # table. Set via `top_statements_for` + dataclasses.replace.
+    statements: tuple[StatementStat, ...] | None = None
 
     @property
     def summary(self) -> dict[str, int]:
@@ -346,6 +446,30 @@ def build_perf_report(
     )
 
 
+def top_statements_for(
+    report: PerfReport,
+    statements: list[StatementStat],
+    *,
+    limit: int = 10,
+) -> tuple[StatementStat, ...]:
+    """The statements (by total exec time) that touch a pressured table.
+
+    Pure: takes the built report's findings and the collected statements,
+    keeps those referencing at least one flagged table, and returns the
+    ``limit`` costliest. The caller attaches the result via
+    ``dataclasses.replace(report, statements=...)``. This is what turns
+    "table X seq-scans" into "*these* queries drive it".
+    """
+    pressured = {(f.stats.schema, f.stats.table) for f in report.findings}
+    touching = [
+        s
+        for s in statements
+        if any(s.references(sch, tbl) for (sch, tbl) in pressured)
+    ]
+    touching.sort(key=lambda s: s.total_exec_ms, reverse=True)
+    return tuple(touching[:limit])
+
+
 _VERDICT_LABEL = {
     CONFIRMED: "confirmed (no index)",
     INDEX_UNUSED: "index unused",
@@ -403,7 +527,23 @@ def render_text(report: PerfReport) -> str:
     out.append("")
     out.append(_summary_line(report))
     out.append(_CAVEAT)
+    out.extend(_statements_text(report.statements))
     return "\n".join(out)
+
+
+def _statements_text(statements: tuple[StatementStat, ...] | None) -> list[str]:
+    """Text lines for the optional `pg_stat_statements` attribution block."""
+    if statements is None:
+        return []
+    head = ["", "Top statements touching a pressured table (pg_stat_statements):"]
+    if not statements:
+        return [*head, "  (none reference a flagged table)"]
+    for s in statements:
+        head.append(
+            f"  {s.total_exec_ms:>12,.0f} ms total  {s.mean_exec_ms:>9,.1f} ms mean  "
+            f"{s.calls:>9,} calls   {s.short_query()}"
+        )
+    return head
 
 
 def render_json(report: PerfReport) -> str:
@@ -431,6 +571,20 @@ def render_json(report: PerfReport) -> str:
             for f in report.findings
         ],
     }
+    if report.statements is not None:
+        payload["statements"] = [
+            {
+                "query": s.query,
+                "calls": s.calls,
+                "total_exec_ms": round(s.total_exec_ms, 3),
+                "mean_exec_ms": round(s.mean_exec_ms, 3),
+                "rows": s.rows,
+                "tables": sorted(
+                    f"{sch}.{tbl}" if sch else tbl for (sch, tbl) in s.tables
+                ),
+            }
+            for s in report.statements
+        ]
     return json.dumps(payload, indent=2)
 
 
@@ -451,7 +605,49 @@ def render_markdown(report: PerfReport) -> str:
             f"{f.stats.seq_scan:,} | {f.stats.seq_tup_read:,} | "
             f"{f.stats.seq_scan_pct}% | {_VERDICT_LABEL[f.classification]} |"
         )
+    if report.statements is not None:
+        out += ["", "## Top statements touching a pressured table", ""]
+        if not report.statements:
+            out.append("_None of the recorded statements reference a flagged table._")
+        else:
+            out += [
+                "| Total ms | Mean ms | Calls | Query |",
+                "|--:|--:|--:|---|",
+            ]
+            for s in report.statements:
+                q = s.short_query().replace("|", "\\|")
+                out.append(
+                    f"| {s.total_exec_ms:,.0f} | {s.mean_exec_ms:,.1f} | "
+                    f"{s.calls:,} | `{q}` |"
+                )
     return "\n".join(out) + "\n"
+
+
+def _statements_html(statements: tuple[StatementStat, ...] | None) -> str:
+    """The optional `pg_stat_statements` attribution block (HTML fragment)."""
+    if statements is None:
+        return ""
+    heading = "\n  <h2>Top statements touching a pressured table</h2>"
+    if not statements:
+        return (
+            f'{heading}\n  <p class="caveat">None of the recorded '
+            "statements reference a flagged table.</p>"
+        )
+    rows = "\n".join(
+        "      <tr>"
+        f'<td class="num">{s.total_exec_ms:,.0f}</td>'
+        f'<td class="num">{s.mean_exec_ms:,.1f}</td>'
+        f'<td class="num">{s.calls:,}</td>'
+        f"<td><code>{html.escape(s.short_query())}</code></td>"
+        "</tr>"
+        for s in statements
+    )
+    return (
+        f"{heading}\n  <table>\n    <thead>\n      <tr>"
+        "<th>Total ms</th><th>Mean ms</th><th>Calls</th><th>Query</th>"
+        "</tr>\n    </thead>\n    <tbody>\n"
+        f"{rows}\n    </tbody>\n  </table>"
+    )
 
 
 def render_html(
@@ -497,6 +693,8 @@ def render_html(
             )
         rows_html = "\n".join(row_lines)
 
+    statements_html = _statements_html(report.statements)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -518,6 +716,7 @@ def render_html(
   }}
   header {{ margin-bottom: 1.5rem; }}
   h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
+  h2 {{ font-size: 1.15rem; margin: 1.75rem 0 .5rem; }}
   .meta {{ color: #57606a; font-size: .85rem; }}
   .summary {{ margin: 1rem 0 .5rem; }}
   .caveat {{ color: #57606a; font-size: .85rem; margin: .25rem 0 1rem; }}
@@ -561,7 +760,7 @@ def render_html(
     <tbody>
 {rows_html}
     </tbody>
-  </table>
+  </table>{statements_html}
   <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
 </body>
 </html>
