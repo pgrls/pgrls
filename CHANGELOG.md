@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-30
+
+### Added
+
+- **`pgrls init --preset`** — scaffold a `pgrls.toml` tailored to a stack:
+  `generic` (per-tenant via an `app.*` GUC), `supabase` / `neon` (per-user
+  ownership via `auth.uid()` / `auth.user_id()`), or `postgrest` (per-tenant
+  via a `request.jwt.claim.*` GUC). Each preset documents its tenancy
+  convention and the exact `pgrls generate` command that scaffolds matching,
+  lint-clean policies, turning a two-step (configure, then learn the generate
+  flags) onboarding into one. Presets change documentation only — the
+  generated config parses identically and leaves every rule at its default
+  regardless of preset, so `pgrls lint` runs unchanged. Defaults to `generic`
+  (the prior `pgrls init` output).
+
 ## [0.10.0] - 2026-05-30
 
 ### Added

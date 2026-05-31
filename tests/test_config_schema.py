@@ -12,7 +12,7 @@ import json
 import tomllib
 from pathlib import Path
 
-from pgrls.cli import _INIT_TEMPLATE
+from pgrls.cli import _INIT_PRESETS, _render_init_config
 
 _SCHEMA_PATH = Path(__file__).resolve().parents[1] / "pgrls.schema.json"
 
@@ -39,8 +39,10 @@ def test_schema_top_level_tables_match_init_template() -> None:
     # tomllib ignores the leading `#:schema` comment. Every top-level
     # table the documented template uses must be a declared schema
     # property — if `pgrls init` grows a new table, the schema (and this
-    # test) must grow with it.
-    parsed = tomllib.loads(_INIT_TEMPLATE)
+    # test) must grow with it. Checked for every preset, since a preset
+    # could in principle introduce a stack-specific table.
     schema_props = set(_schema()["properties"])
-    assert set(parsed) <= schema_props
-    assert {"database", "lint", "diff"} <= set(parsed)
+    for preset in _INIT_PRESETS:
+        parsed = tomllib.loads(_render_init_config(preset))
+        assert set(parsed) <= schema_props, preset
+        assert {"database", "lint", "diff"} <= set(parsed), preset

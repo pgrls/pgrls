@@ -169,6 +169,109 @@ def test_root_help_lists_init() -> None:
     assert "init" in result.output
 
 
+def test_init_default_preset_is_generic(tmp_path) -> None:
+    # `pgrls init` with no --preset must produce exactly the generic
+    # template — the default behaviour is unchanged by the preset feature.
+    from pgrls.cli import _render_init_config
+
+    out = tmp_path / "pgrls.toml"
+    result = CliRunner().invoke(main, ["init", "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.read_text(encoding="utf-8") == _render_init_config("generic")
+
+
+def test_init_every_preset_parses_with_defaults(tmp_path) -> None:
+    # Every preset is a documentation-only variation: the file must parse
+    # through load_config and leave EVERY rule at its default, exactly like
+    # the generic template, so `pgrls lint` runs unchanged regardless of
+    # which preset scaffolded the config.
+    from pgrls.cli import _INIT_PRESETS
+    from pgrls.config import load_config
+
+    for preset in _INIT_PRESETS:
+        out = tmp_path / f"{preset}.toml"
+        result = CliRunner().invoke(
+            main, ["init", "--output", str(out), "--preset", preset]
+        )
+        assert result.exit_code == 0, (preset, result.output)
+        assert f"({preset} preset)" in result.output
+        cfg = load_config(str(out))
+        assert cfg.schemas == ["public"], preset
+        assert cfg.fail_on == "warning", preset
+        assert cfg.diff_fail_on == "dangerous", preset
+        assert cfg.database_url is None, preset
+        assert cfg.disable == [], preset
+        assert cfg.severity_overrides == {}, preset
+        assert cfg.rule_options == {}, preset
+        # The schema directive stays the first line for every preset.
+        first_line = out.read_text(encoding="utf-8").splitlines()[0]
+        assert first_line.startswith("#:schema "), preset
+
+
+def test_init_preset_documents_matching_generate_command(tmp_path) -> None:
+    # The payoff of a preset: it names the stack and documents the exact
+    # `pgrls generate` invocation (using only flags generate accepts) that
+    # scaffolds matching, lint-clean policies.
+    expected = {
+        "generic": (
+            "per-tenant",
+            "pgrls generate --apply",
+        ),
+        "supabase": (
+            "Supabase",
+            "pgrls generate --model owner --convention supabase --apply",
+        ),
+        "postgrest": (
+            "PostgREST",
+            "pgrls generate --convention postgrest --apply",
+        ),
+        "neon": (
+            "Neon Authorize",
+            "pgrls generate --model owner --convention supabase "
+            "--auth-function auth.user_id --apply",
+        ),
+    }
+    runner = CliRunner()
+    for preset, (marker, command) in expected.items():
+        out = tmp_path / f"{preset}.toml"
+        result = runner.invoke(
+            main, ["init", "--output", str(out), "--preset", preset]
+        )
+        assert result.exit_code == 0, (preset, result.output)
+        text = out.read_text(encoding="utf-8")
+        assert marker in text, preset
+        assert command in text, preset
+
+
+def test_init_preset_is_case_insensitive(tmp_path) -> None:
+    out = tmp_path / "pgrls.toml"
+    result = CliRunner().invoke(
+        main, ["init", "--output", str(out), "--preset", "SUPABASE"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "(supabase preset)" in result.output
+    assert "Supabase" in out.read_text(encoding="utf-8")
+
+
+def test_init_rejects_unknown_preset(tmp_path) -> None:
+    out = tmp_path / "pgrls.toml"
+    result = CliRunner().invoke(
+        main, ["init", "--output", str(out), "--preset", "django"]
+    )
+    # click rejects an invalid Choice with a usage error (exit 2) and
+    # writes nothing.
+    assert result.exit_code == 2
+    assert "django" in result.output
+    assert not out.exists()
+
+
+def test_init_help_lists_presets() -> None:
+    result = CliRunner().invoke(main, ["init", "--help"])
+    assert result.exit_code == 0
+    for preset in ("generic", "supabase", "postgrest", "neon"):
+        assert preset in result.output
+
+
 def test_explain_prints_rule_rationale() -> None:
     # `explain` needs no database — it reads only pgrls's own rule
     # catalog. The output is a header line plus the rule's
