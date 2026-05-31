@@ -10,6 +10,25 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-30
+
+### Added
+
+- **`pgrls perf`** — runtime sequential-scan analysis. PERF003 predicts a
+  missing index *statically*; `pgrls perf` reads what the database actually
+  did (`pg_stat_user_tables`) and ranks RLS-enabled tables by rows read
+  sequentially, cross-referencing each against PERF003: a table PERF003
+  flagged that is *also* observed seq-scanning is a **confirmed**
+  missing-index candidate; a table PERF003 thought was indexed that still
+  seq-scans means the index **isn't being used** (poor selectivity, stale
+  statistics) — a finding static analysis can't produce. Text / JSON /
+  Markdown / HTML output; `--min-rows` / `--min-seq-scans` / `--min-seq-pct`
+  tune the thresholds (defaults conservative — small tables seq-scan by the
+  planner's choice); `--fail-on-findings` gates CI. Table-level counters
+  include every scan, not only RLS-driven ones, so this prioritises
+  investigation rather than proving RLS is the cause (statement-level
+  attribution via `pg_stat_statements` comes in a later release).
+
 ## [0.11.0] - 2026-05-30
 
 ### Added

@@ -327,6 +327,20 @@ pgrls history snapshots/ --format json -o trend.json   # machine-readable for pl
 
 Each row is one snapshot plus the **NEW** / **FIXED** delta vs. the prior snapshot in chronological order (findings keyed by `(rule_id, location)` so a schema-wide finding stays PERSISTENT rather than NEW+FIXED on every comparison). A trailing summary line names the net change over the full series.
 
+## Runtime seq-scans — `pgrls perf`
+
+`PERF003` predicts a missing index *statically* (the RLS predicate column has no usable index, so the planner *will* seq-scan). `pgrls perf` reads what the database actually did — Postgres's cumulative table statistics (`pg_stat_user_tables`) — and ranks RLS-enabled tables by rows read sequentially, cross-referencing each against PERF003:
+
+```bash
+pgrls perf --database-url "$DATABASE_URL"                 # text table + summary
+pgrls perf --database-url "$DATABASE_URL" --format json   # also markdown / html
+pgrls perf --database-url "$DATABASE_URL" --fail-on-findings   # CI gate
+```
+
+A table PERF003 flagged that is *also* observed seq-scanning is a **confirmed** missing-index candidate; a table PERF003 thought was indexed that still seq-scans means the index **isn't being used** — poor selectivity or stale statistics, which no amount of schema reading would catch. Tune `--min-rows` / `--min-seq-scans` / `--min-seq-pct` to set what counts as pressure (defaults are conservative — small tables seq-scan by the planner's choice).
+
+Honest scope: `pg_stat_user_tables` counts *every* sequential scan on a table, not only those an RLS predicate drove, so this prioritises where to look rather than proving RLS is the cause. Partitioned tables are under-covered in this release — a partitioned parent records no direct scans (queries hit the children) and partition children don't carry the parent's RLS flag — so their scans may not surface (a false negative, never a false positive). Warm the planner's statistics first (exercise the workload, then `ANALYZE`).
+
 ## Configuration
 
 Drop a `pgrls.toml` next to your project. See `pgrls.example.toml` in the repo for a fully commented version.

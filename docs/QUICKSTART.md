@@ -120,3 +120,7 @@ re-baseline after a clean-up pass.
   TOML extensions). `--preset supabase|postgrest|neon|generic` tailors the
   documented tenancy convention and the matching `pgrls generate` command
   to your stack (rules stay at their defaults).
+- **`pgrls perf`** — read Postgres's runtime table statistics
+  (`pg_stat_user_tables`) and surface RLS-enabled tables observed to
+  sequentially scan in production, cross-referenced with PERF003's static
+  index analysis (`--fail-on-findings` gates CI).

@@ -74,6 +74,13 @@ from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
 from pgrls.coverage import load_artifact as load_coverage_artifact
 from pgrls.coverage import render as render_coverage
+from pgrls.perf import (
+    PERF_FORMATS,
+    PerfThresholds,
+    build_perf_report,
+    collect_table_stats,
+)
+from pgrls.perf import render as render_perf
 from pgrls.rules import (
     Rule,
     RuleRegistry,
@@ -2980,6 +2987,193 @@ def coverage(
     if fail_under is not None and pct < fail_under:
         click.echo(
             f"pgrls: coverage {pct}% is below --fail-under {fail_under}%.",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _perf003_flagged_tables(schema: Schema) -> set[tuple[str, str]]:
+    """The ``(schema, table)`` set PERF003 statically flags.
+
+    A table is flagged when PERF003 reports any of its policies as having
+    a predicate column without a usable leading-column index. Run with
+    empty options — this is an internal classification signal for
+    ``pgrls perf`` (confirmed-missing-index vs index-unused), deliberately
+    independent of the user's PERF003 lint config (disable / allowlist /
+    severity). PERF003's violation ``location`` is the policy id
+    ``schema.table.policy``; we match against each table's known policy
+    ids rather than parse the string, so quoted identifiers can't trip it.
+    """
+    perf003 = next((r for r in all_rules() if r.id == "PERF003"), None)
+    if perf003 is None:  # pragma: no cover - PERF003 is always registered
+        return set()
+    flagged_locations = {v.location for v in perf003.check(schema, {})}
+    out: set[tuple[str, str]] = set()
+    for table in schema.tables:
+        for policy in table.policies:
+            if f"{table.schema}.{table.name}.{policy.name}" in flagged_locations:
+                out.add((table.schema, table.name))
+    return out
+
+
+@main.command()
+@click.option(
+    "--database-url",
+    envvar="DATABASE_URL",
+    default=None,
+    help="Postgres connection string. Falls back to $DATABASE_URL.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to report on (overrides config).",
+)
+@click.option(
+    "--min-rows",
+    "min_rows",
+    type=click.IntRange(min=0),
+    default=PerfThresholds.min_live_tup,
+    show_default=True,
+    help=(
+        "Ignore tables with fewer than this many estimated live rows — "
+        "a sequential scan of a small table is cheap and usually correct."
+    ),
+)
+@click.option(
+    "--min-seq-scans",
+    "min_seq_scans",
+    type=click.IntRange(min=0),
+    default=PerfThresholds.min_seq_scans,
+    show_default=True,
+    help=(
+        "Ignore tables sequentially scanned fewer than this many times "
+        "(a handful of scans is noise, not a steady-state cost)."
+    ),
+)
+@click.option(
+    "--min-seq-pct",
+    "min_seq_pct",
+    type=click.FloatRange(0, 100),
+    default=PerfThresholds.min_seq_pct,
+    show_default=True,
+    help=(
+        "Ignore tables that do less than this %% of their scanning "
+        "sequentially (a mostly-index-scanned table is healthy)."
+    ),
+)
+@click.option(
+    "--fail-on-findings",
+    is_flag=True,
+    default=False,
+    help="Exit 1 if any RLS table is under seq-scan pressure (CI gate).",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the report to this file instead of stdout (any --format).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(list(PERF_FORMATS), case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+def perf(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    min_rows: int,
+    min_seq_scans: int,
+    min_seq_pct: float,
+    fail_on_findings: bool,
+    output_path: str | None,
+    output_format: str,
+) -> None:
+    """Surface RLS-protected tables observed to seq-scan in production.
+
+    PERF003 predicts a missing index *statically*; this reads what the
+    database actually did. It pulls Postgres's cumulative table statistics
+    (`pg_stat_user_tables`) and ranks RLS-enabled tables by rows read
+    sequentially, cross-referencing each against PERF003: a table PERF003
+    flagged that *also* seq-scans is a **confirmed** missing-index
+    candidate; a table PERF003 thought was indexed that still seq-scans
+    means the index **isn't being used** (poor selectivity, stale stats).
+
+    Table-level counters include *every* sequential scan, not only those an
+    RLS predicate drove — so this prioritises where to look, it doesn't
+    prove RLS is the cause (statement-level attribution comes later).
+    `--min-rows` / `--min-seq-scans` / `--min-seq-pct` tune the thresholds;
+    `--fail-on-findings` gates CI. Warm the planner's statistics first
+    (exercise the workload, then ANALYZE).
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas,
+        fail_on=None,
+    )
+    if effective.database_url is None:
+        raise ToolError(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+
+    thresholds = PerfThresholds(
+        min_live_tup=min_rows,
+        min_seq_scans=min_seq_scans,
+        min_seq_pct=min_seq_pct,
+    )
+
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+            stats = collect_table_stats(conn, effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+    report = build_perf_report(
+        schema,
+        stats,
+        statically_flagged=_perf003_flagged_tables(schema),
+        thresholds=thresholds,
+    )
+    rendered = render_perf(report, output_format)
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    if output_path is not None:
+        try:
+            Path(output_path).write_text(
+                rendered, encoding="utf-8", newline=""
+            )
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
+    else:
+        click.echo(rendered, nl=False)
+
+    if fail_on_findings and report.findings:
+        n = len(report.findings)
+        noun = "table" if n == 1 else "tables"
+        click.echo(
+            f"pgrls: {n} RLS {noun} under seq-scan pressure "
+            "(--fail-on-findings).",
             err=True,
         )
         sys.exit(1)
