@@ -29,7 +29,7 @@ from typing import Any
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse the rule's detection so the fixer indexes exactly the
 # columns PERF003 reports — single source of truth.
@@ -57,10 +57,8 @@ class PERF003Fixer:
             # fixer keys on (table, column), not (policy, column).
             columns: set[str] = set()
             for policy in table.policies:
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 columns.update(
                     PERF003._unindexed_columns(table, policy)

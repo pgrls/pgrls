@@ -63,7 +63,7 @@ from typing import Any
 from pglast.ast import FuncCall, Node
 
 from pgrls.ast_utils import extract_column_refs
-from pgrls.model import Schema, Table
+from pgrls.model import Schema, Table, policy_id
 # Reuse PERF003's canonical own-column resolution and leading-column
 # index check — PERF004 flags a subset of the same column/index space,
 # so sharing the helpers keeps the two rules' notions of "own column"
@@ -123,8 +123,8 @@ class PERF004:
                 continue
             live_columns = set(table.columns)
             for policy in table.policies:
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 wrapped: set[str] = set()
                 for ast in (policy.using_ast, policy.with_check_ast):
@@ -138,14 +138,14 @@ class PERF004:
                 )
                 if not flagged:
                     continue
-                out.append(self._violation(table, policy, policy_id, flagged))
+                out.append(self._violation(table, policy, pid, flagged))
         return out
 
     def _violation(
         self,
         table: Table,
         policy: Any,
-        policy_id: str,
+        pid: str,
         columns: list[str],
     ) -> Violation:
         cols = ", ".join(repr(c) for c in columns)
@@ -162,9 +162,9 @@ class PERF004:
                 "Add an expression index matching the predicate (e.g. "
                 f"`CREATE INDEX ON {table.qualified_name} (lower(col))`), "
                 "compare the bare column instead, or allowlist this "
-                f"policy as {policy_id!r} in [lint.rules.PERF004] (for "
+                f"policy as {pid!r} in [lint.rules.PERF004] (for "
                 "example when a matching expression index already exists "
                 "— pgrls cannot detect those)."
             ),
-            location=policy_id,
+            location=pid,
         )

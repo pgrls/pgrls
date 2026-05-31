@@ -93,7 +93,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -132,11 +132,11 @@ class SEC023:
                 )
                 if not targeted:
                     continue
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
-                    self._violation(table, policy, policy_id, targeted)
+                    self._violation(table, policy, pid, targeted)
                 )
         return out
 
@@ -144,7 +144,7 @@ class SEC023:
         self,
         table: Table,
         policy: Policy,
-        policy_id: str,
+        pid: str,
         targeted: list[str],
     ) -> Violation:
         if len(targeted) == 1:
@@ -171,7 +171,7 @@ class SEC023:
                 "takes effect, or drop the dead TO reference. See "
                 "also SEC016, which flags the role itself. If a "
                 "policy that names a bypassing role is intentional, "
-                f"allowlist it as {policy_id!r} in [lint.rules.SEC023]."
+                f"allowlist it as {pid!r} in [lint.rules.SEC023]."
             ),
-            location=policy_id,
+            location=pid,
         )

@@ -46,7 +46,7 @@ from pglast.stream import RawStream
 from pgrls.ast_utils import extract_column_refs
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
-from pgrls.model import Schema, Table
+from pgrls.model import Schema, Table, policy_id
 # Reuse PERF004's canonical own-column resolution and leading-column
 # index check — the fixer indexes exactly the (table, column) pairs
 # the rule reports as wasted, no more, no less.
@@ -129,8 +129,8 @@ class PERF004Fixer:
             # CREATE INDEX, not two duplicate statements.
             seen_expressions: set[str] = set()
             for policy in table.policies:
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 # Resolve which columns of this policy PERF004 would
                 # actually flag (wrapped + indexed + live). Mirrors

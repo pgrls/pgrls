@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -59,10 +59,8 @@ class SEC006:
                 # nothing.
                 if policy.with_check_sql:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
                     Violation(
@@ -70,7 +68,7 @@ class SEC006:
                         severity="error",
                         title=self.title,
                         message=self._message(table, policy),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

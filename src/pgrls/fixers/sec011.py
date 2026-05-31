@@ -59,7 +59,7 @@ from pglast.stream import RawStream
 from pgrls.ast_utils import is_literal_true
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 
 
@@ -144,8 +144,8 @@ class SEC011Fixer:
         out: list[Fix] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
 
                 try:
@@ -180,7 +180,7 @@ class SEC011Fixer:
                 out.append(
                     Fix(
                         rule_id="SEC011",
-                        location=policy_id,
+                        location=pid,
                         sql=stmt,
                         description=(
                             f"Remove the `OR true` disjunct from policy "

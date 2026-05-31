@@ -34,12 +34,8 @@ from typing import Any
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
-from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
-
-
-def _is_allowlisted(table: Table, allowlist: set[str]) -> bool:
-    return table.name in allowlist or table.qualified_name in allowlist
+from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 
 
 class SEC032Fixer:
@@ -58,7 +54,7 @@ class SEC032Fixer:
                 continue
             if not table.policies:
                 continue  # RLS off with no policies is SEC001's
-            if _is_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
             # A partition child whose ancestor has RLS is already
             # covered for parent-routed queries; SEC032 itself

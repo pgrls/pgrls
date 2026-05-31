@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import find_func_calls
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -68,10 +68,8 @@ class PERF001:
                 )
                 if not matches:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
                     Violation(
@@ -87,7 +85,7 @@ class PERF001:
                             "(SELECT auth.uid()) so the planner caches "
                             "the result for the whole statement."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

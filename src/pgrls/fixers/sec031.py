@@ -40,7 +40,7 @@ from typing import Any
 from pgrls.ast_utils import is_literal_true
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 
 
@@ -77,8 +77,8 @@ class SEC031Fixer:
                     and not is_literal_true(policy.with_check_ast)
                 ):
                     continue
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
                 out.append(self._fix(table.schema, table.name, policy.name))
         return out

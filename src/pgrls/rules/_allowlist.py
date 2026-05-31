@@ -133,6 +133,17 @@ def parse_table_ref_allowlist(
     return set(items)
 
 
+def table_in_allowlist(table: Any, allowlist: set[str]) -> bool:
+    """True if ``table`` is allowlisted by bare name or ``schema.table``.
+
+    The matcher half of ``parse_table_ref_allowlist`` — previously
+    re-implemented as private ``_is_allowlisted`` / ``_table_allowlisted``
+    helpers (and inline) across ~15 rule and fixer sites, in two spellings
+    (``table.qualified_name`` vs an inline ``f"{table.schema}.{table.name}"``).
+    """
+    return table.name in allowlist or table.qualified_name in allowlist
+
+
 def parse_qualified_table_allowlist(
     rule_id: str, options: dict[str, Any]
 ) -> set[str]:

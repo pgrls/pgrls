@@ -63,7 +63,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 # Commands whose presence on any policy means the table has
@@ -114,19 +114,10 @@ class SEC022:
                 for policy in table.policies
             ):
                 continue
-            if self._is_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
             out.append(self._violation(table))
         return out
-
-    @staticmethod
-    def _is_allowlisted(table: Table, allowlist: set[str]) -> bool:
-        # Mirrors SEC001 — a table-ref allowlist entry matches
-        # either the bare name or the schema-qualified name.
-        return (
-            table.name in allowlist
-            or table.qualified_name in allowlist
-        )
 
     def _violation(self, table: Table) -> Violation:
         count = len(table.policies)

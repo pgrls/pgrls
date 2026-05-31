@@ -40,7 +40,7 @@ from pglast.stream import RawStream
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse the rule's detection so the fixer fixes exactly the
 # policies SEC020 reports — single source of truth.
@@ -61,10 +61,8 @@ class SEC020Fixer:
             for policy in table.policies:
                 if not _is_open_write_asymmetry(policy):
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
                 # `_is_open_write_asymmetry` already established that
                 # using_ast is not None, so RawStream has a real
@@ -78,7 +76,7 @@ class SEC020Fixer:
                 out.append(
                     Fix(
                         rule_id="SEC020",
-                        location=policy_id,
+                        location=pid,
                         sql=sql,
                         description=(
                             f"Replace the constant-true WITH CHECK "

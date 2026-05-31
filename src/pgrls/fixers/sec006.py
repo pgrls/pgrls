@@ -39,7 +39,7 @@ from pglast.stream import RawStream
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the write-side command set — imported
 # from the rule so the fixer flags exactly what the rule reports.
@@ -81,10 +81,8 @@ class SEC006Fixer:
                 # skip and leave the SEC006 finding for the operator.
                 if policy.using_ast is None:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
                 using_sql = RawStream()(policy.using_ast)
                 sql = (
@@ -95,7 +93,7 @@ class SEC006Fixer:
                 out.append(
                     Fix(
                         rule_id="SEC006",
-                        location=policy_id,
+                        location=pid,
                         sql=sql,
                         description=(
                             f"Add a WITH CHECK clause to policy "

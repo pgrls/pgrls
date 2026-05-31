@@ -47,11 +47,10 @@ from typing import Any
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.rules.sec030 import (
     _parse_auth_functions,
     _scoping_columns,
-    _table_allowlisted,
 )
 
 
@@ -78,7 +77,7 @@ class SEC030Fixer:
             # mirrors the no-Fix behaviour.
             if not table.column_details:
                 continue
-            if _table_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
 
             scoping: set[str] = set()
