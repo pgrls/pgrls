@@ -70,7 +70,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
+from pgrls._render_common import make_dispatcher, pluralize, render_text_table
+
+_HISTORY_CSS = """    tr td { background: #0d1117; }
+    tr:nth-child(even) td { background: #161b22; }
+    code { background: #161b22; }
+  }
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem 0; }
+  .meta { color: #57606a; font-size: .85rem; }
+  .summary { margin: 1rem 0 1.5rem; font-size: 1rem; }
+  .net-good { color: #1a7f37; font-weight: 600; }
+  .net-bad  { color: #cf222e; font-weight: 600; }
+  .net-flat { color: #57606a; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }
+  thead th { text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; white-space: nowrap; }
+  thead th.num { text-align: right; }
+  tbody td { padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.new { color: #cf222e; font-weight: 600; }
+  td.fixed { color: #1a7f37; font-weight: 600; }
+  code { background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }"""
 
 
 @dataclass(frozen=True)
@@ -101,12 +127,9 @@ class SnapshotRow:
 
 
 HistoryFormat = Literal["text", "json", "markdown", "html"]
-HISTORY_FORMATS: tuple[HistoryFormat, ...] = (
-    "text",
-    "json",
-    "markdown",
-    "html",
-)
+# `HISTORY_FORMATS` and `render` are defined at the bottom of the module
+# via `make_dispatcher`, sourced from the renderer map so the format list
+# can't drift from the renderers it advertises.
 
 
 def _read_snapshot(path: Path) -> Snapshot | None:
@@ -232,16 +255,7 @@ def render_text(rows: list[SnapshotRow]) -> str:
         )
         for row in rows
     ]
-    widths = [
-        max(len(headers[i]), max(len(r[i]) for r in body))
-        for i in range(len(headers))
-    ]
-    header_line = "  ".join(
-        h.ljust(widths[i]) for i, h in enumerate(headers)
-    )
-    out = [header_line]
-    for r in body:
-        out.append("  ".join(r[i].ljust(widths[i]) for i in range(len(r))))
+    out = render_text_table(headers, body)
     out.append("")
     out.append(_summary_line(rows))
     return "\n".join(out) + "\n"
@@ -337,8 +351,8 @@ def _summary_line(rows: list[SnapshotRow]) -> str:
         return "No snapshots."
     if s["snapshots"] == 1:
         return (
-            f"1 snapshot, {s['first_total']} finding"
-            f"{'s' if s['first_total'] != 1 else ''}."
+            f"1 snapshot, {s['first_total']} "
+            f"{pluralize(s['first_total'], 'finding')}."
         )
     delta = s["net_change"]
     direction = "+" if delta > 0 else ""
@@ -432,8 +446,8 @@ def render_html(
     elif summary["snapshots"] == 1:
         n = summary["first_total"]
         band_html = (
-            f'<p class="summary"><strong>{n}</strong> finding'
-            f"{'s' if n != 1 else ''} in the only snapshot.</p>"
+            f'<p class="summary"><strong>{n}</strong> '
+            f"{pluralize(n, 'finding')} in the only snapshot.</p>"
         )
     else:
         net_cls = "net-good" if net < 0 else ("net-bad" if net > 0 else "net-flat")
@@ -446,56 +460,7 @@ def render_html(
             f"{summary['total_new']} new, {summary['total_fixed']} fixed).</p>"
         )
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>pgrls history</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
-         Roboto, "Helvetica Neue", Arial, sans-serif;
-         margin: 2rem auto; max-width: 72rem; padding: 0 1rem;
-         color: #1f2328; background: #ffffff; }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e6edf3; background: #0d1117; }}
-    table {{ border-color: #30363d; }}
-    th {{ background: #161b22; }}
-    tr td {{ background: #0d1117; }}
-    tr:nth-child(even) td {{ background: #161b22; }}
-    code {{ background: #161b22; }}
-  }}
-  header {{ margin-bottom: 1.5rem; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
-  .meta {{ color: #57606a; font-size: .85rem; }}
-  .summary {{ margin: 1rem 0 1.5rem; font-size: 1rem; }}
-  .net-good {{ color: #1a7f37; font-weight: 600; }}
-  .net-bad  {{ color: #cf222e; font-weight: 600; }}
-  .net-flat {{ color: #57606a; font-weight: 600; }}
-  table {{ width: 100%; border-collapse: collapse;
-           border: 1px solid #d0d7de; }}
-  thead th {{ text-align: left; padding: .5rem .75rem;
-              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
-              font-weight: 600; white-space: nowrap; }}
-  thead th.num {{ text-align: right; }}
-  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
-  tbody tr:last-child td {{ border-bottom: 0; }}
-  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  td.new {{ color: #cf222e; font-weight: 600; }}
-  td.fixed {{ color: #1a7f37; font-weight: 600; }}
-  code {{ background: #f6f8fa; padding: .1rem .35rem;
-          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
-  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
-  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>pgrls history</h1>
-    <p class="meta">Generated by <code>pgrls history --format html</code> · {html.escape(now)}</p>
-    {band_html}
-  </header>
-  <table>
+    body = f"""  <table>
     <thead>
       <tr>
         <th>Timestamp</th>
@@ -511,20 +476,24 @@ def render_html(
     <tbody>
 {rows_html}
     </tbody>
-  </table>
-  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a> · <em>{summary_sentence}</em></footer>
-</body>
-</html>
-"""
+  </table>"""
+
+    return html_page(
+        title="pgrls history",
+        heading="pgrls history",
+        command="pgrls history --format html",
+        generated_at_iso=html.escape(now),
+        extra_css=_HISTORY_CSS,
+        max_width="72rem",
+        header_extra=f"    {band_html}",
+        body=body,
+        footer_extra=f" · <em>{summary_sentence}</em>",
+    )
 
 
-_RENDERERS = {
+render, HISTORY_FORMATS = make_dispatcher({
     "text": render_text,
     "json": render_json,
     "markdown": render_markdown,
     "html": render_html,
-}
-
-
-def render(rows: list[SnapshotRow], output_format: HistoryFormat) -> str:
-    return _RENDERERS[output_format](rows)
+})

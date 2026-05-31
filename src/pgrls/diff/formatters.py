@@ -17,7 +17,7 @@ from collections import Counter
 from datetime import datetime
 from typing import get_args
 
-from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
 from pgrls.diff.differ import Change, ChangeKind, Classification
 from pgrls.formatters import format_violations
 from pgrls.formatters._common import (
@@ -840,6 +840,48 @@ _CLASSIFICATION_COLOR: dict[Classification, str] = {
     "dangerous": "#cf222e",        # GitHub red
 }
 
+# The diff page's own CSS, spliced between `_html_common.BASE_CSS_HEAD`
+# (`max_width="72rem"`) and `BASE_CSS_TAIL`. The classification colours
+# are interpolated from `_CLASSIFICATION_COLOR` so the pill palette and
+# the `.net-good` banner can't drift from the markdown emoji scheme.
+_DIFF_CSS = f"""    tr td {{ background: #0d1117; }}
+    tr:nth-child(even) td {{ background: #161b22; }}
+    code {{ background: #161b22; }}
+  }}
+  header {{ margin-bottom: 1.5rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
+  .meta {{ color: #57606a; font-size: .85rem; }}
+  .summary {{ margin: 1rem 0 .5rem; font-size: 1rem; }}
+  .net-good {{ color: {_CLASSIFICATION_COLOR['safe']}; }}
+  .pills {{ display: flex; flex-wrap: wrap; gap: .5rem;
+            margin: 0 0 1.5rem 0; }}
+  .pill {{ display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }}
+  .class-safe            {{ color: {_CLASSIFICATION_COLOR['safe']}; }}
+  .class-requires_review {{ color: {_CLASSIFICATION_COLOR['requires_review']}; }}
+  .class-breaking        {{ color: {_CLASSIFICATION_COLOR['breaking']}; }}
+  .class-dangerous       {{ color: {_CLASSIFICATION_COLOR['dangerous']}; }}
+  table {{ width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }}
+  thead th {{ text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; white-space: nowrap; }}
+  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de;
+              vertical-align: top; }}
+  tbody tr:last-child td {{ border-bottom: 0; }}
+  code {{ background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
+  pre.predicate {{ background: #f6f8fa; padding: .5rem .75rem;
+                   border-radius: 4px; margin: .5rem 0 0 0;
+                   font: .9em ui-monospace, Menlo, monospace;
+                   white-space: pre-wrap; word-break: break-word; }}
+  @media (prefers-color-scheme: dark) {{
+    pre.predicate {{ background: #161b22; }}
+  }}
+  .pred-minus {{ color: #cf222e; display: block; }}
+  .pred-plus  {{ color: #1a7f37; display: block; }}"""
+
 
 def format_diff_html(
     changes: list[Change],
@@ -968,69 +1010,7 @@ def format_diff_html(
             )
         rows_html = "\n".join(row_lines)
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>pgrls diff</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
-         Roboto, "Helvetica Neue", Arial, sans-serif;
-         margin: 2rem auto; max-width: 72rem; padding: 0 1rem;
-         color: #1f2328; background: #ffffff; }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e6edf3; background: #0d1117; }}
-    table {{ border-color: #30363d; }}
-    th {{ background: #161b22; }}
-    tr td {{ background: #0d1117; }}
-    tr:nth-child(even) td {{ background: #161b22; }}
-    code {{ background: #161b22; }}
-  }}
-  header {{ margin-bottom: 1.5rem; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
-  .meta {{ color: #57606a; font-size: .85rem; }}
-  .summary {{ margin: 1rem 0 .5rem; font-size: 1rem; }}
-  .net-good {{ color: {_CLASSIFICATION_COLOR['safe']}; }}
-  .pills {{ display: flex; flex-wrap: wrap; gap: .5rem;
-            margin: 0 0 1.5rem 0; }}
-  .pill {{ display: inline-block; padding: .15rem .55rem;
-           border-radius: 999px; font-size: .85rem;
-           border: 1px solid currentColor; }}
-  .class-safe            {{ color: {_CLASSIFICATION_COLOR['safe']}; }}
-  .class-requires_review {{ color: {_CLASSIFICATION_COLOR['requires_review']}; }}
-  .class-breaking        {{ color: {_CLASSIFICATION_COLOR['breaking']}; }}
-  .class-dangerous       {{ color: {_CLASSIFICATION_COLOR['dangerous']}; }}
-  table {{ width: 100%; border-collapse: collapse;
-           border: 1px solid #d0d7de; }}
-  thead th {{ text-align: left; padding: .5rem .75rem;
-              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
-              font-weight: 600; white-space: nowrap; }}
-  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de;
-              vertical-align: top; }}
-  tbody tr:last-child td {{ border-bottom: 0; }}
-  code {{ background: #f6f8fa; padding: .1rem .35rem;
-          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
-  pre.predicate {{ background: #f6f8fa; padding: .5rem .75rem;
-                   border-radius: 4px; margin: .5rem 0 0 0;
-                   font: .9em ui-monospace, Menlo, monospace;
-                   white-space: pre-wrap; word-break: break-word; }}
-  @media (prefers-color-scheme: dark) {{
-    pre.predicate {{ background: #161b22; }}
-  }}
-  .pred-minus {{ color: #cf222e; display: block; }}
-  .pred-plus  {{ color: #1a7f37; display: block; }}
-  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
-  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>pgrls diff</h1>
-    <p class="meta">Generated by <code>pgrls diff --format html</code> · {html.escape(now)}</p>
-    {band_html}
-  </header>
-  <table>
+    body = f"""  <table>
     <thead>
       <tr>
         <th>Classification</th>
@@ -1042,11 +1022,18 @@ def format_diff_html(
     <tbody>
 {rows_html}
     </tbody>
-  </table>
-  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
-</body>
-</html>
-"""
+  </table>"""
+
+    return html_page(
+        title="pgrls diff",
+        heading="pgrls diff",
+        command="pgrls diff --format html",
+        generated_at_iso=html.escape(now),
+        extra_css=_DIFF_CSS,
+        max_width="72rem",
+        header_extra=f"    {band_html}",
+        body=body,
+    )
 
 
 # Public constant for the CLI: the user-facing values for the

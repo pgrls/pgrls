@@ -41,9 +41,36 @@ import pglast
 import psycopg
 from psycopg.rows import dict_row
 
-from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
+from pgrls._render_common import make_dispatcher, pluralize, render_text_table
 from pgrls.ast_utils import extract_range_vars
 from pgrls.model import Schema
+
+_PERF_CSS = """    tr:nth-child(even) td { background: #0d1117; }
+    tr:nth-child(odd) td { background: #161b22; }
+    code { background: #161b22; }
+  }
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem 0; }
+  h2 { font-size: 1.15rem; margin: 1.75rem 0 .5rem; }
+  .meta { color: #57606a; font-size: .85rem; }
+  .summary { margin: 1rem 0 .5rem; }
+  .caveat { color: #57606a; font-size: .85rem; margin: .25rem 0 1rem; }
+  .pill { display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }
+  .status-confirmed    { color: #cf222e; }
+  .status-index-unused { color: #9a6700; }
+  table { width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }
+  thead th { text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; }
+  tbody td { padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  code { background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }"""
 
 __all__ = [
     "ARTIFACT_VERSION",
@@ -485,9 +512,9 @@ _CAVEAT = (
 def _summary_line(report: PerfReport) -> str:
     s = report.summary
     n = s["findings"]
-    noun = "table" if n == 1 else "tables"
+    noun = pluralize(n, "table")
     return (
-        f"{n} of {s['rls_tables']} RLS {('table' if s['rls_tables'] == 1 else 'tables')} "
+        f"{n} of {s['rls_tables']} RLS {pluralize(s['rls_tables'], 'table')} "
         f"under seq-scan pressure ({noun}: {s['confirmed']} confirmed, "
         f"{s['index_unused']} index-unused)."
     )
@@ -516,14 +543,7 @@ def render_text(report: PerfReport) -> str:
         for f in report.findings
     ]
     headers = ("TABLE", "ROWS", "SEQ SCANS", "SEQ ROWS READ", "SEQ %", "VERDICT")
-    widths = [
-        max(len(headers[i]), max(len(r[i]) for r in rows))
-        for i in range(len(headers))
-    ]
-    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    out = [line]
-    for r in rows:
-        out.append("  ".join(r[i].ljust(widths[i]) for i in range(len(r))))
+    out = render_text_table(headers, rows)
     out.append("")
     out.append(_summary_line(report))
     out.append(_CAVEAT)
@@ -695,58 +715,7 @@ def render_html(
 
     statements_html = _statements_html(report.statements)
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>pgrls runtime RLS seq-scan report</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
-         Roboto, "Helvetica Neue", Arial, sans-serif;
-         margin: 2rem auto; max-width: 64rem; padding: 0 1rem;
-         color: #1f2328; background: #ffffff; }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e6edf3; background: #0d1117; }}
-    table {{ border-color: #30363d; }}
-    th {{ background: #161b22; }}
-    tr:nth-child(even) td {{ background: #0d1117; }}
-    tr:nth-child(odd) td {{ background: #161b22; }}
-    code {{ background: #161b22; }}
-  }}
-  header {{ margin-bottom: 1.5rem; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
-  h2 {{ font-size: 1.15rem; margin: 1.75rem 0 .5rem; }}
-  .meta {{ color: #57606a; font-size: .85rem; }}
-  .summary {{ margin: 1rem 0 .5rem; }}
-  .caveat {{ color: #57606a; font-size: .85rem; margin: .25rem 0 1rem; }}
-  .pill {{ display: inline-block; padding: .15rem .55rem;
-           border-radius: 999px; font-size: .85rem;
-           border: 1px solid currentColor; }}
-  .status-confirmed    {{ color: #cf222e; }}
-  .status-index-unused {{ color: #9a6700; }}
-  table {{ width: 100%; border-collapse: collapse;
-           border: 1px solid #d0d7de; }}
-  thead th {{ text-align: left; padding: .5rem .75rem;
-              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
-              font-weight: 600; }}
-  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
-  tbody tr:last-child td {{ border-bottom: 0; }}
-  td.num {{ font-variant-numeric: tabular-nums; text-align: right; }}
-  code {{ background: #f6f8fa; padding: .1rem .35rem;
-          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
-  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
-  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>Runtime RLS seq-scan report</h1>
-    <p class="meta">Generated by <code>pgrls perf --format html</code> · {html.escape(now)}</p>
-    <p class="summary">{html.escape(_summary_line(report))}</p>
-    <p class="caveat">{html.escape(_CAVEAT)}</p>
-  </header>
-  <table>
+    body = f"""  <table>
     <thead>
       <tr>
         <th>Table</th>
@@ -760,21 +729,27 @@ def render_html(
     <tbody>
 {rows_html}
     </tbody>
-  </table>{statements_html}
-  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
-</body>
-</html>
-"""
+  </table>{statements_html}"""
+
+    header_extra = (
+        f'    <p class="summary">{html.escape(_summary_line(report))}</p>\n'
+        f'    <p class="caveat">{html.escape(_CAVEAT)}</p>'
+    )
+
+    return html_page(
+        title="pgrls runtime RLS seq-scan report",
+        heading="Runtime RLS seq-scan report",
+        command="pgrls perf --format html",
+        generated_at_iso=html.escape(now),
+        extra_css=_PERF_CSS,
+        header_extra=header_extra,
+        body=body,
+    )
 
 
-_RENDERERS = {
+render, PERF_FORMATS = make_dispatcher({
     "text": render_text,
     "json": render_json,
     "markdown": render_markdown,
     "html": render_html,
-}
-PERF_FORMATS = tuple(_RENDERERS)
-
-
-def render(report: PerfReport, output_format: str) -> str:
-    return _RENDERERS[output_format](report)
+})

@@ -39,8 +39,44 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
+from pgrls._render_common import (
+    make_dispatcher,
+    markdown_table,
+    pluralize,
+    render_text_table,
+)
 from pgrls.model import Schema
+
+_REPORT_CSS = """    tr:nth-child(even) td { background: #0d1117; }
+    tr:nth-child(odd) td { background: #161b22; }
+    code { background: #161b22; }
+  }
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem 0; }
+  .meta { color: #57606a; font-size: .85rem; }
+  .summary { margin: 1rem 0 .5rem; }
+  .pills { display: flex; flex-wrap: wrap; gap: .5rem;
+            margin: 0 0 1.5rem 0; }
+  .pill { display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }
+  .status-protected         { color: #1a7f37; }
+  .status-not-forced        { color: #9a6700; }
+  .status-no-policies       { color: #57606a; }
+  .status-covered-by-parent { color: #0969da; }
+  .status-rls-off           { color: #cf222e; }
+  .status-empty             { color: #57606a; }
+  table { width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }
+  thead th { text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; }
+  tbody td { padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; }
+  code { background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }"""
 
 # Ordered best → worst, which is also the order the summary line lists
 # non-zero counts. (The `status` property's precedence is independent of
@@ -149,7 +185,7 @@ def _summary_line(report: Report) -> str:
     """`N table(s): X protected, Y not forced, …` — non-zero statuses
     only, pluralized, in STATUSES order."""
     n = len(report.tables)
-    noun = "table" if n == 1 else "tables"
+    noun = pluralize(n, "table")
     s = report.summary
     parts = [
         f"{s[_status_key(st)]} {_STATUS_LABELS[st]}"
@@ -175,14 +211,7 @@ def render_text(report: Report) -> str:
         for t in report.tables
     ]
     headers = ("TABLE", "STATUS", "RLS", "FORCE", "POLICIES")
-    widths = [
-        max(len(headers[i]), max(len(r[i]) for r in rows))
-        for i in range(len(headers))
-    ]
-    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    out = [line]
-    for r in rows:
-        out.append("  ".join(r[i].ljust(widths[i]) for i in range(len(r))))
+    out = render_text_table(headers, rows)
     out.append("")
     out.append(_summary_line(report))
     return "\n".join(out)
@@ -210,21 +239,18 @@ def render_json(report: Report) -> str:
 
 def render_markdown(report: Report) -> str:
     """Markdown table + summary, paste-ready for an audit doc / PR."""
-    out = [
-        "# RLS posture",
-        "",
-        _summary_line(report),
-        "",
-        "| Table | Status | RLS | FORCE | Policies |",
-        "|---|---|---|---|---|",
-    ]
-    for t in report.tables:
-        out.append(
+    return markdown_table(
+        heading="# RLS posture",
+        summary=_summary_line(report),
+        header_row="| Table | Status | RLS | FORCE | Policies |",
+        separator_row="|---|---|---|---|---|",
+        body_rows=[
             f"| {t.qualified_name} | {t.status} | "
             f"{'yes' if t.rls_enabled else 'no'} | "
             f"{'yes' if t.force_rls else 'no'} | {t.policy_count} |"
-        )
-    return "\n".join(out) + "\n"
+            for t in report.tables
+        ],
+    )
 
 
 def render_html(
@@ -324,66 +350,9 @@ def render_html(
         rows_html = "\n".join(row_lines)
 
     total = s["tables"]
-    noun = "table" if total == 1 else "tables"
+    noun = pluralize(total, "table")
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>pgrls RLS posture report</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
-         Roboto, "Helvetica Neue", Arial, sans-serif;
-         margin: 2rem auto; max-width: 64rem; padding: 0 1rem;
-         color: #1f2328; background: #ffffff; }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e6edf3; background: #0d1117; }}
-    table {{ border-color: #30363d; }}
-    th {{ background: #161b22; }}
-    tr:nth-child(even) td {{ background: #0d1117; }}
-    tr:nth-child(odd) td {{ background: #161b22; }}
-    code {{ background: #161b22; }}
-  }}
-  header {{ margin-bottom: 1.5rem; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
-  .meta {{ color: #57606a; font-size: .85rem; }}
-  .summary {{ margin: 1rem 0 .5rem; }}
-  .pills {{ display: flex; flex-wrap: wrap; gap: .5rem;
-            margin: 0 0 1.5rem 0; }}
-  .pill {{ display: inline-block; padding: .15rem .55rem;
-           border-radius: 999px; font-size: .85rem;
-           border: 1px solid currentColor; }}
-  .status-protected         {{ color: #1a7f37; }}
-  .status-not-forced        {{ color: #9a6700; }}
-  .status-no-policies       {{ color: #57606a; }}
-  .status-covered-by-parent {{ color: #0969da; }}
-  .status-rls-off           {{ color: #cf222e; }}
-  .status-empty             {{ color: #57606a; }}
-  table {{ width: 100%; border-collapse: collapse;
-           border: 1px solid #d0d7de; }}
-  thead th {{ text-align: left; padding: .5rem .75rem;
-              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
-              font-weight: 600; }}
-  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
-  tbody tr:last-child td {{ border-bottom: 0; }}
-  td.num {{ font-variant-numeric: tabular-nums; }}
-  code {{ background: #f6f8fa; padding: .1rem .35rem;
-          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
-  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
-  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>RLS posture report</h1>
-    <p class="meta">Generated by <code>pgrls report --format html</code> · {html.escape(now)}</p>
-    <p class="summary"><strong>{total}</strong> {noun} scanned.</p>
-    <div class="pills">
-      {chips_html}
-    </div>
-  </header>
-  <table>
+    body = f"""  <table>
     <thead>
       <tr>
         <th>Table</th>
@@ -396,21 +365,29 @@ def render_html(
     <tbody>
 {rows_html}
     </tbody>
-  </table>
-  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
-</body>
-</html>
-"""
+  </table>"""
+
+    header_extra = (
+        f'    <p class="summary"><strong>{total}</strong> {noun} scanned.</p>\n'
+        '    <div class="pills">\n'
+        f"      {chips_html}\n"
+        "    </div>"
+    )
+
+    return html_page(
+        title="pgrls RLS posture report",
+        heading="RLS posture report",
+        command="pgrls report --format html",
+        generated_at_iso=html.escape(now),
+        extra_css=_REPORT_CSS,
+        header_extra=header_extra,
+        body=body,
+    )
 
 
-_RENDERERS = {
+render, REPORT_FORMATS = make_dispatcher({
     "text": render_text,
     "json": render_json,
     "markdown": render_markdown,
     "html": render_html,
-}
-REPORT_FORMATS = tuple(_RENDERERS)
-
-
-def render(report: Report, output_format: str) -> str:
-    return _RENDERERS[output_format](report)
+})

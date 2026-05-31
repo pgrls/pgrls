@@ -3335,7 +3335,7 @@ def history(
         raise ToolError(str(exc)) from exc
 
     rows = build_rows(snapshots)
-    rendered = render_history(rows, output_format)  # type: ignore[arg-type]
+    rendered = render_history(rows, output_format)
     if not rendered.endswith("\n"):
         rendered += "\n"
     if output_path is not None:
