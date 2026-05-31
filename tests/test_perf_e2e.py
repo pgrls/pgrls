@@ -27,6 +27,7 @@ from pgrls.perf import (
     INDEX_UNUSED,
     PerfThresholds,
     build_perf_report,
+    collect_statements,
     collect_table_stats,
 )
 
@@ -174,3 +175,46 @@ def test_perf_index_unused_when_predicate_is_indexed(apply_sql, pg_conn) -> None
     assert finding is not None
     assert finding.classification == INDEX_UNUSED
     assert finding.severity == "info"
+
+
+def test_collect_statements_none_without_extension(apply_sql, pg_conn) -> None:
+    # The shared test container doesn't preload pg_stat_statements, so the
+    # extension is absent — collect_statements must degrade to None (never
+    # raise), which is what lets `pgrls perf --statements` fall back cleanly.
+    apply_sql("CREATE TABLE public.x (id int)")
+    assert collect_statements(pg_conn) is None
+
+
+def test_collect_statements_live_with_extension() -> None:
+    # Validate the pg_stat_statements SQL + relation parsing against a REAL
+    # extension. Needs a throwaway container with the library preloaded
+    # (it can't be enabled at runtime), so this boots its own — skipped when
+    # an external DB is supplied (we can't reconfigure its preload libs).
+    import os
+
+    import pytest
+
+    if os.environ.get("PGRLS_TEST_DATABASE_URL"):
+        pytest.skip("needs a throwaway container to set shared_preload_libraries")
+    from testcontainers.postgres import PostgresContainer
+
+    image = os.environ.get("PGRLS_TEST_PG_IMAGE", "postgres:16-alpine")
+    container = PostgresContainer(
+        image, username="postgres", password="postgres", dbname="postgres"
+    ).with_command("postgres -c shared_preload_libraries=pg_stat_statements")
+    with container as pg:
+        url = pg.get_connection_url(driver=None)
+        with psycopg.connect(url, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+                cur.execute(
+                    "CREATE TABLE public.s_posts (id int, tenant_id int)"
+                )
+                for _ in range(3):
+                    cur.execute(
+                        "SELECT * FROM public.s_posts WHERE tenant_id = 1"
+                    )
+            stmts = collect_statements(conn)
+    assert stmts is not None
+    # The SELECT was normalized + parsed; it references the qualified table.
+    assert any(s.references("public", "s_posts") for s in stmts)

@@ -79,10 +79,13 @@ from pgrls.perf import (
     DEFAULT_PERF_ARTIFACT_PATH,
     PERF_FORMATS,
     PerfThresholds,
+    StatementStat,
     TableStats,
     build_perf_report,
+    collect_statements,
     collect_table_stats,
     load_perf_artifact,
+    top_statements_for,
     write_perf_artifact,
 )
 from pgrls.perf import render as render_perf
@@ -3114,6 +3117,15 @@ def _perf003_flagged_tables(schema: Schema) -> set[tuple[str, str]]:
     help="Exit 1 if any RLS table is under seq-scan pressure (CI gate).",
 )
 @click.option(
+    "--statements",
+    is_flag=True,
+    default=False,
+    help=(
+        "Attribute seq-scan cost to specific queries via pg_stat_statements "
+        "(extension required; degrades gracefully if absent)."
+    ),
+)
+@click.option(
     "--output",
     "-o",
     "output_path",
@@ -3149,6 +3161,7 @@ def perf(
     min_seq_scans: int,
     min_seq_pct: float,
     fail_on_findings: bool,
+    statements: bool,
     output_path: str | None,
     snapshot_path: str | None,
     output_format: str,
@@ -3164,10 +3177,13 @@ def perf(
     means the index **isn't being used** (poor selectivity, stale stats).
 
     Table-level counters include *every* sequential scan, not only those an
-    RLS predicate drove — so this prioritises where to look, it doesn't
-    prove RLS is the cause (statement-level attribution comes later).
-    `--min-rows` / `--min-seq-scans` / `--min-seq-pct` tune the thresholds;
-    `--fail-on-findings` gates CI. Warm the planner's statistics first
+    RLS predicate drove — so this prioritises where to look. `--statements`
+    narrows that down: it attributes the cost to specific queries via
+    `pg_stat_statements` (when the extension is installed), listing the
+    costliest statements that touch a pressured table. `--min-rows` /
+    `--min-seq-scans` / `--min-seq-pct` tune the thresholds;
+    `--fail-on-findings` gates CI; `--snapshot` writes the artifact for
+    `pgrls lint --perf` (PERF005). Warm the planner's statistics first
     (exercise the workload, then ANALYZE).
     """
     try:
@@ -3192,10 +3208,13 @@ def perf(
         min_seq_pct=min_seq_pct,
     )
 
+    stmt_rows: list[StatementStat] | None = None
     try:
         with psycopg.connect(effective.database_url) as conn:
             schema = introspect(conn, schemas=effective.schemas)
             stats = collect_table_stats(conn, effective.schemas)
+            if statements:
+                stmt_rows = collect_statements(conn)
     except psycopg.Error as exc:
         raise ToolError(f"Database error: {exc}") from exc
     except ValueError as exc:
@@ -3207,6 +3226,22 @@ def perf(
         statically_flagged=_perf003_flagged_tables(schema),
         thresholds=thresholds,
     )
+    if statements:
+        if stmt_rows is None:
+            click.echo(
+                "pgrls: --statements: pg_stat_statements is unavailable "
+                "(extension not installed, or registered but unreadable); "
+                "reporting table-level stats only.",
+                err=True,
+            )
+        elif report.findings:
+            # Only attach when there's a pressured table to attribute to —
+            # with no findings the section is vacuous, and leaving
+            # `statements=None` keeps every output format consistent (none
+            # shows the block) rather than text alone omitting it.
+            report = replace(
+                report, statements=top_statements_for(report, stmt_rows)
+            )
 
     # `--snapshot` persists the raw counters for `pgrls lint --perf`
     # (PERF005). Written before any --fail-on-findings exit so a gated run
