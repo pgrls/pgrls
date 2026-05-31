@@ -2152,6 +2152,54 @@ that's an application-side migration (the schema may not have an
 to make sure both columns stay populated during the migration
 window).
 
+<a id="rule-sec035"></a>
+
+## SEC035 — UNIQUE constraint not scoped to the tenant discriminator
+
+**Severity:** warning.
+
+A multi-tenant table whose rows are isolated by a discriminator
+(`tenant_id = current_setting('app.tenant')`, `user_id = auth.uid()`)
+must scope its UNIQUE constraints by that same column. A *global*
+unique — `UNIQUE (email)` instead of `UNIQUE (tenant_id, email)` — has
+two failure modes RLS does not prevent:
+
+1. **Cross-tenant existence leak.** RLS hides other tenants' rows from
+   `SELECT`, but a unique index is enforced across *all* rows.
+   Inserting `email = 'a@b.com'` when another (invisible) tenant
+   already holds it raises `duplicate key value violates unique
+   constraint` — telling the caller a value is taken in a tenant they
+   can't see. An enumeration oracle across the isolation boundary.
+2. **Functional false-conflict.** Two tenants legitimately cannot both
+   use the same email/slug/username, even though each owns its own
+   namespace.
+
+The fix is a composite unique that includes the discriminator:
+`UNIQUE (tenant_id, email)`.
+
+Detection is conservative — SEC035 flags a unique index only when the
+table has RLS plus a policy that scopes a column by `=` against an
+auth-context value (the discriminator; if none is found the tenancy is
+unknown and the rule stays silent), the index is `UNIQUE` but **not**
+the PRIMARY KEY (a surrogate PK is global by design), the index does
+not include any discriminator column, and the index's columns are not
+*all* `uuid` (a uuid is globally unique by construction and leaks
+nothing enumerable). The discriminator search errs broad, so SEC035
+under-flags rather than risk a false positive on a correctly-scoped
+table.
+
+Allowlist a table where a cluster-wide unique is intentional (a
+deliberately global identifier):
+
+```toml
+[lint.rules.SEC035]
+allowlist = ["public.api_tokens"]
+```
+
+No auto-fix — converting `UNIQUE (email)` to `UNIQUE (tenant_id,
+email)` can fail if the existing data already holds a cross-tenant
+duplicate, so the remedy needs a data audit pgrls can't perform.
+
 <a id="rule-sec036"></a>
 
 ## SEC036 — Policy `EXISTS (SELECT FROM auth.users WHERE …)` clause has no caller binding

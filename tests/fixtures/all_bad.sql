@@ -709,3 +709,24 @@ ALTER TABLE public.allbad_sec037 FORCE ROW LEVEL SECURITY;
 CREATE POLICY unknown_role_check ON public.allbad_sec037
     FOR ALL TO postgres
     USING (auth.role() = 'admin');
+
+-- SEC035: UNIQUE constraint not scoped to the tenant discriminator.
+-- A tenant_id-scoping policy, but a GLOBAL `UNIQUE (email)` instead of
+-- `UNIQUE (tenant_id, email)` — an INSERT colliding with another
+-- (invisible) tenant's row raises a duplicate-key error, leaking
+-- cross-tenant existence. TO postgres + FORCE + the tenant_id index
+-- silence SEC003 / SEC007 / PERF003. The uuid PRIMARY KEY is excluded
+-- as a global surrogate (is_primary).
+CREATE TABLE public.allbad_sec035 (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id uuid NOT NULL,
+    email text NOT NULL,
+    UNIQUE (email)
+);
+ALTER TABLE public.allbad_sec035 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec035 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_iso ON public.allbad_sec035
+    FOR ALL TO postgres
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+CREATE INDEX ON public.allbad_sec035 (tenant_id);

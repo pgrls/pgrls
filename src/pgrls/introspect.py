@@ -430,6 +430,7 @@ SELECT
     am.amname AS access_method,
     i.indisunique AS is_unique,
     i.indpred IS NOT NULL AS is_partial,
+    i.indisprimary AS is_primary,
     COALESCE(
         ARRAY(
             SELECT COALESCE(a.attname, '')
@@ -953,6 +954,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 columns=tuple(row["columns"]),
                 is_unique=row["is_unique"],
                 is_partial=row["is_partial"],
+                is_primary=row["is_primary"],
             )
         )
 

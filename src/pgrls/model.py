@@ -2,9 +2,11 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 12 (v12 added ``signature`` to ``SecdefFunction``
-and ``LeakproofFunction`` so per-overload `ALTER FUNCTION` fixes
-can target the right one; v11 added top-level
+Currently version 13 (v13 added ``is_primary`` to ``Index`` — from
+``pg_index.indisprimary`` — so SEC035 can tell a surrogate primary
+key apart from a tenant-scopable UNIQUE; v12 added ``signature`` to
+``SecdefFunction`` and ``LeakproofFunction`` so per-overload
+`ALTER FUNCTION` fixes can target the right one; v11 added top-level
 ``bypassrls_escalation_roles`` for SEC029;
 v10 added top-level ``leakproof_functions`` for
 SEC017; v9 added top-level ``bypassrls_roles`` for SEC016;
@@ -43,7 +45,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 12
+SNAPSHOT_VERSION = 13
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,11 @@ class Index:
     columns: tuple[str, ...]
     is_unique: bool
     is_partial: bool
+    # ``pg_index.indisprimary`` — the table's PRIMARY KEY index. Captured in
+    # snapshot v13+ so SEC035 can tell a UNIQUE constraint that should be
+    # tenant-scoped apart from the surrogate PK (which is global by design).
+    # Defaults False so pre-v13 snapshots and hand-built fixtures round-trip.
+    is_primary: bool = False
 
 
 @dataclass(frozen=True)
@@ -640,6 +647,7 @@ class Schema:
                             "columns": list(idx.columns),
                             "is_unique": idx.is_unique,
                             "is_partial": idx.is_partial,
+                            "is_primary": idx.is_primary,
                         }
                         for idx in t.indexes
                     ],
@@ -736,9 +744,14 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v11 snapshot dict.
+        """Reconstruct a Schema from a v3-v13 snapshot dict.
 
-        v11 (current): adds top-level ``bypassrls_escalation_roles``
+        v13 (current): adds ``is_primary`` to each ``Index`` for
+        SEC035. v3-v12 snapshots have no key; they load with
+        ``is_primary=False`` — SEC035 then can't distinguish a
+        surrogate primary key from a tenant-scopable UNIQUE and
+        stays conservative until the snapshot is re-captured.
+        v11: adds top-level ``bypassrls_escalation_roles``
         for SEC029. v3-v10 snapshots have no key; they load with
         ``bypassrls_escalation_roles=()`` — SEC029 finds nothing to
         flag until the snapshot is re-captured against a live
@@ -783,12 +796,12 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12. v1 / v2 snapshots must be regenerated against "
-                "the current schema."
+                "10, 11, 12, 13. v1 / v2 snapshots must be regenerated "
+                "against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -880,6 +893,7 @@ class Schema:
                     columns=tuple(idx["columns"]),
                     is_unique=idx["is_unique"],
                     is_partial=idx["is_partial"],
+                    is_primary=idx.get("is_primary", False),
                 )
                 for idx in indexes_raw
             )

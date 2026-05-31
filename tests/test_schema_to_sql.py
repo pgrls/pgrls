@@ -385,13 +385,13 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_twelve():
+def test_snapshot_version_is_thirteen():
     # Bumped 11 → 12 to add per-overload `signature` to
     # `SecdefFunction` and `LeakproofFunction` (additive — unlocks
     # the SEC014/15/17 fixers that need the argument-type
     # signature to emit `ALTER FUNCTION name(<sig>)`). Pin so a
     # future bump is deliberate.
-    assert SNAPSHOT_VERSION == 12
+    assert SNAPSHOT_VERSION == 13
 
 
 def test_to_snapshot_emits_column_details_array():
