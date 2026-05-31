@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **forty-eight rules across four
+In the current release it ships **forty-nine rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -63,6 +63,9 @@ every row),
 `true` — accepts every write),
 `SEC029` (role can `SET ROLE` to a `BYPASSRLS` role through
 membership — an escalation path that disables every policy),
+`SEC035` (UNIQUE constraint not scoped to the tenant discriminator —
+a global `UNIQUE(email)` leaks cross-tenant existence via duplicate-key
+errors; make it `UNIQUE(tenant_id, email)`),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —

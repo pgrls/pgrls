@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-30
+
+### Added
+
+- **SEC035 — UNIQUE constraint not scoped to the tenant discriminator.**
+  A multi-tenant table with a global `UNIQUE (email)` (instead of
+  `UNIQUE (tenant_id, email)`) leaks cross-tenant existence: an INSERT
+  colliding with another tenant's invisible row raises a duplicate-key
+  error, an enumeration oracle across the RLS boundary — and blocks
+  legitimate writes. SEC035 (warning) flags a unique index that excludes
+  the discriminator the table's policies scope by, excluding the PRIMARY
+  KEY and all-uuid uniques (globally unique by design) to stay
+  high-precision. Allowlist a table where a cluster-wide unique is
+  intentional. Brings the catalog to **49 rules**.
+
+### Changed
+
+- Snapshot format → **v13**: `Index.is_primary` is now captured (from
+  `pg_index.indisprimary`), letting SEC035 tell a surrogate primary key
+  apart from a tenant-scopable UNIQUE. Pre-v13 snapshots load unchanged
+  (the field defaults to false).
+
 ## [0.9.0] - 2026-05-30
 
 ### Added

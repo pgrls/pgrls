@@ -62,7 +62,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 12,
+        "version": 13,
         "tables": [
             {
                 "schema": "public",
@@ -220,13 +220,12 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_twelve_after_function_signature_addition() -> None:
-    # SNAPSHOT_VERSION bumped from 11 → 12 to add per-overload
-    # `signature` to SecdefFunction and LeakproofFunction (unlocks
-    # the SEC014/15/17 fixers' per-overload `ALTER FUNCTION` SQL).
+def test_snapshot_version_is_thirteen_after_index_is_primary() -> None:
+    # SNAPSHOT_VERSION bumped 12 → 13 to add `Index.is_primary`
+    # (lets SEC035 tell a surrogate PK from a tenant-scopable UNIQUE).
     # Pin the new version so a future bump is deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 12
+    assert snap["version"] == 13
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -455,7 +454,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
     }
-    assert snap["version"] == 12
+    assert snap["version"] == 13
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
