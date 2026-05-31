@@ -1386,13 +1386,17 @@ def snapshot(
         click.echo(payload)
 
 
-# The starter config `pgrls init` writes. Every active key is a no-op
-# default (so the file parses and `pgrls lint` runs unchanged); the
-# illustrative knobs — connection string, disable list, per-rule
-# allowlist / severity override — are commented examples. `[database].url`
-# is deliberately left commented so a fresh file doesn't fail with an
-# env-var error before the user has wired up DATABASE_URL.
-_INIT_TEMPLATE = """\
+# The starter config `pgrls init` writes, assembled from three parts: a
+# shared head (schema directive + [database] connection comment), a
+# per-preset middle (the `schemas` key plus the stack's RLS conventions,
+# including the exact `pgrls generate` command that scaffolds matching
+# policies), and a shared [lint]/[diff] tail. Every active key is a no-op
+# default — the file parses and `pgrls lint` runs unchanged regardless of
+# preset; the only thing a preset changes is the documented convention and
+# generate command, never a rule's behaviour. `[database].url` is left
+# commented so a fresh file doesn't fail with an env-var error before the
+# user has wired up DATABASE_URL.
+_INIT_HEAD = """\
 #:schema https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json
 # pgrls configuration. Rule reference:
 # https://github.com/pgrls/pgrls/blob/main/AGENTS.md
@@ -1404,10 +1408,14 @@ _INIT_TEMPLATE = """\
 # version control. When set, $VAR / ${VAR} are interpolated from the
 # environment, e.g. url = "$DATABASE_URL".
 # url = "postgres://user:pass@localhost:5432/app"
+"""
 
+_INIT_SCHEMAS = """\
 # Schemas to lint. Defaults to ["public"].
 schemas = ["public"]
+"""
 
+_INIT_TAIL = """\
 [lint]
 # Severity that makes `pgrls lint` exit non-zero: error | warning | info.
 # CI gates on this. Default: "warning".
@@ -1432,6 +1440,81 @@ fail_on = "warning"
 fail_on = "dangerous"
 """
 
+# Per-preset RLS conventions block. Each names the stack's tenancy model and
+# the exact `pgrls generate` invocation that scaffolds matching, lint-clean
+# policies — using only flags `pgrls generate` actually accepts. The
+# predicate examples are illustrative (the real cast is derived from the
+# discriminator column's type). These are comments only: the generated config
+# parses identically and leaves every rule at its default for all presets.
+_INIT_CONV_GENERIC = """\
+# --- RLS conventions: per-tenant isolation via a session GUC ---
+# Scaffold gold-standard RLS for any table that has a `tenant_id` column
+# but no policies, then confirm the result lints clean:
+#
+#     pgrls generate --apply && pgrls lint
+#
+# Generated predicate (index-friendly; NULL when the GUC is unset = deny):
+#     tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid)
+# Set the GUC per transaction:  SET app.tenant_id = '<id>';"""
+
+_INIT_CONV_SUPABASE = """\
+# --- Supabase RLS conventions: per-user ownership via auth.uid() ---
+# Supabase manages the `auth` and `storage` schemas; lint only your own
+# schema (`public`, above). Scaffold gold-standard per-user RLS for any
+# table that has a `user_id` column but no policies:
+#
+#     pgrls generate --model owner --convention supabase --apply && pgrls lint
+#
+# Generated predicate — the initplan-cached form Supabase recommends over
+# bare auth.uid() (re-evaluated per row):
+#     user_id = (SELECT auth.uid())"""
+
+_INIT_CONV_POSTGREST = """\
+# --- PostgREST RLS conventions: per-tenant isolation via a JWT claim ---
+# PostgREST sets request.jwt.claim.* GUCs from the verified JWT. Scaffold
+# gold-standard per-tenant RLS for any table that has a `tenant_id` column
+# but no policies:
+#
+#     pgrls generate --convention postgrest --apply && pgrls lint
+#
+# Generated predicate:
+#     tenant_id = (SELECT current_setting('request.jwt.claim.tenant_id', true)::uuid)"""
+
+_INIT_CONV_NEON = """\
+# --- Neon Authorize RLS conventions: per-user ownership via auth.user_id() ---
+# Neon Authorize exposes the JWT subject through auth.user_id() (text).
+# Scaffold gold-standard per-user RLS for any table that has a `user_id`
+# column but no policies:
+#
+#     pgrls generate --model owner --convention supabase --auth-function auth.user_id --apply
+#
+# Generated predicate:
+#     user_id = (SELECT auth.user_id())"""
+
+# Insertion order is the order shown in --help and tested by the CLI suite.
+_INIT_CONVENTIONS: dict[str, str] = {
+    "generic": _INIT_CONV_GENERIC,
+    "supabase": _INIT_CONV_SUPABASE,
+    "postgrest": _INIT_CONV_POSTGREST,
+    "neon": _INIT_CONV_NEON,
+}
+_INIT_PRESETS = tuple(_INIT_CONVENTIONS)
+
+
+def _render_init_config(preset: str) -> str:
+    """Assemble the starter pgrls.toml for the given stack preset.
+
+    Blocks are joined with a blank line between them and a single trailing
+    newline, independent of each constant's own trailing whitespace.
+    """
+    parts = [
+        _INIT_HEAD,
+        _INIT_SCHEMAS,
+        _INIT_CONVENTIONS[preset],
+        _INIT_TAIL,
+    ]
+    return "\n\n".join(part.rstrip("\n") for part in parts) + "\n"
+
 
 @main.command()
 @click.option(
@@ -1444,11 +1527,24 @@ fail_on = "dangerous"
     help="Path to write the config.",
 )
 @click.option(
+    "--preset",
+    type=click.Choice(_INIT_PRESETS, case_sensitive=False),
+    default="generic",
+    show_default=True,
+    help=(
+        "Tailor the starter config to a stack: 'generic' (per-tenant via an "
+        "app GUC), 'supabase' / 'neon' (per-user via auth.uid() / "
+        "auth.user_id()), or 'postgrest' (per-tenant via a JWT claim). Each "
+        "documents the matching `pgrls generate` command; rules stay at "
+        "their defaults."
+    ),
+)
+@click.option(
     "--force",
     is_flag=True,
     help="Overwrite the file if it already exists.",
 )
-def init(output_path: str, force: bool) -> None:
+def init(output_path: str, preset: str, force: bool) -> None:
     """Write a starter pgrls.toml with the common options documented.
 
     The generated file parses as-is and leaves every rule at its
@@ -1456,19 +1552,25 @@ def init(output_path: str, force: bool) -> None:
     string, disable list, and per-rule allowlist / severity overrides
     are included as commented examples to edit. Refuses to clobber an
     existing file unless `--force` is given.
+
+    `--preset` tailors the documented tenancy convention and the exact
+    `pgrls generate` command to a stack (supabase / postgrest / neon /
+    generic) without changing any rule's behaviour.
     """
+    preset = preset.lower()
     path = Path(output_path)
     if path.exists() and not force:
         raise ToolError(
             f"{path} already exists. Pass --force to overwrite it."
         )
     try:
-        path.write_text(_INIT_TEMPLATE, encoding="utf-8")
+        path.write_text(_render_init_config(preset), encoding="utf-8")
     except OSError as exc:
         raise ToolError(f"Cannot write {path}: {exc}") from exc
     click.echo(
-        f"Wrote {path}. Set [database].url (or pass --database-url / "
-        "$DATABASE_URL), then run `pgrls lint`."
+        f"Wrote {path} ({preset} preset). Set [database].url (or pass "
+        "--database-url / $DATABASE_URL), then run `pgrls lint`. To scaffold "
+        "RLS, run the `pgrls generate` command noted in the file."
     )
 
 

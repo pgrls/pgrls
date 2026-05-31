@@ -117,4 +117,6 @@ re-baseline after a clean-up pass.
   or `--format markdown` for PR comments.
 - **`pgrls init`** — scaffold a commented `pgrls.toml` with the
   `#:schema` directive (gives editor autocomplete via SchemaStore-aware
-  TOML extensions).
+  TOML extensions). `--preset supabase|postgrest|neon|generic` tailors the
+  documented tenancy convention and the matching `pgrls generate` command
+  to your stack (rules stay at their defaults).

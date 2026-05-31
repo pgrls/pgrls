@@ -94,8 +94,11 @@ Cross-tenant reads are blocked, so this passes a tenant-isolation review. But th
 Scaffold a config (optional — `pgrls` runs with zero config):
 
 ```bash
-pgrls init          # writes a commented pgrls.toml; --force to overwrite
+pgrls init                     # writes a commented pgrls.toml; --force to overwrite
+pgrls init --preset supabase   # tailor the conventions to a stack
 ```
+
+`--preset` (`generic` · `supabase` · `postgrest` · `neon`) tailors the documented tenancy convention and the exact `pgrls generate` command for that stack — rules stay at their defaults.
 
 Point `pgrls` at any Postgres database:
 
