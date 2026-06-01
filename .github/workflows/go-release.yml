@@ -67,7 +67,7 @@ jobs:
       run:
         working-directory: go
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # On tag push, GITHUB_REF is the tag; the default
           # checkout fetches that tagged commit. For manual
@@ -75,7 +75,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
@@ -149,7 +149,7 @@ jobs:
       run:
         working-directory: go
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -158,7 +158,7 @@ jobs:
         # current latest stable Go (1.25) so the runner's
         # stdlib doesn't surface unpatched-in-older-line CVEs
         # that aren't bugs in this module's code.
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25"
           cache-dependency-path: go/go.sum
@@ -174,12 +174,12 @@ jobs:
     needs: [verify, vuln]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           # Newest of the test matrix — `go list -m` doesn't
           # care about the module's `go` directive (it just
@@ -212,7 +212,7 @@ jobs:
     needs: [verify, vuln, warm-proxy]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
