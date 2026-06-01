@@ -1,6 +1,8 @@
 """Unit tests for the auto-fix machinery and per-rule fixers."""
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from pgrls.ast_utils import parse_expr

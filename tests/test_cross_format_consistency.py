@@ -222,6 +222,13 @@ def test_history_all_four_formats_agree_on_new_fixed_deltas() -> None:
     assert md_new == expected_new
     assert md_fixed == expected_fixed
 
+    # HTML: new / fixed are the last two cells; zero renders as `—`.
+    html_rows = _html_data_rows(html)
+    html_new = [_parse_emdash_int(_extract_td_text(r, -2)) for r in html_rows]
+    html_fixed = [_parse_emdash_int(_extract_td_text(r, -1)) for r in html_rows]
+    assert html_new == expected_new
+    assert html_fixed == expected_fixed
+
 
 def test_history_summary_numbers_agree_across_formats() -> None:
     rows = _history_rows()
@@ -280,6 +287,12 @@ def test_history_severity_counts_agree_across_formats() -> None:
     assert [int(r[3]) for r in md_data] == expected_errors
     assert [int(r[4]) for r in md_data] == expected_warnings
     assert [int(r[5]) for r in md_data] == expected_infos
+
+    # HTML: severity columns are 3 (errors) / 4 (warnings) / 5 (infos);
+    # they render zero as a plain `0`, so the numeric helper applies.
+    assert _html_numeric_cells_at_index(html, total_col_index=3) == expected_errors
+    assert _html_numeric_cells_at_index(html, total_col_index=4) == expected_warnings
+    assert _html_numeric_cells_at_index(html, total_col_index=5) == expected_infos
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -487,7 +500,7 @@ def _html_catalog_rows_by_id(html_out: str) -> dict[str, str]:
 # pgrls diff — five renderers agree on the numbers
 # ──────────────────────────────────────────────────────────────────
 
-import json as _json_diff  # avoid shadowing in case of future module-level json use
+import json as _json_diff  # noqa: E402  (avoid shadowing in case of future module-level json use)
 from datetime import timezone as _tz_diff, datetime as _dt_diff  # noqa: E402
 
 from pgrls.diff.differ import Change, ChangeKind  # noqa: E402
