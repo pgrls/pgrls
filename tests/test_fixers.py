@@ -795,6 +795,27 @@ def test_perf001_fix_silent_when_using_is_none() -> None:
     assert PERF001Fixer().fix(schema, {}) == []
 
 
+def test_perf001_fix_wraps_auth_call_on_sublink_testexpr() -> None:
+    # Regression (audit finding #11): `auth.uid() IN (SELECT ...)`
+    # puts the unwrapped auth call on the SubLink's `testexpr` (the
+    # IN-LHS), not inside the subselect. PERF001's RULE fires on it
+    # (find_func_calls(exclude_sublinks=True) walks testexpr — see
+    # tests/rules/test_perf001.py::test_perf001_fires_on_unwrapped_auth_on_in_lhs),
+    # so the fixer MUST rewrite it too or it leaves a reported
+    # violation unfixed. The subselect itself stays untouched.
+    schema = _wrap_policy(
+        _policy("auth.uid() IN (SELECT id FROM trusted_admins)")
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql
+    # The testexpr call is now wrapped …
+    assert "(SELECT auth.uid()) IN (SELECT id FROM trusted_admins)" in sql
+    # … and the wrap is applied exactly once (no double-wrapping of
+    # the subselect or the testexpr).
+    assert sql.count("SELECT auth.uid()") == 1
+
+
 def test_perf001_fix_respects_allowlist() -> None:
     schema = _wrap_policy(_policy("user_id = auth.uid()"))
     options = {"allowlist": ["public.t.p"]}
@@ -836,6 +857,52 @@ def test_sec006_fix_emits_with_check_mirroring_using() -> None:
 def test_sec006_fix_silent_when_with_check_already_present() -> None:
     p = _policy("user_id = 1", command="ALL", with_check="user_id = 1")
     assert SEC006Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec006_fix_strips_or_true_before_mirroring_into_with_check() -> None:
+    # Regression (audit finding #4): a USING with a constant-true
+    # disjunct (`user_id = 1 OR true`) must NOT be mirrored verbatim
+    # into the new WITH CHECK — that would create a constant-true
+    # write check admitting EVERY write, the wide-open write side
+    # SEC006 exists to close. SEC011 (same `pgrls fix` pass) only
+    # rewrites USING, never the WITH CHECK SEC006 just emitted, so a
+    # single pass would otherwise leave the write side open. The
+    # disjunct is stripped before mirroring.
+    schema = _wrap_policy(_policy("user_id = 1 OR true", command="ALL"))
+    fixes = SEC006Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql
+    assert "WITH CHECK (user_id = 1)" in sql
+    # The constant-true bypass must be gone — no always-true write check.
+    assert "TRUE" not in sql
+    assert "true" not in sql
+
+
+def test_sec006_fix_keeps_real_disjuncts_when_stripping_or_true() -> None:
+    # `a OR b OR true` → keep `a OR b`; only the literal-true disjunct
+    # is removed, the real predicate is preserved (not over-narrowed).
+    schema = _wrap_policy(
+        _policy("user_id = 1 OR user_id = 2 OR true", command="ALL")
+    )
+    sql = SEC006Fixer().fix(schema, {})[0].sql
+    assert "WITH CHECK (user_id = 1 OR user_id = 2)" in sql
+    assert "TRUE" not in sql
+
+
+def test_sec006_fix_declines_when_using_is_only_constant_true() -> None:
+    # `true OR true` collapses to nothing once the trues are stripped
+    # — there is no real predicate to mirror, so the fixer must NOT
+    # emit a constant-true WITH CHECK. It declines and leaves the
+    # SEC006 finding for the operator (the conservative choice).
+    schema = _wrap_policy(_policy("true OR true", command="ALL"))
+    assert SEC006Fixer().fix(schema, {}) == []
+
+
+def test_sec006_fix_declines_when_using_is_bare_true() -> None:
+    # A bare `USING (true)` write check would mirror to a constant-true
+    # WITH CHECK — never emit one. Decline; the finding stays.
+    schema = _wrap_policy(_policy("true", command="ALL"))
+    assert SEC006Fixer().fix(schema, {}) == []
 
 
 def test_sec006_fix_silent_on_select_policy() -> None:
@@ -1182,6 +1249,35 @@ def test_sec020_fix_silent_when_with_check_is_a_real_predicate() -> None:
     # WITH CHECK already mirrors a real predicate — nothing to fix.
     p = _policy("user_id = 1", command="ALL", with_check="user_id = 1")
     assert SEC020Fixer().fix(_wrap_policy(p), {}) == []
+
+
+def test_sec020_fix_strips_or_true_before_mirroring_into_with_check() -> None:
+    # Regression (audit finding #4): SEC020 replaces a constant-true
+    # WITH CHECK with the USING predicate. If USING itself carries a
+    # constant-true disjunct (`user_id = 1 OR true`), mirroring it
+    # verbatim just swaps one always-true WITH CHECK for another —
+    # the write side stays wide open, the exact thing SEC020 flags.
+    # The disjunct must be stripped before mirroring.
+    schema = _wrap_policy(
+        _policy("user_id = 1 OR true", command="ALL", with_check="true")
+    )
+    fixes = SEC020Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql
+    assert "WITH CHECK (user_id = 1)" in sql
+    assert "TRUE" not in sql
+    assert "true" not in sql
+
+
+def test_sec020_fix_declines_when_using_collapses_to_constant_true() -> None:
+    # `true OR true` is not a bare literal-true (so SEC020's rule
+    # fires) but collapses to nothing once stripped. The fixer must
+    # NOT emit a constant-true WITH CHECK — it declines and leaves
+    # the finding.
+    schema = _wrap_policy(
+        _policy("true OR true", command="ALL", with_check="true")
+    )
+    assert SEC020Fixer().fix(schema, {}) == []
 
 
 def test_sec020_fix_silent_when_with_check_absent() -> None:
@@ -2355,6 +2451,93 @@ def test_generate_fixes_passes_rule_options() -> None:
     assert fixes == []
 
 
+def test_generate_fixes_suppresses_alter_on_hyg003_dropped_policy() -> None:
+    # Regression (audit findings #3 + #10): two duplicate policies
+    # (HYG003) whose shared predicate also trips PERF001. Naively
+    # sorting by (rule_id, location) put `HYG003 DROP p_b` BEFORE
+    # `PERF001 ALTER p_b`, so the emitted migration ran an ALTER on a
+    # policy that had just been dropped — a runtime failure mid-
+    # script. generate_fixes must SUPPRESS the ALTER targeting any
+    # policy HYG003 will drop, leaving a runnable sequence. The
+    # surviving twin (`p_a`) still gets its ALTER, so no remediation
+    # is lost.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    _policy("user_id = auth.uid()", name="p_a"),
+                    _policy("user_id = auth.uid()", name="p_b"),
+                ),
+                columns=("id", "user_id"),
+                indexes=(_idx("user_id", name="t_user_id_idx"),),
+            ),
+        )
+    )
+    fixes = generate_fixes(schema, rule_options={})
+    pairs = [(f.rule_id, f.location) for f in fixes]
+    # The redundant duplicate is dropped …
+    assert ("HYG003", "public.t.p_b") in pairs
+    # … the surviving twin is wrapped by PERF001 …
+    assert ("PERF001", "public.t.p_a") in pairs
+    # … and crucially NO ALTER targets the dropped policy.
+    assert ("PERF001", "public.t.p_b") not in pairs
+
+    # The emitted sequence must be runnable: every ALTER POLICY must
+    # name a policy that is NOT dropped earlier in the script.
+    dropped = {
+        f.location for f in fixes if f.sql.startswith("DROP POLICY")
+    }
+    altered = {
+        f.location for f in fixes if f.sql.startswith("ALTER POLICY")
+    }
+    assert dropped.isdisjoint(altered)
+
+
+def test_generate_fixes_suppresses_alter_when_three_duplicates() -> None:
+    # Three identical policies: HYG003 keeps `p_a`, drops `p_b` and
+    # `p_c`. Only the survivor may carry an ALTER; both drops must be
+    # ALTER-free so the migration runs.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    _policy("user_id = auth.uid()", name="p_a"),
+                    _policy("user_id = auth.uid()", name="p_b"),
+                    _policy("user_id = auth.uid()", name="p_c"),
+                ),
+                columns=("id", "user_id"),
+                indexes=(_idx("user_id", name="t_user_id_idx"),),
+            ),
+        )
+    )
+    fixes = generate_fixes(schema, rule_options={})
+    pairs = {(f.rule_id, f.location) for f in fixes}
+    assert ("HYG003", "public.t.p_b") in pairs
+    assert ("HYG003", "public.t.p_c") in pairs
+    assert ("PERF001", "public.t.p_a") in pairs
+    # No ALTER on either dropped policy.
+    assert ("PERF001", "public.t.p_b") not in pairs
+    assert ("PERF001", "public.t.p_c") not in pairs
+
+
+def test_generate_fixes_keeps_alter_when_no_duplicate_dropped() -> None:
+    # Sanity: with no HYG003 drop, the suppression is inert — a lone
+    # PERF001-tripping policy still gets its ALTER.
+    schema = _wrap_policy(_policy("user_id = auth.uid()"))
+    fixes = generate_fixes(schema, rule_options={})
+    assert [(f.rule_id, f.location) for f in fixes] == [
+        ("PERF001", "public.t.p"),
+    ]
+
+
 # ---------- SEC011 fixer ----------
 
 
@@ -2532,6 +2715,29 @@ def test_sec011_fix_raises_on_malformed_allowlist() -> None:
     schema = _wrap_policy(_policy("user_id = 1 OR true"))
     with pytest.raises(TypeError, match="allowlist"):
         SEC011Fixer().fix(schema, {"allowlist": "public.t.p"})
+
+
+def test_strip_constant_true_for_mirror_behaviour() -> None:
+    # The SEC006/SEC020 fixers reuse this helper (audit finding #4) to
+    # avoid mirroring a constant-true USING into a wide-open WITH
+    # CHECK. Pin its contract directly.
+    from pglast.stream import RawStream
+
+    from pgrls.fixers.sec011 import strip_constant_true_for_mirror
+
+    def strip(sql: str) -> str | None:
+        out = strip_constant_true_for_mirror(parse_expr(sql))
+        return None if out is None else RawStream()(out)
+
+    # None input → None.
+    assert strip_constant_true_for_mirror(None) is None
+    # Constant-true disjunct removed; real predicate kept.
+    assert strip("user_id = 1 OR true") == "user_id = 1"
+    # A clean predicate is returned unchanged.
+    assert strip("user_id = 1") == "user_id = 1"
+    # Trivially-true predicates → None (caller must not mirror them).
+    assert strip("true") is None
+    assert strip("true OR true") is None
 
 
 def test_default_fixers_registers_every_shipping_fixer() -> None:
