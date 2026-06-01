@@ -69,6 +69,12 @@ dev = [
     # Not in the runtime / testing extras — it's a contributor tool, not
     # something downstream users of `pgrls.testing` need.
     "hypothesis>=6.0",
+    # Lint + type gates. Run in CI by the `lint` job in test.yml and
+    # locally via `uv run ruff check src/ tests/` / `uv run mypy
+    # src/pgrls` — previously these gates ran only on contributors'
+    # machines, never in CI (a linter that didn't lint itself).
+    "ruff>=0.15",
+    "mypy>=2.0",
 ]
 
 [project.scripts]
