@@ -11,13 +11,17 @@ from pgrls.cli import main
 from pgrls.coverage import (
     ARTIFACT_VERSION,
     CoverageData,
+    CoverageReport,
     ExercisedTuple,
+    PolicyCoverage,
     ambiguous_relation_names,
     build_coverage,
     exercised_from_sql,
     is_policy_covered,
     load_artifact,
     render,
+    render_markdown,
+    render_text,
     write_artifact,
 )
 from pgrls.model import Policy, Schema, Table
@@ -344,6 +348,65 @@ def test_all_renderers_agree_on_counts() -> None:
     html = render(report, "html")
     assert html.startswith("<!DOCTYPE html>")
     assert "50.0%" in html
+
+
+def _one_policy_report(*, policy: str, roles: tuple[str, ...]) -> CoverageReport:
+    return CoverageReport(
+        policies=(
+            PolicyCoverage(
+                schema="public",
+                table="invoices",
+                policy=policy,
+                command="SELECT",  # type: ignore[arg-type]
+                roles=roles,
+                covered=False,
+            ),
+        )
+    )
+
+
+def _coverage_md_data_rows(out: str) -> list[str]:
+    return [
+        ln
+        for ln in out.splitlines()
+        if ln.startswith("|") and "---" not in ln and "| Policy |" not in ln
+    ]
+
+
+def test_render_markdown_pipe_in_location_and_role_no_corruption() -> None:
+    # A `|` in the policy name (→ location) or in a role name must be
+    # escaped so it doesn't add a phantom GFM column. Regression for
+    # audit finding #16.
+    report = _one_policy_report(policy="pol|icy", roles=("ro|le", "two"))
+    out = render_markdown(report)
+    data_rows = _coverage_md_data_rows(out)
+    assert len(data_rows) == 1
+    row = data_rows[0]
+    assert "public.invoices.pol\\|icy" in row
+    assert "ro\\|le" in row
+    # 4 columns → 5 unescaped pipe delimiters.
+    assert row.replace("\\|", "").count("|") == 5
+
+
+def test_render_markdown_newline_in_location_does_not_split_row() -> None:
+    # Regression for #16: a `\n` in the location would end the GFM row
+    # early. `safe_location` rewrites it to the two-char `\n` text.
+    report = _one_policy_report(policy="pol\nicy", roles=("authenticated",))
+    out = render_markdown(report)
+    data_rows = _coverage_md_data_rows(out)
+    assert len(data_rows) == 1
+    assert "public.invoices.pol\\nicy" in data_rows[0]
+
+
+def test_render_text_newline_in_location_and_role_no_split() -> None:
+    # Regression for audit finding #23: a `\n` in the location or a
+    # role name must not split the fixed-width text row.
+    report = _one_policy_report(policy="pol\nicy", roles=("ro\nle", "two"))
+    out = render_text(report)
+    data_lines = [ln for ln in out.splitlines() if "invoices" in ln]
+    assert len(data_lines) == 1
+    assert "public.invoices.pol\\nicy" in data_lines[0]
+    assert "ro\\nle,two" in data_lines[0]
 
 
 # ---------- CLI command (mocked introspection) ----------
