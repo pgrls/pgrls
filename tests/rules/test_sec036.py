@@ -116,6 +116,39 @@ def test_fires_once_per_policy_even_with_multiple_offending_subselects() -> (
     assert len(violations) == 1
 
 
+def test_fires_when_target_reached_through_join_without_binding() -> None:
+    # Regression (#18): the target table is reached through an explicit
+    # JOIN, so the sub-select's `fromClause` holds a `JoinExpr`, not a
+    # top-level `RangeVar`. The JOIN's ON quals only correlate the two
+    # *inner* tables (`u.id = m.user_id`) — nothing binds the OUTER
+    # row to the calling user — so this is the same binding-free bypass
+    # ("does any admin membership exist") and must fire. Before the fix
+    # the JoinExpr was invisible and SEC036 silently missed it.
+    expr = (
+        "EXISTS (SELECT 1 FROM memberships m "
+        "JOIN auth.users u ON u.id = m.user_id "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="join_admin"))
+    violations = SEC036().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.join_admin"
+    assert "auth.users" in violations[0].message
+
+
+def test_fires_when_target_is_right_arm_of_nested_join() -> None:
+    # The target table sits in the right arm of a nested JOIN tree.
+    # The recursion into `JoinExpr.larg`/`.rarg` must reach it.
+    expr = (
+        "EXISTS (SELECT 1 FROM a "
+        "JOIN b ON a.id = b.a_id "
+        "JOIN auth.users u ON u.id = b.user_id "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="nested_join"))
+    assert len(SEC036().check(schema, {})) == 1
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Silent — caller binding present, or non-target table, or wrong shape
 # ──────────────────────────────────────────────────────────────────────
@@ -138,6 +171,20 @@ def test_silent_when_subselect_binds_caller(binding: str) -> None:
     )
     schema = _wrap(_policy(f"({expr})", name="caller_bound"))
     assert SEC036().check(schema, {}) == [], binding
+
+
+def test_silent_when_join_on_clause_binds_caller() -> None:
+    # Regression (#18) precision: a JOIN to the target whose ON clause
+    # binds the caller (`u.id = auth.uid()`) IS correctly scoped — the
+    # binding check must inspect JOIN ON quals, not only the top-level
+    # WHERE, or this correctly-written policy would false-fire.
+    expr = (
+        "EXISTS (SELECT 1 FROM memberships m "
+        "JOIN auth.users u ON u.id = auth.uid() "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="join_caller_bound"))
+    assert SEC036().check(schema, {}) == []
 
 
 def test_silent_on_in_subselect_against_auth_users() -> None:

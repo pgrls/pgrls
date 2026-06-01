@@ -657,16 +657,24 @@ def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
     # `_GRANTS_SQL` body and asserting the sentinel pattern is
     # present.
 
-    # Bail out gracefully — full integration coverage of the NULL
-    # path requires a non-superuser connection that lacks SELECT
-    # on pg_authid, which the testcontainer fixture doesn't easily
-    # provide. The literal SQL audit below is the regression
-    # guard.
+    # The grantee-OID -> name resolution joins the world-readable
+    # `pg_roles` view, NOT `pg_authid` (which a non-superuser cannot
+    # SELECT — a LEFT JOIN to it raises `permission denied` mid-
+    # introspection rather than yielding a NULL row). The literal SQL
+    # audit below guards both the readable-catalog choice and the
+    # COALESCE sentinel.
     from pgrls.introspect import _GRANTS_SQL
+    assert "pg_authid" not in _GRANTS_SQL, (
+        "GRANTS query must NOT join pg_authid — a non-superuser "
+        "connection cannot SELECT it, so introspect() would crash for "
+        "any unprivileged run against a table with an explicit GRANT. "
+        "Use the world-readable pg_roles view instead."
+    )
+    assert "pg_catalog.pg_roles ar" in _GRANTS_SQL
     assert "COALESCE(ar.rolname, 'oid:' || ax.grantee::text)" in _GRANTS_SQL, (
-        "GRANTS query must COALESCE pg_authid.rolname to an "
-        "'oid:N' sentinel so unresolvable grantee OIDs don't "
-        "leak NULL into Grant.role."
+        "GRANTS query must COALESCE the resolved rolname to an "
+        "'oid:N' sentinel so unresolvable grantee OIDs don't leak "
+        "NULL into Grant.role."
     )
 
 

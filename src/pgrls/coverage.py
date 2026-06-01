@@ -31,6 +31,7 @@ from pglast.ast import Node, RangeVar
 
 from pgrls._html_common import resolve_generated_at, to_iso_z
 from pgrls.ast_utils import statement_command
+from pgrls.formatters._common import safe_location
 from pgrls.model import Policy, Schema, Table
 
 ARTIFACT_VERSION = 1
@@ -364,9 +365,17 @@ def render_text(report: CoverageReport) -> str:
         return "No policies found in the scanned schemas."
     rows = [
         (
-            p.location,
+            # `safe_location` keeps the row single-line and the
+            # fixed-width columns aligned: a quoted Postgres
+            # identifier (location) or role name can legally carry
+            # `\n` / `\t` / zero-width chars, which would otherwise
+            # split the row. Each role is sanitized before the join
+            # so a newline inside one role can't break the cell.
+            # No-op on clean identifiers; mirrors the lint/diff text
+            # formatters.
+            safe_location(p.location),
             p.command,
-            ",".join(p.roles),
+            ",".join(safe_location(r) for r in p.roles),
             "yes" if p.covered else "no",
         )
         for p in report.policies
@@ -414,8 +423,19 @@ def render_markdown(report: CoverageReport) -> str:
         "|---|---|---|---|",
     ]
     for p in report.policies:
+        # `safe_location` neutralizes newlines / zero-width chars (a
+        # raw `\n` ends the GFM row early); the manual `|` -> `\|`
+        # escape stops a pipe inside a quoted Postgres identifier or
+        # role name from splitting the cell. Each role is sanitized
+        # before the join. All no-ops on well-formed input, so
+        # existing output is unchanged. Mirrors the lint/diff
+        # markdown cell sanitization.
+        location = safe_location(p.location).replace("|", "\\|")
+        roles = ",".join(
+            safe_location(r).replace("|", "\\|") for r in p.roles
+        )
         out.append(
-            f"| {p.location} | {p.command} | {','.join(p.roles)} | "
+            f"| {location} | {p.command} | {roles} | "
             f"{'yes' if p.covered else 'no'} |"
         )
     return "\n".join(out) + "\n"

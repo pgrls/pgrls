@@ -18,8 +18,8 @@ jobs:
     name: Build sdist + wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - name: Build and check distributions
@@ -27,7 +27,7 @@ jobs:
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -42,7 +42,7 @@ jobs:
       # PYPI_API_TOKEN secret is involved.
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/

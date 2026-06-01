@@ -49,6 +49,11 @@
           "type": "object",
           "description": "Per-rule settings, keyed by rule ID — e.g. a [lint.rules.SEC001] table.",
           "additionalProperties": { "$ref": "#/$defs/ruleOptions" }
+        },
+        "extra_rules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Dotted Python module paths that expose additional project-specific rules via a `RULES` attribute (loaded by pgrls.rules.load_extra_rules). Each entry is a non-empty importable module path, e.g. [\"mycompany.pgrls_rules\"]. Built-in rules always run; these run alongside them, and their IDs become usable in `disable` and [lint.rules.<ID>]."
         }
       }
     },

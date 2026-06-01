@@ -109,13 +109,37 @@ def generate_fixes(
     which `pgrls fix` surfaces as a tool error — the same failure
     `pgrls lint` produces for the same config.
 
-    Sort is alphabetical by `rule_id` then `location`. Today's
-    fixers emit independent statements (`ALTER TABLE`, `ALTER
-    VIEW`, `ALTER POLICY`), so the ordering is correctness-
-    irrelevant. A future fixer that depends on order (e.g. CREATE
-    POLICY before its referenced table is forced) will need
-    explicit dependency-based ordering — the alphabetical sort is
-    incidental, not guaranteed.
+    Most fixers emit independent statements (`ALTER TABLE`, `ALTER
+    VIEW`, `ALTER POLICY`) whose relative order does not affect the
+    final state. The one exception is HYG003, the only fixer that
+    `DROP`s an object: a `DROP POLICY p` and an `ALTER POLICY p`
+    (from PERF001 / SEC006 / SEC011 / SEC020 firing on the same
+    duplicate policy's shared predicate) are NOT order-independent —
+    run the DROP first and the ALTER fails on a policy that no longer
+    exists, leaving the emitted migration unrunnable mid-script.
+
+    We resolve this by SUPPRESSING any `ALTER`-emitting fix that
+    targets a policy HYG003 is going to DROP. The drop's surviving
+    twin (the name-sorted-first duplicate HYG003 keeps) carries the
+    identical predicate, so the same ALTER fixer also fires on it —
+    that ALTER does the remediation, and the ALTER on the doomed
+    duplicate was redundant as well as unrunnable. The result is
+    always a runnable statement sequence with no lost remediation.
+
+    Note this does NOT merge multiple ALTERs that target the *same
+    surviving* policy (e.g. PERF001 and SEC019 both rewriting one
+    policy's USING): those remain separate `ALTER POLICY` statements
+    and `pgrls fix --apply` converges over repeated runs, a contract
+    pinned by
+    `test_sec019_and_perf001_both_fire_on_unwrapped_one_arg_current_setting`.
+    Each such ALTER only narrows or hardens the clause it names; none
+    re-introduces a bypass another fixer removed, so no security
+    rewrite is silently reverted.
+
+    Within those constraints the sort is alphabetical by `rule_id`
+    then `location`. A future fixer with a hard ordering dependency
+    (e.g. CREATE POLICY before its referenced table is forced) would
+    need explicit dependency-based ordering layered on top.
     """
     out: list[Fix] = []
     for fixer in default_fixers():
@@ -123,6 +147,26 @@ def generate_fixes(
             continue
         opts = rule_options.get(fixer.rule_id, {})
         out.extend(fixer.fix(schema, opts))
+
+    # HYG003 is the only fixer that DROPs a policy. Any ALTER fix that
+    # targets a policy HYG003 will drop would be applied against a
+    # now-nonexistent policy (depending on emit order) and fail. Drop
+    # those ALTERs: the dropped policy's surviving duplicate gets the
+    # same ALTER, so nothing is lost. `location` is the qualified
+    # policy id (`schema.table.policy`) for every per-policy fixer, so
+    # it is the right join key. (HYG003 also emits per-policy
+    # `location`s, hence the rule_id guard so a drop never suppresses
+    # itself.)
+    dropped_policy_ids = {
+        f.location for f in out if f.rule_id == "HYG003"
+    }
+    if dropped_policy_ids:
+        out = [
+            f
+            for f in out
+            if f.rule_id == "HYG003" or f.location not in dropped_policy_ids
+        ]
+
     return sorted(out, key=lambda f: (f.rule_id, f.location))
 
 

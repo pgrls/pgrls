@@ -205,6 +205,75 @@ def test_render_markdown_table() -> None:
     assert "| public.good | protected | yes | yes | 1 |" in out
 
 
+def _report_data_rows(out: str) -> list[str]:
+    """The data rows of a `render_markdown` pipe-table (drop heading,
+    blank lines, summary line, and the header + separator rows)."""
+    return [
+        ln
+        for ln in out.splitlines()
+        if ln.startswith("|") and "---" not in ln and "| Table |" not in ln
+    ]
+
+
+def test_render_markdown_pipe_in_name_does_not_corrupt_table() -> None:
+    # A `|` inside a quoted Postgres identifier must be escaped so it
+    # doesn't add a phantom column to the GFM row. Regression for
+    # audit finding #15.
+    schema = Schema(
+        tables=(_table("we|rd", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render_markdown(build_report(schema))
+    data_rows = _report_data_rows(out)
+    assert len(data_rows) == 1
+    row = data_rows[0]
+    # The literal pipe is backslash-escaped, not a cell separator.
+    assert "we\\|rd" in row
+    # Exactly 5 columns → 6 unescaped pipe delimiters (leading,
+    # trailing, and 4 interior). Count pipes that are NOT escaped.
+    assert row.replace("\\|", "").count("|") == 6
+
+
+def test_render_markdown_newline_in_name_does_not_split_row() -> None:
+    # A `\n` inside a quoted identifier would otherwise end the GFM
+    # row early and push the rest onto a new line. `safe_location`
+    # rewrites it to the two-char `\n` text. Regression for #15.
+    schema = Schema(
+        tables=(_table("we\nrd", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render_markdown(build_report(schema))
+    data_rows = _report_data_rows(out)
+    assert len(data_rows) == 1
+    # The visible escape text appears; no raw newline inside the row.
+    assert "we\\nrd" in data_rows[0]
+
+
+def test_render_text_newline_in_name_does_not_split_row() -> None:
+    # The fixed-width text table must stay one line per table even
+    # when a name carries a newline, or column alignment and any
+    # line-anchored CI grep break. Regression for audit finding #23.
+    schema = Schema(
+        tables=(_table("we\nrd", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render_text(build_report(schema))
+    # The data row carries the visible `\n` escape, not a raw newline.
+    data_lines = [ln for ln in out.splitlines() if "we" in ln]
+    assert len(data_lines) == 1
+    assert "we\\nrd" in data_lines[0]
+    assert "protected" in data_lines[0]
+
+
+def test_render_text_pipe_in_name_is_left_literal() -> None:
+    # The text table has no pipe-delimiter semantics, so a `|` in a
+    # name passes through unescaped (only newline / control / zero-
+    # width chars are rewritten). Confirms `safe_location` is a no-op
+    # on pipes for the text path. Regression for #23.
+    schema = Schema(
+        tables=(_table("we|rd", rls=True, force=True, policies=(_policy(),)),)
+    )
+    out = render_text(build_report(schema))
+    assert "public.we|rd" in out
+
+
 # ──────────────────────────────────────────────────────────────────
 # HTML format
 # ──────────────────────────────────────────────────────────────────

@@ -197,15 +197,16 @@ ORDER BY a.attrelid, a.attnum
 # special PUBLIC pseudo-role to the literal string "PUBLIC",
 # mirroring the convention already used for `Policy.roles`.
 #
-# Role-name resolution mirrors the `polroles` handling above: a
-# non-superuser pgrls run may not be able to SELECT from
-# `pg_authid` (RLS, missing permissions, race against `DROP
-# ROLE`), leaving `ar.rolname` NULL even when the grantee OID
-# exists. A NULL leaking into `Grant.role` violates the `str`
-# annotation and breaks downstream JSON serialization and
-# `sorted()` calls. COALESCE to a stable `oid:N` sentinel so the
-# type contract holds and the operator can still see what role
-# was referenced.
+# Role-name resolution mirrors the `polroles` handling above,
+# joining the world-readable `pg_roles` view — NOT `pg_authid`,
+# which a non-superuser cannot SELECT (a LEFT JOIN to it raises
+# `permission denied for table pg_authid` mid-introspection, not
+# a NULL row). `ar.rolname` can still be NULL (a race against
+# `DROP ROLE`, or a grantee OID with no matching row). A NULL
+# leaking into `Grant.role` violates the `str` annotation and
+# breaks downstream JSON serialization and `sorted()` calls.
+# COALESCE to a stable `oid:N` sentinel so the type contract
+# holds and the operator can still see what role was referenced.
 #
 # `c.relacl IS NOT NULL` short-circuits before the LATERAL: for
 # tables with the default ACL (no explicit GRANT), `aclexplode`
@@ -229,7 +230,7 @@ SELECT
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN LATERAL aclexplode(c.relacl) ax ON true
-LEFT JOIN pg_catalog.pg_authid ar ON ar.oid = ax.grantee
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
 WHERE c.relkind IN ('r', 'p')
   AND n.nspname = ANY(%s)
   AND c.relacl IS NOT NULL
@@ -243,17 +244,21 @@ SELECT
     c.relname AS view_name,
     c.relkind = 'm' AS is_materialized,
     -- pg_class.reloptions is text[] like {security_invoker=on, security_barrier=on}.
-    -- We accept both 'on' and 'true' since both are valid in PG syntax.
+    -- Parse the option VALUE as a Postgres boolean rather than matching two
+    -- literal spellings: PG accepts on/off, true/false, yes/no, 1/0, t/f, y/n
+    -- (case-insensitive) for boolean reloptions and may store the value as
+    -- typed, so a view created `WITH (security_invoker=1)` (or yes/t/y) must
+    -- still read as TRUE. split on the first '=' into name/value.
     COALESCE(
-        (SELECT TRUE
+        (SELECT lower(split_part(o.opt, '=', 2)) IN ('on', 'true', 'yes', '1', 't', 'y')
          FROM unnest(c.reloptions) AS o(opt)
-         WHERE o.opt = 'security_invoker=on' OR o.opt = 'security_invoker=true'),
+         WHERE split_part(o.opt, '=', 1) = 'security_invoker'),
         FALSE
     ) AS security_invoker,
     COALESCE(
-        (SELECT TRUE
+        (SELECT lower(split_part(o.opt, '=', 2)) IN ('on', 'true', 'yes', '1', 't', 'y')
          FROM unnest(c.reloptions) AS o(opt)
-         WHERE o.opt = 'security_barrier=on' OR o.opt = 'security_barrier=true'),
+         WHERE split_part(o.opt, '=', 1) = 'security_barrier'),
         FALSE
     ) AS security_barrier,
     pg_get_viewdef(c.oid, true) AS definition

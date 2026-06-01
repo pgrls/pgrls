@@ -292,6 +292,49 @@ def test_render_markdown_table() -> None:
     assert "| — | — |" in out_two
 
 
+def _history_md_data_rows(out: str) -> list[str]:
+    return [
+        ln
+        for ln in out.splitlines()
+        if ln.startswith("|") and "---" not in ln and "| Timestamp |" not in ln
+    ]
+
+
+def test_render_markdown_pipe_in_filename_does_not_corrupt_table() -> None:
+    # A `|` in a snapshot filename must be escaped inside the backtick
+    # code span so it doesn't add a phantom GFM column. Regression for
+    # audit finding #20.
+    rows = [_mkrow("we|rd.json", total=2, errors=2, new=2)]
+    out = render_markdown(rows)
+    data_rows = _history_md_data_rows(out)
+    assert len(data_rows) == 1
+    row = data_rows[0]
+    assert "we\\|rd.json" in row
+    # 8 columns → 9 unescaped pipe delimiters.
+    assert row.replace("\\|", "").count("|") == 9
+
+
+def test_render_markdown_newline_in_filename_does_not_split_row() -> None:
+    # Regression for #20: a `\n` in the filename would end the GFM row
+    # early. `safe_location` rewrites it to the two-char `\n` text.
+    rows = [_mkrow("we\nrd.json", total=2, errors=2, new=2)]
+    out = render_markdown(rows)
+    data_rows = _history_md_data_rows(out)
+    assert len(data_rows) == 1
+    assert "we\\nrd.json" in data_rows[0]
+
+
+def test_render_text_newline_in_filename_does_not_split_row() -> None:
+    # The history text table interpolates the snapshot filename too;
+    # a `\n` (POSIX filenames allow any byte but `/` and NUL) would
+    # split the fixed-width row. Same class as audit finding #23.
+    rows = [_mkrow("we\nrd.json", total=2, errors=2, new=2)]
+    out = render_text(rows)
+    data_lines = [ln for ln in out.splitlines() if "rd.json" in ln]
+    assert len(data_lines) == 1
+    assert "we\\nrd.json" in data_lines[0]
+
+
 def test_render_markdown_empty_message() -> None:
     out = render_markdown([])
     assert "## pgrls history" in out

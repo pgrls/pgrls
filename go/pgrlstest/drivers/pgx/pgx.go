@@ -250,7 +250,7 @@ func queryWith(ctx context.Context, q connQueryer, sql string, params ...any) (p
 	// through Query to be safe.
 	first := firstWord(sql)
 	switch first {
-	case "SELECT", "WITH", "VALUES", "SHOW", "EXPLAIN":
+	case "SELECT", "WITH", "VALUES", "SHOW", "EXPLAIN", "TABLE":
 		return queryReturningRows(ctx, q, sql, params...)
 	default:
 		// UPDATE/DELETE/INSERT … RETURNING also returns rows,
@@ -354,8 +354,37 @@ func isInsufficientPrivilege(err error) bool {
 // upper-cased. Used both for routing SQL by leading verb
 // (SELECT vs UPDATE) and for normalizing the command tag
 // returned to QueryResult.Command. Empty input → empty output.
+// stripLeadingNoise removes leading whitespace, SQL line (`-- …`) and
+// block (`/* … */`) comments, and wrapping `(` so the first keyword of
+// e.g. `(SELECT …) UNION …`, `/* c */ SELECT …`, or `-- c\nSELECT …`
+// is recognised for Query-vs-Exec routing. Repeats until a real token
+// leads.
+func stripLeadingNoise(s string) string {
+	for {
+		t := strings.TrimSpace(s)
+		switch {
+		case strings.HasPrefix(t, "--"):
+			i := strings.IndexAny(t, "\r\n")
+			if i < 0 {
+				return ""
+			}
+			s = t[i:]
+		case strings.HasPrefix(t, "/*"):
+			i := strings.Index(t, "*/")
+			if i < 0 {
+				return ""
+			}
+			s = t[i+2:]
+		case strings.HasPrefix(t, "("):
+			s = t[1:]
+		default:
+			return t
+		}
+	}
+}
+
 func firstWord(s string) string {
-	s = strings.TrimSpace(s)
+	s = stripLeadingNoise(s)
 	if s == "" {
 		return ""
 	}
