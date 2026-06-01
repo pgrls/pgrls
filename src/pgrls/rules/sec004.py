@@ -5,15 +5,19 @@ auth_func() returns NULL for anonymous connections, so the IS NULL
 disjunct is true and the OR is satisfied without ever evaluating the
 real check. Anonymous clients see all rows.
 
-Detection looks at top-level OR disjuncts of the USING expression and
+Detection flattens the OR disjuncts of the USING expression — including
+disjuncts nested by explicit parenthesization, since OR is associative
+(`A OR (B OR auth() IS NULL)` is the same hole as the flat form) — and
 flags any disjunct shaped as `auth_func() IS NULL` for one of a
-configurable set of auth-context functions.
+configurable set of auth-context functions. It does not flatten through
+AND / NOT / subqueries: an `IS NULL` gated by an AND is not a standalone
+anonymous-access hole.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from pgrls.ast_utils import find_func_calls, match_is_null, top_level_disjuncts
+from pgrls.ast_utils import find_func_calls, flatten_or_disjuncts, match_is_null
 from pgrls.model import Schema
 from pgrls.violations import Severity, Violation
 
@@ -55,7 +59,7 @@ class SEC004:
             for policy in table.policies:
                 if policy.using_ast is None:
                     continue
-                for disjunct in top_level_disjuncts(policy.using_ast):
+                for disjunct in flatten_or_disjuncts(policy.using_ast):
                     matched = match_is_null(disjunct)
                     if matched is None:
                         continue

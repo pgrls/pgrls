@@ -89,6 +89,36 @@ def top_level_disjuncts(node: Any) -> list[Any]:
     return [node]
 
 
+def flatten_or_disjuncts(node: Any) -> list[Any]:
+    """Return every disjunct of a (possibly nested) OR expression.
+
+    Unlike `top_level_disjuncts`, this flattens nested OR `BoolExpr`
+    nodes: `A OR (B OR C)` yields `[A, B, C]`. OR is associative and
+    pglast preserves explicit parenthesization as a nested `BoolExpr`,
+    so the natural authoring order `<real check> OR (<other> OR
+    auth() IS NULL)` would otherwise hide the trailing disjunct from a
+    caller (e.g. SEC004) that only splits the outermost OR.
+
+    Recursion is into OR `BoolExpr` args ONLY. AND / NOT `BoolExpr`s
+    and `SubLink`s are returned as opaque single disjuncts — they are
+    not part of the same disjunction (an `IS NULL` under an `AND`, a
+    `NOT`, or inside a subquery is not a standalone OR-disjunct), so
+    the caller handles them atomically. A non-OR `node` yields
+    `[node]`, matching `top_level_disjuncts`.
+    """
+    if not (
+        isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR
+    ):
+        return [node]
+    disjuncts: list[Any] = []
+    for arg in node.args or ():
+        if isinstance(arg, BoolExpr) and arg.boolop == BoolExprType.OR_EXPR:
+            disjuncts.extend(flatten_or_disjuncts(arg))
+        else:
+            disjuncts.append(arg)
+    return disjuncts
+
+
 def extract_column_refs(
     node: Any, *, exclude_sublinks: bool = False
 ) -> set[tuple[str, ...]]:
