@@ -111,6 +111,24 @@ func TestFirstWord_ParsesCommandTag(t *testing.T) {
 	}
 }
 
+func TestFirstWord_StripsLeadingNoise(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want string
+	}{
+		{"(SELECT * FROM t)", "SELECT"},
+		{"((SELECT 1))", "SELECT"},
+		{"/* hint */ SELECT 1", "SELECT"},
+		{"-- comment\nSELECT 1", "SELECT"},
+		{"TABLE foo", "TABLE"},
+	}
+	for _, c := range cases {
+		if got := firstWord(c.sql); got != c.want {
+			t.Errorf("firstWord(%q) = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
 func TestHasReturning_DetectsKeyword(t *testing.T) {
 	cases := map[string]bool{
 		"UPDATE t SET x = 1 RETURNING id":           true,

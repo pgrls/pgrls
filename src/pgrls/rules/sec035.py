@@ -47,7 +47,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, Node
+from pglast.ast import A_Expr, Node, SubLink
 from pglast.enums import A_Expr_Kind
 
 from pgrls.ast_utils import extract_column_refs, find_func_calls, own_column_ref
@@ -99,6 +99,14 @@ def _discriminator_columns(table: Table, auth_functions: set[str]) -> set[str]:
     broader than SEC030's fromless-only rule: a broader discriminator set
     means SEC035 credits more uniques as scoped and under-flags — the safe
     direction for avoiding false positives.
+
+    The walk does NOT descend into a `SubLink` body (same guard as
+    SEC030's `_scoping_columns`): a discriminator equality must be a
+    predicate of the policy itself, not of a sub-query. Descending
+    would let a column inside a sub-select ACL (`… (SELECT 1 FROM acl
+    WHERE tenant_id = auth.uid())`) that happens to share a bare name
+    with an own-table column be wrongly credited as the table's
+    discriminator — suppressing a genuine cross-tenant UNIQUE finding.
     """
     cols: set[str] = set()
 
@@ -108,6 +116,8 @@ def _discriminator_columns(table: Table, auth_functions: set[str]) -> set[str]:
         if isinstance(node, (list, tuple)):
             for item in node:
                 walk(item)
+            return
+        if isinstance(node, SubLink):
             return
         if isinstance(node, A_Expr) and node.kind == A_Expr_Kind.AEXPR_OP:
             op = node.name[-1].sval if node.name else None

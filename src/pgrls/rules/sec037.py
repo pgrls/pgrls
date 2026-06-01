@@ -117,6 +117,21 @@ def _is_equality(node: A_Expr) -> bool:
     )
 
 
+def _is_in_list(node: A_Expr) -> bool:
+    """True if `node` is an `IN (...)` / `NOT IN (...)` list expression.
+
+    Postgres parses `x IN (a, b)` as an `A_Expr` of kind `AEXPR_IN`
+    whose `name` is `=` (and `<>` for `NOT IN`); `lexpr` is the tested
+    value and `rexpr` is the tuple of list elements. `auth.role() IN
+    ('admin', 'editor')` is the same always-false silent-deny shape as
+    `auth.role() = 'admin' OR auth.role() = 'editor'` when every listed
+    value is an unknown role, so it needs the same treatment.
+    """
+    # `A_Expr.kind` is typed `Any` by pglast — wrap in bool() so
+    # mypy --strict doesn't flag a `no-any-return`.
+    return bool(node.kind == A_Expr_Kind.AEXPR_IN)
+
+
 # Mirror of `_SQL_VALUE_FUNCTION_NAMES` in `pgrls.ast_utils` —
 # Postgres parses `current_user`, `session_user`, etc. as
 # `SQLValueFunction` nodes (a separate AST node class from `FuncCall`),
@@ -201,11 +216,13 @@ def _find_unknown_role_comparisons(
     role_functions: set[str],
     known_roles: set[str],
 ) -> list[str]:
-    """Find every `auth.role() = '<unknown>'` (or reversed) comparison.
+    """Find every `auth.role() = '<unknown>'` (or reversed / `IN`) comparison.
 
     Returns the unknown-role literals encountered (one entry per
-    offending comparison; same literal may appear twice for two
-    distinct comparisons in the same policy).
+    offending literal; same literal may appear twice for two distinct
+    comparisons in the same policy). Covers both the binary `=`/`<>`
+    shape and the `auth.role() IN ('a', 'b')` list shape — each unknown
+    list element is reported just like a standalone `= 'unknown'`.
     """
     hits: list[str] = []
 
@@ -230,6 +247,18 @@ def _find_unknown_role_comparisons(
                     # has a literal so `_is_string_const` returns
                     # None and we don't append.
                     break
+        elif isinstance(n, A_Expr) and _is_in_list(n):
+            # `auth.role() IN ('admin', 'editor')`: the tested value is
+            # `lexpr`, the list is `rexpr`. Only the value side can be
+            # the role call (the list holds the candidate literals).
+            # Each list element outside the known set is its own
+            # unknown-role hit, mirroring the per-disjunct `=` path.
+            if _is_role_call(n.lexpr, role_functions):
+                elements = n.rexpr if isinstance(n.rexpr, (list, tuple)) else ()
+                for element in elements:
+                    sval = _is_string_const(element)
+                    if sval is not None and sval not in known_roles:
+                        hits.append(sval)
         if isinstance(n, Node):
             for field_name in n:
                 walk(getattr(n, field_name, None))

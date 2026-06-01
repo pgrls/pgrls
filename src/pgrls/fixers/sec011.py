@@ -136,6 +136,54 @@ def _strip_clause(ast: Any) -> tuple[Any, bool]:
     return _strip_or_true(candidate)
 
 
+def strip_constant_true_for_mirror(ast: Any) -> Any | None:
+    """Return a copy of `ast` safe to mirror into a NEW `WITH CHECK`,
+    or `None` if no non-trivial predicate survives.
+
+    The SEC006 and SEC020 fixers mirror a policy's `USING` predicate
+    into `WITH CHECK`. A `USING` that contains a constant-true
+    disjunct (`x = 1 OR true`) is absorbing — mirrored verbatim it
+    produces a `WITH CHECK` that admits *every* write, the exact
+    wide-open write side those fixers exist to close. SEC011 runs in
+    the same `pgrls fix` pass but only ever rewrites `USING`, never a
+    `WITH CHECK` that SEC006/SEC020 just created, so the constant-true
+    write side would survive the pass.
+
+    This strips the constant-true disjunct (reusing SEC011's
+    `_strip_or_true`, the single source of truth for the
+    monotone-position stripping rule) before mirroring, so what's
+    emitted is the real predicate, not the bypass. Returns:
+
+    * the stripped copy, if a real predicate remains;
+    * `None` if the predicate was trivially true to begin with (a
+      bare `true`) or collapsed to nothing once the trues were
+      removed (`true OR true` → `_CannotStrip`). In that case the
+      caller must NOT emit a constant-true `WITH CHECK` — it leaves
+      the finding for the operator, the conservative choice for a
+      security fixer.
+
+    Note this only narrows the mirrored predicate; it never broadens
+    it (`_strip_or_true` declines to descend past a `NOT` or any
+    non-monotone node), so the resulting `WITH CHECK` is always at
+    least as strict as a verbatim mirror would have been.
+    """
+    if ast is None:
+        return None
+    candidate = copy.deepcopy(ast)
+    try:
+        stripped, _changed = _strip_or_true(candidate)
+    except _CannotStrip:
+        # The whole predicate was constant-true (e.g. `true OR true`)
+        # — there is no real predicate to mirror. Decline.
+        return None
+    # A bare top-level `true` is not a BoolExpr, so `_strip_or_true`
+    # leaves it untouched; guard it here so we never mirror a literal
+    # constant-true write check.
+    if is_literal_true(stripped):
+        return None
+    return stripped
+
+
 class SEC011Fixer:
     rule_id: str = "SEC011"
 

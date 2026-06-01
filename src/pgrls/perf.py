@@ -43,6 +43,7 @@ from psycopg.rows import dict_row
 
 from pgrls._html_common import resolve_generated_at, to_iso_z
 from pgrls.ast_utils import extract_range_vars
+from pgrls.formatters._common import gfm_inline_code, safe_location
 from pgrls.model import Schema
 
 __all__ = [
@@ -506,7 +507,13 @@ def render_text(report: PerfReport) -> str:
         )
     rows = [
         (
-            f.stats.qualified_name,
+            # `safe_location` keeps the row single-line and the
+            # fixed-width columns aligned: a quoted Postgres
+            # identifier can legally carry `\n` / `\t` / zero-width
+            # chars, which would otherwise split the row. No-op on
+            # clean identifiers; mirrors the lint/diff text
+            # formatters.
+            safe_location(f.stats.qualified_name),
             f"{f.stats.n_live_tup:,}",
             f"{f.stats.seq_scan:,}",
             f"{f.stats.seq_tup_read:,}",
@@ -600,8 +607,19 @@ def render_markdown(report: PerfReport) -> str:
         "|---|--:|--:|--:|--:|---|",
     ]
     for f in report.findings:
+        # `safe_location` neutralizes newlines / zero-width chars,
+        # the `|` -> `\|` escape stops a pipe in a quoted identifier
+        # from splitting the cell, and `gfm_inline_code` adds the
+        # backtick span (widening the wrapper if the name itself
+        # contains backticks). All no-ops on a well-formed
+        # `schema.table`, so the existing `` | `public.posts` | ``
+        # output is unchanged. Mirrors the lint/diff markdown
+        # location cell.
+        name = gfm_inline_code(
+            safe_location(f.stats.qualified_name).replace("|", "\\|")
+        )
         out.append(
-            f"| `{f.stats.qualified_name}` | {f.stats.n_live_tup:,} | "
+            f"| {name} | {f.stats.n_live_tup:,} | "
             f"{f.stats.seq_scan:,} | {f.stats.seq_tup_read:,} | "
             f"{f.stats.seq_scan_pct}% | {_VERDICT_LABEL[f.classification]} |"
         )

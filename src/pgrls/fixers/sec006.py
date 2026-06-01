@@ -30,6 +30,17 @@ The `USING` predicate is round-tripped through
 `pglast.stream.RawStream` rather than echoed verbatim — symmetric
 with the PERF001 fixer, so pglast's escaping is applied
 consistently regardless of where the SQL originated.
+
+Before mirroring, a constant-true disjunct (`x = 1 OR true`) is
+stripped from the predicate (via SEC011's
+`strip_constant_true_for_mirror`). A verbatim mirror of an
+`OR true` USING would produce a `WITH CHECK` that admits every
+write — the wide-open write side this fixer exists to close — and
+SEC011, which runs in the same `pgrls fix` pass, only rewrites
+USING, never the WITH CHECK SEC006 just created. If nothing
+non-trivial survives the strip (`true`, `true OR true`), the fixer
+declines and leaves the SEC006 finding for the operator rather than
+emit a constant-true WITH CHECK.
 """
 from __future__ import annotations
 
@@ -39,6 +50,10 @@ from pglast.stream import RawStream
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
+# Reuse SEC011's constant-true stripping so a USING with an `OR true`
+# disjunct is not mirrored verbatim into a wide-open WITH CHECK —
+# single source of truth for the monotone-position stripping rule.
+from pgrls.fixers.sec011 import strip_constant_true_for_mirror
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the write-side command set — imported
@@ -84,7 +99,23 @@ class SEC006Fixer:
                 pid = policy_id(table, policy)
                 if pid in skip:
                     continue
-                using_sql = RawStream()(policy.using_ast)
+                # Strip any constant-true disjunct (`x = 1 OR true`)
+                # before mirroring USING into WITH CHECK. Mirrored
+                # verbatim it would create a constant-true write check
+                # that admits every write — the wide-open write side
+                # this fixer exists to close. SEC011 (same `pgrls fix`
+                # pass) only ever rewrites USING, never the WITH CHECK
+                # SEC006 just emitted, so the bypass would survive the
+                # pass. If nothing non-trivial survives the strip
+                # (`true`, `true OR true`), decline — leave the SEC006
+                # finding for the operator rather than emit a
+                # constant-true WITH CHECK.
+                mirror_ast = strip_constant_true_for_mirror(
+                    policy.using_ast
+                )
+                if mirror_ast is None:
+                    continue
+                using_sql = RawStream()(mirror_ast)
                 sql = (
                     f"ALTER POLICY {quote_ident(policy.name)} "
                     f"ON {quote_qualified(table.schema, table.name)}\n"

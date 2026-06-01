@@ -64,7 +64,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import RangeVar, SubLink
+from pglast.ast import JoinExpr, RangeVar, SubLink
 from pglast.enums import SubLinkType
 
 from pgrls.ast_utils import find_func_calls
@@ -126,6 +126,81 @@ def _parse_binding_functions(options: dict[str, Any]) -> set[str]:
     return set(raw)
 
 
+def _from_item_range_vars(from_item: Any) -> list[RangeVar]:
+    """RangeVars reachable from a single FROM-clause item.
+
+    A bare `FROM auth.users` is a `RangeVar`; `FROM a JOIN b ON …` is a
+    `JoinExpr` whose `larg` / `rarg` hold the (possibly further-nested)
+    operands. The original walk inspected only top-level `RangeVar`s,
+    so an `auth.users` reached through a JOIN was invisible and the
+    binding-free EXISTS bypass slipped through. Recurse into `JoinExpr`
+    arms so the target table is found however it's joined in.
+    """
+    out: list[RangeVar] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, RangeVar):
+            out.append(item)
+        elif isinstance(item, JoinExpr):
+            walk(item.larg)
+            walk(item.rarg)
+
+    walk(from_item)
+    return out
+
+
+def _matches_target(
+    rv: RangeVar, target_tables: set[tuple[str, str]]
+) -> bool:
+    # `schemaname` is None for unqualified references (`FROM users`) —
+    # those default to whatever's on the caller's `search_path`. We
+    # can't statically tell whether an unqualified `users` resolves to
+    # `auth.users` or `public.users`, so we require an explicit
+    # `auth.users` qualification. (Users who want bare-`users` matching
+    # can add `["public.users"]` etc. to target_tables.)
+    return (
+        rv.schemaname is not None
+        and (rv.schemaname.lower(), rv.relname.lower()) in target_tables
+    )
+
+
+def _from_clause_targets(
+    sel: Any, target_tables: set[tuple[str, str]]
+) -> list[RangeVar]:
+    """Target RangeVars in a sub-select's FROM clause (JOINs included)."""
+    if sel is None or sel.fromClause is None:
+        return []
+    out: list[RangeVar] = []
+    for from_item in sel.fromClause:
+        for rv in _from_item_range_vars(from_item):
+            if _matches_target(rv, target_tables):
+                out.append(rv)
+    return out
+
+
+def _from_clause_join_quals(sel: Any) -> list[Any]:
+    """ON-clause predicates of every JoinExpr in a sub-select's FROM.
+
+    A caller binding can live in a JOIN's `ON` quals
+    (`JOIN auth.users u ON u.id = auth.uid()`) rather than the
+    sub-select's top-level WHERE, so the binding check must search
+    these too — otherwise a correctly-bound JOIN would false-fire.
+    """
+    quals: list[Any] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, JoinExpr):
+            if item.quals is not None:
+                quals.append(item.quals)
+            walk(item.larg)
+            walk(item.rarg)
+
+    if sel is not None and sel.fromClause is not None:
+        for from_item in sel.fromClause:
+            walk(from_item)
+    return quals
+
+
 def _exists_sublinks_against_target(
     node: Any, target_tables: set[tuple[str, str]]
 ) -> list[SubLink]:
@@ -135,6 +210,10 @@ def _exists_sublinks_against_target(
     with two offending EXISTS clauses surfaces both. (One finding
     per policy below; we still want the walk to be exhaustive in
     case a future variant wants per-sub-link reporting.)
+
+    The target table is matched whether it appears as a top-level FROM
+    item or through a JOIN (`FROM a JOIN auth.users …`) — see
+    `_from_clause_targets`.
     """
     out: list[SubLink] = []
 
@@ -146,27 +225,8 @@ def _exists_sublinks_against_target(
                 walk(item)
             return
         if isinstance(n, SubLink) and n.subLinkType == SubLinkType.EXISTS_SUBLINK:
-            sel = n.subselect
-            if sel is not None and sel.fromClause is not None:
-                for from_item in sel.fromClause:
-                    if isinstance(from_item, RangeVar):
-                        # `schemaname` is None for unqualified references
-                        # (`FROM users`) — those default to whatever's on
-                        # the caller's `search_path`. We can't statically
-                        # tell whether an unqualified `users` resolves to
-                        # `auth.users` or `public.users`, so we require
-                        # an explicit `auth.users` qualification. (Users
-                        # who want bare-`users` matching can add
-                        # `["public.users"]` etc. to target_tables.)
-                        if (
-                            from_item.schemaname is not None
-                            and (
-                                from_item.schemaname.lower(),
-                                from_item.relname.lower(),
-                            ) in target_tables
-                        ):
-                            out.append(n)
-                            break
+            if _from_clause_targets(n.subselect, target_tables):
+                out.append(n)
         # Walk into Node fields regardless — nested SubLinks happen.
         try:
             field_names = list(n)
@@ -182,11 +242,21 @@ def _exists_sublinks_against_target(
 def _has_binding_reference(
     sublink: SubLink, binding_functions: set[str]
 ) -> bool:
-    """True if the sub-select's WHERE clause references a binding fn."""
-    where = sublink.subselect.whereClause if sublink.subselect else None
-    if where is None:
+    """True if the sub-select binds the caller anywhere it can.
+
+    Checks the sub-select's top-level WHERE *and* every JOIN `ON`
+    clause — a binding predicate (`u.id = auth.uid()`) is equally
+    valid in either position, so both must be searched to avoid a
+    false positive on a correctly-bound JOIN.
+    """
+    sel = sublink.subselect
+    if sel is None:
         return False
-    return bool(find_func_calls(where, binding_functions))
+    candidates = [sel.whereClause, *_from_clause_join_quals(sel)]
+    return any(
+        c is not None and find_func_calls(c, binding_functions)
+        for c in candidates
+    )
 
 
 class SEC036:
@@ -232,24 +302,14 @@ class SEC036:
                         # Identify which target table the offending
                         # sub-link reads — useful in the finding
                         # message when target_tables has more than
-                        # one entry.
+                        # one entry. Matches through a JOIN too.
                         target = "auth.users"
-                        sel = sublink.subselect
-                        if sel and sel.fromClause:
-                            for from_item in sel.fromClause:
-                                if isinstance(from_item, RangeVar) and (
-                                    from_item.schemaname is not None
-                                ):
-                                    key = (
-                                        from_item.schemaname.lower(),
-                                        from_item.relname.lower(),
-                                    )
-                                    if key in target_tables:
-                                        target = (
-                                            f"{from_item.schemaname}."
-                                            f"{from_item.relname}"
-                                        )
-                                        break
+                        matched = _from_clause_targets(
+                            sublink.subselect, target_tables
+                        )
+                        if matched:
+                            rv = matched[0]
+                            target = f"{rv.schemaname}.{rv.relname}"
                         out.append(
                             Violation(
                                 rule_id="SEC036",

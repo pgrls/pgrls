@@ -3,9 +3,13 @@ emit an `ALTER POLICY` statement.
 
 The rewrite walks the policy's USING expression AST. Each FuncCall
 matching the rule's auth_functions set is replaced with a SubLink
-wrapping it — `auth.uid()` becomes `(SELECT auth.uid())`. SubLinks
-already in the tree are skipped so already-wrapped calls stay as
-they are.
+wrapping it — `auth.uid()` becomes `(SELECT auth.uid())`. A
+SubLink's subselect is skipped so an already-wrapped call stays as
+it is, but the SubLink's `testexpr` (the LHS of `x IN (SELECT …)` /
+`ANY` / `ALL`) IS walked — an unwrapped auth call there re-evaluates
+per row and PERF001's rule flags it, so the fixer must rewrite it
+too. This mirrors `ast_utils.find_func_calls(exclude_sublinks=True)`,
+which the rule uses.
 
 `SQLValueFunction` nodes (`current_user`, `session_user`) are
 intentionally NOT wrapped: see `_funccall_matches` for the
@@ -126,8 +130,23 @@ def _wrap_unwrapped_calls(node: Any, names: set[str]) -> tuple[Any, bool]:
     if _funccall_matches(node, names):
         return _wrap_funccall(node), True
     if isinstance(node, SubLink):
-        # Already wrapped — leave the inside alone.
-        return node, False
+        # The subselect is already a `(SELECT …)` — any auth call
+        # inside it is wrapped, so leave it alone. But the SubLink's
+        # `testexpr` (the LHS of `x IN (SELECT …)` / `ANY` / `ALL`)
+        # is the policy's own expression, NOT inside the subquery:
+        # an unwrapped `auth.uid() IN (SELECT …)` re-evaluates the
+        # auth call per row. PERF001's RULE flags it (its
+        # `find_func_calls(exclude_sublinks=True)` walks `testexpr`),
+        # so the fixer must rewrite it too or it leaves a reported
+        # violation unfixed. Recurse into `testexpr` only; the
+        # subselect stays untouched. Mirrors
+        # `ast_utils.find_func_calls`'s SubLink handling.
+        if node.testexpr is None:
+            return node, False
+        new_testexpr, changed = _wrap_unwrapped_calls(node.testexpr, names)
+        if changed:
+            node.testexpr = new_testexpr
+        return node, changed
     if not isinstance(node, Node):
         return node, False
 

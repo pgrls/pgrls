@@ -37,10 +37,10 @@ jobs:
       run:
         working-directory: ts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           # Match `engines.node >= 20` from package.json. Newer
           # Node is fine to publish from but we pin to LTS.
@@ -102,10 +102,10 @@ jobs:
       # provenance attestation. Mirrors the npm provenance flow.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm

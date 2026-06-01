@@ -118,6 +118,42 @@ def test_owner_model_discriminator_via_auth_uid() -> None:
     assert locs == ["public.docs (docs_slug_key)"]
 
 
+def test_sublink_column_not_credited_as_discriminator() -> None:
+    # Regression (#26): the table's REAL discriminator is the direct
+    # own-table comparison `user_id = (SELECT auth.uid())`. The policy
+    # also contains a sub-select ACL whose predicate compares the own-
+    # column-NAMED `email` to an auth value
+    # (`… WHERE email = current_setting('app.email')`). That `email`
+    # lives inside a sub-select on another table and must NOT be
+    # credited as this table's discriminator. Before the fix it was,
+    # so the global `UNIQUE (email)` was wrongly treated as "scoped"
+    # and the genuine cross-tenant finding was silently suppressed —
+    # a false negative. With the SubLink guard the discriminator set is
+    # just {user_id}, and the un-scoped UNIQUE on `email` fires.
+    cols = (
+        Column("id", "uuid", is_nullable=False),
+        Column("user_id", "uuid", is_nullable=False),
+        Column("email", "text", is_nullable=False),
+    )
+    using = (
+        "user_id = (SELECT auth.uid()) "
+        "AND id IN (SELECT doc_id FROM shares "
+        "WHERE email = current_setting('app.email'))"
+    )
+    t = Table(
+        schema="public",
+        name="docs",
+        rls_enabled=True,
+        force_rls=True,
+        policies=(_policy(using),),
+        columns=("id", "user_id", "email"),
+        column_details=cols,
+        indexes=(_idx("docs_email_key", ("email",), unique=True),),
+    )
+    locs = [v.location for v in SEC035().check(Schema(tables=(t,)), {})]
+    assert locs == ["public.docs (docs_email_key)"]
+
+
 def test_message_names_discriminator_and_fix() -> None:
     v = SEC035().check(
         Schema(tables=(_table(_idx("users_email_key", ("email",), unique=True)),)), {}

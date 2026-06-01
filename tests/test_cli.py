@@ -3788,3 +3788,26 @@ def test_fix_check_composes_with_rule_filter(
     # filtered it out — it must not appear.
     assert "SEC002" not in result.output
     assert "public.fix_check_filter_b" not in result.output
+
+
+def test_snapshot_output_write_error_exits_2(tmp_path) -> None:
+    # `snapshot --output` to an unwritable path must exit 2 (clean
+    # ToolError), not crash with an uncaught traceback (exit 1). The
+    # write was the only --output writer not wrapped in try/except
+    # OSError, unlike its 8 sibling commands. Regression.
+    from unittest.mock import MagicMock, patch
+
+    cm = MagicMock()
+    cm.__enter__.return_value = MagicMock()
+    cm.__exit__.return_value = False
+    bad = tmp_path / "missing-dir" / "snap.json"  # parent does not exist
+    with patch("pgrls.cli.psycopg.connect", return_value=cm), patch(
+        "pgrls.cli.introspect", return_value=Schema(tables=())
+    ):
+        result = CliRunner().invoke(
+            main,
+            ["snapshot", "--database-url", "postgresql://x", "--output", str(bad)],
+        )
+    assert result.exit_code == 2, result.output
+    assert "Cannot write" in result.output
+    assert "Traceback" not in result.output
