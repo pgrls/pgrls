@@ -60,7 +60,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import FuncCall, Node
+from pglast.ast import FuncCall, Node, SubLink
 
 from pgrls.ast_utils import extract_column_refs
 from pgrls.model import Schema, Table
@@ -91,6 +91,16 @@ def _function_wrapped_own_columns(node: Any, table: Table) -> set[str]:
         if isinstance(n, (list, tuple)):
             for item in n:
                 walk(item)
+            return
+        if isinstance(n, SubLink):
+            # A FuncCall inside a sub-select (`EXISTS (SELECT 1 FROM m
+            # WHERE lower(email) = …)`) wraps a column on *another*
+            # table, not an own-table column — collecting it would
+            # false-fire PERF004. Mirror the SubLink skip in
+            # `ast_utils.extract_column_refs` / `find_func_calls`:
+            # walk the test expression (the LHS of an `IN`/`ANY`,
+            # which lives on the own table) but not the subquery body.
+            walk(n.testexpr)
             return
         if isinstance(n, FuncCall):
             for ref in extract_column_refs(n, exclude_sublinks=True):
