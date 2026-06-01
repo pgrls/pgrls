@@ -1,0 +1,199 @@
+{
+  "pgrls_version": "0.14.0",
+  "totals": {
+    "cases": 18,
+    "positive": 10,
+    "negative": 8,
+    "tp": 10,
+    "fp": 0,
+    "fn": 0,
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "cases": [
+    {
+      "name": "goldstandard-tenant",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "goldstandard-owner",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec004-coalesce-wrapper-safe",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec004-is-null-under-and-safe",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec004-is-null-in-subquery-safe",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec004-is-not-null-safe",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec001-no-rls",
+      "kind": "positive",
+      "expect": [
+        "SEC001"
+      ],
+      "fired": [
+        "SEC001"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec002-rls-not-forced",
+      "kind": "positive",
+      "expect": [
+        "SEC002"
+      ],
+      "fired": [
+        "SEC002"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec003-policy-to-public",
+      "kind": "positive",
+      "expect": [
+        "SEC003"
+      ],
+      "fired": [
+        "SEC003"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec004-inverted-auth",
+      "kind": "positive",
+      "expect": [
+        "SEC004"
+      ],
+      "fired": [
+        "SEC004"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec006-update-no-with-check",
+      "kind": "positive",
+      "expect": [
+        "SEC006"
+      ],
+      "fired": [
+        "SEC006"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "perf001-unwrapped-current-setting",
+      "kind": "positive",
+      "expect": [
+        "PERF001"
+      ],
+      "fired": [
+        "PERF001"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "perf003-no-index",
+      "kind": "positive",
+      "expect": [
+        "PERF003"
+      ],
+      "fired": [
+        "PERF003"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec032-dormant-policies",
+      "kind": "positive",
+      "expect": [
+        "SEC032"
+      ],
+      "fired": [
+        "SEC032"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "per-command-policies-clean",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "jwt-claim-tenant-clean",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "hyg002-placeholder-name",
+      "kind": "positive",
+      "expect": [
+        "HYG002"
+      ],
+      "fired": [
+        "HYG002"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec005-session-state-only",
+      "kind": "positive",
+      "expect": [
+        "SEC005"
+      ],
+      "fired": [
+        "SEC005"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    }
+  ]
+}
