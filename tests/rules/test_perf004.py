@@ -166,6 +166,59 @@ def test_perf004_silent_on_coalesce_out_of_scope() -> None:
     assert PERF004().check(schema, {}) == []
 
 
+def test_perf004_skips_sublink_column_refs() -> None:
+    # Regression (#24): a function-wrapped column INSIDE a sub-select
+    # (`EXISTS (SELECT 1 FROM members WHERE lower(email) = …)`) belongs
+    # to `members`, not the policy's own table — the docstring excludes
+    # sub-select columns. Even though `email` is an own-table column
+    # name with a plain index here, the `lower(email)` inside the
+    # sub-select must NOT be collected, or PERF004 false-fires on the
+    # own table's index. Mirrors PERF003's
+    # `test_perf003_skips_sublink_column_refs`.
+    schema = Schema(
+        tables=(
+            _table(
+                policies=(
+                    _policy(
+                        using_sql=(
+                            "EXISTS (SELECT 1 FROM members "
+                            "WHERE lower(email) = "
+                            "lower(current_setting('app.email')))"
+                        )
+                    ),
+                ),
+                indexes=(_index(("email",)),),
+            ),
+        )
+    )
+    assert PERF004().check(schema, {}) == []
+
+
+def test_perf004_still_fires_on_own_wrap_alongside_sublink() -> None:
+    # Precision companion to the skip above: a direct own-column wrap
+    # (`lower(email) = …`) in the SAME policy as a sub-select still
+    # fires on the own column — the sublink skip must not suppress the
+    # genuine own-table finding.
+    schema = Schema(
+        tables=(
+            _table(
+                policies=(
+                    _policy(
+                        using_sql=(
+                            "lower(email) = current_setting('app.email') "
+                            "OR EXISTS (SELECT 1 FROM members "
+                            "WHERE lower(members.alias) = 'x')"
+                        )
+                    ),
+                ),
+                indexes=(_index(("email",)),),
+            ),
+        )
+    )
+    [v] = PERF004().check(schema, {})
+    assert "'email'" in v.message
+
+
 def test_perf004_silent_when_rls_disabled() -> None:
     schema = Schema(
         tables=(

@@ -120,6 +120,58 @@ def test_fires_per_distinct_unknown_literal() -> None:
     } == {"admin", "super"}
 
 
+def test_fires_on_in_list_with_all_unknown_roles() -> None:
+    # Regression (#27): `auth.role() IN ('admin', 'editor')` is the
+    # same silent-deny shape as `auth.role() = 'admin' OR auth.role()
+    # = 'editor'` — it never matches when every listed value is outside
+    # the known set. Each distinct unknown element is its own finding,
+    # mirroring the per-disjunct `=` path.
+    schema = _wrap(_policy("(auth.role() IN ('admin', 'editor'))", name="in_roles"))
+    violations = SEC037().check(schema, {})
+    assert len(violations) == 2
+    assert {
+        unknown
+        for unknown in ("admin", "editor")
+        if any(unknown in v.message for v in violations)
+    } == {"admin", "editor"}
+
+
+def test_fires_on_not_in_list_unknown_role() -> None:
+    # `NOT IN` parses as the same AEXPR_IN node (name `<>`); the role
+    # call is still on the value side and the listed literal is still
+    # unknown, so it surfaces too.
+    schema = _wrap(_policy("(auth.role() NOT IN ('admin'))", name="not_in_admin"))
+    violations = SEC037().check(schema, {})
+    assert len(violations) == 1
+    assert "admin" in violations[0].message
+
+
+def test_in_list_fires_only_on_the_unknown_element() -> None:
+    # Mixed list: a known role plus an unknown one. Only the unknown
+    # `'admin'` is a finding — the known `'authenticated'` is fine.
+    # Pins that membership is checked per element, not "is the whole
+    # list unknown".
+    schema = _wrap(
+        _policy("(auth.role() IN ('authenticated', 'admin'))", name="mixed_in")
+    )
+    violations = SEC037().check(schema, {})
+    assert len(violations) == 1
+    assert "admin" in violations[0].message
+
+
+def test_in_list_dedupes_against_equality_same_literal() -> None:
+    # `auth.role() = 'admin' OR auth.role() IN ('admin')` — the same
+    # unknown literal across an `=` and an `IN` is one mistake, one
+    # finding (per-literal dedup in `check`).
+    schema = _wrap(
+        _policy(
+            "(auth.role() = 'admin' OR auth.role() IN ('admin'))",
+            name="dup_admin",
+        )
+    )
+    assert len(SEC037().check(schema, {})) == 1
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Silent — known role, non-auth.role check, unrelated comparison
 # ──────────────────────────────────────────────────────────────────────
