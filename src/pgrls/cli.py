@@ -1219,6 +1219,19 @@ def fix(
             "file). Choose one."
         )
 
+    # Parse --config up-front so a malformed config file surfaces
+    # before a bad --rule (and before the db-url guard inside the
+    # context manager), preserving the pre-refactor fix() error
+    # precedence — config, then --rule, then db-url — for inputs that
+    # trip more than one of these at once. The context manager below
+    # re-reads + merges + guards + connects; this standalone parse
+    # exists only to pin that ordering (the re-read is a cheap,
+    # idempotent TOML parse).
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
     # Validate `--rule` early — a typo silently producing zero
     # fixes is hard to debug. The "no auto-fixable" message
     # should be reserved for "DB is clean", not "you spelled the
