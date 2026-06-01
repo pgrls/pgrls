@@ -2734,6 +2734,25 @@ def test_fix_bad_toml_exits_2_not_1(tmp_path) -> None:
     assert "Traceback" not in result.output
 
 
+def test_fix_bad_toml_precedes_unknown_rule(tmp_path) -> None:
+    # When --config is malformed AND --rule names an unknown rule, the
+    # config-parse error must win — matching the pre-refactor fix()
+    # error order (config, then --rule, then db-url). Pins the
+    # precedence so the connect/introspect preamble dedup cannot
+    # silently reorder which of several simultaneous user errors
+    # surfaces first.
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text("[database\n")  # malformed TOML
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--config", str(cfg), "--rule", "BOGUS"]
+    )
+    assert result.exit_code == 2, result.output
+    # The config-parse error, NOT "unknown auto-fixable rule(s): BOGUS".
+    assert "unknown auto-fixable rule" not in result.output
+    assert "Traceback" not in result.output
+
+
 def test_fix_apply_handles_multiple_fixes(
     pg_url: str, apply_sql
 ) -> None:
