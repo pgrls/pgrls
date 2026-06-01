@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Literal
 
 from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls.formatters._common import gfm_inline_code, safe_location
 
 
 @dataclass(frozen=True)
@@ -222,7 +223,13 @@ def render_text(rows: list[SnapshotRow]) -> str:
     body = [
         (
             row.snapshot.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            row.snapshot.path.name,
+            # `safe_location` keeps the row single-line and the
+            # fixed-width columns aligned: a snapshot filename can
+            # legally carry a `\n` (POSIX allows any byte but `/`
+            # and NUL), which would otherwise split the row. No-op
+            # on a clean `a.json`; mirrors the lint/diff text
+            # formatters.
+            safe_location(row.snapshot.path.name),
             str(row.snapshot.raw_total),
             str(row.snapshot.counts.get("error", 0)),
             str(row.snapshot.counts.get("warning", 0)),
@@ -287,10 +294,20 @@ def render_markdown(rows: list[SnapshotRow]) -> str:
         "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
+        # `safe_location` neutralizes newlines / zero-width chars (a
+        # raw `\n` in a snapshot filename would end the GFM row
+        # early), the `|` -> `\|` escape stops a pipe from splitting
+        # the cell, and `gfm_inline_code` adds the backtick span
+        # (widening the wrapper if the filename contains backticks).
+        # All no-ops on a well-formed `a.json`, so existing output
+        # is unchanged. Mirrors the lint/diff markdown location cell.
+        fn = gfm_inline_code(
+            safe_location(row.snapshot.path.name).replace("|", "\\|")
+        )
         out.append(
-            "| {ts} | `{fn}` | {tot} | {err} | {warn} | {info} | {new} | {fix} |".format(
+            "| {ts} | {fn} | {tot} | {err} | {warn} | {info} | {new} | {fix} |".format(
                 ts=row.snapshot.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                fn=row.snapshot.path.name,
+                fn=fn,
                 tot=row.snapshot.raw_total,
                 err=row.snapshot.counts.get("error", 0),
                 warn=row.snapshot.counts.get("warning", 0),

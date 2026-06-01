@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls.formatters._common import safe_location
 from pgrls.model import Schema
 
 # Ordered best → worst, which is also the order the summary line lists
@@ -166,7 +167,13 @@ def render_text(report: Report) -> str:
         return "No tables found in the scanned schemas."
     rows = [
         (
-            t.qualified_name,
+            # `safe_location` keeps the row single-line: a Postgres
+            # identifier may legally carry `\n` / `\t` / zero-width
+            # chars inside a quoted name, which would otherwise split
+            # the row and destroy the fixed-width column alignment.
+            # No-op on clean identifiers. Mirrors the lint/diff text
+            # formatters.
+            safe_location(t.qualified_name),
             t.status,
             "yes" if t.rls_enabled else "no",
             "yes" if t.force_rls else "no",
@@ -219,8 +226,17 @@ def render_markdown(report: Report) -> str:
         "|---|---|---|---|---|",
     ]
     for t in report.tables:
+        # `safe_location` neutralizes newlines / zero-width chars (a
+        # raw `\n` would end the GFM row early); the manual `|` ->
+        # `\|` escape keeps a pipe inside a quoted Postgres
+        # identifier from splitting the cell. Both are no-ops on a
+        # well-formed `schema.table`, so existing snapshots are
+        # unchanged. Mirrors the lint/diff markdown formatters'
+        # cell-sanitization (kept bare rather than backtick-wrapped
+        # to preserve this table's established plain-text column).
+        name = safe_location(t.qualified_name).replace("|", "\\|")
         out.append(
-            f"| {t.qualified_name} | {t.status} | "
+            f"| {name} | {t.status} | "
             f"{'yes' if t.rls_enabled else 'no'} | "
             f"{'yes' if t.force_rls else 'no'} | {t.policy_count} |"
         )

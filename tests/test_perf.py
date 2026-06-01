@@ -257,6 +257,58 @@ def test_render_markdown_table() -> None:
     assert md.endswith("\n")
 
 
+def _report_one_named(name: str) -> PerfReport:
+    ts = _stats(
+        "public", name, seq_scan=500, seq_tup_read=5_000_000,
+        idx_scan=1, n_live_tup=500_000,
+    )
+    return PerfReport(
+        findings=(PerfFinding(ts, CONFIRMED, "warning"),),
+        rls_tables_considered=1,
+    )
+
+
+def _perf_md_finding_rows(out: str) -> list[str]:
+    """Markdown data rows for the findings table (before the optional
+    statements section), excluding heading / caveat / header / sep."""
+    rows: list[str] = []
+    for ln in out.splitlines():
+        if not ln.startswith("| `"):
+            continue  # only finding rows start with a backticked table cell
+        rows.append(ln)
+    return rows
+
+
+def test_render_markdown_pipe_in_name_does_not_corrupt_table() -> None:
+    # A `|` in a quoted Postgres identifier must be escaped inside the
+    # backtick code span so it doesn't add a phantom GFM column.
+    # Regression for audit finding #17.
+    out = render(_report_one_named("we|rd"), "markdown")
+    rows = _perf_md_finding_rows(out)
+    assert len(rows) == 1
+    row = rows[0]
+    assert "public.we\\|rd" in row
+    # 6 columns → 7 unescaped pipe delimiters.
+    assert row.replace("\\|", "").count("|") == 7
+
+
+def test_render_markdown_newline_in_name_does_not_split_row() -> None:
+    # Regression for #17: a `\n` would end the GFM row early.
+    out = render(_report_one_named("we\nrd"), "markdown")
+    rows = _perf_md_finding_rows(out)
+    assert len(rows) == 1
+    assert "public.we\\nrd" in rows[0]
+
+
+def test_render_text_newline_in_name_does_not_split_row() -> None:
+    # Regression for audit finding #23: a `\n` in a name must not
+    # split the fixed-width text row.
+    out = render(_report_one_named("we\nrd"), "text")
+    data_lines = [ln for ln in out.splitlines() if "public.we" in ln]
+    assert len(data_lines) == 1
+    assert "public.we\\nrd" in data_lines[0]
+
+
 def test_render_html_escapes_and_is_standalone() -> None:
     ts = _stats("public", "tab<x>", seq_scan=500, seq_tup_read=5_000_000, idx_scan=1, n_live_tup=500_000)
     report = PerfReport(findings=(PerfFinding(ts, INDEX_UNUSED, "info"),), rls_tables_considered=1)
