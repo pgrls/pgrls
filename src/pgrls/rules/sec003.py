@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -34,10 +34,8 @@ class SEC003:
                     continue
                 if "PUBLIC" not in policy.roles:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
                     Violation(
@@ -52,7 +50,7 @@ class SEC003:
                             "Restrict to a specific role (e.g. "
                             "TO authenticated)."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

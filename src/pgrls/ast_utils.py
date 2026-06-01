@@ -198,6 +198,35 @@ _SQL_VALUE_FUNCTION_NAMES: dict[Any, str] = {
 }
 
 
+def own_column_ref(ref: tuple[str, ...], table: Any) -> str | None:
+    """The column name ``ref`` denotes if it is an own-table column, else None.
+
+    ``ref`` is a column reference as produced by ``extract_column_refs``:
+    ``(col,)`` (bare), ``(table, col)``, or ``(schema, table, col)``. A bare
+    ref matches against ``table.columns``; qualified refs must also match the
+    table's name (and schema). Single source of truth for "is this an own
+    column" — previously copy-pasted as the ``_is_own_column_ref`` /
+    ``_own_columns`` ladder across SEC005, SEC018, SEC030, SEC035, PERF003.
+    Returns the column name (truthy) on a match so callers can use it either
+    as a boolean test or to collect matched names.
+    """
+    if len(ref) == 1:
+        return ref[0] if ref[0] in table.columns else None
+    if len(ref) == 2:
+        return (
+            ref[1] if ref[0] == table.name and ref[1] in table.columns else None
+        )
+    if len(ref) == 3:
+        return (
+            ref[2]
+            if ref[0] == table.schema
+            and ref[1] == table.name
+            and ref[2] in table.columns
+            else None
+        )
+    return None
+
+
 def find_func_calls(
     node: Any, names: set[str], *, exclude_sublinks: bool = False
 ) -> list[Any]:

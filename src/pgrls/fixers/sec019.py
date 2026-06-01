@@ -50,7 +50,7 @@ from pglast.stream import RawStream
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 
 _CURRENT_SETTING = "current_setting"
@@ -131,10 +131,8 @@ class SEC019Fixer:
         out: list[Fix] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
 
                 # Mutate deep-copies so the rule's `Schema` view is
@@ -175,7 +173,7 @@ class SEC019Fixer:
                 out.append(
                     Fix(
                         rule_id="SEC019",
-                        location=policy_id,
+                        location=pid,
                         sql=stmt,
                         description=(
                             f"Add `, true` (missing_ok = true) to "

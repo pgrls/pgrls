@@ -60,7 +60,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import find_func_calls
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -97,8 +97,8 @@ class SEC034:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 trees = [
                     t
@@ -141,7 +141,7 @@ class SEC034:
                             "the read is intentional (audit log, "
                             "display-only)."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

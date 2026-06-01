@@ -26,7 +26,7 @@ from typing import Any
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Policy, Schema
+from pgrls.model import Policy, Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse the rule's signature so the fixer groups duplicates exactly
 # as HYG003 reports them — single source of truth.
@@ -55,10 +55,8 @@ class HYG003Fixer:
                 ordered = sorted(group, key=lambda p: p.name)
                 original = ordered[0]
                 for dup in ordered[1:]:
-                    policy_id = (
-                        f"{table.schema}.{table.name}.{dup.name}"
-                    )
-                    if policy_id in skip:
+                    pid = policy_id(table, dup)
+                    if pid in skip:
                         continue
                     out.append(
                         self._fix(table.schema, table.name, dup, original)

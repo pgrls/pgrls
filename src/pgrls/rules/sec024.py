@@ -81,7 +81,7 @@ from typing import Any
 from pglast.ast import A_Const, String, TypeCast
 
 from pgrls.ast_utils import find_func_calls
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -153,11 +153,11 @@ class SEC024:
                         names |= _unqualified_setting_names(ast)
                 if not names:
                     continue
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
-                    self._violation(table, policy, policy_id, sorted(names))
+                    self._violation(table, policy, pid, sorted(names))
                 )
         return out
 
@@ -165,7 +165,7 @@ class SEC024:
         self,
         table: Table,
         policy: Policy,
-        policy_id: str,
+        pid: str,
         names: list[str],
     ) -> Violation:
         quoted = ", ".join(repr(n) for n in names)
@@ -190,7 +190,7 @@ class SEC024:
                 "dropped prefix — read 'app.tenant_id', not "
                 "'tenant_id'. If the policy genuinely keys off a "
                 "built-in parameter, allowlist it as "
-                f"{policy_id!r} in [lint.rules.SEC024]."
+                f"{pid!r} in [lint.rules.SEC024]."
             ),
-            location=policy_id,
+            location=pid,
         )

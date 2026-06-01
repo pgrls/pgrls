@@ -31,7 +31,7 @@ from pgrls.coverage import (
     ambiguous_relation_names,
     is_policy_covered,
 )
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -54,8 +54,8 @@ class HYG004:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 if is_policy_covered(
                     table, policy, coverage, ambiguous_relations=ambiguous
@@ -75,10 +75,10 @@ class HYG004:
                             "under a matching role and command. An untested "
                             "policy can silently stop enforcing what you "
                             "intend. Add a pgrls.testing case that exercises "
-                            f"it, or allowlist {policy_id!r} in "
+                            f"it, or allowlist {pid!r} in "
                             "[lint.rules.HYG004]."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

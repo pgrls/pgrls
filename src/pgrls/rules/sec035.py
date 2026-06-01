@@ -50,9 +50,9 @@ from typing import Any
 from pglast.ast import A_Expr, Node, SubLink
 from pglast.enums import A_Expr_Kind
 
-from pgrls.ast_utils import extract_column_refs, find_func_calls
+from pgrls.ast_utils import extract_column_refs, find_func_calls, own_column_ref
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 # Same default auth-context set as SEC030 / PERF001: a column compared by
@@ -84,17 +84,9 @@ def _own_columns(side: Any, table: Table) -> set[str]:
     """
     names: set[str] = set()
     for ref in extract_column_refs(side, exclude_sublinks=True):
-        if len(ref) == 1 and ref[0] in table.columns:
-            names.add(ref[0])
-        elif len(ref) == 2 and ref[0] == table.name and ref[1] in table.columns:
-            names.add(ref[1])
-        elif (
-            len(ref) == 3
-            and ref[0] == table.schema
-            and ref[1] == table.name
-            and ref[2] in table.columns
-        ):
-            names.add(ref[2])
+        col = own_column_ref(ref, table)
+        if col is not None:
+            names.add(col)
     return names
 
 
@@ -159,7 +151,7 @@ class SEC035:
         for table in schema.tables:
             if not table.rls_enabled or not table.policies or not table.indexes:
                 continue
-            if table.name in allowlist or table.qualified_name in allowlist:
+            if table_in_allowlist(table, allowlist):
                 continue
             discriminators = _discriminator_columns(table, auth_functions)
             if not discriminators:

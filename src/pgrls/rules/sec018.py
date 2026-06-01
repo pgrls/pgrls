@@ -124,8 +124,8 @@ from typing import Any
 
 from pglast.ast import A_Expr, Node
 
-from pgrls.ast_utils import extract_column_refs, find_func_calls
-from pgrls.model import Policy, Schema, Table
+from pgrls.ast_utils import extract_column_refs, find_func_calls, own_column_ref
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -136,26 +136,6 @@ from pgrls.violations import Severity, Violation
 _ROLE_IDENTITY_FUNCTIONS: frozenset[str] = frozenset(
     {"current_user", "current_role", "user", "session_user"}
 )
-
-
-def _is_own_column_ref(ref: tuple[str, ...], table: Table) -> bool:
-    """True if a ColumnRef name tuple names a column of `table`.
-
-    Mirrors `SEC005._is_own_column_ref` — bare (`col`),
-    table-qualified (`table.col`), and schema-qualified
-    (`schema.table.col`) forms all resolve against `table.columns`.
-    """
-    if len(ref) == 1:
-        return ref[0] in table.columns
-    if len(ref) == 2:
-        return ref[0] == table.name and ref[1] in table.columns
-    if len(ref) == 3:
-        return (
-            ref[0] == table.schema
-            and ref[1] == table.name
-            and ref[2] in table.columns
-        )
-    return False
 
 
 # The per-operand checks use `exclude_sublinks=True`: a
@@ -177,7 +157,7 @@ def _side_has_role_identity(side: Any) -> bool:
 
 def _side_has_own_column(side: Any, table: Table) -> bool:
     return any(
-        _is_own_column_ref(ref, table)
+        own_column_ref(ref, table) is not None
         for ref in extract_column_refs(side, exclude_sublinks=True)
     )
 
@@ -250,14 +230,14 @@ class SEC018:
                         break
                 if not fires:
                     continue
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
-                out.append(self._violation(table, policy, policy_id))
+                out.append(self._violation(table, policy, pid))
         return out
 
     def _violation(
-        self, table: Table, policy: Policy, policy_id: str
+        self, table: Table, policy: Policy, pid: str
     ) -> Violation:
         return Violation(
             rule_id=self.id,
@@ -281,8 +261,8 @@ class SEC018:
                 "this project genuinely uses the role-per-tenant "
                 "pattern (one Postgres role per tenant, SET ROLE per "
                 "request), current_user is the right key here — "
-                f"allowlist this policy as {policy_id!r} in "
+                f"allowlist this policy as {pid!r} in "
                 "[lint.rules.SEC018]."
             ),
-            location=policy_id,
+            location=pid,
         )

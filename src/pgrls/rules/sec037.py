@@ -64,7 +64,7 @@ from pglast.ast import (
 )
 from pglast.enums import A_Expr_Kind, SQLValueFunctionOp
 
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -284,8 +284,8 @@ class SEC037:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 trees = [
                     t
@@ -332,7 +332,7 @@ class SEC037:
                                     "known_roles if you have an "
                                     "intentional override."
                                 ),
-                                location=policy_id,
+                                location=pid,
                             )
                         )
         return out

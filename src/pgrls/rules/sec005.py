@@ -19,28 +19,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.ast_utils import extract_column_refs
-from pgrls.model import Schema, Table
+from pgrls.ast_utils import extract_column_refs, own_column_ref
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     return parse_policy_id_allowlist('SEC005', options)
-
-
-def _is_own_column_ref(ref: tuple[str, ...], table: Table) -> bool:
-    if len(ref) == 1:
-        return ref[0] in table.columns
-    if len(ref) == 2:
-        return ref[0] == table.name and ref[1] in table.columns
-    if len(ref) == 3:
-        return (
-            ref[0] == table.schema
-            and ref[1] == table.name
-            and ref[2] in table.columns
-        )
-    return False
 
 
 class SEC005:
@@ -64,12 +50,10 @@ class SEC005:
                     refs |= extract_column_refs(policy.using_ast)
                 if policy.with_check_ast is not None:
                     refs |= extract_column_refs(policy.with_check_ast)
-                if any(_is_own_column_ref(r, table) for r in refs):
+                if any(own_column_ref(r, table) is not None for r in refs):
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
                     Violation(
@@ -85,7 +69,7 @@ class SEC005:
                             "Add a row-level condition (e.g. "
                             "tenant_id = current_setting('app.tenant'))."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 
@@ -61,13 +61,10 @@ class SEC012:
                 continue
             if any(policy.permissive for policy in table.policies):
                 continue
-            if self._is_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
             out.append(self._violation(table))
         return out
-
-    def _is_allowlisted(self, table: Table, allowlist: set[str]) -> bool:
-        return table.name in allowlist or table.qualified_name in allowlist
 
     def _violation(self, table: Table) -> Violation:
         n = len(table.policies)

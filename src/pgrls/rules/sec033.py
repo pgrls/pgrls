@@ -60,7 +60,7 @@ from typing import Any
 from pglast.ast import A_Const, Node, String
 
 from pgrls.ast_utils import extract_column_refs
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -196,10 +196,8 @@ class SEC033:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 # Walk both USING and WITH CHECK — WITH CHECK governs
                 # writes and is the more common privilege-escalation
@@ -254,7 +252,7 @@ class SEC033:
                             "allowlist this policy in "
                             "[lint.rules.SEC033]."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

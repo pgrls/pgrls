@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 
@@ -44,7 +44,7 @@ class SEC001:
                 # two don't double-fire; a bare RLS-off table (no
                 # policies) stays SEC001's.
                 continue
-            if self._is_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
             ancestors = list(schema.ancestors_of(table))
             if any(a.rls_enabled for a in ancestors):
@@ -54,9 +54,6 @@ class SEC001:
 
     def _parse_allowlist(self, options: dict[str, Any]) -> set[str]:
         return parse_table_ref_allowlist("SEC001", options)
-
-    def _is_allowlisted(self, table: Table, allowlist: set[str]) -> bool:
-        return table.name in allowlist or table.qualified_name in allowlist
 
     def _violation(
         self, table: Table, ancestors: list[Table]
