@@ -54,10 +54,8 @@ def parse_expr(
     """
     if not sql:
         return None
-    wrapped = f"SELECT ({sql}) AS _expr"
-    try:
-        parsed = pglast.parse_sql(wrapped)
-    except pglast.parser.ParseError:
+
+    def _warn_unparseable() -> None:
         # Compose a message that puts the policy ID first so it
         # grep-finds easily; fall back to the "no location" form
         # if the caller didn't pass one (e.g. a programmatic test
@@ -73,8 +71,24 @@ def parse_expr(
             f"pgrls: warning: {head}. {tail} Original SQL: {sql!r}",
             file=sys.stderr,
         )
+
+    wrapped = f"SELECT ({sql}) AS _expr"
+    try:
+        parsed = pglast.parse_sql(wrapped)
+    except pglast.parser.ParseError:
+        _warn_unparseable()
         return None
     select_stmt = parsed[0].stmt
+    # Unbalanced parens in the fragment can let it escape the
+    # `SELECT (...)` wrapper into a set operation (UNION/INTERSECT/
+    # EXCEPT) or another non-SELECT shape whose `targetList` is None —
+    # `targetList[0]` would then raise TypeError/IndexError. Treat any
+    # non-scalar-expression shape as unparseable (same warning + None as
+    # a ParseError) so callers' fallbacks engage (diff requires_review,
+    # AST rules skip the clause).
+    if not isinstance(select_stmt, SelectStmt) or not select_stmt.targetList:
+        _warn_unparseable()
+        return None
     target = select_stmt.targetList[0]
     return target.val
 
@@ -87,6 +101,36 @@ def top_level_disjuncts(node: Any) -> list[Any]:
     if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
         return list(node.args or ())
     return [node]
+
+
+def flatten_or_disjuncts(node: Any) -> list[Any]:
+    """Return every disjunct of a (possibly nested) OR expression.
+
+    Unlike `top_level_disjuncts`, this flattens nested OR `BoolExpr`
+    nodes: `A OR (B OR C)` yields `[A, B, C]`. OR is associative and
+    pglast preserves explicit parenthesization as a nested `BoolExpr`,
+    so the natural authoring order `<real check> OR (<other> OR
+    auth() IS NULL)` would otherwise hide the trailing disjunct from a
+    caller (e.g. SEC004) that only splits the outermost OR.
+
+    Recursion is into OR `BoolExpr` args ONLY. AND / NOT `BoolExpr`s
+    and `SubLink`s are returned as opaque single disjuncts — they are
+    not part of the same disjunction (an `IS NULL` under an `AND`, a
+    `NOT`, or inside a subquery is not a standalone OR-disjunct), so
+    the caller handles them atomically. A non-OR `node` yields
+    `[node]`, matching `top_level_disjuncts`.
+    """
+    if not (
+        isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR
+    ):
+        return [node]
+    disjuncts: list[Any] = []
+    for arg in node.args or ():
+        if isinstance(arg, BoolExpr) and arg.boolop == BoolExprType.OR_EXPR:
+            disjuncts.extend(flatten_or_disjuncts(arg))
+        else:
+            disjuncts.append(arg)
+    return disjuncts
 
 
 def extract_column_refs(

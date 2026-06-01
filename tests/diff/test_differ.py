@@ -60,6 +60,26 @@ def test_diff_two_empty_schemas_yields_no_changes() -> None:
     assert diff_schemas(Schema(tables=()), Schema(tables=())) == []
 
 
+def test_semantically_equivalent_policy_predicate_is_no_change() -> None:
+    # A policy whose USING predicate is rewritten to a logically
+    # equivalent but syntactically different form (De Morgan) must diff
+    # as NO change when the diff-z3 extra is installed: Z3 returns
+    # "semantic_equivalent", which _diff_policy_shapes must treat like
+    # "unchanged". Regression — "semantic_equivalent" was absent from
+    # the result->Change mapping tables, so diff_schemas raised
+    # KeyError('semantic_equivalent') on this valid input.
+    pytest.importorskip("z3")
+    base = Schema(
+        tables=(_t("t", rls=True, policies=(_p("p", using_sql="NOT (a AND b)"),)),)
+    )
+    head = Schema(
+        tables=(
+            _t("t", rls=True, policies=(_p("p", using_sql="(NOT a) OR (NOT b)"),)),
+        )
+    )
+    assert diff_schemas(base, head) == []
+
+
 def test_change_dataclass_is_frozen() -> None:
     c = Change(
         kind=ChangeKind.RLS_FLIPPED,

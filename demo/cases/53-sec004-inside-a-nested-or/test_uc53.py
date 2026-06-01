@@ -1,17 +1,16 @@
-"""Use case 53: SEC004 inside a nested OR — false-negative pin."""
+"""Use case 53: SEC004 inside a nested OR — now caught (FN fixed)."""
 from __future__ import annotations
 
 
-def test_uc53_sec004_silent_on_nested_or_documented_false_negative(
+def test_uc53_sec004_fires_on_nested_or(
     lint_output: str,
 ) -> None:
     # `flag = 'system' OR ((SELECT auth.uid()) IS NULL OR
-    # user_id = (SELECT auth.uid()))` — the auth IS NULL
-    # disjunct is buried inside a nested OR. SEC004 splits at
-    # the top level only (per top_level_disjuncts), so it
-    # does NOT fire here. This is a documented false negative;
-    # pin it so a future change to descend into nested ORs is
-    # deliberate (and probably noisier on real schemas).
-    assert "SEC004  app.nested_or_check" not in lint_output
-
-
+    # user_id = (SELECT auth.uid()))` — the `auth() IS NULL`
+    # disjunct is buried inside a parenthesized nested OR. OR is
+    # associative, so this is the same anonymous-access hole as
+    # the flat form `A OR B OR auth() IS NULL`. SEC004 now flattens
+    # nested OR disjuncts (ast_utils.flatten_or_disjuncts) before
+    # the IS NULL check, so it fires here — previously a documented
+    # false negative pinned by this case.
+    assert "SEC004  app.nested_or_check.nested_or\n" in lint_output

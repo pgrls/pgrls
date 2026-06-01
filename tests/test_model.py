@@ -2,7 +2,22 @@ from __future__ import annotations
 
 import pytest
 
-from pgrls.model import Policy, PolicyCommand, Schema, Snapshot, Table
+from pgrls.model import (
+    BypassRlsEscalation,
+    BypassRlsRole,
+    Column,
+    Grant,
+    Index,
+    LeakproofFunction,
+    Policy,
+    PolicyCommand,
+    Schema,
+    SecdefFunction,
+    Snapshot,
+    Table,
+    Trigger,
+    View,
+)
 
 
 def test_table_construction() -> None:
@@ -548,3 +563,146 @@ def test_view_dataclass_is_frozen() -> None:
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         v.name = "x"  # type: ignore[misc]
+
+
+def test_fully_populated_schema_roundtrip() -> None:
+    """Property: from_snapshot(to_snapshot(s)) == s for a Schema that
+    populates every field of every dataclass.
+
+    Guards the to_snapshot / from_snapshot field-list symmetry going
+    forward: if a field is added to a dataclass and wired into only one
+    of the two halves, this round-trip stops being an identity and the
+    test fails. AST fields on Policy are deliberately None here — they
+    are intentionally not serialized (callers re-parse on demand), so
+    None is the snapshot-able state that round-trips by equality.
+    """
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="parent",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(
+                    Policy(
+                        name="tenant_isolation",
+                        command="SELECT",
+                        permissive=False,
+                        roles=("app_user", "PUBLIC"),
+                        using_sql="tenant_id = current_setting('app.tid')::int",
+                        with_check_sql=None,
+                        using_ast=None,
+                        with_check_ast=None,
+                    ),
+                    Policy(
+                        name="insert_guard",
+                        command="INSERT",
+                        permissive=True,
+                        roles=("app_user",),
+                        using_sql=None,
+                        with_check_sql="tenant_id = current_setting('app.tid')::int",
+                        using_ast=None,
+                        with_check_ast=None,
+                    ),
+                ),
+                columns=("id", "tenant_id"),
+                partition_of=None,
+                grants=(
+                    Grant(role="app_user", privileges=("SELECT", "INSERT")),
+                    Grant(role="PUBLIC", privileges=("SELECT",)),
+                ),
+                column_details=(
+                    Column(name="id", data_type="integer", is_nullable=False),
+                    Column(
+                        name="tenant_id",
+                        data_type="integer",
+                        is_nullable=False,
+                    ),
+                ),
+                triggers=(
+                    Trigger(
+                        name="audit_trg",
+                        function_schema="audit",
+                        function_name="log_change",
+                        event="INSERT OR UPDATE",
+                        timing="AFTER",
+                        enabled=False,
+                    ),
+                ),
+                indexes=(
+                    Index(
+                        name="parent_tenant_idx",
+                        access_method="btree",
+                        # second position is an expression slot (empty
+                        # string) — exercises the positional-alignment
+                        # round-trip.
+                        columns=("tenant_id", ""),
+                        is_unique=True,
+                        is_partial=True,
+                        is_primary=False,
+                    ),
+                    Index(
+                        name="parent_pkey",
+                        access_method="btree",
+                        columns=("id",),
+                        is_unique=True,
+                        is_partial=False,
+                        is_primary=True,
+                    ),
+                ),
+            ),
+            Table(
+                schema="public",
+                name="child",
+                rls_enabled=False,
+                force_rls=False,
+                policies=(),
+                columns=("id",),
+                partition_of=("public", "parent"),
+                grants=(),
+                column_details=(
+                    Column(name="id", data_type="integer", is_nullable=True),
+                ),
+                triggers=(),
+                indexes=(),
+            ),
+        ),
+        views=(
+            View(
+                schema="public",
+                name="v_users",
+                is_materialized=True,
+                security_invoker=True,
+                security_barrier=True,
+                definition="SELECT id FROM public.parent",
+                references=(("public", "parent"), ("public", "child")),
+                security_definer_calls=("public.read_secret", "audit.who"),
+            ),
+        ),
+        security_definer_functions=(
+            SecdefFunction(
+                qualified_name="public.read_secret",
+                body="SELECT 1",
+                language="sql",
+                search_path="pg_catalog, public, pg_temp",
+                signature="integer, text",
+            ),
+        ),
+        bypassrls_roles=(
+            BypassRlsRole(name="admin", superuser=False, can_login=True),
+        ),
+        leakproof_functions=(
+            LeakproofFunction(
+                qualified_name="public.lp", signature="integer"
+            ),
+        ),
+        bypassrls_escalation_roles=(
+            BypassRlsEscalation(
+                member="app_user",
+                via=("admin", "ops"),
+                member_can_login=True,
+            ),
+        ),
+    )
+
+    assert Schema.from_snapshot(schema.to_snapshot()) == schema

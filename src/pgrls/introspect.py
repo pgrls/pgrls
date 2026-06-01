@@ -197,15 +197,16 @@ ORDER BY a.attrelid, a.attnum
 # special PUBLIC pseudo-role to the literal string "PUBLIC",
 # mirroring the convention already used for `Policy.roles`.
 #
-# Role-name resolution mirrors the `polroles` handling above: a
-# non-superuser pgrls run may not be able to SELECT from
-# `pg_authid` (RLS, missing permissions, race against `DROP
-# ROLE`), leaving `ar.rolname` NULL even when the grantee OID
-# exists. A NULL leaking into `Grant.role` violates the `str`
-# annotation and breaks downstream JSON serialization and
-# `sorted()` calls. COALESCE to a stable `oid:N` sentinel so the
-# type contract holds and the operator can still see what role
-# was referenced.
+# Role-name resolution mirrors the `polroles` handling above,
+# joining the world-readable `pg_roles` view — NOT `pg_authid`,
+# which a non-superuser cannot SELECT (a LEFT JOIN to it raises
+# `permission denied for table pg_authid` mid-introspection, not
+# a NULL row). `ar.rolname` can still be NULL (a race against
+# `DROP ROLE`, or a grantee OID with no matching row). A NULL
+# leaking into `Grant.role` violates the `str` annotation and
+# breaks downstream JSON serialization and `sorted()` calls.
+# COALESCE to a stable `oid:N` sentinel so the type contract
+# holds and the operator can still see what role was referenced.
 #
 # `c.relacl IS NOT NULL` short-circuits before the LATERAL: for
 # tables with the default ACL (no explicit GRANT), `aclexplode`
@@ -229,7 +230,7 @@ SELECT
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN LATERAL aclexplode(c.relacl) ax ON true
-LEFT JOIN pg_catalog.pg_authid ar ON ar.oid = ax.grantee
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
 WHERE c.relkind IN ('r', 'p')
   AND n.nspname = ANY(%s)
   AND c.relacl IS NOT NULL
@@ -243,17 +244,21 @@ SELECT
     c.relname AS view_name,
     c.relkind = 'm' AS is_materialized,
     -- pg_class.reloptions is text[] like {security_invoker=on, security_barrier=on}.
-    -- We accept both 'on' and 'true' since both are valid in PG syntax.
+    -- Parse the option VALUE as a Postgres boolean rather than matching two
+    -- literal spellings: PG accepts on/off, true/false, yes/no, 1/0, t/f, y/n
+    -- (case-insensitive) for boolean reloptions and may store the value as
+    -- typed, so a view created `WITH (security_invoker=1)` (or yes/t/y) must
+    -- still read as TRUE. split on the first '=' into name/value.
     COALESCE(
-        (SELECT TRUE
+        (SELECT lower(split_part(o.opt, '=', 2)) IN ('on', 'true', 'yes', '1', 't', 'y')
          FROM unnest(c.reloptions) AS o(opt)
-         WHERE o.opt = 'security_invoker=on' OR o.opt = 'security_invoker=true'),
+         WHERE split_part(o.opt, '=', 1) = 'security_invoker'),
         FALSE
     ) AS security_invoker,
     COALESCE(
-        (SELECT TRUE
+        (SELECT lower(split_part(o.opt, '=', 2)) IN ('on', 'true', 'yes', '1', 't', 'y')
          FROM unnest(c.reloptions) AS o(opt)
-         WHERE o.opt = 'security_barrier=on' OR o.opt = 'security_barrier=true'),
+         WHERE split_part(o.opt, '=', 1) = 'security_barrier'),
         FALSE
     ) AS security_barrier,
     pg_get_viewdef(c.oid, true) AS definition
@@ -806,6 +811,53 @@ def _build_secdef_calls_index(
     return out
 
 
+def _build_views(
+    cur: Any,
+    schemas: list[str],
+    secdef_functions: tuple[SecdefFunction, ...],
+) -> tuple[View, ...]:
+    """Build the `View` tuple for `schemas` from `pg_catalog`.
+
+    Depends only on the schema list (not the introspected table OIDs):
+    views are discovered by `_VIEWS_SQL`, their table references by
+    `_VIEW_DEPS_SQL`, and their SECDEF-call attribution by matching the
+    already-fetched `secdef_functions` against each view body. Shared by
+    both `introspect` return paths (the no-tables early return and the
+    main path) so the view-construction logic lives in one place.
+
+    `secdef_functions` is passed in rather than re-fetched so the caller
+    keeps a single `_fetch_secdef_functions` round trip per introspection
+    (the same tuple also populates `Schema.security_definer_functions`).
+    """
+    cur.execute(_VIEWS_SQL, (schemas,))
+    view_rows = cur.fetchall()
+    deps_index: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    cur.execute(_VIEW_DEPS_SQL, [list(schemas)])
+    for row in cur.fetchall():
+        key = (row["view_schema"], row["view_name"])
+        deps_index.setdefault(key, set()).add(
+            (row["ref_schema"], row["ref_name"])
+        )
+    secdef_index = _build_secdef_calls_index(secdef_functions, view_rows)
+    return tuple(
+        View(
+            schema=row["schema_name"],
+            name=row["view_name"],
+            is_materialized=row["is_materialized"],
+            security_invoker=row["security_invoker"],
+            security_barrier=row["security_barrier"],
+            definition=row["definition"],
+            references=tuple(sorted(
+                deps_index.get((row["schema_name"], row["view_name"]), set())
+            )),
+            security_definer_calls=secdef_index.get(
+                (row["schema_name"], row["view_name"]), ()
+            ),
+        )
+        for row in view_rows
+    )
+
+
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
 
@@ -848,42 +900,12 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         table_rows = cur.fetchall()
         if not table_rows:
             # No tables, but we still need to check for views.
-            cur.execute(_VIEWS_SQL, (schemas,))
-            view_rows_early = cur.fetchall()
-            deps_index_early: dict[tuple[str, str], set[tuple[str, str]]] = {}
-            cur.execute(_VIEW_DEPS_SQL, [list(schemas)])
-            for row in cur.fetchall():
-                key = (row["view_schema"], row["view_name"])
-                deps_index_early.setdefault(key, set()).add(
-                    (row["ref_schema"], row["ref_name"])
-                )
-            secdef_funcs_early = _fetch_secdef_functions(cur, schemas)
-            secdef_index_early = _build_secdef_calls_index(
-                secdef_funcs_early, view_rows_early
-            )
-            views_early = tuple(
-                View(
-                    schema=row["schema_name"],
-                    name=row["view_name"],
-                    is_materialized=row["is_materialized"],
-                    security_invoker=row["security_invoker"],
-                    security_barrier=row["security_barrier"],
-                    definition=row["definition"],
-                    references=tuple(sorted(
-                        deps_index_early.get(
-                            (row["schema_name"], row["view_name"]), set()
-                        )
-                    )),
-                    security_definer_calls=secdef_index_early.get(
-                        (row["schema_name"], row["view_name"]), ()
-                    ),
-                )
-                for row in view_rows_early
-            )
+            secdef_funcs = _fetch_secdef_functions(cur, schemas)
+            views = _build_views(cur, schemas, secdef_funcs)
             return Schema(
                 tables=(),
-                views=views_early,
-                security_definer_functions=secdef_funcs_early,
+                views=views,
+                security_definer_functions=secdef_funcs,
                 bypassrls_roles=bypassrls_roles,
                 leakproof_functions=leakproof_funcs,
                 bypassrls_escalation_roles=bypassrls_escalation,
@@ -909,17 +931,8 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 row["privilege_type"]
             )
 
-        cur.execute(_VIEWS_SQL, (schemas,))
-        view_rows = cur.fetchall()
-        deps_index: dict[tuple[str, str], set[tuple[str, str]]] = {}
-        cur.execute(_VIEW_DEPS_SQL, [list(schemas)])
-        for row in cur.fetchall():
-            key = (row["view_schema"], row["view_name"])
-            deps_index.setdefault(key, set()).add(
-                (row["ref_schema"], row["ref_name"])
-            )
         secdef_funcs = _fetch_secdef_functions(cur, schemas)
-        secdef_index = _build_secdef_calls_index(secdef_funcs, view_rows)
+        views = _build_views(cur, schemas, secdef_funcs)
 
     columns_by_oid: dict[int, list[str]] = defaultdict(list)
     column_details_by_oid: dict[int, list[Column]] = defaultdict(list)
@@ -1056,24 +1069,6 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         )
         for row in table_rows
     ]
-
-    views = tuple(
-        View(
-            schema=row["schema_name"],
-            name=row["view_name"],
-            is_materialized=row["is_materialized"],
-            security_invoker=row["security_invoker"],
-            security_barrier=row["security_barrier"],
-            definition=row["definition"],
-            references=tuple(sorted(
-                deps_index.get((row["schema_name"], row["view_name"]), set())
-            )),
-            security_definer_calls=secdef_index.get(
-                (row["schema_name"], row["view_name"]), ()
-            ),
-        )
-        for row in view_rows
-    )
 
     return Schema(
         tables=tuple(tables),

@@ -772,9 +772,9 @@ Out of scope (intentional):
 
 ## SEC015 — SECURITY DEFINER function exposed to pg_temp shadowing
 
-**Severity:** warning. **Auto-fix:** no (the `ALTER FUNCTION …
-SET search_path` rewrite needs the function's full argument
-signature, which introspection doesn't capture).
+**Severity:** warning. **Auto-fix:** yes (`pgrls fix` emits one
+`ALTER FUNCTION <schema>.<name>(<signature>) SET search_path = …`
+per flagged overload, pinning `pg_temp` as the last token).
 
 A `SECURITY DEFINER` function runs as its owner. When the body
 references a relation or data type — a table, view, sequence,
@@ -812,14 +812,27 @@ DEFINER functions: naming `pg_temp` last forces the temp schema
 to be searched last.
 
 The introspector decodes the function's `search_path` from
-`pg_proc.proconfig` (snapshot v8+). The fix is mechanical —
-append `pg_temp` to the function's `SET search_path` clause (or
-add the clause) — but `pgrls fix` doesn't apply it: the
-`ALTER FUNCTION name(argtypes) SET search_path = …` statement
-needs the function's argument types, and introspection captures
-`proname` without `proargtypes`. Run the `ALTER FUNCTION` by
-hand, or allowlist the function after confirming its body
-fully-qualifies every object reference (in which case
+`pg_proc.proconfig` (snapshot v8+). The fix is mechanical, and
+`pgrls fix` applies it: per flagged overload it emits
+`ALTER FUNCTION <schema>.<name>(<signature>) SET search_path = …`,
+rewriting the path so `pg_temp` is pinned last with exactly one
+occurrence. When the function already pins a path, the existing
+entries are preserved (case-intact) and any earlier `pg_temp`
+tokens are stripped so it ends up last; when no path is pinned at
+all, the fixer emits the minimal-but-safe default
+`SET search_path = pg_catalog, pg_temp` — strictly tighter than
+the caller's path, so a function whose body needs unqualified
+names from another schema needs the operator to insert that
+schema before `pg_temp` in the generated SQL (the Fix description
+prompts this). The fixer **abstains** in two cases: a pre-v12
+snapshot whose captured `signature` is empty (a bare
+`ALTER FUNCTION name()` would target the wrong overload — re-snapshot
+against v12+ to populate signatures), and a `search_path` whose raw
+GUC string contains both a quote and a comma (a possible quoted
+schema name with an internal comma that the naive comma-split
+tokenizer can't safely rewrite). Either way you can run the
+`ALTER FUNCTION` by hand, or allowlist the function after confirming
+its body fully-qualifies every object reference (in which case
 `search_path` is moot).
 
 The allowlist key is `schema.function` (two parts). Bare
@@ -955,10 +968,12 @@ Out of scope (intentional):
 
 ## SEC017 — Function with the LEAKPROOF attribute bypasses the RLS barrier
 
-**Severity:** warning. **Auto-fix:** no (whether the `LEAKPROOF`
-claim actually holds is a judgement about the function's runtime
-behaviour — error paths, timing — that needs human review; pgrls
-will not blindly emit `ALTER FUNCTION … NOT LEAKPROOF`).
+**Severity:** warning. **Auto-fix:** yes (`pgrls fix` emits
+`ALTER FUNCTION <schema>.<name>(<signature>) NOT LEAKPROOF` per
+flagged overload). The *other* remedy — proving the function is
+genuinely leakproof and keeping the marking — is human judgement
+about its runtime behaviour (error paths, timing) and stays
+out of scope; allowlist the function to take it.
 
 A function marked `LEAKPROOF` carries a promise to the query
 planner: it has **no side channels** — it will not reveal anything
@@ -991,10 +1006,17 @@ Marking a function `LEAKPROOF` requires superuser — it is always a
 deliberate act. SEC017 flags every function in the introspected
 schemas whose `pg_proc.proleakproof` is true (snapshot v10+), so
 each gets an explicit audit decision: confirm no error path and no
-timing channel can expose an argument, or remove the marking with
-`ALTER FUNCTION name(argtypes) NOT LEAKPROOF`. pgrls does not parse
-the body to prove leakproofness — that is the brittle analysis the
-rule deliberately avoids (the stance SEC014 takes on SECDEF
+timing channel can expose an argument, or remove the marking.
+`pgrls fix` automates the removal — it emits `ALTER FUNCTION
+<schema>.<name>(<signature>) NOT LEAKPROOF` for **each** flagged
+overload (one statement per overload, since a single `ALTER
+FUNCTION` reaches only one). It **abstains** on a pre-v12 snapshot
+whose captured `signature` is empty: a bare `ALTER FUNCTION name()
+NOT LEAKPROOF` would target the zero-argument overload, wrong for
+every function that has arguments — re-snapshot against a live
+v12+ database to populate signatures, then re-run. pgrls does not
+parse the body to prove leakproofness — that is the brittle analysis
+the rule deliberately avoids (the stance SEC014 takes on SECDEF
 bodies). Postgres's own built-in leakproof functions live in
 `pg_catalog`, outside the linted schemas, so they never surface
 here.
@@ -1881,9 +1903,21 @@ nullable discriminator is intentional — a public-or-tenant table
 whose public rows legitimately have a `NULL` tenant, say — by table
 name (bare or `schema.table`) in `[lint.rules.SEC030].allowlist`.
 
-**No auto-fix** — `SET NOT NULL` fails on a column that already holds
-`NULL`s, so the remedy needs a backfill and a population strategy
-pgrls can't author.
+**Auto-fix.** `pgrls fix` emits `ALTER TABLE <schema>.<table> ALTER
+COLUMN <column> SET NOT NULL` — one statement per flagged column.
+**Caveat:** the ALTER scans the column and fails with `ERROR: column
+contains null values` if any row is already `NULL`. Because `pgrls
+fix --apply` runs every emitted Fix in a single all-or-nothing
+transaction, that failure rolls back the **entire batch** (every
+SEC001 / SEC002 / etc. Fix alongside is undone). pgrls cannot infer
+the right tenant-id / sentinel to backfill with, so the Fix
+description prompts you to backfill existing `NULL`s first (an
+`UPDATE … SET <column> = <value> WHERE <column> IS NULL`), or to use
+`pgrls fix --output FILE` to materialize the SQL and run the backfill
+and the ALTER separately. The complementary remedy — a `DEFAULT` or
+trigger so the column stays populated — is operator-specific and not
+auto-emitted; allowlist the table if the `NULL`s are an intentional
+sentinel.
 
 <a id="rule-sec031"></a>
 
@@ -1981,9 +2015,18 @@ owner access must also be governed), or dropping the policies if RLS
 was never intended. Allowlist by table name (bare or `schema.table`)
 when an RLS-off-with-policies table is deliberate.
 
-**No auto-fix** — enabling RLS on a live table is an operational
-decision (it immediately changes who sees what), not a mechanical
-edit pgrls should make unprompted.
+**Auto-fix.** `pgrls fix` emits `ALTER TABLE <schema>.<table> ENABLE
+ROW LEVEL SECURITY` for each flagged table — the same DDL SEC001's
+fixer emits, the difference being that SEC032's tables already carry
+policies, so enabling RLS activates them immediately (the Fix
+description notes the policies go live and to re-`lint` afterward).
+`FORCE` is **not** toggled — governing owner access is a separate
+intent that SEC002's fixer carries (run `pgrls fix --rule SEC002`
+next if owner access must also be governed). The fixer mirrors the
+rule's scoping: a partition child whose ancestor chain already has
+RLS enabled is skipped (it's covered for parent-routed queries
+upstream). The other remedy — dropping the policies if RLS was never
+intended — needs human intent and is not auto-emitted.
 
 <a id="rule-sec033"></a>
 

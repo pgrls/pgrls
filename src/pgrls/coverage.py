@@ -37,6 +37,7 @@ from pgrls._render_common import (
     render_text_table,
 )
 from pgrls.ast_utils import statement_command
+from pgrls.formatters._common import safe_location
 from pgrls.model import Policy, Schema, Table
 
 _COVERAGE_CSS = """    tr:nth-child(even) td { background: #0d1117; }
@@ -394,9 +395,17 @@ def render_text(report: CoverageReport) -> str:
         return "No policies found in the scanned schemas."
     rows = [
         (
-            p.location,
+            # `safe_location` keeps the row single-line and the
+            # fixed-width columns aligned: a quoted Postgres
+            # identifier (location) or role name can legally carry
+            # `\n` / `\t` / zero-width chars, which would otherwise
+            # split the row. Each role is sanitized before the join
+            # so a newline inside one role can't break the cell.
+            # No-op on clean identifiers; mirrors the lint/diff text
+            # formatters.
+            safe_location(p.location),
             p.command,
-            ",".join(p.roles),
+            ",".join(safe_location(r) for r in p.roles),
             "yes" if p.covered else "no",
         )
         for p in report.policies
@@ -428,16 +437,28 @@ def render_json(report: CoverageReport) -> str:
 
 
 def render_markdown(report: CoverageReport) -> str:
+    # `safe_location` neutralizes newlines / zero-width chars; the
+    # manual `|` -> `\|` escape stops a pipe inside a quoted Postgres
+    # identifier or role name from splitting the cell. Each role is
+    # sanitized before the join. All no-ops on well-formed input, so
+    # existing output is unchanged. Mirrors the lint/diff markdown
+    # cell sanitization.
+    body_rows = []
+    for p in report.policies:
+        location = safe_location(p.location).replace("|", "\\|")
+        roles = ",".join(
+            safe_location(r).replace("|", "\\|") for r in p.roles
+        )
+        body_rows.append(
+            f"| {location} | {p.command} | {roles} | "
+            f"{'yes' if p.covered else 'no'} |"
+        )
     return markdown_table(
         heading="# RLS test coverage",
         summary=_summary_line(report),
         header_row="| Policy | Command | Roles | Covered |",
         separator_row="|---|---|---|---|",
-        body_rows=[
-            f"| {p.location} | {p.command} | {','.join(p.roles)} | "
-            f"{'yes' if p.covered else 'no'} |"
-            for p in report.policies
-        ],
+        body_rows=body_rows,
     )
 
 

@@ -200,7 +200,7 @@ func (d *dbDriver) acquireLocked(ctx context.Context) (*sql.Conn, error) {
 // same — there's no command-tag reading API in database/sql.
 func queryWith(ctx context.Context, q connQueryer, sqlText string, params ...any) (pgrlstest.QueryResult, error) {
 	first := firstWord(sqlText)
-	if first == "SELECT" || first == "WITH" || first == "VALUES" || first == "SHOW" || first == "EXPLAIN" || hasReturning(sqlText) {
+	if first == "SELECT" || first == "WITH" || first == "VALUES" || first == "SHOW" || first == "EXPLAIN" || first == "TABLE" || hasReturning(sqlText) {
 		return queryReturningRows(ctx, q, sqlText, params...)
 	}
 	return execWithoutRows(ctx, q, sqlText, params...)
@@ -246,7 +246,7 @@ func queryReturningRows(ctx context.Context, q connQueryer, sqlText string, para
 	// the DML verb (UPDATE / DELETE / INSERT), not "SELECT".
 	return pgrlstest.QueryResult{
 		Rows:     out,
-		Command:  firstWord(sqlText),
+		Command:  mainCommand(sqlText),
 		RowCount: int64(len(out)),
 	}, nil
 }
@@ -266,7 +266,7 @@ func execWithoutRows(ctx context.Context, q connQueryer, sqlText string, params 
 	count, _ := res.RowsAffected()
 	return pgrlstest.QueryResult{
 		Rows:     nil,
-		Command:  firstWord(sqlText),
+		Command:  mainCommand(sqlText),
 		RowCount: count,
 	}, nil
 }
@@ -297,8 +297,37 @@ func isInsufficientPrivilege(err error) bool {
 	return string(pqErr.Code) == "42501"
 }
 
+// stripLeadingNoise removes leading whitespace, SQL line (`-- …`) and
+// block (`/* … */`) comments, and wrapping `(` so the first keyword of
+// e.g. `(SELECT …) UNION …`, `/* c */ SELECT …`, or `-- c\nSELECT …`
+// is recognised for Query-vs-Exec routing. Repeats until a real token
+// leads.
+func stripLeadingNoise(s string) string {
+	for {
+		t := strings.TrimSpace(s)
+		switch {
+		case strings.HasPrefix(t, "--"):
+			i := strings.IndexAny(t, "\r\n")
+			if i < 0 {
+				return ""
+			}
+			s = t[i:]
+		case strings.HasPrefix(t, "/*"):
+			i := strings.Index(t, "*/")
+			if i < 0 {
+				return ""
+			}
+			s = t[i+2:]
+		case strings.HasPrefix(t, "("):
+			s = t[1:]
+		default:
+			return t
+		}
+	}
+}
+
 func firstWord(s string) string {
-	s = strings.TrimSpace(s)
+	s = stripLeadingNoise(s)
 	if s == "" {
 		return ""
 	}
@@ -306,6 +335,64 @@ func firstWord(s string) string {
 		return strings.ToUpper(s[:i])
 	}
 	return strings.ToUpper(s)
+}
+
+// mainCommand returns the upper-case top-level statement verb, looking
+// past a leading WITH (CTE) clause so `WITH … UPDATE … RETURNING`
+// reports "UPDATE" (not "WITH") and AssertSilentlyDropped classifies
+// CTE-wrapped DML by its real verb. For non-WITH statements it equals
+// firstWord. CTE bodies live inside parens, so the verb is the first
+// command keyword at parenthesis depth 0 after the CTE list;
+// single-quoted literals are skipped so a `)` inside a literal doesn't
+// unbalance the scan. Not a full parser — a statement whose CTE bodies
+// use dollar-quoting or comments with unbalanced parens falls back to
+// "WITH" (the previous behaviour).
+func mainCommand(s string) string {
+	if first := firstWord(s); first != "WITH" {
+		return first
+	}
+	s = stripLeadingNoise(s)
+	depth := 0
+	for i := 0; i < len(s); {
+		switch c := s[i]; c {
+		case '(':
+			depth++
+			i++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+		case '\'':
+			i++
+			for i < len(s) {
+				if s[i] == '\'' {
+					if i+1 < len(s) && s[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		default:
+			if depth == 0 && isIdentChar(c) {
+				j := i
+				for j < len(s) && isIdentChar(s[j]) {
+					j++
+				}
+				switch strings.ToUpper(s[i:j]) {
+				case "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE":
+					return strings.ToUpper(s[i:j])
+				}
+				i = j
+			} else {
+				i++
+			}
+		}
+	}
+	return "WITH"
 }
 
 func hasReturning(sqlText string) bool {

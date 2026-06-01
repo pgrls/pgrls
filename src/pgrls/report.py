@@ -46,6 +46,7 @@ from pgrls._render_common import (
     pluralize,
     render_text_table,
 )
+from pgrls.formatters._common import safe_location
 from pgrls.model import Schema
 
 _REPORT_CSS = """    tr:nth-child(even) td { background: #0d1117; }
@@ -202,7 +203,13 @@ def render_text(report: Report) -> str:
         return "No tables found in the scanned schemas."
     rows = [
         (
-            t.qualified_name,
+            # `safe_location` keeps the row single-line: a Postgres
+            # identifier may legally carry `\n` / `\t` / zero-width
+            # chars inside a quoted name, which would otherwise split
+            # the row and destroy the fixed-width column alignment.
+            # No-op on clean identifiers. Mirrors the lint/diff text
+            # formatters.
+            safe_location(t.qualified_name),
             t.status,
             "yes" if t.rls_enabled else "no",
             "yes" if t.force_rls else "no",
@@ -239,17 +246,27 @@ def render_json(report: Report) -> str:
 
 def render_markdown(report: Report) -> str:
     """Markdown table + summary, paste-ready for an audit doc / PR."""
+    # `safe_location` neutralizes newlines / zero-width chars (a raw
+    # `\n` would end the GFM row early); the manual `|` -> `\|` escape
+    # keeps a pipe inside a quoted Postgres identifier from splitting
+    # the cell. Both are no-ops on a well-formed `schema.table`, so
+    # existing snapshots are unchanged. Mirrors the lint/diff markdown
+    # cell-sanitization (kept bare rather than backtick-wrapped to
+    # preserve this table's established plain-text column).
+    body_rows = []
+    for t in report.tables:
+        name = safe_location(t.qualified_name).replace("|", "\\|")
+        body_rows.append(
+            f"| {name} | {t.status} | "
+            f"{'yes' if t.rls_enabled else 'no'} | "
+            f"{'yes' if t.force_rls else 'no'} | {t.policy_count} |"
+        )
     return markdown_table(
         heading="# RLS posture",
         summary=_summary_line(report),
         header_row="| Table | Status | RLS | FORCE | Policies |",
         separator_row="|---|---|---|---|---|",
-        body_rows=[
-            f"| {t.qualified_name} | {t.status} | "
-            f"{'yes' if t.rls_enabled else 'no'} | "
-            f"{'yes' if t.force_rls else 'no'} | {t.policy_count} |"
-            for t in report.tables
-        ],
+        body_rows=body_rows,
     )
 
 
