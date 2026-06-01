@@ -29,10 +29,40 @@ from typing import Any, Iterable
 import pglast
 from pglast.ast import Node, RangeVar
 
-from pgrls._html_common import resolve_generated_at, to_iso_z
+from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
+from pgrls._render_common import (
+    make_dispatcher,
+    markdown_table,
+    pluralize,
+    render_text_table,
+)
 from pgrls.ast_utils import statement_command
 from pgrls.formatters._common import safe_location
 from pgrls.model import Policy, Schema, Table
+
+_COVERAGE_CSS = """    tr:nth-child(even) td { background: #0d1117; }
+    tr:nth-child(odd) td { background: #161b22; }
+    code { background: #161b22; }
+  }
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem 0; }
+  .meta { color: #57606a; font-size: .85rem; }
+  .summary { margin: 1rem 0 .5rem; }
+  .pill { display: inline-block; padding: .15rem .55rem;
+           border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }
+  .status-covered   { color: #1a7f37; }
+  .status-uncovered { color: #cf222e; }
+  table { width: 100%; border-collapse: collapse;
+           border: 1px solid #d0d7de; }
+  thead th { text-align: left; padding: .5rem .75rem;
+              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
+              font-weight: 600; }
+  tbody td { padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num { font-variant-numeric: tabular-nums; }
+  code { background: #f6f8fa; padding: .1rem .35rem;
+          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }"""
 
 ARTIFACT_VERSION = 1
 DEFAULT_ARTIFACT_PATH = ".pgrls-coverage.json"
@@ -353,7 +383,7 @@ def build_coverage(schema: Schema, data: CoverageData) -> CoverageReport:
 def _summary_line(report: CoverageReport) -> str:
     s = report.summary
     n = s["policies"]
-    noun = "policy" if n == 1 else "policies"
+    noun = pluralize(int(n), "policy", "policies")
     return (
         f"{n} {noun}: {s['covered']} covered, "
         f"{s['uncovered']} uncovered ({s['coverage_pct']}%)."
@@ -381,14 +411,7 @@ def render_text(report: CoverageReport) -> str:
         for p in report.policies
     ]
     headers = ("POLICY", "COMMAND", "ROLES", "COVERED")
-    widths = [
-        max(len(headers[i]), max(len(r[i]) for r in rows))
-        for i in range(len(headers))
-    ]
-    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    out = [line]
-    for r in rows:
-        out.append("  ".join(r[i].ljust(widths[i]) for i in range(len(r))))
+    out = render_text_table(headers, rows)
     out.append("")
     out.append(_summary_line(report))
     return "\n".join(out)
@@ -414,31 +437,29 @@ def render_json(report: CoverageReport) -> str:
 
 
 def render_markdown(report: CoverageReport) -> str:
-    out = [
-        "# RLS test coverage",
-        "",
-        _summary_line(report),
-        "",
-        "| Policy | Command | Roles | Covered |",
-        "|---|---|---|---|",
-    ]
+    # `safe_location` neutralizes newlines / zero-width chars; the
+    # manual `|` -> `\|` escape stops a pipe inside a quoted Postgres
+    # identifier or role name from splitting the cell. Each role is
+    # sanitized before the join. All no-ops on well-formed input, so
+    # existing output is unchanged. Mirrors the lint/diff markdown
+    # cell sanitization.
+    body_rows = []
     for p in report.policies:
-        # `safe_location` neutralizes newlines / zero-width chars (a
-        # raw `\n` ends the GFM row early); the manual `|` -> `\|`
-        # escape stops a pipe inside a quoted Postgres identifier or
-        # role name from splitting the cell. Each role is sanitized
-        # before the join. All no-ops on well-formed input, so
-        # existing output is unchanged. Mirrors the lint/diff
-        # markdown cell sanitization.
         location = safe_location(p.location).replace("|", "\\|")
         roles = ",".join(
             safe_location(r).replace("|", "\\|") for r in p.roles
         )
-        out.append(
+        body_rows.append(
             f"| {location} | {p.command} | {roles} | "
             f"{'yes' if p.covered else 'no'} |"
         )
-    return "\n".join(out) + "\n"
+    return markdown_table(
+        heading="# RLS test coverage",
+        summary=_summary_line(report),
+        header_row="| Policy | Command | Roles | Covered |",
+        separator_row="|---|---|---|---|",
+        body_rows=body_rows,
+    )
 
 
 def render_html(
@@ -480,57 +501,9 @@ def render_html(
         rows_html = "\n".join(row_lines)
 
     total = s["policies"]
-    noun = "policy" if total == 1 else "policies"
+    noun = pluralize(int(total), "policy", "policies")
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>pgrls RLS test coverage</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
-         Roboto, "Helvetica Neue", Arial, sans-serif;
-         margin: 2rem auto; max-width: 64rem; padding: 0 1rem;
-         color: #1f2328; background: #ffffff; }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e6edf3; background: #0d1117; }}
-    table {{ border-color: #30363d; }}
-    th {{ background: #161b22; }}
-    tr:nth-child(even) td {{ background: #0d1117; }}
-    tr:nth-child(odd) td {{ background: #161b22; }}
-    code {{ background: #161b22; }}
-  }}
-  header {{ margin-bottom: 1.5rem; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem 0; }}
-  .meta {{ color: #57606a; font-size: .85rem; }}
-  .summary {{ margin: 1rem 0 .5rem; }}
-  .pill {{ display: inline-block; padding: .15rem .55rem;
-           border-radius: 999px; font-size: .85rem;
-           border: 1px solid currentColor; }}
-  .status-covered   {{ color: #1a7f37; }}
-  .status-uncovered {{ color: #cf222e; }}
-  table {{ width: 100%; border-collapse: collapse;
-           border: 1px solid #d0d7de; }}
-  thead th {{ text-align: left; padding: .5rem .75rem;
-              background: #f6f8fa; border-bottom: 1px solid #d0d7de;
-              font-weight: 600; }}
-  tbody td {{ padding: .5rem .75rem; border-bottom: 1px solid #d0d7de; }}
-  tbody tr:last-child td {{ border-bottom: 0; }}
-  td.num {{ font-variant-numeric: tabular-nums; }}
-  code {{ background: #f6f8fa; padding: .1rem .35rem;
-          border-radius: 4px; font: .9em ui-monospace, Menlo, monospace; }}
-  .empty {{ text-align: center; color: #57606a; padding: 1.5rem; }}
-  footer {{ margin-top: 2rem; color: #57606a; font-size: .8rem; }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>RLS test coverage</h1>
-    <p class="meta">Generated by <code>pgrls coverage --format html</code> · {html.escape(now)}</p>
-    <p class="summary"><strong>{s['covered']}</strong> of <strong>{total}</strong> {noun} covered ({s['coverage_pct']}%).</p>
-  </header>
-  <table>
+    body = f"""  <table>
     <thead>
       <tr>
         <th>Policy</th>
@@ -542,21 +515,25 @@ def render_html(
     <tbody>
 {rows_html}
     </tbody>
-  </table>
-  <footer>pgrls — Postgres Row-Level Security linter · <a href="https://github.com/pgrls/pgrls">github.com/pgrls/pgrls</a></footer>
-</body>
-</html>
-"""
+  </table>"""
+
+    return html_page(
+        title="pgrls RLS test coverage",
+        heading="RLS test coverage",
+        command="pgrls coverage --format html",
+        generated_at_iso=html.escape(now),
+        extra_css=_COVERAGE_CSS,
+        header_extra=(
+            f'    <p class="summary"><strong>{s["covered"]}</strong> of '
+            f"<strong>{total}</strong> {noun} covered ({s['coverage_pct']}%).</p>"
+        ),
+        body=body,
+    )
 
 
-_RENDERERS = {
+render, COVERAGE_FORMATS = make_dispatcher({
     "text": render_text,
     "json": render_json,
     "markdown": render_markdown,
     "html": render_html,
-}
-COVERAGE_FORMATS = tuple(_RENDERERS)
-
-
-def render(report: CoverageReport, output_format: str) -> str:
-    return _RENDERERS[output_format](report)
+})
