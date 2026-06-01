@@ -177,3 +177,43 @@ def test_sec004_default_set_covers_auth_role() -> None:
         _policy_with_using("auth.role() IS NULL OR user_id = '1'")
     )
     assert len(SEC004().check(schema, {})) == 1
+
+
+def test_sec004_fires_on_nested_right_or_disjunct() -> None:
+    # The natural authoring order — real checks first, anonymous escape
+    # parenthesized last — must still be flagged. pglast preserves the
+    # explicit parens as a nested OR BoolExpr; flatten_or_disjuncts
+    # recurses through it so the trailing `auth.uid() IS NULL` is seen.
+    # Truth-value-identical to the flat form, which was already caught.
+    schema = _wrap(
+        _policy_with_using(
+            "is_admin = true OR (owner_id = auth.uid() OR auth.uid() IS NULL)"
+        )
+    )
+    violations = SEC004().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.p"
+
+
+def test_sec004_fires_on_deeply_nested_or_disjunct() -> None:
+    # Recursion must reach an IS NULL nested several OR-levels deep.
+    schema = _wrap(
+        _policy_with_using(
+            "a = 1 OR (b = 2 OR (c = 3 OR auth.uid() IS NULL))"
+        )
+    )
+    assert len(SEC004().check(schema, {})) == 1
+
+
+def test_sec004_does_not_fire_on_is_null_gated_by_nested_and() -> None:
+    # An IS NULL under an AND is NOT a standalone anonymous-access hole:
+    # the AND still requires `b = 2`, so an anonymous connection (auth
+    # NULL) does not automatically satisfy the policy. flatten_or_disjuncts
+    # must NOT flatten through AND, so the AND is one opaque disjunct and
+    # match_is_null returns None for it.
+    schema = _wrap(
+        _policy_with_using(
+            "a = 1 OR (b = 2 AND auth.uid() IS NULL)"
+        )
+    )
+    assert SEC004().check(schema, {}) == []
