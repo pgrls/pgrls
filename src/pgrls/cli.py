@@ -22,7 +22,8 @@ import inspect
 import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,24 +125,87 @@ def main() -> None:
     """Framework-agnostic linter and testing toolkit for Postgres Row-Level Security."""
 
 
+# ---------------------------------------------------------------------------
+# Shared option decorators
+# ---------------------------------------------------------------------------
+#
+# The `--database-url` / `--config` / `--schemas` trio is identical across
+# every command that connects to a live database, and the `--output` /
+# `--format` pair recurs on the report-style commands. Declaring them once
+# here (and stacking them onto each command) keeps the option metadata —
+# names, envvars, defaults, types, and help — in lockstep across commands;
+# previously the help strings had drifted ("schemas to lint" vs "to scan"
+# vs "to report on"). The canonical `--schemas` help is the generic
+# "scan" wording. Commands whose option genuinely differs (e.g. `diff`'s
+# URL-source `--schemas`, `explain`'s catalog-only `--config`) keep their
+# own bespoke declarations rather than forcing a mismatched shared one.
+
+
+def common_db_options(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Stack the shared `--database-url` / `--config` / `--schemas` options.
+
+    Applied (in this order) so the rendered `--help` lists database-url,
+    then config, then schemas — matching the long-standing layout of
+    every connect-to-Postgres command. Decorators apply bottom-up, so the
+    options are declared here in reverse of the displayed order.
+    """
+    func = click.option(
+        "--schemas",
+        default=None,
+        help="Comma-separated schemas to scan (overrides config).",
+    )(func)
+    func = click.option(
+        "--config",
+        "config_path",
+        type=click.Path(exists=True, dir_okay=False),
+        default=None,
+        help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+    )(func)
+    func = click.option(
+        "--database-url",
+        envvar="DATABASE_URL",
+        help="Postgres connection string. Falls back to $DATABASE_URL.",
+    )(func)
+    return func
+
+
+def output_format_options(
+    formats: list[str], *, output_help: str
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Stack the shared `--output` / `--format` pair (output shown first).
+
+    `formats` is the `--format` choice list (each command supports a
+    different set); `output_help` is the per-command help for `--output`
+    (the destination wording differs — "report" vs "trend report" etc.).
+    Everything else — option names, the `-o` short flag, types, defaults,
+    `--format`'s "Output format." help and `text` default — is identical,
+    so it lives here.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        func = click.option(
+            "--format",
+            "output_format",
+            type=click.Choice(formats, case_sensitive=False),
+            default="text",
+            show_default=True,
+            help="Output format.",
+        )(func)
+        func = click.option(
+            "--output",
+            "-o",
+            "output_path",
+            type=click.Path(dir_okay=False),
+            default=None,
+            help=output_help,
+        )(func)
+        return func
+
+    return decorator
+
+
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to lint (overrides config).",
-)
+@common_db_options
 @click.option(
     "--rule",
     "rules",
@@ -290,15 +354,7 @@ def lint(
 
     # Validate `--rule` early — a typo silently producing zero
     # findings is hard to debug. Mirrors `pgrls fix --rule`.
-    if rules:
-        normalized_rules = {r.upper() for r in rules}
-        unknown = sorted(normalized_rules - known)
-        if unknown:
-            raise ToolError(
-                f"unknown rule(s): {', '.join(unknown)}. "
-                f"Available: {', '.join(sorted(known))}."
-            )
-        rules = tuple(sorted(normalized_rules))
+    rules = _validate_rule_filter(rules, known, kind="")
 
     # `--exclude-rule` — same typo validation, plus a contradiction
     # check against --rule (naming a rule in both is incoherent).
@@ -463,6 +519,19 @@ def lint(
         sys.exit(1)
 
 
+def _parse_schemas_csv(raw: str) -> list[str]:
+    """Split a `--schemas` CSV into a clean, de-whitespaced list.
+
+    The single source of truth for parsing the `--schemas` value:
+    splits on commas, trims each entry, and drops empties (so a
+    trailing comma or a whitespace-only entry is ignored). Callers
+    decide what to do with an empty result — `_merge_overrides` and
+    `diff` raise slightly different errors — so the emptiness check is
+    intentionally left to them and not done here.
+    """
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def _merge_overrides(
     config: Config,
     *,
@@ -471,7 +540,7 @@ def _merge_overrides(
     fail_on: str | None,
 ) -> Config:
     if schemas_csv:
-        schemas = [s.strip() for s in schemas_csv.split(",") if s.strip()]
+        schemas = _parse_schemas_csv(schemas_csv)
         if not schemas:
             raise ToolError(
                 f"--schemas {schemas_csv!r} produced an empty schema list. "
@@ -495,6 +564,160 @@ def _merge_overrides(
         severity_overrides=dict(config.severity_overrides),
         diff_fail_on=config.diff_fail_on,
     )
+
+
+def _load_effective_config(
+    *,
+    config_path: str | None,
+    database_url: str | None,
+    schemas_csv: str | None,
+    fail_on: str | None = None,
+) -> Config:
+    """Load the config file, merge CLI overrides, and guard the DB URL.
+
+    The first half of nearly every connect-to-Postgres command:
+    `load_config` (wrapping `ConfigError` as a `ToolError`), then
+    `_merge_overrides`, then the "no database connection" guard. Returns
+    the effective `Config` (with a non-None `database_url`). Kept
+    separate from `_connect_and_introspect` so the two callers that hold
+    the connection open afterward (`fix`, `generate`) can reuse the same
+    preamble via `_connect_introspect_ctx`.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    effective = _merge_overrides(
+        config,
+        database_url=database_url,
+        schemas_csv=schemas_csv,
+        fail_on=fail_on,
+    )
+
+    if effective.database_url is None:
+        raise ToolError(
+            "No database connection: pass --database-url or set DATABASE_URL."
+        )
+    return effective
+
+
+def _connect_and_introspect(
+    *,
+    config_path: str | None,
+    database_url: str | None,
+    schemas_csv: str | None,
+    fail_on: str | None = None,
+) -> tuple[Config, Schema]:
+    """Resolve the effective config, connect, and introspect — read-only.
+
+    The full preamble for commands that only need the introspected
+    schema (lint, snapshot, report, coverage, perf): load + merge +
+    guard via `_load_effective_config`, then open a short-lived psycopg
+    connection and introspect. The connection is closed before
+    returning. psycopg / value errors are rewrapped as `ToolError`
+    with the same messages the call sites used inline. Returns
+    `(effective_config, schema)`.
+    """
+    effective = _load_effective_config(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas_csv,
+        fail_on=fail_on,
+    )
+    assert effective.database_url is not None  # guaranteed above
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    return effective, schema
+
+
+@contextmanager
+def _connect_introspect_ctx(
+    *,
+    config_path: str | None,
+    database_url: str | None,
+    schemas_csv: str | None,
+    fail_on: str | None = None,
+) -> Iterator[tuple[Config, psycopg.Connection[Any], Schema]]:
+    """Like `_connect_and_introspect`, but keeps the connection open.
+
+    For `fix` / `generate`, which introspect, generate SQL, and then
+    (under `--apply`) execute that SQL on the *same* connection. Yields
+    `(effective_config, conn, schema)` inside the `psycopg.connect`
+    context manager, so the connection's commit-on-success /
+    rollback-on-exception semantics still apply. The psycopg / value
+    error rewrapping matches the read-only variant; errors raised by the
+    caller's `with` body (e.g. a fixer's `TypeError`, or a `ToolError`)
+    propagate unchanged.
+    """
+    effective = _load_effective_config(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas_csv,
+        fail_on=fail_on,
+    )
+    assert effective.database_url is not None  # guaranteed above
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+            yield effective, conn, schema
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _emit(rendered: str, output_path: str | None) -> None:
+    r"""Write a rendered report to `--output` or stdout, byte-identically.
+
+    Ensures a single trailing newline, then either writes the text to
+    `output_path` (with `newline=""` so the formatter's `\n` is not
+    translated to `\r\n` on Windows — the file must match what stdout
+    would have received) or echoes it with `click.echo(nl=False)`. An
+    `OSError` on write becomes a `ToolError("Cannot write {path}: …")`.
+    Shared by report / coverage / perf / history.
+    """
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    if output_path is not None:
+        try:
+            Path(output_path).write_text(
+                rendered, encoding="utf-8", newline=""
+            )
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
+    else:
+        click.echo(rendered, nl=False)
+
+
+def _validate_rule_filter(
+    rules: tuple[str, ...], known: set[str], *, kind: str
+) -> tuple[str, ...]:
+    """Validate and normalize a `--rule` filter against the known ids.
+
+    Upper-cases the requested ids, rejects any not in `known` with the
+    shared "unknown {kind}rule(s): … Available: …" message (a typo that
+    silently produced zero findings/fixes is hard to debug), and returns
+    the sorted, normalized tuple. `kind` distinguishes the two callers'
+    wording: `""` for `pgrls lint` ("unknown rule(s)") and
+    `"auto-fixable "` for `pgrls fix` ("unknown auto-fixable rule(s)").
+    Returns the input unchanged when `rules` is empty.
+    """
+    if not rules:
+        return rules
+    normalized = {r.upper() for r in rules}
+    unknown = sorted(normalized - known)
+    if unknown:
+        raise ToolError(
+            f"unknown {kind}rule(s): {', '.join(unknown)}. "
+            f"Available: {', '.join(sorted(known))}."
+        )
+    return tuple(sorted(normalized))
 
 
 def _rule_docstring(rule: Rule) -> str:
@@ -748,24 +971,129 @@ def _fix_apply_failure_message(
     )
 
 
+def _apply_statements(
+    conn: psycopg.Connection[Any],
+    stmts: list[Any],  # Fix dataclasses; loose-typed to avoid circular import
+    *,
+    lock_key: str,
+) -> None:
+    """Apply generated SQL statements all-or-nothing on `conn`.
+
+    Takes a transaction-scoped advisory lock keyed on a stable hash of
+    `lock_key` (so two concurrent `pgrls fix`/`generate --apply` runs
+    serialize rather than racing on a stale snapshot), then executes each
+    statement in order. On the first failure the connection is rolled
+    back and a `ToolError` carrying `_fix_apply_failure_message` is
+    raised; on success the transaction is committed. Callers print their
+    own success echo afterward.
+
+    `lock_key` is a fixed internal constant (`pgrls.fix` /
+    `pgrls.generate`), so it is embedded directly as a SQL string
+    literal — keeping the executed statement byte-identical to the
+    pre-refactor inline form.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT pg_advisory_xact_lock(hashtext('{lock_key}'))"
+        )
+        for i, f in enumerate(stmts, start=1):
+            try:
+                cur.execute(f.sql)
+            except psycopg.Error as exc:
+                # All-or-nothing: surface the failing SQL, the psycopg
+                # error, and a remediation hint, then roll back so the
+                # database is left unchanged.
+                conn.rollback()
+                raise ToolError(
+                    _fix_apply_failure_message(i, len(stmts), f, exc)
+                ) from exc
+    conn.commit()
+
+
+def _plural_fixes(n: int) -> str:
+    """`fix` / `fixes` agreement used throughout the `pgrls fix` output."""
+    return "fix" if n == 1 else "fixes"
+
+
+def _fix_check(fixes: list[Any]) -> None:
+    """`pgrls fix --check`: list offending pairs, then exit 1.
+
+    The summary count and next-step hint go to stderr; the
+    `(rule_id, location)` listing goes to stdout so
+    `pgrls fix --check > violations.log` captures it for CI. Always
+    exits 1 (the caller only reaches here with a non-empty `fixes`).
+    """
+    count = len(fixes)
+    plural = "" if count == 1 else "s"
+    click.echo(
+        f"pgrls fix --check: {count} auto-fixable "
+        f"violation{plural} found.",
+        err=True,
+    )
+    for f in fixes:
+        click.echo(f"  {f.rule_id}  {f.location}")
+    click.echo(
+        "Run `pgrls fix --apply` to apply them, or "
+        "`pgrls fix --output migration.sql` to write a "
+        "migration.",
+        err=True,
+    )
+    sys.exit(1)
+
+
+def _fix_write_migration(fixes: list[Any], output_path: str) -> None:
+    """`pgrls fix --output FILE`: write the migration script, note it.
+
+    Deterministic (no timestamp), so regenerating against an unchanged
+    schema yields a byte-identical file. Distinct error wording
+    ("cannot write fixes to …") from the report-style `_emit`, so this
+    stays bespoke.
+    """
+    migration = render_migration(fixes, tool_version=__version__)
+    try:
+        Path(output_path).write_text(migration, encoding="utf-8")
+    except OSError as exc:
+        raise ToolError(
+            f"cannot write fixes to {output_path}: {exc}"
+        ) from exc
+    click.echo(
+        f"pgrls: wrote {len(fixes)} {_plural_fixes(len(fixes))} to "
+        f"{output_path}.",
+        err=True,
+    )
+
+
+def _fix_emit_and_maybe_apply(
+    fixes: list[Any],
+    conn: psycopg.Connection[Any],
+    *,
+    apply: bool,
+) -> None:
+    """Shared dry-run / `--apply` tail of `pgrls fix`.
+
+    Echoes the SQL bodies (with their `-- [rule]` comments) to stdout —
+    so `pgrls fix > migration.sql` still produces a paste-able script —
+    then either applies them all-or-nothing (`--apply`) and reports the
+    applied count, or prints the dry-run hint. Both status lines go to
+    stderr.
+    """
+    click.echo(render_fixes(fixes))
+    if apply:
+        _apply_statements(conn, fixes, lock_key="pgrls.fix")
+        click.echo(
+            f"pgrls: applied {len(fixes)} {_plural_fixes(len(fixes))}.",
+            err=True,
+        )
+    else:
+        click.echo(
+            f"pgrls: {len(fixes)} {_plural_fixes(len(fixes))} ready "
+            "(dry-run). Re-run with --apply to execute.",
+            err=True,
+        )
+
+
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to scan (overrides config).",
-)
+@common_db_options
 @click.option(
     "--rule",
     "rules",
@@ -891,173 +1219,54 @@ def fix(
             "file). Choose one."
         )
 
-    try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        raise ToolError(str(exc)) from exc
-
     # Validate `--rule` early — a typo silently producing zero
     # fixes is hard to debug. The "no auto-fixable" message
     # should be reserved for "DB is clean", not "you spelled the
     # rule wrong." Case-normalize to match the rest of the
     # config surfaces (`[lint].disable`, `[lint.rules.<ID>]`,
-    # `--fail-on`).
+    # `--fail-on`). Mirrors `pgrls lint --rule`.
     auto_fixable = {fixer.rule_id for fixer in default_fixers()}
-    if rules:
-        normalized_rules = {r.upper() for r in rules}
-        unknown = sorted(normalized_rules - auto_fixable)
-        if unknown:
-            raise ToolError(
-                f"unknown auto-fixable rule(s): {', '.join(unknown)}. "
-                f"Available: {', '.join(sorted(auto_fixable))}."
-            )
-        rules = tuple(sorted(normalized_rules))
+    rules = _validate_rule_filter(rules, auto_fixable, kind="auto-fixable ")
 
-    effective = _merge_overrides(
-        config,
+    with _connect_introspect_ctx(
+        config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
-        fail_on=None,
-    )
+    ) as (effective, conn, schema):
+        try:
+            fixes = generate_fixes(
+                schema,
+                rule_options=effective.rule_options,
+                rule_filter=set(rules) if rules else None,
+            )
+        except (TypeError, ValueError) as exc:
+            # A fixer raises TypeError on a malformed allowlist
+            # — the same strict validation the rules apply — so
+            # `pgrls fix` rejects bad config with a clear tool
+            # error, exactly as `pgrls lint` does.
+            raise ToolError(str(exc)) from exc
 
-    if effective.database_url is None:
-        raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
-        )
+        if not fixes:
+            click.echo(
+                "pgrls: no auto-fixable violations found.",
+                err=True,
+            )
+            return
 
-    try:
-        with psycopg.connect(effective.database_url) as conn:
-            schema = introspect(conn, schemas=effective.schemas)
-            try:
-                fixes = generate_fixes(
-                    schema,
-                    rule_options=effective.rule_options,
-                    rule_filter=set(rules) if rules else None,
-                )
-            except (TypeError, ValueError) as exc:
-                # A fixer raises TypeError on a malformed allowlist
-                # — the same strict validation the rules apply — so
-                # `pgrls fix` rejects bad config with a clear tool
-                # error, exactly as `pgrls lint` does.
-                raise ToolError(str(exc)) from exc
+        # Four mutually exclusive output modes (the flag conflicts are
+        # rejected above): --check (CI gate), --output (migration file),
+        # dry-run (default), and --apply. Each is its own helper.
+        if check:
+            _fix_check(fixes)
+            return  # unreachable (_fix_check exits 1); pins control flow
 
-            if not fixes:
-                click.echo(
-                    "pgrls: no auto-fixable violations found.",
-                    err=True,
-                )
-                return
-
-            # `--check` is a CI gate — list the offending
-            # (rule, location) pairs and exit 1 without emitting
-            # SQL. The actionable next step is named so a
-            # pre-commit-style hook output is self-documenting.
-            #
-            # Output split: the violation listing goes to *stdout*
-            # so `pgrls fix --check > violations.log` captures it
-            # for CI artefacts; the summary and next-step hint go
-            # to stderr so they don't pollute parseable output.
-            # Matches `pgrls lint` (findings on stdout, status on
-            # stderr) and `ruff --check`.
-            if check:
-                count = len(fixes)
-                plural = "" if count == 1 else "s"
-                click.echo(
-                    f"pgrls fix --check: {count} auto-fixable "
-                    f"violation{plural} found.",
-                    err=True,
-                )
-                for f in fixes:
-                    click.echo(f"  {f.rule_id}  {f.location}")
-                click.echo(
-                    "Run `pgrls fix --apply` to apply them, or "
-                    "`pgrls fix --output migration.sql` to write a "
-                    "migration.",
-                    err=True,
-                )
-                sys.exit(1)
-
-            # `--output` writes the migration file and stops here.
+        if output_path is not None:
             # `--apply` is already rejected alongside `--output`, so
-            # reaching this branch means a pure dry-run-to-file.
-            if output_path is not None:
-                migration = render_migration(
-                    fixes, tool_version=__version__
-                )
-                try:
-                    Path(output_path).write_text(
-                        migration, encoding="utf-8"
-                    )
-                except OSError as exc:
-                    raise ToolError(
-                        f"cannot write fixes to {output_path}: {exc}"
-                    ) from exc
-                click.echo(
-                    f"pgrls: wrote {len(fixes)} "
-                    f"fix{'es' if len(fixes) != 1 else ''} to "
-                    f"{output_path}.",
-                    err=True,
-                )
-                return
+            # reaching here means a pure dry-run-to-file.
+            _fix_write_migration(fixes, output_path)
+            return
 
-            # Otherwise the SQL bodies + their `-- [rule]
-            # description` comments go to stdout so `pgrls fix >
-            # migration.sql` still produces a clean, paste-able
-            # script.
-            click.echo(render_fixes(fixes))
-
-            if apply:
-                with conn.cursor() as cur:
-                    # Advisory lock keyed on a stable hash of
-                    # 'pgrls.fix' so the APPLY phase of two concurrent
-                    # `pgrls fix --apply` runs cannot interleave their
-                    # statement executions. It does NOT serialize
-                    # planning — introspection and fix generation
-                    # already ran above, before the lock — but the
-                    # fixers emit idempotent, absolute target-state DDL
-                    # (e.g. PERF001 sets the policy to its wrapped
-                    # form), so a second run re-asserts the same end
-                    # state rather than double-wrapping.
-                    cur.execute(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtext('pgrls.fix'))"
-                    )
-                    for i, f in enumerate(fixes, start=1):
-                        try:
-                            cur.execute(f.sql)
-                        except psycopg.Error as exc:
-                            # All-or-nothing: psycopg's connection
-                            # context manager rolls back on
-                            # exception. Surface the failing SQL,
-                            # the underlying psycopg error, AND a
-                            # remediation hint so the user can act
-                            # without scrolling back through
-                            # stdout to find which `-- [rule]`
-                            # block matched.
-                            conn.rollback()
-                            raise ToolError(
-                                _fix_apply_failure_message(
-                                    i, len(fixes), f, exc
-                                )
-                            ) from exc
-                conn.commit()
-                click.echo(
-                    f"pgrls: applied {len(fixes)} "
-                    f"fix{'es' if len(fixes) != 1 else ''}.",
-                    err=True,
-                )
-            else:
-                click.echo(
-                    f"pgrls: {len(fixes)} "
-                    f"fix{'es' if len(fixes) != 1 else ''} ready "
-                    "(dry-run). Re-run with --apply to execute.",
-                    err=True,
-                )
-    except psycopg.Error as exc:
-        raise ToolError(f"Database error: {exc}") from exc
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
-
+        _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
 
 def _parse_generate_tables(
     raw: tuple[str, ...],
@@ -1092,24 +1301,7 @@ def _parse_generate_tables(
 
 
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    default=None,
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to scan (overrides config).",
-)
+@common_db_options
 @click.option(
     "--model",
     type=click.Choice(["tenant", "owner"], case_sensitive=False),
@@ -1253,22 +1445,6 @@ def generate(
     # Column default depends on the model when not given explicitly.
     resolved_column = column or ("user_id" if model_norm == "owner" else "tenant_id")
 
-    try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        raise ToolError(str(exc)) from exc
-
-    effective = _merge_overrides(
-        config,
-        database_url=database_url,
-        schemas_csv=schemas,
-        fail_on=None,
-    )
-    if effective.database_url is None:
-        raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
-        )
-
     options = GenerateOptions(
         tenant_column=resolved_column,
         model="owner" if model_norm == "owner" else "tenant",
@@ -1280,104 +1456,71 @@ def generate(
         tables=_parse_generate_tables(tables),
     )
 
-    try:
-        with psycopg.connect(effective.database_url) as conn:
-            schema = introspect(conn, schemas=effective.schemas)
-            result = plan_generation(schema, options)
+    with _connect_introspect_ctx(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas,
+    ) as (effective, conn, schema):
+        result = plan_generation(schema, options)
 
-            # Advisory notes + skipped tables → stderr (never pollutes the
-            # SQL on stdout / in the migration file).
-            for note in result.notes:
-                click.echo(f"pgrls: note: {note}", err=True)
-            for qname, reason in result.skipped:
-                click.echo(f"pgrls: skipped {qname} — {reason}", err=True)
+        # Advisory notes + skipped tables → stderr (never pollutes the
+        # SQL on stdout / in the migration file).
+        for note in result.notes:
+            click.echo(f"pgrls: note: {note}", err=True)
+        for qname, reason in result.skipped:
+            click.echo(f"pgrls: skipped {qname} — {reason}", err=True)
 
-            if not result.statements:
-                click.echo(
-                    "pgrls: nothing to generate (no unprotected tables with "
-                    "the discriminator column).",
-                    err=True,
+        if not result.statements:
+            click.echo(
+                "pgrls: nothing to generate (no unprotected tables with "
+                "the discriminator column).",
+                err=True,
+            )
+            return
+
+        stmts = list(result.statements)
+
+        if output_path is not None:
+            path = Path(output_path)
+            if path.exists() and not force:
+                raise ToolError(
+                    f"{output_path} already exists. Pass --force to "
+                    "overwrite it."
                 )
-                return
+            migration = render_migration(stmts, tool_version=__version__)
+            try:
+                path.write_text(migration, encoding="utf-8", newline="")
+            except OSError as exc:
+                raise ToolError(
+                    f"cannot write generated SQL to {output_path}: {exc}"
+                ) from exc
+            click.echo(
+                f"pgrls: wrote {len(stmts)} statement(s) to "
+                f"{output_path}.",
+                err=True,
+            )
+            return
 
-            stmts = list(result.statements)
+        click.echo(render_fixes(stmts))
 
-            if output_path is not None:
-                path = Path(output_path)
-                if path.exists() and not force:
-                    raise ToolError(
-                        f"{output_path} already exists. Pass --force to "
-                        "overwrite it."
-                    )
-                migration = render_migration(stmts, tool_version=__version__)
-                try:
-                    path.write_text(migration, encoding="utf-8", newline="")
-                except OSError as exc:
-                    raise ToolError(
-                        f"cannot write generated SQL to {output_path}: {exc}"
-                    ) from exc
-                click.echo(
-                    f"pgrls: wrote {len(stmts)} statement(s) to "
-                    f"{output_path}.",
-                    err=True,
-                )
-                return
-
-            click.echo(render_fixes(stmts))
-
-            if apply:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtext('pgrls.generate'))"
-                    )
-                    for i, f in enumerate(stmts, start=1):
-                        try:
-                            cur.execute(f.sql)
-                        except psycopg.Error as exc:
-                            conn.rollback()
-                            raise ToolError(
-                                _fix_apply_failure_message(
-                                    i, len(stmts), f, exc
-                                )
-                            ) from exc
-                conn.commit()
-                click.echo(
-                    f"pgrls: applied {len(stmts)} statement(s). "
-                    "Run `pgrls lint` to confirm a clean result.",
-                    err=True,
-                )
-            else:
-                click.echo(
-                    f"pgrls: {len(stmts)} statement(s) ready (dry-run). "
-                    "Re-run with --apply to execute, or --output FILE to "
-                    "write a migration.",
-                    err=True,
-                )
-    except psycopg.Error as exc:
-        raise ToolError(f"Database error: {exc}") from exc
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
+        if apply:
+            _apply_statements(conn, stmts, lock_key="pgrls.generate")
+            click.echo(
+                f"pgrls: applied {len(stmts)} statement(s). "
+                "Run `pgrls lint` to confirm a clean result.",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"pgrls: {len(stmts)} statement(s) ready (dry-run). "
+                "Re-run with --apply to execute, or --output FILE to "
+                "write a migration.",
+                err=True,
+            )
 
 
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to scan (overrides config).",
-)
+@common_db_options
 @click.option(
     "--output",
     "-o",
@@ -2813,39 +2956,10 @@ def explain(
 
 
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    default=None,
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to report on (overrides config).",
-)
-@click.option(
-    "--output",
-    "-o",
-    "output_path",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help="Write the report to this file instead of stdout (any --format).",
-)
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(list(REPORT_FORMATS), case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
+@common_db_options
+@output_format_options(
+    list(REPORT_FORMATS),
+    output_help="Write the report to this file instead of stdout (any --format).",
 )
 def report(
     database_url: str | None,
@@ -2867,67 +2981,18 @@ def report(
     `--output FILE` writes it to a file (e.g. an audit doc) instead of
     stdout.
     """
-    try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        raise ToolError(str(exc)) from exc
-
-    effective = _merge_overrides(
-        config,
+    _, schema = _connect_and_introspect(
+        config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
-        fail_on=None,
     )
-    if effective.database_url is None:
-        raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
-        )
-
-    try:
-        with psycopg.connect(effective.database_url) as conn:
-            schema = introspect(conn, schemas=effective.schemas)
-    except psycopg.Error as exc:
-        raise ToolError(f"Database error: {exc}") from exc
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
 
     rendered = render_report(build_report(schema), output_format)
-    # Normalize a single trailing newline so file and stdout output are
-    # byte-identical (text/json renderers don't add one; markdown does).
-    if not rendered.endswith("\n"):
-        rendered += "\n"
-    if output_path is not None:
-        # `newline=""` disables universal-newline translation so the
-        # file matches stdout byte-for-byte (no `\n`→`\r\n` on Windows).
-        try:
-            Path(output_path).write_text(
-                rendered, encoding="utf-8", newline=""
-            )
-        except OSError as exc:
-            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
-    else:
-        click.echo(rendered, nl=False)
+    _emit(rendered, output_path)
 
 
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    default=None,
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to report on (overrides config).",
-)
+@common_db_options
 @click.option(
     "--coverage",
     "coverage_path",
@@ -2943,21 +3008,9 @@ def report(
     default=None,
     help="Exit 1 if coverage %% is below this threshold (CI gate).",
 )
-@click.option(
-    "--output",
-    "-o",
-    "output_path",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help="Write the report to this file instead of stdout (any --format).",
-)
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(list(COVERAGE_FORMATS), case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
+@output_format_options(
+    list(COVERAGE_FORMATS),
+    output_help="Write the report to this file instead of stdout (any --format).",
 )
 def coverage(
     database_url: str | None,
@@ -2979,21 +3032,15 @@ def coverage(
     paste-ready / standalone-page output. `--fail-under N` exits 1 when
     coverage falls below N% — drop it in CI next to `pgrls lint`.
     """
-    try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        raise ToolError(str(exc)) from exc
-
-    effective = _merge_overrides(
-        config,
+    # Resolve config + guard the DB URL first, then load the coverage
+    # artifact *before* connecting so a bad artifact path fails fast
+    # (preserving the original error precedence: artifact errors surface
+    # before any database connection is attempted).
+    effective = _load_effective_config(
+        config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
-        fail_on=None,
     )
-    if effective.database_url is None:
-        raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
-        )
 
     try:
         data = load_coverage_artifact(coverage_path)
@@ -3008,6 +3055,7 @@ def coverage(
             f"Cannot read coverage artifact {coverage_path!r}: {exc}"
         ) from exc
 
+    assert effective.database_url is not None  # guaranteed above
     try:
         with psycopg.connect(effective.database_url) as conn:
             schema = introspect(conn, schemas=effective.schemas)
@@ -3018,17 +3066,7 @@ def coverage(
 
     report = build_coverage(schema, data)
     rendered = render_coverage(report, output_format)
-    if not rendered.endswith("\n"):
-        rendered += "\n"
-    if output_path is not None:
-        try:
-            Path(output_path).write_text(
-                rendered, encoding="utf-8", newline=""
-            )
-        except OSError as exc:
-            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
-    else:
-        click.echo(rendered, nl=False)
+    _emit(rendered, output_path)
 
     pct = report.summary["coverage_pct"]
     if fail_under is not None and pct < fail_under:
@@ -3064,24 +3102,7 @@ def _perf003_flagged_tables(schema: Schema) -> set[tuple[str, str]]:
 
 
 @main.command()
-@click.option(
-    "--database-url",
-    envvar="DATABASE_URL",
-    default=None,
-    help="Postgres connection string. Falls back to $DATABASE_URL.",
-)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
-)
-@click.option(
-    "--schemas",
-    default=None,
-    help="Comma-separated schemas to report on (overrides config).",
-)
+@common_db_options
 @click.option(
     "--min-rows",
     "min_rows",
@@ -3191,21 +3212,11 @@ def perf(
     `pgrls lint --perf` (PERF005). Warm the planner's statistics first
     (exercise the workload, then ANALYZE).
     """
-    try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        raise ToolError(str(exc)) from exc
-
-    effective = _merge_overrides(
-        config,
+    effective = _load_effective_config(
+        config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
-        fail_on=None,
     )
-    if effective.database_url is None:
-        raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
-        )
 
     thresholds = PerfThresholds(
         min_live_tup=min_rows,
@@ -3213,6 +3224,7 @@ def perf(
         min_seq_pct=min_seq_pct,
     )
 
+    assert effective.database_url is not None  # guaranteed above
     stmt_rows: list[StatementStat] | None = None
     try:
         with psycopg.connect(effective.database_url) as conn:
@@ -3263,17 +3275,7 @@ def perf(
         click.echo(f"pgrls: wrote runtime-stats artifact {snapshot_path}.", err=True)
 
     rendered = render_perf(report, output_format)
-    if not rendered.endswith("\n"):
-        rendered += "\n"
-    if output_path is not None:
-        try:
-            Path(output_path).write_text(
-                rendered, encoding="utf-8", newline=""
-            )
-        except OSError as exc:
-            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
-    else:
-        click.echo(rendered, nl=False)
+    _emit(rendered, output_path)
 
     if fail_on_findings and report.findings:
         n = len(report.findings)
@@ -3291,21 +3293,11 @@ def perf(
     "directory",
     type=click.Path(exists=True, file_okay=False, dir_okay=True),
 )
-@click.option(
-    "--output",
-    "-o",
-    "output_path",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help="Write the trend report to this file instead of stdout (any --format).",
-)
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(list(HISTORY_FORMATS), case_sensitive=False),
-    default="text",
-    show_default=True,
-    help="Output format.",
+@output_format_options(
+    list(HISTORY_FORMATS),
+    output_help=(
+        "Write the trend report to this file instead of stdout (any --format)."
+    ),
 )
 def history(
     directory: str,
@@ -3341,14 +3333,4 @@ def history(
 
     rows = build_rows(snapshots)
     rendered = render_history(rows, output_format)
-    if not rendered.endswith("\n"):
-        rendered += "\n"
-    if output_path is not None:
-        try:
-            Path(output_path).write_text(
-                rendered, encoding="utf-8", newline=""
-            )
-        except OSError as exc:
-            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
-    else:
-        click.echo(rendered, nl=False)
+    _emit(rendered, output_path)
