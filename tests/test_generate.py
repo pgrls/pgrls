@@ -353,6 +353,41 @@ def test_cli_bad_table_flag() -> None:
     assert "schema.table:column" in res.output
 
 
+def test_cli_config_and_dburl_errors_precede_bad_table(
+    tmp_path, monkeypatch
+) -> None:
+    # generate() must surface a config-parse error and a missing-db-url
+    # error BEFORE a bad --table syntax error — matching the pre-refactor
+    # order (config-parse, db-url-missing, then --table). Pins the
+    # precedence so the connect/introspect preamble dedup cannot silently
+    # reorder which of several simultaneous user errors surfaces first
+    # (the generate() analogue of
+    # test_fix_bad_toml_precedes_unknown_rule). _run() always injects
+    # --database-url, so this exercises the omitted combination directly.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    runner = CliRunner()
+
+    # (1) malformed --config + bad --table → the config-parse error wins.
+    bad = tmp_path / "pgrls.toml"
+    bad.write_text("[database\n")  # malformed TOML
+    res = runner.invoke(
+        main, ["generate", "--config", str(bad), "--table", "no-colon"]
+    )
+    assert res.exit_code == 2, res.output
+    assert "schema.table:column" not in res.output  # not the --table error
+    assert "Traceback" not in res.output
+
+    # (2) valid --config, no db-url, bad --table → the db-url error wins.
+    good = tmp_path / "good.toml"
+    good.write_text("")  # valid (empty) config
+    res = runner.invoke(
+        main, ["generate", "--config", str(good), "--table", "no-colon"]
+    )
+    assert res.exit_code == 2, res.output
+    assert "No database connection" in res.output
+    assert "schema.table:column" not in res.output
+
+
 def test_cli_nothing_to_generate() -> None:
     res = _run(Schema(tables=(_table("logs", (_ID,)),)), [])
     assert res.exit_code == 0

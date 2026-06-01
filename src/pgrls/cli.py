@@ -1458,6 +1458,19 @@ def generate(
     # Column default depends on the model when not given explicitly.
     resolved_column = column or ("user_id" if model_norm == "owner" else "tenant_id")
 
+    # Resolve config (parse + merge + db-url guard) BEFORE parsing
+    # --table, so a malformed --config and a missing database URL both
+    # surface ahead of a bad --table value — matching the pre-refactor
+    # generate() order (convention/column checks, then config-parse,
+    # then db-url-missing, then --table syntax). The context manager
+    # below re-resolves + connects; this up-front call exists only to
+    # pin that precedence (the analogue of fix()'s up-front parse).
+    _load_effective_config(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas,
+    )
+
     options = GenerateOptions(
         tenant_column=resolved_column,
         model="owner" if model_norm == "owner" else "tenant",
