@@ -54,10 +54,8 @@ def parse_expr(
     """
     if not sql:
         return None
-    wrapped = f"SELECT ({sql}) AS _expr"
-    try:
-        parsed = pglast.parse_sql(wrapped)
-    except pglast.parser.ParseError:
+
+    def _warn_unparseable() -> None:
         # Compose a message that puts the policy ID first so it
         # grep-finds easily; fall back to the "no location" form
         # if the caller didn't pass one (e.g. a programmatic test
@@ -73,8 +71,24 @@ def parse_expr(
             f"pgrls: warning: {head}. {tail} Original SQL: {sql!r}",
             file=sys.stderr,
         )
+
+    wrapped = f"SELECT ({sql}) AS _expr"
+    try:
+        parsed = pglast.parse_sql(wrapped)
+    except pglast.parser.ParseError:
+        _warn_unparseable()
         return None
     select_stmt = parsed[0].stmt
+    # Unbalanced parens in the fragment can let it escape the
+    # `SELECT (...)` wrapper into a set operation (UNION/INTERSECT/
+    # EXCEPT) or another non-SELECT shape whose `targetList` is None —
+    # `targetList[0]` would then raise TypeError/IndexError. Treat any
+    # non-scalar-expression shape as unparseable (same warning + None as
+    # a ParseError) so callers' fallbacks engage (diff requires_review,
+    # AST rules skip the clause).
+    if not isinstance(select_stmt, SelectStmt) or not select_stmt.targetList:
+        _warn_unparseable()
+        return None
     target = select_stmt.targetList[0]
     return target.val
 

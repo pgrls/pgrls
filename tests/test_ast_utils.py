@@ -33,6 +33,17 @@ def test_parse_expr_returns_none_for_none_input() -> None:
     assert parse_expr(None) is None  # type: ignore[arg-type]
 
 
+def test_parse_expr_returns_none_for_setop_escape(capsys) -> None:
+    # A fragment whose own unbalanced parens let it escape the
+    # `SELECT (...)` wrapper into a top-level set operation (here UNION)
+    # parses to a SelectStmt whose targetList is None; parse_expr must
+    # return None (with the standard warning) rather than raise
+    # TypeError on `targetList[0]`. Regression for the diff / AST-rule
+    # crash on a corrupted or hand-edited snapshot predicate.
+    assert parse_expr("1) UNION SELECT (1") is None
+    assert "could not parse" in capsys.readouterr().err.lower()
+
+
 def test_parse_expr_default_fail_message_tail_lists_lint_rules(capsys) -> None:
     # The default tail (lint context) lists the SEC/PERF/HYG rule IDs
     # that get skipped on parse failure, so a `pgrls lint` user knows

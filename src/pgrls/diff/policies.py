@@ -337,7 +337,14 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
                 location=location,
                 clause=clause_label,
             )
-            if result == "unchanged":
+            if result in ("unchanged", "semantic_equivalent"):
+                # "semantic_equivalent" is Z3's verdict that the two
+                # predicates prove logically equal despite differing
+                # syntax — i.e. no Change, exactly like "unchanged" (see
+                # diff/_z3_compare). It is deliberately absent from the
+                # mapping tables below, so it MUST be skipped here too,
+                # else `mapping[result]` raises KeyError on valid input
+                # whenever the diff-z3 extra is installed.
                 continue
             kind, classification = mapping[result]
             message_fragment = _PREDICATE_RESULT_MESSAGES[result]

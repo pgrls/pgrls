@@ -1009,13 +1009,15 @@ def fix(
             if apply:
                 with conn.cursor() as cur:
                     # Advisory lock keyed on a stable hash of
-                    # 'pgrls.fix' so two concurrent `pgrls fix
-                    # --apply` runs serialize. Without this, the
-                    # second process would introspect a stale
-                    # snapshot, regenerate fixes against pre-
-                    # mutation policy text, and either undo the
-                    # first process's PERF001 wrap or double-
-                    # wrap it.
+                    # 'pgrls.fix' so the APPLY phase of two concurrent
+                    # `pgrls fix --apply` runs cannot interleave their
+                    # statement executions. It does NOT serialize
+                    # planning — introspection and fix generation
+                    # already ran above, before the lock — but the
+                    # fixers emit idempotent, absolute target-state DDL
+                    # (e.g. PERF001 sets the policy to its wrapped
+                    # form), so a second run re-asserts the same end
+                    # state rather than double-wrapping.
                     cur.execute(
                         "SELECT pg_advisory_xact_lock("
                         "hashtext('pgrls.fix'))"
@@ -1430,7 +1432,10 @@ def snapshot(
 
     payload = json.dumps(schema.to_snapshot(), indent=2, ensure_ascii=False)
     if output_path:
-        Path(output_path).write_text(payload + "\n", encoding="utf-8")
+        try:
+            Path(output_path).write_text(payload + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise ToolError(f"Cannot write {output_path}: {exc}") from exc
     else:
         click.echo(payload)
 
