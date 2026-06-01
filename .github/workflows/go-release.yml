@@ -111,9 +111,9 @@ jobs:
         # release-noise channel is the GitHub Release body,
         # not the workflow logs (verbose only helps when
         # triaging a failure, which is the PR-workflow's job).
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.62.2
+          version: v2.12.2
           working-directory: go
           args: --timeout=5m
 
