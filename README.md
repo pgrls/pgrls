@@ -577,6 +577,20 @@ pgrls's built-in rule catalog, so they need no database connection.
 For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
 configuration options (allowlists, etc.), see `pgrls.example.toml`.
 
+### Precision & false positives
+
+A linter is only useful if you can trust it not to cry wolf. pgrls ships an
+**adjudicated precision corpus** — small, self-contained schemas, each
+labeled with exactly which rules should fire, including deliberately
+adversarial *near-misses* (a `coalesce()`-wrapped auth check, an `IS NULL`
+buried in a subquery, a predicate hidden in a `SubLink`) that look like
+violations but are safe. The full rule set runs over every case against a
+real Postgres; the result is published in
+[`docs/PRECISION.md`](docs/PRECISION.md), and a CI job re-measures on every
+push and fails if any rule fires where it shouldn't. Regenerate with
+`python -m corpus.measure`; see [`corpus/README.md`](corpus/README.md) to
+add cases.
+
 For per-release changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ## CI integration

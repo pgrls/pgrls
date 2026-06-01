@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Precision corpus** (`corpus/`) — an adjudicated set of small,
+  self-contained schemas (positives that must fire a specific rule +
+  deliberately adversarial negatives that must stay silent: a
+  `coalesce()`-wrapped auth check, an `IS NULL` buried in a subquery or
+  under `AND`, …) measuring per-rule precision and false-positive behavior
+  over the real introspection + lint path. The published run is
+  `docs/PRECISION.md`; a new CI job (`pytest corpus/`) re-measures on every
+  push and fails on any false positive or false negative. Regenerate with
+  `python -m corpus.measure`. Not shipped in the wheel — it's a quality
+  gate, not a runtime dependency.
+
+### Changed
+
+- CI `lint` job now also ruff-checks `corpus/` and `bench/`, not just
+  `src/` and `tests/`.
+
 ## [0.14.0] - 2026-05-30
 
 ### Added
