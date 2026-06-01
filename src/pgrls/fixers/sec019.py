@@ -45,11 +45,11 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import A_Const, Boolean, FuncCall, Node, String
-from pglast.stream import RawStream
+from pglast.ast import A_Const, Boolean
 
+from pgrls.ast_utils import func_name_parts, transform_tree
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_ident, quote_qualified
+from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 
@@ -63,16 +63,9 @@ def _is_one_arg_current_setting(node: Any) -> bool:
     qualified form — the same shape SEC019's `find_func_calls`
     detection accepts.
     """
-    if not isinstance(node, FuncCall):
+    qualified, bare = func_name_parts(node)
+    if qualified is None:
         return False
-    parts: list[str] = []
-    for f in node.funcname or ():
-        if isinstance(f, String):
-            parts.append(f.sval)
-    if not parts:
-        return False
-    qualified = ".".join(parts)
-    bare = parts[-1]
     if bare != _CURRENT_SETTING and qualified != f"pg_catalog.{_CURRENT_SETTING}":
         return False
     args = node.args or ()
@@ -88,37 +81,26 @@ def _add_missing_ok(node: Any) -> tuple[Any, bool]:
     matches, so any later check reading the rewritten AST sees a
     literal true exactly as it would have from a hand-written
     two-argument call.
-    """
-    if node is None:
-        return node, False
-    if _is_one_arg_current_setting(node):
-        # Mutate the FuncCall in place — append the missing_ok
-        # arg as a literal `true`.
-        new_args = (*node.args, A_Const(val=Boolean(boolval=True)))
-        node.args = new_args
-        return node, True
-    if not isinstance(node, Node):
-        return node, False
 
-    changed = False
-    for field_name in node:
-        value = getattr(node, field_name, None)
-        if isinstance(value, (list, tuple)):
-            new_items: list[Any] = []
-            list_changed = False
-            for item in value:
-                new_item, item_changed = _add_missing_ok(item)
-                new_items.append(new_item)
-                list_changed = list_changed or item_changed
-            if list_changed:
-                setattr(node, field_name, type(value)(new_items))
-                changed = True
-        elif isinstance(value, Node):
-            new_v, v_changed = _add_missing_ok(value)
-            if v_changed:
-                setattr(node, field_name, new_v)
-                changed = True
-    return node, changed
+    The recursion is `ast_utils.transform_tree`; the leaf function
+    below carries the only SEC019-specific behaviour: a one-arg
+    `current_setting` call is mutated in place to append the
+    missing_ok arg (a terminal `(node, True)`); every other node
+    returns `None` to recurse. Unlike PERF001 there is no
+    don't-descend guard — SEC019 rewrites matching calls anywhere in
+    the tree.
+    """
+
+    def leaf(n: Any) -> tuple[Any, bool] | None:
+        if _is_one_arg_current_setting(n):
+            # Mutate the FuncCall in place — append the missing_ok
+            # arg as a literal `true`.
+            new_args = (*n.args, A_Const(val=Boolean(boolval=True)))
+            n.args = new_args
+            return n, True
+        return None
+
+    return transform_tree(node, leaf)
 
 
 class SEC019Fixer:
@@ -154,20 +136,17 @@ class SEC019Fixer:
                 if not (using_changed or with_check_changed):
                     continue
 
-                clauses: list[str] = []
-                if using_changed:
-                    clauses.append(
-                        f"    USING ({RawStream()(new_using_ast)})"
-                    )
-                if with_check_changed:
-                    clauses.append(
-                        f"    WITH CHECK ({RawStream()(new_wc_ast)})"
-                    )
-                stmt = (
-                    f"ALTER POLICY {quote_ident(policy.name)} "
-                    f"ON {quote_qualified(table.schema, table.name)}\n"
-                    + "\n".join(clauses)
-                    + ";"
+                # Only re-emit the clause(s) that actually changed, so
+                # the migration is the minimal diff. `alter_policy`
+                # renders each provided clause through RawStream and
+                # orders USING before WITH CHECK.
+                stmt = alter_policy(
+                    table,
+                    policy.name,
+                    using_ast=new_using_ast if using_changed else None,
+                    with_check_ast=(
+                        new_wc_ast if with_check_changed else None
+                    ),
                 )
 
                 out.append(

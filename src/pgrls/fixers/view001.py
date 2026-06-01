@@ -12,69 +12,31 @@ materialized views (VIEW003's domain), skip views already running in
 invoker mode, skip views whose `references` contain no RLS-protected
 tables, and skip allowlisted views.
 
-Identifiers are double-quoted via `_idents.quote_qualified` when
-Postgres syntax requires it (mixed case, embedded special chars).
-Plain `snake_case` names are emitted bare for readability.
+The shared `ALTER VIEW … SET (<reloption> = true)` body lives in
+`_views.alter_view_reloption_fixer` (VIEW002 differs only in the
+reloption, the checked attribute, and the description); identifiers
+are double-quoted via `_idents.quote_qualified` when Postgres syntax
+requires it. Plain `snake_case` names are emitted bare for readability.
 """
 from __future__ import annotations
 
-from typing import Any
-
-from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_qualified
-from pgrls.model import Schema, View
-from pgrls.rules._allowlist import parse_qualified_view_allowlist
+from pgrls.fixers._views import alter_view_reloption_fixer
 
 
-def _is_allowlisted(view: View, allowlist: set[str]) -> bool:
-    return view.qualified_name in allowlist
+def _description(qualified_name: str, leaked_qnames: str) -> str:
+    return (
+        f"Set security_invoker on {qualified_name} "
+        "so queries against the view enforce RLS on "
+        f"{leaked_qnames} against the caller's "
+        "privileges instead of the view owner's."
+    )
 
 
-class VIEW001Fixer:
-    rule_id: str = "VIEW001"
-
-    def fix(
-        self, schema: Schema, options: dict[str, Any]
-    ) -> list[Fix]:
-        # Strict allowlist parsing (the same parser VIEW001 uses):
-        # a malformed allowlist raises, surfaced by the `fix` CLI.
-        allowlist = parse_qualified_view_allowlist("VIEW001", options)
-        rls_tables: set[tuple[str, str]] = {
-            (t.schema, t.name) for t in schema.tables if t.rls_enabled
-        }
-        out: list[Fix] = []
-        for view in schema.views:
-            # Mirror VIEW001's detection in lockstep.
-            if view.is_materialized:
-                continue
-            if view.security_invoker:
-                continue
-            if _is_allowlisted(view, allowlist):
-                continue
-            leaked = sorted(
-                ref for ref in view.references if ref in rls_tables
-            )
-            if not leaked:
-                continue
-            qname = quote_qualified(view.schema, view.name)
-            leaked_qnames = ", ".join(
-                f"{s}.{n}" for s, n in leaked
-            )
-            sql = (
-                f"ALTER VIEW {qname} "
-                "SET (security_invoker = true);"
-            )
-            out.append(
-                Fix(
-                    rule_id="VIEW001",
-                    location=view.qualified_name,
-                    sql=sql,
-                    description=(
-                        f"Set security_invoker on {view.qualified_name} "
-                        "so queries against the view enforce RLS on "
-                        f"{leaked_qnames} against the caller's "
-                        "privileges instead of the view owner's."
-                    ),
-                )
-            )
-        return out
+VIEW001Fixer = alter_view_reloption_fixer(
+    rule_id="VIEW001",
+    reloption="security_invoker",
+    attr="security_invoker",
+    description=_description,
+)
+VIEW001Fixer.__name__ = "VIEW001Fixer"
+VIEW001Fixer.__qualname__ = "VIEW001Fixer"

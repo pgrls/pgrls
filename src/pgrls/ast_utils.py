@@ -10,6 +10,7 @@ stays internal until v1.0.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import pglast
@@ -227,6 +228,93 @@ def own_column_ref(ref: tuple[str, ...], table: Any) -> str | None:
     return None
 
 
+def transform_tree(
+    node: Any,
+    leaf_fn: Callable[[Any], tuple[Any, bool] | None],
+) -> tuple[Any, bool]:
+    """Recursively rewrite a pglast tree, dispatched by `leaf_fn`.
+
+    `leaf_fn(node)` is consulted for every node, in pre-order, BEFORE
+    any descent — matching the hand-written fixer walkers it replaces,
+    which test their matcher first. It returns either:
+
+    * `(new_node, changed)` — a TERMINAL result: this node (and its
+      subtree) is not descended into; `new_node` takes its place and
+      `changed` bubbles up. Use this both to rewrite a matched node
+      (`(replacement, True)`) and to deliberately skip a subtree
+      without changing it (`(node, False)` — e.g. PERF001 declines to
+      descend into an already-wrapped `SubLink`).
+    * `None` — not terminal: recurse into this node's children.
+
+    On the recursive path, every `Node`-typed field and every item of
+    a list/tuple-typed field is transformed. A container field is only
+    rebuilt (and re-`setattr`'d) when at least one of its items
+    changed, preserving the original container type
+    (`type(value)(new_items)`); a scalar `Node` field is only
+    re-`setattr`'d when it changed. The node is mutated in place and
+    returned as the SAME object, so callers that need the input
+    untouched must pass a deep copy — exactly as the original
+    `_wrap_unwrapped_calls` / `_add_missing_ok` required.
+
+    The shared descent body for PERF001's `(SELECT …)` wrapping and
+    SEC019's `current_setting(…, true)` rewrite, which were
+    byte-identical below the leaf checks. `leaf_fn` carries the only
+    per-fixer logic (match test, replacement shape, and — for PERF001
+    — the don't-descend-into-SubLink guard).
+    """
+    result = leaf_fn(node)
+    if result is not None:
+        return result
+    if not isinstance(node, Node):
+        return node, False
+
+    changed = False
+    for field_name in node:
+        value = getattr(node, field_name, None)
+        if isinstance(value, (list, tuple)):
+            new_items: list[Any] = []
+            list_changed = False
+            for item in value:
+                new_item, item_changed = transform_tree(item, leaf_fn)
+                new_items.append(new_item)
+                list_changed = list_changed or item_changed
+            if list_changed:
+                setattr(node, field_name, type(value)(new_items))
+                changed = True
+        elif isinstance(value, Node):
+            new_v, v_changed = transform_tree(value, leaf_fn)
+            if v_changed:
+                setattr(node, field_name, new_v)
+                changed = True
+    return node, changed
+
+
+def func_name_parts(node: Any) -> tuple[str | None, str | None]:
+    """Pull the dotted name out of a `FuncCall`, as `(qualified, bare)`.
+
+    `node.funcname` is a tuple of `String` (and, for `*`, `A_Star`)
+    nodes. `auth.uid(...)` yields `funcname = (String("auth"),
+    String("uid"))` → `("auth.uid", "uid")`; a bare `uid(...)` →
+    `("uid", "uid")`. Returns `(None, None)` when `node` is not a
+    `FuncCall` or carries no `String` name parts.
+
+    Single source of truth for the "qualified name and bare name of a
+    function call" extraction that `find_func_calls` and several
+    fixers (PERF001's `_funccall_matches`, SEC019's
+    `_is_one_arg_current_setting`) each open-coded — callers test
+    `qualified in names or bare in names`.
+    """
+    if not isinstance(node, FuncCall):
+        return None, None
+    parts: list[str] = []
+    for f in node.funcname or ():
+        if isinstance(f, String):
+            parts.append(f.sval)
+    if not parts:
+        return None, None
+    return ".".join(parts), parts[-1]
+
+
 def find_func_calls(
     node: Any, names: set[str], *, exclude_sublinks: bool = False
 ) -> list[Any]:
@@ -265,15 +353,11 @@ def find_func_calls(
             walk(n.testexpr)
             return
         if isinstance(n, FuncCall):
-            parts: list[str] = []
-            for f in n.funcname or ():
-                if isinstance(f, String):
-                    parts.append(f.sval)
-            if parts:
-                qualified = ".".join(parts)
-                bare = parts[-1]
-                if qualified in names or bare in names:
-                    matches.append(n)
+            qualified, bare = func_name_parts(n)
+            if qualified is not None and (
+                qualified in names or bare in names
+            ):
+                matches.append(n)
         if isinstance(n, SQLValueFunction):
             name = _SQL_VALUE_FUNCTION_NAMES.get(n.op)
             if name and name in names:
