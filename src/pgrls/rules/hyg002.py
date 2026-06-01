@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -107,10 +107,8 @@ class HYG002:
             for policy in table.policies:
                 if not _name_contains_placeholder(policy.name, words):
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
                     Violation(
@@ -127,7 +125,7 @@ class HYG002:
                             "policy is truly final, allowlist it "
                             "explicitly."
                         ),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

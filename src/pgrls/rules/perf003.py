@@ -64,7 +64,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import extract_column_refs
-from pgrls.model import Schema, Table
+from pgrls.model import Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -144,16 +144,14 @@ class PERF003:
                 # tables when they have policies.
                 continue
             for policy in table.policies:
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 unindexed = self._unindexed_columns(table, policy)
                 if not unindexed:
                     continue
                 out.append(self._violation(
-                    table, policy_id, policy.name, unindexed
+                    table, pid, policy.name, unindexed
                 ))
         return out
 
@@ -220,7 +218,7 @@ class PERF003:
     def _violation(
         self,
         table: Table,
-        policy_id: str,
+        pid: str,
         policy_name: str,
         unindexed: list[str],
     ) -> Violation:
@@ -242,11 +240,11 @@ class PERF003:
                 "of rows. Add a B-tree index whose leading column "
                 f"matches (e.g. `CREATE INDEX ON {table.qualified_name} "
                 "(tenant_id)` for a tenant_id-filtered policy), or "
-                f"allowlist this policy as {policy_id!r} in "
+                f"allowlist this policy as {pid!r} in "
                 "[lint.rules.PERF003] if a matching expression "
                 "index exists (expression indexes aren't matched in "
                 "v0.5.10) or if sequential scan is acceptable for "
                 "the table's size."
             ),
-            location=policy_id,
+            location=pid,
         )

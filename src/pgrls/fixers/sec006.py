@@ -54,7 +54,7 @@ from pgrls.fixers._idents import quote_ident, quote_qualified
 # disjunct is not mirrored verbatim into a wide-open WITH CHECK —
 # single source of truth for the monotone-position stripping rule.
 from pgrls.fixers.sec011 import strip_constant_true_for_mirror
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the write-side command set — imported
 # from the rule so the fixer flags exactly what the rule reports.
@@ -96,10 +96,8 @@ class SEC006Fixer:
                 # skip and leave the SEC006 finding for the operator.
                 if policy.using_ast is None:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
                 # Strip any constant-true disjunct (`x = 1 OR true`)
                 # before mirroring USING into WITH CHECK. Mirrored
@@ -126,7 +124,7 @@ class SEC006Fixer:
                 out.append(
                     Fix(
                         rule_id="SEC006",
-                        location=policy_id,
+                        location=pid,
                         sql=sql,
                         description=(
                             f"Add a WITH CHECK clause to policy "

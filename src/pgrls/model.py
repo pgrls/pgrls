@@ -34,6 +34,7 @@ __all__ = [
     "Policy",
     "PolicyCommand",
     "SNAPSHOT_VERSION",
+    "policy_id",
     "Schema",
     "SecdefFunction",
     "Snapshot",
@@ -62,6 +63,17 @@ class Policy:
     @property
     def is_permissive(self) -> bool:
         return self.permissive
+
+
+def policy_id(table: "Table", policy: Policy) -> str:
+    """The canonical ``schema.table.policy`` identity for a policy.
+
+    Single source of truth for the string used as a ``Violation.location``
+    and matched against ``[lint.rules.<ID>].allowlist`` policy-id entries —
+    previously hand-built as an ``f"{table.schema}.{table.name}.{policy.name}"``
+    literal at dozens of rule and fixer sites.
+    """
+    return f"{table.schema}.{table.name}.{policy.name}"
 
 
 @dataclass(frozen=True)

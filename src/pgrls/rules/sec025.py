@@ -77,7 +77,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import extract_range_vars
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -155,14 +155,12 @@ class SEC025:
                         unprotected.add(f"{resolved[0]}.{resolved[1]}")
                 if not unprotected:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 out.append(
                     self._violation(
-                        table, policy, policy_id, sorted(unprotected)
+                        table, policy, pid, sorted(unprotected)
                     )
                 )
         return out
@@ -171,7 +169,7 @@ class SEC025:
         self,
         table: Table,
         policy: Policy,
-        policy_id: str,
+        pid: str,
         unprotected: list[str],
     ) -> Violation:
         if len(unprotected) == 1:
@@ -197,7 +195,7 @@ class SEC025:
                 "is intentional (a read-only reference table such "
                 "as countries / currencies / plan types every "
                 "tenant is meant to read) — allowlist this policy "
-                f"as {policy_id!r} in [lint.rules.SEC025]."
+                f"as {pid!r} in [lint.rules.SEC025]."
             ),
-            location=policy_id,
+            location=pid,
         )

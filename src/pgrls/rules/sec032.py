@@ -42,7 +42,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.model import Schema
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 
@@ -61,7 +61,7 @@ class SEC032:
                 continue
             if not table.policies:
                 continue  # RLS off with no policies is SEC001's
-            if table.name in allowlist or table.qualified_name in allowlist:
+            if table_in_allowlist(table, allowlist):
                 continue
             # A partition child whose ancestor has RLS is covered for
             # parent-routed queries; its dormant policies aren't a hole.

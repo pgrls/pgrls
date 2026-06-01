@@ -45,7 +45,7 @@ from pglast.stream import RawStream
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
-from pgrls.model import Schema
+from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Single source of truth for the default auth-function set —
 # imported from the rule so a future addition (e.g.
@@ -191,10 +191,8 @@ class PERF001Fixer:
             for policy in table.policies:
                 if policy.using_ast is None:
                     continue
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in skip:
+                pid = policy_id(table, policy)
+                if pid in skip:
                     continue
 
                 # `_wrap_unwrapped_calls` mutates pglast Node
@@ -237,7 +235,7 @@ class PERF001Fixer:
                 out.append(
                     Fix(
                         rule_id="PERF001",
-                        location=policy_id,
+                        location=pid,
                         sql=stmt,
                         description=(
                             f"Wrap auth function call(s) in policy "

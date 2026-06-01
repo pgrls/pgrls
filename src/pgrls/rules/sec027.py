@@ -68,7 +68,7 @@ from typing import Any
 
 from pgrls.ast_utils import extract_column_refs
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 # Column names that, by default, denote a per-user access boundary
@@ -90,15 +90,6 @@ def _parse_principal_columns(options: dict[str, Any]) -> set[str]:
             'column names (e.g. ["owner_id", "user_id"]).'
         )
     return set(raw)
-
-
-def _table_allowlisted(table: Table, allowlist: set[str]) -> bool:
-    """True if the table is named in the allowlist by either its
-    bare name or its schema-qualified form (mirrors SEC001)."""
-    return (
-        table.name in allowlist
-        or f"{table.schema}.{table.name}" in allowlist
-    )
 
 
 def _columns_referenced_by_policies(table: Table) -> set[str]:
@@ -143,7 +134,7 @@ class SEC027:
                 continue
             if not table.columns:
                 continue
-            if _table_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
 
             present = [c for c in table.columns if c in principal_columns]

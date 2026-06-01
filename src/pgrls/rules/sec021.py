@@ -63,7 +63,7 @@ from pglast.ast import A_Const, A_Expr, Node, String, TypeCast
 from pglast.enums import A_Expr_Kind
 
 from pgrls.ast_utils import extract_column_refs
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -220,14 +220,14 @@ class SEC021:
                         break
                 if not fires:
                     continue
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
-                out.append(self._violation(table, policy, policy_id))
+                out.append(self._violation(table, policy, pid))
         return out
 
     def _violation(
-        self, table: Table, policy: Policy, policy_id: str
+        self, table: Table, policy: Policy, pid: str
     ) -> Violation:
         return Violation(
             rule_id=self.id,
@@ -247,7 +247,7 @@ class SEC021:
                 "or a JWT claim. If comparing this column to a fixed "
                 "value is intentional (a table pinned to one tenant, "
                 "an admin-only policy), allowlist this policy as "
-                f"{policy_id!r} in [lint.rules.SEC021]."
+                f"{pid!r} in [lint.rules.SEC021]."
             ),
-            location=policy_id,
+            location=pid,
         )

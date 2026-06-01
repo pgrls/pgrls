@@ -66,7 +66,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import find_func_calls
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -111,14 +111,14 @@ class SEC019:
                         break
                 if not fires:
                     continue
-                policy_id = f"{table.schema}.{table.name}.{policy.name}"
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
-                out.append(self._violation(table, policy, policy_id))
+                out.append(self._violation(table, policy, pid))
         return out
 
     def _violation(
-        self, table: Table, policy: Policy, policy_id: str
+        self, table: Table, policy: Policy, pid: str
     ) -> Violation:
         return Violation(
             rule_id=self.id,
@@ -141,7 +141,7 @@ class SEC019:
                 "so this is an info-level robustness nudge: pick the "
                 "overload deliberately. If the raise-on-unset "
                 "behaviour is intended, allowlist this policy as "
-                f"{policy_id!r} in [lint.rules.SEC019]."
+                f"{pid!r} in [lint.rules.SEC019]."
             ),
-            location=policy_id,
+            location=pid,
         )

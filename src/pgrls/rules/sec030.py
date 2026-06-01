@@ -104,9 +104,9 @@ from typing import Any
 from pglast.ast import A_Expr, Node, SelectStmt, String, SubLink
 from pglast.enums import A_Expr_Kind
 
-from pgrls.ast_utils import extract_column_refs, find_func_calls
+from pgrls.ast_utils import extract_column_refs, find_func_calls, own_column_ref
 from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
 
 # Functions that read a per-request session value — the *correct*
@@ -128,15 +128,6 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
             'strings (e.g. ["auth.uid", "current_setting"]).'
         )
     return set(raw)
-
-
-def _table_allowlisted(table: Table, allowlist: set[str]) -> bool:
-    """True if the table is named by bare or schema-qualified form
-    (mirrors SEC001 / SEC027)."""
-    return (
-        table.name in allowlist
-        or f"{table.schema}.{table.name}" in allowlist
-    )
 
 
 def _expr_op(node: A_Expr) -> str | None:
@@ -165,17 +156,9 @@ def _own_column_names(side: Any, table: Table) -> set[str]:
     """
     names: set[str] = set()
     for ref in extract_column_refs(side, exclude_sublinks=True):
-        if len(ref) == 1 and ref[0] in table.columns:
-            names.add(ref[0])
-        elif len(ref) == 2 and ref[0] == table.name and ref[1] in table.columns:
-            names.add(ref[1])
-        elif (
-            len(ref) == 3
-            and ref[0] == table.schema
-            and ref[1] == table.name
-            and ref[2] in table.columns
-        ):
-            names.add(ref[2])
+        col = own_column_ref(ref, table)
+        if col is not None:
+            names.add(col)
     return names
 
 
@@ -306,7 +289,7 @@ class SEC030:
             # so skip — mirrors SEC018's no-column-list degradation.
             if not table.column_details:
                 continue
-            if _table_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
 
             scoping: set[str] = set()

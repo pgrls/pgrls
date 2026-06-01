@@ -5,12 +5,8 @@ from typing import Any
 
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
-from pgrls.model import Schema, Table
-from pgrls.rules._allowlist import parse_table_ref_allowlist
-
-
-def _is_allowlisted(table: Table, allowlist: set[str]) -> bool:
-    return table.name in allowlist or table.qualified_name in allowlist
+from pgrls.model import Schema
+from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 
 
 class SEC001Fixer:
@@ -27,7 +23,7 @@ class SEC001Fixer:
             # Mirror SEC001's detection: RLS off, not allowlisted.
             if table.rls_enabled:
                 continue
-            if _is_allowlisted(table, allowlist):
+            if table_in_allowlist(table, allowlist):
                 continue
             # Skip partition children. SEC001 flags a child only
             # because an ancestor lacks RLS — or, when the parent

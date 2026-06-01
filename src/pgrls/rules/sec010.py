@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import is_literal_false
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -52,10 +52,8 @@ class SEC010:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                policy_id = (
-                    f"{table.schema}.{table.name}.{policy.name}"
-                )
-                if policy_id in allowlist:
+                pid = policy_id(table, policy)
+                if pid in allowlist:
                     continue
                 clause = self._which_clause_is_false(policy)
                 if clause is None:
@@ -66,7 +64,7 @@ class SEC010:
                         severity="warning",
                         title=self.title,
                         message=self._message(table, policy, clause),
-                        location=policy_id,
+                        location=pid,
                     )
                 )
         return out

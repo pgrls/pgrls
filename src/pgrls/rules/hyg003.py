@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
@@ -81,13 +81,11 @@ class HYG003:
                 ordered = sorted(group, key=lambda p: p.name)
                 original = ordered[0]
                 for dup in ordered[1:]:
-                    policy_id = (
-                        f"{table.schema}.{table.name}.{dup.name}"
-                    )
-                    if policy_id in allowlist:
+                    pid = policy_id(table, dup)
+                    if pid in allowlist:
                         continue
                     out.append(
-                        self._violation(table, dup, original, policy_id)
+                        self._violation(table, dup, original, pid)
                     )
         return out
 
@@ -96,7 +94,7 @@ class HYG003:
         table: Table,
         dup: Policy,
         original: Policy,
-        policy_id: str,
+        pid: str,
     ) -> Violation:
         return Violation(
             rule_id=self.id,
@@ -112,7 +110,7 @@ class HYG003:
                 "identical policy changes nothing. It is almost "
                 "always a copy-paste or migration leftover — drop "
                 "one of the pair. If keeping both is intended, "
-                f"allowlist {policy_id!r} in [lint.rules.HYG003]."
+                f"allowlist {pid!r} in [lint.rules.HYG003]."
             ),
-            location=policy_id,
+            location=pid,
         )
