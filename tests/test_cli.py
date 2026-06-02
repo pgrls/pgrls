@@ -597,8 +597,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 50 rules ship today (catalog header should say so).
-    assert "<strong>50</strong> rules" in result.output
+    # 51 rules ship today (catalog header should say so).
+    assert "<strong>51</strong> rules" in result.output
     # Header carries the auto-fixable count (17 as of v0.6.20+).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -1417,10 +1417,13 @@ def test_lint_fires_sec004_on_lovable_cve_pattern(
     # don't fire on that table. Both tables scope by a nullable
     # `user_id` (TEXT) against current_setting → SEC030 (the rule
     # detects the auth value whether bare on sec004_target or wrapped
-    # in a sub-select on sec004_clean).
+    # in a sub-select on sec004_clean). SEC038 (semantic, Z3-backed)
+    # co-fires with SEC004 on inverted_auth — the `current_setting()
+    # IS NULL OR …` USING is provably anon-valid (TRUE for every row
+    # under anon). Both detectors agreeing on the catastrophic leak.
     _assert_rules_fire_exactly(
         result.output,
-        {"SEC003", "SEC004", "SEC007", "PERF001", "SEC022", "SEC030"},
+        {"SEC003", "SEC004", "SEC007", "PERF001", "SEC022", "SEC030", "SEC038"},
     )
 
 
@@ -1435,9 +1438,10 @@ def test_lint_exclude_rule_skips_named_rule(pg_url: str, apply_sql) -> None:
         ["lint", "--database-url", pg_url, "--exclude-rule", "SEC003"],
     )
     # SEC003 is excluded; the rest of sec004_bad's findings remain.
+    # SEC038 co-fires with SEC004 on the anon-valid inverted_auth USING.
     _assert_rules_fire_exactly(
         result.output,
-        {"SEC004", "SEC007", "PERF001", "SEC022", "SEC030"},
+        {"SEC004", "SEC007", "PERF001", "SEC022", "SEC030", "SEC038"},
     )
 
 
@@ -1615,8 +1619,20 @@ def test_lint_sec004_auth_functions_override_suppresses(
         '[lint.rules.SEC004]\nauth_functions = ["my.custom_auth"]\n'
     )
     runner = CliRunner()
+    # Exclude SEC038 here: this test pins SEC004's auth_functions
+    # override, but SEC038 (the semantic sibling) fires on the same
+    # inverted_auth policy with its own default auth set and its finding
+    # message cross-references "SEC004" in prose — which would defeat the
+    # bare-substring assertion below. SEC038's own override is covered by
+    # tests/rules/test_sec038.py.
     result = runner.invoke(
-        main, ["lint", "--database-url", pg_url, "--config", str(cfg)]
+        main,
+        [
+            "lint",
+            "--database-url", pg_url,
+            "--config", str(cfg),
+            "--exclude-rule", "SEC038",
+        ],
     )
     assert "SEC004" not in result.output
 
@@ -1834,6 +1850,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         runner = CliRunner()
         result = runner.invoke(main, ["lint", "--database-url", pg_url])
         assert result.exit_code == 1, result.output
+        from pgrls.diff._z3_compare import Z3_AVAILABLE
         from pgrls.rules import all_rules
 
         # HYG004 (policy has no behavioral test) and PERF005 (RLS table
@@ -1843,7 +1860,16 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         # rule fires" contract — their firing is covered by
         # tests/rules/test_hyg004.py / test_perf005.py and the integration
         # tests in tests/test_perf.py.
+        #
+        # SEC038 (semantic anon-read) requires the optional pgrls[diff-z3]
+        # extra and NO-OPs when z3 is absent. The repo's primary CI lane
+        # and the demo lane both have the extra, so SEC038 fires there;
+        # the dependency-free lane exercises the NO-OP path, so drop it
+        # from the expected set (and from the pinned-location assertion
+        # below) when z3 is unavailable.
         expected = {r.id for r in all_rules()} - {"HYG004", "PERF005"}
+        if not Z3_AVAILABLE:
+            expected -= {"SEC038"}
         _assert_rules_fire_exactly(result.output, expected)
         # Pin each (rule, location) pair to its intended target.
         # Substring plus trailing newline anchors against the
@@ -1898,6 +1924,14 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         ):
             assert rule_loc in result.output, (
                 f"{rule_loc!r} missing from output:\n{result.output}"
+            )
+        # SEC038's pinned location is gated behind the optional z3 extra
+        # (see the expected-set guard above): with z3 it fires on the
+        # NOT-wrapped inverted-auth policy; without it the rule NO-OPs.
+        if Z3_AVAILABLE:
+            sec038_loc = "SEC038  public.allbad_sec038.anon_read\n"
+            assert sec038_loc in result.output, (
+                f"{sec038_loc!r} missing from output:\n{result.output}"
             )
     finally:
         # Drop the schema before the role: the SEC023 policy's

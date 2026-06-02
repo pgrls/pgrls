@@ -103,6 +103,7 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Literal
 
 try:
@@ -125,15 +126,23 @@ from pglast.ast import (
     FuncCall,
     Integer,
     NullTest,
+    ResTarget,
+    SelectStmt,
+    SQLValueFunction,
     String,
+    SubLink,
     TypeCast,
 )
 from pglast.enums import (
     A_Expr_Kind,
     BoolExprType,
     NullTestType,
+    SQLValueFunctionOp,
+    SubLinkType,
 )
 from pglast.stream import RawStream
+
+from pgrls.ast_utils import func_name_parts
 
 
 # Comparison operator strings appearing in `A_Expr.name[0].sval` for
@@ -204,6 +213,14 @@ class _Context:
         # variable, enabling implication checks across predicates
         # that reference identical opaque expressions.
         self._opaque_vars: dict[str, Any] = {}
+        # H2 (SEC038) — Kleene three-valued null-flags, keyed per
+        # column / opaque-expr. SEPARATE namespace + dict from
+        # `_null_vars` (the 2-valued path's disconnected marker) so the
+        # diff path stays byte-for-byte untouched. Decl names are
+        # prefixed `_nullflag__` and never land in `_vars`, so
+        # `is_real_column` excludes them and `_decode_model` drops them
+        # from the witness exactly like `_isnull__*` / `_opaque__*`.
+        self._nullflag_vars: dict[str, Any] = {}
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -241,6 +258,23 @@ class _Context:
         if existing.sort() == sort:
             return existing
         return None
+
+    def null_flag(self, key: str) -> Any:
+        """Free Kleene null-flag (a Z3 Bool) for the value keyed by ``key``.
+
+        H2 (SEC038) only. A separate namespace + dict from
+        ``null_marker`` (the 2-valued diff path's disconnected marker),
+        so the diff path is untouched. The decl name is prefixed
+        ``_nullflag__`` and the var never enters ``_vars``, so
+        ``is_real_column`` returns False for it and ``_decode_model``
+        drops it from the witness — keeping the emitted row real-columns
+        only, exactly like ``_isnull__*`` / ``_opaque__*``.
+        """
+        existing = self._nullflag_vars.get(key)
+        if existing is None:
+            existing = z3.Bool(f"_nullflag__{key}")
+            self._nullflag_vars[key] = existing
+        return existing
 
     def is_real_column(self, name: str) -> bool:
         """True iff `name` is a real column var (not a null/opaque marker).
@@ -877,3 +911,577 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     if not _row_is_sufficient_witness(row, base_z3, head_z3, ctx):
         return None
     return row
+
+
+# ===========================================================================
+# H2 (SEC038) — semantic anonymous-read property via Kleene three-valued
+# (3VL) logic. ADDITIVE: nothing above this line is touched. Every symbol
+# below is new. The 2-valued diff path (`_to_z3` / `classify_via_z3` /
+# `counterexample` / `_implies`) is unchanged and its tests stay green.
+#
+# The property: a read-capable policy (FOR ALL / FOR SELECT) leaks to
+# anonymous iff its USING predicate, evaluated under a session where every
+# auth-context function (auth.uid/role/jwt, current_user, session_user,
+# current_setting) returns NULL, is VALID — i.e. evaluates to *exactly
+# TRUE* (Kleene) for EVERY row assignment. Under SQL 3VL a row is visible
+# iff the predicate is exactly TRUE (NULL and FALSE both hide the row), so
+# validity means "anonymous unconditionally reads all rows" — the
+# Lovable-CVE catastrophic class.
+#
+# Firing criterion (zero-false-positive on the corpus): USING is anon-valid
+# iff `NOT(is_true(USING_anon))` is UNSAT. A scoped predicate
+# (`col = current_setting(...)`) under anon becomes `col = NULL` → Kleene U
+# (not TRUE) → not valid → does NOT fire. An inverted-auth disjunct
+# (`auth.uid() IS NULL OR real_check`) under anon becomes `TRUE OR …` →
+# TRUE for all rows → valid → fires. A narrow public carve-out
+# (`col = <const> OR …`) is TRUE only for *some* rows → not valid → does
+# NOT fire. Untranslatable sub-expressions ⇒ None ⇒ cannot prove validity
+# ⇒ DO NOT fire. Soundness over recall.
+# ===========================================================================
+
+
+@dataclass
+class _TV:
+    """A three-valued (Kleene) truth: a pair of Z3 Bools.
+
+    ``is_true`` holds iff the value is exactly TRUE; ``is_null`` holds iff
+    it is the Kleene unknown (U). For every *derived* node these are
+    exclusive by construction (a node can't be both TRUE and U). For a
+    *free leaf* lifted into a truth (a bool column / bool opaque used as a
+    predicate) the exclusivity ``Or(Not(is_true), Not(is_null))`` is
+    asserted explicitly at lift time — a SOUNDNESS requirement (§ amendment
+    #1): omitting it can only add models to ``is_true`` and produce a
+    spurious VALID verdict (a false fire).
+    """
+
+    is_true: Any   # z3.BoolRef
+    is_null: Any   # z3.BoolRef
+
+
+@dataclass
+class _Val:
+    """A non-boolean (scalar) value plus its Kleene null-flag."""
+
+    value: Any     # z3.ExprRef
+    is_null: Any   # z3.BoolRef
+
+
+# Auth-context functions forced to NULL under an anonymous session. Mirrors
+# SEC004's `_DEFAULT_AUTH_FUNCTIONS` and ast_utils' SQLValueFunction set so
+# the two rules stay consistent and configurable.
+_DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
+    "auth.uid",
+    "auth.role",
+    "auth.jwt",
+    "current_user",
+    "session_user",
+    "current_setting",
+})
+
+# Postgres parses `current_user`, `session_user`, etc. as SQLValueFunction
+# nodes (a separate class from FuncCall). Mirror of `_SVFOP_NAMES` /
+# `_SQL_VALUE_FUNCTION_NAMES`.
+_ANON_SVFOP_NAMES: dict[Any, str] = {
+    SQLValueFunctionOp.SVFOP_CURRENT_USER: "current_user",
+    SQLValueFunctionOp.SVFOP_SESSION_USER: "session_user",
+    SQLValueFunctionOp.SVFOP_USER: "user",
+    SQLValueFunctionOp.SVFOP_CURRENT_ROLE: "current_role",
+}
+
+
+def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
+    """True iff ``node`` is an auth-context call forced to NULL under anon.
+
+    Recognizes the same two AST shapes SEC004 / SEC037 do:
+    - ``FuncCall`` whose qualified-or-bare name ∈ ``auth_funcs``
+      (``auth.uid()``, ``current_setting('app.x')``, a bare ``uid()``).
+    - ``SQLValueFunction`` whose mapped name ∈ ``auth_funcs``
+      (``current_user`` / ``session_user`` written without parens).
+    """
+    if isinstance(node, FuncCall):
+        qualified, bare = func_name_parts(node)
+        if qualified is None:
+            return False
+        return qualified in auth_funcs or bare in auth_funcs
+    if isinstance(node, SQLValueFunction):
+        name = _ANON_SVFOP_NAMES.get(node.op)
+        return name is not None and name in auth_funcs
+    return False
+
+
+def _unwrap_scalar_sublink(node: Any) -> Any:
+    """``(SELECT <expr>)`` → ``<expr>``; anything else returned unchanged.
+
+    Only a single-target ``EXPR_SUBLINK`` with no FROM / WHERE / set-op /
+    DISTINCT / GROUP BY / HAVING is unwrapped (a genuine scalar
+    projection). Everything else — ``EXISTS``, an ``IN``-subquery, a
+    multi-target or FROM-bearing select — is left as-is, so the 3VL
+    translator returns None on it (soundness abort). Load-bearing: every
+    auth call in the corpus is ``(SELECT auth.uid())``-wrapped, so without
+    this the rule never fires on the real corpus; but an EXISTS subquery
+    (corpus ``sec004-is-null-in-subquery-safe``) must stay opaque so that
+    case stays clean.
+    """
+    if not isinstance(node, SubLink):
+        return node
+    if node.subLinkType != SubLinkType.EXPR_SUBLINK:
+        return node
+    sel = node.subselect
+    if not isinstance(sel, SelectStmt):
+        return node
+    target_list = sel.targetList
+    if not target_list or len(target_list) != 1:
+        return node
+    # `sel.op` is a SetOperation IntEnum; SETOP_NONE == 0 is a plain
+    # SELECT. Reject UNION/INTERSECT/EXCEPT and any FROM/WHERE/aggregation
+    # shape — those aren't a bare scalar.
+    if (
+        sel.fromClause
+        or sel.whereClause
+        or int(sel.op) != 0
+        or sel.distinctClause
+        or sel.groupClause
+        or sel.havingClause
+    ):
+        return node
+    target = target_list[0]
+    if not isinstance(target, ResTarget):
+        return node
+    return target.val
+
+
+def _as_val(x: Any) -> Any:
+    """Coerce a translation result into a ``_Val`` scalar operand.
+
+    ``_TV`` (a boolean-valued node) lowers to ``_Val(value=is_true,
+    is_null=is_null)`` — its truth becomes the scalar value, its null-flag
+    carries through. ``_Val`` passes through. ``None`` propagates. This is
+    the dual of ``_lift_to_tv``: amendments #3/#4 require boolean operands
+    (a bool literal, a bool column, a ``(... IS NULL)::bool`` cast) to be
+    usable wherever a scalar ``_Val`` is expected.
+    """
+    if x is None:
+        return None
+    if isinstance(x, _Val):
+        return x
+    if isinstance(x, _TV):
+        return _Val(value=x.is_true, is_null=x.is_null)
+    return None
+
+
+def _lift_to_tv(x: Any, assertions: list[Any]) -> Any:
+    """Coerce a translation result into a ``_TV`` truth.
+
+    ``_TV`` passes through. A ``_Val`` whose value is Bool-sorted is a
+    free bool leaf used as a predicate — lift to ``_TV`` AND append the
+    exclusivity constraint ``Or(Not(value), Not(is_null))`` (amendment #1:
+    soundness — a free leaf must not satisfy ``value ∧ is_null``). A
+    non-bool ``_Val`` used as a truth is not a Kleene truth → None
+    (abort). ``None`` propagates.
+    """
+    if x is None:
+        return None
+    if isinstance(x, _TV):
+        return x
+    if isinstance(x, _Val):
+        if x.value.sort() == z3.BoolSort():
+            assertions.append(z3.Or(z3.Not(x.value), z3.Not(x.is_null)))
+            return _TV(is_true=x.value, is_null=x.is_null)
+        return None
+    return None
+
+
+def _anon_3vl(
+    node: Any, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """Translate a pglast predicate node into a Kleene ``_TV`` / ``_Val``.
+
+    Returns ``_TV`` for a boolean-valued node (comparison, AND/OR/NOT,
+    NullTest, bool column / bool literal), ``_Val`` for a scalar (column,
+    auth call, literal, arithmetic, COALESCE, cast), or ``None`` when any
+    sub-expression is untranslatable (soundness abort — propagated by the
+    ``any(... is None)`` pattern, mirroring ``_to_z3``).
+
+    ``assertions`` collects leaf-exclusivity constraints (§ amendment #1);
+    the caller adds them to BOTH the validity and witness solvers.
+
+    Every call unwraps a scalar SubLink first, then checks the anon-NULL
+    leaf BEFORE the generic FuncCall / SQLValueFunction branches.
+    """
+    node = _unwrap_scalar_sublink(node)
+
+    # --- anon-NULL leaf: auth.uid()/role()/jwt(), current_setting(...),
+    # current_user, session_user — forced to NULL under an anonymous
+    # session. Value is irrelevant (it's NULL); is_null is unconditionally
+    # True. (Checked before the generic FuncCall branch.)
+    if _is_anon_null_leaf(node, auth_funcs):
+        return _Val(
+            value=ctx.opaque(_canon(node), z3.StringSort()),
+            is_null=z3.BoolVal(True),
+        )
+
+    # --- literals.
+    if isinstance(node, A_Const):
+        v = _const_to_z3(node)
+        if v is None:
+            return None  # literal NULL / unsupported
+        # Bool literal at top level is a truth; the caller's _lift_to_tv
+        # promotes a Bool-sorted _Val. Keep it a _Val here so it also
+        # works as a scalar comparison operand (amendment #3).
+        return _Val(value=v, is_null=z3.BoolVal(False))
+
+    # --- bare ColumnRef. Bool sort by default (used as a predicate or a
+    # bool operand); a typed comparison context rebinds it via the 3VL
+    # operand resolver. The free null-flag is a Kleene U candidate.
+    if isinstance(node, ColumnRef):
+        key = _column_key(node)
+        if not key:
+            return None
+        value = ctx.column(key, z3.BoolSort())
+        if value is None:
+            return None
+        return _Val(value=value, is_null=ctx.null_flag(key))
+
+    # --- non-auth function call: opaque value + FREE null-flag (a
+    # non-auth function is NOT known-NULL under anon). Sanity-translate
+    # args so an unparseable signature aborts.
+    if isinstance(node, FuncCall):
+        for arg in (node.args or ()):
+            if _anon_3vl(arg, ctx, auth_funcs, assertions) is None:
+                return None
+        key = _canon(node)
+        return _Val(
+            value=ctx.opaque(key, z3.StringSort()),
+            is_null=ctx.null_flag(key),
+        )
+
+    # --- boolean connectives (Kleene tables).
+    if isinstance(node, BoolExpr):
+        return _anon_boolexpr(node, ctx, auth_funcs, assertions)
+
+    # --- comparison / arithmetic.
+    if isinstance(node, A_Expr):
+        if node.kind == A_Expr_Kind.AEXPR_OP:
+            return _anon_binop(node, ctx, auth_funcs, assertions)
+        # IN / BETWEEN / others: soundness abort in v1 (SEC004 still
+        # guards the literal IS NULL shape syntactically).
+        return None
+
+    # --- NULL tests. The arg is resolved as a SCALAR (_Val) so
+    # `auth.uid() IS NULL`, `(... )::cast IS NULL`, etc. all work — this
+    # is the whole point vs the 2VL path (amendment #2: route through the
+    # scalar resolver, not the bool-_TV path). The result is a definite
+    # truth (never U): IS NULL is exactly the null-flag.
+    if isinstance(node, NullTest):
+        inner = _as_val(_anon_3vl(node.arg, ctx, auth_funcs, assertions))
+        if inner is None:
+            return None
+        if node.nulltesttype == NullTestType.IS_NULL:
+            return _TV(is_true=inner.is_null, is_null=z3.BoolVal(False))
+        if node.nulltesttype == NullTestType.IS_NOT_NULL:
+            return _TV(
+                is_true=z3.Not(inner.is_null), is_null=z3.BoolVal(False)
+            )
+        return None
+
+    # --- COALESCE: value is the first non-null arg; null iff all null.
+    if isinstance(node, CoalesceExpr):
+        vals: list[Any] = []
+        for arg in (node.args or ()):
+            v = _as_val(_anon_3vl(arg, ctx, auth_funcs, assertions))
+            if v is None:
+                return None
+            vals.append(v)
+        if not vals:
+            return None
+        try:
+            value = vals[-1].value
+            for v in reversed(vals[:-1]):
+                value = z3.If(z3.Not(v.is_null), v.value, value)
+            is_null = vals[0].is_null
+            for v in vals[1:]:
+                is_null = z3.And(is_null, v.is_null)
+        except z3.Z3Exception:
+            return None  # sort mismatch across branches
+        return _Val(value=value, is_null=is_null)
+
+    # --- CASE: v1 soundness abort (no CASE corpus negative; Oracle §3.5).
+    if isinstance(node, CaseExpr):
+        return None
+
+    # --- TypeCast. Handle both a scalar (_Val) and a boolean (_TV) inner
+    # (amendment #4: P4 `(... IS NULL)::bool` feeds a _TV inner). A cast
+    # of NULL is NULL, so the inner null-flag always carries through.
+    if isinstance(node, TypeCast):
+        return _anon_typecast(node, ctx, auth_funcs, assertions)
+
+    return None  # anything else: soundness abort
+
+
+def _anon_boolexpr(
+    node: BoolExpr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """Kleene AND / OR / NOT over ``_TV`` operands.
+
+    NOT x:  is_true = ¬x.is_true ∧ ¬x.is_null ; is_null = x.is_null
+    AND:    is_true = ⋀ tᵢ ; is_null = (some nᵢ) ∧ (no falsey operand)
+    OR:     is_true = ⋁ tᵢ ; is_null = (some nᵢ) ∧ (no true operand)
+
+    These are exactly the SQL three-valued tables (`NULL OR TRUE = TRUE`,
+    `NULL AND FALSE = FALSE`, `NULL OR NULL = NULL`, `U AND T = U`,
+    `F AND U = F`). Each operand is lifted to a ``_TV`` (a bool column /
+    literal operand becomes a truth, asserting leaf exclusivity).
+    """
+    raw_args = node.args or ()
+    tvs: list[_TV] = []
+    for arg in raw_args:
+        tv = _lift_to_tv(
+            _anon_3vl(arg, ctx, auth_funcs, assertions), assertions
+        )
+        if tv is None:
+            return None
+        tvs.append(tv)
+    if not tvs:
+        return None
+
+    if node.boolop == BoolExprType.NOT_EXPR:
+        if len(tvs) != 1:
+            return None
+        x = tvs[0]
+        return _TV(
+            is_true=z3.And(z3.Not(x.is_true), z3.Not(x.is_null)),
+            is_null=x.is_null,
+        )
+
+    if node.boolop == BoolExprType.AND_EXPR:
+        if len(tvs) < 2:
+            return tvs[0]
+        acc = tvs[0]
+        for y in tvs[1:]:
+            falsey_x = z3.And(z3.Not(acc.is_true), z3.Not(acc.is_null))
+            falsey_y = z3.And(z3.Not(y.is_true), z3.Not(y.is_null))
+            is_true = z3.And(acc.is_true, y.is_true)
+            is_null = z3.Or(
+                z3.And(acc.is_null, z3.Not(falsey_y)),
+                z3.And(y.is_null, z3.Not(falsey_x)),
+            )
+            acc = _TV(is_true=is_true, is_null=is_null)
+        return acc
+
+    if node.boolop == BoolExprType.OR_EXPR:
+        if len(tvs) < 2:
+            return tvs[0]
+        acc = tvs[0]
+        for y in tvs[1:]:
+            is_true = z3.Or(acc.is_true, y.is_true)
+            is_null = z3.And(
+                z3.Or(acc.is_null, y.is_null),
+                z3.Not(acc.is_true),
+                z3.Not(y.is_true),
+            )
+            acc = _TV(is_true=is_true, is_null=is_null)
+        return acc
+
+    return None
+
+
+def _anon_binop(
+    node: A_Expr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """Kleene comparison / arithmetic over scalar ``_Val`` operands.
+
+    Comparison (`= != <> < > <= >=`) → ``_TV``:
+        is_true = ¬na ∧ ¬nb ∧ op(va, vb) ; is_null = na ∨ nb
+    Arithmetic (`+ - * / %`) → ``_Val``:
+        value = op(va, vb) ; is_null = na ∨ nb
+
+    The comparison rule is the single highest-risk detail (§ amendment /
+    Oracle N4): when one side is anon-NULL (`nb = True`), ``is_true``
+    collapses to False and ``is_null`` to True — i.e. ``col = NULL`` is
+    Kleene U, never a satisfiable 2VL Bool. That is what keeps
+    ``U AND T = U`` / ``U OR U = U`` and the corpus negatives clean.
+    """
+    op_names = list(node.name or ())
+    if len(op_names) != 1 or not isinstance(op_names[0], String):
+        return None
+    op = op_names[0].sval
+    comparison_fn = _COMPARISON_OPS.get(op)
+    arithmetic_fn = _ARITHMETIC_OPS.get(op)
+    if comparison_fn is None and arithmetic_fn is None:
+        return None
+
+    left, right = _resolve_3vl_operands(
+        node.lexpr, node.rexpr, ctx, auth_funcs, assertions
+    )
+    if left is None or right is None:
+        return None
+
+    if comparison_fn is not None:
+        try:
+            cmp_z3 = comparison_fn(left.value, right.value)
+        except z3.Z3Exception:
+            return None
+        return _TV(
+            is_true=z3.And(
+                z3.Not(left.is_null), z3.Not(right.is_null), cmp_z3
+            ),
+            is_null=z3.Or(left.is_null, right.is_null),
+        )
+
+    if arithmetic_fn is not None:
+        try:
+            value = arithmetic_fn(left.value, right.value)
+        except z3.Z3Exception:
+            return None
+        return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null))
+
+    return None  # unreachable (guarded above) — satisfies the type checker
+
+
+def _resolve_3vl_operands(
+    lexpr: Any,
+    rexpr: Any,
+    ctx: _Context,
+    auth_funcs: set[str],
+    assertions: list[Any],
+) -> tuple[Any, Any]:
+    """Translate both comparison operands to ``_Val`` pairs.
+
+    Distinct from ``_resolve_binop_operands`` (the 2VL path) — that one
+    returns bare Z3 exprs, not ``_Val`` null-pairs. When one side is a
+    bare ColumnRef and the other resolves to a concrete-sorted ``_Val``,
+    the column is bound to that sort (its null-flag is a free Kleene U
+    candidate). ``col OP col`` binds both as String (mirroring the 2VL
+    default). Any None → ``(None, None)``.
+    """
+    lexpr = _unwrap_scalar_sublink(lexpr)
+    rexpr = _unwrap_scalar_sublink(rexpr)
+    l_is_col = isinstance(lexpr, ColumnRef)
+    r_is_col = isinstance(rexpr, ColumnRef)
+
+    def col_val(col: ColumnRef, sort: Any) -> Any:
+        key = _column_key(col)
+        if not key:
+            return None
+        var = ctx.column(key, sort)
+        if var is None:
+            return None  # type conflict against a prior binding
+        return _Val(value=var, is_null=ctx.null_flag(key))
+
+    if l_is_col and not r_is_col:
+        right = _as_val(_anon_3vl(rexpr, ctx, auth_funcs, assertions))
+        if right is None:
+            return (None, None)
+        left = col_val(lexpr, right.value.sort())
+        return (left, right)
+    if r_is_col and not l_is_col:
+        left = _as_val(_anon_3vl(lexpr, ctx, auth_funcs, assertions))
+        if left is None:
+            return (None, None)
+        right = col_val(rexpr, left.value.sort())
+        return (left, right)
+    if l_is_col and r_is_col:
+        return (col_val(lexpr, z3.StringSort()), col_val(rexpr, z3.StringSort()))
+    left = _as_val(_anon_3vl(lexpr, ctx, auth_funcs, assertions))
+    right = _as_val(_anon_3vl(rexpr, ctx, auth_funcs, assertions))
+    return (left, right)
+
+
+def _anon_typecast(
+    node: TypeCast, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """Translate ``<expr>::<type>`` under 3VL, preserving the null-flag.
+
+    The inner may be scalar (``_Val``) or boolean (``_TV`` — e.g. P4's
+    ``(... IS NULL)::bool``, amendment #4). A cast of NULL is NULL, so the
+    inner ``is_null`` always carries through. When the target sort matches
+    the inner value's sort the cast is a no-op; otherwise the value is
+    opaque under the target sort (an unknown target keeps a String opaque)
+    but the null-flag is preserved.
+    """
+    inner_raw = _anon_3vl(node.arg, ctx, auth_funcs, assertions)
+    if inner_raw is None:
+        return None
+    inner = _as_val(inner_raw)
+    if inner is None:
+        return None
+    target_sort = _typename_segments_to_sort(node.typeName)
+    if target_sort is None:
+        # Unknown target type — opaque value, keep the inner null-flag.
+        return _Val(
+            value=ctx.opaque(_canon(node), z3.StringSort()),
+            is_null=inner.is_null,
+        )
+    if inner.value.sort() == target_sort:
+        return _Val(value=inner.value, is_null=inner.is_null)
+    return _Val(
+        value=ctx.opaque(_canon(node), target_sort),
+        is_null=inner.is_null,
+    )
+
+
+def anon_read_counterexample(
+    using_node: Any, auth_functions: set[str] | None = None
+) -> dict[str, object] | None:
+    """Prove (or refute) that ``using_node`` is anon-VALID under Kleene 3VL.
+
+    Returns a dict when the USING predicate is provably TRUE for EVERY row
+    under an anonymous session (every auth function NULL) — meaning the
+    policy unconditionally leaks all rows to an unauthenticated client.
+    Returns ``None`` otherwise.
+
+    Under the validity criterion the predicate is TRUE for every row, so
+    the proof artifact is "all rows": the returned dict is empty ``{}``
+    (the predicate pins no specific real column — a genuine empty model is
+    the honest witness, § amendment #6). A non-empty dict is possible only
+    if a future "satisfiable read" criterion is added; SEC038 treats any
+    non-None return as "fire".
+
+    ``None`` when:
+    - Z3 is unavailable;
+    - the predicate (or any sub-expression) is untranslatable — cannot
+      prove validity, so no claim;
+    - ``NOT(is_true)`` is SAT — some row escapes ⇒ scoped, not a
+      catastrophic leak;
+    - the solver returns ``unknown`` (timeout) — no claim (mirrors
+      ``_implies``).
+
+    Soundness over recall: never claim a leak that can't be proven.
+    """
+    if not Z3_AVAILABLE:
+        return None
+    auth = (
+        auth_functions
+        if auth_functions is not None
+        else set(_DEFAULT_AUTH_FUNCTIONS)
+    )
+    ctx = _Context()
+    assertions: list[Any] = []
+    tv = _lift_to_tv(
+        _anon_3vl(using_node, ctx, auth, assertions), assertions
+    )
+    if tv is None:
+        return None
+
+    # Validity: NOT(is_true) UNSAT under the leaf-exclusivity constraints.
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
+    solver.add(z3.Not(tv.is_true))
+    result = solver.check()
+    if result != z3.unsat:
+        return None  # sat (a row escapes) or unknown (timeout) ⇒ no fire
+
+    # Valid ⇒ every row is read ⇒ any model of is_true is a sound witness
+    # (no sufficiency gate needed — contrast counterexample()/H1, which
+    # proves only a strict-superset loosening). Reuse the SAME ctx so
+    # `_decode_model`'s real-column filter already knows the columns.
+    witness = z3.Solver()
+    witness.set("timeout", 1000)
+    for a in assertions:
+        witness.add(a)
+    witness.add(tv.is_true)
+    if witness.check() != z3.sat:  # defensive; valid ⇒ sat
+        return {}
+    return _decode_model(witness.model(), ctx)

@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **fifty rules across four
+In the current release it ships **fifty-one rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -21,7 +21,13 @@ like `user_metadata` — the authenticated user can rewrite the value
 the policy reads), `SEC036` (policy `EXISTS (SELECT FROM auth.users
 WHERE …)` clause with no caller binding — evaluates to "is there
 any admin at all" instead of "is THIS user an admin", so every
-authenticated user passes once any matching row exists), `HYG001`
+authenticated user passes once any matching row exists), `SEC038`
+(semantic anonymous-read leak — the Z3-backed sibling of SEC004:
+proves the USING predicate is unconditionally TRUE for an
+unauthenticated session under Kleene 3VL, catching the NOT-wrapped
+and cast-wrapped inverted-auth variants SEC004's syntactic match
+misses; requires the optional `pgrls[diff-z3]` extra and NO-OPs
+without it), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
@@ -858,7 +864,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Fifty rules across four categories.** SEC001–SEC037,
+- **Fifty-one rules across four categories.** SEC001–SEC038,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

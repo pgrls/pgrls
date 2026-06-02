@@ -10,6 +10,49 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-01
+
+### Added
+
+- **SEC038 — semantic anonymous-read leak (Z3-backed).** A new
+  `error`-severity rule that proves, with the Z3 SMT solver, that a
+  read-capable policy's USING predicate is *unconditionally TRUE for an
+  unauthenticated session* — one where every auth-context function
+  (`auth.uid()` / `auth.role()` / `auth.jwt()`, `current_user`,
+  `session_user`, `current_setting()`) returns NULL. Under SQL
+  three-valued (Kleene) logic a row is visible iff USING is exactly TRUE,
+  so a predicate that is valid (TRUE for *every* row) under anon reads
+  the whole table — the Lovable-CVE catastrophic class.
+
+  SEC038 is the semantic sibling of the always-on, dependency-free
+  syntactic SEC004. SEC004 matches the literal shape `auth_func() IS
+  NULL`; SEC038 catches the inverted-auth variants that match misses —
+  `NOT (auth.uid() IS NOT NULL) OR …`, `(auth.uid() IS NULL)::bool OR …`,
+  a coerced-GUC `(SELECT current_setting('app.x'))::uuid IS NULL OR …`.
+  Both rules co-fire on the canonical Lovable shape; neither suppresses
+  the other (SEC004 still fires on a machine without the Z3 extra).
+
+  Firing criterion is *anonymous validity*: SEC038 fires iff
+  `NOT(USING_anon is TRUE)` is unsatisfiable under Kleene 3VL. This is
+  provably zero-false-positive on safe policies — a tenant/owner
+  predicate `col = (SELECT current_setting(…))` becomes `col = NULL` →
+  Kleene unknown (not TRUE) → not valid → does not fire; a narrow public
+  carve-out (`col = <constant> OR …`) is TRUE only for some rows → not
+  valid → does not fire. Soundness over recall: any sub-expression the
+  encoding cannot translate makes the predicate UNKNOWN, so validity
+  can't be proven and the rule stays silent. Because validity means
+  "TRUE for every row", the finding reports an unconditional leak (all
+  rows), not a single example row.
+
+  Requires the optional `pgrls[diff-z3]` extra (the Z3 solver). When z3
+  is **not** installed SEC038 NO-OPs — it returns no findings rather than
+  guessing; SEC004 keeps the syntactic guard. Configurable via
+  `[lint.rules.SEC038]` (`auth_functions`, `allowlist`).
+
+  Rule count is now 51 (was 50). The new Kleene 3VL encoder
+  (`anon_read_counterexample` in `pgrls.diff._z3_compare`) is purely
+  additive — the 2-valued `pgrls diff` implication path is unchanged.
+
 ## [0.15.0] - 2026-06-01
 
 ### Added

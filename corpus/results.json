@@ -1,10 +1,10 @@
 {
-  "pgrls_version": "0.14.0",
+  "pgrls_version": "0.16.0",
   "totals": {
-    "cases": 18,
-    "positive": 10,
+    "cases": 19,
+    "positive": 11,
     "negative": 8,
-    "tp": 10,
+    "tp": 12,
     "fp": 0,
     "fn": 0,
     "precision": 1.0,
@@ -99,10 +99,24 @@
       "name": "sec004-inverted-auth",
       "kind": "positive",
       "expect": [
-        "SEC004"
+        "SEC004",
+        "SEC038"
       ],
       "fired": [
-        "SEC004"
+        "SEC004",
+        "SEC038"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "sec038-not-wrapped-auth",
+      "kind": "positive",
+      "expect": [
+        "SEC038"
+      ],
+      "fired": [
+        "SEC038"
       ],
       "false_positives": [],
       "false_negatives": []
