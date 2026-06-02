@@ -30,6 +30,15 @@ dependencies = [
     "click>=8.2",
     "psycopg[binary]>=3.1",
     "pglast>=6,<7",
+    # z3-solver ships precompiled wheels (fast, no C++ toolchain) and
+    # powers the semantic verifier path — `pgrls diff` predicate analysis
+    # (the concrete leaking-row counterexample) and the SEC038
+    # anonymous-read proof. Promoted from the optional `diff-z3` extra to a
+    # core dependency so those features run on a plain `pip install pgrls`
+    # instead of silently no-op'ing. It's one wheel with no transitive
+    # bloat — far lighter than the docker/testcontainers `diff-apply`
+    # extra, which stays optional.
+    "z3-solver>=4.13",
 ]
 
 [project.optional-dependencies]
@@ -38,14 +47,11 @@ dependencies = [
 # slim for the lint-only path. Users who want the testing toolkit
 # install with `pip install pgrls[testing]`.
 testing = ["pytest>=8.0"]
-# Optional Z3-based predicate implication checking for
-# `pgrls diff` (v0.4+). Without this extra, the diff classifier
-# uses only the syntactic AST patterns; with it, predicate edits
-# that don't match a syntactic pattern get a second-chance check
-# via SAT-style implication. Z3 itself is a Microsoft Research
-# project (MIT-licensed); the `z3-solver` PyPI package ships
-# precompiled wheels for the major platforms, so installs are
-# fast and don't require a C++ toolchain.
+# `z3-solver` is a CORE dependency as of 0.16.0 (see the comment in
+# `dependencies` above), so the Z3 predicate analysis + SEC038 run on a
+# plain `pip install pgrls`. This extra is retained as a no-op alias so
+# the documented `pip install pgrls[diff-z3]` keeps working for anyone
+# who pinned it; it adds nothing beyond the core dependency.
 diff-z3 = ["z3-solver>=4.13"]
 # Optional `--apply migration.sql` support for `pgrls diff`. Pulls
 # in testcontainers so the diff can spin up an ephemeral Postgres,

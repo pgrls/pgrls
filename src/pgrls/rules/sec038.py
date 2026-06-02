@@ -40,9 +40,9 @@ Soundness over recall: any sub-expression that cannot be translated to the
 proven and SEC038 does NOT fire. A missed exotic leak is acceptable (SEC004
 still guards syntactically); a false positive is not.
 
-SEC038 REQUIRES the optional `pgrls[diff-z3]` extra (the Z3 SMT solver).
-When z3 is not installed the rule NO-OPs — it returns no findings rather
-than guessing. Install with `pip install 'pgrls[diff-z3]'` to enable it.
+SEC038 uses the Z3 SMT solver, a core dependency since 0.16.0, so it runs
+on a plain `pip install pgrls`. In the unusual case where z3 can't be
+imported the rule NO-OPs — it returns no findings rather than guessing.
 
 Because validity means "TRUE for every row", the proof artifact is "all
 rows" — SEC038 reports an unconditional leak, not a single example row.

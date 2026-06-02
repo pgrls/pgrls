@@ -33,7 +33,7 @@
 > - **Lint & fix** — `pgrls lint` checks a live database against all fifty-one rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tables that lack it — per-tenant (`tenant_id`) or per-user (`--model owner`, incl. the Supabase `auth.uid()` form): ENABLE + FORCE, an isolation policy, a restrictive floor, and the index, output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
-> - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Optional Z3-based predicate analysis (`pip install pgrls[diff-z3]`), plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
+> - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Z3-based predicate analysis is built in, plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
 > - **TypeScript port** — [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm implements the same RLS-testing contract for JS/TS — both `pg` and `postgres.js` driver adapters, vitest-friendly. See [`ts/`](ts/) in this repo.
 > - **VS Code extension** — [`pgrls/pgrls-vscode`](https://github.com/pgrls/pgrls-vscode) wraps the CLI; `pgrls: Lint database` surfaces findings as diagnostics in the Problems panel, with hover documentation per rule.
 
@@ -504,8 +504,7 @@ gated behind `--explain`.)
 | Column dropped (still referenced)      | REQUIRES_REVIEW        |
 | GRANT added on non-RLS table to PUBLIC | DANGEROUS              |
 
-When the optional Z3 analysis is installed (`pip install pgrls[diff-z3]`),
-a DANGEROUS *semantic-loosening* verdict — the new predicate admits a
+A DANGEROUS *semantic-loosening* verdict — the new predicate admits a
 strict superset of the old one's rows — also prints a concrete
 **leaking row**: a row the new policy admits but the old one rejected
 (e.g. `example leaking row: {tenant_id=2}`), in both text and JSON
@@ -562,7 +561,7 @@ pattern documentation.
 | [SEC035](docs/RULES.md#rule-sec035) | warning | UNIQUE constraint not scoped to the tenant discriminator — a global `UNIQUE(email)` instead of `UNIQUE(tenant_id, email)` leaks cross-tenant existence via duplicate-key errors (the PRIMARY KEY and all-uuid uniques are excluded) |
 | [SEC036](docs/RULES.md#rule-sec036) | error | Policy `EXISTS (SELECT FROM auth.users WHERE …)` sub-select with no caller binding — checks "is there any admin at all" instead of "is THIS user an admin", so every authenticated user passes once any matching row exists |
 | [SEC037](docs/RULES.md#rule-sec037) | warning | Policy compares `auth.role()` to a value outside the known role set (`anon` / `authenticated` / `service_role`) — comparison never matches and silently denies every row, masking the broken policy |
-| [SEC038](docs/RULES.md#rule-sec038) | error | Semantic anonymous-read leak — Z3 proves the USING predicate is unconditionally TRUE for an unauthenticated session (all auth functions NULL), catching inverted-auth variants SEC004's syntactic match misses; requires the [diff-z3] extra. |
+| [SEC038](docs/RULES.md#rule-sec038) | error | Semantic anonymous-read leak — Z3 proves the USING predicate is unconditionally TRUE for an unauthenticated session (all auth functions NULL), catching inverted-auth variants SEC004's syntactic match misses. |
 | [PERF001](docs/RULES.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](docs/RULES.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](docs/RULES.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |

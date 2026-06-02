@@ -2486,11 +2486,10 @@ Only read-capable PERMISSIVE policies are inspected — RESTRICTIVE
 policies can only narrow access, and INSERT/UPDATE/DELETE USING
 clauses gate the rows touched, not rows exposed on SELECT.
 
-**Requires the optional `[diff-z3]` extra.** SEC038 needs the Z3
-SMT solver, installed via `pip install 'pgrls[diff-z3]'`. When z3
-is **not** installed the rule NO-OPs — it returns no findings
-rather than guessing. (The dependency-free [SEC004](#rule-sec004)
-keeps the always-on syntactic guard.)
+SEC038 uses the Z3 SMT solver, a **core dependency since 0.16.0**, so it
+runs on a plain `pip install pgrls`. In the unusual case where z3 can't be
+imported the rule NO-OPs — it returns no findings rather than guessing.
+(The [SEC004](#rule-sec004) syntactic guard runs regardless.)
 
 **Configuration.**
 

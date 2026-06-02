@@ -1,7 +1,8 @@
 """Unit tests for SEC038 — semantic anonymous-read leak (Z3-backed 3VL).
 
-SEC038 requires the optional `pgrls[diff-z3]` extra. The module skips when
-z3 is absent (the soundness contract is that the rule NO-OPs there — pinned
+z3-solver is a core dependency as of 0.16.0, so SEC038 runs on a plain
+install; these tests still `importorskip` on z3 as a defensive guard. The
+soundness contract is that the rule NO-OPs if z3 is somehow absent — pinned
 by `test_sec038_noop_when_z3_unavailable`, which does NOT skip).
 
 The fire / no-fire cases are re-derived from the soundness oracle: a
