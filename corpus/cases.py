@@ -158,6 +158,17 @@ CASES: list[Case] = [
             pred="(SELECT auth.uid()) IS NOT NULL AND owner_id = (SELECT auth.uid())",
         ),
     ),
+    # (The intentional-public-data FP guard — a constant / bool carve-out
+    # that is satisfiable-but-not-valid under anon, so SEC038 must stay
+    # silent — is exercised by the unit suite (test_sec038_clean_on_narrow
+    # _public_carveout / _shared_bool_carveout) and the encoder suite
+    # (test_anon_clean_on_narrow_public_carveout / _shared_bool_carveout).
+    # It is omitted from the corpus because every such carve-out shape on
+    # the gold-standard table co-fires an orthogonal rule — SEC021 on a
+    # literal-vs-identity-column compare, PERF003 on an unindexed bool
+    # discriminator — which would obscure the SEC038-stays-clean signal the
+    # corpus negative is meant to isolate. The existing negatives below
+    # already prove SEC038 stays silent on real safe shapes.)
     # ============================ positives ============================
     Case(
         name="sec001-no-rls",
@@ -187,13 +198,37 @@ CASES: list[Case] = [
     Case(
         name="sec004-inverted-auth",
         kind="positive",
-        expect=frozenset({"SEC004"}),
+        expect=frozenset({"SEC004", "SEC038"}),
         note="Lovable CVE shape: `(SELECT current_setting()) IS NULL OR …` "
         "top-level disjunct. Wrapped so PERF001 stays quiet; SEC004 still "
-        "fires (it descends into the SubLink).",
+        "fires (it descends into the SubLink). SEC038 (semantic, Z3-backed) "
+        "co-fires here — under anon the current_setting is NULL, so the IS "
+        "NULL disjunct is TRUE for every row (anon-valid). Two independent "
+        "detectors agreeing on the same catastrophic leak.",
         sql=_clean_owner(
             "accounts",
             pred="(SELECT current_setting('app.user_id', true))::uuid IS NULL "
+            "OR owner_id = (SELECT auth.uid())",
+        ),
+    ),
+    Case(
+        name="sec038-not-wrapped-auth",
+        kind="positive",
+        expect=frozenset({"SEC038"}),
+        note="Semantic-only anon-read: `NOT ((SELECT auth.uid()) IS NOT "
+        "NULL)` is `auth.uid() IS NULL` — but SEC004's literal "
+        "`auth() IS NULL` matcher misses the NOT-wrapped form (verified: "
+        "SEC004 stays silent here, SEC038 fires). Under anon the disjunct "
+        "is TRUE for every row → anon-valid → SEC038 fires. The headline "
+        "value of the semantic check; the second disjunct is the real owner "
+        "check (no literal) so SEC021 stays quiet and SEC038 is the only "
+        "finding. (The `::bool`-cast variant is covered by the unit + "
+        "encoder suites, where the predicate is parsed directly; Postgres "
+        "elides the redundant `::bool` on a round-trip, collapsing it to "
+        "the plain `IS NULL` shape SEC004 already catches.)",
+        sql=_clean_owner(
+            "vaults",
+            pred="NOT ((SELECT auth.uid()) IS NOT NULL) "
             "OR owner_id = (SELECT auth.uid())",
         ),
     ),

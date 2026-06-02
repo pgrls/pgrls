@@ -2420,6 +2420,96 @@ migration (`auth.role() = 'admin'` → `app_metadata` lookup), or
 known-roles config extension. The finding message tells the
 operator what to do; the choice isn't mechanical.
 
+<a id="rule-sec038"></a>
+
+## SEC038 — Semantic anonymous-read leak (Z3-backed)
+
+**Severity:** error.
+
+**The hazard.** A read-capable policy (FOR ALL or FOR SELECT)
+leaks every row to anonymous if its USING predicate is provably,
+unconditionally TRUE for an unauthenticated session — one where
+every auth-context function (`auth.uid()` / `auth.role()` /
+`auth.jwt()`, `current_user`, `session_user`, `current_setting()`)
+returns NULL. Under SQL three-valued (Kleene) logic a row is
+visible iff USING evaluates to exactly TRUE; NULL and FALSE both
+hide the row.
+
+SEC038 is the *semantic* sibling of [SEC004](#rule-sec004). SEC004
+is purely syntactic — it flattens OR disjuncts and matches the
+literal shape `auth_func() IS NULL`. SEC038 catches the
+inverted-auth variants that shape misses:
+
+```sql
+USING (NOT (auth.uid() IS NOT NULL) OR owner_id = auth.uid())  -- NOT-wrapped
+USING ((auth.uid() IS NULL)::bool   OR owner_id = auth.uid())  -- cast-wrapped
+USING ((SELECT current_setting('app.user'))::uuid IS NULL OR …) -- coerced GUC
+```
+
+In each case, under an anonymous session the inverting disjunct is
+TRUE for *every* row, so the policy reads all rows — the
+Lovable-CVE catastrophic class, only obfuscated past the syntactic
+matcher.
+
+**Standard fix.** Gate on a non-null auth check and drop the
+inverting disjunct:
+
+```sql
+USING (auth.uid() IS NOT NULL AND owner_id = auth.uid())
+```
+
+This is the semantic form of the SEC004 hole — see
+[SEC004](#rule-sec004) for the syntactic variant and its fixer.
+
+**Detection.** Translates the USING predicate into a Kleene
+three-valued encoding (every auth function pinned to NULL) and asks
+Z3 whether it is **valid** — TRUE for *every* row assignment, i.e.
+`NOT(USING_anon is TRUE)` is unsatisfiable. Validity means
+"anonymous unconditionally reads all rows". This is provably
+zero-false-positive on safe policies:
+
+* A tenant / owner predicate `col = (SELECT current_setting('app.x'))`
+  becomes `col = NULL` under anon → Kleene U (not TRUE) → not valid
+  → does **not** fire.
+* A narrow / intentional public carve-out (`col = <constant> OR …`)
+  is TRUE only for *some* rows → not valid → does **not** fire — no
+  false positive on intentional public data.
+
+Soundness over recall: any sub-expression the encoding cannot
+translate makes the predicate's truth UNKNOWN, so validity cannot
+be proven and SEC038 stays silent. A missed exotic leak is
+acceptable (SEC004 still guards syntactically); a false positive is
+not. Because validity means "TRUE for every row", the finding
+reports an unconditional leak (all rows), not a single example row.
+
+Only read-capable PERMISSIVE policies are inspected — RESTRICTIVE
+policies can only narrow access, and INSERT/UPDATE/DELETE USING
+clauses gate the rows touched, not rows exposed on SELECT.
+
+**Requires the optional `[diff-z3]` extra.** SEC038 needs the Z3
+SMT solver, installed via `pip install 'pgrls[diff-z3]'`. When z3
+is **not** installed the rule NO-OPs — it returns no findings
+rather than guessing. (The dependency-free [SEC004](#rule-sec004)
+keeps the always-on syntactic guard.)
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC038]
+# Function names treated as anonymous-NULL under an unauthenticated
+# session. Replaces the default ["auth.uid", "auth.role",
+# "auth.jwt", "current_user", "session_user", "current_setting"].
+# Mirrors SEC004's option so the two rules stay consistent.
+auth_functions = ["auth.uid", "current_setting"]
+
+# Per-policy escape hatch for intentional public-data tables.
+allowlist = ["public.announcements.public_read"]
+```
+
+**No auto-fix.** The right replacement depends on intent — add a
+non-null auth guard, remove the inverting disjunct, or (for genuine
+public data) allowlist the policy. The choice isn't mechanical.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

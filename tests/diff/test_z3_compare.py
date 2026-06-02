@@ -20,6 +20,7 @@ z3_solver = pytest.importorskip("z3")
 from pgrls.ast_utils import parse_expr  # noqa: E402
 from pgrls.diff._z3_compare import (  # noqa: E402
     Z3_AVAILABLE,
+    anon_read_counterexample,
     classify_via_z3,
     counterexample,
 )
@@ -554,3 +555,168 @@ def test_counterexample_for_loosen_via_public_helper():
     assert _row_satisfies_head_not_base(
         "tenant_id = 1", "tenant_id = 1 OR tenant_id = 2", cx
     )
+
+
+# ---------------------------------------------------------------------------
+# H2 (SEC038) — `anon_read_counterexample`: the Kleene 3VL anonymous-read
+# validity prover. Additive; the 2-valued path above is untouched.
+#
+# Contract: returns a dict (a proof artifact) iff the USING predicate is
+# anon-VALID — TRUE for every row under an anonymous session (every auth
+# function NULL) — else None. We assert the dict/None *shape*, never exact
+# column values (the validity criterion yields an empty model, but the
+# stable contract is "fires" vs "doesn't"), mirroring the H1 discipline.
+# ---------------------------------------------------------------------------
+
+_OWNER = "owner_id = '00000000-0000-0000-0000-000000000001'::uuid"
+
+
+def _anon(sql: str) -> object:
+    node = parse_expr(sql)
+    assert node is not None, "test predicate should parse"
+    return anon_read_counterexample(node)
+
+
+# --- VALID (fires): a dict is returned --------------------------------------
+
+
+def test_anon_fires_on_not_wrapped_is_not_null() -> None:
+    # P1 — the NOT-wrapped variant SEC004 misses.
+    assert _anon(f"NOT ((SELECT auth.uid()) IS NOT NULL) OR {_OWNER}") is not None
+
+
+def test_anon_fires_on_is_null_or_true() -> None:
+    # P2.
+    assert _anon("(SELECT auth.uid()) IS NULL OR true") is not None
+
+
+def test_anon_fires_on_bool_cast_is_null() -> None:
+    # P4 — the `::bool`-cast variant; the TypeCast wraps a _TV inner
+    # (amendment #4). Asserted at the encoder level, not just the rule.
+    assert _anon(f"((SELECT auth.uid()) IS NULL)::bool OR {_OWNER}") is not None
+
+
+def test_anon_fires_on_corpus_inverted_auth_shape() -> None:
+    # P3 / sec004-inverted-auth.
+    assert _anon(
+        "(SELECT current_setting('app.user_id', true))::uuid IS NULL "
+        "OR owner_id = (SELECT auth.uid())"
+    ) is not None
+
+
+def test_anon_fires_on_multiple_auth_is_null() -> None:
+    # P6.
+    assert _anon(
+        "(SELECT auth.role()) IS NULL OR (SELECT auth.uid()) IS NULL "
+        "OR tenant_id = (SELECT current_setting('app.t', true)::uuid)"
+    ) is not None
+
+
+def test_anon_fires_on_bare_true() -> None:
+    assert _anon("true") is not None
+
+
+def test_anon_fires_on_trivial_tautology() -> None:
+    assert _anon("1 = 1") is not None
+
+
+# --- NOT VALID (no fire): None is returned ----------------------------------
+
+
+def test_anon_clean_on_owner_predicate() -> None:
+    # N2 — col = NULL is Kleene U, never a satisfiable 2VL Bool.
+    assert _anon("owner_id = (SELECT auth.uid())") is None
+
+
+def test_anon_clean_on_tenant_predicate() -> None:
+    # N1.
+    assert _anon(
+        "tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid)"
+    ) is None
+
+
+def test_anon_clean_on_is_null_under_and() -> None:
+    # N4 (make-or-break): U OR (U AND T) = U.
+    assert _anon(
+        "owner_id = (SELECT auth.uid()) OR "
+        "(owner_id = (SELECT current_setting('app.public_owner', true)::uuid) "
+        "AND (SELECT auth.uid()) IS NULL)"
+    ) is None
+
+
+def test_anon_clean_on_is_not_null_guard() -> None:
+    # N6: F AND U = F.
+    assert _anon(
+        "(SELECT auth.uid()) IS NOT NULL AND owner_id = (SELECT auth.uid())"
+    ) is None
+
+
+def test_anon_clean_on_narrow_public_carveout() -> None:
+    # S1: a constant carve-out is TRUE only for some rows → not valid.
+    assert _anon(
+        "tenant_id = '00000000-0000-0000-0000-000000000000'::uuid "
+        "OR owner_id = (SELECT auth.uid())"
+    ) is None
+
+
+def test_anon_clean_on_shared_bool_carveout() -> None:
+    # S2: a boolean comparison operand (amendment #3) — not valid.
+    assert _anon("shared = true OR owner_id = (SELECT auth.uid())") is None
+
+
+def test_anon_clean_on_coerced_guc_count() -> None:
+    # P5-excluded: 0 = NULL is U → U OR U = U → not valid.
+    assert _anon(
+        "0 = (SELECT current_setting('app.uid_count', true))::int "
+        "OR owner_id = (SELECT auth.uid())"
+    ) is None
+
+
+def test_anon_clean_on_untranslatable_exists_subquery() -> None:
+    # An EXISTS subquery is left opaque (not unwrapped) → abort → None.
+    assert _anon(
+        "owner_id = (SELECT auth.uid()) OR EXISTS "
+        "(SELECT 1 FROM t WHERE (SELECT auth.uid()) IS NULL)"
+    ) is None
+
+
+def test_anon_clean_on_in_list() -> None:
+    # AEXPR_IN is an untranslatable shape in v1 → abort → None.
+    assert _anon("owner_id IN ('a', 'b') OR (SELECT auth.uid()) IS NULL") is None
+
+
+def test_anon_returns_none_when_z3_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pgrls.diff._z3_compare as z3c
+
+    monkeypatch.setattr(z3c, "Z3_AVAILABLE", False)
+    assert _anon("(SELECT auth.uid()) IS NULL OR true") is None
+
+
+def test_anon_bool_column_leaf_cannot_be_true_and_null() -> None:
+    # Amendment #1 (soundness): a bool-column leaf lifted to a _TV must
+    # carry the exclusivity constraint, so value ∧ null_flag is UNSAT —
+    # otherwise an unsound VALID verdict (false fire) becomes reachable.
+    from pgrls.diff._z3_compare import (
+        _DEFAULT_AUTH_FUNCTIONS,
+        _anon_3vl,
+        _Context,
+        _lift_to_tv,
+    )
+
+    ctx = _Context()
+    assertions: list[object] = []
+    node = parse_expr("flag OR owner_id = (SELECT auth.uid())")
+    assert node is not None
+    _lift_to_tv(
+        _anon_3vl(node, ctx, set(_DEFAULT_AUTH_FUNCTIONS), assertions),
+        assertions,
+    )
+    flag = ctx.column("flag", z3_solver.BoolSort())
+    flag_nullflag = ctx.null_flag("flag")
+    solver = z3_solver.Solver()
+    for a in assertions:
+        solver.add(a)
+    solver.add(z3_solver.And(flag, flag_nullflag))
+    assert solver.check() == z3_solver.unsat

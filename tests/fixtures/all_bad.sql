@@ -730,3 +730,33 @@ CREATE POLICY tenant_iso ON public.allbad_sec035
     USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
     WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
 CREATE INDEX ON public.allbad_sec035 (tenant_id);
+
+-- SEC038: semantic anonymous-read leak. A NOT-wrapped inverted-auth
+-- disjunct that SEC004's literal `auth() IS NULL` matcher misses --
+-- `NOT ((SELECT auth.uid()) IS NOT NULL)` is semantically
+-- `auth.uid() IS NULL`, so under an anonymous session (auth.uid() =
+-- NULL) the disjunct is TRUE for every row and the policy reads all
+-- rows. Z3 proves the USING is anon-valid (TRUE for every row under
+-- Kleene 3VL). Requires the [diff-z3] extra -- in the no-z3 CI lane
+-- SEC038 NO-OPs and the test's z3-guard drops it from the expected
+-- set. The chosen USING deliberately does NOT fire SEC004 (no literal
+-- `auth_func() IS NULL` disjunct, it's the NOT-wrapped form), keeping
+-- this block isolating.
+-- Pinned silences: TO postgres (SEC003/SEC007), RLS on with FORCE
+-- (SEC001/SEC002/SEC032), owner_id NOT NULL + indexed (SEC030/
+-- PERF003/PERF004), no OR-true / identity-literal / current_user
+-- shapes (SEC011/SEC021/SEC018), and owner_id referenced so the
+-- predicate is not session-state-only (SEC005). The auth.uid() stub
+-- returns uuid (to match owner_id) and uses a single-quoted body, as
+-- the fixture suite's no-dollar-quoting hygiene check forbids the
+-- dollar-dollar form.
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid
+    LANGUAGE sql STABLE
+    AS 'SELECT NULL::uuid';
+CREATE TABLE public.allbad_sec038 (id int, owner_id uuid NOT NULL);
+ALTER TABLE public.allbad_sec038 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec038 FORCE ROW LEVEL SECURITY;
+CREATE POLICY anon_read ON public.allbad_sec038
+    FOR ALL TO postgres
+    USING (NOT ((SELECT auth.uid()) IS NOT NULL) OR owner_id = (SELECT auth.uid()));
+CREATE INDEX ON public.allbad_sec038 (owner_id);
