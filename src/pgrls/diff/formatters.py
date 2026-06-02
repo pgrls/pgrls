@@ -473,6 +473,21 @@ if _missing_kinds:
 del _missing_kinds, _all_marker_kinds
 
 
+def _format_counterexample(cx: dict[str, object]) -> str:
+    """Render a leaking-row counterexample as a copy-pasteable row literal.
+
+    ``{v!r}`` gives ``'abc'`` for strings, ``5`` for ints, ``True`` for
+    bools, ``3.5`` for reals — unambiguous and round-trippable. An empty
+    dict can only be produced by the soundness gate when EVERY row leaks
+    (``head ∧ ¬base`` is a tautology — e.g. an unsatisfiable base
+    predicate), so "(any row)" is literally accurate there, not a guess.
+    """
+    if not cx:
+        return "(any row — the old predicate rejected everything)"
+    parts = ", ".join(f"{k}={v!r}" for k, v in cx.items())
+    return f"{{{parts}}}"
+
+
 def _render_stanza(change: Change, *, explain: bool = False) -> list[str]:
     """Return lines (no trailing newline) for one Change stanza.
 
@@ -526,6 +541,17 @@ def _render_stanza(change: Change, *, explain: bool = False) -> list[str]:
     # Classification line (2-space indent, uppercase tag)
     tag = change.classification.upper()
     lines.append(f"  [{tag}] {change.message}")
+
+    # Concrete leaking row (Z3 verifier artifact). Printed
+    # unconditionally — NOT gated behind `--explain` — because a
+    # counterexample is a hard verifier output that also rides in the
+    # JSON surface; it sits between the classification line and the
+    # optional `--explain` rationale, sharing the 2-space label indent.
+    if change.counterexample is not None:
+        lines.append(
+            "  example leaking row: "
+            f"{_format_counterexample(change.counterexample)}"
+        )
 
     # Optional rationale line — `pgrls diff --explain`. Indented to
     # match the classification line and prefixed with `-> ` so the
@@ -657,6 +683,7 @@ def _change_to_violation(c: Change) -> Violation:
         title=_humanize_kind_name(c.kind.name),
         message=c.message,
         location=c.location,
+        counterexample=c.counterexample,
     )
 
 

@@ -5,7 +5,7 @@ and requires-review cases. Each test pins exactly one return value.
 """
 from __future__ import annotations
 
-from pgrls.diff.ast_compare import compare_predicates
+from pgrls.diff.ast_compare import compare_predicates, counterexample_for
 
 
 # ---------------------------------------------------------------------------
@@ -244,3 +244,30 @@ def test_location_and_clause_kwargs_unchanged():
         )
         == "unchanged"
     )
+
+
+# ---------------------------------------------------------------------------
+# counterexample_for — clean-degrade contract (Z3-AGNOSTIC, no gate).
+# These must hold whether or not the diff-z3 extra is installed: the
+# function imports z3 lazily and returns None on the unchanged / empty
+# paths regardless, so importing this module never hard-requires z3 and
+# the call never raises. (Presence-of-a-counterexample is asserted in
+# the z3-gated test_z3_compare.py instead.)
+# ---------------------------------------------------------------------------
+
+
+def test_counterexample_for_returns_none_on_unchanged():
+    # Identical predicates → head ∧ ¬base is UNSAT (or z3 absent) → None
+    # either way. Proves the no-z3 import path is safe and non-raising.
+    assert counterexample_for("a = 1", "a = 1") is None
+
+
+def test_counterexample_for_returns_none_on_empty_side():
+    # An absent predicate short-circuits before any z3 import.
+    assert counterexample_for(None, "a = 1") is None
+    assert counterexample_for("a = 1", "") is None
+
+
+def test_counterexample_for_returns_none_on_parse_failure():
+    # Unparseable SQL → parse_expr returns None → None, no raise.
+    assert counterexample_for("WHERE :::", "a = 1") is None

@@ -183,3 +183,37 @@ def compare_predicates(
         return z3_result
 
     return "requires_review"
+
+
+def counterexample_for(
+    base_sql: str | None,
+    head_sql: str | None,
+    *,
+    location: str | None = None,
+    clause: str | None = None,
+) -> dict[str, object] | None:
+    """Leaking-row counterexample for a loosened predicate change, or None.
+
+    Re-parses both predicates (mirroring ``compare_predicates``) and
+    delegates to the Z3 model extractor. Returns None when either side
+    is empty / fails to parse, Z3 is unavailable, or no self-sufficient
+    leaking row exists — an equivalent or tightened change, or a leak that
+    can't be expressed as a column-only row (see
+    ``_z3_compare.counterexample``).
+
+    Intended to be called only on the ``"semantic_loosened"`` verdict
+    (the Z3 path); the ``from ... import counterexample`` is local so
+    importing ``ast_compare`` never hard-requires Z3, matching the lazy
+    ``classify_via_z3`` import above. No ``fail_message_tail`` is passed:
+    this runs only after ``compare_predicates`` has already classified,
+    so re-emitting a parse warning here would double-report.
+    """
+    if not base_sql or not head_sql:
+        return None
+    base_node = parse_expr(base_sql, location=location, clause=clause)
+    head_node = parse_expr(head_sql, location=location, clause=clause)
+    if base_node is None or head_node is None:
+        return None
+    from pgrls.diff._z3_compare import counterexample
+
+    return counterexample(base_node, head_node)

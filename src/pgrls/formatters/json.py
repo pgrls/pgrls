@@ -47,6 +47,16 @@ def format_json(violations: list[Violation]) -> str:
                 "title": v.title,
                 "message": v.message,
                 "location": v.location,
+                # Additive, non-breaking key (per the contract above):
+                # present only when set, so non-diff lint runs and
+                # non-loosened diffs keep the historical shape. Values
+                # are JSON-native (int / str / bool / float), so
+                # `json.dumps` handles them directly.
+                **(
+                    {"counterexample": v.counterexample}
+                    if v.counterexample is not None
+                    else {}
+                ),
             }
             for v in violations
         ],

@@ -1111,3 +1111,129 @@ def test_partition_of_only_diff_emits_no_changes() -> None:
         )
     )
     assert diff_schemas(base2, head2) == []
+
+
+# ---------------------------------------------------------------------------
+# H1 — leaking-row counterexample surfacing.
+#
+# The serialization tests below build a Change with a hand-supplied
+# counterexample directly, so they exercise the Change → Violation →
+# JSON / text projection deterministically WITHOUT invoking the solver
+# (Z3-agnostic, never flaky). The end-to-end population test is gated on
+# z3 because only the verifier path produces a non-None counterexample.
+# ---------------------------------------------------------------------------
+
+
+def _loosened_change_with_cx() -> Change:
+    return Change(
+        kind=ChangeKind.USING_LOOSENED,
+        classification="dangerous",
+        location="public.t",
+        message="Policy public.t USING predicate loosened.",
+        before_sql="tenant_id = 1",
+        after_sql="tenant_id = 1 OR tenant_id = 2",
+        counterexample={"tenant_id": 2},
+    )
+
+
+def test_json_includes_counterexample() -> None:
+    import json
+
+    from pgrls.diff.formatters import format_diff_json
+
+    payload = json.loads(format_diff_json([_loosened_change_with_cx()]))
+    assert payload["violations"][0]["counterexample"] == {"tenant_id": 2}
+
+
+def test_json_omits_counterexample_when_absent() -> None:
+    import json
+
+    from pgrls.diff.formatters import format_diff_json
+
+    c = Change(
+        kind=ChangeKind.RLS_FLIPPED,
+        classification="dangerous",
+        location="public.t",
+        message="RLS disabled",
+        before_sql=None,
+        after_sql=None,
+    )
+    payload = json.loads(format_diff_json([c]))
+    assert "counterexample" not in payload["violations"][0]
+
+
+def test_text_includes_leaking_row() -> None:
+    from pgrls.diff.formatters import format_diff_text
+
+    out = format_diff_text([_loosened_change_with_cx()])
+    assert "example leaking row" in out
+    assert "tenant_id=2" in out
+
+
+def test_text_omits_leaking_row_when_absent() -> None:
+    from pgrls.diff.formatters import format_diff_text
+
+    c = Change(
+        kind=ChangeKind.USING_LOOSENED,
+        classification="dangerous",
+        location="public.t",
+        message="Policy public.t USING predicate loosened.",
+        before_sql="tenant_id = 1",
+        after_sql="tenant_id = 1 OR tenant_id = 2",
+        counterexample=None,
+    )
+    out = format_diff_text([c])
+    assert "example leaking row" not in out
+
+
+def test_diff_schemas_populates_counterexample_on_semantic_loosen() -> None:
+    # End-to-end through diff_schemas: a Z3-only semantic loosen (the
+    # syntactic OR-add pattern is dodged by spreading the disjunction
+    # so compare_predicates must reach classify_via_z3) yields a
+    # USING_LOOSENED Change carrying a sound leaking row.
+    pytest.importorskip("z3")
+    base = Schema(
+        tables=(_t("t", rls=True, policies=(_p("p", using_sql="tenant_id = 1"),)),)
+    )
+    head = Schema(
+        tables=(
+            _t(
+                "t",
+                rls=True,
+                policies=(
+                    _p("p", using_sql="tenant_id = 1 OR tenant_id = 2 OR tenant_id = 3"),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    loosened = [c for c in changes if c.kind == ChangeKind.USING_LOOSENED]
+    assert len(loosened) == 1
+    cx = loosened[0].counterexample
+    assert cx is not None
+    # Only real columns, and the row is a member of head ∖ base.
+    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert cx.get("tenant_id") in (2, 3)
+
+
+def test_diff_schemas_no_counterexample_on_syntactic_loosen() -> None:
+    # A SINGLE OR-disjunct add is caught by the syntactic `loosened_or`
+    # pattern BEFORE Z3 runs — also DANGEROUS, but H1 deliberately does
+    # not attach a counterexample to the non-verifier path, so the
+    # field stays None.
+    base = Schema(
+        tables=(_t("t", rls=True, policies=(_p("p", using_sql="tenant_id = 1"),)),)
+    )
+    head = Schema(
+        tables=(
+            _t(
+                "t",
+                rls=True,
+                policies=(_p("p", using_sql="tenant_id = 1 OR tenant_id = 2"),),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    loosened = [c for c in changes if c.kind == ChangeKind.USING_LOOSENED]
+    assert len(loosened) == 1
+    assert loosened[0].counterexample is None
