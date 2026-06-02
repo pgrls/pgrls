@@ -1208,7 +1208,12 @@ def policy_to_sql(p: Policy, qname: str) -> str:
     role_strs = [
         "PUBLIC" if r == "PUBLIC" else quote_ident(r) for r in p.roles
     ]
-    parts.append(f"TO {', '.join(role_strs)}")
+    # Omit `TO` entirely when there are no roles — emitting `TO ` with
+    # an empty role list is a syntax error that aborts `diff --apply`.
+    # A roleless CREATE POLICY defaults to PUBLIC, which is what an
+    # empty role set means.
+    if role_strs:
+        parts.append(f"TO {', '.join(role_strs)}")
     if p.using_sql:
         parts.append(f"USING ({p.using_sql})")
     if p.with_check_sql:

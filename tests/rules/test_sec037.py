@@ -136,11 +136,31 @@ def test_fires_on_in_list_with_all_unknown_roles() -> None:
     } == {"admin", "editor"}
 
 
-def test_fires_on_not_in_list_unknown_role() -> None:
-    # `NOT IN` parses as the same AEXPR_IN node (name `<>`); the role
-    # call is still on the value side and the listed literal is still
-    # unknown, so it surfaces too.
+def test_does_not_fire_on_not_in_list() -> None:
+    # `auth.role() NOT IN ('admin')` is ALWAYS TRUE for any real role
+    # (auth.role() returns a genuine role, never the unknown 'admin'),
+    # so every row is VISIBLE — the OPPOSITE of SEC037's silent-deny
+    # hazard ("comparison never matches, every row hidden"). Emitting
+    # the silent-deny finding here is an inverted-semantics false
+    # positive. `NOT IN` parses as AEXPR_IN with operator name `<>`;
+    # only plain `IN` (operator `=`) is the silent-deny shape, so
+    # SEC037 must stay silent on `NOT IN`.
     schema = _wrap(_policy("(auth.role() NOT IN ('admin'))", name="not_in_admin"))
+    assert SEC037().check(schema, {}) == []
+
+
+def test_fires_on_schema_qualified_equality_operator() -> None:
+    # pglast can render/parse `=` as the schema-qualified
+    # `OPERATOR(pg_catalog.=)`. The equality check matches on the
+    # operator name's FINAL component, so the silent-deny shape is
+    # caught in the qualified form too (regression for the len(name)==1
+    # gate that previously rejected it).
+    schema = _wrap(
+        _policy(
+            "(auth.role() OPERATOR(pg_catalog.=) 'admin')",
+            name="qualified_eq",
+        )
+    )
     violations = SEC037().check(schema, {})
     assert len(violations) == 1
     assert "admin" in violations[0].message

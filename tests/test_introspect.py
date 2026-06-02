@@ -212,6 +212,28 @@ def test_columns_skips_dropped_columns(
     assert "kept" in things.columns
 
 
+def test_index_columns_exclude_covering_include_columns(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A covering index's INCLUDE columns are NOT part of the logical
+    # key, so they must not land in Index.columns — otherwise SEC035
+    # mistakes a `UNIQUE (email) INCLUDE (tenant_id)` for a
+    # tenant-scoped unique and misses the cross-tenant existence leak.
+    # pg_index.indkey lists key columns then INCLUDE columns; we slice
+    # to indnkeyatts (0-based) so only the key columns are captured.
+    apply_sql(
+        """
+        CREATE TABLE public.members (email TEXT, tenant_id UUID);
+        CREATE UNIQUE INDEX members_email_key
+            ON public.members (email) INCLUDE (tenant_id);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    members = next(t for t in schema.tables if t.name == "members")
+    idx = next(i for i in members.indexes if i.name == "members_email_key")
+    assert tuple(idx.columns) == ("email",)
+
+
 def test_populates_policy_using_ast(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

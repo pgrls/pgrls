@@ -439,7 +439,15 @@ SELECT
     COALESCE(
         ARRAY(
             SELECT COALESCE(a.attname, '')
-            FROM unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord)
+            -- Slice to the KEY columns only: indkey holds key columns
+            -- followed by INCLUDE (covering) columns, and a covering
+            -- column must not be read as part of the index's logical
+            -- key (else SEC035 mistakes a UNIQUE(email) INCLUDE
+            -- (tenant_id) for tenant-scoped). indnkeyatts = key count.
+            -- `indkey::int[]` keeps int2vector's 0-based lower bound,
+            -- so the first indnkeyatts elements are [0 : indnkeyatts-1].
+            FROM unnest((i.indkey::int[])[0:i.indnkeyatts - 1])
+                 WITH ORDINALITY AS k(attnum, ord)
             LEFT JOIN pg_catalog.pg_attribute a
                 ON a.attrelid = i.indrelid
                AND a.attnum = k.attnum

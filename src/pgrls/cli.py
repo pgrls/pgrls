@@ -563,6 +563,11 @@ def _merge_overrides(
         rule_options=dict(config.rule_options),
         severity_overrides=dict(config.severity_overrides),
         diff_fail_on=config.diff_fail_on,
+        # Preserve project-declared custom rules across the override
+        # merge — without this they fall back to the dataclass default
+        # [] and `pgrls lint` silently never runs them (they still load
+        # for `explain`/validation, so the miss looks like coverage).
+        extra_rules=list(config.extra_rules),
     )
 
 
@@ -1855,9 +1860,11 @@ def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
             with psycopg.connect(arg) as conn:
                 return introspect(conn, schemas=schemas)
         except psycopg.Error as exc:
-            raise ToolError(
-                f"Database error connecting to {arg!r}: {exc}"
-            ) from exc
+            # Do NOT interpolate `arg` — it is a DSN that may embed a
+            # password (`postgres://user:pw@host/db`), and this message
+            # lands in CI logs. Mirror the redacted form every other
+            # command uses.
+            raise ToolError(f"Database error connecting to the database: {exc}") from exc
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
 

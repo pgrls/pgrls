@@ -1200,6 +1200,26 @@ def test_merge_overrides_preserves_diff_fail_on() -> None:
     assert merged.diff_fail_on == "requires-review"
 
 
+def test_merge_overrides_preserves_extra_rules() -> None:
+    # `pgrls lint` runs custom `[lint].extra_rules` via the merged
+    # Config. Dropping the field here (the dataclass default is [])
+    # makes `_run_rules` silently never run them while `explain` and
+    # --rule validation still see them — a silent false-negative for
+    # the documented SDK extension point. Pin the threading.
+    config = Config(
+        database_url="postgres://config",
+        schemas=["public"],
+        disable=[],
+        fail_on="warning",
+        rule_options={},
+        extra_rules=["my_pkg.rules:TenantCheck"],
+    )
+    merged = _merge_overrides(
+        config, database_url=None, schemas_csv=None, fail_on=None
+    )
+    assert merged.extra_rules == ["my_pkg.rules:TenantCheck"]
+
+
 def test_introspect_populates_policy_using_ast(pg_url: str, apply_sql) -> None:
     apply_sql(
         """

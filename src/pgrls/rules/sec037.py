@@ -106,14 +106,19 @@ def _parse_role_functions(options: dict[str, Any]) -> set[str]:
 
 
 def _is_equality(node: A_Expr) -> bool:
-    """True if `node` is a plain binary `=` operator expression."""
+    """True if `node` is a binary `=` operator expression.
+
+    Matches on the operator name's FINAL component, so a
+    schema-qualified `OPERATOR(pg_catalog.=)` (the round-trip form
+    pglast can emit) is recognized as `=` just like a bare `=`.
+    """
     name = node.name
     return (
         node.kind == A_Expr_Kind.AEXPR_OP
         and name is not None
-        and len(name) == 1
-        and isinstance(name[0], String)
-        and name[0].sval == "="
+        and len(name) >= 1
+        and isinstance(name[-1], String)
+        and name[-1].sval == "="
     )
 
 
@@ -127,9 +132,21 @@ def _is_in_list(node: A_Expr) -> bool:
     `auth.role() = 'admin' OR auth.role() = 'editor'` when every listed
     value is an unknown role, so it needs the same treatment.
     """
+    # Only plain `IN` is the always-false silent-deny shape. Postgres
+    # parses `IN (...)` with operator name `=` and `NOT IN (...)` with
+    # `<>`; an `auth.role() NOT IN (<unknown roles>)` is always TRUE
+    # (not a silent deny), so treating it like `IN` is a false
+    # positive. Match `=` only.
     # `A_Expr.kind` is typed `Any` by pglast — wrap in bool() so
     # mypy --strict doesn't flag a `no-any-return`.
-    return bool(node.kind == A_Expr_Kind.AEXPR_IN)
+    name = node.name
+    return bool(
+        node.kind == A_Expr_Kind.AEXPR_IN
+        and name is not None
+        and len(name) >= 1
+        and isinstance(name[-1], String)
+        and name[-1].sval == "="
+    )
 
 
 # Mirror of `_SQL_VALUE_FUNCTION_NAMES` in `pgrls.ast_utils` —

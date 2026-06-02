@@ -245,6 +245,28 @@ def test_snapshot_version_is_fourteen_after_dotted_function_fields() -> None:
     assert snap["version"] == 14
 
 
+def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
+    # A Policy with no roles must NOT render `TO ` (empty) — that's a
+    # syntax error that aborts `diff --apply`. A roleless CREATE POLICY
+    # defaults to PUBLIC, so omitting the TO clause is the correct,
+    # executable render.
+    from pgrls.model import Policy, policy_to_sql
+
+    p = Policy(
+        name="p",
+        command="ALL",
+        permissive=True,
+        roles=(),
+        using_sql="true",
+        with_check_sql=None,
+        using_ast=None,
+        with_check_ast=None,
+    )
+    sql = policy_to_sql(p, "public.t")
+    assert "TO " not in sql
+    assert sql == "CREATE POLICY p ON public.t USING (true);"
+
+
 def test_snapshot_includes_partition_of_when_set() -> None:
     table = Table(
         schema="public",
