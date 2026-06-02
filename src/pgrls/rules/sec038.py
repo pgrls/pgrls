@@ -72,6 +72,9 @@ _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.jwt",
     "current_user",
     "session_user",
+    # SQL-standard synonyms of current_user — all NULL under anon.
+    "current_role",
+    "user",
     "current_setting",
 })
 

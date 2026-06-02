@@ -51,6 +51,19 @@ def test_sec004_fires_on_current_setting_is_null_disjunct() -> None:
     assert len(SEC004().check(schema, {})) == 1
 
 
+def test_sec004_fires_on_current_role_and_user_is_null_disjunct() -> None:
+    # current_role and bare USER are SQL-standard synonyms of
+    # current_user (parsed as SVFOP nodes); each is NULL under an
+    # unauthenticated session, so `<svfop> IS NULL OR …` is the same
+    # anonymous-read hole. Regression for their absence from the
+    # default auth-function set.
+    for using in (
+        "current_role IS NULL OR user_id = '1'",
+        "user IS NULL OR user_id = '1'",
+    ):
+        assert len(SEC004().check(_wrap(_policy_with_using(using)), {})) == 1
+
+
 def test_sec004_fires_on_current_user_is_null_disjunct() -> None:
     schema = _wrap(
         _policy_with_using("current_user IS NULL OR user_id = '1'")

@@ -28,6 +28,12 @@ _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.jwt",
     "current_user",
     "session_user",
+    # current_role + bare USER are SQL-standard synonyms of
+    # current_user (SVFOP_CURRENT_ROLE / SVFOP_USER); all return NULL
+    # under an unauthenticated session, so a leak gated on them is the
+    # same anonymous-read hole.
+    "current_role",
+    "user",
     "current_setting",
 })
 

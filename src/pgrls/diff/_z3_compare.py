@@ -976,6 +976,10 @@ _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.jwt",
     "current_user",
     "session_user",
+    # SQL-standard synonyms of current_user (SVFOP_CURRENT_ROLE /
+    # SVFOP_USER, already mapped in _ANON_SVFOP_NAMES) — NULL under anon.
+    "current_role",
+    "user",
     "current_setting",
 })
 
