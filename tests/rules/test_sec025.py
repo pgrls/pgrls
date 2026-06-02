@@ -106,6 +106,29 @@ def test_sec025_silent_when_referenced_table_is_rls_protected() -> None:
     assert SEC025().check(schema, options={}) == []
 
 
+def test_sec025_silent_on_cte_shadowing_rls_disabled_table() -> None:
+    # The policy references a CTE *named* `members`, not the base
+    # table. In Postgres a CTE name shadows a same-named table within
+    # its scope, so the unqualified `members` ref is the CTE — SEC025
+    # must not resolve it to the RLS-disabled `members` table (a false
+    # positive). The CTE body here touches no base table at all.
+    schema = Schema(
+        tables=(
+            _docs(
+                _policy(
+                    using=(
+                        "tenant_id IN ("
+                        "WITH members AS (SELECT 1 AS tenant_id) "
+                        "SELECT tenant_id FROM members)"
+                    )
+                )
+            ),
+            _members(rls_enabled=False),
+        )
+    )
+    assert SEC025().check(schema, options={}) == []
+
+
 def test_sec025_silent_on_self_reference() -> None:
     # A policy on `documents` referencing `documents` itself in a
     # sub-select inherits the same RLS gate (its own policies apply

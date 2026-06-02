@@ -76,6 +76,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pglast.ast import CommonTableExpr, Node
+
 from pgrls.ast_utils import extract_range_vars
 from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
@@ -114,6 +116,39 @@ def _resolve_table_ref(
     return None
 
 
+def _cte_names(node: Any) -> set[str]:
+    """Collect every CTE name (`WITH <name> AS …`) defined in `node`.
+
+    A reference to a CTE parses as an *unqualified* RangeVar whose
+    relname is the CTE name — it is NOT a base-table reference, and in
+    Postgres a CTE name shadows a same-named table within its scope.
+    SEC025 must therefore not resolve such a ref to a same-named
+    RLS-disabled table (the false positive). Collecting names across
+    the whole predicate is a safe over-approximation: the only effect
+    is to not flag an unqualified ref that matches a CTE name, which is
+    exactly the ref Postgres resolves to the CTE anyway.
+    """
+    names: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, CommonTableExpr):
+            ctename = getattr(n, "ctename", None)
+            if isinstance(ctename, str) and ctename:
+                names.add(ctename)
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return names
+
+
 class SEC025:
     id: str = "SEC025"
     severity: Severity = "warning"
@@ -135,11 +170,20 @@ class SEC025:
         for table in schema.tables:
             for policy in table.policies:
                 refs: set[tuple[str | None, str]] = set()
+                cte_names: set[str] = set()
                 for ast in (policy.using_ast, policy.with_check_ast):
                     if ast is not None:
                         refs |= set(extract_range_vars(ast))
+                        cte_names |= _cte_names(ast)
                 unprotected: set[str] = set()
                 for ref_schema, ref_name in refs:
+                    # An unqualified ref whose name matches a CTE
+                    # defined in the same predicate is a CTE reference,
+                    # not a base table — skip it. It would otherwise
+                    # resolve to a same-named RLS-disabled table (a
+                    # false positive); Postgres resolves it to the CTE.
+                    if ref_schema is None and ref_name in cte_names:
+                        continue
                     resolved = _resolve_table_ref(
                         ref_schema, ref_name, table.schema,
                         table_map, view_set,
