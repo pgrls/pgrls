@@ -1007,7 +1007,18 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
         qualified, bare = func_name_parts(node)
         if qualified is None:
             return False
-        return qualified in auth_funcs or bare in auth_funcs
+        if qualified in auth_funcs:
+            return True
+        # Bare-name fallback: an UNQUALIFIED call has qualified == bare
+        # and is already covered above. The fallback therefore only
+        # ever fires for a *schema-qualified* call matched by its last
+        # component — and a user-defined `myschema.current_setting()`
+        # is a DIFFERENT function from the pg_catalog builtin, so
+        # forcing it to NULL would be a SEC038 false positive. Only
+        # honor the bare match for the pg_catalog builtins.
+        if qualified.startswith("pg_catalog.") and bare in auth_funcs:
+            return True
+        return False
     if isinstance(node, SQLValueFunction):
         name = _ANON_SVFOP_NAMES.get(node.op)
         return name is not None and name in auth_funcs

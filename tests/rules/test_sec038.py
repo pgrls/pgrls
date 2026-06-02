@@ -212,6 +212,32 @@ def test_sec038_clean_on_shared_bool_carveout() -> None:
     assert SEC038().check(schema, {}) == []
 
 
+def test_sec038_no_false_positive_on_user_function_named_like_builtin() -> None:
+    # A user-defined `myschema.current_setting(...)` is NOT the
+    # pg_catalog builtin and must not be forced to NULL under anon —
+    # otherwise `myschema.current_setting('x') IS NULL OR <scoped>`
+    # would be proved valid and SEC038 would false-fire. Regression
+    # for the bare-name builtin collision (a schema-qualified call is
+    # a different function with unknown anonymous behaviour).
+    safe = _wrap(
+        _policy_with_using(
+            "myschema.current_setting('app.tenant') IS NULL OR " + _OWNER_LIT
+        )
+    )
+    assert SEC038().check(safe, {}) == []
+
+
+def test_sec038_fires_on_unqualified_and_pg_catalog_builtin() -> None:
+    # Control for the above: the unqualified builtin (and its explicit
+    # pg_catalog form) IS forced to NULL under anon, so the same
+    # inverted-auth disjunct is a real anonymous-read leak.
+    for fn in ("current_setting", "pg_catalog.current_setting"):
+        leak = _wrap(
+            _policy_with_using(f"{fn}('app.tenant') IS NULL OR " + _OWNER_LIT)
+        )
+        assert len(SEC038().check(leak, {})) == 1
+
+
 def test_sec038_clean_on_coerced_guc_count() -> None:
     # P5-excluded: `0 = current_setting('app.uid_count')::int OR owner = uid`.
     # Under anon the coerced GUC is NULL → `0 = NULL` is U, so `U OR U = U`
