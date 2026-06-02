@@ -64,7 +64,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import JoinExpr, RangeVar, SubLink
+from pglast.ast import (
+    JoinExpr,
+    Node,
+    RangeSubselect,
+    RangeVar,
+    SelectStmt,
+    SubLink,
+)
 from pglast.enums import SubLinkType
 
 from pgrls.ast_utils import find_func_calls
@@ -144,6 +151,15 @@ def _from_item_range_vars(from_item: Any) -> list[RangeVar]:
         elif isinstance(item, JoinExpr):
             walk(item.larg)
             walk(item.rarg)
+        elif isinstance(item, RangeSubselect):
+            # `FROM (SELECT ... FROM auth.users) sub` — the target
+            # table is one level down in the sub-select's own FROM.
+            # Recurse its fromClause so an EXISTS that reaches the
+            # target through a derived table is still detected.
+            sub = item.subquery
+            if isinstance(sub, SelectStmt):
+                for fc in sub.fromClause or ():
+                    walk(fc)
 
     walk(from_item)
     return out
@@ -239,6 +255,62 @@ def _exists_sublinks_against_target(
     return out
 
 
+def _scalar_value_subselects(qual: Any) -> list[Any]:
+    """Sub-selects of SCALAR (EXPR_SUBLINK) sub-links reachable in
+    `qual` without crossing a non-scalar (EXISTS/ANY/ALL) sub-link.
+
+    A scalar `(SELECT auth.uid())` used as a value genuinely binds the
+    caller (the PERF001-recommended wrap). A nested EXISTS/ANY/ALL is a
+    SEPARATE existence test, not a binding of the outer EXISTS, so we
+    must not look inside it — else an admin-any bypass whose WHERE
+    merely contains an unrelated nested auth call (e.g. a correlated
+    audit sub-select) would be treated as caller-bound and the real
+    leak suppressed (the SEC036 false negative).
+    """
+    out: list[Any] = []
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, SubLink):
+            walk(n.testexpr)
+            if (
+                n.subLinkType == SubLinkType.EXPR_SUBLINK
+                and n.subselect is not None
+            ):
+                out.append(n.subselect)
+                walk(n.subselect)
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(qual)
+    return out
+
+
+def _qual_binds_caller(qual: Any, binding_functions: set[str]) -> bool:
+    """True if a binding auth call in `qual` constrains the EXISTS to
+    the calling user.
+
+    A binding call counts when it is (1) directly in the qual or in an
+    IN/ANY/ALL testexpr — `exclude_sublinks=True` stops the search at
+    every sub-select boundary; or (2) inside a scalar value sub-select
+    (`col = (SELECT auth.uid())`). A call inside a nested EXISTS/ANY/ALL
+    body is deliberately NOT counted (see `_scalar_value_subselects`).
+    """
+    if find_func_calls(qual, binding_functions, exclude_sublinks=True):
+        return True
+    return any(
+        find_func_calls(sub, binding_functions)
+        for sub in _scalar_value_subselects(qual)
+    )
+
+
 def _has_binding_reference(
     sublink: SubLink, binding_functions: set[str]
 ) -> bool:
@@ -246,15 +318,17 @@ def _has_binding_reference(
 
     Checks the sub-select's top-level WHERE *and* every JOIN `ON`
     clause — a binding predicate (`u.id = auth.uid()`) is equally
-    valid in either position, so both must be searched to avoid a
-    false positive on a correctly-bound JOIN.
+    valid in either position. The search descends into scalar
+    `(SELECT …)` value sub-selects (the PERF001 wrap) but NOT into a
+    nested EXISTS/ANY/ALL body, so an unrelated auth call in a deeper
+    existence sub-select cannot mask an unbound admin-any check.
     """
     sel = sublink.subselect
     if sel is None:
         return False
     candidates = [sel.whereClause, *_from_clause_join_quals(sel)]
     return any(
-        c is not None and find_func_calls(c, binding_functions)
+        c is not None and _qual_binds_caller(c, binding_functions)
         for c in candidates
     )
 

@@ -187,6 +187,61 @@ def test_silent_when_join_on_clause_binds_caller() -> None:
     assert SEC036().check(schema, {}) == []
 
 
+def test_fires_on_admin_any_with_unrelated_nested_auth_call() -> None:
+    # Regression (#1): the admin-any EXISTS is unbound — its WHERE only
+    # checks `role = 'admin'`. The auth.uid() lives in an UNRELATED
+    # nested EXISTS (a correlated audit sub-select), a separate
+    # existence test, not a binding of the outer EXISTS. The binding
+    # search must NOT descend into it, or this real
+    # every-authenticated-user bypass ships as clean.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users u "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin' "
+        "AND EXISTS (SELECT 1 FROM audit_log a WHERE a.actor = auth.uid()))"
+    )
+    schema = _wrap(_policy(f"({expr})", name="admin_any_distractor"))
+    [v] = SEC036().check(schema, {})
+    assert v.rule_id == "SEC036"
+
+
+def test_silent_on_scalar_wrap_binding_not_confused_with_nested_exists() -> None:
+    # Precision companion to the distractor: a scalar `(SELECT
+    # auth.uid())` value sub-select DOES bind (the PERF001 wrap), so the
+    # binding search must still descend into EXPR_SUBLINK subselects.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users u "
+        "WHERE u.id = (SELECT auth.uid()) "
+        "AND u.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="scalar_wrap_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_fires_when_target_reached_through_from_subselect() -> None:
+    # Regression (#14): the target table sits inside a derived table
+    # (`FROM (SELECT * FROM auth.users) sub`). The FROM walk must
+    # recurse into the sub-select's own FROM, or the unbound admin-any
+    # EXISTS is invisible.
+    expr = (
+        "EXISTS (SELECT 1 FROM (SELECT * FROM auth.users) sub "
+        "WHERE sub.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="target_via_subselect"))
+    [v] = SEC036().check(schema, {})
+    assert v.rule_id == "SEC036"
+
+
+def test_silent_when_from_subselect_target_is_caller_bound() -> None:
+    # Precision for #14: the same derived-table shape, but the EXISTS
+    # binds the caller — must stay silent.
+    expr = (
+        "EXISTS (SELECT 1 FROM (SELECT * FROM auth.users) sub "
+        "WHERE sub.id = auth.uid())"
+    )
+    schema = _wrap(_policy(f"({expr})", name="subselect_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
 def test_silent_on_in_subselect_against_auth_users() -> None:
     # The IN/ANY variant has a different failure mode (rows owned by
     # any admin, not all rows when any admin exists). SEC036 is
