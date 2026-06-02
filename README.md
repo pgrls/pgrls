@@ -488,7 +488,9 @@ Pass `--explain` to append a one-paragraph rationale beneath each
 classified Change in the text output — why a dropped PERMISSIVE
 policy is BREAKING rather than DANGEROUS, why a column drop is
 REQUIRES_REVIEW, etc. Text format only; JSON / SARIF already carry
-the classification tag.
+the classification tag. (The leaking-row counterexample described
+below is separate: it is emitted unconditionally on the Z3 path, not
+gated behind `--explain`.)
 
 | Change category                        | Default classification |
 |----------------------------------------|------------------------|
@@ -501,6 +503,18 @@ the classification tag.
 | Roles widened (PUBLIC or new role)     | DANGEROUS              |
 | Column dropped (still referenced)      | REQUIRES_REVIEW        |
 | GRANT added on non-RLS table to PUBLIC | DANGEROUS              |
+
+When the optional Z3 analysis is installed (`pip install pgrls[diff-z3]`),
+a DANGEROUS *semantic-loosening* verdict — the new predicate admits a
+strict superset of the old one's rows — also prints a concrete
+**leaking row**: a row the new policy admits but the old one rejected
+(e.g. `example leaking row: {tenant_id=2}`), in both text and JSON
+output. The row is only emitted when its column values are a sound,
+self-sufficient witness; when the leak depends on a NULL test or an
+opaque value (a function call, a `current_setting(...)` GUC, `COALESCE`,
+or `CASE`), pgrls prints the label-only DANGEROUS verdict rather than a
+row that would not actually leak. Without the extra, the verdict is
+unchanged and no row is printed.
 
 See [AGENTS.md](AGENTS.md) for the full classification table and AST
 pattern documentation.

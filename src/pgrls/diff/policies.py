@@ -17,7 +17,7 @@ Module-private helpers and dispatch tables live here too.
 """
 from __future__ import annotations
 
-from pgrls.diff.ast_compare import compare_predicates
+from pgrls.diff.ast_compare import compare_predicates, counterexample_for
 from pgrls.diff.differ import Change, ChangeKind, Classification
 from pgrls.model import Policy, Table
 
@@ -348,6 +348,19 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
                 continue
             kind, classification = mapping[result]
             message_fragment = _PREDICATE_RESULT_MESSAGES[result]
+            # Counterexample only on the Z3 "semantic_loosened" verdict:
+            # the syntactic loosen results (`loosened_or`,
+            # `loosened_and_drop`) are also DANGEROUS but never went
+            # through Z3, so there's no model to mine. Gating on the
+            # result (not the "dangerous" classification) keeps the
+            # leaking-row feature strictly tied to the verifier path.
+            cx = (
+                counterexample_for(
+                    base_sql, head_sql, location=location, clause=clause_label
+                )
+                if result == "semantic_loosened"
+                else None
+            )
             changes.append(
                 Change(
                     kind=kind,
@@ -359,6 +372,7 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
                     ),
                     before_sql=base_sql,
                     after_sql=head_sql,
+                    counterexample=cx,
                 )
             )
 

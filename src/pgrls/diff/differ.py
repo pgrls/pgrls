@@ -20,7 +20,7 @@ table sub-rule sequence the formatters rely on.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
 
@@ -94,6 +94,13 @@ class Change:
     their own source formatting (parens, casing, whitespace) rather
     than a RawStream-normalized rewrite. Either side may be None
     when a predicate is added or removed.
+
+    For loosened predicate Changes, `counterexample` may carry a
+    `{column: value}` row that HEAD admits but BASE rejects (Z3 path
+    only; None otherwise). It is excluded from `__eq__` / `__hash__`
+    (`compare=False`) so the frozen dataclass stays hashable even
+    with a dict payload — its presence is fully derived from the
+    other fields, so dropping it from equality changes nothing.
     """
 
     kind: ChangeKind
@@ -102,6 +109,9 @@ class Change:
     message: str
     before_sql: str | None
     after_sql: str | None
+    counterexample: dict[str, object] | None = field(
+        default=None, compare=False, hash=False
+    )
 
 
 def diff_schemas(base: Schema, head: Schema) -> list[Change]:

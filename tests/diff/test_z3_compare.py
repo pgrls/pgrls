@@ -18,7 +18,11 @@ import pytest
 z3_solver = pytest.importorskip("z3")
 
 from pgrls.ast_utils import parse_expr  # noqa: E402
-from pgrls.diff._z3_compare import classify_via_z3, Z3_AVAILABLE  # noqa: E402
+from pgrls.diff._z3_compare import (  # noqa: E402
+    Z3_AVAILABLE,
+    classify_via_z3,
+    counterexample,
+)
 
 
 def _classify(base_sql: str, head_sql: str) -> object:
@@ -414,3 +418,139 @@ def test_type_conflict_on_column_returns_none():
     # Z3 sorts (Int and String). The translator refuses and returns
     # None rather than misclassifying.
     assert _classify("col = 5", "col = 'foo'") is None
+
+
+# ---------------------------------------------------------------------------
+# Counterexample emitter (H1) — assert the PROPERTY that the reported
+# row genuinely satisfies `head ∧ ¬base`, never a nondeterministic exact
+# value. The Z3 model is not stable across solver versions; the only
+# stable contract is "this row leaks".
+# ---------------------------------------------------------------------------
+
+
+def _counterexample(base_sql: str, head_sql: str):
+    base = parse_expr(base_sql)
+    head = parse_expr(head_sql)
+    assert base is not None and head is not None
+    return counterexample(base, head)
+
+
+def _row_satisfies_head_not_base(base_sql, head_sql, row) -> bool:
+    """Re-feed the reported row through the translator and check that
+    pinning every reported column to its value keeps ``head ∧ ¬base``
+    SAT — i.e. the row really is a member of ``head ∖ base``.
+
+    The pin var is fetched from the freshly-rebuilt context's
+    ``_vars`` so it is byte-identical to the variable already inside
+    ``h`` / ``b`` (same name + sort); no sort is guessed from the
+    Python value (which would mis-handle ``bool`` vs ``int``).
+    """
+    from pgrls.diff._z3_compare import _Context, _to_z3
+
+    ctx = _Context()
+    base = parse_expr(base_sql)
+    head = parse_expr(head_sql)
+    b = _to_z3(base, ctx)
+    h = _to_z3(head, ctx)
+    s = z3_solver.Solver()
+    s.add(z3_solver.And(h, z3_solver.Not(b)))
+    for key, val in row.items():
+        var = ctx.column(key, _py_value_sort(val))
+        assert var is not None, f"reported column {key!r} not bindable"
+        s.add(var == val)
+    return s.check() == z3_solver.sat
+
+
+def _py_value_sort(val):
+    """Z3 sort for a Python value. `bool` BEFORE `int` — `isinstance(
+    True, int)` is True, so an Int dispatch would mis-bind a Bool."""
+    if isinstance(val, bool):
+        return z3_solver.BoolSort()
+    if isinstance(val, int):
+        return z3_solver.IntSort()
+    if isinstance(val, float):
+        return z3_solver.RealSort()
+    return z3_solver.StringSort()
+
+
+def test_counterexample_present_on_or_loosen():
+    base, head = "tenant_id = 1", "tenant_id = 1 OR tenant_id = 2"
+    # Tie the counterexample to the verdict it explains.
+    assert _classify(base, head) == "semantic_loosened"
+    cx = _counterexample(base, head)
+    assert cx is not None
+    # Every key is a REAL column — no synthetic vars leaked.
+    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    # SOUNDNESS: the row genuinely satisfies head ∧ ¬base.
+    assert _row_satisfies_head_not_base(base, head, cx)
+
+
+def test_counterexample_present_on_range_loosen():
+    # base `x > 5` → head `x > 0`: every model has 0 < x ≤ 5; we assert
+    # the property, never the exact int Z3 happens to pick.
+    base, head = "x > 5", "x > 0"
+    assert _classify(base, head) == "semantic_loosened"
+    cx = _counterexample(base, head)
+    assert cx is not None
+    assert _row_satisfies_head_not_base(base, head, cx)
+
+
+def test_counterexample_string_column():
+    base, head = "name = 'a'", "name = 'a' OR name = 'b'"
+    assert _classify(base, head) == "semantic_loosened"
+    cx = _counterexample(base, head)
+    assert cx is not None
+    assert _row_satisfies_head_not_base(base, head, cx)
+
+
+def test_no_counterexample_when_equivalent():
+    # Semantically equal predicates: head ∧ ¬base is UNSAT.
+    assert _classify("a = 1", "1 = a") == "semantic_equivalent"
+    assert _counterexample("a = 1", "1 = a") is None
+
+
+def test_no_counterexample_when_tightened():
+    # Head stricter than base: head ∧ ¬base UNSAT.
+    assert _classify("a = 1 OR a = 2", "a = 1") == "semantic_tightened"
+    assert _counterexample("a = 1 OR a = 2", "a = 1") is None
+
+
+def test_no_counterexample_when_null_dependent_loosen():
+    # SOUNDNESS GATE (the critique's fatal case): base `active = true`,
+    # head `active = true OR deleted_at IS NULL` classifies loosened,
+    # but the leak hinges on `deleted_at IS NULL` — a synthetic NULL
+    # marker, not a column value. The real-column projection
+    # `{active: False}` does NOT leak on its own, so the emitter must
+    # return None (degrade to label-only) rather than a non-leaking row.
+    assert _classify("active = true", "active = true OR deleted_at IS NULL") == (
+        "semantic_loosened"
+    )
+    assert _counterexample(
+        "active = true", "active = true OR deleted_at IS NULL"
+    ) is None
+
+
+def test_no_counterexample_when_opaque_only_loosen():
+    # SOUNDNESS GATE: GUC / function-based tenancy — the single most
+    # common real RLS shape. base `current_setting('app.t') = 'a'`,
+    # head adds `OR current_setting('app.t') = 'b'`. The leak requires
+    # the GUC to equal 'b' (an opaque var), which no column row can
+    # express; the real-column projection is empty and insufficient,
+    # so the emitter returns None.
+    base = "current_setting('app.t') = 'a'"
+    head = "current_setting('app.t') = 'a' OR current_setting('app.t') = 'b'"
+    assert _classify(base, head) == "semantic_loosened"
+    assert _counterexample(base, head) is None
+
+
+def test_counterexample_for_loosen_via_public_helper():
+    # Exercises the re-parse public helper `counterexample_for` (the
+    # entry point policies.py actually calls) end-to-end.
+    from pgrls.diff.ast_compare import counterexample_for
+
+    cx = counterexample_for("tenant_id = 1", "tenant_id = 1 OR tenant_id = 2")
+    assert cx is not None
+    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert _row_satisfies_head_not_base(
+        "tenant_id = 1", "tenant_id = 1 OR tenant_id = 2", cx
+    )

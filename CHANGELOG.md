@@ -10,7 +10,29 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-01
+
 ### Added
+
+- **`pgrls diff` counterexamples** — when the Z3 analysis proves a
+  policy-predicate change is DANGEROUS by *semantic loosening* (the new
+  predicate admits a strict superset of the old one's row set), the
+  verdict now carries a concrete *leaking row* — e.g.
+  `example leaking row: {tenant_id=2}` — a row the new policy admits but
+  the old one rejected. Surfaced in text output and as a structured
+  `counterexample` key in JSON (additive, non-breaking). The row is a
+  verifier artifact, emitted unconditionally on the Z3 path (not gated
+  behind `--explain`).
+
+  Soundness first: a row is emitted only when its real-column values are
+  a *self-sufficient* witness — i.e. every row matching them genuinely
+  lies in HEAD ∖ BASE. When the leak hinges on a NULL test or an opaque
+  value (a function call, `current_setting(...)` GUC, `COALESCE`, or
+  `CASE`) that a column-only row cannot honestly express, no row is
+  emitted and the verdict degrades to the label-only DANGEROUS — never a
+  row that does not actually leak. Requires the optional
+  `pgrls[diff-z3]` extra; without it the DANGEROUS verdict is unchanged
+  and no counterexample appears.
 
 - **Precision corpus** (`corpus/`) — an adjudicated set of small,
   self-contained schemas (positives that must fire a specific rule +

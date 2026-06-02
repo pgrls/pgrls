@@ -7,7 +7,7 @@ future release is a one-line edit.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, get_args
 
 __all__ = [
@@ -68,6 +68,18 @@ class Violation:
     title: str
     message: str
     location: str | None  # qualified table name or policy id; None for schema-wide
+    # Optional structured leaking-row counterexample, carried only by
+    # `pgrls diff` loosened-predicate violations on the Z3 path (a
+    # `{column: value}` row HEAD admits but BASE rejects). `compare=False`
+    # keeps the frozen dataclass hashable despite the dict payload —
+    # no current call site hashes raw Violations (baseline.py hashes a
+    # finding_key tuple, pr_comment hashes rule_id), and excluding it
+    # from __eq__/__hash__ preserves the prior equality semantics while
+    # forestalling a latent `unhashable type: 'dict'` crash if a future
+    # caller builds a `set[Violation]`.
+    counterexample: dict[str, object] | None = field(
+        default=None, compare=False, hash=False
+    )
 
 
 def is_at_or_above(severity: Severity, threshold: Severity) -> bool:

@@ -242,6 +242,20 @@ class _Context:
             return existing
         return None
 
+    def is_real_column(self, name: str) -> bool:
+        """True iff `name` is a real column var (not a null/opaque marker).
+
+        `column()` binds via ``z3.Const(key, sort)`` (the var's decl name
+        is exactly ``key``), whereas ``null_marker`` / ``opaque`` prefix
+        their decl names with ``_isnull__`` / ``_opaque__`` and live in
+        the separate ``_null_vars`` / ``_opaque_vars`` dicts. So a model
+        decl whose name is a key of ``_vars`` is authoritatively a real
+        column; everything else is a synthetic marker. Preferred over
+        prefix-string matching, which a user column literally named
+        ``_isnull__x`` could otherwise spoof.
+        """
+        return name in self._vars
+
 
 def _column_key(node: ColumnRef) -> str:
     """Render `ColumnRef.fields` as a `.`-joined identifier key.
@@ -723,3 +737,143 @@ def _implies(p: Any, q: Any) -> bool:
     # `unknown` ⇒ solver gave up (timeout, etc.) ⇒ treat as fails
     # so we don't claim implication we couldn't verify.
     return bool(result == z3.unsat)
+
+
+def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
+    """Render a Z3 model into ``{column_key: python_value}``.
+
+    Keeps only real columns (``ctx.is_real_column``) — synthetic
+    ``_isnull__*`` / ``_opaque__*`` markers are dropped — and decodes
+    each value by its Z3 sort, one-to-one with the constructors in
+    ``_const_to_z3`` (Int → ``as_long``, String → ``as_string``,
+    Bool → ``z3.is_true``, Real → ``float(as_fraction())``). Any other
+    sort is omitted (defensive). ``model.decls()`` yields only the
+    constants Z3 actually assigned; a don't-care column is simply
+    absent and is never fabricated.
+    """
+    row: dict[str, object] = {}
+    for decl in model.decls():
+        name = decl.name()
+        if not ctx.is_real_column(name):
+            continue  # skip _isnull__ / _opaque__ synthetic vars
+        value = model[decl]
+        sort = value.sort()
+        if sort == z3.IntSort():
+            row[name] = value.as_long()
+        elif sort == z3.StringSort():
+            row[name] = value.as_string()
+        elif sort == z3.BoolSort():
+            row[name] = z3.is_true(value)
+        elif sort == z3.RealSort():
+            row[name] = float(value.as_fraction())
+        # any other sort: omit (defensive)
+    return row
+
+
+def _row_is_sufficient_witness(
+    row: dict[str, object], base_z3: Any, head_z3: Any, ctx: _Context
+) -> bool:
+    """True iff pinning `row`'s columns forces ``head ∧ ¬base`` for ALL
+    completions of the free (synthetic / unpinned) variables.
+
+    A Z3 model of ``head ∧ ¬base`` is a *full* assignment; the
+    real-column projection ``row`` we return drops every synthetic
+    (``_isnull__*`` / ``_opaque__*``) var. A projection is NOT in
+    general a satisfying assignment — e.g. for ``active = true`` vs
+    ``active = true OR deleted_at IS NULL`` the model is
+    ``{active=False, _isnull__deleted_at=True}`` but ``{active=False}``
+    alone does not leak (it needs ``deleted_at IS NULL``). Emitting
+    ``{active=False}`` would be unsound.
+
+    Soundness gate: the row is a genuine, self-sufficient witness iff
+    ``(pins) ∧ ¬(head ∧ ¬base)`` is UNSAT — i.e. there is no completion
+    of the unpinned variables under which the pinned row fails to leak.
+    Only then does every row matching ``row`` (for any value of the
+    columns/markers we did not pin) lie inside HEAD \\ BASE. We rebuild
+    the pins against the SAME ``ctx`` used to build ``base_z3`` /
+    ``head_z3`` so each pinned ``z3.Const(key, sort)`` is identical to
+    the variable already inside the formulas.
+    """
+    pins = []
+    for key, val in row.items():
+        var = ctx.column(key, _py_value_sort(val))
+        if var is None:
+            # Sort clash against the bound var — cannot honestly pin
+            # this value, so we cannot prove sufficiency. Bail safe.
+            return False
+        pins.append(var == val)
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    pinned = z3.And(*pins) if len(pins) >= 2 else (pins[0] if pins else z3.BoolVal(True))
+    solver.add(z3.And(pinned, z3.Not(z3.And(head_z3, z3.Not(base_z3)))))
+    # UNSAT ⇒ no completion escapes head ∧ ¬base ⇒ row is sufficient.
+    return bool(solver.check() == z3.unsat)
+
+
+def _py_value_sort(val: object) -> Any:
+    """Z3 sort for a decoded Python value, mirroring ``_decode_model``.
+
+    ``bool`` is checked BEFORE ``int`` because ``isinstance(True, int)``
+    is True in Python — a Bool column value would otherwise bind to
+    ``IntSort`` and clash with the real BoolSort var inside the
+    formula. ``float`` (a decoded Real) → ``RealSort``.
+    """
+    if isinstance(val, bool):
+        return z3.BoolSort()
+    if isinstance(val, int):
+        return z3.IntSort()
+    if isinstance(val, float):
+        return z3.RealSort()
+    return z3.StringSort()
+
+
+def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
+    """Return a concrete leaking row for a loosened predicate change, or None.
+
+    The returned dict maps real column keys → decoded Python values. By
+    construction (see the soundness gate below) every row matching the
+    returned columns is admitted by HEAD and rejected by BASE — a row
+    the new policy newly leaks relative to the old one.
+
+    Returns None when:
+
+    * Z3 is unavailable;
+    * either predicate fails to translate (unsupported node / type clash);
+    * ``head ∧ ¬base`` is UNSAT — the head admits no row the base rejected
+      (an equivalent or tightened change); or
+    * the real-column projection of the model is not a *self-sufficient*
+      witness — the leak depends on a NULL test or an opaque
+      (function / GUC / COALESCE / CASE) value that the column-only row
+      cannot honestly express. In that case we emit NO counterexample
+      (degrade to the label-only DANGEROUS verdict) rather than a row
+      that does not actually leak. Soundness over cleverness.
+
+    Whenever ``head ∧ ¬base`` is SAT and witnessable, the returned row is a
+    sound member of HEAD ∖ BASE — this also holds for the *incomparable*
+    case (head and base each admit rows the other rejects), which is NOT a
+    None condition. pgrls invokes this only on the ``"semantic_loosened"``
+    verdict, where the change is a strict loosening, so in practice the row
+    always proves a genuine widening of the admitted set.
+    """
+    if not Z3_AVAILABLE:
+        return None
+    ctx = _Context()
+    base_z3 = _to_z3(base_node, ctx)
+    head_z3 = _to_z3(head_node, ctx)
+    if base_z3 is None or head_z3 is None:
+        return None
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    # SAME formula as _implies(head_z3, base_z3) — we keep the model.
+    solver.add(z3.And(head_z3, z3.Not(base_z3)))
+    if solver.check() != z3.sat:
+        return None  # soundness guard: no model ⇒ no claim
+    row = _decode_model(solver.model(), ctx)
+    # Soundness gate (critique #1/#2): the real-column projection must
+    # be a witness on its own, independent of the dropped synthetic
+    # vars. An empty row (all-opaque/all-GUC loosen) is sufficient iff
+    # EVERY row leaks — which is exactly when the gate passes; for the
+    # common GUC-only loosen it does not, so we return None.
+    if not _row_is_sufficient_witness(row, base_z3, head_z3, ctx):
+        return None
+    return row
