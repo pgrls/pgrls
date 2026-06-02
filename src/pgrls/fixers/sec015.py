@@ -137,6 +137,13 @@ class SEC015Fixer:
             # overload. Operator re-snapshots to populate.
             if not fn.signature:
                 continue
+            # Abstain on pre-v14 snapshots — schema_name/function_name
+            # were not captured, and splitting the ambiguous
+            # qualified_name targets the wrong object when the schema
+            # name contains a dot. Live introspection always sets
+            # these; operator re-snapshots an older baseline to populate.
+            if not fn.schema_name or not fn.function_name:
+                continue
             # Abstain on quoted-comma schema names the naive
             # tokenizer can't safely rewrite.
             if (
@@ -147,6 +154,8 @@ class SEC015Fixer:
             out.append(
                 self._fix(
                     fn.qualified_name,
+                    fn.schema_name,
+                    fn.function_name,
                     fn.signature,
                     fn.search_path,
                 )
@@ -156,10 +165,18 @@ class SEC015Fixer:
     @staticmethod
     def _fix(
         qualified_name: str,
+        schema_name: str,
+        function_name: str,
         signature: str,
         original_path: str | None,
     ) -> Fix:
-        schema_name, _, function_name = qualified_name.partition(".")
+        # schema_name / function_name are captured as separate fields
+        # (snapshot v14+) precisely so the fixer never splits the
+        # ambiguous `qualified_name` (`nspname || '.' || proname`),
+        # which yields the wrong schema/function when either component
+        # contains a dot (e.g. a schema named `a.b`). Route each
+        # component through `quote_qualified` so a name like `Order` /
+        # `a.b` / a reserved keyword still produces valid server SQL.
         qident = quote_qualified(schema_name, function_name)
         new_path = _rewritten_path(original_path)
         return Fix(

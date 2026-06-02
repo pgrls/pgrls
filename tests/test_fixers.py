@@ -1932,14 +1932,24 @@ def _secdef(
     search_path: str | None = None,
     body: str = "SELECT 1",
     language: str = "sql",
+    schema_name: str | None = None,
+    function_name: str | None = None,
 ) -> Any:
     from pgrls.model import SecdefFunction
+
+    # Mirror introspection: schema_name / function_name are captured
+    # separately (v14+). Default to splitting on the LAST dot so the
+    # common single-dot `schema.func` case matches; tests exercising a
+    # dotted schema / function name pass them explicitly.
+    s, _, f = qname.rpartition(".")
     return SecdefFunction(
         qualified_name=qname,
         body=body,
         language=language,
         search_path=search_path,
         signature=signature,
+        schema_name=s if schema_name is None else schema_name,
+        function_name=f if function_name is None else function_name,
     )
 
 
@@ -2114,14 +2124,29 @@ def test_sec015_fix_raises_on_malformed_allowlist() -> None:
 # ---------- SEC017 fixer ----------
 
 
-def _leakproof(qname: str, signature: str = "") -> Any:
+def _leakproof(
+    qname: str,
+    signature: str = "",
+    *,
+    schema_name: str | None = None,
+    function_name: str | None = None,
+) -> Any:
     """Local helper for SEC017Fixer tests. Inlined LeakproofFunction
     constructor — duplicating the shape rather than importing the
     one from `tests/rules/test_sec017.py` to keep the fixer-test
     file self-contained (test_fixers.py never imports across the
-    `tests/rules/` directory)."""
+    `tests/rules/` directory). schema_name / function_name default to
+    splitting on the LAST dot (the common `schema.func` case); the
+    dotted-name regression tests pass them explicitly."""
     from pgrls.model import LeakproofFunction
-    return LeakproofFunction(qualified_name=qname, signature=signature)
+
+    s, _, f = qname.rpartition(".")
+    return LeakproofFunction(
+        qualified_name=qname,
+        signature=signature,
+        schema_name=s if schema_name is None else schema_name,
+        function_name=f if function_name is None else function_name,
+    )
 
 
 def test_sec017_fix_emits_alter_function_not_leakproof() -> None:
@@ -3631,3 +3656,117 @@ def test_perf004_fix_raises_on_malformed_allowlist() -> None:
         PERF004Fixer().fix(schema, {"allowlist": "public.users.p"})
     with pytest.raises(TypeError, match="allowlist"):
         PERF004Fixer().fix(schema, {"allowlist": [" public.users.p "]})
+
+
+# ---------- SEC015 / SEC017: dotted schema/function names ----------
+#
+# Regression for the qualified-name split bug. `qualified_name` is
+# `nspname || '.' || proname` from introspection — ambiguous once
+# either component contains a dot. The old fixers did
+# `qualified_name.partition(".")`, so a function `f` in schema `a.b`
+# (qualified_name `a.b.f`) was split to schema `a`, function `b.f`,
+# emitting `ALTER FUNCTION a."b.f"(…)` — wrong object. The fix carries
+# schema_name / function_name as separate model fields (snapshot v14+);
+# these tests pin that the emitted ALTER FUNCTION targets the right
+# object and that the fixer abstains when the fields are absent.
+
+
+def test_sec015_fix_targets_correct_object_when_schema_name_has_dot() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "a.b.f",
+                signature="integer",
+                schema_name="a.b",
+                function_name="f",
+            ),
+        ),
+    )
+    [fix] = SEC015Fixer().fix(schema, {})
+    assert fix.sql == (
+        'ALTER FUNCTION "a.b".f(integer) '
+        "SET search_path = pg_catalog, pg_temp;"
+    )
+    # The old buggy split would have produced this wrong target.
+    assert 'a."b.f"' not in fix.sql
+
+
+def test_sec015_fix_targets_correct_object_when_function_name_has_dot() -> None:
+    # rpartition-killer: function `a.b` in schema `s` (qname `s.a.b`).
+    # Only the separate fields get this right.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "s.a.b",
+                signature="integer",
+                schema_name="s",
+                function_name="a.b",
+            ),
+        ),
+    )
+    [fix] = SEC015Fixer().fix(schema, {})
+    assert fix.sql == (
+        'ALTER FUNCTION s."a.b"(integer) '
+        "SET search_path = pg_catalog, pg_temp;"
+    )
+
+
+def test_sec015_fix_abstains_when_schema_function_fields_missing() -> None:
+    # Pre-v14 snapshot: no schema_name/function_name. Abstain rather
+    # than split the ambiguous qualified_name into a wrong target.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "a.b.f",
+                signature="integer",
+                schema_name="",
+                function_name="",
+            ),
+        ),
+    )
+    assert SEC015Fixer().fix(schema, {}) == []
+
+
+def test_sec017_fix_targets_correct_object_when_schema_name_has_dot() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof(
+                "a.b.f",
+                "integer",
+                schema_name="a.b",
+                function_name="f",
+            ),
+        ),
+    )
+    [fix] = SEC017Fixer().fix(schema, {})
+    assert fix.sql == 'ALTER FUNCTION "a.b".f(integer) NOT LEAKPROOF;'
+    assert 'a."b.f"' not in fix.sql
+
+
+def test_sec017_fix_targets_correct_object_when_function_name_has_dot() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof(
+                "s.a.b",
+                "integer",
+                schema_name="s",
+                function_name="a.b",
+            ),
+        ),
+    )
+    [fix] = SEC017Fixer().fix(schema, {})
+    assert fix.sql == 'ALTER FUNCTION s."a.b"(integer) NOT LEAKPROOF;'
+
+
+def test_sec017_fix_abstains_when_schema_function_fields_missing() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof(
+                "a.b.f",
+                "integer",
+                schema_name="",
+                function_name="",
+            ),
+        ),
+    )
+    assert SEC017Fixer().fix(schema, {}) == []

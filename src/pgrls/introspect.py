@@ -470,6 +470,8 @@ ORDER BY i.indrelid, c.relname
 _SECDEF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
+    n.nspname AS schema_name,
+    p.proname AS function_name,
     p.prosrc AS body,
     l.lanname AS lang,
     p.proconfig AS config,
@@ -591,6 +593,8 @@ ORDER BY mem.rolname, tgt.rolname
 _LEAKPROOF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
+    n.nspname AS schema_name,
+    p.proname AS function_name,
     pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
@@ -648,6 +652,8 @@ def _fetch_secdef_functions(
             language=row["lang"],
             search_path=_extract_search_path(row["config"]),
             signature=row["signature"] or "",
+            schema_name=row["schema_name"],
+            function_name=row["function_name"],
         )
         for row in cur.fetchall()
     )
@@ -724,6 +730,8 @@ def _fetch_leakproof_functions(
         LeakproofFunction(
             qualified_name=row["qname"],
             signature=row["signature"] or "",
+            schema_name=row["schema_name"],
+            function_name=row["function_name"],
         )
         for row in cur.fetchall()
     )

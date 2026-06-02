@@ -46,7 +46,9 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 13
+SNAPSHOT_VERSION = 14  # v14: SecdefFunction/LeakproofFunction gain
+# separate schema_name + function_name (the ambiguous qualified_name
+# join cannot be split when a component contains a dot).
 
 
 @dataclass(frozen=True)
@@ -373,6 +375,15 @@ class SecdefFunction:
     # zero-arg functions; non-empty like `integer, text` for
     # overloads. Snapshot v12+; older snapshots load with "".
     signature: str = ""
+    # Schema and function name as SEPARATE components (snapshot v14+).
+    # `qualified_name` is the ambiguous `nspname || '.' || proname`
+    # join, which cannot be split unambiguously once either component
+    # contains a dot (a schema or function named `a.b`). Fixers that
+    # emit `ALTER FUNCTION schema.name` MUST use these fields rather
+    # than splitting `qualified_name`. v4-v13 snapshots load with ""
+    # — the SEC015 fixer abstains rather than guess a wrong target.
+    schema_name: str = ""
+    function_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -512,6 +523,13 @@ class LeakproofFunction:
     # arg functions; non-empty for overloads. Snapshot v12+; v10–v11
     # snapshots load with "".
     signature: str = ""
+    # Separate schema / function name components (snapshot v14+); see
+    # SecdefFunction. The SEC017 fixer uses these to build a correct
+    # `ALTER FUNCTION` even when the schema name contains a dot,
+    # instead of splitting the ambiguous `qualified_name`. v10-v13
+    # snapshots load with "" — the fixer abstains rather than guess.
+    schema_name: str = ""
+    function_name: str = ""
 
 
 # --- Snapshot decoders -------------------------------------------------
@@ -642,6 +660,9 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         language=f["language"],
         search_path=f.get("search_path"),
         signature=f.get("signature", ""),
+        # v14 additions; v4-v13 snapshots have no keys -> "".
+        schema_name=f.get("schema_name", ""),
+        function_name=f.get("function_name", ""),
     )
 
 
@@ -658,6 +679,9 @@ def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
     return LeakproofFunction(
         qualified_name=f["qualified_name"],
         signature=f.get("signature", ""),
+        # v14 additions; v10-v13 snapshots have no keys -> "".
+        schema_name=f.get("schema_name", ""),
+        function_name=f.get("function_name", ""),
     )
 
 
@@ -859,6 +883,10 @@ class Schema:
                     # `ALTER FUNCTION` fixes. Empty for zero-arg
                     # functions. v4-v11 snapshots load with "".
                     "signature": f.signature,
+                    # v14 — separate schema / function name so fixers
+                    # never split the ambiguous qualified_name.
+                    "schema_name": f.schema_name,
+                    "function_name": f.function_name,
                 }
                 for f in self.security_definer_functions
             ],
@@ -890,6 +918,10 @@ class Schema:
                     # qualified_name appear here as separate entries
                     # since v12; v10-v11 snapshots load with "".
                     "signature": f.signature,
+                    # v14 — separate schema / function name (see
+                    # security_definer_functions above).
+                    "schema_name": f.schema_name,
+                    "function_name": f.function_name,
                 }
                 for f in self.leakproof_functions
             ],
@@ -963,11 +995,11 @@ class Schema:
         introspects directly, which still parses ASTs on capture.
         """
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13. v1 / v2 snapshots must be regenerated "
+                "10, 11, 12, 13, 14. v1 / v2 snapshots must be regenerated "
                 "against the current schema."
             )
 

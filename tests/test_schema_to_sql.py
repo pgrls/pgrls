@@ -385,13 +385,13 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_thirteen():
-    # Bumped 11 → 12 to add per-overload `signature` to
-    # `SecdefFunction` and `LeakproofFunction` (additive — unlocks
-    # the SEC014/15/17 fixers that need the argument-type
-    # signature to emit `ALTER FUNCTION name(<sig>)`). Pin so a
-    # future bump is deliberate.
-    assert SNAPSHOT_VERSION == 13
+def test_snapshot_version_is_fourteen():
+    # Bumped 13 → 14 to add separate schema_name / function_name to
+    # `SecdefFunction` and `LeakproofFunction` (so the SEC015/SEC017
+    # fixers never split the ambiguous qualified_name — correct even
+    # when a schema name contains a dot). Pin so a future bump is
+    # deliberate.
+    assert SNAPSHOT_VERSION == 14
 
 
 def test_to_snapshot_emits_column_details_array():

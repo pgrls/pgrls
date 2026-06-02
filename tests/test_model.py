@@ -77,7 +77,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 13,
+        "version": 14,
         "tables": [
             {
                 "schema": "public",
@@ -235,12 +235,14 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_thirteen_after_index_is_primary() -> None:
-    # SNAPSHOT_VERSION bumped 12 → 13 to add `Index.is_primary`
-    # (lets SEC035 tell a surrogate PK from a tenant-scopable UNIQUE).
-    # Pin the new version so a future bump is deliberate.
+def test_snapshot_version_is_fourteen_after_dotted_function_fields() -> None:
+    # SNAPSHOT_VERSION bumped 13 → 14 to add separate schema_name /
+    # function_name to SecdefFunction + LeakproofFunction, so the
+    # SEC015/SEC017 fixers never split the ambiguous qualified_name
+    # (wrong when a schema name contains a dot). Pin the new version
+    # so a future bump is deliberate.
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 13
+    assert snap["version"] == 14
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -469,7 +471,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
     }
-    assert snap["version"] == 13
+    assert snap["version"] == 14
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
