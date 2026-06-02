@@ -44,14 +44,24 @@ breaking changes — they will be called out in this file.
   "TRUE for every row", the finding reports an unconditional leak (all
   rows), not a single example row.
 
-  Requires the optional `pgrls[diff-z3]` extra (the Z3 solver). When z3
-  is **not** installed SEC038 NO-OPs — it returns no findings rather than
-  guessing; SEC004 keeps the syntactic guard. Configurable via
-  `[lint.rules.SEC038]` (`auth_functions`, `allowlist`).
+  Runs on a plain `pip install pgrls` — `z3-solver` is now a core
+  dependency (see Changed below). In the unusual case where z3 can't be
+  imported SEC038 NO-OPs; SEC004 keeps the syntactic guard. Configurable
+  via `[lint.rules.SEC038]` (`auth_functions`, `allowlist`).
 
   Rule count is now 51 (was 50). The new Kleene 3VL encoder
   (`anon_read_counterexample` in `pgrls.diff._z3_compare`) is purely
   additive — the 2-valued `pgrls diff` implication path is unchanged.
+
+### Changed
+
+- **`z3-solver` is now a core dependency** (was the optional `diff-z3`
+  extra). The semantic verifier features — SEC038 and `pgrls diff`'s
+  concrete leaking-row counterexample — now run on a plain
+  `pip install pgrls` instead of silently no-op'ing without the extra.
+  z3-solver ships precompiled wheels (one package, no C++ toolchain). The
+  `pgrls[diff-z3]` extra is retained as a no-op alias for backward
+  compatibility.
 
 ## [0.15.0] - 2026-06-01
 

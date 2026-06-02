@@ -1861,12 +1861,11 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         # tests/rules/test_hyg004.py / test_perf005.py and the integration
         # tests in tests/test_perf.py.
         #
-        # SEC038 (semantic anon-read) requires the optional pgrls[diff-z3]
-        # extra and NO-OPs when z3 is absent. The repo's primary CI lane
-        # and the demo lane both have the extra, so SEC038 fires there;
-        # the dependency-free lane exercises the NO-OP path, so drop it
-        # from the expected set (and from the pinned-location assertion
-        # below) when z3 is unavailable.
+        # SEC038 (semantic anon-read) uses z3-solver, a core dependency
+        # since 0.16.0, so it fires wherever pgrls is installed. The
+        # Z3_AVAILABLE check stays as a defensive guard: if z3 is somehow
+        # absent the rule NO-OPs, so drop it from the expected set (and the
+        # pinned-location assertion below) in that case.
         expected = {r.id for r in all_rules()} - {"HYG004", "PERF005"}
         if not Z3_AVAILABLE:
             expected -= {"SEC038"}

@@ -1,9 +1,10 @@
 """SAT-based predicate implication via Z3 (Phases 1, 3, and 4).
 
-Z3 is an optional dependency (``pip install pgrls[diff-z3]``). When
-unavailable, ``Z3_AVAILABLE`` is False and ``classify_via_z3``
-returns None — callers fall through to whatever existing syntactic
-classifier they were using. ``compare_predicates`` (the public
+Z3 (``z3-solver``) is a core dependency as of 0.16.0, so this path runs
+on a plain ``pip install pgrls``. The ``Z3_AVAILABLE`` guard is retained
+as a defensive fallback: if z3 somehow can't be imported it is False and
+``classify_via_z3`` returns None — callers fall through to whatever
+existing syntactic classifier they were using. ``compare_predicates`` (the public
 entry point in ``ast_compare.py``) imports this module lazily so
 the Z3 codepath can never break the lint / non-diff paths even if
 ``z3-solver`` is missing or fails to import. When Z3 is installed,
