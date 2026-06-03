@@ -939,9 +939,14 @@ def _row_is_sufficient_witness(
     pins = []
     for key, val in row.items():
         var = ctx.column(key, _py_value_sort(val))
-        if var is None:
-            # Sort clash against the bound var — cannot honestly pin
-            # this value, so we cannot prove sufficiency. Bail safe.
+        if var is None:  # pragma: no cover
+            # Unreachable: `row` comes only from `_decode_model`, which
+            # decodes each column by its bound sort, and `_py_value_sort`
+            # is the exact inverse, so the re-derived sort always equals
+            # the original binding and `ctx.column` never returns None
+            # here. Kept as a defensive soundness bail (matches the
+            # pragma-marked siblings): a sort clash means we cannot
+            # honestly pin the value, so we cannot prove sufficiency.
             return False
         pins.append(var == val)
     solver = z3.Solver()

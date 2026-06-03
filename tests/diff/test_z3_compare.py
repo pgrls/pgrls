@@ -504,6 +504,25 @@ def test_counterexample_string_column():
     assert _row_satisfies_head_not_base(base, head, cx)
 
 
+def test_counterexample_present_on_incomparable_pair():
+    # R19 #2: the documented non-None "incomparable" admit-path — neither
+    # base→head nor head→base holds, yet head ∧ ¬base is SAT (partially
+    # overlapping ranges). classify_via_z3 returns None (requires_review),
+    # so production (policies.py, which calls the emitter only on
+    # "semantic_loosened") never reaches this path today. The test pins
+    # the admit-path's soundness DIRECTLY, so a future feature that wires
+    # counterexample() to the incomparable verdict cannot silently emit a
+    # row that does not actually leak.
+    base, head = "x > 0", "x < 10"
+    # Incomparable → no loosened/tightened/equivalent verdict.
+    assert _classify(base, head) is None
+    cx = _counterexample(base, head)
+    assert cx is not None
+    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    # SOUNDNESS: the returned row genuinely lies in head ∖ base.
+    assert _row_satisfies_head_not_base(base, head, cx)
+
+
 def test_no_counterexample_when_equivalent():
     # Semantically equal predicates: head ∧ ¬base is UNSAT.
     assert _classify("a = 1", "1 = a") == "semantic_equivalent"
