@@ -86,11 +86,19 @@ def _is_safe_path_token(tok: str) -> bool:
     if _BARE_PATH_TOKEN.match(tok):
         return True
     # Double-quoted identifier: opens and closes with `"`, and every
-    # interior `"` is doubled (`""`). Strip the doubled quotes, then the
-    # remainder must contain no lone `"` — otherwise the closing quote is
-    # spurious and punctuation after it would be unquoted SQL.
+    # interior `"` is doubled (`""`).
     if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
-        return '"' not in tok[1:-1].replace('""', "")
+        body = tok[1:-1]
+        # Reject a zero-length delimited identifier — `""` (or a token
+        # that is only doubled quotes) — which Postgres rejects as
+        # "zero-length delimited identifier". The unescaped body, with
+        # each `""` collapsed to a single `"`, must be non-empty.
+        if not body.replace('""', '"'):
+            return False
+        # Strip the doubled quotes, then the remainder must contain no
+        # lone `"` — otherwise the closing quote is spurious and
+        # punctuation after it would be unquoted SQL.
+        return '"' not in body.replace('""', "")
     return False
 
 
@@ -154,6 +162,14 @@ def _rewritten_path(existing: str | None) -> str:
         # comparison is case-insensitive for built-in schema names).
         if tok.lower() == "pg_temp":
             continue
+        # The `$user` placeholder is valid in a search_path only when
+        # double-quoted (`"$user"`); a bare `$user` is a syntax error.
+        # Live introspection always stores it quoted, but a hand-built /
+        # snapshot path may carry the bare form (which _is_safe_path_token
+        # accepts), so normalize it on emit — otherwise the rewritten
+        # ALTER FUNCTION would fail to parse server-side.
+        if tok == "$user":
+            tok = '"$user"'
         tokens.append(tok)
     tokens.append("pg_temp")
     return ", ".join(tokens)

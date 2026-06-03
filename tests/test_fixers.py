@@ -2091,6 +2091,45 @@ def test_sec015_fix_rewrites_quoted_identifier_without_comma() -> None:
     assert 'SET search_path = "My Schema", pg_temp;' in f.sql
 
 
+def test_sec015_fix_requotes_bare_dollar_user_in_search_path() -> None:
+    # R13 #3: the `$user` placeholder is valid only when double-quoted
+    # (`"$user"`); a bare `$user` is a syntax error. _is_safe_path_token
+    # accepts the bare form (live introspection always stores it quoted,
+    # but a hand-built / snapshot path may carry it bare), so the fixer
+    # must re-quote it on emit instead of splicing it verbatim into an
+    # unrunnable ALTER FUNCTION.
+    from pglast import parse_sql
+
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer", search_path="$user, public"),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public.f(integer) '
+        'SET search_path = "$user", public, pg_temp;'
+    )
+    # The emitted DDL must parse server-side (the bug produced a bare
+    # `$user` that Postgres rejects with `syntax error at or near "$"`).
+    parse_sql(f.sql)
+
+
+def test_sec015_fix_abstains_on_empty_quoted_search_path_token() -> None:
+    # R13 #4: an empty double-quoted token (`""`) is a zero-length
+    # delimited identifier that Postgres rejects. _is_safe_path_token
+    # must treat it as unsafe so the fixer abstains (the finding still
+    # fires for the operator) rather than emitting an unrunnable
+    # `SET search_path = "", pg_temp`.
+    for path in ('""', '"", public'):
+        schema = Schema(
+            security_definer_functions=(
+                _secdef("public.f", signature="integer", search_path=path),
+            ),
+        )
+        assert SEC015Fixer().fix(schema, {}) == [], path
+
+
 def test_sec015_fix_emits_per_overload() -> None:
     schema = Schema(
         security_definer_functions=(
