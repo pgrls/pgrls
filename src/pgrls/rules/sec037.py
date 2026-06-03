@@ -183,7 +183,13 @@ def _is_role_call(node: Any, role_functions: set[str]) -> bool:
     - `SQLValueFunction` for the SQL keyword forms `current_user`,
       `session_user`, `user`, `current_role` — Postgres parses
       these without parentheses into a separate node class.
+
+    A surrounding `TypeCast` is stripped first — `auth.role()::text =
+    'admin'` parses the role side as a TypeCast, and the literal side is
+    already unwrapped by `_is_string_const`, so unwrapping here keeps the
+    two sides symmetric (otherwise a cast role call silently escapes).
     """
+    node = _unwrap_typecast(node)
     if isinstance(node, SQLValueFunction):
         name = _SVFOP_NAMES.get(node.op)
         return name is not None and name in role_functions

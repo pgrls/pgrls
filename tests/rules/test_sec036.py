@@ -379,3 +379,43 @@ def test_rejects_malformed_binding_functions_option() -> None:
             {"binding_functions": ["auth.uid", 7]},
         )
     assert "function names" in str(exc.value)
+
+
+def test_sec036_fires_on_setop_union_subselect_reaching_target() -> None:
+    # Regression (round-7): a set-op (UNION/INTERSECT/EXCEPT) sub-select
+    # puts its FROM items in larg/rarg, not fromClause. An unbound
+    # admin-any EXISTS reaching auth.users through a UNION arm must still
+    # be flagged (the every-authenticated-user bypass SEC036 exists for).
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users "
+        "WHERE raw_app_meta_data ->> 'role' = 'admin' "
+        "UNION SELECT 1 FROM other_t)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="setop_unbound"))
+    violations = SEC036().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.setop_unbound"
+
+
+def test_sec036_silent_on_setop_union_bound_to_caller() -> None:
+    # Lockstep: a correctly-bound set-op EXISTS (the binding lives in an
+    # arm's WHERE) must NOT false-fire now that target detection is
+    # set-op-aware.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users WHERE id = auth.uid() "
+        "UNION SELECT 1 FROM other_t)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="setop_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_sec036_silent_on_having_clause_binding() -> None:
+    # Regression (round-7): a HAVING-clause binding constrains the EXISTS
+    # to the caller exactly like a WHERE binding. Omitting havingClause
+    # from the candidate quals false-fired at error severity.
+    for expr in (
+        "EXISTS (SELECT 1 FROM auth.users GROUP BY id HAVING id = auth.uid())",
+        "EXISTS (SELECT 1 FROM auth.users HAVING bool_or(id = auth.uid()))",
+    ):
+        schema = _wrap(_policy(f"({expr})", name="having_bound"))
+        assert SEC036().check(schema, {}) == [], expr

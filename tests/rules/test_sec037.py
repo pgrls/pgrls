@@ -278,3 +278,17 @@ def test_rejects_malformed_role_functions_option() -> None:
             {"role_functions": ["auth.role", 9]},
         )
     assert "function names" in str(exc.value)
+
+
+def test_sec037_fires_on_typecast_wrapped_role_call() -> None:
+    # Regression (round-7): the role-call side is unwrapped of a TypeCast
+    # just like the literal side, so `auth.role()::text = 'admin'` (and the
+    # parenthesized form) is recognized as the silent-deny footgun, not
+    # silently missed.
+    for using in (
+        "auth.role()::text = 'admin'",
+        "(auth.role())::text = 'admin'",
+    ):
+        violations = SEC037().check(_wrap(_policy(using, name="cast")), {})
+        assert len(violations) == 1, using
+        assert violations[0].location == "public.t.cast"

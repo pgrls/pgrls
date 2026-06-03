@@ -86,7 +86,7 @@ from pglast.ast import (
     SelectStmt,
     SubLink,
 )
-from pglast.enums import SubLinkType
+from pglast.enums import SetOperation, SubLinkType
 
 from pgrls.ast_utils import find_func_calls
 from pgrls.model import Schema, policy_id
@@ -198,7 +198,20 @@ def _from_clause_targets(
     sel: Any, target_tables: set[tuple[str, str]]
 ) -> list[RangeVar]:
     """Target RangeVars in a sub-select's FROM clause (JOINs included)."""
-    if sel is None or sel.fromClause is None:
+    if sel is None:
+        return []
+    # Set operation (UNION / INTERSECT / EXCEPT): pglast leaves
+    # `fromClause` None and puts the real FROM items in larg/rarg. Recurse
+    # into both arms so an `EXISTS (SELECT 1 FROM auth.users WHERE … UNION
+    # …)` is still examined. (The binding scan is made set-op-aware in
+    # lockstep so a correctly-bound set-op policy doesn't begin to
+    # false-fire.)
+    if sel.op != SetOperation.SETOP_NONE:
+        return [
+            *_from_clause_targets(sel.larg, target_tables),
+            *_from_clause_targets(sel.rarg, target_tables),
+        ]
+    if sel.fromClause is None:
         return []
     out: list[RangeVar] = []
     for from_item in sel.fromClause:
@@ -225,8 +238,15 @@ def _from_clause_binding_quals(sel: Any) -> list[Any]:
     def walk_select(s: Any) -> None:
         if s is None:
             return
+        # Set operation: the binding quals live in the arms, not here.
+        if s.op != SetOperation.SETOP_NONE:
+            walk_select(s.larg)
+            walk_select(s.rarg)
+            return
         if s.whereClause is not None:
             quals.append(s.whereClause)
+        if s.havingClause is not None:
+            quals.append(s.havingClause)
         for from_item in s.fromClause or ():
             walk_item(from_item)
 
@@ -242,8 +262,16 @@ def _from_clause_binding_quals(sel: Any) -> list[Any]:
                 walk_select(sub)
 
     if sel is not None:
-        for from_item in sel.fromClause or ():
-            walk_item(from_item)
+        if sel.op != SetOperation.SETOP_NONE:
+            # Top-level set-op: collect the binding quals of both arms
+            # (their WHERE / HAVING / JOIN-ONs) so a set-op EXISTS that
+            # binds the caller in an arm is recognized, in lockstep with
+            # target detection above.
+            walk_select(sel.larg)
+            walk_select(sel.rarg)
+        else:
+            for from_item in sel.fromClause or ():
+                walk_item(from_item)
     return quals
 
 
@@ -356,7 +384,15 @@ def _has_binding_reference(
     sel = sublink.subselect
     if sel is None:
         return False
-    candidates = [sel.whereClause, *_from_clause_binding_quals(sel)]
+    # A HAVING binding constrains the EXISTS to the caller exactly like a
+    # WHERE binding — `… GROUP BY id HAVING id = auth.uid()`, or even the
+    # GROUP-BY-less `HAVING bool_or(id = auth.uid())`. Omitting it
+    # false-fired a correctly-bound policy at error severity.
+    candidates = [
+        sel.whereClause,
+        sel.havingClause,
+        *_from_clause_binding_quals(sel),
+    ]
     return any(
         c is not None and _qual_binds_caller(c, binding_functions)
         for c in candidates
