@@ -18,6 +18,7 @@ import pytest
 
 from pgrls.model import (
     Column,
+    ColumnGrant,
     Grant,
     Policy,
     SNAPSHOT_VERSION,
@@ -276,6 +277,74 @@ def test_to_sql_emits_grant_per_role_pair():
     sql = schema.to_sql()
     assert "GRANT SELECT ON public.t TO PUBLIC;" in sql
     assert "GRANT SELECT, INSERT ON public.t TO app_user;" in sql
+
+
+def test_to_sql_emits_column_grant_per_role_pair():
+    # R16 #5 (coverage): the column-grant emit path (replayed verbatim by
+    # `diff --apply` to build the baseline) had no to_sql assertion. Each
+    # privilege carries its own parenthesized column; PUBLIC renders bare;
+    # a named role and multiple privileges round-trip.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(),
+                columns=("id", "ssn"),
+                column_details=(
+                    Column(name="id", data_type="integer", is_nullable=False),
+                    Column(name="ssn", data_type="text", is_nullable=True),
+                ),
+                column_grants=(
+                    ColumnGrant(
+                        role="PUBLIC", column="ssn", privileges=("SELECT",)
+                    ),
+                    ColumnGrant(
+                        role="app_user",
+                        column="ssn",
+                        privileges=("SELECT", "UPDATE"),
+                    ),
+                ),
+            ),
+        )
+    )
+    sql = schema.to_sql()
+    assert "GRANT SELECT (ssn) ON public.t TO PUBLIC;" in sql
+    assert (
+        "GRANT SELECT (ssn), UPDATE (ssn) ON public.t TO app_user;" in sql
+    )
+
+
+def test_to_sql_quotes_reserved_column_and_role_in_column_grant():
+    # The column and role of a column grant route through quote_ident, so
+    # a reserved-keyword column ("select") and a mixed-case role ("Reader")
+    # must be double-quoted — otherwise the emitted DDL is unparseable and
+    # aborts the all-or-nothing `diff --apply` baseline transaction.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(),
+                columns=("id", "select"),
+                column_details=(
+                    Column(name="id", data_type="integer", is_nullable=False),
+                    Column(name="select", data_type="text", is_nullable=True),
+                ),
+                column_grants=(
+                    ColumnGrant(
+                        role="Reader", column="select", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    sql = schema.to_sql()
+    assert 'GRANT SELECT ("select") ON public.t TO "Reader";' in sql
 
 
 def test_to_sql_renders_public_role_unquoted():

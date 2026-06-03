@@ -852,6 +852,51 @@ def test_column_grant_public_no_rls_is_dangerous() -> None:
     assert len(added) == 1 and added[0].classification == "requires_review"
 
 
+def test_column_grant_revoked_is_safe() -> None:
+    # R16 #7 (coverage): when a column grant's privilege set strictly
+    # shrinks between base and head, the diff must emit a single
+    # GRANT_REVOKED change classified "safe" (a revoke only narrows
+    # access — never a security regression) that names the column. This
+    # is the only _diff_column_grants branch the suite did not exercise.
+    base = Schema(
+        tables=(
+            _t(
+                rls=True,
+                force=True,
+                column_grants=(
+                    ColumnGrant(
+                        role="reporter",
+                        column="ssn",
+                        privileges=("SELECT", "UPDATE"),
+                    ),
+                ),
+            ),
+        )
+    )
+    head = Schema(
+        tables=(
+            _t(
+                rls=True,
+                force=True,
+                column_grants=(
+                    ColumnGrant(
+                        role="reporter", column="ssn", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    revoked = [c for c in changes if c.kind == ChangeKind.GRANT_REVOKED]
+    assert len(revoked) == 1
+    assert revoked[0].classification == "safe"
+    assert "ssn" in revoked[0].message
+    assert "UPDATE" in revoked[0].message  # the lost privilege is named
+    # The unchanged SELECT privilege produces no added/dangerous churn.
+    assert ChangeKind.GRANT_PUBLIC_NO_RLS not in {c.kind for c in changes}
+    assert ChangeKind.GRANT_ADDED not in {c.kind for c in changes}
+
+
 def test_grant_public_no_rls_fires_even_when_stale_policies_present() -> None:
     # Postgres only enforces policies when RLS is on; with RLS off,
     # any policies on the table are dormant. A new PUBLIC grant on
