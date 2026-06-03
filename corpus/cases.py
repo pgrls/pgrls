@@ -233,11 +233,22 @@ CASES: list[Case] = [
         ),
     ),
     Case(
-        name="sec006-update-no-with-check",
-        kind="positive",
-        expect=frozenset({"SEC006"}),
-        note="UPDATE policy with USING only and no WITH CHECK — a row can "
-        "be updated out of the tenant's scope.",
+        # Re-adjudicated (was a stale `positive` expecting SEC006). An
+        # UPDATE policy with USING only and no WITH CHECK LOOKS like a
+        # missing-write-check hole, but Postgres reuses the USING expression
+        # as the implicit WITH CHECK on UPDATE, so the written row must still
+        # satisfy `tenant_id = <session>`; the restrictive floor's WITH CHECK
+        # reinforces it. Verified on live PG16: a cross-tenant UPDATE is
+        # rejected ("new row violates row-level security policy"). This is the
+        # documented reused-USING shape SEC006 must NOT flag — the FP closed
+        # in the SEC006 false-positive fixes — so it belongs here as the
+        # adversarial near-miss, not as a positive.
+        name="sec006-update-using-reused-as-check",
+        kind="negative",
+        expect=frozenset(),
+        note="UPDATE policy with USING only, no WITH CHECK. Safe: Postgres "
+        "reuses the USING as the implicit WITH CHECK on UPDATE (write side "
+        "closed), reinforced by the restrictive floor. SEC006 must NOT fire.",
         sql="""
 CREATE TABLE public.invoices (id uuid PRIMARY KEY, tenant_id uuid NOT NULL, amount int);
 ALTER TABLE public.invoices ENABLE ROW LEVEL SECURITY;
@@ -250,6 +261,32 @@ CREATE POLICY inv_floor ON public.invoices AS RESTRICTIVE FOR ALL TO authenticat
     USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
     WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
 CREATE INDEX ON public.invoices (tenant_id);
+""",
+    ),
+    Case(
+        # The GENUINE SEC006 hole (replaces the positive coverage the
+        # re-adjudicated case above used to provide): a permissive INSERT
+        # policy with no WITH CHECK. INSERT carries no USING for Postgres to
+        # reuse, so the missing WITH CHECK leaves the policy's write side
+        # unconstrained — exactly the open shape SEC006 flags. Verified on
+        # live PG16 that this fires SEC006 and nothing else.
+        name="sec006-insert-no-with-check",
+        kind="positive",
+        expect=frozenset({"SEC006"}),
+        note="Permissive INSERT policy with no WITH CHECK — INSERT has no "
+        "USING to reuse, so the missing write check is the genuine open "
+        "shape SEC006 flags (the inverse of the reused-USING UPDATE above).",
+        sql="""
+CREATE TABLE public.orders (id uuid PRIMARY KEY, tenant_id uuid NOT NULL, body text);
+ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.orders FORCE ROW LEVEL SECURITY;
+CREATE POLICY orders_sel ON public.orders FOR SELECT TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+CREATE POLICY orders_ins ON public.orders FOR INSERT TO authenticated;
+CREATE POLICY orders_floor ON public.orders AS RESTRICTIVE FOR ALL TO authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+CREATE INDEX ON public.orders (tenant_id);
 """,
     ),
     Case(
