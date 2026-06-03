@@ -106,10 +106,13 @@ def _format_message(policy: Any, table: Any, witness: dict[str, object]) -> str:
         "so the policy reads all rows."
     )
     # Under the v1 validity criterion the predicate is TRUE for *every*
-    # row, so the honest artifact is "all rows" — the witness dict is
-    # empty. The non-empty branch is dead for v1; it stays only for a
-    # future "satisfiable read" criterion (amendment #6).
-    if witness:  # pragma: no cover - v1 validity always yields an empty witness
+    # row, so the honest artifact is "all rows": anon_read_counterexample
+    # GUARANTEES an empty witness dict (it returns {} after proving
+    # validity, never an arbitrary model). This non-empty branch is
+    # therefore genuinely dead for v1 — the pragma is accurate — and is
+    # retained only as the message hook for a future "satisfiable read"
+    # criterion (amendment #6).
+    if witness:  # pragma: no cover - anon_read_counterexample always returns {} in v1
         pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
         artifact = (
             f" For example, a row with {{{pairs}}} is visible to an "

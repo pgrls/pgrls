@@ -1537,11 +1537,15 @@ def anon_read_counterexample(
     Returns ``None`` otherwise.
 
     Under the validity criterion the predicate is TRUE for every row, so
-    the proof artifact is "all rows": the returned dict is empty ``{}``
-    (the predicate pins no specific real column — a genuine empty model is
-    the honest witness, § amendment #6). A non-empty dict is possible only
-    if a future "satisfiable read" criterion is added; SEC038 treats any
-    non-None return as "fire".
+    the proof artifact is "all rows": the returned dict is ALWAYS empty
+    ``{}``. Validity means ``is_true`` holds for every assignment of the
+    real columns, so no column value characterizes the leak — a genuine
+    empty model is the honest witness (§ amendment #6), and decoding an
+    arbitrary satisfying model instead would yield a misleading non-empty
+    dict (e.g. ``{flag: False}`` for ``flag OR NOT flag``) implying those
+    columns matter when they do not. The non-empty shape is reserved for a
+    future "satisfiable read" criterion. SEC038 treats any non-None return
+    as "fire".
 
     ``None`` when:
     - Z3 is unavailable;
@@ -1579,15 +1583,13 @@ def anon_read_counterexample(
     if result != z3.unsat:
         return None  # sat (a row escapes) or unknown (timeout) ⇒ no fire
 
-    # Valid ⇒ every row is read ⇒ any model of is_true is a sound witness
-    # (no sufficiency gate needed — contrast counterexample()/H1, which
-    # proves only a strict-superset loosening). Reuse the SAME ctx so
-    # `_decode_model`'s real-column filter already knows the columns.
-    witness = z3.Solver()
-    witness.set("timeout", 1000)
-    for a in assertions:
-        witness.add(a)
-    witness.add(tv.is_true)
-    if witness.check() != z3.sat:  # defensive; valid ⇒ sat
-        return {}
-    return _decode_model(witness.model(), ctx)
+    # Valid ⇒ NOT(is_true) is UNSAT ⇒ is_true holds for EVERY assignment of
+    # the real columns: no column value characterizes the leak — every row
+    # leaks unconditionally. So the honest proof artifact is the empty
+    # model ``{}`` ("all rows", § amendment #6), NOT an arbitrary
+    # satisfying assignment of is_true: decoding such a model would yield a
+    # non-empty dict (e.g. ``{flag: False}`` for ``flag OR NOT flag``) that
+    # misleadingly implies those columns matter when they do not. SEC038
+    # treats any non-None return as "fire"; the empty dict drives its
+    # "every row is visible unconditionally" message.
+    return {}

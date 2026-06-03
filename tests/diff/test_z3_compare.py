@@ -683,6 +683,21 @@ def test_anon_fires_on_trivial_tautology() -> None:
     assert _anon("1 = 1") is not None
 
 
+def test_anon_witness_is_always_empty_under_validity() -> None:
+    # R14 #4: under the v1 validity criterion the predicate is TRUE for
+    # EVERY assignment of the real columns, so no column value
+    # characterizes the leak — anon_read_counterexample returns the empty
+    # model {} (the honest "all rows" artifact), NEVER an arbitrary
+    # satisfying assignment. A valid predicate carrying a FREE real bool
+    # column (`flag OR NOT flag`) previously leaked `{'flag': False}` from
+    # the witness model, contradicting both the docstring and the SEC038
+    # dead-witness pragma. Pin == {} (not just `is not None`) so the
+    # contract cannot silently drift.
+    assert _anon("(SELECT auth.uid()) IS NULL OR flag OR NOT flag") == {}
+    assert _anon("(SELECT auth.uid()) IS NULL OR true") == {}
+    assert _anon("true") == {}
+
+
 # --- NOT VALID (no fire): None is returned ----------------------------------
 
 
