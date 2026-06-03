@@ -1478,12 +1478,14 @@ def _anon_typecast(
 ) -> Any:
     """Translate ``<expr>::<type>`` under 3VL, preserving the null-flag.
 
-    The inner may be scalar (``_Val``) or boolean (``_TV`` — e.g. P4's
-    ``(... IS NULL)::bool``, amendment #4). A cast of NULL is NULL, so the
-    inner ``is_null`` always carries through. When the target sort matches
-    the inner value's sort the cast is a no-op; otherwise the value is
-    opaque under the target sort (an unknown target keeps a String opaque)
-    but the null-flag is preserved.
+    The inner is coerced to a ``_Val`` via ``_as_val``: a boolean ``_TV``
+    inner (e.g. P4's ``(... IS NULL)::bool``, amendment #4) becomes a
+    Bool-sorted scalar whose value carries its truth and whose null-flag
+    carries through — there is no separate ``_TV`` branch here. A cast of
+    NULL is NULL, so the inner ``is_null`` always propagates. When the
+    target sort matches the inner value's sort the cast is a no-op;
+    otherwise the value is opaque under the target sort (an unknown
+    target keeps a String opaque) but the null-flag is preserved.
     """
     inner_raw = _anon_3vl(node.arg, ctx, auth_funcs, assertions)
     if inner_raw is None:

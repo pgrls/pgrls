@@ -739,6 +739,17 @@ def test_anon_clean_on_in_list() -> None:
     assert _anon("owner_id IN ('a', 'b') OR (SELECT auth.uid()) IS NULL") is None
 
 
+def test_anon_clean_on_case_expr_aborts() -> None:
+    # R12 #9: the v1 3VL encoder does not model CaseExpr — it returns
+    # None (declines to prove validity = the safe direction). Pin that
+    # abort so any future change adding CASE support to _anon_3vl is a
+    # deliberate, reviewed flip rather than a silent SEC038 FP/FN.
+    assert _anon(
+        "CASE WHEN (SELECT auth.uid()) IS NULL THEN true "
+        "ELSE owner_id = (SELECT auth.uid()) END"
+    ) is None
+
+
 def test_anon_returns_none_when_z3_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
