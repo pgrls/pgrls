@@ -806,3 +806,32 @@ def test_null_limitation_does_not_compromise_soundness() -> None:
     assert counterexample(
         parse_expr("col = 5"), parse_expr("col = 5 OR col = 6")
     ) == {"col": 6}
+
+
+def test_counterexample_empty_row_for_all_rows_leak() -> None:
+    # Regression (round-5): when head ∧ ¬base is a tautology (base rejects
+    # every row, head admits all), the verifier's most important admit-case
+    # is "every row leaks" — a sound EMPTY-projection witness. Pin the {}
+    # return and the witness gate accepting the empty pin.
+    from pgrls.diff._z3_compare import (
+        _Context,
+        _row_is_sufficient_witness,
+        _to_z3,
+    )
+
+    base = parse_expr("a IS NULL AND a IS NOT NULL")  # always false
+    head = parse_expr("true")
+    assert counterexample(base, head) == {}
+    ctx = _Context()
+    base_z3 = _to_z3(base, ctx)
+    head_z3 = _to_z3(head, ctx)
+    assert _row_is_sufficient_witness({}, base_z3, head_z3, ctx) is True
+
+
+def test_counterexample_decodes_real_column_as_float() -> None:
+    # Regression (round-5): the RealSort decode path (as_fraction -> float)
+    # is otherwise untested; a Z3/pglast upgrade could silently break it.
+    cx = counterexample(parse_expr("price > 5.0"), parse_expr("price > 0.0"))
+    assert cx is not None
+    assert isinstance(cx["price"], float)
+    assert _row_satisfies_head_not_base("price > 5.0", "price > 0.0", cx)

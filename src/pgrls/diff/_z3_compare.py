@@ -389,9 +389,13 @@ def _to_z3(node: Any, ctx: _Context) -> Any:
         if any(a is None for a in args):
             return None
         if node.boolop == BoolExprType.AND_EXPR:
-            return z3.And(*args) if len(args) >= 2 else (args[0] if args else None)
+            if len(args) >= 2:
+                return z3.And(*args)
+            return args[0] if args else None  # pragma: no cover
         if node.boolop == BoolExprType.OR_EXPR:
-            return z3.Or(*args) if len(args) >= 2 else (args[0] if args else None)
+            if len(args) >= 2:
+                return z3.Or(*args)
+            return args[0] if args else None  # pragma: no cover
         if node.boolop == BoolExprType.NOT_EXPR:
             if len(args) != 1:
                 return None
@@ -1323,7 +1327,7 @@ def _anon_boolexpr(
         )
 
     if node.boolop == BoolExprType.AND_EXPR:
-        if len(tvs) < 2:
+        if len(tvs) < 2:  # pragma: no cover - pglast flattens AND to >=2 args
             return tvs[0]
         acc = tvs[0]
         for y in tvs[1:]:
@@ -1338,7 +1342,7 @@ def _anon_boolexpr(
         return acc
 
     if node.boolop == BoolExprType.OR_EXPR:
-        if len(tvs) < 2:
+        if len(tvs) < 2:  # pragma: no cover - pglast flattens OR to >=2 args
             return tvs[0]
         acc = tvs[0]
         for y in tvs[1:]:

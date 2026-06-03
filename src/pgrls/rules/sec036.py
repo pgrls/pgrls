@@ -38,6 +38,20 @@ the failure mode is different — "show rows whose owner is any
 admin" vs "show all rows if any admin exists"). It's deferred to a
 separate rule; SEC036 only covers `EXISTS`.
 
+Deferred limitation (deliberate, conservative under-flag): the
+target-table scan inspects the EXISTS sub-select's `fromClause` only,
+not its `withClause`. An `EXISTS (WITH u AS (SELECT * FROM auth.users)
+SELECT 1 FROM u WHERE …)` reaches `auth.users` through a CTE, so the
+sub-select's `fromClause` holds the bare CTE-name range var and the
+target is not seen — the EXISTS is not examined and SEC036 does not
+fire. Resolving it correctly means making BOTH the target scan and the
+caller-binding scan CTE-aware in lockstep (else a correctly-bound CTE
+policy would begin to false-fire); since CTEs inside policy EXISTS
+sub-queries are rare and the failure mode here is a missed flag rather
+than a false positive, the rule keeps its conservative stance rather
+than risk a new FP. Inline the table reference instead of wrapping it
+in a CTE to get the check.
+
 Configuration: `[lint.rules.SEC036]` accepts:
 
   - `target_tables` (list[str]) — `schema.table` references whose

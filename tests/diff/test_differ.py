@@ -1237,3 +1237,24 @@ def test_diff_schemas_no_counterexample_on_syntactic_loosen() -> None:
     loosened = [c for c in changes if c.kind == ChangeKind.USING_LOOSENED]
     assert len(loosened) == 1
     assert loosened[0].counterexample is None
+
+
+def test_text_and_json_render_empty_counterexample_as_any_row() -> None:
+    # An empty-dict counterexample is the H1 verifier's "every row leaks"
+    # witness (the old predicate rejected everything). Pin both renderings.
+    import json as _json
+
+    from pgrls.diff.formatters import format_diff_json, format_diff_text
+
+    c = Change(
+        kind=ChangeKind.USING_LOOSENED,
+        classification="dangerous",
+        location="public.t",
+        message="Policy public.t USING predicate loosened.",
+        before_sql="false",
+        after_sql="true",
+        counterexample={},
+    )
+    assert "example leaking row: (any row" in format_diff_text([c])
+    payload = _json.loads(format_diff_json([c]))
+    assert payload["violations"][0]["counterexample"] == {}
