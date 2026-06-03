@@ -360,6 +360,46 @@ def test_sec026_silent_on_hardcoded_like_pattern() -> None:
     assert SEC026().check(schema, options={}) == []
 
 
+@pytest.mark.parametrize(
+    "using",
+    [
+        # Auth value is the SUBJECT, pattern is a hard-coded literal:
+        # LIKE/ILIKE family (deparsed and keyword forms).
+        "current_user ~~ 'admin%'",
+        "current_user LIKE 'admin%'",
+        "current_setting('app.tag', true) ~~* 'beta_%'",
+        # POSIX regex on the subject side vs a literal pattern.
+        "current_setting('app.role', true) ~ '^tenant_'",
+        # The literal pattern may carry an explicit cast …
+        "current_user ~~ 'admin%'::text",
+        # … or be wrapped in the FROM-less scalar sub-select form.
+        "current_user ~~ (SELECT 'admin%')",
+    ],
+)
+def test_sec026_silent_on_auth_subject_against_literal_pattern(
+    using: str,
+) -> None:
+    # R16 #4: when the auth value is the SUBJECT and the pattern is an
+    # author-controlled string literal, every `%`/`_`/`.*` lives in the
+    # policy text — the attacker cannot inject a wildcard into the role
+    # name or GUC being matched. This is the LIKE/regex analogue of the
+    # `current_user = 'postgres'` admin-escape SEC018 deliberately
+    # allows; the warning-severity rule must NOT fire.
+    schema = Schema(tables=(_table(_policy(using=using)),))
+    assert SEC026().check(schema, options={}) == [], using
+
+
+def test_sec026_still_fires_when_auth_subject_pattern_is_data_driven() -> None:
+    # The skip is narrow: only a LITERAL pattern is safe. When the pattern
+    # operand is itself a column/expression (which could carry an injected
+    # wildcard), the auth-subject form still fires — matching the existing
+    # `current_user ILIKE user_email` coverage.
+    schema = Schema(
+        tables=(_table(_policy(using="current_user ~~ user_email")),)
+    )
+    assert len(SEC026().check(schema, options={})) == 1
+
+
 def test_sec026_silent_on_in_membership_check() -> None:
     # `column IN (...)` is `AEXPR_OP` with operator name `=`
     # against an array; not a pattern operator. No fire.

@@ -107,6 +107,7 @@ from __future__ import annotations
 from typing import Any
 
 from pglast.ast import (
+    A_Const,
     A_Expr,
     FuncCall,
     Node,
@@ -336,6 +337,23 @@ def _side_has_auth_call(side: Any, names: set[str]) -> bool:
     )
 
 
+def _is_literal_pattern(side: Any) -> bool:
+    """True if `side` is a fixed string literal pattern — an `A_Const`
+    string, possibly wrapped in casts or a FROM-less scalar sub-select.
+
+    Such a pattern is entirely author-controlled: every `%`/`_`/`.*`
+    metacharacter is written in the policy itself, so the attacker has
+    nothing to inject. (Contrast a GUC/JWT auth value or a data-driven
+    column pattern, where the wildcard can come from outside.)
+    Unwraps the same FROM-less scalar sub-select wrapper as
+    `_effective_operand` so `(SELECT 'admin%')` is recognized too.
+    """
+    node = _effective_operand(side)
+    while isinstance(node, TypeCast):
+        node = node.arg
+    return isinstance(node, A_Const) and isinstance(node.val, String)
+
+
 def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
     """Walk the AST and return the set of pattern-operator names that
     compare against an auth-context function on either operand.
@@ -380,6 +398,21 @@ def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
                     _is_non_text_typed(_effective_operand(side))
                     or _is_non_text_typed(_effective_operand(other))
                 ):
+                    continue
+                # FP guard (R16 #4): the genuine hazard is a wildcard the
+                # ATTACKER can inject — i.e. the auth value is the PATTERN
+                # operand (`col LIKE current_setting(...)`, where a GUC set
+                # to `%`/`.*` matches every row). When the auth value is
+                # instead the SUBJECT (`side is n.lexpr`) and the pattern
+                # (`other`, the right operand) is a fixed string literal —
+                # `current_user ~~ 'admin%'`, `current_setting('app.role')
+                # ~ '^tenant_'` — every metacharacter is author-controlled
+                # and there is nothing to inject, so it is safe. Keep
+                # firing only when the pattern is itself a data-driven
+                # column/expression (which could carry an injected
+                # wildcard), mirroring SEC018's `current_user = 'postgres'`
+                # admin-escape allowance for the equality case.
+                if side is n.lexpr and _is_literal_pattern(other):
                     continue
                 if op is not None:
                     found.add(op)
