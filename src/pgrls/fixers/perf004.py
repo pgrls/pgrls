@@ -38,9 +38,11 @@ description points at the alternative.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
-from pglast.ast import FuncCall, Node
+from pglast.ast import A_Expr, FuncCall, Node, String
+from pglast.enums import A_Expr_Kind
 from pglast.stream import RawStream
 
 from pgrls.ast_utils import extract_column_refs
@@ -54,17 +56,60 @@ from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.rules.perf003 import _has_leading_column_index, _own_table_column
 
 
+# Comparison / pattern operators whose direct operand the planner
+# evaluates as an indexable value expression. Arithmetic / concat
+# operators (`+`, `||`, …) are deliberately excluded: their result, not
+# the inner FuncCall, is the comparison operand.
+_COMPARISON_OPS: frozenset[str] = frozenset({
+    "=", "<>", "!=", "<", ">", "<=", ">=",
+    "~~", "~~*", "!~~", "!~~*", "~", "~*", "!~", "!~*",
+})
+_COMPARISON_AEXPR_KINDS: frozenset[Any] = frozenset({
+    A_Expr_Kind.AEXPR_IN,
+    A_Expr_Kind.AEXPR_LIKE,
+    A_Expr_Kind.AEXPR_ILIKE,
+    A_Expr_Kind.AEXPR_BETWEEN,
+    A_Expr_Kind.AEXPR_NOT_BETWEEN,
+})
+
+
+def _is_comparison_operand_parent(parent: Any) -> bool:
+    """True if `parent` is a comparison whose DIRECT operand is therefore
+    an indexable value expression.
+
+    A FuncCall that is the direct operand of such a comparison
+    (`lower(email) = …`, `date_trunc(...) >= …`, `lower(x) LIKE …`) IS the
+    expression the planner indexes, so an expression index on it is
+    correct. A FuncCall nested inside a value-producing wrapper —
+    `COALESCE(lower(email), …)`, `CASE … lower(email) …`, `lower(a) ||
+    lower(b)`, another FuncCall's args — is a STRICT SUB-EXPRESSION of the
+    real operand; indexing it alone yields an index the planner can never
+    use, so those wrappers must NOT qualify.
+    """
+    if not isinstance(parent, A_Expr):
+        return False
+    if parent.kind in _COMPARISON_AEXPR_KINDS:
+        return True
+    if parent.kind == A_Expr_Kind.AEXPR_OP:
+        names = [s.sval for s in (parent.name or ()) if isinstance(s, String)]
+        return bool(names) and names[-1] in _COMPARISON_OPS
+    return False
+
+
 def _top_funccalls_wrapping(
     node: Any, table: Table, flagged_columns: set[str]
 ) -> list[FuncCall]:
-    """Return the OUTERMOST FuncCalls in `node` that wrap a flagged
-    own-table column.
+    """Return the FuncCalls in `node` that wrap a flagged own-table column
+    AND are the DIRECT operand of a comparison — i.e. the exact expression
+    the planner would index.
 
-    "Outermost" means: the FuncCall contains (recursively) a flagged
-    column, and is NOT itself a descendant of another FuncCall that
-    also wraps the column. For `lower(upper(email))` with `email`
-    flagged, returns `[FuncCall("lower", …)]` once — the index has
-    to match the full predicate expression, not the inner `upper`.
+    For `lower(upper(email))` (email flagged) returns `[lower(upper(email))]`
+    once — the index must match the full predicate operand, not the inner
+    `upper`. A flagged column wrapped in a FuncCall that is itself nested in
+    a COALESCE / CASE / concat / arithmetic operand is NOT returned: the
+    fixer cannot emit a correct index for it (the planner's operand is the
+    enclosing value expression, outside the fixer's FuncCall scope), so it
+    defers to the human, exactly as the rule message suggests.
 
     Sub-select column refs are excluded by `extract_column_refs(
     exclude_sublinks=True)` — those belong to other tables and PERF004
@@ -79,32 +124,32 @@ def _top_funccalls_wrapping(
                 return True
         return False
 
-    def walk(n: Any, inside_funccall: bool) -> None:
+    def walk(n: Any, parent: Any) -> None:
         if n is None:
             return
         if isinstance(n, (list, tuple)):
+            # List elements (e.g. an IN rexpr list, or A_Expr.name) keep
+            # the ENCLOSING node as their parent.
             for item in n:
-                walk(item, inside_funccall)
+                walk(item, parent)
             return
         if isinstance(n, FuncCall):
-            if not inside_funccall and wraps_flagged(n):
+            if _is_comparison_operand_parent(parent) and wraps_flagged(n):
                 out.append(n)
-                # Don't recurse — any nested FuncCall inside `n` is
-                # already covered by the outer index expression.
+                # Covered — any nested FuncCall is part of this index expr.
                 return
-            # Either we're already inside a wrapping FuncCall (the
-            # outer one covered us) or this FuncCall doesn't wrap a
-            # flagged column. Recurse with the inside flag set so a
-            # sibling FuncCall under a non-wrapping parent (rare)
-            # still gets considered.
+            # Not a comparison operand (nested in a value wrapper, or this
+            # FuncCall doesn't wrap a flagged column). Recurse with THIS
+            # FuncCall as parent so a deeper comparison-operand FuncCall is
+            # still found but never treated as a bare operand.
             for field_name in n:
-                walk(getattr(n, field_name, None), True)
+                walk(getattr(n, field_name, None), n)
             return
         if isinstance(n, Node):
             for field_name in n:
-                walk(getattr(n, field_name, None), inside_funccall)
+                walk(getattr(n, field_name, None), n)
 
-    walk(node, False)
+    walk(node, None)
     return out
 
 
@@ -176,6 +221,19 @@ class PERF004Fixer:
         schema: str, table: str, policy_name: str, expr_sql: str
     ) -> Fix:
         qtable = quote_qualified(schema, table)
+        # Deterministic, idempotent index name. The PERF004 RULE keys off
+        # the BARE column having a plain index and cannot decode an
+        # expression index, so it keeps firing after the fix lands; an
+        # unnamed `CREATE INDEX` would then be regenerated byte-identical
+        # on the next `pgrls fix` run and Postgres would auto-name a
+        # DUPLICATE. A name derived from (schema, table, expression) plus
+        # `IF NOT EXISTS` makes a second run a no-op and the --output
+        # migration safely re-runnable. The digest keeps the name a valid,
+        # collision-resistant identifier well under Postgres's 63-char cap.
+        digest = hashlib.sha1(
+            f"{schema}.{table}.{expr_sql}".encode()
+        ).hexdigest()[:16]
+        index_name = f"pgrls_idx_{digest}"
         return Fix(
             rule_id="PERF004",
             # One Fix per (table, expression) — the location names
@@ -183,7 +241,8 @@ class PERF004Fixer:
             # one table sort deterministically and pin which
             # predicate they match.
             location=f"{schema}.{table}::{expr_sql}",
-            sql=f"CREATE INDEX ON {qtable} ({expr_sql});",
+            sql=f"CREATE INDEX IF NOT EXISTS {index_name} ON {qtable} "
+            f"({expr_sql});",
             description=(
                 f"Create an expression index on {schema}.{table} "
                 f"matching the policy predicate `{expr_sql}` so the "

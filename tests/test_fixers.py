@@ -3591,7 +3591,8 @@ def test_perf004_fix_emits_expression_index_for_single_func_wrap() -> None:
     assert len(fixes) == 1
     f = fixes[0]
     assert f.rule_id == "PERF004"
-    assert f.sql == "CREATE INDEX ON public.users (lower(email));"
+    assert f.sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+    assert f.sql.endswith(" ON public.users (lower(email));")
     assert "lower(email)" in f.location
 
 
@@ -3640,8 +3641,9 @@ def test_perf004_fix_emits_outermost_funccall_for_nested_wrap() -> None:
     ),))
     fixes = PERF004Fixer().fix(schema, {})
     assert len(fixes) == 1
-    assert fixes[0].sql == (
-        "CREATE INDEX ON public.users (lower(upper(email)));"
+    assert fixes[0].sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+    assert fixes[0].sql.endswith(
+        " ON public.users (lower(upper(email)));"
     )
 
 
@@ -3654,9 +3656,8 @@ def test_perf004_fix_dedupes_expression_across_policies() -> None:
         _policy(pred, name="write", command="ALL", with_check=pred),
     ),))
     fixes = PERF004Fixer().fix(schema, {})
-    assert [f.sql for f in fixes] == [
-        "CREATE INDEX ON public.users (lower(email));"
-    ]
+    assert len(fixes) == 1
+    assert fixes[0].sql.endswith(" ON public.users (lower(email));")
 
 
 def test_perf004_fix_emits_separate_index_per_distinct_expression() -> None:
@@ -3667,10 +3668,15 @@ def test_perf004_fix_emits_separate_index_per_distinct_expression() -> None:
         _policy("upper(email) = current_setting('app.u')", name="up"),
     ),))
     fixes = PERF004Fixer().fix(schema, {})
-    assert sorted(f.sql for f in fixes) == [
-        "CREATE INDEX ON public.users (lower(email));",
-        "CREATE INDEX ON public.users (upper(email));",
+    suffixes = sorted(f.sql.split(" ON ", 1)[1] for f in fixes)
+    assert suffixes == [
+        "public.users (lower(email));",
+        "public.users (upper(email));",
     ]
+    assert all(
+        f.sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+        for f in fixes
+    )
 
 
 def test_perf004_fix_respects_allowlist() -> None:
@@ -3699,6 +3705,37 @@ def test_perf004_fix_description_flags_lock_concurrently_and_alternative() -> No
     # The actual expression text appears in the description so the
     # operator sees what's being indexed without reading SQL.
     assert "lower(email)" in f.description
+
+
+def test_perf004_fix_suppressed_when_funccall_nested_in_value_expr() -> None:
+    # Regression (round-7): the flagged FuncCall is a STRICT SUB-EXPRESSION
+    # of the comparison operand (wrapped in COALESCE / concat / CASE). An
+    # index on just the inner FuncCall can never serve the predicate, so
+    # the fixer must suppress and defer to the human — never emit a useless
+    # index. (The RULE still flags the function-wrapped column; only the
+    # auto-fix is withheld.)
+    for pred in (
+        "coalesce(lower(email), '') = current_setting('app.e')",
+        "lower(email) || upper(email) = current_setting('app.e')",
+        "(CASE WHEN id > 0 THEN lower(email) END) = current_setting('app.e')",
+    ):
+        schema = Schema(tables=(_perf004_table(_policy(pred, name="p")),))
+        assert PERF004Fixer().fix(schema, {}) == [], pred
+
+
+def test_perf004_fix_index_is_named_and_idempotent() -> None:
+    # Regression (round-7): the emitted CREATE INDEX is named
+    # (deterministic) and IF NOT EXISTS, so a second `pgrls fix` run is
+    # byte-identical and re-applying the migration is a no-op — no
+    # duplicate-index accumulation.
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.e')", name="p"),
+    ),))
+    first = PERF004Fixer().fix(schema, {})
+    second = PERF004Fixer().fix(schema, {})
+    assert len(first) == 1
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in first[0].sql
+    assert [f.sql for f in first] == [f.sql for f in second]
 
 
 def test_perf004_fix_raises_on_malformed_allowlist() -> None:
