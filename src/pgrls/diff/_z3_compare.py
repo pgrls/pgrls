@@ -725,7 +725,11 @@ def _in_to_z3(node: A_Expr, ctx: _Context) -> Any:
         return None
     if not all(isinstance(item, A_Const) for item in rexpr):
         return None
-    if not rexpr:
+    if not rexpr:  # pragma: no cover - `col IN ()` is a Postgres syntax
+        # error, so a parsed AEXPR_IN always has >=1 element. This guard
+        # (an empty list survives the all()-over-[] check above, which is
+        # vacuously True) is a defensive failsafe, never reached from
+        # parsed SQL.
         return z3.BoolVal(False)  # empty IN list — never matches
     # Use the first literal's sort to bind the column.
     first_sort = _infer_sort(rexpr[0])

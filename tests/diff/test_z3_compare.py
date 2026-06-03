@@ -612,6 +612,18 @@ def test_anon_fires_on_multiple_auth_is_null() -> None:
     ) is not None
 
 
+def test_anon_fires_on_bare_sqlvaluefunction_current_user() -> None:
+    # `current_user` / `session_user` written WITHOUT parens parse as
+    # SQLValueFunction nodes — a distinct AST class from FuncCall —
+    # forced to NULL under anon by the _ANON_SVFOP_NAMES branch of
+    # `_is_anon_null_leaf`. The inverted `current_user IS NULL OR
+    # <owner>` disjunct is then TRUE for every row → valid → fires.
+    # The existing `(SELECT auth.uid())`-wrapped tests are all FuncCall,
+    # so this is the only coverage of the SQLValueFunction anon-leaf.
+    assert _anon(f"current_user IS NULL OR {_OWNER}") is not None
+    assert _anon(f"session_user IS NULL OR {_OWNER}") is not None
+
+
 def test_anon_fires_on_bare_true() -> None:
     assert _anon("true") is not None
 
@@ -621,6 +633,14 @@ def test_anon_fires_on_trivial_tautology() -> None:
 
 
 # --- NOT VALID (no fire): None is returned ----------------------------------
+
+
+def test_anon_clean_on_bare_sqlvaluefunction_equality() -> None:
+    # `current_user = 'admin'` under anon is `NULL = 'admin'` → Kleene U
+    # → not valid → no fire. Guards the SQLValueFunction leaf against
+    # being mis-encoded as a concrete (non-null) value, which would
+    # leak a false positive.
+    assert _anon("current_user = 'admin'") is None
 
 
 def test_anon_clean_on_owner_predicate() -> None:

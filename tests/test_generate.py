@@ -108,6 +108,30 @@ def test_predicate_supabase_custom_auth_function_quoted() -> None:
     assert p == "user_id = (SELECT auth.user_id())"
 
 
+def test_predicate_supabase_unqualified_auth_function() -> None:
+    # An --auth-function with NO schema qualifier (no dot) takes the
+    # bare-name branch: quote_ident the single component, no schema
+    # prefix. `uid` → `(SELECT uid())`.
+    p = session_predicate(
+        "user_id",
+        "uuid",
+        GenerateOptions(model="owner", convention="supabase", auth_function="uid"),
+    )
+    assert p == "user_id = (SELECT uid())"
+
+
+def test_predicate_supabase_unqualified_auth_function_needs_quoting() -> None:
+    # A bare auth-function name that is a reserved word / mixed-case must
+    # be quoted by quote_ident on the bare-name branch — proving the
+    # branch routes through quote_ident, not a raw splice.
+    p = session_predicate(
+        "user_id",
+        "uuid",
+        GenerateOptions(model="owner", convention="supabase", auth_function="User"),
+    )
+    assert p == 'user_id = (SELECT "User"())'
+
+
 def test_owner_model_uses_owner_policy_names() -> None:
     schema = Schema(tables=(_table("posts", (_ID, _UID)),))
     opts = GenerateOptions(model="owner", tenant_column="user_id", convention="supabase")
