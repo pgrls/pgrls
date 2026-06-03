@@ -223,6 +223,55 @@ def test_diff_snapshot_vs_snapshot_text_format(tmp_path: Path) -> None:
     assert result.output.strip()  # non-empty
 
 
+def test_diff_file_vs_file_succeeds_when_config_url_env_var_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: `diff a.json b.json` must run even when an
+    auto-loaded `[database].url` references an unset env var.
+
+    `diff` of two snapshot files never reads the DB URL, but
+    load_config used to eagerly interpolate `[database].url` and raise
+    when the var was unset — turning a "no schema change" run into an
+    exit-2 indistinguishable from a real regression. The interpolation
+    failure is now deferred, so this must exit 0.
+    """
+    monkeypatch.delenv("UNSET_DB_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "$UNSET_DB_URL"\n', encoding="utf-8")
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_TABLE_WITH_RLS), encoding="utf-8")
+    head.write_text(json.dumps(_TABLE_WITH_RLS), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["diff", str(base), str(head), "--config", str(cfg)]
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_diff_no_head_surfaces_deferred_url_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When `diff` DOES need the configured URL as its head source but
+    interpolation failed, the specific cause is surfaced — not the
+    generic 'No head' guidance."""
+    monkeypatch.delenv("UNSET_DB_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "$UNSET_DB_URL"\n', encoding="utf-8")
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps(_TABLE_WITH_RLS), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["diff", str(base), "--config", str(cfg)])
+
+    assert result.exit_code != 0
+    assert "UNSET_DB_URL" in result.output
+
+
 def test_diff_with_dangerous_change_exits_1(tmp_path: Path) -> None:
     """RLS disabled in head (was enabled in base) → dangerous → exit 1."""
     base = tmp_path / "base.json"

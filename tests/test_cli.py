@@ -287,6 +287,48 @@ def test_explain_prints_rule_rationale() -> None:
     assert "BYPASSRLS" in result.output
 
 
+def test_explain_succeeds_when_config_url_env_var_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: `explain --config cfg.toml` must run even when the
+    config's `[database].url` references an unset env var.
+
+    `explain` reads only the rule catalog — never the DB. load_config
+    used to raise during eager `[database].url` interpolation, breaking
+    a command documented as needing no connection. The failure is now
+    deferred, so this must exit 0 and still print the rule rationale.
+    """
+    monkeypatch.delenv("UNSET_DB_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "$UNSET_DB_URL"\n', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC001", "--config", str(cfg)])
+
+    assert result.exit_code == 0, result.output
+    assert "SEC001" in result.output
+
+
+def test_lint_surfaces_deferred_url_error_at_connection_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A DB-needing command (`lint`) with an unresolvable configured
+    URL still fails — but with the SPECIFIC deferred cause, not the
+    generic 'No database connection' guidance. No DB is touched: the
+    connection guard fires before any connect attempt."""
+    monkeypatch.delenv("UNSET_DB_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "$UNSET_DB_URL"\n', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--config", str(cfg)])
+
+    assert result.exit_code == 2, result.output
+    assert "UNSET_DB_URL" in result.output
+
+
 def test_explain_is_case_insensitive() -> None:
     # `explain sec001` and `explain SEC001` resolve the same rule
     # and produce byte-identical output.

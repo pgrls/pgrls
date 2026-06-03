@@ -384,8 +384,12 @@ def lint(
     )
 
     if effective.database_url is None:
+        # If `[database].url` was set but its env-var interpolation
+        # failed, surface that specific cause (deferred from
+        # load_config) instead of the generic guidance.
         raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
+            effective.database_url_error
+            or "No database connection: pass --database-url or set DATABASE_URL."
         )
 
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
@@ -555,8 +559,9 @@ def _merge_overrides(
     effective_fail_on: Severity = (
         coerce_severity(fail_on) if fail_on is not None else config.fail_on
     )
+    effective_database_url = database_url or config.database_url
     return Config(
-        database_url=database_url or config.database_url,
+        database_url=effective_database_url,
         schemas=schemas,
         disable=list(config.disable),
         fail_on=effective_fail_on,
@@ -568,6 +573,15 @@ def _merge_overrides(
         # [] and `pgrls lint` silently never runs them (they still load
         # for `explain`/validation, so the miss looks like coverage).
         extra_rules=list(config.extra_rules),
+        # Carry the deferred `[database].url` interpolation error only
+        # while it is still relevant: if `--database-url` supplied a
+        # URL, the effective URL is non-None and the config's failed
+        # interpolation no longer matters, so drop it.
+        database_url_error=(
+            None
+            if effective_database_url is not None
+            else config.database_url_error
+        ),
     )
 
 
@@ -601,8 +615,12 @@ def _load_effective_config(
     )
 
     if effective.database_url is None:
+        # If `[database].url` was set but its env-var interpolation
+        # failed, surface that specific cause (deferred from
+        # load_config) instead of the generic guidance.
         raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
+            effective.database_url_error
+            or "No database connection: pass --database-url or set DATABASE_URL."
         )
     return effective
 
@@ -1626,8 +1644,12 @@ def snapshot(
     )
 
     if effective.database_url is None:
+        # If `[database].url` was set but its env-var interpolation
+        # failed, surface that specific cause (deferred from
+        # load_config) instead of the generic guidance.
         raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
+            effective.database_url_error
+            or "No database connection: pass --database-url or set DATABASE_URL."
         )
 
     try:
@@ -2350,8 +2372,14 @@ def diff(
     if migration_path is None and head is None:
         head = database_url or config.database_url
         if head is None:
+            # A configured `[database].url` whose env-var interpolation
+            # failed lands here (deferred from load_config). Surface the
+            # specific cause rather than the generic "No head" guidance —
+            # the user did configure a head source, it just couldn't
+            # resolve.
             raise ToolError(
-                "No head: pass <head> argument, set DATABASE_URL, "
+                config.database_url_error
+                or "No head: pass <head> argument, set DATABASE_URL, "
                 "or configure [database].url in pgrls.toml."
             )
 
