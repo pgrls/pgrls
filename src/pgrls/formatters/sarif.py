@@ -132,8 +132,13 @@ def _result(
     # keeps the document GitHub-ingestible for any future schema-
     # wide rule that doesn't pin to a specific table or policy.
     # Real qualified names never contain parentheses, so the
-    # sentinel is unambiguous.
-    fqn = v.location if v.location is not None else "(schema-wide)"
+    # sentinel is unambiguous. Guard on falsiness (not `is not None`):
+    # an empty-string location is still effectively no location — an
+    # empty `fullyQualifiedName` is GitHub-rejected just like a missing
+    # one — and falsy matches the sentinel the sibling formatters
+    # (text/markdown/github/junit/pr_comment/html) all emit for `""`,
+    # so the SARIF run agrees with them on that finding.
+    fqn = v.location if v.location else "(schema-wide)"
     out["locations"] = [
         {"logicalLocations": [{"fullyQualifiedName": fqn}]}
     ]
