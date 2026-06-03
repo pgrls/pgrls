@@ -3141,19 +3141,30 @@ def test_perf001_fix_quotes_policy_and_table_when_required() -> None:
 
 
 def test_quote_ident_rejects_null_byte() -> None:
-    # Postgres rejects nulls in CREATE; if a snapshot or hand-
-    # built Schema sneaks one in, fail fast here with a clear
-    # message rather than emitting `"a\x00b"` for the server to
-    # reject with a confusing error.
+    # NUL is the ONE character Postgres forbids in an identifier (it
+    # terminates the C string — even `"a\x00b"` is an unterminated quoted
+    # identifier). Fail fast with a clear message rather than emitting it.
     from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="control character"):
+    with pytest.raises(ValueError, match="NUL byte"):
         quote_ident("evil\x00name")
 
 
-def test_quote_ident_rejects_embedded_newline() -> None:
+def test_quote_ident_quotes_embedded_control_chars_postgres_permits() -> None:
+    # R15 #7: tab / newline / CR are LEGAL inside a double-quoted
+    # identifier (`CREATE TABLE "a<TAB>b"` parses) and live introspection
+    # can return such a name raw. quote_ident must double-quote them (the
+    # `"`->`""` escape makes the result safe), NOT reject the whole C0
+    # range — over-rejecting aborted every fix / Schema.to_sql() in the
+    # run on a single such object. The emitted identifier must round-trip.
+    from pglast import parse_sql
+
     from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="control character"):
-        quote_ident("name\nwith\nnewlines")
+
+    for name in ("name\nwith\nnewlines", "a\tb", "a\rb"):
+        quoted = quote_ident(name)
+        assert quoted == '"' + name + '"', name
+        # The quoted form parses in an identifier position.
+        parse_sql(f"CREATE TABLE {quoted} (id integer)")
 
 
 def test_perf001_fix_never_emits_with_check_even_with_content() -> None:
@@ -3332,23 +3343,20 @@ def test_quote_ident_keyword_check_is_case_insensitive() -> None:
     assert quote_ident("Select") == '"Select"'
 
 
-def test_quote_ident_rejects_tab_character() -> None:
-    # An earlier change rejected null/newline; tab is the same
-    # hazard. Pin the wider control-char check so the defense is
-    # uniform.
+def test_quote_ident_quotes_all_c0_controls_except_nul() -> None:
+    # R15 #7: every C0 control + DEL EXCEPT NUL is a legal double-quoted
+    # identifier character in Postgres, so quote_ident must double-quote
+    # it (not reject the whole range, which aborted the entire fix /
+    # Schema.to_sql() run on one such object). NUL alone is rejected —
+    # it terminates the C string and cannot appear even double-quoted.
     from pgrls.fixers._idents import quote_ident
 
-    with pytest.raises(ValueError, match="control character"):
-        quote_ident("weird\tname")
-
-
-def test_quote_ident_rejects_all_c0_controls() -> None:
-    from pgrls.fixers._idents import quote_ident
-
-    for codepoint in list(range(0x20)) + [0x7f]:
+    for codepoint in list(range(0x01, 0x20)) + [0x7f]:
         ch = chr(codepoint)
-        with pytest.raises(ValueError, match="control character"):
-            quote_ident(f"x{ch}y")
+        name = f"x{ch}y"
+        assert quote_ident(name) == '"' + name + '"', hex(codepoint)
+    with pytest.raises(ValueError, match="NUL byte"):
+        quote_ident("x\x00y")
 
 
 def test_quote_ident_quotes_non_ascii() -> None:

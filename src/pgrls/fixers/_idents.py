@@ -22,11 +22,13 @@ which the server rejects.
 
 The structural regex `[a-z_][a-z0-9_]*` is kept as a fast pre-filter:
 anything outside it (mixed case, embedded spaces/dots/punctuation,
-non-ASCII letters, leading digit) is quoted without a probe. C0
-control characters and DEL are rejected outright — Postgres rejects
-them at CREATE time, but a snapshot or hand-built `Schema` could carry
-them; failing fast here beats producing SQL that parses confusingly on
-the server.
+non-ASCII letters, leading digit) is quoted without a probe. Only a NUL
+byte is rejected outright — it is the one character Postgres forbids in
+an identifier even when double-quoted (it terminates the C string).
+Tab / newline / CR and the rest of the C0 range are legal double-quoted
+identifier characters, so they are quoted (not rejected): rejecting the
+whole range over-rejected legitimately-named objects (a quoted
+`"a<TAB>b"` table is valid Postgres) and aborted the whole fix run.
 """
 from __future__ import annotations
 
@@ -41,12 +43,18 @@ from pglast.stream import RawStream
 
 _PLAIN_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-# C0 controls (\x00..\x1f) and DEL (\x7f). An earlier change
-# rejected null byte, LF, and CR; tab and the rest of the C0 range
-# pose the same embedding-in-quoted-SQL hazard. Catch the whole
-# range so the defense is uniform and a future reader doesn't read
-# the null-only test and assume tab is fine.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# NUL (\x00) is the ONLY character Postgres forbids in an identifier —
+# it terminates the underlying C string, so even a double-quoted
+# `"a<NUL>b"` is an "unterminated quoted identifier" error. Every other
+# byte, including tab / newline / CR and the rest of the C0 range, is a
+# legal identifier character when double-quoted (`CREATE TABLE "a<TAB>b"`
+# parses), and live introspection returns such names raw. Double-quoting
+# (with the `"` -> `""` escape below) neutralizes them safely — there is
+# no embedding-breakout hazard, since only an unescaped `"` could close
+# the quotes. So reject ONLY NUL and quote the rest; rejecting the whole
+# C0 range over-rejected legitimately-named objects and aborted the
+# entire fix / Schema.to_sql() run on one of them.
+_NUL_RE = re.compile(r"\x00")
 
 
 @lru_cache(maxsize=4096)
@@ -95,11 +103,13 @@ def quote_ident(name: str) -> str:
     Doubled quotes inside the name are escaped (`he"llo` →
     `"he""llo"`), matching Postgres's standard escaping rule.
 
-    Rejects null bytes, control characters, and DEL explicitly.
-    Postgres rejects them at CREATE time so they can't reach this
-    helper from real introspection, but a snapshot or hand-built
-    `Schema` could; failing fast here is clearer than emitting
-    `"a\\x00b"` and getting a confusing parse error from the server.
+    Rejects only a NUL byte — the sole character Postgres forbids in an
+    identifier (it can't appear even double-quoted). Every other byte,
+    including tab / newline / CR, is a legal double-quoted identifier
+    character that Postgres accepts and that live introspection can
+    return raw, so it is quoted, not rejected. (An earlier version
+    rejected the whole C0 range + DEL, which over-rejected legitimately-
+    named objects and aborted the entire fix / Schema.to_sql() run.)
 
     Bare-vs-quoted is decided by `_is_safe_bare_ident` (a pglast
     `ColId` probe), so reserved AND type_func_name keywords (`select`,
@@ -107,9 +117,9 @@ def quote_ident(name: str) -> str:
     """
     if not name:
         raise ValueError("identifier is empty")
-    if _CONTROL_CHARS_RE.search(name):
+    if _NUL_RE.search(name):
         raise ValueError(
-            f"identifier contains a control character; "
+            f"identifier contains a NUL byte (forbidden by Postgres); "
             f"refusing to emit: {name!r}"
         )
     if _is_safe_bare_ident(name):
