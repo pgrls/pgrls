@@ -27,7 +27,8 @@ from datetime import datetime
 from typing import Any, Iterable
 
 import pglast
-from pglast.ast import Node, RangeVar
+from pglast.ast import MergeStmt, Node, RangeVar
+from pglast.enums import CmdType
 
 from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
 from pgrls._render_common import (
@@ -183,6 +184,40 @@ def _own_range_vars(stmt: Any) -> list[tuple[str | None, str]]:
     return found
 
 
+# MERGE WHEN-clause command types that touch an RLS-governed command.
+# (CMD_NOTHING — `WHEN ... THEN DO NOTHING` — has no command and is
+# omitted.)
+_MERGE_CMD_TYPES: dict[Any, str] = {
+    CmdType.CMD_INSERT: "INSERT",
+    CmdType.CMD_UPDATE: "UPDATE",
+    CmdType.CMD_DELETE: "DELETE",
+}
+
+
+def _write_commands(stmt: Any) -> set[str] | None:
+    """The RLS write command(s) a statement applies to its target.
+
+    Returns an empty set for a plain SELECT (recognized; every relation
+    it touches is a read), a singleton for INSERT/UPDATE/DELETE, the set
+    of UPDATE/INSERT/DELETE a MERGE's WHEN clauses perform (MERGE is
+    multi-command — a single `statement_command` can't express it, which
+    is why a MERGE previously contributed zero coverage and HYG004
+    reported an exercised write policy as uncovered), or None when the
+    statement carries no RLS command (DDL, SET, …).
+    """
+    if isinstance(stmt, MergeStmt):
+        cmds: set[str] = set()
+        for when in getattr(stmt, "mergeWhenClauses", None) or ():
+            name = _MERGE_CMD_TYPES.get(getattr(when, "commandType", None))
+            if name:
+                cmds.add(name)
+        return cmds
+    base = statement_command(stmt)
+    if base is None:
+        return None
+    return set() if base == "SELECT" else {base}
+
+
 def _collect_accesses(
     stmt: Any, cte_scope: frozenset[str] = frozenset()
 ) -> list[tuple[str | None, str, str]]:
@@ -200,8 +235,8 @@ def _collect_accesses(
     statement's own write target gets the write command; every other
     directly-referenced relation is a `SELECT` read.
     """
-    command = statement_command(stmt)
-    if command is None:
+    write_commands = _write_commands(stmt)
+    if write_commands is None:
         return []
     out: list[tuple[str | None, str, str]] = []
 
@@ -224,7 +259,7 @@ def _collect_accesses(
             )
 
     target_key: tuple[str | None, str] | None = None
-    if command != "SELECT":
+    if write_commands:
         target = getattr(stmt, "relation", None)
         target_relname = getattr(target, "relname", None)
         if isinstance(target_relname, str) and target_relname:
@@ -234,7 +269,14 @@ def _collect_accesses(
         # A bare reference to a CTE name is a query alias, not a table.
         if s is None and r in scope:
             continue
-        out.append((s, r, command if (s, r) == target_key else "SELECT"))
+        if (s, r) == target_key:
+            # Credit the write target with every command it receives —
+            # one for INSERT/UPDATE/DELETE, the full set for a MERGE
+            # whose WHEN clauses perform several.
+            for cmd in sorted(write_commands):
+                out.append((s, r, cmd))
+        else:
+            out.append((s, r, "SELECT"))
     return out
 
 

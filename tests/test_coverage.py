@@ -89,6 +89,26 @@ def test_exercised_from_sql_insert_select_splits_target_and_source() -> None:
     assert out == {(None, "audit", "INSERT"), (None, "invoices", "SELECT")}
 
 
+def test_exercised_from_sql_merge_credits_each_when_command() -> None:
+    # MERGE is multi-command: the target gets EVERY command its WHEN
+    # clauses perform (UPDATE + INSERT here), the source is a read.
+    # Regression — a MERGE previously mapped to no command at all, so
+    # it contributed zero coverage and HYG004 reported an exercised
+    # write policy as uncovered.
+    out = set(
+        exercised_from_sql(
+            "MERGE INTO t USING s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET x = 1 "
+            "WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+        )
+    )
+    assert out == {
+        (None, "t", "UPDATE"),
+        (None, "t", "INSERT"),
+        (None, "s", "SELECT"),
+    }
+
+
 def test_exercised_from_sql_non_dml_and_parse_failure() -> None:
     assert exercised_from_sql("CREATE TABLE x (id int)") == []
     assert exercised_from_sql("SET LOCAL ROLE admin") == []
