@@ -1039,13 +1039,14 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # always has at least one of INSERT / DELETE / UPDATE /
         # TRUNCATE set, and the CASE chain in `_TRIGGERS_SQL` covers
         # all four. If a future Postgres adds a fifth event bit
-        # pgrls doesn't recognize, every CASE arm produces NULL,
-        # `array_remove(..., NULL)` empties the array, and
-        # `array_to_string([], ' OR ')` yields NULL. Raise loudly so
-        # the operator files a bug rather than seeing a malformed
-        # "(BEFORE )" message that's easy to misread. Matches the
-        # `polcmd` unknown-value handling below.
-        if row["event"] is None:
+        # pgrls doesn't recognize, every CASE arm produces NULL and
+        # `array_remove(..., NULL)` empties the array — but
+        # `array_to_string([], ' OR ')` yields the EMPTY STRING, not
+        # NULL. Guard on falsiness (catches both '' and None) so the
+        # documented failsafe actually fires; otherwise a future event
+        # bit would silently produce a malformed "(BEFORE )" message.
+        # Matches the `polcmd` unknown-value handling below.
+        if not row["event"]:
             raise RuntimeError(
                 f"Unknown pg_trigger.tgtype event bits for trigger "
                 f"{row['trigger_name']!r} (table OID "

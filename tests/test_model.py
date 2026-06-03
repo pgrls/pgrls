@@ -925,3 +925,28 @@ def test_from_snapshot_accepts_quoted_identifier_type() -> None:
     )
     schema = Schema.from_snapshot(snap)
     assert schema.tables[0].column_details[0].data_type == '"My Type"'
+
+
+def test_from_snapshot_rejects_collate_in_data_type() -> None:
+    # Regression (round-5): a COLLATE clause smuggled into a column
+    # data_type is interpolated into the CREATE TABLE `diff --apply` runs.
+    # A legitimate format_type data_type never carries an inline COLLATE,
+    # so the parse-validator must reject it.
+    snap = _minimal_snapshot(
+        column_details=[
+            {"name": "c", "data_type": 'integer COLLATE "C"',
+             "is_nullable": True},
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_non_object_payload() -> None:
+    # Regression (round-5): a file that is valid JSON but not a snapshot
+    # OBJECT (bare array / null / string / number) must raise the ValueError
+    # `_resolve_diff_source` catches, not an unhandled AttributeError that
+    # escapes as a raw traceback.
+    for payload in ([], None, "x", 42):
+        with pytest.raises(ValueError, match="JSON object"):
+            Schema.from_snapshot(payload)  # type: ignore[arg-type]

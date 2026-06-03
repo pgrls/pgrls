@@ -411,10 +411,19 @@ def under_seq_scan_pressure(
     by ``build_perf_report`` (the ``pgrls perf`` command) and the PERF005
     lint rule so the two never drift.
     """
+    # Gate on the RAW seq-scan fraction, not the 1-dp display value
+    # `seq_scan_pct`: a table at 49.96% rounds to 50.0 and would clear a
+    # min_seq_pct=50.0 gate it is actually below. Same rounding-defeats-the-
+    # gate class already fixed for `coverage --fail-under`; keep
+    # `seq_scan_pct` rounded for display only.
+    seq_pct_raw = (
+        0.0 if ts.total_scans == 0
+        else 100.0 * ts.seq_scan / ts.total_scans
+    )
     return (
         ts.n_live_tup >= thresholds.min_live_tup
         and ts.seq_scan >= thresholds.min_seq_scans
-        and ts.seq_scan_pct >= thresholds.min_seq_pct
+        and seq_pct_raw >= thresholds.min_seq_pct
     )
 
 

@@ -1358,8 +1358,9 @@ def test_triggers_captures_truncate_event(
 ) -> None:
     # `TRUNCATE` is forced to STATEMENT-level by Postgres. The
     # CASE-chain bit for TRUNCATE (`tgtype & 32`) must produce
-    # the literal "TRUNCATE" — the `or ""` fallback in introspect
-    # would mask a decoding bug as a missing event, so pin this
+    # the literal "TRUNCATE"; introspect's `if not row["event"]:`
+    # guard would raise on an empty decode rather than mask a
+    # decoding bug as a missing event, so pin the happy path
     # explicitly. TRUNCATE-only triggers are common for cache /
     # audit invalidation, so this is a real shape SEC013 needs
     # to surface cleanly.

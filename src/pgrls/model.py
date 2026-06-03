@@ -93,8 +93,10 @@ def _is_safe_data_type(data_type: object) -> bool:
     if len(elts) != 1 or not isinstance(elts[0], ColumnDef):
         return False  # a `,` added a second column (or a table constraint)
     col = elts[0]
-    if col.colname != "__pgrls_col" or col.constraints:
-        return False  # an embedded DEFAULT/CHECK/GENERATED clause
+    if col.colname != "__pgrls_col" or col.constraints or col.collClause:
+        return False  # embedded DEFAULT/CHECK/GENERATED, or a COLLATE
+        # clause (a legitimate format_type data_type never carries an
+        # inline COLLATE, so rejecting it loses nothing real).
     # A `)` that closed the column list early to smuggle a table-level
     # clause (INHERITS / OF type / PARTITION OF / WITH-options).
     return not any(
@@ -1131,6 +1133,17 @@ class Schema:
         lint path (`pgrls lint`) doesn't use `from_snapshot` — it
         introspects directly, which still parses ASTs on capture.
         """
+        if not isinstance(payload, dict):
+            # A file that is valid JSON but not a snapshot OBJECT (a bare
+            # array, null, string, or number) would otherwise AttributeError
+            # on `.get` below — which `_resolve_diff_source` doesn't catch,
+            # so it escapes as a raw traceback. Raise the ValueError it does
+            # catch so `pgrls diff` reports a clean "not a valid pgrls
+            # snapshot" instead.
+            raise ValueError(
+                "snapshot must be a JSON object, got "
+                f"{type(payload).__name__}"
+            )
         version = payload.get("version")
         if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14):
             raise ValueError(
