@@ -147,6 +147,27 @@ def _parse_binding_functions(options: dict[str, Any]) -> set[str]:
     return set(raw)
 
 
+def _select_from_items(sel: Any) -> list[Any]:
+    """A SelectStmt's effective FROM-clause items.
+
+    A set operation (UNION / INTERSECT / EXCEPT) leaves `fromClause`
+    None and stores the real FROM items in `larg` / `rarg`, so flatten
+    those arms' FROM items. This is the single place the set-op split is
+    handled, so the target scan (`_from_clause_targets` and the derived-
+    table descent in `_from_item_range_vars`) stays in lockstep with the
+    set-op-aware binding scan (`_from_clause_binding_quals`). Returns []
+    for a non-SelectStmt.
+    """
+    if not isinstance(sel, SelectStmt):
+        return []
+    if sel.op != SetOperation.SETOP_NONE:
+        return [
+            *_select_from_items(sel.larg),
+            *_select_from_items(sel.rarg),
+        ]
+    return list(sel.fromClause or ())
+
+
 def _from_item_range_vars(from_item: Any) -> list[RangeVar]:
     """RangeVars reachable from a single FROM-clause item.
 
@@ -168,12 +189,13 @@ def _from_item_range_vars(from_item: Any) -> list[RangeVar]:
         elif isinstance(item, RangeSubselect):
             # `FROM (SELECT ... FROM auth.users) sub` — the target
             # table is one level down in the sub-select's own FROM.
-            # Recurse its fromClause so an EXISTS that reaches the
-            # target through a derived table is still detected.
-            sub = item.subquery
-            if isinstance(sub, SelectStmt):
-                for fc in sub.fromClause or ():
-                    walk(fc)
+            # Recurse its effective FROM items so an EXISTS that reaches
+            # the target through a derived table is still detected —
+            # including when the derived table is itself a set operation
+            # (`FROM (SELECT … FROM auth.users UNION SELECT …) sub`),
+            # whose FROM items live in larg/rarg, not fromClause.
+            for fc in _select_from_items(item.subquery):
+                walk(fc)
 
     walk(from_item)
     return out
@@ -197,24 +219,17 @@ def _matches_target(
 def _from_clause_targets(
     sel: Any, target_tables: set[tuple[str, str]]
 ) -> list[RangeVar]:
-    """Target RangeVars in a sub-select's FROM clause (JOINs included)."""
-    if sel is None:
-        return []
-    # Set operation (UNION / INTERSECT / EXCEPT): pglast leaves
-    # `fromClause` None and puts the real FROM items in larg/rarg. Recurse
-    # into both arms so an `EXISTS (SELECT 1 FROM auth.users WHERE … UNION
-    # …)` is still examined. (The binding scan is made set-op-aware in
-    # lockstep so a correctly-bound set-op policy doesn't begin to
-    # false-fire.)
-    if sel.op != SetOperation.SETOP_NONE:
-        return [
-            *_from_clause_targets(sel.larg, target_tables),
-            *_from_clause_targets(sel.rarg, target_tables),
-        ]
-    if sel.fromClause is None:
-        return []
+    """Target RangeVars in a sub-select's FROM clause (JOINs included).
+
+    `_select_from_items` flattens a top-level set operation
+    (UNION / INTERSECT / EXCEPT) into its arms' FROM items — so an
+    `EXISTS (SELECT 1 FROM auth.users … UNION …)` is examined — and
+    `_from_item_range_vars` descends JOINs and derived tables (the latter
+    set-op-aware too). The binding scan is set-op-aware in lockstep so a
+    correctly-bound set-op policy never begins to false-fire.
+    """
     out: list[RangeVar] = []
-    for from_item in sel.fromClause:
+    for from_item in _select_from_items(sel):
         for rv in _from_item_range_vars(from_item):
             if _matches_target(rv, target_tables):
                 out.append(rv)

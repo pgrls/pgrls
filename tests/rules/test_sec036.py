@@ -409,6 +409,38 @@ def test_sec036_silent_on_setop_union_bound_to_caller() -> None:
     assert SEC036().check(schema, {}) == []
 
 
+def test_sec036_fires_on_setop_nested_in_derived_table() -> None:
+    # Regression (round-10 #5): the target scan recursed a derived
+    # table's `fromClause` directly, so a derived table that is itself a
+    # set operation — `FROM (SELECT id FROM auth.users UNION SELECT …) s`,
+    # whose FROM items live in larg/rarg — was invisible and the unbound
+    # admin-any EXISTS slipped through. It must now be flagged.
+    expr = (
+        "EXISTS (SELECT 1 FROM ("
+        "SELECT id FROM auth.users UNION SELECT id FROM other_t"
+        ") s WHERE s.id IS NOT NULL)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="derived_setop_unbound"))
+    violations = SEC036().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.derived_setop_unbound"
+
+
+def test_sec036_silent_on_setop_nested_in_derived_table_bound() -> None:
+    # Lockstep: a binding inside the derived set-op's arm (WHERE) must
+    # keep it silent — the binding scan already descends derived-table
+    # set-ops, so target detection becoming set-op-aware here must not
+    # introduce a false positive.
+    expr = (
+        "EXISTS (SELECT 1 FROM ("
+        "SELECT id FROM auth.users WHERE id = auth.uid() "
+        "UNION SELECT id FROM other_t WHERE id = auth.uid()"
+        ") s)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="derived_setop_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
 def test_sec036_silent_on_having_clause_binding() -> None:
     # Regression (round-7): a HAVING-clause binding constrains the EXISTS
     # to the caller exactly like a WHERE binding. Omitting havingClause
