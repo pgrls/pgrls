@@ -72,6 +72,26 @@ def test_sec024_silent_on_qualified_name() -> None:
     assert SEC024().check(schema, options={}) == []
 
 
+def test_sec024_silent_on_user_defined_current_setting() -> None:
+    # R14 #3: SEC024's premise is the Postgres BUILTIN current_setting
+    # (an unqualified GUC name "cannot be SET as a customized parameter
+    # at all"). find_func_calls matches on bare OR qualified name, so a
+    # user-defined `myschema.current_setting('tenant_id')` — a different
+    # function that may legitimately take an unqualified string — used to
+    # mis-fire. It must be skipped while the builtin (bare and
+    # pg_catalog-qualified) keeps firing.
+    schema = _schema(
+        _policy(using="tenant_id = myschema.current_setting('tenant_id')")
+    )
+    assert SEC024().check(schema, options={}) == []
+    # Sanity: the pg_catalog-qualified builtin with an unqualified GUC
+    # name still fires.
+    fires = _schema(
+        _policy(using="tenant_id = pg_catalog.current_setting('tenant_id')")
+    )
+    assert len(SEC024().check(fires, options={})) == 1
+
+
 def test_sec024_fires_on_cast_wrapped_literal() -> None:
     # Postgres deparses a string-literal argument with an explicit
     # cast — `current_setting('tenant'::text, true)` — which is the

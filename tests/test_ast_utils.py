@@ -9,7 +9,6 @@ from pgrls.ast_utils import (
     is_literal_true,
     match_is_null,
     parse_expr,
-    top_level_disjuncts,
 )
 
 
@@ -83,29 +82,6 @@ def test_parse_expr_custom_tail_with_location_keeps_named_policy(
     assert "could not parse policy public.t.bad_policy" in err
     assert "(USING clause)" in err
     assert "Diff falls back to REQUIRES_REVIEW." in err
-
-
-def test_top_level_disjuncts_splits_or_chain() -> None:
-    node = parse_expr("a = 1 OR b = 2 OR c = 3")
-    assert node is not None
-    disjuncts = top_level_disjuncts(node)
-    assert len(disjuncts) == 3
-
-
-def test_top_level_disjuncts_returns_singleton_for_and() -> None:
-    node = parse_expr("a = 1 AND b = 2")
-    assert node is not None
-    disjuncts = top_level_disjuncts(node)
-    assert len(disjuncts) == 1
-    assert disjuncts[0] is node
-
-
-def test_top_level_disjuncts_returns_singleton_for_leaf() -> None:
-    node = parse_expr("a = 1")
-    assert node is not None
-    disjuncts = top_level_disjuncts(node)
-    assert len(disjuncts) == 1
-    assert disjuncts[0] is node
 
 
 
@@ -243,36 +219,6 @@ def test_parse_expr_handles_complex_boolean_tree() -> None:
 def test_parse_expr_handles_in_and_subquery() -> None:
     node = parse_expr("a IN (SELECT id FROM t WHERE active = true)")
     assert node is not None
-
-
-def test_top_level_disjuncts_treats_top_and_as_singleton() -> None:
-    # Top is AND — entire expression is one disjunct.
-    node = parse_expr("(a = 1 OR b = 2) AND c = 3")
-    assert node is not None
-    disjuncts = top_level_disjuncts(node)
-    assert len(disjuncts) == 1
-    assert disjuncts[0] is node
-
-
-def test_top_level_disjuncts_splits_top_or_with_and_inside() -> None:
-    # Top is OR with AND inside one branch — 2 disjuncts.
-    node = parse_expr("(a = 1 AND b = 2) OR c = 3")
-    assert node is not None
-    disjuncts = top_level_disjuncts(node)
-    assert len(disjuncts) == 2
-
-
-def test_top_level_disjuncts_does_not_descend_into_nested_or() -> None:
-    # `a OR (b OR c)` parses to nested ORs. The helper splits at the top
-    # level only; the inner `(b OR c)` stays bundled. This pins the
-    # behavior — SEC004 relies on it (a wrapped IS-NULL inside a nested
-    # OR isn't a top-level disjunct in the SEC004 sense).
-    node = parse_expr("a = 1 OR (b = 2 OR c = 3)")
-    assert node is not None
-    disjuncts = top_level_disjuncts(node)
-    # Pglast may or may not flatten — accept either shape but make sure
-    # we don't produce more than the top-level OR's arg count would imply.
-    assert 2 <= len(disjuncts) <= 3
 
 
 def test_extract_column_refs_collects_function_arguments() -> None:

@@ -60,12 +60,33 @@ def test_env_interpolation_braces(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert cfg.database_url == "postgres://from-env/db2"
 
 
-def test_env_interpolation_missing_var_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_interpolation_missing_var_is_deferred_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A `[database].url` referencing an unset env var must NOT raise at
+    # load time — that would break no-DB commands (`diff` file-vs-file,
+    # `explain`) which never read the URL. Instead the failure is
+    # deferred: `database_url` is None and the specific cause is parked
+    # in `database_url_error` for the connection guard to re-raise.
     monkeypatch.delenv("MISSING_VAR", raising=False)
     cfg_file = tmp_path / "pgrls.toml"
     cfg_file.write_text('[database]\nurl = "${MISSING_VAR}"\n')
+    cfg = load_config(path=cfg_file)
+    assert cfg.database_url is None
+    assert cfg.database_url_error is not None
+    assert "MISSING_VAR" in cfg.database_url_error
+
+
+def test_interpolate_env_helper_still_raises_on_missing_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The low-level helper contract is unchanged: it raises on a missing
+    # var. Only `_build_config` defers that raise for `[database].url`.
+    from pgrls.config import _interpolate_env
+
+    monkeypatch.delenv("MISSING_VAR", raising=False)
     with pytest.raises(ConfigError, match="MISSING_VAR"):
-        load_config(path=cfg_file)
+        _interpolate_env("${MISSING_VAR}")
 
 
 def test_invalid_fail_on_raises(tmp_path: Path) -> None:
@@ -429,16 +450,21 @@ def test_dollar_dollar_escape_does_not_interfere_with_real_var(
     assert out == "alice says $$"
 
 
-def test_empty_env_var_value_raises_clear_error(
+def test_empty_env_var_value_is_deferred_with_clear_error(
     monkeypatch, tmp_path,
 ) -> None:
-    from pgrls.config import ConfigError, load_config
+    # A URL that interpolates to the empty string is the same class of
+    # environment-state failure as an unset var: deferred, not raised,
+    # so no-DB commands still run. The clear "empty after env-var
+    # interpolation" reason is parked for the connection guard.
+    from pgrls.config import load_config
     monkeypatch.setenv("EMPTY_DB", "")
     cfg = tmp_path / "pgrls.toml"
     cfg.write_text('[database]\nurl = "${EMPTY_DB}"\n')
-    import pytest
-    with pytest.raises(ConfigError, match="empty after env-var interpolation"):
-        load_config(cfg)
+    config = load_config(cfg)
+    assert config.database_url is None
+    assert config.database_url_error is not None
+    assert "empty after env-var interpolation" in config.database_url_error
 
 
 # ---------------------------------------------------------------------------

@@ -639,6 +639,50 @@ def test_format_diff_json_severity_mapping_exhaustive():
     assert by_loc["public.d.pol"] == "error"
 
 
+def test_format_diff_json_carries_raw_classification():
+    # R12 #8: breaking and requires_review both project to
+    # `severity: warning`, so the JSON must also carry the raw 4-way
+    # `classification` key — otherwise a CI consumer can't split "block
+    # on breaking" from "warn on requires_review" from the JSON alone.
+    changes = [
+        _change(ChangeKind.TABLE_DROPPED, "breaking", location="public.b",
+                message="breaking msg."),
+        _change(ChangeKind.GRANT_ADDED, "requires_review", location="public.c.r",
+                message="requires_review msg."),
+    ]
+    parsed = _json.loads(format_diff_json(changes))
+    by_loc = {v["location"]: v for v in parsed["violations"]}
+    assert by_loc["public.b"]["severity"] == "warning"
+    assert by_loc["public.b"]["classification"] == "breaking"
+    assert by_loc["public.c.r"]["severity"] == "warning"
+    assert by_loc["public.c.r"]["classification"] == "requires_review"
+
+
+def test_format_diff_sarif_carries_raw_classification():
+    # Same on the SARIF side — via the standard result.properties bag.
+    changes = [
+        _change(ChangeKind.TABLE_DROPPED, "breaking", location="public.b",
+                message="breaking msg."),
+    ]
+    parsed = _json.loads(format_diff_sarif(changes))
+    result = parsed["runs"][0]["results"][0]
+    assert result["properties"]["classification"] == "breaking"
+
+
+def test_lint_violation_json_omits_classification_key():
+    # Additive: a plain lint Violation (no classification) must keep the
+    # historical shape — the key appears only on diff output.
+    from pgrls.formatters import format_violations
+    from pgrls.violations import Violation
+
+    v = Violation(
+        rule_id="SEC001", severity="error", title="t",
+        message="m", location="public.t",
+    )
+    parsed = _json.loads(format_violations([v], format="json"))
+    assert "classification" not in parsed["violations"][0]
+
+
 def test_format_diff_json_empty_changes_produces_valid_empty_object():
     result = format_diff_json([])
     parsed = _json.loads(result)

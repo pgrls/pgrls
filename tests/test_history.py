@@ -121,6 +121,38 @@ def test_load_snapshots_errors_on_missing_directory(tmp_path: Path) -> None:
         load_snapshots(tmp_path / "no_such_dir")
 
 
+def test_read_snapshot_buckets_off_spec_severity_into_other(
+    tmp_path: Path,
+) -> None:
+    # An external rule plugin may write a snapshot carrying a severity
+    # pgrls doesn't model ("critical"/"blocker"). _read_snapshot must
+    # bucket those under 'other' so error+warning+info+other reconciles
+    # to raw_total — otherwise the three modeled columns silently
+    # under-sum the total in every history view.
+    _write_snapshot(
+        tmp_path / "snap.json",
+        [
+            _v("SEC001", "public.a", sev="error"),
+            _v("X001", "public.b", sev="critical"),
+            _v("X002", "public.c", sev="blocker"),
+        ],
+        mtime=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+    snaps = load_snapshots(tmp_path)
+    assert len(snaps) == 1
+    counts = snaps[0].counts
+    assert counts["error"] == 1
+    assert counts["other"] == 2
+    assert (
+        counts["error"]
+        + counts["warning"]
+        + counts["info"]
+        + counts["other"]
+        == snaps[0].raw_total
+        == 3
+    )
+
+
 def test_build_rows_first_snapshot_baseline_is_all_new() -> None:
     # The first snapshot has no prior baseline, so every finding
     # counts as NEW and fixed_count is 0. Downstream summaries
@@ -275,6 +307,53 @@ def test_render_json_shape() -> None:
     # baseline-is-all-new count — only NEWs after a real baseline.
     assert payload["summary"]["total_new"] == 0
     assert payload["summary"]["total_fixed"] == 1
+
+
+def test_render_json_keeps_non_ascii_identifiers_literal() -> None:
+    # R14 #5: render_json passes ensure_ascii=False (matching the
+    # lint/sarif/snapshot/explain JSON contract), so a non-ASCII snapshot
+    # filename / identifier stays readable instead of being escaped to
+    # \uXXXX. Assert against the RAW string — json.loads would hide the
+    # difference, since both forms decode to the identical Python str.
+    raw = render_json([_mkrow("rapport-é.json", total=1, errors=1, new=1)])
+    assert "rapport-é.json" in raw
+    assert "\\u" not in raw
+
+
+def test_render_other_column_only_when_off_spec_severity_present() -> None:
+    # R14 #6: when a snapshot carries an off-spec ('other') severity
+    # (e.g. an extra-rule plugin emits 'critical'), the text/markdown/HTML
+    # trend tables add an OTHER column so ERROR+WARN+INFO+OTHER reconciles
+    # to TOTAL — mirroring the JSON 'others' key. For the common
+    # all-standard history the column is omitted (the table is not
+    # widened); the other render tests pin that narrow header.
+    mix = SnapshotRow(
+        snapshot=Snapshot(
+            path=Path("x.json"),
+            timestamp=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=4,
+            counts={"error": 1, "warning": 0, "info": 1, "other": 2},
+        ),
+        new_count=0,
+        fixed_count=0,
+    )
+    assert "OTHER" in render_text([mix])
+    md = render_markdown([mix])
+    assert (
+        "| Timestamp | File | Total | Error | Warn | Info | Other | New | Fixed |"
+        in md
+    )
+    # Reconciles: error 1 + warn 0 + info 1 + other 2 == total 4.
+    assert "| 4 | 1 | 0 | 1 | 2 |" in md
+    html_out = render_html([mix])
+    assert '<th class="num">Other</th>' in html_out
+
+    # A standard-only history keeps the narrow table (no OTHER column).
+    std = _mkrow("a.json", total=2, errors=2, new=2)
+    assert "OTHER" not in render_text([std])
+    assert "Other" not in render_markdown([std])
+    assert ">Other<" not in render_html([std])
 
 
 def test_render_markdown_table() -> None:

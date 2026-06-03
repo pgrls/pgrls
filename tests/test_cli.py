@@ -287,6 +287,48 @@ def test_explain_prints_rule_rationale() -> None:
     assert "BYPASSRLS" in result.output
 
 
+def test_explain_succeeds_when_config_url_env_var_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: `explain --config cfg.toml` must run even when the
+    config's `[database].url` references an unset env var.
+
+    `explain` reads only the rule catalog — never the DB. load_config
+    used to raise during eager `[database].url` interpolation, breaking
+    a command documented as needing no connection. The failure is now
+    deferred, so this must exit 0 and still print the rule rationale.
+    """
+    monkeypatch.delenv("UNSET_DB_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "$UNSET_DB_URL"\n', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["explain", "SEC001", "--config", str(cfg)])
+
+    assert result.exit_code == 0, result.output
+    assert "SEC001" in result.output
+
+
+def test_lint_surfaces_deferred_url_error_at_connection_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A DB-needing command (`lint`) with an unresolvable configured
+    URL still fails — but with the SPECIFIC deferred cause, not the
+    generic 'No database connection' guidance. No DB is touched: the
+    connection guard fires before any connect attempt."""
+    monkeypatch.delenv("UNSET_DB_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text('[database]\nurl = "$UNSET_DB_URL"\n', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["lint", "--config", str(cfg)])
+
+    assert result.exit_code == 2, result.output
+    assert "UNSET_DB_URL" in result.output
+
+
 def test_explain_is_case_insensitive() -> None:
     # `explain sec001` and `explain SEC001` resolve the same rule
     # and produce byte-identical output.
@@ -353,6 +395,22 @@ def test_explain_covers_every_registered_rule() -> None:
         assert first_line not in result.output, (
             f"{rule.id}: docstring title line was not stripped"
         )
+
+
+def test_explain_format_is_case_insensitive() -> None:
+    # R11 #9: `--format` on `explain` must accept mixed/upper case like
+    # every other command's --format (lint, diff, perf). `JSON` must
+    # behave exactly like `json`, not exit 2 with a usage error.
+    runner = CliRunner()
+    for value in ("JSON", "Json", "MARKDOWN"):
+        result = runner.invoke(
+            main, ["explain", "SEC001", "--format", value]
+        )
+        assert result.exit_code == 0, (value, result.output)
+    # `JSON` produces parseable JSON, identical to `json`.
+    upper = runner.invoke(main, ["explain", "SEC001", "--format", "JSON"])
+    lower = runner.invoke(main, ["explain", "SEC001", "--format", "json"])
+    assert json.loads(upper.output) == json.loads(lower.output)
 
 
 def test_explain_format_markdown_per_rule_renders_heading_and_body() -> None:
@@ -1200,6 +1258,26 @@ def test_merge_overrides_preserves_diff_fail_on() -> None:
     assert merged.diff_fail_on == "requires-review"
 
 
+def test_merge_overrides_preserves_extra_rules() -> None:
+    # `pgrls lint` runs custom `[lint].extra_rules` via the merged
+    # Config. Dropping the field here (the dataclass default is [])
+    # makes `_run_rules` silently never run them while `explain` and
+    # --rule validation still see them — a silent false-negative for
+    # the documented SDK extension point. Pin the threading.
+    config = Config(
+        database_url="postgres://config",
+        schemas=["public"],
+        disable=[],
+        fail_on="warning",
+        rule_options={},
+        extra_rules=["my_pkg.rules:TenantCheck"],
+    )
+    merged = _merge_overrides(
+        config, database_url=None, schemas_csv=None, fail_on=None
+    )
+    assert merged.extra_rules == ["my_pkg.rules:TenantCheck"]
+
+
 def test_introspect_populates_policy_using_ast(pg_url: str, apply_sql) -> None:
     apply_sql(
         """
@@ -1352,22 +1430,29 @@ def test_lint_sec003_allowlist_via_config_exempts(
     assert "SEC003" not in result.output
 
 
-def test_lint_fires_sec006_on_update_and_all_without_with_check(
+def test_lint_sec006_fires_on_open_insert_not_reused_using(
     pg_url: str, apply_sql
 ) -> None:
     apply_sql((FIXTURES_DIR / "sec006_bad.sql").read_text())
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "public.sec006_update.update_bad" in result.output
-    assert "public.sec006_all.all_bad" in result.output
+    # SEC006 fires on the genuinely-open write: a permissive INSERT with
+    # no WITH CHECK and no USING for Postgres to reuse.
+    assert "SEC006  public.sec006_open.open_insert" in result.output
+    # SEC006 must NOT fire on permissive UPDATE/ALL with a real USING and
+    # no WITH CHECK: Postgres reuses the USING as the implicit WITH CHECK,
+    # so the write side is constrained. (Those policies still appear in the
+    # output via other rules, so anchor the regression to the SEC006 line.)
+    assert "SEC006  public.sec006_update.update_bad" not in result.output
+    assert "SEC006  public.sec006_all.all_bad" not in result.output
     assert "public.sec006_clean" not in result.output
-    # The three bad policies are permissive PUBLIC → SEC003 + SEC007.
-    # update_bad / all_bad have unwrapped current_setting → PERF001.
-    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005, and
-    # is a permissive write policy with a constant-true WITH CHECK →
-    # SEC028 (open write). update_bad / all_bad scope by a nullable
-    # `tenant_id` (TEXT, no NOT NULL) against current_setting → SEC030.
+    # update_bad / all_bad / open_insert are permissive PUBLIC →
+    # SEC003 + SEC007. update_bad / all_bad have unwrapped current_setting
+    # → PERF001, and scope by a nullable `tenant_id` (TEXT) → SEC030.
+    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005, and is a
+    # permissive write policy with a constant-true WITH CHECK → SEC028
+    # (open write). open_insert (INSERT, no WITH CHECK) → SEC006.
     _assert_rules_fire_exactly(
         result.output,
         {
@@ -1387,10 +1472,12 @@ def test_lint_sec006_allowlist_via_config_exempts(
 ) -> None:
     apply_sql((FIXTURES_DIR / "sec006_bad.sql").read_text())
     cfg = tmp_path / "pgrls.toml"
+    # open_insert is the only policy SEC006 fires on now (the reused-USING
+    # update_bad / all_bad are correctly silent); allowlisting it suppresses
+    # the rule entirely.
     cfg.write_text(
         '[lint.rules.SEC006]\n'
-        'allowlist = ["public.sec006_update.update_bad", '
-        '"public.sec006_all.all_bad"]\n'
+        'allowlist = ["public.sec006_open.open_insert"]\n'
     )
     runner = CliRunner()
     result = runner.invoke(
@@ -1884,7 +1971,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC005  public.allbad_sec003.public_perm\n",
             "SEC005  public.allbad_hyg001.orphan\n",
             "SEC005  public.allbad_sec010.block_all\n",
-            "SEC006  public.allbad_sec006.update_no_check\n",
+            "SEC006  public.allbad_sec006.insert_dead\n",
             "SEC007  public.allbad_sec003\n",
             "SEC008  public.allbad_sec003.public_perm\n",
             "SEC009  public.allbad_sec002\n",
@@ -3157,10 +3244,8 @@ def test_fix_emits_perf003_create_index(pg_url: str, apply_sql) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["fix", "--database-url", pg_url])
     assert result.exit_code == 0, result.output
-    assert (
-        "CREATE INDEX ON public.fix_perf003 (tenant_id);"
-        in result.output
-    )
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in result.output
+    assert "ON public.fix_perf003 (tenant_id);" in result.output
     assert "dry-run" in result.output
 
 
@@ -3457,6 +3542,77 @@ def test_fix_output_writes_migration_file(
     # stderr confirms the write and names the path.
     assert "wrote 1 fix" in result.stderr
     assert str(out_file) in result.stderr
+
+
+def test_fix_output_refuses_to_clobber_without_force(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # `pgrls fix --output FILE` must not silently overwrite an existing
+    # file (a hand-edited migration). Without --force it errors and
+    # leaves the file byte-for-byte intact; with --force it overwrites.
+    # Mirrors `pgrls generate` / `pgrls init`.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_out_force (id INT);
+        ALTER TABLE public.fix_out_force ENABLE ROW LEVEL SECURITY;
+        """
+    )
+    out_file = tmp_path / "migration.sql"
+    sentinel = "-- hand-edited, do not clobber\n"
+    out_file.write_text(sentinel, encoding="utf-8")
+    runner = CliRunner()
+
+    # Second write without --force is rejected; the file is untouched.
+    rejected = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--output", str(out_file)],
+    )
+    assert rejected.exit_code == 2
+    assert "already exists" in rejected.output
+    assert "--force" in rejected.output
+    assert out_file.read_text(encoding="utf-8") == sentinel
+
+    # With --force it overwrites with the real migration.
+    forced = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--output", str(out_file), "--force",
+        ],
+    )
+    assert forced.exit_code == 0, forced.output
+    text = out_file.read_text(encoding="utf-8")
+    assert sentinel not in text
+    assert "ALTER TABLE public.fix_out_force FORCE ROW LEVEL SECURITY;" in text
+
+
+def test_fix_write_migration_passes_newline_empty(tmp_path, monkeypatch) -> None:
+    # R12 #7: the migration must be written with newline="" so the LF
+    # render_migration emits is byte-identical to the stdout dry-run and
+    # to `generate --output` across platforms (text mode on Windows
+    # rewrites \n -> \r\n otherwise). A byte-level test can't catch this
+    # on POSIX runners, so assert the write kwarg directly.
+    from pathlib import Path
+
+    from pgrls.cli import _fix_write_migration
+    from pgrls.fixers import Fix
+
+    captured: dict = {}
+    orig = Path.write_text
+
+    def spy(self, data, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return orig(self, data, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    fix = Fix(
+        rule_id="SEC002",
+        location="public.t",
+        sql="ALTER TABLE public.t FORCE ROW LEVEL SECURITY;",
+        description="enable FORCE row security",
+    )
+    _fix_write_migration([fix], str(tmp_path / "m.sql"), force=True)
+    assert captured.get("newline") == ""
 
 
 def test_fix_output_cannot_combine_with_apply(

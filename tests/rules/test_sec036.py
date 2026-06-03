@@ -162,6 +162,11 @@ def test_fires_when_target_is_right_arm_of_nested_join() -> None:
         "id = (SELECT auth.uid())",  # PERF001-wrapped form
         "current_user = (id::text)",
         "current_setting('request.jwt.claim.sub', true)::uuid = id",
+        # R19 #1: IN / `= ANY` sub-query binding. Postgres parses both as
+        # ANY_SUBLINK; a single-target `SELECT auth.uid()` genuinely binds
+        # the caller, exactly like the scalar EXPR_SUBLINK form above.
+        "id IN (SELECT auth.uid())",
+        "id = ANY(SELECT auth.uid())",
     ],
 )
 def test_silent_when_subselect_binds_caller(binding: str) -> None:
@@ -184,6 +189,94 @@ def test_silent_when_join_on_clause_binds_caller() -> None:
         "WHERE u.raw_app_meta_data ->> 'role' = 'admin')"
     )
     schema = _wrap(_policy(f"({expr})", name="join_caller_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_fires_on_admin_any_with_unrelated_nested_auth_call() -> None:
+    # Regression (#1): the admin-any EXISTS is unbound — its WHERE only
+    # checks `role = 'admin'`. The auth.uid() lives in an UNRELATED
+    # nested EXISTS (a correlated audit sub-select), a separate
+    # existence test, not a binding of the outer EXISTS. The binding
+    # search must NOT descend into it, or this real
+    # every-authenticated-user bypass ships as clean.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users u "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin' "
+        "AND EXISTS (SELECT 1 FROM audit_log a WHERE a.actor = auth.uid()))"
+    )
+    schema = _wrap(_policy(f"({expr})", name="admin_any_distractor"))
+    [v] = SEC036().check(schema, {})
+    assert v.rule_id == "SEC036"
+
+
+def test_fires_when_any_subquery_is_not_a_single_auth_target() -> None:
+    # R19 #1 tightness: the IN/ANY binding exception is gated to a
+    # single-target `SELECT <auth call>`. A membership-style ANY sub-query
+    # whose auth call lives in its WHERE (the target is an unrelated
+    # column) is NOT a recognized binding — descending into arbitrary
+    # ANY/ALL bodies would let an unrelated nested auth call mask a real
+    # admin-any leak (the deliberately-preserved false-negative-avoidance,
+    # mirroring the nested-EXISTS distractor above). So this still fires.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users u "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin' "
+        "AND u.id = ANY(SELECT m.user_id FROM memberships m "
+        "WHERE m.owner = auth.uid()))"
+    )
+    schema = _wrap(_policy(f"({expr})", name="membership_any_distractor"))
+    assert len(SEC036().check(schema, {})) == 1
+
+
+def test_silent_on_scalar_wrap_binding_not_confused_with_nested_exists() -> None:
+    # Precision companion to the distractor: a scalar `(SELECT
+    # auth.uid())` value sub-select DOES bind (the PERF001 wrap), so the
+    # binding search must still descend into EXPR_SUBLINK subselects.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users u "
+        "WHERE u.id = (SELECT auth.uid()) "
+        "AND u.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="scalar_wrap_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_fires_when_target_reached_through_from_subselect() -> None:
+    # Regression (#14): the target table sits inside a derived table
+    # (`FROM (SELECT * FROM auth.users) sub`). The FROM walk must
+    # recurse into the sub-select's own FROM, or the unbound admin-any
+    # EXISTS is invisible.
+    expr = (
+        "EXISTS (SELECT 1 FROM (SELECT * FROM auth.users) sub "
+        "WHERE sub.raw_app_meta_data ->> 'role' = 'admin')"
+    )
+    schema = _wrap(_policy(f"({expr})", name="target_via_subselect"))
+    [v] = SEC036().check(schema, {})
+    assert v.rule_id == "SEC036"
+
+
+def test_silent_when_from_subselect_target_is_caller_bound() -> None:
+    # Precision for #14: the same derived-table shape, but the EXISTS
+    # binds the caller — must stay silent.
+    expr = (
+        "EXISTS (SELECT 1 FROM (SELECT * FROM auth.users) sub "
+        "WHERE sub.id = auth.uid())"
+    )
+    schema = _wrap(_policy(f"({expr})", name="subselect_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_silent_when_binding_lives_inside_a_derived_table() -> None:
+    # Regression (round-2 #4): target detection recurses into a derived
+    # table (round-1 #14), so the binding check must too. A policy that
+    # binds the caller INSIDE the derived table's own WHERE is correctly
+    # scoped and must stay silent — otherwise the target is found one
+    # level down but the binding there is never inspected (false positive).
+    expr = (
+        "EXISTS (SELECT 1 FROM "
+        "(SELECT id FROM auth.users WHERE id = auth.uid()) sub "
+        "WHERE sub.id IS NOT NULL)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="bound_in_derived"))
     assert SEC036().check(schema, {}) == []
 
 
@@ -309,3 +402,75 @@ def test_rejects_malformed_binding_functions_option() -> None:
             {"binding_functions": ["auth.uid", 7]},
         )
     assert "function names" in str(exc.value)
+
+
+def test_sec036_fires_on_setop_union_subselect_reaching_target() -> None:
+    # Regression (round-7): a set-op (UNION/INTERSECT/EXCEPT) sub-select
+    # puts its FROM items in larg/rarg, not fromClause. An unbound
+    # admin-any EXISTS reaching auth.users through a UNION arm must still
+    # be flagged (the every-authenticated-user bypass SEC036 exists for).
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users "
+        "WHERE raw_app_meta_data ->> 'role' = 'admin' "
+        "UNION SELECT 1 FROM other_t)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="setop_unbound"))
+    violations = SEC036().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.setop_unbound"
+
+
+def test_sec036_silent_on_setop_union_bound_to_caller() -> None:
+    # Lockstep: a correctly-bound set-op EXISTS (the binding lives in an
+    # arm's WHERE) must NOT false-fire now that target detection is
+    # set-op-aware.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users WHERE id = auth.uid() "
+        "UNION SELECT 1 FROM other_t)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="setop_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_sec036_fires_on_setop_nested_in_derived_table() -> None:
+    # Regression (round-10 #5): the target scan recursed a derived
+    # table's `fromClause` directly, so a derived table that is itself a
+    # set operation — `FROM (SELECT id FROM auth.users UNION SELECT …) s`,
+    # whose FROM items live in larg/rarg — was invisible and the unbound
+    # admin-any EXISTS slipped through. It must now be flagged.
+    expr = (
+        "EXISTS (SELECT 1 FROM ("
+        "SELECT id FROM auth.users UNION SELECT id FROM other_t"
+        ") s WHERE s.id IS NOT NULL)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="derived_setop_unbound"))
+    violations = SEC036().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.derived_setop_unbound"
+
+
+def test_sec036_silent_on_setop_nested_in_derived_table_bound() -> None:
+    # Lockstep: a binding inside the derived set-op's arm (WHERE) must
+    # keep it silent — the binding scan already descends derived-table
+    # set-ops, so target detection becoming set-op-aware here must not
+    # introduce a false positive.
+    expr = (
+        "EXISTS (SELECT 1 FROM ("
+        "SELECT id FROM auth.users WHERE id = auth.uid() "
+        "UNION SELECT id FROM other_t WHERE id = auth.uid()"
+        ") s)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="derived_setop_bound"))
+    assert SEC036().check(schema, {}) == []
+
+
+def test_sec036_silent_on_having_clause_binding() -> None:
+    # Regression (round-7): a HAVING-clause binding constrains the EXISTS
+    # to the caller exactly like a WHERE binding. Omitting havingClause
+    # from the candidate quals false-fired at error severity.
+    for expr in (
+        "EXISTS (SELECT 1 FROM auth.users GROUP BY id HAVING id = auth.uid())",
+        "EXISTS (SELECT 1 FROM auth.users HAVING bool_or(id = auth.uid()))",
+    ):
+        schema = _wrap(_policy(f"({expr})", name="having_bound"))
+        assert SEC036().check(schema, {}) == [], expr

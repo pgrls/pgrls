@@ -36,8 +36,6 @@ def _diff_grants(base_table: Table, head_table: Table) -> list[Change]:
     }
 
     all_roles = sorted(set(base_grants_by_role) | set(head_grants_by_role))
-    if not all_roles:
-        return []
 
     changes: list[Change] = []
     qname = head_table.qualified_name
@@ -100,6 +98,90 @@ def _diff_grants(base_table: Table, head_table: Table) -> list[Change]:
                         message=(
                             f"On {qname}, role {role} gained privileges"
                             f" {added_str}."
+                        ),
+                        before_sql=None,
+                        after_sql=None,
+                    )
+                )
+
+    changes.extend(_diff_column_grants(base_table, head_table))
+    return changes
+
+
+def _diff_column_grants(
+    base_table: Table, head_table: Table
+) -> list[Change]:
+    """Same revoke/add/PUBLIC-no-RLS logic as `_diff_grants`, at COLUMN
+    granularity (`pg_attribute.attacl`).
+
+    A column-level PUBLIC grant added on a table with RLS off is the same
+    exposure as the table-level case — every connected role can read that
+    column with no row filter — so it routes to the dangerous
+    GRANT_PUBLIC_NO_RLS path, naming the exposed column. Keyed by
+    `(role, column)`; iterated in sorted order for determinism.
+    """
+    base_by_key: dict[tuple[str, str], set[str]] = {
+        (g.role, g.column): set(g.privileges)
+        for g in base_table.column_grants
+    }
+    head_by_key: dict[tuple[str, str], set[str]] = {
+        (g.role, g.column): set(g.privileges)
+        for g in head_table.column_grants
+    }
+
+    changes: list[Change] = []
+    qname = head_table.qualified_name
+
+    for role, column in sorted(set(base_by_key) | set(head_by_key)):
+        base_privs = base_by_key.get((role, column), set())
+        head_privs = head_by_key.get((role, column), set())
+        revoked_privs = base_privs - head_privs
+        added_privs = head_privs - base_privs
+        location = f"{qname}.{role}.{column}"
+
+        if revoked_privs:
+            revoked_str = ", ".join(sorted(revoked_privs))
+            changes.append(
+                Change(
+                    kind=ChangeKind.GRANT_REVOKED,
+                    classification="safe",
+                    location=location,
+                    message=(
+                        f"On {qname}, role {role} lost column privileges"
+                        f" {revoked_str} on column {column!r}."
+                    ),
+                    before_sql=None,
+                    after_sql=None,
+                )
+            )
+
+        if added_privs:
+            added_str = ", ".join(sorted(added_privs))
+            if role == "PUBLIC" and not head_table.rls_enabled:
+                changes.append(
+                    Change(
+                        kind=ChangeKind.GRANT_PUBLIC_NO_RLS,
+                        classification="dangerous",
+                        location=location,
+                        message=(
+                            f"On {qname}, role PUBLIC gained {added_str}"
+                            f" on column {column!r} of a table with no RLS"
+                            " — every connected role can read that column"
+                            " for every row."
+                        ),
+                        before_sql=None,
+                        after_sql=None,
+                    )
+                )
+            else:
+                changes.append(
+                    Change(
+                        kind=ChangeKind.GRANT_ADDED,
+                        classification="requires_review",
+                        location=location,
+                        message=(
+                            f"On {qname}, role {role} gained column"
+                            f" privileges {added_str} on column {column!r}."
                         ),
                         before_sql=None,
                         after_sql=None,

@@ -384,8 +384,12 @@ def lint(
     )
 
     if effective.database_url is None:
+        # If `[database].url` was set but its env-var interpolation
+        # failed, surface that specific cause (deferred from
+        # load_config) instead of the generic guidance.
         raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
+            effective.database_url_error
+            or "No database connection: pass --database-url or set DATABASE_URL."
         )
 
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
@@ -555,14 +559,29 @@ def _merge_overrides(
     effective_fail_on: Severity = (
         coerce_severity(fail_on) if fail_on is not None else config.fail_on
     )
+    effective_database_url = database_url or config.database_url
     return Config(
-        database_url=database_url or config.database_url,
+        database_url=effective_database_url,
         schemas=schemas,
         disable=list(config.disable),
         fail_on=effective_fail_on,
         rule_options=dict(config.rule_options),
         severity_overrides=dict(config.severity_overrides),
         diff_fail_on=config.diff_fail_on,
+        # Preserve project-declared custom rules across the override
+        # merge — without this they fall back to the dataclass default
+        # [] and `pgrls lint` silently never runs them (they still load
+        # for `explain`/validation, so the miss looks like coverage).
+        extra_rules=list(config.extra_rules),
+        # Carry the deferred `[database].url` interpolation error only
+        # while it is still relevant: if `--database-url` supplied a
+        # URL, the effective URL is non-None and the config's failed
+        # interpolation no longer matters, so drop it.
+        database_url_error=(
+            None
+            if effective_database_url is not None
+            else config.database_url_error
+        ),
     )
 
 
@@ -596,8 +615,12 @@ def _load_effective_config(
     )
 
     if effective.database_url is None:
+        # If `[database].url` was set but its env-var interpolation
+        # failed, surface that specific cause (deferred from
+        # load_config) instead of the generic guidance.
         raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
+            effective.database_url_error
+            or "No database connection: pass --database-url or set DATABASE_URL."
         )
     return effective
 
@@ -1041,17 +1064,34 @@ def _fix_check(fixes: list[Any]) -> None:
     sys.exit(1)
 
 
-def _fix_write_migration(fixes: list[Any], output_path: str) -> None:
+def _fix_write_migration(
+    fixes: list[Any], output_path: str, *, force: bool
+) -> None:
     """`pgrls fix --output FILE`: write the migration script, note it.
 
     Deterministic (no timestamp), so regenerating against an unchanged
     schema yields a byte-identical file. Distinct error wording
     ("cannot write fixes to …") from the report-style `_emit`, so this
     stays bespoke.
+
+    Refuses to clobber an existing file unless `force` is set — the same
+    overwrite guard `pgrls generate --output` and `pgrls init` use, so a
+    re-run of `pgrls fix -o migration.sql` can't silently destroy a
+    hand-edited migration.
     """
+    path = Path(output_path)
+    if path.exists() and not force:
+        raise ToolError(
+            f"{output_path} already exists. Pass --force to overwrite it."
+        )
     migration = render_migration(fixes, tool_version=__version__)
     try:
-        Path(output_path).write_text(migration, encoding="utf-8")
+        # newline="" so the LF render_migration emits is written
+        # verbatim — without it, text mode on Windows rewrites \n to
+        # \r\n, making the file diverge byte-for-byte from the stdout
+        # dry-run and from `generate --output` (which already passes
+        # newline=""), breaking the documented determinism guarantee.
+        path.write_text(migration, encoding="utf-8", newline="")
     except OSError as exc:
         raise ToolError(
             f"cannot write fixes to {output_path}: {exc}"
@@ -1117,6 +1157,12 @@ def _fix_emit_and_maybe_apply(
     "with --apply.",
 )
 @click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite the --output file if it already exists.",
+)
+@click.option(
     "--check",
     is_flag=True,
     default=False,
@@ -1134,6 +1180,7 @@ def fix(
     rules: tuple[str, ...],
     apply: bool,
     output_path: str | None,
+    force: bool,
     check: bool,
 ) -> None:
     """Auto-remediate violations whose fix is mechanical.
@@ -1181,9 +1228,12 @@ def fix(
     `-- [rule] description` comment per statement — instead of
     printing it to stdout. The file is deterministic (no
     timestamp), so regenerating against an unchanged schema
-    produces a byte-identical result. `--output` cannot be
-    combined with `--apply`: one writes a migration to run later,
-    the other executes immediately.
+    produces a byte-identical result. An existing `--output`
+    file is never silently clobbered: the command errors unless
+    `--force` is passed (matching `pgrls generate` and `pgrls
+    init`). `--output` cannot be combined with `--apply`: one
+    writes a migration to run later, the other executes
+    immediately.
 
     `--check` is a CI gate: it exits 1 if any auto-fixable
     violations would be emitted (and 0 otherwise), without
@@ -1276,7 +1326,7 @@ def fix(
         if output_path is not None:
             # `--apply` is already rejected alongside `--output`, so
             # reaching here means a pure dry-run-to-file.
-            _fix_write_migration(fixes, output_path)
+            _fix_write_migration(fixes, output_path, force=force)
             return
 
         _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
@@ -1487,7 +1537,14 @@ def generate(
         database_url=database_url,
         schemas_csv=schemas,
     ) as (effective, conn, schema):
-        result = plan_generation(schema, options)
+        try:
+            result = plan_generation(schema, options)
+        except ValueError as exc:
+            # session_predicate rejects an unsafe column type before it
+            # can reach a `::<type>` cast (defense-in-depth on the
+            # introspected type). Surface it as a clean CLI error rather
+            # than a traceback.
+            raise ToolError(str(exc)) from exc
 
         # Advisory notes + skipped tables → stderr (never pollutes the
         # SQL on stdout / in the migration file).
@@ -1587,8 +1644,12 @@ def snapshot(
     )
 
     if effective.database_url is None:
+        # If `[database].url` was set but its env-var interpolation
+        # failed, surface that specific cause (deferred from
+        # load_config) instead of the generic guidance.
         raise ToolError(
-            "No database connection: pass --database-url or set DATABASE_URL."
+            effective.database_url_error
+            or "No database connection: pass --database-url or set DATABASE_URL."
         )
 
     try:
@@ -1855,9 +1916,11 @@ def _resolve_diff_source(arg: str, *, schemas: list[str]) -> Schema:
             with psycopg.connect(arg) as conn:
                 return introspect(conn, schemas=schemas)
         except psycopg.Error as exc:
-            raise ToolError(
-                f"Database error connecting to {arg!r}: {exc}"
-            ) from exc
+            # Do NOT interpolate `arg` — it is a DSN that may embed a
+            # password (`postgres://user:pw@host/db`), and this message
+            # lands in CI logs. Mirror the redacted form every other
+            # command uses.
+            raise ToolError(f"Database error connecting to the database: {exc}") from exc
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
 
@@ -2309,8 +2372,14 @@ def diff(
     if migration_path is None and head is None:
         head = database_url or config.database_url
         if head is None:
+            # A configured `[database].url` whose env-var interpolation
+            # failed lands here (deferred from load_config). Surface the
+            # specific cause rather than the generic "No head" guidance —
+            # the user did configure a head source, it just couldn't
+            # resolve.
             raise ToolError(
-                "No head: pass <head> argument, set DATABASE_URL, "
+                config.database_url_error
+                or "No head: pass <head> argument, set DATABASE_URL, "
                 "or configure [database].url in pgrls.toml."
             )
 
@@ -2856,7 +2925,7 @@ def _render_catalog_html(rules: list[Rule], *, fixable_ids: set[str]) -> str:
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["text", "markdown", "json", "html"]),
+    type=click.Choice(["text", "markdown", "json", "html"], case_sensitive=False),
     default="text",
     show_default=True,
     help=(
@@ -3094,10 +3163,17 @@ def coverage(
     rendered = render_coverage(report, output_format)
     _emit(rendered, output_path)
 
-    pct = report.summary["coverage_pct"]
-    if fail_under is not None and pct < fail_under:
+    # Gate on the RAW fraction, not the 1-dp display value: 9999/10000 =
+    # 99.99% rounds to 100.0 and would slip past --fail-under 100 even
+    # though a policy is uncovered.
+    summary = report.summary
+    total_policies = summary["policies"]
+    covered = summary["covered"]
+    raw_pct = 100.0 if total_policies == 0 else 100.0 * covered / total_policies
+    if fail_under is not None and raw_pct < fail_under:
         click.echo(
-            f"pgrls: coverage {pct}% is below --fail-under {fail_under}%.",
+            f"pgrls: coverage {covered}/{total_policies} policies "
+            f"({raw_pct:.2f}%) is below --fail-under {fail_under}%.",
             err=True,
         )
         sys.exit(1)

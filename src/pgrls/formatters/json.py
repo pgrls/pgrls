@@ -57,6 +57,17 @@ def format_json(violations: list[Violation]) -> str:
                     if v.counterexample is not None
                     else {}
                 ),
+                # Additive, non-breaking: the raw 4-way diff
+                # classification (safe / breaking / requires_review /
+                # dangerous). Present only on `pgrls diff` output, so
+                # lint runs keep the historical shape. Lets a consumer
+                # split breaking from requires_review (both project to
+                # `severity: warning`).
+                **(
+                    {"classification": v.classification}
+                    if v.classification is not None
+                    else {}
+                ),
             }
             for v in violations
         ],
@@ -70,9 +81,17 @@ def format_json(violations: list[Violation]) -> str:
 
 def _summary(violations: list[Violation]) -> dict[str, int]:
     counts: Counter[Severity] = Counter(v.severity for v in violations)
+    errors = counts.get("error", 0)
+    warnings = counts.get("warning", 0)
+    infos = counts.get("info", 0)
+    total = len(violations)
     return {
-        "errors": counts.get("error", 0),
-        "warnings": counts.get("warning", 0),
-        "infos": counts.get("info", 0),
-        "total": len(violations),
+        "errors": errors,
+        "warnings": warnings,
+        "infos": infos,
+        # Any off-spec severity (an external rule plugin may emit one
+        # the formatter doesn't model) lands here so the four buckets
+        # always reconcile: errors + warnings + infos + others == total.
+        "others": total - errors - warnings - infos,
+        "total": total,
     }

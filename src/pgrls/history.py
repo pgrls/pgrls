@@ -160,7 +160,9 @@ def _read_snapshot(path: Path) -> Snapshot | None:
         )
         return None
     keys: set[FindingKey] = set()
-    counts: dict[str, int] = {"error": 0, "warning": 0, "info": 0}
+    counts: dict[str, int] = {
+        "error": 0, "warning": 0, "info": 0, "other": 0,
+    }
     for v in violations:
         if not isinstance(v, dict):
             continue
@@ -171,8 +173,16 @@ def _read_snapshot(path: Path) -> Snapshot | None:
         loc = v.get("location")
         loc_str = loc if (loc is None or isinstance(loc, str)) else None
         keys.add(FindingKey(rule_id=rule_id, location=loc_str))
-        if isinstance(severity, str) and severity in counts:
+        if isinstance(severity, str) and severity in ("error", "warning", "info"):
             counts[severity] += 1
+        else:
+            # Off-spec, missing, or non-string severity on an otherwise
+            # well-formed finding (an external rule plugin may emit a
+            # severity pgrls doesn't model). Bucket it under 'other' so
+            # error+warning+info+other equals the well-formed finding
+            # count (== raw_total when every entry parses) — without it
+            # the three columns silently under-sum the total.
+            counts["other"] += 1
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     return Snapshot(
         path=path,
@@ -233,6 +243,12 @@ def render_text(rows: list[SnapshotRow]) -> str:
     """
     if not rows:
         return "No snapshots found.\n"
+    # Only show the OTHER column when some snapshot actually has an
+    # off-spec ('other') severity, so the common all-standard table is
+    # not widened. When present it keeps ERROR+WARN+INFO+OTHER reconciled
+    # to TOTAL — mirroring the JSON 'others' key — instead of the three
+    # columns silently under-summing TOTAL.
+    show_other = any(row.snapshot.counts.get("other", 0) for row in rows)
     headers = (
         "TIMESTAMP",
         "FILE",
@@ -240,6 +256,7 @@ def render_text(rows: list[SnapshotRow]) -> str:
         "ERROR",
         "WARN",
         "INFO",
+        *(("OTHER",) if show_other else ()),
         "NEW",
         "FIXED",
     )
@@ -257,6 +274,11 @@ def render_text(rows: list[SnapshotRow]) -> str:
             str(row.snapshot.counts.get("error", 0)),
             str(row.snapshot.counts.get("warning", 0)),
             str(row.snapshot.counts.get("info", 0)),
+            *(
+                (str(row.snapshot.counts.get("other", 0)),)
+                if show_other
+                else ()
+            ),
             str(row.new_count) if row.new_count else "-",
             str(row.fixed_count) if row.fixed_count else "-",
         )
@@ -286,6 +308,9 @@ def render_json(rows: list[SnapshotRow]) -> str:
                 "errors": row.snapshot.counts.get("error", 0),
                 "warnings": row.snapshot.counts.get("warning", 0),
                 "infos": row.snapshot.counts.get("info", 0),
+                # Off-spec / unmodeled severities, so errors + warnings
+                # + infos + others reconciles to total.
+                "others": row.snapshot.counts.get("other", 0),
                 "new": row.new_count,
                 "fixed": row.fixed_count,
             }
@@ -293,7 +318,10 @@ def render_json(rows: list[SnapshotRow]) -> str:
         ],
         "summary": _summary_dict(rows),
     }
-    return json.dumps(payload, indent=2) + "\n"
+    # ensure_ascii=False so non-ASCII identifiers (quoted table/policy/
+    # role names) stay readable instead of escaped to \uXXXX — matches
+    # the lint/sarif/snapshot/explain JSON contract.
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
 
 
 def render_markdown(rows: list[SnapshotRow]) -> str:
@@ -301,11 +329,17 @@ def render_markdown(rows: list[SnapshotRow]) -> str:
     engineering update or a PR comment."""
     if not rows:
         return "## pgrls history\n\nNo snapshots found.\n"
+    # Only add the Other column when some snapshot has an off-spec
+    # severity, so the common all-standard table is not widened (mirrors
+    # render_text and the JSON 'others' key).
+    show_other = any(row.snapshot.counts.get("other", 0) for row in rows)
+    other_h = " Other |" if show_other else ""
+    other_sep = "---:|" if show_other else ""
     out = [
         "## pgrls history",
         "",
-        "| Timestamp | File | Total | Error | Warn | Info | New | Fixed |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        f"| Timestamp | File | Total | Error | Warn | Info |{other_h} New | Fixed |",
+        f"|---|---|---:|---:|---:|---:|{other_sep}---:|---:|",
     ]
     for row in rows:
         # `safe_location` neutralizes newlines / zero-width chars (a
@@ -318,14 +352,18 @@ def render_markdown(rows: list[SnapshotRow]) -> str:
         fn = gfm_inline_code(
             safe_location(row.snapshot.path.name).replace("|", "\\|")
         )
+        other_cell = (
+            f" {row.snapshot.counts.get('other', 0)} |" if show_other else ""
+        )
         out.append(
-            "| {ts} | {fn} | {tot} | {err} | {warn} | {info} | {new} | {fix} |".format(
+            "| {ts} | {fn} | {tot} | {err} | {warn} | {info} |{other} {new} | {fix} |".format(
                 ts=row.snapshot.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 fn=fn,
                 tot=row.snapshot.raw_total,
                 err=row.snapshot.counts.get("error", 0),
                 warn=row.snapshot.counts.get("warning", 0),
                 info=row.snapshot.counts.get("info", 0),
+                other=other_cell,
                 new=row.new_count if row.new_count else "—",
                 fix=row.fixed_count if row.fixed_count else "—",
             )
@@ -420,9 +458,17 @@ def render_html(
     summary = _summary_dict(rows)
     summary_sentence = html.escape(_summary_line(rows))
 
+    # Only add the Other column when some snapshot has an off-spec
+    # severity, so the common all-standard table is not widened (mirrors
+    # render_text/markdown and the JSON 'others' key). An empty history
+    # has no rows and thus no 'other', so the colspan stays 8.
+    show_other = any(row.snapshot.counts.get("other", 0) for row in rows)
+    other_th = '\n        <th class="num">Other</th>' if show_other else ""
+    colspan = "9" if show_other else "8"
+
     if not rows:
         rows_html = (
-            '<tr><td colspan="8" class="empty">'
+            f'<tr><td colspan="{colspan}" class="empty">'
             "No snapshots found."
             "</td></tr>"
         )
@@ -440,6 +486,11 @@ def render_html(
             fix_cell = (
                 str(row.fixed_count) if row.fixed_count else "—"
             )
+            other_cell = (
+                f'<td class="num">{snap.counts.get("other", 0)}</td>'
+                if show_other
+                else ""
+            )
             row_lines.append(
                 f"      <tr>"
                 f"<td>{ts}</td>"
@@ -448,6 +499,7 @@ def render_html(
                 f'<td class="num">{snap.counts.get("error", 0)}</td>'
                 f'<td class="num">{snap.counts.get("warning", 0)}</td>'
                 f'<td class="num">{snap.counts.get("info", 0)}</td>'
+                f"{other_cell}"
                 f"<td{new_cls}>{new_cell}</td>"
                 f"<td{fix_cls}>{fix_cell}</td>"
                 "</tr>"
@@ -485,7 +537,7 @@ def render_html(
         <th class="num">Total</th>
         <th class="num">Error</th>
         <th class="num">Warn</th>
-        <th class="num">Info</th>
+        <th class="num">Info</th>{other_th}
         <th class="num">New</th>
         <th class="num">Fixed</th>
       </tr>

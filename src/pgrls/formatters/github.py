@@ -104,7 +104,10 @@ def format_github(violations: list[Violation]) -> str:
     """
     lines: list[str] = []
     for v in violations:
-        command = _COMMAND_BY_SEVERITY[v.severity]
+        # Fail CLOSED on an off-spec severity from an extra rule: emit the
+        # most-visible `error` annotation rather than KeyError-ing the
+        # whole (CI-facing) run, so the finding still surfaces loudly.
+        command = _COMMAND_BY_SEVERITY.get(v.severity, "error")
         title = _escape_property(
             f"{v.rule_id} {_location_for_title(v.location)}"
         )

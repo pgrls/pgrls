@@ -118,6 +118,21 @@ def test_sarif_handles_location_none_with_schema_placeholder() -> None:
     )
 
 
+def test_sarif_handles_empty_string_location_with_schema_placeholder() -> None:
+    # R13 #6: Violation.location is `str | None`, so `""` is
+    # representable (an extra/plugin rule may emit it). An empty-string
+    # location is still effectively no location — an empty
+    # `fullyQualifiedName` is GitHub-rejected just like a missing one —
+    # so the guard must be falsy, not `is not None`, and must render the
+    # same `(schema-wide)` sentinel the sibling formatters emit for `""`.
+    out = format_violations([_v(location="")], format="sarif")
+    result = json.loads(out)["runs"][0]["results"][0]
+    assert (
+        result["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+        == "(schema-wide)"
+    )
+
+
 def test_sarif_zero_violations_emits_valid_empty_run() -> None:
     out = format_violations([], format="sarif")
     parsed = json.loads(out)
@@ -247,3 +262,12 @@ def test_sarif_severity_mapping_exhaustive_contract() -> None:
             parsed["runs"][0]["results"][0]["level"]
             == expected_sarif_level
         ), f"{severity} should map to {expected_sarif_level}"
+
+
+def test_sarif_off_spec_severity_fails_closed_to_error() -> None:
+    # CI / Code-Scanning path: an off-spec severity must not KeyError the
+    # SARIF upload; map it to the most-visible "error" level (fail closed).
+    out = format_violations([_v(severity="critical")], format="sarif")
+    doc = json.loads(out)
+    result = doc["runs"][0]["results"][0]
+    assert result["level"] == "error"

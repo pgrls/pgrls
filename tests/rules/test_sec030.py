@@ -170,8 +170,13 @@ def test_sec030_fires_on_schema_qualified_discriminator() -> None:
     assert "'tenant_id'" in v.message
 
 
-def test_sec030_fires_on_column_wrapped_in_function() -> None:
-    # lower(name) = current_setting(...) still scopes by `name`.
+def test_sec030_silent_on_column_wrapped_in_function() -> None:
+    # R11 #8: `lower(slug) = current_setting(...)` scopes by the
+    # TRANSFORM `lower(slug)`, not the bare column `slug` the message
+    # would name. The discriminator must be the DIRECT operand of the
+    # `=` (the documented `col = <auth value>` shape), so a derived
+    # expression no longer fires (it was an over-match that mislabeled
+    # the scoping column).
     schema = Schema(
         tables=(
             _table(
@@ -183,8 +188,28 @@ def test_sec030_fires_on_column_wrapped_in_function() -> None:
             ),
         )
     )
+    assert SEC030().check(schema, options={}) == []
+
+
+def test_sec030_fires_on_cast_of_nullable_discriminator() -> None:
+    # A TypeCast of the bare column IS still the direct operand —
+    # `tenant_id::text = current_setting(...)` scopes by tenant_id and
+    # must still fire when tenant_id is nullable.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="tenant_id::text = current_setting('app.tenant')"
+                ),
+                cols=(
+                    ("id", "uuid", False),
+                    ("tenant_id", "uuid", True),
+                ),
+            ),
+        )
+    )
     [v] = SEC030().check(schema, options={})
-    assert "'slug'" in v.message
+    assert "'tenant_id'" in v.message
 
 
 def test_sec030_lists_multiple_nullable_scoping_columns_in_one_violation() -> None:
@@ -247,6 +272,51 @@ def test_sec030_silent_on_non_equality_operator() -> None:
         )
     )
     assert SEC030().check(schema, options={}) == []
+
+
+def test_sec030_silent_on_non_discriminator_column_equality() -> None:
+    # R15 #6: SEC030's hazard (silent row-hiding + loaded-gun cross-tenant
+    # leak) is specific to a tenant/user DISCRIMINATOR. A point-in-time
+    # read `created_at = current_setting('app.snapshot_time')` is a scalar
+    # `=` against a session value, but `created_at` is not a discriminator
+    # — a NULL there is fail-closed, and the `SET NOT NULL` remedy would
+    # wrongly break a legitimately-nullable timestamp. Gated out by the
+    # identity-column name check.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "created_at = "
+                        "current_setting('app.snapshot_time')::timestamptz"
+                    )
+                ),
+                cols=(
+                    ("id", "uuid", False),
+                    ("created_at", "timestamptz", True),
+                ),
+            ),
+        )
+    )
+    assert SEC030().check(schema, options={}) == []
+    # A non-default discriminator name fires once configured.
+    region_schema = Schema(
+        tables=(
+            _table(
+                _policy(using="region = current_setting('app.region')"),
+                cols=(("id", "uuid", False), ("region", "text", True)),
+            ),
+        )
+    )
+    assert SEC030().check(region_schema, options={}) == []
+    assert (
+        len(
+            SEC030().check(
+                region_schema, options={"identity_columns": ["region"]}
+            )
+        )
+        == 1
+    )
 
 
 def test_sec030_silent_on_array_membership_any() -> None:

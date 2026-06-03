@@ -777,17 +777,22 @@ def test_perf001_fix_wraps_multiple_calls_in_one_expression() -> None:
     assert "(SELECT auth.role())" in sql
 
 
-def test_perf001_fix_preserves_with_check_verbatim() -> None:
-    # WITH CHECK should be reproduced as-is — the rule is USING-only.
+def test_perf001_fix_emits_only_using_not_unchanged_with_check() -> None:
+    # PERF001 rewrites only USING, so it must emit ONLY the USING clause.
+    # Re-emitting the unchanged WITH CHECK (an `ALTER POLICY` replaces the
+    # whole clause) would clobber — and silently revert — a WITH CHECK fix
+    # another fixer makes on the same policy in one migration (SEC020's
+    # mirror, SEC011's strip). Matches SEC011/SEC019's minimal-diff rule.
     p = _policy(
         "user_id = auth.uid()",
         command="ALL",
         with_check="user_id = (SELECT auth.uid())",
     )
     schema = _wrap_policy(p)
-    sql = PERF001Fixer().fix(schema, {})[0].sql
-    assert "WITH CHECK (user_id = (SELECT auth.uid()))" in sql
-    assert "USING (user_id = (SELECT auth.uid()))" in sql
+    fix = PERF001Fixer().fix(schema, {})[0]
+    assert "USING (user_id = (SELECT auth.uid()))" in fix.sql
+    assert "WITH CHECK" not in fix.sql
+    assert fix.clauses == frozenset({"using"})
 
 
 def test_perf001_fix_silent_when_using_is_none() -> None:
@@ -854,6 +859,9 @@ def test_sec006_fix_emits_with_check_mirroring_using() -> None:
     assert f.location == "public.t.p"
     assert "ALTER POLICY p ON public.t" in f.sql
     assert "WITH CHECK (user_id = 1)" in f.sql
+    # The fix writes the WITH CHECK clause; it must declare so the
+    # anti-clobber guard keeps a single writer per (policy, clause).
+    assert f.clauses == frozenset({"with_check"})
 
 
 def test_sec006_fix_silent_when_with_check_already_present() -> None:
@@ -1200,16 +1208,14 @@ def test_sec019_and_perf001_both_fire_on_unwrapped_one_arg_current_setting() -> 
     # PERF001 (wrap auth calls in `(SELECT …)`) and SEC019 (add the
     # `, true` second argument) both target the same shape — an
     # unwrapped one-arg `current_setting` — and run independently.
-    # Both emit an `ALTER POLICY` for the same policy: PERF001
-    # wraps but leaves the arity at one; SEC019 adds the missing_ok
-    # argument but leaves the call unwrapped. Whichever runs last
-    # overwrites the prior clause, so `pgrls fix --apply` converges
-    # in TWO passes on a policy that triggers both rules.
-    #
-    # This regression test pins that contract — a future "smart
-    # composite fixer" that emitted a single combined ALTER would
-    # need to update this test deliberately rather than silently
-    # change `pgrls fix`'s convergence story.
+    # Each fixer, called on its OWN, emits an `ALTER POLICY` for the
+    # policy: PERF001 wraps but leaves the arity at one; SEC019 adds the
+    # missing_ok argument but leaves the call unwrapped. This pins each
+    # fixer's individual output. The orchestrator no longer lets both
+    # land in one migration (they'd clobber on the shared USING clause):
+    # `generate_fixes` keeps one writer per (policy, clause) — see
+    # `test_generate_fixes_suppresses_clobbering_clause_rewrites` — and
+    # the suppressed fixer re-fires on the next `pgrls fix` run.
     schema = _wrap_policy(
         _policy("user_id = current_setting('app.user')")
     )
@@ -1730,20 +1736,22 @@ def test_sec030_fix_respects_allowlist_unqualified() -> None:
 
 
 def test_sec030_fix_quotes_mixed_case_column() -> None:
-    # Postgres identifiers like `TenantId` need double-quoting in
-    # ALTER COLUMN, otherwise the server lowercases and rejects.
+    # Postgres identifiers like `Tenant_Id` need double-quoting in
+    # ALTER COLUMN, otherwise the server lowercases and rejects. (Uses a
+    # mixed-case spelling of the identity column `tenant_id` so it still
+    # passes SEC030's identity-column gate while exercising the quoting.)
     table = _sec030_table(
         column_details=(
             Column(name="id", data_type="uuid", is_nullable=False),
             Column(
-                name="TenantId",
+                name="Tenant_Id",
                 data_type="integer",
                 is_nullable=True,
             ),
         ),
     )
     policy = _scoping_policy(
-        column='"TenantId"',  # quoted in policy SQL
+        column='"Tenant_Id"',  # quoted in policy SQL
         name="tenant",
     )
     table = Table(
@@ -1760,7 +1768,7 @@ def test_sec030_fix_quotes_mixed_case_column() -> None:
     assert len(fixes) == 1
     assert fixes[0].sql == (
         'ALTER TABLE public.documents '
-        'ALTER COLUMN "TenantId" SET NOT NULL;'
+        'ALTER COLUMN "Tenant_Id" SET NOT NULL;'
     )
 
 
@@ -1932,14 +1940,24 @@ def _secdef(
     search_path: str | None = None,
     body: str = "SELECT 1",
     language: str = "sql",
+    schema_name: str | None = None,
+    function_name: str | None = None,
 ) -> Any:
     from pgrls.model import SecdefFunction
+
+    # Mirror introspection: schema_name / function_name are captured
+    # separately (v14+). Default to splitting on the LAST dot so the
+    # common single-dot `schema.func` case matches; tests exercising a
+    # dotted schema / function name pass them explicitly.
+    s, _, f = qname.rpartition(".")
     return SecdefFunction(
         qualified_name=qname,
         body=body,
         language=language,
         search_path=search_path,
         signature=signature,
+        schema_name=s if schema_name is None else schema_name,
+        function_name=f if function_name is None else function_name,
     )
 
 
@@ -2035,6 +2053,108 @@ def test_sec015_fix_abstains_on_quoted_comma_search_path() -> None:
     assert SEC015Fixer().fix(schema, {}) == []
 
 
+def test_sec015_fix_abstains_on_injection_in_search_path_token() -> None:
+    # A snapshot is a trust boundary: a tampered proconfig value with a
+    # statement-terminating token must NOT be spliced verbatim into the
+    # emitted `ALTER FUNCTION … SET search_path = …`. The fixer abstains
+    # (the SEC015 finding still fires for the operator); no DDL is built
+    # from the poisoned token.
+    for poisoned in (
+        "public; DROP TABLE secrets; --",  # bare token w/ terminator
+        "public, evil; DROP TABLE t",      # second token unsafe
+        "public-- comment",                 # bare token w/ comment
+    ):
+        schema = Schema(
+            security_definer_functions=(
+                _secdef(
+                    "public.f",
+                    signature="integer",
+                    search_path=poisoned,
+                ),
+            ),
+        )
+        assert SEC015Fixer().fix(schema, {}) == [], poisoned
+
+
+def test_sec015_fix_rewrites_quoted_identifier_without_comma() -> None:
+    # A single double-quoted schema (no comma) is a benign token — the
+    # surrounding quotes neutralize any interior punctuation — so the
+    # fixer still rewrites it, pinning pg_temp last.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "public.f",
+                signature="integer",
+                search_path='"My Schema"',
+            ),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert 'SET search_path = "My Schema", pg_temp;' in f.sql
+
+
+def test_sec015_fix_requotes_bare_dollar_user_in_search_path() -> None:
+    # R13 #3: the `$user` placeholder is valid only when double-quoted
+    # (`"$user"`); a bare `$user` is a syntax error. _is_safe_path_token
+    # accepts the bare form (live introspection always stores it quoted,
+    # but a hand-built / snapshot path may carry it bare), so the fixer
+    # must re-quote it on emit instead of splicing it verbatim into an
+    # unrunnable ALTER FUNCTION.
+    from pglast import parse_sql
+
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer", search_path="$user, public"),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public.f(integer) '
+        'SET search_path = "$user", public, pg_temp;'
+    )
+    # The emitted DDL must parse server-side (the bug produced a bare
+    # `$user` that Postgres rejects with `syntax error at or near "$"`).
+    parse_sql(f.sql)
+
+
+def test_sec015_fix_quotes_reserved_keyword_search_path_token() -> None:
+    # R15 #5: a bare reserved-keyword schema token (`order`, `user`,
+    # `select`) passes _is_safe_path_token's `[A-Za-z_]...` regex, but
+    # splicing it verbatim into `SET search_path = order, …` is a syntax
+    # error that — under fix --apply's single all-or-nothing transaction —
+    # rolls back every other fix. The fixer must quote it on emit (same
+    # class as the bare-$user gap). quote_ident is minimal, so `public`
+    # stays bare.
+    from pglast import parse_sql
+
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer", search_path="order, public"),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public.f(integer) '
+        'SET search_path = "order", public, pg_temp;'
+    )
+    parse_sql(f.sql)  # the emitted DDL must parse server-side
+
+
+def test_sec015_fix_abstains_on_empty_quoted_search_path_token() -> None:
+    # R13 #4: an empty double-quoted token (`""`) is a zero-length
+    # delimited identifier that Postgres rejects. _is_safe_path_token
+    # must treat it as unsafe so the fixer abstains (the finding still
+    # fires for the operator) rather than emitting an unrunnable
+    # `SET search_path = "", pg_temp`.
+    for path in ('""', '"", public'):
+        schema = Schema(
+            security_definer_functions=(
+                _secdef("public.f", signature="integer", search_path=path),
+            ),
+        )
+        assert SEC015Fixer().fix(schema, {}) == [], path
+
+
 def test_sec015_fix_emits_per_overload() -> None:
     schema = Schema(
         security_definer_functions=(
@@ -2114,14 +2234,29 @@ def test_sec015_fix_raises_on_malformed_allowlist() -> None:
 # ---------- SEC017 fixer ----------
 
 
-def _leakproof(qname: str, signature: str = "") -> Any:
+def _leakproof(
+    qname: str,
+    signature: str = "",
+    *,
+    schema_name: str | None = None,
+    function_name: str | None = None,
+) -> Any:
     """Local helper for SEC017Fixer tests. Inlined LeakproofFunction
     constructor — duplicating the shape rather than importing the
     one from `tests/rules/test_sec017.py` to keep the fixer-test
     file self-contained (test_fixers.py never imports across the
-    `tests/rules/` directory)."""
+    `tests/rules/` directory). schema_name / function_name default to
+    splitting on the LAST dot (the common `schema.func` case); the
+    dotted-name regression tests pass them explicitly."""
     from pgrls.model import LeakproofFunction
-    return LeakproofFunction(qualified_name=qname, signature=signature)
+
+    s, _, f = qname.rpartition(".")
+    return LeakproofFunction(
+        qualified_name=qname,
+        signature=signature,
+        schema_name=s if schema_name is None else schema_name,
+        function_name=f if function_name is None else function_name,
+    )
 
 
 def test_sec017_fix_emits_alter_function_not_leakproof() -> None:
@@ -2420,6 +2555,61 @@ def test_generate_fixes_returns_union_sorted_by_rule_id_and_location() -> None:
         "public.a_table",
         "public.z_table",
     ]
+
+
+def test_generate_fixes_suppresses_clobbering_clause_rewrites() -> None:
+    # CRITICAL regression: SEC011 (strip `OR true`), SEC019 (add
+    # missing_ok), and PERF001 (SELECT-wrap) all rewrite the SAME USING
+    # clause. Emitted together in one migration, SEC019 / PERF001 — which
+    # build their ALTER from the ORIGINAL predicate — silently revert
+    # SEC011's `OR true` security strip (the last ALTER wins). generate_fixes
+    # now keeps only ONE writer per (policy, clause): the security-narrowing
+    # SEC011 strip. The migration must not revive `OR true`.
+    schema = _wrap_policy(
+        _policy(
+            "user_id = current_setting('app.t') OR true",
+            command="SELECT",
+        )
+    )
+    fixes = generate_fixes(schema, rule_options={})
+    clause_rewrites = [
+        f for f in fixes if f.rule_id in {"PERF001", "SEC011", "SEC019"}
+    ]
+    assert [f.rule_id for f in clause_rewrites] == ["SEC011"]
+    sec011 = clause_rewrites[0]
+    assert "USING (user_id = current_setting('app.t'))" in sec011.sql
+    # No `OR true` / `OR TRUE` revived anywhere in the emitted migration.
+    assert "TRUE" not in "\n".join(f.sql for f in fixes).upper()
+
+
+def test_suppress_clobbering_clause_rewrites_keeps_one_writer_per_clause() -> None:
+    # Unit-level coverage of the orchestrator's per-clause keeper logic.
+    from pgrls.fixers import _suppress_clobbering_clause_rewrites as suppress
+
+    def _f(rule_id: str, clauses: set[str]) -> Fix:
+        return Fix(rule_id, "public.t.p", f"-- {rule_id}", "d",
+                   clauses=frozenset(clauses))
+
+    # Same clause (USING): the security-narrowing SEC011 wins; SEC019 and
+    # PERF001 are dropped (defer to the next run).
+    kept = suppress([_f("PERF001", {"using"}), _f("SEC011", {"using"}),
+                     _f("SEC019", {"using"})])
+    assert [f.rule_id for f in kept] == ["SEC011"]
+
+    # Different clauses don't contest — both survive (no false suppression).
+    kept = suppress([_f("SEC011", {"using"}), _f("SEC019", {"with_check"})])
+    assert {f.rule_id for f in kept} == {"SEC011", "SEC019"}
+
+    # A non-clause fix (ALTER TABLE etc., empty clauses) is never touched.
+    alter = Fix("SEC002", "public.t", "ALTER TABLE ...", "d")
+    kept = suppress([alter, _f("SEC011", {"using"}), _f("SEC019", {"using"})])
+    assert alter in kept and [f.rule_id for f in kept if f.clauses] == ["SEC011"]
+
+    # A multi-clause non-keeper is dropped WHOLE when it loses any clause
+    # (its other clause re-fires next run).
+    kept = suppress([_f("SEC011", {"using"}),
+                     _f("SEC019", {"using", "with_check"})])
+    assert [f.rule_id for f in kept] == ["SEC011"]
 
 
 def test_generate_fixes_filters_to_requested_rule() -> None:
@@ -2976,29 +3166,38 @@ def test_perf001_fix_quotes_policy_and_table_when_required() -> None:
 
 
 def test_quote_ident_rejects_null_byte() -> None:
-    # Postgres rejects nulls in CREATE; if a snapshot or hand-
-    # built Schema sneaks one in, fail fast here with a clear
-    # message rather than emitting `"a\x00b"` for the server to
-    # reject with a confusing error.
+    # NUL is the ONE character Postgres forbids in an identifier (it
+    # terminates the C string — even `"a\x00b"` is an unterminated quoted
+    # identifier). Fail fast with a clear message rather than emitting it.
     from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="control character"):
+    with pytest.raises(ValueError, match="NUL byte"):
         quote_ident("evil\x00name")
 
 
-def test_quote_ident_rejects_embedded_newline() -> None:
+def test_quote_ident_quotes_embedded_control_chars_postgres_permits() -> None:
+    # R15 #7: tab / newline / CR are LEGAL inside a double-quoted
+    # identifier (`CREATE TABLE "a<TAB>b"` parses) and live introspection
+    # can return such a name raw. quote_ident must double-quote them (the
+    # `"`->`""` escape makes the result safe), NOT reject the whole C0
+    # range — over-rejecting aborted every fix / Schema.to_sql() in the
+    # run on a single such object. The emitted identifier must round-trip.
+    from pglast import parse_sql
+
     from pgrls.fixers._idents import quote_ident
-    with pytest.raises(ValueError, match="control character"):
-        quote_ident("name\nwith\nnewlines")
+
+    for name in ("name\nwith\nnewlines", "a\tb", "a\rb"):
+        quoted = quote_ident(name)
+        assert quoted == '"' + name + '"', name
+        # The quoted form parses in an identifier position.
+        parse_sql(f"CREATE TABLE {quoted} (id integer)")
 
 
-def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
-    # WITH CHECK should be re-emitted via RawStream rather than
-    # echoed verbatim. Asymmetric handling would be an injection
-    # vector if `with_check_sql` ever sources from somewhere
-    # other than `pg_get_expr`. We verify the round-trip by
-    # passing a WITH CHECK shape that pglast normalizes (single
-    # quotes around boolean false), then asserting the
-    # round-tripped form appears in the SQL.
+def test_perf001_fix_never_emits_with_check_even_with_content() -> None:
+    # PERF001 never changes WITH CHECK, so it must not re-emit it even when
+    # the WITH CHECK carries non-trivial content. Re-emitting it would
+    # clobber a sibling fixer's WITH CHECK rewrite in the same migration
+    # (the critical clobber bug). PERF001 also no longer round-trips WITH
+    # CHECK, so it presents no WITH CHECK injection surface at all.
     p = _policy(
         "user_id = auth.uid()",
         command="ALL",
@@ -3006,12 +3205,9 @@ def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
     )
     schema = _wrap_policy(p)
     sql = PERF001Fixer().fix(schema, {})[0].sql
-    # The WITH CHECK passed through RawStream — pglast's printer
-    # would normalize whitespace and casing. Assert the structural
-    # content is present.
-    assert "WITH CHECK" in sql
-    assert "deleted_at" in sql
-    assert "IS NULL" in sql
+    assert "USING (user_id = (SELECT auth.uid()))" in sql
+    assert "WITH CHECK" not in sql
+    assert "deleted_at" not in sql
 
 
 def test_perf001_fix_sublink_wraps_do_not_alias_each_other() -> None:
@@ -3087,6 +3283,79 @@ def test_quote_ident_quotes_reserved_keywords() -> None:
         )
 
 
+def test_quote_ident_quotes_type_func_name_keywords() -> None:
+    # R10 #1: the type_func_name-reserved keywords are NOT in the
+    # "fully reserved" subset but are equally invalid as a bare ColId
+    # (policy / table / column name). A policy named `join` or column
+    # named `left` reaches quote_ident verbatim from clean live
+    # introspection; emitting it bare produces `ALTER POLICY join …`,
+    # which the server rejects. All must be quoted.
+    from pgrls.fixers._idents import quote_ident
+
+    for kw in (
+        "join", "left", "right", "inner", "outer", "full", "cross",
+        "natural", "is", "isnull", "notnull", "like", "ilike", "similar",
+        "overlaps", "binary", "authorization", "collation",
+        "concurrently", "freeze", "verbose", "tablesample",
+        "current_schema",
+    ):
+        out = quote_ident(kw)
+        assert out == f'"{kw}"', (
+            f"type_func_name keyword {kw!r} must be quoted, got {out!r}"
+        )
+
+
+def test_quote_ident_keeps_col_name_keywords_and_type_names_bare() -> None:
+    # Guard against over-quoting: col_name-keywords (`between`) and
+    # type-context keywords (`bigint`, `numeric`, `int`) ARE valid as a
+    # bare ColId, so they must stay unquoted — quoting them would churn
+    # output and (for a column) could misname.
+    from pgrls.fixers._idents import quote_ident
+
+    for name in ("between", "bigint", "numeric", "int", "integer", "text"):
+        assert quote_ident(name) == name, (
+            f"{name!r} is a valid bare identifier and must NOT be quoted"
+        )
+
+
+def test_quote_ident_round_trips_keyword_policy_and_column() -> None:
+    # R10 #1 end-to-end: a policy named `join` and a column named `left`
+    # must round-trip through the emission helpers into SQL that
+    # re-parses. Before the fix these emitted unparseable DDL that
+    # aborted `fix --apply` / `diff --apply` / `generate`.
+    import pglast
+
+    from pgrls.fixers._idents import alter_policy, create_index_sql
+    from pgrls.model import Policy, policy_to_sql
+
+    class _T:
+        schema = "public"
+        name = "t"
+
+    using = pglast.parse_sql("SELECT 1 WHERE tenant_id = 1")[0].stmt.whereClause
+
+    alter = alter_policy(_T, "join", using_ast=using)
+    assert '"join"' in alter
+    pglast.parse_sql(alter)  # must not raise
+
+    idx = create_index_sql("public.t", "left")
+    assert '"left"' in idx
+    pglast.parse_sql(idx)
+
+    pol = Policy(
+        name="join",
+        command="SELECT",
+        permissive=True,
+        roles=("authenticated",),
+        using_sql="tenant_id = 1",
+        with_check_sql=None,
+        using_ast=using,
+    )
+    created = policy_to_sql(pol, "public.t")
+    assert 'CREATE POLICY "join"' in created
+    pglast.parse_sql(created)
+
+
 def test_quote_ident_keyword_check_is_case_insensitive() -> None:
     # Postgres parses identifiers case-insensitively before
     # quoting. `SELECT` / `Select` / `select` all collide with the
@@ -3099,23 +3368,20 @@ def test_quote_ident_keyword_check_is_case_insensitive() -> None:
     assert quote_ident("Select") == '"Select"'
 
 
-def test_quote_ident_rejects_tab_character() -> None:
-    # An earlier change rejected null/newline; tab is the same
-    # hazard. Pin the wider control-char check so the defense is
-    # uniform.
+def test_quote_ident_quotes_all_c0_controls_except_nul() -> None:
+    # R15 #7: every C0 control + DEL EXCEPT NUL is a legal double-quoted
+    # identifier character in Postgres, so quote_ident must double-quote
+    # it (not reject the whole range, which aborted the entire fix /
+    # Schema.to_sql() run on one such object). NUL alone is rejected —
+    # it terminates the C string and cannot appear even double-quoted.
     from pgrls.fixers._idents import quote_ident
 
-    with pytest.raises(ValueError, match="control character"):
-        quote_ident("weird\tname")
-
-
-def test_quote_ident_rejects_all_c0_controls() -> None:
-    from pgrls.fixers._idents import quote_ident
-
-    for codepoint in list(range(0x20)) + [0x7f]:
+    for codepoint in list(range(0x01, 0x20)) + [0x7f]:
         ch = chr(codepoint)
-        with pytest.raises(ValueError, match="control character"):
-            quote_ident(f"x{ch}y")
+        name = f"x{ch}y"
+        assert quote_ident(name) == '"' + name + '"', hex(codepoint)
+    with pytest.raises(ValueError, match="NUL byte"):
+        quote_ident("x\x00y")
 
 
 def test_quote_ident_quotes_non_ascii() -> None:
@@ -3310,6 +3576,18 @@ def _perf_table(
     )
 
 
+def _idx_target(sql: str) -> str:
+    """`CREATE INDEX IF NOT EXISTS pgrls_idx_<hash> ON <X>` → `<X>`.
+
+    create_index_sql emits a deterministic-but-opaque index name (so a
+    committed migration is re-runnable), so PERF003-fixer tests assert
+    the idempotent prefix plus the meaningful `ON …` target rather than
+    the full hashed name.
+    """
+    assert sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_"), sql
+    return sql.split(" ON ", 1)[1]
+
+
 def test_perf003_fix_emits_create_index_for_unindexed_column() -> None:
     schema = Schema(tables=(_perf_table(
         _policy("tenant_id = current_setting('app.t', true)", name="p"),
@@ -3318,8 +3596,24 @@ def test_perf003_fix_emits_create_index_for_unindexed_column() -> None:
     assert len(fixes) == 1
     f = fixes[0]
     assert f.rule_id == "PERF003"
-    assert f.sql == "CREATE INDEX ON public.t (tenant_id);"
+    assert _idx_target(f.sql) == "public.t (tenant_id);"
     assert f.location == "public.t (tenant_id)"
+
+
+def test_create_index_sql_is_idempotent_and_deterministic() -> None:
+    # R11 #6: a committed `pgrls fix --output` / `generate --output`
+    # migration must be re-runnable. An unnamed CREATE INDEX is NOT a
+    # no-op on re-apply (Postgres auto-names a duplicate), so the helper
+    # emits a deterministic name + IF NOT EXISTS.
+    from pgrls.fixers._idents import create_index_sql
+
+    a = create_index_sql("public.t", "tenant_id")
+    assert a == create_index_sql("public.t", "tenant_id")  # deterministic
+    assert a.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+    assert a.endswith(" ON public.t (tenant_id);")
+    # Distinct (table, column) → distinct index name.
+    assert create_index_sql("public.t", "owner") != a
+    assert create_index_sql("public.other", "tenant_id") != a
 
 
 def test_perf003_fix_silent_when_column_has_leading_index() -> None:
@@ -3357,9 +3651,9 @@ def test_perf003_fix_emits_per_table_for_same_column_on_two_tables() -> None:
         _perf_table(_policy(pred), name="b"),
     ))
     fixes = PERF003Fixer().fix(schema, {})
-    assert sorted(f.sql for f in fixes) == [
-        "CREATE INDEX ON public.a (tenant_id);",
-        "CREATE INDEX ON public.b (tenant_id);",
+    assert sorted(_idx_target(f.sql) for f in fixes) == [
+        "public.a (tenant_id);",
+        "public.b (tenant_id);",
     ]
 
 
@@ -3378,9 +3672,7 @@ def test_perf003_fix_dedupes_column_across_policies() -> None:
         ),
     ),))
     fixes = PERF003Fixer().fix(schema, {})
-    assert [f.sql for f in fixes] == [
-        "CREATE INDEX ON public.t (tenant_id);"
-    ]
+    assert [_idx_target(f.sql) for f in fixes] == ["public.t (tenant_id);"]
 
 
 def test_perf003_fix_emits_one_index_per_unindexed_column() -> None:
@@ -3392,9 +3684,9 @@ def test_perf003_fix_emits_one_index_per_unindexed_column() -> None:
         ),
     ),))
     fixes = PERF003Fixer().fix(schema, {})
-    assert sorted(f.sql for f in fixes) == [
-        "CREATE INDEX ON public.t (owner);",
-        "CREATE INDEX ON public.t (tenant_id);",
+    assert sorted(_idx_target(f.sql) for f in fixes) == [
+        "public.t (owner);",
+        "public.t (tenant_id);",
     ]
 
 
@@ -3407,7 +3699,7 @@ def test_perf003_fix_skips_the_already_indexed_column() -> None:
         indexes=(_idx("tenant_id"),),
     ),))
     fixes = PERF003Fixer().fix(schema, {})
-    assert [f.sql for f in fixes] == ["CREATE INDEX ON public.t (owner);"]
+    assert [_idx_target(f.sql) for f in fixes] == ["public.t (owner);"]
 
 
 def test_perf003_fix_respects_allowlist() -> None:
@@ -3434,9 +3726,7 @@ def test_perf003_fix_indexes_column_kept_in_scope_by_a_live_policy() -> None:
     fixes = PERF003Fixer().fix(
         schema, {"allowlist": ["public.t.exempt"]}
     )
-    assert [f.sql for f in fixes] == [
-        "CREATE INDEX ON public.t (tenant_id);"
-    ]
+    assert [_idx_target(f.sql) for f in fixes] == ["public.t (tenant_id);"]
 
 
 def test_perf003_fix_quotes_table_name_when_required() -> None:
@@ -3454,7 +3744,7 @@ def test_perf003_fix_quotes_table_name_when_required() -> None:
         ),
     ))
     sql = PERF003Fixer().fix(schema, {})[0].sql
-    assert sql == 'CREATE INDEX ON public."MixedCase" (tenant_id);'
+    assert _idx_target(sql) == 'public."MixedCase" (tenant_id);'
 
 
 def test_perf003_fix_description_flags_lock_and_concurrently() -> None:
@@ -3513,7 +3803,8 @@ def test_perf004_fix_emits_expression_index_for_single_func_wrap() -> None:
     assert len(fixes) == 1
     f = fixes[0]
     assert f.rule_id == "PERF004"
-    assert f.sql == "CREATE INDEX ON public.users (lower(email));"
+    assert f.sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+    assert f.sql.endswith(" ON public.users (lower(email));")
     assert "lower(email)" in f.location
 
 
@@ -3553,6 +3844,53 @@ def test_perf004_fix_silent_when_func_wraps_value_side() -> None:
     assert PERF004Fixer().fix(schema, {}) == []
 
 
+def test_perf004_fix_emits_index_for_func_eq_any_and_all() -> None:
+    # R12 #2: `func(col) = ANY(array)` / `= ALL(array)` parse as
+    # AEXPR_OP_ANY / AEXPR_OP_ALL (not plain AEXPR_OP). `x = ANY(arr)` is
+    # sargable, the PERF004 rule flags it, so the fixer must emit the
+    # expression index — not silently produce nothing.
+    for using in (
+        "lower(email) = ANY(ARRAY['a@x', 'b@x'])",
+        "lower(email) = ALL(ARRAY['a@x'])",
+    ):
+        schema = Schema(tables=(_perf004_table(_policy(using)),))
+        fixes = PERF004Fixer().fix(schema, {})
+        assert len(fixes) == 1, using
+        assert fixes[0].sql.endswith(" ON public.users (lower(email));"), using
+
+
+def test_perf004_fix_silent_on_func_in_in_list_value_side() -> None:
+    # R11 #5: in `email IN (lower(name), 'x')` only the lexpr (`email`)
+    # is indexable; the IN-list values are not. A func wrapping a column
+    # on the value side must NOT emit a (dead) expression index.
+    schema = Schema(tables=(_perf004_table(
+        _policy("email IN (lower(name), 'x')"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_on_func_in_between_bounds() -> None:
+    # The BETWEEN bounds (rexpr) are values, not indexable operands.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "id BETWEEN length(email) AND length(name)",
+        ),
+        columns=("id", "email", "name"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_on_comparison_nested_in_case() -> None:
+    # A comparison nested inside a CASE feeds the CASE value; the planner
+    # cannot use an index on its inner FuncCall, so no fix is emitted.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "(CASE WHEN lower(email) = 'a' THEN 1 ELSE 0 END) = 1",
+        ),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
 def test_perf004_fix_emits_outermost_funccall_for_nested_wrap() -> None:
     # `lower(upper(email))` — the planner needs an index matching
     # the full predicate expression, not the inner `upper`. The
@@ -3562,9 +3900,103 @@ def test_perf004_fix_emits_outermost_funccall_for_nested_wrap() -> None:
     ),))
     fixes = PERF004Fixer().fix(schema, {})
     assert len(fixes) == 1
-    assert fixes[0].sql == (
-        "CREATE INDEX ON public.users (lower(upper(email)));"
+    assert fixes[0].sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+    assert fixes[0].sql.endswith(
+        " ON public.users (lower(upper(email)));"
     )
+
+
+def test_perf004_fix_abstains_on_non_immutable_function() -> None:
+    # R14 #1: `date_trunc('day', created_at)` on a timestamptz column is
+    # STABLE (depends on the session TimeZone), and Postgres rejects
+    # STABLE/VOLATILE functions in an index expression. The PERF004 rule
+    # still flags the function-wrapped indexed column, but the fixer must
+    # ABSTAIN rather than emit a CREATE INDEX that fails at apply — which,
+    # under `pgrls fix --apply`'s single all-or-nothing transaction, would
+    # roll back every other fix in the batch. `lower(...)` (IMMUTABLE)
+    # still emits; this verifies the non-immutable case degrades.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "date_trunc('day', created_at) = current_setting('app.d')"
+        ),
+        columns=("id", "created_at"),
+        indexes=(_idx("created_at", name="users_created_idx"),),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_abstains_on_user_defined_same_named_function() -> None:
+    # A user-defined `myschema.lower(...)` is a DIFFERENT function from the
+    # builtin and may be VOLATILE, so the fixer must not assume it is
+    # index-safe just because the bare name is on the immutable allowlist
+    # — only the unqualified / pg_catalog-qualified builtin counts.
+    schema = Schema(tables=(_perf004_table(
+        _policy("myschema.lower(email) = current_setting('app.e')"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_finds_wrap_inside_nested_boolexpr() -> None:
+    # R18 #4: a function-wrapped discriminator buried under a NESTED
+    # boolean (a BoolExpr inside another BoolExpr) must still be found —
+    # the BoolExpr walk arm recurses preserving the _PRED context. Every
+    # other PERF004 fixer test uses a single top-level comparison, so this
+    # pins the nested-BoolExpr recursion in _top_funccalls_wrapping.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "active OR (lower(email) = current_setting('app.e') AND id > 0)"
+        ),
+        columns=("id", "email", "active"),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql.endswith(" ON public.users (lower(email));")
+
+
+def test_perf004_fix_abstains_on_two_arg_length_encoding_overload() -> None:
+    # R16 #2: `length(bytea, name)` — the 2-arg form with an explicit
+    # source encoding — is STABLE (it performs an encoding conversion),
+    # while every 1-arg `length(...)` overload is IMMUTABLE. Postgres
+    # rejects a STABLE function in an index expression, so a fixer
+    # trusting the bare name `length` would emit a `CREATE INDEX
+    # (length(data, 'UTF8'))` that fails at apply and — under fix
+    # --apply's single all-or-nothing transaction — rolls back every
+    # other fix in the batch. The arity gate must make it ABSTAIN.
+    schema = Schema(tables=(_perf004_table(
+        _policy("length(data, 'UTF8') = current_setting('app.x')"),
+        columns=("id", "data"),
+        indexes=(_idx("data", name="users_data_idx"),),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_still_emits_for_single_arg_length() -> None:
+    # The arity gate must not over-abstain: the 1-arg `length(data)`
+    # overload IS IMMUTABLE and index-safe. This also proves the PERF004
+    # rule fires on the `length(<col>) = <stable>` shape, so the abstain
+    # above is genuinely "rule fires, fixer abstains" — not "undetected".
+    schema = Schema(tables=(_perf004_table(
+        _policy("length(data) = current_setting('app.x')"),
+        columns=("id", "data"),
+        indexes=(_idx("data", name="users_data_idx"),),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql.endswith(" ON public.users (length(data));")
+
+
+def test_is_immutable_index_expr_arity_gate_for_length() -> None:
+    # Unit-level pin on the arity gate (R16 #2): the STABLE 2-arg
+    # `length(bytea, name)` overload is not index-safe; the IMMUTABLE
+    # 1-arg form is.
+    from pglast import parse_sql
+
+    from pgrls.fixers.perf004 import _is_immutable_index_expr
+
+    two_arg = parse_sql("SELECT length(data, 'UTF8')")[0].stmt.targetList[0].val
+    one_arg = parse_sql("SELECT length(data)")[0].stmt.targetList[0].val
+    assert _is_immutable_index_expr(two_arg) is False
+    assert _is_immutable_index_expr(one_arg) is True
 
 
 def test_perf004_fix_dedupes_expression_across_policies() -> None:
@@ -3576,9 +4008,8 @@ def test_perf004_fix_dedupes_expression_across_policies() -> None:
         _policy(pred, name="write", command="ALL", with_check=pred),
     ),))
     fixes = PERF004Fixer().fix(schema, {})
-    assert [f.sql for f in fixes] == [
-        "CREATE INDEX ON public.users (lower(email));"
-    ]
+    assert len(fixes) == 1
+    assert fixes[0].sql.endswith(" ON public.users (lower(email));")
 
 
 def test_perf004_fix_emits_separate_index_per_distinct_expression() -> None:
@@ -3589,10 +4020,15 @@ def test_perf004_fix_emits_separate_index_per_distinct_expression() -> None:
         _policy("upper(email) = current_setting('app.u')", name="up"),
     ),))
     fixes = PERF004Fixer().fix(schema, {})
-    assert sorted(f.sql for f in fixes) == [
-        "CREATE INDEX ON public.users (lower(email));",
-        "CREATE INDEX ON public.users (upper(email));",
+    suffixes = sorted(f.sql.split(" ON ", 1)[1] for f in fixes)
+    assert suffixes == [
+        "public.users (lower(email));",
+        "public.users (upper(email));",
     ]
+    assert all(
+        f.sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+        for f in fixes
+    )
 
 
 def test_perf004_fix_respects_allowlist() -> None:
@@ -3623,6 +4059,37 @@ def test_perf004_fix_description_flags_lock_concurrently_and_alternative() -> No
     assert "lower(email)" in f.description
 
 
+def test_perf004_fix_suppressed_when_funccall_nested_in_value_expr() -> None:
+    # Regression (round-7): the flagged FuncCall is a STRICT SUB-EXPRESSION
+    # of the comparison operand (wrapped in COALESCE / concat / CASE). An
+    # index on just the inner FuncCall can never serve the predicate, so
+    # the fixer must suppress and defer to the human — never emit a useless
+    # index. (The RULE still flags the function-wrapped column; only the
+    # auto-fix is withheld.)
+    for pred in (
+        "coalesce(lower(email), '') = current_setting('app.e')",
+        "lower(email) || upper(email) = current_setting('app.e')",
+        "(CASE WHEN id > 0 THEN lower(email) END) = current_setting('app.e')",
+    ):
+        schema = Schema(tables=(_perf004_table(_policy(pred, name="p")),))
+        assert PERF004Fixer().fix(schema, {}) == [], pred
+
+
+def test_perf004_fix_index_is_named_and_idempotent() -> None:
+    # Regression (round-7): the emitted CREATE INDEX is named
+    # (deterministic) and IF NOT EXISTS, so a second `pgrls fix` run is
+    # byte-identical and re-applying the migration is a no-op — no
+    # duplicate-index accumulation.
+    schema = Schema(tables=(_perf004_table(
+        _policy("lower(email) = current_setting('app.e')", name="p"),
+    ),))
+    first = PERF004Fixer().fix(schema, {})
+    second = PERF004Fixer().fix(schema, {})
+    assert len(first) == 1
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in first[0].sql
+    assert [f.sql for f in first] == [f.sql for f in second]
+
+
 def test_perf004_fix_raises_on_malformed_allowlist() -> None:
     schema = Schema(tables=(_perf004_table(
         _policy("lower(email) = current_setting('app.x')", name="p"),
@@ -3631,3 +4098,117 @@ def test_perf004_fix_raises_on_malformed_allowlist() -> None:
         PERF004Fixer().fix(schema, {"allowlist": "public.users.p"})
     with pytest.raises(TypeError, match="allowlist"):
         PERF004Fixer().fix(schema, {"allowlist": [" public.users.p "]})
+
+
+# ---------- SEC015 / SEC017: dotted schema/function names ----------
+#
+# Regression for the qualified-name split bug. `qualified_name` is
+# `nspname || '.' || proname` from introspection — ambiguous once
+# either component contains a dot. The old fixers did
+# `qualified_name.partition(".")`, so a function `f` in schema `a.b`
+# (qualified_name `a.b.f`) was split to schema `a`, function `b.f`,
+# emitting `ALTER FUNCTION a."b.f"(…)` — wrong object. The fix carries
+# schema_name / function_name as separate model fields (snapshot v14+);
+# these tests pin that the emitted ALTER FUNCTION targets the right
+# object and that the fixer abstains when the fields are absent.
+
+
+def test_sec015_fix_targets_correct_object_when_schema_name_has_dot() -> None:
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "a.b.f",
+                signature="integer",
+                schema_name="a.b",
+                function_name="f",
+            ),
+        ),
+    )
+    [fix] = SEC015Fixer().fix(schema, {})
+    assert fix.sql == (
+        'ALTER FUNCTION "a.b".f(integer) '
+        "SET search_path = pg_catalog, pg_temp;"
+    )
+    # The old buggy split would have produced this wrong target.
+    assert 'a."b.f"' not in fix.sql
+
+
+def test_sec015_fix_targets_correct_object_when_function_name_has_dot() -> None:
+    # rpartition-killer: function `a.b` in schema `s` (qname `s.a.b`).
+    # Only the separate fields get this right.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "s.a.b",
+                signature="integer",
+                schema_name="s",
+                function_name="a.b",
+            ),
+        ),
+    )
+    [fix] = SEC015Fixer().fix(schema, {})
+    assert fix.sql == (
+        'ALTER FUNCTION s."a.b"(integer) '
+        "SET search_path = pg_catalog, pg_temp;"
+    )
+
+
+def test_sec015_fix_abstains_when_schema_function_fields_missing() -> None:
+    # Pre-v14 snapshot: no schema_name/function_name. Abstain rather
+    # than split the ambiguous qualified_name into a wrong target.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "a.b.f",
+                signature="integer",
+                schema_name="",
+                function_name="",
+            ),
+        ),
+    )
+    assert SEC015Fixer().fix(schema, {}) == []
+
+
+def test_sec017_fix_targets_correct_object_when_schema_name_has_dot() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof(
+                "a.b.f",
+                "integer",
+                schema_name="a.b",
+                function_name="f",
+            ),
+        ),
+    )
+    [fix] = SEC017Fixer().fix(schema, {})
+    assert fix.sql == 'ALTER FUNCTION "a.b".f(integer) NOT LEAKPROOF;'
+    assert 'a."b.f"' not in fix.sql
+
+
+def test_sec017_fix_targets_correct_object_when_function_name_has_dot() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof(
+                "s.a.b",
+                "integer",
+                schema_name="s",
+                function_name="a.b",
+            ),
+        ),
+    )
+    [fix] = SEC017Fixer().fix(schema, {})
+    assert fix.sql == 'ALTER FUNCTION s."a.b"(integer) NOT LEAKPROOF;'
+
+
+def test_sec017_fix_abstains_when_schema_function_fields_missing() -> None:
+    schema = Schema(
+        leakproof_functions=(
+            _leakproof(
+                "a.b.f",
+                "integer",
+                schema_name="",
+                function_name="",
+            ),
+        ),
+    )
+    assert SEC017Fixer().fix(schema, {}) == []

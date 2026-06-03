@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from pgrls.cli import main
@@ -49,6 +50,24 @@ def test_predicate_postgrest_convention() -> None:
     assert (
         p
         == "tenant_id = (SELECT current_setting('request.jwt.claim.tenant_id', true)::uuid)"
+    )
+
+
+def test_predicate_rejects_unsafe_column_type_cast() -> None:
+    # `coltype` is spliced into a `::<type>` cast. A type that doesn't
+    # parse as a single bare column type (an injection payload, or a
+    # tampered snapshot value should a snapshot-fed path ever be added)
+    # must be refused, not emitted.
+    with pytest.raises(ValueError, match="unsafe column type"):
+        session_predicate("tenant_id", "uuid); DROP TABLE t; --", GenerateOptions())
+
+
+def test_predicate_allows_parenthesized_real_type_cast() -> None:
+    # A legitimate parameterized type (commas/parens are part of a real
+    # type) passes the validator and casts normally.
+    p = session_predicate("amount", "numeric(10,2)", GenerateOptions())
+    assert p == (
+        "amount = (SELECT current_setting('app.amount', true)::numeric(10,2))"
     )
 
 
@@ -108,6 +127,60 @@ def test_predicate_supabase_custom_auth_function_quoted() -> None:
     assert p == "user_id = (SELECT auth.user_id())"
 
 
+def test_predicate_supabase_unqualified_auth_function() -> None:
+    # An --auth-function with NO schema qualifier (no dot) takes the
+    # bare-name branch: quote_ident the single component, no schema
+    # prefix. `uid` → `(SELECT uid())`.
+    p = session_predicate(
+        "user_id",
+        "uuid",
+        GenerateOptions(model="owner", convention="supabase", auth_function="uid"),
+    )
+    assert p == "user_id = (SELECT uid())"
+
+
+def test_predicate_supabase_unqualified_auth_function_needs_quoting() -> None:
+    # A bare auth-function name that is a reserved word / mixed-case must
+    # be quoted by quote_ident on the bare-name branch — proving the
+    # branch routes through quote_ident, not a raw splice.
+    p = session_predicate(
+        "user_id",
+        "uuid",
+        GenerateOptions(model="owner", convention="supabase", auth_function="User"),
+    )
+    assert p == 'user_id = (SELECT "User"())'
+
+
+def test_predicate_supabase_rejects_multi_dot_auth_function() -> None:
+    # R16 #6: a 3+-part --auth-function is ambiguous. rpartition('.')
+    # would fold the leading dots into a single quoted schema
+    # (`db.auth.uid` -> `"db.auth".uid()`), silently referencing a
+    # function that does not exist and aborting `generate --apply`.
+    # Reject it with a clear error instead.
+    with pytest.raises(ValueError, match="more than one dot"):
+        session_predicate(
+            "user_id",
+            "uuid",
+            GenerateOptions(
+                model="owner",
+                convention="supabase",
+                auth_function="db.auth.uid",
+            ),
+        )
+
+
+def test_auth_function_sql_shapes() -> None:
+    # Unit pin on the renderer: bare / schema-qualified accepted (minimal
+    # quoting), 3+-part rejected.
+    from pgrls.generate import _auth_function_sql
+
+    assert _auth_function_sql("uid") == "uid"
+    assert _auth_function_sql("auth.uid") == "auth.uid"
+    assert _auth_function_sql("User") == '"User"'
+    with pytest.raises(ValueError, match="more than one dot"):
+        _auth_function_sql("a.b.c")
+
+
 def test_owner_model_uses_owner_policy_names() -> None:
     schema = Schema(tables=(_table("posts", (_ID, _UID)),))
     opts = GenerateOptions(model="owner", tenant_column="user_id", convention="supabase")
@@ -133,7 +206,8 @@ def test_owner_via_table_override_and_no_restrictive() -> None:
     assert "CREATE POLICY docs_owner_isolation ON public.docs" in sqls
     assert "creator_id = (SELECT auth.uid())" in sqls
     assert "AS RESTRICTIVE" not in sqls and "docs_owner_floor" not in sqls
-    assert "CREATE INDEX ON public.docs (creator_id)" in sqls
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in sqls
+    assert "ON public.docs (creator_id)" in sqls
 
 
 def test_cli_supabase_requires_owner_model() -> None:
@@ -167,7 +241,8 @@ def test_auto_detect_emits_full_setup() -> None:
     assert "FORCE ROW LEVEL SECURITY" in joined
     assert "CREATE POLICY posts_tenant_isolation ON public.posts" in joined
     assert "AS RESTRICTIVE" in joined  # the floor
-    assert "CREATE INDEX ON public.posts (tenant_id)" in joined
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in joined
+    assert "ON public.posts (tenant_id)" in joined
 
 
 def test_skip_already_policied_table_with_reason() -> None:
@@ -193,7 +268,7 @@ def test_explicit_table_override_for_nonconventional_column() -> None:
     opts = GenerateOptions(tables=(("public", "orgs", "org_id"),))
     sqls = "\n".join(f.sql for f in plan_generation(schema, opts).statements)
     assert "org_id = (SELECT current_setting('app.org_id', true)::bigint)" in sqls
-    assert "CREATE INDEX ON public.orgs (org_id)" in sqls
+    assert "ON public.orgs (org_id)" in sqls
 
 
 def test_explicit_table_not_found_is_reported() -> None:
@@ -221,13 +296,60 @@ def test_partition_child_skipped_parent_targeted() -> None:
     result = plan_generation(Schema(tables=(parent, child)), GenerateOptions())
     sqls = "\n".join(f.sql for f in result.statements)
     # Parent set up (incl. its cascading index); no statement touches the child.
-    assert "CREATE INDEX ON public.events (tenant_id)" in sqls
+    assert "ON public.events (tenant_id)" in sqls
     assert "events_2026" not in sqls
     # Child reported as skipped, pointing at the parent.
     assert any(
         q == "public.events_2026" and "partition of public.events" in r
         for q, r in result.skipped
     )
+
+
+def test_plan_generation_skips_table_without_captured_column_type() -> None:
+    # R11 #11: a pre-v5 snapshot carries `columns` but empty
+    # `column_details`, so the discriminator's type is unknown. Without
+    # it we cannot emit a correctly-cast predicate (a non-text column
+    # would yield an invalid `tenant_id = (SELECT current_setting(...))`
+    # with no `::uuid`), so plan_generation refuses the table rather than
+    # emit a predicate that may not apply / lint clean.
+    legacy = Table(
+        schema="public",
+        name="posts",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        columns=("id", "tenant_id"),
+        column_details=(),  # pre-v5 baseline — no type info
+    )
+    result = plan_generation(Schema(tables=(legacy,)), GenerateOptions())
+    assert result.statements == ()
+    reasons = dict(result.skipped)
+    assert "no captured type for column 'tenant_id'" in reasons["public.posts"]
+
+
+def test_plan_generation_skips_when_discriminator_column_absent() -> None:
+    # An EXPLICITLY-targeted table (`--table public.logs:tenant_id`) that
+    # does not actually have the named column is skipped with a clear
+    # "column not found" reason (not a crash). Auto-detect can't reach
+    # this — it only picks tables that have the column — so it requires
+    # an explicit override.
+    no_disc = Table(
+        schema="public",
+        name="logs",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        columns=("id", "body"),
+        column_details=(
+            Column("id", "uuid", is_nullable=False),
+            Column("body", "text", is_nullable=True),
+        ),
+    )
+    opts = GenerateOptions(tables=(("public", "logs", "tenant_id"),))
+    result = plan_generation(Schema(tables=(no_disc,)), opts)
+    assert result.statements == ()
+    reasons = dict(result.skipped)
+    assert "column 'tenant_id' not found" in reasons["public.logs"]
 
 
 def test_partition_skip_message_names_root_for_multilevel() -> None:
@@ -250,7 +372,7 @@ def test_partition_skip_message_names_root_for_multilevel() -> None:
     # Trailing space distinguishes "public.events " from "public.events_2026".
     assert "partition of public.events " in reasons["public.events_2026"]
     assert "partition of public.events " in reasons["public.events_2026_q1"]
-    assert "CREATE INDEX ON public.events (tenant_id)" in "\n".join(
+    assert "ON public.events (tenant_id)" in "\n".join(
         f.sql for f in result.statements
     )
 

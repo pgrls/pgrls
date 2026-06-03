@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pglast
-from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, Node, NullTest, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, UpdateStmt
+from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, Node, NullTest, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
 from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
@@ -94,21 +94,11 @@ def parse_expr(
     return target.val
 
 
-def top_level_disjuncts(node: Any) -> list[Any]:
-    """If node is a top-level OR expression, return its disjunct children.
-
-    Otherwise return a single-element list containing the node itself.
-    """
-    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
-        return list(node.args or ())
-    return [node]
-
-
 def flatten_or_disjuncts(node: Any) -> list[Any]:
     """Return every disjunct of a (possibly nested) OR expression.
 
-    Unlike `top_level_disjuncts`, this flattens nested OR `BoolExpr`
-    nodes: `A OR (B OR C)` yields `[A, B, C]`. OR is associative and
+    Flattens nested OR `BoolExpr` nodes: `A OR (B OR C)` yields
+    `[A, B, C]`. OR is associative and
     pglast preserves explicit parenthesization as a nested `BoolExpr`,
     so the natural authoring order `<real check> OR (<other> OR
     auth() IS NULL)` would otherwise hide the trailing disjunct from a
@@ -119,7 +109,7 @@ def flatten_or_disjuncts(node: Any) -> list[Any]:
     not part of the same disjunction (an `IS NULL` under an `AND`, a
     `NOT`, or inside a subquery is not a standalone OR-disjunct), so
     the caller handles them atomically. A non-OR `node` yields
-    `[node]`, matching `top_level_disjuncts`.
+    `[node]`.
     """
     if not (
         isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR
@@ -487,3 +477,66 @@ def is_literal_false(node: Any) -> bool:
     equivalents.
     """
     return _is_literal_bool(node, value=False)
+
+
+def is_builtin_current_setting(node: Any) -> bool:
+    """True iff `node` is a call to the Postgres BUILTIN ``current_setting``
+    — unqualified, or ``pg_catalog``-qualified — and NOT a user-defined
+    ``<schema>.current_setting``.
+
+    ``find_func_calls(node, {"current_setting"})`` matches on EITHER the
+    qualified or the bare name (so it also returns a same-named UDF like
+    ``myschema.current_setting``). Every rule that reasons about the
+    builtin's GUC semantics — SEC019's ``missing_ok``-less overload,
+    SEC024's unqualified-name requirement, and the never-NULL guard below
+    — must gate on this, or it false-fires on a user-defined function
+    that merely shares the bare name. Single source of truth so those
+    gates cannot drift.
+    """
+    if not isinstance(node, FuncCall):
+        return False
+    qualified, _bare = func_name_parts(node)
+    return qualified in ("current_setting", "pg_catalog.current_setting")
+
+
+def is_never_null_current_setting(node: Any) -> bool:
+    """True iff `node` is a builtin ``current_setting`` call that can
+    NEVER return NULL — so an ``IS NULL`` test on it is a dead disjunct,
+    not an anonymous-read hole.
+
+    The builtin ``current_setting`` (unqualified or ``pg_catalog``-
+    qualified) is never-NULL in two argument forms:
+
+    * one-arg ``current_setting(name)`` — RAISES ``unrecognized
+      configuration parameter`` on an unset GUC and otherwise returns a
+      non-NULL string (even ``''`` is non-NULL);
+    * two-arg ``current_setting(name, false)`` — the ``missing_ok=false``
+      form ALSO raises on an unset GUC, so it too is never NULL.
+
+    Only ``current_setting(name, true)`` (``missing_ok=true``) returns
+    NULL when the GUC is unset and stays NULLable. A non-literal second
+    argument is treated conservatively as NULLable (so the IS-NULL rule
+    keeps firing), and a user-defined ``myschema.current_setting`` is a
+    DIFFERENT function that is not matched at all.
+
+    Single source of truth shared by SEC004 (`_has_nullable_auth_call`)
+    and the SEC038 anon-read encoder (`_is_anon_null_leaf`) so the two
+    never-NULL guards cannot drift — they did: R12 fixed only the 1-arg
+    case in both, and R13 found the 2-arg-``false`` gap latent in both.
+    """
+    if not is_builtin_current_setting(node):
+        return False
+    args = node.args
+    if not args:
+        return False
+    if len(args) == 1:
+        return True
+    if len(args) == 2:
+        # missing_ok=false also raises on an unset GUC → never NULL.
+        # Unwrap any TypeCast (`false::bool`) before the literal test;
+        # `true` and any non-literal second arg stay NULLable.
+        second = args[1]
+        while isinstance(second, TypeCast):
+            second = second.arg
+        return is_literal_false(second)
+    return False

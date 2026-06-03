@@ -414,3 +414,20 @@ def test_text_rationale_map_none_leaves_output_unchanged() -> None:
         [_v()], format="text", rationale_map=None
     )
     assert augmented == baseline
+
+
+def test_text_off_spec_severity_degrades_without_crashing() -> None:
+    # An extra rule's off-spec severity must not KeyError the default text
+    # output (the gate tolerates it — commit a916863). Degrade to the raw
+    # severity label and still count it in the summary tally.
+    v = Violation(
+        rule_id="X001",
+        severity="critical",  # type: ignore[arg-type]
+        title="t",
+        message="m",
+        location="public.t",
+    )
+    out = format_violations([v], format="text")
+    assert "X001" in out
+    assert "critical" in out
+    assert "1 critical" in out

@@ -68,6 +68,19 @@ class Config:
     # and `docs/RULE_AUTHORING.md` for the per-rule shape. Empty
     # list means "no extras"; built-ins always run regardless.
     extra_rules: list[str] = field(default_factory=list)
+    # Deferred `[database].url` interpolation failure. When the config
+    # declares a `[database].url` but its env-var interpolation cannot
+    # resolve (a referenced var is unset, or the result is empty), the
+    # error is NOT raised at load time: `database_url` is set to None
+    # and the human-readable reason is parked here. Commands that need
+    # a connection re-raise it at their "No database connection" guard
+    # (so the specific cause — e.g. "Environment variable 'X' is not
+    # set" — still reaches the user), while no-DB commands that never
+    # read the URL (`diff` file-vs-file, `explain`) run unaffected.
+    # None when the URL resolved cleanly, was absent, or was overridden
+    # on the CLI. Structural errors (url not a string) still raise
+    # eagerly — those are config bugs, not environment state.
+    database_url_error: str | None = None
 
 
 def load_config(path: Path | str | None) -> Config:
@@ -201,17 +214,36 @@ def _build_config(raw: dict[str, Any]) -> Config:
         raise ConfigError("[lint] must be a table")
 
     url_raw = database.get("url")
+    database_url_error: str | None = None
     if url_raw is None:
         database_url = None
     elif isinstance(url_raw, str):
-        database_url = _interpolate_env(url_raw)
-        if not database_url:
-            raise ConfigError(
-                "[database].url is empty after env-var interpolation. "
-                "This usually means a referenced env var is set to "
-                "the empty string. Set the variable to a real "
-                "connection string or remove the [database].url key."
-            )
+        # Interpolation failures (an unset env var, or a value that
+        # resolves to empty) are DEFERRED, not raised: a command that
+        # never reads the URL — `diff` file-vs-file, `explain` — must
+        # still run even when `[database].url` references a var that is
+        # not exported. The reason is parked in `database_url_error`
+        # and re-raised by the "No database connection" guard only when
+        # a command actually needs the connection. A structural error
+        # (url is not a string) is a config bug, not environment state,
+        # so it still raises eagerly for every command.
+        try:
+            interpolated = _interpolate_env(url_raw)
+        except ConfigError as exc:
+            database_url = None
+            database_url_error = str(exc)
+        else:
+            if interpolated:
+                database_url = interpolated
+            else:
+                database_url = None
+                database_url_error = (
+                    "[database].url is empty after env-var "
+                    "interpolation. This usually means a referenced "
+                    "env var is set to the empty string. Set the "
+                    "variable to a real connection string or remove "
+                    "the [database].url key."
+                )
     else:
         raise ConfigError(
             f"[database].url must be a string, got {type(url_raw).__name__}"
@@ -409,6 +441,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
         severity_overrides=severity_overrides,
         diff_fail_on=diff_fail_on,
         extra_rules=extra_rules,
+        database_url_error=database_url_error,
     )
 
 

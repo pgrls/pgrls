@@ -504,6 +504,25 @@ def test_counterexample_string_column():
     assert _row_satisfies_head_not_base(base, head, cx)
 
 
+def test_counterexample_present_on_incomparable_pair():
+    # R19 #2: the documented non-None "incomparable" admit-path — neither
+    # base→head nor head→base holds, yet head ∧ ¬base is SAT (partially
+    # overlapping ranges). classify_via_z3 returns None (requires_review),
+    # so production (policies.py, which calls the emitter only on
+    # "semantic_loosened") never reaches this path today. The test pins
+    # the admit-path's soundness DIRECTLY, so a future feature that wires
+    # counterexample() to the incomparable verdict cannot silently emit a
+    # row that does not actually leak.
+    base, head = "x > 0", "x < 10"
+    # Incomparable → no loosened/tightened/equivalent verdict.
+    assert _classify(base, head) is None
+    cx = _counterexample(base, head)
+    assert cx is not None
+    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    # SOUNDNESS: the returned row genuinely lies in head ∖ base.
+    assert _row_satisfies_head_not_base(base, head, cx)
+
+
 def test_no_counterexample_when_equivalent():
     # Semantically equal predicates: head ∧ ¬base is UNSAT.
     assert _classify("a = 1", "1 = a") == "semantic_equivalent"
@@ -596,6 +615,29 @@ def test_anon_fires_on_bool_cast_is_null() -> None:
     assert _anon(f"((SELECT auth.uid()) IS NULL)::bool OR {_OWNER}") is not None
 
 
+def test_anon_fires_on_unknown_type_cast_of_auth_call_is_null() -> None:
+    # R11 #3: a cast of an anon-null auth call to an UNKNOWN target type
+    # (jsonb/inet/date/… — the common Supabase shapes) must keep the
+    # null-flag carry-through (`cast of NULL is NULL`), so the inverted
+    # `auth.uid()::jsonb IS NULL OR <owner>` proves valid and fires. This
+    # exercises the _anon_typecast unknown-target-type branch — the one
+    # the `::bool` test does not reach.
+    for cast_type in ("jsonb", "inet", "date", "timestamp"):
+        sql = f"((SELECT auth.uid())::{cast_type}) IS NULL OR {_OWNER}"
+        assert _anon(sql) is not None, cast_type
+
+
+def test_anon_clean_on_unknown_type_cast_tenant_predicate() -> None:
+    # The mirror: a tenant/owner predicate whose auth value is cast to an
+    # unknown type is Kleene U under anon (col = NULL), not valid → no
+    # fire. Guards the carry-through against being mis-encoded as a fresh
+    # non-null value (which would turn a real inverted-auth leak into a
+    # MISS after a refactor).
+    assert _anon(
+        "owner_id = ((SELECT current_setting('app.o', true))::jsonb)"
+    ) is None
+
+
 def test_anon_fires_on_corpus_inverted_auth_shape() -> None:
     # P3 / sec004-inverted-auth.
     assert _anon(
@@ -612,6 +654,46 @@ def test_anon_fires_on_multiple_auth_is_null() -> None:
     ) is not None
 
 
+def test_anon_fires_on_bare_sqlvaluefunction_when_configured() -> None:
+    # `current_user` / `session_user` written WITHOUT parens parse as
+    # SQLValueFunction nodes — a distinct AST class from FuncCall. They
+    # are NOT in the DEFAULT anon set (they always return the session
+    # role name, never NULL — R11 #1), so by default they do NOT fire.
+    # But when a project explicitly configures them, the _ANON_SVFOP_NAMES
+    # branch of `_is_anon_null_leaf` still models them as anon-NULL and
+    # the inverted disjunct fires — this exercises the SQLValueFunction
+    # leaf path.
+    for fn in ("current_user", "session_user"):
+        node = parse_expr(f"{fn} IS NULL OR {_OWNER}")
+        assert node is not None
+        assert anon_read_counterexample(node, {fn}) is not None
+
+
+def test_anon_clean_on_never_null_role_svfop_by_default() -> None:
+    # R11 #1: with the default anon set, `current_user IS NULL` is NOT
+    # treated as anon-NULL (current_user is never NULL in Postgres), so
+    # the inverted disjunct does not prove valid — no false fire.
+    assert _anon(f"current_user IS NULL OR {_OWNER}") is None
+    assert _anon(f"session_user IS NULL OR {_OWNER}") is None
+
+
+def test_anon_clean_on_never_null_current_setting() -> None:
+    # R13 #2 (SEC038 mirror of the SEC004 fix): a never-NULL builtin
+    # current_setting — the one-arg form, or the two-arg
+    # `current_setting(name, false)` (missing_ok=false also raises on an
+    # unset GUC) — is not anon-NULL, so the inverted `… IS NULL OR owner`
+    # must NOT prove valid (no false fire). The shared
+    # `is_never_null_current_setting` guard backs both the rule and this
+    # encoder, so the 1-arg and 2-arg-false cases can no longer drift.
+    assert _anon(f"current_setting('app.x') IS NULL OR {_OWNER}") is None
+    assert _anon(f"current_setting('app.x', false) IS NULL OR {_OWNER}") is None
+    assert _anon(
+        f"pg_catalog.current_setting('app.x', false::boolean) IS NULL OR {_OWNER}"
+    ) is None
+    # The genuinely-NULLable `, true` form still fires (no false negative).
+    assert _anon(f"current_setting('app.x', true) IS NULL OR {_OWNER}") is not None
+
+
 def test_anon_fires_on_bare_true() -> None:
     assert _anon("true") is not None
 
@@ -620,7 +702,30 @@ def test_anon_fires_on_trivial_tautology() -> None:
     assert _anon("1 = 1") is not None
 
 
+def test_anon_witness_is_always_empty_under_validity() -> None:
+    # R14 #4: under the v1 validity criterion the predicate is TRUE for
+    # EVERY assignment of the real columns, so no column value
+    # characterizes the leak — anon_read_counterexample returns the empty
+    # model {} (the honest "all rows" artifact), NEVER an arbitrary
+    # satisfying assignment. A valid predicate carrying a FREE real bool
+    # column (`flag OR NOT flag`) previously leaked `{'flag': False}` from
+    # the witness model, contradicting both the docstring and the SEC038
+    # dead-witness pragma. Pin == {} (not just `is not None`) so the
+    # contract cannot silently drift.
+    assert _anon("(SELECT auth.uid()) IS NULL OR flag OR NOT flag") == {}
+    assert _anon("(SELECT auth.uid()) IS NULL OR true") == {}
+    assert _anon("true") == {}
+
+
 # --- NOT VALID (no fire): None is returned ----------------------------------
+
+
+def test_anon_clean_on_bare_sqlvaluefunction_equality() -> None:
+    # `current_user = 'admin'` under anon is `NULL = 'admin'` → Kleene U
+    # → not valid → no fire. Guards the SQLValueFunction leaf against
+    # being mis-encoded as a concrete (non-null) value, which would
+    # leak a false positive.
+    assert _anon("current_user = 'admin'") is None
 
 
 def test_anon_clean_on_owner_predicate() -> None:
@@ -685,6 +790,43 @@ def test_anon_clean_on_in_list() -> None:
     assert _anon("owner_id IN ('a', 'b') OR (SELECT auth.uid()) IS NULL") is None
 
 
+def test_anon_clean_on_case_expr_aborts() -> None:
+    # R12 #9: the v1 3VL encoder does not model CaseExpr — it returns
+    # None (declines to prove validity = the safe direction). Pin that
+    # abort so any future change adding CASE support to _anon_3vl is a
+    # deliberate, reviewed flip rather than a silent SEC038 FP/FN.
+    assert _anon(
+        "CASE WHEN (SELECT auth.uid()) IS NULL THEN true "
+        "ELSE owner_id = (SELECT auth.uid()) END"
+    ) is None
+
+
+def test_anon_clean_on_string_sorted_arithmetic_no_crash() -> None:
+    # R13 #1: the Z3 Python operator overloads raise a plain TypeError
+    # (NOT z3.Z3Exception) when arithmetic `-`/`*`/`/`/`%` is applied to
+    # String-sorted operands — which happens routinely for opaque values
+    # (now()/current_setting/an unknown-target cast) and for `col OP col`
+    # (both default to StringSort). Before the fix this escaped the
+    # operator-application catch and crashed SEC038 (and, via the cli
+    # dispatch loop, the WHOLE lint run). Each predicate must now degrade
+    # to None (untranslatable -> NO-OP), not raise. The headline case is
+    # a benign, idiomatic "recent rows" window policy.
+    assert _anon("created_at > now() - interval '7 days'") is None
+    assert _anon("created_at <> now() - interval '7 days'") is None
+    # `col OP col` arithmetic (both sides default to StringSort):
+    for op in ("-", "*", "/", "%"):
+        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") is None, op
+
+
+def test_anon_clean_on_bool_sorted_comparison_no_crash() -> None:
+    # R13 #1 (sibling): `<`/`>`/`<=`/`>=` on two Bool-sorted operands —
+    # e.g. comparing two IS NULL tests — also raises a plain TypeError
+    # from the Z3 overload, not z3.Z3Exception. The 3VL comparison site
+    # must degrade to None rather than crash.
+    assert _anon("(owner_id IS NULL) > (tenant_id IS NULL)") is None
+    assert _anon("(owner_id IS NULL) <= (tenant_id IS NULL)") is None
+
+
 def test_anon_returns_none_when_z3_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -720,3 +862,160 @@ def test_anon_bool_column_leaf_cannot_be_true_and_null() -> None:
         solver.add(a)
     solver.add(z3_solver.And(flag, flag_nullflag))
     assert solver.check() == z3_solver.unsat
+
+
+def test_bare_constant_predicate_degrades_instead_of_crashing() -> None:
+    # A non-boolean bare predicate — USING (1), USING (42), USING ('x') —
+    # translates to a non-Bool Z3 sort. z3.Not / z3.And on it raise
+    # Z3Exception, which used to crash classify_via_z3 / counterexample
+    # (and therefore `pgrls diff`). Both must now degrade to None so the
+    # caller falls through to requires_review. Postgres rejects such a
+    # USING at policy creation, but a hand-built / snapshot-loaded
+    # predicate can still reach the differ.
+    bool_node = parse_expr("active")
+    for bare in ("1", "42", "'x'"):
+        bare_node = parse_expr(bare)
+        assert classify_via_z3(bool_node, bare_node) is None
+        assert classify_via_z3(bare_node, bool_node) is None
+        assert classify_via_z3(bare_node, bare_node) is None
+        assert counterexample(bool_node, bare_node) is None
+        assert counterexample(bare_node, bool_node) is None
+    # A bare BOOLEAN constant is a valid predicate and must NOT be gated
+    # out: USING (true) still classifies normally.
+    assert (
+        classify_via_z3(parse_expr("true"), parse_expr("true"))
+        == "semantic_equivalent"
+    )
+
+
+def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
+    # R13 #1 (2VL diff path): String-sorted arithmetic (`-`/`*`/`/`/`%`)
+    # makes the Z3 operator overload raise a plain TypeError, not
+    # z3.Z3Exception. classify_via_z3 / counterexample used to let it
+    # escape and crash `pgrls diff`; both must now degrade to None so the
+    # caller falls through to requires_review. Sibling of
+    # test_bare_constant_predicate_degrades_instead_of_crashing (which
+    # pins the Z3Exception case).
+    base = parse_expr("created_at > now() - interval '1 day'")
+    head = parse_expr("created_at > now() - interval '7 days'")
+    assert classify_via_z3(base, head) is None
+    assert classify_via_z3(head, base) is None
+    assert counterexample(base, head) is None
+    # `col OP col` arithmetic — both operands default to StringSort:
+    cc = parse_expr("a - b > c")
+    assert classify_via_z3(cc, cc) is None
+    assert counterexample(cc, cc) is None
+
+
+def test_reserved_marker_prefix_column_cannot_alias_the_null_marker() -> None:
+    # R15 #3: the synthetic NULL marker for column `x` is minted as
+    # z3.Bool("_isnull__x"); a REAL column literally named `_isnull__x`
+    # (legal via a quoted identifier) is bound as z3.Const("_isnull__x",
+    # Bool) and — since Z3 keys a constant by name+sort — would alias the
+    # marker in the `base AND NOT head` implication query, silently
+    # collapsing distinct predicates to `semantic_equivalent` (a
+    # suppressed diff Change; by symmetry a missed DANGEROUS loosening).
+    # `_column_key` now refuses to bind a reserved-prefix column, so the
+    # predicate degrades to requires_review (None) — never a false
+    # equivalence.
+    assert _classify("x IS NULL AND y = 1", '"_isnull__x" AND y = 1') is None
+    # _column_key returns "" for every reserved synthetic prefix...
+    from pgrls.diff._z3_compare import _column_key
+
+    for name in ("_isnull__x", "_opaque__foo", "_nullflag__z"):
+        ref = parse_expr(f'"{name}" = 1').lexpr
+        assert _column_key(ref) == "", name
+    # ...but a near-miss / ordinary name still binds normally.
+    assert _column_key(parse_expr('"_isnullx" = 1').lexpr) == "_isnullx"
+    assert _column_key(parse_expr("owner_id = 1").lexpr) == "owner_id"
+
+
+def test_null_marker_disconnection_is_a_documented_safe_limitation() -> None:
+    # CHARACTERIZATION of the deliberate NullTest limitation (module
+    # docstring): the IS NULL marker is modelled DISCONNECTED from the
+    # column's value var — a 2-valued approximation of Postgres 3VL.
+    #
+    # A faithful 2-valued linkage was attempted and rejected as UNSOUND
+    # under negation (z3.Not is 2-valued; Postgres `NOT (col = x)` is
+    # 3-valued — NULL when col is NULL), so it would only trade these
+    # over-reports for a new class of `NOT (...)` false alarms. A correct
+    # fix needs a full Kleene 3VL re-encoding of the diff path.
+    #
+    # `col IS NOT NULL AND col = x` is EQUIVALENT to `col = x` in Postgres
+    # (a value comparison already excludes NULL rows), but the disconnected
+    # marker over-reports it. Pinned so a future 3VL fix flips this
+    # deliberately, not by accident.
+    assert (
+        classify_via_z3(
+            parse_expr("active IS NOT NULL AND active = true"),
+            parse_expr("active = true"),
+        )
+        == "semantic_loosened"
+    )
+    assert (
+        classify_via_z3(
+            parse_expr("active = true"),
+            parse_expr("active IS NOT NULL AND active = true"),
+        )
+        == "semantic_tightened"
+    )
+
+
+def test_null_limitation_does_not_compromise_soundness() -> None:
+    # The limitation must never cost the verifier its safety guarantees —
+    # these are exactly the invariants a naive null-guard "fix" broke, and
+    # that any real fix must preserve.
+    #
+    # Arithmetic equivalence holds (a naive guard flipped this to
+    # `tightened`):
+    assert (
+        classify_via_z3(parse_expr("col - 3 > 0"), parse_expr("col > 3"))
+        == "semantic_equivalent"
+    )
+    # A genuine NULL-admitting loosening is STILL flagged DANGEROUS — the
+    # coarse model never MISSES a real loosening (the safety-critical
+    # direction is intact):
+    assert (
+        classify_via_z3(
+            parse_expr("col = 5"), parse_expr("col = 5 OR col IS NULL")
+        )
+        == "semantic_loosened"
+    )
+    # A genuine value loosening is flagged AND still yields the concrete
+    # leaking row (col = 6 is the unique member of head \ base):
+    assert (
+        classify_via_z3(parse_expr("col = 5"), parse_expr("col = 5 OR col = 6"))
+        == "semantic_loosened"
+    )
+    assert counterexample(
+        parse_expr("col = 5"), parse_expr("col = 5 OR col = 6")
+    ) == {"col": 6}
+
+
+def test_counterexample_empty_row_for_all_rows_leak() -> None:
+    # Regression (round-5): when head ∧ ¬base is a tautology (base rejects
+    # every row, head admits all), the verifier's most important admit-case
+    # is "every row leaks" — a sound EMPTY-projection witness. Pin the {}
+    # return and the witness gate accepting the empty pin.
+    from pgrls.diff._z3_compare import (
+        _Context,
+        _row_is_sufficient_witness,
+        _to_z3,
+    )
+
+    base = parse_expr("a IS NULL AND a IS NOT NULL")  # always false
+    head = parse_expr("true")
+    assert counterexample(base, head) == {}
+    ctx = _Context()
+    base_z3 = _to_z3(base, ctx)
+    head_z3 = _to_z3(head, ctx)
+    assert _row_is_sufficient_witness({}, base_z3, head_z3, ctx) is True
+
+
+def test_counterexample_decodes_real_column_as_float() -> None:
+    # Regression (round-5): the RealSort decode path (as_fraction -> float)
+    # is otherwise untested; a Z3/pglast upgrade could silently break it.
+    cx = counterexample(parse_expr("price > 5.0"), parse_expr("price > 0.0"))
+    assert cx is not None
+    assert isinstance(cx["price"], float)
+    assert _row_satisfies_head_not_base("price > 5.0", "price > 0.0", cx)

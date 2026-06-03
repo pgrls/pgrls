@@ -141,3 +141,10 @@ def test_github_via_format_violations_dispatch() -> None:
     )
     assert out.startswith("::error ")
     assert "ignored" not in out
+
+
+def test_github_off_spec_severity_fails_closed_to_error() -> None:
+    # CI annotation path: an off-spec severity must not KeyError; emit the
+    # most-visible `::error` annotation (fail closed) so it still surfaces.
+    out = format_github([_v(severity="critical")])
+    assert out.startswith("::error ")

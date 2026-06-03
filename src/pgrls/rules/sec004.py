@@ -17,17 +17,47 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.ast_utils import find_func_calls, flatten_or_disjuncts, match_is_null
+from pgrls.ast_utils import (
+    find_func_calls,
+    flatten_or_disjuncts,
+    is_never_null_current_setting,
+    match_is_null,
+)
 from pgrls.model import Schema
 from pgrls.violations import Severity, Violation
 
 
+def _has_nullable_auth_call(inner: Any, auth_functions: set[str]) -> bool:
+    """True if `inner` contains an auth call that can actually be NULL.
+
+    `find_func_calls` matches every configured auth function in `inner`;
+    a never-NULL ``current_setting`` among them (the one-arg form, or the
+    two-arg ``current_setting(name, false)`` — both raise on an unset GUC
+    rather than returning NULL) does not make the ``IS NULL`` disjunct an
+    anonymous-read hole. Any OTHER match (auth.uid/role/jwt, or the
+    two-arg ``current_setting(name, true)``) is genuinely NULLable.
+    """
+    matches = find_func_calls(inner, auth_functions)
+    return any(not is_never_null_current_setting(m) for m in matches)
+
+
+# Only functions that genuinely return NULL for an unauthenticated
+# request belong here: an `IS NULL` disjunct is a real anonymous-read
+# hole only if the function can actually be NULL. auth.uid/role/jwt read
+# JWT claims (NULL when no token); current_setting(name, true) returns
+# NULL when the GUC is unset.
+#
+# NOT included: current_user / session_user / current_role / user. These
+# SQLValueFunctions ALWAYS return the session role name — Postgres has no
+# unauthenticated backend (PostgREST's "anon" is itself a real role), so
+# `current_user IS NULL` is the constant FALSE and a disjunct gated on it
+# is dead, not a leak. Flagging it is a false positive. The role-identity
+# hazard for these functions is a column COMPARISON (`owner = current_user`),
+# which is SEC018's / SEC026's job, not an IS-NULL anonymous-read hole.
 _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.uid",
     "auth.role",
     "auth.jwt",
-    "current_user",
-    "session_user",
     "current_setting",
 })
 
@@ -66,7 +96,7 @@ class SEC004:
                     inner, is_null = matched
                     if not is_null:
                         continue
-                    if not find_func_calls(inner, auth_functions):
+                    if not _has_nullable_auth_call(inner, auth_functions):
                         continue
                     out.append(
                         Violation(

@@ -132,16 +132,31 @@ def _result(
     # keeps the document GitHub-ingestible for any future schema-
     # wide rule that doesn't pin to a specific table or policy.
     # Real qualified names never contain parentheses, so the
-    # sentinel is unambiguous.
-    fqn = v.location if v.location is not None else "(schema-wide)"
+    # sentinel is unambiguous. Guard on falsiness (not `is not None`):
+    # an empty-string location is still effectively no location — an
+    # empty `fullyQualifiedName` is GitHub-rejected just like a missing
+    # one — and falsy matches the sentinel the sibling formatters
+    # (text/markdown/github/junit/pr_comment/html) all emit for `""`,
+    # so the SARIF run agrees with them on that finding.
+    fqn = v.location if v.location else "(schema-wide)"
     out["locations"] = [
         {"logicalLocations": [{"fullyQualifiedName": fqn}]}
     ]
+    # The raw 4-way diff classification goes in the SARIF property bag
+    # (§3.27.x `result.properties`) — additive and ignored by consumers
+    # that don't read it, but it lets a CI pipeline split breaking from
+    # requires_review (both map to SARIF `level: warning`). Present only
+    # on `pgrls diff` output.
+    if v.classification is not None:
+        out["properties"] = {"classification": v.classification}
     return out
 
 
 def _level(severity: Severity) -> str:
     # SARIF v2.1.0 levels: "none" | "note" | "warning" | "error".
-    return {"error": "error", "warning": "warning", "info": "note"}[
-        severity
-    ]
+    # Fail CLOSED on an off-spec severity from an extra rule: map it to
+    # "error" (the most visible level) rather than KeyError-ing the whole
+    # CI / Code-Scanning upload, so the finding still surfaces loudly.
+    return {"error": "error", "warning": "warning", "info": "note"}.get(
+        severity, "error"
+    )

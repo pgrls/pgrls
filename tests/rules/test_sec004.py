@@ -51,11 +51,74 @@ def test_sec004_fires_on_current_setting_is_null_disjunct() -> None:
     assert len(SEC004().check(schema, {})) == 1
 
 
-def test_sec004_fires_on_current_user_is_null_disjunct() -> None:
+def test_sec004_silent_on_one_arg_current_setting_is_null() -> None:
+    # R12 #1: the one-arg `current_setting('app.x')` RAISES on an unset
+    # GUC and is otherwise a non-NULL string — it is NEVER NULL, so the
+    # `IS NULL` disjunct is dead and the policy fails closed. Flagging it
+    # ERROR-severity is a false positive (the two-arg missing_ok form is
+    # the genuinely-NULLable one). Covers the builtin in both spellings.
+    for fn in ("current_setting", "pg_catalog.current_setting"):
+        schema = _wrap(
+            _policy_with_using(f"{fn}('app.x') IS NULL OR user_id = '1'")
+        )
+        assert SEC004().check(schema, {}) == [], fn
+
+
+def test_sec004_silent_on_two_arg_false_current_setting_is_null() -> None:
+    # R13 #2: the two-arg `current_setting(name, false)` form ALSO raises
+    # on an unset GUC (missing_ok=false), so it is NEVER NULL just like
+    # the one-arg form — the `IS NULL` disjunct is dead and the policy
+    # fails closed. The R12 fix keyed on arity (1 arg) and so left this
+    # 2-arg-false case still false-firing at ERROR severity. Only the
+    # `, true` form (test above) is genuinely NULLable. Covers bare
+    # `false`, `FALSE`, and the `false::boolean` cast, in both builtin
+    # spellings.
+    for fn in ("current_setting", "pg_catalog.current_setting"):
+        for lit in ("false", "FALSE", "false::boolean"):
+            using = f"{fn}('app.x', {lit}) IS NULL OR user_id = '1'"
+            assert SEC004().check(_wrap(_policy_with_using(using)), {}) == [], using
+
+
+def test_sec004_fires_on_user_defined_one_arg_current_setting() -> None:
+    # A user-defined `myschema.current_setting(text)` is NOT the builtin
+    # and could legitimately return NULL, so the never-NULL skip must not
+    # suppress it (it matches via the bare name in the auth set).
+    schema = _wrap(
+        _policy_with_using(
+            "myschema.current_setting('app.x') IS NULL OR user_id = '1'"
+        )
+    )
+    assert len(
+        SEC004().check(schema, {"auth_functions": ["current_setting"]})
+    ) == 1
+
+
+def test_sec004_silent_on_never_null_role_svfops_by_default() -> None:
+    # R11 #1: current_user / session_user / current_role / user ALWAYS
+    # return the session role name — Postgres has no unauthenticated
+    # backend (PostgREST's "anon" is a real role), so `<svfop> IS NULL`
+    # is the constant FALSE and the disjunct is dead, not an
+    # anonymous-read hole. Flagging it is a false positive, so these are
+    # no longer in the default auth-function set.
+    for using in (
+        "current_user IS NULL OR user_id = '1'",
+        "session_user IS NULL OR user_id = '1'",
+        "current_role IS NULL OR user_id = '1'",
+        "user IS NULL OR user_id = '1'",
+    ):
+        assert SEC004().check(_wrap(_policy_with_using(using)), {}) == [], using
+
+
+def test_sec004_fires_on_never_null_svfop_when_explicitly_configured() -> None:
+    # The mechanism still honors an explicit opt-in: a project that
+    # configures current_user into the auth set gets it flagged. (The
+    # default just no longer assumes it.)
     schema = _wrap(
         _policy_with_using("current_user IS NULL OR user_id = '1'")
     )
-    assert len(SEC004().check(schema, {})) == 1
+    assert len(
+        SEC004().check(schema, {"auth_functions": ["current_user"]})
+    ) == 1
 
 
 def test_sec004_does_not_fire_on_is_not_null() -> None:
@@ -163,13 +226,6 @@ def test_sec004_fires_on_with_check_disjunct_not_just_using() -> None:
     )
     schema = _wrap(policy)
     assert SEC004().check(schema, {}) == []
-
-
-def test_sec004_default_set_covers_session_user() -> None:
-    schema = _wrap(
-        _policy_with_using("session_user IS NULL OR user_id = '1'")
-    )
-    assert len(SEC004().check(schema, {})) == 1
 
 
 def test_sec004_default_set_covers_auth_role() -> None:

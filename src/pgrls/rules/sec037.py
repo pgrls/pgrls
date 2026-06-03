@@ -54,6 +54,7 @@ from __future__ import annotations
 from typing import Any
 
 from pglast.ast import (
+    A_ArrayExpr,
     A_Const,
     A_Expr,
     FuncCall,
@@ -106,14 +107,19 @@ def _parse_role_functions(options: dict[str, Any]) -> set[str]:
 
 
 def _is_equality(node: A_Expr) -> bool:
-    """True if `node` is a plain binary `=` operator expression."""
+    """True if `node` is a binary `=` operator expression.
+
+    Matches on the operator name's FINAL component, so a
+    schema-qualified `OPERATOR(pg_catalog.=)` (the round-trip form
+    pglast can emit) is recognized as `=` just like a bare `=`.
+    """
     name = node.name
     return (
         node.kind == A_Expr_Kind.AEXPR_OP
         and name is not None
-        and len(name) == 1
-        and isinstance(name[0], String)
-        and name[0].sval == "="
+        and len(name) >= 1
+        and isinstance(name[-1], String)
+        and name[-1].sval == "="
     )
 
 
@@ -127,9 +133,46 @@ def _is_in_list(node: A_Expr) -> bool:
     `auth.role() = 'admin' OR auth.role() = 'editor'` when every listed
     value is an unknown role, so it needs the same treatment.
     """
+    # Only plain `IN` is the always-false silent-deny shape. Postgres
+    # parses `IN (...)` with operator name `=` and `NOT IN (...)` with
+    # `<>`; an `auth.role() NOT IN (<unknown roles>)` is always TRUE
+    # (not a silent deny), so treating it like `IN` is a false
+    # positive. Match `=` only.
     # `A_Expr.kind` is typed `Any` by pglast — wrap in bool() so
     # mypy --strict doesn't flag a `no-any-return`.
-    return bool(node.kind == A_Expr_Kind.AEXPR_IN)
+    name = node.name
+    return bool(
+        node.kind == A_Expr_Kind.AEXPR_IN
+        and name is not None
+        and len(name) >= 1
+        and isinstance(name[-1], String)
+        and name[-1].sval == "="
+    )
+
+
+def _is_any_all_eq(node: A_Expr) -> bool:
+    """True if `node` is `<x> = ANY (ARRAY[...])` / `= ALL (ARRAY[...])`.
+
+    This is the form Postgres stores and `pg_get_expr` re-renders for an
+    `IN` list (and any multi-value role check): `auth.role() IN ('a','b')`
+    round-trips as `auth.role() = ANY (ARRAY['a'::text,'b'::text])`, an
+    `A_Expr` of kind `AEXPR_OP_ANY`. So on an introspected / snapshotted
+    schema — every real input the rule sees — this is the ONLY shape that
+    appears; the `_is_in_list` (AEXPR_IN) branch is dead there and lives on
+    only for the lint-of-handwritten-source path.
+
+    Gated to operator name `=` (exactly like `_is_in_list`): `<> ALL` is
+    the `NOT IN` normalization, which is always-TRUE for unknown values,
+    not a silent deny — matching it would be a false positive.
+    """
+    name = node.name
+    return bool(
+        node.kind in (A_Expr_Kind.AEXPR_OP_ANY, A_Expr_Kind.AEXPR_OP_ALL)
+        and name is not None
+        and len(name) >= 1
+        and isinstance(name[-1], String)
+        and name[-1].sval == "="
+    )
 
 
 # Mirror of `_SQL_VALUE_FUNCTION_NAMES` in `pgrls.ast_utils` —
@@ -166,7 +209,13 @@ def _is_role_call(node: Any, role_functions: set[str]) -> bool:
     - `SQLValueFunction` for the SQL keyword forms `current_user`,
       `session_user`, `user`, `current_role` — Postgres parses
       these without parentheses into a separate node class.
+
+    A surrounding `TypeCast` is stripped first — `auth.role()::text =
+    'admin'` parses the role side as a TypeCast, and the literal side is
+    already unwrapped by `_is_string_const`, so unwrapping here keeps the
+    two sides symmetric (otherwise a cast role call silently escapes).
     """
+    node = _unwrap_typecast(node)
     if isinstance(node, SQLValueFunction):
         name = _SVFOP_NAMES.get(node.op)
         return name is not None and name in role_functions
@@ -255,6 +304,26 @@ def _find_unknown_role_comparisons(
             # unknown-role hit, mirroring the per-disjunct `=` path.
             if _is_role_call(n.lexpr, role_functions):
                 elements = n.rexpr if isinstance(n.rexpr, (list, tuple)) else ()
+                for element in elements:
+                    sval = _is_string_const(element)
+                    if sval is not None and sval not in known_roles:
+                        hits.append(sval)
+        elif isinstance(n, A_Expr) and _is_any_all_eq(n):
+            # The pg_get_expr-normalized form of `IN` / a multi-value
+            # role check: `auth.role() = ANY (ARRAY['a'::text, ...])`.
+            # This is the shape SEC037 actually sees on every introspected
+            # policy (the AEXPR_IN branch above is dead there). Treat it
+            # exactly like IN — the role call is `lexpr`, the array holds
+            # the candidate literals; report each one outside the known
+            # set. `n.rexpr` is an `A_ArrayExpr` whose `.elements` are the
+            # (TypeCast-wrapped) `A_Const` literals.
+            if _is_role_call(n.lexpr, role_functions):
+                elements = (
+                    n.rexpr.elements
+                    if isinstance(n.rexpr, A_ArrayExpr)
+                    and n.rexpr.elements is not None
+                    else ()
+                )
                 for element in elements:
                     sval = _is_string_const(element)
                     if sval is not None and sval not in known_roles:

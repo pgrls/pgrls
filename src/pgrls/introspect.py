@@ -1,6 +1,7 @@
 """Read RLS-relevant state from `pg_catalog` into a normalized Schema."""
 from __future__ import annotations
 
+import sys
 from collections import defaultdict
 from typing import Any, cast
 
@@ -13,6 +14,7 @@ from pgrls.model import (
     BypassRlsEscalation,
     BypassRlsRole,
     Column,
+    ColumnGrant,
     Grant,
     Index,
     LeakproofFunction,
@@ -221,7 +223,11 @@ ORDER BY a.attrelid, a.attnum
 # here so two introspections of the same DB produce byte-
 # identical Schema (downstream snapshot determinism).
 _GRANTS_SQL = """
-SELECT
+-- DISTINCT drops aclexplode's per-grantor multiplicity: a privilege
+-- re-granted to the same grantee by two grantors (the normal WITH GRANT
+-- OPTION case) yields one row per grantor, which would otherwise append
+-- a duplicate into Grant.privileges. Mirrors the polroles SELECT DISTINCT.
+SELECT DISTINCT
     c.oid AS table_oid,
     CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
          ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
@@ -235,7 +241,48 @@ WHERE c.relkind IN ('r', 'p')
   AND n.nspname = ANY(%s)
   AND c.relacl IS NOT NULL
   AND ax.grantee IS NOT NULL
+  -- Exclude the table owner's own ACL row. A default-ACL table has
+  -- relacl=NULL and aclexplode yields nothing, so the owner's
+  -- always-implicit privileges are invisible. But the moment ANY explicit
+  -- GRANT is added, Postgres materializes the FULL ACL including the
+  -- owner's self-grant — which would then surface as a phantom
+  -- DIFF_GRANT_ADDED on the owner (and to_sql() would re-emit GRANT … TO
+  -- owner for diff --apply). The owner always holds these privileges, so
+  -- it is never a real delta; drop the row so capture is independent of
+  -- whether other grants exist.
+  AND ax.grantee <> c.relowner
 ORDER BY c.oid, role_name, ax.privilege_type
+"""
+
+# Column-level grants from `pg_attribute.attacl` (`GRANT SELECT (col) ON
+# t TO role`). Stored separately from table-level `relacl`, so a PUBLIC
+# column grant on a no-RLS table is otherwise invisible to the diff's
+# GRANT_PUBLIC_NO_RLS detection. Mirrors `_GRANTS_SQL`: real columns only
+# (`attnum > 0 AND NOT attisdropped`), the owner self-grant excluded
+# (same phantom-delta rationale as the table-grant query — the owner
+# always holds the privilege), grantee 0 rendered as PUBLIC.
+_COLUMN_GRANTS_SQL = """
+-- DISTINCT drops aclexplode's per-grantor multiplicity (see _GRANTS_SQL).
+SELECT DISTINCT
+    c.oid AS table_oid,
+    a.attname AS column_name,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+LEFT JOIN LATERAL aclexplode(a.attacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname = ANY(%s)
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND a.attacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> c.relowner
+ORDER BY c.oid, column_name, role_name, ax.privilege_type
 """
 
 _VIEWS_SQL = """
@@ -281,10 +328,21 @@ JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
 JOIN pg_catalog.pg_depend d
   ON d.objid = r.oid
  AND d.classid = 'pg_rewrite'::regclass
+ -- Constrain the REFERENCED side to relations too. Postgres draws OIDs
+ -- from one cluster-wide counter shared across catalogs, so without this
+ -- a rewrite-rule dependency on a pg_proc / pg_type / pg_operator object
+ -- whose OID happens to collide with a pg_class relation OID would join
+ -- through and emit a phantom (ref_schema, ref_name) — a spurious view
+ -- reference that VIEW001/002/003 could then report as an RLS leak. The
+ -- function-result deps the fixture notes are tracked via pg_proc, not
+ -- pg_class, so they must be structurally excluded here, not by luck.
+ AND d.refclassid = 'pg_catalog.pg_class'::regclass
 JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
 JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
 WHERE v.relkind IN ('v', 'm')
-  AND t.relkind IN ('r', 'p')   -- regular tables + partitioned tables
+  AND t.relkind IN ('r', 'p', 'v', 'm')  -- tables, partitioned tables, AND
+                                         -- views/matviews so view→view
+                                         -- chains can be resolved in Python
   AND vn.nspname = ANY(%s)
   AND v.oid != t.oid             -- exclude self-rule rows
 ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
@@ -439,7 +497,15 @@ SELECT
     COALESCE(
         ARRAY(
             SELECT COALESCE(a.attname, '')
-            FROM unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord)
+            -- Slice to the KEY columns only: indkey holds key columns
+            -- followed by INCLUDE (covering) columns, and a covering
+            -- column must not be read as part of the index's logical
+            -- key (else SEC035 mistakes a UNIQUE(email) INCLUDE
+            -- (tenant_id) for tenant-scoped). indnkeyatts = key count.
+            -- `indkey::int[]` keeps int2vector's 0-based lower bound,
+            -- so the first indnkeyatts elements are [0 : indnkeyatts-1].
+            FROM unnest((i.indkey::int[])[0:i.indnkeyatts - 1])
+                 WITH ORDINALITY AS k(attnum, ord)
             LEFT JOIN pg_catalog.pg_attribute a
                 ON a.attrelid = i.indrelid
                AND a.attnum = k.attnum
@@ -470,6 +536,8 @@ ORDER BY i.indrelid, c.relname
 _SECDEF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
+    n.nspname AS schema_name,
+    p.proname AS function_name,
     p.prosrc AS body,
     l.lanname AS lang,
     p.proconfig AS config,
@@ -576,21 +644,23 @@ ORDER BY mem.rolname, tgt.rolname
 # what remains is user-defined functions a superuser deliberately
 # marked LEAKPROOF (only a superuser can).
 #
-# `SELECT DISTINCT` collapses overloads: `public.f(int)` and
-# `public.f(text)` both marked LEAKPROOF yield a single `public.f`
-# row. This matches SEC017's allowlist granularity — the allowlist
-# key is the qualified name with no signature, so one allowlist
-# entry already covers every overload; one finding per qualified
-# name keeps the report aligned with that.
+# Each overload is captured as its OWN row (no DISTINCT, since v12):
+# `public.f(int)` and `public.f(text)` both marked LEAKPROOF yield two
+# rows, each carrying its `signature`
+# (`pg_get_function_identity_arguments`) plus schema_name / function_name —
+# so a SEC017 fixer can target `ALTER FUNCTION name(<signature>) NOT
+# LEAKPROOF` per overload. SEC017 itself dedupes across overloads for its
+# qualified-name-level reporting (and the allowlist key is the qualified
+# name, so one entry covers every overload). The body (`prosrc`/`lanname`)
+# is NOT fetched — unlike `_SECDEF_FUNCS_SQL`, SEC017 is an audit prompt,
+# not a body analysis.
 #
-# Only the qualified name is selected — SEC017 is an audit prompt,
-# it does not parse the body (unlike `_SECDEF_FUNCS_SQL`, which
-# also fetches `prosrc`/`lanname` for VIEW004).
-#
-# ORDER BY qname for snapshot determinism.
+# ORDER BY qname, signature for snapshot determinism across overloads.
 _LEAKPROOF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
+    n.nspname AS schema_name,
+    p.proname AS function_name,
     pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
@@ -648,6 +718,8 @@ def _fetch_secdef_functions(
             language=row["lang"],
             search_path=_extract_search_path(row["config"]),
             signature=row["signature"] or "",
+            schema_name=row["schema_name"],
+            function_name=row["function_name"],
         )
         for row in cur.fetchall()
     )
@@ -724,6 +796,8 @@ def _fetch_leakproof_functions(
         LeakproofFunction(
             qualified_name=row["qname"],
             signature=row["signature"] or "",
+            schema_name=row["schema_name"],
+            function_name=row["function_name"],
         )
         for row in cur.fetchall()
     )
@@ -753,40 +827,60 @@ def _build_secdef_calls_index(
     # strings, and snapshot v4 stores `security_definer_calls` as part
     # of the byte-stable Schema serialization, so non-deterministic
     # canonicalization would silently shuffle snapshots between runs.
-    # If two SECDEF functions share the same bare name across schemas,
-    # `setdefault` keeps the alphabetically-first qualified form. This
-    # is a best-effort attribution path: `find_func_calls` still
-    # matches the qualified form exactly when `pg_get_viewdef` emits
-    # it, and the bare-only fallback is rare in practice (most viewdef
-    # output qualifies cross-schema function calls). VIEW004 takes a
-    # different tack at the *table*-ref layer — when a bare table name
-    # in a function body could resolve to multiple RLS-protected
-    # tables, it over-reports all candidates rather than picking one —
-    # because the rule's user-facing message is what surfaces the
-    # leak, and under-attribution there would be silently insecure.
-    # The two layers (function-name canonicalization here, table-name
-    # over-reporting in VIEW004) chose opposite trade-offs based on
-    # what failure mode hurts the user most.
-    bare_to_qual: dict[str, str] = {}
+    # If two SECDEF functions share the same bare name across schemas, a
+    # bare `helper()` call in a view body could resolve to EITHER. Map each
+    # bare name to ALL qualified SECDEF names that share it and feed every
+    # candidate into the view's `security_definer_calls`, so VIEW004 parses
+    # every possible body. This mirrors VIEW004's table-ref layer (which
+    # over-reports all bare-name table candidates) and makes the same
+    # choice: under-attribution here would be a SILENTLY MISSED leak — the
+    # benign overload analyzed while the leaking one is skipped — which is
+    # the worse failure for a security rule. `find_func_calls` still matches
+    # a qualified call exactly when `pg_get_viewdef` emits it; the bare-name
+    # expansion only ADDS candidates, never drops the exact match. Sorting
+    # keeps the result byte-stable for the snapshot.
+    bare_to_quals: dict[str, list[str]] = {}
     for q in sorted(secdef_qnames):
-        bare_to_qual.setdefault(q.rsplit(".", 1)[-1], q)
-    name_set = secdef_qnames | set(bare_to_qual.keys())
+        bare_to_quals.setdefault(q.rsplit(".", 1)[-1], []).append(q)
+    name_set = secdef_qnames | set(bare_to_quals.keys())
 
     out: dict[tuple[str, str], tuple[str, ...]] = {}
     for row in view_rows:
         key = (row["schema_name"], row["view_name"])
         try:
             parsed = pglast.parse_sql(row["definition"])
+            if not parsed:
+                out[key] = ()
+                continue
+            matches = find_func_calls(parsed[0].stmt, name_set)
         except pglast.parser.ParseError:
             # An unparseable view body is not a fatal error for
             # introspection — skip SECDEF detection for this view
             # (other rules still see its references / flags).
             out[key] = ()
             continue
-        if not parsed:
+        except RecursionError:
+            # A pathologically deep view body (~1000+ nested calls)
+            # parses fine in pglast's C parser but blows Python's
+            # recursion limit inside the pure-Python find_func_calls
+            # walk. RecursionError subclasses RuntimeError (not
+            # ParseError), so without this guard it escapes introspect()
+            # and crashes pgrls with a raw traceback instead of degrading
+            # — and this path is reached on the common schema that has a
+            # SECURITY DEFINER function. Skip SECDEF attribution for this
+            # one view (mirrors the rule-time walk guard in
+            # cli._run_rules) rather than aborting all introspection.
+            # Under-attribution here means a possibly-missed VIEW004 leak
+            # candidate; the view is named on stderr so the operator can
+            # follow up.
+            print(
+                f"pgrls: warning: skipping SECURITY DEFINER call detection "
+                f"for view {key[0]}.{key[1]}: body too deeply nested to "
+                f"walk.",
+                file=sys.stderr,
+            )
             out[key] = ()
             continue
-        matches = find_func_calls(parsed[0].stmt, name_set)
         found: set[str] = set()
         for m in matches:
             # `find_func_calls` may also return `SQLValueFunction`
@@ -803,12 +897,57 @@ def _build_secdef_calls_index(
             qualified = ".".join(parts)
             if qualified in secdef_qnames:
                 found.add(qualified)
-            else:
-                bare = parts[-1]
-                if bare in bare_to_qual:
-                    found.add(bare_to_qual[bare])
+            elif len(parts) == 1:
+                # Over-report ONLY for a genuinely UNQUALIFIED call: its
+                # target depends on the runtime search_path, so feed ALL
+                # SECDEF functions sharing the bare name to VIEW004 (the
+                # leaking overload is never silently skipped — see the
+                # bare_to_quals comment above).
+                #
+                # A QUALIFIED call (`other.read_secret()`) names exactly
+                # one function with no search_path ambiguity. If that
+                # exact qualified name is not a SECDEF function it is a
+                # non-match and must be dropped — NOT expanded to a
+                # same-bare-name SECDEF in another schema, which would
+                # taint every view in the database calling any
+                # `<schema>.read_secret()` (a false positive that also
+                # persists into the snapshot's security_definer_calls).
+                found.update(bare_to_quals.get(parts[-1], ()))
         out[key] = tuple(sorted(found))
     return out
+
+
+def _resolve_view_base_tables(
+    view_key: tuple[str, str],
+    deps_index: dict[tuple[str, str], set[tuple[str, str]]],
+    view_keys: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """The transitive base-table set a view reads, chasing view→view edges.
+
+    `deps_index` maps each introspected view to its DIRECT dependency
+    relations — tables AND other views (relkind v/m). A reference that is
+    itself an introspected view is chased; anything else is a base table
+    (or an out-of-scope relation we cannot resolve further) and is
+    collected. So a `view → view → table` chain surfaces the underlying
+    table in the outer view's references, which is what VIEW001/002/003 and
+    the view fixer intersect against RLS-enabled tables. Postgres forbids
+    circular view dependencies, but the `visited` guard keeps this
+    terminating regardless.
+    """
+    tables: set[tuple[str, str]] = set()
+    visited: set[tuple[str, str]] = set()
+    stack = [view_key]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for ref in deps_index.get(current, set()):
+            if ref in view_keys:
+                stack.append(ref)
+            else:
+                tables.add(ref)
+    return tables
 
 
 def _build_views(
@@ -838,6 +977,13 @@ def _build_views(
         deps_index.setdefault(key, set()).add(
             (row["ref_schema"], row["ref_name"])
         )
+    # `deps_index` now holds DIRECT edges to tables AND views. Collapse
+    # view→view edges to the base tables the chain ultimately reads so
+    # `references` stays "tables the view body reads" but is transitive —
+    # a view built on another view no longer drops the underlying table.
+    view_keys = {
+        (row["schema_name"], row["view_name"]) for row in view_rows
+    }
     secdef_index = _build_secdef_calls_index(secdef_functions, view_rows)
     return tuple(
         View(
@@ -848,7 +994,11 @@ def _build_views(
             security_barrier=row["security_barrier"],
             definition=row["definition"],
             references=tuple(sorted(
-                deps_index.get((row["schema_name"], row["view_name"]), set())
+                _resolve_view_base_tables(
+                    (row["schema_name"], row["view_name"]),
+                    deps_index,
+                    view_keys,
+                )
             )),
             security_definer_calls=secdef_index.get(
                 (row["schema_name"], row["view_name"]), ()
@@ -931,6 +1081,26 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 row["privilege_type"]
             )
 
+        # Column-level grants (pg_attribute.attacl), grouped per
+        # (role, column) so each column grant is one ColumnGrant.
+        cur.execute(_COLUMN_GRANTS_SQL, (schemas,))
+        col_grants_acc: dict[
+            int, dict[tuple[str, str], list[str]]
+        ] = defaultdict(lambda: defaultdict(list))
+        for row in cur.fetchall():
+            col_grants_acc[row["table_oid"]][
+                (row["role_name"], row["column_name"])
+            ].append(row["privilege_type"])
+        column_grants_by_oid: dict[int, list[ColumnGrant]] = {
+            oid: [
+                ColumnGrant(
+                    role=role, column=col, privileges=tuple(privs)
+                )
+                for (role, col), privs in sorted(rolecol.items())
+            ]
+            for oid, rolecol in col_grants_acc.items()
+        }
+
         secdef_funcs = _fetch_secdef_functions(cur, schemas)
         views = _build_views(cur, schemas, secdef_funcs)
 
@@ -977,13 +1147,14 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # always has at least one of INSERT / DELETE / UPDATE /
         # TRUNCATE set, and the CASE chain in `_TRIGGERS_SQL` covers
         # all four. If a future Postgres adds a fifth event bit
-        # pgrls doesn't recognize, every CASE arm produces NULL,
-        # `array_remove(..., NULL)` empties the array, and
-        # `array_to_string([], ' OR ')` yields NULL. Raise loudly so
-        # the operator files a bug rather than seeing a malformed
-        # "(BEFORE )" message that's easy to misread. Matches the
-        # `polcmd` unknown-value handling below.
-        if row["event"] is None:
+        # pgrls doesn't recognize, every CASE arm produces NULL and
+        # `array_remove(..., NULL)` empties the array — but
+        # `array_to_string([], ' OR ')` yields the EMPTY STRING, not
+        # NULL. Guard on falsiness (catches both '' and None) so the
+        # documented failsafe actually fires; otherwise a future event
+        # bit would silently produce a malformed "(BEFORE )" message.
+        # Matches the `polcmd` unknown-value handling below.
+        if not row["event"]:
             raise RuntimeError(
                 f"Unknown pg_trigger.tgtype event bits for trigger "
                 f"{row['trigger_name']!r} (table OID "
@@ -1066,6 +1237,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             ),
             triggers=tuple(triggers_by_oid.get(row["table_oid"], [])),
             indexes=tuple(indexes_by_oid.get(row["table_oid"], [])),
+            column_grants=tuple(
+                column_grants_by_oid.get(row["table_oid"], [])
+            ),
         )
         for row in table_rows
     ]

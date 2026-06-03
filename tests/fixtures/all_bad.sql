@@ -36,9 +36,16 @@ CREATE POLICY inverted ON public.allbad_sec004
         OR user_id = current_setting('app.user_id', true)
     );
 
--- SEC006: UPDATE policy missing WITH CHECK. (current_setting is also
--- unwrapped here, so PERF001 fires on this policy too — that's
--- intentional, the combined fixture is meant to exercise every rule.)
+-- update_no_check: restrictive FOR UPDATE with a real USING and no
+-- WITH CHECK. SEC006 must NOT fire on it — Postgres reuses the USING as
+-- the implicit WITH CHECK (for restrictive policies too), so it is not a
+-- dead policy. It stays for PERF001 (unwrapped current_setting), SEC030
+-- (nullable tenant scope) and SEC012 (restrictive-only set).
+-- insert_dead: restrictive FOR INSERT with no WITH CHECK — INSERT carries
+-- no USING for Postgres to reuse, so the missing WITH CHECK genuinely
+-- defaults to `true` and the policy constrains nothing. THIS is what fires
+-- SEC006 (restrictive dead-policy diagnosis), and being restrictive it
+-- keeps the table's policy set restrictive-only so SEC012 still fires.
 CREATE TABLE public.allbad_sec006 (id INT, tenant_id TEXT);
 ALTER TABLE public.allbad_sec006 ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.allbad_sec006 FORCE ROW LEVEL SECURITY;
@@ -46,6 +53,9 @@ CREATE POLICY update_no_check ON public.allbad_sec006
     AS RESTRICTIVE
     FOR UPDATE TO PUBLIC
     USING (tenant_id = current_setting('app.t', true));
+CREATE POLICY insert_dead ON public.allbad_sec006
+    AS RESTRICTIVE
+    FOR INSERT TO PUBLIC;
 
 -- HYG001: orphaned column reference. Postgres 16 prevents real DROP COLUMN
 -- when a policy depends on it, so simulate the orphaned state by marking

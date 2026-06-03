@@ -55,12 +55,16 @@ What SEC026 catches:
   `user_email LIKE (SELECT current_setting('app.email', true))` is
   semantically identical to the un-wrapped form — Postgres evaluates
   the scalar SubLink to a value and feeds it to `LIKE` — so SEC026
-  inspects operand subtrees including SubLink contents. The PERF001
-  wrap idiom does not close this hole. The same outer walk also
-  reaches A_Expr nodes inside a sub-select on its own (e.g.
-  `EXISTS (SELECT 1 FROM members WHERE m.email LIKE
-  current_setting(...))` fires on the inner LIKE), but each policy
-  is reported once — `check` short-circuits on the first match.
+  treats a FROM-less scalar sub-select (the PERF001 wrap idiom) as the
+  pattern operand. A sub-select WITH a from clause is a *lookup*, not
+  the pattern: an auth call buried in its WHERE/JOIN (`user_email LIKE
+  (SELECT pattern FROM patterns WHERE owner = current_user)`) is a row
+  filter, not the value driving the predicate, so SEC026 does NOT fire
+  on it (see `_side_has_auth_call`). The same outer walk still reaches
+  A_Expr nodes inside a sub-select on its own (e.g. `EXISTS (SELECT 1
+  FROM members WHERE m.email LIKE current_setting(...))` fires on the
+  inner LIKE), but each policy is reported once — `check`
+  short-circuits on the first match.
 
 What SEC026 deliberately does not catch:
 
@@ -102,9 +106,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, Node, String
+from pglast.ast import (
+    A_Const,
+    A_Expr,
+    FuncCall,
+    Node,
+    SelectStmt,
+    String,
+    SubLink,
+    TypeCast,
+)
 
-from pgrls.ast_utils import find_func_calls
+from pgrls.ast_utils import find_func_calls, func_name_parts
 from pgrls.model import Policy, Schema
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -150,6 +163,16 @@ _PATTERN_OP_NAMES: frozenset[str] = frozenset(
     {"~~", "~~*", "!~~", "!~~*", "~", "~*", "!~", "!~*"}
 )
 
+# The NEGATED pattern operators: NOT LIKE / NOT ILIKE / !~ / !~*. A
+# wildcard auth value (`%` / `.*`) on these makes the predicate FALSE for
+# every row — it DENIES all access (fail-closed), the opposite of the
+# positive operators' "matches every row" exposure. The finding still
+# fires (a wildcard GUC corrupts a deny-list predicate), but the impact
+# message must describe denial, not exposure.
+_NEGATED_PATTERN_OP_NAMES: frozenset[str] = frozenset(
+    {"!~~", "!~~*", "!~", "!~*"}
+)
+
 
 def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
     raw = options.get("auth_functions")
@@ -193,51 +216,233 @@ def _is_pattern_expr(node: A_Expr) -> bool:
     return name is not None and name in _PATTERN_OP_NAMES
 
 
-def _side_has_auth_call(side: Any, names: set[str]) -> bool:
-    """True if `side` (an operand of an A_Expr) contains an
-    auth-context function call.
+# `~` and `!~` are POSIX regex match on text, but they are ALSO the
+# geometric "contains" operator and the ltree/lquery match operator.
+# When SEC026's auth value is cast to (or constructed as) one of these
+# non-text types, the operator is a typed containment/match — not a
+# regex pattern — and the rule must not fire (false positive). The LIKE
+# family (`~~`/`~~*`/`!~~`/`!~~*`) and case-insensitive regex (`~*`/
+# `!~*`) are text-only and never overloaded, so they are not guarded.
+_OVERLOADED_REGEX_OPS: frozenset[str] = frozenset({"~", "!~"})
+_NON_TEXT_PATTERN_TYPES: frozenset[str] = frozenset({
+    "point", "box", "circle", "polygon", "path", "line", "lseg",
+    "ltree", "lquery", "ltxtquery",
+})
 
-    Unlike SEC018, SEC026 does NOT pass `exclude_sublinks=True`:
-    `col LIKE (SELECT current_setting(...))` evaluates the scalar
-    SubLink to a value and feeds it to `LIKE`, so the
-    SubLink-wrapped form is the same vulnerability as the
-    un-wrapped one and must fire. The outer walk's recursion into
-    SubLinks still independently inspects A_Expr nodes inside a
-    sub-select; the per-policy short-circuit in `check` keeps each
-    policy to one Violation regardless.
+
+def _is_non_text_typed(side: Any) -> bool:
+    """True if `side`'s top node casts to — or constructs — a non-text
+    type (geometric / ltree), i.e. the operand of a geometric/ltree
+    `~`, not a text regex pattern."""
+    if isinstance(side, TypeCast):
+        names = [
+            s.sval
+            for s in (side.typeName.names or ())
+            if isinstance(s, String)
+        ]
+        return bool(names) and names[-1] in _NON_TEXT_PATTERN_TYPES
+    if isinstance(side, FuncCall):
+        fnames = [
+            s.sval for s in (side.funcname or ()) if isinstance(s, String)
+        ]
+        return bool(fnames) and fnames[-1] in _NON_TEXT_PATTERN_TYPES
+    return False
+
+
+def _fromless_subselects(side: Any) -> list[SelectStmt]:
+    """Scalar sub-selects in `side` that have NO from clause.
+
+    A `(SELECT current_setting('app.x'))` — no FROM — carries the
+    compared value in its target list; that is the wrapped form
+    PERF001 recommends, and it IS the LIKE/regex pattern operand. A
+    sub-select WITH a from clause (`(SELECT pattern FROM patterns WHERE
+    owner = current_user)`) is a lookup whose internal predicates are
+    NOT the pattern the outer column matches against, so it must not be
+    treated as the auth operand. Mirrors SEC030's helper of the same
+    name. The walk inspects only fromless-ness at this level, not
+    sub-select bodies.
     """
-    return bool(find_func_calls(side, names))
+    out: list[SelectStmt] = []
 
-
-def _has_pattern_against_auth(node: Any, names: set[str]) -> bool:
-    """Walk the AST and return True if any `A_Expr` is a pattern
-    operator with an auth-context function call on either operand.
-
-    Mirrors SEC018's `_compares_role_identity_to_own_column`: walks
-    every node (recursing into sub-selects so a nested A_Expr is
-    independently inspected) and checks each `A_Expr` whose `kind`
-    qualifies as a pattern operator.
-    """
-
-    def walk(n: Any) -> bool:
+    def walk(n: Any) -> None:
         if n is None:
-            return False
+            return
         if isinstance(n, (list, tuple)):
-            return any(walk(item) for item in n)
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, SubLink):
+            sub = n.subselect
+            if isinstance(sub, SelectStmt) and not sub.fromClause:
+                out.append(sub)
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(side)
+    return out
+
+
+def _effective_operand(side: Any) -> Any:
+    """The expression a pattern operator actually compares against.
+
+    For the FROM-less scalar sub-select PERF001 recommends
+    (`path ~ (SELECT current_setting('app.q')::lquery)`), the compared
+    value is the sub-select's single projected expression, not the
+    `SubLink` wrapper. `_side_has_auth_call` already looks THROUGH that
+    wrapper to find the auth call; the non-text-type guard must look
+    through the SAME wrapper, or it inspects the SubLink (whose top node
+    is not the `::lquery` cast), the guard returns False, and SEC026
+    false-fires on the very rewrite pgrls advocates. Returns the
+    projection (`targetList[0].val`) for a bare single-target FROM-less
+    scalar sub-select, else `side` unchanged. (R15 #4)
+    """
+    if isinstance(side, SubLink):
+        sub = side.subselect
+        if (
+            isinstance(sub, SelectStmt)
+            and not sub.fromClause
+            and sub.targetList
+            and len(sub.targetList) == 1
+        ):
+            val = getattr(sub.targetList[0], "val", None)
+            if val is not None:
+                return val
+    return side
+
+
+def _side_has_auth_call(side: Any, names: set[str]) -> bool:
+    """True if the LIKE/regex pattern operand `side` IS an auth value.
+
+    The auth value drives the pattern when it is a *direct* call
+    (`col LIKE current_setting(...)`) or lives in the projection of a
+    FROM-less scalar sub-select (`col LIKE (SELECT current_setting())`,
+    the form PERF001 recommends). `exclude_sublinks=True` on the direct
+    pass keeps a sub-select's *internal* predicate out of the operand's
+    value; the fromless branch then re-adds the wrapped recommended form.
+
+    A sub-select WITH a from clause is a lookup, not the pattern, so an
+    auth call buried in its WHERE/JOIN (`col LIKE (SELECT pattern FROM
+    patterns WHERE owner = current_user)`) is NOT counted — avoiding a
+    false positive where current_user is merely a row filter. The outer
+    `_has_pattern_against_auth` walk still inspects any A_Expr inside the
+    sub-select independently, so a genuine inner pattern still fires.
+    """
+    if find_func_calls(side, names, exclude_sublinks=True):
+        return True
+    return any(
+        find_func_calls(sub.targetList, names, exclude_sublinks=True)
+        for sub in _fromless_subselects(side)
+    )
+
+
+def _is_literal_pattern(side: Any) -> bool:
+    """True if `side` is a fixed string literal pattern — an `A_Const`
+    string, possibly wrapped in casts or a FROM-less scalar sub-select.
+
+    Such a pattern is entirely author-controlled: every `%`/`_`/`.*`
+    metacharacter is written in the policy itself, so the attacker has
+    nothing to inject. (Contrast a GUC/JWT auth value or a data-driven
+    column pattern, where the wildcard can come from outside.)
+    Unwraps the same FROM-less scalar sub-select wrapper as
+    `_effective_operand` so `(SELECT 'admin%')` is recognized too.
+    """
+    node = _effective_operand(side)
+    while isinstance(node, TypeCast):
+        node = node.arg
+    if isinstance(node, A_Const) and isinstance(node.val, String):
+        return True
+    # Postgres rewrites `X SIMILAR TO 'lit'` into
+    # `X OPERATOR(pg_catalog.~) pg_catalog.similar_to_escape('lit')` (and
+    # `similar_to_escape('lit', 'esc')` for an explicit ESCAPE), so the
+    # pattern operand of a SIMILAR TO is a FuncCall, not a bare A_Const.
+    # A `similar_to_escape(<string literal>, …)` is still an entirely
+    # author-controlled literal pattern with no attacker-injectable
+    # wildcard — recognize it so the R16 #4 admin-escape guard treats
+    # SIMILAR TO identically to LIKE / `~` (as the rule docstring states),
+    # rather than false-firing on `current_user SIMILAR TO 'admin%'`.
+    if isinstance(node, FuncCall):
+        _, bare = func_name_parts(node)
+        if bare == "similar_to_escape" and node.args:
+            first = node.args[0]
+            while isinstance(first, TypeCast):
+                first = first.arg
+            return isinstance(first, A_Const) and isinstance(first.val, String)
+    return False
+
+
+def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
+    """Walk the AST and return the set of pattern-operator names that
+    compare against an auth-context function on either operand.
+
+    Empty set means no match (the rule does not fire). The names let the
+    caller distinguish positive operators (`~~`, `~`, …) from negated
+    ones (`!~~`, `!~`, …), whose failure mode is denial, not exposure.
+
+    Mirrors SEC018's `_compares_role_identity_to_own_column`: walks every
+    node (recursing into sub-selects so a nested A_Expr is independently
+    inspected) and checks each `A_Expr` whose name qualifies as a pattern
+    operator.
+    """
+    found: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
         if isinstance(n, A_Expr) and _is_pattern_expr(n):
-            if _side_has_auth_call(n.lexpr, names) or _side_has_auth_call(
-                n.rexpr, names
-            ):
-                return True
+            op = _expr_name(n)
+            overloaded = op in _OVERLOADED_REGEX_OPS
+            for side, other in ((n.lexpr, n.rexpr), (n.rexpr, n.lexpr)):
+                if not _side_has_auth_call(side, names):
+                    continue
+                # `~` / `!~` double as geometric "contains" and the
+                # ltree/lquery match operator. If EITHER operand is cast
+                # to / built as a non-text type, this isn't a text regex
+                # match — skip (false positive). The non-text cast may
+                # sit on the auth-value side
+                # (`current_setting(...)::lquery ~ col`) OR on the
+                # column side (`(path::lquery) ~ current_setting(...)`),
+                # so both operands must be checked. Unwrap a FROM-less
+                # scalar sub-select first via `_effective_operand` so the
+                # PERF001-recommended `~ (SELECT …::lquery)` form is
+                # judged on its projected cast, not the opaque SubLink —
+                # the same wrapper `_side_has_auth_call` looks through.
+                if overloaded and (
+                    _is_non_text_typed(_effective_operand(side))
+                    or _is_non_text_typed(_effective_operand(other))
+                ):
+                    continue
+                # FP guard (R16 #4): the genuine hazard is a wildcard the
+                # ATTACKER can inject — i.e. the auth value is the PATTERN
+                # operand (`col LIKE current_setting(...)`, where a GUC set
+                # to `%`/`.*` matches every row). When the auth value is
+                # instead the SUBJECT (`side is n.lexpr`) and the pattern
+                # (`other`, the right operand) is a fixed string literal —
+                # `current_user ~~ 'admin%'`, `current_setting('app.role')
+                # ~ '^tenant_'` — every metacharacter is author-controlled
+                # and there is nothing to inject, so it is safe. Keep
+                # firing only when the pattern is itself a data-driven
+                # column/expression (which could carry an injected
+                # wildcard), mirroring SEC018's `current_user = 'postgres'`
+                # admin-escape allowance for the equality case.
+                if side is n.lexpr and _is_literal_pattern(other):
+                    continue
+                if op is not None:
+                    found.add(op)
+                break
             # fall through — the A_Expr may have nested A_Expr
             # nodes deeper in its operands.
         if isinstance(n, Node):
             for field_name in n:
-                if walk(getattr(n, field_name, None)):
-                    return True
-        return False
+                walk(getattr(n, field_name, None))
 
-    return walk(node)
+    walk(node)
+    return found
 
 
 def _policy_id(table_schema: str, table_name: str, policy: Policy) -> str:
@@ -260,32 +465,56 @@ class SEC026:
                 policy_id = _policy_id(table.schema, table.name, policy)
                 if policy_id in allowlist:
                     continue
-                fires = False
+                matched_ops: set[str] = set()
                 for ast in (policy.using_ast, policy.with_check_ast):
-                    if ast is not None and _has_pattern_against_auth(ast, names):
-                        fires = True
-                        break
-                if not fires:
+                    if ast is not None:
+                        matched_ops |= _pattern_ops_against_auth(ast, names)
+                if not matched_ops:
                     continue
                 out.append(
                     Violation(
                         rule_id="SEC026",
                         severity=self.severity,
                         title=self.title,
-                        message=(
-                            f"Policy {policy.name!r} on "
-                            f"{table.qualified_name} compares a value against "
-                            "an auth-context function using a pattern "
-                            "operator (LIKE / ILIKE / SIMILAR TO / regex). "
-                            "Pattern operators make the predicate depend on "
-                            "the shape of the auth value — a GUC set to "
-                            "'%' or '.*' would match every row. Use '=' "
-                            "(or wrap both sides in lower() for "
-                            "case-insensitive equality) or include the "
-                            "policy in [lint.rules.SEC026].allowlist if the "
-                            "pattern semantics are deliberate."
+                        message=self._message(
+                            policy.name, table.qualified_name, matched_ops
                         ),
                         location=policy_id,
                     )
                 )
         return out
+
+    @staticmethod
+    def _message(
+        policy_name: str, qualified_name: str, matched_ops: set[str]
+    ) -> str:
+        head = (
+            f"Policy {policy_name!r} on {qualified_name} compares a value "
+            "against an auth-context function using a pattern operator "
+            "(LIKE / ILIKE / SIMILAR TO / regex). "
+        )
+        # If EVERY matched operator is negated (NOT LIKE / !~), a wildcard
+        # auth value makes the predicate FALSE for all rows — it denies,
+        # it does not expose. Any positive operator present means the
+        # exposure framing applies.
+        if matched_ops <= _NEGATED_PATTERN_OP_NAMES:
+            impact = (
+                "This is a negated pattern operator (NOT LIKE / NOT ILIKE "
+                "/ !~), so the predicate's tightness depends on the shape "
+                "of the auth value — a GUC set to '%' or '.*' would match "
+                "every row and therefore DENY every row, silently hiding "
+                "all data. "
+            )
+        else:
+            impact = (
+                "Pattern operators make the predicate depend on the shape "
+                "of the auth value — a GUC set to '%' or '.*' would match "
+                "every row, exposing every row. "
+            )
+        fix = (
+            "Use '=' (or wrap both sides in lower() for case-insensitive "
+            "equality) or include the policy in "
+            "[lint.rules.SEC026].allowlist if the pattern semantics are "
+            "deliberate."
+        )
+        return head + impact + fix

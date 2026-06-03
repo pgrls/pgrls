@@ -62,6 +62,20 @@ def test_sec019_fires_on_one_arg_current_setting() -> None:
     assert "[lint.rules.SEC019]" in v.message
 
 
+def test_sec019_silent_on_user_defined_current_setting() -> None:
+    # R14 #3 (sibling of the SEC024 fix): SEC019's premise is the BUILTIN
+    # current_setting's missing_ok-less overload. find_func_calls matches
+    # on bare OR qualified name, so a user-defined
+    # `myschema.current_setting('app.x')` — unrelated to the builtin's
+    # overload semantics — used to mis-fire. It must be skipped while the
+    # builtin (bare and pg_catalog-qualified) keeps firing.
+    schema = _wrap(_policy("tenant_id = myschema.current_setting('app.x')"))
+    assert SEC019().check(schema, {}) == []
+    # Sanity: the pg_catalog-qualified builtin one-arg form still fires.
+    fires = _wrap(_policy("tenant_id = pg_catalog.current_setting('app.x')"))
+    assert len(SEC019().check(fires, {})) == 1
+
+
 def test_sec019_fires_when_one_arg_only_in_with_check() -> None:
     p = _policy(
         with_check="tenant_id = current_setting('app.tenant')",

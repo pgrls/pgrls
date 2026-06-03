@@ -61,6 +61,11 @@ def format_markdown(violations: list[Violation]) -> str:
         n = counts.get(sev, 0)
         if n:
             parts.append(f"{n} {sev}{'s' if n != 1 else ''}")
+    # Off-spec severities (from an extra rule) appended after the known
+    # ones, sorted, so the tally never silently drops a finding.
+    for sev in sorted((s for s in counts if s not in ALL_SEVERITIES), key=str):
+        n = counts[sev]
+        parts.append(f"{n} {sev}{'s' if n != 1 else ''}")
     summary = ", ".join(parts)
     total = len(violations)
 
@@ -76,7 +81,9 @@ def format_markdown(violations: list[Violation]) -> str:
 
 
 def _row(v: Violation) -> str:
-    severity = _SEVERITY_LABEL[v.severity]
+    # Fail soft on an off-spec severity (the gate tolerates it): fall back
+    # to the raw severity string rather than KeyError-ing the whole run.
+    severity = _SEVERITY_LABEL.get(v.severity, str(v.severity))
     rule_link = _rule_link(v.rule_id)
     message = _escape_cell(v.message)
     return f"| {severity} | {rule_link} | {_location_cell(v.location)} | {message} |\n"

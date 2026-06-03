@@ -36,7 +36,13 @@ from pgrls.fixers._idents import (
     quote_ident,
     quote_qualified,
 )
-from pgrls.model import Policy, Schema, Table, policy_to_sql
+from pgrls.model import (
+    Policy,
+    Schema,
+    Table,
+    _is_safe_data_type,
+    policy_to_sql,
+)
 
 Convention = Literal["app-guc", "postgrest", "supabase"]
 # What the discriminator scopes rows to: a tenant (per-tenant isolation) or
@@ -94,6 +100,37 @@ class GenerateResult:
     notes: tuple[str, ...] = ()
 
 
+def _auth_function_sql(fn: str) -> str:
+    """Render an `--auth-function` value as a quoted function reference.
+
+    Accepts a bare name (`uid` -> `"uid"`) or a `schema.function` pair
+    (`auth.uid` -> `auth."uid"`), splitting on the rightmost dot and
+    quoting each segment independently.
+
+    A value with MORE THAN ONE dot is rejected: pgrls qualifies a
+    function as schema.function only, so `rpartition('.')` would fold the
+    extra dots into a single quoted schema (`a.b.c` -> `"a.b".c()`),
+    silently emitting a reference to a function that does not exist —
+    `generate --apply` then aborts the whole all-or-nothing batch with a
+    Postgres "function does not exist" error. Reject early with a clear
+    message instead (mirrors the `seed()` table-name guard in
+    testing/client.py). A schema or function name that genuinely contains
+    a dot must be handled by passing the qualified pieces explicitly; it
+    cannot be disambiguated from a dotted name here.
+    """
+    if fn.count(".") > 1:
+        raise ValueError(
+            f"--auth-function {fn!r} has more than one dot. Expected a "
+            'bare function name (e.g. "uid") or a schema-qualified name '
+            '(e.g. "auth.uid"); a multi-part name is ambiguous and would '
+            "render an invalid function reference."
+        )
+    if "." in fn:
+        schema_part, _, name_part = fn.rpartition(".")
+        return quote_qualified(schema_part, name_part)
+    return quote_ident(fn)
+
+
 def session_predicate(
     column: str, coltype: str | None, options: GenerateOptions
 ) -> str:
@@ -115,12 +152,7 @@ def session_predicate(
     if options.convention == "supabase":
         # `col = (SELECT auth.uid())` — the canonical Supabase row-owner
         # form. No cast: auth.uid() returns uuid (match a uuid column).
-        fn = options.auth_function
-        if "." in fn:
-            schema_part, _, name_part = fn.rpartition(".")
-            fn_sql = quote_qualified(schema_part, name_part)
-        else:
-            fn_sql = quote_ident(fn)
+        fn_sql = _auth_function_sql(options.auth_function)
         return f"{qcol} = (SELECT {fn_sql}())"
 
     setting = options.resolved_setting(column)
@@ -128,6 +160,20 @@ def session_predicate(
     escaped = setting.replace("'", "''")
     call = f"current_setting('{escaped}', true)"
     if coltype and coltype.lower() not in _TEXT_TYPES:
+        # `coltype` is spliced raw into a `::<type>` cast. It comes from
+        # live introspection (`format_type`), which is always a benign
+        # type expression — but route it through the same probe-parse
+        # validator the snapshot trust boundary uses, so the cast can
+        # never become an injection sink if a snapshot-fed source is
+        # added later. A real type (`uuid`, `numeric(10,2)`, `text[]`,
+        # `"My Type"`) passes; a tampered `uuid); DROP …` is rejected.
+        if not _is_safe_data_type(coltype):
+            raise ValueError(
+                f"refusing to build a cast from an unsafe column type "
+                f"{coltype!r} for column {column!r}: it does not parse as a "
+                "single bare column type. This should never happen for a "
+                "type read from live introspection."
+            )
         call = f"{call}::{coltype}"
     return f"{qcol} = (SELECT {call})"
 
@@ -143,9 +189,12 @@ def _column_nullable(table: Table, column: str) -> bool:
     for col in table.column_details:
         if col.name == column:
             return col.is_nullable
-    # Unknown (older snapshot without column_details) — assume nullable so
-    # we surface the SEC030 caveat rather than silently asserting NOT NULL.
-    return True
+    # Unknown (older snapshot without column_details). plan_generation
+    # now skips a table whose discriminator has no captured type before
+    # consulting nullability, so this fallback is unreachable from that
+    # path; keep it as a defensive default (assume nullable → surface the
+    # SEC030 caveat rather than silently asserting NOT NULL).
+    return True  # pragma: no cover - guarded by the type-info skip
 
 
 def _statements_for_table(
@@ -303,6 +352,25 @@ def plan_generation(
                 (
                     table.qualified_name,
                     "already has policies — refine with `pgrls lint` / `fix`",
+                )
+            )
+            continue
+
+        if _column_type(table, column) is None:
+            # No captured type for the discriminator — a pre-v5 snapshot
+            # whose `column_details` is empty. Without the type we cannot
+            # emit a correctly-cast predicate (`tenant_id = (SELECT
+            # current_setting(...))` with no `::uuid` is invalid for a
+            # non-text column), so refuse rather than emit a predicate
+            # that may not apply / lint clean. Live introspection always
+            # carries column_details, so this only guards a stale
+            # snapshot fed to plan_generation; re-introspect to generate.
+            skipped.append(
+                (
+                    table.qualified_name,
+                    f"no captured type for column {column!r} (pre-v5 "
+                    "snapshot) — re-introspect against a live database to "
+                    "generate a correctly-cast predicate",
                 )
             )
             continue

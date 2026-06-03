@@ -188,7 +188,7 @@ JSON (`--format json`):
       "location": "public.users"
     }
   ],
-  "summary": { "errors": 1, "warnings": 0, "infos": 0, "total": 1 }
+  "summary": { "errors": 1, "warnings": 0, "infos": 0, "others": 0, "total": 1 }
 }
 ```
 

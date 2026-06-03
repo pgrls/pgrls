@@ -443,6 +443,91 @@ def test_view004_bare_name_collision_reports_all_rls_candidates() -> None:
     assert "staging.user" in msg
 
 
+def test_view004_bare_cte_name_shadows_rls_table_no_false_positive() -> None:
+    # A SECDEF function body defines an inline CTE whose name collides
+    # with an RLS-protected table (`orders`) and then reads ONLY the
+    # CTE. Postgres resolves the bare `orders` ref to the CTE, not the
+    # base table — so there is no RLS bypass. Without the CTE-shadow
+    # guard, the bare-name resolver would misattribute the ref to the
+    # RLS-protected `public.orders` and fire a false positive. The CTE
+    # body here reads no table at all (`SELECT 1`), so nothing leaks.
+    schema = Schema(
+        tables=(_table("public", "orders", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="orders_view",
+                security_definer_calls=("public.read_orders",),
+            ),
+        ),
+        security_definer_functions=(
+            _secdef(
+                "public.read_orders",
+                'WITH orders AS (SELECT 1 AS x) SELECT * FROM orders',
+            ),
+        ),
+    )
+    assert VIEW004().check(schema, options={}) == []
+
+
+def test_view004_cte_shadow_does_not_suppress_real_leak_inside_cte() -> None:
+    # The CTE-shadow guard must suppress ONLY the bare CTE ref, never a
+    # genuine RLS read. Here the CTE is named `orders` (shadowing the
+    # RLS table) but its body qualifies a read of the *real*
+    # RLS-protected `public.orders`. That qualified read inside the CTE
+    # definition still bypasses RLS via the function owner and must
+    # fire — proving the guard doesn't over-suppress.
+    schema = Schema(
+        tables=(_table("public", "orders", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="orders_view",
+                security_definer_calls=("public.read_orders",),
+            ),
+        ),
+        security_definer_functions=(
+            _secdef(
+                "public.read_orders",
+                "WITH orders AS (SELECT * FROM public.orders) "
+                "SELECT * FROM orders",
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    assert "public.orders" in violations[0].message
+
+
+def test_view004_cte_shadow_is_per_statement_not_whole_body() -> None:
+    # A CTE defined in statement A must NOT suppress a bare leak of the
+    # same name in statement B (CTE scope is per-statement). Statement 1
+    # defines a harmless `orders` CTE; statement 2 reads the bare
+    # `orders` table with no CTE in scope — that is a real leak and must
+    # fire. Collecting CTE names per-statement (not across the whole
+    # body) is what keeps this a true positive.
+    schema = Schema(
+        tables=(_table("public", "orders", rls=True),),
+        views=(
+            _view(
+                schema="public",
+                name="orders_view",
+                security_definer_calls=("public.read_orders",),
+            ),
+        ),
+        security_definer_functions=(
+            _secdef(
+                "public.read_orders",
+                "WITH orders AS (SELECT 1 AS x) SELECT * FROM orders; "
+                "SELECT * FROM orders",
+            ),
+        ),
+    )
+    violations = VIEW004().check(schema, options={})
+    assert len(violations) == 1
+    assert "public.orders" in violations[0].message
+
+
 def test_view004_skips_secdef_function_with_empty_body() -> None:
     # A SECDEF function whose body parses to zero statements (empty,
     # whitespace, or comment-only) yields no range vars to inspect.

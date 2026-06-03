@@ -28,6 +28,7 @@ __all__ = [
     "BypassRlsEscalation",
     "BypassRlsRole",
     "Column",
+    "ColumnGrant",
     "Grant",
     "Index",
     "LeakproofFunction",
@@ -46,7 +47,141 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 13
+SNAPSHOT_VERSION = 15  # v15: per-table column_grants (pg_attribute.attacl)
+# — emitted only when present, so a schema with no column-level grants
+# round-trips byte-identically apart from this version bump. v14:
+# SecdefFunction/LeakproofFunction gain separate schema_name +
+# function_name (the ambiguous qualified_name join cannot be split when a
+# component contains a dot).
+
+# --- Snapshot trust-boundary validation --------------------------------
+#
+# `Schema.to_sql()` restores a snapshot to a scratch database for
+# `pgrls diff --apply`, interpolating snapshot-sourced VALUES (column
+# types, grant privileges, the policy command, the policy predicate)
+# into executed DDL. Identifiers are always quoted via quote_ident, but
+# these value fields are not — so a hand-crafted malicious snapshot
+# file could inject DDL. The decoders validate the structured values at
+# load time and `policy_to_sql` validates the free-form predicate at
+# emit time, so an unsafe snapshot is rejected before any SQL runs.
+
+def _is_safe_data_type(data_type: object) -> bool:
+    """True iff `data_type` is a single, injection-free column type.
+
+    A snapshot's data_type is interpolated raw into ``CREATE TABLE t
+    (col <data_type>)`` by ``to_sql()`` for ``diff --apply``. A character
+    allowlist cannot separate legitimate punctuation (``numeric(10,2)``,
+    ``int[]``, ``"My Type"``) from injection — the comma/parens/quotes a
+    real type needs are exactly what ``integer, evil bool DEFAULT (true)``
+    (adds a column) or ``int) INHERITS (...)`` (adds a clause) abuse. So
+    instead of a regex, parse a probe ``CREATE TABLE`` and require the
+    type to occupy exactly one bare column definition and nothing else.
+    """
+    if not isinstance(data_type, str) or not data_type.strip():
+        return False
+    import pglast
+    from pglast.ast import ColumnDef, CreateStmt
+
+    try:
+        stmts = pglast.parse_sql(
+            f"CREATE TABLE __pgrls_probe (__pgrls_col {data_type})"
+        )
+    except Exception:
+        return False
+    if len(stmts) != 1:  # a `;` smuggled a second statement
+        return False
+    stmt = stmts[0].stmt
+    if not isinstance(stmt, CreateStmt):
+        return False
+    elts = list(stmt.tableElts or ())
+    if len(elts) != 1 or not isinstance(elts[0], ColumnDef):
+        return False  # a `,` added a second column (or a table constraint)
+    col = elts[0]
+    if col.colname != "__pgrls_col" or col.constraints or col.collClause:
+        return False  # embedded DEFAULT/CHECK/GENERATED, or a COLLATE
+        # clause (a legitimate format_type data_type never carries an
+        # inline COLLATE, so rejecting it loses nothing real).
+    # A `)` that closed the column list early to smuggle a table-level
+    # clause (INHERITS / OF type / PARTITION OF / WITH-options).
+    return not any(
+        getattr(stmt, attr, None)
+        for attr in ("inhRelations", "ofTypename", "partbound", "options")
+    )
+
+
+# Table-level privileges Postgres recognizes (pg_class ACL).
+_VALID_TABLE_PRIVILEGES: frozenset[str] = frozenset({
+    "SELECT", "INSERT", "UPDATE", "DELETE",
+    "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
+})
+
+# Postgres only allows these four privileges at COLUMN granularity
+# (`GRANT SELECT (col) …`); DELETE/TRUNCATE/TRIGGER are table-only.
+_VALID_COLUMN_PRIVILEGES: frozenset[str] = frozenset({
+    "SELECT", "INSERT", "UPDATE", "REFERENCES",
+})
+
+_VALID_POLICY_COMMANDS: frozenset[str] = frozenset(
+    {"ALL", "SELECT", "INSERT", "UPDATE", "DELETE"}
+)
+
+
+def _contains_sql_comment(sql: str) -> bool:
+    """True if `sql` carries a SQL line (``--``) or block (``/* */``)
+    comment token OUTSIDE a string/identifier literal.
+
+    The scanner tags string and identifier literals as their own tokens
+    (``SCONST`` / ``IDENT``), so ``note = 'a--b'`` is NOT flagged — only
+    a genuine comment is. A value sourced from live introspection
+    (``pg_get_expr`` for predicates, ``pg_get_function_identity_arguments``
+    for signatures) never contains a comment: Postgres re-renders the
+    parsed form. A comment therefore signals a hand-crafted / tampered
+    snapshot, and a *trailing* ``--`` is precisely the token that
+    survives an isolated validation probe yet then comments out the rest
+    of the emitted statement on its line — silently dropping a
+    ``WITH CHECK`` clause, swallowing the next statement, or (for a
+    function signature) hiding an injected paren / ``SET`` clause. Reject
+    it. A scan error (e.g. an unterminated block comment) is treated as
+    unsafe.
+    """
+    from pglast import parser
+
+    try:
+        return any(
+            tok.name in ("SQL_COMMENT", "C_COMMENT")
+            for tok in parser.scan(sql)
+        )
+    except Exception:
+        return True
+
+
+def _predicate_is_single_statement(sql: str) -> bool:
+    """True if `sql` is a single SQL expression — i.e. wrapping it as
+    ``USING (<sql>)`` cannot smuggle a second statement.
+
+    A malicious snapshot predicate like ``true); DROP TABLE x; --``
+    parses as TWO statements once wrapped and is rejected. (``parse_expr``
+    is NOT a sufficient check: it parses only the leading expression and
+    silently ignores trailing injected statements.)
+
+    A trailing line comment (``true)--``) is the subtler escape: it
+    passes the isolated ``SELECT 1 WHERE (<sql>)`` probe (the comment
+    eats the probe's own closing paren) but, once emitted as
+    ``USING (<sql>) WITH CHECK (…)`` on one line, comments out the
+    closing paren and the entire ``WITH CHECK`` clause — silently
+    dropping a write-side check or breaking ``diff --apply``. Reject any
+    predicate carrying a comment (real ``pg_get_expr`` output never has
+    one — see ``_contains_sql_comment``).
+    """
+    import pglast
+
+    if _contains_sql_comment(sql):
+        return False
+    try:
+        stmts = pglast.parse_sql(f"SELECT 1 WHERE ({sql})")
+    except Exception:
+        return False
+    return len(stmts) == 1
 
 
 @dataclass(frozen=True)
@@ -116,6 +251,25 @@ class Grant:
 
 
 @dataclass(frozen=True)
+class ColumnGrant:
+    """A column-level privilege grant (`GRANT SELECT (col) ON t TO role`).
+
+    Captured from `pg_attribute.attacl` (snapshot: additive, emitted only
+    when present, so a pre-v8 baseline round-trips to ``()``). Distinct
+    from the table-level `Grant`: a column grant exposes only the named
+    column, and only SELECT / INSERT / UPDATE / REFERENCES can be granted
+    at column granularity. PUBLIC pseudo-role is `role="PUBLIC"`, mirroring
+    `Grant` / `Policy.roles`. Feeds the diff's GRANT_PUBLIC_NO_RLS path so a
+    `GRANT SELECT (ssn) ON t TO PUBLIC` on a no-RLS table is flagged
+    dangerous at column granularity, not silently treated as no-change.
+    """
+
+    role: str
+    column: str
+    privileges: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class View:
     """A view or materialized view captured by introspection.
 
@@ -128,6 +282,10 @@ class View:
 
     `references` is the sorted, de-duplicated set of `(schema, name)`
     table pairs the view body reads from (resolved via `pg_depend`).
+    Resolution is transitive through intermediate views: a
+    `view → view → table` chain surfaces the base table here, not the
+    intermediate view, so a view built on another view still exposes its
+    underlying RLS-protected tables to VIEW001/002/003.
     `security_definer_calls` is the sorted, de-duplicated tuple of
     qualified function names called by the view body that have
     `pg_proc.prosecdef = true`. Both default to empty.
@@ -315,6 +473,13 @@ class Table:
     # round-trip with `indexes=()` so PERF003 simply finds nothing
     # to flag against older snapshots until they're re-captured.
     indexes: tuple[Index, ...] = ()
+    # Column-level privilege grants (`GRANT SELECT (col) …`) — populated
+    # from `pg_attribute.attacl` in snapshot v8+. Modeled separately from
+    # table-level `grants` (which read `pg_class.relacl`) so the diff can
+    # flag a PUBLIC column grant on a no-RLS table as dangerous at column
+    # granularity. Default `()` keeps test fixtures and pre-v8 baselines
+    # working unchanged (they round-trip with `column_grants=()`).
+    column_grants: tuple[ColumnGrant, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -373,6 +538,15 @@ class SecdefFunction:
     # zero-arg functions; non-empty like `integer, text` for
     # overloads. Snapshot v12+; older snapshots load with "".
     signature: str = ""
+    # Schema and function name as SEPARATE components (snapshot v14+).
+    # `qualified_name` is the ambiguous `nspname || '.' || proname`
+    # join, which cannot be split unambiguously once either component
+    # contains a dot (a schema or function named `a.b`). Fixers that
+    # emit `ALTER FUNCTION schema.name` MUST use these fields rather
+    # than splitting `qualified_name`. v4-v13 snapshots load with ""
+    # — the SEC015 fixer abstains rather than guess a wrong target.
+    schema_name: str = ""
+    function_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -512,6 +686,13 @@ class LeakproofFunction:
     # arg functions; non-empty for overloads. Snapshot v12+; v10–v11
     # snapshots load with "".
     signature: str = ""
+    # Separate schema / function name components (snapshot v14+); see
+    # SecdefFunction. The SEC017 fixer uses these to build a correct
+    # `ALTER FUNCTION` even when the schema name contains a dot,
+    # instead of splitting the ambiguous `qualified_name`. v10-v13
+    # snapshots load with "" — the fixer abstains rather than guess.
+    schema_name: str = ""
+    function_name: str = ""
 
 
 # --- Snapshot decoders -------------------------------------------------
@@ -532,26 +713,132 @@ def _policy_from_dict(p: dict[str, Any]) -> Policy:
     # intentionally left None — the v0.2.1 contract documents that
     # callers parse on demand (only pgrls.diff._diff_columns needs them,
     # and it lazy-parses).
+    command = p["command"]
+    pname = p.get("policy_name") or p.get("name")
+    if command not in _VALID_POLICY_COMMANDS:
+        raise ValueError(
+            f"snapshot policy {pname!r} has an invalid "
+            f"command {command!r}. Allowed: ALL, SELECT, INSERT, UPDATE, "
+            "DELETE."
+        )
+    using_sql = p.get("using_sql")
+    with_check_sql = p.get("with_check_sql")
+    # Reject clause/command combinations Postgres forbids — a malformed or
+    # hand-built snapshot carrying one would make `policy_to_sql` (and thus
+    # `pgrls diff --apply`) emit DDL Postgres rejects. WITH CHECK is valid
+    # only on INSERT / UPDATE / ALL; USING only on SELECT / UPDATE / DELETE
+    # / ALL. The truthy check mirrors `policy_to_sql`'s emission gate, so an
+    # empty-string clause (never emitted) is not rejected.
+    if with_check_sql and command in {"SELECT", "DELETE"}:
+        raise ValueError(
+            f"snapshot policy {pname!r} is FOR {command} but carries a "
+            "WITH CHECK clause; Postgres allows WITH CHECK only on INSERT / "
+            "UPDATE / ALL policies, so replaying it via `pgrls diff --apply` "
+            "would emit invalid DDL."
+        )
+    if using_sql and command == "INSERT":
+        raise ValueError(
+            f"snapshot policy {pname!r} is FOR INSERT but carries a USING "
+            "clause; Postgres allows USING only on SELECT / UPDATE / DELETE "
+            "/ ALL policies, so replaying it via `pgrls diff --apply` would "
+            "emit invalid DDL."
+        )
+    roles_raw = p["roles"]
+    for r in roles_raw:
+        if not isinstance(r, str) or not r:
+            # Each role is emitted as an identifier into `CREATE POLICY …
+            # TO <roles>` (model.py policy_to_sql → quote_ident). Validate
+            # at decode like _grant_from_dict / _column_from_dict do for
+            # their values, so a tampered snapshot surfaces the same clean
+            # ValueError instead of a raw TypeError deep in quote_ident.
+            raise ValueError(
+                f"snapshot policy {pname!r} has an invalid role {r!r}; "
+                "each role must be a non-empty string."
+            )
     return Policy(
         name=p.get("policy_name") or p["name"],
-        command=p["command"],
+        command=command,
         permissive=p["permissive"],
-        roles=tuple(p["roles"]),
-        using_sql=p.get("using_sql"),
-        with_check_sql=p.get("with_check_sql"),
+        roles=tuple(roles_raw),
+        using_sql=using_sql,
+        with_check_sql=with_check_sql,
         using_ast=None,
         with_check_ast=None,
     )
 
 
 def _grant_from_dict(g: dict[str, Any]) -> Grant:
-    return Grant(role=g["role"], privileges=tuple(g["privileges"]))
+    privileges = tuple(g["privileges"])
+    if not privileges:
+        # A GRANT must name at least one privilege. `to_sql()` builds
+        # `GRANT {', '.join(privileges)} ON … TO …`, so an empty tuple
+        # emits `GRANT  ON … TO role;` — a syntax error that aborts the
+        # baseline setup `pgrls diff --apply` runs. Live introspection
+        # groups privileges by role (always >=1), so this only rejects a
+        # hand-built / tampered snapshot — reject at decode for a clean
+        # error at load, not a confusing parse failure at apply.
+        raise ValueError(
+            f"snapshot grant for role {g.get('role')!r} lists no "
+            "privileges; a GRANT must name at least one privilege."
+        )
+    for priv in privileges:
+        if (
+            not isinstance(priv, str)
+            or priv.upper() not in _VALID_TABLE_PRIVILEGES
+        ):
+            raise ValueError(
+                f"snapshot grant for role {g.get('role')!r} lists an "
+                f"unknown/unsafe privilege {priv!r}. Allowed: "
+                + ", ".join(sorted(_VALID_TABLE_PRIVILEGES))
+                + " — grants are replayed verbatim by `pgrls diff --apply`."
+            )
+    return Grant(role=g["role"], privileges=privileges)
+
+
+def _column_grant_from_dict(g: dict[str, Any]) -> ColumnGrant:
+    column = g["column"]
+    if not isinstance(column, str) or not column:
+        raise ValueError(
+            f"snapshot column grant for role {g.get('role')!r} has an "
+            f"invalid column {column!r}; it must be a non-empty string."
+        )
+    privileges = tuple(g["privileges"])
+    if not privileges:
+        raise ValueError(
+            f"snapshot column grant for role {g.get('role')!r} on column "
+            f"{column!r} lists no privileges; a GRANT must name at least one."
+        )
+    for priv in privileges:
+        if (
+            not isinstance(priv, str)
+            or priv.upper() not in _VALID_COLUMN_PRIVILEGES
+        ):
+            raise ValueError(
+                f"snapshot column grant for role {g.get('role')!r} on column "
+                f"{column!r} lists an unknown/unsafe column privilege "
+                f"{priv!r}. Allowed: "
+                + ", ".join(sorted(_VALID_COLUMN_PRIVILEGES))
+                + " — grants are replayed verbatim by `pgrls diff --apply`."
+            )
+    return ColumnGrant(
+        role=g["role"], column=column, privileges=privileges
+    )
 
 
 def _column_from_dict(c: dict[str, Any]) -> Column:
+    data_type = c["data_type"]
+    if not _is_safe_data_type(data_type):
+        raise ValueError(
+            f"snapshot column {c.get('name')!r} has an unsafe or "
+            f"unparseable data_type {data_type!r}. It is interpolated into "
+            "the CREATE TABLE that `pgrls diff --apply` runs, so it must be "
+            "a single column type — validated by parsing a probe CREATE "
+            "TABLE; a value that adds a column, a table clause, or a second "
+            "statement is rejected."
+        )
     return Column(
         name=c["name"],
-        data_type=c["data_type"],
+        data_type=data_type,
         is_nullable=c.get("is_nullable", True),
     )
 
@@ -616,6 +903,10 @@ def _table_from_dict(
         ),
         # v7+ indexes; v3-v6 baselines round-trip to ().
         indexes=tuple(_index_from_dict(idx) for idx in t.get("indexes", [])),
+        # v8+ column-level grants; v3-v7 baselines round-trip to ().
+        column_grants=tuple(
+            _column_grant_from_dict(cg) for cg in t.get("column_grants", [])
+        ),
     )
 
 
@@ -632,16 +923,82 @@ def _view_from_dict(v: dict[str, Any]) -> View:
     )
 
 
+def _is_safe_signature(signature: object) -> bool:
+    """True iff `signature` is a single, injection-free function arg list.
+
+    The SEC015 / SEC017 fixers interpolate a snapshot's `signature`
+    (``pg_get_function_identity_arguments`` output) raw into
+    ``ALTER FUNCTION name(<signature>) …``. From live introspection it is
+    trustworthy, but a hand-crafted snapshot is a trust boundary, so
+    validate it the same way ``_is_safe_data_type`` validates a column
+    type: parse a probe ``CREATE FUNCTION`` and require the signature to
+    occupy exactly one function's argument list and nothing else. An
+    injection that escapes the parens to add a statement (``integer)
+    RETURNS void AS ''; DROP TABLE users; --``) parses as >1 statement and
+    is rejected. Empty ("" — a zero-arg function, or a pre-v12 snapshot)
+    is trivially safe.
+    """
+    if not isinstance(signature, str):
+        return False
+    if not signature.strip():
+        return True
+    # Reject a comment-bearing signature up front: the CREATE FUNCTION
+    # probe below accepts a post-paramlist `SET` clause, and a trailing
+    # `--` comments out the probe's own `)` tail — so a tampered
+    # `int) SET search_path = pg_temp, public --` would PASS the probe
+    # and let the SEC015/SEC017 fixer emit an `ALTER FUNCTION … SET
+    # search_path` that pins pg_temp FIRST (re-introducing CVE-2018-1058).
+    # `pg_get_function_identity_arguments` never emits a comment, so a
+    # real signature is unaffected.
+    if _contains_sql_comment(signature):
+        return False
+    import pglast
+    from pglast.ast import CreateFunctionStmt, String
+    try:
+        stmts = pglast.parse_sql(
+            f"CREATE FUNCTION __pgrls_probe({signature}) "
+            "RETURNS void LANGUAGE sql AS ''"
+        )
+    except Exception:
+        return False
+    if len(stmts) != 1:
+        return False
+    stmt = stmts[0].stmt
+    if not isinstance(stmt, CreateFunctionStmt):
+        return False
+    # The function name must be exactly the probe name — a single
+    # unqualified identifier. An injection that escaped the arg list to
+    # rename / qualify / add a clause changes this.
+    names = list(stmt.funcname or ())
+    return (
+        len(names) == 1
+        and isinstance(names[0], String)
+        and names[0].sval == "__pgrls_probe"
+    )
+
+
 def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
     # `search_path` is a v8 addition; v4-v7 snapshots have no key, so
     # `.get(...)` yields None ("no SET search_path clause"). `signature`
     # is a v12 addition; v4-v11 snapshots load it as "".
+    sig = f.get("signature", "")
+    if not _is_safe_signature(sig):
+        raise ValueError(
+            "snapshot SECURITY DEFINER function "
+            f"{f.get('qualified_name')!r} has an unsafe or unparseable "
+            f"signature {sig!r}; it is interpolated into the ALTER FUNCTION "
+            "the SEC015 fixer emits, so it must be a single function "
+            "argument list (validated by parsing a probe CREATE FUNCTION)."
+        )
     return SecdefFunction(
         qualified_name=f["qualified_name"],
         body=f["body"],
         language=f["language"],
         search_path=f.get("search_path"),
-        signature=f.get("signature", ""),
+        signature=sig,
+        # v14 additions; v4-v13 snapshots have no keys -> "".
+        schema_name=f.get("schema_name", ""),
+        function_name=f.get("function_name", ""),
     )
 
 
@@ -655,9 +1012,21 @@ def _bypassrls_role_from_dict(r: dict[str, Any]) -> BypassRlsRole:
 
 def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
     # `signature` is a v12 addition; v10-v11 snapshots load it as "".
+    sig = f.get("signature", "")
+    if not _is_safe_signature(sig):
+        raise ValueError(
+            "snapshot LEAKPROOF function "
+            f"{f.get('qualified_name')!r} has an unsafe or unparseable "
+            f"signature {sig!r}; it is interpolated into the ALTER FUNCTION "
+            "the SEC017 fixer emits, so it must be a single function "
+            "argument list (validated by parsing a probe CREATE FUNCTION)."
+        )
     return LeakproofFunction(
         qualified_name=f["qualified_name"],
-        signature=f.get("signature", ""),
+        signature=sig,
+        # v14 additions; v10-v13 snapshots have no keys -> "".
+        schema_name=f.get("schema_name", ""),
+        function_name=f.get("function_name", ""),
     )
 
 
@@ -818,6 +1187,24 @@ class Schema:
                         }
                         for idx in t.indexes
                     ],
+                    # v15: column-level grants. Emitted ONLY when present
+                    # so every schema captured before this feature (none
+                    # carry column grants) serializes byte-identically
+                    # apart from the version bump — no golden churn.
+                    **(
+                        {
+                            "column_grants": [
+                                {
+                                    "role": cg.role,
+                                    "column": cg.column,
+                                    "privileges": list(cg.privileges),
+                                }
+                                for cg in t.column_grants
+                            ]
+                        }
+                        if t.column_grants
+                        else {}
+                    ),
                 }
                 for t in self.tables
             ],
@@ -859,6 +1246,10 @@ class Schema:
                     # `ALTER FUNCTION` fixes. Empty for zero-arg
                     # functions. v4-v11 snapshots load with "".
                     "signature": f.signature,
+                    # v14 — separate schema / function name so fixers
+                    # never split the ambiguous qualified_name.
+                    "schema_name": f.schema_name,
+                    "function_name": f.function_name,
                 }
                 for f in self.security_definer_functions
             ],
@@ -890,6 +1281,10 @@ class Schema:
                     # qualified_name appear here as separate entries
                     # since v12; v10-v11 snapshots load with "".
                     "signature": f.signature,
+                    # v14 — separate schema / function name (see
+                    # security_definer_functions above).
+                    "schema_name": f.schema_name,
+                    "function_name": f.function_name,
                 }
                 for f in self.leakproof_functions
             ],
@@ -962,13 +1357,24 @@ class Schema:
         lint path (`pgrls lint`) doesn't use `from_snapshot` — it
         introspects directly, which still parses ASTs on capture.
         """
+        if not isinstance(payload, dict):
+            # A file that is valid JSON but not a snapshot OBJECT (a bare
+            # array, null, string, or number) would otherwise AttributeError
+            # on `.get` below — which `_resolve_diff_source` doesn't catch,
+            # so it escapes as a raw traceback. Raise the ValueError it does
+            # catch so `pgrls diff` reports a clean "not a valid pgrls
+            # snapshot" instead.
+            raise ValueError(
+                "snapshot must be a JSON object, got "
+                f"{type(payload).__name__}"
+            )
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13. v1 / v2 snapshots must be regenerated "
-                "against the current schema."
+                "10, 11, 12, 13, 14, 15. v1 / v2 snapshots must be "
+                "regenerated against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -1148,6 +1554,21 @@ class Schema:
                 out.append(
                     f"GRANT {privs} ON {qname} TO {role_sql};"
                 )
+            # Column-level grants: `GRANT SELECT (col) ON t TO role`. The
+            # column is quoted; each privilege carries the same parenthesized
+            # column list, matching how Postgres records per-column ACLs.
+            for cg in t.column_grants:
+                col_privs = ", ".join(
+                    f"{p} ({quote_ident(cg.column)})" for p in cg.privileges
+                )
+                role_sql = (
+                    "PUBLIC"
+                    if cg.role == "PUBLIC"
+                    else quote_ident(cg.role)
+                )
+                out.append(
+                    f"GRANT {col_privs} ON {qname} TO {role_sql};"
+                )
 
         return "\n".join(out) + "\n"
 
@@ -1168,6 +1589,20 @@ def policy_to_sql(p: Policy, qname: str) -> str:
     """
     from pgrls.fixers._idents import quote_ident
 
+    # `command` is spliced raw as `FOR {command}`, so validate it at the
+    # emit sink the same way the USING / WITH CHECK predicates are guarded
+    # below — a Policy built from a less-trusted source with an
+    # out-of-Literal command (e.g. 'SELECT; DROP TABLE x; --') would
+    # otherwise inject a second statement. The snapshot decoder already
+    # rejects bad commands, so this never triggers for well-formed input;
+    # it makes the sink self-defending regardless of caller.
+    if p.command not in _VALID_POLICY_COMMANDS:
+        raise ValueError(
+            f"policy {p.name!r} has an invalid command {p.command!r}; "
+            f"refusing to emit it into executable DDL (expected one of "
+            f"{sorted(_VALID_POLICY_COMMANDS)})"
+        )
+
     parts = ["CREATE POLICY", quote_ident(p.name), "ON", qname]
     if not p.permissive:
         parts.append("AS RESTRICTIVE")
@@ -1176,9 +1611,25 @@ def policy_to_sql(p: Policy, qname: str) -> str:
     role_strs = [
         "PUBLIC" if r == "PUBLIC" else quote_ident(r) for r in p.roles
     ]
-    parts.append(f"TO {', '.join(role_strs)}")
+    # Omit `TO` entirely when there are no roles — emitting `TO ` with
+    # an empty role list is a syntax error that aborts `diff --apply`.
+    # A roleless CREATE POLICY defaults to PUBLIC, which is what an
+    # empty role set means.
+    if role_strs:
+        parts.append(f"TO {', '.join(role_strs)}")
     if p.using_sql:
+        if not _predicate_is_single_statement(p.using_sql):
+            raise ValueError(
+                f"policy {p.name!r} USING predicate is not a single SQL "
+                f"expression; refusing to emit it into executable DDL: "
+                f"{p.using_sql!r}"
+            )
         parts.append(f"USING ({p.using_sql})")
     if p.with_check_sql:
+        if not _predicate_is_single_statement(p.with_check_sql):
+            raise ValueError(
+                f"policy {p.name!r} WITH CHECK predicate is not a single "
+                f"SQL expression; refusing to emit it: {p.with_check_sql!r}"
+            )
         parts.append(f"WITH CHECK ({p.with_check_sql})")
     return " ".join(parts) + ";"

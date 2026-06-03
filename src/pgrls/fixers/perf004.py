@@ -29,6 +29,19 @@ hold a write lock for the duration; the description points at the
 `CONCURRENTLY` alternative for production-size tables, and `pgrls
 fix --output` writes the SQL to a file for the operator to adapt.
 
+Postgres requires every function in an index expression to be
+IMMUTABLE and rejects STABLE / VOLATILE ones at runtime. The fixer
+therefore emits an index only when the *whole* operand is provably
+immutable — built solely from a curated set of always-IMMUTABLE
+builtin functions (`lower`, `upper`, `md5`, …), column refs, and
+literals (`_is_immutable_index_expr`). The conditionally-STABLE time
+functions (`date_trunc('day', created_at)` on a `timestamptz` is
+STABLE) and anything it cannot vouch for — operators, casts,
+user-defined functions — make it ABSTAIN: the rule still reports, and
+the operator reshapes the predicate / adds the index by hand. This
+keeps `pgrls fix --apply` (one all-or-nothing transaction) from
+aborting the whole batch on a single server-rejected CREATE INDEX.
+
 The fix is **additive**: it CREATEs an index alongside the existing
 plain index that PERF004 reported as wasted. PERF004's other remedy
 — rewriting the predicate to compare the bare column — needs human
@@ -38,12 +51,14 @@ description points at the alternative.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
-from pglast.ast import FuncCall, Node
+from pglast.ast import A_Const, A_Expr, BoolExpr, ColumnRef, FuncCall, Node, String
+from pglast.enums import A_Expr_Kind
 from pglast.stream import RawStream
 
-from pgrls.ast_utils import extract_column_refs
+from pgrls.ast_utils import extract_column_refs, func_name_parts
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table, policy_id
@@ -54,21 +69,172 @@ from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.rules.perf003 import _has_leading_column_index, _own_table_column
 
 
+# Comparison / pattern operators whose direct operand the planner
+# evaluates as an indexable value expression. Arithmetic / concat
+# operators (`+`, `||`, …) are deliberately excluded: their result, not
+# the inner FuncCall, is the comparison operand.
+_COMPARISON_OPS: frozenset[str] = frozenset({
+    "=", "<>", "!=", "<", ">", "<=", ">=",
+    "~~", "~~*", "!~~", "!~~*", "~", "~*", "!~", "!~*",
+})
+_COMPARISON_AEXPR_KINDS: frozenset[Any] = frozenset({
+    A_Expr_Kind.AEXPR_IN,
+    A_Expr_Kind.AEXPR_LIKE,
+    A_Expr_Kind.AEXPR_ILIKE,
+    A_Expr_Kind.AEXPR_BETWEEN,
+    A_Expr_Kind.AEXPR_NOT_BETWEEN,
+})
+
+
+# Builtin functions that are IMMUTABLE in EVERY overload, so an
+# expression built only from them (+ column refs + literals) is legal in
+# a CREATE INDEX. Postgres requires every function in an index expression
+# to be IMMUTABLE and rejects STABLE/VOLATILE ones at runtime ("functions
+# in index expression must be marked IMMUTABLE"). Deliberately CONSERVATIVE
+# and builtin-focused: the dominant PERF004 wrapper is case-normalization
+# (`lower`/`upper`). Notably EXCLUDED are the conditionally-STABLE time
+# functions — `date_trunc`/`date_part`/`extract`/`to_char`/`age`/… —
+# whose volatility depends on the argument type (e.g. `date_trunc('day',
+# ts)` is STABLE for `timestamptz` but IMMUTABLE for `timestamp`). When
+# the expression is not provably immutable the fixer ABSTAINS (the rule
+# still reports; the operator reshapes/indexes by hand), rather than
+# emitting a CREATE INDEX that fails at apply and — under fix --apply's
+# single all-or-nothing transaction — rolls back every other fix too.
+_IMMUTABLE_INDEX_SAFE_FUNCS: frozenset[str] = frozenset({
+    # Case / text normalization — the dominant PERF004 wrapper shape.
+    "lower", "upper", "initcap",
+    # Hashing.
+    "md5", "sha224", "sha256", "sha384", "sha512",
+    # Length.
+    "length", "char_length", "character_length",
+    "octet_length", "bit_length",
+    # Trim / pad.
+    "btrim", "ltrim", "rtrim", "trim", "lpad", "rpad",
+    # Substring / slice.
+    "substr", "substring", "left", "right",
+    # Other pure string transforms.
+    "reverse", "replace", "translate", "ascii", "chr", "to_hex",
+    # Basic numeric (every overload IMMUTABLE).
+    "abs", "sign", "ceil", "ceiling", "floor", "round", "trunc", "mod",
+})
+
+
+# A handful of allowlisted builtins are IMMUTABLE in their common
+# overload but ship a non-IMMUTABLE overload selected by a DIFFERENT
+# argument count. `length(bytea, name)` (2-arg, with an explicit source
+# encoding) is STABLE — it performs an encoding conversion — whereas
+# every single-argument `length(...)` overload is IMMUTABLE. A
+# `CREATE INDEX (length(data, 'UTF8'))` is rejected by Postgres
+# ("functions in index expression must be marked IMMUTABLE") and, under
+# fix --apply's single all-or-nothing transaction, would roll back every
+# other fix in the batch. We can't resolve the overload by argument type
+# statically, but we CAN gate on arity: a name listed here is only
+# vouched-for at the argument counts whose every matching pg_catalog
+# overload is IMMUTABLE. (Verified against pg_proc: `length/2` is the
+# ONLY non-IMMUTABLE overload across the entire allowlist above —
+# char_length/character_length/octet_length/bit_length are IMMUTABLE in
+# all forms.) A name absent from this map is IMMUTABLE regardless of arity.
+_IMMUTABLE_SAFE_ARITIES: dict[str, frozenset[int]] = {
+    "length": frozenset({1}),
+}
+
+
+def _is_immutable_index_expr(node: Any) -> bool:
+    """True iff `node` is safe to splice into a ``CREATE INDEX`` — i.e. the
+    whole expression is built only from known-IMMUTABLE builtin functions,
+    column refs, and literal constants.
+
+    Conservative by design: any node it cannot vouch for as IMMUTABLE —
+    a non-allowlisted or schema-qualified (possibly user-defined, possibly
+    VOLATILE) function, an operator (``A_Expr``), a ``TypeCast``,
+    ``CaseExpr``/``CoalesceExpr``, a sub-select, … — makes it return False,
+    so the fixer abstains rather than emit an index Postgres would reject.
+    """
+    if node is None:
+        return True
+    if isinstance(node, (list, tuple)):
+        return all(_is_immutable_index_expr(item) for item in node)
+    if isinstance(node, FuncCall):
+        qualified, bare = func_name_parts(node)
+        if bare is None or bare not in _IMMUTABLE_INDEX_SAFE_FUNCS:
+            return False
+        # Builtin only: a user-defined `myschema.lower(...)` is a DIFFERENT
+        # function that may be VOLATILE, so only the unqualified or
+        # pg_catalog-qualified builtin counts (mirrors
+        # ast_utils.is_builtin_current_setting). Its args must in turn be
+        # immutable — a nested STABLE call (`lower(date_trunc(...))`) or a
+        # value wrapper would equally make the index illegal.
+        if qualified != bare and qualified != f"pg_catalog.{bare}":
+            return False
+        # Arity gate: a name with a non-IMMUTABLE overload at some other
+        # argument count (e.g. STABLE `length(bytea, name)`) is only
+        # safe at the vouched-for arities. Abstain otherwise rather than
+        # emit an index Postgres rejects.
+        allowed_arities = _IMMUTABLE_SAFE_ARITIES.get(bare)
+        if allowed_arities is not None and (
+            len(node.args or ()) not in allowed_arities
+        ):
+            return False
+        return _is_immutable_index_expr(node.args)
+    if isinstance(node, (ColumnRef, A_Const)):
+        return True
+    # Any other node type cannot be vouched for — abstain.
+    return False
+
+
+def _has_comparison_op_name(node: A_Expr) -> bool:
+    """True if `node`'s operator name is a sargable comparison (`=`, `<`,
+    `~`, …) rather than arithmetic/concat (`+`, `||`)."""
+    names = [s.sval for s in (node.name or ()) if isinstance(s, String)]
+    return bool(names) and names[-1] in _COMPARISON_OPS
+
+
+def _is_scalar_comparison(node: A_Expr) -> bool:
+    """True if `node` is a plain binary scalar comparison (AEXPR_OP `=`,
+    `<`, `~`, …) — both operands are indexable value expressions (the
+    planner may use an index on either side)."""
+    return node.kind == A_Expr_Kind.AEXPR_OP and _has_comparison_op_name(node)
+
+
+# Indexability context threaded through the walk:
+#   _PRED    — a boolean/predicate position (top, or under AND/OR/NOT).
+#              A comparison here is a real predicate comparison.
+#   _OPERAND — the direct operand of a predicate-level comparison. A
+#              FuncCall wrapping a flagged column here IS the expression
+#              the planner indexes.
+#   _VALUE   — inside a value-producing wrapper (CASE / COALESCE /
+#              arithmetic / concat / a FuncCall's args / the value side of
+#              IN·BETWEEN·LIKE). A FuncCall here is a strict
+#              sub-expression, never the indexable operand.
+_PRED = "predicate"
+_OPERAND = "operand"
+_VALUE = "value"
+
+
 def _top_funccalls_wrapping(
     node: Any, table: Table, flagged_columns: set[str]
 ) -> list[FuncCall]:
-    """Return the OUTERMOST FuncCalls in `node` that wrap a flagged
-    own-table column.
+    """FuncCalls in `node` that wrap a flagged own-table column AND are the
+    DIRECT operand of a predicate-level comparison — the exact expression
+    the planner would index.
 
-    "Outermost" means: the FuncCall contains (recursively) a flagged
-    column, and is NOT itself a descendant of another FuncCall that
-    also wraps the column. For `lower(upper(email))` with `email`
-    flagged, returns `[FuncCall("lower", …)]` once — the index has
-    to match the full predicate expression, not the inner `upper`.
+    For `lower(upper(email))` (email flagged) returns `[lower(upper(email))]`
+    once — the index must match the full predicate operand, not the inner
+    `upper`. A flagged column reached only as a STRICT SUB-EXPRESSION of the
+    real operand is NOT returned, because the planner's operand is the
+    enclosing value expression and an index on the inner piece is dead:
 
-    Sub-select column refs are excluded by `extract_column_refs(
-    exclude_sublinks=True)` — those belong to other tables and PERF004
-    itself skips them.
+    * the value side of `IN` / `BETWEEN` / `LIKE` (`col IN (lower(x), …)`,
+      `col BETWEEN date_trunc(a) AND date_trunc(b)`) — only the lexpr is
+      indexable, the rexpr is the value list / bounds / pattern;
+    * a `COALESCE` / `CASE` / concat / arithmetic wrapper; and
+    * a comparison nested INSIDE such a value wrapper
+      (`CASE WHEN lower(email) = … THEN …`) — its result feeds the
+      wrapper, so its operands are not predicate operands.
+
+    The fixer defers those to the human, exactly as the rule message
+    suggests. Sub-select column refs are excluded by `extract_column_refs(
+    exclude_sublinks=True)`.
     """
     out: list[FuncCall] = []
 
@@ -79,32 +245,86 @@ def _top_funccalls_wrapping(
                 return True
         return False
 
-    def walk(n: Any, inside_funccall: bool) -> None:
+    def walk(n: Any, ctx: str) -> None:
         if n is None:
             return
         if isinstance(n, (list, tuple)):
             for item in n:
-                walk(item, inside_funccall)
+                walk(item, ctx)
             return
         if isinstance(n, FuncCall):
-            if not inside_funccall and wraps_flagged(n):
-                out.append(n)
-                # Don't recurse — any nested FuncCall inside `n` is
-                # already covered by the outer index expression.
+            if ctx == _OPERAND and wraps_flagged(n):
+                # Only emit when the WHOLE operand is provably IMMUTABLE —
+                # Postgres rejects STABLE/VOLATILE functions in an index
+                # expression, and the common Supabase shape
+                # `date_trunc('day', created_at)` on a timestamptz column
+                # is STABLE. Abstaining (the rule still reports) is the
+                # safe degradation; emitting an index that fails at apply
+                # would roll back the whole all-or-nothing fix batch.
+                if _is_immutable_index_expr(n):
+                    out.append(n)
+                # Covered either way — a nested FuncCall is part of this
+                # operand, never a separate index. (When not immutable we
+                # deliberately do NOT descend looking for an inner index:
+                # the planner's operand is the whole expression.)
                 return
-            # Either we're already inside a wrapping FuncCall (the
-            # outer one covered us) or this FuncCall doesn't wrap a
-            # flagged column. Recurse with the inside flag set so a
-            # sibling FuncCall under a non-wrapping parent (rare)
-            # still gets considered.
+            # Args are sub-expressions, never a predicate operand.
             for field_name in n:
-                walk(getattr(n, field_name, None), True)
+                walk(getattr(n, field_name, None), _VALUE)
+            return
+        if isinstance(n, BoolExpr):
+            # AND / OR / NOT preserve the boolean/predicate position.
+            for field_name in n:
+                walk(getattr(n, field_name, None), _PRED)
+            return
+        if isinstance(n, A_Expr):
+            if ctx == _PRED and _is_scalar_comparison(n):
+                # Plain scalar comparison: an index on either operand helps.
+                walk(n.lexpr, _OPERAND)
+                walk(n.rexpr, _OPERAND)
+                walk(n.name, _VALUE)
+                return
+            if ctx == _PRED and n.kind in _COMPARISON_AEXPR_KINDS:
+                # IN / LIKE / ILIKE / BETWEEN / NOT BETWEEN: only the lexpr
+                # is indexable; the rexpr is the value list / bounds /
+                # pattern the planner never indexes.
+                walk(n.lexpr, _OPERAND)
+                walk(n.rexpr, _VALUE)
+                walk(n.name, _VALUE)
+                return
+            if (
+                ctx == _PRED
+                and n.kind in (
+                    A_Expr_Kind.AEXPR_OP_ANY,
+                    A_Expr_Kind.AEXPR_OP_ALL,
+                )
+                and _has_comparison_op_name(n)
+            ):
+                # `func(col) = ANY(array)` / `= ALL(array)`: `x = ANY(arr)`
+                # is sargable, so the lexpr IS the indexable operand (the
+                # planner can use an expression index on it); the rexpr is
+                # the array/value side. The PERF004 rule flags these, so
+                # the fixer must emit the index too. Gate on a comparison
+                # operator name so a non-sargable `func(col) <op> ANY(...)`
+                # still defers to the human.
+                walk(n.lexpr, _OPERAND)
+                walk(n.rexpr, _VALUE)
+                walk(n.name, _VALUE)
+                return
+            # A non-comparison operator (`||`, arithmetic), or a comparison
+            # NOT in predicate position (nested in a value wrapper): its
+            # operands feed a value, so they are not predicate operands.
+            for field_name in n:
+                walk(getattr(n, field_name, None), _VALUE)
             return
         if isinstance(n, Node):
+            # Any other node — CaseExpr / CoalesceExpr / TypeCast / SubLink
+            # / … — is a value wrapper; a FuncCall reached through it is a
+            # strict sub-expression, not a direct comparison operand.
             for field_name in n:
-                walk(getattr(n, field_name, None), inside_funccall)
+                walk(getattr(n, field_name, None), _VALUE)
 
-    walk(node, False)
+    walk(node, _PRED)
     return out
 
 
@@ -176,6 +396,19 @@ class PERF004Fixer:
         schema: str, table: str, policy_name: str, expr_sql: str
     ) -> Fix:
         qtable = quote_qualified(schema, table)
+        # Deterministic, idempotent index name. The PERF004 RULE keys off
+        # the BARE column having a plain index and cannot decode an
+        # expression index, so it keeps firing after the fix lands; an
+        # unnamed `CREATE INDEX` would then be regenerated byte-identical
+        # on the next `pgrls fix` run and Postgres would auto-name a
+        # DUPLICATE. A name derived from (schema, table, expression) plus
+        # `IF NOT EXISTS` makes a second run a no-op and the --output
+        # migration safely re-runnable. The digest keeps the name a valid,
+        # collision-resistant identifier well under Postgres's 63-char cap.
+        digest = hashlib.sha1(
+            f"{schema}.{table}.{expr_sql}".encode()
+        ).hexdigest()[:16]
+        index_name = f"pgrls_idx_{digest}"
         return Fix(
             rule_id="PERF004",
             # One Fix per (table, expression) — the location names
@@ -183,7 +416,8 @@ class PERF004Fixer:
             # one table sort deterministically and pin which
             # predicate they match.
             location=f"{schema}.{table}::{expr_sql}",
-            sql=f"CREATE INDEX ON {qtable} ({expr_sql});",
+            sql=f"CREATE INDEX IF NOT EXISTS {index_name} ON {qtable} "
+            f"({expr_sql});",
             description=(
                 f"Create an expression index on {schema}.{table} "
                 f"matching the policy predicate `{expr_sql}` so the "

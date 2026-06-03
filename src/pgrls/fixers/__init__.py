@@ -41,6 +41,15 @@ class Fix:
     location: str
     sql: str
     description: str
+    # The policy clause(s) this fix's `ALTER POLICY` actually re-emits —
+    # a subset of {"using", "with_check"}. `ALTER POLICY ... USING (x)`
+    # REPLACES the whole USING clause (likewise WITH CHECK), so two fixes
+    # that re-emit the SAME clause on one policy clobber each other. The
+    # orchestrator uses this to keep one writer per (policy, clause) and
+    # never let a clause-regenerating fixer silently revert a security
+    # strip. Empty for fixes that don't rewrite a policy clause
+    # (ALTER TABLE, DROP POLICY, ALTER VIEW, …).
+    clauses: frozenset[str] = frozenset()
 
 
 @runtime_checkable
@@ -126,15 +135,22 @@ def generate_fixes(
     duplicate was redundant as well as unrunnable. The result is
     always a runnable statement sequence with no lost remediation.
 
-    Note this does NOT merge multiple ALTERs that target the *same
-    surviving* policy (e.g. PERF001 and SEC019 both rewriting one
-    policy's USING): those remain separate `ALTER POLICY` statements
-    and `pgrls fix --apply` converges over repeated runs, a contract
-    pinned by
-    `test_sec019_and_perf001_both_fire_on_unwrapped_one_arg_current_setting`.
-    Each such ALTER only narrows or hardens the clause it names; none
-    re-introduces a bypass another fixer removed, so no security
-    rewrite is silently reverted.
+    A second, sharper hazard: multiple fixers rewrite a policy's USING /
+    WITH CHECK, and each emits a FULL `ALTER POLICY ... USING/WITH CHECK
+    (...)` that REPLACES the whole clause. Two ALTERs that re-emit the
+    SAME clause on one policy clobber each other (the name-sorted-last
+    wins), and the clause-REGENERATING fixers (SEC019's missing_ok pass,
+    PERF001's SELECT-wrap) build their clause from the ORIGINAL predicate —
+    so applied after SEC011 / SEC020's `OR true` strip they silently revert
+    it, leaving the policy wide open in that single migration. To prevent
+    that we keep at most ONE writer per (policy, clause): the
+    security-NARROWING fixer (SEC011 / SEC020) when present, else the
+    name-sorted-first writer. A fix that loses a clause it would re-emit is
+    dropped whole; its remaining work re-fires on the next `pgrls fix` run
+    (the converges-over-repeated-runs contract) once the kept fix's change
+    no longer triggers it. The keep is CLAUSE-precise (via `Fix.clauses`),
+    so two narrowing strips on different clauses (SEC011 on USING, SEC020
+    on WITH CHECK) both survive — they don't actually collide.
 
     Within those constraints the sort is alphabetical by `rule_id`
     then `location`. A future fixer with a hard ordering dependency
@@ -167,7 +183,50 @@ def generate_fixes(
             if f.rule_id == "HYG003" or f.location not in dropped_policy_ids
         ]
 
+    out = _suppress_clobbering_clause_rewrites(out)
+
     return sorted(out, key=lambda f: (f.rule_id, f.location))
+
+
+# Fixers that re-emit a `WITH CHECK` from a non-trivial predicate (a real
+# narrowing of the write side); they must win a clause contest so their
+# strip / mirror is never clobbered by a clause-regenerating fixer.
+_NARROWING_RULE_IDS = frozenset({"SEC011", "SEC020"})
+
+
+def _suppress_clobbering_clause_rewrites(fixes: list[Fix]) -> list[Fix]:
+    """Keep at most one writer per (policy, clause) among clause-rewriting
+    fixes, so no `ALTER POLICY` clause replacement clobbers (and silently
+    reverts) another's.
+
+    A fix participates only if it re-emits a policy clause (``f.clauses``
+    non-empty). For each contested (location, clause) the keeper is the
+    security-narrowing fixer (SEC011 / SEC020) if present, else the
+    name-sorted-first writer. A fix that is NOT the keeper on any clause it
+    re-emits is dropped whole — `pgrls fix` re-runs converge it once the
+    kept change no longer triggers it.
+    """
+    # winner[(location, clause)] = rule_id that keeps that clause
+    contenders: dict[tuple[str, str], list[Fix]] = {}
+    for f in fixes:
+        for clause in f.clauses:
+            contenders.setdefault((f.location, clause), []).append(f)
+    winners: dict[tuple[str, str], str] = {}
+    for key, group in contenders.items():
+        narrowing = [f for f in group if f.rule_id in _NARROWING_RULE_IDS]
+        winners[key] = min(
+            (narrowing or group), key=lambda f: f.rule_id
+        ).rule_id
+    kept: list[Fix] = []
+    for f in fixes:
+        if not f.clauses:
+            kept.append(f)
+            continue
+        if all(
+            winners[(f.location, clause)] == f.rule_id for clause in f.clauses
+        ):
+            kept.append(f)
+    return kept
 
 
 def render_fixes(fixes: list[Fix]) -> str:

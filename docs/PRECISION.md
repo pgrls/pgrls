@@ -12,7 +12,7 @@ The negatives are deliberately **adversarial** — `coalesce()`-wrapped auth che
 
 ## Headline
 
-- **19** cases (11 positive, 8 negative/near-miss)
+- **20** cases (11 positive, 9 negative/near-miss)
 - **12** true positives, **0** false positives, **0** false negatives
 - **Precision:** 100.0%
 - **Recall:** 100.0%

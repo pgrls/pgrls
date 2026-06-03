@@ -20,6 +20,7 @@ from pgrls.coverage import (
     is_policy_covered,
     load_artifact,
     render,
+    render_html,
     render_markdown,
     render_text,
     write_artifact,
@@ -87,6 +88,26 @@ def test_exercised_from_sql_insert_select_splits_target_and_source() -> None:
     # The write target is credited INSERT; the read source is SELECT.
     out = set(exercised_from_sql("INSERT INTO audit SELECT * FROM invoices"))
     assert out == {(None, "audit", "INSERT"), (None, "invoices", "SELECT")}
+
+
+def test_exercised_from_sql_merge_credits_each_when_command() -> None:
+    # MERGE is multi-command: the target gets EVERY command its WHEN
+    # clauses perform (UPDATE + INSERT here), the source is a read.
+    # Regression — a MERGE previously mapped to no command at all, so
+    # it contributed zero coverage and HYG004 reported an exercised
+    # write policy as uncovered.
+    out = set(
+        exercised_from_sql(
+            "MERGE INTO t USING s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET x = 1 "
+            "WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)"
+        )
+    )
+    assert out == {
+        (None, "t", "UPDATE"),
+        (None, "t", "INSERT"),
+        (None, "s", "SELECT"),
+    }
 
 
 def test_exercised_from_sql_non_dml_and_parse_failure() -> None:
@@ -324,6 +345,28 @@ def test_summary_no_policies_is_fully_covered() -> None:
     }
 
 
+def test_summary_partial_coverage_never_displays_misleading_100() -> None:
+    # 1999/2000 = 99.95% rounds to 100.0 at one decimal place. The display
+    # must NOT read as full coverage when a policy is uncovered — clamp it
+    # below 100 so "100.0%" means exactly that.
+    report = CoverageReport(
+        policies=tuple(
+            PolicyCoverage(
+                schema="public",
+                table="t",
+                policy=f"p{i}",
+                command="SELECT",
+                roles=("r",),
+                covered=i != 0,
+            )
+            for i in range(2000)
+        )
+    )
+    s = report.summary
+    assert (s["policies"], s["covered"], s["uncovered"]) == (2000, 1999, 1)
+    assert s["coverage_pct"] == 99.9  # not 100.0
+
+
 # ---------- renderers ----------
 
 
@@ -409,6 +452,30 @@ def test_render_text_newline_in_location_and_role_no_split() -> None:
     assert "ro\\nle,two" in data_lines[0]
 
 
+def test_render_empty_report_across_formats() -> None:
+    # R17 #2 (coverage): the no-policies branches of the renderers are
+    # reachable whenever `pgrls coverage` runs against a schema with zero
+    # policies, yet shipped untested. Pin each renderer's empty state so a
+    # future refactor of the shared render / HTML helpers can't silently
+    # break the no-policies output (malformed HTML, stale message).
+    report = CoverageReport(policies=())
+    # Empty coverage is vacuously 100% (no gaps).
+    assert report.summary["coverage_pct"] == 100.0
+    # Text: the early no-policies sentinel (no table emitted).
+    assert render_text(report) == "No policies found in the scanned schemas."
+    # Markdown: a well-formed table header + heading, no body rows.
+    md = render_markdown(report)
+    assert "# RLS test coverage" in md
+    assert "| Policy | Command | Roles | Covered |" in md
+    assert "|---|---|---|---|" in md
+    # HTML: the colspan empty row, the sentinel text, and the 100.0%
+    # summary. generated_at must be timezone-aware.
+    html_out = render_html(report, generated_at=_AWARE)
+    assert '<td colspan="4" class="empty">' in html_out
+    assert "No policies found in the scanned schemas." in html_out
+    assert "100.0%" in html_out
+
+
 # ---------- CLI command (mocked introspection) ----------
 
 
@@ -450,6 +517,37 @@ def test_cli_coverage_reports_and_fail_under(tmp_path) -> None:
         tmp_path, ["--coverage", path, "--fail-under", "50"], schema=schema
     )
     assert res3.exit_code == 0, res3.output
+
+
+def test_cli_coverage_fail_under_compares_raw_not_rounded(tmp_path) -> None:
+    # Regression: the gate compared the 1-dp display value, so a coverage
+    # that rounds up to the threshold slipped past. 2/3 = 66.67% displays
+    # as 66.7%, so --fail-under 66.7 passed under the old (rounded) gate;
+    # the raw fraction 66.67 < 66.7 must fail.
+    path = str(tmp_path / "cov.json")
+    write_artifact(
+        path,
+        [
+            ExercisedTuple(None, "invoices", "r", "SELECT"),
+            ExercisedTuple(None, "invoices", "r", "INSERT"),
+        ],
+        generated_at=_AWARE,
+    )
+    schema = _one_table_schema(
+        _policy("sel", "SELECT", ("r",)),
+        _policy("ins", "INSERT", ("r",)),
+        _policy("del", "DELETE", ("r",)),  # never exercised → 2/3 covered
+    )
+    res = _run_coverage(
+        tmp_path, ["--coverage", path, "--fail-under", "66.7"], schema=schema
+    )
+    assert res.exit_code == 1, res.output
+    assert "below --fail-under" in res.output
+    # The raw 66.67% still clears a threshold strictly below it.
+    res2 = _run_coverage(
+        tmp_path, ["--coverage", path, "--fail-under", "66.6"], schema=schema
+    )
+    assert res2.exit_code == 0, res2.output
 
 
 def test_cli_lint_coverage_enables_hyg004(tmp_path) -> None:

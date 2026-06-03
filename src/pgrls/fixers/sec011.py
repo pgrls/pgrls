@@ -226,6 +226,14 @@ class SEC011Fixer:
                         rule_id="SEC011",
                         location=pid,
                         sql=stmt,
+                        clauses=frozenset(
+                            c
+                            for c, ch in (
+                                ("using", using_changed),
+                                ("with_check", wc_changed),
+                            )
+                            if ch
+                        ),
                         description=(
                             f"Remove the `OR true` disjunct from policy "
                             f"{policy.name!r} on {table.qualified_name}, "

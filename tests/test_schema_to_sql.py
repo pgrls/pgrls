@@ -18,6 +18,7 @@ import pytest
 
 from pgrls.model import (
     Column,
+    ColumnGrant,
     Grant,
     Policy,
     SNAPSHOT_VERSION,
@@ -210,6 +211,35 @@ def test_to_sql_emits_create_policy_with_all_clauses():
     )
 
 
+def test_to_sql_rejects_trailing_comment_in_using_predicate():
+    # Regression (round-10 #3): a snapshot predicate ending in `--`
+    # passes the isolated `SELECT 1 WHERE (<sql>)` probe (the comment
+    # eats the probe's own closing paren) but, once emitted as
+    # `USING (<sql>) WITH CHECK (…)` on one line, comments out the
+    # closing paren and the entire WITH CHECK clause — silently dropping
+    # the write-side check / breaking diff --apply. to_sql() must refuse.
+    pol = _p(
+        command="ALL",
+        using_sql="true)--",
+        with_check_sql="tenant_id = current_setting('app.t')::uuid",
+    )
+    schema = Schema(tables=(_t(policies=(pol,)),))
+    with pytest.raises(ValueError, match="single SQL expression"):
+        schema.to_sql()
+
+
+def test_to_sql_allows_double_dash_inside_string_literal():
+    # Guard against over-rejection: a `--` INSIDE a string literal is
+    # part of the value, not a comment, so the predicate is safe to emit.
+    pol = _p(
+        command="SELECT",
+        using_sql="note <> 'a--b'",
+    )
+    schema = Schema(tables=(_t(policies=(pol,)),))
+    sql = schema.to_sql()
+    assert "USING (note <> 'a--b')" in sql
+
+
 def test_to_sql_omits_as_permissive_default():
     # PERMISSIVE is the Postgres default; omit the explicit
     # `AS PERMISSIVE` keyword for cleanliness.
@@ -247,6 +277,74 @@ def test_to_sql_emits_grant_per_role_pair():
     sql = schema.to_sql()
     assert "GRANT SELECT ON public.t TO PUBLIC;" in sql
     assert "GRANT SELECT, INSERT ON public.t TO app_user;" in sql
+
+
+def test_to_sql_emits_column_grant_per_role_pair():
+    # R16 #5 (coverage): the column-grant emit path (replayed verbatim by
+    # `diff --apply` to build the baseline) had no to_sql assertion. Each
+    # privilege carries its own parenthesized column; PUBLIC renders bare;
+    # a named role and multiple privileges round-trip.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(),
+                columns=("id", "ssn"),
+                column_details=(
+                    Column(name="id", data_type="integer", is_nullable=False),
+                    Column(name="ssn", data_type="text", is_nullable=True),
+                ),
+                column_grants=(
+                    ColumnGrant(
+                        role="PUBLIC", column="ssn", privileges=("SELECT",)
+                    ),
+                    ColumnGrant(
+                        role="app_user",
+                        column="ssn",
+                        privileges=("SELECT", "UPDATE"),
+                    ),
+                ),
+            ),
+        )
+    )
+    sql = schema.to_sql()
+    assert "GRANT SELECT (ssn) ON public.t TO PUBLIC;" in sql
+    assert (
+        "GRANT SELECT (ssn), UPDATE (ssn) ON public.t TO app_user;" in sql
+    )
+
+
+def test_to_sql_quotes_reserved_column_and_role_in_column_grant():
+    # The column and role of a column grant route through quote_ident, so
+    # a reserved-keyword column ("select") and a mixed-case role ("Reader")
+    # must be double-quoted — otherwise the emitted DDL is unparseable and
+    # aborts the all-or-nothing `diff --apply` baseline transaction.
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="t",
+                rls_enabled=True,
+                force_rls=True,
+                policies=(),
+                columns=("id", "select"),
+                column_details=(
+                    Column(name="id", data_type="integer", is_nullable=False),
+                    Column(name="select", data_type="text", is_nullable=True),
+                ),
+                column_grants=(
+                    ColumnGrant(
+                        role="Reader", column="select", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    sql = schema.to_sql()
+    assert 'GRANT SELECT ("select") ON public.t TO "Reader";' in sql
 
 
 def test_to_sql_renders_public_role_unquoted():
@@ -385,13 +483,11 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_thirteen():
-    # Bumped 11 → 12 to add per-overload `signature` to
-    # `SecdefFunction` and `LeakproofFunction` (additive — unlocks
-    # the SEC014/15/17 fixers that need the argument-type
-    # signature to emit `ALTER FUNCTION name(<sig>)`). Pin so a
+def test_snapshot_version_is_fifteen():
+    # Bumped 14 → 15 to add per-table column_grants (pg_attribute.attacl)
+    # so the diff flags a PUBLIC column grant on a no-RLS table. Pin so a
     # future bump is deliberate.
-    assert SNAPSHOT_VERSION == 13
+    assert SNAPSHOT_VERSION == 15
 
 
 def test_to_snapshot_emits_column_details_array():
@@ -477,4 +573,17 @@ def test_from_snapshot_v3_v4_roundtrip_then_to_sql_raises():
     }
     schema = Schema.from_snapshot(v4_payload)
     with pytest.raises(ValueError, match="column_details"):
+        schema.to_sql()
+
+
+def test_to_sql_rejects_multi_statement_policy_predicate() -> None:
+    # A policy predicate that smuggles a second statement
+    # (`true); DROP TABLE secrets; --`) must not be emitted into the
+    # DDL that `pgrls diff --apply` executes — policy_to_sql requires
+    # the predicate to be a single SQL expression. (#5: to_sql is a
+    # trust-boundary sink for snapshot-sourced values.)
+    schema = Schema(
+        tables=(_t(policies=(_p(using_sql="true); DROP TABLE secrets; --"),)),)
+    )
+    with pytest.raises(ValueError, match="single SQL expression"):
         schema.to_sql()

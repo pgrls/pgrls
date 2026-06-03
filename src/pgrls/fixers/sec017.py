@@ -72,19 +72,37 @@ class SEC017Fixer:
             # The operator re-snapshots to populate signatures.
             if not fn.signature:
                 continue
-            out.append(self._fix(fn.qualified_name, fn.signature))
+            # Abstain on pre-v14 snapshots — schema_name/function_name
+            # were not captured, and splitting the ambiguous
+            # qualified_name targets the wrong object when the schema
+            # name contains a dot. Live introspection always sets these.
+            if not fn.schema_name or not fn.function_name:
+                continue
+            out.append(
+                self._fix(
+                    fn.qualified_name,
+                    fn.schema_name,
+                    fn.function_name,
+                    fn.signature,
+                )
+            )
         return out
 
     @staticmethod
-    def _fix(qualified_name: str, signature: str) -> Fix:
-        # `qualified_name` is `n.nspname || '.' || p.proname` from
-        # introspection — raw, unquoted. Route through
-        # `quote_qualified` so a function or schema named `Order` /
-        # `"weird name"` / a reserved keyword still produces valid
-        # SQL on the server. The `signature` side already comes
-        # from `pg_get_function_identity_arguments` which is
-        # server-formatted with the right quoting.
-        schema_name, _, function_name = qualified_name.partition(".")
+    def _fix(
+        qualified_name: str,
+        schema_name: str,
+        function_name: str,
+        signature: str,
+    ) -> Fix:
+        # schema_name / function_name are captured as separate fields
+        # (snapshot v14+). Splitting the ambiguous `qualified_name`
+        # (`nspname || '.' || proname`) targets the wrong object when
+        # the schema name contains a dot, so use the components
+        # directly. Route each through `quote_qualified` so a function
+        # or schema named `Order` / `a.b` / a reserved keyword still
+        # produces valid SQL. The `signature` side already comes from
+        # `pg_get_function_identity_arguments` (server-formatted).
         qident = quote_qualified(schema_name, function_name)
         return Fix(
             rule_id="SEC017",

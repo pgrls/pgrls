@@ -93,6 +93,19 @@ def test_sec038_fires_on_bool_cast_is_null() -> None:
     assert len(SEC038().check(schema, {})) == 1
 
 
+def test_sec038_fires_on_unknown_type_cast_of_auth_call_is_null() -> None:
+    # R11 #3: the catastrophic shape on real Supabase schemas —
+    # `auth.uid()::jsonb IS NULL OR <owner>`. The cast of an anon-null
+    # auth call to an unknown target type preserves the null flag, so the
+    # inverted disjunct is valid under anon and SEC038 fires.
+    schema = _wrap(
+        _policy_with_using(
+            f"((SELECT auth.uid())::jsonb) IS NULL OR {_OWNER_LIT}"
+        )
+    )
+    assert len(SEC038().check(schema, {})) == 1
+
+
 def test_sec038_fires_on_multiple_auth_is_null_disjuncts() -> None:
     # P6: role IS NULL OR uid IS NULL OR <scoped> — anon makes the first
     # two disjuncts TRUE, so the whole OR is TRUE for every row.
@@ -179,6 +192,59 @@ def test_sec038_clean_on_coalesce_sentinel() -> None:
     assert SEC038().check(schema, {}) == []
 
 
+@pytest.mark.parametrize(
+    "using",
+    [
+        # R18 #1: a bare integer column inside COALESCE used to default to
+        # BoolSort (no comparison-sort context), and Z3 silently coerced
+        # the Bool into {0,1}, so these safe, auth-free tier/level/
+        # visibility gates were mis-proven VALID and SEC038 fabricated a
+        # catastrophic "anonymous read leak" error. Each is genuinely
+        # FALSE for a high access_level (leaks nothing), so it must stay
+        # clean (the rule now abstains on the mismatched-sort fold).
+        "COALESCE(access_level, 0) < 3",
+        "COALESCE(access_level, 0) <= 1",
+        "COALESCE(access_level, 0) + 0 < 2",
+        "COALESCE(access_level, 0) >= 0",
+        # Boundary shapes that were already clean — pin them so the fix
+        # didn't regress the genuinely-not-valid comparisons either way.
+        "COALESCE(access_level, 0) < 1",
+        "COALESCE(access_level, 0) > 1",
+    ],
+)
+def test_sec038_clean_on_coalesce_numeric_gate(using: str) -> None:
+    assert SEC038().check(_wrap(_policy_with_using(using)), {}) == [], using
+
+
+def test_sec038_fires_on_three_arg_all_anon_null_coalesce_is_null() -> None:
+    # R18 #3: pin the N-arg COALESCE `is_null` AND-chain fold. Three
+    # anon-NULL args → the COALESCE is NULL under anon → `IS NULL` is TRUE
+    # for every row → valid → fire. Guards the fold that, if mis-ordered,
+    # could silently turn a real leak into a false negative.
+    schema = _wrap(
+        _policy_with_using(
+            "COALESCE((SELECT auth.uid()), (SELECT auth.uid()), "
+            "(SELECT auth.uid())) IS NULL OR " + _OWNER_LIT
+        )
+    )
+    assert len(SEC038().check(schema, {})) == 1
+
+
+def test_sec038_clean_on_three_arg_coalesce_with_non_null_tail() -> None:
+    # R18 #3: the same 3-arg shape but with a non-NULL literal tail → the
+    # COALESCE is non-NULL → `IS NULL` is FALSE → the predicate reduces to
+    # the narrow owner match → not valid → clean. Pins the value `If`-chain
+    # fold alongside the `is_null` fold above.
+    schema = _wrap(
+        _policy_with_using(
+            "COALESCE((SELECT auth.uid()), (SELECT auth.uid()), "
+            "'00000000-0000-0000-0000-000000000009'::uuid) IS NULL OR "
+            + _OWNER_LIT
+        )
+    )
+    assert SEC038().check(schema, {}) == []
+
+
 def test_sec038_clean_on_jwt_claim_tenant() -> None:
     # N8: jwt-claim tenancy. auth.jwt() is anon-NULL; the `->>` operator is
     # untranslatable → soundness abort → clean (either way, no fire).
@@ -210,6 +276,36 @@ def test_sec038_clean_on_shared_bool_carveout() -> None:
         _policy_with_using("shared = true OR owner_id = (SELECT auth.uid())")
     )
     assert SEC038().check(schema, {}) == []
+
+
+def test_sec038_no_false_positive_on_user_function_named_like_builtin() -> None:
+    # A user-defined `myschema.current_setting(...)` is NOT the
+    # pg_catalog builtin and must not be forced to NULL under anon —
+    # otherwise `myschema.current_setting('x') IS NULL OR <scoped>`
+    # would be proved valid and SEC038 would false-fire. Regression
+    # for the bare-name builtin collision (a schema-qualified call is
+    # a different function with unknown anonymous behaviour).
+    safe = _wrap(
+        _policy_with_using(
+            "myschema.current_setting('app.tenant') IS NULL OR " + _OWNER_LIT
+        )
+    )
+    assert SEC038().check(safe, {}) == []
+
+
+def test_sec038_fires_on_unqualified_and_pg_catalog_builtin() -> None:
+    # Control for the above: the unqualified builtin (and its explicit
+    # pg_catalog form), in the NULLable two-arg form, IS forced to NULL
+    # under anon, so the inverted-auth disjunct is a real anonymous-read
+    # leak. (The one-arg form is never NULL — see
+    # test_sec038_silent_on_one_arg_current_setting_is_null.)
+    for fn in ("current_setting", "pg_catalog.current_setting"):
+        leak = _wrap(
+            _policy_with_using(
+                f"{fn}('app.tenant', true) IS NULL OR " + _OWNER_LIT
+            )
+        )
+        assert len(SEC038().check(leak, {})) == 1
 
 
 def test_sec038_clean_on_coerced_guc_count() -> None:
@@ -363,6 +459,32 @@ def test_sec038_message_describes_unconditional_anon_leak() -> None:
     assert "SEC004" in msg
 
 
+def test_sec038_silent_on_one_arg_current_setting_is_null() -> None:
+    # R12 #1 (supersedes R9 #10): the one-arg `current_setting('app.x')`
+    # RAISES `unrecognized configuration parameter` on an unset GUC and
+    # is otherwise a non-NULL string — it is NEVER NULL, so the
+    # `IS NULL` disjunct is dead and the policy fails closed. SEC038 must
+    # NOT prove it anon-valid (it would be a false positive, mirroring
+    # SEC004).
+    schema = _wrap(
+        _policy_with_using(
+            f"current_setting('app.x') IS NULL OR {_OWNER_LIT}"
+        )
+    )
+    assert SEC038().check(schema, {}) == []
+
+
+def test_sec038_fires_on_two_arg_current_setting_is_null() -> None:
+    # The two-arg `current_setting(name, true)` returns NULL when unset
+    # → the inverted disjunct IS anon-valid → genuine leak → fires.
+    schema = _wrap(
+        _policy_with_using(
+            f"(SELECT current_setting('app.x', true)) IS NULL OR {_OWNER_LIT}"
+        )
+    )
+    assert len(SEC038().check(schema, {})) == 1
+
+
 def test_sec038_noop_when_z3_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     # HARD-CONSTRAINT regression guard: SEC038 must NO-OP when z3 is absent.
     # This test does NOT skip — it runs even where z3 IS installed, by
@@ -372,3 +494,36 @@ def test_sec038_noop_when_z3_unavailable(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(z3c, "Z3_AVAILABLE", False)
     schema = _wrap(_policy_with_using("(SELECT auth.uid()) IS NULL OR true"))
     assert SEC038().check(schema, {}) == []
+
+
+def test_sec038_arithmetic_operand_3vl_branch() -> None:
+    # Coverage (round-7): exercise the Kleene arithmetic-operand branch of
+    # the 3VL encoder (null-flag propagated as Or(left, right)). FIRE — anon
+    # makes the IS NULL disjunct TRUE and the surviving disjunct does
+    # arithmetic on a column operand:
+    fire = _wrap(
+        _policy_with_using("(SELECT auth.uid()) IS NULL OR amount + 1 > 0")
+    )
+    assert len(SEC038().check(fire, {})) == 1
+    # NO-FIRE — arithmetic compared to a per-request auth value: under anon
+    # the value is NULL, so the comparison is Kleene-unknown, never provably
+    # TRUE for all rows.
+    scoped = _wrap(
+        _policy_with_using(
+            "amount + 1 = (SELECT current_setting('app.x', true))::int"
+        )
+    )
+    assert SEC038().check(scoped, {}) == []
+
+
+def test_sec038_column_vs_column_operand_3vl_branch() -> None:
+    # Coverage (round-7): exercise the col-op-col operand branch (both
+    # operands default to StringSort with free null-flags). FIRE via the
+    # anon IS NULL disjunct:
+    fire = _wrap(
+        _policy_with_using("a = b OR (SELECT auth.uid()) IS NULL")
+    )
+    assert len(SEC038().check(fire, {})) == 1
+    # NO-FIRE — a plain two-column comparison is not provably TRUE for every
+    # row, so anon cannot read everything.
+    assert SEC038().check(_wrap(_policy_with_using("a = b")), {}) == []

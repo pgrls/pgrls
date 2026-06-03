@@ -746,3 +746,23 @@ def test_cli_perf_statements_no_section_without_findings() -> None:
     res = _run_perf_statements(schema=schema, stats=small, stmts=stmts)
     assert res.exit_code == 0, res.output
     assert '"statements"' not in res.output
+
+
+def test_under_seq_scan_pressure_gates_on_raw_fraction() -> None:
+    # Regression (round-5): the gate must compare the RAW seq-scan fraction,
+    # not the 1-dp display value. 4996/10000 = 49.96% rounds to 50.0 and
+    # would clear a min_seq_pct=50.0 gate it is actually below.
+    thresholds = PerfThresholds(
+        min_live_tup=1, min_seq_scans=1, min_seq_pct=50.0
+    )
+    just_below = _stats(
+        "public", "t", seq_scan=4996, seq_tup_read=0, idx_scan=5004,
+        n_live_tup=10000,
+    )
+    assert just_below.seq_scan_pct == 50.0  # rounded display value
+    assert under_seq_scan_pressure(just_below, thresholds) is False  # raw 49.96
+    at_threshold = _stats(
+        "public", "t", seq_scan=5000, seq_tup_read=0, idx_scan=5000,
+        n_live_tup=10000,
+    )
+    assert under_seq_scan_pressure(at_threshold, thresholds) is True

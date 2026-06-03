@@ -59,10 +59,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, A_Expr, Node, String, TypeCast
+from pglast.ast import A_Const, A_Expr, ColumnRef, Node, String, TypeCast
 from pglast.enums import A_Expr_Kind
 
-from pgrls.ast_utils import extract_column_refs
 from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -139,22 +138,27 @@ def _is_literal_operand(node: Any) -> bool:
     return False
 
 
-def _side_has_identity_column(
+def _operand_is_identity_column(
     side: Any, identity_columns: set[str]
 ) -> bool:
-    """True if `side` references a column with an identity-ish name.
+    """True if `side` IS an identity-named column as the DIRECT operand.
 
-    `extract_column_refs` returns name tuples; the column name is the
-    last component, so `tenant_id`, `t.tenant_id`, and
-    `public.t.tenant_id` all resolve to `tenant_id`.
-    `exclude_sublinks=True` stops a column inside a sub-select
-    operand from counting as this operand's column — the tree walk
-    reaches sub-select `A_Expr` nodes on its own.
+    The operand node must itself be a `ColumnRef` (optionally wrapped in
+    one or more `TypeCast`s — `tenant_id::text`) whose last name
+    component is in the identity set, so `tenant_id`, `t.tenant_id`, and
+    `public.t.tenant_id` all resolve to `tenant_id`. Requiring the
+    DIRECT operand — not merely the column appearing somewhere in the
+    side's subtree — keeps the rule on the documented `tenant_id = 1`
+    shape and excludes derived expressions that do NOT pin the policy to
+    a single tenant: `substring(tenant_id, 1, 2) = 'ab'`,
+    `tenant_id + 1 = 5`, `tenant_id || 'x' = 'foo'`.
     """
-    return any(
-        ref and ref[-1].lower() in identity_columns
-        for ref in extract_column_refs(side, exclude_sublinks=True)
-    )
+    while isinstance(side, TypeCast):
+        side = side.arg
+    if not isinstance(side, ColumnRef):
+        return False
+    names = [f.sval for f in (side.fields or ()) if isinstance(f, String)]
+    return bool(names) and names[-1].lower() in identity_columns
 
 
 def _compares_identity_column_to_literal(
@@ -176,10 +180,10 @@ def _compares_identity_column_to_literal(
         if isinstance(n, A_Expr) and _is_equality(n):
             lhs, rhs = n.lexpr, n.rexpr
             if (
-                _side_has_identity_column(lhs, identity_columns)
+                _operand_is_identity_column(lhs, identity_columns)
                 and _is_literal_operand(rhs)
             ) or (
-                _side_has_identity_column(rhs, identity_columns)
+                _operand_is_identity_column(rhs, identity_columns)
                 and _is_literal_operand(lhs)
             ):
                 return True
@@ -237,17 +241,19 @@ class SEC021:
                 f"Policy {policy.name!r} on {table.qualified_name} "
                 "compares an identity column (a tenant / owner-style "
                 "column) against a hardcoded literal — e.g. "
-                "`tenant_id = 1`. A literal pins the policy to one "
-                "specific tenant: every session is handed the same "
-                "fixed slice of rows instead of being scoped to its "
-                "own tenant. This is almost always a scaffolding "
-                "value left in place of the per-request session "
-                "context. Key the policy off a value the application "
-                "sets per request — current_setting('app.tenant_id'), "
-                "or a JWT claim. If comparing this column to a fixed "
-                "value is intentional (a table pinned to one tenant, "
-                "an admin-only policy), allowlist this policy as "
-                f"{pid!r} in [lint.rules.SEC021]."
+                "`tenant_id = 1`. If that literal is the policy's only "
+                "discriminator, every session is handed the same fixed "
+                "slice of rows instead of being scoped to its own tenant "
+                "— almost always a scaffolding value left in place of the "
+                "per-request session context. (If the literal is instead "
+                "an additive sentinel — one disjunct of an OR alongside a "
+                "real per-request scope, e.g. marking shared/public rows — "
+                "that is legitimate.) Key the per-tenant comparison off a "
+                "value the application sets per request — "
+                "current_setting('app.tenant_id'), or a JWT claim. If the "
+                "fixed value is intentional (a table pinned to one tenant, "
+                "an admin-only policy, a shared-row sentinel), allowlist "
+                f"this policy as {pid!r} in [lint.rules.SEC021]."
             ),
             location=pid,
         )

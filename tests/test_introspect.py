@@ -212,6 +212,28 @@ def test_columns_skips_dropped_columns(
     assert "kept" in things.columns
 
 
+def test_index_columns_exclude_covering_include_columns(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A covering index's INCLUDE columns are NOT part of the logical
+    # key, so they must not land in Index.columns — otherwise SEC035
+    # mistakes a `UNIQUE (email) INCLUDE (tenant_id)` for a
+    # tenant-scoped unique and misses the cross-tenant existence leak.
+    # pg_index.indkey lists key columns then INCLUDE columns; we slice
+    # to indnkeyatts (0-based) so only the key columns are captured.
+    apply_sql(
+        """
+        CREATE TABLE public.members (email TEXT, tenant_id UUID);
+        CREATE UNIQUE INDEX members_email_key
+            ON public.members (email) INCLUDE (tenant_id);
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    members = next(t for t in schema.tables if t.name == "members")
+    idx = next(i for i in members.indexes if i.name == "members_email_key")
+    assert tuple(idx.columns) == ("email",)
+
+
 def test_populates_policy_using_ast(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
@@ -566,6 +588,70 @@ def test_introspect_captures_grants(
     assert grants_by_role["grant_test_actor"] >= {"SELECT", "INSERT"}
 
 
+def test_introspect_captures_column_grants(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # R15 #2: column-level grants live in pg_attribute.attacl, not
+    # pg_class.relacl, so they must be captured separately. Validate the
+    # _COLUMN_GRANTS_SQL query against a live Postgres — the production
+    # form, not a hand-built assumption.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS colgrant_actor;
+        CREATE ROLE colgrant_actor NOLOGIN;
+        CREATE TABLE public.colgranted_t (id INT, ssn TEXT, note TEXT);
+        GRANT SELECT (ssn), UPDATE (ssn) ON public.colgranted_t
+            TO colgrant_actor;
+        GRANT SELECT (note) ON public.colgranted_t TO PUBLIC;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "colgranted_t")
+    by_key = {
+        (cg.role, cg.column): set(cg.privileges) for cg in t.column_grants
+    }
+    assert by_key.get(("colgrant_actor", "ssn")) == {"SELECT", "UPDATE"}
+    assert by_key.get(("PUBLIC", "note")) == {"SELECT"}
+    # A bare table-level grant must NOT leak into column_grants.
+    assert all(cg.column in ("ssn", "note") for cg in t.column_grants)
+
+
+def test_introspect_grants_dedupe_multiple_grantors(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # R18 #2: aclexplode(relacl) returns one row per (grantor, grantee,
+    # privilege). When the SAME privilege is granted to one grantee by two
+    # grantors (the normal WITH GRANT OPTION re-grant), the query must NOT
+    # duplicate it into Grant.privileges — snapshot canonicality requires a
+    # set-like privilege list. _GRANTS_SQL's SELECT DISTINCT enforces this.
+    apply_sql(
+        """
+        DROP TABLE IF EXISTS public.dg_t;
+        DROP ROLE IF EXISTS dg_target;
+        DROP ROLE IF EXISTS dg_g1;
+        DROP ROLE IF EXISTS dg_g2;
+        CREATE ROLE dg_g1 NOLOGIN;
+        CREATE ROLE dg_g2 NOLOGIN;
+        CREATE ROLE dg_target NOLOGIN;
+        CREATE TABLE public.dg_t (id INT);
+        GRANT SELECT ON public.dg_t TO dg_g1 WITH GRANT OPTION;
+        GRANT SELECT ON public.dg_t TO dg_g2 WITH GRANT OPTION;
+        SET ROLE dg_g1;
+        GRANT SELECT ON public.dg_t TO dg_target;
+        RESET ROLE;
+        SET ROLE dg_g2;
+        GRANT SELECT ON public.dg_t TO dg_target;
+        RESET ROLE;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "dg_t")
+    grants_by_role = {g.role: g.privileges for g in t.grants}
+    # Two grantors → two aclexplode rows for (dg_target, SELECT); the
+    # captured privilege tuple must carry SELECT exactly once.
+    assert grants_by_role.get("dg_target") == ("SELECT",)
+
+
 def test_introspect_grants_resolve_public_pseudo_role(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
@@ -675,6 +761,85 @@ def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
         "GRANTS query must COALESCE the resolved rolname to an "
         "'oid:N' sentinel so unresolvable grantee OIDs don't leak "
         "NULL into Grant.role."
+    )
+
+
+def test_introspect_excludes_owner_self_grant(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A default-ACL table (relacl=NULL) yields zero grant rows, so the
+    # owner's always-implicit privileges are invisible. The moment ANY
+    # explicit GRANT lands, Postgres materializes the FULL ACL — which
+    # INCLUDES the owner's own self-grant. That owner row is never a real
+    # access delta (the owner always holds it), so it must not surface as a
+    # captured Grant. `_GRANTS_SQL` filters `ax.grantee <> c.relowner`.
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT current_user")
+        row = cur.fetchone()
+        assert row is not None
+        owner = row[0]
+
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS owner_grant_other;
+        CREATE ROLE owner_grant_other NOLOGIN;
+        CREATE TABLE public.owner_grant_t (id INT);
+        GRANT SELECT ON public.owner_grant_t TO owner_grant_other;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "owner_grant_t")
+    roles = {g.role for g in t.grants}
+    # The explicitly granted role is captured ...
+    assert "owner_grant_other" in roles
+    # ... but the owner's materialized self-grant is NOT.
+    assert owner not in roles, (
+        f"owner role {owner!r} leaked into captured grants — its "
+        "always-implicit self-grant must be filtered out of _GRANTS_SQL"
+    )
+
+
+def test_introspect_diff_no_phantom_owner_grant_on_first_grant(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Regression for the phantom DIFF_GRANT_ADDED: snapshot a table BEFORE
+    # any explicit GRANT, then AFTER the first GRANT to another role. The
+    # diff must show exactly the new role's grant — never a spurious
+    # owner-attributed change born from the ACL materializing the owner's
+    # implicit privileges.
+    from pgrls.diff.differ import ChangeKind, diff_schemas
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT current_user")
+        row = cur.fetchone()
+        assert row is not None
+        owner = row[0]
+
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS phantom_grant_role;
+        CREATE ROLE phantom_grant_role NOLOGIN;
+        CREATE TABLE public.phantom_grant_t (id INT);
+        """
+    )
+    before = introspect(pg_conn, schemas=["public"])
+    apply_sql("GRANT SELECT ON public.phantom_grant_t TO phantom_grant_role")
+    after = introspect(pg_conn, schemas=["public"])
+
+    changes = diff_schemas(before, after)
+    grant_changes = [
+        c
+        for c in changes
+        if c.kind
+        in (ChangeKind.GRANT_ADDED, ChangeKind.GRANT_PUBLIC_NO_RLS)
+        and "phantom_grant_t" in c.location
+    ]
+    located_roles = {c.location.rsplit(".", 1)[-1] for c in grant_changes}
+    assert "phantom_grant_role" in located_roles
+    assert owner not in located_roles, (
+        "first GRANT to another role produced a phantom owner-attributed "
+        f"DIFF_GRANT_ADDED ({owner!r}); _GRANTS_SQL must exclude the "
+        "owner self-grant so capture is independent of other grants"
     )
 
 
@@ -1102,6 +1267,23 @@ def test_introspect_resolves_view_to_table_references(
     )
 
 
+def test_view_deps_sql_constrains_referenced_side_to_relations() -> None:
+    # Regression (round-12 #6): without `d.refclassid =
+    # 'pg_catalog.pg_class'` the pg_depend join blindly resolves
+    # refobjid against pg_class, so a rewrite-rule dependency on a
+    # pg_proc / pg_type / pg_operator object whose OID collides with a
+    # relation OID (PG OIDs are cluster-wide across catalogs) would emit
+    # a phantom view reference — a silent VIEW001/002/003 false positive.
+    # An actual cross-catalog OID collision is infeasible to stage in a
+    # unit test, so pin the structural filter at the source.
+    from pgrls.introspect import _VIEW_DEPS_SQL
+
+    assert "d.refclassid = 'pg_catalog.pg_class'::regclass" in _VIEW_DEPS_SQL, (
+        "VIEW deps query must constrain the referenced side to pg_class so "
+        "a cross-catalog OID collision can't yield a phantom view reference"
+    )
+
+
 def test_introspect_view_with_no_references_has_empty_tuple(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
@@ -1135,19 +1317,15 @@ def test_introspect_view_referencing_partitioned_table(
     assert ("public", "events") in v.references
 
 
-def test_introspect_view_chained_through_view_does_not_chase(
+def test_introspect_view_chain_resolves_to_base_table(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
-    # v0.3.0 design: view→table deps are SINGLE HOP. A view that
-    # reads ANOTHER view that reads an RLS-protected table should
-    # NOT have the underlying table in its `references`. The
-    # intermediate view's references point at the table; the outer
-    # view's references point at the intermediate view (filtered
-    # out by relkind='r','p' in the query).
-    #
-    # This test pins the deferral — v0.4 may add transitive
-    # walks; if so, this test should be deleted in the same change
-    # so the intent is visible.
+    # A view that reads ANOTHER view, which reads a (potentially
+    # RLS-protected) table, surfaces the BASE TABLE in its references.
+    # The chain is resolved transitively so VIEW001/002/003 and the view
+    # fixer see the underlying table through any depth of view nesting.
+    # (Earlier versions stopped at the intermediate view — a false
+    # negative; this replaces that pinned deferral.)
     apply_sql(
         """
         CREATE TABLE public.t (id INT);
@@ -1156,11 +1334,38 @@ def test_introspect_view_chained_through_view_does_not_chase(
         """
     )
     schema = introspect(pg_conn, schemas=["public"])
-    outer = next(view for view in schema.views if view.name == "outer_v")
-    # `inner_v` is a view (relkind='v'), filtered out by query.
-    # `t` is a table BUT outer_v's pg_depend doesn't link to it
-    # directly — the chain goes through inner_v.
-    assert ("public", "t") not in outer.references
+    inner = next(v for v in schema.views if v.name == "inner_v")
+    outer = next(v for v in schema.views if v.name == "outer_v")
+    # Both surface the base table; neither lists the intermediate view
+    # (`references` stays "tables the view body reads", now transitive).
+    assert inner.references == (("public", "t"),)
+    assert outer.references == (("public", "t"),)
+
+
+def test_resolve_view_base_tables_chains_diamonds_and_cycles() -> None:
+    # Transitive resolver, unit-level (no live DB). View `a` reads view
+    # `b` (→ view `c` → table t) and table `u` directly; the base set is
+    # {t, u}, with intermediate views excluded.
+    from pgrls.introspect import _resolve_view_base_tables
+
+    views = {("public", "a"), ("public", "b"), ("public", "c")}
+    deps = {
+        ("public", "a"): {("public", "b"), ("public", "u")},
+        ("public", "b"): {("public", "c")},
+        ("public", "c"): {("public", "t")},
+    }
+    assert _resolve_view_base_tables(("public", "a"), deps, views) == {
+        ("public", "t"),
+        ("public", "u"),
+    }
+    # A pathological cycle still terminates and collects reachable tables.
+    cyclic = {
+        ("public", "a"): {("public", "b")},
+        ("public", "b"): {("public", "a"), ("public", "t")},
+    }
+    assert _resolve_view_base_tables(("public", "a"), cyclic, views) == {
+        ("public", "t"),
+    }
 
 
 def test_introspect_view_dependency_filter_by_schema(
@@ -1313,8 +1518,9 @@ def test_triggers_captures_truncate_event(
 ) -> None:
     # `TRUNCATE` is forced to STATEMENT-level by Postgres. The
     # CASE-chain bit for TRUNCATE (`tgtype & 32`) must produce
-    # the literal "TRUNCATE" — the `or ""` fallback in introspect
-    # would mask a decoding bug as a missing event, so pin this
+    # the literal "TRUNCATE"; introspect's `if not row["event"]:`
+    # guard would raise on an empty decode rather than mask a
+    # decoding bug as a missing event, so pin the happy path
     # explicitly. TRUNCATE-only triggers are common for cache /
     # audit invalidation, so this is a real shape SEC013 needs
     # to surface cleanly.
@@ -1563,3 +1769,115 @@ def test_indexes_deterministic_per_table(
     schema = introspect(pg_conn, schemas=["public"])
     t = next(x for x in schema.tables if x.name == "t")
     assert [i.name for i in t.indexes] == ["alpha_idx", "zeta_idx"]
+
+
+def test_secdef_calls_index_attributes_all_same_bare_name_candidates() -> None:
+    # Regression (round-5): two SECDEF functions share the bare name
+    # `helper` across schemas. A bare `helper()` call in a view body (the
+    # normal pg_get_viewdef output when the function is on the search_path)
+    # must be attributed to BOTH `aaa.helper` AND `public.helper`, not just
+    # the alphabetically-first one. Under-attribution would let VIEW004
+    # analyze only the benign overload and silently miss a real RLS-via-view
+    # leak in the other. A qualified call still resolves to the exact one.
+    from pgrls.introspect import _build_secdef_calls_index
+    from pgrls.model import SecdefFunction
+
+    def _f(qname: str) -> SecdefFunction:
+        return SecdefFunction(qualified_name=qname, body="SELECT 1",
+                              language="sql")
+
+    secdef = (_f("aaa.helper"), _f("public.helper"))
+    bare = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT helper() AS h;"}],
+    )
+    assert bare[("public", "v")] == ("aaa.helper", "public.helper")
+    # A schema-qualified call is attributed only to that exact function.
+    qualified = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT public.helper() AS h;"}],
+    )
+    assert qualified[("public", "v")] == ("public.helper",)
+
+
+def test_secdef_calls_index_does_not_misattribute_qualified_other_schema() -> None:
+    # Regression (round-11 #2): a view calls a fully-qualified
+    # `other.read_secret()` that shares ONLY its bare name with the real
+    # SECDEF `public.read_secret`. A qualified call names exactly one
+    # function (no search_path ambiguity), so when that exact name is not
+    # a SECDEF function the call must be dropped — NOT expanded to the
+    # same-bare-name SECDEF in another schema. Otherwise a single SECDEF
+    # helper taints every view in the DB calling any
+    # `<schema>.read_secret()` (a false positive persisted into the
+    # snapshot). The bare-name over-report applies to UNQUALIFIED calls
+    # only.
+    from pgrls.introspect import _build_secdef_calls_index
+    from pgrls.model import SecdefFunction
+
+    secdef = (
+        SecdefFunction(
+            qualified_name="public.read_secret", body="SELECT 1",
+            language="sql",
+        ),
+    )
+    index = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT other.read_secret() AS s;"}],
+    )
+    assert index[("public", "v")] == ()
+    # Sanity: the bare call and the matching qualified call still attach.
+    bare = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT read_secret() AS s;"}],
+    )
+    assert bare[("public", "v")] == ("public.read_secret",)
+    exact = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT public.read_secret() AS s;"}],
+    )
+    assert exact[("public", "v")] == ("public.read_secret",)
+
+
+def test_secdef_calls_index_degrades_on_deeply_nested_view_body(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # R14 #2: a pathologically deep view body (~1000+ nested calls)
+    # parses fine in pglast's C parser but blows Python's recursion limit
+    # inside the pure-Python find_func_calls walk. RecursionError is a
+    # RuntimeError (not a ParseError), so before the guard it escaped
+    # introspect() and crashed pgrls. The path is only reached when a
+    # SECURITY DEFINER function exists (the common Supabase/PostgREST
+    # case). It must degrade: skip that one view's SECDEF attribution and
+    # warn, not abort all introspection.
+    from pgrls.introspect import _build_secdef_calls_index
+    from pgrls.model import SecdefFunction
+
+    body = "id"
+    for _ in range(3000):
+        body = f"read_secret({body})"
+    deep = f"SELECT {body} AS x"
+
+    secdef = (
+        SecdefFunction(
+            qualified_name="public.read_secret", body="SELECT 1",
+            language="sql",
+        ),
+    )
+    index = _build_secdef_calls_index(
+        secdef,
+        [
+            {"schema_name": "public", "view_name": "deep", "definition": deep},
+            # A normal sibling view in the same batch still resolves —
+            # the guard skips only the offending view.
+            {"schema_name": "public", "view_name": "ok",
+             "definition": "SELECT read_secret() AS s;"},
+        ],
+    )
+    assert index[("public", "deep")] == ()  # degraded, no crash
+    assert index[("public", "ok")] == ("public.read_secret",)
+    assert "public.deep" in capsys.readouterr().err  # warned, named the view

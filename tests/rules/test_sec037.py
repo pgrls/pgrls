@@ -136,11 +136,76 @@ def test_fires_on_in_list_with_all_unknown_roles() -> None:
     } == {"admin", "editor"}
 
 
-def test_fires_on_not_in_list_unknown_role() -> None:
-    # `NOT IN` parses as the same AEXPR_IN node (name `<>`); the role
-    # call is still on the value side and the listed literal is still
-    # unknown, so it surfaces too.
+def test_fires_on_pg_get_expr_normalized_any_array_form() -> None:
+    # R15 #1: this is the form SEC037 ACTUALLY sees at runtime. Postgres
+    # stores polqual normalized and pg_get_expr re-renders
+    # `auth.role() IN ('admin','editor')` as
+    # `auth.role() = ANY (ARRAY['admin'::text, 'editor'::text])` (an
+    # A_Expr of kind AEXPR_OP_ANY). The raw-IN test above never exercises
+    # this — it parses the hand-written AEXPR_IN — so the rule's headline
+    # case was a false negative on EVERY introspected/snapshotted schema
+    # until the AEXPR_OP_ANY branch landed. Build the fixture from the
+    # normalized string so the production path is genuinely covered.
+    schema = _wrap(
+        _policy(
+            "(auth.role() = ANY (ARRAY['admin'::text, 'editor'::text]))",
+            name="any_roles",
+        )
+    )
+    violations = SEC037().check(schema, {})
+    assert len(violations) == 2
+    assert {
+        unknown
+        for unknown in ("admin", "editor")
+        if any(unknown in v.message for v in violations)
+    } == {"admin", "editor"}
+    # `= ALL (ARRAY['admin'])` — the single-value / contradictory form —
+    # is likewise a silent deny when the value is unknown.
+    all_schema = _wrap(
+        _policy("(auth.role() = ALL (ARRAY['admin'::text]))", name="all_role")
+    )
+    assert len(SEC037().check(all_schema, {})) == 1
+
+
+def test_does_not_fire_on_not_in_normalized_neq_all_form() -> None:
+    # The pg_get_expr normalization of `auth.role() NOT IN ('admin')` is
+    # `auth.role() <> ALL (ARRAY['admin'::text])`, which is ALWAYS TRUE
+    # for a real role — every row visible, the OPPOSITE of the silent-deny
+    # hazard. The AEXPR_OP_ANY/ALL branch is gated to operator name `=`
+    # (mirroring the IN branch's `=`-only gate), so `<> ALL` must NOT fire.
+    schema = _wrap(
+        _policy(
+            "(auth.role() <> ALL (ARRAY['admin'::text]))", name="neq_all"
+        )
+    )
+    assert SEC037().check(schema, {}) == []
+
+
+def test_does_not_fire_on_not_in_list() -> None:
+    # `auth.role() NOT IN ('admin')` is ALWAYS TRUE for any real role
+    # (auth.role() returns a genuine role, never the unknown 'admin'),
+    # so every row is VISIBLE — the OPPOSITE of SEC037's silent-deny
+    # hazard ("comparison never matches, every row hidden"). Emitting
+    # the silent-deny finding here is an inverted-semantics false
+    # positive. `NOT IN` parses as AEXPR_IN with operator name `<>`;
+    # only plain `IN` (operator `=`) is the silent-deny shape, so
+    # SEC037 must stay silent on `NOT IN`.
     schema = _wrap(_policy("(auth.role() NOT IN ('admin'))", name="not_in_admin"))
+    assert SEC037().check(schema, {}) == []
+
+
+def test_fires_on_schema_qualified_equality_operator() -> None:
+    # pglast can render/parse `=` as the schema-qualified
+    # `OPERATOR(pg_catalog.=)`. The equality check matches on the
+    # operator name's FINAL component, so the silent-deny shape is
+    # caught in the qualified form too (regression for the len(name)==1
+    # gate that previously rejected it).
+    schema = _wrap(
+        _policy(
+            "(auth.role() OPERATOR(pg_catalog.=) 'admin')",
+            name="qualified_eq",
+        )
+    )
     violations = SEC037().check(schema, {})
     assert len(violations) == 1
     assert "admin" in violations[0].message
@@ -258,3 +323,17 @@ def test_rejects_malformed_role_functions_option() -> None:
             {"role_functions": ["auth.role", 9]},
         )
     assert "function names" in str(exc.value)
+
+
+def test_sec037_fires_on_typecast_wrapped_role_call() -> None:
+    # Regression (round-7): the role-call side is unwrapped of a TypeCast
+    # just like the literal side, so `auth.role()::text = 'admin'` (and the
+    # parenthesized form) is recognized as the silent-deny footgun, not
+    # silently missed.
+    for using in (
+        "auth.role()::text = 'admin'",
+        "(auth.role())::text = 'admin'",
+    ):
+        violations = SEC037().check(_wrap(_policy(using, name="cast")), {})
+        assert len(violations) == 1, using
+        assert violations[0].location == "public.t.cast"

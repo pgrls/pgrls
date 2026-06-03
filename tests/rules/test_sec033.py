@@ -164,6 +164,15 @@ def test_fires_on_both_vectors_produces_single_violation() -> None:
         "auth.jwt() ->> 'sub' = owner_id::text",
         # GUC-based scoping
         "current_setting('app.uid', true) = owner_id::text",
+        # Regression (#2): the string 'user_metadata' as a DATA VALUE,
+        # not a JSON key operand of an arrow/path operator.
+        "event_type = 'user_metadata'",
+        # A JSON *value* that merely equals the key name — the key
+        # operand here is 'role', not 'user_metadata'.
+        "auth.jwt() ->> 'role' = 'user_metadata'",
+        # A bare reference to the metadata column, NOT used as a JSON
+        # extraction source — not the self-bypass hazard.
+        "raw_user_meta_data IS NOT NULL",
     ],
 )
 def test_silent_on_safe_shapes(expr: str) -> None:
@@ -178,6 +187,140 @@ def test_silent_when_no_policy_predicate() -> None:
     schema = _wrap(_policy(using=None, name="open"))
     violations = SEC033().check(schema, {})
     assert violations == []
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Silent — `user_metadata` nested under the service-role `app_metadata`
+# root (regression #6: detection is root-aware, not root-blind)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # Arrow chain rooted at app_metadata: the end user cannot write
+        # inside the service-role-only app_metadata object, so a
+        # user_metadata key read under it is trustworthy.
+        "auth.jwt() -> 'app_metadata' -> 'user_metadata' ->> 'role' = 'admin'",
+        # Path form: app_metadata precedes user_metadata in the path.
+        "auth.jwt() #>> '{app_metadata,user_metadata,role}' = 'admin'",
+        # Deeper nesting, still rooted at app_metadata.
+        "auth.jwt() #> '{app_metadata,nested,user_metadata}' IS NOT NULL",
+        # Rooted at the service-role `raw_app_meta_data` column.
+        (
+            "(SELECT raw_app_meta_data -> 'user_metadata' ->> 'role' "
+            "FROM auth.users WHERE id = auth.uid()) = 'admin'"
+        ),
+    ],
+)
+def test_silent_on_user_metadata_nested_under_app_metadata(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="nested_safe"))
+    violations = SEC033().check(schema, {})
+    assert violations == [], expr
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Silent — `user_metadata` key read out of a NON-JWT source (R16 #3):
+# a plain application JSONB column is not the user-writable JWT claim
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # `settings` is an ordinary table column, not the verified JWT.
+        "settings -> 'user_metadata' ->> 'role' = 'admin'",
+        "(settings ->> 'user_metadata') = 'x'",
+        # Path form rooted in a plain column.
+        "prefs #>> '{user_metadata,role}' = 'admin'",
+        # A nested column expression — still not a JWT source.
+        "(data -> 'profile') ->> 'user_metadata' = 'x'",
+    ],
+)
+def test_silent_on_user_metadata_from_non_jwt_source(expr: str) -> None:
+    # R16 #3: the string-key vector fires only when the JSON-extraction
+    # chain roots in the verified JWT (auth.jwt() / the PostgREST
+    # request.jwt GUC / the raw_user_meta_data column). A `user_metadata`
+    # key read out of a plain application JSONB column is NOT the
+    # self-bypass hazard — the value is not the user-controllable JWT
+    # claim — so the error-severity rule must stay silent.
+    schema = _wrap(_policy(f"({expr})", name="plain_column"))
+    violations = SEC033().check(schema, {})
+    assert violations == [], expr
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fires — `user_metadata` read out of a recognized JWT source other than
+# the default auth.jwt(): the PostgREST GUC and a configured helper
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # PostgREST: the request.jwt.claims GUC carries the verified JWT.
+        (
+            "(current_setting('request.jwt.claims', true)::jsonb "
+            "-> 'user_metadata' ->> 'role') = 'admin'"
+        ),
+        # …path form on the same GUC source.
+        (
+            "((current_setting('request.jwt.claims', true)::jsonb) "
+            "#>> '{user_metadata,role}') = 'admin'"
+        ),
+    ],
+)
+def test_fires_on_user_metadata_from_postgrest_jwt_guc(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="postgrest_jwt"))
+    violations = SEC033().check(schema, {})
+    assert len(violations) == 1, expr
+
+
+def test_jwt_functions_option_gates_a_custom_helper() -> None:
+    # A project-local JWT helper is not a recognized source by default
+    # (so it does NOT fire — the conservative FP-safe behavior), but
+    # configuring `jwt_functions` opens it up.
+    schema = _wrap(
+        _policy(
+            "(my_schema.jwt() ->> 'user_metadata') = 'admin'", name="custom"
+        )
+    )
+    assert SEC033().check(schema, {}) == []
+    violations = SEC033().check(
+        schema, {"jwt_functions": ["auth.jwt", "my_schema.jwt"]}
+    )
+    assert len(violations) == 1
+
+
+def test_rejects_malformed_jwt_functions_option() -> None:
+    schema = _wrap(_policy("(auth.jwt() ->> 'user_metadata') = 'x'"))
+    with pytest.raises(TypeError, match="jwt_functions"):
+        SEC033().check(schema, {"jwt_functions": "auth.jwt"})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fires — `user_metadata` is the TOP-LEVEL claim even when app_metadata
+# appears deeper in the same chain (root order is what matters)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # user_metadata is the root claim; app_metadata is just a subkey
+        # the end user can still set underneath it.
+        "auth.jwt() -> 'user_metadata' -> 'app_metadata' ->> 'role' = 'admin'",
+        # Path form: user_metadata precedes app_metadata.
+        "auth.jwt() #>> '{user_metadata,app_metadata,role}' = 'admin'",
+    ],
+)
+def test_fires_when_user_metadata_is_root_even_if_app_metadata_below(
+    expr: str,
+) -> None:
+    schema = _wrap(_policy(f"({expr})", name="root_user_metadata"))
+    violations = SEC033().check(schema, {})
+    assert len(violations) == 1, expr
+    assert violations[0].location == "public.t.root_user_metadata"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -303,3 +446,40 @@ def test_emits_one_violation_per_offending_policy() -> None:
         "public.docs.bad1",
         "public.docs.bad2",
     }
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # Regression (round-7): the #>>/#> PATH-operator spelling must honor
+        # a server-controlled root in the LEFT operand, like the arrow form.
+        # Reading from the service-role raw_app_meta_data column:
+        "raw_app_meta_data #>> '{user_metadata,role}' = 'admin'",
+        "raw_app_meta_data #> '{user_metadata,role}' IS NOT NULL",
+        # Left operand already selects the app_metadata root:
+        "(auth.jwt() -> 'app_metadata') #>> '{user_metadata,role}' = 'admin'",
+        # Safe root precedes the user key within the same path literal:
+        "auth.jwt() #>> '{app_metadata,user_metadata,role}' = 'admin'",
+    ],
+)
+def test_silent_on_path_operator_rooted_in_server_controlled(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="path_safe"))
+    assert SEC033().check(schema, {}) == [], expr
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # The genuine hazard: user_metadata read as a top-level claim via a
+        # path operator (nothing server-controlled root-ward of it).
+        "auth.jwt() #>> '{user_metadata,role}' = 'admin'",
+        # user_metadata is the ROOT even though app_metadata appears deeper
+        # — fires (via the arrow node for the user_metadata key).
+        "(auth.jwt() -> 'user_metadata' -> 'app_metadata') #>> '{role}' = 'admin'",
+    ],
+)
+def test_fires_on_path_operator_user_metadata_root(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="path_hazard"))
+    violations = SEC033().check(schema, {})
+    assert len(violations) == 1, expr
+    assert violations[0].location == "public.t.path_hazard"

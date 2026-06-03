@@ -106,6 +106,79 @@ def test_sec025_silent_when_referenced_table_is_rls_protected() -> None:
     assert SEC025().check(schema, options={}) == []
 
 
+def test_sec025_silent_on_cte_shadowing_rls_disabled_table() -> None:
+    # The policy references a CTE *named* `members`, not the base
+    # table. In Postgres a CTE name shadows a same-named table within
+    # its scope, so the unqualified `members` ref is the CTE — SEC025
+    # must not resolve it to the RLS-disabled `members` table (a false
+    # positive). The CTE body here touches no base table at all.
+    schema = Schema(
+        tables=(
+            _docs(
+                _policy(
+                    using=(
+                        "tenant_id IN ("
+                        "WITH members AS (SELECT 1 AS tenant_id) "
+                        "SELECT tenant_id FROM members)"
+                    )
+                )
+            ),
+            _members(rls_enabled=False),
+        )
+    )
+    assert SEC025().check(schema, options={}) == []
+
+
+def test_sec025_fires_when_cte_shadow_is_in_the_other_clause() -> None:
+    # R10 #2: a CTE named `members` in USING must NOT suppress a bare
+    # `members` reference in WITH CHECK — USING and WITH CHECK are
+    # independent Postgres scopes, so the WITH CHECK ref genuinely reads
+    # the RLS-disabled `public.members`. The earlier code unioned CTE
+    # names across both clauses and silently swallowed this real leak.
+    schema = Schema(
+        tables=(
+            _docs(
+                _policy(
+                    using=(
+                        "tenant_id IN ("
+                        "WITH members AS (SELECT 1 AS tenant_id) "
+                        "SELECT tenant_id FROM members)"
+                    ),
+                    with_check=(
+                        "tenant_id IN (SELECT tenant_id FROM public.members)"
+                    ),
+                )
+            ),
+            _members(rls_enabled=False),
+        )
+    )
+    [v] = SEC025().check(schema, options={})
+    assert v.location == "public.documents.p"
+    assert "public.members" in v.message
+
+
+def test_sec025_same_clause_cte_shadow_still_suppressed_with_two_clauses() -> None:
+    # Guard against over-firing from the per-clause refactor: when the
+    # CTE shadow and the bare ref are in the SAME clause, suppression
+    # must still hold even though the OTHER clause is also present.
+    schema = Schema(
+        tables=(
+            _docs(
+                _policy(
+                    using=(
+                        "tenant_id IN ("
+                        "WITH members AS (SELECT 1 AS tenant_id) "
+                        "SELECT tenant_id FROM members)"
+                    ),
+                    with_check="tenant_id = 1",
+                )
+            ),
+            _members(rls_enabled=False),
+        )
+    )
+    assert SEC025().check(schema, options={}) == []
+
+
 def test_sec025_silent_on_self_reference() -> None:
     # A policy on `documents` referencing `documents` itself in a
     # sub-select inherits the same RLS gate (its own policies apply

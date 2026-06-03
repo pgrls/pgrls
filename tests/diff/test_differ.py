@@ -12,7 +12,7 @@ from pgrls.diff import (
     Classification,
     diff_schemas,
 )
-from pgrls.model import Grant, Policy, Schema, Table
+from pgrls.model import ColumnGrant, Grant, Policy, Schema, Table
 
 
 def _t(
@@ -24,6 +24,7 @@ def _t(
     policies: tuple[Policy, ...] = (),
     columns: tuple[str, ...] = ("id",),
     grants: tuple[Grant, ...] = (),
+    column_grants: tuple[ColumnGrant, ...] = (),
 ) -> Table:
     return Table(
         schema="public",
@@ -34,6 +35,7 @@ def _t(
         columns=columns,
         partition_of=partition_of,
         grants=grants,
+        column_grants=column_grants,
     )
 
 
@@ -804,6 +806,97 @@ def test_grant_public_no_rls_is_dangerous() -> None:
     assert public_no_rls[0].classification == "dangerous"
 
 
+def test_column_grant_public_no_rls_is_dangerous() -> None:
+    # R15 #2: a column-level PUBLIC grant added on a no-RLS table exposes
+    # that column to every connected role — the same data-exposure as a
+    # table-level PUBLIC grant, at column granularity. Must route to the
+    # dangerous GRANT_PUBLIC_NO_RLS path (not be silently no-change), and
+    # name the exposed column.
+    base = Schema(tables=(_t(rls=False),))
+    head = Schema(
+        tables=(
+            _t(
+                rls=False,
+                column_grants=(
+                    ColumnGrant(
+                        role="PUBLIC", column="ssn", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    public_no_rls = [
+        c for c in changes if c.kind == ChangeKind.GRANT_PUBLIC_NO_RLS
+    ]
+    assert len(public_no_rls) == 1
+    assert public_no_rls[0].classification == "dangerous"
+    assert "ssn" in public_no_rls[0].message
+    # With RLS enabled the same column grant is only requires_review.
+    head_rls = Schema(
+        tables=(
+            _t(
+                rls=True,
+                force=True,
+                column_grants=(
+                    ColumnGrant(
+                        role="PUBLIC", column="ssn", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    changes_rls = diff_schemas(Schema(tables=(_t(rls=True, force=True),)), head_rls)
+    assert ChangeKind.GRANT_PUBLIC_NO_RLS not in {c.kind for c in changes_rls}
+    added = [c for c in changes_rls if c.kind == ChangeKind.GRANT_ADDED]
+    assert len(added) == 1 and added[0].classification == "requires_review"
+
+
+def test_column_grant_revoked_is_safe() -> None:
+    # R16 #7 (coverage): when a column grant's privilege set strictly
+    # shrinks between base and head, the diff must emit a single
+    # GRANT_REVOKED change classified "safe" (a revoke only narrows
+    # access — never a security regression) that names the column. This
+    # is the only _diff_column_grants branch the suite did not exercise.
+    base = Schema(
+        tables=(
+            _t(
+                rls=True,
+                force=True,
+                column_grants=(
+                    ColumnGrant(
+                        role="reporter",
+                        column="ssn",
+                        privileges=("SELECT", "UPDATE"),
+                    ),
+                ),
+            ),
+        )
+    )
+    head = Schema(
+        tables=(
+            _t(
+                rls=True,
+                force=True,
+                column_grants=(
+                    ColumnGrant(
+                        role="reporter", column="ssn", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    revoked = [c for c in changes if c.kind == ChangeKind.GRANT_REVOKED]
+    assert len(revoked) == 1
+    assert revoked[0].classification == "safe"
+    assert "ssn" in revoked[0].message
+    assert "UPDATE" in revoked[0].message  # the lost privilege is named
+    # The unchanged SELECT privilege produces no added/dangerous churn.
+    assert ChangeKind.GRANT_PUBLIC_NO_RLS not in {c.kind for c in changes}
+    assert ChangeKind.GRANT_ADDED not in {c.kind for c in changes}
+
+
 def test_grant_public_no_rls_fires_even_when_stale_policies_present() -> None:
     # Postgres only enforces policies when RLS is on; with RLS off,
     # any policies on the table are dormant. A new PUBLIC grant on
@@ -1237,3 +1330,24 @@ def test_diff_schemas_no_counterexample_on_syntactic_loosen() -> None:
     loosened = [c for c in changes if c.kind == ChangeKind.USING_LOOSENED]
     assert len(loosened) == 1
     assert loosened[0].counterexample is None
+
+
+def test_text_and_json_render_empty_counterexample_as_any_row() -> None:
+    # An empty-dict counterexample is the H1 verifier's "every row leaks"
+    # witness (the old predicate rejected everything). Pin both renderings.
+    import json as _json
+
+    from pgrls.diff.formatters import format_diff_json, format_diff_text
+
+    c = Change(
+        kind=ChangeKind.USING_LOOSENED,
+        classification="dangerous",
+        location="public.t",
+        message="Policy public.t USING predicate loosened.",
+        before_sql="false",
+        after_sql="true",
+        counterexample={},
+    )
+    assert "example leaking row: (any row" in format_diff_text([c])
+    payload = _json.loads(format_diff_json([c]))
+    assert payload["violations"][0]["counterexample"] == {}

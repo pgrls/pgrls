@@ -215,28 +215,27 @@ class PERF001Fixer:
                     continue
 
                 new_using_sql = RawStream()(new_using_ast)
+                # Emit ONLY the USING clause PERF001 rewrites. An
+                # `ALTER POLICY ... USING (x)` replaces just the USING
+                # clause and leaves WITH CHECK untouched, so re-emitting an
+                # unchanged WITH CHECK here would gain nothing AND clobber —
+                # silently reverting — a WITH CHECK fix another fixer made
+                # on the same policy in the same migration (e.g. SEC020's
+                # mirror or SEC011's strip). PERF001 never changes
+                # WITH CHECK; omitting it is the correct minimal diff,
+                # matching SEC011 / SEC019.
                 stmt = (
                     f"ALTER POLICY {quote_ident(policy.name)} "
                     f"ON {quote_qualified(table.schema, table.name)}\n"
-                    f"    USING ({new_using_sql})"
+                    f"    USING ({new_using_sql});"
                 )
-                if policy.with_check_ast is not None:
-                    # Round-trip WITH CHECK through RawStream too so
-                    # the emission uses pglast's escaping consistently
-                    # — symmetric with USING. A future change that
-                    # sources `with_check_sql` from somewhere other
-                    # than `pg_get_expr` (config override, snapshot
-                    # file, hand-edited fixture) doesn't bypass the
-                    # round-trip and become an injection vector.
-                    new_with_check_sql = RawStream()(policy.with_check_ast)
-                    stmt += f"\n    WITH CHECK ({new_with_check_sql})"
-                stmt += ";"
 
                 out.append(
                     Fix(
                         rule_id="PERF001",
                         location=pid,
                         sql=stmt,
+                        clauses=frozenset({"using"}),
                         description=(
                             f"Wrap auth function call(s) in policy "
                             f"{policy.name!r} on "

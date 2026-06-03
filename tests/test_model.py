@@ -77,7 +77,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 13,
+        "version": 15,
         "tables": [
             {
                 "schema": "public",
@@ -235,12 +235,36 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_thirteen_after_index_is_primary() -> None:
-    # SNAPSHOT_VERSION bumped 12 → 13 to add `Index.is_primary`
-    # (lets SEC035 tell a surrogate PK from a tenant-scopable UNIQUE).
-    # Pin the new version so a future bump is deliberate.
+def test_snapshot_version_is_fifteen_after_column_grants() -> None:
+    # SNAPSHOT_VERSION bumped 14 → 15 to add per-table column_grants
+    # (pg_attribute.attacl), so the diff flags a PUBLIC column grant on a
+    # no-RLS table. Pin the new version so a future bump is deliberate.
+    # (v14 added separate schema_name/function_name to SecdefFunction /
+    # LeakproofFunction.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 13
+    assert snap["version"] == 15
+
+
+def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
+    # A Policy with no roles must NOT render `TO ` (empty) — that's a
+    # syntax error that aborts `diff --apply`. A roleless CREATE POLICY
+    # defaults to PUBLIC, so omitting the TO clause is the correct,
+    # executable render.
+    from pgrls.model import Policy, policy_to_sql
+
+    p = Policy(
+        name="p",
+        command="ALL",
+        permissive=True,
+        roles=(),
+        using_sql="true",
+        with_check_sql=None,
+        using_ast=None,
+        with_check_ast=None,
+    )
+    sql = policy_to_sql(p, "public.t")
+    assert "TO " not in sql
+    assert sql == "CREATE POLICY p ON public.t USING (true);"
 
 
 def test_snapshot_includes_partition_of_when_set() -> None:
@@ -469,7 +493,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
     }
-    assert snap["version"] == 13
+    assert snap["version"] == 15
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -706,3 +730,388 @@ def test_fully_populated_schema_roundtrip() -> None:
     )
 
     assert Schema.from_snapshot(schema.to_snapshot()) == schema
+
+
+# --- #5: snapshot trust-boundary validation (to_sql injection) ----------
+
+
+def _minimal_snapshot(**table_overrides: object) -> dict:
+    """A minimal valid v14 snapshot with one bare table; callers
+    override a table field to inject a malicious value."""
+    table = {
+        "schema": "public",
+        "name": "t",
+        "rls_enabled": False,
+        "force_rls": False,
+        "columns": [],
+        "partition_of": None,
+        "grants": [],
+        "column_details": [],
+        "triggers": [],
+        "indexes": [],
+        "policies": [],
+    }
+    table.update(table_overrides)
+    return {
+        "version": 14,
+        "tables": [table],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [],
+        "bypassrls_roles": [],
+        "leakproof_functions": [],
+        "bypassrls_escalation_roles": [],
+    }
+
+
+def test_from_snapshot_rejects_data_type_injection() -> None:
+    snap = _minimal_snapshot(
+        column_details=[
+            {
+                "name": "id",
+                "data_type": "int); DROP TABLE secrets; --",
+                "is_nullable": True,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_grant_privilege_injection() -> None:
+    snap = _minimal_snapshot(
+        grants=[{"role": "r", "privileges": ["SELECT ON x TO evil; GRANT ALL"]}]
+    )
+    with pytest.raises(ValueError, match="privilege"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_empty_grant_privileges() -> None:
+    # R13 #5: an empty privileges list would make to_sql() emit
+    # `GRANT  ON … TO role;` (double space), a syntax error that aborts
+    # the baseline `pgrls diff --apply` runs. Live introspection groups
+    # by role (always >=1 privilege), so this only guards a hand-built /
+    # tampered snapshot — reject at decode, not at apply.
+    snap = _minimal_snapshot(grants=[{"role": "r", "privileges": []}])
+    with pytest.raises(ValueError, match="no privileges"):
+        Schema.from_snapshot(snap)
+
+
+def test_column_grants_round_trip_through_snapshot() -> None:
+    # R15 #2: column-level grants serialize/decode additively (snapshot
+    # v15). A schema that has them round-trips faithfully; one that does
+    # not omits the key entirely (byte-stable for pre-feature schemas).
+    from pgrls.model import ColumnGrant, Column, SNAPSHOT_VERSION
+
+    cg = ColumnGrant(role="PUBLIC", column="ssn", privileges=("SELECT",))
+    t = Table(
+        schema="public", name="users", rls_enabled=False, force_rls=False,
+        policies=(), columns=("ssn",),
+        column_details=(Column(name="ssn", data_type="text", is_nullable=True),),
+        column_grants=(cg,),
+    )
+    snap = Schema(tables=(t,)).to_snapshot()
+    assert snap["version"] == SNAPSHOT_VERSION == 15
+    assert snap["tables"][0]["column_grants"] == [
+        {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
+    ]
+    assert Schema.from_snapshot(snap).tables[0].column_grants == (cg,)
+    # A table with no column grants omits the key (byte-stability).
+    plain = Table(
+        schema="public", name="plain", rls_enabled=True, force_rls=True,
+        policies=(),
+        column_details=(Column(name="id", data_type="uuid", is_nullable=False),),
+    )
+    assert "column_grants" not in Schema(tables=(plain,)).to_snapshot()["tables"][0]
+
+
+def test_from_snapshot_rejects_invalid_column_grant_privilege() -> None:
+    # DELETE/TRUNCATE/TRIGGER cannot be granted at column granularity;
+    # reject a tampered snapshot that lists one (mirrors the table-grant
+    # privilege validation).
+    snap = _minimal_snapshot(
+        column_grants=[
+            {"role": "PUBLIC", "column": "ssn", "privileges": ["DELETE"]}
+        ]
+    )
+    with pytest.raises(ValueError, match="column privilege"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_invalid_policy_command() -> None:
+    snap = _minimal_snapshot(
+        policies=[
+            {
+                "policy_name": "p",
+                "command": "ALL; DROP TABLE x",
+                "permissive": True,
+                "roles": ["r"],
+                "using_sql": "true",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="invalid command"):
+        Schema.from_snapshot(snap)
+
+
+def test_policy_to_sql_rejects_out_of_literal_command() -> None:
+    # R12 #4: policy_to_sql splices `command` raw as `FOR {command}`. The
+    # decoder rejects bad commands, but a Policy built directly in Python
+    # (a less-trusted future caller) could carry an out-of-Literal value;
+    # the emit sink must self-defend like its USING/WITH CHECK siblings.
+    from pgrls.model import Policy, policy_to_sql
+
+    p = Policy(
+        name="p",
+        command="SELECT; DROP TABLE x; --",  # type: ignore[arg-type]
+        permissive=True,
+        roles=("r",),
+        using_sql="true",
+        with_check_sql=None,
+    )
+    with pytest.raises(ValueError, match="invalid command"):
+        policy_to_sql(p, "public.t")
+
+
+def test_from_snapshot_rejects_non_string_role() -> None:
+    # R12 #5: roles are emitted as identifiers into `CREATE POLICY … TO`,
+    # so a tampered snapshot with a non-string role must surface the same
+    # clean ValueError the other structured fields produce — not a raw
+    # TypeError deep in quote_ident.
+    snap = _minimal_snapshot(
+        policies=[
+            {
+                "policy_name": "p",
+                "command": "ALL",
+                "permissive": True,
+                "roles": [123],
+                "using_sql": "true",
+                "with_check_sql": "true",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="invalid role"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_select_delete_policy_with_with_check() -> None:
+    # Regression (round-3 #11): a SELECT / DELETE policy carrying a
+    # WITH CHECK clause makes `policy_to_sql` (and `pgrls diff --apply`)
+    # emit DDL Postgres rejects — WITH CHECK is valid only on INSERT /
+    # UPDATE / ALL. Reject the malformed combination at the decode boundary.
+    for command in ("SELECT", "DELETE"):
+        snap = _minimal_snapshot(
+            policies=[
+                {
+                    "policy_name": "p",
+                    "command": command,
+                    "permissive": True,
+                    "roles": ["r"],
+                    "using_sql": "true",
+                    "with_check_sql": "id > 0",
+                }
+            ]
+        )
+        with pytest.raises(ValueError, match="WITH CHECK"):
+            Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_insert_policy_with_using() -> None:
+    # The mirror case: USING is valid only on SELECT / UPDATE / DELETE /
+    # ALL; an INSERT policy with USING would emit invalid DDL.
+    snap = _minimal_snapshot(
+        policies=[
+            {
+                "policy_name": "p",
+                "command": "INSERT",
+                "permissive": True,
+                "roles": ["r"],
+                "using_sql": "true",
+                "with_check_sql": "id > 0",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="USING"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_valid_command_clause_combinations() -> None:
+    # The combination check must NOT reject Postgres-valid shapes: USING
+    # on SELECT/DELETE, WITH CHECK on INSERT, both on UPDATE/ALL. An
+    # empty-string clause is harmless (never emitted) and is also accepted.
+    policies = [
+        {"policy_name": "s", "command": "SELECT", "permissive": True,
+         "roles": ["r"], "using_sql": "true"},
+        {"policy_name": "d", "command": "DELETE", "permissive": True,
+         "roles": ["r"], "using_sql": "true"},
+        {"policy_name": "i", "command": "INSERT", "permissive": True,
+         "roles": ["r"], "with_check_sql": "true"},
+        {"policy_name": "u", "command": "UPDATE", "permissive": True,
+         "roles": ["r"], "using_sql": "true", "with_check_sql": "true"},
+        {"policy_name": "a", "command": "ALL", "permissive": True,
+         "roles": ["r"], "using_sql": "true", "with_check_sql": "true"},
+        {"policy_name": "se", "command": "SELECT", "permissive": True,
+         "roles": ["r"], "using_sql": "true", "with_check_sql": ""},
+    ]
+    schema = Schema.from_snapshot(_minimal_snapshot(policies=policies))
+    assert len(schema.tables[0].policies) == 6
+
+
+def test_from_snapshot_accepts_real_types_and_privileges() -> None:
+    # Validation is permissive enough for real Postgres types /
+    # privileges — these must round-trip without error.
+    snap = _minimal_snapshot(
+        column_details=[
+            {"name": "id", "data_type": "integer", "is_nullable": False},
+            {"name": "amt", "data_type": "numeric(10,2)", "is_nullable": True},
+            {"name": "tags", "data_type": "text[]", "is_nullable": True},
+            {
+                "name": "ts",
+                "data_type": "timestamp with time zone",
+                "is_nullable": True,
+            },
+        ],
+        grants=[{"role": "app", "privileges": ["SELECT", "INSERT", "UPDATE"]}],
+    )
+    schema = Schema.from_snapshot(snap)
+    assert schema.tables[0].column_details[1].data_type == "numeric(10,2)"
+
+
+def test_from_snapshot_rejects_data_type_column_injection() -> None:
+    # Regression (round-2 #1): the comma + space the old regex allowed
+    # for `numeric(10,2)` ALSO let a snapshot inject a SECOND column.
+    # Parse-validation rejects it (the probe CREATE TABLE has 2 columns).
+    snap = _minimal_snapshot(
+        column_details=[
+            {
+                "name": "id",
+                "data_type": "integer, evil boolean DEFAULT (true)",
+                "is_nullable": True,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_data_type_inherits_injection() -> None:
+    snap = _minimal_snapshot(
+        column_details=[
+            {
+                "name": "id",
+                "data_type": "integer) INHERITS (pg_catalog.pg_class",
+                "is_nullable": True,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_quoted_identifier_type() -> None:
+    # Regression (round-2 #10): the old char-allowlist over-restricted
+    # and rejected a legitimate quoted type name, crashing diff on a
+    # valid schema. Parse-validation accepts it.
+    snap = _minimal_snapshot(
+        column_details=[{"name": "x", "data_type": '"My Type"', "is_nullable": True}]
+    )
+    schema = Schema.from_snapshot(snap)
+    assert schema.tables[0].column_details[0].data_type == '"My Type"'
+
+
+def test_from_snapshot_rejects_collate_in_data_type() -> None:
+    # Regression (round-5): a COLLATE clause smuggled into a column
+    # data_type is interpolated into the CREATE TABLE `diff --apply` runs.
+    # A legitimate format_type data_type never carries an inline COLLATE,
+    # so the parse-validator must reject it.
+    snap = _minimal_snapshot(
+        column_details=[
+            {"name": "c", "data_type": 'integer COLLATE "C"',
+             "is_nullable": True},
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_non_object_payload() -> None:
+    # Regression (round-5): a file that is valid JSON but not a snapshot
+    # OBJECT (bare array / null / string / number) must raise the ValueError
+    # `_resolve_diff_source` catches, not an unhandled AttributeError that
+    # escapes as a raw traceback.
+    for payload in ([], None, "x", 42):
+        with pytest.raises(ValueError, match="JSON object"):
+            Schema.from_snapshot(payload)  # type: ignore[arg-type]
+
+
+def test_from_snapshot_rejects_injection_in_secdef_signature() -> None:
+    # Regression (round-7): `signature` is interpolated into the
+    # ALTER FUNCTION the SEC015 fixer emits, so a hand-crafted snapshot
+    # smuggling DDL through it must be rejected at the decode boundary
+    # like data_type / privileges already are.
+    snap = _minimal_snapshot()
+    snap["security_definer_functions"] = [
+        {
+            "qualified_name": "public.f",
+            "body": "SELECT 1",
+            "language": "sql",
+            "signature":
+                "integer) RETURNS void LANGUAGE sql AS ''; "
+                "DROP TABLE users; --",
+        }
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_injection_in_leakproof_signature() -> None:
+    snap = _minimal_snapshot()
+    snap["leakproof_functions"] = [
+        {"qualified_name": "public.f", "signature": "integer); DROP TABLE x; --"}
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_real_function_signatures() -> None:
+    # Real pg_get_function_identity_arguments outputs must round-trip.
+    snap = _minimal_snapshot()
+    snap["security_definer_functions"] = [
+        {"qualified_name": "public.f", "body": "SELECT 1", "language": "sql",
+         "signature": "a integer, b text[]"},
+    ]
+    snap["leakproof_functions"] = [
+        {"qualified_name": "public.g", "signature": "VARIADIC text[]"},
+    ]
+    schema = Schema.from_snapshot(snap)
+    assert schema.security_definer_functions[0].signature == "a integer, b text[]"
+    assert schema.leakproof_functions[0].signature == "VARIADIC text[]"
+
+
+def test_from_snapshot_rejects_trailing_comment_in_secdef_signature() -> None:
+    # Regression (round-10 #4): the CREATE FUNCTION probe accepts a
+    # post-paramlist `SET` clause and a trailing `--` comments out the
+    # probe's own `)` tail, so this tampered signature would PASS the
+    # old probe and let the SEC015 fixer emit an ALTER FUNCTION that
+    # pins pg_temp FIRST (re-introducing CVE-2018-1058). The comment
+    # guard rejects it at the decode boundary.
+    snap = _minimal_snapshot()
+    snap["security_definer_functions"] = [
+        {
+            "qualified_name": "public.f",
+            "body": "SELECT 1",
+            "language": "sql",
+            "signature": "integer) SET search_path = pg_temp, public --",
+        }
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_trailing_comment_in_leakproof_signature() -> None:
+    snap = _minimal_snapshot()
+    snap["leakproof_functions"] = [
+        {"qualified_name": "public.f", "signature": "integer) SECURITY DEFINER --"}
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)

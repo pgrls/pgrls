@@ -94,6 +94,37 @@ def test_sec018_fires_on_any_against_array_column() -> None:
     assert len(SEC018().check(schema, {})) == 1
 
 
+def test_sec018_silent_on_concat_with_role_identity() -> None:
+    # R11 #4: `||` combines current_user INTO a composite value rather
+    # than comparing a column against it. Neither `owner_role ||
+    # current_user` (top operator is `||`, not a comparison) nor
+    # `audit_key = owner_role || current_user` (current_user is buried in
+    # the rhs `||`, not the direct operand) is a column-keyed-off-role
+    # check.
+    cols = ("id", "owner_role", "audit_key")
+    for using in (
+        "owner_role || current_user",
+        "audit_key = owner_role || current_user",
+        "audit_key = current_user || ':' || owner_role",
+    ):
+        assert SEC018().check(
+            _wrap(_policy(using), columns=cols), {}
+        ) == [], using
+
+
+def test_sec018_fires_on_inequality_and_function_wrapped_column() -> None:
+    # The role identity must be the DIRECT operand, but the OWN-COLUMN
+    # side may be wrapped — `lower(owner_role) = current_user` is still
+    # the anti-pattern. Inequality comparisons stay in scope per the
+    # rule's documented "= or another comparison".
+    for using in (
+        "owner_role <> current_user",
+        "owner_role > session_user",
+        "lower(owner_role) = current_user",
+    ):
+        assert len(SEC018().check(_wrap(_policy(using)), {})) == 1, using
+
+
 def test_sec018_fires_when_only_in_with_check() -> None:
     p = _policy(with_check="owner_role = current_user", command="INSERT")
     assert len(SEC018().check(_wrap(p), {})) == 1

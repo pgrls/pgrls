@@ -36,6 +36,18 @@ JSON operator was used; the column-ref path catches the direct
 `raw_user_meta_data` column reference (typically via a SELECT
 sub-link against `auth.users`).
 
+A `user_metadata` key nested under the service-role-only `app_metadata`
+root is deliberately NOT flagged — the end user cannot write inside
+`app_metadata`, so the value is trustworthy:
+
+    USING (auth.jwt() -> 'app_metadata' -> 'user_metadata' ->> 'role' …)
+    USING ((auth.jwt() #>> '{app_metadata,user_metadata,role}') = 'admin')
+
+Detection is root-aware: the arrow form inspects the left-operand chain
+and the path form inspects element order, so only a `user_metadata` read
+that roots at the top-level JWT claim (not under `app_metadata` /
+`raw_app_meta_data`) fires.
+
 The rule is `error` severity because the bypass is deterministic and
 exploitable by any authenticated user — same hazard class as SEC004
 (inverted auth check / anonymous access).
@@ -49,6 +61,14 @@ Configuration: `[lint.rules.SEC033]` accepts:
   - `column_names` (list[str]) — case-insensitive bare column names
     whose last-component reference flags. Replaces the default
     `["raw_user_meta_data"]`.
+  - `jwt_functions` (list[str]) — JWT-accessor function names whose
+    return value is treated as the verified JWT claims object. Replaces
+    the default `["auth.jwt"]`. The string-key vector fires only when the
+    JSON-extraction chain roots in one of these functions, the PostgREST
+    `current_setting('request.jwt....')` GUC, or a `column_names` column —
+    so a `user_metadata` key read out of a plain application JSONB column
+    (`settings -> 'user_metadata'`) is NOT flagged. Add a project-local
+    JWT helper here, e.g. `["auth.jwt", "my_schema.jwt"]`.
   - `allowlist` (list[str]) — `schema.table.policy` IDs to exempt
     (e.g. an audit-write policy that genuinely needs to read the
     user-supplied metadata for a side-effect, not for authorization).
@@ -57,9 +77,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, Node, String
+from pglast.ast import A_Const, A_Expr, FuncCall, Node, String, TypeCast
 
-from pgrls.ast_utils import extract_column_refs
+from pgrls.ast_utils import extract_column_refs, func_name_parts
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -68,6 +88,26 @@ from pgrls.violations import Severity, Violation
 _DEFAULT_STRING_KEYS: frozenset[str] = frozenset({"user_metadata"})
 
 _DEFAULT_COLUMN_NAMES: frozenset[str] = frozenset({"raw_user_meta_data"})
+
+# Server-controlled metadata roots. In the Supabase / PostgREST model the
+# service role (never the end user) writes `app_metadata` /
+# `raw_app_meta_data`, so a `user_metadata` key read *nested under* one of
+# these lives inside the service-role object and is NOT the self-bypass
+# hazard. SEC033 exempts those reads (see `_unrooted_user_key`).
+_SAFE_ROOT_KEYS: frozenset[str] = frozenset(
+    {"app_metadata", "raw_app_meta_data"}
+)
+_SAFE_ROOT_COLUMNS: frozenset[str] = frozenset({"raw_app_meta_data"})
+
+# JWT-accessor functions whose return value IS the verified JWT claims
+# object — the only source whose `user_metadata` key is the end-user-
+# writable claim. `auth.jwt()` is the Supabase helper; the PostgREST
+# `current_setting('request.jwt....')` GUC is recognized separately (its
+# name, not the function name, identifies it). A `user_metadata` key read
+# out of any OTHER root (a plain application JSONB column) is NOT the
+# self-bypass hazard, so the string-key vector requires one of these
+# roots before firing. Extend via `[lint.rules.SEC033].jwt_functions`.
+_DEFAULT_JWT_FUNCTIONS: frozenset[str] = frozenset({"auth.jwt"})
 
 
 def _parse_string_keys(options: dict[str, Any]) -> set[str]:
@@ -95,6 +135,21 @@ def _parse_column_names(options: dict[str, Any]) -> set[str]:
         )
     # Column-name matching is case-insensitive — Postgres lowercases
     # unquoted identifiers (matches how extract_column_refs returns them).
+    return {s.lower() for s in raw}
+
+
+def _parse_jwt_functions(options: dict[str, Any]) -> set[str]:
+    raw = options.get("jwt_functions")
+    if raw is None:
+        return set(_DEFAULT_JWT_FUNCTIONS)
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise TypeError(
+            "[lint.rules.SEC033].jwt_functions must be a list of "
+            'JWT-accessor function names, e.g. ["auth.jwt"]'
+        )
+    # Function names are case-insensitive in Postgres (unquoted
+    # identifiers lowercase), and func_name_parts returns lowercased
+    # names — normalize so a configured "AUTH.JWT" still matches.
     return {s.lower() for s in raw}
 
 
@@ -127,49 +182,189 @@ def _array_literal_keys(sval: str) -> list[str]:
     ]
 
 
-def _contains_string_const(node: Any, keys: set[str]) -> bool:
-    """True if any A_Const(String) node in the tree matches one of `keys`.
+_JSON_EXTRACT_OPS: frozenset[str] = frozenset({"->", "->>", "#>", "#>>"})
 
-    Two match shapes:
-      1. Exact equality — `auth.jwt() -> 'user_metadata' ...` produces
-         an `A_Const(String) sval='user_metadata'`.
-      2. Array-element membership — `auth.jwt() #> '{user_metadata,...}'`
-         produces a single `A_Const(String) sval='{user_metadata,...}'`
-         (Postgres `text[]` literal syntax, NOT a JSON object). We
-         crack the array open and check each element. The parser
-         doesn't unescape backslash sequences like `{"a\\"b"}` — the
-         realistic claim-key set doesn't contain quotes or backslashes,
-         so the omission is harmless here.
+
+def _expr_op_name(node: A_Expr) -> str | None:
+    """The bare operator name of an `A_Expr` (last element of `name`)."""
+    parts = [f.sval for f in (node.name or ()) if isinstance(f, String)]
+    return parts[-1] if parts else None
+
+
+def _extract_key_sval(rexpr: Any) -> str | None:
+    """The string value of a JSON arrow/path key operand, or None.
+
+    `pg_get_expr` (introspection) renders a string literal as
+    `'user_metadata'::text` — a TypeCast around the A_Const — so unwrap
+    any casts to reach the constant. (Source SQL parses to a bare
+    A_Const; this handles both forms.)
     """
+    node = rexpr
+    while isinstance(node, TypeCast):
+        node = node.arg
+    if isinstance(node, A_Const) and isinstance(node.val, String):
+        sval = node.val.sval
+        return sval if isinstance(sval, str) else None
+    return None
 
-    def walk(n: Any) -> bool:
-        if n is None:
-            return False
+
+def _key_operand_matches(rexpr: Any, keys: frozenset[str] | set[str]) -> bool:
+    """True if the key operand of a JSON arrow/path operator names a
+    configured key — exact for `->`/`->>`, array-element membership for
+    the `#>`/`#>>` `{a,b}` path literal.
+    """
+    sval = _extract_key_sval(rexpr)
+    if sval is None:
+        return False
+    if sval in keys:
+        return True
+    return any(elem in keys for elem in _array_literal_keys(sval))
+
+
+def _has_key_in_extract_position(
+    node: Any, keys: frozenset[str] | set[str]
+) -> bool:
+    """True if any of `keys` appears as the KEY operand of a JSON
+    extraction operator (`->` / `->>` / `#>` / `#>>`) anywhere in `node`.
+
+    Root-blind primitive: used to test whether a left (root-ward) operand
+    chain already selects a server-controlled key such as `app_metadata`.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
         if isinstance(n, (list, tuple)):
-            return any(walk(item) for item in n)
-        if isinstance(n, A_Const):
-            val = n.val
-            if isinstance(val, String):
-                if val.sval in keys:
-                    return True
-                # Array-literal form (path operators)
-                for elem in _array_literal_keys(val.sval):
-                    if elem in keys:
-                        return True
-            # A_Const wraps a single scalar (String/Integer/Float/etc.) —
-            # nothing more to walk inside, return early so we don't
-            # iterate the Node fields below pointlessly.
-            return False
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, A_Expr) and _expr_op_name(n) in _JSON_EXTRACT_OPS:
+            if _key_operand_matches(n.rexpr, keys):
+                found = True
+                return
         if isinstance(n, Node):
             for field_name in n:
-                if walk(getattr(n, field_name, None)):
-                    return True
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
+
+
+def _unrooted_user_key(
+    node: A_Expr,
+    keys: set[str],
+    jwt_functions: set[str],
+    column_names: set[str],
+) -> bool:
+    """For a single JSON extraction `A_Expr`, True if it reads a configured
+    user-writable key as a TOP-LEVEL claim OUT OF THE VERIFIED JWT — i.e.
+    the chain roots in a JWT source (`auth.jwt()` /
+    `current_setting('request.jwt....')` / the `raw_user_meta_data`
+    column) AND is NOT nested under a server-controlled root such as
+    `app_metadata`. A `user_metadata` key read out of a plain application
+    JSONB column is not the self-bypass hazard and does not fire.
+
+      ``auth.jwt() -> 'user_metadata' ->> 'role'``           → True  (hazard)
+      ``auth.jwt() -> 'app_metadata' -> 'user_metadata' …``  → False (safe)
+      ``… #>> '{user_metadata,role}'``                       → True  (hazard)
+      ``… #>> '{app_metadata,user_metadata,role}'``          → False (safe)
+
+    Both forms also consult the LEFT operand chain: a `user_metadata` read
+    whose left side already selects `app_metadata` (or the
+    `raw_app_meta_data` column) lives inside the service-role object and
+    isn't user-writable. For the path-literal form the element ORDER within
+    the `{…}` literal ALSO decides the root — a user-writable key is
+    hazardous only if no server-controlled key precedes it AND the left
+    operand doesn't already root in a server-controlled source:
+
+      ``auth.jwt() -> 'user_metadata' ->> 'role'``           → True  (hazard)
+      ``auth.jwt() -> 'app_metadata' -> 'user_metadata' …``  → False (safe)
+      ``… #>> '{user_metadata,role}'``                       → True  (hazard)
+      ``… #>> '{app_metadata,user_metadata,role}'``          → False (safe)
+      ``raw_app_meta_data #>> '{user_metadata,role}'``       → False (safe)
+      ``(jwt -> 'app_metadata') #>> '{user_metadata,role}'`` → False (safe)
+    """
+    sval = _extract_key_sval(node.rexpr)
+    if sval is None:
         return False
 
-    return walk(node)
+    path = _array_literal_keys(sval)
+    if path:
+        # The left operand chain is root-ward of every path element, so a
+        # server-controlled root on the left makes the whole read safe —
+        # `raw_app_meta_data #>> '{user_metadata,…}'` or
+        # `(jwt -> 'app_metadata') #>> '{user_metadata,…}'`. (A user_metadata
+        # ROOT in the left chain is caught by the arrow node for it, so this
+        # never hides a genuine hazard.) Otherwise the intra-literal order
+        # decides: a user key is hazardous unless a safe-root key precedes
+        # it within the same literal.
+        if _is_server_controlled_root(node.lexpr):
+            return False
+        # …and the chain must actually root in the verified JWT; a path
+        # read out of a plain JSONB column is not the bypass hazard.
+        if not _is_jwt_source(node.lexpr, jwt_functions, column_names):
+            return False
+        for i, elem in enumerate(path):
+            if elem in keys and not any(
+                e in _SAFE_ROOT_KEYS for e in path[:i]
+            ):
+                return True
+        return False
+
+    if sval in keys:
+        return not _is_server_controlled_root(node.lexpr) and _is_jwt_source(
+            node.lexpr, jwt_functions, column_names
+        )
+    return False
 
 
-def _references_column(node: Any, column_names: set[str]) -> bool:
+def _string_key_via_json_op(
+    node: Any,
+    keys: set[str],
+    jwt_functions: set[str],
+    column_names: set[str],
+) -> bool:
+    """True if a configured user-writable key is read as a TOP-LEVEL JWT
+    claim — in JSON key-operand position, rooted in a verified-JWT source
+    (`auth.jwt()` / `current_setting('request.jwt....')` / the
+    `raw_user_meta_data` column) and NOT nested under a server-controlled
+    key such as `app_metadata`.
+
+    Scoped deliberately to unrooted key-operand reads OF THE JWT. A data-value
+    comparison like `event_type = 'user_metadata'`, a JSON *value* equal to
+    a key name (`… ->> 'role' = 'user_metadata'`), a `user_metadata`
+    sub-object nested inside the service-role-only `app_metadata`, and a
+    `user_metadata` key read out of a plain application JSONB column that
+    is NOT the JWT (`settings -> 'user_metadata'`) all fail to select the
+    end-user-writable claim, so none fire.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, A_Expr) and _expr_op_name(n) in _JSON_EXTRACT_OPS:
+            if _unrooted_user_key(n, keys, jwt_functions, column_names):
+                found = True
+                return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
+
+
+def _references_column(
+    node: Any, column_names: frozenset[str] | set[str]
+) -> bool:
     """True if the tree references a column whose last name matches.
 
     Captures bare `raw_user_meta_data`, table-qualified
@@ -179,6 +374,113 @@ def _references_column(node: Any, column_names: set[str]) -> bool:
         if ref and ref[-1].lower() in column_names:
             return True
     return False
+
+
+def _is_server_controlled_root(lexpr: Any) -> bool:
+    """True if a JSON extraction's left (root-ward) operand selects a
+    server-controlled metadata root: the `app_metadata` JSON key or the
+    `raw_app_meta_data` column. A `user_metadata` key read layered on top
+    of such a root is part of the service-role object, not the
+    end-user-writable claim.
+    """
+    return _has_key_in_extract_position(
+        lexpr, _SAFE_ROOT_KEYS
+    ) or _references_column(lexpr, _SAFE_ROOT_COLUMNS)
+
+
+def _json_chain_root(node: Any) -> Any:
+    """Descend the LEFT-operand chain of nested JSON-extraction `A_Expr`s
+    (unwrapping any casts) to the root-ward leaf — the source the keys are
+    ultimately extracted FROM.
+
+      ``auth.jwt() -> 'user_metadata' ->> 'role'``  → the ``auth.jwt()`` FuncCall
+      ``settings -> 'user_metadata' ->> 'role'``    → the ``settings`` ColumnRef
+    """
+    cur = node
+    while True:
+        while isinstance(cur, TypeCast):
+            cur = cur.arg
+        if isinstance(cur, A_Expr) and _expr_op_name(cur) in _JSON_EXTRACT_OPS:
+            cur = cur.lexpr
+            continue
+        return cur
+
+
+def _first_string_arg(node: FuncCall) -> str | None:
+    """The string value of a FuncCall's first argument (unwrapping a
+    cast), or None."""
+    args = node.args or ()
+    if not args:
+        return None
+    arg = args[0]
+    while isinstance(arg, TypeCast):
+        arg = arg.arg
+    if isinstance(arg, A_Const) and isinstance(arg.val, String):
+        sval = arg.val.sval
+        return sval if isinstance(sval, str) else None
+    return None
+
+
+def _is_jwt_source(
+    lexpr: Any, jwt_functions: set[str], column_names: set[str]
+) -> bool:
+    """True if a JSON-extraction chain's root-ward operand selects the
+    VERIFIED JWT — the only source whose `user_metadata` key is the
+    end-user-writable claim that the self-bypass hazard depends on.
+
+    Recognized roots (mirrors SEC033's documented sources):
+      * a JWT-accessor function — ``auth.jwt()`` or a configured one;
+      * the PostgREST ``current_setting('request.jwt....')`` GUC; or
+      * the user-writable metadata column (``raw_user_meta_data`` /
+        ``auth.users``'s metadata column), per `column_names`.
+
+    A plain application JSONB column as the root
+    (``settings -> 'user_metadata'``) is NOT a JWT source: the value is
+    not the user-controllable JWT claim, so reading a `user_metadata` key
+    out of it is not the privilege-escalation footgun and must not fire.
+    """
+    root = _json_chain_root(lexpr)
+    if isinstance(root, FuncCall):
+        qualified, bare = func_name_parts(root)
+        if qualified in jwt_functions or bare in jwt_functions:
+            return True
+        if bare == "current_setting":
+            name = _first_string_arg(root)
+            return name is not None and name.startswith("request.jwt")
+        return False
+    # A reference to the user-writable metadata column (typically
+    # auth.users.raw_user_meta_data) is itself a JWT-equivalent source.
+    return _references_column(root, column_names)
+
+
+def _column_via_json_op(node: Any, column_names: set[str]) -> bool:
+    """True if a configured metadata column is the SOURCE (left operand)
+    of a JSON extraction operator — `raw_user_meta_data ->> 'role'`.
+
+    A bare reference (e.g. `raw_user_meta_data IS NOT NULL`, or the
+    column selected for an unrelated reason) is not the self-bypass
+    hazard and must not fire.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, A_Expr) and _expr_op_name(n) in _JSON_EXTRACT_OPS:
+            if _references_column(n.lexpr, column_names):
+                found = True
+                return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
 
 
 class SEC033:
@@ -191,6 +493,7 @@ class SEC033:
     ) -> list[Violation]:
         string_keys = _parse_string_keys(options)
         column_names = _parse_column_names(options)
+        jwt_functions = _parse_jwt_functions(options)
         allowlist = parse_policy_id_allowlist("SEC033", options)
 
         out: list[Violation] = []
@@ -211,10 +514,13 @@ class SEC033:
                 if not trees:
                     continue
                 hit_string = any(
-                    _contains_string_const(t, string_keys) for t in trees
+                    _string_key_via_json_op(
+                        t, string_keys, jwt_functions, column_names
+                    )
+                    for t in trees
                 )
                 hit_column = any(
-                    _references_column(t, column_names) for t in trees
+                    _column_via_json_op(t, column_names) for t in trees
                 )
                 if not (hit_string or hit_column):
                     continue

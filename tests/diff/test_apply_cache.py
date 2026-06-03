@@ -279,3 +279,50 @@ def test_image_exists_returns_true_when_present(monkeypatch):
 
     monkeypatch.setattr(docker, "from_env", fake_from_env)
     assert _apply_cache.image_exists("pgrls-baseline:0000000000000000") is True
+
+
+# ---------------------------------------------------------------------------
+# commit_baseline — best-effort failure paths (must swallow, never raise)
+# ---------------------------------------------------------------------------
+
+
+def test_commit_baseline_returns_none_when_docker_sdk_missing(monkeypatch):
+    """R18 #5: committing the baseline cache is best-effort. If the
+    `docker` SDK isn't importable, return without raising so
+    `pgrls diff --apply` still succeeds (next run just pays full setup
+    cost). Mirrors the image_exists SDK-missing test."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "docker" or name.startswith("docker."):
+            raise ImportError("docker not available in this test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert (
+        _apply_cache.commit_baseline(
+            container_id="abc123", tag="pgrls-baseline:abcdef0123456789"
+        )
+        is None
+    )
+
+
+def test_commit_baseline_swallows_docker_error(monkeypatch):
+    """A docker daemon error during commit must be swallowed (logged at
+    DEBUG), never propagated to fail the diff. Mirrors the image_exists
+    daemon-error test."""
+    import docker
+    from docker.errors import APIError
+
+    def fake_from_env():
+        raise APIError("daemon unhappy")
+
+    monkeypatch.setattr(docker, "from_env", fake_from_env)
+    assert (
+        _apply_cache.commit_baseline(
+            container_id="abc123", tag="pgrls-baseline:abcdef0123456789"
+        )
+        is None
+    )

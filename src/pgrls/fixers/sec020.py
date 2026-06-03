@@ -105,6 +105,7 @@ class SEC020Fixer:
                         rule_id="SEC020",
                         location=pid,
                         sql=sql,
+                        clauses=frozenset({"with_check"}),
                         description=(
                             f"Replace the constant-true WITH CHECK "
                             f"on policy {policy.name!r} on "

@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **SEC015 / SEC017 fixers emitted the wrong `ALTER FUNCTION` target
+  when a schema name contained a dot.** The fixers reconstructed the
+  schema and function name by splitting the introspected
+  `qualified_name` (`nspname || '.' || proname`) on the *first* dot, so
+  a function `f` in a schema named `a.b` produced
+  `ALTER FUNCTION a."b.f"(…)` — the wrong schema *and* the wrong object
+  (it errors, or worse silently targets a different function). The join
+  is fundamentally ambiguous once either component contains a dot, so
+  introspection now captures the schema and function name as separate
+  fields on `SecdefFunction` / `LeakproofFunction` (snapshot **v14**),
+  and the fixers use them directly instead of splitting. The fixers
+  abstain (emit no Fix) when those fields are absent — e.g. a pre-v14
+  snapshot loaded for `fix` — rather than guess a target. Snapshot
+  format bumps to v14; v3–v13 snapshots still load.
+
 ## [0.16.0] - 2026-06-01
 
 ### Added

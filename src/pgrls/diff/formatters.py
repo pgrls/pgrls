@@ -684,6 +684,9 @@ def _change_to_violation(c: Change) -> Violation:
         message=c.message,
         location=c.location,
         counterexample=c.counterexample,
+        # Carry the raw 4-way classification so json/sarif consumers can
+        # split breaking vs requires_review (both project to `warning`).
+        classification=c.classification,
     )
 
 
