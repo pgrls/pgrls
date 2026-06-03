@@ -1608,3 +1608,34 @@ def test_indexes_deterministic_per_table(
     schema = introspect(pg_conn, schemas=["public"])
     t = next(x for x in schema.tables if x.name == "t")
     assert [i.name for i in t.indexes] == ["alpha_idx", "zeta_idx"]
+
+
+def test_secdef_calls_index_attributes_all_same_bare_name_candidates() -> None:
+    # Regression (round-5): two SECDEF functions share the bare name
+    # `helper` across schemas. A bare `helper()` call in a view body (the
+    # normal pg_get_viewdef output when the function is on the search_path)
+    # must be attributed to BOTH `aaa.helper` AND `public.helper`, not just
+    # the alphabetically-first one. Under-attribution would let VIEW004
+    # analyze only the benign overload and silently miss a real RLS-via-view
+    # leak in the other. A qualified call still resolves to the exact one.
+    from pgrls.introspect import _build_secdef_calls_index
+    from pgrls.model import SecdefFunction
+
+    def _f(qname: str) -> SecdefFunction:
+        return SecdefFunction(qualified_name=qname, body="SELECT 1",
+                              language="sql")
+
+    secdef = (_f("aaa.helper"), _f("public.helper"))
+    bare = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT helper() AS h;"}],
+    )
+    assert bare[("public", "v")] == ("aaa.helper", "public.helper")
+    # A schema-qualified call is attributed only to that exact function.
+    qualified = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT public.helper() AS h;"}],
+    )
+    assert qualified[("public", "v")] == ("public.helper",)

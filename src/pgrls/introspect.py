@@ -771,24 +771,22 @@ def _build_secdef_calls_index(
     # strings, and snapshot v4 stores `security_definer_calls` as part
     # of the byte-stable Schema serialization, so non-deterministic
     # canonicalization would silently shuffle snapshots between runs.
-    # If two SECDEF functions share the same bare name across schemas,
-    # `setdefault` keeps the alphabetically-first qualified form. This
-    # is a best-effort attribution path: `find_func_calls` still
-    # matches the qualified form exactly when `pg_get_viewdef` emits
-    # it, and the bare-only fallback is rare in practice (most viewdef
-    # output qualifies cross-schema function calls). VIEW004 takes a
-    # different tack at the *table*-ref layer — when a bare table name
-    # in a function body could resolve to multiple RLS-protected
-    # tables, it over-reports all candidates rather than picking one —
-    # because the rule's user-facing message is what surfaces the
-    # leak, and under-attribution there would be silently insecure.
-    # The two layers (function-name canonicalization here, table-name
-    # over-reporting in VIEW004) chose opposite trade-offs based on
-    # what failure mode hurts the user most.
-    bare_to_qual: dict[str, str] = {}
+    # If two SECDEF functions share the same bare name across schemas, a
+    # bare `helper()` call in a view body could resolve to EITHER. Map each
+    # bare name to ALL qualified SECDEF names that share it and feed every
+    # candidate into the view's `security_definer_calls`, so VIEW004 parses
+    # every possible body. This mirrors VIEW004's table-ref layer (which
+    # over-reports all bare-name table candidates) and makes the same
+    # choice: under-attribution here would be a SILENTLY MISSED leak — the
+    # benign overload analyzed while the leaking one is skipped — which is
+    # the worse failure for a security rule. `find_func_calls` still matches
+    # a qualified call exactly when `pg_get_viewdef` emits it; the bare-name
+    # expansion only ADDS candidates, never drops the exact match. Sorting
+    # keeps the result byte-stable for the snapshot.
+    bare_to_quals: dict[str, list[str]] = {}
     for q in sorted(secdef_qnames):
-        bare_to_qual.setdefault(q.rsplit(".", 1)[-1], q)
-    name_set = secdef_qnames | set(bare_to_qual.keys())
+        bare_to_quals.setdefault(q.rsplit(".", 1)[-1], []).append(q)
+    name_set = secdef_qnames | set(bare_to_quals.keys())
 
     out: dict[tuple[str, str], tuple[str, ...]] = {}
     for row in view_rows:
@@ -822,9 +820,11 @@ def _build_secdef_calls_index(
             if qualified in secdef_qnames:
                 found.add(qualified)
             else:
-                bare = parts[-1]
-                if bare in bare_to_qual:
-                    found.add(bare_to_qual[bare])
+                # Over-report: a bare call to a name shared by SECDEF
+                # functions in multiple schemas feeds ALL of them to
+                # VIEW004 so the leaking overload is never silently
+                # skipped (see the bare_to_quals comment above).
+                found.update(bare_to_quals.get(parts[-1], ()))
         out[key] = tuple(sorted(found))
     return out
 
