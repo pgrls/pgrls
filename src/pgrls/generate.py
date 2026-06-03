@@ -100,6 +100,37 @@ class GenerateResult:
     notes: tuple[str, ...] = ()
 
 
+def _auth_function_sql(fn: str) -> str:
+    """Render an `--auth-function` value as a quoted function reference.
+
+    Accepts a bare name (`uid` -> `"uid"`) or a `schema.function` pair
+    (`auth.uid` -> `auth."uid"`), splitting on the rightmost dot and
+    quoting each segment independently.
+
+    A value with MORE THAN ONE dot is rejected: pgrls qualifies a
+    function as schema.function only, so `rpartition('.')` would fold the
+    extra dots into a single quoted schema (`a.b.c` -> `"a.b".c()`),
+    silently emitting a reference to a function that does not exist —
+    `generate --apply` then aborts the whole all-or-nothing batch with a
+    Postgres "function does not exist" error. Reject early with a clear
+    message instead (mirrors the `seed()` table-name guard in
+    testing/client.py). A schema or function name that genuinely contains
+    a dot must be handled by passing the qualified pieces explicitly; it
+    cannot be disambiguated from a dotted name here.
+    """
+    if fn.count(".") > 1:
+        raise ValueError(
+            f"--auth-function {fn!r} has more than one dot. Expected a "
+            'bare function name (e.g. "uid") or a schema-qualified name '
+            '(e.g. "auth.uid"); a multi-part name is ambiguous and would '
+            "render an invalid function reference."
+        )
+    if "." in fn:
+        schema_part, _, name_part = fn.rpartition(".")
+        return quote_qualified(schema_part, name_part)
+    return quote_ident(fn)
+
+
 def session_predicate(
     column: str, coltype: str | None, options: GenerateOptions
 ) -> str:
@@ -121,12 +152,7 @@ def session_predicate(
     if options.convention == "supabase":
         # `col = (SELECT auth.uid())` — the canonical Supabase row-owner
         # form. No cast: auth.uid() returns uuid (match a uuid column).
-        fn = options.auth_function
-        if "." in fn:
-            schema_part, _, name_part = fn.rpartition(".")
-            fn_sql = quote_qualified(schema_part, name_part)
-        else:
-            fn_sql = quote_ident(fn)
+        fn_sql = _auth_function_sql(options.auth_function)
         return f"{qcol} = (SELECT {fn_sql}())"
 
     setting = options.resolved_setting(column)

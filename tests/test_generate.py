@@ -151,6 +151,36 @@ def test_predicate_supabase_unqualified_auth_function_needs_quoting() -> None:
     assert p == 'user_id = (SELECT "User"())'
 
 
+def test_predicate_supabase_rejects_multi_dot_auth_function() -> None:
+    # R16 #6: a 3+-part --auth-function is ambiguous. rpartition('.')
+    # would fold the leading dots into a single quoted schema
+    # (`db.auth.uid` -> `"db.auth".uid()`), silently referencing a
+    # function that does not exist and aborting `generate --apply`.
+    # Reject it with a clear error instead.
+    with pytest.raises(ValueError, match="more than one dot"):
+        session_predicate(
+            "user_id",
+            "uuid",
+            GenerateOptions(
+                model="owner",
+                convention="supabase",
+                auth_function="db.auth.uid",
+            ),
+        )
+
+
+def test_auth_function_sql_shapes() -> None:
+    # Unit pin on the renderer: bare / schema-qualified accepted (minimal
+    # quoting), 3+-part rejected.
+    from pgrls.generate import _auth_function_sql
+
+    assert _auth_function_sql("uid") == "uid"
+    assert _auth_function_sql("auth.uid") == "auth.uid"
+    assert _auth_function_sql("User") == '"User"'
+    with pytest.raises(ValueError, match="more than one dot"):
+        _auth_function_sql("a.b.c")
+
+
 def test_owner_model_uses_owner_policy_names() -> None:
     schema = Schema(tables=(_table("posts", (_ID, _UID)),))
     opts = GenerateOptions(model="owner", tenant_column="user_id", convention="supabase")
