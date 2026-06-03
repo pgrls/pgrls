@@ -116,6 +116,35 @@ _VALID_POLICY_COMMANDS: frozenset[str] = frozenset(
 )
 
 
+def _contains_sql_comment(sql: str) -> bool:
+    """True if `sql` carries a SQL line (``--``) or block (``/* */``)
+    comment token OUTSIDE a string/identifier literal.
+
+    The scanner tags string and identifier literals as their own tokens
+    (``SCONST`` / ``IDENT``), so ``note = 'a--b'`` is NOT flagged — only
+    a genuine comment is. A value sourced from live introspection
+    (``pg_get_expr`` for predicates, ``pg_get_function_identity_arguments``
+    for signatures) never contains a comment: Postgres re-renders the
+    parsed form. A comment therefore signals a hand-crafted / tampered
+    snapshot, and a *trailing* ``--`` is precisely the token that
+    survives an isolated validation probe yet then comments out the rest
+    of the emitted statement on its line — silently dropping a
+    ``WITH CHECK`` clause, swallowing the next statement, or (for a
+    function signature) hiding an injected paren / ``SET`` clause. Reject
+    it. A scan error (e.g. an unterminated block comment) is treated as
+    unsafe.
+    """
+    from pglast import parser
+
+    try:
+        return any(
+            tok.name in ("SQL_COMMENT", "C_COMMENT")
+            for tok in parser.scan(sql)
+        )
+    except Exception:
+        return True
+
+
 def _predicate_is_single_statement(sql: str) -> bool:
     """True if `sql` is a single SQL expression — i.e. wrapping it as
     ``USING (<sql>)`` cannot smuggle a second statement.
@@ -124,9 +153,20 @@ def _predicate_is_single_statement(sql: str) -> bool:
     parses as TWO statements once wrapped and is rejected. (``parse_expr``
     is NOT a sufficient check: it parses only the leading expression and
     silently ignores trailing injected statements.)
+
+    A trailing line comment (``true)--``) is the subtler escape: it
+    passes the isolated ``SELECT 1 WHERE (<sql>)`` probe (the comment
+    eats the probe's own closing paren) but, once emitted as
+    ``USING (<sql>) WITH CHECK (…)`` on one line, comments out the
+    closing paren and the entire ``WITH CHECK`` clause — silently
+    dropping a write-side check or breaking ``diff --apply``. Reject any
+    predicate carrying a comment (real ``pg_get_expr`` output never has
+    one — see ``_contains_sql_comment``).
     """
     import pglast
 
+    if _contains_sql_comment(sql):
+        return False
     try:
         stmts = pglast.parse_sql(f"SELECT 1 WHERE ({sql})")
     except Exception:
@@ -808,6 +848,16 @@ def _is_safe_signature(signature: object) -> bool:
         return False
     if not signature.strip():
         return True
+    # Reject a comment-bearing signature up front: the CREATE FUNCTION
+    # probe below accepts a post-paramlist `SET` clause, and a trailing
+    # `--` comments out the probe's own `)` tail — so a tampered
+    # `int) SET search_path = pg_temp, public --` would PASS the probe
+    # and let the SEC015/SEC017 fixer emit an `ALTER FUNCTION … SET
+    # search_path` that pins pg_temp FIRST (re-introducing CVE-2018-1058).
+    # `pg_get_function_identity_arguments` never emits a comment, so a
+    # real signature is unaffected.
+    if _contains_sql_comment(signature):
+        return False
     import pglast
     from pglast.ast import CreateFunctionStmt, String
     try:

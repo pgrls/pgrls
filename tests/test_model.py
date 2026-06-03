@@ -994,3 +994,32 @@ def test_from_snapshot_accepts_real_function_signatures() -> None:
     schema = Schema.from_snapshot(snap)
     assert schema.security_definer_functions[0].signature == "a integer, b text[]"
     assert schema.leakproof_functions[0].signature == "VARIADIC text[]"
+
+
+def test_from_snapshot_rejects_trailing_comment_in_secdef_signature() -> None:
+    # Regression (round-10 #4): the CREATE FUNCTION probe accepts a
+    # post-paramlist `SET` clause and a trailing `--` comments out the
+    # probe's own `)` tail, so this tampered signature would PASS the
+    # old probe and let the SEC015 fixer emit an ALTER FUNCTION that
+    # pins pg_temp FIRST (re-introducing CVE-2018-1058). The comment
+    # guard rejects it at the decode boundary.
+    snap = _minimal_snapshot()
+    snap["security_definer_functions"] = [
+        {
+            "qualified_name": "public.f",
+            "body": "SELECT 1",
+            "language": "sql",
+            "signature": "integer) SET search_path = pg_temp, public --",
+        }
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_trailing_comment_in_leakproof_signature() -> None:
+    snap = _minimal_snapshot()
+    snap["leakproof_functions"] = [
+        {"qualified_name": "public.f", "signature": "integer) SECURITY DEFINER --"}
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)

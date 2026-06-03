@@ -210,6 +210,35 @@ def test_to_sql_emits_create_policy_with_all_clauses():
     )
 
 
+def test_to_sql_rejects_trailing_comment_in_using_predicate():
+    # Regression (round-10 #3): a snapshot predicate ending in `--`
+    # passes the isolated `SELECT 1 WHERE (<sql>)` probe (the comment
+    # eats the probe's own closing paren) but, once emitted as
+    # `USING (<sql>) WITH CHECK (…)` on one line, comments out the
+    # closing paren and the entire WITH CHECK clause — silently dropping
+    # the write-side check / breaking diff --apply. to_sql() must refuse.
+    pol = _p(
+        command="ALL",
+        using_sql="true)--",
+        with_check_sql="tenant_id = current_setting('app.t')::uuid",
+    )
+    schema = Schema(tables=(_t(policies=(pol,)),))
+    with pytest.raises(ValueError, match="single SQL expression"):
+        schema.to_sql()
+
+
+def test_to_sql_allows_double_dash_inside_string_literal():
+    # Guard against over-rejection: a `--` INSIDE a string literal is
+    # part of the value, not a comment, so the predicate is safe to emit.
+    pol = _p(
+        command="SELECT",
+        using_sql="note <> 'a--b'",
+    )
+    schema = Schema(tables=(_t(policies=(pol,)),))
+    sql = schema.to_sql()
+    assert "USING (note <> 'a--b')" in sql
+
+
 def test_to_sql_omits_as_permissive_default():
     # PERMISSIVE is the Postgres default; omit the explicit
     # `AS PERMISSIVE` keyword for cleanliness.
