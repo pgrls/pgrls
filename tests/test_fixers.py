@@ -3208,6 +3208,79 @@ def test_quote_ident_quotes_reserved_keywords() -> None:
         )
 
 
+def test_quote_ident_quotes_type_func_name_keywords() -> None:
+    # R10 #1: the type_func_name-reserved keywords are NOT in the
+    # "fully reserved" subset but are equally invalid as a bare ColId
+    # (policy / table / column name). A policy named `join` or column
+    # named `left` reaches quote_ident verbatim from clean live
+    # introspection; emitting it bare produces `ALTER POLICY join …`,
+    # which the server rejects. All must be quoted.
+    from pgrls.fixers._idents import quote_ident
+
+    for kw in (
+        "join", "left", "right", "inner", "outer", "full", "cross",
+        "natural", "is", "isnull", "notnull", "like", "ilike", "similar",
+        "overlaps", "binary", "authorization", "collation",
+        "concurrently", "freeze", "verbose", "tablesample",
+        "current_schema",
+    ):
+        out = quote_ident(kw)
+        assert out == f'"{kw}"', (
+            f"type_func_name keyword {kw!r} must be quoted, got {out!r}"
+        )
+
+
+def test_quote_ident_keeps_col_name_keywords_and_type_names_bare() -> None:
+    # Guard against over-quoting: col_name-keywords (`between`) and
+    # type-context keywords (`bigint`, `numeric`, `int`) ARE valid as a
+    # bare ColId, so they must stay unquoted — quoting them would churn
+    # output and (for a column) could misname.
+    from pgrls.fixers._idents import quote_ident
+
+    for name in ("between", "bigint", "numeric", "int", "integer", "text"):
+        assert quote_ident(name) == name, (
+            f"{name!r} is a valid bare identifier and must NOT be quoted"
+        )
+
+
+def test_quote_ident_round_trips_keyword_policy_and_column() -> None:
+    # R10 #1 end-to-end: a policy named `join` and a column named `left`
+    # must round-trip through the emission helpers into SQL that
+    # re-parses. Before the fix these emitted unparseable DDL that
+    # aborted `fix --apply` / `diff --apply` / `generate`.
+    import pglast
+
+    from pgrls.fixers._idents import alter_policy, create_index_sql
+    from pgrls.model import Policy, policy_to_sql
+
+    class _T:
+        schema = "public"
+        name = "t"
+
+    using = pglast.parse_sql("SELECT 1 WHERE tenant_id = 1")[0].stmt.whereClause
+
+    alter = alter_policy(_T, "join", using_ast=using)
+    assert '"join"' in alter
+    pglast.parse_sql(alter)  # must not raise
+
+    idx = create_index_sql("public.t", "left")
+    assert '"left"' in idx
+    pglast.parse_sql(idx)
+
+    pol = Policy(
+        name="join",
+        command="SELECT",
+        permissive=True,
+        roles=("authenticated",),
+        using_sql="tenant_id = 1",
+        with_check_sql=None,
+        using_ast=using,
+    )
+    created = policy_to_sql(pol, "public.t")
+    assert 'CREATE POLICY "join"' in created
+    pglast.parse_sql(created)
+
+
 def test_quote_ident_keyword_check_is_case_insensitive() -> None:
     # Postgres parses identifiers case-insensitively before
     # quoting. `SELECT` / `Select` / `select` all collide with the
