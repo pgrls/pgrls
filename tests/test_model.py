@@ -774,7 +774,7 @@ def test_from_snapshot_rejects_data_type_injection() -> None:
             }
         ]
     )
-    with pytest.raises(ValueError, match="unsafe data_type"):
+    with pytest.raises(ValueError, match="data_type"):
         Schema.from_snapshot(snap)
 
 
@@ -820,3 +820,45 @@ def test_from_snapshot_accepts_real_types_and_privileges() -> None:
     )
     schema = Schema.from_snapshot(snap)
     assert schema.tables[0].column_details[1].data_type == "numeric(10,2)"
+
+
+def test_from_snapshot_rejects_data_type_column_injection() -> None:
+    # Regression (round-2 #1): the comma + space the old regex allowed
+    # for `numeric(10,2)` ALSO let a snapshot inject a SECOND column.
+    # Parse-validation rejects it (the probe CREATE TABLE has 2 columns).
+    snap = _minimal_snapshot(
+        column_details=[
+            {
+                "name": "id",
+                "data_type": "integer, evil boolean DEFAULT (true)",
+                "is_nullable": True,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_data_type_inherits_injection() -> None:
+    snap = _minimal_snapshot(
+        column_details=[
+            {
+                "name": "id",
+                "data_type": "integer) INHERITS (pg_catalog.pg_class",
+                "is_nullable": True,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_quoted_identifier_type() -> None:
+    # Regression (round-2 #10): the old char-allowlist over-restricted
+    # and rejected a legitimate quoted type name, crashing diff on a
+    # valid schema. Parse-validation accepts it.
+    snap = _minimal_snapshot(
+        column_details=[{"name": "x", "data_type": '"My Type"', "is_nullable": True}]
+    )
+    schema = Schema.from_snapshot(snap)
+    assert schema.tables[0].column_details[0].data_type == '"My Type"'

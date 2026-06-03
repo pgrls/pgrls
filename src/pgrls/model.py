@@ -19,7 +19,6 @@ info via the new ``column_details`` per table; v4 added top-level
 """
 from __future__ import annotations
 
-import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cached_property
@@ -62,12 +61,47 @@ SNAPSHOT_VERSION = 14  # v14: SecdefFunction/LeakproofFunction gain
 # load time and `policy_to_sql` validates the free-form predicate at
 # emit time, so an unsafe snapshot is rejected before any SQL runs.
 
-# Real Postgres type names: identifiers, spaces (`timestamp with time
-# zone`), parens/commas (`numeric(10,2)`, `geometry(Point,4326)`),
-# brackets (`int[]`), dots (`myschema.t`), double-quotes (`"char"`).
-# Excludes `;` `'` `-` `/` `\` — the statement-break / comment /
-# string-escape characters an injection needs.
-_SAFE_DATA_TYPE = re.compile(r'^[A-Za-z0-9_ ()\[\],."]+$')
+def _is_safe_data_type(data_type: object) -> bool:
+    """True iff `data_type` is a single, injection-free column type.
+
+    A snapshot's data_type is interpolated raw into ``CREATE TABLE t
+    (col <data_type>)`` by ``to_sql()`` for ``diff --apply``. A character
+    allowlist cannot separate legitimate punctuation (``numeric(10,2)``,
+    ``int[]``, ``"My Type"``) from injection — the comma/parens/quotes a
+    real type needs are exactly what ``integer, evil bool DEFAULT (true)``
+    (adds a column) or ``int) INHERITS (...)`` (adds a clause) abuse. So
+    instead of a regex, parse a probe ``CREATE TABLE`` and require the
+    type to occupy exactly one bare column definition and nothing else.
+    """
+    if not isinstance(data_type, str) or not data_type.strip():
+        return False
+    import pglast
+    from pglast.ast import ColumnDef, CreateStmt
+
+    try:
+        stmts = pglast.parse_sql(
+            f"CREATE TABLE __pgrls_probe (__pgrls_col {data_type})"
+        )
+    except Exception:
+        return False
+    if len(stmts) != 1:  # a `;` smuggled a second statement
+        return False
+    stmt = stmts[0].stmt
+    if not isinstance(stmt, CreateStmt):
+        return False
+    elts = list(stmt.tableElts or ())
+    if len(elts) != 1 or not isinstance(elts[0], ColumnDef):
+        return False  # a `,` added a second column (or a table constraint)
+    col = elts[0]
+    if col.colname != "__pgrls_col" or col.constraints:
+        return False  # an embedded DEFAULT/CHECK/GENERATED clause
+    # A `)` that closed the column list early to smuggle a table-level
+    # clause (INHERITS / OF type / PARTITION OF / WITH-options).
+    return not any(
+        getattr(stmt, attr, None)
+        for attr in ("inhRelations", "ofTypename", "partbound", "options")
+    )
+
 
 # Table-level privileges Postgres recognizes (pg_class ACL).
 _VALID_TABLE_PRIVILEGES: frozenset[str] = frozenset({
@@ -635,12 +669,14 @@ def _grant_from_dict(g: dict[str, Any]) -> Grant:
 
 def _column_from_dict(c: dict[str, Any]) -> Column:
     data_type = c["data_type"]
-    if not isinstance(data_type, str) or not _SAFE_DATA_TYPE.match(data_type):
+    if not _is_safe_data_type(data_type):
         raise ValueError(
-            f"snapshot column {c.get('name')!r} has an unsafe data_type "
-            f"{data_type!r}. Type names may contain only letters, digits, "
-            'spaces, and ()[],."_ — values that reach the DDL emitted by '
-            "`pgrls diff --apply` are validated against injection."
+            f"snapshot column {c.get('name')!r} has an unsafe or "
+            f"unparseable data_type {data_type!r}. It is interpolated into "
+            "the CREATE TABLE that `pgrls diff --apply` runs, so it must be "
+            "a single column type — validated by parsing a probe CREATE "
+            "TABLE; a value that adds a column, a table clause, or a second "
+            "statement is rejected."
         )
     return Column(
         name=c["name"],
