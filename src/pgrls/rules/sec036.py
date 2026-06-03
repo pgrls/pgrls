@@ -366,22 +366,101 @@ def _scalar_value_subselects(qual: Any) -> list[Any]:
     return out
 
 
+def _is_single_auth_target_select(
+    subselect: Any, binding_functions: set[str]
+) -> bool:
+    """True if `subselect` is a single-target ``SELECT <auth call>`` whose
+    sole target expression is a binding auth call.
+
+    A multi-target select, or one whose lone target is NOT the auth call
+    (e.g. a membership lookup ``SELECT user_id FROM m WHERE u = auth.uid()``
+    where the auth call lives in the WHERE), returns False — this keeps the
+    ANY/IN binding exception below as tight as the scalar form and never
+    descends into a body looking for an arbitrary nested auth call.
+    """
+    if not isinstance(subselect, SelectStmt):
+        return False
+    targets = subselect.targetList
+    if not targets or len(targets) != 1:
+        return False
+    return bool(
+        find_func_calls(
+            getattr(targets[0], "val", None),
+            binding_functions,
+            exclude_sublinks=True,
+        )
+    )
+
+
+def _any_subselect_binds_caller(
+    qual: Any, binding_functions: set[str]
+) -> bool:
+    """True if `qual` binds the caller via an IN / ``= ANY`` sub-query
+    whose sub-select projects EXACTLY a single binding auth call —
+    ``<expr> IN (SELECT auth.uid())`` / ``<expr> = ANY (SELECT auth.uid())``.
+
+    Postgres parses BOTH forms as ``ANY_SUBLINK``, which
+    `_scalar_value_subselects` deliberately does not descend into (so an
+    unrelated auth call buried in a nested ANY/ALL/EXISTS body cannot mask
+    a real admin-any leak — the SEC036 false negative). This is the
+    narrow, sound exception: a single-target sub-select whose sole target
+    IS the auth call genuinely constrains the row to the caller, exactly
+    like the scalar ``col = (SELECT auth.uid())`` (EXPR_SUBLINK) form. The
+    single-target gate keeps the FN-avoidance intact.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, SubLink):
+            # Walk the testexpr (the LHS of IN/ANY) for nested sub-links,
+            # but do NOT descend into the sub-select body except for the
+            # tight single-target binding check — preserving the
+            # FN-avoidance that `_scalar_value_subselects` documents.
+            walk(n.testexpr)
+            if (
+                n.subLinkType == SubLinkType.ANY_SUBLINK
+                and _is_single_auth_target_select(
+                    n.subselect, binding_functions
+                )
+            ):
+                found = True
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(qual)
+    return found
+
+
 def _qual_binds_caller(qual: Any, binding_functions: set[str]) -> bool:
     """True if a binding auth call in `qual` constrains the EXISTS to
     the calling user.
 
     A binding call counts when it is (1) directly in the qual or in an
     IN/ANY/ALL testexpr — `exclude_sublinks=True` stops the search at
-    every sub-select boundary; or (2) inside a scalar value sub-select
-    (`col = (SELECT auth.uid())`). A call inside a nested EXISTS/ANY/ALL
-    body is deliberately NOT counted (see `_scalar_value_subselects`).
+    every sub-select boundary; (2) inside a scalar value sub-select
+    (`col = (SELECT auth.uid())`); or (3) the target of a single-target
+    IN/ANY sub-query (`col IN (SELECT auth.uid())` / `= ANY (SELECT
+    auth.uid())`). A call inside a nested EXISTS/ANY/ALL body that is NOT
+    that tight single-target binding form is deliberately NOT counted
+    (see `_scalar_value_subselects` / `_any_subselect_binds_caller`).
     """
     if find_func_calls(qual, binding_functions, exclude_sublinks=True):
         return True
-    return any(
+    if any(
         find_func_calls(sub, binding_functions)
         for sub in _scalar_value_subselects(qual)
-    )
+    ):
+        return True
+    return _any_subselect_binds_caller(qual, binding_functions)
 
 
 def _has_binding_reference(

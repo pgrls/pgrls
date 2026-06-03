@@ -162,6 +162,11 @@ def test_fires_when_target_is_right_arm_of_nested_join() -> None:
         "id = (SELECT auth.uid())",  # PERF001-wrapped form
         "current_user = (id::text)",
         "current_setting('request.jwt.claim.sub', true)::uuid = id",
+        # R19 #1: IN / `= ANY` sub-query binding. Postgres parses both as
+        # ANY_SUBLINK; a single-target `SELECT auth.uid()` genuinely binds
+        # the caller, exactly like the scalar EXPR_SUBLINK form above.
+        "id IN (SELECT auth.uid())",
+        "id = ANY(SELECT auth.uid())",
     ],
 )
 def test_silent_when_subselect_binds_caller(binding: str) -> None:
@@ -202,6 +207,24 @@ def test_fires_on_admin_any_with_unrelated_nested_auth_call() -> None:
     schema = _wrap(_policy(f"({expr})", name="admin_any_distractor"))
     [v] = SEC036().check(schema, {})
     assert v.rule_id == "SEC036"
+
+
+def test_fires_when_any_subquery_is_not_a_single_auth_target() -> None:
+    # R19 #1 tightness: the IN/ANY binding exception is gated to a
+    # single-target `SELECT <auth call>`. A membership-style ANY sub-query
+    # whose auth call lives in its WHERE (the target is an unrelated
+    # column) is NOT a recognized binding — descending into arbitrary
+    # ANY/ALL bodies would let an unrelated nested auth call mask a real
+    # admin-any leak (the deliberately-preserved false-negative-avoidance,
+    # mirroring the nested-EXISTS distractor above). So this still fires.
+    expr = (
+        "EXISTS (SELECT 1 FROM auth.users u "
+        "WHERE u.raw_app_meta_data ->> 'role' = 'admin' "
+        "AND u.id = ANY(SELECT m.user_id FROM memberships m "
+        "WHERE m.owner = auth.uid()))"
+    )
+    schema = _wrap(_policy(f"({expr})", name="membership_any_distractor"))
+    assert len(SEC036().check(schema, {})) == 1
 
 
 def test_silent_on_scalar_wrap_binding_not_confused_with_nested_exists() -> None:
