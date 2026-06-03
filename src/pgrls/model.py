@@ -707,11 +707,23 @@ def _policy_from_dict(p: dict[str, Any]) -> Policy:
             "/ ALL policies, so replaying it via `pgrls diff --apply` would "
             "emit invalid DDL."
         )
+    roles_raw = p["roles"]
+    for r in roles_raw:
+        if not isinstance(r, str) or not r:
+            # Each role is emitted as an identifier into `CREATE POLICY …
+            # TO <roles>` (model.py policy_to_sql → quote_ident). Validate
+            # at decode like _grant_from_dict / _column_from_dict do for
+            # their values, so a tampered snapshot surfaces the same clean
+            # ValueError instead of a raw TypeError deep in quote_ident.
+            raise ValueError(
+                f"snapshot policy {pname!r} has an invalid role {r!r}; "
+                "each role must be a non-empty string."
+            )
     return Policy(
         name=p.get("policy_name") or p["name"],
         command=command,
         permissive=p["permissive"],
-        roles=tuple(p["roles"]),
+        roles=tuple(roles_raw),
         using_sql=using_sql,
         with_check_sql=with_check_sql,
         using_ast=None,
@@ -1461,6 +1473,20 @@ def policy_to_sql(p: Policy, qname: str) -> str:
     most cases, but we follow the dump style for predictability.
     """
     from pgrls.fixers._idents import quote_ident
+
+    # `command` is spliced raw as `FOR {command}`, so validate it at the
+    # emit sink the same way the USING / WITH CHECK predicates are guarded
+    # below — a Policy built from a less-trusted source with an
+    # out-of-Literal command (e.g. 'SELECT; DROP TABLE x; --') would
+    # otherwise inject a second statement. The snapshot decoder already
+    # rejects bad commands, so this never triggers for well-formed input;
+    # it makes the sink self-defending regardless of caller.
+    if p.command not in _VALID_POLICY_COMMANDS:
+        raise ValueError(
+            f"policy {p.name!r} has an invalid command {p.command!r}; "
+            f"refusing to emit it into executable DDL (expected one of "
+            f"{sorted(_VALID_POLICY_COMMANDS)})"
+        )
 
     parts = ["CREATE POLICY", quote_ident(p.name), "ON", qname]
     if not p.permissive:

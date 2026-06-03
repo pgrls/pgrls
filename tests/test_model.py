@@ -802,6 +802,46 @@ def test_from_snapshot_rejects_invalid_policy_command() -> None:
         Schema.from_snapshot(snap)
 
 
+def test_policy_to_sql_rejects_out_of_literal_command() -> None:
+    # R12 #4: policy_to_sql splices `command` raw as `FOR {command}`. The
+    # decoder rejects bad commands, but a Policy built directly in Python
+    # (a less-trusted future caller) could carry an out-of-Literal value;
+    # the emit sink must self-defend like its USING/WITH CHECK siblings.
+    from pgrls.model import Policy, policy_to_sql
+
+    p = Policy(
+        name="p",
+        command="SELECT; DROP TABLE x; --",  # type: ignore[arg-type]
+        permissive=True,
+        roles=("r",),
+        using_sql="true",
+        with_check_sql=None,
+    )
+    with pytest.raises(ValueError, match="invalid command"):
+        policy_to_sql(p, "public.t")
+
+
+def test_from_snapshot_rejects_non_string_role() -> None:
+    # R12 #5: roles are emitted as identifiers into `CREATE POLICY … TO`,
+    # so a tampered snapshot with a non-string role must surface the same
+    # clean ValueError the other structured fields produce — not a raw
+    # TypeError deep in quote_ident.
+    snap = _minimal_snapshot(
+        policies=[
+            {
+                "policy_name": "p",
+                "command": "ALL",
+                "permissive": True,
+                "roles": [123],
+                "using_sql": "true",
+                "with_check_sql": "true",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="invalid role"):
+        Schema.from_snapshot(snap)
+
+
 def test_from_snapshot_rejects_select_delete_policy_with_with_check() -> None:
     # Regression (round-3 #11): a SELECT / DELETE policy carrying a
     # WITH CHECK clause makes `policy_to_sql` (and `pgrls diff --apply`)
