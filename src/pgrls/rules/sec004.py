@@ -17,9 +17,47 @@ from __future__ import annotations
 
 from typing import Any
 
+from pglast.ast import FuncCall, String
+
 from pgrls.ast_utils import find_func_calls, flatten_or_disjuncts, match_is_null
 from pgrls.model import Schema
 from pgrls.violations import Severity, Violation
+
+
+def _is_one_arg_current_setting(node: Any) -> bool:
+    """True if `node` is the one-argument ``current_setting(name)`` call.
+
+    That form RAISES ``unrecognized configuration parameter`` on an unset
+    GUC and otherwise returns a non-NULL string (even ``''`` is non-NULL),
+    so it can NEVER be NULL — an ``IS NULL`` on it is a dead disjunct, not
+    an anonymous-read hole. The two-argument ``current_setting(name, true)``
+    (missing_ok) form returns NULL when unset and stays NULLable.
+    """
+    if not isinstance(node, FuncCall):
+        return False
+    parts = [f.sval for f in (node.funcname or ()) if isinstance(f, String)]
+    # Only the builtin current_setting (unqualified or pg_catalog-
+    # qualified) has the raise-on-unset / never-NULL semantics; a
+    # user-defined `myschema.current_setting` could legitimately return
+    # NULL, so leave it NULLable.
+    is_builtin = parts == ["current_setting"] or parts == [
+        "pg_catalog",
+        "current_setting",
+    ]
+    return is_builtin and len(node.args or ()) == 1
+
+
+def _has_nullable_auth_call(inner: Any, auth_functions: set[str]) -> bool:
+    """True if `inner` contains an auth call that can actually be NULL.
+
+    `find_func_calls` matches every configured auth function in `inner`;
+    a one-argument ``current_setting`` among them is never NULL (see
+    above), so it does not make the ``IS NULL`` disjunct an
+    anonymous-read hole. Any OTHER match (auth.uid/role/jwt, or the
+    two-arg ``current_setting``) is genuinely NULLable.
+    """
+    matches = find_func_calls(inner, auth_functions)
+    return any(not _is_one_arg_current_setting(m) for m in matches)
 
 
 # Only functions that genuinely return NULL for an unauthenticated
@@ -77,7 +115,7 @@ class SEC004:
                     inner, is_null = matched
                     if not is_null:
                         continue
-                    if not find_func_calls(inner, auth_functions):
+                    if not _has_nullable_auth_call(inner, auth_functions):
                         continue
                     out.append(
                         Violation(

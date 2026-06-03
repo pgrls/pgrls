@@ -1067,6 +1067,16 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
         qualified, bare = func_name_parts(node)
         if qualified is None:
             return False
+        # The one-arg builtin current_setting(name) RAISES on an unset
+        # GUC and is otherwise a non-NULL string — it is NEVER NULL, so
+        # modeling it as anon-NULL would make `current_setting('x') IS
+        # NULL OR …` prove valid and false-fire (mirrors SEC004). Only
+        # the two-arg current_setting(name, true) is NULLable under anon.
+        if (
+            qualified in ("current_setting", "pg_catalog.current_setting")
+            and len(node.args or ()) == 1
+        ):
+            return False
         if qualified in auth_funcs:
             return True
         # Bare-name fallback: an UNQUALIFIED call has qualified == bare

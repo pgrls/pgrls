@@ -51,6 +51,33 @@ def test_sec004_fires_on_current_setting_is_null_disjunct() -> None:
     assert len(SEC004().check(schema, {})) == 1
 
 
+def test_sec004_silent_on_one_arg_current_setting_is_null() -> None:
+    # R12 #1: the one-arg `current_setting('app.x')` RAISES on an unset
+    # GUC and is otherwise a non-NULL string — it is NEVER NULL, so the
+    # `IS NULL` disjunct is dead and the policy fails closed. Flagging it
+    # ERROR-severity is a false positive (the two-arg missing_ok form is
+    # the genuinely-NULLable one). Covers the builtin in both spellings.
+    for fn in ("current_setting", "pg_catalog.current_setting"):
+        schema = _wrap(
+            _policy_with_using(f"{fn}('app.x') IS NULL OR user_id = '1'")
+        )
+        assert SEC004().check(schema, {}) == [], fn
+
+
+def test_sec004_fires_on_user_defined_one_arg_current_setting() -> None:
+    # A user-defined `myschema.current_setting(text)` is NOT the builtin
+    # and could legitimately return NULL, so the never-NULL skip must not
+    # suppress it (it matches via the bare name in the auth set).
+    schema = _wrap(
+        _policy_with_using(
+            "myschema.current_setting('app.x') IS NULL OR user_id = '1'"
+        )
+    )
+    assert len(
+        SEC004().check(schema, {"auth_functions": ["current_setting"]})
+    ) == 1
+
+
 def test_sec004_silent_on_never_null_role_svfops_by_default() -> None:
     # R11 #1: current_user / session_user / current_role / user ALWAYS
     # return the session role name — Postgres has no unauthenticated

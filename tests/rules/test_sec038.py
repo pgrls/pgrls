@@ -242,11 +242,15 @@ def test_sec038_no_false_positive_on_user_function_named_like_builtin() -> None:
 
 def test_sec038_fires_on_unqualified_and_pg_catalog_builtin() -> None:
     # Control for the above: the unqualified builtin (and its explicit
-    # pg_catalog form) IS forced to NULL under anon, so the same
-    # inverted-auth disjunct is a real anonymous-read leak.
+    # pg_catalog form), in the NULLable two-arg form, IS forced to NULL
+    # under anon, so the inverted-auth disjunct is a real anonymous-read
+    # leak. (The one-arg form is never NULL — see
+    # test_sec038_silent_on_one_arg_current_setting_is_null.)
     for fn in ("current_setting", "pg_catalog.current_setting"):
         leak = _wrap(
-            _policy_with_using(f"{fn}('app.tenant') IS NULL OR " + _OWNER_LIT)
+            _policy_with_using(
+                f"{fn}('app.tenant', true) IS NULL OR " + _OWNER_LIT
+            )
         )
         assert len(SEC038().check(leak, {})) == 1
 
@@ -402,35 +406,30 @@ def test_sec038_message_describes_unconditional_anon_leak() -> None:
     assert "SEC004" in msg
 
 
-def test_sec038_message_caveats_one_arg_current_setting() -> None:
-    # R9 #10: the one-arg `current_setting('app.x')` RAISES when the GUC
-    # is unset (it doesn't return NULL), so for an unconfigured anon
-    # session the policy may ERROR rather than read every row. SEC038
-    # still fires (the inverted-auth shape is unsound), but the message
-    # must acknowledge the error-vs-leak nuance accurately.
+def test_sec038_silent_on_one_arg_current_setting_is_null() -> None:
+    # R12 #1 (supersedes R9 #10): the one-arg `current_setting('app.x')`
+    # RAISES `unrecognized configuration parameter` on an unset GUC and
+    # is otherwise a non-NULL string — it is NEVER NULL, so the
+    # `IS NULL` disjunct is dead and the policy fails closed. SEC038 must
+    # NOT prove it anon-valid (it would be a false positive, mirroring
+    # SEC004).
     schema = _wrap(
         _policy_with_using(
             f"current_setting('app.x') IS NULL OR {_OWNER_LIT}"
         )
     )
-    [v] = SEC038().check(schema, {})
-    msg = v.message
-    assert "one-argument current_setting" in msg
-    assert "unrecognized configuration parameter" in msg
-    # Still firing and still pointing at the real fix.
-    assert "SEC004" in msg
+    assert SEC038().check(schema, {}) == []
 
 
-def test_sec038_message_omits_caveat_for_two_arg_current_setting() -> None:
+def test_sec038_fires_on_two_arg_current_setting_is_null() -> None:
     # The two-arg `current_setting(name, true)` returns NULL when unset
-    # (genuinely leaks, no error), so the one-arg caveat must NOT appear.
+    # → the inverted disjunct IS anon-valid → genuine leak → fires.
     schema = _wrap(
         _policy_with_using(
             f"(SELECT current_setting('app.x', true)) IS NULL OR {_OWNER_LIT}"
         )
     )
-    [v] = SEC038().check(schema, {})
-    assert "one-argument current_setting" not in v.message
+    assert len(SEC038().check(schema, {})) == 1
 
 
 def test_sec038_noop_when_z3_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
