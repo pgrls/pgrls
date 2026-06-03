@@ -400,6 +400,39 @@ def test_sec026_silent_on_ltree_match_against_auth_value() -> None:
     assert SEC026().check(schema, options={}) == []
 
 
+def test_sec026_silent_on_ltree_match_against_subselect_wrapped_auth() -> None:
+    # R15 #4: `~` is the ltree/lquery match operator, and the auth value
+    # may use the FROM-less scalar sub-select pgrls's PERF001 recommends:
+    # `path ~ (SELECT current_setting('app.q')::lquery)`. The non-text
+    # guard previously inspected the SubLink (whose top node is not the
+    # `::lquery` cast), returned False, and SEC026 false-fired on the very
+    # rewrite pgrls advocates. The guard now unwraps the sub-select
+    # projection (the same wrapper auth-call detection looks through), so
+    # this typed ltree match stays silent — matching the direct form.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="(path ~ (SELECT current_setting('app.q')::lquery))"
+                )
+            ),
+        )
+    )
+    assert SEC026().check(schema, options={}) == []
+    # No false negative: a genuine TEXT regex via the same sub-select wrap
+    # still fires (the operand is text-typed, so the guard does not skip).
+    text_schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="(user_email ~ (SELECT current_setting('app.re')))"
+                )
+            ),
+        )
+    )
+    assert len(SEC026().check(text_schema, options={})) == 1
+
+
 def test_sec026_silent_on_geometric_contains_against_auth_value() -> None:
     # Regression (#15): `~` is also the geometric "contains" operator.
     # An operand built via a point() constructor from an auth GUC is a

@@ -283,6 +283,34 @@ def _fromless_subselects(side: Any) -> list[SelectStmt]:
     return out
 
 
+def _effective_operand(side: Any) -> Any:
+    """The expression a pattern operator actually compares against.
+
+    For the FROM-less scalar sub-select PERF001 recommends
+    (`path ~ (SELECT current_setting('app.q')::lquery)`), the compared
+    value is the sub-select's single projected expression, not the
+    `SubLink` wrapper. `_side_has_auth_call` already looks THROUGH that
+    wrapper to find the auth call; the non-text-type guard must look
+    through the SAME wrapper, or it inspects the SubLink (whose top node
+    is not the `::lquery` cast), the guard returns False, and SEC026
+    false-fires on the very rewrite pgrls advocates. Returns the
+    projection (`targetList[0].val`) for a bare single-target FROM-less
+    scalar sub-select, else `side` unchanged. (R15 #4)
+    """
+    if isinstance(side, SubLink):
+        sub = side.subselect
+        if (
+            isinstance(sub, SelectStmt)
+            and not sub.fromClause
+            and sub.targetList
+            and len(sub.targetList) == 1
+        ):
+            val = getattr(sub.targetList[0], "val", None)
+            if val is not None:
+                return val
+    return side
+
+
 def _side_has_auth_call(side: Any, names: set[str]) -> bool:
     """True if the LIKE/regex pattern operand `side` IS an auth value.
 
@@ -343,9 +371,14 @@ def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
                 # sit on the auth-value side
                 # (`current_setting(...)::lquery ~ col`) OR on the
                 # column side (`(path::lquery) ~ current_setting(...)`),
-                # so both operands must be checked.
+                # so both operands must be checked. Unwrap a FROM-less
+                # scalar sub-select first via `_effective_operand` so the
+                # PERF001-recommended `~ (SELECT …::lquery)` form is
+                # judged on its projected cast, not the opaque SubLink —
+                # the same wrapper `_side_has_auth_call` looks through.
                 if overloaded and (
-                    _is_non_text_typed(side) or _is_non_text_typed(other)
+                    _is_non_text_typed(_effective_operand(side))
+                    or _is_non_text_typed(_effective_operand(other))
                 ):
                     continue
                 if op is not None:
