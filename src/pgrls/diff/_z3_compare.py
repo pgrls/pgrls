@@ -57,10 +57,26 @@ Supported AST nodes (Phases 1 + 3 + 4):
 * ``BoolExpr`` (AND, OR, NOT) — translated to ``z3.And``, ``z3.Or``,
   ``z3.Not``.
 * ``NullTest`` (IS NULL, IS NOT NULL) — modeled as opaque Z3
-  Booleans (``is_null_<col>``). Sound but coarse: comparisons are
-  not constrained to be non-null, so 3VL nuances may produce
-  inconclusive results in either direction. The caller falls
-  through to ``requires_review`` rather than misclassifying.
+  Booleans (``is_null_<col>``) DISCONNECTED from the column's value
+  variable. Sound in the safety-critical direction — a real loosening
+  is never missed (the disconnection only ever ADDS models, so an
+  implication that should fail still fails) — but COARSE. Because the
+  marker and value var are independent, Z3 can pick a physically
+  impossible model (a column both ``IS NULL`` and equal to a concrete
+  value). So when a column carries BOTH an IS NULL test and a value
+  comparison, the classifier can OVER-report: a NULL-equivalent
+  refactor such as ``col IS NOT NULL AND col = x`` vs ``col = x`` is
+  reported ``semantic_loosened`` (a false DANGEROUS) instead of
+  ``semantic_equivalent``. This is a deliberate, known limitation:
+  faithfully linking the marker to the value variable requires
+  threading non-null guards through arithmetic operands AND reworking
+  the counterexample witness-sufficiency gate — a naive linkage
+  instead breaks arithmetic equivalence (``col - 3 > 0`` vs ``col > 3``
+  flips to ``tightened``) and suppresses valid counterexamples. The
+  over-report is the SAFE failure mode (it flags a safe change for
+  review; it never passes a dangerous one), so the coarse model is
+  retained rather than risk the verifier's soundness for a false
+  alarm.
 * ``A_Expr`` with ``BETWEEN`` / ``NOT BETWEEN`` (Phase 3) —
   translated to the equivalent AND/OR of inequalities. Symmetric
   variants (``BETWEEN SYMMETRIC``) currently abort.
