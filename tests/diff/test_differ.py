@@ -12,7 +12,7 @@ from pgrls.diff import (
     Classification,
     diff_schemas,
 )
-from pgrls.model import Grant, Policy, Schema, Table
+from pgrls.model import ColumnGrant, Grant, Policy, Schema, Table
 
 
 def _t(
@@ -24,6 +24,7 @@ def _t(
     policies: tuple[Policy, ...] = (),
     columns: tuple[str, ...] = ("id",),
     grants: tuple[Grant, ...] = (),
+    column_grants: tuple[ColumnGrant, ...] = (),
 ) -> Table:
     return Table(
         schema="public",
@@ -34,6 +35,7 @@ def _t(
         columns=columns,
         partition_of=partition_of,
         grants=grants,
+        column_grants=column_grants,
     )
 
 
@@ -802,6 +804,52 @@ def test_grant_public_no_rls_is_dangerous() -> None:
     public_no_rls = [c for c in changes if c.kind == ChangeKind.GRANT_PUBLIC_NO_RLS]
     assert len(public_no_rls) == 1
     assert public_no_rls[0].classification == "dangerous"
+
+
+def test_column_grant_public_no_rls_is_dangerous() -> None:
+    # R15 #2: a column-level PUBLIC grant added on a no-RLS table exposes
+    # that column to every connected role — the same data-exposure as a
+    # table-level PUBLIC grant, at column granularity. Must route to the
+    # dangerous GRANT_PUBLIC_NO_RLS path (not be silently no-change), and
+    # name the exposed column.
+    base = Schema(tables=(_t(rls=False),))
+    head = Schema(
+        tables=(
+            _t(
+                rls=False,
+                column_grants=(
+                    ColumnGrant(
+                        role="PUBLIC", column="ssn", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    public_no_rls = [
+        c for c in changes if c.kind == ChangeKind.GRANT_PUBLIC_NO_RLS
+    ]
+    assert len(public_no_rls) == 1
+    assert public_no_rls[0].classification == "dangerous"
+    assert "ssn" in public_no_rls[0].message
+    # With RLS enabled the same column grant is only requires_review.
+    head_rls = Schema(
+        tables=(
+            _t(
+                rls=True,
+                force=True,
+                column_grants=(
+                    ColumnGrant(
+                        role="PUBLIC", column="ssn", privileges=("SELECT",)
+                    ),
+                ),
+            ),
+        )
+    )
+    changes_rls = diff_schemas(Schema(tables=(_t(rls=True, force=True),)), head_rls)
+    assert ChangeKind.GRANT_PUBLIC_NO_RLS not in {c.kind for c in changes_rls}
+    added = [c for c in changes_rls if c.kind == ChangeKind.GRANT_ADDED]
+    assert len(added) == 1 and added[0].classification == "requires_review"
 
 
 def test_grant_public_no_rls_fires_even_when_stale_policies_present() -> None:

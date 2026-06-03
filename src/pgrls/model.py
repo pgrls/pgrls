@@ -28,6 +28,7 @@ __all__ = [
     "BypassRlsEscalation",
     "BypassRlsRole",
     "Column",
+    "ColumnGrant",
     "Grant",
     "Index",
     "LeakproofFunction",
@@ -46,9 +47,12 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 14  # v14: SecdefFunction/LeakproofFunction gain
-# separate schema_name + function_name (the ambiguous qualified_name
-# join cannot be split when a component contains a dot).
+SNAPSHOT_VERSION = 15  # v15: per-table column_grants (pg_attribute.attacl)
+# — emitted only when present, so a schema with no column-level grants
+# round-trips byte-identically apart from this version bump. v14:
+# SecdefFunction/LeakproofFunction gain separate schema_name +
+# function_name (the ambiguous qualified_name join cannot be split when a
+# component contains a dot).
 
 # --- Snapshot trust-boundary validation --------------------------------
 #
@@ -109,6 +113,12 @@ def _is_safe_data_type(data_type: object) -> bool:
 _VALID_TABLE_PRIVILEGES: frozenset[str] = frozenset({
     "SELECT", "INSERT", "UPDATE", "DELETE",
     "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
+})
+
+# Postgres only allows these four privileges at COLUMN granularity
+# (`GRANT SELECT (col) …`); DELETE/TRUNCATE/TRIGGER are table-only.
+_VALID_COLUMN_PRIVILEGES: frozenset[str] = frozenset({
+    "SELECT", "INSERT", "UPDATE", "REFERENCES",
 })
 
 _VALID_POLICY_COMMANDS: frozenset[str] = frozenset(
@@ -237,6 +247,25 @@ class Grant:
     """
 
     role: str
+    privileges: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ColumnGrant:
+    """A column-level privilege grant (`GRANT SELECT (col) ON t TO role`).
+
+    Captured from `pg_attribute.attacl` (snapshot: additive, emitted only
+    when present, so a pre-v8 baseline round-trips to ``()``). Distinct
+    from the table-level `Grant`: a column grant exposes only the named
+    column, and only SELECT / INSERT / UPDATE / REFERENCES can be granted
+    at column granularity. PUBLIC pseudo-role is `role="PUBLIC"`, mirroring
+    `Grant` / `Policy.roles`. Feeds the diff's GRANT_PUBLIC_NO_RLS path so a
+    `GRANT SELECT (ssn) ON t TO PUBLIC` on a no-RLS table is flagged
+    dangerous at column granularity, not silently treated as no-change.
+    """
+
+    role: str
+    column: str
     privileges: tuple[str, ...]
 
 
@@ -444,6 +473,13 @@ class Table:
     # round-trip with `indexes=()` so PERF003 simply finds nothing
     # to flag against older snapshots until they're re-captured.
     indexes: tuple[Index, ...] = ()
+    # Column-level privilege grants (`GRANT SELECT (col) …`) — populated
+    # from `pg_attribute.attacl` in snapshot v8+. Modeled separately from
+    # table-level `grants` (which read `pg_class.relacl`) so the diff can
+    # flag a PUBLIC column grant on a no-RLS table as dangerous at column
+    # granularity. Default `()` keeps test fixtures and pre-v8 baselines
+    # working unchanged (they round-trip with `column_grants=()`).
+    column_grants: tuple[ColumnGrant, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -759,6 +795,36 @@ def _grant_from_dict(g: dict[str, Any]) -> Grant:
     return Grant(role=g["role"], privileges=privileges)
 
 
+def _column_grant_from_dict(g: dict[str, Any]) -> ColumnGrant:
+    column = g["column"]
+    if not isinstance(column, str) or not column:
+        raise ValueError(
+            f"snapshot column grant for role {g.get('role')!r} has an "
+            f"invalid column {column!r}; it must be a non-empty string."
+        )
+    privileges = tuple(g["privileges"])
+    if not privileges:
+        raise ValueError(
+            f"snapshot column grant for role {g.get('role')!r} on column "
+            f"{column!r} lists no privileges; a GRANT must name at least one."
+        )
+    for priv in privileges:
+        if (
+            not isinstance(priv, str)
+            or priv.upper() not in _VALID_COLUMN_PRIVILEGES
+        ):
+            raise ValueError(
+                f"snapshot column grant for role {g.get('role')!r} on column "
+                f"{column!r} lists an unknown/unsafe column privilege "
+                f"{priv!r}. Allowed: "
+                + ", ".join(sorted(_VALID_COLUMN_PRIVILEGES))
+                + " — grants are replayed verbatim by `pgrls diff --apply`."
+            )
+    return ColumnGrant(
+        role=g["role"], column=column, privileges=privileges
+    )
+
+
 def _column_from_dict(c: dict[str, Any]) -> Column:
     data_type = c["data_type"]
     if not _is_safe_data_type(data_type):
@@ -837,6 +903,10 @@ def _table_from_dict(
         ),
         # v7+ indexes; v3-v6 baselines round-trip to ().
         indexes=tuple(_index_from_dict(idx) for idx in t.get("indexes", [])),
+        # v8+ column-level grants; v3-v7 baselines round-trip to ().
+        column_grants=tuple(
+            _column_grant_from_dict(cg) for cg in t.get("column_grants", [])
+        ),
     )
 
 
@@ -1117,6 +1187,24 @@ class Schema:
                         }
                         for idx in t.indexes
                     ],
+                    # v15: column-level grants. Emitted ONLY when present
+                    # so every schema captured before this feature (none
+                    # carry column grants) serializes byte-identically
+                    # apart from the version bump — no golden churn.
+                    **(
+                        {
+                            "column_grants": [
+                                {
+                                    "role": cg.role,
+                                    "column": cg.column,
+                                    "privileges": list(cg.privileges),
+                                }
+                                for cg in t.column_grants
+                            ]
+                        }
+                        if t.column_grants
+                        else {}
+                    ),
                 }
                 for t in self.tables
             ],
@@ -1281,12 +1369,12 @@ class Schema:
                 f"{type(payload).__name__}"
             )
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14. v1 / v2 snapshots must be regenerated "
-                "against the current schema."
+                "10, 11, 12, 13, 14, 15. v1 / v2 snapshots must be "
+                "regenerated against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -1465,6 +1553,21 @@ class Schema:
                 )
                 out.append(
                     f"GRANT {privs} ON {qname} TO {role_sql};"
+                )
+            # Column-level grants: `GRANT SELECT (col) ON t TO role`. The
+            # column is quoted; each privilege carries the same parenthesized
+            # column list, matching how Postgres records per-column ACLs.
+            for cg in t.column_grants:
+                col_privs = ", ".join(
+                    f"{p} ({quote_ident(cg.column)})" for p in cg.privileges
+                )
+                role_sql = (
+                    "PUBLIC"
+                    if cg.role == "PUBLIC"
+                    else quote_ident(cg.role)
+                )
+                out.append(
+                    f"GRANT {col_privs} ON {qname} TO {role_sql};"
                 )
 
         return "\n".join(out) + "\n"

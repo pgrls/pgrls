@@ -414,13 +414,11 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_fourteen():
-    # Bumped 13 → 14 to add separate schema_name / function_name to
-    # `SecdefFunction` and `LeakproofFunction` (so the SEC015/SEC017
-    # fixers never split the ambiguous qualified_name — correct even
-    # when a schema name contains a dot). Pin so a future bump is
-    # deliberate.
-    assert SNAPSHOT_VERSION == 14
+def test_snapshot_version_is_fifteen():
+    # Bumped 14 → 15 to add per-table column_grants (pg_attribute.attacl)
+    # so the diff flags a PUBLIC column grant on a no-RLS table. Pin so a
+    # future bump is deliberate.
+    assert SNAPSHOT_VERSION == 15
 
 
 def test_to_snapshot_emits_column_details_array():

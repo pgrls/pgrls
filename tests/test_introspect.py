@@ -588,6 +588,34 @@ def test_introspect_captures_grants(
     assert grants_by_role["grant_test_actor"] >= {"SELECT", "INSERT"}
 
 
+def test_introspect_captures_column_grants(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # R15 #2: column-level grants live in pg_attribute.attacl, not
+    # pg_class.relacl, so they must be captured separately. Validate the
+    # _COLUMN_GRANTS_SQL query against a live Postgres — the production
+    # form, not a hand-built assumption.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS colgrant_actor;
+        CREATE ROLE colgrant_actor NOLOGIN;
+        CREATE TABLE public.colgranted_t (id INT, ssn TEXT, note TEXT);
+        GRANT SELECT (ssn), UPDATE (ssn) ON public.colgranted_t
+            TO colgrant_actor;
+        GRANT SELECT (note) ON public.colgranted_t TO PUBLIC;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "colgranted_t")
+    by_key = {
+        (cg.role, cg.column): set(cg.privileges) for cg in t.column_grants
+    }
+    assert by_key.get(("colgrant_actor", "ssn")) == {"SELECT", "UPDATE"}
+    assert by_key.get(("PUBLIC", "note")) == {"SELECT"}
+    # A bare table-level grant must NOT leak into column_grants.
+    assert all(cg.column in ("ssn", "note") for cg in t.column_grants)
+
+
 def test_introspect_grants_resolve_public_pseudo_role(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

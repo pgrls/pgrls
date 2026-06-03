@@ -77,7 +77,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 14,
+        "version": 15,
         "tables": [
             {
                 "schema": "public",
@@ -235,14 +235,14 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_fourteen_after_dotted_function_fields() -> None:
-    # SNAPSHOT_VERSION bumped 13 → 14 to add separate schema_name /
-    # function_name to SecdefFunction + LeakproofFunction, so the
-    # SEC015/SEC017 fixers never split the ambiguous qualified_name
-    # (wrong when a schema name contains a dot). Pin the new version
-    # so a future bump is deliberate.
+def test_snapshot_version_is_fifteen_after_column_grants() -> None:
+    # SNAPSHOT_VERSION bumped 14 → 15 to add per-table column_grants
+    # (pg_attribute.attacl), so the diff flags a PUBLIC column grant on a
+    # no-RLS table. Pin the new version so a future bump is deliberate.
+    # (v14 added separate schema_name/function_name to SecdefFunction /
+    # LeakproofFunction.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 14
+    assert snap["version"] == 15
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -493,7 +493,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
     }
-    assert snap["version"] == 14
+    assert snap["version"] == 15
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -794,6 +794,47 @@ def test_from_snapshot_rejects_empty_grant_privileges() -> None:
     # tampered snapshot — reject at decode, not at apply.
     snap = _minimal_snapshot(grants=[{"role": "r", "privileges": []}])
     with pytest.raises(ValueError, match="no privileges"):
+        Schema.from_snapshot(snap)
+
+
+def test_column_grants_round_trip_through_snapshot() -> None:
+    # R15 #2: column-level grants serialize/decode additively (snapshot
+    # v15). A schema that has them round-trips faithfully; one that does
+    # not omits the key entirely (byte-stable for pre-feature schemas).
+    from pgrls.model import ColumnGrant, Column, SNAPSHOT_VERSION
+
+    cg = ColumnGrant(role="PUBLIC", column="ssn", privileges=("SELECT",))
+    t = Table(
+        schema="public", name="users", rls_enabled=False, force_rls=False,
+        policies=(), columns=("ssn",),
+        column_details=(Column(name="ssn", data_type="text", is_nullable=True),),
+        column_grants=(cg,),
+    )
+    snap = Schema(tables=(t,)).to_snapshot()
+    assert snap["version"] == SNAPSHOT_VERSION == 15
+    assert snap["tables"][0]["column_grants"] == [
+        {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
+    ]
+    assert Schema.from_snapshot(snap).tables[0].column_grants == (cg,)
+    # A table with no column grants omits the key (byte-stability).
+    plain = Table(
+        schema="public", name="plain", rls_enabled=True, force_rls=True,
+        policies=(),
+        column_details=(Column(name="id", data_type="uuid", is_nullable=False),),
+    )
+    assert "column_grants" not in Schema(tables=(plain,)).to_snapshot()["tables"][0]
+
+
+def test_from_snapshot_rejects_invalid_column_grant_privilege() -> None:
+    # DELETE/TRUNCATE/TRIGGER cannot be granted at column granularity;
+    # reject a tampered snapshot that lists one (mirrors the table-grant
+    # privilege validation).
+    snap = _minimal_snapshot(
+        column_grants=[
+            {"role": "PUBLIC", "column": "ssn", "privileges": ["DELETE"]}
+        ]
+    )
+    with pytest.raises(ValueError, match="column privilege"):
         Schema.from_snapshot(snap)
 
 

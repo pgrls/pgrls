@@ -14,6 +14,7 @@ from pgrls.model import (
     BypassRlsEscalation,
     BypassRlsRole,
     Column,
+    ColumnGrant,
     Grant,
     Index,
     LeakproofFunction,
@@ -247,6 +248,36 @@ WHERE c.relkind IN ('r', 'p')
   -- whether other grants exist.
   AND ax.grantee <> c.relowner
 ORDER BY c.oid, role_name, ax.privilege_type
+"""
+
+# Column-level grants from `pg_attribute.attacl` (`GRANT SELECT (col) ON
+# t TO role`). Stored separately from table-level `relacl`, so a PUBLIC
+# column grant on a no-RLS table is otherwise invisible to the diff's
+# GRANT_PUBLIC_NO_RLS detection. Mirrors `_GRANTS_SQL`: real columns only
+# (`attnum > 0 AND NOT attisdropped`), the owner self-grant excluded
+# (same phantom-delta rationale as the table-grant query — the owner
+# always holds the privilege), grantee 0 rendered as PUBLIC.
+_COLUMN_GRANTS_SQL = """
+SELECT
+    c.oid AS table_oid,
+    a.attname AS column_name,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+LEFT JOIN LATERAL aclexplode(a.attacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname = ANY(%s)
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND a.attacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> c.relowner
+ORDER BY c.oid, column_name, role_name, ax.privilege_type
 """
 
 _VIEWS_SQL = """
@@ -1045,6 +1076,26 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 row["privilege_type"]
             )
 
+        # Column-level grants (pg_attribute.attacl), grouped per
+        # (role, column) so each column grant is one ColumnGrant.
+        cur.execute(_COLUMN_GRANTS_SQL, (schemas,))
+        col_grants_acc: dict[
+            int, dict[tuple[str, str], list[str]]
+        ] = defaultdict(lambda: defaultdict(list))
+        for row in cur.fetchall():
+            col_grants_acc[row["table_oid"]][
+                (row["role_name"], row["column_name"])
+            ].append(row["privilege_type"])
+        column_grants_by_oid: dict[int, list[ColumnGrant]] = {
+            oid: [
+                ColumnGrant(
+                    role=role, column=col, privileges=tuple(privs)
+                )
+                for (role, col), privs in sorted(rolecol.items())
+            ]
+            for oid, rolecol in col_grants_acc.items()
+        }
+
         secdef_funcs = _fetch_secdef_functions(cur, schemas)
         views = _build_views(cur, schemas, secdef_funcs)
 
@@ -1181,6 +1232,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             ),
             triggers=tuple(triggers_by_oid.get(row["table_oid"], [])),
             indexes=tuple(indexes_by_oid.get(row["table_oid"], [])),
+            column_grants=tuple(
+                column_grants_by_oid.get(row["table_oid"], [])
+            ),
         )
         for row in table_rows
     ]
