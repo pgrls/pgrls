@@ -30,6 +30,7 @@ the server.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from functools import lru_cache
 from typing import Any
@@ -180,12 +181,25 @@ def force_rls_sql(qname: str) -> str:
 
 
 def create_index_sql(qname: str, column: str) -> str:
-    """`CREATE INDEX ON <qname> (<column>);` (PERF003 shape).
+    """`CREATE INDEX IF NOT EXISTS <name> ON <qname> (<column>);`.
 
     `qname` is already a quoted qualified name; `column` is a raw
-    identifier and is quoted here via `quote_ident`. The index name
-    is left to Postgres (no explicit name), matching PERF003's
-    recommended remediation. Shared verbatim by the PERF003 fixer
-    and `pgrls generate`.
+    identifier and is quoted here via `quote_ident`. Shared verbatim by
+    the PERF003 fixer and `pgrls generate`.
+
+    The index is given a DETERMINISTIC name plus `IF NOT EXISTS` (the
+    same scheme PERF004's fixer uses) so an emitted `pgrls fix --output`
+    / `pgrls generate --output` migration is safely re-runnable.
+    Postgres does NOT treat a repeated *unnamed* `CREATE INDEX` as a
+    no-op — it auto-names and builds a redundant duplicate — so leaving
+    the name to Postgres made committed migrations non-idempotent. The
+    name hashes the (qualified table, column) so it is stable across
+    runs and collision-resistant.
     """
-    return f"CREATE INDEX ON {qname} ({quote_ident(column)});"
+    index_name = "pgrls_idx_" + hashlib.sha1(
+        f"{qname}.{column}".encode()
+    ).hexdigest()[:16]
+    return (
+        f"CREATE INDEX IF NOT EXISTS {index_name} "
+        f"ON {qname} ({quote_ident(column)});"
+    )

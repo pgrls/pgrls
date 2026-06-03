@@ -3186,10 +3186,8 @@ def test_fix_emits_perf003_create_index(pg_url: str, apply_sql) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["fix", "--database-url", pg_url])
     assert result.exit_code == 0, result.output
-    assert (
-        "CREATE INDEX ON public.fix_perf003 (tenant_id);"
-        in result.output
-    )
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in result.output
+    assert "ON public.fix_perf003 (tenant_id);" in result.output
     assert "dry-run" in result.output
 
 

@@ -3504,6 +3504,18 @@ def _perf_table(
     )
 
 
+def _idx_target(sql: str) -> str:
+    """`CREATE INDEX IF NOT EXISTS pgrls_idx_<hash> ON <X>` → `<X>`.
+
+    create_index_sql emits a deterministic-but-opaque index name (so a
+    committed migration is re-runnable), so PERF003-fixer tests assert
+    the idempotent prefix plus the meaningful `ON …` target rather than
+    the full hashed name.
+    """
+    assert sql.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_"), sql
+    return sql.split(" ON ", 1)[1]
+
+
 def test_perf003_fix_emits_create_index_for_unindexed_column() -> None:
     schema = Schema(tables=(_perf_table(
         _policy("tenant_id = current_setting('app.t', true)", name="p"),
@@ -3512,8 +3524,24 @@ def test_perf003_fix_emits_create_index_for_unindexed_column() -> None:
     assert len(fixes) == 1
     f = fixes[0]
     assert f.rule_id == "PERF003"
-    assert f.sql == "CREATE INDEX ON public.t (tenant_id);"
+    assert _idx_target(f.sql) == "public.t (tenant_id);"
     assert f.location == "public.t (tenant_id)"
+
+
+def test_create_index_sql_is_idempotent_and_deterministic() -> None:
+    # R11 #6: a committed `pgrls fix --output` / `generate --output`
+    # migration must be re-runnable. An unnamed CREATE INDEX is NOT a
+    # no-op on re-apply (Postgres auto-names a duplicate), so the helper
+    # emits a deterministic name + IF NOT EXISTS.
+    from pgrls.fixers._idents import create_index_sql
+
+    a = create_index_sql("public.t", "tenant_id")
+    assert a == create_index_sql("public.t", "tenant_id")  # deterministic
+    assert a.startswith("CREATE INDEX IF NOT EXISTS pgrls_idx_")
+    assert a.endswith(" ON public.t (tenant_id);")
+    # Distinct (table, column) → distinct index name.
+    assert create_index_sql("public.t", "owner") != a
+    assert create_index_sql("public.other", "tenant_id") != a
 
 
 def test_perf003_fix_silent_when_column_has_leading_index() -> None:
@@ -3551,9 +3579,9 @@ def test_perf003_fix_emits_per_table_for_same_column_on_two_tables() -> None:
         _perf_table(_policy(pred), name="b"),
     ))
     fixes = PERF003Fixer().fix(schema, {})
-    assert sorted(f.sql for f in fixes) == [
-        "CREATE INDEX ON public.a (tenant_id);",
-        "CREATE INDEX ON public.b (tenant_id);",
+    assert sorted(_idx_target(f.sql) for f in fixes) == [
+        "public.a (tenant_id);",
+        "public.b (tenant_id);",
     ]
 
 
@@ -3572,9 +3600,7 @@ def test_perf003_fix_dedupes_column_across_policies() -> None:
         ),
     ),))
     fixes = PERF003Fixer().fix(schema, {})
-    assert [f.sql for f in fixes] == [
-        "CREATE INDEX ON public.t (tenant_id);"
-    ]
+    assert [_idx_target(f.sql) for f in fixes] == ["public.t (tenant_id);"]
 
 
 def test_perf003_fix_emits_one_index_per_unindexed_column() -> None:
@@ -3586,9 +3612,9 @@ def test_perf003_fix_emits_one_index_per_unindexed_column() -> None:
         ),
     ),))
     fixes = PERF003Fixer().fix(schema, {})
-    assert sorted(f.sql for f in fixes) == [
-        "CREATE INDEX ON public.t (owner);",
-        "CREATE INDEX ON public.t (tenant_id);",
+    assert sorted(_idx_target(f.sql) for f in fixes) == [
+        "public.t (owner);",
+        "public.t (tenant_id);",
     ]
 
 
@@ -3601,7 +3627,7 @@ def test_perf003_fix_skips_the_already_indexed_column() -> None:
         indexes=(_idx("tenant_id"),),
     ),))
     fixes = PERF003Fixer().fix(schema, {})
-    assert [f.sql for f in fixes] == ["CREATE INDEX ON public.t (owner);"]
+    assert [_idx_target(f.sql) for f in fixes] == ["public.t (owner);"]
 
 
 def test_perf003_fix_respects_allowlist() -> None:
@@ -3628,9 +3654,7 @@ def test_perf003_fix_indexes_column_kept_in_scope_by_a_live_policy() -> None:
     fixes = PERF003Fixer().fix(
         schema, {"allowlist": ["public.t.exempt"]}
     )
-    assert [f.sql for f in fixes] == [
-        "CREATE INDEX ON public.t (tenant_id);"
-    ]
+    assert [_idx_target(f.sql) for f in fixes] == ["public.t (tenant_id);"]
 
 
 def test_perf003_fix_quotes_table_name_when_required() -> None:
@@ -3648,7 +3672,7 @@ def test_perf003_fix_quotes_table_name_when_required() -> None:
         ),
     ))
     sql = PERF003Fixer().fix(schema, {})[0].sql
-    assert sql == 'CREATE INDEX ON public."MixedCase" (tenant_id);'
+    assert _idx_target(sql) == 'public."MixedCase" (tenant_id);'
 
 
 def test_perf003_fix_description_flags_lock_and_concurrently() -> None:

@@ -176,7 +176,8 @@ def test_owner_via_table_override_and_no_restrictive() -> None:
     assert "CREATE POLICY docs_owner_isolation ON public.docs" in sqls
     assert "creator_id = (SELECT auth.uid())" in sqls
     assert "AS RESTRICTIVE" not in sqls and "docs_owner_floor" not in sqls
-    assert "CREATE INDEX ON public.docs (creator_id)" in sqls
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in sqls
+    assert "ON public.docs (creator_id)" in sqls
 
 
 def test_cli_supabase_requires_owner_model() -> None:
@@ -210,7 +211,8 @@ def test_auto_detect_emits_full_setup() -> None:
     assert "FORCE ROW LEVEL SECURITY" in joined
     assert "CREATE POLICY posts_tenant_isolation ON public.posts" in joined
     assert "AS RESTRICTIVE" in joined  # the floor
-    assert "CREATE INDEX ON public.posts (tenant_id)" in joined
+    assert "CREATE INDEX IF NOT EXISTS pgrls_idx_" in joined
+    assert "ON public.posts (tenant_id)" in joined
 
 
 def test_skip_already_policied_table_with_reason() -> None:
@@ -236,7 +238,7 @@ def test_explicit_table_override_for_nonconventional_column() -> None:
     opts = GenerateOptions(tables=(("public", "orgs", "org_id"),))
     sqls = "\n".join(f.sql for f in plan_generation(schema, opts).statements)
     assert "org_id = (SELECT current_setting('app.org_id', true)::bigint)" in sqls
-    assert "CREATE INDEX ON public.orgs (org_id)" in sqls
+    assert "ON public.orgs (org_id)" in sqls
 
 
 def test_explicit_table_not_found_is_reported() -> None:
@@ -264,7 +266,7 @@ def test_partition_child_skipped_parent_targeted() -> None:
     result = plan_generation(Schema(tables=(parent, child)), GenerateOptions())
     sqls = "\n".join(f.sql for f in result.statements)
     # Parent set up (incl. its cascading index); no statement touches the child.
-    assert "CREATE INDEX ON public.events (tenant_id)" in sqls
+    assert "ON public.events (tenant_id)" in sqls
     assert "events_2026" not in sqls
     # Child reported as skipped, pointing at the parent.
     assert any(
@@ -293,7 +295,7 @@ def test_partition_skip_message_names_root_for_multilevel() -> None:
     # Trailing space distinguishes "public.events " from "public.events_2026".
     assert "partition of public.events " in reasons["public.events_2026"]
     assert "partition of public.events " in reasons["public.events_2026_q1"]
-    assert "CREATE INDEX ON public.events (tenant_id)" in "\n".join(
+    assert "ON public.events (tenant_id)" in "\n".join(
         f.sql for f in result.statements
     )
 
