@@ -142,6 +142,9 @@ def _result(
 
 def _level(severity: Severity) -> str:
     # SARIF v2.1.0 levels: "none" | "note" | "warning" | "error".
-    return {"error": "error", "warning": "warning", "info": "note"}[
-        severity
-    ]
+    # Fail CLOSED on an off-spec severity from an extra rule: map it to
+    # "error" (the most visible level) rather than KeyError-ing the whole
+    # CI / Code-Scanning upload, so the finding still surfaces loudly.
+    return {"error": "error", "warning": "warning", "info": "note"}.get(
+        severity, "error"
+    )

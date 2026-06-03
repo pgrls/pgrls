@@ -247,3 +247,12 @@ def test_sarif_severity_mapping_exhaustive_contract() -> None:
             parsed["runs"][0]["results"][0]["level"]
             == expected_sarif_level
         ), f"{severity} should map to {expected_sarif_level}"
+
+
+def test_sarif_off_spec_severity_fails_closed_to_error() -> None:
+    # CI / Code-Scanning path: an off-spec severity must not KeyError the
+    # SARIF upload; map it to the most-visible "error" level (fail closed).
+    out = format_violations([_v(severity="critical")], format="sarif")
+    doc = json.loads(out)
+    result = doc["runs"][0]["results"][0]
+    assert result["level"] == "error"

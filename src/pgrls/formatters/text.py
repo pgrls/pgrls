@@ -44,8 +44,12 @@ def format_text(
         else:
             cleaned = safe_location(v.location)
             loc = cleaned if cleaned else EMPTY_OR_ZERO_WIDTH_SENTINEL
+        # Fail soft on an off-spec severity from an extra rule (the gate
+        # tolerates it; the formatter must too — see html.py): fall back to
+        # the raw severity string instead of KeyError-ing the whole run.
+        label = _SEVERITY_LABEL.get(v.severity, str(v.severity))
         block = (
-            f"  {_SEVERITY_LABEL[v.severity]}  {v.rule_id}  {loc}\n"
+            f"  {label}  {v.rule_id}  {loc}\n"
             f"         {v.message}"
         )
         # `pgrls lint --explain` passes a `{rule_id: rationale}`
@@ -68,6 +72,11 @@ def format_text(
         n = counts.get(sev, 0)
         if n:
             parts.append(f"{n} {sev}{'s' if n != 1 else ''}")
+    # Off-spec severities (from an extra rule) are appended after the known
+    # ones, sorted, so the tally never silently drops a finding.
+    for sev in sorted((s for s in counts if s not in ALL_SEVERITIES), key=str):
+        n = counts[sev]
+        parts.append(f"{n} {sev}{'s' if n != 1 else ''}")
     summary = ", ".join(parts) or "0 issues"
 
     body = "\n\n".join(lines)

@@ -461,3 +461,11 @@ def test_markdown_location_backslash_then_pipe_keeps_table_intact() -> None:
     # backticks suppress markdown processing), which is faithful
     # to the input.
     assert "weird\\\\|name" in table_rows[0]
+
+
+def test_markdown_off_spec_severity_degrades_without_crashing() -> None:
+    # Off-spec severity must not KeyError the markdown table; degrade to
+    # the raw severity in the cell and keep it in the summary tally.
+    out = format_violations([_v(severity="critical")], format="markdown")
+    assert "SEC001" in out
+    assert "critical" in out
