@@ -3936,6 +3936,23 @@ def test_perf004_fix_abstains_on_user_defined_same_named_function() -> None:
     assert PERF004Fixer().fix(schema, {}) == []
 
 
+def test_perf004_fix_finds_wrap_inside_nested_boolexpr() -> None:
+    # R18 #4: a function-wrapped discriminator buried under a NESTED
+    # boolean (a BoolExpr inside another BoolExpr) must still be found —
+    # the BoolExpr walk arm recurses preserving the _PRED context. Every
+    # other PERF004 fixer test uses a single top-level comparison, so this
+    # pins the nested-BoolExpr recursion in _top_funccalls_wrapping.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "active OR (lower(email) = current_setting('app.e') AND id > 0)"
+        ),
+        columns=("id", "email", "active"),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql.endswith(" ON public.users (lower(email));")
+
+
 def test_perf004_fix_abstains_on_two_arg_length_encoding_overload() -> None:
     # R16 #2: `length(bytea, name)` — the 2-arg form with an explicit
     # source encoding — is STABLE (it performs an encoding conversion),
