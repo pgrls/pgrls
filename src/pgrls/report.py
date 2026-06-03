@@ -241,7 +241,10 @@ def render_json(report: Report) -> str:
             for t in report.tables
         ],
     }
-    return json.dumps(payload, indent=2)
+    # ensure_ascii=False so non-ASCII identifiers (quoted table/policy/
+    # role names) stay readable instead of escaped to \uXXXX — matches
+    # the lint/sarif/snapshot/explain JSON contract.
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 def render_markdown(report: Report) -> str:

@@ -309,6 +309,17 @@ def test_render_json_shape() -> None:
     assert payload["summary"]["total_fixed"] == 1
 
 
+def test_render_json_keeps_non_ascii_identifiers_literal() -> None:
+    # R14 #5: render_json passes ensure_ascii=False (matching the
+    # lint/sarif/snapshot/explain JSON contract), so a non-ASCII snapshot
+    # filename / identifier stays readable instead of being escaped to
+    # \uXXXX. Assert against the RAW string — json.loads would hide the
+    # difference, since both forms decode to the identical Python str.
+    raw = render_json([_mkrow("rapport-é.json", total=1, errors=1, new=1)])
+    assert "rapport-é.json" in raw
+    assert "\\u" not in raw
+
+
 def test_render_markdown_table() -> None:
     rows = [_mkrow("a.json", total=2, errors=2, new=2)]
     out = render_markdown(rows)

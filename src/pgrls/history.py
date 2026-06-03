@@ -306,7 +306,10 @@ def render_json(rows: list[SnapshotRow]) -> str:
         ],
         "summary": _summary_dict(rows),
     }
-    return json.dumps(payload, indent=2) + "\n"
+    # ensure_ascii=False so non-ASCII identifiers (quoted table/policy/
+    # role names) stay readable instead of escaped to \uXXXX — matches
+    # the lint/sarif/snapshot/explain JSON contract.
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
 
 
 def render_markdown(rows: list[SnapshotRow]) -> str:

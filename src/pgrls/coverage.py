@@ -487,7 +487,10 @@ def render_json(report: CoverageReport) -> str:
             for p in report.policies
         ],
     }
-    return json.dumps(payload, indent=2)
+    # ensure_ascii=False so non-ASCII identifiers (quoted table/policy/
+    # role names) stay readable instead of escaped to \uXXXX — matches
+    # the lint/sarif/snapshot/explain JSON contract.
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 def render_markdown(report: CoverageReport) -> str:
