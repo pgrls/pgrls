@@ -320,6 +320,42 @@ def test_render_json_keeps_non_ascii_identifiers_literal() -> None:
     assert "\\u" not in raw
 
 
+def test_render_other_column_only_when_off_spec_severity_present() -> None:
+    # R14 #6: when a snapshot carries an off-spec ('other') severity
+    # (e.g. an extra-rule plugin emits 'critical'), the text/markdown/HTML
+    # trend tables add an OTHER column so ERROR+WARN+INFO+OTHER reconciles
+    # to TOTAL — mirroring the JSON 'others' key. For the common
+    # all-standard history the column is omitted (the table is not
+    # widened); the other render tests pin that narrow header.
+    mix = SnapshotRow(
+        snapshot=Snapshot(
+            path=Path("x.json"),
+            timestamp=datetime(2026, 5, 20, tzinfo=timezone.utc),
+            findings=frozenset(),
+            raw_total=4,
+            counts={"error": 1, "warning": 0, "info": 1, "other": 2},
+        ),
+        new_count=0,
+        fixed_count=0,
+    )
+    assert "OTHER" in render_text([mix])
+    md = render_markdown([mix])
+    assert (
+        "| Timestamp | File | Total | Error | Warn | Info | Other | New | Fixed |"
+        in md
+    )
+    # Reconciles: error 1 + warn 0 + info 1 + other 2 == total 4.
+    assert "| 4 | 1 | 0 | 1 | 2 |" in md
+    html_out = render_html([mix])
+    assert '<th class="num">Other</th>' in html_out
+
+    # A standard-only history keeps the narrow table (no OTHER column).
+    std = _mkrow("a.json", total=2, errors=2, new=2)
+    assert "OTHER" not in render_text([std])
+    assert "Other" not in render_markdown([std])
+    assert ">Other<" not in render_html([std])
+
+
 def test_render_markdown_table() -> None:
     rows = [_mkrow("a.json", total=2, errors=2, new=2)]
     out = render_markdown(rows)
