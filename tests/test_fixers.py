@@ -777,17 +777,22 @@ def test_perf001_fix_wraps_multiple_calls_in_one_expression() -> None:
     assert "(SELECT auth.role())" in sql
 
 
-def test_perf001_fix_preserves_with_check_verbatim() -> None:
-    # WITH CHECK should be reproduced as-is — the rule is USING-only.
+def test_perf001_fix_emits_only_using_not_unchanged_with_check() -> None:
+    # PERF001 rewrites only USING, so it must emit ONLY the USING clause.
+    # Re-emitting the unchanged WITH CHECK (an `ALTER POLICY` replaces the
+    # whole clause) would clobber — and silently revert — a WITH CHECK fix
+    # another fixer makes on the same policy in one migration (SEC020's
+    # mirror, SEC011's strip). Matches SEC011/SEC019's minimal-diff rule.
     p = _policy(
         "user_id = auth.uid()",
         command="ALL",
         with_check="user_id = (SELECT auth.uid())",
     )
     schema = _wrap_policy(p)
-    sql = PERF001Fixer().fix(schema, {})[0].sql
-    assert "WITH CHECK (user_id = (SELECT auth.uid()))" in sql
-    assert "USING (user_id = (SELECT auth.uid()))" in sql
+    fix = PERF001Fixer().fix(schema, {})[0]
+    assert "USING (user_id = (SELECT auth.uid()))" in fix.sql
+    assert "WITH CHECK" not in fix.sql
+    assert fix.clauses == frozenset({"using"})
 
 
 def test_perf001_fix_silent_when_using_is_none() -> None:
@@ -1200,16 +1205,14 @@ def test_sec019_and_perf001_both_fire_on_unwrapped_one_arg_current_setting() -> 
     # PERF001 (wrap auth calls in `(SELECT …)`) and SEC019 (add the
     # `, true` second argument) both target the same shape — an
     # unwrapped one-arg `current_setting` — and run independently.
-    # Both emit an `ALTER POLICY` for the same policy: PERF001
-    # wraps but leaves the arity at one; SEC019 adds the missing_ok
-    # argument but leaves the call unwrapped. Whichever runs last
-    # overwrites the prior clause, so `pgrls fix --apply` converges
-    # in TWO passes on a policy that triggers both rules.
-    #
-    # This regression test pins that contract — a future "smart
-    # composite fixer" that emitted a single combined ALTER would
-    # need to update this test deliberately rather than silently
-    # change `pgrls fix`'s convergence story.
+    # Each fixer, called on its OWN, emits an `ALTER POLICY` for the
+    # policy: PERF001 wraps but leaves the arity at one; SEC019 adds the
+    # missing_ok argument but leaves the call unwrapped. This pins each
+    # fixer's individual output. The orchestrator no longer lets both
+    # land in one migration (they'd clobber on the shared USING clause):
+    # `generate_fixes` keeps one writer per (policy, clause) — see
+    # `test_generate_fixes_suppresses_clobbering_clause_rewrites` — and
+    # the suppressed fixer re-fires on the next `pgrls fix` run.
     schema = _wrap_policy(
         _policy("user_id = current_setting('app.user')")
     )
@@ -2447,6 +2450,61 @@ def test_generate_fixes_returns_union_sorted_by_rule_id_and_location() -> None:
     ]
 
 
+def test_generate_fixes_suppresses_clobbering_clause_rewrites() -> None:
+    # CRITICAL regression: SEC011 (strip `OR true`), SEC019 (add
+    # missing_ok), and PERF001 (SELECT-wrap) all rewrite the SAME USING
+    # clause. Emitted together in one migration, SEC019 / PERF001 — which
+    # build their ALTER from the ORIGINAL predicate — silently revert
+    # SEC011's `OR true` security strip (the last ALTER wins). generate_fixes
+    # now keeps only ONE writer per (policy, clause): the security-narrowing
+    # SEC011 strip. The migration must not revive `OR true`.
+    schema = _wrap_policy(
+        _policy(
+            "user_id = current_setting('app.t') OR true",
+            command="SELECT",
+        )
+    )
+    fixes = generate_fixes(schema, rule_options={})
+    clause_rewrites = [
+        f for f in fixes if f.rule_id in {"PERF001", "SEC011", "SEC019"}
+    ]
+    assert [f.rule_id for f in clause_rewrites] == ["SEC011"]
+    sec011 = clause_rewrites[0]
+    assert "USING (user_id = current_setting('app.t'))" in sec011.sql
+    # No `OR true` / `OR TRUE` revived anywhere in the emitted migration.
+    assert "TRUE" not in "\n".join(f.sql for f in fixes).upper()
+
+
+def test_suppress_clobbering_clause_rewrites_keeps_one_writer_per_clause() -> None:
+    # Unit-level coverage of the orchestrator's per-clause keeper logic.
+    from pgrls.fixers import _suppress_clobbering_clause_rewrites as suppress
+
+    def _f(rule_id: str, clauses: set[str]) -> Fix:
+        return Fix(rule_id, "public.t.p", f"-- {rule_id}", "d",
+                   clauses=frozenset(clauses))
+
+    # Same clause (USING): the security-narrowing SEC011 wins; SEC019 and
+    # PERF001 are dropped (defer to the next run).
+    kept = suppress([_f("PERF001", {"using"}), _f("SEC011", {"using"}),
+                     _f("SEC019", {"using"})])
+    assert [f.rule_id for f in kept] == ["SEC011"]
+
+    # Different clauses don't contest — both survive (no false suppression).
+    kept = suppress([_f("SEC011", {"using"}), _f("SEC019", {"with_check"})])
+    assert {f.rule_id for f in kept} == {"SEC011", "SEC019"}
+
+    # A non-clause fix (ALTER TABLE etc., empty clauses) is never touched.
+    alter = Fix("SEC002", "public.t", "ALTER TABLE ...", "d")
+    kept = suppress([alter, _f("SEC011", {"using"}), _f("SEC019", {"using"})])
+    assert alter in kept and [f.rule_id for f in kept if f.clauses] == ["SEC011"]
+
+    # A multi-clause non-keeper is dropped WHOLE when it loses any clause
+    # (its other clause re-fires next run).
+    kept = suppress([_f("SEC011", {"using"}),
+                     _f("SEC019", {"using", "with_check"})])
+    assert [f.rule_id for f in kept] == ["SEC011"]
+
+
 def test_generate_fixes_filters_to_requested_rule() -> None:
     schema = Schema(
         tables=(
@@ -3016,14 +3074,12 @@ def test_quote_ident_rejects_embedded_newline() -> None:
         quote_ident("name\nwith\nnewlines")
 
 
-def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
-    # WITH CHECK should be re-emitted via RawStream rather than
-    # echoed verbatim. Asymmetric handling would be an injection
-    # vector if `with_check_sql` ever sources from somewhere
-    # other than `pg_get_expr`. We verify the round-trip by
-    # passing a WITH CHECK shape that pglast normalizes (single
-    # quotes around boolean false), then asserting the
-    # round-tripped form appears in the SQL.
+def test_perf001_fix_never_emits_with_check_even_with_content() -> None:
+    # PERF001 never changes WITH CHECK, so it must not re-emit it even when
+    # the WITH CHECK carries non-trivial content. Re-emitting it would
+    # clobber a sibling fixer's WITH CHECK rewrite in the same migration
+    # (the critical clobber bug). PERF001 also no longer round-trips WITH
+    # CHECK, so it presents no WITH CHECK injection surface at all.
     p = _policy(
         "user_id = auth.uid()",
         command="ALL",
@@ -3031,12 +3087,9 @@ def test_perf001_fix_round_trips_with_check_through_pglast() -> None:
     )
     schema = _wrap_policy(p)
     sql = PERF001Fixer().fix(schema, {})[0].sql
-    # The WITH CHECK passed through RawStream — pglast's printer
-    # would normalize whitespace and casing. Assert the structural
-    # content is present.
-    assert "WITH CHECK" in sql
-    assert "deleted_at" in sql
-    assert "IS NULL" in sql
+    assert "USING (user_id = (SELECT auth.uid()))" in sql
+    assert "WITH CHECK" not in sql
+    assert "deleted_at" not in sql
 
 
 def test_perf001_fix_sublink_wraps_do_not_alias_each_other() -> None:

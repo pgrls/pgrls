@@ -154,6 +154,14 @@ class SEC019Fixer:
                         rule_id="SEC019",
                         location=pid,
                         sql=stmt,
+                        clauses=frozenset(
+                            c
+                            for c, ch in (
+                                ("using", using_changed),
+                                ("with_check", with_check_changed),
+                            )
+                            if ch
+                        ),
                         description=(
                             f"Add `, true` (missing_ok = true) to "
                             f"current_setting() in policy "
