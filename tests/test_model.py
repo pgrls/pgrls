@@ -730,3 +730,93 @@ def test_fully_populated_schema_roundtrip() -> None:
     )
 
     assert Schema.from_snapshot(schema.to_snapshot()) == schema
+
+
+# --- #5: snapshot trust-boundary validation (to_sql injection) ----------
+
+
+def _minimal_snapshot(**table_overrides: object) -> dict:
+    """A minimal valid v14 snapshot with one bare table; callers
+    override a table field to inject a malicious value."""
+    table = {
+        "schema": "public",
+        "name": "t",
+        "rls_enabled": False,
+        "force_rls": False,
+        "columns": [],
+        "partition_of": None,
+        "grants": [],
+        "column_details": [],
+        "triggers": [],
+        "indexes": [],
+        "policies": [],
+    }
+    table.update(table_overrides)
+    return {
+        "version": 14,
+        "tables": [table],
+        "policies": [],
+        "views": [],
+        "security_definer_functions": [],
+        "bypassrls_roles": [],
+        "leakproof_functions": [],
+        "bypassrls_escalation_roles": [],
+    }
+
+
+def test_from_snapshot_rejects_data_type_injection() -> None:
+    snap = _minimal_snapshot(
+        column_details=[
+            {
+                "name": "id",
+                "data_type": "int); DROP TABLE secrets; --",
+                "is_nullable": True,
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="unsafe data_type"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_grant_privilege_injection() -> None:
+    snap = _minimal_snapshot(
+        grants=[{"role": "r", "privileges": ["SELECT ON x TO evil; GRANT ALL"]}]
+    )
+    with pytest.raises(ValueError, match="privilege"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_invalid_policy_command() -> None:
+    snap = _minimal_snapshot(
+        policies=[
+            {
+                "policy_name": "p",
+                "command": "ALL; DROP TABLE x",
+                "permissive": True,
+                "roles": ["r"],
+                "using_sql": "true",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="invalid command"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_real_types_and_privileges() -> None:
+    # Validation is permissive enough for real Postgres types /
+    # privileges — these must round-trip without error.
+    snap = _minimal_snapshot(
+        column_details=[
+            {"name": "id", "data_type": "integer", "is_nullable": False},
+            {"name": "amt", "data_type": "numeric(10,2)", "is_nullable": True},
+            {"name": "tags", "data_type": "text[]", "is_nullable": True},
+            {
+                "name": "ts",
+                "data_type": "timestamp with time zone",
+                "is_nullable": True,
+            },
+        ],
+        grants=[{"role": "app", "privileges": ["SELECT", "INSERT", "UPDATE"]}],
+    )
+    schema = Schema.from_snapshot(snap)
+    assert schema.tables[0].column_details[1].data_type == "numeric(10,2)"

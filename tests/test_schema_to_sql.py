@@ -478,3 +478,16 @@ def test_from_snapshot_v3_v4_roundtrip_then_to_sql_raises():
     schema = Schema.from_snapshot(v4_payload)
     with pytest.raises(ValueError, match="column_details"):
         schema.to_sql()
+
+
+def test_to_sql_rejects_multi_statement_policy_predicate() -> None:
+    # A policy predicate that smuggles a second statement
+    # (`true); DROP TABLE secrets; --`) must not be emitted into the
+    # DDL that `pgrls diff --apply` executes — policy_to_sql requires
+    # the predicate to be a single SQL expression. (#5: to_sql is a
+    # trust-boundary sink for snapshot-sourced values.)
+    schema = Schema(
+        tables=(_t(policies=(_p(using_sql="true); DROP TABLE secrets; --"),)),)
+    )
+    with pytest.raises(ValueError, match="single SQL expression"):
+        schema.to_sql()

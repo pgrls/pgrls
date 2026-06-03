@@ -19,6 +19,7 @@ info via the new ``column_details`` per table; v4 added top-level
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cached_property
@@ -49,6 +50,52 @@ Snapshot = dict[str, Any]
 SNAPSHOT_VERSION = 14  # v14: SecdefFunction/LeakproofFunction gain
 # separate schema_name + function_name (the ambiguous qualified_name
 # join cannot be split when a component contains a dot).
+
+# --- Snapshot trust-boundary validation --------------------------------
+#
+# `Schema.to_sql()` restores a snapshot to a scratch database for
+# `pgrls diff --apply`, interpolating snapshot-sourced VALUES (column
+# types, grant privileges, the policy command, the policy predicate)
+# into executed DDL. Identifiers are always quoted via quote_ident, but
+# these value fields are not — so a hand-crafted malicious snapshot
+# file could inject DDL. The decoders validate the structured values at
+# load time and `policy_to_sql` validates the free-form predicate at
+# emit time, so an unsafe snapshot is rejected before any SQL runs.
+
+# Real Postgres type names: identifiers, spaces (`timestamp with time
+# zone`), parens/commas (`numeric(10,2)`, `geometry(Point,4326)`),
+# brackets (`int[]`), dots (`myschema.t`), double-quotes (`"char"`).
+# Excludes `;` `'` `-` `/` `\` — the statement-break / comment /
+# string-escape characters an injection needs.
+_SAFE_DATA_TYPE = re.compile(r'^[A-Za-z0-9_ ()\[\],."]+$')
+
+# Table-level privileges Postgres recognizes (pg_class ACL).
+_VALID_TABLE_PRIVILEGES: frozenset[str] = frozenset({
+    "SELECT", "INSERT", "UPDATE", "DELETE",
+    "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
+})
+
+_VALID_POLICY_COMMANDS: frozenset[str] = frozenset(
+    {"ALL", "SELECT", "INSERT", "UPDATE", "DELETE"}
+)
+
+
+def _predicate_is_single_statement(sql: str) -> bool:
+    """True if `sql` is a single SQL expression — i.e. wrapping it as
+    ``USING (<sql>)`` cannot smuggle a second statement.
+
+    A malicious snapshot predicate like ``true); DROP TABLE x; --``
+    parses as TWO statements once wrapped and is rejected. (``parse_expr``
+    is NOT a sufficient check: it parses only the leading expression and
+    silently ignores trailing injected statements.)
+    """
+    import pglast
+
+    try:
+        stmts = pglast.parse_sql(f"SELECT 1 WHERE ({sql})")
+    except Exception:
+        return False
+    return len(stmts) == 1
 
 
 @dataclass(frozen=True)
@@ -550,9 +597,17 @@ def _policy_from_dict(p: dict[str, Any]) -> Policy:
     # intentionally left None — the v0.2.1 contract documents that
     # callers parse on demand (only pgrls.diff._diff_columns needs them,
     # and it lazy-parses).
+    command = p["command"]
+    if command not in _VALID_POLICY_COMMANDS:
+        raise ValueError(
+            "snapshot policy "
+            f"{(p.get('policy_name') or p.get('name'))!r} has an invalid "
+            f"command {command!r}. Allowed: ALL, SELECT, INSERT, UPDATE, "
+            "DELETE."
+        )
     return Policy(
         name=p.get("policy_name") or p["name"],
-        command=p["command"],
+        command=command,
         permissive=p["permissive"],
         roles=tuple(p["roles"]),
         using_sql=p.get("using_sql"),
@@ -563,13 +618,33 @@ def _policy_from_dict(p: dict[str, Any]) -> Policy:
 
 
 def _grant_from_dict(g: dict[str, Any]) -> Grant:
-    return Grant(role=g["role"], privileges=tuple(g["privileges"]))
+    privileges = tuple(g["privileges"])
+    for priv in privileges:
+        if (
+            not isinstance(priv, str)
+            or priv.upper() not in _VALID_TABLE_PRIVILEGES
+        ):
+            raise ValueError(
+                f"snapshot grant for role {g.get('role')!r} lists an "
+                f"unknown/unsafe privilege {priv!r}. Allowed: "
+                + ", ".join(sorted(_VALID_TABLE_PRIVILEGES))
+                + " — grants are replayed verbatim by `pgrls diff --apply`."
+            )
+    return Grant(role=g["role"], privileges=privileges)
 
 
 def _column_from_dict(c: dict[str, Any]) -> Column:
+    data_type = c["data_type"]
+    if not isinstance(data_type, str) or not _SAFE_DATA_TYPE.match(data_type):
+        raise ValueError(
+            f"snapshot column {c.get('name')!r} has an unsafe data_type "
+            f"{data_type!r}. Type names may contain only letters, digits, "
+            'spaces, and ()[],."_ — values that reach the DDL emitted by '
+            "`pgrls diff --apply` are validated against injection."
+        )
     return Column(
         name=c["name"],
-        data_type=c["data_type"],
+        data_type=data_type,
         is_nullable=c.get("is_nullable", True),
     )
 
@@ -1215,7 +1290,18 @@ def policy_to_sql(p: Policy, qname: str) -> str:
     if role_strs:
         parts.append(f"TO {', '.join(role_strs)}")
     if p.using_sql:
+        if not _predicate_is_single_statement(p.using_sql):
+            raise ValueError(
+                f"policy {p.name!r} USING predicate is not a single SQL "
+                f"expression; refusing to emit it into executable DDL: "
+                f"{p.using_sql!r}"
+            )
         parts.append(f"USING ({p.using_sql})")
     if p.with_check_sql:
+        if not _predicate_is_single_statement(p.with_check_sql):
+            raise ValueError(
+                f"policy {p.name!r} WITH CHECK predicate is not a single "
+                f"SQL expression; refusing to emit it: {p.with_check_sql!r}"
+            )
         parts.append(f"WITH CHECK ({p.with_check_sql})")
     return " ".join(parts) + ";"
