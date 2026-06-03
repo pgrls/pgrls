@@ -3748,6 +3748,38 @@ def test_perf004_fix_silent_when_func_wraps_value_side() -> None:
     assert PERF004Fixer().fix(schema, {}) == []
 
 
+def test_perf004_fix_silent_on_func_in_in_list_value_side() -> None:
+    # R11 #5: in `email IN (lower(name), 'x')` only the lexpr (`email`)
+    # is indexable; the IN-list values are not. A func wrapping a column
+    # on the value side must NOT emit a (dead) expression index.
+    schema = Schema(tables=(_perf004_table(
+        _policy("email IN (lower(name), 'x')"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_on_func_in_between_bounds() -> None:
+    # The BETWEEN bounds (rexpr) are values, not indexable operands.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "id BETWEEN length(email) AND length(name)",
+        ),
+        columns=("id", "email", "name"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_silent_on_comparison_nested_in_case() -> None:
+    # A comparison nested inside a CASE feeds the CASE value; the planner
+    # cannot use an index on its inner FuncCall, so no fix is emitted.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "(CASE WHEN lower(email) = 'a' THEN 1 ELSE 0 END) = 1",
+        ),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
 def test_perf004_fix_emits_outermost_funccall_for_nested_wrap() -> None:
     # `lower(upper(email))` — the planner needs an index matching
     # the full predicate expression, not the inner `upper`. The

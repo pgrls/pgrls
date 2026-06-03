@@ -41,7 +41,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from pglast.ast import A_Expr, FuncCall, Node, String
+from pglast.ast import A_Expr, BoolExpr, FuncCall, Node, String
 from pglast.enums import A_Expr_Kind
 from pglast.stream import RawStream
 
@@ -73,47 +73,55 @@ _COMPARISON_AEXPR_KINDS: frozenset[Any] = frozenset({
 })
 
 
-def _is_comparison_operand_parent(parent: Any) -> bool:
-    """True if `parent` is a comparison whose DIRECT operand is therefore
-    an indexable value expression.
-
-    A FuncCall that is the direct operand of such a comparison
-    (`lower(email) = …`, `date_trunc(...) >= …`, `lower(x) LIKE …`) IS the
-    expression the planner indexes, so an expression index on it is
-    correct. A FuncCall nested inside a value-producing wrapper —
-    `COALESCE(lower(email), …)`, `CASE … lower(email) …`, `lower(a) ||
-    lower(b)`, another FuncCall's args — is a STRICT SUB-EXPRESSION of the
-    real operand; indexing it alone yields an index the planner can never
-    use, so those wrappers must NOT qualify.
-    """
-    if not isinstance(parent, A_Expr):
+def _is_scalar_comparison(node: A_Expr) -> bool:
+    """True if `node` is a plain binary scalar comparison (AEXPR_OP `=`,
+    `<`, `~`, …) — both operands are indexable value expressions (the
+    planner may use an index on either side)."""
+    if node.kind != A_Expr_Kind.AEXPR_OP:
         return False
-    if parent.kind in _COMPARISON_AEXPR_KINDS:
-        return True
-    if parent.kind == A_Expr_Kind.AEXPR_OP:
-        names = [s.sval for s in (parent.name or ()) if isinstance(s, String)]
-        return bool(names) and names[-1] in _COMPARISON_OPS
-    return False
+    names = [s.sval for s in (node.name or ()) if isinstance(s, String)]
+    return bool(names) and names[-1] in _COMPARISON_OPS
+
+
+# Indexability context threaded through the walk:
+#   _PRED    — a boolean/predicate position (top, or under AND/OR/NOT).
+#              A comparison here is a real predicate comparison.
+#   _OPERAND — the direct operand of a predicate-level comparison. A
+#              FuncCall wrapping a flagged column here IS the expression
+#              the planner indexes.
+#   _VALUE   — inside a value-producing wrapper (CASE / COALESCE /
+#              arithmetic / concat / a FuncCall's args / the value side of
+#              IN·BETWEEN·LIKE). A FuncCall here is a strict
+#              sub-expression, never the indexable operand.
+_PRED = "predicate"
+_OPERAND = "operand"
+_VALUE = "value"
 
 
 def _top_funccalls_wrapping(
     node: Any, table: Table, flagged_columns: set[str]
 ) -> list[FuncCall]:
-    """Return the FuncCalls in `node` that wrap a flagged own-table column
-    AND are the DIRECT operand of a comparison — i.e. the exact expression
+    """FuncCalls in `node` that wrap a flagged own-table column AND are the
+    DIRECT operand of a predicate-level comparison — the exact expression
     the planner would index.
 
     For `lower(upper(email))` (email flagged) returns `[lower(upper(email))]`
     once — the index must match the full predicate operand, not the inner
-    `upper`. A flagged column wrapped in a FuncCall that is itself nested in
-    a COALESCE / CASE / concat / arithmetic operand is NOT returned: the
-    fixer cannot emit a correct index for it (the planner's operand is the
-    enclosing value expression, outside the fixer's FuncCall scope), so it
-    defers to the human, exactly as the rule message suggests.
+    `upper`. A flagged column reached only as a STRICT SUB-EXPRESSION of the
+    real operand is NOT returned, because the planner's operand is the
+    enclosing value expression and an index on the inner piece is dead:
 
-    Sub-select column refs are excluded by `extract_column_refs(
-    exclude_sublinks=True)` — those belong to other tables and PERF004
-    itself skips them.
+    * the value side of `IN` / `BETWEEN` / `LIKE` (`col IN (lower(x), …)`,
+      `col BETWEEN date_trunc(a) AND date_trunc(b)`) — only the lexpr is
+      indexable, the rexpr is the value list / bounds / pattern;
+    * a `COALESCE` / `CASE` / concat / arithmetic wrapper; and
+    * a comparison nested INSIDE such a value wrapper
+      (`CASE WHEN lower(email) = … THEN …`) — its result feeds the
+      wrapper, so its operands are not predicate operands.
+
+    The fixer defers those to the human, exactly as the rule message
+    suggests. Sub-select column refs are excluded by `extract_column_refs(
+    exclude_sublinks=True)`.
     """
     out: list[FuncCall] = []
 
@@ -124,32 +132,56 @@ def _top_funccalls_wrapping(
                 return True
         return False
 
-    def walk(n: Any, parent: Any) -> None:
+    def walk(n: Any, ctx: str) -> None:
         if n is None:
             return
         if isinstance(n, (list, tuple)):
-            # List elements (e.g. an IN rexpr list, or A_Expr.name) keep
-            # the ENCLOSING node as their parent.
             for item in n:
-                walk(item, parent)
+                walk(item, ctx)
             return
         if isinstance(n, FuncCall):
-            if _is_comparison_operand_parent(parent) and wraps_flagged(n):
+            if ctx == _OPERAND and wraps_flagged(n):
                 out.append(n)
                 # Covered — any nested FuncCall is part of this index expr.
                 return
-            # Not a comparison operand (nested in a value wrapper, or this
-            # FuncCall doesn't wrap a flagged column). Recurse with THIS
-            # FuncCall as parent so a deeper comparison-operand FuncCall is
-            # still found but never treated as a bare operand.
+            # Args are sub-expressions, never a predicate operand.
             for field_name in n:
-                walk(getattr(n, field_name, None), n)
+                walk(getattr(n, field_name, None), _VALUE)
+            return
+        if isinstance(n, BoolExpr):
+            # AND / OR / NOT preserve the boolean/predicate position.
+            for field_name in n:
+                walk(getattr(n, field_name, None), _PRED)
+            return
+        if isinstance(n, A_Expr):
+            if ctx == _PRED and _is_scalar_comparison(n):
+                # Plain scalar comparison: an index on either operand helps.
+                walk(n.lexpr, _OPERAND)
+                walk(n.rexpr, _OPERAND)
+                walk(n.name, _VALUE)
+                return
+            if ctx == _PRED and n.kind in _COMPARISON_AEXPR_KINDS:
+                # IN / LIKE / ILIKE / BETWEEN / NOT BETWEEN: only the lexpr
+                # is indexable; the rexpr is the value list / bounds /
+                # pattern the planner never indexes.
+                walk(n.lexpr, _OPERAND)
+                walk(n.rexpr, _VALUE)
+                walk(n.name, _VALUE)
+                return
+            # A non-comparison operator (`||`, arithmetic), or a comparison
+            # NOT in predicate position (nested in a value wrapper): its
+            # operands feed a value, so they are not predicate operands.
+            for field_name in n:
+                walk(getattr(n, field_name, None), _VALUE)
             return
         if isinstance(n, Node):
+            # Any other node — CaseExpr / CoalesceExpr / TypeCast / SubLink
+            # / … — is a value wrapper; a FuncCall reached through it is a
+            # strict sub-expression, not a direct comparison operand.
             for field_name in n:
-                walk(getattr(n, field_name, None), n)
+                walk(getattr(n, field_name, None), _VALUE)
 
-    walk(node, None)
+    walk(node, _PRED)
     return out
 
 
