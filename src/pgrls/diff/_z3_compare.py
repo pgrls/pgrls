@@ -734,6 +734,29 @@ def _in_to_z3(node: A_Expr, ctx: _Context) -> Any:
 _Z3Result = Literal["semantic_equivalent", "semantic_tightened", "semantic_loosened"]
 
 
+def _as_bool_predicate(expr: Any) -> Any | None:
+    """Return `expr` iff it is a Z3 Bool expression, else None.
+
+    A predicate that translates to a non-Bool sort — a bare constant
+    (`USING (1)`, `USING ('x')`) or a bare numeric column — cannot drive
+    the implication / counterexample checks: `z3.Not` and `z3.And` require
+    Bool operands and otherwise raise Z3Exception. Postgres rejects a
+    non-boolean USING / WITH CHECK at policy creation, but a hand-built or
+    snapshot-loaded predicate can still reach the differ, so gate the
+    top-level translation here and let the caller fall through to
+    `requires_review` instead of crashing `pgrls diff`. (Operands such as
+    the `1` in `x = 1` are unaffected — only the whole-predicate result is
+    checked.)
+    """
+    if expr is None:
+        return None
+    try:
+        is_bool = expr.sort() == z3.BoolSort()
+    except (z3.Z3Exception, AttributeError):
+        return None
+    return expr if is_bool else None
+
+
 def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     """Classify a base/head predicate pair using Z3 implication.
 
@@ -755,8 +778,8 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     if not Z3_AVAILABLE:
         return None
     ctx = _Context()
-    base_z3 = _to_z3(base_node, ctx)
-    head_z3 = _to_z3(head_node, ctx)
+    base_z3 = _as_bool_predicate(_to_z3(base_node, ctx))
+    head_z3 = _as_bool_predicate(_to_z3(head_node, ctx))
     if base_z3 is None or head_z3 is None:
         return None
 
@@ -909,8 +932,8 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     if not Z3_AVAILABLE:
         return None
     ctx = _Context()
-    base_z3 = _to_z3(base_node, ctx)
-    head_z3 = _to_z3(head_node, ctx)
+    base_z3 = _as_bool_predicate(_to_z3(base_node, ctx))
+    head_z3 = _as_bool_predicate(_to_z3(head_node, ctx))
     if base_z3 is None or head_z3 is None:
         return None
     solver = z3.Solver()

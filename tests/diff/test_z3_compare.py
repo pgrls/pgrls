@@ -720,3 +720,27 @@ def test_anon_bool_column_leaf_cannot_be_true_and_null() -> None:
         solver.add(a)
     solver.add(z3_solver.And(flag, flag_nullflag))
     assert solver.check() == z3_solver.unsat
+
+
+def test_bare_constant_predicate_degrades_instead_of_crashing() -> None:
+    # A non-boolean bare predicate — USING (1), USING (42), USING ('x') —
+    # translates to a non-Bool Z3 sort. z3.Not / z3.And on it raise
+    # Z3Exception, which used to crash classify_via_z3 / counterexample
+    # (and therefore `pgrls diff`). Both must now degrade to None so the
+    # caller falls through to requires_review. Postgres rejects such a
+    # USING at policy creation, but a hand-built / snapshot-loaded
+    # predicate can still reach the differ.
+    bool_node = parse_expr("active")
+    for bare in ("1", "42", "'x'"):
+        bare_node = parse_expr(bare)
+        assert classify_via_z3(bool_node, bare_node) is None
+        assert classify_via_z3(bare_node, bool_node) is None
+        assert classify_via_z3(bare_node, bare_node) is None
+        assert counterexample(bool_node, bare_node) is None
+        assert counterexample(bare_node, bool_node) is None
+    # A bare BOOLEAN constant is a valid predicate and must NOT be gated
+    # out: USING (true) still classifies normally.
+    assert (
+        classify_via_z3(parse_expr("true"), parse_expr("true"))
+        == "semantic_equivalent"
+    )
