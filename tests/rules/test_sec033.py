@@ -164,6 +164,15 @@ def test_fires_on_both_vectors_produces_single_violation() -> None:
         "auth.jwt() ->> 'sub' = owner_id::text",
         # GUC-based scoping
         "current_setting('app.uid', true) = owner_id::text",
+        # Regression (#2): the string 'user_metadata' as a DATA VALUE,
+        # not a JSON key operand of an arrow/path operator.
+        "event_type = 'user_metadata'",
+        # A JSON *value* that merely equals the key name — the key
+        # operand here is 'role', not 'user_metadata'.
+        "auth.jwt() ->> 'role' = 'user_metadata'",
+        # A bare reference to the metadata column, NOT used as a JSON
+        # extraction source — not the self-bypass hazard.
+        "raw_user_meta_data IS NOT NULL",
     ],
 )
 def test_silent_on_safe_shapes(expr: str) -> None:

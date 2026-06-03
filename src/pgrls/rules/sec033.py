@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Const, Node, String
+from pglast.ast import A_Const, A_Expr, Node, String, TypeCast
 
 from pgrls.ast_utils import extract_column_refs
 from pgrls.model import Schema, policy_id
@@ -127,46 +127,66 @@ def _array_literal_keys(sval: str) -> list[str]:
     ]
 
 
-def _contains_string_const(node: Any, keys: set[str]) -> bool:
-    """True if any A_Const(String) node in the tree matches one of `keys`.
+_JSON_EXTRACT_OPS: frozenset[str] = frozenset({"->", "->>", "#>", "#>>"})
 
-    Two match shapes:
-      1. Exact equality — `auth.jwt() -> 'user_metadata' ...` produces
-         an `A_Const(String) sval='user_metadata'`.
-      2. Array-element membership — `auth.jwt() #> '{user_metadata,...}'`
-         produces a single `A_Const(String) sval='{user_metadata,...}'`
-         (Postgres `text[]` literal syntax, NOT a JSON object). We
-         crack the array open and check each element. The parser
-         doesn't unescape backslash sequences like `{"a\\"b"}` — the
-         realistic claim-key set doesn't contain quotes or backslashes,
-         so the omission is harmless here.
+
+def _expr_op_name(node: A_Expr) -> str | None:
+    """The bare operator name of an `A_Expr` (last element of `name`)."""
+    parts = [f.sval for f in (node.name or ()) if isinstance(f, String)]
+    return parts[-1] if parts else None
+
+
+def _key_operand_matches(rexpr: Any, keys: set[str]) -> bool:
+    """True if the key operand of a JSON arrow/path operator names a
+    configured key — exact for `->`/`->>`, array-element membership for
+    the `#>`/`#>>` `{a,b}` path literal.
+
+    `pg_get_expr` (introspection) renders a string literal as
+    `'user_metadata'::text` — a TypeCast around the A_Const — so unwrap
+    any casts to reach the constant. (Source SQL parses to a bare
+    A_Const; this handles both forms.)
     """
+    node = rexpr
+    while isinstance(node, TypeCast):
+        node = node.arg
+    if isinstance(node, A_Const) and isinstance(node.val, String):
+        sval = node.val.sval
+        if sval in keys:
+            return True
+        return any(elem in keys for elem in _array_literal_keys(sval))
+    return False
 
-    def walk(n: Any) -> bool:
-        if n is None:
-            return False
+
+def _string_key_via_json_op(node: Any, keys: set[str]) -> bool:
+    """True if a configured key appears as the KEY operand of a JSON
+    extraction operator (`->` / `->>` / `#>` / `#>>`) in `node`.
+
+    Scoped deliberately to the key-operand position. The previous
+    "string appears anywhere" match false-fired on a data-value
+    comparison like `event_type = 'user_metadata'` or a JSON *value*
+    that merely equals a key name (`… ->> 'role' = 'user_metadata'`) —
+    neither selects the user-modifiable `user_metadata` sub-object.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
         if isinstance(n, (list, tuple)):
-            return any(walk(item) for item in n)
-        if isinstance(n, A_Const):
-            val = n.val
-            if isinstance(val, String):
-                if val.sval in keys:
-                    return True
-                # Array-literal form (path operators)
-                for elem in _array_literal_keys(val.sval):
-                    if elem in keys:
-                        return True
-            # A_Const wraps a single scalar (String/Integer/Float/etc.) —
-            # nothing more to walk inside, return early so we don't
-            # iterate the Node fields below pointlessly.
-            return False
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, A_Expr) and _expr_op_name(n) in _JSON_EXTRACT_OPS:
+            if _key_operand_matches(n.rexpr, keys):
+                found = True
+                return
         if isinstance(n, Node):
             for field_name in n:
-                if walk(getattr(n, field_name, None)):
-                    return True
-        return False
+                walk(getattr(n, field_name, None))
 
-    return walk(node)
+    walk(node)
+    return found
 
 
 def _references_column(node: Any, column_names: set[str]) -> bool:
@@ -179,6 +199,36 @@ def _references_column(node: Any, column_names: set[str]) -> bool:
         if ref and ref[-1].lower() in column_names:
             return True
     return False
+
+
+def _column_via_json_op(node: Any, column_names: set[str]) -> bool:
+    """True if a configured metadata column is the SOURCE (left operand)
+    of a JSON extraction operator — `raw_user_meta_data ->> 'role'`.
+
+    A bare reference (e.g. `raw_user_meta_data IS NOT NULL`, or the
+    column selected for an unrelated reason) is not the self-bypass
+    hazard and must not fire.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, A_Expr) and _expr_op_name(n) in _JSON_EXTRACT_OPS:
+            if _references_column(n.lexpr, column_names):
+                found = True
+                return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
 
 
 class SEC033:
@@ -211,10 +261,10 @@ class SEC033:
                 if not trees:
                     continue
                 hit_string = any(
-                    _contains_string_const(t, string_keys) for t in trees
+                    _string_key_via_json_op(t, string_keys) for t in trees
                 )
                 hit_column = any(
-                    _references_column(t, column_names) for t in trees
+                    _column_via_json_op(t, column_names) for t in trees
                 )
                 if not (hit_string or hit_column):
                     continue
