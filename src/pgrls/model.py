@@ -211,6 +211,10 @@ class View:
 
     `references` is the sorted, de-duplicated set of `(schema, name)`
     table pairs the view body reads from (resolved via `pg_depend`).
+    Resolution is transitive through intermediate views: a
+    `view → view → table` chain surfaces the base table here, not the
+    intermediate view, so a view built on another view still exposes its
+    underlying RLS-protected tables to VIEW001/002/003.
     `security_definer_calls` is the sorted, de-duplicated tuple of
     qualified function names called by the view body that have
     `pg_proc.prosecdef = true`. Both default to empty.

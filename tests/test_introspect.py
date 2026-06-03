@@ -1157,19 +1157,15 @@ def test_introspect_view_referencing_partitioned_table(
     assert ("public", "events") in v.references
 
 
-def test_introspect_view_chained_through_view_does_not_chase(
+def test_introspect_view_chain_resolves_to_base_table(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
-    # v0.3.0 design: view→table deps are SINGLE HOP. A view that
-    # reads ANOTHER view that reads an RLS-protected table should
-    # NOT have the underlying table in its `references`. The
-    # intermediate view's references point at the table; the outer
-    # view's references point at the intermediate view (filtered
-    # out by relkind='r','p' in the query).
-    #
-    # This test pins the deferral — v0.4 may add transitive
-    # walks; if so, this test should be deleted in the same change
-    # so the intent is visible.
+    # A view that reads ANOTHER view, which reads a (potentially
+    # RLS-protected) table, surfaces the BASE TABLE in its references.
+    # The chain is resolved transitively so VIEW001/002/003 and the view
+    # fixer see the underlying table through any depth of view nesting.
+    # (Earlier versions stopped at the intermediate view — a false
+    # negative; this replaces that pinned deferral.)
     apply_sql(
         """
         CREATE TABLE public.t (id INT);
@@ -1178,11 +1174,38 @@ def test_introspect_view_chained_through_view_does_not_chase(
         """
     )
     schema = introspect(pg_conn, schemas=["public"])
-    outer = next(view for view in schema.views if view.name == "outer_v")
-    # `inner_v` is a view (relkind='v'), filtered out by query.
-    # `t` is a table BUT outer_v's pg_depend doesn't link to it
-    # directly — the chain goes through inner_v.
-    assert ("public", "t") not in outer.references
+    inner = next(v for v in schema.views if v.name == "inner_v")
+    outer = next(v for v in schema.views if v.name == "outer_v")
+    # Both surface the base table; neither lists the intermediate view
+    # (`references` stays "tables the view body reads", now transitive).
+    assert inner.references == (("public", "t"),)
+    assert outer.references == (("public", "t"),)
+
+
+def test_resolve_view_base_tables_chains_diamonds_and_cycles() -> None:
+    # Transitive resolver, unit-level (no live DB). View `a` reads view
+    # `b` (→ view `c` → table t) and table `u` directly; the base set is
+    # {t, u}, with intermediate views excluded.
+    from pgrls.introspect import _resolve_view_base_tables
+
+    views = {("public", "a"), ("public", "b"), ("public", "c")}
+    deps = {
+        ("public", "a"): {("public", "b"), ("public", "u")},
+        ("public", "b"): {("public", "c")},
+        ("public", "c"): {("public", "t")},
+    }
+    assert _resolve_view_base_tables(("public", "a"), deps, views) == {
+        ("public", "t"),
+        ("public", "u"),
+    }
+    # A pathological cycle still terminates and collects reachable tables.
+    cyclic = {
+        ("public", "a"): {("public", "b")},
+        ("public", "b"): {("public", "a"), ("public", "t")},
+    }
+    assert _resolve_view_base_tables(("public", "a"), cyclic, views) == {
+        ("public", "t"),
+    }
 
 
 def test_introspect_view_dependency_filter_by_schema(

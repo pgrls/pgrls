@@ -284,7 +284,9 @@ JOIN pg_catalog.pg_depend d
 JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
 JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
 WHERE v.relkind IN ('v', 'm')
-  AND t.relkind IN ('r', 'p')   -- regular tables + partitioned tables
+  AND t.relkind IN ('r', 'p', 'v', 'm')  -- tables, partitioned tables, AND
+                                         -- views/matviews so view→view
+                                         -- chains can be resolved in Python
   AND vn.nspname = ANY(%s)
   AND v.oid != t.oid             -- exclude self-rule rows
 ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
@@ -827,6 +829,39 @@ def _build_secdef_calls_index(
     return out
 
 
+def _resolve_view_base_tables(
+    view_key: tuple[str, str],
+    deps_index: dict[tuple[str, str], set[tuple[str, str]]],
+    view_keys: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """The transitive base-table set a view reads, chasing view→view edges.
+
+    `deps_index` maps each introspected view to its DIRECT dependency
+    relations — tables AND other views (relkind v/m). A reference that is
+    itself an introspected view is chased; anything else is a base table
+    (or an out-of-scope relation we cannot resolve further) and is
+    collected. So a `view → view → table` chain surfaces the underlying
+    table in the outer view's references, which is what VIEW001/002/003 and
+    the view fixer intersect against RLS-enabled tables. Postgres forbids
+    circular view dependencies, but the `visited` guard keeps this
+    terminating regardless.
+    """
+    tables: set[tuple[str, str]] = set()
+    visited: set[tuple[str, str]] = set()
+    stack = [view_key]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for ref in deps_index.get(current, set()):
+            if ref in view_keys:
+                stack.append(ref)
+            else:
+                tables.add(ref)
+    return tables
+
+
 def _build_views(
     cur: Any,
     schemas: list[str],
@@ -854,6 +889,13 @@ def _build_views(
         deps_index.setdefault(key, set()).add(
             (row["ref_schema"], row["ref_name"])
         )
+    # `deps_index` now holds DIRECT edges to tables AND views. Collapse
+    # view→view edges to the base tables the chain ultimately reads so
+    # `references` stays "tables the view body reads" but is transitive —
+    # a view built on another view no longer drops the underlying table.
+    view_keys = {
+        (row["schema_name"], row["view_name"]) for row in view_rows
+    }
     secdef_index = _build_secdef_calls_index(secdef_functions, view_rows)
     return tuple(
         View(
@@ -864,7 +906,11 @@ def _build_views(
             security_barrier=row["security_barrier"],
             definition=row["definition"],
             references=tuple(sorted(
-                deps_index.get((row["schema_name"], row["view_name"]), set())
+                _resolve_view_base_tables(
+                    (row["schema_name"], row["view_name"]),
+                    deps_index,
+                    view_keys,
+                )
             )),
             security_definer_calls=secdef_index.get(
                 (row["schema_name"], row["view_name"]), ()
