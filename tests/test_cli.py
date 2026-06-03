@@ -355,6 +355,22 @@ def test_explain_covers_every_registered_rule() -> None:
         )
 
 
+def test_explain_format_is_case_insensitive() -> None:
+    # R11 #9: `--format` on `explain` must accept mixed/upper case like
+    # every other command's --format (lint, diff, perf). `JSON` must
+    # behave exactly like `json`, not exit 2 with a usage error.
+    runner = CliRunner()
+    for value in ("JSON", "Json", "MARKDOWN"):
+        result = runner.invoke(
+            main, ["explain", "SEC001", "--format", value]
+        )
+        assert result.exit_code == 0, (value, result.output)
+    # `JSON` produces parseable JSON, identical to `json`.
+    upper = runner.invoke(main, ["explain", "SEC001", "--format", "JSON"])
+    lower = runner.invoke(main, ["explain", "SEC001", "--format", "json"])
+    assert json.loads(upper.output) == json.loads(lower.output)
+
+
 def test_explain_format_markdown_per_rule_renders_heading_and_body() -> None:
     # `pgrls explain SEC001 --format markdown` emits an H2 heading,
     # a `**Severity:**` line, then the rule's reference body — the

@@ -2892,7 +2892,7 @@ def _render_catalog_html(rules: list[Rule], *, fixable_ids: set[str]) -> str:
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["text", "markdown", "json", "html"]),
+    type=click.Choice(["text", "markdown", "json", "html"], case_sensitive=False),
     default="text",
     show_default=True,
     help=(
