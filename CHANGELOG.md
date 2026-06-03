@@ -10,22 +10,71 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-03
+
+A soundness- and precision-hardening release: the output of a 20-round
+adversarial repo-review loop (each finding independently verified before
+acceptance), plus one new diff capability. No new rules; the Z3-backed
+SEC038 verifier and the whole rule set are materially more trustworthy.
+
+### Added
+
+- **Column-level grants are now captured and diffed.** Introspection
+  reads `pg_attribute.attacl`, so a `GRANT SELECT (col) … TO PUBLIC` on a
+  table with RLS off routes to the dangerous `GRANT_PUBLIC_NO_RLS` path
+  (previously invisible — table-level `relacl` only). Snapshot format
+  bumps to **v15** (additive — the key is emitted only when present, so
+  pre-feature snapshots serialize byte-identically apart from the version
+  number); v3–v14 snapshots still load.
+- **`pgrls diff --format json|sarif` carries the raw 4-way
+  classification** (`safe` / `requires_review` / `breaking` /
+  `dangerous`) instead of collapsing it to three buckets.
+
 ### Fixed
 
+- **Z3 / SEC038 soundness — abstain over fabricate.** The 3VL anon-read
+  verifier and the diff counterexample emitter no longer mis-prove or
+  mis-emit on several shapes: a mismatched-sort `COALESCE` fold (a bare
+  integer column defaulted to BoolSort and Z3 silently coerced it to
+  {0,1}, fabricating an "anonymous read leak" on a safe
+  `COALESCE(level, 0) < 3` gate); String-sorted arithmetic; never-NULL
+  `current_setting`/`current_user`/`session_user` leaves; and a
+  synthetic-marker name colliding with a real column. Uncertain shapes
+  degrade to no-fire / label-only rather than a false verdict.
+- **Rule false positives eliminated** on real-world-shaped policies:
+  SEC026 (auth value matched against a hard-coded literal / `SIMILAR TO`
+  / ltree pattern), SEC033 (now requires the JSON chain to root in a
+  verified JWT source), SEC036 (a single-target `IN`/`= ANY (SELECT
+  auth.uid())` is recognized as a caller binding), SEC030, SEC024, and
+  SEC006 (a USING-only UPDATE is safe — Postgres reuses USING as the
+  implicit WITH CHECK).
+- **No dangerous or un-runnable generated SQL.** PERF004 abstains on a
+  non-IMMUTABLE index expression (incl. the STABLE 2-arg `length(bytea,
+  name)` overload); `generate --auth-function` rejects an ambiguous
+  multi-dot name; the SEC015 fixer quotes reserved-keyword search-path
+  tokens; and `pgrls fix` / `Schema.to_sql()` close latent
+  identifier-quoting and DDL-injection gaps.
 - **SEC015 / SEC017 fixers emitted the wrong `ALTER FUNCTION` target
-  when a schema name contained a dot.** The fixers reconstructed the
-  schema and function name by splitting the introspected
-  `qualified_name` (`nspname || '.' || proname`) on the *first* dot, so
-  a function `f` in a schema named `a.b` produced
-  `ALTER FUNCTION a."b.f"(…)` — the wrong schema *and* the wrong object
-  (it errors, or worse silently targets a different function). The join
-  is fundamentally ambiguous once either component contains a dot, so
-  introspection now captures the schema and function name as separate
-  fields on `SecdefFunction` / `LeakproofFunction` (snapshot **v14**),
-  and the fixers use them directly instead of splitting. The fixers
-  abstain (emit no Fix) when those fields are absent — e.g. a pre-v14
-  snapshot loaded for `fix` — rather than guess a target. Snapshot
-  format bumps to v14; v3–v13 snapshots still load.
+  when a schema name contained a dot.** Introspection now captures the
+  schema and function name as separate fields on `SecdefFunction` /
+  `LeakproofFunction` instead of splitting the ambiguous
+  `nspname || '.' || proname` join; the fixers use them directly and
+  abstain when the fields are absent (a pre-v14 snapshot) rather than
+  guess a target.
+- **`[database].url` env interpolation is now lazy.** `pgrls diff`
+  (snapshot-vs-snapshot) and `pgrls explain` no longer fail with exit 2
+  just because a `[database].url` env var referenced by an auto-loaded
+  `pgrls.toml` is unset — the error is deferred to the commands that
+  actually open a connection.
+- **Introspection determinism:** the grant queries `SELECT DISTINCT`, so
+  a privilege re-granted to the same role by two grantors no longer
+  duplicates in the snapshot.
+
+### Changed
+
+- Model decode/emit hardening: empty-privilege grants are rejected at
+  snapshot decode; `policy_to_sql` validates the policy command on emit
+  and the roles list on decode.
 
 ## [0.16.0] - 2026-06-01
 
