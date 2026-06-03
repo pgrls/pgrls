@@ -950,3 +950,47 @@ def test_from_snapshot_rejects_non_object_payload() -> None:
     for payload in ([], None, "x", 42):
         with pytest.raises(ValueError, match="JSON object"):
             Schema.from_snapshot(payload)  # type: ignore[arg-type]
+
+
+def test_from_snapshot_rejects_injection_in_secdef_signature() -> None:
+    # Regression (round-7): `signature` is interpolated into the
+    # ALTER FUNCTION the SEC015 fixer emits, so a hand-crafted snapshot
+    # smuggling DDL through it must be rejected at the decode boundary
+    # like data_type / privileges already are.
+    snap = _minimal_snapshot()
+    snap["security_definer_functions"] = [
+        {
+            "qualified_name": "public.f",
+            "body": "SELECT 1",
+            "language": "sql",
+            "signature":
+                "integer) RETURNS void LANGUAGE sql AS ''; "
+                "DROP TABLE users; --",
+        }
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_injection_in_leakproof_signature() -> None:
+    snap = _minimal_snapshot()
+    snap["leakproof_functions"] = [
+        {"qualified_name": "public.f", "signature": "integer); DROP TABLE x; --"}
+    ]
+    with pytest.raises(ValueError, match="signature"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_real_function_signatures() -> None:
+    # Real pg_get_function_identity_arguments outputs must round-trip.
+    snap = _minimal_snapshot()
+    snap["security_definer_functions"] = [
+        {"qualified_name": "public.f", "body": "SELECT 1", "language": "sql",
+         "signature": "a integer, b text[]"},
+    ]
+    snap["leakproof_functions"] = [
+        {"qualified_name": "public.g", "signature": "VARIADIC text[]"},
+    ]
+    schema = Schema.from_snapshot(snap)
+    assert schema.security_definer_functions[0].signature == "a integer, b text[]"
+    assert schema.leakproof_functions[0].signature == "VARIADIC text[]"

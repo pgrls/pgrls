@@ -789,16 +789,69 @@ def _view_from_dict(v: dict[str, Any]) -> View:
     )
 
 
+def _is_safe_signature(signature: object) -> bool:
+    """True iff `signature` is a single, injection-free function arg list.
+
+    The SEC015 / SEC017 fixers interpolate a snapshot's `signature`
+    (``pg_get_function_identity_arguments`` output) raw into
+    ``ALTER FUNCTION name(<signature>) …``. From live introspection it is
+    trustworthy, but a hand-crafted snapshot is a trust boundary, so
+    validate it the same way ``_is_safe_data_type`` validates a column
+    type: parse a probe ``CREATE FUNCTION`` and require the signature to
+    occupy exactly one function's argument list and nothing else. An
+    injection that escapes the parens to add a statement (``integer)
+    RETURNS void AS ''; DROP TABLE users; --``) parses as >1 statement and
+    is rejected. Empty ("" — a zero-arg function, or a pre-v12 snapshot)
+    is trivially safe.
+    """
+    if not isinstance(signature, str):
+        return False
+    if not signature.strip():
+        return True
+    import pglast
+    from pglast.ast import CreateFunctionStmt, String
+    try:
+        stmts = pglast.parse_sql(
+            f"CREATE FUNCTION __pgrls_probe({signature}) "
+            "RETURNS void LANGUAGE sql AS ''"
+        )
+    except Exception:
+        return False
+    if len(stmts) != 1:
+        return False
+    stmt = stmts[0].stmt
+    if not isinstance(stmt, CreateFunctionStmt):
+        return False
+    # The function name must be exactly the probe name — a single
+    # unqualified identifier. An injection that escaped the arg list to
+    # rename / qualify / add a clause changes this.
+    names = list(stmt.funcname or ())
+    return (
+        len(names) == 1
+        and isinstance(names[0], String)
+        and names[0].sval == "__pgrls_probe"
+    )
+
+
 def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
     # `search_path` is a v8 addition; v4-v7 snapshots have no key, so
     # `.get(...)` yields None ("no SET search_path clause"). `signature`
     # is a v12 addition; v4-v11 snapshots load it as "".
+    sig = f.get("signature", "")
+    if not _is_safe_signature(sig):
+        raise ValueError(
+            "snapshot SECURITY DEFINER function "
+            f"{f.get('qualified_name')!r} has an unsafe or unparseable "
+            f"signature {sig!r}; it is interpolated into the ALTER FUNCTION "
+            "the SEC015 fixer emits, so it must be a single function "
+            "argument list (validated by parsing a probe CREATE FUNCTION)."
+        )
     return SecdefFunction(
         qualified_name=f["qualified_name"],
         body=f["body"],
         language=f["language"],
         search_path=f.get("search_path"),
-        signature=f.get("signature", ""),
+        signature=sig,
         # v14 additions; v4-v13 snapshots have no keys -> "".
         schema_name=f.get("schema_name", ""),
         function_name=f.get("function_name", ""),
@@ -815,9 +868,18 @@ def _bypassrls_role_from_dict(r: dict[str, Any]) -> BypassRlsRole:
 
 def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
     # `signature` is a v12 addition; v10-v11 snapshots load it as "".
+    sig = f.get("signature", "")
+    if not _is_safe_signature(sig):
+        raise ValueError(
+            "snapshot LEAKPROOF function "
+            f"{f.get('qualified_name')!r} has an unsafe or unparseable "
+            f"signature {sig!r}; it is interpolated into the ALTER FUNCTION "
+            "the SEC017 fixer emits, so it must be a single function "
+            "argument list (validated by parsing a probe CREATE FUNCTION)."
+        )
     return LeakproofFunction(
         qualified_name=f["qualified_name"],
-        signature=f.get("signature", ""),
+        signature=sig,
         # v14 additions; v10-v13 snapshots have no keys -> "".
         schema_name=f.get("schema_name", ""),
         function_name=f.get("function_name", ""),
