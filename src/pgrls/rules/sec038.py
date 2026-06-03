@@ -105,7 +105,7 @@ def _format_message(policy: Any, table: Any, witness: dict[str, object]) -> str:
     # row, so the honest artifact is "all rows" — the witness dict is
     # empty. The non-empty branch is dead for v1; it stays only for a
     # future "satisfiable read" criterion (amendment #6).
-    if witness:
+    if witness:  # pragma: no cover - v1 validity always yields an empty witness
         pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
         artifact = (
             f" For example, a row with {{{pairs}}} is visible to an "

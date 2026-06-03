@@ -398,3 +398,36 @@ def test_sec038_noop_when_z3_unavailable(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(z3c, "Z3_AVAILABLE", False)
     schema = _wrap(_policy_with_using("(SELECT auth.uid()) IS NULL OR true"))
     assert SEC038().check(schema, {}) == []
+
+
+def test_sec038_arithmetic_operand_3vl_branch() -> None:
+    # Coverage (round-7): exercise the Kleene arithmetic-operand branch of
+    # the 3VL encoder (null-flag propagated as Or(left, right)). FIRE — anon
+    # makes the IS NULL disjunct TRUE and the surviving disjunct does
+    # arithmetic on a column operand:
+    fire = _wrap(
+        _policy_with_using("(SELECT auth.uid()) IS NULL OR amount + 1 > 0")
+    )
+    assert len(SEC038().check(fire, {})) == 1
+    # NO-FIRE — arithmetic compared to a per-request auth value: under anon
+    # the value is NULL, so the comparison is Kleene-unknown, never provably
+    # TRUE for all rows.
+    scoped = _wrap(
+        _policy_with_using(
+            "amount + 1 = (SELECT current_setting('app.x', true))::int"
+        )
+    )
+    assert SEC038().check(scoped, {}) == []
+
+
+def test_sec038_column_vs_column_operand_3vl_branch() -> None:
+    # Coverage (round-7): exercise the col-op-col operand branch (both
+    # operands default to StringSort with free null-flags). FIRE via the
+    # anon IS NULL disjunct:
+    fire = _wrap(
+        _policy_with_using("a = b OR (SELECT auth.uid()) IS NULL")
+    )
+    assert len(SEC038().check(fire, {})) == 1
+    # NO-FIRE — a plain two-column comparison is not provably TRUE for every
+    # row, so anon cannot read everything.
+    assert SEC038().check(_wrap(_policy_with_using("a = b")), {}) == []

@@ -588,18 +588,18 @@ ORDER BY mem.rolname, tgt.rolname
 # what remains is user-defined functions a superuser deliberately
 # marked LEAKPROOF (only a superuser can).
 #
-# `SELECT DISTINCT` collapses overloads: `public.f(int)` and
-# `public.f(text)` both marked LEAKPROOF yield a single `public.f`
-# row. This matches SEC017's allowlist granularity — the allowlist
-# key is the qualified name with no signature, so one allowlist
-# entry already covers every overload; one finding per qualified
-# name keeps the report aligned with that.
+# Each overload is captured as its OWN row (no DISTINCT, since v12):
+# `public.f(int)` and `public.f(text)` both marked LEAKPROOF yield two
+# rows, each carrying its `signature`
+# (`pg_get_function_identity_arguments`) plus schema_name / function_name —
+# so a SEC017 fixer can target `ALTER FUNCTION name(<signature>) NOT
+# LEAKPROOF` per overload. SEC017 itself dedupes across overloads for its
+# qualified-name-level reporting (and the allowlist key is the qualified
+# name, so one entry covers every overload). The body (`prosrc`/`lanname`)
+# is NOT fetched — unlike `_SECDEF_FUNCS_SQL`, SEC017 is an audit prompt,
+# not a body analysis.
 #
-# Only the qualified name is selected — SEC017 is an audit prompt,
-# it does not parse the body (unlike `_SECDEF_FUNCS_SQL`, which
-# also fetches `prosrc`/`lanname` for VIEW004).
-#
-# ORDER BY qname for snapshot determinism.
+# ORDER BY qname, signature for snapshot determinism across overloads.
 _LEAKPROOF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
