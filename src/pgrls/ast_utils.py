@@ -479,6 +479,26 @@ def is_literal_false(node: Any) -> bool:
     return _is_literal_bool(node, value=False)
 
 
+def is_builtin_current_setting(node: Any) -> bool:
+    """True iff `node` is a call to the Postgres BUILTIN ``current_setting``
+    — unqualified, or ``pg_catalog``-qualified — and NOT a user-defined
+    ``<schema>.current_setting``.
+
+    ``find_func_calls(node, {"current_setting"})`` matches on EITHER the
+    qualified or the bare name (so it also returns a same-named UDF like
+    ``myschema.current_setting``). Every rule that reasons about the
+    builtin's GUC semantics — SEC019's ``missing_ok``-less overload,
+    SEC024's unqualified-name requirement, and the never-NULL guard below
+    — must gate on this, or it false-fires on a user-defined function
+    that merely shares the bare name. Single source of truth so those
+    gates cannot drift.
+    """
+    if not isinstance(node, FuncCall):
+        return False
+    qualified, _bare = func_name_parts(node)
+    return qualified in ("current_setting", "pg_catalog.current_setting")
+
+
 def is_never_null_current_setting(node: Any) -> bool:
     """True iff `node` is a builtin ``current_setting`` call that can
     NEVER return NULL — so an ``IS NULL`` test on it is a dead disjunct,
@@ -504,10 +524,7 @@ def is_never_null_current_setting(node: Any) -> bool:
     never-NULL guards cannot drift — they did: R12 fixed only the 1-arg
     case in both, and R13 found the 2-arg-``false`` gap latent in both.
     """
-    if not isinstance(node, FuncCall):
-        return False
-    qualified, _bare = func_name_parts(node)
-    if qualified not in ("current_setting", "pg_catalog.current_setting"):
+    if not is_builtin_current_setting(node):
         return False
     args = node.args
     if not args:

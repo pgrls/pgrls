@@ -65,7 +65,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.ast_utils import find_func_calls
+from pgrls.ast_utils import find_func_calls, is_builtin_current_setting
 from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -83,9 +83,17 @@ def _has_one_arg_current_setting(node: Any) -> bool:
     that raises on an unset GUC.
     """
     for call in find_func_calls(node, {_CURRENT_SETTING}):
-        # `find_func_calls` can also return SQLValueFunction nodes
-        # (current_user etc.); those have no `args`. current_setting
-        # is always a FuncCall — guard defensively all the same.
+        # SEC019's premise is the BUILTIN current_setting's missing_ok
+        # overload. `find_func_calls` matches on either the qualified or
+        # the bare name, so a user-defined `<schema>.current_setting(x)`
+        # — unrelated to the builtin's overload semantics — would
+        # mis-fire. Gate on the builtin via the shared helper (mirrors
+        # SEC024 / the never-NULL guard). A SQLValueFunction is not a
+        # builtin current_setting and is skipped here too.
+        if not is_builtin_current_setting(call):
+            continue
+        # current_setting is always a FuncCall, so it has `args`; guard
+        # defensively all the same.
         args = getattr(call, "args", None)
         if args is not None and len(args) == 1:
             return True

@@ -80,7 +80,7 @@ from typing import Any
 
 from pglast.ast import A_Const, String, TypeCast
 
-from pgrls.ast_utils import find_func_calls
+from pgrls.ast_utils import find_func_calls, is_builtin_current_setting
 from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -101,9 +101,19 @@ def _unqualified_setting_names(node: Any) -> set[str]:
     """
     names: set[str] = set()
     for call in find_func_calls(node, {_CURRENT_SETTING}):
-        # `find_func_calls` can also return SQLValueFunction nodes,
-        # which have no `args`; current_setting is always a FuncCall
-        # but guard defensively all the same.
+        # SEC024's premise is the Postgres BUILTIN current_setting —
+        # whose unqualified parameter names "cannot be SET as a
+        # customized parameter at all". `find_func_calls` matches on
+        # EITHER the qualified or the bare name, so a user-defined
+        # `<schema>.current_setting(...)` (a different function that may
+        # legitimately take an unqualified string) would mis-fire. Gate
+        # on the builtin via the shared helper (also used by SEC019 and
+        # the never-NULL guard). A SQLValueFunction is not a builtin
+        # current_setting and is skipped here too.
+        if not is_builtin_current_setting(call):
+            continue
+        # current_setting is always a FuncCall, so it has `args`; guard
+        # defensively all the same.
         args = getattr(call, "args", None)
         if not args:
             continue
