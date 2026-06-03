@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pglast
-from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, Node, NullTest, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, UpdateStmt
+from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, Node, NullTest, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
 from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
 
 
@@ -477,3 +477,49 @@ def is_literal_false(node: Any) -> bool:
     equivalents.
     """
     return _is_literal_bool(node, value=False)
+
+
+def is_never_null_current_setting(node: Any) -> bool:
+    """True iff `node` is a builtin ``current_setting`` call that can
+    NEVER return NULL — so an ``IS NULL`` test on it is a dead disjunct,
+    not an anonymous-read hole.
+
+    The builtin ``current_setting`` (unqualified or ``pg_catalog``-
+    qualified) is never-NULL in two argument forms:
+
+    * one-arg ``current_setting(name)`` — RAISES ``unrecognized
+      configuration parameter`` on an unset GUC and otherwise returns a
+      non-NULL string (even ``''`` is non-NULL);
+    * two-arg ``current_setting(name, false)`` — the ``missing_ok=false``
+      form ALSO raises on an unset GUC, so it too is never NULL.
+
+    Only ``current_setting(name, true)`` (``missing_ok=true``) returns
+    NULL when the GUC is unset and stays NULLable. A non-literal second
+    argument is treated conservatively as NULLable (so the IS-NULL rule
+    keeps firing), and a user-defined ``myschema.current_setting`` is a
+    DIFFERENT function that is not matched at all.
+
+    Single source of truth shared by SEC004 (`_has_nullable_auth_call`)
+    and the SEC038 anon-read encoder (`_is_anon_null_leaf`) so the two
+    never-NULL guards cannot drift — they did: R12 fixed only the 1-arg
+    case in both, and R13 found the 2-arg-``false`` gap latent in both.
+    """
+    if not isinstance(node, FuncCall):
+        return False
+    qualified, _bare = func_name_parts(node)
+    if qualified not in ("current_setting", "pg_catalog.current_setting"):
+        return False
+    args = node.args
+    if not args:
+        return False
+    if len(args) == 1:
+        return True
+    if len(args) == 2:
+        # missing_ok=false also raises on an unset GUC → never NULL.
+        # Unwrap any TypeCast (`false::bool`) before the literal test;
+        # `true` and any non-literal second arg stay NULLable.
+        second = args[1]
+        while isinstance(second, TypeCast):
+            second = second.arg
+        return is_literal_false(second)
+    return False

@@ -64,6 +64,21 @@ def test_sec004_silent_on_one_arg_current_setting_is_null() -> None:
         assert SEC004().check(schema, {}) == [], fn
 
 
+def test_sec004_silent_on_two_arg_false_current_setting_is_null() -> None:
+    # R13 #2: the two-arg `current_setting(name, false)` form ALSO raises
+    # on an unset GUC (missing_ok=false), so it is NEVER NULL just like
+    # the one-arg form — the `IS NULL` disjunct is dead and the policy
+    # fails closed. The R12 fix keyed on arity (1 arg) and so left this
+    # 2-arg-false case still false-firing at ERROR severity. Only the
+    # `, true` form (test above) is genuinely NULLable. Covers bare
+    # `false`, `FALSE`, and the `false::boolean` cast, in both builtin
+    # spellings.
+    for fn in ("current_setting", "pg_catalog.current_setting"):
+        for lit in ("false", "FALSE", "false::boolean"):
+            using = f"{fn}('app.x', {lit}) IS NULL OR user_id = '1'"
+            assert SEC004().check(_wrap(_policy_with_using(using)), {}) == [], using
+
+
 def test_sec004_fires_on_user_defined_one_arg_current_setting() -> None:
     # A user-defined `myschema.current_setting(text)` is NOT the builtin
     # and could legitimately return NULL, so the never-NULL skip must not

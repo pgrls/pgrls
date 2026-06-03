@@ -658,6 +658,23 @@ def test_anon_clean_on_never_null_role_svfop_by_default() -> None:
     assert _anon(f"session_user IS NULL OR {_OWNER}") is None
 
 
+def test_anon_clean_on_never_null_current_setting() -> None:
+    # R13 #2 (SEC038 mirror of the SEC004 fix): a never-NULL builtin
+    # current_setting — the one-arg form, or the two-arg
+    # `current_setting(name, false)` (missing_ok=false also raises on an
+    # unset GUC) — is not anon-NULL, so the inverted `… IS NULL OR owner`
+    # must NOT prove valid (no false fire). The shared
+    # `is_never_null_current_setting` guard backs both the rule and this
+    # encoder, so the 1-arg and 2-arg-false cases can no longer drift.
+    assert _anon(f"current_setting('app.x') IS NULL OR {_OWNER}") is None
+    assert _anon(f"current_setting('app.x', false) IS NULL OR {_OWNER}") is None
+    assert _anon(
+        f"pg_catalog.current_setting('app.x', false::boolean) IS NULL OR {_OWNER}"
+    ) is None
+    # The genuinely-NULLable `, true` form still fires (no false negative).
+    assert _anon(f"current_setting('app.x', true) IS NULL OR {_OWNER}") is not None
+
+
 def test_anon_fires_on_bare_true() -> None:
     assert _anon("true") is not None
 
