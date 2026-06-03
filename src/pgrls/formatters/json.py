@@ -57,6 +57,17 @@ def format_json(violations: list[Violation]) -> str:
                     if v.counterexample is not None
                     else {}
                 ),
+                # Additive, non-breaking: the raw 4-way diff
+                # classification (safe / breaking / requires_review /
+                # dangerous). Present only on `pgrls diff` output, so
+                # lint runs keep the historical shape. Lets a consumer
+                # split breaking from requires_review (both project to
+                # `severity: warning`).
+                **(
+                    {"classification": v.classification}
+                    if v.classification is not None
+                    else {}
+                ),
             }
             for v in violations
         ],

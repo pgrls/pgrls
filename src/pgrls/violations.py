@@ -80,6 +80,18 @@ class Violation:
     counterexample: dict[str, object] | None = field(
         default=None, compare=False, hash=False
     )
+    # Optional diff-classification tag, carried only by `pgrls diff`
+    # Changes projected into Violations. The diff's 4-way classification
+    # (safe / breaking / requires_review / dangerous) is richer than the
+    # 3-level Violation.severity it projects to, so the machine formats
+    # (json / sarif) surface this additive raw value, letting a CI
+    # consumer split "block on breaking" from "warn on requires_review".
+    # None for lint violations. `compare=False` for the same reason as
+    # `counterexample` (keep the frozen dataclass hashable / equality
+    # stable).
+    classification: str | None = field(
+        default=None, compare=False, hash=False
+    )
 
     def __post_init__(self) -> None:
         # Fold a case-variant of a known severity to its canonical form

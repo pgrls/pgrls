@@ -137,6 +137,13 @@ def _result(
     out["locations"] = [
         {"logicalLocations": [{"fullyQualifiedName": fqn}]}
     ]
+    # The raw 4-way diff classification goes in the SARIF property bag
+    # (§3.27.x `result.properties`) — additive and ignored by consumers
+    # that don't read it, but it lets a CI pipeline split breaking from
+    # requires_review (both map to SARIF `level: warning`). Present only
+    # on `pgrls diff` output.
+    if v.classification is not None:
+        out["properties"] = {"classification": v.classification}
     return out
 
 
