@@ -36,6 +36,18 @@ JSON operator was used; the column-ref path catches the direct
 `raw_user_meta_data` column reference (typically via a SELECT
 sub-link against `auth.users`).
 
+A `user_metadata` key nested under the service-role-only `app_metadata`
+root is deliberately NOT flagged — the end user cannot write inside
+`app_metadata`, so the value is trustworthy:
+
+    USING (auth.jwt() -> 'app_metadata' -> 'user_metadata' ->> 'role' …)
+    USING ((auth.jwt() #>> '{app_metadata,user_metadata,role}') = 'admin')
+
+Detection is root-aware: the arrow form inspects the left-operand chain
+and the path form inspects element order, so only a `user_metadata` read
+that roots at the top-level JWT claim (not under `app_metadata` /
+`raw_app_meta_data`) fires.
+
 The rule is `error` severity because the bypass is deterministic and
 exploitable by any authenticated user — same hazard class as SEC004
 (inverted auth check / anonymous access).
@@ -68,6 +80,16 @@ from pgrls.violations import Severity, Violation
 _DEFAULT_STRING_KEYS: frozenset[str] = frozenset({"user_metadata"})
 
 _DEFAULT_COLUMN_NAMES: frozenset[str] = frozenset({"raw_user_meta_data"})
+
+# Server-controlled metadata roots. In the Supabase / PostgREST model the
+# service role (never the end user) writes `app_metadata` /
+# `raw_app_meta_data`, so a `user_metadata` key read *nested under* one of
+# these lives inside the service-role object and is NOT the self-bypass
+# hazard. SEC033 exempts those reads (see `_unrooted_user_key`).
+_SAFE_ROOT_KEYS: frozenset[str] = frozenset(
+    {"app_metadata", "raw_app_meta_data"}
+)
+_SAFE_ROOT_COLUMNS: frozenset[str] = frozenset({"raw_app_meta_data"})
 
 
 def _parse_string_keys(options: dict[str, Any]) -> set[str]:
@@ -136,10 +158,8 @@ def _expr_op_name(node: A_Expr) -> str | None:
     return parts[-1] if parts else None
 
 
-def _key_operand_matches(rexpr: Any, keys: set[str]) -> bool:
-    """True if the key operand of a JSON arrow/path operator names a
-    configured key — exact for `->`/`->>`, array-element membership for
-    the `#>`/`#>>` `{a,b}` path literal.
+def _extract_key_sval(rexpr: Any) -> str | None:
+    """The string value of a JSON arrow/path key operand, or None.
 
     `pg_get_expr` (introspection) renders a string literal as
     `'user_metadata'::text` — a TypeCast around the A_Const — so unwrap
@@ -151,21 +171,31 @@ def _key_operand_matches(rexpr: Any, keys: set[str]) -> bool:
         node = node.arg
     if isinstance(node, A_Const) and isinstance(node.val, String):
         sval = node.val.sval
-        if sval in keys:
-            return True
-        return any(elem in keys for elem in _array_literal_keys(sval))
-    return False
+        return sval if isinstance(sval, str) else None
+    return None
 
 
-def _string_key_via_json_op(node: Any, keys: set[str]) -> bool:
-    """True if a configured key appears as the KEY operand of a JSON
-    extraction operator (`->` / `->>` / `#>` / `#>>`) in `node`.
+def _key_operand_matches(rexpr: Any, keys: frozenset[str] | set[str]) -> bool:
+    """True if the key operand of a JSON arrow/path operator names a
+    configured key — exact for `->`/`->>`, array-element membership for
+    the `#>`/`#>>` `{a,b}` path literal.
+    """
+    sval = _extract_key_sval(rexpr)
+    if sval is None:
+        return False
+    if sval in keys:
+        return True
+    return any(elem in keys for elem in _array_literal_keys(sval))
 
-    Scoped deliberately to the key-operand position. The previous
-    "string appears anywhere" match false-fired on a data-value
-    comparison like `event_type = 'user_metadata'` or a JSON *value*
-    that merely equals a key name (`… ->> 'role' = 'user_metadata'`) —
-    neither selects the user-modifiable `user_metadata` sub-object.
+
+def _has_key_in_extract_position(
+    node: Any, keys: frozenset[str] | set[str]
+) -> bool:
+    """True if any of `keys` appears as the KEY operand of a JSON
+    extraction operator (`->` / `->>` / `#>` / `#>>`) anywhere in `node`.
+
+    Root-blind primitive: used to test whether a left (root-ward) operand
+    chain already selects a server-controlled key such as `app_metadata`.
     """
     found = False
 
@@ -189,7 +219,76 @@ def _string_key_via_json_op(node: Any, keys: set[str]) -> bool:
     return found
 
 
-def _references_column(node: Any, column_names: set[str]) -> bool:
+def _unrooted_user_key(node: A_Expr, keys: set[str]) -> bool:
+    """For a single JSON extraction `A_Expr`, True if it reads a configured
+    user-writable key as a TOP-LEVEL claim — i.e. NOT nested under a
+    server-controlled root such as `app_metadata`.
+
+      ``auth.jwt() -> 'user_metadata' ->> 'role'``           → True  (hazard)
+      ``auth.jwt() -> 'app_metadata' -> 'user_metadata' …``  → False (safe)
+      ``… #>> '{user_metadata,role}'``                       → True  (hazard)
+      ``… #>> '{app_metadata,user_metadata,role}'``          → False (safe)
+
+    Path-literal form: element ORDER decides the root — a user-writable
+    key is hazardous only if no server-controlled key precedes it. Arrow
+    form: the LEFT operand chain is the root — a `user_metadata` read whose
+    left side already selects `app_metadata` (or the `raw_app_meta_data`
+    column) lives inside the service-role object and isn't user-writable.
+    """
+    sval = _extract_key_sval(node.rexpr)
+    if sval is None:
+        return False
+
+    path = _array_literal_keys(sval)
+    if path:
+        for i, elem in enumerate(path):
+            if elem in keys and not any(
+                e in _SAFE_ROOT_KEYS for e in path[:i]
+            ):
+                return True
+        return False
+
+    if sval in keys:
+        return not _is_server_controlled_root(node.lexpr)
+    return False
+
+
+def _string_key_via_json_op(node: Any, keys: set[str]) -> bool:
+    """True if a configured user-writable key is read as a TOP-LEVEL JWT
+    claim — in JSON key-operand position and NOT rooted under a
+    server-controlled key such as `app_metadata`.
+
+    Scoped deliberately to unrooted key-operand reads. A data-value
+    comparison like `event_type = 'user_metadata'`, a JSON *value* equal to
+    a key name (`… ->> 'role' = 'user_metadata'`), and a `user_metadata`
+    sub-object nested inside the service-role-only `app_metadata` all
+    fail to select the end-user-writable claim, so none fire.
+    """
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, A_Expr) and _expr_op_name(n) in _JSON_EXTRACT_OPS:
+            if _unrooted_user_key(n, keys):
+                found = True
+                return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
+
+
+def _references_column(
+    node: Any, column_names: frozenset[str] | set[str]
+) -> bool:
     """True if the tree references a column whose last name matches.
 
     Captures bare `raw_user_meta_data`, table-qualified
@@ -199,6 +298,18 @@ def _references_column(node: Any, column_names: set[str]) -> bool:
         if ref and ref[-1].lower() in column_names:
             return True
     return False
+
+
+def _is_server_controlled_root(lexpr: Any) -> bool:
+    """True if a JSON extraction's left (root-ward) operand selects a
+    server-controlled metadata root: the `app_metadata` JSON key or the
+    `raw_app_meta_data` column. A `user_metadata` key read layered on top
+    of such a root is part of the service-role object, not the
+    end-user-writable claim.
+    """
+    return _has_key_in_extract_position(
+        lexpr, _SAFE_ROOT_KEYS
+    ) or _references_column(lexpr, _SAFE_ROOT_COLUMNS)
 
 
 def _column_via_json_op(node: Any, column_names: set[str]) -> bool:

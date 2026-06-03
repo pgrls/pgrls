@@ -190,6 +190,61 @@ def test_silent_when_no_policy_predicate() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Silent — `user_metadata` nested under the service-role `app_metadata`
+# root (regression #6: detection is root-aware, not root-blind)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # Arrow chain rooted at app_metadata: the end user cannot write
+        # inside the service-role-only app_metadata object, so a
+        # user_metadata key read under it is trustworthy.
+        "auth.jwt() -> 'app_metadata' -> 'user_metadata' ->> 'role' = 'admin'",
+        # Path form: app_metadata precedes user_metadata in the path.
+        "auth.jwt() #>> '{app_metadata,user_metadata,role}' = 'admin'",
+        # Deeper nesting, still rooted at app_metadata.
+        "auth.jwt() #> '{app_metadata,nested,user_metadata}' IS NOT NULL",
+        # Rooted at the service-role `raw_app_meta_data` column.
+        (
+            "(SELECT raw_app_meta_data -> 'user_metadata' ->> 'role' "
+            "FROM auth.users WHERE id = auth.uid()) = 'admin'"
+        ),
+    ],
+)
+def test_silent_on_user_metadata_nested_under_app_metadata(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="nested_safe"))
+    violations = SEC033().check(schema, {})
+    assert violations == [], expr
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fires — `user_metadata` is the TOP-LEVEL claim even when app_metadata
+# appears deeper in the same chain (root order is what matters)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # user_metadata is the root claim; app_metadata is just a subkey
+        # the end user can still set underneath it.
+        "auth.jwt() -> 'user_metadata' -> 'app_metadata' ->> 'role' = 'admin'",
+        # Path form: user_metadata precedes app_metadata.
+        "auth.jwt() #>> '{user_metadata,app_metadata,role}' = 'admin'",
+    ],
+)
+def test_fires_when_user_metadata_is_root_even_if_app_metadata_below(
+    expr: str,
+) -> None:
+    schema = _wrap(_policy(f"({expr})", name="root_user_metadata"))
+    violations = SEC033().check(schema, {})
+    assert len(violations) == 1, expr
+    assert violations[0].location == "public.t.root_user_metadata"
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Configuration paths
 # ──────────────────────────────────────────────────────────────────────
 
