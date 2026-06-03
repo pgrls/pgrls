@@ -223,7 +223,11 @@ ORDER BY a.attrelid, a.attnum
 # here so two introspections of the same DB produce byte-
 # identical Schema (downstream snapshot determinism).
 _GRANTS_SQL = """
-SELECT
+-- DISTINCT drops aclexplode's per-grantor multiplicity: a privilege
+-- re-granted to the same grantee by two grantors (the normal WITH GRANT
+-- OPTION case) yields one row per grantor, which would otherwise append
+-- a duplicate into Grant.privileges. Mirrors the polroles SELECT DISTINCT.
+SELECT DISTINCT
     c.oid AS table_oid,
     CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
          ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
@@ -258,7 +262,8 @@ ORDER BY c.oid, role_name, ax.privilege_type
 # (same phantom-delta rationale as the table-grant query — the owner
 # always holds the privilege), grantee 0 rendered as PUBLIC.
 _COLUMN_GRANTS_SQL = """
-SELECT
+-- DISTINCT drops aclexplode's per-grantor multiplicity (see _GRANTS_SQL).
+SELECT DISTINCT
     c.oid AS table_oid,
     a.attname AS column_name,
     CASE WHEN ax.grantee = 0 THEN 'PUBLIC'

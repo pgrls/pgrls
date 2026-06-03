@@ -616,6 +616,42 @@ def test_introspect_captures_column_grants(
     assert all(cg.column in ("ssn", "note") for cg in t.column_grants)
 
 
+def test_introspect_grants_dedupe_multiple_grantors(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # R18 #2: aclexplode(relacl) returns one row per (grantor, grantee,
+    # privilege). When the SAME privilege is granted to one grantee by two
+    # grantors (the normal WITH GRANT OPTION re-grant), the query must NOT
+    # duplicate it into Grant.privileges — snapshot canonicality requires a
+    # set-like privilege list. _GRANTS_SQL's SELECT DISTINCT enforces this.
+    apply_sql(
+        """
+        DROP TABLE IF EXISTS public.dg_t;
+        DROP ROLE IF EXISTS dg_target;
+        DROP ROLE IF EXISTS dg_g1;
+        DROP ROLE IF EXISTS dg_g2;
+        CREATE ROLE dg_g1 NOLOGIN;
+        CREATE ROLE dg_g2 NOLOGIN;
+        CREATE ROLE dg_target NOLOGIN;
+        CREATE TABLE public.dg_t (id INT);
+        GRANT SELECT ON public.dg_t TO dg_g1 WITH GRANT OPTION;
+        GRANT SELECT ON public.dg_t TO dg_g2 WITH GRANT OPTION;
+        SET ROLE dg_g1;
+        GRANT SELECT ON public.dg_t TO dg_target;
+        RESET ROLE;
+        SET ROLE dg_g2;
+        GRANT SELECT ON public.dg_t TO dg_target;
+        RESET ROLE;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "dg_t")
+    grants_by_role = {g.role: g.privileges for g in t.grants}
+    # Two grantors → two aclexplode rows for (dg_target, SELECT); the
+    # captured privilege tuple must carry SELECT exactly once.
+    assert grants_by_role.get("dg_target") == ("SELECT",)
+
+
 def test_introspect_grants_resolve_public_pseudo_role(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
