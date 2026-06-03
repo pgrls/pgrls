@@ -3936,6 +3936,52 @@ def test_perf004_fix_abstains_on_user_defined_same_named_function() -> None:
     assert PERF004Fixer().fix(schema, {}) == []
 
 
+def test_perf004_fix_abstains_on_two_arg_length_encoding_overload() -> None:
+    # R16 #2: `length(bytea, name)` — the 2-arg form with an explicit
+    # source encoding — is STABLE (it performs an encoding conversion),
+    # while every 1-arg `length(...)` overload is IMMUTABLE. Postgres
+    # rejects a STABLE function in an index expression, so a fixer
+    # trusting the bare name `length` would emit a `CREATE INDEX
+    # (length(data, 'UTF8'))` that fails at apply and — under fix
+    # --apply's single all-or-nothing transaction — rolls back every
+    # other fix in the batch. The arity gate must make it ABSTAIN.
+    schema = Schema(tables=(_perf004_table(
+        _policy("length(data, 'UTF8') = current_setting('app.x')"),
+        columns=("id", "data"),
+        indexes=(_idx("data", name="users_data_idx"),),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_still_emits_for_single_arg_length() -> None:
+    # The arity gate must not over-abstain: the 1-arg `length(data)`
+    # overload IS IMMUTABLE and index-safe. This also proves the PERF004
+    # rule fires on the `length(<col>) = <stable>` shape, so the abstain
+    # above is genuinely "rule fires, fixer abstains" — not "undetected".
+    schema = Schema(tables=(_perf004_table(
+        _policy("length(data) = current_setting('app.x')"),
+        columns=("id", "data"),
+        indexes=(_idx("data", name="users_data_idx"),),
+    ),))
+    fixes = PERF004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql.endswith(" ON public.users (length(data));")
+
+
+def test_is_immutable_index_expr_arity_gate_for_length() -> None:
+    # Unit-level pin on the arity gate (R16 #2): the STABLE 2-arg
+    # `length(bytea, name)` overload is not index-safe; the IMMUTABLE
+    # 1-arg form is.
+    from pglast import parse_sql
+
+    from pgrls.fixers.perf004 import _is_immutable_index_expr
+
+    two_arg = parse_sql("SELECT length(data, 'UTF8')")[0].stmt.targetList[0].val
+    one_arg = parse_sql("SELECT length(data)")[0].stmt.targetList[0].val
+    assert _is_immutable_index_expr(two_arg) is False
+    assert _is_immutable_index_expr(one_arg) is True
+
+
 def test_perf004_fix_dedupes_expression_across_policies() -> None:
     # Two policies wrapping the same column in the same expression
     # → one CREATE INDEX, not two duplicates.

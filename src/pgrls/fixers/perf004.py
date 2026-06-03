@@ -119,6 +119,26 @@ _IMMUTABLE_INDEX_SAFE_FUNCS: frozenset[str] = frozenset({
 })
 
 
+# A handful of allowlisted builtins are IMMUTABLE in their common
+# overload but ship a non-IMMUTABLE overload selected by a DIFFERENT
+# argument count. `length(bytea, name)` (2-arg, with an explicit source
+# encoding) is STABLE — it performs an encoding conversion — whereas
+# every single-argument `length(...)` overload is IMMUTABLE. A
+# `CREATE INDEX (length(data, 'UTF8'))` is rejected by Postgres
+# ("functions in index expression must be marked IMMUTABLE") and, under
+# fix --apply's single all-or-nothing transaction, would roll back every
+# other fix in the batch. We can't resolve the overload by argument type
+# statically, but we CAN gate on arity: a name listed here is only
+# vouched-for at the argument counts whose every matching pg_catalog
+# overload is IMMUTABLE. (Verified against pg_proc: `length/2` is the
+# ONLY non-IMMUTABLE overload across the entire allowlist above —
+# char_length/character_length/octet_length/bit_length are IMMUTABLE in
+# all forms.) A name absent from this map is IMMUTABLE regardless of arity.
+_IMMUTABLE_SAFE_ARITIES: dict[str, frozenset[int]] = {
+    "length": frozenset({1}),
+}
+
+
 def _is_immutable_index_expr(node: Any) -> bool:
     """True iff `node` is safe to splice into a ``CREATE INDEX`` — i.e. the
     whole expression is built only from known-IMMUTABLE builtin functions,
@@ -145,6 +165,15 @@ def _is_immutable_index_expr(node: Any) -> bool:
         # immutable — a nested STABLE call (`lower(date_trunc(...))`) or a
         # value wrapper would equally make the index illegal.
         if qualified != bare and qualified != f"pg_catalog.{bare}":
+            return False
+        # Arity gate: a name with a non-IMMUTABLE overload at some other
+        # argument count (e.g. STABLE `length(bytea, name)`) is only
+        # safe at the vouched-for arities. Abstain otherwise rather than
+        # emit an index Postgres rejects.
+        allowed_arities = _IMMUTABLE_SAFE_ARITIES.get(bare)
+        if allowed_arities is not None and (
+            len(node.args or ()) not in allowed_arities
+        ):
             return False
         return _is_immutable_index_expr(node.args)
     if isinstance(node, (ColumnRef, A_Const)):
