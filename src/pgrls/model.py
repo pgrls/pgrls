@@ -733,6 +733,18 @@ def _policy_from_dict(p: dict[str, Any]) -> Policy:
 
 def _grant_from_dict(g: dict[str, Any]) -> Grant:
     privileges = tuple(g["privileges"])
+    if not privileges:
+        # A GRANT must name at least one privilege. `to_sql()` builds
+        # `GRANT {', '.join(privileges)} ON … TO …`, so an empty tuple
+        # emits `GRANT  ON … TO role;` — a syntax error that aborts the
+        # baseline setup `pgrls diff --apply` runs. Live introspection
+        # groups privileges by role (always >=1), so this only rejects a
+        # hand-built / tampered snapshot — reject at decode for a clean
+        # error at load, not a confusing parse failure at apply.
+        raise ValueError(
+            f"snapshot grant for role {g.get('role')!r} lists no "
+            "privileges; a GRANT must name at least one privilege."
+        )
     for priv in privileges:
         if (
             not isinstance(priv, str)

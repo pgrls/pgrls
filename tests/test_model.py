@@ -786,6 +786,17 @@ def test_from_snapshot_rejects_grant_privilege_injection() -> None:
         Schema.from_snapshot(snap)
 
 
+def test_from_snapshot_rejects_empty_grant_privileges() -> None:
+    # R13 #5: an empty privileges list would make to_sql() emit
+    # `GRANT  ON … TO role;` (double space), a syntax error that aborts
+    # the baseline `pgrls diff --apply` runs. Live introspection groups
+    # by role (always >=1 privilege), so this only guards a hand-built /
+    # tampered snapshot — reject at decode, not at apply.
+    snap = _minimal_snapshot(grants=[{"role": "r", "privileges": []}])
+    with pytest.raises(ValueError, match="no privileges"):
+        Schema.from_snapshot(snap)
+
+
 def test_from_snapshot_rejects_invalid_policy_command() -> None:
     snap = _minimal_snapshot(
         policies=[
