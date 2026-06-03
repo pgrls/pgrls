@@ -3544,6 +3544,35 @@ def test_fix_output_refuses_to_clobber_without_force(
     assert "ALTER TABLE public.fix_out_force FORCE ROW LEVEL SECURITY;" in text
 
 
+def test_fix_write_migration_passes_newline_empty(tmp_path, monkeypatch) -> None:
+    # R12 #7: the migration must be written with newline="" so the LF
+    # render_migration emits is byte-identical to the stdout dry-run and
+    # to `generate --output` across platforms (text mode on Windows
+    # rewrites \n -> \r\n otherwise). A byte-level test can't catch this
+    # on POSIX runners, so assert the write kwarg directly.
+    from pathlib import Path
+
+    from pgrls.cli import _fix_write_migration
+    from pgrls.fixers import Fix
+
+    captured: dict = {}
+    orig = Path.write_text
+
+    def spy(self, data, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return orig(self, data, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    fix = Fix(
+        rule_id="SEC002",
+        location="public.t",
+        sql="ALTER TABLE public.t FORCE ROW LEVEL SECURITY;",
+        description="enable FORCE row security",
+    )
+    _fix_write_migration([fix], str(tmp_path / "m.sql"), force=True)
+    assert captured.get("newline") == ""
+
+
 def test_fix_output_cannot_combine_with_apply(
     pg_url: str, tmp_path
 ) -> None:

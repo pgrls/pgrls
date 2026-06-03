@@ -1068,7 +1068,12 @@ def _fix_write_migration(
         )
     migration = render_migration(fixes, tool_version=__version__)
     try:
-        path.write_text(migration, encoding="utf-8")
+        # newline="" so the LF render_migration emits is written
+        # verbatim — without it, text mode on Windows rewrites \n to
+        # \r\n, making the file diverge byte-for-byte from the stdout
+        # dry-run and from `generate --output` (which already passes
+        # newline=""), breaking the documented determinism guarantee.
+        path.write_text(migration, encoding="utf-8", newline="")
     except OSError as exc:
         raise ToolError(
             f"cannot write fixes to {output_path}: {exc}"
