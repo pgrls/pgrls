@@ -229,11 +229,20 @@ def _unrooted_user_key(node: A_Expr, keys: set[str]) -> bool:
       ``… #>> '{user_metadata,role}'``                       → True  (hazard)
       ``… #>> '{app_metadata,user_metadata,role}'``          → False (safe)
 
-    Path-literal form: element ORDER decides the root — a user-writable
-    key is hazardous only if no server-controlled key precedes it. Arrow
-    form: the LEFT operand chain is the root — a `user_metadata` read whose
-    left side already selects `app_metadata` (or the `raw_app_meta_data`
-    column) lives inside the service-role object and isn't user-writable.
+    Both forms also consult the LEFT operand chain: a `user_metadata` read
+    whose left side already selects `app_metadata` (or the
+    `raw_app_meta_data` column) lives inside the service-role object and
+    isn't user-writable. For the path-literal form the element ORDER within
+    the `{…}` literal ALSO decides the root — a user-writable key is
+    hazardous only if no server-controlled key precedes it AND the left
+    operand doesn't already root in a server-controlled source:
+
+      ``auth.jwt() -> 'user_metadata' ->> 'role'``           → True  (hazard)
+      ``auth.jwt() -> 'app_metadata' -> 'user_metadata' …``  → False (safe)
+      ``… #>> '{user_metadata,role}'``                       → True  (hazard)
+      ``… #>> '{app_metadata,user_metadata,role}'``          → False (safe)
+      ``raw_app_meta_data #>> '{user_metadata,role}'``       → False (safe)
+      ``(jwt -> 'app_metadata') #>> '{user_metadata,role}'`` → False (safe)
     """
     sval = _extract_key_sval(node.rexpr)
     if sval is None:
@@ -241,6 +250,16 @@ def _unrooted_user_key(node: A_Expr, keys: set[str]) -> bool:
 
     path = _array_literal_keys(sval)
     if path:
+        # The left operand chain is root-ward of every path element, so a
+        # server-controlled root on the left makes the whole read safe —
+        # `raw_app_meta_data #>> '{user_metadata,…}'` or
+        # `(jwt -> 'app_metadata') #>> '{user_metadata,…}'`. (A user_metadata
+        # ROOT in the left chain is caught by the arrow node for it, so this
+        # never hides a genuine hazard.) Otherwise the intra-literal order
+        # decides: a user key is hazardous unless a safe-root key precedes
+        # it within the same literal.
+        if _is_server_controlled_root(node.lexpr):
+            return False
         for i, elem in enumerate(path):
             if elem in keys and not any(
                 e in _SAFE_ROOT_KEYS for e in path[:i]

@@ -367,3 +367,40 @@ def test_emits_one_violation_per_offending_policy() -> None:
         "public.docs.bad1",
         "public.docs.bad2",
     }
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # Regression (round-7): the #>>/#> PATH-operator spelling must honor
+        # a server-controlled root in the LEFT operand, like the arrow form.
+        # Reading from the service-role raw_app_meta_data column:
+        "raw_app_meta_data #>> '{user_metadata,role}' = 'admin'",
+        "raw_app_meta_data #> '{user_metadata,role}' IS NOT NULL",
+        # Left operand already selects the app_metadata root:
+        "(auth.jwt() -> 'app_metadata') #>> '{user_metadata,role}' = 'admin'",
+        # Safe root precedes the user key within the same path literal:
+        "auth.jwt() #>> '{app_metadata,user_metadata,role}' = 'admin'",
+    ],
+)
+def test_silent_on_path_operator_rooted_in_server_controlled(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="path_safe"))
+    assert SEC033().check(schema, {}) == [], expr
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # The genuine hazard: user_metadata read as a top-level claim via a
+        # path operator (nothing server-controlled root-ward of it).
+        "auth.jwt() #>> '{user_metadata,role}' = 'admin'",
+        # user_metadata is the ROOT even though app_metadata appears deeper
+        # — fires (via the arrow node for the user_metadata key).
+        "(auth.jwt() -> 'user_metadata' -> 'app_metadata') #>> '{role}' = 'admin'",
+    ],
+)
+def test_fires_on_path_operator_user_metadata_root(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="path_hazard"))
+    violations = SEC033().check(schema, {})
+    assert len(violations) == 1, expr
+    assert violations[0].location == "public.t.path_hazard"
