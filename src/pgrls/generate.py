@@ -36,7 +36,13 @@ from pgrls.fixers._idents import (
     quote_ident,
     quote_qualified,
 )
-from pgrls.model import Policy, Schema, Table, policy_to_sql
+from pgrls.model import (
+    Policy,
+    Schema,
+    Table,
+    _is_safe_data_type,
+    policy_to_sql,
+)
 
 Convention = Literal["app-guc", "postgrest", "supabase"]
 # What the discriminator scopes rows to: a tenant (per-tenant isolation) or
@@ -128,6 +134,20 @@ def session_predicate(
     escaped = setting.replace("'", "''")
     call = f"current_setting('{escaped}', true)"
     if coltype and coltype.lower() not in _TEXT_TYPES:
+        # `coltype` is spliced raw into a `::<type>` cast. It comes from
+        # live introspection (`format_type`), which is always a benign
+        # type expression — but route it through the same probe-parse
+        # validator the snapshot trust boundary uses, so the cast can
+        # never become an injection sink if a snapshot-fed source is
+        # added later. A real type (`uuid`, `numeric(10,2)`, `text[]`,
+        # `"My Type"`) passes; a tampered `uuid); DROP …` is rejected.
+        if not _is_safe_data_type(coltype):
+            raise ValueError(
+                f"refusing to build a cast from an unsafe column type "
+                f"{coltype!r} for column {column!r}: it does not parse as a "
+                "single bare column type. This should never happen for a "
+                "type read from live introspection."
+            )
         call = f"{call}::{coltype}"
     return f"{qcol} = (SELECT {call})"
 

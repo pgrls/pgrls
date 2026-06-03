@@ -57,6 +57,7 @@ function names (`schema.function`). An entry silences every overload.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pgrls.fixers import Fix
@@ -65,21 +66,66 @@ from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_qualified_function_allowlist
 from pgrls.rules.sec015 import _is_pg_temp_safe
 
+# A search_path entry is safe to splice verbatim into `SET search_path =
+# …` only if it cannot carry statement-terminating punctuation or a
+# comment. Two benign shapes:
+#   * a bare SQL identifier — letters/digits/underscore/`$`, not starting
+#     with a digit (covers `public`, `pg_catalog`, `pg_temp`); and
+#   * the special `$user` placeholder.
+# A double-quoted identifier (`"My Schema"`, `"$user"`) is handled
+# separately — the surrounding quotes neutralize any interior
+# punctuation, so a `;` inside quotes names a schema rather than ending
+# the statement.
+_BARE_PATH_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _is_safe_path_token(tok: str) -> bool:
+    """True iff `tok` is a benign search_path element (see above)."""
+    if tok == "$user":
+        return True
+    if _BARE_PATH_TOKEN.match(tok):
+        return True
+    # Double-quoted identifier: opens and closes with `"`, and every
+    # interior `"` is doubled (`""`). Strip the doubled quotes, then the
+    # remainder must contain no lone `"` — otherwise the closing quote is
+    # spurious and punctuation after it would be unquoted SQL.
+    if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+        return '"' not in tok[1:-1].replace('""', "")
+    return False
+
 
 def _safe_to_rewrite(search_path: str) -> bool:
-    """Detect the documented quoted-comma corner case the naive
-    comma-split tokenizer can't handle. A search_path containing
-    both `"` and `,` *might* be a quoted schema with an inner
-    comma; the fixer abstains rather than emit a wrong rewrite.
+    """Whether the fixer can safely rebuild this search_path.
 
-    Conservative: a path like `"weird_schema", public` (no inner
-    comma in the quoted name) also abstains. That's a false-negative
-    on rewrite, never a false-positive — the operator simply runs
-    the rule's allowlist or hand-fixes the function. Better than
-    silently rewriting `"My, Schema"` → `My, Schema, pg_temp` and
-    losing the original schema.
+    Two abstain conditions, both conservative (a false-negative on
+    rewrite is harmless — the operator allowlists or hand-fixes the
+    function — while a wrong/unsafe rewrite is not):
+
+    1. **Quoted-comma ambiguity.** A path containing both `"` and `,`
+       *might* be a quoted schema with an inner comma the naive
+       comma-split would mis-tokenize. Abstain (so `"My, Schema",
+       public` is never silently flattened to `My, Schema, pg_temp`).
+       A path like `"weird_schema", public` (no inner comma) also
+       abstains — acceptable over-caution.
+
+    2. **Unsafe token (snapshot trust boundary).** A snapshot's
+       `proconfig` is replayed into the emitted `ALTER FUNCTION … SET
+       search_path = …`. A poisoned value such as
+       `public; DROP TABLE t; --` would otherwise be spliced verbatim.
+       Abstain unless every comma-token is a benign identifier
+       (`_is_safe_path_token`). Live introspection always yields
+       well-formed tokens, so this only ever rejects a hand-edited /
+       tampered snapshot.
     """
-    return not ('"' in search_path and ',' in search_path)
+    if '"' in search_path and ',' in search_path:
+        return False
+    for raw in search_path.split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        if not _is_safe_path_token(tok):
+            return False
+    return True
 
 
 def _rewritten_path(existing: str | None) -> str:

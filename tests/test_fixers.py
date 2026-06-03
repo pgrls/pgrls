@@ -2051,6 +2051,46 @@ def test_sec015_fix_abstains_on_quoted_comma_search_path() -> None:
     assert SEC015Fixer().fix(schema, {}) == []
 
 
+def test_sec015_fix_abstains_on_injection_in_search_path_token() -> None:
+    # A snapshot is a trust boundary: a tampered proconfig value with a
+    # statement-terminating token must NOT be spliced verbatim into the
+    # emitted `ALTER FUNCTION … SET search_path = …`. The fixer abstains
+    # (the SEC015 finding still fires for the operator); no DDL is built
+    # from the poisoned token.
+    for poisoned in (
+        "public; DROP TABLE secrets; --",  # bare token w/ terminator
+        "public, evil; DROP TABLE t",      # second token unsafe
+        "public-- comment",                 # bare token w/ comment
+    ):
+        schema = Schema(
+            security_definer_functions=(
+                _secdef(
+                    "public.f",
+                    signature="integer",
+                    search_path=poisoned,
+                ),
+            ),
+        )
+        assert SEC015Fixer().fix(schema, {}) == [], poisoned
+
+
+def test_sec015_fix_rewrites_quoted_identifier_without_comma() -> None:
+    # A single double-quoted schema (no comma) is a benign token — the
+    # surrounding quotes neutralize any interior punctuation — so the
+    # fixer still rewrites it, pinning pg_temp last.
+    schema = Schema(
+        security_definer_functions=(
+            _secdef(
+                "public.f",
+                signature="integer",
+                search_path='"My Schema"',
+            ),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert 'SET search_path = "My Schema", pg_temp;' in f.sql
+
+
 def test_sec015_fix_emits_per_overload() -> None:
     schema = Schema(
         security_definer_functions=(

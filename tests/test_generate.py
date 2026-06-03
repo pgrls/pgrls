@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from pgrls.cli import main
@@ -49,6 +50,24 @@ def test_predicate_postgrest_convention() -> None:
     assert (
         p
         == "tenant_id = (SELECT current_setting('request.jwt.claim.tenant_id', true)::uuid)"
+    )
+
+
+def test_predicate_rejects_unsafe_column_type_cast() -> None:
+    # `coltype` is spliced into a `::<type>` cast. A type that doesn't
+    # parse as a single bare column type (an injection payload, or a
+    # tampered snapshot value should a snapshot-fed path ever be added)
+    # must be refused, not emitted.
+    with pytest.raises(ValueError, match="unsafe column type"):
+        session_predicate("tenant_id", "uuid); DROP TABLE t; --", GenerateOptions())
+
+
+def test_predicate_allows_parenthesized_real_type_cast() -> None:
+    # A legitimate parameterized type (commas/parens are part of a real
+    # type) passes the validator and casts normally.
+    p = session_predicate("amount", "numeric(10,2)", GenerateOptions())
+    assert p == (
+        "amount = (SELECT current_setting('app.amount', true)::numeric(10,2))"
     )
 
 

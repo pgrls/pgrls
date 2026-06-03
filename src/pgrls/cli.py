@@ -1514,7 +1514,14 @@ def generate(
         database_url=database_url,
         schemas_csv=schemas,
     ) as (effective, conn, schema):
-        result = plan_generation(schema, options)
+        try:
+            result = plan_generation(schema, options)
+        except ValueError as exc:
+            # session_predicate rejects an unsafe column type before it
+            # can reach a `::<type>` cast (defense-in-depth on the
+            # introspected type). Surface it as a clean CLI error rather
+            # than a traceback.
+            raise ToolError(str(exc)) from exc
 
         # Advisory notes + skipped tables → stderr (never pollutes the
         # SQL on stdout / in the migration file).
