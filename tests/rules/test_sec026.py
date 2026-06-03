@@ -364,6 +364,41 @@ def test_sec026_silent_when_policy_has_no_predicates() -> None:
     assert SEC026().check(schema, options={}) == []
 
 
+def test_sec026_silent_on_ltree_match_against_auth_value() -> None:
+    # Regression (#15): `~` is also the ltree/lquery match operator.
+    # `path ~ (<auth>)::lquery` is a typed ltree match, NOT a text
+    # regex pattern — must not fire.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="(path ~ (current_setting('app.q', true))::lquery)"
+                )
+            ),
+        )
+    )
+    assert SEC026().check(schema, options={}) == []
+
+
+def test_sec026_silent_on_geometric_contains_against_auth_value() -> None:
+    # Regression (#15): `~` is also the geometric "contains" operator.
+    # An operand built via a point() constructor from an auth GUC is a
+    # geometric value, not a text regex pattern — must not fire.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "(region ~ point("
+                        "current_setting('app.x', true)::float8, 0))"
+                    )
+                )
+            ),
+        )
+    )
+    assert SEC026().check(schema, options={}) == []
+
+
 # --- allowlist / configuration ------------------------------------------
 
 

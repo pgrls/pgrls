@@ -102,7 +102,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, Node, String
+from pglast.ast import A_Expr, FuncCall, Node, String, TypeCast
 
 from pgrls.ast_utils import find_func_calls
 from pgrls.model import Policy, Schema
@@ -193,6 +193,39 @@ def _is_pattern_expr(node: A_Expr) -> bool:
     return name is not None and name in _PATTERN_OP_NAMES
 
 
+# `~` and `!~` are POSIX regex match on text, but they are ALSO the
+# geometric "contains" operator and the ltree/lquery match operator.
+# When SEC026's auth value is cast to (or constructed as) one of these
+# non-text types, the operator is a typed containment/match — not a
+# regex pattern — and the rule must not fire (false positive). The LIKE
+# family (`~~`/`~~*`/`!~~`/`!~~*`) and case-insensitive regex (`~*`/
+# `!~*`) are text-only and never overloaded, so they are not guarded.
+_OVERLOADED_REGEX_OPS: frozenset[str] = frozenset({"~", "!~"})
+_NON_TEXT_PATTERN_TYPES: frozenset[str] = frozenset({
+    "point", "box", "circle", "polygon", "path", "line", "lseg",
+    "ltree", "lquery", "ltxtquery",
+})
+
+
+def _is_non_text_typed(side: Any) -> bool:
+    """True if `side`'s top node casts to — or constructs — a non-text
+    type (geometric / ltree), i.e. the operand of a geometric/ltree
+    `~`, not a text regex pattern."""
+    if isinstance(side, TypeCast):
+        names = [
+            s.sval
+            for s in (side.typeName.names or ())
+            if isinstance(s, String)
+        ]
+        return bool(names) and names[-1] in _NON_TEXT_PATTERN_TYPES
+    if isinstance(side, FuncCall):
+        fnames = [
+            s.sval for s in (side.funcname or ()) if isinstance(s, String)
+        ]
+        return bool(fnames) and fnames[-1] in _NON_TEXT_PATTERN_TYPES
+    return False
+
+
 def _side_has_auth_call(side: Any, names: set[str]) -> bool:
     """True if `side` (an operand of an A_Expr) contains an
     auth-context function call.
@@ -225,9 +258,16 @@ def _has_pattern_against_auth(node: Any, names: set[str]) -> bool:
         if isinstance(n, (list, tuple)):
             return any(walk(item) for item in n)
         if isinstance(n, A_Expr) and _is_pattern_expr(n):
-            if _side_has_auth_call(n.lexpr, names) or _side_has_auth_call(
-                n.rexpr, names
-            ):
+            overloaded = _expr_name(n) in _OVERLOADED_REGEX_OPS
+            for side in (n.lexpr, n.rexpr):
+                if not _side_has_auth_call(side, names):
+                    continue
+                # `~` / `!~` double as geometric "contains" and the
+                # ltree/lquery match operator. If the auth value is
+                # cast to / built as a non-text type, this isn't a
+                # regex pattern match — skip that side (false positive).
+                if overloaded and _is_non_text_typed(side):
+                    continue
                 return True
             # fall through — the A_Expr may have nested A_Expr
             # nodes deeper in its operands.
