@@ -1,6 +1,7 @@
 """Read RLS-relevant state from `pg_catalog` into a normalized Schema."""
 from __future__ import annotations
 
+import sys
 from collections import defaultdict
 from typing import Any, cast
 
@@ -812,16 +813,38 @@ def _build_secdef_calls_index(
         key = (row["schema_name"], row["view_name"])
         try:
             parsed = pglast.parse_sql(row["definition"])
+            if not parsed:
+                out[key] = ()
+                continue
+            matches = find_func_calls(parsed[0].stmt, name_set)
         except pglast.parser.ParseError:
             # An unparseable view body is not a fatal error for
             # introspection — skip SECDEF detection for this view
             # (other rules still see its references / flags).
             out[key] = ()
             continue
-        if not parsed:
+        except RecursionError:
+            # A pathologically deep view body (~1000+ nested calls)
+            # parses fine in pglast's C parser but blows Python's
+            # recursion limit inside the pure-Python find_func_calls
+            # walk. RecursionError subclasses RuntimeError (not
+            # ParseError), so without this guard it escapes introspect()
+            # and crashes pgrls with a raw traceback instead of degrading
+            # — and this path is reached on the common schema that has a
+            # SECURITY DEFINER function. Skip SECDEF attribution for this
+            # one view (mirrors the rule-time walk guard in
+            # cli._run_rules) rather than aborting all introspection.
+            # Under-attribution here means a possibly-missed VIEW004 leak
+            # candidate; the view is named on stderr so the operator can
+            # follow up.
+            print(
+                f"pgrls: warning: skipping SECURITY DEFINER call detection "
+                f"for view {key[0]}.{key[1]}: body too deeply nested to "
+                f"walk.",
+                file=sys.stderr,
+            )
             out[key] = ()
             continue
-        matches = find_func_calls(parsed[0].stmt, name_set)
         found: set[str] = set()
         for m in matches:
             # `find_func_calls` may also return `SQLValueFunction`

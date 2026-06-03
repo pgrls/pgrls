@@ -1777,3 +1777,43 @@ def test_secdef_calls_index_does_not_misattribute_qualified_other_schema() -> No
           "definition": "SELECT public.read_secret() AS s;"}],
     )
     assert exact[("public", "v")] == ("public.read_secret",)
+
+
+def test_secdef_calls_index_degrades_on_deeply_nested_view_body(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # R14 #2: a pathologically deep view body (~1000+ nested calls)
+    # parses fine in pglast's C parser but blows Python's recursion limit
+    # inside the pure-Python find_func_calls walk. RecursionError is a
+    # RuntimeError (not a ParseError), so before the guard it escaped
+    # introspect() and crashed pgrls. The path is only reached when a
+    # SECURITY DEFINER function exists (the common Supabase/PostgREST
+    # case). It must degrade: skip that one view's SECDEF attribution and
+    # warn, not abort all introspection.
+    from pgrls.introspect import _build_secdef_calls_index
+    from pgrls.model import SecdefFunction
+
+    body = "id"
+    for _ in range(3000):
+        body = f"read_secret({body})"
+    deep = f"SELECT {body} AS x"
+
+    secdef = (
+        SecdefFunction(
+            qualified_name="public.read_secret", body="SELECT 1",
+            language="sql",
+        ),
+    )
+    index = _build_secdef_calls_index(
+        secdef,
+        [
+            {"schema_name": "public", "view_name": "deep", "definition": deep},
+            # A normal sibling view in the same batch still resolves —
+            # the guard skips only the offending view.
+            {"schema_name": "public", "view_name": "ok",
+             "definition": "SELECT read_secret() AS s;"},
+        ],
+    )
+    assert index[("public", "deep")] == ()  # degraded, no crash
+    assert index[("public", "ok")] == ("public.read_secret",)
+    assert "public.deep" in capsys.readouterr().err  # warned, named the view
