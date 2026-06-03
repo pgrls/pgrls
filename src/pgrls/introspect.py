@@ -829,11 +829,21 @@ def _build_secdef_calls_index(
             qualified = ".".join(parts)
             if qualified in secdef_qnames:
                 found.add(qualified)
-            else:
-                # Over-report: a bare call to a name shared by SECDEF
-                # functions in multiple schemas feeds ALL of them to
-                # VIEW004 so the leaking overload is never silently
-                # skipped (see the bare_to_quals comment above).
+            elif len(parts) == 1:
+                # Over-report ONLY for a genuinely UNQUALIFIED call: its
+                # target depends on the runtime search_path, so feed ALL
+                # SECDEF functions sharing the bare name to VIEW004 (the
+                # leaking overload is never silently skipped — see the
+                # bare_to_quals comment above).
+                #
+                # A QUALIFIED call (`other.read_secret()`) names exactly
+                # one function with no search_path ambiguity. If that
+                # exact qualified name is not a SECDEF function it is a
+                # non-match and must be dropped — NOT expanded to a
+                # same-bare-name SECDEF in another schema, which would
+                # taint every view in the database calling any
+                # `<schema>.read_secret()` (a false positive that also
+                # persists into the snapshot's security_definer_calls).
                 found.update(bare_to_quals.get(parts[-1], ()))
         out[key] = tuple(sorted(found))
     return out

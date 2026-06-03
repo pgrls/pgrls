@@ -1719,3 +1719,44 @@ def test_secdef_calls_index_attributes_all_same_bare_name_candidates() -> None:
           "definition": "SELECT public.helper() AS h;"}],
     )
     assert qualified[("public", "v")] == ("public.helper",)
+
+
+def test_secdef_calls_index_does_not_misattribute_qualified_other_schema() -> None:
+    # Regression (round-11 #2): a view calls a fully-qualified
+    # `other.read_secret()` that shares ONLY its bare name with the real
+    # SECDEF `public.read_secret`. A qualified call names exactly one
+    # function (no search_path ambiguity), so when that exact name is not
+    # a SECDEF function the call must be dropped — NOT expanded to the
+    # same-bare-name SECDEF in another schema. Otherwise a single SECDEF
+    # helper taints every view in the DB calling any
+    # `<schema>.read_secret()` (a false positive persisted into the
+    # snapshot). The bare-name over-report applies to UNQUALIFIED calls
+    # only.
+    from pgrls.introspect import _build_secdef_calls_index
+    from pgrls.model import SecdefFunction
+
+    secdef = (
+        SecdefFunction(
+            qualified_name="public.read_secret", body="SELECT 1",
+            language="sql",
+        ),
+    )
+    index = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT other.read_secret() AS s;"}],
+    )
+    assert index[("public", "v")] == ()
+    # Sanity: the bare call and the matching qualified call still attach.
+    bare = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT read_secret() AS s;"}],
+    )
+    assert bare[("public", "v")] == ("public.read_secret",)
+    exact = _build_secdef_calls_index(
+        secdef,
+        [{"schema_name": "public", "view_name": "v",
+          "definition": "SELECT public.read_secret() AS s;"}],
+    )
+    assert exact[("public", "v")] == ("public.read_secret",)
