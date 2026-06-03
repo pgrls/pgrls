@@ -389,7 +389,19 @@ class CoverageReport:
         covered = sum(1 for p in self.policies if p.covered)
         # No policies → nothing to cover → 100% (vacuously). Avoids a
         # division-by-zero and reads as "no gaps" in CI gates.
-        pct = 100.0 if total == 0 else round(100.0 * covered / total, 1)
+        #
+        # For partial coverage, never let the 1-dp display round to a
+        # misleading 100.0 (or 0.0): 9999/10000 = 99.99% must not read as
+        # "100.0%" when a policy is uncovered. Clamp the displayed value
+        # into the open interval (0, 100) and reserve the exact endpoints
+        # for genuinely full / empty coverage. The CI gate compares the
+        # raw fraction (see `pgrls coverage --fail-under`), not this value.
+        if total == 0 or covered == total:
+            pct = 100.0
+        elif covered == 0:
+            pct = 0.0
+        else:
+            pct = min(99.9, max(0.1, round(100.0 * covered / total, 1)))
         return {
             "policies": total,
             "covered": covered,

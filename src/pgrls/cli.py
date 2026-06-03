@@ -3101,10 +3101,17 @@ def coverage(
     rendered = render_coverage(report, output_format)
     _emit(rendered, output_path)
 
-    pct = report.summary["coverage_pct"]
-    if fail_under is not None and pct < fail_under:
+    # Gate on the RAW fraction, not the 1-dp display value: 9999/10000 =
+    # 99.99% rounds to 100.0 and would slip past --fail-under 100 even
+    # though a policy is uncovered.
+    summary = report.summary
+    total_policies = summary["policies"]
+    covered = summary["covered"]
+    raw_pct = 100.0 if total_policies == 0 else 100.0 * covered / total_policies
+    if fail_under is not None and raw_pct < fail_under:
         click.echo(
-            f"pgrls: coverage {pct}% is below --fail-under {fail_under}%.",
+            f"pgrls: coverage {covered}/{total_policies} policies "
+            f"({raw_pct:.2f}%) is below --fail-under {fail_under}%.",
             err=True,
         )
         sys.exit(1)

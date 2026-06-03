@@ -344,6 +344,28 @@ def test_summary_no_policies_is_fully_covered() -> None:
     }
 
 
+def test_summary_partial_coverage_never_displays_misleading_100() -> None:
+    # 1999/2000 = 99.95% rounds to 100.0 at one decimal place. The display
+    # must NOT read as full coverage when a policy is uncovered — clamp it
+    # below 100 so "100.0%" means exactly that.
+    report = CoverageReport(
+        policies=tuple(
+            PolicyCoverage(
+                schema="public",
+                table="t",
+                policy=f"p{i}",
+                command="SELECT",
+                roles=("r",),
+                covered=i != 0,
+            )
+            for i in range(2000)
+        )
+    )
+    s = report.summary
+    assert (s["policies"], s["covered"], s["uncovered"]) == (2000, 1999, 1)
+    assert s["coverage_pct"] == 99.9  # not 100.0
+
+
 # ---------- renderers ----------
 
 
@@ -470,6 +492,37 @@ def test_cli_coverage_reports_and_fail_under(tmp_path) -> None:
         tmp_path, ["--coverage", path, "--fail-under", "50"], schema=schema
     )
     assert res3.exit_code == 0, res3.output
+
+
+def test_cli_coverage_fail_under_compares_raw_not_rounded(tmp_path) -> None:
+    # Regression: the gate compared the 1-dp display value, so a coverage
+    # that rounds up to the threshold slipped past. 2/3 = 66.67% displays
+    # as 66.7%, so --fail-under 66.7 passed under the old (rounded) gate;
+    # the raw fraction 66.67 < 66.7 must fail.
+    path = str(tmp_path / "cov.json")
+    write_artifact(
+        path,
+        [
+            ExercisedTuple(None, "invoices", "r", "SELECT"),
+            ExercisedTuple(None, "invoices", "r", "INSERT"),
+        ],
+        generated_at=_AWARE,
+    )
+    schema = _one_table_schema(
+        _policy("sel", "SELECT", ("r",)),
+        _policy("ins", "INSERT", ("r",)),
+        _policy("del", "DELETE", ("r",)),  # never exercised → 2/3 covered
+    )
+    res = _run_coverage(
+        tmp_path, ["--coverage", path, "--fail-under", "66.7"], schema=schema
+    )
+    assert res.exit_code == 1, res.output
+    assert "below --fail-under" in res.output
+    # The raw 66.67% still clears a threshold strictly below it.
+    res2 = _run_coverage(
+        tmp_path, ["--coverage", path, "--fail-under", "66.6"], schema=schema
+    )
+    assert res2.exit_code == 0, res2.output
 
 
 def test_cli_lint_coverage_enables_hyg004(tmp_path) -> None:
