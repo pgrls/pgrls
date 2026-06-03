@@ -399,6 +399,42 @@ def test_sec026_silent_on_geometric_contains_against_auth_value() -> None:
     assert SEC026().check(schema, options={}) == []
 
 
+def test_sec026_silent_on_column_side_lquery_cast_against_auth_value() -> None:
+    # Regression (R9 #9): `~` is the ltree/lquery match operator when
+    # EITHER operand is non-text-typed. The non-text cast may sit on the
+    # COLUMN side — `(path::lquery) ~ current_setting(...)` — not just on
+    # the auth-value side. The earlier guard only inspected the auth-value
+    # operand, so a column-side cast slipped through as a false positive.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "(path::lquery) ~ current_setting('app.x', true)"
+                    )
+                )
+            ),
+        )
+    )
+    assert SEC026().check(schema, options={}) == []
+
+
+def test_sec026_still_fires_on_plain_text_regex_against_auth_value() -> None:
+    # Guard against over-suppression from the both-operands check: a
+    # genuine text `~` regex against an auth value must still fire.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="user_email ~ current_setting('app.email', true)"
+                )
+            ),
+        )
+    )
+    [v] = SEC026().check(schema, options={})
+    assert v.rule_id == "SEC026"
+
+
 # --- allowlist / configuration ------------------------------------------
 
 

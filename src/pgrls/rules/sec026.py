@@ -315,14 +315,20 @@ def _has_pattern_against_auth(node: Any, names: set[str]) -> bool:
             return any(walk(item) for item in n)
         if isinstance(n, A_Expr) and _is_pattern_expr(n):
             overloaded = _expr_name(n) in _OVERLOADED_REGEX_OPS
-            for side in (n.lexpr, n.rexpr):
+            for side, other in ((n.lexpr, n.rexpr), (n.rexpr, n.lexpr)):
                 if not _side_has_auth_call(side, names):
                     continue
                 # `~` / `!~` double as geometric "contains" and the
-                # ltree/lquery match operator. If the auth value is
-                # cast to / built as a non-text type, this isn't a
-                # regex pattern match — skip that side (false positive).
-                if overloaded and _is_non_text_typed(side):
+                # ltree/lquery match operator. If EITHER operand is cast
+                # to / built as a non-text type, this isn't a text regex
+                # match — skip (false positive). The non-text cast may
+                # sit on the auth-value side
+                # (`current_setting(...)::lquery ~ col`) OR on the
+                # column side (`(path::lquery) ~ current_setting(...)`),
+                # so both operands must be checked.
+                if overloaded and (
+                    _is_non_text_typed(side) or _is_non_text_typed(other)
+                ):
                     continue
                 return True
             # fall through — the A_Expr may have nested A_Expr

@@ -389,6 +389,37 @@ def test_sec038_message_describes_unconditional_anon_leak() -> None:
     assert "SEC004" in msg
 
 
+def test_sec038_message_caveats_one_arg_current_setting() -> None:
+    # R9 #10: the one-arg `current_setting('app.x')` RAISES when the GUC
+    # is unset (it doesn't return NULL), so for an unconfigured anon
+    # session the policy may ERROR rather than read every row. SEC038
+    # still fires (the inverted-auth shape is unsound), but the message
+    # must acknowledge the error-vs-leak nuance accurately.
+    schema = _wrap(
+        _policy_with_using(
+            f"current_setting('app.x') IS NULL OR {_OWNER_LIT}"
+        )
+    )
+    [v] = SEC038().check(schema, {})
+    msg = v.message
+    assert "one-argument current_setting" in msg
+    assert "unrecognized configuration parameter" in msg
+    # Still firing and still pointing at the real fix.
+    assert "SEC004" in msg
+
+
+def test_sec038_message_omits_caveat_for_two_arg_current_setting() -> None:
+    # The two-arg `current_setting(name, true)` returns NULL when unset
+    # (genuinely leaks, no error), so the one-arg caveat must NOT appear.
+    schema = _wrap(
+        _policy_with_using(
+            f"(SELECT current_setting('app.x', true)) IS NULL OR {_OWNER_LIT}"
+        )
+    )
+    [v] = SEC038().check(schema, {})
+    assert "one-argument current_setting" not in v.message
+
+
 def test_sec038_noop_when_z3_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     # HARD-CONSTRAINT regression guard: SEC038 must NO-OP when z3 is absent.
     # This test does NOT skip — it runs even where z3 IS installed, by

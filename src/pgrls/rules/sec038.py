@@ -61,6 +61,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pglast.ast import FuncCall, Node, String
+
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -92,6 +94,38 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
     return set(raw)
 
 
+def _has_one_arg_current_setting(node: Any) -> bool:
+    """True if the predicate calls the *one-argument* ``current_setting``.
+
+    `current_setting('app.x')` RAISES `unrecognized configuration
+    parameter` when the GUC is unset, whereas `current_setting('app.x',
+    true)` returns NULL. SEC038's 3VL model treats current_setting as
+    anon-NULL; for the one-arg form the practical anon outcome is a
+    query *error*, not an unconditional read. Detecting it lets the
+    message stay accurate without changing the (correct) decision to
+    fire on the inverted-auth shape.
+    """
+
+    def walk(n: Any) -> bool:
+        if n is None:
+            return False
+        if isinstance(n, (list, tuple)):
+            return any(walk(item) for item in n)
+        if isinstance(n, FuncCall):
+            fname = [
+                s.sval for s in (n.funcname or ()) if isinstance(s, String)
+            ]
+            if fname and fname[-1] == "current_setting" and len(n.args or ()) == 1:
+                return True
+        if isinstance(n, Node):
+            for field_name in n:
+                if walk(getattr(n, field_name, None)):
+                    return True
+        return False
+
+    return walk(node)
+
+
 def _format_message(policy: Any, table: Any, witness: dict[str, object]) -> str:
     head = (
         f"Policy {policy.name!r} on {table.qualified_name} leaks every row "
@@ -116,6 +150,26 @@ def _format_message(policy: Any, table: Any, witness: dict[str, object]) -> str:
             " Every row is visible unconditionally (the predicate is "
             "constant-true under anon — it pins no row column)."
         )
+    # The 3VL model treats current_setting() as anon-NULL. That holds
+    # for the two-arg `current_setting(name, true)` form (returns NULL
+    # when unset). The ONE-arg `current_setting(name)` instead RAISES
+    # `unrecognized configuration parameter` when unset — so for an
+    # unconfigured anonymous session the policy may ERROR rather than
+    # read every row. The inverted-auth shape is still unsound and must
+    # be fixed (a configured session, or a switch to the two-arg form,
+    # leaks unconditionally), so SEC038 still fires — but say so plainly.
+    if _has_one_arg_current_setting(policy.using_ast):
+        caveat = (
+            " Note: this predicate uses the one-argument current_setting(), "
+            "which RAISES `unrecognized configuration parameter` when the "
+            "setting is unset rather than returning NULL — so an "
+            "unconfigured anonymous session may error rather than read "
+            "every row. The shape is still unsound (a configured session, "
+            "or the two-argument current_setting(name, true) form, leaks "
+            "unconditionally), so fix it regardless."
+        )
+    else:
+        caveat = ""
     fix = (
         " Gate the policy on a non-null auth check (e.g. "
         "`auth.uid() IS NOT NULL AND <tenant/owner check>`) or remove the "
@@ -123,7 +177,7 @@ def _format_message(policy: Any, table: Any, witness: dict[str, object]) -> str:
         "form of the SEC004 inverted-auth hole — see SEC004 for the "
         "syntactic variant."
     )
-    return head + artifact + fix
+    return head + artifact + caveat + fix
 
 
 class SEC038:
