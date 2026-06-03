@@ -20,6 +20,7 @@ from pgrls.coverage import (
     is_policy_covered,
     load_artifact,
     render,
+    render_html,
     render_markdown,
     render_text,
     write_artifact,
@@ -449,6 +450,30 @@ def test_render_text_newline_in_location_and_role_no_split() -> None:
     assert len(data_lines) == 1
     assert "public.invoices.pol\\nicy" in data_lines[0]
     assert "ro\\nle,two" in data_lines[0]
+
+
+def test_render_empty_report_across_formats() -> None:
+    # R17 #2 (coverage): the no-policies branches of the renderers are
+    # reachable whenever `pgrls coverage` runs against a schema with zero
+    # policies, yet shipped untested. Pin each renderer's empty state so a
+    # future refactor of the shared render / HTML helpers can't silently
+    # break the no-policies output (malformed HTML, stale message).
+    report = CoverageReport(policies=())
+    # Empty coverage is vacuously 100% (no gaps).
+    assert report.summary["coverage_pct"] == 100.0
+    # Text: the early no-policies sentinel (no table emitted).
+    assert render_text(report) == "No policies found in the scanned schemas."
+    # Markdown: a well-formed table header + heading, no body rows.
+    md = render_markdown(report)
+    assert "# RLS test coverage" in md
+    assert "| Policy | Command | Roles | Covered |" in md
+    assert "|---|---|---|---|" in md
+    # HTML: the colspan empty row, the sentinel text, and the 100.0%
+    # summary. generated_at must be timezone-aware.
+    html_out = render_html(report, generated_at=_AWARE)
+    assert '<td colspan="4" class="empty">' in html_out
+    assert "No policies found in the scanned schemas." in html_out
+    assert "100.0%" in html_out
 
 
 # ---------- CLI command (mocked introspection) ----------
