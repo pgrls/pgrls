@@ -45,6 +45,7 @@ import sys
 from typing import Any
 
 import pglast
+from pglast.ast import CommonTableExpr, Node
 
 from pgrls.ast_utils import extract_range_vars
 from pgrls.model import Schema
@@ -54,6 +55,39 @@ from pgrls.violations import Severity, Violation
 
 def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     return parse_qualified_view_allowlist('VIEW004', options)
+
+
+def _cte_names(node: Any) -> set[str]:
+    """Collect every CTE name (`WITH <name> AS …`) defined in `node`.
+
+    A reference to a CTE parses as an *unqualified* RangeVar whose
+    relname is the CTE name — it is NOT a base-table reference, and in
+    Postgres a CTE name shadows a same-named table within its scope. A
+    SECDEF function body `WITH "orders" AS (...) SELECT * FROM "orders"`
+    reads the inline CTE, not the RLS-protected `public.orders`; without
+    this guard the bare `orders` ref would be misattributed to every
+    RLS-protected table sharing that bare name (a false positive, since
+    bare refs over-report by design). Mirrors SEC025's CTE-shadow guard.
+    """
+    names: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, CommonTableExpr):
+            ctename = getattr(n, "ctename", None)
+            if isinstance(ctename, str) and ctename:
+                names.add(ctename)
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return names
 
 
 def _secdef_fn_leaks(
@@ -128,11 +162,21 @@ def _secdef_fn_leaks(
     # `SELECT 1; SELECT * FROM secret;`). Walk every parsed RawStmt —
     # the leaking SELECT could be at any position.
     for raw_stmt in parsed:
+        # CTE names defined within THIS statement shadow same-named
+        # tables in its scope. Collect per-statement (not across the
+        # whole body) so a CTE in one statement can't suppress a real
+        # bare-ref leak in another — a security rule must not
+        # under-attribute.
+        cte_names = _cte_names(raw_stmt.stmt)
         range_vars = extract_range_vars(raw_stmt.stmt)
         for sname, tname in range_vars:
             if sname is not None:
                 if (sname, tname) in rls_tables:
                     leaked.add(f"{sname}.{tname}")
+            elif tname in cte_names:
+                # An unqualified ref to a CTE defined in this statement —
+                # Postgres resolves it to the CTE, not the base table.
+                continue
             elif tname in bare_table_to_qual:
                 for s, n in bare_table_to_qual[tname]:
                     leaked.add(f"{s}.{n}")
