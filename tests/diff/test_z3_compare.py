@@ -888,6 +888,29 @@ def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
     assert counterexample(cc, cc) is None
 
 
+def test_reserved_marker_prefix_column_cannot_alias_the_null_marker() -> None:
+    # R15 #3: the synthetic NULL marker for column `x` is minted as
+    # z3.Bool("_isnull__x"); a REAL column literally named `_isnull__x`
+    # (legal via a quoted identifier) is bound as z3.Const("_isnull__x",
+    # Bool) and — since Z3 keys a constant by name+sort — would alias the
+    # marker in the `base AND NOT head` implication query, silently
+    # collapsing distinct predicates to `semantic_equivalent` (a
+    # suppressed diff Change; by symmetry a missed DANGEROUS loosening).
+    # `_column_key` now refuses to bind a reserved-prefix column, so the
+    # predicate degrades to requires_review (None) — never a false
+    # equivalence.
+    assert _classify("x IS NULL AND y = 1", '"_isnull__x" AND y = 1') is None
+    # _column_key returns "" for every reserved synthetic prefix...
+    from pgrls.diff._z3_compare import _column_key
+
+    for name in ("_isnull__x", "_opaque__foo", "_nullflag__z"):
+        ref = parse_expr(f'"{name}" = 1').lexpr
+        assert _column_key(ref) == "", name
+    # ...but a near-miss / ordinary name still binds normally.
+    assert _column_key(parse_expr('"_isnullx" = 1').lexpr) == "_isnullx"
+    assert _column_key(parse_expr("owner_id = 1").lexpr) == "owner_id"
+
+
 def test_null_marker_disconnection_is_a_documented_safe_limitation() -> None:
     # CHARACTERIZATION of the deliberate NullTest limitation (module
     # docstring): the IS NULL marker is modelled DISCONNECTED from the

@@ -232,6 +232,29 @@ _REAL_TYPES = frozenset({
 })
 _BOOL_TYPES = frozenset({"bool", "boolean"})
 
+# Z3 decl-name prefixes for the synthetic vars the context mints: the
+# NULL marker (`null_marker`), opaque-expression vars (`opaque`), and the
+# SEC038 Kleene null-flag (`null_flag`). A REAL column is bound via
+# `column()` under its verbatim key, and Z3 identifies a constant by
+# name+sort — so a real column literally named `_isnull__x` (legal: a
+# double-quoted identifier may contain anything but NUL) would alias the
+# NULL marker synthesized for column `x` in the implication query, making
+# distinct predicates look `semantic_equivalent` (a silently-suppressed
+# diff Change, and by symmetry a missed DANGEROUS loosening). Embedding a
+# NUL in the prefix does NOT help — Z3 truncates decl names at NUL — so
+# instead `_column_key` refuses to bind any column whose key collides
+# with these prefixes (it returns "" → the predicate degrades to
+# requires_review, the safe direction). Single source of truth so the
+# minting sites and that guard cannot drift. (R15 #3)
+_NULL_MARKER_PREFIX = "_isnull__"
+_OPAQUE_PREFIX = "_opaque__"
+_NULLFLAG_PREFIX = "_nullflag__"
+_RESERVED_MARKER_PREFIXES: tuple[str, ...] = (
+    _NULL_MARKER_PREFIX,
+    _OPAQUE_PREFIX,
+    _NULLFLAG_PREFIX,
+)
+
 
 class _Context:
     """Shared variable + type-inference context across base and head.
@@ -279,7 +302,7 @@ class _Context:
         """Return the Z3 Bool for `<col> IS NULL` opaque marker."""
         existing = self._null_vars.get(key)
         if existing is None:
-            existing = z3.Bool(f"_isnull__{key}")
+            existing = z3.Bool(f"{_NULL_MARKER_PREFIX}{key}")
             self._null_vars[key] = existing
         return existing
 
@@ -290,7 +313,7 @@ class _Context:
         """
         existing = self._opaque_vars.get(key)
         if existing is None:
-            var = z3.Const(f"_opaque__{key}", sort)
+            var = z3.Const(f"{_OPAQUE_PREFIX}{key}", sort)
             self._opaque_vars[key] = var
             return var
         if existing.sort() == sort:
@@ -310,7 +333,7 @@ class _Context:
         """
         existing = self._nullflag_vars.get(key)
         if existing is None:
-            existing = z3.Bool(f"_nullflag__{key}")
+            existing = z3.Bool(f"{_NULLFLAG_PREFIX}{key}")
             self._nullflag_vars[key] = existing
         return existing
 
@@ -342,7 +365,17 @@ def _column_key(node: ColumnRef) -> str:
             parts.append(field.sval)
         else:
             return ""  # unsupported (e.g., A_Star)
-    return ".".join(parts)
+    key = ".".join(parts)
+    # A real column whose key collides with a synthetic marker namespace
+    # would alias the marker var in the implication query (Z3 keys a
+    # constant by name+sort), silently making distinct predicates look
+    # equivalent. Such a column name is pathological but legal (a quoted
+    # identifier may be literally `_isnull__x`), so refuse to bind it:
+    # return "" and the caller degrades the predicate to requires_review
+    # (the safe direction). See `_RESERVED_MARKER_PREFIXES`.
+    if key.startswith(_RESERVED_MARKER_PREFIXES):
+        return ""
+    return key
 
 
 def _const_to_z3(node: A_Const) -> Any:
