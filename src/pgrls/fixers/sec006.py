@@ -133,6 +133,13 @@ class SEC006Fixer:
                             "USING predicate so writes are "
                             "constrained the same way reads are."
                         ),
+                        # This fix writes the WITH CHECK clause. Declaring
+                        # it lets generate_fixes' anti-clobber guard keep a
+                        # single writer per (policy, clause) — e.g. if
+                        # SEC020 also targets this policy's WITH CHECK, the
+                        # security-narrowing rewrite wins instead of both
+                        # silently racing.
+                        clauses=frozenset({"with_check"}),
                     )
                 )
         return out

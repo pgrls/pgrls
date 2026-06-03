@@ -859,6 +859,9 @@ def test_sec006_fix_emits_with_check_mirroring_using() -> None:
     assert f.location == "public.t.p"
     assert "ALTER POLICY p ON public.t" in f.sql
     assert "WITH CHECK (user_id = 1)" in f.sql
+    # The fix writes the WITH CHECK clause; it must declare so the
+    # anti-clobber guard keeps a single writer per (policy, clause).
+    assert f.clauses == frozenset({"with_check"})
 
 
 def test_sec006_fix_silent_when_with_check_already_present() -> None:

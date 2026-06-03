@@ -36,6 +36,7 @@ def test_json_zero_violations_emits_empty_list_and_zero_summary() -> None:
             "errors": 0,
             "warnings": 0,
             "infos": 0,
+            "others": 0,
             "total": 0,
         },
     }
@@ -73,8 +74,32 @@ def test_json_summary_counts_by_severity() -> None:
         "errors": 2,
         "warnings": 1,
         "infos": 1,
+        "others": 0,
         "total": 4,
     }
+
+
+def test_json_summary_buckets_off_spec_severity_into_others() -> None:
+    # An external rule plugin may emit a severity pgrls doesn't model
+    # (e.g. "critical"). It must land in `others` so the four severity
+    # buckets reconcile to total — never silently dropped, which would
+    # make errors + warnings + infos < total.
+    vs = [
+        _v(rule_id="SEC001", severity="error"),
+        _v(rule_id="X001", severity="critical"),
+        _v(rule_id="X002", severity="blocker"),
+    ]
+    summary = json.loads(format_violations(vs, format="json"))["summary"]
+    assert summary["errors"] == 1
+    assert summary["others"] == 2
+    assert (
+        summary["errors"]
+        + summary["warnings"]
+        + summary["infos"]
+        + summary["others"]
+        == summary["total"]
+        == 3
+    )
 
 
 def test_json_preserves_caller_order() -> None:
@@ -131,6 +156,7 @@ def test_json_summary_keys_are_stable_contract() -> None:
         "errors",
         "warnings",
         "infos",
+        "others",
         "total",
     }
 

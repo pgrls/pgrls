@@ -160,7 +160,9 @@ def _read_snapshot(path: Path) -> Snapshot | None:
         )
         return None
     keys: set[FindingKey] = set()
-    counts: dict[str, int] = {"error": 0, "warning": 0, "info": 0}
+    counts: dict[str, int] = {
+        "error": 0, "warning": 0, "info": 0, "other": 0,
+    }
     for v in violations:
         if not isinstance(v, dict):
             continue
@@ -171,8 +173,16 @@ def _read_snapshot(path: Path) -> Snapshot | None:
         loc = v.get("location")
         loc_str = loc if (loc is None or isinstance(loc, str)) else None
         keys.add(FindingKey(rule_id=rule_id, location=loc_str))
-        if isinstance(severity, str) and severity in counts:
+        if isinstance(severity, str) and severity in ("error", "warning", "info"):
             counts[severity] += 1
+        else:
+            # Off-spec, missing, or non-string severity on an otherwise
+            # well-formed finding (an external rule plugin may emit a
+            # severity pgrls doesn't model). Bucket it under 'other' so
+            # error+warning+info+other equals the well-formed finding
+            # count (== raw_total when every entry parses) — without it
+            # the three columns silently under-sum the total.
+            counts["other"] += 1
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     return Snapshot(
         path=path,
@@ -286,6 +296,9 @@ def render_json(rows: list[SnapshotRow]) -> str:
                 "errors": row.snapshot.counts.get("error", 0),
                 "warnings": row.snapshot.counts.get("warning", 0),
                 "infos": row.snapshot.counts.get("info", 0),
+                # Off-spec / unmodeled severities, so errors + warnings
+                # + infos + others reconciles to total.
+                "others": row.snapshot.counts.get("other", 0),
                 "new": row.new_count,
                 "fixed": row.fixed_count,
             }

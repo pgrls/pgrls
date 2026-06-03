@@ -30,7 +30,7 @@ def test_uc71_json_empty_when_every_rule_is_disabled(
     parsed = lint_json(config=cfg)
     assert parsed["violations"] == []
     assert parsed["summary"] == {
-        "errors": 0, "warnings": 0, "infos": 0, "total": 0,
+        "errors": 0, "warnings": 0, "infos": 0, "others": 0, "total": 0,
     }
 
 

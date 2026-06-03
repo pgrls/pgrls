@@ -70,9 +70,17 @@ def format_json(violations: list[Violation]) -> str:
 
 def _summary(violations: list[Violation]) -> dict[str, int]:
     counts: Counter[Severity] = Counter(v.severity for v in violations)
+    errors = counts.get("error", 0)
+    warnings = counts.get("warning", 0)
+    infos = counts.get("info", 0)
+    total = len(violations)
     return {
-        "errors": counts.get("error", 0),
-        "warnings": counts.get("warning", 0),
-        "infos": counts.get("info", 0),
-        "total": len(violations),
+        "errors": errors,
+        "warnings": warnings,
+        "infos": infos,
+        # Any off-spec severity (an external rule plugin may emit one
+        # the formatter doesn't model) lands here so the four buckets
+        # always reconcile: errors + warnings + infos + others == total.
+        "others": total - errors - warnings - infos,
+        "total": total,
     }

@@ -121,6 +121,38 @@ def test_load_snapshots_errors_on_missing_directory(tmp_path: Path) -> None:
         load_snapshots(tmp_path / "no_such_dir")
 
 
+def test_read_snapshot_buckets_off_spec_severity_into_other(
+    tmp_path: Path,
+) -> None:
+    # An external rule plugin may write a snapshot carrying a severity
+    # pgrls doesn't model ("critical"/"blocker"). _read_snapshot must
+    # bucket those under 'other' so error+warning+info+other reconciles
+    # to raw_total — otherwise the three modeled columns silently
+    # under-sum the total in every history view.
+    _write_snapshot(
+        tmp_path / "snap.json",
+        [
+            _v("SEC001", "public.a", sev="error"),
+            _v("X001", "public.b", sev="critical"),
+            _v("X002", "public.c", sev="blocker"),
+        ],
+        mtime=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+    snaps = load_snapshots(tmp_path)
+    assert len(snaps) == 1
+    counts = snaps[0].counts
+    assert counts["error"] == 1
+    assert counts["other"] == 2
+    assert (
+        counts["error"]
+        + counts["warning"]
+        + counts["info"]
+        + counts["other"]
+        == snaps[0].raw_total
+        == 3
+    )
+
+
 def test_build_rows_first_snapshot_baseline_is_all_new() -> None:
     # The first snapshot has no prior baseline, so every finding
     # counts as NEW and fixed_count is 0. Downstream summaries

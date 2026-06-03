@@ -12,7 +12,7 @@ def test_uc68_json_top_level_contract_end_to_end(
     parsed = lint_json()
     assert set(parsed.keys()) == {"violations", "summary"}
     assert set(parsed["summary"].keys()) == {
-        "errors", "warnings", "infos", "total",
+        "errors", "warnings", "infos", "others", "total",
     }
     if parsed["violations"]:
         assert set(parsed["violations"][0].keys()) == {
