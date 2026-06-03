@@ -162,6 +162,16 @@ _PATTERN_OP_NAMES: frozenset[str] = frozenset(
     {"~~", "~~*", "!~~", "!~~*", "~", "~*", "!~", "!~*"}
 )
 
+# The NEGATED pattern operators: NOT LIKE / NOT ILIKE / !~ / !~*. A
+# wildcard auth value (`%` / `.*`) on these makes the predicate FALSE for
+# every row — it DENIES all access (fail-closed), the opposite of the
+# positive operators' "matches every row" exposure. The finding still
+# fires (a wildcard GUC corrupts a deny-list predicate), but the impact
+# message must describe denial, not exposure.
+_NEGATED_PATTERN_OP_NAMES: frozenset[str] = frozenset(
+    {"!~~", "!~~*", "!~", "!~*"}
+)
+
 
 def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
     raw = options.get("auth_functions")
@@ -298,23 +308,31 @@ def _side_has_auth_call(side: Any, names: set[str]) -> bool:
     )
 
 
-def _has_pattern_against_auth(node: Any, names: set[str]) -> bool:
-    """Walk the AST and return True if any `A_Expr` is a pattern
-    operator with an auth-context function call on either operand.
+def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
+    """Walk the AST and return the set of pattern-operator names that
+    compare against an auth-context function on either operand.
 
-    Mirrors SEC018's `_compares_role_identity_to_own_column`: walks
-    every node (recursing into sub-selects so a nested A_Expr is
-    independently inspected) and checks each `A_Expr` whose `kind`
-    qualifies as a pattern operator.
+    Empty set means no match (the rule does not fire). The names let the
+    caller distinguish positive operators (`~~`, `~`, …) from negated
+    ones (`!~~`, `!~`, …), whose failure mode is denial, not exposure.
+
+    Mirrors SEC018's `_compares_role_identity_to_own_column`: walks every
+    node (recursing into sub-selects so a nested A_Expr is independently
+    inspected) and checks each `A_Expr` whose name qualifies as a pattern
+    operator.
     """
+    found: set[str] = set()
 
-    def walk(n: Any) -> bool:
+    def walk(n: Any) -> None:
         if n is None:
-            return False
+            return
         if isinstance(n, (list, tuple)):
-            return any(walk(item) for item in n)
+            for item in n:
+                walk(item)
+            return
         if isinstance(n, A_Expr) and _is_pattern_expr(n):
-            overloaded = _expr_name(n) in _OVERLOADED_REGEX_OPS
+            op = _expr_name(n)
+            overloaded = op in _OVERLOADED_REGEX_OPS
             for side, other in ((n.lexpr, n.rexpr), (n.rexpr, n.lexpr)):
                 if not _side_has_auth_call(side, names):
                     continue
@@ -330,14 +348,17 @@ def _has_pattern_against_auth(node: Any, names: set[str]) -> bool:
                     _is_non_text_typed(side) or _is_non_text_typed(other)
                 ):
                     continue
-                return True
+                if op is not None:
+                    found.add(op)
+                break
             # fall through — the A_Expr may have nested A_Expr
             # nodes deeper in its operands.
         if isinstance(n, Node):
             for field_name in n:
-                if walk(getattr(n, field_name, None)):
-                    return True
-        return False
+                walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
 
     return walk(node)
 
@@ -362,32 +383,56 @@ class SEC026:
                 policy_id = _policy_id(table.schema, table.name, policy)
                 if policy_id in allowlist:
                     continue
-                fires = False
+                matched_ops: set[str] = set()
                 for ast in (policy.using_ast, policy.with_check_ast):
-                    if ast is not None and _has_pattern_against_auth(ast, names):
-                        fires = True
-                        break
-                if not fires:
+                    if ast is not None:
+                        matched_ops |= _pattern_ops_against_auth(ast, names)
+                if not matched_ops:
                     continue
                 out.append(
                     Violation(
                         rule_id="SEC026",
                         severity=self.severity,
                         title=self.title,
-                        message=(
-                            f"Policy {policy.name!r} on "
-                            f"{table.qualified_name} compares a value against "
-                            "an auth-context function using a pattern "
-                            "operator (LIKE / ILIKE / SIMILAR TO / regex). "
-                            "Pattern operators make the predicate depend on "
-                            "the shape of the auth value — a GUC set to "
-                            "'%' or '.*' would match every row. Use '=' "
-                            "(or wrap both sides in lower() for "
-                            "case-insensitive equality) or include the "
-                            "policy in [lint.rules.SEC026].allowlist if the "
-                            "pattern semantics are deliberate."
+                        message=self._message(
+                            policy.name, table.qualified_name, matched_ops
                         ),
                         location=policy_id,
                     )
                 )
         return out
+
+    @staticmethod
+    def _message(
+        policy_name: str, qualified_name: str, matched_ops: set[str]
+    ) -> str:
+        head = (
+            f"Policy {policy_name!r} on {qualified_name} compares a value "
+            "against an auth-context function using a pattern operator "
+            "(LIKE / ILIKE / SIMILAR TO / regex). "
+        )
+        # If EVERY matched operator is negated (NOT LIKE / !~), a wildcard
+        # auth value makes the predicate FALSE for all rows — it denies,
+        # it does not expose. Any positive operator present means the
+        # exposure framing applies.
+        if matched_ops <= _NEGATED_PATTERN_OP_NAMES:
+            impact = (
+                "This is a negated pattern operator (NOT LIKE / NOT ILIKE "
+                "/ !~), so the predicate's tightness depends on the shape "
+                "of the auth value — a GUC set to '%' or '.*' would match "
+                "every row and therefore DENY every row, silently hiding "
+                "all data. "
+            )
+        else:
+            impact = (
+                "Pattern operators make the predicate depend on the shape "
+                "of the auth value — a GUC set to '%' or '.*' would match "
+                "every row, exposing every row. "
+            )
+        fix = (
+            "Use '=' (or wrap both sides in lower() for case-insensitive "
+            "equality) or include the policy in "
+            "[lint.rules.SEC026].allowlist if the pattern semantics are "
+            "deliberate."
+        )
+        return head + impact + fix

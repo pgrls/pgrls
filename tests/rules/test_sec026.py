@@ -67,6 +67,26 @@ def test_sec026_fires_on_like_against_current_setting() -> None:
     assert v.location == "public.documents.p"
     assert "pattern operator" in v.message
     assert "allowlist" in v.message
+    # Positive operator → the exposure framing.
+    assert "exposing every row" in v.message
+    assert "DENY every row" not in v.message
+
+
+def test_sec026_negated_operator_message_says_deny_not_expose() -> None:
+    # R12 #3: `NOT LIKE` / `!~` still fire (a wildcard GUC corrupts a
+    # deny-list predicate), but a wildcard there makes the predicate
+    # FALSE for every row — it DENIES all access, the opposite of the
+    # positive operators' exposure. The message must say so, not claim
+    # "exposing every row".
+    for using in (
+        "user_email NOT LIKE current_setting('app.blocked')",
+        "user_email !~ current_setting('app.blocked')",
+    ):
+        schema = Schema(tables=(_table(_policy(using=using)),))
+        [v] = SEC026().check(schema, options={})
+        assert "DENY every row" in v.message, using
+        assert "silently hiding all data" in v.message, using
+        assert "exposing every row" not in v.message, using
 
 
 def test_sec026_fires_on_ilike_against_current_setting() -> None:
