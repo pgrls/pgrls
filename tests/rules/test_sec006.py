@@ -189,14 +189,10 @@ def test_sec006_fires_on_each_offending_policy_independently() -> None:
 
 
 def test_sec006_restrictive_write_policy_emits_dead_policy_message() -> None:
-    # A restrictive INSERT/UPDATE policy without WITH CHECK is
-    # NOT the security hole the permissive case is — Postgres
-    # defaults the missing clause to `true` and AND-combines into
-    # the restrictive group, so the policy imposes no constraint
-    # on new rows. That's a "dead policy" hygiene problem with a
-    # different remediation framing than the permissive case.
-    # Pin both: SEC006 still fires (the dead-policy bug is real),
-    # but the message reflects the actual diagnosis.
+    # A restrictive INSERT with no WITH CHECK is genuinely dead — INSERT
+    # carries no USING for Postgres to reuse, so the missing clause
+    # defaults to `true` and the policy constrains nothing. SEC006 fires
+    # with the dead-policy diagnosis (a hygiene bug, not a security hole).
     p = _policy(
         "restrictive_floor",
         command="INSERT",
@@ -210,6 +206,42 @@ def test_sec006_restrictive_write_policy_emits_dead_policy_message() -> None:
     assert "Restrictive policy" in msg
     assert "dead policy" in msg
     assert "defaults the missing clause to `true`" in msg
+
+
+def test_sec006_suppresses_restrictive_update_all_with_reusable_using() -> None:
+    # Regression (round-5): a restrictive FOR UPDATE/ALL with a real USING
+    # and no WITH CHECK is NOT a dead policy — Postgres reuses the USING as
+    # the implicit WITH CHECK for restrictive policies too, so the write
+    # side is constrained. Flagging it was an error-severity false positive
+    # whose "remove the policy" remediation would delete a real constraint.
+    for command in ("UPDATE", "ALL"):
+        violations = SEC006().check(
+            _wrap(
+                _policy("p", command=command, with_check=None,
+                        permissive=False)
+            ),
+            {},
+        )
+        assert violations == [], command
+
+
+def test_sec006_restrictive_open_shapes_still_dead_policy() -> None:
+    # A restrictive write policy with nothing to reuse still fires the
+    # dead-policy diagnosis: INSERT (no USING), or UPDATE/ALL whose USING
+    # is absent or constant-true.
+    for command, using in (
+        ("UPDATE", None),
+        ("ALL", "true"),
+    ):
+        violations = SEC006().check(
+            _wrap(
+                _policy("p", command=command, with_check=None,
+                        permissive=False, using=using)
+            ),
+            {},
+        )
+        assert len(violations) == 1, (command, using)
+        assert "dead policy" in violations[0].message
 
 
 def test_sec006_permissive_message_unchanged() -> None:

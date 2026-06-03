@@ -1,29 +1,31 @@
 """SEC006 — INSERT/UPDATE/ALL policy missing WITH CHECK.
 
 USING filters reads. WITH CHECK validates writes against the policy
-predicate. The failure mode and the remediation framing depend on
-whether the policy is permissive or restrictive:
+predicate. A missing WITH CHECK is only a problem when Postgres has
+nothing to reuse as one:
 
-  * Permissive write policy with no WITH CHECK *and nothing for
-    Postgres to reuse as one*: lets clients write rows the policy
-    would otherwise forbid. Concrete security hole — but only for
-    INSERT (which carries no USING) or an UPDATE/ALL whose USING is
-    absent or constant-true. For an UPDATE/ALL with a real USING,
-    Postgres reuses the USING expression as the implicit WITH CHECK,
-    so the written row must still satisfy it; that shape is closed
-    and is intentionally NOT flagged (see `_permissive_write_is_open`).
+  * For an UPDATE/ALL policy with a real USING, Postgres reuses the
+    USING expression as the implicit WITH CHECK — for BOTH permissive
+    and restrictive policies — so the written row must still satisfy it.
+    That shape is closed and is intentionally NOT flagged (see
+    `_write_is_open`). Flagging it was a false positive whose restrictive
+    "dead policy / remove it" remediation would have deleted a real
+    write-side constraint.
 
-  * Restrictive write policy with no WITH CHECK: Postgres defaults
-    the missing WITH CHECK to `true`, AND-combined into the
-    restrictive group. The policy imposes no constraint on the
-    new row — it is a dead policy. Not a security hole on its
-    own (the table's other restrictives still apply), but a bug:
-    the author wrote the policy intending to forbid something and
-    is forbidding nothing.
+  * The genuinely open shapes are INSERT (which carries no USING) and an
+    UPDATE/ALL whose USING is absent or constant-true (nothing meaningful
+    to reuse). The diagnosis then branches on `permissive`:
 
-Both cases need the same fix — add a WITH CHECK clause — but the
-message branches on `permissive` so the diagnosis matches the
-actual problem.
+      - Permissive + open: a concrete security hole — the policy admits
+        writes that violate the read-side predicate.
+      - Restrictive + open: the un-reusable missing WITH CHECK defaults
+        to `true`, AND-combined into the restrictive group, so the policy
+        imposes no constraint on new rows — a dead policy. Not a hole on
+        its own (other restrictives still apply) but a bug: the author
+        meant to forbid something and forbids nothing.
+
+Both flagged shapes need the same fix — add a WITH CHECK clause — but the
+message branches on `permissive` so the diagnosis matches the problem.
 """
 from __future__ import annotations
 
@@ -42,12 +44,13 @@ def _parse_allowlist(options: dict[str, Any]) -> set[str]:
     return parse_policy_id_allowlist('SEC006', options)
 
 
-def _permissive_write_is_open(policy: Policy) -> bool:
-    """Does a permissive write policy with no WITH CHECK actually accept
-    arbitrary writes?
+def _write_is_open(policy: Policy) -> bool:
+    """Does a write policy with no WITH CHECK actually leave writes
+    unconstrained?
 
-    Postgres reuses a policy's USING expression as the implicit WITH CHECK
-    whenever WITH CHECK is omitted on an UPDATE/ALL policy. So a permissive
+    Applies to permissive AND restrictive policies alike: Postgres reuses a
+    policy's USING expression as the implicit WITH CHECK whenever WITH CHECK
+    is omitted on an UPDATE/ALL policy, regardless of permissivity. So a
     ``FOR UPDATE USING (tenant_id = …)`` with no WITH CHECK still forces the
     *written* row to satisfy ``tenant_id = …`` — the write side is closed,
     not open. The only genuinely open shapes are:
@@ -89,15 +92,17 @@ class SEC006:
                 # nothing.
                 if policy.with_check_sql:
                     continue
-                # Permissive UPDATE/ALL with a non-trivial USING is not an
-                # open write: Postgres reuses the USING expression as the
+                # An UPDATE/ALL with a non-trivial USING is not an open
+                # write: Postgres reuses the USING expression as the
                 # implicit WITH CHECK when WITH CHECK is omitted, so the
-                # written row must still satisfy the USING predicate. Only
-                # INSERT (no USING to reuse) or an UPDATE/ALL whose USING is
-                # absent/constant-true leaves writes genuinely unconstrained.
-                # The restrictive path is unaffected: a missing WITH CHECK on
-                # a restrictive policy still defaults to `true` (dead policy).
-                if policy.permissive and not _permissive_write_is_open(policy):
+                # written row must still satisfy the USING predicate. This
+                # holds for permissive AND restrictive policies — so a
+                # restrictive `FOR UPDATE USING (tenant = …)` is NOT a dead
+                # policy (flagging it was a false positive whose "remove the
+                # policy" advice would delete a real write-side constraint).
+                # Only INSERT (no USING to reuse) or an UPDATE/ALL whose
+                # USING is absent/constant-true leaves writes unconstrained.
+                if not _write_is_open(policy):
                     continue
                 pid = policy_id(table, policy)
                 if pid in allowlist:

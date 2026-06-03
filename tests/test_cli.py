@@ -1913,7 +1913,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC005  public.allbad_sec003.public_perm\n",
             "SEC005  public.allbad_hyg001.orphan\n",
             "SEC005  public.allbad_sec010.block_all\n",
-            "SEC006  public.allbad_sec006.update_no_check\n",
+            "SEC006  public.allbad_sec006.insert_dead\n",
             "SEC007  public.allbad_sec003\n",
             "SEC008  public.allbad_sec003.public_perm\n",
             "SEC009  public.allbad_sec002\n",
