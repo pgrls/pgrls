@@ -29,6 +29,19 @@ hold a write lock for the duration; the description points at the
 `CONCURRENTLY` alternative for production-size tables, and `pgrls
 fix --output` writes the SQL to a file for the operator to adapt.
 
+Postgres requires every function in an index expression to be
+IMMUTABLE and rejects STABLE / VOLATILE ones at runtime. The fixer
+therefore emits an index only when the *whole* operand is provably
+immutable — built solely from a curated set of always-IMMUTABLE
+builtin functions (`lower`, `upper`, `md5`, …), column refs, and
+literals (`_is_immutable_index_expr`). The conditionally-STABLE time
+functions (`date_trunc('day', created_at)` on a `timestamptz` is
+STABLE) and anything it cannot vouch for — operators, casts,
+user-defined functions — make it ABSTAIN: the rule still reports, and
+the operator reshapes the predicate / adds the index by hand. This
+keeps `pgrls fix --apply` (one all-or-nothing transaction) from
+aborting the whole batch on a single server-rejected CREATE INDEX.
+
 The fix is **additive**: it CREATEs an index alongside the existing
 plain index that PERF004 reported as wasted. PERF004's other remedy
 — rewriting the predicate to compare the bare column — needs human
@@ -41,11 +54,11 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from pglast.ast import A_Expr, BoolExpr, FuncCall, Node, String
+from pglast.ast import A_Const, A_Expr, BoolExpr, ColumnRef, FuncCall, Node, String
 from pglast.enums import A_Expr_Kind
 from pglast.stream import RawStream
 
-from pgrls.ast_utils import extract_column_refs
+from pgrls.ast_utils import extract_column_refs, func_name_parts
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table, policy_id
@@ -71,6 +84,73 @@ _COMPARISON_AEXPR_KINDS: frozenset[Any] = frozenset({
     A_Expr_Kind.AEXPR_BETWEEN,
     A_Expr_Kind.AEXPR_NOT_BETWEEN,
 })
+
+
+# Builtin functions that are IMMUTABLE in EVERY overload, so an
+# expression built only from them (+ column refs + literals) is legal in
+# a CREATE INDEX. Postgres requires every function in an index expression
+# to be IMMUTABLE and rejects STABLE/VOLATILE ones at runtime ("functions
+# in index expression must be marked IMMUTABLE"). Deliberately CONSERVATIVE
+# and builtin-focused: the dominant PERF004 wrapper is case-normalization
+# (`lower`/`upper`). Notably EXCLUDED are the conditionally-STABLE time
+# functions — `date_trunc`/`date_part`/`extract`/`to_char`/`age`/… —
+# whose volatility depends on the argument type (e.g. `date_trunc('day',
+# ts)` is STABLE for `timestamptz` but IMMUTABLE for `timestamp`). When
+# the expression is not provably immutable the fixer ABSTAINS (the rule
+# still reports; the operator reshapes/indexes by hand), rather than
+# emitting a CREATE INDEX that fails at apply and — under fix --apply's
+# single all-or-nothing transaction — rolls back every other fix too.
+_IMMUTABLE_INDEX_SAFE_FUNCS: frozenset[str] = frozenset({
+    # Case / text normalization — the dominant PERF004 wrapper shape.
+    "lower", "upper", "initcap",
+    # Hashing.
+    "md5", "sha224", "sha256", "sha384", "sha512",
+    # Length.
+    "length", "char_length", "character_length",
+    "octet_length", "bit_length",
+    # Trim / pad.
+    "btrim", "ltrim", "rtrim", "trim", "lpad", "rpad",
+    # Substring / slice.
+    "substr", "substring", "left", "right",
+    # Other pure string transforms.
+    "reverse", "replace", "translate", "ascii", "chr", "to_hex",
+    # Basic numeric (every overload IMMUTABLE).
+    "abs", "sign", "ceil", "ceiling", "floor", "round", "trunc", "mod",
+})
+
+
+def _is_immutable_index_expr(node: Any) -> bool:
+    """True iff `node` is safe to splice into a ``CREATE INDEX`` — i.e. the
+    whole expression is built only from known-IMMUTABLE builtin functions,
+    column refs, and literal constants.
+
+    Conservative by design: any node it cannot vouch for as IMMUTABLE —
+    a non-allowlisted or schema-qualified (possibly user-defined, possibly
+    VOLATILE) function, an operator (``A_Expr``), a ``TypeCast``,
+    ``CaseExpr``/``CoalesceExpr``, a sub-select, … — makes it return False,
+    so the fixer abstains rather than emit an index Postgres would reject.
+    """
+    if node is None:
+        return True
+    if isinstance(node, (list, tuple)):
+        return all(_is_immutable_index_expr(item) for item in node)
+    if isinstance(node, FuncCall):
+        qualified, bare = func_name_parts(node)
+        if bare is None or bare not in _IMMUTABLE_INDEX_SAFE_FUNCS:
+            return False
+        # Builtin only: a user-defined `myschema.lower(...)` is a DIFFERENT
+        # function that may be VOLATILE, so only the unqualified or
+        # pg_catalog-qualified builtin counts (mirrors
+        # ast_utils.is_builtin_current_setting). Its args must in turn be
+        # immutable — a nested STABLE call (`lower(date_trunc(...))`) or a
+        # value wrapper would equally make the index illegal.
+        if qualified != bare and qualified != f"pg_catalog.{bare}":
+            return False
+        return _is_immutable_index_expr(node.args)
+    if isinstance(node, (ColumnRef, A_Const)):
+        return True
+    # Any other node type cannot be vouched for — abstain.
+    return False
 
 
 def _has_comparison_op_name(node: A_Expr) -> bool:
@@ -145,8 +225,19 @@ def _top_funccalls_wrapping(
             return
         if isinstance(n, FuncCall):
             if ctx == _OPERAND and wraps_flagged(n):
-                out.append(n)
-                # Covered — any nested FuncCall is part of this index expr.
+                # Only emit when the WHOLE operand is provably IMMUTABLE —
+                # Postgres rejects STABLE/VOLATILE functions in an index
+                # expression, and the common Supabase shape
+                # `date_trunc('day', created_at)` on a timestamptz column
+                # is STABLE. Abstaining (the rule still reports) is the
+                # safe degradation; emitting an index that fails at apply
+                # would roll back the whole all-or-nothing fix batch.
+                if _is_immutable_index_expr(n):
+                    out.append(n)
+                # Covered either way — a nested FuncCall is part of this
+                # operand, never a separate index. (When not immutable we
+                # deliberately do NOT descend looking for an inner index:
+                # the planner's operand is the whole expression.)
                 return
             # Args are sub-expressions, never a predicate operand.
             for field_name in n:

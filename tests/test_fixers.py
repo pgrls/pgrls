@@ -3873,6 +3873,36 @@ def test_perf004_fix_emits_outermost_funccall_for_nested_wrap() -> None:
     )
 
 
+def test_perf004_fix_abstains_on_non_immutable_function() -> None:
+    # R14 #1: `date_trunc('day', created_at)` on a timestamptz column is
+    # STABLE (depends on the session TimeZone), and Postgres rejects
+    # STABLE/VOLATILE functions in an index expression. The PERF004 rule
+    # still flags the function-wrapped indexed column, but the fixer must
+    # ABSTAIN rather than emit a CREATE INDEX that fails at apply — which,
+    # under `pgrls fix --apply`'s single all-or-nothing transaction, would
+    # roll back every other fix in the batch. `lower(...)` (IMMUTABLE)
+    # still emits; this verifies the non-immutable case degrades.
+    schema = Schema(tables=(_perf004_table(
+        _policy(
+            "date_trunc('day', created_at) = current_setting('app.d')"
+        ),
+        columns=("id", "created_at"),
+        indexes=(_idx("created_at", name="users_created_idx"),),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
+def test_perf004_fix_abstains_on_user_defined_same_named_function() -> None:
+    # A user-defined `myschema.lower(...)` is a DIFFERENT function from the
+    # builtin and may be VOLATILE, so the fixer must not assume it is
+    # index-safe just because the bare name is on the immutable allowlist
+    # — only the unqualified / pg_catalog-qualified builtin counts.
+    schema = Schema(tables=(_perf004_table(
+        _policy("myschema.lower(email) = current_setting('app.e')"),
+    ),))
+    assert PERF004Fixer().fix(schema, {}) == []
+
+
 def test_perf004_fix_dedupes_expression_across_policies() -> None:
     # Two policies wrapping the same column in the same expression
     # → one CREATE INDEX, not two duplicates.
