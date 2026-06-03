@@ -744,3 +744,65 @@ def test_bare_constant_predicate_degrades_instead_of_crashing() -> None:
         classify_via_z3(parse_expr("true"), parse_expr("true"))
         == "semantic_equivalent"
     )
+
+
+def test_null_marker_disconnection_is_a_documented_safe_limitation() -> None:
+    # CHARACTERIZATION of the deliberate NullTest limitation (module
+    # docstring): the IS NULL marker is modelled DISCONNECTED from the
+    # column's value var — a 2-valued approximation of Postgres 3VL.
+    #
+    # A faithful 2-valued linkage was attempted and rejected as UNSOUND
+    # under negation (z3.Not is 2-valued; Postgres `NOT (col = x)` is
+    # 3-valued — NULL when col is NULL), so it would only trade these
+    # over-reports for a new class of `NOT (...)` false alarms. A correct
+    # fix needs a full Kleene 3VL re-encoding of the diff path.
+    #
+    # `col IS NOT NULL AND col = x` is EQUIVALENT to `col = x` in Postgres
+    # (a value comparison already excludes NULL rows), but the disconnected
+    # marker over-reports it. Pinned so a future 3VL fix flips this
+    # deliberately, not by accident.
+    assert (
+        classify_via_z3(
+            parse_expr("active IS NOT NULL AND active = true"),
+            parse_expr("active = true"),
+        )
+        == "semantic_loosened"
+    )
+    assert (
+        classify_via_z3(
+            parse_expr("active = true"),
+            parse_expr("active IS NOT NULL AND active = true"),
+        )
+        == "semantic_tightened"
+    )
+
+
+def test_null_limitation_does_not_compromise_soundness() -> None:
+    # The limitation must never cost the verifier its safety guarantees —
+    # these are exactly the invariants a naive null-guard "fix" broke, and
+    # that any real fix must preserve.
+    #
+    # Arithmetic equivalence holds (a naive guard flipped this to
+    # `tightened`):
+    assert (
+        classify_via_z3(parse_expr("col - 3 > 0"), parse_expr("col > 3"))
+        == "semantic_equivalent"
+    )
+    # A genuine NULL-admitting loosening is STILL flagged DANGEROUS — the
+    # coarse model never MISSES a real loosening (the safety-critical
+    # direction is intact):
+    assert (
+        classify_via_z3(
+            parse_expr("col = 5"), parse_expr("col = 5 OR col IS NULL")
+        )
+        == "semantic_loosened"
+    )
+    # A genuine value loosening is flagged AND still yields the concrete
+    # leaking row (col = 6 is the unique member of head \ base):
+    assert (
+        classify_via_z3(parse_expr("col = 5"), parse_expr("col = 5 OR col = 6"))
+        == "semantic_loosened"
+    )
+    assert counterexample(
+        parse_expr("col = 5"), parse_expr("col = 5 OR col = 6")
+    ) == {"col": 6}

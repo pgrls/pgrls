@@ -67,15 +67,29 @@ Supported AST nodes (Phases 1 + 3 + 4):
   comparison, the classifier can OVER-report: a NULL-equivalent
   refactor such as ``col IS NOT NULL AND col = x`` vs ``col = x`` is
   reported ``semantic_loosened`` (a false DANGEROUS) instead of
-  ``semantic_equivalent``. This is a deliberate, known limitation:
-  faithfully linking the marker to the value variable requires
-  threading non-null guards through arithmetic operands AND reworking
-  the counterexample witness-sufficiency gate — a naive linkage
-  instead breaks arithmetic equivalence (``col - 3 > 0`` vs ``col > 3``
-  flips to ``tightened``) and suppresses valid counterexamples. The
-  over-report is the SAFE failure mode (it flags a safe change for
-  review; it never passes a dangerous one), so the coarse model is
-  retained rather than risk the verifier's soundness for a false
+  ``semantic_equivalent``. This is a deliberate, known limitation.
+
+  A faithful *2-valued* linkage is impossible, not merely hard:
+  threading a ``NOT is_null`` guard onto each comparison is unsound
+  under negation. ``z3.Not`` is 2-valued, but Postgres ``NOT (col = x)``
+  is 3-valued — NULL when ``col`` is NULL — so a guarded ``col = x``
+  modelled as ``(col == x) AND NOT is_null`` makes ``NOT (col = x)``
+  evaluate TRUE on a NULL row, which Postgres rejects. The guard would
+  therefore merely trade these IS-NULL over-reports for a NEW class of
+  false alarms on ``NOT (...)`` predicates (``col != x`` vs
+  ``NOT (col = x)``, equivalent in Postgres, would split into a false
+  ``loosened``). A naive attempt also breaks arithmetic equivalence
+  (``col - 3 > 0`` vs ``col > 3``) and the counterexample
+  witness-sufficiency gate. ``test_null_limitation_*`` pins both the
+  over-report and the safety invariants a real fix must keep.
+
+  A correct fix needs a full Kleene three-valued re-encoding of the diff
+  path (a truth flag AND a null flag per node, with
+  ``NOT(unknown) = unknown``) — like the additive SEC038 ``anon_read``
+  encoder but adapted to bidirectional implication. That is a larger
+  rework, deferred. The over-report is the SAFE failure mode (it flags a
+  safe change for review; it never passes a dangerous one), so the coarse
+  model is retained rather than risk the verifier's soundness for a false
   alarm.
 * ``A_Expr`` with ``BETWEEN`` / ``NOT BETWEEN`` (Phase 3) —
   translated to the equivalent AND/OR of inequalities. Symmetric
