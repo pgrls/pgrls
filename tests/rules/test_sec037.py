@@ -136,6 +136,51 @@ def test_fires_on_in_list_with_all_unknown_roles() -> None:
     } == {"admin", "editor"}
 
 
+def test_fires_on_pg_get_expr_normalized_any_array_form() -> None:
+    # R15 #1: this is the form SEC037 ACTUALLY sees at runtime. Postgres
+    # stores polqual normalized and pg_get_expr re-renders
+    # `auth.role() IN ('admin','editor')` as
+    # `auth.role() = ANY (ARRAY['admin'::text, 'editor'::text])` (an
+    # A_Expr of kind AEXPR_OP_ANY). The raw-IN test above never exercises
+    # this — it parses the hand-written AEXPR_IN — so the rule's headline
+    # case was a false negative on EVERY introspected/snapshotted schema
+    # until the AEXPR_OP_ANY branch landed. Build the fixture from the
+    # normalized string so the production path is genuinely covered.
+    schema = _wrap(
+        _policy(
+            "(auth.role() = ANY (ARRAY['admin'::text, 'editor'::text]))",
+            name="any_roles",
+        )
+    )
+    violations = SEC037().check(schema, {})
+    assert len(violations) == 2
+    assert {
+        unknown
+        for unknown in ("admin", "editor")
+        if any(unknown in v.message for v in violations)
+    } == {"admin", "editor"}
+    # `= ALL (ARRAY['admin'])` — the single-value / contradictory form —
+    # is likewise a silent deny when the value is unknown.
+    all_schema = _wrap(
+        _policy("(auth.role() = ALL (ARRAY['admin'::text]))", name="all_role")
+    )
+    assert len(SEC037().check(all_schema, {})) == 1
+
+
+def test_does_not_fire_on_not_in_normalized_neq_all_form() -> None:
+    # The pg_get_expr normalization of `auth.role() NOT IN ('admin')` is
+    # `auth.role() <> ALL (ARRAY['admin'::text])`, which is ALWAYS TRUE
+    # for a real role — every row visible, the OPPOSITE of the silent-deny
+    # hazard. The AEXPR_OP_ANY/ALL branch is gated to operator name `=`
+    # (mirroring the IN branch's `=`-only gate), so `<> ALL` must NOT fire.
+    schema = _wrap(
+        _policy(
+            "(auth.role() <> ALL (ARRAY['admin'::text]))", name="neq_all"
+        )
+    )
+    assert SEC037().check(schema, {}) == []
+
+
 def test_does_not_fire_on_not_in_list() -> None:
     # `auth.role() NOT IN ('admin')` is ALWAYS TRUE for any real role
     # (auth.role() returns a genuine role, never the unknown 'admin'),

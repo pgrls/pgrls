@@ -54,6 +54,7 @@ from __future__ import annotations
 from typing import Any
 
 from pglast.ast import (
+    A_ArrayExpr,
     A_Const,
     A_Expr,
     FuncCall,
@@ -142,6 +143,31 @@ def _is_in_list(node: A_Expr) -> bool:
     name = node.name
     return bool(
         node.kind == A_Expr_Kind.AEXPR_IN
+        and name is not None
+        and len(name) >= 1
+        and isinstance(name[-1], String)
+        and name[-1].sval == "="
+    )
+
+
+def _is_any_all_eq(node: A_Expr) -> bool:
+    """True if `node` is `<x> = ANY (ARRAY[...])` / `= ALL (ARRAY[...])`.
+
+    This is the form Postgres stores and `pg_get_expr` re-renders for an
+    `IN` list (and any multi-value role check): `auth.role() IN ('a','b')`
+    round-trips as `auth.role() = ANY (ARRAY['a'::text,'b'::text])`, an
+    `A_Expr` of kind `AEXPR_OP_ANY`. So on an introspected / snapshotted
+    schema — every real input the rule sees — this is the ONLY shape that
+    appears; the `_is_in_list` (AEXPR_IN) branch is dead there and lives on
+    only for the lint-of-handwritten-source path.
+
+    Gated to operator name `=` (exactly like `_is_in_list`): `<> ALL` is
+    the `NOT IN` normalization, which is always-TRUE for unknown values,
+    not a silent deny — matching it would be a false positive.
+    """
+    name = node.name
+    return bool(
+        node.kind in (A_Expr_Kind.AEXPR_OP_ANY, A_Expr_Kind.AEXPR_OP_ALL)
         and name is not None
         and len(name) >= 1
         and isinstance(name[-1], String)
@@ -278,6 +304,26 @@ def _find_unknown_role_comparisons(
             # unknown-role hit, mirroring the per-disjunct `=` path.
             if _is_role_call(n.lexpr, role_functions):
                 elements = n.rexpr if isinstance(n.rexpr, (list, tuple)) else ()
+                for element in elements:
+                    sval = _is_string_const(element)
+                    if sval is not None and sval not in known_roles:
+                        hits.append(sval)
+        elif isinstance(n, A_Expr) and _is_any_all_eq(n):
+            # The pg_get_expr-normalized form of `IN` / a multi-value
+            # role check: `auth.role() = ANY (ARRAY['a'::text, ...])`.
+            # This is the shape SEC037 actually sees on every introspected
+            # policy (the AEXPR_IN branch above is dead there). Treat it
+            # exactly like IN — the role call is `lexpr`, the array holds
+            # the candidate literals; report each one outside the known
+            # set. `n.rexpr` is an `A_ArrayExpr` whose `.elements` are the
+            # (TypeCast-wrapped) `A_Const` literals.
+            if _is_role_call(n.lexpr, role_functions):
+                elements = (
+                    n.rexpr.elements
+                    if isinstance(n.rexpr, A_ArrayExpr)
+                    and n.rexpr.elements is not None
+                    else ()
+                )
                 for element in elements:
                     sval = _is_string_const(element)
                     if sval is not None and sval not in known_roles:
