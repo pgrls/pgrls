@@ -1028,19 +1028,18 @@ class _Val:
     is_null: Any   # z3.BoolRef
 
 
-# Auth-context functions forced to NULL under an anonymous session. Mirrors
-# SEC004's `_DEFAULT_AUTH_FUNCTIONS` and ast_utils' SQLValueFunction set so
-# the two rules stay consistent and configurable.
+# Auth-context functions forced to NULL under an anonymous session.
+# Mirrors SEC004 / SEC038. Only genuinely-nullable functions belong:
+# current_user / session_user / current_role / user are EXCLUDED because
+# they always return the session role name (never NULL — there is no
+# unauthenticated backend), so treating them as anon-NULL would make an
+# inverted `current_user IS NULL OR …` prove valid and false-fire. A
+# caller may still pass them in an explicit `auth_funcs` set (the
+# SQLValueFunction branch / _ANON_SVFOP_NAMES honors a configured name).
 _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.uid",
     "auth.role",
     "auth.jwt",
-    "current_user",
-    "session_user",
-    # SQL-standard synonyms of current_user (SVFOP_CURRENT_ROLE /
-    # SVFOP_USER, already mapped in _ANON_SVFOP_NAMES) — NULL under anon.
-    "current_role",
-    "user",
     "current_setting",
 })
 

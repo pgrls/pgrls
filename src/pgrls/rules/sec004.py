@@ -22,18 +22,23 @@ from pgrls.model import Schema
 from pgrls.violations import Severity, Violation
 
 
+# Only functions that genuinely return NULL for an unauthenticated
+# request belong here: an `IS NULL` disjunct is a real anonymous-read
+# hole only if the function can actually be NULL. auth.uid/role/jwt read
+# JWT claims (NULL when no token); current_setting(name, true) returns
+# NULL when the GUC is unset.
+#
+# NOT included: current_user / session_user / current_role / user. These
+# SQLValueFunctions ALWAYS return the session role name — Postgres has no
+# unauthenticated backend (PostgREST's "anon" is itself a real role), so
+# `current_user IS NULL` is the constant FALSE and a disjunct gated on it
+# is dead, not a leak. Flagging it is a false positive. The role-identity
+# hazard for these functions is a column COMPARISON (`owner = current_user`),
+# which is SEC018's / SEC026's job, not an IS-NULL anonymous-read hole.
 _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.uid",
     "auth.role",
     "auth.jwt",
-    "current_user",
-    "session_user",
-    # current_role + bare USER are SQL-standard synonyms of
-    # current_user (SVFOP_CURRENT_ROLE / SVFOP_USER); all return NULL
-    # under an unauthenticated session, so a leak gated on them is the
-    # same anonymous-read hole.
-    "current_role",
-    "user",
     "current_setting",
 })
 

@@ -51,24 +51,32 @@ def test_sec004_fires_on_current_setting_is_null_disjunct() -> None:
     assert len(SEC004().check(schema, {})) == 1
 
 
-def test_sec004_fires_on_current_role_and_user_is_null_disjunct() -> None:
-    # current_role and bare USER are SQL-standard synonyms of
-    # current_user (parsed as SVFOP nodes); each is NULL under an
-    # unauthenticated session, so `<svfop> IS NULL OR …` is the same
-    # anonymous-read hole. Regression for their absence from the
-    # default auth-function set.
+def test_sec004_silent_on_never_null_role_svfops_by_default() -> None:
+    # R11 #1: current_user / session_user / current_role / user ALWAYS
+    # return the session role name — Postgres has no unauthenticated
+    # backend (PostgREST's "anon" is a real role), so `<svfop> IS NULL`
+    # is the constant FALSE and the disjunct is dead, not an
+    # anonymous-read hole. Flagging it is a false positive, so these are
+    # no longer in the default auth-function set.
     for using in (
+        "current_user IS NULL OR user_id = '1'",
+        "session_user IS NULL OR user_id = '1'",
         "current_role IS NULL OR user_id = '1'",
         "user IS NULL OR user_id = '1'",
     ):
-        assert len(SEC004().check(_wrap(_policy_with_using(using)), {})) == 1
+        assert SEC004().check(_wrap(_policy_with_using(using)), {}) == [], using
 
 
-def test_sec004_fires_on_current_user_is_null_disjunct() -> None:
+def test_sec004_fires_on_never_null_svfop_when_explicitly_configured() -> None:
+    # The mechanism still honors an explicit opt-in: a project that
+    # configures current_user into the auth set gets it flagged. (The
+    # default just no longer assumes it.)
     schema = _wrap(
         _policy_with_using("current_user IS NULL OR user_id = '1'")
     )
-    assert len(SEC004().check(schema, {})) == 1
+    assert len(
+        SEC004().check(schema, {"auth_functions": ["current_user"]})
+    ) == 1
 
 
 def test_sec004_does_not_fire_on_is_not_null() -> None:
@@ -176,13 +184,6 @@ def test_sec004_fires_on_with_check_disjunct_not_just_using() -> None:
     )
     schema = _wrap(policy)
     assert SEC004().check(schema, {}) == []
-
-
-def test_sec004_default_set_covers_session_user() -> None:
-    schema = _wrap(
-        _policy_with_using("session_user IS NULL OR user_id = '1'")
-    )
-    assert len(SEC004().check(schema, {})) == 1
 
 
 def test_sec004_default_set_covers_auth_role() -> None:

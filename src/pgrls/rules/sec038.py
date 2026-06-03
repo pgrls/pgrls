@@ -68,15 +68,19 @@ from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 
+# Only functions that genuinely return NULL for an unauthenticated
+# request. current_user / session_user / current_role / user are
+# EXCLUDED: they always return the session role name (Postgres has no
+# unauthenticated backend — PostgREST's "anon" is a real role), so they
+# are never NULL and modeling them as anon-NULL would make
+# `current_user IS NULL OR …` prove valid and FALSE-fire. Mirrors
+# SEC004. (A project that genuinely wants them treated as anon-NULL can
+# still add them via `[lint.rules.SEC038].auth_functions`; the
+# SQLValueFunction branch in the encoder honors a configured set.)
 _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "auth.uid",
     "auth.role",
     "auth.jwt",
-    "current_user",
-    "session_user",
-    # SQL-standard synonyms of current_user — all NULL under anon.
-    "current_role",
-    "user",
     "current_setting",
 })
 

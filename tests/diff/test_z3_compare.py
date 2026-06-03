@@ -612,16 +612,27 @@ def test_anon_fires_on_multiple_auth_is_null() -> None:
     ) is not None
 
 
-def test_anon_fires_on_bare_sqlvaluefunction_current_user() -> None:
+def test_anon_fires_on_bare_sqlvaluefunction_when_configured() -> None:
     # `current_user` / `session_user` written WITHOUT parens parse as
-    # SQLValueFunction nodes — a distinct AST class from FuncCall —
-    # forced to NULL under anon by the _ANON_SVFOP_NAMES branch of
-    # `_is_anon_null_leaf`. The inverted `current_user IS NULL OR
-    # <owner>` disjunct is then TRUE for every row → valid → fires.
-    # The existing `(SELECT auth.uid())`-wrapped tests are all FuncCall,
-    # so this is the only coverage of the SQLValueFunction anon-leaf.
-    assert _anon(f"current_user IS NULL OR {_OWNER}") is not None
-    assert _anon(f"session_user IS NULL OR {_OWNER}") is not None
+    # SQLValueFunction nodes — a distinct AST class from FuncCall. They
+    # are NOT in the DEFAULT anon set (they always return the session
+    # role name, never NULL — R11 #1), so by default they do NOT fire.
+    # But when a project explicitly configures them, the _ANON_SVFOP_NAMES
+    # branch of `_is_anon_null_leaf` still models them as anon-NULL and
+    # the inverted disjunct fires — this exercises the SQLValueFunction
+    # leaf path.
+    for fn in ("current_user", "session_user"):
+        node = parse_expr(f"{fn} IS NULL OR {_OWNER}")
+        assert node is not None
+        assert anon_read_counterexample(node, {fn}) is not None
+
+
+def test_anon_clean_on_never_null_role_svfop_by_default() -> None:
+    # R11 #1: with the default anon set, `current_user IS NULL` is NOT
+    # treated as anon-NULL (current_user is never NULL in Postgres), so
+    # the inverted disjunct does not prove valid — no false fire.
+    assert _anon(f"current_user IS NULL OR {_OWNER}") is None
+    assert _anon(f"session_user IS NULL OR {_OWNER}") is None
 
 
 def test_anon_fires_on_bare_true() -> None:
