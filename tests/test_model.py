@@ -802,6 +802,69 @@ def test_from_snapshot_rejects_invalid_policy_command() -> None:
         Schema.from_snapshot(snap)
 
 
+def test_from_snapshot_rejects_select_delete_policy_with_with_check() -> None:
+    # Regression (round-3 #11): a SELECT / DELETE policy carrying a
+    # WITH CHECK clause makes `policy_to_sql` (and `pgrls diff --apply`)
+    # emit DDL Postgres rejects — WITH CHECK is valid only on INSERT /
+    # UPDATE / ALL. Reject the malformed combination at the decode boundary.
+    for command in ("SELECT", "DELETE"):
+        snap = _minimal_snapshot(
+            policies=[
+                {
+                    "policy_name": "p",
+                    "command": command,
+                    "permissive": True,
+                    "roles": ["r"],
+                    "using_sql": "true",
+                    "with_check_sql": "id > 0",
+                }
+            ]
+        )
+        with pytest.raises(ValueError, match="WITH CHECK"):
+            Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_rejects_insert_policy_with_using() -> None:
+    # The mirror case: USING is valid only on SELECT / UPDATE / DELETE /
+    # ALL; an INSERT policy with USING would emit invalid DDL.
+    snap = _minimal_snapshot(
+        policies=[
+            {
+                "policy_name": "p",
+                "command": "INSERT",
+                "permissive": True,
+                "roles": ["r"],
+                "using_sql": "true",
+                "with_check_sql": "id > 0",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="USING"):
+        Schema.from_snapshot(snap)
+
+
+def test_from_snapshot_accepts_valid_command_clause_combinations() -> None:
+    # The combination check must NOT reject Postgres-valid shapes: USING
+    # on SELECT/DELETE, WITH CHECK on INSERT, both on UPDATE/ALL. An
+    # empty-string clause is harmless (never emitted) and is also accepted.
+    policies = [
+        {"policy_name": "s", "command": "SELECT", "permissive": True,
+         "roles": ["r"], "using_sql": "true"},
+        {"policy_name": "d", "command": "DELETE", "permissive": True,
+         "roles": ["r"], "using_sql": "true"},
+        {"policy_name": "i", "command": "INSERT", "permissive": True,
+         "roles": ["r"], "with_check_sql": "true"},
+        {"policy_name": "u", "command": "UPDATE", "permissive": True,
+         "roles": ["r"], "using_sql": "true", "with_check_sql": "true"},
+        {"policy_name": "a", "command": "ALL", "permissive": True,
+         "roles": ["r"], "using_sql": "true", "with_check_sql": "true"},
+        {"policy_name": "se", "command": "SELECT", "permissive": True,
+         "roles": ["r"], "using_sql": "true", "with_check_sql": ""},
+    ]
+    schema = Schema.from_snapshot(_minimal_snapshot(policies=policies))
+    assert len(schema.tables[0].policies) == 6
+
+
 def test_from_snapshot_accepts_real_types_and_privileges() -> None:
     # Validation is permissive enough for real Postgres types /
     # privileges — these must round-trip without error.

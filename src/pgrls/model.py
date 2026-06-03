@@ -636,20 +636,42 @@ def _policy_from_dict(p: dict[str, Any]) -> Policy:
     # callers parse on demand (only pgrls.diff._diff_columns needs them,
     # and it lazy-parses).
     command = p["command"]
+    pname = p.get("policy_name") or p.get("name")
     if command not in _VALID_POLICY_COMMANDS:
         raise ValueError(
-            "snapshot policy "
-            f"{(p.get('policy_name') or p.get('name'))!r} has an invalid "
+            f"snapshot policy {pname!r} has an invalid "
             f"command {command!r}. Allowed: ALL, SELECT, INSERT, UPDATE, "
             "DELETE."
+        )
+    using_sql = p.get("using_sql")
+    with_check_sql = p.get("with_check_sql")
+    # Reject clause/command combinations Postgres forbids — a malformed or
+    # hand-built snapshot carrying one would make `policy_to_sql` (and thus
+    # `pgrls diff --apply`) emit DDL Postgres rejects. WITH CHECK is valid
+    # only on INSERT / UPDATE / ALL; USING only on SELECT / UPDATE / DELETE
+    # / ALL. The truthy check mirrors `policy_to_sql`'s emission gate, so an
+    # empty-string clause (never emitted) is not rejected.
+    if with_check_sql and command in {"SELECT", "DELETE"}:
+        raise ValueError(
+            f"snapshot policy {pname!r} is FOR {command} but carries a "
+            "WITH CHECK clause; Postgres allows WITH CHECK only on INSERT / "
+            "UPDATE / ALL policies, so replaying it via `pgrls diff --apply` "
+            "would emit invalid DDL."
+        )
+    if using_sql and command == "INSERT":
+        raise ValueError(
+            f"snapshot policy {pname!r} is FOR INSERT but carries a USING "
+            "clause; Postgres allows USING only on SELECT / UPDATE / DELETE "
+            "/ ALL policies, so replaying it via `pgrls diff --apply` would "
+            "emit invalid DDL."
         )
     return Policy(
         name=p.get("policy_name") or p["name"],
         command=command,
         permissive=p["permissive"],
         roles=tuple(p["roles"]),
-        using_sql=p.get("using_sql"),
-        with_check_sql=p.get("with_check_sql"),
+        using_sql=using_sql,
+        with_check_sql=with_check_sql,
         using_ast=None,
         with_check_ast=None,
     )
