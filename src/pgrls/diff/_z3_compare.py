@@ -1324,6 +1324,21 @@ def _anon_3vl(
             vals.append(v)
         if not vals:
             return None
+        # Every COALESCE branch shares a common type in Postgres, so the
+        # translated branch values must share a Z3 sort. A mismatch here
+        # is an ENCODING ARTIFACT, not real SQL: a bare column argument
+        # reaches the COALESCE with no comparison-sort context, so it
+        # defaults to BoolSort (see the ColumnRef branch above), while a
+        # sibling numeric/text literal is Int/Real/String. The `z3.If`
+        # fold below SILENTLY COERCES such a Bool into {0,1} rather than
+        # raising, so the `except z3.Z3Exception` never catches it — and a
+        # numeric gate like `COALESCE(level, 0) < 3` would be mis-encoded
+        # as unconditionally TRUE, fabricating a catastrophic SEC038
+        # anonymous-read-leak verdict on a safe, auth-free predicate.
+        # Abstain on any cross-branch sort mismatch: soundness (no false
+        # positive) over coverage. (R18 #1)
+        if len({v.value.sort() for v in vals}) > 1:
+            return None
         try:
             value = vals[-1].value
             for v in reversed(vals[:-1]):

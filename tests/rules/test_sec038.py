@@ -192,6 +192,59 @@ def test_sec038_clean_on_coalesce_sentinel() -> None:
     assert SEC038().check(schema, {}) == []
 
 
+@pytest.mark.parametrize(
+    "using",
+    [
+        # R18 #1: a bare integer column inside COALESCE used to default to
+        # BoolSort (no comparison-sort context), and Z3 silently coerced
+        # the Bool into {0,1}, so these safe, auth-free tier/level/
+        # visibility gates were mis-proven VALID and SEC038 fabricated a
+        # catastrophic "anonymous read leak" error. Each is genuinely
+        # FALSE for a high access_level (leaks nothing), so it must stay
+        # clean (the rule now abstains on the mismatched-sort fold).
+        "COALESCE(access_level, 0) < 3",
+        "COALESCE(access_level, 0) <= 1",
+        "COALESCE(access_level, 0) + 0 < 2",
+        "COALESCE(access_level, 0) >= 0",
+        # Boundary shapes that were already clean — pin them so the fix
+        # didn't regress the genuinely-not-valid comparisons either way.
+        "COALESCE(access_level, 0) < 1",
+        "COALESCE(access_level, 0) > 1",
+    ],
+)
+def test_sec038_clean_on_coalesce_numeric_gate(using: str) -> None:
+    assert SEC038().check(_wrap(_policy_with_using(using)), {}) == [], using
+
+
+def test_sec038_fires_on_three_arg_all_anon_null_coalesce_is_null() -> None:
+    # R18 #3: pin the N-arg COALESCE `is_null` AND-chain fold. Three
+    # anon-NULL args → the COALESCE is NULL under anon → `IS NULL` is TRUE
+    # for every row → valid → fire. Guards the fold that, if mis-ordered,
+    # could silently turn a real leak into a false negative.
+    schema = _wrap(
+        _policy_with_using(
+            "COALESCE((SELECT auth.uid()), (SELECT auth.uid()), "
+            "(SELECT auth.uid())) IS NULL OR " + _OWNER_LIT
+        )
+    )
+    assert len(SEC038().check(schema, {})) == 1
+
+
+def test_sec038_clean_on_three_arg_coalesce_with_non_null_tail() -> None:
+    # R18 #3: the same 3-arg shape but with a non-NULL literal tail → the
+    # COALESCE is non-NULL → `IS NULL` is FALSE → the predicate reduces to
+    # the narrow owner match → not valid → clean. Pins the value `If`-chain
+    # fold alongside the `is_null` fold above.
+    schema = _wrap(
+        _policy_with_using(
+            "COALESCE((SELECT auth.uid()), (SELECT auth.uid()), "
+            "'00000000-0000-0000-0000-000000000009'::uuid) IS NULL OR "
+            + _OWNER_LIT
+        )
+    )
+    assert SEC038().check(schema, {}) == []
+
+
 def test_sec038_clean_on_jwt_claim_tenant() -> None:
     # N8: jwt-claim tenancy. auth.jwt() is anon-NULL; the `->>` operator is
     # untranslatable → soundness abort → clean (either way, no fire).
