@@ -61,7 +61,7 @@ import re
 from typing import Any
 
 from pgrls.fixers import Fix
-from pgrls.fixers._idents import quote_qualified
+from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_qualified_function_allowlist
 from pgrls.rules.sec015 import _is_pg_temp_safe
@@ -162,14 +162,19 @@ def _rewritten_path(existing: str | None) -> str:
         # comparison is case-insensitive for built-in schema names).
         if tok.lower() == "pg_temp":
             continue
-        # The `$user` placeholder is valid in a search_path only when
-        # double-quoted (`"$user"`); a bare `$user` is a syntax error.
-        # Live introspection always stores it quoted, but a hand-built /
-        # snapshot path may carry the bare form (which _is_safe_path_token
-        # accepts), so normalize it on emit — otherwise the rewritten
-        # ALTER FUNCTION would fail to parse server-side.
-        if tok == "$user":
-            tok = '"$user"'
+        # Quote on emit any BARE token that is not a valid unquoted
+        # identifier — a reserved keyword (`order`, `user`, `select`) or
+        # the `$user` placeholder (bare `$user` is a syntax error). All
+        # are accepted by _is_safe_path_token (so _safe_to_rewrite did not
+        # abstain), but splicing them verbatim into `SET search_path = …`
+        # produces unrunnable DDL that, under fix --apply's single
+        # transaction, rolls back every other fix. quote_ident is minimal
+        # (leaves `public`/`pg_catalog` bare, emits `"order"` / `"$user"`),
+        # so the common output is unchanged. An already-double-quoted
+        # token (`"My Schema"`, which _is_safe_path_token also accepts) is
+        # left verbatim — re-quoting it would double the quotes.
+        if not (tok.startswith('"') and tok.endswith('"')):
+            tok = quote_ident(tok)
         tokens.append(tok)
     tokens.append("pg_temp")
     return ", ".join(tokens)

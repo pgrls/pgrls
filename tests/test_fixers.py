@@ -2115,6 +2115,29 @@ def test_sec015_fix_requotes_bare_dollar_user_in_search_path() -> None:
     parse_sql(f.sql)
 
 
+def test_sec015_fix_quotes_reserved_keyword_search_path_token() -> None:
+    # R15 #5: a bare reserved-keyword schema token (`order`, `user`,
+    # `select`) passes _is_safe_path_token's `[A-Za-z_]...` regex, but
+    # splicing it verbatim into `SET search_path = order, …` is a syntax
+    # error that — under fix --apply's single all-or-nothing transaction —
+    # rolls back every other fix. The fixer must quote it on emit (same
+    # class as the bare-$user gap). quote_ident is minimal, so `public`
+    # stays bare.
+    from pglast import parse_sql
+
+    schema = Schema(
+        security_definer_functions=(
+            _secdef("public.f", signature="integer", search_path="order, public"),
+        ),
+    )
+    [f] = SEC015Fixer().fix(schema, {})
+    assert f.sql == (
+        'ALTER FUNCTION public.f(integer) '
+        'SET search_path = "order", public, pg_temp;'
+    )
+    parse_sql(f.sql)  # the emitted DDL must parse server-side
+
+
 def test_sec015_fix_abstains_on_empty_quoted_search_path_token() -> None:
     # R13 #4: an empty double-quoted token (`""`) is a zero-length
     # delimited identifier that Postgres rejects. _is_safe_path_token
