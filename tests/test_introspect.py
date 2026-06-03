@@ -700,6 +700,85 @@ def test_introspect_grants_resolve_unknown_role_oid_to_sentinel(
     )
 
 
+def test_introspect_excludes_owner_self_grant(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A default-ACL table (relacl=NULL) yields zero grant rows, so the
+    # owner's always-implicit privileges are invisible. The moment ANY
+    # explicit GRANT lands, Postgres materializes the FULL ACL — which
+    # INCLUDES the owner's own self-grant. That owner row is never a real
+    # access delta (the owner always holds it), so it must not surface as a
+    # captured Grant. `_GRANTS_SQL` filters `ax.grantee <> c.relowner`.
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT current_user")
+        row = cur.fetchone()
+        assert row is not None
+        owner = row[0]
+
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS owner_grant_other;
+        CREATE ROLE owner_grant_other NOLOGIN;
+        CREATE TABLE public.owner_grant_t (id INT);
+        GRANT SELECT ON public.owner_grant_t TO owner_grant_other;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    t = next(x for x in schema.tables if x.name == "owner_grant_t")
+    roles = {g.role for g in t.grants}
+    # The explicitly granted role is captured ...
+    assert "owner_grant_other" in roles
+    # ... but the owner's materialized self-grant is NOT.
+    assert owner not in roles, (
+        f"owner role {owner!r} leaked into captured grants — its "
+        "always-implicit self-grant must be filtered out of _GRANTS_SQL"
+    )
+
+
+def test_introspect_diff_no_phantom_owner_grant_on_first_grant(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # Regression for the phantom DIFF_GRANT_ADDED: snapshot a table BEFORE
+    # any explicit GRANT, then AFTER the first GRANT to another role. The
+    # diff must show exactly the new role's grant — never a spurious
+    # owner-attributed change born from the ACL materializing the owner's
+    # implicit privileges.
+    from pgrls.diff.differ import ChangeKind, diff_schemas
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT current_user")
+        row = cur.fetchone()
+        assert row is not None
+        owner = row[0]
+
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS phantom_grant_role;
+        CREATE ROLE phantom_grant_role NOLOGIN;
+        CREATE TABLE public.phantom_grant_t (id INT);
+        """
+    )
+    before = introspect(pg_conn, schemas=["public"])
+    apply_sql("GRANT SELECT ON public.phantom_grant_t TO phantom_grant_role")
+    after = introspect(pg_conn, schemas=["public"])
+
+    changes = diff_schemas(before, after)
+    grant_changes = [
+        c
+        for c in changes
+        if c.kind
+        in (ChangeKind.GRANT_ADDED, ChangeKind.GRANT_PUBLIC_NO_RLS)
+        and "phantom_grant_t" in c.location
+    ]
+    located_roles = {c.location.rsplit(".", 1)[-1] for c in grant_changes}
+    assert "phantom_grant_role" in located_roles
+    assert owner not in located_roles, (
+        "first GRANT to another role produced a phantom owner-attributed "
+        f"DIFF_GRANT_ADDED ({owner!r}); _GRANTS_SQL must exclude the "
+        "owner self-grant so capture is independent of other grants"
+    )
+
+
 def test_introspect_captures_views(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

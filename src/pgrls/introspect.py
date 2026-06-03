@@ -235,6 +235,16 @@ WHERE c.relkind IN ('r', 'p')
   AND n.nspname = ANY(%s)
   AND c.relacl IS NOT NULL
   AND ax.grantee IS NOT NULL
+  -- Exclude the table owner's own ACL row. A default-ACL table has
+  -- relacl=NULL and aclexplode yields nothing, so the owner's
+  -- always-implicit privileges are invisible. But the moment ANY explicit
+  -- GRANT is added, Postgres materializes the FULL ACL including the
+  -- owner's self-grant — which would then surface as a phantom
+  -- DIFF_GRANT_ADDED on the owner (and to_sql() would re-emit GRANT … TO
+  -- owner for diff --apply). The owner always holds these privileges, so
+  -- it is never a real delta; drop the row so capture is independent of
+  -- whether other grants exist.
+  AND ax.grantee <> c.relowner
 ORDER BY c.oid, role_name, ax.privilege_type
 """
 
