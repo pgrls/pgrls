@@ -55,12 +55,16 @@ What SEC026 catches:
   `user_email LIKE (SELECT current_setting('app.email', true))` is
   semantically identical to the un-wrapped form — Postgres evaluates
   the scalar SubLink to a value and feeds it to `LIKE` — so SEC026
-  inspects operand subtrees including SubLink contents. The PERF001
-  wrap idiom does not close this hole. The same outer walk also
-  reaches A_Expr nodes inside a sub-select on its own (e.g.
-  `EXISTS (SELECT 1 FROM members WHERE m.email LIKE
-  current_setting(...))` fires on the inner LIKE), but each policy
-  is reported once — `check` short-circuits on the first match.
+  treats a FROM-less scalar sub-select (the PERF001 wrap idiom) as the
+  pattern operand. A sub-select WITH a from clause is a *lookup*, not
+  the pattern: an auth call buried in its WHERE/JOIN (`user_email LIKE
+  (SELECT pattern FROM patterns WHERE owner = current_user)`) is a row
+  filter, not the value driving the predicate, so SEC026 does NOT fire
+  on it (see `_side_has_auth_call`). The same outer walk still reaches
+  A_Expr nodes inside a sub-select on its own (e.g. `EXISTS (SELECT 1
+  FROM members WHERE m.email LIKE current_setting(...))` fires on the
+  inner LIKE), but each policy is reported once — `check`
+  short-circuits on the first match.
 
 What SEC026 deliberately does not catch:
 
@@ -102,7 +106,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, FuncCall, Node, String, TypeCast
+from pglast.ast import (
+    A_Expr,
+    FuncCall,
+    Node,
+    SelectStmt,
+    String,
+    SubLink,
+    TypeCast,
+)
 
 from pgrls.ast_utils import find_func_calls
 from pgrls.model import Policy, Schema
@@ -226,20 +238,64 @@ def _is_non_text_typed(side: Any) -> bool:
     return False
 
 
-def _side_has_auth_call(side: Any, names: set[str]) -> bool:
-    """True if `side` (an operand of an A_Expr) contains an
-    auth-context function call.
+def _fromless_subselects(side: Any) -> list[SelectStmt]:
+    """Scalar sub-selects in `side` that have NO from clause.
 
-    Unlike SEC018, SEC026 does NOT pass `exclude_sublinks=True`:
-    `col LIKE (SELECT current_setting(...))` evaluates the scalar
-    SubLink to a value and feeds it to `LIKE`, so the
-    SubLink-wrapped form is the same vulnerability as the
-    un-wrapped one and must fire. The outer walk's recursion into
-    SubLinks still independently inspects A_Expr nodes inside a
-    sub-select; the per-policy short-circuit in `check` keeps each
-    policy to one Violation regardless.
+    A `(SELECT current_setting('app.x'))` — no FROM — carries the
+    compared value in its target list; that is the wrapped form
+    PERF001 recommends, and it IS the LIKE/regex pattern operand. A
+    sub-select WITH a from clause (`(SELECT pattern FROM patterns WHERE
+    owner = current_user)`) is a lookup whose internal predicates are
+    NOT the pattern the outer column matches against, so it must not be
+    treated as the auth operand. Mirrors SEC030's helper of the same
+    name. The walk inspects only fromless-ness at this level, not
+    sub-select bodies.
     """
-    return bool(find_func_calls(side, names))
+    out: list[SelectStmt] = []
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, SubLink):
+            sub = n.subselect
+            if isinstance(sub, SelectStmt) and not sub.fromClause:
+                out.append(sub)
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(side)
+    return out
+
+
+def _side_has_auth_call(side: Any, names: set[str]) -> bool:
+    """True if the LIKE/regex pattern operand `side` IS an auth value.
+
+    The auth value drives the pattern when it is a *direct* call
+    (`col LIKE current_setting(...)`) or lives in the projection of a
+    FROM-less scalar sub-select (`col LIKE (SELECT current_setting())`,
+    the form PERF001 recommends). `exclude_sublinks=True` on the direct
+    pass keeps a sub-select's *internal* predicate out of the operand's
+    value; the fromless branch then re-adds the wrapped recommended form.
+
+    A sub-select WITH a from clause is a lookup, not the pattern, so an
+    auth call buried in its WHERE/JOIN (`col LIKE (SELECT pattern FROM
+    patterns WHERE owner = current_user)`) is NOT counted — avoiding a
+    false positive where current_user is merely a row filter. The outer
+    `_has_pattern_against_auth` walk still inspects any A_Expr inside the
+    sub-select independently, so a genuine inner pattern still fires.
+    """
+    if find_func_calls(side, names, exclude_sublinks=True):
+        return True
+    return any(
+        find_func_calls(sub.targetList, names, exclude_sublinks=True)
+        for sub in _fromless_subselects(side)
+    )
 
 
 def _has_pattern_against_auth(node: Any, names: set[str]) -> bool:

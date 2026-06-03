@@ -477,3 +477,42 @@ def test_sec026_raises_on_malformed_allowlist() -> None:
         SEC026().check(
             schema, options={"allowlist": [" public.documents.p "]}
         )
+
+
+def test_sec026_silent_on_auth_call_in_from_bearing_subselect_filter() -> None:
+    # Regression (round-5): the auth call (current_setting) is a ROW FILTER
+    # inside a FROM-bearing lookup sub-select; the LIKE pattern is the
+    # `pattern` column, not the auth value. SEC026 must NOT fire — the auth
+    # value's shape does not drive the predicate here.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "user_email LIKE (SELECT pattern FROM patterns "
+                        "WHERE tenant = current_setting('app.tenant'))"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert SEC026().check(schema, options={}) == []
+
+
+def test_sec026_still_fires_on_fromless_wrapped_auth_value() -> None:
+    # A FROM-less scalar sub-select (the PERF001 wrap idiom) IS the pattern
+    # operand, so the auth value's shape DOES drive the predicate — fires.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "user_email LIKE "
+                        "(SELECT current_setting('app.email'))"
+                    ),
+                ),
+            ),
+        )
+    )
+    [v] = SEC026().check(schema, options={})
+    assert v.rule_id == "SEC026"
