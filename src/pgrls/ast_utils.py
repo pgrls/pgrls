@@ -94,21 +94,11 @@ def parse_expr(
     return target.val
 
 
-def top_level_disjuncts(node: Any) -> list[Any]:
-    """If node is a top-level OR expression, return its disjunct children.
-
-    Otherwise return a single-element list containing the node itself.
-    """
-    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
-        return list(node.args or ())
-    return [node]
-
-
 def flatten_or_disjuncts(node: Any) -> list[Any]:
     """Return every disjunct of a (possibly nested) OR expression.
 
-    Unlike `top_level_disjuncts`, this flattens nested OR `BoolExpr`
-    nodes: `A OR (B OR C)` yields `[A, B, C]`. OR is associative and
+    Flattens nested OR `BoolExpr` nodes: `A OR (B OR C)` yields
+    `[A, B, C]`. OR is associative and
     pglast preserves explicit parenthesization as a nested `BoolExpr`,
     so the natural authoring order `<real check> OR (<other> OR
     auth() IS NULL)` would otherwise hide the trailing disjunct from a
@@ -119,7 +109,7 @@ def flatten_or_disjuncts(node: Any) -> list[Any]:
     not part of the same disjunction (an `IS NULL` under an `AND`, a
     `NOT`, or inside a subquery is not a standalone OR-disjunct), so
     the caller handles them atomically. A non-OR `node` yields
-    `[node]`, matching `top_level_disjuncts`.
+    `[node]`.
     """
     if not (
         isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR
