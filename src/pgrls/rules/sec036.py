@@ -194,26 +194,42 @@ def _from_clause_targets(
     return out
 
 
-def _from_clause_join_quals(sel: Any) -> list[Any]:
-    """ON-clause predicates of every JoinExpr in a sub-select's FROM.
+def _from_clause_binding_quals(sel: Any) -> list[Any]:
+    """Every qual in `sel`'s FROM clause where a caller binding can live.
 
-    A caller binding can live in a JOIN's `ON` quals
-    (`JOIN auth.users u ON u.id = auth.uid()`) rather than the
-    sub-select's top-level WHERE, so the binding check must search
-    these too — otherwise a correctly-bound JOIN would false-fire.
+    JOIN `ON` clauses (`JOIN auth.users u ON u.id = auth.uid()`), AND —
+    because target detection recurses into derived tables
+    (`_from_item_range_vars` handles RangeSubselect) — the WHERE and JOIN
+    ONs of those derived tables too, recursively. Without the
+    derived-table descent a policy that binds the caller INSIDE a derived
+    table (`FROM (SELECT id FROM auth.users WHERE id = auth.uid()) sub`)
+    false-fires: the target is found one level down but the binding there
+    is never inspected (asymmetry with target detection).
     """
     quals: list[Any] = []
 
-    def walk(item: Any) -> None:
+    def walk_select(s: Any) -> None:
+        if s is None:
+            return
+        if s.whereClause is not None:
+            quals.append(s.whereClause)
+        for from_item in s.fromClause or ():
+            walk_item(from_item)
+
+    def walk_item(item: Any) -> None:
         if isinstance(item, JoinExpr):
             if item.quals is not None:
                 quals.append(item.quals)
-            walk(item.larg)
-            walk(item.rarg)
+            walk_item(item.larg)
+            walk_item(item.rarg)
+        elif isinstance(item, RangeSubselect):
+            sub = item.subquery
+            if isinstance(sub, SelectStmt):
+                walk_select(sub)
 
-    if sel is not None and sel.fromClause is not None:
-        for from_item in sel.fromClause:
-            walk(from_item)
+    if sel is not None:
+        for from_item in sel.fromClause or ():
+            walk_item(from_item)
     return quals
 
 
@@ -326,7 +342,7 @@ def _has_binding_reference(
     sel = sublink.subselect
     if sel is None:
         return False
-    candidates = [sel.whereClause, *_from_clause_join_quals(sel)]
+    candidates = [sel.whereClause, *_from_clause_binding_quals(sel)]
     return any(
         c is not None and _qual_binds_caller(c, binding_functions)
         for c in candidates

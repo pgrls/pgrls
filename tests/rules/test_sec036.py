@@ -242,6 +242,21 @@ def test_silent_when_from_subselect_target_is_caller_bound() -> None:
     assert SEC036().check(schema, {}) == []
 
 
+def test_silent_when_binding_lives_inside_a_derived_table() -> None:
+    # Regression (round-2 #4): target detection recurses into a derived
+    # table (round-1 #14), so the binding check must too. A policy that
+    # binds the caller INSIDE the derived table's own WHERE is correctly
+    # scoped and must stay silent — otherwise the target is found one
+    # level down but the binding there is never inspected (false positive).
+    expr = (
+        "EXISTS (SELECT 1 FROM "
+        "(SELECT id FROM auth.users WHERE id = auth.uid()) sub "
+        "WHERE sub.id IS NOT NULL)"
+    )
+    schema = _wrap(_policy(f"({expr})", name="bound_in_derived"))
+    assert SEC036().check(schema, {}) == []
+
+
 def test_silent_on_in_subselect_against_auth_users() -> None:
     # The IN/ANY variant has a different failure mode (rows owned by
     # any admin, not all rows when any admin exists). SEC036 is
