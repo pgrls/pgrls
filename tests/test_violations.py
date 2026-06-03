@@ -98,3 +98,39 @@ def test_coerce_severity_rejects_invalid() -> None:
         coerce_severity("CRITICAL")
     with pytest.raises(ValueError, match="not one of"):
         coerce_severity("")
+
+
+def test_violation_normalizes_off_spec_severity_case() -> None:
+    # An extra (user-supplied) rule that stamps "ERROR" / "Warning" on a
+    # Violation used to flow an off-spec value straight into
+    # `is_at_or_above`, which then did `SEVERITY_ORDER["ERROR"]` → KeyError
+    # and crashed the whole lint run. The construction boundary now folds
+    # it to the canonical Severity.
+    v = Violation(
+        rule_id="X001",
+        severity="ERROR",  # type: ignore[arg-type]
+        title="t",
+        message="m",
+        location=None,
+    )
+    assert v.severity == "error"
+    # And the coerced value is usable everywhere downstream.
+    assert is_at_or_above(v.severity, "warning") is True
+
+
+def test_violation_tolerates_unknown_severity_and_fails_closed() -> None:
+    # A genuinely off-spec severity from a misbehaving extra rule must NOT
+    # crash construction or the exit-code gate — formatters degrade it
+    # gracefully, and the gate counts it (fails closed) so the finding
+    # isn't silently dropped. (Earlier, is_at_or_above KeyError-ed here and
+    # crashed the whole lint run.)
+    v = Violation(
+        rule_id="X002",
+        severity="critical",  # type: ignore[arg-type]
+        title="t",
+        message="m",
+        location=None,
+    )
+    assert v.severity == "critical"  # preserved, not rejected
+    assert is_at_or_above(v.severity, "error") is True
+    assert is_at_or_above(v.severity, "info") is True

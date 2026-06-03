@@ -81,7 +81,33 @@ class Violation:
         default=None, compare=False, hash=False
     )
 
+    def __post_init__(self) -> None:
+        # Fold a case-variant of a known severity to its canonical form
+        # ("ERROR" -> "error") so an extra (user-supplied) rule's casing
+        # typo is treated as the real severity rather than as unknown.
+        # A genuinely off-spec value is deliberately LEFT UNTOUCHED, not
+        # rejected: formatters render it defensively (see the unknown-
+        # severity formatter tests) and `is_at_or_above` fails closed on
+        # it, so one off-spec finding degrades gracefully instead of
+        # crashing the whole run. The dataclass is frozen, so assign via
+        # object.__setattr__.
+        if isinstance(self.severity, str):
+            lowered = self.severity.lower()
+            if lowered != self.severity and lowered in ALL_SEVERITIES:
+                object.__setattr__(self, "severity", lowered)
+
 
 def is_at_or_above(severity: Severity, threshold: Severity) -> bool:
-    """True when `severity` is at least as severe as `threshold` (lower = more severe)."""
-    return SEVERITY_ORDER[severity] <= SEVERITY_ORDER[threshold]
+    """True when `severity` is at least as severe as `threshold` (lower = more severe).
+
+    `threshold` is always a validated Severity (a CLI choice / config
+    value). `severity` comes off a Violation and may be off-spec when an
+    extra (user) rule stamped a value outside ALL_SEVERITIES; rather than
+    KeyError-ing the exit-code gate, treat an unknown severity as failing
+    any threshold — a custom rule fired, so its finding counts instead of
+    being silently dropped (fail closed).
+    """
+    rank = SEVERITY_ORDER.get(severity)
+    if rank is None:
+        return True
+    return rank <= SEVERITY_ORDER[threshold]
