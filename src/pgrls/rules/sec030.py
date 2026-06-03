@@ -60,6 +60,14 @@ Detection is structural and deliberately conservative:
   policy's own table (same resolution SEC005 / SEC018 use), so a
   sub-select join column or catalog lookup is not mistaken for the
   discriminator.
+* **Identity/discriminator column names only.** The hazard is specific
+  to a tenant/user key, so the own column must additionally carry a
+  discriminator name (`tenant_id`, `user_id`, `org_id`, … — the same
+  default set SEC021 uses, overridable via `identity_columns`). A
+  non-discriminator column compared to a session value — a point-in-time
+  read `created_at = current_setting('app.snapshot_time')::timestamptz` —
+  does NOT fire: a NULL there is fail-closed, and the `SET NOT NULL`
+  remedy would wrongly break a legitimately-nullable timestamp.
 * **Column is a direct operand; the auth value may be wrapped in a
   fromless sub-select.** The discriminator column must be a direct
   operand of the `=` (column extraction excludes sub-selects), but
@@ -82,6 +90,14 @@ Configure the auth-context function set (replaces the default):
 ```toml
 [lint.rules.SEC030]
 auth_functions = ["auth.uid", "current_setting", "request.jwt.claim"]
+```
+
+Configure which column names count as discriminators (replaces the
+default identity set — add a project-specific key, or narrow it):
+
+```toml
+[lint.rules.SEC030]
+identity_columns = ["tenant_id", "workspace", "region"]
 ```
 
 Allowlist tables where a nullable discriminator is intentional (the
@@ -107,6 +123,10 @@ from pglast.enums import A_Expr_Kind
 from pgrls.ast_utils import find_func_calls, own_column_ref
 from pgrls.model import Schema, Table
 from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
+# Reuse SEC021's identity/discriminator column-name set as the shared
+# default so the two rules' notion of "what looks like a tenant/user key"
+# cannot drift (R15 #6). SEC030 keeps its own configurable override.
+from pgrls.rules.sec021 import _DEFAULT_IDENTITY_COLUMNS
 from pgrls.violations import Severity, Violation
 
 # Functions that read a per-request session value — the *correct*
@@ -128,6 +148,34 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
             'strings (e.g. ["auth.uid", "current_setting"]).'
         )
     return set(raw)
+
+
+def _parse_identity_columns(options: dict[str, Any]) -> set[str]:
+    """Column names SEC030 treats as tenant/user discriminators.
+
+    SEC030's hazard model — silent row-hiding plus a loaded-gun
+    cross-tenant leak one NULL-tolerant edit away — is specific to a
+    tenant/user DISCRIMINATOR. A non-discriminator column that merely
+    happens to be compared `=` to a session value (e.g. a point-in-time
+    read `created_at = current_setting('app.snapshot_time')::timestamptz`)
+    is NOT a discriminator: a NULL there is fail-closed and a NULL-
+    tolerant edit only widens a time filter, not a tenant boundary.
+    Telling the operator to `SET NOT NULL` on such a column is wrong, so
+    gate firing on an identity-column name. Defaults to the same set
+    SEC021 uses (single source of truth) and is overridable per project
+    with `[lint.rules.SEC030].identity_columns`.
+    """
+    raw = options.get("identity_columns")
+    if raw is None:
+        return set(_DEFAULT_IDENTITY_COLUMNS)
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise TypeError(
+            "[lint.rules.SEC030].identity_columns must be a list of "
+            'column names, e.g. ["tenant_id", "org_id"].'
+        )
+    # Case-fold: Postgres lowercases unquoted identifiers, and the
+    # column-name comparison lowercases the operand too.
+    return {s.lower() for s in raw}
 
 
 def _expr_op(node: A_Expr) -> str | None:
@@ -221,8 +269,13 @@ def _side_has_auth_call(side: Any, auth_functions: set[str]) -> bool:
     )
 
 
-def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[str]:
-    """Own columns compared with `=` against an auth-context value.
+def _scoping_columns(
+    node: Any,
+    table: Table,
+    auth_functions: set[str],
+    identity_columns: set[str],
+) -> set[str]:
+    """Own *discriminator* columns compared with `=` against an auth value.
 
     Walks the policy predicate's `A_Expr` nodes; when the operator is
     a scalar `=` and one operand carries an auth-context call while
@@ -230,6 +283,13 @@ def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[s
     side are scoping keys. Requiring the two on opposite operands
     distinguishes a scoping predicate (`tenant_id = current_setting(…)`)
     from an auth call used elsewhere.
+
+    The own column must additionally be an identity/discriminator name
+    (`identity_columns`) — SEC030's hazard is specific to a tenant/user
+    key, so a non-discriminator column compared to a session value (e.g.
+    a snapshot-time `created_at = current_setting(…)`) is not surfaced
+    (it would otherwise mis-advise `SET NOT NULL` on a legitimately-
+    nullable timestamp).
 
     The walk does NOT descend into a `SubLink` body: a
     discriminator-equality must be a predicate of the policy itself,
@@ -261,11 +321,11 @@ def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[s
             lhs, rhs = n.lexpr, n.rexpr
             if _side_has_auth_call(lhs, auth_functions):
                 col = _direct_own_column(rhs, table)
-                if col is not None:
+                if col is not None and col.lower() in identity_columns:
                     found.add(col)
             if _side_has_auth_call(rhs, auth_functions):
                 col = _direct_own_column(lhs, table)
-                if col is not None:
+                if col is not None and col.lower() in identity_columns:
                     found.add(col)
             # fall through — keep walking operands for nested A_Expr
             # nodes (boolean AND/OR chains), but not into sub-selects.
@@ -286,6 +346,7 @@ class SEC030:
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Violation]:
         auth_functions = _parse_auth_functions(options)
+        identity_columns = _parse_identity_columns(options)
         allowlist = parse_table_ref_allowlist("SEC030", options)
         out: list[Violation] = []
         for table in schema.tables:
@@ -305,7 +366,9 @@ class SEC030:
             for policy in table.policies:
                 for ast in (policy.using_ast, policy.with_check_ast):
                     if ast is not None:
-                        scoping |= _scoping_columns(ast, table, auth_functions)
+                        scoping |= _scoping_columns(
+                            ast, table, auth_functions, identity_columns
+                        )
             if not scoping:
                 continue
 

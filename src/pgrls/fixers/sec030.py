@@ -50,6 +50,7 @@ from pgrls.model import Schema, Table
 from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.rules.sec030 import (
     _parse_auth_functions,
+    _parse_identity_columns,
     _scoping_columns,
 )
 
@@ -65,6 +66,7 @@ class SEC030Fixer:
         # fix` as a tool error.
         allowlist = parse_table_ref_allowlist("SEC030", options)
         auth_functions = _parse_auth_functions(options)
+        identity_columns = _parse_identity_columns(options)
         out: list[Fix] = []
         for table in schema.tables:
             # Mirror SEC030's detection precisely.
@@ -85,7 +87,7 @@ class SEC030Fixer:
                 for ast in (policy.using_ast, policy.with_check_ast):
                     if ast is not None:
                         scoping |= _scoping_columns(
-                            ast, table, auth_functions
+                            ast, table, auth_functions, identity_columns
                         )
             if not scoping:
                 continue

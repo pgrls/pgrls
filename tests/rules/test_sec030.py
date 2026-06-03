@@ -274,6 +274,51 @@ def test_sec030_silent_on_non_equality_operator() -> None:
     assert SEC030().check(schema, options={}) == []
 
 
+def test_sec030_silent_on_non_discriminator_column_equality() -> None:
+    # R15 #6: SEC030's hazard (silent row-hiding + loaded-gun cross-tenant
+    # leak) is specific to a tenant/user DISCRIMINATOR. A point-in-time
+    # read `created_at = current_setting('app.snapshot_time')` is a scalar
+    # `=` against a session value, but `created_at` is not a discriminator
+    # — a NULL there is fail-closed, and the `SET NOT NULL` remedy would
+    # wrongly break a legitimately-nullable timestamp. Gated out by the
+    # identity-column name check.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using=(
+                        "created_at = "
+                        "current_setting('app.snapshot_time')::timestamptz"
+                    )
+                ),
+                cols=(
+                    ("id", "uuid", False),
+                    ("created_at", "timestamptz", True),
+                ),
+            ),
+        )
+    )
+    assert SEC030().check(schema, options={}) == []
+    # A non-default discriminator name fires once configured.
+    region_schema = Schema(
+        tables=(
+            _table(
+                _policy(using="region = current_setting('app.region')"),
+                cols=(("id", "uuid", False), ("region", "text", True)),
+            ),
+        )
+    )
+    assert SEC030().check(region_schema, options={}) == []
+    assert (
+        len(
+            SEC030().check(
+                region_schema, options={"identity_columns": ["region"]}
+            )
+        )
+        == 1
+    )
+
+
 def test_sec030_silent_on_array_membership_any() -> None:
     # `<auth> = ANY(tags)` is array membership (A_Expr kind
     # AEXPR_OP_ANY), a different access model from a scalar

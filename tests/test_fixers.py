@@ -1736,20 +1736,22 @@ def test_sec030_fix_respects_allowlist_unqualified() -> None:
 
 
 def test_sec030_fix_quotes_mixed_case_column() -> None:
-    # Postgres identifiers like `TenantId` need double-quoting in
-    # ALTER COLUMN, otherwise the server lowercases and rejects.
+    # Postgres identifiers like `Tenant_Id` need double-quoting in
+    # ALTER COLUMN, otherwise the server lowercases and rejects. (Uses a
+    # mixed-case spelling of the identity column `tenant_id` so it still
+    # passes SEC030's identity-column gate while exercising the quoting.)
     table = _sec030_table(
         column_details=(
             Column(name="id", data_type="uuid", is_nullable=False),
             Column(
-                name="TenantId",
+                name="Tenant_Id",
                 data_type="integer",
                 is_nullable=True,
             ),
         ),
     )
     policy = _scoping_policy(
-        column='"TenantId"',  # quoted in policy SQL
+        column='"Tenant_Id"',  # quoted in policy SQL
         name="tenant",
     )
     table = Table(
@@ -1766,7 +1768,7 @@ def test_sec030_fix_quotes_mixed_case_column() -> None:
     assert len(fixes) == 1
     assert fixes[0].sql == (
         'ALTER TABLE public.documents '
-        'ALTER COLUMN "TenantId" SET NOT NULL;'
+        'ALTER COLUMN "Tenant_Id" SET NOT NULL;'
     )
 
 
