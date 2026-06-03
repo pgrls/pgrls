@@ -1,8 +1,14 @@
 """Unit tests for SEC006 — INSERT/UPDATE/ALL policy missing WITH CHECK."""
 from __future__ import annotations
 
+from pgrls.ast_utils import parse_expr
 from pgrls.model import Policy, Schema, Table
 from pgrls.rules.sec006 import SEC006
+
+# The common multi-tenant USING predicate. A real (non-constant) USING is
+# what Postgres reuses as the implicit WITH CHECK on UPDATE/ALL, so a
+# permissive policy carrying it is NOT an open write.
+_REAL_USING = "tenant_id = current_setting('app.t')"
 
 
 def _policy(
@@ -11,13 +17,15 @@ def _policy(
     command: str,
     with_check: str | None,
     permissive: bool = True,
+    using: str | None = _REAL_USING,
 ) -> Policy:
     return Policy(
         name=name,
         command=command,  # type: ignore[arg-type]
         permissive=permissive,
         roles=("authenticated",),
-        using_sql="tenant_id = current_setting('app.t')",
+        using_sql=using,
+        using_ast=parse_expr(using) if using else None,
         with_check_sql=with_check,
     )
 
@@ -44,18 +52,47 @@ def test_sec006_fires_on_insert_without_with_check() -> None:
     assert violations[0].location == "public.t.p"
 
 
-def test_sec006_fires_on_update_without_with_check() -> None:
+def test_sec006_suppresses_permissive_update_with_reusable_using() -> None:
+    # Permissive FOR UPDATE with a real USING and no WITH CHECK is NOT an
+    # open write: Postgres reuses the USING expression as the implicit
+    # WITH CHECK, so the written row must still satisfy `tenant_id = …`.
+    # This is the most common multi-tenant shape; firing here was a false
+    # positive that failed clean-lint CI.
     violations = SEC006().check(
         _wrap(_policy("p", command="UPDATE", with_check=None)), {}
     )
-    assert len(violations) == 1
+    assert violations == []
 
 
-def test_sec006_fires_on_all_without_with_check() -> None:
+def test_sec006_suppresses_permissive_all_with_reusable_using() -> None:
+    # Same reuse semantics apply to FOR ALL (its write side is INSERT and
+    # UPDATE, both of which honour the reused WITH CHECK).
     violations = SEC006().check(
         _wrap(_policy("p", command="ALL", with_check=None)), {}
     )
+    assert violations == []
+
+
+def test_sec006_fires_on_update_without_using_or_with_check() -> None:
+    # No USING for Postgres to reuse → the write side is genuinely
+    # unconstrained, so the finding is real.
+    violations = SEC006().check(
+        _wrap(_policy("p", command="UPDATE", with_check=None, using=None)),
+        {},
+    )
     assert len(violations) == 1
+    assert violations[0].location == "public.t.p"
+
+
+def test_sec006_fires_on_all_with_constant_true_using() -> None:
+    # A constant-true USING reused as WITH CHECK admits every written row,
+    # so the write side is still open — the finding is real.
+    violations = SEC006().check(
+        _wrap(_policy("p", command="ALL", with_check=None, using="true")),
+        {},
+    )
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.p"
 
 
 def test_sec006_does_not_fire_on_select_without_with_check() -> None:
@@ -137,15 +174,18 @@ def test_sec006_fires_on_each_offending_policy_independently() -> None:
                 policies=(
                     _policy("a", command="INSERT", with_check=None),
                     _policy("b", command="UPDATE", with_check="x = 1"),
+                    # Real USING reused as WITH CHECK → closed → no finding.
                     _policy("c", command="ALL", with_check=None),
                     _policy("d", command="SELECT", with_check=None),
+                    # No USING to reuse → genuinely open → finding.
+                    _policy("e", command="ALL", with_check=None, using=None),
                 ),
             ),
         )
     )
     violations = SEC006().check(schema, {})
     locations = sorted(v.location for v in violations)
-    assert locations == ["public.t.a", "public.t.c"]
+    assert locations == ["public.t.a", "public.t.e"]
 
 
 def test_sec006_restrictive_write_policy_emits_dead_policy_message() -> None:

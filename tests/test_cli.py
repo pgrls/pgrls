@@ -1372,22 +1372,29 @@ def test_lint_sec003_allowlist_via_config_exempts(
     assert "SEC003" not in result.output
 
 
-def test_lint_fires_sec006_on_update_and_all_without_with_check(
+def test_lint_sec006_fires_on_open_insert_not_reused_using(
     pg_url: str, apply_sql
 ) -> None:
     apply_sql((FIXTURES_DIR / "sec006_bad.sql").read_text())
     runner = CliRunner()
     result = runner.invoke(main, ["lint", "--database-url", pg_url])
     assert result.exit_code == 1, result.output
-    assert "public.sec006_update.update_bad" in result.output
-    assert "public.sec006_all.all_bad" in result.output
+    # SEC006 fires on the genuinely-open write: a permissive INSERT with
+    # no WITH CHECK and no USING for Postgres to reuse.
+    assert "SEC006  public.sec006_open.open_insert" in result.output
+    # SEC006 must NOT fire on permissive UPDATE/ALL with a real USING and
+    # no WITH CHECK: Postgres reuses the USING as the implicit WITH CHECK,
+    # so the write side is constrained. (Those policies still appear in the
+    # output via other rules, so anchor the regression to the SEC006 line.)
+    assert "SEC006  public.sec006_update.update_bad" not in result.output
+    assert "SEC006  public.sec006_all.all_bad" not in result.output
     assert "public.sec006_clean" not in result.output
-    # The three bad policies are permissive PUBLIC → SEC003 + SEC007.
-    # update_bad / all_bad have unwrapped current_setting → PERF001.
-    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005, and
-    # is a permissive write policy with a constant-true WITH CHECK →
-    # SEC028 (open write). update_bad / all_bad scope by a nullable
-    # `tenant_id` (TEXT, no NOT NULL) against current_setting → SEC030.
+    # update_bad / all_bad / open_insert are permissive PUBLIC →
+    # SEC003 + SEC007. update_bad / all_bad have unwrapped current_setting
+    # → PERF001, and scope by a nullable `tenant_id` (TEXT) → SEC030.
+    # insert_bad's WITH CHECK (true) has no own-col ref → SEC005, and is a
+    # permissive write policy with a constant-true WITH CHECK → SEC028
+    # (open write). open_insert (INSERT, no WITH CHECK) → SEC006.
     _assert_rules_fire_exactly(
         result.output,
         {
@@ -1407,10 +1414,12 @@ def test_lint_sec006_allowlist_via_config_exempts(
 ) -> None:
     apply_sql((FIXTURES_DIR / "sec006_bad.sql").read_text())
     cfg = tmp_path / "pgrls.toml"
+    # open_insert is the only policy SEC006 fires on now (the reused-USING
+    # update_bad / all_bad are correctly silent); allowlisting it suppresses
+    # the rule entirely.
     cfg.write_text(
         '[lint.rules.SEC006]\n'
-        'allowlist = ["public.sec006_update.update_bad", '
-        '"public.sec006_all.all_bad"]\n'
+        'allowlist = ["public.sec006_open.open_insert"]\n'
     )
     runner = CliRunner()
     result = runner.invoke(

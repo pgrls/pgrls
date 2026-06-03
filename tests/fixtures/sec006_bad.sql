@@ -12,7 +12,12 @@ CREATE POLICY insert_bad ON public.sec006_insert
     TO PUBLIC
     WITH CHECK (true);
 
--- SEC006 fires on UPDATE with USING-only (UPDATE can omit WITH CHECK).
+-- update_bad / all_bad: permissive UPDATE/ALL with a *real* USING and no
+-- WITH CHECK. SEC006 must NOT fire here: Postgres reuses the USING
+-- expression as the implicit WITH CHECK, so the written row must still
+-- satisfy `tenant_id = …` — the write side is constrained, not open.
+-- They stay in this fixture to exercise SEC003/SEC007/PERF001/SEC030 and
+-- to pin the reuse-suppression regression (SEC006 silent on this shape).
 CREATE TABLE public.sec006_update (id INT, tenant_id TEXT);
 ALTER TABLE public.sec006_update ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec006_update FORCE ROW LEVEL SECURITY;
@@ -22,7 +27,6 @@ CREATE POLICY update_bad ON public.sec006_update
     USING (tenant_id = current_setting('app.t', true));
 CREATE INDEX sec006_update_tenant_idx ON public.sec006_update (tenant_id);
 
--- SEC006 fires on ALL with USING-only.
 CREATE TABLE public.sec006_all (id INT, tenant_id TEXT);
 ALTER TABLE public.sec006_all ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.sec006_all FORCE ROW LEVEL SECURITY;
@@ -31,6 +35,18 @@ CREATE POLICY all_bad ON public.sec006_all
     TO PUBLIC
     USING (tenant_id = current_setting('app.t', true));
 CREATE INDEX sec006_all_tenant_idx ON public.sec006_all (tenant_id);
+
+-- SEC006 DOES fire on a genuinely-open write: a permissive INSERT policy
+-- with no WITH CHECK has no USING for Postgres to reuse, so it admits
+-- every inserted row. `tenant_id` is NOT NULL and the policy carries no
+-- predicate, so PERF001/PERF003/SEC030 stay silent and SEC006 is the
+-- write-side finding on this table.
+CREATE TABLE public.sec006_open (id INT, tenant_id TEXT NOT NULL);
+ALTER TABLE public.sec006_open ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sec006_open FORCE ROW LEVEL SECURITY;
+CREATE POLICY open_insert ON public.sec006_open
+    FOR INSERT
+    TO PUBLIC;
 
 -- Clean: RESTRICTIVE UPDATE policy with WITH CHECK present —
 -- SEC006 does not fire. RESTRICTIVE type keeps SEC003 from
