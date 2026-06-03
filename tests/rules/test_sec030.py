@@ -170,8 +170,13 @@ def test_sec030_fires_on_schema_qualified_discriminator() -> None:
     assert "'tenant_id'" in v.message
 
 
-def test_sec030_fires_on_column_wrapped_in_function() -> None:
-    # lower(name) = current_setting(...) still scopes by `name`.
+def test_sec030_silent_on_column_wrapped_in_function() -> None:
+    # R11 #8: `lower(slug) = current_setting(...)` scopes by the
+    # TRANSFORM `lower(slug)`, not the bare column `slug` the message
+    # would name. The discriminator must be the DIRECT operand of the
+    # `=` (the documented `col = <auth value>` shape), so a derived
+    # expression no longer fires (it was an over-match that mislabeled
+    # the scoping column).
     schema = Schema(
         tables=(
             _table(
@@ -183,8 +188,28 @@ def test_sec030_fires_on_column_wrapped_in_function() -> None:
             ),
         )
     )
+    assert SEC030().check(schema, options={}) == []
+
+
+def test_sec030_fires_on_cast_of_nullable_discriminator() -> None:
+    # A TypeCast of the bare column IS still the direct operand —
+    # `tenant_id::text = current_setting(...)` scopes by tenant_id and
+    # must still fire when tenant_id is nullable.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(
+                    using="tenant_id::text = current_setting('app.tenant')"
+                ),
+                cols=(
+                    ("id", "uuid", False),
+                    ("tenant_id", "uuid", True),
+                ),
+            ),
+        )
+    )
     [v] = SEC030().check(schema, options={})
-    assert "'slug'" in v.message
+    assert "'tenant_id'" in v.message
 
 
 def test_sec030_lists_multiple_nullable_scoping_columns_in_one_violation() -> None:

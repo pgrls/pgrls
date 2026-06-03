@@ -88,6 +88,26 @@ def test_sec021_fires_on_typecast_wrapped_literal() -> None:
     assert len(SEC021().check(schema, {})) == 1
 
 
+def test_sec021_fires_on_typecast_wrapped_identity_column() -> None:
+    # A cast of the identity column is still the DIRECT operand —
+    # `tenant_id::text = 'acme'` pins to one tenant and must fire.
+    schema = _wrap(_policy("tenant_id::text = 'acme'"))
+    assert len(SEC021().check(schema, {})) == 1
+
+
+def test_sec021_silent_on_derived_expression_of_identity_column() -> None:
+    # R11 #7: the identity column must be the DIRECT operand. A derived
+    # expression (substring / arithmetic / concat) of the column does
+    # NOT pin the policy to a single tenant, so it must not fire against
+    # the documented `tenant_id = 1` shape.
+    for using in (
+        "substring(tenant_id::text, 1, 2) = 'ab'",
+        "tenant_id + 1 = 5",
+        "tenant_id || 'x' = 'foo'",
+    ):
+        assert SEC021().check(_wrap(_policy(using)), {}) == [], using
+
+
 def test_sec021_fires_when_only_in_with_check() -> None:
     p = _policy(with_check="tenant_id = 1", command="INSERT")
     assert len(SEC021().check(_wrap(p), {})) == 1

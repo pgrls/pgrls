@@ -122,39 +122,99 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, Node
+from pglast.ast import A_Expr, Node, SQLValueFunction, String, TypeCast
+from pglast.enums import A_Expr_Kind, SQLValueFunctionOp
 
-from pgrls.ast_utils import extract_column_refs, find_func_calls, own_column_ref
+from pgrls.ast_utils import extract_column_refs, own_column_ref
 from pgrls.model import Policy, Schema, Table, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 # `current_user`, `current_role`, and `user` are three spellings of
 # the same value (the current execution role); `session_user` is the
-# login role. Postgres parses all four as `SQLValueFunction` nodes,
-# which `find_func_calls` matches by these names.
+# login role. Postgres parses all four as `SQLValueFunction` nodes.
 _ROLE_IDENTITY_FUNCTIONS: frozenset[str] = frozenset(
     {"current_user", "current_role", "user", "session_user"}
 )
 
+# SQLValueFunction op → name, so a bare `current_user` / `session_user`
+# (parsed without parens into its own node class) is matched as a
+# direct operand.
+_SVFOP_NAMES: dict[Any, str] = {
+    SQLValueFunctionOp.SVFOP_CURRENT_USER: "current_user",
+    SQLValueFunctionOp.SVFOP_SESSION_USER: "session_user",
+    SQLValueFunctionOp.SVFOP_USER: "user",
+    SQLValueFunctionOp.SVFOP_CURRENT_ROLE: "current_role",
+}
 
-# The per-operand checks use `exclude_sublinks=True`: a
-# `current_user` or column buried inside a sub-select is not an
-# operand *value* of the enclosing A_Expr (it belongs to the
-# sub-select's own predicate). `owner = (SELECT r FROM other WHERE
-# m = current_user)` must not pair `owner` with that nested
-# `current_user`. The tree walk below still recurses into
-# sub-selects separately, so an A_Expr *inside* a sub-select —
-# e.g. a correlated `t.owner = current_user` — is still examined
-# on its own.
-def _side_has_role_identity(side: Any) -> bool:
-    return bool(
-        find_func_calls(
-            side, set(_ROLE_IDENTITY_FUNCTIONS), exclude_sublinks=True
-        )
+# Only these binary operators express the row-matching comparison the
+# rule is about. A non-comparison operator like `||` (string concat)
+# combines a role identity INTO a value rather than comparing against a
+# column, so `audit_key = owner || current_user` is not "the column is
+# keyed off current_user". `IS DISTINCT FROM` (a different A_Expr kind)
+# is intentionally out of scope.
+_COMPARISON_OPS: frozenset[str] = frozenset(
+    {"=", "<>", "!=", "<", ">", "<=", ">="}
+)
+
+# The A_Expr kinds that carry a scalar comparison operator: a plain
+# binary op (`a = b`) and the array-quantified forms (`a = ANY(arr)` /
+# `a = ALL(arr)`). `current_user = ANY(member_roles)` is still a
+# role-identity-vs-own-column comparison. Other kinds (IN-list, LIKE,
+# BETWEEN, IS DISTINCT, NULLIF) are out of scope.
+_COMPARISON_KINDS: frozenset[Any] = frozenset({
+    A_Expr_Kind.AEXPR_OP,
+    A_Expr_Kind.AEXPR_OP_ANY,
+    A_Expr_Kind.AEXPR_OP_ALL,
+})
+
+
+def _unwrap_typecast(node: Any) -> Any:
+    """Strip surrounding `TypeCast` wrappers (`current_user::text`)."""
+    while isinstance(node, TypeCast):
+        node = node.arg
+    return node
+
+
+def _is_comparison(node: A_Expr) -> bool:
+    """True if `node` is a scalar/array comparison operator (not `||`)."""
+    if node.kind not in _COMPARISON_KINDS:
+        return False
+    name = node.name
+    return (
+        name is not None
+        and len(name) == 1
+        and isinstance(name[0], String)
+        and name[0].sval in _COMPARISON_OPS
     )
 
 
+def _operand_is_role_identity(side: Any) -> bool:
+    """True if `side` IS a role-identity function as the DIRECT operand.
+
+    A bare `current_user` (optionally `::text`-cast) parses as a
+    `SQLValueFunction`. Requiring the role identity to be the operand
+    itself — not merely present somewhere in the side's subtree —
+    excludes shapes where it is combined into a larger value (e.g.
+    `owner || current_user`), which is not a column-keyed-off-role
+    comparison.
+    """
+    node = _unwrap_typecast(side)
+    if isinstance(node, SQLValueFunction):
+        return _SVFOP_NAMES.get(node.op) in _ROLE_IDENTITY_FUNCTIONS
+    return False
+
+
+# The own-column check uses `exclude_sublinks=True`: a column buried
+# inside a sub-select is not an operand *value* of the enclosing
+# A_Expr (it belongs to the sub-select's own predicate). `owner =
+# (SELECT r FROM other WHERE m = current_user)` must not pair `owner`
+# with that nested `current_user`. The tree walk below still recurses
+# into sub-selects separately, so an A_Expr *inside* a sub-select —
+# e.g. a correlated `t.owner = current_user` — is still examined on
+# its own. The role identity is matched as the DIRECT operand
+# (`_operand_is_role_identity`), so a sub-select on the other side is a
+# non-match there too.
 def _side_has_own_column(side: Any, table: Table) -> bool:
     return any(
         own_column_ref(ref, table) is not None
@@ -181,13 +241,13 @@ def _compares_role_identity_to_own_column(node: Any, table: Table) -> bool:
             return False
         if isinstance(n, (list, tuple)):
             return any(walk(item) for item in n)
-        if isinstance(n, A_Expr):
+        if isinstance(n, A_Expr) and _is_comparison(n):
             lhs, rhs = n.lexpr, n.rexpr
             if (
-                _side_has_role_identity(lhs)
+                _operand_is_role_identity(lhs)
                 and _side_has_own_column(rhs, table)
             ) or (
-                _side_has_role_identity(rhs)
+                _operand_is_role_identity(rhs)
                 and _side_has_own_column(lhs, table)
             ):
                 return True

@@ -101,10 +101,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, Node, SelectStmt, String, SubLink
+from pglast.ast import A_Expr, ColumnRef, Node, SelectStmt, String, SubLink, TypeCast
 from pglast.enums import A_Expr_Kind
 
-from pgrls.ast_utils import extract_column_refs, find_func_calls, own_column_ref
+from pgrls.ast_utils import find_func_calls, own_column_ref
 from pgrls.model import Schema, Table
 from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
@@ -144,22 +144,27 @@ def _expr_op(node: A_Expr) -> str | None:
     return parts[-1] if parts else None
 
 
-def _own_column_names(side: Any, table: Table) -> set[str]:
-    """Bare names of `table`'s own columns referenced in `side`.
+def _direct_own_column(side: Any, table: Table) -> str | None:
+    """The own-column name when `side` IS that column as DIRECT operand.
 
-    Resolves bare (`col`), table-qualified (`t.col`), and
-    schema-qualified (`s.t.col`) refs against `table.columns`, the
-    same own-column resolution SEC005 / SEC018 use. Extraction passes
-    `exclude_sublinks=True` so a column inside a sub-select on this
-    operand is kept out of the name set — the discriminator must be a
-    direct operand of the comparison.
+    The operand node must itself be a `ColumnRef` (optionally
+    `TypeCast`-wrapped — `tenant_id::text`) that resolves against
+    `table.columns` — the same own-column resolution SEC005 / SEC018
+    use. Requiring the DIRECT operand, not merely the column appearing
+    somewhere in the side's subtree, keeps SEC030 on the documented
+    scalar-equality shape (`tenant_id = current_setting(…)`) and
+    excludes a derived value of the column
+    (`substring(tenant_id, 1, 2) = current_setting(…)`), which scopes by
+    a transform — not by the column the message would name.
     """
-    names: set[str] = set()
-    for ref in extract_column_refs(side, exclude_sublinks=True):
-        col = own_column_ref(ref, table)
-        if col is not None:
-            names.add(col)
-    return names
+    while isinstance(side, TypeCast):
+        side = side.arg
+    if not isinstance(side, ColumnRef):
+        return None
+    names = tuple(f.sval for f in (side.fields or ()) if isinstance(f, String))
+    if not names:
+        return None
+    return own_column_ref(names, table)
 
 
 def _fromless_subselects(side: Any) -> list[SelectStmt]:
@@ -255,9 +260,13 @@ def _scoping_columns(node: Any, table: Table, auth_functions: set[str]) -> set[s
         ):
             lhs, rhs = n.lexpr, n.rexpr
             if _side_has_auth_call(lhs, auth_functions):
-                found.update(_own_column_names(rhs, table))
+                col = _direct_own_column(rhs, table)
+                if col is not None:
+                    found.add(col)
             if _side_has_auth_call(rhs, auth_functions):
-                found.update(_own_column_names(lhs, table))
+                col = _direct_own_column(lhs, table)
+                if col is not None:
+                    found.add(col)
             # fall through — keep walking operands for nested A_Expr
             # nodes (boolean AND/OR chains), but not into sub-selects.
         if isinstance(n, Node):
