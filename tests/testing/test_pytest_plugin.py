@@ -107,6 +107,37 @@ def test_pgrls_db_fixture_yields_working_client(pg_url: str) -> None:
             next(gen)
 
 
+def test_sessionfinish_swallows_artifact_write_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # R11 #10: a coverage-artifact write failure (read-only dir, ENOSPC,
+    # permission denied) must NEVER fail the user's otherwise-green test
+    # run — tests have already completed. pytest_sessionfinish catches
+    # OSError, warns to stderr, and returns normally.
+    from types import SimpleNamespace
+
+    import pgrls.coverage as cov
+    from pgrls.testing import pytest_plugin
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(cov, "write_artifact", _boom)
+    monkeypatch.setenv("PGRLS_COVERAGE_PATH", "/nonexistent/dir/cov.json")
+
+    session = SimpleNamespace(
+        config=SimpleNamespace(
+            _pgrls_coverage=SimpleNamespace(exercised={("public", "t")})
+        )
+    )
+    # Must not raise.
+    pytest_plugin.pytest_sessionfinish(session, exitstatus=0)  # type: ignore[arg-type]
+
+    err = capsys.readouterr().err
+    assert "could not write coverage artifact" in err
+
+
 def test_plugin_registered_via_entrypoint() -> None:
     # Reading the installed distribution metadata is the most
     # reliable check that the pytest11 entrypoint is wired —

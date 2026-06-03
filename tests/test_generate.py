@@ -275,6 +275,53 @@ def test_partition_child_skipped_parent_targeted() -> None:
     )
 
 
+def test_plan_generation_skips_table_without_captured_column_type() -> None:
+    # R11 #11: a pre-v5 snapshot carries `columns` but empty
+    # `column_details`, so the discriminator's type is unknown. Without
+    # it we cannot emit a correctly-cast predicate (a non-text column
+    # would yield an invalid `tenant_id = (SELECT current_setting(...))`
+    # with no `::uuid`), so plan_generation refuses the table rather than
+    # emit a predicate that may not apply / lint clean.
+    legacy = Table(
+        schema="public",
+        name="posts",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        columns=("id", "tenant_id"),
+        column_details=(),  # pre-v5 baseline — no type info
+    )
+    result = plan_generation(Schema(tables=(legacy,)), GenerateOptions())
+    assert result.statements == ()
+    reasons = dict(result.skipped)
+    assert "no captured type for column 'tenant_id'" in reasons["public.posts"]
+
+
+def test_plan_generation_skips_when_discriminator_column_absent() -> None:
+    # An EXPLICITLY-targeted table (`--table public.logs:tenant_id`) that
+    # does not actually have the named column is skipped with a clear
+    # "column not found" reason (not a crash). Auto-detect can't reach
+    # this — it only picks tables that have the column — so it requires
+    # an explicit override.
+    no_disc = Table(
+        schema="public",
+        name="logs",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        columns=("id", "body"),
+        column_details=(
+            Column("id", "uuid", is_nullable=False),
+            Column("body", "text", is_nullable=True),
+        ),
+    )
+    opts = GenerateOptions(tables=(("public", "logs", "tenant_id"),))
+    result = plan_generation(Schema(tables=(no_disc,)), opts)
+    assert result.statements == ()
+    reasons = dict(result.skipped)
+    assert "column 'tenant_id' not found" in reasons["public.logs"]
+
+
 def test_partition_skip_message_names_root_for_multilevel() -> None:
     # root → mid → leaf. Only the root is generated; both mid and leaf are
     # skipped and their reason names the ROOT (the table that gets the RLS),

@@ -93,6 +93,19 @@ def test_sec038_fires_on_bool_cast_is_null() -> None:
     assert len(SEC038().check(schema, {})) == 1
 
 
+def test_sec038_fires_on_unknown_type_cast_of_auth_call_is_null() -> None:
+    # R11 #3: the catastrophic shape on real Supabase schemas —
+    # `auth.uid()::jsonb IS NULL OR <owner>`. The cast of an anon-null
+    # auth call to an unknown target type preserves the null flag, so the
+    # inverted disjunct is valid under anon and SEC038 fires.
+    schema = _wrap(
+        _policy_with_using(
+            f"((SELECT auth.uid())::jsonb) IS NULL OR {_OWNER_LIT}"
+        )
+    )
+    assert len(SEC038().check(schema, {})) == 1
+
+
 def test_sec038_fires_on_multiple_auth_is_null_disjuncts() -> None:
     # P6: role IS NULL OR uid IS NULL OR <scoped> — anon makes the first
     # two disjuncts TRUE, so the whole OR is TRUE for every row.

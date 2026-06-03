@@ -596,6 +596,29 @@ def test_anon_fires_on_bool_cast_is_null() -> None:
     assert _anon(f"((SELECT auth.uid()) IS NULL)::bool OR {_OWNER}") is not None
 
 
+def test_anon_fires_on_unknown_type_cast_of_auth_call_is_null() -> None:
+    # R11 #3: a cast of an anon-null auth call to an UNKNOWN target type
+    # (jsonb/inet/date/… — the common Supabase shapes) must keep the
+    # null-flag carry-through (`cast of NULL is NULL`), so the inverted
+    # `auth.uid()::jsonb IS NULL OR <owner>` proves valid and fires. This
+    # exercises the _anon_typecast unknown-target-type branch — the one
+    # the `::bool` test does not reach.
+    for cast_type in ("jsonb", "inet", "date", "timestamp"):
+        sql = f"((SELECT auth.uid())::{cast_type}) IS NULL OR {_OWNER}"
+        assert _anon(sql) is not None, cast_type
+
+
+def test_anon_clean_on_unknown_type_cast_tenant_predicate() -> None:
+    # The mirror: a tenant/owner predicate whose auth value is cast to an
+    # unknown type is Kleene U under anon (col = NULL), not valid → no
+    # fire. Guards the carry-through against being mis-encoded as a fresh
+    # non-null value (which would turn a real inverted-auth leak into a
+    # MISS after a refactor).
+    assert _anon(
+        "owner_id = ((SELECT current_setting('app.o', true))::jsonb)"
+    ) is None
+
+
 def test_anon_fires_on_corpus_inverted_auth_shape() -> None:
     # P3 / sec004-inverted-auth.
     assert _anon(

@@ -163,9 +163,12 @@ def _column_nullable(table: Table, column: str) -> bool:
     for col in table.column_details:
         if col.name == column:
             return col.is_nullable
-    # Unknown (older snapshot without column_details) — assume nullable so
-    # we surface the SEC030 caveat rather than silently asserting NOT NULL.
-    return True
+    # Unknown (older snapshot without column_details). plan_generation
+    # now skips a table whose discriminator has no captured type before
+    # consulting nullability, so this fallback is unreachable from that
+    # path; keep it as a defensive default (assume nullable → surface the
+    # SEC030 caveat rather than silently asserting NOT NULL).
+    return True  # pragma: no cover - guarded by the type-info skip
 
 
 def _statements_for_table(
@@ -323,6 +326,25 @@ def plan_generation(
                 (
                     table.qualified_name,
                     "already has policies — refine with `pgrls lint` / `fix`",
+                )
+            )
+            continue
+
+        if _column_type(table, column) is None:
+            # No captured type for the discriminator — a pre-v5 snapshot
+            # whose `column_details` is empty. Without the type we cannot
+            # emit a correctly-cast predicate (`tenant_id = (SELECT
+            # current_setting(...))` with no `::uuid` is invalid for a
+            # non-text column), so refuse rather than emit a predicate
+            # that may not apply / lint clean. Live introspection always
+            # carries column_details, so this only guards a stale
+            # snapshot fed to plan_generation; re-introspect to generate.
+            skipped.append(
+                (
+                    table.qualified_name,
+                    f"no captured type for column {column!r} (pre-v5 "
+                    "snapshot) — re-introspect against a live database to "
+                    "generate a correctly-cast predicate",
                 )
             )
             continue
