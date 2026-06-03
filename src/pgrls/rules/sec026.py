@@ -117,7 +117,7 @@ from pglast.ast import (
     TypeCast,
 )
 
-from pgrls.ast_utils import find_func_calls
+from pgrls.ast_utils import find_func_calls, func_name_parts
 from pgrls.model import Policy, Schema
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
@@ -351,7 +351,25 @@ def _is_literal_pattern(side: Any) -> bool:
     node = _effective_operand(side)
     while isinstance(node, TypeCast):
         node = node.arg
-    return isinstance(node, A_Const) and isinstance(node.val, String)
+    if isinstance(node, A_Const) and isinstance(node.val, String):
+        return True
+    # Postgres rewrites `X SIMILAR TO 'lit'` into
+    # `X OPERATOR(pg_catalog.~) pg_catalog.similar_to_escape('lit')` (and
+    # `similar_to_escape('lit', 'esc')` for an explicit ESCAPE), so the
+    # pattern operand of a SIMILAR TO is a FuncCall, not a bare A_Const.
+    # A `similar_to_escape(<string literal>, …)` is still an entirely
+    # author-controlled literal pattern with no attacker-injectable
+    # wildcard — recognize it so the R16 #4 admin-escape guard treats
+    # SIMILAR TO identically to LIKE / `~` (as the rule docstring states),
+    # rather than false-firing on `current_user SIMILAR TO 'admin%'`.
+    if isinstance(node, FuncCall):
+        _, bare = func_name_parts(node)
+        if bare == "similar_to_escape" and node.args:
+            first = node.args[0]
+            while isinstance(first, TypeCast):
+                first = first.arg
+            return isinstance(first, A_Const) and isinstance(first.val, String)
+    return False
 
 
 def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
@@ -425,8 +443,6 @@ def _pattern_ops_against_auth(node: Any, names: set[str]) -> set[str]:
 
     walk(node)
     return found
-
-    return walk(node)
 
 
 def _policy_id(table_schema: str, table_name: str, policy: Policy) -> str:

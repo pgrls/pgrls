@@ -374,6 +374,15 @@ def test_sec026_silent_on_hardcoded_like_pattern() -> None:
         "current_user ~~ 'admin%'::text",
         # … or be wrapped in the FROM-less scalar sub-select form.
         "current_user ~~ (SELECT 'admin%')",
+        # R17 #1: SIMILAR TO must be treated identically to LIKE/`~`.
+        # Postgres rewrites `X SIMILAR TO 'lit'` to
+        # `X ~ pg_catalog.similar_to_escape('lit')`, so the pattern is a
+        # FuncCall — the literal-pattern guard must see through it.
+        "current_user SIMILAR TO 'admin%'",
+        "current_setting('app.role', true) SIMILAR TO 'admin%'",
+        "current_user NOT SIMILAR TO 'admin%'",
+        # …including the explicit-ESCAPE 2-arg similar_to_escape form.
+        "current_user SIMILAR TO 'admin!%' ESCAPE '!'",
     ],
 )
 def test_sec026_silent_on_auth_subject_against_literal_pattern(
@@ -396,6 +405,21 @@ def test_sec026_still_fires_when_auth_subject_pattern_is_data_driven() -> None:
     # `current_user ILIKE user_email` coverage.
     schema = Schema(
         tables=(_table(_policy(using="current_user ~~ user_email")),)
+    )
+    assert len(SEC026().check(schema, options={})) == 1
+
+
+def test_sec026_still_fires_on_similar_to_against_auth_pattern() -> None:
+    # The SIMILAR TO literal-pattern allowance must NOT leak into the
+    # genuine hazard: when the auth value is the PATTERN (a GUC that could
+    # be `%`/`.*`) and the subject is a data column, SEC026 still fires —
+    # `similar_to_escape(current_setting(...))` is not a literal pattern.
+    schema = Schema(
+        tables=(
+            _table(
+                _policy(using="user_email SIMILAR TO current_setting('app.p')")
+            ),
+        )
     )
     assert len(SEC026().check(schema, options={})) == 1
 
