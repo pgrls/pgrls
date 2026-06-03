@@ -73,14 +73,18 @@ _COMPARISON_AEXPR_KINDS: frozenset[Any] = frozenset({
 })
 
 
+def _has_comparison_op_name(node: A_Expr) -> bool:
+    """True if `node`'s operator name is a sargable comparison (`=`, `<`,
+    `~`, …) rather than arithmetic/concat (`+`, `||`)."""
+    names = [s.sval for s in (node.name or ()) if isinstance(s, String)]
+    return bool(names) and names[-1] in _COMPARISON_OPS
+
+
 def _is_scalar_comparison(node: A_Expr) -> bool:
     """True if `node` is a plain binary scalar comparison (AEXPR_OP `=`,
     `<`, `~`, …) — both operands are indexable value expressions (the
     planner may use an index on either side)."""
-    if node.kind != A_Expr_Kind.AEXPR_OP:
-        return False
-    names = [s.sval for s in (node.name or ()) if isinstance(s, String)]
-    return bool(names) and names[-1] in _COMPARISON_OPS
+    return node.kind == A_Expr_Kind.AEXPR_OP and _has_comparison_op_name(node)
 
 
 # Indexability context threaded through the walk:
@@ -164,6 +168,25 @@ def _top_funccalls_wrapping(
                 # IN / LIKE / ILIKE / BETWEEN / NOT BETWEEN: only the lexpr
                 # is indexable; the rexpr is the value list / bounds /
                 # pattern the planner never indexes.
+                walk(n.lexpr, _OPERAND)
+                walk(n.rexpr, _VALUE)
+                walk(n.name, _VALUE)
+                return
+            if (
+                ctx == _PRED
+                and n.kind in (
+                    A_Expr_Kind.AEXPR_OP_ANY,
+                    A_Expr_Kind.AEXPR_OP_ALL,
+                )
+                and _has_comparison_op_name(n)
+            ):
+                # `func(col) = ANY(array)` / `= ALL(array)`: `x = ANY(arr)`
+                # is sargable, so the lexpr IS the indexable operand (the
+                # planner can use an expression index on it); the rexpr is
+                # the array/value side. The PERF004 rule flags these, so
+                # the fixer must emit the index too. Gate on a comparison
+                # operator name so a non-sargable `func(col) <op> ANY(...)`
+                # still defers to the human.
                 walk(n.lexpr, _OPERAND)
                 walk(n.rexpr, _VALUE)
                 walk(n.name, _VALUE)

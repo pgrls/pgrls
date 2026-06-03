@@ -3772,6 +3772,21 @@ def test_perf004_fix_silent_when_func_wraps_value_side() -> None:
     assert PERF004Fixer().fix(schema, {}) == []
 
 
+def test_perf004_fix_emits_index_for_func_eq_any_and_all() -> None:
+    # R12 #2: `func(col) = ANY(array)` / `= ALL(array)` parse as
+    # AEXPR_OP_ANY / AEXPR_OP_ALL (not plain AEXPR_OP). `x = ANY(arr)` is
+    # sargable, the PERF004 rule flags it, so the fixer must emit the
+    # expression index — not silently produce nothing.
+    for using in (
+        "lower(email) = ANY(ARRAY['a@x', 'b@x'])",
+        "lower(email) = ALL(ARRAY['a@x'])",
+    ):
+        schema = Schema(tables=(_perf004_table(_policy(using)),))
+        fixes = PERF004Fixer().fix(schema, {})
+        assert len(fixes) == 1, using
+        assert fixes[0].sql.endswith(" ON public.users (lower(email));"), using
+
+
 def test_perf004_fix_silent_on_func_in_in_list_value_side() -> None:
     # R11 #5: in `email IN (lower(name), 'x')` only the lexpr (`email`)
     # is indexable; the IN-list values are not. A func wrapping a column
