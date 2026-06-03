@@ -1046,17 +1046,29 @@ def _fix_check(fixes: list[Any]) -> None:
     sys.exit(1)
 
 
-def _fix_write_migration(fixes: list[Any], output_path: str) -> None:
+def _fix_write_migration(
+    fixes: list[Any], output_path: str, *, force: bool
+) -> None:
     """`pgrls fix --output FILE`: write the migration script, note it.
 
     Deterministic (no timestamp), so regenerating against an unchanged
     schema yields a byte-identical file. Distinct error wording
     ("cannot write fixes to …") from the report-style `_emit`, so this
     stays bespoke.
+
+    Refuses to clobber an existing file unless `force` is set — the same
+    overwrite guard `pgrls generate --output` and `pgrls init` use, so a
+    re-run of `pgrls fix -o migration.sql` can't silently destroy a
+    hand-edited migration.
     """
+    path = Path(output_path)
+    if path.exists() and not force:
+        raise ToolError(
+            f"{output_path} already exists. Pass --force to overwrite it."
+        )
     migration = render_migration(fixes, tool_version=__version__)
     try:
-        Path(output_path).write_text(migration, encoding="utf-8")
+        path.write_text(migration, encoding="utf-8")
     except OSError as exc:
         raise ToolError(
             f"cannot write fixes to {output_path}: {exc}"
@@ -1122,6 +1134,12 @@ def _fix_emit_and_maybe_apply(
     "with --apply.",
 )
 @click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite the --output file if it already exists.",
+)
+@click.option(
     "--check",
     is_flag=True,
     default=False,
@@ -1139,6 +1157,7 @@ def fix(
     rules: tuple[str, ...],
     apply: bool,
     output_path: str | None,
+    force: bool,
     check: bool,
 ) -> None:
     """Auto-remediate violations whose fix is mechanical.
@@ -1186,9 +1205,12 @@ def fix(
     `-- [rule] description` comment per statement — instead of
     printing it to stdout. The file is deterministic (no
     timestamp), so regenerating against an unchanged schema
-    produces a byte-identical result. `--output` cannot be
-    combined with `--apply`: one writes a migration to run later,
-    the other executes immediately.
+    produces a byte-identical result. An existing `--output`
+    file is never silently clobbered: the command errors unless
+    `--force` is passed (matching `pgrls generate` and `pgrls
+    init`). `--output` cannot be combined with `--apply`: one
+    writes a migration to run later, the other executes
+    immediately.
 
     `--check` is a CI gate: it exits 1 if any auto-fixable
     violations would be emitted (and 0 otherwise), without
@@ -1281,7 +1303,7 @@ def fix(
         if output_path is not None:
             # `--apply` is already rejected alongside `--output`, so
             # reaching here means a pure dry-run-to-file.
-            _fix_write_migration(fixes, output_path)
+            _fix_write_migration(fixes, output_path, force=force)
             return
 
         _fix_emit_and_maybe_apply(fixes, conn, apply=apply)

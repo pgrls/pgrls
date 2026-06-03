@@ -3488,6 +3488,48 @@ def test_fix_output_writes_migration_file(
     assert str(out_file) in result.stderr
 
 
+def test_fix_output_refuses_to_clobber_without_force(
+    pg_url: str, apply_sql, tmp_path
+) -> None:
+    # `pgrls fix --output FILE` must not silently overwrite an existing
+    # file (a hand-edited migration). Without --force it errors and
+    # leaves the file byte-for-byte intact; with --force it overwrites.
+    # Mirrors `pgrls generate` / `pgrls init`.
+    apply_sql(
+        """
+        CREATE TABLE public.fix_out_force (id INT);
+        ALTER TABLE public.fix_out_force ENABLE ROW LEVEL SECURITY;
+        """
+    )
+    out_file = tmp_path / "migration.sql"
+    sentinel = "-- hand-edited, do not clobber\n"
+    out_file.write_text(sentinel, encoding="utf-8")
+    runner = CliRunner()
+
+    # Second write without --force is rejected; the file is untouched.
+    rejected = runner.invoke(
+        main,
+        ["fix", "--database-url", pg_url, "--output", str(out_file)],
+    )
+    assert rejected.exit_code == 2
+    assert "already exists" in rejected.output
+    assert "--force" in rejected.output
+    assert out_file.read_text(encoding="utf-8") == sentinel
+
+    # With --force it overwrites with the real migration.
+    forced = runner.invoke(
+        main,
+        [
+            "fix", "--database-url", pg_url,
+            "--output", str(out_file), "--force",
+        ],
+    )
+    assert forced.exit_code == 0, forced.output
+    text = out_file.read_text(encoding="utf-8")
+    assert sentinel not in text
+    assert "ALTER TABLE public.fix_out_force FORCE ROW LEVEL SECURITY;" in text
+
+
 def test_fix_output_cannot_combine_with_apply(
     pg_url: str, tmp_path
 ) -> None:
