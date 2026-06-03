@@ -291,6 +291,15 @@ JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
 JOIN pg_catalog.pg_depend d
   ON d.objid = r.oid
  AND d.classid = 'pg_rewrite'::regclass
+ -- Constrain the REFERENCED side to relations too. Postgres draws OIDs
+ -- from one cluster-wide counter shared across catalogs, so without this
+ -- a rewrite-rule dependency on a pg_proc / pg_type / pg_operator object
+ -- whose OID happens to collide with a pg_class relation OID would join
+ -- through and emit a phantom (ref_schema, ref_name) — a spurious view
+ -- reference that VIEW001/002/003 could then report as an RLS leak. The
+ -- function-result deps the fixture notes are tracked via pg_proc, not
+ -- pg_class, so they must be structurally excluded here, not by luck.
+ AND d.refclassid = 'pg_catalog.pg_class'::regclass
 JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
 JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
 WHERE v.relkind IN ('v', 'm')

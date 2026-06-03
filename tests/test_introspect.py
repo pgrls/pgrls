@@ -1203,6 +1203,23 @@ def test_introspect_resolves_view_to_table_references(
     )
 
 
+def test_view_deps_sql_constrains_referenced_side_to_relations() -> None:
+    # Regression (round-12 #6): without `d.refclassid =
+    # 'pg_catalog.pg_class'` the pg_depend join blindly resolves
+    # refobjid against pg_class, so a rewrite-rule dependency on a
+    # pg_proc / pg_type / pg_operator object whose OID collides with a
+    # relation OID (PG OIDs are cluster-wide across catalogs) would emit
+    # a phantom view reference — a silent VIEW001/002/003 false positive.
+    # An actual cross-catalog OID collision is infeasible to stage in a
+    # unit test, so pin the structural filter at the source.
+    from pgrls.introspect import _VIEW_DEPS_SQL
+
+    assert "d.refclassid = 'pg_catalog.pg_class'::regclass" in _VIEW_DEPS_SQL, (
+        "VIEW deps query must constrain the referenced side to pg_class so "
+        "a cross-catalog OID collision can't yield a phantom view reference"
+    )
+
+
 def test_introspect_view_with_no_references_has_empty_tuple(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
