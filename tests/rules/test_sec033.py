@@ -220,6 +220,85 @@ def test_silent_on_user_metadata_nested_under_app_metadata(expr: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Silent — `user_metadata` key read out of a NON-JWT source (R16 #3):
+# a plain application JSONB column is not the user-writable JWT claim
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # `settings` is an ordinary table column, not the verified JWT.
+        "settings -> 'user_metadata' ->> 'role' = 'admin'",
+        "(settings ->> 'user_metadata') = 'x'",
+        # Path form rooted in a plain column.
+        "prefs #>> '{user_metadata,role}' = 'admin'",
+        # A nested column expression — still not a JWT source.
+        "(data -> 'profile') ->> 'user_metadata' = 'x'",
+    ],
+)
+def test_silent_on_user_metadata_from_non_jwt_source(expr: str) -> None:
+    # R16 #3: the string-key vector fires only when the JSON-extraction
+    # chain roots in the verified JWT (auth.jwt() / the PostgREST
+    # request.jwt GUC / the raw_user_meta_data column). A `user_metadata`
+    # key read out of a plain application JSONB column is NOT the
+    # self-bypass hazard — the value is not the user-controllable JWT
+    # claim — so the error-severity rule must stay silent.
+    schema = _wrap(_policy(f"({expr})", name="plain_column"))
+    violations = SEC033().check(schema, {})
+    assert violations == [], expr
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fires — `user_metadata` read out of a recognized JWT source other than
+# the default auth.jwt(): the PostgREST GUC and a configured helper
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # PostgREST: the request.jwt.claims GUC carries the verified JWT.
+        (
+            "(current_setting('request.jwt.claims', true)::jsonb "
+            "-> 'user_metadata' ->> 'role') = 'admin'"
+        ),
+        # …path form on the same GUC source.
+        (
+            "((current_setting('request.jwt.claims', true)::jsonb) "
+            "#>> '{user_metadata,role}') = 'admin'"
+        ),
+    ],
+)
+def test_fires_on_user_metadata_from_postgrest_jwt_guc(expr: str) -> None:
+    schema = _wrap(_policy(f"({expr})", name="postgrest_jwt"))
+    violations = SEC033().check(schema, {})
+    assert len(violations) == 1, expr
+
+
+def test_jwt_functions_option_gates_a_custom_helper() -> None:
+    # A project-local JWT helper is not a recognized source by default
+    # (so it does NOT fire — the conservative FP-safe behavior), but
+    # configuring `jwt_functions` opens it up.
+    schema = _wrap(
+        _policy(
+            "(my_schema.jwt() ->> 'user_metadata') = 'admin'", name="custom"
+        )
+    )
+    assert SEC033().check(schema, {}) == []
+    violations = SEC033().check(
+        schema, {"jwt_functions": ["auth.jwt", "my_schema.jwt"]}
+    )
+    assert len(violations) == 1
+
+
+def test_rejects_malformed_jwt_functions_option() -> None:
+    schema = _wrap(_policy("(auth.jwt() ->> 'user_metadata') = 'x'"))
+    with pytest.raises(TypeError, match="jwt_functions"):
+        SEC033().check(schema, {"jwt_functions": "auth.jwt"})
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Fires — `user_metadata` is the TOP-LEVEL claim even when app_metadata
 # appears deeper in the same chain (root order is what matters)
 # ──────────────────────────────────────────────────────────────────────
