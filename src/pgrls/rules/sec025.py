@@ -169,34 +169,21 @@ class SEC025:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                refs: set[tuple[str | None, str]] = set()
-                cte_names: set[str] = set()
+                # Resolve each clause INDEPENDENTLY: a CTE is scoped to
+                # the clause that defines it. USING and WITH CHECK are
+                # separate expression scopes in Postgres, so a CTE in
+                # one must NOT shadow a base-table reference in the
+                # other — unioning the CTE names across both clauses
+                # (the previous behavior) silently suppressed a real
+                # RLS-disabled-table reference in the sibling clause, a
+                # security false negative. Mirrors VIEW004's
+                # per-statement CTE discipline.
+                unprotected: set[str] = set()
                 for ast in (policy.using_ast, policy.with_check_ast):
                     if ast is not None:
-                        refs |= set(extract_range_vars(ast))
-                        cte_names |= _cte_names(ast)
-                unprotected: set[str] = set()
-                for ref_schema, ref_name in refs:
-                    # An unqualified ref whose name matches a CTE
-                    # defined in the same predicate is a CTE reference,
-                    # not a base table — skip it. It would otherwise
-                    # resolve to a same-named RLS-disabled table (a
-                    # false positive); Postgres resolves it to the CTE.
-                    if ref_schema is None and ref_name in cte_names:
-                        continue
-                    resolved = _resolve_table_ref(
-                        ref_schema, ref_name, table.schema,
-                        table_map, view_set,
-                    )
-                    if resolved is None:
-                        continue
-                    # A self-reference (policy on T referencing T)
-                    # inherits the same RLS gate — its own policies
-                    # apply transitively, so skip it.
-                    if resolved == (table.schema, table.name):
-                        continue
-                    if not table_map[resolved]:
-                        unprotected.add(f"{resolved[0]}.{resolved[1]}")
+                        unprotected |= self._unprotected_in_clause(
+                            ast, table, table_map, view_set
+                        )
                 if not unprotected:
                     continue
                 pid = policy_id(table, policy)
@@ -208,6 +195,44 @@ class SEC025:
                     )
                 )
         return out
+
+    @staticmethod
+    def _unprotected_in_clause(
+        ast: Any,
+        table: Table,
+        table_map: dict[tuple[str, str], bool],
+        view_set: set[tuple[str, str]],
+    ) -> set[str]:
+        """RLS-disabled tables a SINGLE policy clause references.
+
+        CTE names are collected from THIS clause only, so an unqualified
+        ref matching a CTE defined in the same clause is treated as the
+        CTE (Postgres resolves it there) and skipped — but a CTE defined
+        in a *different* clause never suppresses it.
+        """
+        cte_names = _cte_names(ast)
+        unprotected: set[str] = set()
+        for ref_schema, ref_name in extract_range_vars(ast):
+            # An unqualified ref whose name matches a CTE defined in
+            # this clause is a CTE reference, not a base table — skip
+            # it. It would otherwise resolve to a same-named
+            # RLS-disabled table (a false positive); Postgres resolves
+            # it to the CTE.
+            if ref_schema is None and ref_name in cte_names:
+                continue
+            resolved = _resolve_table_ref(
+                ref_schema, ref_name, table.schema, table_map, view_set,
+            )
+            if resolved is None:
+                continue
+            # A self-reference (policy on T referencing T) inherits the
+            # same RLS gate — its own policies apply transitively, so
+            # skip it.
+            if resolved == (table.schema, table.name):
+                continue
+            if not table_map[resolved]:
+                unprotected.add(f"{resolved[0]}.{resolved[1]}")
+        return unprotected
 
     def _violation(
         self,
