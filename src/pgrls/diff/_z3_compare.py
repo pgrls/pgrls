@@ -195,9 +195,16 @@ _COMPARISON_OPS: dict[str, Any] = {
 # Phase 4 — arithmetic operators. The Z3 ExprRef class overloads
 # the Python operators, so the lambdas just produce the
 # corresponding z3.ArithRef expressions when both operands are
-# Int or Real. Z3 raises Z3Exception if the operands' sorts don't
-# support arithmetic (e.g. String); the caller catches and
-# returns None.
+# Int or Real. When the operands' sorts don't support the operator
+# (e.g. String `-`/`*`/`/`/`%`, which routinely happens for opaque
+# values like now()/current_setting/an unknown-target cast, and for
+# `col OP col` where both sides default to StringSort) the Python
+# operator overload raises a plain TypeError — NOT z3.Z3Exception.
+# Every call site applying one of these lambdas must therefore catch
+# (z3.Z3Exception, TypeError) and degrade to None (untranslatable ->
+# NO-OP), or the TypeError escapes the whole rule-dispatch loop.
+# (`+` is the exception: Z3 overloads it to Concat for strings, so
+# it never raises here.)
 _ARITHMETIC_OPS: dict[str, Any] = {
     "+": lambda a, b: a + b,
     "-": lambda a, b: a - b,
@@ -486,7 +493,11 @@ def _binop_to_z3(node: A_Expr, ctx: _Context) -> Any:
         return None
     try:
         return op_fn(lhs, rhs)
-    except z3.Z3Exception:
+    except (z3.Z3Exception, TypeError):
+        # TypeError: a Python-overloaded operator (arithmetic `-`/`*`/
+        # `/`/`%`, or a `<`/`>` comparison) applied to String- or
+        # Bool-sorted operands it doesn't support. Degrade to None
+        # (untranslatable -> NO-OP) rather than letting it escape.
         return None
 
 
@@ -638,7 +649,9 @@ def _between_to_z3(node: A_Expr, ctx: _Context, *, negate: bool) -> Any:
 
     try:
         body = z3.And(lo_z3 <= expr_z3_low, expr_z3_high <= hi_z3)
-    except z3.Z3Exception:
+    except (z3.Z3Exception, TypeError):
+        # `<=` on Bool-sorted operands raises TypeError (not
+        # Z3Exception); degrade to None like every other operator site.
         return None
     return z3.Not(body) if negate else body
 
@@ -1405,7 +1418,10 @@ def _anon_binop(
     if comparison_fn is not None:
         try:
             cmp_z3 = comparison_fn(left.value, right.value)
-        except z3.Z3Exception:
+        except (z3.Z3Exception, TypeError):
+            # TypeError: `<`/`>`/`<=`/`>=` on two Bool-sorted operands
+            # (e.g. `(a IS NULL) > (b IS NULL)`) — Z3 raises a plain
+            # TypeError, not Z3Exception. Untranslatable -> NO-OP.
             return None
         return _TV(
             is_true=z3.And(
@@ -1417,7 +1433,11 @@ def _anon_binop(
     if arithmetic_fn is not None:
         try:
             value = arithmetic_fn(left.value, right.value)
-        except z3.Z3Exception:
+        except (z3.Z3Exception, TypeError):
+            # TypeError: String `-`/`*`/`/`/`%` (the common case is a
+            # time window like `created_at > now() - interval '7 days'`,
+            # where now()/interval resolve to opaque String operands).
+            # Z3 raises a plain TypeError, not Z3Exception. NO-OP.
             return None
         return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null))
 

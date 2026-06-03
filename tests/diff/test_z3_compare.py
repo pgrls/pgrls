@@ -750,6 +750,32 @@ def test_anon_clean_on_case_expr_aborts() -> None:
     ) is None
 
 
+def test_anon_clean_on_string_sorted_arithmetic_no_crash() -> None:
+    # R13 #1: the Z3 Python operator overloads raise a plain TypeError
+    # (NOT z3.Z3Exception) when arithmetic `-`/`*`/`/`/`%` is applied to
+    # String-sorted operands — which happens routinely for opaque values
+    # (now()/current_setting/an unknown-target cast) and for `col OP col`
+    # (both default to StringSort). Before the fix this escaped the
+    # operator-application catch and crashed SEC038 (and, via the cli
+    # dispatch loop, the WHOLE lint run). Each predicate must now degrade
+    # to None (untranslatable -> NO-OP), not raise. The headline case is
+    # a benign, idiomatic "recent rows" window policy.
+    assert _anon("created_at > now() - interval '7 days'") is None
+    assert _anon("created_at <> now() - interval '7 days'") is None
+    # `col OP col` arithmetic (both sides default to StringSort):
+    for op in ("-", "*", "/", "%"):
+        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") is None, op
+
+
+def test_anon_clean_on_bool_sorted_comparison_no_crash() -> None:
+    # R13 #1 (sibling): `<`/`>`/`<=`/`>=` on two Bool-sorted operands —
+    # e.g. comparing two IS NULL tests — also raises a plain TypeError
+    # from the Z3 overload, not z3.Z3Exception. The 3VL comparison site
+    # must degrade to None rather than crash.
+    assert _anon("(owner_id IS NULL) > (tenant_id IS NULL)") is None
+    assert _anon("(owner_id IS NULL) <= (tenant_id IS NULL)") is None
+
+
 def test_anon_returns_none_when_z3_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -809,6 +835,25 @@ def test_bare_constant_predicate_degrades_instead_of_crashing() -> None:
         classify_via_z3(parse_expr("true"), parse_expr("true"))
         == "semantic_equivalent"
     )
+
+
+def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
+    # R13 #1 (2VL diff path): String-sorted arithmetic (`-`/`*`/`/`/`%`)
+    # makes the Z3 operator overload raise a plain TypeError, not
+    # z3.Z3Exception. classify_via_z3 / counterexample used to let it
+    # escape and crash `pgrls diff`; both must now degrade to None so the
+    # caller falls through to requires_review. Sibling of
+    # test_bare_constant_predicate_degrades_instead_of_crashing (which
+    # pins the Z3Exception case).
+    base = parse_expr("created_at > now() - interval '1 day'")
+    head = parse_expr("created_at > now() - interval '7 days'")
+    assert classify_via_z3(base, head) is None
+    assert classify_via_z3(head, base) is None
+    assert counterexample(base, head) is None
+    # `col OP col` arithmetic — both operands default to StringSort:
+    cc = parse_expr("a - b > c")
+    assert classify_via_z3(cc, cc) is None
+    assert counterexample(cc, cc) is None
 
 
 def test_null_marker_disconnection_is_a_documented_safe_limitation() -> None:
