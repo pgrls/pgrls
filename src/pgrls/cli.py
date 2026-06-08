@@ -269,6 +269,7 @@ def migration_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 @main.command()
+@click.pass_context
 @common_db_options
 @migration_source_options
 @click.option(
@@ -382,6 +383,7 @@ def migration_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
     ),
 )
 def lint(
+    ctx: click.Context,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
@@ -455,13 +457,20 @@ def lint(
     )
 
     # Schema source: a live database (--database-url) or an ephemeral build
-    # from migration files (--migrations / --supabase) — never both.
-    if migrations_path is not None and database_url is not None:
+    # from migration files (--migrations / --supabase) — never both. An
+    # ambient $DATABASE_URL must not block the ephemeral path (it is the
+    # common CI setup), so the conflict fires only when --database-url was
+    # passed explicitly on the command line.
+    use_migrations = migrations_path is not None or supabase
+    db_url_explicit = (
+        ctx.get_parameter_source("database_url")
+        is click.core.ParameterSource.COMMANDLINE
+    )
+    if use_migrations and db_url_explicit:
         raise ToolError(
             "choose one schema source: a live database (--database-url) or "
-            "an ephemeral build (--migrations), not both."
+            "an ephemeral build (--migrations / --supabase), not both."
         )
-    use_migrations = migrations_path is not None or supabase
 
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
     # feeds HYG004 (policy has no behavioral test), inert otherwise.

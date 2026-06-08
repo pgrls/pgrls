@@ -34,6 +34,9 @@ LAYOUTS: tuple[str, ...] = (
 # ``R__desc.sql`` (repeatable). Version is digits separated by ``.`` or ``_``.
 _FLYWAY_VERSIONED = re.compile(r"^V(\d+(?:[._]\d+)*)__.+\.sql$")
 _FLYWAY_REPEATABLE = re.compile(r"^R__.+\.sql$")
+# Undo migrations (``U<version>__desc.sql``). Recognized as Flyway-shaped for
+# layout detection, but excluded from a forward build (never applied).
+_FLYWAY_UNDO = re.compile(r"^U(\d+(?:[._]\d+)*)__.+\.sql$")
 
 
 class LayoutError(Exception):
@@ -50,7 +53,11 @@ class MigrationPlan:
 
 
 def _is_flyway_name(name: str) -> bool:
-    return bool(_FLYWAY_VERSIONED.match(name) or _FLYWAY_REPEATABLE.match(name))
+    return bool(
+        _FLYWAY_VERSIONED.match(name)
+        or _FLYWAY_REPEATABLE.match(name)
+        or _FLYWAY_UNDO.match(name)
+    )
 
 
 def _flyway_sort_key(path: Path) -> tuple[int, tuple[int, ...], str]:
@@ -117,20 +124,39 @@ def _resolve_supabase(path: Path) -> tuple[tuple[Path, ...], Path]:
 
 
 def _resolve_sqitch(path: Path) -> tuple[Path, ...]:
-    """Order deploy scripts by the change order in ``sqitch.plan``."""
-    plan = (path / "sqitch.plan").read_text(encoding="utf-8")
+    """Order deploy scripts by the change order in ``sqitch.plan``.
+
+    Handles reworked changes: a change name reappearing after a ``@tag`` is a
+    rework whose earlier occurrence is the as-of-tag snapshot
+    ``deploy/<change>@<tag>.sql`` and whose later occurrence is the current
+    ``deploy/<change>.sql`` — so the same file is never queued twice.
+    """
+    try:
+        plan = (path / "sqitch.plan").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LayoutError(f"cannot read {path / 'sqitch.plan'}: {exc}") from exc
     deploy = path / "deploy"
     files: list[Path] = []
+    seen: dict[str, int] = {}
+    last_tag: str | None = None
     for raw in plan.splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", "%")):
             continue  # comments and pragmas
-        change = line.split()[0]
-        if change.startswith("@"):
-            continue  # tag line, not a change
+        token = line.split()[0]
+        if token.startswith("@"):
+            last_tag = token[1:]  # a tag marks a rework boundary
+            continue
+        change = token
+        if change in seen and last_tag is not None:
+            # Rework: the earlier occurrence is the as-of-tag snapshot.
+            snapshot = deploy / f"{change}@{last_tag}.sql"
+            if snapshot.is_file():
+                files[seen[change]] = snapshot
         candidate = deploy / f"{change}.sql"
         if candidate.is_file():
             files.append(candidate)
+            seen[change] = len(files) - 1
     if not files:
         raise LayoutError(
             f"sqitch.plan in {path} named no deployable changes under "
@@ -178,9 +204,15 @@ def resolve_plan(
         return MigrationPlan(files=files, layout="prisma", root=path)
 
     if layout == "flyway":
-        files = tuple(sorted(path.glob("*.sql"), key=_flyway_sort_key))
+        # Undo scripts (U*) are never applied in a forward build.
+        files = tuple(
+            sorted(
+                (p for p in path.glob("*.sql") if not _FLYWAY_UNDO.match(p.name)),
+                key=_flyway_sort_key,
+            )
+        )
         if not files:
-            raise LayoutError(f"no Flyway .sql files under {path}.")
+            raise LayoutError(f"no forward Flyway .sql files under {path}.")
         return MigrationPlan(files=files, layout="flyway", root=path)
 
     if layout == "sqitch":
@@ -188,9 +220,13 @@ def resolve_plan(
 
     # glob
     pattern = glob_pattern or "*.sql"
-    files = tuple(sorted(path.glob(pattern)))
-    if not files:
+    try:
+        matches = sorted(path.glob(pattern))
+    except (ValueError, NotImplementedError) as exc:
         raise LayoutError(
-            f"pattern {pattern!r} matched no files under {path}."
-        )
-    return MigrationPlan(files=files, layout="glob", root=path)
+            f"invalid --migrations-glob pattern {pattern!r}: {exc}. Use a "
+            f"pattern relative to {path}, e.g. 'db/migrate/*.sql'."
+        ) from exc
+    if not matches:
+        raise LayoutError(f"pattern {pattern!r} matched no files under {path}.")
+    return MigrationPlan(files=tuple(matches), layout="glob", root=path)

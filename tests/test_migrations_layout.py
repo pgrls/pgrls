@@ -143,3 +143,41 @@ def test_resolve_glob_no_match(tmp_path: Path) -> None:
     _touch(tmp_path / "a.sql")
     with pytest.raises(LayoutError, match="matched no files"):
         resolve_plan(tmp_path, layout="glob", glob_pattern="*.nope")
+
+
+def test_detect_flyway_with_undo_scripts(tmp_path: Path) -> None:
+    _touch(tmp_path / "V1__init.sql")
+    _touch(tmp_path / "V2__add.sql")
+    _touch(tmp_path / "U1__undo_add.sql")
+    # Undo scripts are Flyway-shaped, so the dir still detects as flyway —
+    # not glob, which would apply U1 first lexically and DROP-before-create.
+    assert detect_layout(tmp_path) == "flyway"
+
+
+def test_resolve_flyway_excludes_undo(tmp_path: Path) -> None:
+    v1 = _touch(tmp_path / "V1__init.sql")
+    v2 = _touch(tmp_path / "V2__add.sql")
+    _touch(tmp_path / "U1__undo_add.sql")
+    plan = resolve_plan(tmp_path, layout="flyway")
+    assert plan.files == (v1, v2)  # a forward build never applies U*
+
+
+def test_resolve_sqitch_rework(tmp_path: Path) -> None:
+    _touch(
+        tmp_path / "sqitch.plan",
+        "%project=t\n\n"
+        "users 2020-01-01T00:00:00Z me <m@x> # add\n"
+        "@v1.0 2020-01-02T00:00:00Z me <m@x> # release\n"
+        "users [users@v1.0] 2020-01-03T00:00:00Z me <m@x> # rework\n",
+    )
+    snap = _touch(tmp_path / "deploy" / "users@v1.0.sql")
+    base = _touch(tmp_path / "deploy" / "users.sql")
+    plan = resolve_plan(tmp_path, layout="sqitch")
+    # earlier occurrence -> as-of-tag snapshot, later -> current; no double-apply
+    assert plan.files == (snap, base)
+
+
+def test_resolve_glob_absolute_pattern_errors(tmp_path: Path) -> None:
+    _touch(tmp_path / "a.sql")
+    with pytest.raises(LayoutError, match="invalid --migrations-glob"):
+        resolve_plan(tmp_path, layout="glob", glob_pattern="/etc/*.sql")

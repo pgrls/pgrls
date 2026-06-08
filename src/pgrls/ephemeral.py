@@ -46,13 +46,6 @@ CREATE OR REPLACE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE
 # Roles a Supabase project's policies grant to.
 _SUPABASE_ROLES: tuple[str, ...] = ("anon", "authenticated", "service_role")
 
-_CREATE_ROLE_IF_MISSING = (
-    "DO $$ BEGIN "
-    "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN "
-    "EXECUTE format('CREATE ROLE %%I NOLOGIN', %s); "
-    "END IF; END $$;"
-)
-
 
 class EphemeralError(Exception):
     """The ephemeral build could not complete.
@@ -113,7 +106,7 @@ def build_schema_from_migrations(
     for path in files:
         try:
             sources.append((path, path.read_text(encoding="utf-8")))
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise EphemeralError(f"cannot read migration {path}: {exc}") from exc
 
     extensions: set[str] = set()
@@ -135,8 +128,23 @@ def build_schema_from_migrations(
             try:
                 with psycopg.connect(url, autocommit=True) as conn, conn.cursor() as cur:
                     if roles:
+                        from psycopg import sql as _sql
+
                         for role in sorted(roles):
-                            cur.execute(_CREATE_ROLE_IF_MISSING, (role, role))
+                            # Compose the role name as a literal/identifier; a
+                            # server-side %s param inside a DO body has no
+                            # inferable type (IndeterminateDatatype).
+                            cur.execute(
+                                _sql.SQL(
+                                    "DO $$ BEGIN IF NOT EXISTS ("
+                                    "SELECT 1 FROM pg_roles WHERE rolname = {name}"
+                                    ") THEN CREATE ROLE {ident} NOLOGIN; "
+                                    "END IF; END $$;"
+                                ).format(
+                                    name=_sql.Literal(role),
+                                    ident=_sql.Identifier(role),
+                                )
+                            )
                         verbose_log(f"created {len(roles)} role(s): {sorted(roles)}")
                     if provision_supabase:
                         cur.execute(_SUPABASE_PRELUDE)
@@ -158,9 +166,9 @@ def build_schema_from_migrations(
                             cur.execute(text)
                         except psycopg.Error as exc:
                             raise EphemeralError(
-                                f"migration {path.name} failed to apply: {exc}"
+                                f"migration {path} failed to apply: {exc}"
                             ) from exc
-                        verbose_log(f"applied {path.name}")
+                        verbose_log(f"applied {path}")
                 with psycopg.connect(url) as conn:
                     return introspect(conn, schemas=schemas)
             except EphemeralError:

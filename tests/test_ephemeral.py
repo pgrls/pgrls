@@ -157,3 +157,97 @@ def test_lint_migrations_matches_live_introspection(tmp_path: Path) -> None:
     )
     assert projection(eph) == projection(eph2)
     assert ("t", True, ("p",)) in projection(eph)
+
+
+# --- guard / error-handling regressions (no Docker) ------------------------
+
+
+def test_lint_migrations_ignores_ambient_database_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An ambient $DATABASE_URL must NOT trip the conflict guard — that is the
+    # headline CI setup. With an empty dir we reach (and fail at) layout
+    # resolution, proving the conflict guard did not fire on the env var.
+    monkeypatch.setenv("DATABASE_URL", "postgres://env/db")
+    res = CliRunner().invoke(main, ["lint", "--migrations", str(tmp_path)])
+    assert res.exit_code != 0
+    assert "one schema source" not in res.output
+    assert "no .sql migrations" in res.output
+
+
+def test_lint_supabase_conflicts_with_explicit_database_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with CliRunner().isolated_filesystem(temp_dir=tmp_path):
+        res = CliRunner().invoke(
+            main, ["lint", "--supabase", "--database-url", "postgres://x"]
+        )
+    assert res.exit_code != 0
+    assert "one schema source" in res.output
+
+
+def test_non_utf8_migration_clean_error(tmp_path: Path) -> None:
+    pytest.importorskip("testcontainers")  # need to reach the read loop
+    f = tmp_path / "001.sql"
+    f.write_bytes(b"-- caf\xe9\nCREATE TABLE t (id int);\n")  # 0xe9 = Latin-1 é
+    with pytest.raises(ephemeral.EphemeralError, match="cannot read"):
+        ephemeral.build_schema_from_migrations(sql_files=[f], schemas=["public"])
+
+
+# --- role provisioning + diagnostics, Docker-gated -------------------------
+
+
+@requires_docker
+def test_supabase_roles_provisioned(tmp_path: Path) -> None:
+    # A FOR SELECT TO authenticated policy only applies if `authenticated`
+    # exists and auth.uid() resolves — regression for the DO-block param crash.
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.docs (id uuid PRIMARY KEY, owner_id uuid);\n"
+        "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.docs FOR SELECT TO authenticated "
+        "USING (owner_id = auth.uid());\n",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"],
+        schemas=["public"],
+        provision_supabase=True,
+    )
+    assert any(t.name == "docs" for t in schema.tables)
+
+
+@requires_docker
+def test_create_role_provisioned(tmp_path: Path) -> None:
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.t (id int);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.t TO app_user USING (true);\n",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"],
+        schemas=["public"],
+        extra_roles=("app_user",),
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
+def test_failing_migration_names_the_file(tmp_path: Path) -> None:
+    from pgrls.migrations_layout import resolve_plan
+
+    (tmp_path / "20240101_init").mkdir()
+    (tmp_path / "20240101_init" / "migration.sql").write_text(
+        "CREATE TABLE public.a (id int);", encoding="utf-8"
+    )
+    (tmp_path / "20240202_bad").mkdir()
+    (tmp_path / "20240202_bad" / "migration.sql").write_text(
+        "THIS IS NOT SQL;", encoding="utf-8"
+    )
+    plan = resolve_plan(tmp_path, layout="prisma")
+    # Prisma basenames are all "migration.sql" — the error must name the dir.
+    with pytest.raises(ephemeral.EphemeralError, match="20240202_bad"):
+        ephemeral.build_schema_from_migrations(
+            sql_files=plan.files, schemas=["public"]
+        )
