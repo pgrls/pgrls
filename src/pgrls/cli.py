@@ -71,6 +71,8 @@ from pgrls.history import (
 from pgrls.history import render as render_history
 from pgrls.introspect import introspect
 from pgrls.model import Schema
+from pgrls.matrix import MATRIX_FORMATS, build_matrix
+from pgrls.matrix import render as render_matrix
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
@@ -3268,6 +3270,73 @@ def report(
     )
 
     rendered = render_report(build_report(schema), output_format)
+    _emit(rendered, output_path)
+
+
+@main.command()
+@common_db_options
+@click.option(
+    "--roles",
+    "roles_csv",
+    default=None,
+    help=(
+        "Comma-separated roles to show as columns (overrides auto-discovery). "
+        "Default: PUBLIC, anon, authenticated plus every non-system role named "
+        "by a grant or policy, or carrying BYPASSRLS."
+    ),
+)
+@click.option(
+    "--include-system-roles",
+    "include_system",
+    is_flag=True,
+    default=False,
+    help="Also show pg_* system roles (hidden by default).",
+)
+@output_format_options(
+    list(MATRIX_FORMATS),
+    output_help="Write the matrix to this file instead of stdout (any --format).",
+)
+def matrix(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    roles_csv: str | None,
+    include_system: bool,
+    output_path: str | None,
+    output_format: str,
+) -> None:
+    """Show who can access what — a role x table x command access matrix.
+
+    The audit companion to `pgrls report`: instead of each table's posture,
+    it collapses table GRANTs, the RLS enabled/forced flags, and the
+    permissive(OR) / restrictive(AND) policy set into one verdict per cell —
+    `OPEN` (every row reachable), `DENIED` (no privilege, or RLS on with no
+    applicable permissive policy), or `COND` (gated by a row predicate, shown
+    in `--format json`/`html`). Per command it uses the clause Postgres
+    applies: `WITH CHECK` for INSERT, `USING` for SELECT/UPDATE/DELETE.
+    Reads a live database and runs NO lint rules. `--roles a,b` overrides the
+    columns; `--include-system-roles` adds `pg_*`. Note: a table *owner*
+    bypasses RLS unless the table is `FORCE`d, and a superuser bypasses
+    everything — neither is modeled per-cell.
+    """
+    # Validate --roles before connecting so a malformed flag fails fast
+    # (no database round-trip needed to reject it).
+    roles: tuple[str, ...] | None = None
+    if roles_csv is not None:
+        roles = tuple(
+            dict.fromkeys(r.strip() for r in roles_csv.split(",") if r.strip())
+        )
+        if not roles:
+            raise ToolError("--roles listed no role names.")
+
+    _, schema = _connect_and_introspect(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas,
+    )
+
+    built = build_matrix(schema, roles=roles, include_system=include_system)
+    rendered = render_matrix(built, output_format)
     _emit(rendered, output_path)
 
 

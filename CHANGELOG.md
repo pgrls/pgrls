@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-08
+
+### Added
+
+- `pgrls matrix` — an **effective access matrix**: for every role × table ×
+  command, one verdict — `OPEN` (every row reachable), `DENIED` (no privilege,
+  or RLS on with no applicable permissive policy), or `COND` (gated by a row
+  predicate, shown in `--format json`/`html`). It collapses table `GRANT`s, the
+  RLS enabled/forced flags, and the permissive(OR) / restrictive(AND) policy
+  set into a single grid — the audit companion to `pgrls report`. Per command it
+  evaluates the clause Postgres applies (`WITH CHECK` for INSERT, `USING` for
+  SELECT/UPDATE/DELETE — for UPDATE, v1 shows the read-side `USING`, not the
+  write-side `WITH CHECK`) and accounts for `BYPASSRLS` roles. `--roles a,b`
+  overrides the role columns; `--include-system-roles` adds `pg_*`. Four output
+  formats (text / json / markdown / html); runs no lint rules.
+
 ## [0.18.0] - 2026-06-08
 
 ### Added
