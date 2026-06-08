@@ -237,3 +237,26 @@ def test_resolve_empty_glob_rejected(tmp_path: Path) -> None:
     for pat in ("", "   "):
         with pytest.raises(LayoutError, match="cannot be empty"):
             resolve_plan(tmp_path, layout="auto", glob_pattern=pat)
+
+
+def test_resolve_glob_natural_numeric_order(tmp_path: Path) -> None:
+    f1 = _touch(tmp_path / "1_mig.sql")
+    f2 = _touch(tmp_path / "2_mig.sql")
+    f10 = _touch(tmp_path / "10_mig.sql")
+    f11 = _touch(tmp_path / "11_mig.sql")
+    plan = resolve_plan(tmp_path, layout="glob")
+    # natural order: 1, 2, 10, 11 — not lexical 1, 10, 11, 2
+    assert plan.files == (f1, f2, f10, f11)
+
+
+def test_resolve_sqitch_rework_missing_snapshot_no_double(tmp_path: Path) -> None:
+    _touch(
+        tmp_path / "sqitch.plan",
+        "%project=t\n\n"
+        "users 2020-01-01T00:00:00Z me <m@x> # add\n"
+        "@v1.0 2020-01-02T00:00:00Z me <m@x> # release\n"
+        "users [users@v1.0] 2020-01-03T00:00:00Z me <m@x> # rework\n",
+    )
+    base = _touch(tmp_path / "deploy" / "users.sql")  # @tag snapshot absent
+    plan = resolve_plan(tmp_path, layout="sqitch")
+    assert plan.files == (base,)  # never queued twice

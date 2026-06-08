@@ -72,6 +72,20 @@ def _flyway_sort_key(path: Path) -> tuple[int, tuple[int, ...], str]:
     return (4, (), name)
 
 
+def _natural_key(path: Path) -> tuple[int | str, ...]:
+    """Natural sort: digit runs compare numerically so 2.sql precedes 10.sql.
+
+    Plain lexical order misorders unpadded numeric migrations (1, 10, 2); this
+    keeps zero-padded and timestamped names unchanged while fixing unpadded
+    ones. (``re.split`` with a capturing group alternates non-digit/digit, so
+    each position is consistently str or int — no mixed-type comparison.)
+    """
+    return tuple(
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", path.name)
+    )
+
+
 def detect_layout(path: Path) -> str:
     """Infer the migration layout of ``path`` (a directory or a .sql file).
 
@@ -153,12 +167,22 @@ def _resolve_sqitch(path: Path) -> tuple[Path, ...]:
             last_tag = token[1:]  # a tag marks a rework boundary
             continue
         change = token
-        if change in seen and last_tag is not None:
-            # Rework: the earlier occurrence is the as-of-tag snapshot.
-            snapshot = deploy / f"{change}@{last_tag}.sql"
-            if snapshot.is_file():
-                files[seen[change]] = snapshot
         candidate = deploy / f"{change}.sql"
+        if change in seen:
+            # Rework: turn the earlier occurrence into its as-of-tag snapshot
+            # and queue the current deploy file once more — but never queue the
+            # same file twice (a missing snapshot keeps the single entry).
+            snapshot = (
+                deploy / f"{change}@{last_tag}.sql"
+                if last_tag is not None
+                else None
+            )
+            if snapshot is not None and snapshot.is_file():
+                files[seen[change]] = snapshot
+                if candidate.is_file():
+                    files.append(candidate)
+                    seen[change] = len(files) - 1
+            continue
         if candidate.is_file():
             files.append(candidate)
             seen[change] = len(files) - 1
@@ -240,7 +264,9 @@ def resolve_plan(
     # glob
     pattern = glob_pattern or "*.sql"
     try:
-        matches = sorted(p for p in path.glob(pattern) if p.is_file())
+        matches = sorted(
+            (p for p in path.glob(pattern) if p.is_file()), key=_natural_key
+        )
     except (ValueError, NotImplementedError) as exc:
         raise LayoutError(
             f"invalid --migrations-glob pattern {pattern!r}: {exc}. Use a "

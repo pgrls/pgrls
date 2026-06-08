@@ -185,6 +185,8 @@ def build_schema_from_migrations(
         raise
     except Exception as exc:  # noqa: BLE001 - convert any docker/start failure
         raise EphemeralError(
-            f"could not run the ephemeral Postgres container ({exc}). Is "
-            "Docker running, and is the `pgrls[ephemeral]` extra installed?"
+            f"could not boot the ephemeral Postgres container from image "
+            f"{image!r} ({exc}). Check the image name (--pg-image / "
+            "$PGRLS_EPHEMERAL_PG_IMAGE), that Docker is running, and that the "
+            "`pgrls[ephemeral]` extra is installed."
         ) from exc

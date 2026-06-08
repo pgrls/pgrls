@@ -297,6 +297,21 @@ def test_supabase_layout_auto_provisions(tmp_path: Path) -> None:
 
 
 @requires_docker
+def test_bad_pg_image_names_the_image(tmp_path: Path) -> None:
+    # A wrong --pg-image must name the image, not blame Docker/the extra.
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.t (id int);", encoding="utf-8"
+    )
+    with pytest.raises(ephemeral.EphemeralError) as ei:
+        ephemeral.build_schema_from_migrations(
+            sql_files=[tmp_path / "001.sql"],
+            schemas=["public"],
+            pg_image="pgrls-nonexistent/does-not-exist:0",
+        )
+    assert "does-not-exist" in str(ei.value)
+
+
+@requires_docker
 def test_create_role_public_is_skipped(tmp_path: Path) -> None:
     # `public` is a reserved pseudo-role; CREATE ROLE public would fail. The
     # filter must drop it case-insensitively.
