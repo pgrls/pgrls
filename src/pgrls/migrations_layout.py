@@ -34,9 +34,11 @@ LAYOUTS: tuple[str, ...] = (
 # ``R__desc.sql`` (repeatable). Version is digits separated by ``.`` or ``_``.
 _FLYWAY_VERSIONED = re.compile(r"^V(\d+(?:[._]\d+)*)__.+\.sql$")
 _FLYWAY_REPEATABLE = re.compile(r"^R__.+\.sql$")
-# Undo migrations (``U<version>__desc.sql``). Recognized as Flyway-shaped for
-# layout detection, but excluded from a forward build (never applied).
+# Undo migrations (``U<version>__desc.sql``) — excluded from a forward build.
 _FLYWAY_UNDO = re.compile(r"^U(\d+(?:[._]\d+)*)__.+\.sql$")
+# Once-run callbacks that can define schema; ordered around the versioned set.
+_FLYWAY_BEFORE = re.compile(r"^beforeMigrate(?:__.+)?\.sql$")
+_FLYWAY_AFTER = re.compile(r"^afterMigrate(?:__.+)?\.sql$")
 
 
 class LayoutError(Exception):
@@ -52,21 +54,22 @@ class MigrationPlan:
     root: Path
 
 
-def _is_flyway_name(name: str) -> bool:
-    return bool(
-        _FLYWAY_VERSIONED.match(name)
-        or _FLYWAY_REPEATABLE.match(name)
-        or _FLYWAY_UNDO.match(name)
-    )
-
-
 def _flyway_sort_key(path: Path) -> tuple[int, tuple[int, ...], str]:
-    """Order versioned files by numeric version, then repeatable by name."""
-    m = _FLYWAY_VERSIONED.match(path.name)
+    """Forward-build order: beforeMigrate, then versioned (numeric) and
+    repeatable, then afterMigrate, then any other .sql last — never lexical
+    across versions (so V2 precedes V10)."""
+    name = path.name
+    if _FLYWAY_BEFORE.match(name):
+        return (0, (), name)
+    m = _FLYWAY_VERSIONED.match(name)
     if m:
         version = tuple(int(part) for part in re.split(r"[._]", m.group(1)))
-        return (0, version, path.name)
-    return (1, (), path.name)
+        return (1, version, name)
+    if _FLYWAY_REPEATABLE.match(name):
+        return (2, (), name)
+    if _FLYWAY_AFTER.match(name):
+        return (3, (), name)
+    return (4, (), name)
 
 
 def detect_layout(path: Path) -> str:
@@ -97,7 +100,9 @@ def detect_layout(path: Path) -> str:
 
     sql_files = sorted(path.glob("*.sql"))
     if sql_files:
-        if all(_is_flyway_name(p.name) for p in sql_files):
+        # Any versioned V* file means Flyway, even alongside callbacks or a
+        # seed .sql — otherwise we'd fall to glob and apply V10 before V2.
+        if any(_FLYWAY_VERSIONED.match(p.name) for p in sql_files):
             return "flyway"
         return "glob"
 
@@ -180,6 +185,10 @@ def resolve_plan(
     if not path.exists():
         raise LayoutError(f"{path} does not exist.")
 
+    # A supplied --migrations-glob implies the glob layout, else it would be
+    # silently ignored under auto-detection (and the user told to pass it).
+    if layout == "auto" and glob_pattern is not None:
+        layout = "glob"
     if layout == "auto":
         layout = detect_layout(path)
 
@@ -221,7 +230,7 @@ def resolve_plan(
     # glob
     pattern = glob_pattern or "*.sql"
     try:
-        matches = sorted(path.glob(pattern))
+        matches = sorted(p for p in path.glob(pattern) if p.is_file())
     except (ValueError, NotImplementedError) as exc:
         raise LayoutError(
             f"invalid --migrations-glob pattern {pattern!r}: {exc}. Use a "

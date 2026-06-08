@@ -181,3 +181,46 @@ def test_resolve_glob_absolute_pattern_errors(tmp_path: Path) -> None:
     _touch(tmp_path / "a.sql")
     with pytest.raises(LayoutError, match="invalid --migrations-glob"):
         resolve_plan(tmp_path, layout="glob", glob_pattern="/etc/*.sql")
+
+
+def test_detect_flyway_with_callback(tmp_path: Path) -> None:
+    _touch(tmp_path / "V1__init.sql")
+    _touch(tmp_path / "V2__a.sql")
+    _touch(tmp_path / "afterMigrate.sql")
+    # A callback (or any extra .sql) must not flip the dir to lexical glob.
+    assert detect_layout(tmp_path) == "flyway"
+
+
+def test_resolve_flyway_orders_callbacks_and_versions(tmp_path: Path) -> None:
+    before = _touch(tmp_path / "beforeMigrate.sql")
+    v1 = _touch(tmp_path / "V1__init.sql")
+    v2 = _touch(tmp_path / "V2__a.sql")
+    v10 = _touch(tmp_path / "V10__b.sql")
+    after = _touch(tmp_path / "afterMigrate.sql")
+    plan = resolve_plan(tmp_path, layout="flyway")
+    # beforeMigrate, then V numeric (V2 before V10), then afterMigrate last
+    assert plan.files == (before, v1, v2, v10, after)
+
+
+def test_resolve_flyway_seed_file_last(tmp_path: Path) -> None:
+    v1 = _touch(tmp_path / "V1__init.sql")
+    v2 = _touch(tmp_path / "V2__a.sql")
+    seed = _touch(tmp_path / "seed.sql")
+    plan = resolve_plan(tmp_path, layout="flyway")
+    assert plan.files == (v1, v2, seed)
+
+
+def test_resolve_auto_glob_promotion(tmp_path: Path) -> None:
+    # SQL only in a subdir + a --migrations-glob => auto promotes to glob.
+    a = _touch(tmp_path / "db" / "migrate" / "001.sql")
+    b = _touch(tmp_path / "db" / "migrate" / "002.sql")
+    plan = resolve_plan(tmp_path, layout="auto", glob_pattern="db/migrate/*.sql")
+    assert plan.layout == "glob"
+    assert plan.files == (a, b)
+
+
+def test_resolve_glob_skips_directories(tmp_path: Path) -> None:
+    a = _touch(tmp_path / "a.sql")
+    (tmp_path / "sub.sql").mkdir()  # a directory whose name matches *.sql
+    plan = resolve_plan(tmp_path, layout="glob")
+    assert plan.files == (a,)

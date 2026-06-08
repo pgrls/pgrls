@@ -471,6 +471,19 @@ def lint(
             "choose one schema source: a live database (--database-url) or "
             "an ephemeral build (--migrations / --supabase), not both."
         )
+    if not use_migrations:
+        # The ephemeral-only options are meaningless without --migrations /
+        # --supabase; reject them rather than silently lint the live DB.
+        layout_explicit = (
+            ctx.get_parameter_source("migrations_layout")
+            is click.core.ParameterSource.COMMANDLINE
+        )
+        if migrations_glob or create_roles or pg_image or layout_explicit:
+            raise ToolError(
+                "--migrations-layout / --migrations-glob / --create-role / "
+                "--pg-image apply only to an ephemeral build — pass "
+                "--migrations or --supabase (or drop these options)."
+            )
 
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
     # feeds HYG004 (policy has no behavioral test), inert otherwise.

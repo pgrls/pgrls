@@ -1,8 +1,8 @@
 """Build a :class:`~pgrls.model.Schema` by applying migrations to a throwaway DB.
 
-Powers ``pgrls lint --migrations <dir>`` (and ``diff`` / ``generate
---migrations``): boot a disposable Postgres container, apply the project's
-migration SQL in order, introspect the result, then tear the container down.
+Powers ``pgrls lint --migrations <dir>``: boot a disposable Postgres
+container, apply the project's migration SQL in order, introspect the result,
+then tear the container down.
 This removes the single biggest onboarding barrier — needing a reachable,
 already-migrated database — so the only requirement becomes "Docker is
 running."
@@ -113,7 +113,7 @@ def build_schema_from_migrations(
     for _path, text in sources:
         extensions.update(detect_extensions(text))
 
-    roles: set[str] = {r for r in extra_roles if r and r != "PUBLIC"}
+    roles: set[str] = {r for r in extra_roles if r and r.upper() != "PUBLIC"}
     if provision_supabase:
         roles.update(_SUPABASE_ROLES)
 
@@ -175,6 +175,10 @@ def build_schema_from_migrations(
                 raise
             except psycopg.Error as exc:
                 raise EphemeralError(f"ephemeral database error: {exc}") from exc
+            except (ValueError, RuntimeError) as exc:
+                # e.g. introspect() on a missing/reserved --schemas value:
+                # surface the real cause, not the Docker/extra hint below.
+                raise EphemeralError(str(exc)) from exc
     except EphemeralError:
         raise
     except Exception as exc:  # noqa: BLE001 - convert any docker/start failure

@@ -251,3 +251,50 @@ def test_failing_migration_names_the_file(tmp_path: Path) -> None:
         ephemeral.build_schema_from_migrations(
             sql_files=plan.files, schemas=["public"]
         )
+
+
+def test_lint_ephemeral_flags_require_migrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Ephemeral-only flags without --migrations/--supabase must error, not
+    # silently lint the live DB (or give a baffling "no database" message).
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for args in (
+        ["lint", "--create-role", "app_user"],
+        ["lint", "--migrations-layout", "glob"],
+        ["lint", "--pg-image", "postgres:16"],
+    ):
+        res = CliRunner().invoke(main, args)
+        assert res.exit_code != 0, args
+        assert "ephemeral build" in res.output, args
+
+
+@requires_docker
+def test_create_role_public_is_skipped(tmp_path: Path) -> None:
+    # `public` is a reserved pseudo-role; CREATE ROLE public would fail. The
+    # filter must drop it case-insensitively.
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.t (id int);", encoding="utf-8"
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"],
+        schemas=["public"],
+        extra_roles=("public", "PUBLIC"),
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
+def test_bad_schema_surfaces_real_error(tmp_path: Path) -> None:
+    # A --schemas typo must surface introspect's real message, not the
+    # misleading "Is Docker running?" container hint.
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.t (id int);", encoding="utf-8"
+    )
+    with pytest.raises(ephemeral.EphemeralError) as ei:
+        ephemeral.build_schema_from_migrations(
+            sql_files=[tmp_path / "001.sql"], schemas=["does_not_exist"]
+        )
+    msg = str(ei.value)
+    assert "Docker" not in msg
+    assert "does_not_exist" in msg

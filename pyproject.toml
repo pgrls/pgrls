@@ -62,8 +62,8 @@ diff-z3 = ["z3-solver>=4.13"]
 # testcontainers pulls in Docker / Selenium / lots of test
 # infrastructure that lint / fix users don't need.
 diff-apply = ["testcontainers[postgres]>=4.0"]
-# `pgrls lint --migrations` / `generate --migrations` build a schema by
-# applying migration files in a throwaway Postgres (pgrls.ephemeral). Same
+# `pgrls lint --migrations` builds a schema by applying migration files in
+# a throwaway Postgres (pgrls.ephemeral). Same
 # testcontainers dependency as diff-apply; aliased so the feature's install
 # hint reads `pip install pgrls[ephemeral]`.
 ephemeral = ["testcontainers[postgres]>=4.0"]
