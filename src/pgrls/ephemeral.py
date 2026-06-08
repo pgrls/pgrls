@@ -1,0 +1,176 @@
+"""Build a :class:`~pgrls.model.Schema` by applying migrations to a throwaway DB.
+
+Powers ``pgrls lint --migrations <dir>`` (and ``diff`` / ``generate
+--migrations``): boot a disposable Postgres container, apply the project's
+migration SQL in order, introspect the result, then tear the container down.
+This removes the single biggest onboarding barrier — needing a reachable,
+already-migrated database — so the only requirement becomes "Docker is
+running."
+
+Requires the ``pgrls[ephemeral]`` extra (testcontainers + Docker), an alias of
+``pgrls[diff-apply]``. The same machinery backs ``pgrls diff --apply``; this
+module factors the boot -> apply -> introspect core out of the diff-specific
+baseline-restore + cache path in ``cli.py`` so both share one surface.
+"""
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Sequence
+from pathlib import Path
+
+import psycopg
+
+from pgrls.diff._migration_extensions import detect_extensions
+from pgrls.introspect import introspect
+from pgrls.model import Schema
+
+# Image override env var. A feature-neutral name so ``lint --migrations`` users
+# are not told to set a "DIFF_APPLY" variable; falls back to the diff path's
+# pin and then the default so a single export covers both.
+EPHEMERAL_PG_IMAGE_ENV = "PGRLS_EPHEMERAL_PG_IMAGE"
+_DEFAULT_PG_IMAGE = "postgres:17-alpine"
+
+# Supabase ``auth.*`` stubs so Supabase-style policies (``auth.uid()`` etc.)
+# parse-analyze at CREATE POLICY time against a stock Postgres image with no
+# Supabase stack. Mirrors corpus/harness.py:_PRELUDE and
+# demo/cases/_shared.sql — the same prelude pgrls already trusts.
+_SUPABASE_PRELUDE = """
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE
+    AS $$ SELECT current_setting('request.jwt.claim.sub', true)::uuid $$;
+CREATE OR REPLACE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE
+    AS $$ SELECT current_setting('request.jwt.claim.role', true) $$;
+CREATE OR REPLACE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE
+    AS $$ SELECT current_setting('request.jwt.claims', true)::jsonb $$;
+"""
+# Roles a Supabase project's policies grant to.
+_SUPABASE_ROLES: tuple[str, ...] = ("anon", "authenticated", "service_role")
+
+_CREATE_ROLE_IF_MISSING = (
+    "DO $$ BEGIN "
+    "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN "
+    "EXECUTE format('CREATE ROLE %%I NOLOGIN', %s); "
+    "END IF; END $$;"
+)
+
+
+class EphemeralError(Exception):
+    """The ephemeral build could not complete.
+
+    Raised when the ``pgrls[ephemeral]`` extra is missing, Docker is
+    unreachable, or a migration failed to apply. The CLI translates this to a
+    ``ToolError`` (exit 2); this module stays free of Click/CLI imports.
+    """
+
+
+def resolve_pg_image(pg_image: str | None = None) -> str:
+    """The Postgres image to boot: explicit arg, then env vars, then default."""
+    return (
+        pg_image
+        or os.environ.get(EPHEMERAL_PG_IMAGE_ENV)
+        or os.environ.get("PGRLS_DIFF_APPLY_PG_IMAGE")
+        or _DEFAULT_PG_IMAGE
+    )
+
+
+def build_schema_from_migrations(
+    *,
+    sql_files: Sequence[Path],
+    schemas: list[str],
+    extra_roles: Sequence[str] = (),
+    provision_supabase: bool = False,
+    pg_image: str | None = None,
+    verbose_log: Callable[[str], None] = lambda _msg: None,
+) -> Schema:
+    """Boot an ephemeral Postgres, apply ``sql_files`` in order, introspect.
+
+    Each file's text is executed as one multi-statement script (Postgres parses
+    it) on an autocommit connection, in the given order. Extensions named in
+    any file's ``CREATE EXTENSION`` are pre-installed idempotently first;
+    ``extra_roles`` (plus the Supabase roles when ``provision_supabase``) are
+    pre-created ``NOLOGIN`` so role-referencing DDL applies. The container is
+    always torn down (context manager), on success and on failure.
+
+    Raises :class:`EphemeralError` when testcontainers/Docker is unavailable or
+    a file fails to apply (the offending file and the Postgres error are
+    named).
+    """
+    try:
+        from testcontainers.postgres import PostgresContainer
+    except ImportError as exc:
+        raise EphemeralError(
+            "linting from migrations requires the `pgrls[ephemeral]` extra "
+            "(testcontainers + Docker). Install with `pip install "
+            "'pgrls[ephemeral]'` and ensure Docker is running."
+        ) from exc
+
+    files = tuple(sql_files)
+    if not files:
+        raise EphemeralError("no migration SQL files to apply.")
+
+    # Read every file up front so a bad path fails before a container boots.
+    sources: list[tuple[Path, str]] = []
+    for path in files:
+        try:
+            sources.append((path, path.read_text(encoding="utf-8")))
+        except OSError as exc:
+            raise EphemeralError(f"cannot read migration {path}: {exc}") from exc
+
+    extensions: set[str] = set()
+    for _path, text in sources:
+        extensions.update(detect_extensions(text))
+
+    roles: set[str] = {r for r in extra_roles if r and r != "PUBLIC"}
+    if provision_supabase:
+        roles.update(_SUPABASE_ROLES)
+
+    image = resolve_pg_image(pg_image)
+    verbose_log(f"booting ephemeral Postgres ({image})")
+
+    try:
+        with PostgresContainer(
+            image, username="postgres", password="postgres", dbname="postgres"
+        ) as pg:
+            url = pg.get_connection_url(driver=None)
+            try:
+                with psycopg.connect(url, autocommit=True) as conn, conn.cursor() as cur:
+                    if roles:
+                        for role in sorted(roles):
+                            cur.execute(_CREATE_ROLE_IF_MISSING, (role, role))
+                        verbose_log(f"created {len(roles)} role(s): {sorted(roles)}")
+                    if provision_supabase:
+                        cur.execute(_SUPABASE_PRELUDE)
+                        verbose_log("provisioned Supabase auth.* stubs")
+                    if extensions:
+                        from psycopg import sql as _sql
+
+                        for ext in sorted(extensions):
+                            cur.execute(
+                                _sql.SQL(
+                                    "CREATE EXTENSION IF NOT EXISTS {}"
+                                ).format(_sql.Identifier(ext))
+                            )
+                        verbose_log(
+                            f"pre-installed extension(s): {sorted(extensions)}"
+                        )
+                    for path, text in sources:
+                        try:
+                            cur.execute(text)
+                        except psycopg.Error as exc:
+                            raise EphemeralError(
+                                f"migration {path.name} failed to apply: {exc}"
+                            ) from exc
+                        verbose_log(f"applied {path.name}")
+                with psycopg.connect(url) as conn:
+                    return introspect(conn, schemas=schemas)
+            except EphemeralError:
+                raise
+            except psycopg.Error as exc:
+                raise EphemeralError(f"ephemeral database error: {exc}") from exc
+    except EphemeralError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - convert any docker/start failure
+        raise EphemeralError(
+            f"could not run the ephemeral Postgres container ({exc}). Is "
+            "Docker running, and is the `pgrls[ephemeral]` extra installed?"
+        ) from exc

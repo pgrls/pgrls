@@ -204,8 +204,73 @@ def output_format_options(
     return decorator
 
 
+def migration_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Stack the shared `--migrations` ephemeral-build options.
+
+    Lets a command introspect a schema built from migration files in a
+    throwaway Postgres instead of connecting to a live database. Used by
+    `lint`; the engine lives in `pgrls.ephemeral`. Declared bottom-up so
+    `--help` lists `--migrations` first.
+    """
+    from pgrls.migrations_layout import LAYOUTS
+
+    func = click.option(
+        "--pg-image",
+        default=None,
+        help=(
+            "Postgres image for the ephemeral --migrations build "
+            "(default: $PGRLS_EPHEMERAL_PG_IMAGE or postgres:17-alpine)."
+        ),
+    )(func)
+    func = click.option(
+        "--create-role",
+        "create_roles",
+        multiple=True,
+        help=(
+            "Pre-create this role (NOLOGIN) in the ephemeral --migrations "
+            "database before applying, so policies/grants referencing it "
+            "apply. Repeat for multiple."
+        ),
+    )(func)
+    func = click.option(
+        "--supabase",
+        is_flag=True,
+        default=False,
+        help=(
+            "Shortcut for a Supabase project: build from ./supabase/migrations "
+            "and provision the auth.* stubs + anon/authenticated/service_role "
+            "roles. Implies --migrations when none is given."
+        ),
+    )(func)
+    func = click.option(
+        "--migrations-glob",
+        default=None,
+        help="Explicit ordered glob for --migrations-layout glob (e.g. 'db/*.sql').",
+    )(func)
+    func = click.option(
+        "--migrations-layout",
+        type=click.Choice(list(LAYOUTS), case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="Migration layout for --migrations (auto-detected by default).",
+    )(func)
+    func = click.option(
+        "--migrations",
+        "migrations_path",
+        type=click.Path(exists=True),
+        default=None,
+        help=(
+            "Lint a schema built from these migration files in a throwaway "
+            "Postgres (no live database needed): a directory or a .sql file. "
+            "Requires Docker and the pgrls[ephemeral] extra."
+        ),
+    )(func)
+    return func
+
+
 @main.command()
 @common_db_options
+@migration_source_options
 @click.option(
     "--rule",
     "rules",
@@ -331,6 +396,12 @@ def lint(
     baseline_path: Path | None,
     coverage_path: str | None,
     perf_path: str | None,
+    migrations_path: str | None,
+    migrations_layout: str,
+    migrations_glob: str | None,
+    supabase: bool,
+    create_roles: tuple[str, ...],
+    pg_image: str | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
     if update_baseline and baseline_path is None:
@@ -383,14 +454,14 @@ def lint(
         fail_on=fail_on,
     )
 
-    if effective.database_url is None:
-        # If `[database].url` was set but its env-var interpolation
-        # failed, surface that specific cause (deferred from
-        # load_config) instead of the generic guidance.
+    # Schema source: a live database (--database-url) or an ephemeral build
+    # from migration files (--migrations / --supabase) — never both.
+    if migrations_path is not None and database_url is not None:
         raise ToolError(
-            effective.database_url_error
-            or "No database connection: pass --database-url or set DATABASE_URL."
+            "choose one schema source: a live database (--database-url) or "
+            "an ephemeral build (--migrations), not both."
         )
+    use_migrations = migrations_path is not None or supabase
 
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
     # feeds HYG004 (policy has no behavioral test), inert otherwise.
@@ -426,13 +497,32 @@ def lint(
                 f"Cannot read perf artifact {perf_path!r}: {exc}"
             ) from exc
 
-    try:
-        with psycopg.connect(effective.database_url) as conn:
-            schema = introspect(conn, schemas=effective.schemas)
-    except psycopg.Error as exc:
-        raise ToolError(f"Database error: {exc}") from exc
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
+    if use_migrations:
+        schema = _schema_from_migrations(
+            migrations_path=migrations_path,
+            migrations_layout=migrations_layout,
+            migrations_glob=migrations_glob,
+            supabase=supabase,
+            create_roles=create_roles,
+            pg_image=pg_image,
+            schemas=effective.schemas,
+        )
+    else:
+        if effective.database_url is None:
+            # If `[database].url` was set but its env-var interpolation
+            # failed, surface that specific cause (deferred from
+            # load_config) instead of the generic guidance.
+            raise ToolError(
+                effective.database_url_error
+                or "No database connection: pass --database-url or set DATABASE_URL."
+            )
+        try:
+            with psycopg.connect(effective.database_url) as conn:
+                schema = introspect(conn, schemas=effective.schemas)
+        except psycopg.Error as exc:
+            raise ToolError(f"Database error: {exc}") from exc
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
 
     try:
         violations = _run_rules(
@@ -657,6 +747,61 @@ def _connect_and_introspect(
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
     return effective, schema
+
+
+def _schema_from_migrations(
+    *,
+    migrations_path: str | None,
+    migrations_layout: str,
+    migrations_glob: str | None,
+    supabase: bool,
+    create_roles: tuple[str, ...],
+    pg_image: str | None,
+    schemas: list[str],
+) -> Schema:
+    """Build a `Schema` by applying migration files in an ephemeral Postgres.
+
+    Used by `lint --migrations`: resolve the layout to an ordered file
+    list, boot a throwaway Postgres
+    (`pgrls.ephemeral`), apply them, and introspect. `--supabase` defaults the
+    path to ./supabase/migrations and provisions the auth.* stubs + roles.
+    `LayoutError` / `EphemeralError` become `ToolError` (exit 2).
+    """
+    from pgrls import ephemeral
+    from pgrls.migrations_layout import LayoutError, resolve_plan
+
+    path_str = migrations_path
+    layout = migrations_layout
+    if supabase:
+        layout = "supabase"
+        if path_str is None:
+            candidate = Path("supabase/migrations")
+            path_str = str(candidate if candidate.is_dir() else Path("supabase"))
+    if path_str is None:
+        raise ToolError("no migration source: pass --migrations PATH (or --supabase).")
+
+    try:
+        plan = resolve_plan(
+            Path(path_str), layout=layout, glob_pattern=migrations_glob
+        )
+    except LayoutError as exc:
+        raise ToolError(str(exc)) from exc
+
+    click.echo(
+        f"pgrls: applying {len(plan.files)} migration(s) "
+        "in an ephemeral Postgres…",
+        err=True,
+    )
+    try:
+        return ephemeral.build_schema_from_migrations(
+            sql_files=plan.files,
+            schemas=schemas,
+            extra_roles=create_roles,
+            provision_supabase=supabase,
+            pg_image=pg_image,
+        )
+    except ephemeral.EphemeralError as exc:
+        raise ToolError(str(exc)) from exc
 
 
 @contextmanager

@@ -45,6 +45,18 @@ pip install pgrls
 
 Requires Python 3.11+ and Postgres 15+. pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
 
+## Lint without a live database
+
+No database to point at? Hand pgrls your migrations and it builds a throwaway Postgres for you — applies them in order, introspects, lints, and tears it down:
+
+```bash
+pip install 'pgrls[ephemeral]'          # adds testcontainers; needs Docker
+pgrls lint --migrations ./migrations    # auto-detects Supabase / Prisma / Flyway / sqitch / plain .sql
+pgrls lint --supabase                   # shortcut for ./supabase/migrations + the auth.* stubs and roles
+```
+
+`--migrations` takes a directory or a single `.sql` file; the layout is auto-detected (override with `--migrations-layout` / `--migrations-glob`), and `--create-role NAME` pre-creates any role your policies reference. It's the zero-setup way to gate RLS in CI — no service container, no `DATABASE_URL`, just Docker.
+
 ## Real-world bugs pgrls catches
 
 The kind of mistake that ships to prod despite policy review:

@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-08
+
+### Added
+
+- **`pgrls lint --migrations <path>` — lint with no live database.** pgrls
+  boots a throwaway Postgres (testcontainers), applies your migration files
+  in order, introspects the result, lints, and tears it down — removing the
+  "stand up and migrate a database first" onboarding step. Accepts a
+  directory or a single `.sql` file; the layout is auto-detected (Supabase,
+  Prisma, Flyway, sqitch, or plain ordered `.sql`) and overridable with
+  `--migrations-layout` / `--migrations-glob`. `--supabase` is a shortcut for
+  `./supabase/migrations` that also provisions the `auth.*` stubs and the
+  `anon` / `authenticated` / `service_role` roles; `--create-role` pre-creates
+  any other role your policies reference. Requires Docker and the new
+  `pgrls[ephemeral]` extra (an alias of `pgrls[diff-apply]`).
+
 ## [0.17.0] - 2026-06-03
 
 A soundness- and precision-hardening release: the output of a 20-round
