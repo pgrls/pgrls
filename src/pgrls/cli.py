@@ -73,6 +73,8 @@ from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.matrix import MATRIX_FORMATS, build_matrix
 from pgrls.matrix import render as render_matrix
+from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, VERIFY_FORMATS, build_verification
+from pgrls.verify import render as render_verify
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
@@ -3344,6 +3346,77 @@ def matrix(
     built = build_matrix(schema, roles=roles, include_system=include_system)
     rendered = render_matrix(built, output_format)
     _emit(rendered, output_path)
+
+
+@main.command()
+@common_db_options
+@click.option(
+    "--auth-function",
+    "auth_functions",
+    multiple=True,
+    help=(
+        "Treat this function as NULL under an anonymous session, in addition "
+        "to the defaults (auth.uid/role/jwt, current_setting). Repeatable — "
+        "pass a project's custom auth helper, e.g. --auth-function auth.user_id."
+    ),
+)
+@click.option(
+    "--strict",
+    "strict",
+    is_flag=True,
+    default=False,
+    help="Also exit non-zero when any table is UNVERIFIED (not just on a leak).",
+)
+@output_format_options(
+    list(VERIFY_FORMATS),
+    output_help="Write the proof report to this file instead of stdout.",
+)
+def verify(
+    database_url: str | None,
+    config_path: str | None,
+    schemas: str | None,
+    auth_functions: tuple[str, ...],
+    strict: bool,
+    output_path: str | None,
+    output_format: str,
+) -> None:
+    """Prove tenant isolation with Z3 — and show a leaking row when it fails.
+
+    For every RLS-enabled table, `pgrls verify` *proves* whether an
+    **anonymous** session (every auth function — `auth.uid()`/`role()`/`jwt()`,
+    `current_setting(...)` — NULL) can read any row. Three honest verdicts:
+    `PROVEN` (the USING predicate is unsatisfiable under anon — no row is ever
+    anonymously visible), `LEAK` (a row *is* — with a concrete counterexample:
+    a characterizing row or "every row"), or `UNVERIFIED` (Z3 unavailable, the
+    predicate is outside the decidable fragment, or it timed out — here the
+    verifier degrades to the linter; run `pgrls lint`).
+
+    Unlike `pgrls lint` (heuristic findings) this is a soundness proof: it
+    never reports a leak it cannot exhibit, and never reports isolated unless
+    Z3 proves it. Exits non-zero on any leak — drop it in CI as a hard
+    tenant-isolation gate. `--strict` also fails on UNVERIFIED. `--format json`
+    emits the per-table/per-policy verdicts and counterexamples. v1 proves the
+    anonymous-read threat model (the dominant Supabase RLS failure); see the
+    README for scope.
+    """
+    _, schema = _connect_and_introspect(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas,
+    )
+
+    auth = (
+        set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
+        if auth_functions
+        else None
+    )
+    verification = build_verification(schema, auth_functions=auth)
+    _emit(render_verify(verification, output_format), output_path)
+
+    if verification.has_leak:
+        sys.exit(1)
+    if strict and any(t.verdict == "unverified" for t in verification.tables):
+        sys.exit(1)
 
 
 @main.command()

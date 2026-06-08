@@ -10,6 +10,26 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-08
+
+### Added
+
+- `pgrls verify` — a **Z3 tenant-isolation prover**. For every RLS-enabled
+  table it *proves* whether an anonymous session (every auth function —
+  `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — NULL) can read any
+  row, with three honest verdicts: `PROVEN` (the `USING` predicate is
+  unsatisfiable under anon → no row is ever anonymously visible), `LEAK` (a
+  row *is* — with a concrete counterexample: a characterizing row such as
+  `is_public=True`, or "every row" for the `auth.uid() IS NULL OR …`
+  inversion / `USING (true)`), or `UNVERIFIED` (Z3 unavailable, the predicate
+  is outside the decidable fragment, or it timed out — the point where the
+  verifier degrades to the linter). Exits non-zero on any leak (a hard CI
+  tenant-isolation gate); `--strict` also fails on UNVERIFIED. `text` / `json`
+  output; `--auth-function` extends the anon-NULL set with a project's helper.
+  Reuses the SEC038 3VL encoder (soundness over recall — never claims a leak
+  it cannot exhibit, never claims isolated unless Z3 proves it). v1 covers the
+  anonymous-read threat model; authenticated cross-tenant isolation is next.
+
 ### Fixed
 
 - `pgrls diff --apply` no longer crashes with `IndeterminateDatatype` when the
