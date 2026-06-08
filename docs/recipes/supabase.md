@@ -78,12 +78,45 @@ pgrls flags this as **SEC030** (severity `info`) and recommends
 
 ## Wire it into Supabase CI
 
-Two common patterns. Both work the same way: point pgrls at any Postgres
-that holds the same schema you ship to production.
+Three patterns, simplest first. **A** needs no database at all; **B** and
+**C** point pgrls at a live Postgres that holds the same schema you ship to
+production.
 
-### A. Against your migration-applied CI database
+### A. No live database — `pgrls lint --supabase`
 
-If your CI applies migrations to a Postgres service container, just
+Since 0.18.0, pgrls can build the schema itself: it boots a throwaway
+Postgres (via Docker), applies your `supabase/migrations` in order,
+provisions the Supabase `auth.*` stubs and the `anon` / `authenticated` /
+`service_role` roles, then lints the result. No service container, no
+`DATABASE_URL`, no `supabase start`:
+
+```yaml
+# .github/workflows/pgrls.yml
+name: pgrls
+on: [push, pull_request]
+jobs:
+  rls:
+    runs-on: ubuntu-latest   # GitHub's ubuntu runners ship Docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install 'pgrls[ephemeral]'
+      - run: pgrls lint --supabase --schemas public --fail-on error
+```
+
+`--supabase` auto-detects `./supabase/migrations` (point elsewhere with
+`pgrls lint --migrations path/to/migrations`). It needs Docker on the runner
+and the `pgrls[ephemeral]` extra (which pulls in `testcontainers`). This is
+the recommended setup for most projects — CI lints exactly the schema your
+migrations produce, with nothing to provision. See
+[Lint without a live database](../../README.md#lint-without-a-live-database)
+for the cross-stack details (Prisma, Flyway, sqitch, plain globs).
+
+### B. Against your migration-applied CI database
+
+If your CI already applies migrations to a Postgres service container, just
 lint that database after the migrations run:
 
 ```yaml
@@ -100,7 +133,7 @@ jobs:
           fail-on: error
 ```
 
-### B. Against a fresh local Supabase
+### C. Against a fresh local Supabase
 
 If you run `supabase start` in CI (or development), the local Postgres
 is on `postgresql://postgres:postgres@127.0.0.1:54322/postgres`:
