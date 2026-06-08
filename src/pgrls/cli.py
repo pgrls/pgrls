@@ -795,10 +795,14 @@ def _schema_from_migrations(
     path_str = migrations_path
     layout = migrations_layout
     if supabase:
-        layout = "supabase"
         if path_str is None:
             candidate = Path("supabase/migrations")
             path_str = str(candidate if candidate.is_dir() else Path("supabase"))
+        # Default to the supabase layout only when the user hasn't asked for a
+        # specific layout/glob, so --supabase can pair with a custom layout
+        # (e.g. Flyway-named files) instead of silently overriding it.
+        if layout == "auto" and migrations_glob is None:
+            layout = "supabase"
     if path_str is None:
         raise ToolError("no migration source: pass --migrations PATH (or --supabase).")
 

@@ -192,6 +192,14 @@ def resolve_plan(
     if layout == "auto":
         layout = detect_layout(path)
 
+    # A glob pattern is meaningful only for the glob layout; reject it under an
+    # explicit non-glob layout rather than silently dropping it.
+    if glob_pattern is not None and layout != "glob":
+        raise LayoutError(
+            f"--migrations-glob applies only to --migrations-layout glob, not "
+            f"{layout!r}; pass --migrations-layout glob or drop --migrations-glob."
+        )
+
     if layout == "sql":
         if not path.is_file():
             raise LayoutError(f"{path} is not a .sql file.")

@@ -18,9 +18,9 @@ import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import pglast
 import psycopg
 
-from pgrls.diff._migration_extensions import detect_extensions
 from pgrls.introspect import introspect
 from pgrls.model import Schema
 
@@ -77,12 +77,13 @@ def build_schema_from_migrations(
 ) -> Schema:
     """Boot an ephemeral Postgres, apply ``sql_files`` in order, introspect.
 
-    Each file's text is executed as one multi-statement script (Postgres parses
-    it) on an autocommit connection, in the given order. Extensions named in
-    any file's ``CREATE EXTENSION`` are pre-installed idempotently first;
+    Each file is applied in the given order on an autocommit connection; a file
+    containing a non-transactional statement (e.g. ``CREATE INDEX
+    CONCURRENTLY``) is automatically re-applied statement-by-statement.
     ``extra_roles`` (plus the Supabase roles when ``provision_supabase``) are
-    pre-created ``NOLOGIN`` so role-referencing DDL applies. The container is
-    always torn down (context manager), on success and on failure.
+    pre-created ``NOLOGIN`` so role-referencing DDL applies; migrations create
+    their own extensions. The container is always torn down (context manager),
+    on success and on failure.
 
     Raises :class:`EphemeralError` when testcontainers/Docker is unavailable or
     a file fails to apply (the offending file and the Postgres error are
@@ -108,10 +109,6 @@ def build_schema_from_migrations(
             sources.append((path, path.read_text(encoding="utf-8")))
         except (OSError, UnicodeDecodeError) as exc:
             raise EphemeralError(f"cannot read migration {path}: {exc}") from exc
-
-    extensions: set[str] = set()
-    for _path, text in sources:
-        extensions.update(detect_extensions(text))
 
     roles: set[str] = {r for r in extra_roles if r and r.upper() != "PUBLIC"}
     if provision_supabase:
@@ -149,21 +146,26 @@ def build_schema_from_migrations(
                     if provision_supabase:
                         cur.execute(_SUPABASE_PRELUDE)
                         verbose_log("provisioned Supabase auth.* stubs")
-                    if extensions:
-                        from psycopg import sql as _sql
-
-                        for ext in sorted(extensions):
-                            cur.execute(
-                                _sql.SQL(
-                                    "CREATE EXTENSION IF NOT EXISTS {}"
-                                ).format(_sql.Identifier(ext))
-                            )
-                        verbose_log(
-                            f"pre-installed extension(s): {sorted(extensions)}"
-                        )
                     for path, text in sources:
                         try:
-                            cur.execute(text)
+                            try:
+                                cur.execute(text)
+                            except psycopg.errors.ActiveSqlTransaction:
+                                # A non-transactional statement (e.g. CREATE
+                                # INDEX CONCURRENTLY) cannot run in psycopg's
+                                # implicit multi-statement transaction; re-apply
+                                # the file statement-by-statement, as the real
+                                # migration tools do.
+                                try:
+                                    statements = pglast.split(text)
+                                except Exception as exc:  # noqa: BLE001
+                                    raise EphemeralError(
+                                        f"migration {path} has a non-"
+                                        "transactional statement that could not "
+                                        f"be split for retry: {exc}"
+                                    ) from exc
+                                for stmt in statements:
+                                    cur.execute(stmt)
                         except psycopg.Error as exc:
                             raise EphemeralError(
                                 f"migration {path} failed to apply: {exc}"

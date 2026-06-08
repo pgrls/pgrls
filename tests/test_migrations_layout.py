@@ -224,3 +224,9 @@ def test_resolve_glob_skips_directories(tmp_path: Path) -> None:
     (tmp_path / "sub.sql").mkdir()  # a directory whose name matches *.sql
     plan = resolve_plan(tmp_path, layout="glob")
     assert plan.files == (a,)
+
+
+def test_resolve_glob_with_explicit_nonglob_layout_errors(tmp_path: Path) -> None:
+    _touch(tmp_path / "V1__init.sql")
+    with pytest.raises(LayoutError, match="applies only to"):
+        resolve_plan(tmp_path, layout="flyway", glob_pattern="db/*.sql")

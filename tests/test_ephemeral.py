@@ -298,3 +298,63 @@ def test_bad_schema_surfaces_real_error(tmp_path: Path) -> None:
     msg = str(ei.value)
     assert "Docker" not in msg
     assert "does_not_exist" in msg
+
+
+def test_supabase_honors_explicit_glob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    res = CliRunner().invoke(
+        main,
+        [
+            "lint", "--supabase", "--migrations", str(tmp_path),
+            "--migrations-glob", "sub/*.sql",
+        ],
+    )
+    assert res.exit_code != 0
+    # the glob layout was used, not silently overridden to supabase
+    assert "matched no files" in res.output
+
+
+def test_supabase_honors_explicit_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    res = CliRunner().invoke(
+        main,
+        [
+            "lint", "--supabase", "--migrations", str(tmp_path),
+            "--migrations-layout", "flyway",
+        ],
+    )
+    assert res.exit_code != 0
+    assert "Flyway" in res.output  # flyway resolver ran, not supabase
+
+
+@requires_docker
+def test_bare_create_extension_applies(tmp_path: Path) -> None:
+    # A bare CREATE EXTENSION (no IF NOT EXISTS) must apply once, not collide
+    # with a pre-install.
+    (tmp_path / "001.sql").write_text(
+        "CREATE EXTENSION pgcrypto;\nCREATE TABLE public.t (id int);",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"], schemas=["public"]
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
+def test_create_index_concurrently_applies(tmp_path: Path) -> None:
+    # CONCURRENTLY can't run in the implicit multi-statement transaction; the
+    # engine must retry the file statement-by-statement.
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.t (id int);\n"
+        "CREATE INDEX CONCURRENTLY idx_t ON public.t (id);",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"], schemas=["public"]
+    )
+    assert any(t.name == "t" for t in schema.tables)
