@@ -2284,15 +2284,23 @@ def _apply_migration_for_diff(
             with psycopg.connect(url, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     if not cache_hit:
+                        from psycopg import sql
+
                         baseline_start = time.monotonic()
-                        # 1. Pre-create roles referenced by base.
+                        # 1. Pre-create roles referenced by base. Compose the
+                        # role name client-side via sql.Literal / sql.Identifier:
+                        # a server-side %s parameter referenced inside a DO block
+                        # body has no inferable type, so the old `... rolname =
+                        # %s ... format(..., %s)` form raised IndeterminateDatatype
+                        # the moment a baseline referenced a non-PUBLIC role
+                        # (e.g. `authenticated`). Mirrors ephemeral.py.
                         for role in sorted(role_names):
                             cur.execute(
-                                "DO $$ BEGIN "
-                                "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN "
-                                "EXECUTE format('CREATE ROLE %%I NOLOGIN', %s); "
-                                "END IF; END $$;",
-                                (role, role),
+                                sql.SQL(
+                                    "DO $$ BEGIN "
+                                    "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {name}) "
+                                    "THEN CREATE ROLE {ident} NOLOGIN; END IF; END $$;"
+                                ).format(name=sql.Literal(role), ident=sql.Identifier(role))
                             )
                         if role_names:
                             vlog(f"created {len(role_names)} role(s): {sorted(role_names)}")
@@ -2305,8 +2313,6 @@ def _apply_migration_for_diff(
                         # safe identifier interpolation via psycopg's
                         # sql.Identifier defends against unusual names.
                         if extension_set:
-                            from psycopg import sql
-
                             for ext in sorted(extension_set):
                                 cur.execute(
                                     sql.SQL(
