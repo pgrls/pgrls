@@ -1646,3 +1646,94 @@ def anon_read_counterexample(
     # treats any non-None return as "fire"; the empty dict drives its
     # "every row is visible unconditionally" message.
     return {}
+
+
+def _anon_witness_is_sufficient(
+    row: dict[str, object], is_true: Any, ctx: _Context, assertions: list[Any]
+) -> bool:
+    """True iff pinning ``row``'s real columns forces ``is_true`` for ALL
+    completions of the free (synthetic / unpinned) variables.
+
+    The Kleene model of ``is_true`` (an anonymous-read witness) is a *full*
+    assignment; the real-column projection ``row`` drops every synthetic
+    null-flag / opaque marker. A projection is not in general self-sufficient
+    — e.g. ``is_public OR tenant_id = auth.uid()`` admits a row only because
+    ``is_public`` is True, whereas an unconditional ``USING (true)`` admits
+    every row and no column characterizes it. Pin the row and check
+    ``(assertions) ∧ (pins) ∧ ¬is_true`` UNSAT: only then does every row
+    matching ``row`` lie inside the anon-visible set, so it is an honest,
+    self-sufficient counterexample. Mirrors ``_row_is_sufficient_witness``.
+    """
+    pins = []
+    for key, val in row.items():
+        var = ctx.column(key, _py_value_sort(val))
+        if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
+            return False
+        pins.append(var == val)
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
+    pinned = z3.And(*pins) if len(pins) >= 2 else (pins[0] if pins else z3.BoolVal(True))
+    solver.add(z3.And(pinned, z3.Not(is_true)))
+    return bool(solver.check() == z3.unsat)
+
+
+def prove_anon_isolation(
+    using_node: Any, auth_functions: set[str] | None = None
+) -> tuple[str, dict[str, object] | None]:
+    """Prove whether an anonymous session can read any row under ``using_node``.
+
+    Encodes the USING predicate under an anonymous session (every auth
+    function NULL) with the same Kleene-3VL translator SEC038 uses, then asks
+    the *satisfiability* question — can ``is_true`` hold for some row? —
+    rather than SEC038's validity question (does it hold for EVERY row). The
+    satisfiability criterion is what tenant isolation needs: a row is exposed
+    to an unauthenticated client iff the policy's USING is TRUE for it under
+    anon.
+
+    Returns ``(verdict, witness)``:
+
+    - ``("isolated", None)`` — ``is_true`` is UNSAT under anon: **proven** that
+      no row is visible to an anonymous session.
+    - ``("leak", row)`` — ``is_true`` is SAT: an anonymous session can read a
+      row. ``row`` is a self-sufficient characterizing assignment of the real
+      columns (e.g. ``{"is_public": True}``), or ``{}`` when the leak is
+      unconditional (every row, ``USING (true)``) / characterized only by
+      synthetic markers — exactly SEC038's "all rows" artifact.
+    - ``("unverified", None)`` — Z3 unavailable, the predicate (or a
+      sub-expression) is untranslatable, or the solver timed out. No claim is
+      made (the "verifier degrades to a linter" boundary).
+
+    Soundness over recall: never returns ``isolated`` unless ``is_true`` is
+    provably UNSAT, and never returns ``leak`` unless a model exists.
+    """
+    if not Z3_AVAILABLE:
+        return ("unverified", None)
+    auth = (
+        auth_functions
+        if auth_functions is not None
+        else set(_DEFAULT_AUTH_FUNCTIONS)
+    )
+    ctx = _Context()
+    assertions: list[Any] = []
+    tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
+    if tv is None:
+        return ("unverified", None)
+
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
+    solver.add(tv.is_true)
+    result = solver.check()
+    if result == z3.unsat:
+        return ("isolated", None)
+    if result != z3.sat:  # unknown / timeout — no claim
+        return ("unverified", None)
+
+    model = solver.model()
+    row = _decode_model(model, ctx)
+    if row and _anon_witness_is_sufficient(row, tv.is_true, ctx, assertions):
+        return ("leak", row)
+    return ("leak", {})

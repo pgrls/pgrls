@@ -345,6 +345,25 @@ Each cell is one of:
 
 Per command it evaluates the clause Postgres actually applies — `WITH CHECK` for INSERT, `USING` for SELECT/UPDATE/DELETE. (For UPDATE, v1 shows the read-side `USING` — *which rows are reachable*; the write-side `WITH CHECK` gate that validates the new row image is not modeled per-cell.) Columns default to `PUBLIC`, `anon`, `authenticated` plus every non-system role named by a grant or policy, or carrying `BYPASSRLS` (`--roles` overrides; `--include-system-roles` adds `pg_*`). Like `report`, it runs **no rules**. Two further caveats it does not model per-cell: a table *owner* bypasses RLS unless the table is `FORCE`d, and a superuser bypasses everything.
 
+## Prove tenant isolation — `pgrls verify`
+
+`pgrls lint` *flags* a suspicious policy; `pgrls verify` **proves** — with the Z3 SMT solver — that an **anonymous** session (every auth function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — returning `NULL`, the unauthenticated state) cannot read any row. When it can, you get the leaking row, not just a warning.
+
+```bash
+pgrls verify --database-url "$DATABASE_URL"                          # proof report, exits 1 on any leak
+pgrls verify --database-url "$DATABASE_URL" --format json            # per-table / per-policy verdicts + counterexamples
+pgrls verify --database-url "$DATABASE_URL" --strict                 # also fail on UNVERIFIED
+pgrls verify --database-url "$DATABASE_URL" --auth-function auth.user_id   # add a custom auth helper
+```
+
+Each RLS-enabled table gets one of three **honest** verdicts:
+
+- **`PROVEN`** — the `USING` predicate is *unsatisfiable* under an anonymous session: Z3 proves no row is ever anonymously visible.
+- **`LEAK`** — a row *is* anonymously readable, with a concrete counterexample: a characterizing row (`a row with is_public=True is anonymously readable`) or *every row* for the unconditional cases (`USING (true)`, the `auth.uid() IS NULL OR …` inversion — the [signature Supabase bug](#the-signature-supabase-bug), now proven rather than guessed).
+- **`UNVERIFIED`** — Z3 is unavailable, the predicate is outside the decidable fragment, or the solver timed out. This is the point where the **verifier degrades to the linter** — no claim is made; run `pgrls lint` for the heuristic rules.
+
+It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope (v1):** the anonymous-read threat model — the dominant Supabase/PostgREST RLS failure. It reasons over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` read floor is reported `UNVERIFIED` (v1 does not combine floors — an already-`PROVEN` policy stays proven, since a restrictive floor only narrows access), and RLS-disabled tables are out of scope (that is SEC001's job). Authenticated cross-tenant isolation (tenant A reading tenant B) is the next increment. Needs the `z3-solver` dependency (bundled).
+
 ## Tracking trends — `pgrls history`
 
 Pair a daily cron with `pgrls lint --format json -o snapshots/$(date -u +%FT%H%M%SZ).json` and ask `pgrls history snapshots/` weekly — "are we gaining ground over time, or is the findings count creeping up?"
