@@ -161,74 +161,84 @@ def build_schema_from_migrations(
     image = resolve_pg_image(pg_image)
     verbose_log(f"booting ephemeral Postgres ({image})")
 
+    # Boot the container in its own try so only construction/start failures get
+    # the "could not boot" message; the work + teardown are handled separately
+    # below so a teardown blip never masks a successful build.
     try:
-        with PostgresContainer(
+        pg = PostgresContainer(
             image, username="postgres", password="postgres", dbname="postgres"
-        ) as pg:
-            url = pg.get_connection_url(driver=None)
-            try:
-                with psycopg.connect(url, autocommit=True) as conn, conn.cursor() as cur:
-                    if roles:
-                        from psycopg import sql as _sql
-
-                        for role in sorted(roles):
-                            # Compose the role name as a literal/identifier; a
-                            # server-side %s param inside a DO body has no
-                            # inferable type (IndeterminateDatatype).
-                            cur.execute(
-                                _sql.SQL(
-                                    "DO $$ BEGIN IF NOT EXISTS ("
-                                    "SELECT 1 FROM pg_roles WHERE rolname = {name}"
-                                    ") THEN CREATE ROLE {ident} NOLOGIN; "
-                                    "END IF; END $$;"
-                                ).format(
-                                    name=_sql.Literal(role),
-                                    ident=_sql.Identifier(role),
-                                )
-                            )
-                        verbose_log(f"created {len(roles)} role(s): {sorted(roles)}")
-                    if provision_supabase:
-                        cur.execute(_SUPABASE_PRELUDE)
-                        verbose_log("provisioned Supabase auth.* stubs")
-                    for path, text in sources:
-                        try:
-                            if _has_non_transactional(text):
-                                # Can't wrap the file in one transaction (e.g.
-                                # CREATE INDEX CONCURRENTLY); apply each
-                                # statement on its own, as migration tools run
-                                # such files outside a transaction.
-                                try:
-                                    statements = tuple(pglast.split(text))
-                                except Exception:  # noqa: BLE001 - one script
-                                    statements = (text,)
-                                for stmt in statements:
-                                    cur.execute(stmt)
-                            else:
-                                # One implicit transaction per file preserves
-                                # transaction-local state (SET LOCAL) and
-                                # atomicity.
-                                cur.execute(text)
-                        except psycopg.Error as exc:
-                            raise EphemeralError(
-                                f"migration {path} failed to apply: {exc}"
-                            ) from exc
-                        verbose_log(f"applied {path}")
-                with psycopg.connect(url) as conn:
-                    return introspect(conn, schemas=schemas)
-            except EphemeralError:
-                raise
-            except psycopg.Error as exc:
-                raise EphemeralError(f"ephemeral database error: {exc}") from exc
-            except (ValueError, RuntimeError) as exc:
-                # e.g. introspect() on a missing/reserved --schemas value:
-                # surface the real cause, not the Docker/extra hint below.
-                raise EphemeralError(str(exc)) from exc
-    except EphemeralError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - convert any docker/start failure
+        )
+        pg.start()
+    except Exception as exc:  # noqa: BLE001 - container construction/boot failure
         raise EphemeralError(
             f"could not boot the ephemeral Postgres container from image "
             f"{image!r} ({exc}). Check the image name (--pg-image / "
             "$PGRLS_EPHEMERAL_PG_IMAGE), that Docker is running, and that the "
             "`pgrls[ephemeral]` extra is installed."
         ) from exc
+    try:
+        url = pg.get_connection_url(driver=None)
+        try:
+            with psycopg.connect(url, autocommit=True) as conn, conn.cursor() as cur:
+                if roles:
+                    from psycopg import sql as _sql
+
+                    for role in sorted(roles):
+                        # Compose the role name as a literal/identifier; a
+                        # server-side %s param inside a DO body has no
+                        # inferable type (IndeterminateDatatype).
+                        cur.execute(
+                            _sql.SQL(
+                                "DO $$ BEGIN IF NOT EXISTS ("
+                                "SELECT 1 FROM pg_roles WHERE rolname = {name}"
+                                ") THEN CREATE ROLE {ident} NOLOGIN; "
+                                "END IF; END $$;"
+                            ).format(
+                                name=_sql.Literal(role),
+                                ident=_sql.Identifier(role),
+                            )
+                        )
+                    verbose_log(f"created {len(roles)} role(s): {sorted(roles)}")
+                if provision_supabase:
+                    cur.execute(_SUPABASE_PRELUDE)
+                    verbose_log("provisioned Supabase auth.* stubs")
+                for path, text in sources:
+                    try:
+                        if _has_non_transactional(text):
+                            # Can't wrap the file in one transaction (e.g.
+                            # CREATE INDEX CONCURRENTLY); apply each statement
+                            # on its own, as migration tools run such files
+                            # outside a transaction.
+                            try:
+                                statements = tuple(pglast.split(text))
+                            except Exception:  # noqa: BLE001 - one script
+                                statements = (text,)
+                            for stmt in statements:
+                                cur.execute(stmt)
+                        else:
+                            # One implicit transaction per file preserves
+                            # transaction-local state (SET LOCAL) and atomicity.
+                            cur.execute(text)
+                    except psycopg.Error as exc:
+                        raise EphemeralError(
+                            f"migration {path} failed to apply: {exc}"
+                        ) from exc
+                    verbose_log(f"applied {path}")
+            with psycopg.connect(url) as conn:
+                schema = introspect(conn, schemas=schemas)
+        except EphemeralError:
+            raise
+        except psycopg.Error as exc:
+            raise EphemeralError(f"ephemeral database error: {exc}") from exc
+        except (ValueError, RuntimeError) as exc:
+            # e.g. introspect() on a missing/reserved --schemas value: surface
+            # the real cause, not the boot hint above.
+            raise EphemeralError(str(exc)) from exc
+        return schema
+    finally:
+        # A teardown failure (e.g. a Docker blip during remove) must not mask a
+        # successful build or a real apply error.
+        try:
+            pg.stop()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass

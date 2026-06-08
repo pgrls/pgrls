@@ -377,6 +377,48 @@ def test_literal_concurrently_keeps_one_transaction(tmp_path: Path) -> None:
 
 
 @requires_docker
+def test_supabase_with_single_file(tmp_path: Path) -> None:
+    # --supabase + a single .sql dump must build (sql layout) with auth.*
+    # provisioned, not error "must be a directory".
+    f = tmp_path / "schema.sql"
+    f.write_text(
+        "create table public.t (id uuid primary key, owner_id uuid);\n"
+        "alter table public.t enable row level security;\n"
+        "create policy p on public.t for select to authenticated "
+        "using (owner_id = auth.uid());\n",
+        encoding="utf-8",
+    )
+    res = CliRunner().invoke(
+        main, ["lint", "--supabase", "--migrations", str(f), "--format", "json"]
+    )
+    assert "must be a directory" not in res.output
+    assert res.exit_code in (0, 1)  # built + linted, not a ToolError
+
+
+@requires_docker
+def test_teardown_error_does_not_mask_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from testcontainers.postgres import PostgresContainer
+
+    (tmp_path / "001.sql").write_text(
+        "CREATE TABLE public.t (id int);", encoding="utf-8"
+    )
+    orig_stop = PostgresContainer.stop
+
+    def boom(self: object, *a: object, **k: object) -> None:
+        orig_stop(self, *a, **k)  # actually tear down, then simulate a blip
+        raise RuntimeError("simulated teardown blip")
+
+    monkeypatch.setattr(PostgresContainer, "stop", boom)
+    # A teardown failure must not turn a successful build into an error.
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"], schemas=["public"]
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
 def test_create_role_public_is_skipped(tmp_path: Path) -> None:
     # `public` is a reserved pseudo-role; CREATE ROLE public would fail. The
     # filter must drop it case-insensitively.
