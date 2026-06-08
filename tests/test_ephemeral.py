@@ -64,6 +64,23 @@ def test_no_sql_files_errors() -> None:
         ephemeral.build_schema_from_migrations(sql_files=[], schemas=["public"])
 
 
+def test_has_non_transactional_structural() -> None:
+    # Real non-transactional statements -> True (structural, via the AST).
+    assert ephemeral._has_non_transactional("CREATE INDEX CONCURRENTLY i ON t(id)")
+    assert ephemeral._has_non_transactional("DROP INDEX CONCURRENTLY i")
+    assert ephemeral._has_non_transactional("VACUUM")
+    assert ephemeral._has_non_transactional("ALTER SYSTEM SET work_mem = '1MB'")
+    # The keyword in a literal / comment / identifier is NOT non-transactional.
+    assert not ephemeral._has_non_transactional("CREATE TABLE t (id int)")
+    assert not ephemeral._has_non_transactional(
+        "CREATE TABLE t (note text DEFAULT 'run concurrently')"
+    )
+    assert not ephemeral._has_non_transactional(
+        "-- vacuum later\nCREATE TABLE t (id int)"
+    )
+    assert not ephemeral._has_non_transactional('CREATE TABLE t ("vacuum" int)')
+
+
 # --- CLI guards, no Docker -------------------------------------------------
 
 
@@ -335,6 +352,22 @@ def test_set_local_survives_within_file(tmp_path: Path) -> None:
         "CREATE SCHEMA app;\n"
         "SET LOCAL search_path = app;\n"
         "CREATE TABLE t (id int);\n",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"], schemas=["app"]
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
+def test_literal_concurrently_keeps_one_transaction(tmp_path: Path) -> None:
+    # 'concurrently' in a string literal must NOT force statement-by-statement
+    # mode (which would break SET LOCAL): the table must still land in `app`.
+    (tmp_path / "001.sql").write_text(
+        "CREATE SCHEMA app;\n"
+        "SET LOCAL search_path = app;\n"
+        "CREATE TABLE t (id int, note text DEFAULT 'run concurrently please');\n",
         encoding="utf-8",
     )
     schema = ephemeral.build_schema_from_migrations(

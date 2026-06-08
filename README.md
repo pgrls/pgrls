@@ -621,10 +621,12 @@ For per-release changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ## CI integration
 
-pgrls is designed to live in your CI alongside any other linter. It
-needs a Postgres database with your schema applied; it then connects,
+pgrls is designed to live in your CI alongside any other linter. By
+default it connects to a Postgres database with your schema applied,
 introspects, and exits non-zero if any rule at or above
-`fail_on` (default `warning`) fires.
+`fail_on` (default `warning`) fires. No database to point at? `pgrls lint
+--migrations` builds an ephemeral one from your migration files (see
+[Lint without a live database](#lint-without-a-live-database)).
 
 ### pre-commit
 

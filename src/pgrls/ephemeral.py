@@ -15,12 +15,12 @@ implementations are currently separate.
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pglast
 import psycopg
+from pglast import ast as _pgast
 
 from pgrls.introspect import introspect
 from pgrls.model import Schema
@@ -47,15 +47,46 @@ CREATE OR REPLACE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE
 # Roles a Supabase project's policies grant to.
 _SUPABASE_ROLES: tuple[str, ...] = ("anon", "authenticated", "service_role")
 
-# Statements Postgres refuses to run inside a transaction block. A file that
-# contains one is applied statement-by-statement (outside a wrapping tx) rather
-# than as a single transaction. Over-matching (e.g. the word in a comment) only
-# costs that file's atomicity; missing one surfaces a clear apply error.
-_NON_TRANSACTIONAL = re.compile(
-    r"\bconcurrently\b|\bvacuum\b|\balter\s+system\b"
-    r"|\b(?:create|drop)\s+database\b|\b(?:create|drop)\s+tablespace\b",
-    re.IGNORECASE,
+# Statement node types Postgres refuses to run inside a transaction block. A
+# file containing one is applied statement-by-statement (outside a wrapping tx)
+# rather than as a single transaction.
+_NON_TX_NODES = (
+    _pgast.VacuumStmt,
+    _pgast.AlterSystemStmt,
+    _pgast.CreatedbStmt,
+    _pgast.DropdbStmt,
+    _pgast.CreateTableSpaceStmt,
+    _pgast.DropTableSpaceStmt,
 )
+
+
+def _has_non_transactional(text: str) -> bool:
+    """Whether ``text`` has a statement that can't run in a transaction block
+    (CREATE/DROP INDEX CONCURRENTLY, REINDEX ... CONCURRENTLY, VACUUM, ALTER
+    SYSTEM, CREATE/DROP DATABASE/TABLESPACE). Detected on the parse tree, so the
+    keyword in a comment, string literal, or identifier does not count; an
+    unparseable file returns False and is applied as one transaction.
+    """
+    try:
+        parsed = pglast.parse_sql(text)
+    except Exception:  # noqa: BLE001 - unparseable; apply as a single statement
+        return False
+    for raw in parsed:
+        node = raw.stmt
+        if isinstance(node, _NON_TX_NODES):
+            return True
+        if isinstance(node, (_pgast.IndexStmt, _pgast.DropStmt)) and getattr(
+            node, "concurrent", False
+        ):
+            return True
+        if isinstance(node, _pgast.ReindexStmt):
+            for param in node.params or ():
+                if (
+                    isinstance(param, _pgast.DefElem)
+                    and (param.defname or "").lower() == "concurrently"
+                ):
+                    return True
+    return False
 
 
 class EphemeralError(Exception):
@@ -160,22 +191,16 @@ def build_schema_from_migrations(
                         cur.execute(_SUPABASE_PRELUDE)
                         verbose_log("provisioned Supabase auth.* stubs")
                     for path, text in sources:
-                        # Split to detect statements that can't run in a
-                        # transaction; fall back to the whole text when the file
-                        # can't be parsed.
                         try:
-                            statements: tuple[str, ...] = tuple(pglast.split(text))
-                        except Exception:  # noqa: BLE001 - unparseable; one script
-                            statements = (text,)
-                        non_transactional = any(
-                            _NON_TRANSACTIONAL.search(s) for s in statements
-                        )
-                        try:
-                            if non_transactional:
+                            if _has_non_transactional(text):
                                 # Can't wrap the file in one transaction (e.g.
                                 # CREATE INDEX CONCURRENTLY); apply each
                                 # statement on its own, as migration tools run
                                 # such files outside a transaction.
+                                try:
+                                    statements = tuple(pglast.split(text))
+                                except Exception:  # noqa: BLE001 - one script
+                                    statements = (text,)
                                 for stmt in statements:
                                     cur.execute(stmt)
                             else:
