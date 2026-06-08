@@ -326,6 +326,25 @@ pgrls report --database-url "$DATABASE_URL" --format html -o posture.html    # s
 
 Each table gets a coarse status — `protected` (RLS on, FORCE'd, ≥1 permissive policy), `not-forced` (RLS on with a permissive policy, but owner bypasses), `no-policies` (RLS on but no permissive policy → default-deny; covers zero policies *and* restrictive-only tables), `covered-by-parent` (a partition child whose RLS-enabled parent covers queries routed through it — credited when that parent is among the scanned schemas), or `rls-off` — plus an aggregate summary. It runs **no rules** and emits no findings; use `pgrls lint` for that.
 
+## Who can access what — `pgrls matrix`
+
+Where `pgrls report` summarizes each table's posture, `pgrls matrix` answers the audit question directly: **for every role × table × command, can it reach the rows?** It collapses table `GRANT`s, the RLS enabled/forced flags, and the permissive(OR) / restrictive(AND) policy set into one verdict per cell.
+
+```bash
+pgrls matrix --database-url "$DATABASE_URL"                                 # role × table × command grid
+pgrls matrix --database-url "$DATABASE_URL" --roles anon,authenticated     # only these role columns
+pgrls matrix --database-url "$DATABASE_URL" --format json                   # full predicates, machine-readable
+pgrls matrix --database-url "$DATABASE_URL" --format html -o access.html     # standalone audit page
+```
+
+Each cell is one of:
+
+- **`OPEN`** — every row is reachable: the role is granted the command's privilege **and** either RLS is off, the role bypasses RLS (`BYPASSRLS`), or an applicable permissive policy is unconditionally `true` with no restrictive policy narrowing it.
+- **`DENIED`** — no table privilege for that command, *or* RLS is on with no applicable permissive policy (Postgres default-denies).
+- **`COND`** — granted, but gated by a row predicate (shown in `--format json` / `html`): the OR of applicable permissive clauses, AND-ed with any restrictive ones.
+
+Per command it evaluates the clause Postgres actually applies — `WITH CHECK` for INSERT, `USING` for SELECT/UPDATE/DELETE. (For UPDATE, v1 shows the read-side `USING` — *which rows are reachable*; the write-side `WITH CHECK` gate that validates the new row image is not modeled per-cell.) Columns default to `PUBLIC`, `anon`, `authenticated` plus every non-system role named by a grant or policy, or carrying `BYPASSRLS` (`--roles` overrides; `--include-system-roles` adds `pg_*`). Like `report`, it runs **no rules**. Two further caveats it does not model per-cell: a table *owner* bypasses RLS unless the table is `FORCE`d, and a superuser bypasses everything.
+
 ## Tracking trends — `pgrls history`
 
 Pair a daily cron with `pgrls lint --format json -o snapshots/$(date -u +%FT%H%M%SZ).json` and ask `pgrls history snapshots/` weekly — "are we gaining ground over time, or is the findings count creeping up?"
