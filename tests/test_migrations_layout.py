@@ -230,3 +230,10 @@ def test_resolve_glob_with_explicit_nonglob_layout_errors(tmp_path: Path) -> Non
     _touch(tmp_path / "V1__init.sql")
     with pytest.raises(LayoutError, match="applies only to"):
         resolve_plan(tmp_path, layout="flyway", glob_pattern="db/*.sql")
+
+
+def test_resolve_empty_glob_rejected(tmp_path: Path) -> None:
+    _touch(tmp_path / "a.sql")
+    for pat in ("", "   "):
+        with pytest.raises(LayoutError, match="cannot be empty"):
+            resolve_plan(tmp_path, layout="auto", glob_pattern=pat)

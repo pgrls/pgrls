@@ -8,9 +8,9 @@ already-migrated database — so the only requirement becomes "Docker is
 running."
 
 Requires the ``pgrls[ephemeral]`` extra (testcontainers + Docker), an alias of
-``pgrls[diff-apply]``. The same machinery backs ``pgrls diff --apply``; this
-module factors the boot -> apply -> introspect core out of the diff-specific
-baseline-restore + cache path in ``cli.py`` so both share one surface.
+``pgrls[diff-apply]``. It uses the same boot -> apply -> introspect approach as
+``pgrls diff --apply`` (``cli.py``'s ``_apply_migration_for_diff``); the two
+implementations are currently separate.
 """
 from __future__ import annotations
 

@@ -263,10 +263,37 @@ def test_lint_ephemeral_flags_require_migrations(
         ["lint", "--create-role", "app_user"],
         ["lint", "--migrations-layout", "glob"],
         ["lint", "--pg-image", "postgres:16"],
+        ["lint", "--migrations-glob", ""],  # explicit empty must still trip it
     ):
         res = CliRunner().invoke(main, args)
         assert res.exit_code != 0, args
         assert "ephemeral build" in res.output, args
+
+
+@requires_docker
+def test_supabase_layout_auto_provisions(tmp_path: Path) -> None:
+    # Pointing --migrations at a supabase/migrations dir (no --supabase flag)
+    # must still provision auth.* + roles, else the policy fails to apply.
+    mig = tmp_path / "supabase" / "migrations"
+    mig.mkdir(parents=True)
+    (tmp_path / "supabase" / "config.toml").write_text(
+        "# supabase\n", encoding="utf-8"
+    )
+    (mig / "0001_init.sql").write_text(
+        "CREATE TABLE public.docs (id uuid PRIMARY KEY, owner_id uuid);\n"
+        "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.docs FOR SELECT TO authenticated "
+        "USING (owner_id = auth.uid());\n",
+        encoding="utf-8",
+    )
+    res = CliRunner().invoke(
+        main, ["lint", "--migrations", str(mig), "--format", "json"]
+    )
+    # Build must succeed (auth.uid()/authenticated provisioned) → lint runs
+    # (exit 0/1), not a ToolError (exit 2) about a failed apply.
+    assert res.exit_code in (0, 1)
+    assert "failed to apply" not in res.output
+    assert "does not exist" not in res.output
 
 
 @requires_docker

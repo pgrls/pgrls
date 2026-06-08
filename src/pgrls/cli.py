@@ -478,7 +478,12 @@ def lint(
             ctx.get_parameter_source("migrations_layout")
             is click.core.ParameterSource.COMMANDLINE
         )
-        if migrations_glob or create_roles or pg_image or layout_explicit:
+        if (
+            migrations_glob is not None
+            or pg_image is not None
+            or create_roles
+            or layout_explicit
+        ):
             raise ToolError(
                 "--migrations-layout / --migrations-glob / --create-role / "
                 "--pg-image apply only to an ephemeral build — pass "
@@ -818,12 +823,16 @@ def _schema_from_migrations(
         "in an ephemeral Postgres…",
         err=True,
     )
+    # Provision the Supabase auth.* stubs + roles whenever the layout is
+    # Supabase — requested via --supabase OR auto-detected — so a Supabase
+    # migration that calls auth.uid() / grants to authenticated applies.
+    provision = supabase or plan.layout == "supabase"
     try:
         return ephemeral.build_schema_from_migrations(
             sql_files=plan.files,
             schemas=schemas,
             extra_roles=create_roles,
-            provision_supabase=supabase,
+            provision_supabase=provision,
             pg_image=pg_image,
         )
     except ephemeral.EphemeralError as exc:

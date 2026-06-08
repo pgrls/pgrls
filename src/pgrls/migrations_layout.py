@@ -184,6 +184,8 @@ def resolve_plan(
         )
     if not path.exists():
         raise LayoutError(f"{path} does not exist.")
+    if glob_pattern is not None and not glob_pattern.strip():
+        raise LayoutError("--migrations-glob cannot be empty.")
 
     # A supplied --migrations-glob implies the glob layout, else it would be
     # silently ignored under auto-detection (and the user told to pass it).
