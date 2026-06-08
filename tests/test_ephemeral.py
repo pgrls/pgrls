@@ -327,6 +327,23 @@ def test_explicit_commit_then_concurrently(tmp_path: Path) -> None:
 
 
 @requires_docker
+def test_set_local_survives_within_file(tmp_path: Path) -> None:
+    # SET LOCAL only persists within a transaction; a file with no
+    # non-transactional statement must run as one tx so the unqualified table
+    # lands in `app`, not `public`.
+    (tmp_path / "001.sql").write_text(
+        "CREATE SCHEMA app;\n"
+        "SET LOCAL search_path = app;\n"
+        "CREATE TABLE t (id int);\n",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"], schemas=["app"]
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
 def test_create_role_public_is_skipped(tmp_path: Path) -> None:
     # `public` is a reserved pseudo-role; CREATE ROLE public would fail. The
     # filter must drop it case-insensitively.

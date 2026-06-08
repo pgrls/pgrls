@@ -15,6 +15,7 @@ implementations are currently separate.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -45,6 +46,16 @@ CREATE OR REPLACE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE
 """
 # Roles a Supabase project's policies grant to.
 _SUPABASE_ROLES: tuple[str, ...] = ("anon", "authenticated", "service_role")
+
+# Statements Postgres refuses to run inside a transaction block. A file that
+# contains one is applied statement-by-statement (outside a wrapping tx) rather
+# than as a single transaction. Over-matching (e.g. the word in a comment) only
+# costs that file's atomicity; missing one surfaces a clear apply error.
+_NON_TRANSACTIONAL = re.compile(
+    r"\bconcurrently\b|\bvacuum\b|\balter\s+system\b"
+    r"|\b(?:create|drop)\s+database\b|\b(?:create|drop)\s+tablespace\b",
+    re.IGNORECASE,
+)
 
 
 class EphemeralError(Exception):
@@ -77,13 +88,15 @@ def build_schema_from_migrations(
 ) -> Schema:
     """Boot an ephemeral Postgres, apply ``sql_files`` in order, introspect.
 
-    Each file is applied in the given order on an autocommit connection; a file
-    containing a non-transactional statement (e.g. ``CREATE INDEX
-    CONCURRENTLY``) is automatically re-applied statement-by-statement.
-    ``extra_roles`` (plus the Supabase roles when ``provision_supabase``) are
-    pre-created ``NOLOGIN`` so role-referencing DDL applies; migrations create
-    their own extensions. The container is always torn down (context manager),
-    on success and on failure.
+    Each file is applied as one transaction (a single ``cur.execute``) so
+    transaction-local state (e.g. ``SET LOCAL``) and file atomicity are
+    preserved; a file containing a statement that cannot run in a transaction
+    (e.g. ``CREATE INDEX CONCURRENTLY``) is instead applied
+    statement-by-statement, as migration tools run such files. ``extra_roles``
+    (plus the Supabase roles when ``provision_supabase``) are pre-created
+    ``NOLOGIN`` so role-referencing DDL applies; migrations create their own
+    extensions. The container is always torn down (context manager), on success
+    and on failure.
 
     Raises :class:`EphemeralError` when testcontainers/Docker is unavailable or
     a file fails to apply (the offending file and the Postgres error are
@@ -147,19 +160,29 @@ def build_schema_from_migrations(
                         cur.execute(_SUPABASE_PRELUDE)
                         verbose_log("provisioned Supabase auth.* stubs")
                     for path, text in sources:
-                        # Apply each statement on its own so non-transactional
-                        # statements (e.g. CREATE INDEX CONCURRENTLY) and
-                        # explicit BEGIN/COMMIT both work, matching how migration
-                        # tools apply a file — and so a partial apply is never
-                        # re-run from the top. Fall back to the whole text when
-                        # the file can't be parsed into statements.
+                        # Split to detect statements that can't run in a
+                        # transaction; fall back to the whole text when the file
+                        # can't be parsed.
                         try:
                             statements: tuple[str, ...] = tuple(pglast.split(text))
                         except Exception:  # noqa: BLE001 - unparseable; one script
                             statements = (text,)
+                        non_transactional = any(
+                            _NON_TRANSACTIONAL.search(s) for s in statements
+                        )
                         try:
-                            for stmt in statements:
-                                cur.execute(stmt)
+                            if non_transactional:
+                                # Can't wrap the file in one transaction (e.g.
+                                # CREATE INDEX CONCURRENTLY); apply each
+                                # statement on its own, as migration tools run
+                                # such files outside a transaction.
+                                for stmt in statements:
+                                    cur.execute(stmt)
+                            else:
+                                # One implicit transaction per file preserves
+                                # transaction-local state (SET LOCAL) and
+                                # atomicity.
+                                cur.execute(text)
                         except psycopg.Error as exc:
                             raise EphemeralError(
                                 f"migration {path} failed to apply: {exc}"
