@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.17.0"
+version = "0.18.0"
 description = "Static analyzer for Postgres Row-Level Security — 51 lint rules covering tenant and per-user row-scoping bugs, performance traps, and hygiene; 17 mechanically auto-fixable; gold-standard RLS scaffolding (pgrls generate); runtime seq-scan analysis (pgrls perf); semantic policy-diff command for CI gating that emits a concrete leaking row when a change loosens a policy; pytest plugin for RLS isolation tests with coverage."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -62,6 +62,11 @@ diff-z3 = ["z3-solver>=4.13"]
 # testcontainers pulls in Docker / Selenium / lots of test
 # infrastructure that lint / fix users don't need.
 diff-apply = ["testcontainers[postgres]>=4.0"]
+# `pgrls lint --migrations` builds a schema by applying migration files in
+# a throwaway Postgres (pgrls.ephemeral). Same
+# testcontainers dependency as diff-apply; aliased so the feature's install
+# hint reads `pip install pgrls[ephemeral]`.
+ephemeral = ["testcontainers[postgres]>=4.0"]
 # `hatchling` is the build backend (declared in [build-system]) and
 # is installed automatically by `python -m build` / pip's PEP 517
 # isolated env. Don't list it here — including it would suggest to
