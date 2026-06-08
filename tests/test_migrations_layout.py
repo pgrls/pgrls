@@ -260,3 +260,20 @@ def test_resolve_sqitch_rework_missing_snapshot_no_double(tmp_path: Path) -> Non
     base = _touch(tmp_path / "deploy" / "users.sql")  # @tag snapshot absent
     plan = resolve_plan(tmp_path, layout="sqitch")
     assert plan.files == (base,)  # never queued twice
+
+
+def test_resolve_glob_multidir_natural_order(tmp_path: Path) -> None:
+    # One numbered dir per migration with a shared inner filename: must order
+    # by the directory, not the (identical) basename or scandir order.
+    a = _touch(tmp_path / "0001_a" / "up.sql")
+    b = _touch(tmp_path / "0002_b" / "up.sql")
+    j = _touch(tmp_path / "0010_j" / "up.sql")
+    plan = resolve_plan(tmp_path, layout="glob", glob_pattern="*/up.sql")
+    assert plan.files == (a, b, j)
+
+
+def test_resolve_glob_dot_pattern_clean_error(tmp_path: Path) -> None:
+    _touch(tmp_path / "a.sql")
+    for pat in (".", "./"):
+        with pytest.raises(LayoutError):  # never a bare IndexError/AttributeError
+            resolve_plan(tmp_path, layout="glob", glob_pattern=pat)

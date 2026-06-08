@@ -312,6 +312,21 @@ def test_bad_pg_image_names_the_image(tmp_path: Path) -> None:
 
 
 @requires_docker
+def test_explicit_commit_then_concurrently(tmp_path: Path) -> None:
+    # An explicit COMMIT durably applies the pre-COMMIT statements; the
+    # CONCURRENTLY that follows must not trigger a re-apply from the top.
+    (tmp_path / "001.sql").write_text(
+        "BEGIN;\nCREATE TABLE public.t (id int);\nCOMMIT;\n"
+        "CREATE INDEX CONCURRENTLY idx_t ON public.t (id);\n",
+        encoding="utf-8",
+    )
+    schema = ephemeral.build_schema_from_migrations(
+        sql_files=[tmp_path / "001.sql"], schemas=["public"]
+    )
+    assert any(t.name == "t" for t in schema.tables)
+
+
+@requires_docker
 def test_create_role_public_is_skipped(tmp_path: Path) -> None:
     # `public` is a reserved pseudo-role; CREATE ROLE public would fail. The
     # filter must drop it case-insensitively.

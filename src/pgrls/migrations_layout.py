@@ -72,17 +72,15 @@ def _flyway_sort_key(path: Path) -> tuple[int, tuple[int, ...], str]:
     return (4, (), name)
 
 
-def _natural_key(path: Path) -> tuple[int | str, ...]:
-    """Natural sort: digit runs compare numerically so 2.sql precedes 10.sql.
-
-    Plain lexical order misorders unpadded numeric migrations (1, 10, 2); this
-    keeps zero-padded and timestamped names unchanged while fixing unpadded
-    ones. (``re.split`` with a capturing group alternates non-digit/digit, so
-    each position is consistently str or int — no mixed-type comparison.)
+def _natural_segment(name: str) -> tuple[int | str, ...]:
+    """Natural-sort key for one path segment: digit runs compare numerically so
+    ``2`` precedes ``10``. (``re.split`` with a capturing group alternates
+    non-digit/digit, so each position is consistently str or int — no mixed-type
+    comparison.)
     """
     return tuple(
         int(part) if part.isdigit() else part
-        for part in re.split(r"(\d+)", path.name)
+        for part in re.split(r"(\d+)", name)
     )
 
 
@@ -264,14 +262,27 @@ def resolve_plan(
     # glob
     pattern = glob_pattern or "*.sql"
     try:
-        matches = sorted(
-            (p for p in path.glob(pattern) if p.is_file()), key=_natural_key
-        )
-    except (ValueError, NotImplementedError) as exc:
+        found = [p for p in path.glob(pattern) if p.is_file()]
+    except (
+        ValueError,
+        NotImplementedError,
+        IndexError,
+        AttributeError,
+        OSError,
+    ) as exc:
         raise LayoutError(
             f"invalid --migrations-glob pattern {pattern!r}: {exc}. Use a "
             f"pattern relative to {path}, e.g. 'db/migrate/*.sql'."
         ) from exc
+    # Sort by the full path relative to the root (natural per segment) so a
+    # multi-directory pattern like '*/up.sql' orders by directory, not by the
+    # shared basename.
+    matches = sorted(
+        found,
+        key=lambda p: tuple(
+            _natural_segment(s) for s in p.relative_to(path).parts
+        ),
+    )
     if not matches:
         raise LayoutError(f"pattern {pattern!r} matched no files under {path}.")
     return MigrationPlan(files=tuple(matches), layout="glob", root=path)

@@ -147,25 +147,19 @@ def build_schema_from_migrations(
                         cur.execute(_SUPABASE_PRELUDE)
                         verbose_log("provisioned Supabase auth.* stubs")
                     for path, text in sources:
+                        # Apply each statement on its own so non-transactional
+                        # statements (e.g. CREATE INDEX CONCURRENTLY) and
+                        # explicit BEGIN/COMMIT both work, matching how migration
+                        # tools apply a file — and so a partial apply is never
+                        # re-run from the top. Fall back to the whole text when
+                        # the file can't be parsed into statements.
                         try:
-                            try:
-                                cur.execute(text)
-                            except psycopg.errors.ActiveSqlTransaction:
-                                # A non-transactional statement (e.g. CREATE
-                                # INDEX CONCURRENTLY) cannot run in psycopg's
-                                # implicit multi-statement transaction; re-apply
-                                # the file statement-by-statement, as the real
-                                # migration tools do.
-                                try:
-                                    statements = pglast.split(text)
-                                except Exception as exc:  # noqa: BLE001
-                                    raise EphemeralError(
-                                        f"migration {path} has a non-"
-                                        "transactional statement that could not "
-                                        f"be split for retry: {exc}"
-                                    ) from exc
-                                for stmt in statements:
-                                    cur.execute(stmt)
+                            statements: tuple[str, ...] = tuple(pglast.split(text))
+                        except Exception:  # noqa: BLE001 - unparseable; one script
+                            statements = (text,)
+                        try:
+                            for stmt in statements:
+                                cur.execute(stmt)
                         except psycopg.Error as exc:
                             raise EphemeralError(
                                 f"migration {path} failed to apply: {exc}"
