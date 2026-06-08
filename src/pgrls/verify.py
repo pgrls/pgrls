@@ -177,7 +177,10 @@ def build_verification(
 
 
 def _witness_phrase(witness: dict[str, object] | None) -> str:
-    """Human phrase for a leak witness: a characterizing row or 'every row'."""
+    """Human phrase for a leak witness: a characterizing row, 'every row'
+    (unconditional), or a conditional leak with no single characterizing row."""
+    if witness is None:
+        return "a conditional leak — no single row characterizes it"
     if not witness:
         return "every row is anonymously readable"
     pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
@@ -233,7 +236,11 @@ def render_json(v: Verification) -> str:
                         "witness_scope": (
                             None
                             if p.verdict != "leak"
-                            else ("all_rows" if not p.witness else "row")
+                            else "conditional"
+                            if p.witness is None
+                            else "all_rows"
+                            if not p.witness
+                            else "row"
                         ),
                         "reason": p.reason,
                     }

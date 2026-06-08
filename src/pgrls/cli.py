@@ -3367,6 +3367,27 @@ def matrix(
     default=False,
     help="Also exit non-zero when any table is UNVERIFIED (not just on a leak).",
 )
+@click.option(
+    "--emit-repro",
+    "emit_repro_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help=(
+        "For each LEAK, write a runnable reproduction (a .sql script and a "
+        "pytest) to this directory — recreating the table + policy, inserting "
+        "the counterexample row, and SELECTing it as an anonymous session."
+    ),
+)
+@click.option(
+    "--force",
+    "force",
+    is_flag=True,
+    default=False,
+    help=(
+        "Overwrite existing reproduction files in the --emit-repro directory "
+        "(otherwise an existing file is left untouched and the run errors)."
+    ),
+)
 @output_format_options(
     list(VERIFY_FORMATS),
     output_help="Write the proof report to this file instead of stdout.",
@@ -3377,6 +3398,8 @@ def verify(
     schemas: str | None,
     auth_functions: tuple[str, ...],
     strict: bool,
+    emit_repro_dir: str | None,
+    force: bool,
     output_path: str | None,
     output_format: str,
 ) -> None:
@@ -3395,7 +3418,11 @@ def verify(
     never reports a leak it cannot exhibit, and never reports isolated unless
     Z3 proves it. Exits non-zero on any leak — drop it in CI as a hard
     tenant-isolation gate. `--strict` also fails on UNVERIFIED. `--format json`
-    emits the per-table/per-policy verdicts and counterexamples. v1 proves the
+    emits the per-table/per-policy verdicts and counterexamples. `--emit-repro
+    DIR` writes, for each leak, a runnable `.sql` script and a pytest that
+    recreate the table + policy, insert the counterexample row, and SELECT it
+    as an anonymous session — the proof, made reproducible (re-running won't
+    clobber a hand-edited reproduction unless `--force`). v1 proves the
     anonymous-read threat model (the dominant Supabase RLS failure); see the
     README for scope.
     """
@@ -3412,6 +3439,50 @@ def verify(
     )
     verification = build_verification(schema, auth_functions=auth)
     _emit(render_verify(verification, output_format), output_path)
+
+    if emit_repro_dir is not None:
+        from pathlib import Path
+
+        from pgrls.repro import emit_repros
+
+        out_dir = Path(emit_repro_dir)
+        artifacts = emit_repros(schema, verification, auth_functions=auth)
+        if not force:
+            # Refuse to clobber a hand-edited reproduction (the artifacts tell
+            # the developer to edit the INSERT for conditional/cross-table
+            # leaks) — the same --force guard generate/fix/init use. All-or-
+            # nothing: bail before writing anything if any target exists.
+            clash = next(
+                (
+                    out_dir / name
+                    for art in artifacts
+                    for name in (art.sql_filename, art.pytest_filename)
+                    if (out_dir / name).exists()
+                ),
+                None,
+            )
+            if clash is not None:
+                raise ToolError(
+                    f"{clash} already exists. Pass --force to overwrite "
+                    "reproduction files."
+                )
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for art in artifacts:
+                (out_dir / art.sql_filename).write_text(
+                    art.sql, encoding="utf-8", newline="\n"
+                )
+                (out_dir / art.pytest_filename).write_text(
+                    art.pytest, encoding="utf-8", newline="\n"
+                )
+        except OSError as exc:
+            raise ToolError(
+                f"Cannot write reproduction files to {emit_repro_dir}: {exc}"
+            ) from exc
+        click.echo(
+            f"pgrls: wrote {len(artifacts)} reproduction(s) to {emit_repro_dir}",
+            err=True,
+        )
 
     if verification.has_leak:
         sys.exit(1)
