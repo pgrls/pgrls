@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import psycopg
 from click.testing import CliRunner
 
 from pgrls.cli import main
@@ -708,3 +709,66 @@ def test_diff_apply_rejects_v4_baseline_with_clear_message(
     assert result.exit_code != 0
     assert "column_details" in result.output
     assert "v0.5" in result.output or "0.5" in result.output
+
+
+def test_diff_apply_provisions_non_public_baseline_role(
+    pg_url: str, apply_sql, tmp_path: Path
+) -> None:
+    """A baseline whose policies reference a non-PUBLIC role (e.g.
+    `authenticated`) must apply cleanly.
+
+    Regression for the role-provisioning DO block in
+    `_apply_migration_for_diff`: it used a server-side ``%s`` parameter
+    inside the DO body, which has no inferable type, so Postgres raised
+    ``IndeterminateDatatype`` the moment any non-PUBLIC role appeared in the
+    captured baseline. (PUBLIC is special-cased and never hit the path, which
+    is why no prior --apply test caught it.) The role name is now composed
+    client-side with ``psycopg.sql``.
+    """
+    # Idempotently create the non-PUBLIC role the policy targets. apply_sql
+    # splits on `;`, so it can't run a DO block — use a direct cursor.
+    with psycopg.connect(pg_url, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "DO $$ BEGIN "
+            "IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgrls_diffapply_auth') "
+            "THEN CREATE ROLE pgrls_diffapply_auth NOLOGIN; END IF; END $$;"
+        )
+
+    apply_sql(
+        """
+        CREATE TABLE public.acct (id BIGSERIAL, tenant_id UUID NOT NULL);
+        ALTER TABLE public.acct ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE public.acct FORCE ROW LEVEL SECURITY;
+        CREATE POLICY acct_isolation ON public.acct
+            FOR ALL TO pgrls_diffapply_auth
+            USING (tenant_id = current_setting('app.tenant', true)::uuid)
+            WITH CHECK (tenant_id = current_setting('app.tenant', true)::uuid);
+        """
+    )
+
+    runner = CliRunner()
+    snap = runner.invoke(
+        main, ["snapshot", "--database-url", pg_url, "--schemas", "public"]
+    )
+    assert snap.exit_code == 0, snap.output
+    base_path = tmp_path / "base.json"
+    base_path.write_text(snap.output, encoding="utf-8")
+    # Guard: the baseline must actually carry the non-PUBLIC role, else the
+    # test would pass vacuously without exercising role provisioning.
+    assert "pgrls_diffapply_auth" in snap.output
+
+    migration_path = tmp_path / "migration.sql"
+    migration_path.write_text(
+        "ALTER TABLE public.acct ADD COLUMN note text;\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        main,
+        ["diff", str(base_path), "--apply", str(migration_path), "--format", "json"],
+    )
+    # The fix: restoring the baseline pre-creates pgrls_diffapply_auth in the
+    # ephemeral container without IndeterminateDatatype; an additive column is
+    # a neutral change, so the diff exits 0.
+    assert result.exit_code == 0, result.output
+    assert "IndeterminateDatatype" not in result.output
+    assert "could not determine data type" not in result.output

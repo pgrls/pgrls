@@ -10,6 +10,16 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `pgrls diff --apply` no longer crashes with `IndeterminateDatatype` when the
+  captured baseline references a non-PUBLIC role (e.g. `authenticated`). The
+  ephemeral role-provisioning step composed the role name with a server-side
+  `%s` parameter inside a `DO` block body — which has no inferable type — so
+  any baseline carrying a policy/grant for a named role failed to restore. The
+  role name is now composed client-side with `psycopg.sql` (same fix class as
+  the ephemeral migration engine).
+
 ## [0.19.0] - 2026-06-08
 
 ### Added
