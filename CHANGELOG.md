@@ -10,6 +10,36 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-09
+
+### Added
+
+- `pgrls verify --mode cross-tenant` — a second, complementary threat model for
+  the Z3 isolation prover: can a session authenticated as **one tenant** read a
+  **different tenant's** row? For the policy's own `<column> = <session
+  identity>` scoping equality (the predicate `pgrls generate` emits), a row is
+  exposed iff it can be visible while `column` differs from the session's
+  tenant — `PROVEN` when that is UNSAT, `LEAK` when SAT (with a concrete
+  cross-tenant row for an `OR is_public`-style bypass, or a conditional leak
+  with no single characterizing row when the bypass depends on the session —
+  an admin-role disjunct — rather than the row). The default `--mode anon` is
+  unchanged. The two modes are complementary: the signature
+  inverted-auth policy `auth.uid() IS NULL OR tenant_id = auth.uid()` is an
+  anon `LEAK` but cross-tenant `PROVEN` (an authenticated tenant only sees its
+  own rows). Same soundness contract — `cross-tenant` declines to `UNVERIFIED`
+  (never a false `PROVEN`) when a policy has no single scoping equality (a total
+  `USING (true)` leak, already caught by `anon` mode), multiple competing
+  discriminators, or an untranslatable predicate. JSON output gains a top-level
+  `"mode"` and an `"any_other_tenant"` witness scope. `--emit-repro` remains
+  `anon`-only.
+
+### Internal
+
+- The 3VL anonymous-read encoder (`_z3_compare._anon_3vl`) gains a
+  `_Context.session_mode` flag that binds auth-context calls to free, non-null
+  *session symbols* instead of NULL — the sole behavioral fork; with the flag
+  off (every existing caller) the encoder is byte-for-byte unchanged.
+
 ## [0.21.0] - 2026-06-08
 
 ### Added

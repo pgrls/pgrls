@@ -3351,13 +3351,27 @@ def matrix(
 @main.command()
 @common_db_options
 @click.option(
+    "--mode",
+    "mode",
+    type=click.Choice(["anon", "cross-tenant"]),
+    default="anon",
+    show_default=True,
+    help=(
+        "Threat model to prove. 'anon': no row is readable by an "
+        "unauthenticated session. 'cross-tenant': no row of one tenant is "
+        "readable by a session authenticated as a different tenant (verifies "
+        "the `<column> = <session identity>` scoping equality)."
+    ),
+)
+@click.option(
     "--auth-function",
     "auth_functions",
     multiple=True,
     help=(
-        "Treat this function as NULL under an anonymous session, in addition "
-        "to the defaults (auth.uid/role/jwt, current_setting). Repeatable — "
-        "pass a project's custom auth helper, e.g. --auth-function auth.user_id."
+        "Treat this function as an auth-context value, in addition to the "
+        "defaults (auth.uid/role/jwt, current_setting): NULL under 'anon', a "
+        "session identity under 'cross-tenant'. Repeatable — pass a project's "
+        "custom auth helper, e.g. --auth-function auth.user_id."
     ),
 )
 @click.option(
@@ -3396,6 +3410,7 @@ def verify(
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    mode: str,
     auth_functions: tuple[str, ...],
     strict: bool,
     emit_repro_dir: str | None,
@@ -3405,27 +3420,37 @@ def verify(
 ) -> None:
     """Prove tenant isolation with Z3 — and show a leaking row when it fails.
 
-    For every RLS-enabled table, `pgrls verify` *proves* whether an
-    **anonymous** session (every auth function — `auth.uid()`/`role()`/`jwt()`,
-    `current_setting(...)` — NULL) can read any row. Three honest verdicts:
-    `PROVEN` (the USING predicate is unsatisfiable under anon — no row is ever
-    anonymously visible), `LEAK` (a row *is* — with a concrete counterexample:
-    a characterizing row or "every row"), or `UNVERIFIED` (Z3 unavailable, the
-    predicate is outside the decidable fragment, or it timed out — here the
-    verifier degrades to the linter; run `pgrls lint`).
+    For every RLS-enabled table, `pgrls verify` *proves* a read-isolation
+    property. `--mode anon` (default): can an **anonymous** session (every auth
+    function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — NULL)
+    read any row? `--mode cross-tenant`: can a session authenticated as one
+    tenant read a **different** tenant's row (against the policy's
+    `<column> = <session identity>` scoping equality)? Three honest verdicts:
+    `PROVEN` (the read is unsatisfiable under the threat model), `LEAK` (a row
+    *is* readable — with a concrete counterexample), or `UNVERIFIED` (Z3
+    unavailable, the predicate is outside the decidable fragment, it timed out,
+    or — cross-tenant — there is no single scoping equality to verify; here the
+    verifier degrades to the linter, run `pgrls lint`).
 
-    Unlike `pgrls lint` (heuristic findings) this is a soundness proof: it
-    never reports a leak it cannot exhibit, and never reports isolated unless
-    Z3 proves it. Exits non-zero on any leak — drop it in CI as a hard
-    tenant-isolation gate. `--strict` also fails on UNVERIFIED. `--format json`
-    emits the per-table/per-policy verdicts and counterexamples. `--emit-repro
-    DIR` writes, for each leak, a runnable `.sql` script and a pytest that
-    recreate the table + policy, insert the counterexample row, and SELECT it
-    as an anonymous session — the proof, made reproducible (re-running won't
-    clobber a hand-edited reproduction unless `--force`). v1 proves the
-    anonymous-read threat model (the dominant Supabase RLS failure); see the
-    README for scope.
+    The two modes are complementary: the inverted `auth.uid() IS NULL OR …`
+    policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
+    (heuristic findings) this is a soundness proof: it never reports a leak it
+    cannot exhibit, and never reports isolated unless Z3 proves it. Exits
+    non-zero on any leak — drop it in CI as a hard tenant-isolation gate.
+    `--strict` also fails on UNVERIFIED. `--format json` emits the
+    per-table/per-policy verdicts and counterexamples. `--emit-repro DIR`
+    (anon mode) writes, for each leak, a runnable `.sql` script and a pytest
+    that recreate the table + policy, insert the counterexample row, and SELECT
+    it as an anonymous session — the proof, made reproducible (re-running won't
+    clobber a hand-edited reproduction unless `--force`). See the README for
+    scope.
     """
+    if emit_repro_dir is not None and mode != "anon":
+        # The reproduction generator models an anonymous SELECT; a cross-tenant
+        # repro (set the session tenant, insert an other-tenant row, SELECT as
+        # authenticated) is a different shape, out of scope for v1.
+        raise ToolError("--emit-repro is supported only with --mode anon.")
+
     _, schema = _connect_and_introspect(
         config_path=config_path,
         database_url=database_url,
@@ -3437,7 +3462,7 @@ def verify(
         if auth_functions
         else None
     )
-    verification = build_verification(schema, auth_functions=auth)
+    verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
     _emit(render_verify(verification, output_format), output_path)
 
     if emit_repro_dir is not None:
