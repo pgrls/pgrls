@@ -440,3 +440,323 @@ def test_verify_cli_live_scoped_is_isolated(pg_conn: psycopg.Connection) -> None
         )
     schema = introspect(pg_conn, schemas=["public"])
     assert _verdict(build_verification(schema), "public.acct") == "isolated"
+
+
+# --- cross-tenant mode (Z3) ------------------------------------------------
+
+
+def _xt(schema: Schema) -> Verification:
+    return build_verification(schema, mode="cross-tenant")
+
+
+def test_build_verification_default_mode_is_anon() -> None:
+    v = build_verification(Schema(tables=(_table("t", policies=()),)))
+    assert v.mode == "anon"
+
+
+@requires_z3
+def test_cross_tenant_scoped_policy_is_proven() -> None:
+    schema = Schema(tables=(_table("t", policies=(_policy("tenant_id = auth.uid()"),)),))
+    assert _verdict(_xt(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_cross_tenant_cast_scoping_is_proven() -> None:
+    # The exact predicate `pgrls generate` emits — the cast is a no-op (uuid →
+    # String) so the auth value stays a session symbol and the proof holds.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("tenant_id = current_setting('app.tenant_id', true)::uuid"),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_xt(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_cross_tenant_or_public_is_leak_with_row_witness() -> None:
+    # An `OR is_public` bypass exposes another tenant's public rows.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("tenant_id = auth.uid() OR is_public"),)),)
+    )
+    v = _xt(schema)
+    [t] = v.tables
+    leak = next(p for p in t.proofs if p.verdict == "leak")
+    assert t.verdict == "leak"
+    assert leak.witness == {"is_public": True}
+
+
+@requires_z3
+def test_cross_tenant_admin_bypass_is_conditional_leak() -> None:
+    # An admin disjunct lets an admin session read every tenant, but the leak
+    # is conditional on the SESSION's role (not any row column) — so the row
+    # witness is not self-sufficient → conditional leak (witness None), not an
+    # over-claiming row.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("tenant_id = auth.uid() OR auth.role() = 'admin'"),),
+            ),
+        )
+    )
+    v = _xt(schema)
+    [t] = v.tables
+    [p] = t.proofs
+    assert t.verdict == "leak"
+    assert p.witness is None
+
+
+@requires_z3
+def test_cross_tenant_witness_not_over_claimed_on_opaque_conjunct() -> None:
+    # A bypass disjunct gated by an opaque runtime value
+    # (`is_public AND current_setting(...) = 'x'`) is a real leak, but pinning
+    # `is_public=True` alone does NOT force it — the row witness must NOT
+    # over-claim. The sufficiency gate downgrades it to a conditional leak.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "tenant_id = auth.uid() "
+                        "OR (is_public AND current_setting('app.x') = 'y')"
+                    ),
+                ),
+            ),
+        )
+    )
+    v = _xt(schema)
+    [t] = v.tables
+    [p] = t.proofs
+    assert t.verdict == "leak"
+    assert p.witness is None  # NOT {"is_public": True} — that would over-claim
+
+
+@requires_z3
+def test_cross_tenant_unconditional_bypass_is_any_other_tenant() -> None:
+    # A disjunct that is unconditionally true alongside the scoping equality
+    # exposes every other-tenant row with no row condition → empty witness,
+    # rendered as the `any_other_tenant` scope.
+    schema = Schema(tables=(_table("t", policies=(_policy("tenant_id = auth.uid() OR true"),)),))
+    v = _xt(schema)
+    [t] = v.tables
+    [p] = t.proofs
+    assert t.verdict == "leak"
+    assert p.witness == {}
+
+
+@requires_z3
+def test_cross_tenant_hardcoded_tenant_pins_witness() -> None:
+    # A hardcoded other-tenant disjunct pins the leak to that one tenant value
+    # (the discriminator IS characterizing here, unlike the don't-care cases).
+    tid = "00000000-0000-0000-0000-000000000000"
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy(f"tenant_id = auth.uid() OR tenant_id = '{tid}'"),),
+            ),
+        )
+    )
+    v = _xt(schema)
+    [t] = v.tables
+    leak = next(p for p in t.proofs if p.verdict == "leak")
+    assert t.verdict == "leak"
+    assert leak.witness == {"tenant_id": tid}
+
+
+@requires_z3
+def test_cross_tenant_inverted_auth_is_proven_complementary() -> None:
+    # THE headline: the inverted-auth policy is an anon LEAK but cross-tenant
+    # ISOLATED — an authenticated tenant only sees its own rows (the IS NULL
+    # branch is false when authenticated). The two modes are complementary.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("auth.uid() IS NULL OR tenant_id = auth.uid()"),),
+            ),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"  # anon
+    assert _verdict(_xt(schema), "public.t") == "isolated"  # cross-tenant
+
+
+@requires_z3
+def test_cross_tenant_using_true_is_unverified_not_leak() -> None:
+    # USING(true) has no scoping equality → cross-tenant makes no claim (it is
+    # already caught as an anon leak). Soundness: never a false isolated.
+    schema = Schema(tables=(_table("t", policies=(_policy("true"),)),))
+    v = _xt(schema)
+    assert _verdict(v, "public.t") == "unverified"
+    assert not v.has_leak
+
+
+@requires_z3
+def test_cross_tenant_multi_axis_is_unverified() -> None:
+    # Two distinct scoping equalities (different columns) → no single tenant
+    # axis → unverified. Conservative: soundness over recall.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("tenant_id = auth.uid() OR org_id = auth.uid()"),),
+            ),
+        )
+    )
+    assert _verdict(_xt(schema), "public.t") == "unverified"
+
+
+@requires_z3
+def test_cross_tenant_undecidable_predicate_is_unverified() -> None:
+    # An untranslatable predicate → no claim (the verifier degrades to the
+    # linter), same as anon mode.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "tenant_id = ANY(string_to_array(current_setting('x'), ','))"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_xt(schema), "public.t") == "unverified"
+
+
+@requires_z3
+def test_cross_tenant_scoped_is_anon_unverified_or_proven() -> None:
+    # The plain scoped policy `tenant_id = auth.uid()` is cross-tenant PROVEN;
+    # under anon it is also isolated (auth.uid() NULL → tenant_id = NULL is U,
+    # no row visible). Pin both so the modes don't accidentally converge wrong.
+    schema = Schema(tables=(_table("t", policies=(_policy("tenant_id = auth.uid()"),)),))
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+    assert _verdict(_xt(schema), "public.t") == "isolated"
+
+
+# --- cross-tenant renderers ------------------------------------------------
+
+
+@requires_z3
+def test_cross_tenant_render_text_phrasing() -> None:
+    schema = Schema(
+        tables=(
+            _table("safe", policies=(_policy("tenant_id = auth.uid()"),)),
+            _table("leaky", policies=(_policy("tenant_id = auth.uid() OR is_public"),)),
+        )
+    )
+    out = render_text(_xt(schema))
+    assert "no cross-tenant read" in out
+    assert "a row of another tenant with is_public=True is readable" in out
+    # the anon-only phrasings must NOT appear in cross-tenant output
+    assert "anonymously readable" not in out
+
+
+@requires_z3
+def test_cross_tenant_render_json_mode_and_scope() -> None:
+    schema = Schema(
+        tables=(
+            _table("u", policies=(_policy("tenant_id = auth.uid() OR true"),)),
+        )
+    )
+    payload = json.loads(render_json(_xt(schema)))
+    assert payload["mode"] == "cross-tenant"
+    p = payload["tables"][0]["policies"][0]
+    assert p["witness_scope"] == "any_other_tenant"
+    assert p["witness"] == {}
+
+
+def test_anon_render_json_records_mode() -> None:
+    # Regression: the default mode is recorded in JSON (no Z3 needed — a
+    # policy-free table is trivially isolated).
+    payload = json.loads(
+        render_json(build_verification(Schema(tables=(_table("t", policies=()),))))
+    )
+    assert payload["mode"] == "anon"
+
+
+# --- cross-tenant CLI ------------------------------------------------------
+
+
+def test_verify_cli_mode_option_in_help() -> None:
+    result = CliRunner().invoke(main, ["verify", "--help"])
+    assert result.exit_code == 0
+    assert "--mode" in result.output and "cross-tenant" in result.output
+
+
+def test_verify_cli_emit_repro_rejects_cross_tenant() -> None:
+    # --emit-repro models an anonymous SELECT; cross-tenant is a different repro
+    # shape (out of scope v1) → a clean ToolError before any DB connection.
+    result = CliRunner().invoke(
+        main,
+        [
+            "verify",
+            "--mode",
+            "cross-tenant",
+            "--emit-repro",
+            "/tmp/pgrls-xt-repro",
+            "--database-url",
+            "postgresql://unused",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--emit-repro is supported only with --mode anon" in result.output
+
+
+@requires_docker
+@requires_z3
+def test_verify_cli_live_cross_tenant_leak_exits_one(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # End-to-end: an `OR is_public` bypass is a cross-tenant LEAK → exit 1, and
+    # the report frames the row as another tenant's.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs "
+            "  (id bigint PRIMARY KEY, tenant_id uuid, is_public boolean);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid() OR is_public);"
+        )
+    result = CliRunner().invoke(
+        main,
+        [
+            "verify",
+            "--mode",
+            "cross-tenant",
+            "--database-url",
+            pg_url,
+            "--schemas",
+            "public",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert "LEAK" in result.output and "another tenant" in result.output
+
+
+@requires_docker
+@requires_z3
+def test_verify_live_cross_tenant_scoped_is_isolated(
+    pg_conn: psycopg.Connection,
+) -> None:
+    # The gold-standard `pgrls generate` shape is cross-tenant PROVEN end-to-end.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.acct (id bigint PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.acct ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.acct FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.acct FOR SELECT TO public "
+            "  USING (tenant_id = (select auth.uid()));"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    assert _verdict(_xt(schema), "public.acct") == "isolated"

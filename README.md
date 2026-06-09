@@ -347,25 +347,31 @@ Per command it evaluates the clause Postgres actually applies — `WITH CHECK` f
 
 ## Prove tenant isolation — `pgrls verify`
 
-`pgrls lint` *flags* a suspicious policy; `pgrls verify` **proves** — with the Z3 SMT solver — that an **anonymous** session (every auth function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — returning `NULL`, the unauthenticated state) cannot read any row. When it can, you get the leaking row, not just a warning.
+`pgrls lint` *flags* a suspicious policy; `pgrls verify` **proves** — with the Z3 SMT solver — a read-isolation property, and hands back the leaking row (not just a warning) when it fails. Two complementary threat models via `--mode`:
+
+- **`anon`** (default) — an **anonymous** session (every auth function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — returning `NULL`, the unauthenticated state) cannot read any row.
+- **`cross-tenant`** — a session authenticated as *one* tenant cannot read a *different* tenant's row, checked against the policy's own `<column> = <session identity>` scoping equality (the predicate [`pgrls generate`](#scaffold-rls--pgrls-generate) emits).
 
 ```bash
-pgrls verify --database-url "$DATABASE_URL"                          # proof report, exits 1 on any leak
+pgrls verify --database-url "$DATABASE_URL"                          # anon proof, exits 1 on any leak
+pgrls verify --database-url "$DATABASE_URL" --mode cross-tenant       # prove no tenant reads another tenant's rows
 pgrls verify --database-url "$DATABASE_URL" --format json            # per-table / per-policy verdicts + counterexamples
 pgrls verify --database-url "$DATABASE_URL" --strict                 # also fail on UNVERIFIED
 pgrls verify --database-url "$DATABASE_URL" --auth-function auth.user_id   # add a custom auth helper
-pgrls verify --database-url "$DATABASE_URL" --emit-repro ./repro      # write a runnable repro per leak
+pgrls verify --database-url "$DATABASE_URL" --emit-repro ./repro      # (anon) write a runnable repro per leak
 ```
 
-Each RLS-enabled table gets one of three **honest** verdicts:
+The two modes are complementary. The signature inverted-auth policy `auth.uid() IS NULL OR tenant_id = auth.uid()` is an anon **`LEAK`** (an unauthenticated client sees every row) yet cross-tenant **`PROVEN`** (an authenticated tenant only ever sees its own rows — the `IS NULL` branch is false once authenticated). Conversely a `tenant_id = auth.uid() OR is_public` policy is anon-`LEAK` *and* cross-tenant-`LEAK` (another tenant's public rows leak), while `USING (true)` is an anon-`LEAK` but cross-tenant-`UNVERIFIED` (no scoping equality to verify against — already caught by anon mode). Run both for full coverage.
 
-- **`PROVEN`** — the `USING` predicate is *unsatisfiable* under an anonymous session: Z3 proves no row is ever anonymously visible.
-- **`LEAK`** — a row *is* anonymously readable, with a concrete counterexample: a characterizing row (`a row with is_public=True is anonymously readable`), *every row* for the unconditional cases (`USING (true)`, the `auth.uid() IS NULL OR …` inversion — the [signature Supabase bug](#the-signature-supabase-bug), now proven rather than guessed), or — for a *conditional* leak the prover can't pin to a single row — the leak reported without a characterizing row.
-- **`UNVERIFIED`** — Z3 is unavailable, the predicate is outside the decidable fragment, or the solver timed out. This is the point where the **verifier degrades to the linter** — no claim is made; run `pgrls lint` for the heuristic rules.
+Each RLS-enabled table gets one of three **honest** verdicts (the phrasing below is `anon`-mode; `cross-tenant` frames the same verdicts as "readable by a session of a different tenant"):
+
+- **`PROVEN`** — the read is *unsatisfiable* under the threat model: Z3 proves no row is ever visible to an anonymous session (`anon`) / to a session of a different tenant (`cross-tenant`).
+- **`LEAK`** — a row *is* readable, with a concrete counterexample: a characterizing row (`a row with is_public=True is anonymously readable`; cross-tenant: `a row of another tenant with is_public=True is readable`), the unconditional case (`anon`: *every row* — `USING (true)`, the `auth.uid() IS NULL OR …` inversion, now proven rather than guessed; cross-tenant: *a row of any other tenant*), or — for a *conditional* leak the prover can't pin to a single row (an opaque/session-dependent bypass) — the leak reported without a characterizing row.
+- **`UNVERIFIED`** — Z3 is unavailable, the predicate is outside the decidable fragment, the solver timed out, or (`cross-tenant`) the policy has no single tenant-scoping equality to verify against. This is the point where the **verifier degrades to the linter** — no claim is made; run `pgrls lint` for the heuristic rules.
 
 `--emit-repro DIR` turns a `LEAK` into something you can run: for each leak it writes a `.sql` script and a pytest that recreate a throwaway copy of the table from the introspected column types, install the leaking policy, insert the counterexample row, and `SELECT` it back as an anonymous session — the proof, reproduced (and rolled back). The pytest **passes while the leak exists and turns red once you fix the policy** — a runnable proof of the bug (invert the assertion to keep it as a green regression guard). For a characterized or unconditional leak the inserted row reliably triggers the policy; for a *conditional* leak (no pinned row) the placeholder row is best-effort and the `.sql` header flags it for a hand-edit. Re-running won't clobber a hand-edited reproduction unless `--force`.
 
-It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope (v1):** the anonymous-read threat model — the dominant Supabase/PostgREST RLS failure. It reasons over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` read floor is reported `UNVERIFIED` (v1 does not combine floors — an already-`PROVEN` policy stays proven, since a restrictive floor only narrows access), and RLS-disabled tables are out of scope (that is SEC001's job). Authenticated cross-tenant isolation (tenant A reading tenant B) is the next increment. Needs the `z3-solver` dependency (bundled).
+It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope:** both modes reason over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` read floor is reported `UNVERIFIED` (v1 does not combine floors — an already-`PROVEN` policy stays proven, since a restrictive floor only narrows access), and RLS-disabled tables are out of scope (that is SEC001's job). `cross-tenant` mode verifies the single `<column> = <session identity>` scoping equality `pgrls generate` emits; a policy with no such equality (or two competing ones) is `UNVERIFIED` there. `--emit-repro` is `anon`-mode only. Needs the `z3-solver` dependency (bundled).
 
 ## Tracking trends — `pgrls history`
 

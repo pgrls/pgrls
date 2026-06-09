@@ -2,35 +2,46 @@
 
 Where `pgrls lint` *flags* a suspicious policy (SEC004 / SEC038) and `pgrls
 matrix` *summarizes* who-can-read-what, `pgrls verify` **proves** — with Z3 —
-a concrete safety property and hands back a counterexample when it fails:
+a concrete safety property and hands back a counterexample when it fails. Two
+complementary threat models (`--mode`):
 
-    For every RLS-protected table, can an *anonymous* session (every auth
-    function — auth.uid()/role()/jwt(), current_setting(...) — returning NULL,
-    the unauthenticated state) read any row?
+* ``anon`` (default) — for every RLS-protected table, can an *anonymous*
+  session (every auth function — auth.uid()/role()/jwt(), current_setting(...)
+  — returning NULL, the unauthenticated state) read any row?
+* ``cross-tenant`` — can a session authenticated as *one* tenant read a
+  *different* tenant's row? For the policy's own tenant-scoping equality
+  ``<column> = <session identity>``, a row is exposed iff it can be visible
+  while ``column`` differs from the session's tenant.
+
+They are complementary: the inverted ``auth.uid() IS NULL OR …`` policy leaks
+to anon yet correctly scopes authenticated tenants — a ``leak`` in ``anon``,
+``isolated`` in ``cross-tenant``.
 
 The honest three-way verdict mirrors the project's "a verifier that degrades
 to a linter" stance:
 
-* ``isolated``   — **proven**: ``USING`` is UNSAT under an anonymous session,
-  so no row is ever visible to an unauthenticated client.
-* ``leak``       — **disproven**: a row *is* anonymously readable. The
-  counterexample is a concrete characterizing row
-  (``{"is_public": True}``) or "all rows" when the leak is unconditional
-  (``USING (true)``, the ``auth.uid() IS NULL OR …`` inversion).
+* ``isolated``   — **proven**: the read is UNSAT under the threat model — no
+  row is visible to an unauthenticated client (anon) / to a session of a
+  different tenant (cross-tenant).
+* ``leak``       — **disproven**: a row *is* readable. The counterexample is a
+  concrete characterizing row (``{"is_public": True}``); "every row" when an
+  anon leak is unconditional (``USING (true)``, the ``auth.uid() IS NULL OR …``
+  inversion); or, cross-tenant, "a row of another tenant".
 * ``unverified`` — no claim: Z3 is unavailable, the predicate is outside the
-  decidable fragment, or the solver timed out. This is where the verifier
+  decidable fragment, the solver timed out, or (cross-tenant) the policy has no
+  single tenant-scoping equality to verify against. This is where the verifier
   *degrades to the linter* — run `pgrls lint` for the heuristic rules.
 
-Scope (v1): the anonymous-read threat model — the dominant Supabase/PostgREST
-RLS failure (the inverted `auth.uid() IS NULL OR …` policy that exposes every
-row to unauthenticated clients). It reasons over each table's permissive
-``SELECT`` / ``ALL`` policies. A *leaking* permissive policy on a table that
-also carries a ``RESTRICTIVE`` read floor is reported ``unverified`` rather
-than risk an unsound verdict — v1 does not combine restrictive floors into the
-proof; an already-proven-``isolated`` permissive policy stays ``isolated``
-(a restrictive floor only narrows access). Authenticated cross-tenant isolation
-(tenant A reading tenant B) is the next increment. Tables with RLS disabled are
-out of scope (that is SEC001's job, not an isolation proof).
+Scope: both modes reason over each table's permissive ``SELECT`` / ``ALL``
+policies. A *leaking* permissive policy on a table that also carries a
+``RESTRICTIVE`` read floor is reported ``unverified`` rather than risk an
+unsound verdict — v1 does not combine restrictive floors into the proof; an
+already-proven-``isolated`` permissive policy stays ``isolated`` (a restrictive
+floor only narrows access). ``cross-tenant`` mode verifies the single
+``<column> = <session identity>`` shape `pgrls generate` emits; a total leak
+(``USING (true)``) carries no scoping equality and is ``unverified`` there —
+but is already caught as an anon leak. Tables with RLS disabled are out of
+scope (that is SEC001's job, not an isolation proof).
 """
 from __future__ import annotations
 
@@ -38,7 +49,11 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
-from pgrls.diff._z3_compare import _DEFAULT_AUTH_FUNCTIONS, prove_anon_isolation
+from pgrls.diff._z3_compare import (
+    _DEFAULT_AUTH_FUNCTIONS,
+    prove_anon_isolation,
+    prove_cross_tenant_isolation,
+)
 from pgrls.model import Schema
 from pgrls._render_common import make_dispatcher, pluralize, render_text_table
 from pgrls.formatters._common import safe_location
@@ -50,9 +65,32 @@ DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset(_DEFAULT_AUTH_FUNCTIONS)
 
 Verdict = Literal["isolated", "leak", "unverified"]
 
+# The two threat models `pgrls verify` can prove. `anon` (default): can an
+# *unauthenticated* session read any row? `cross-tenant`: can a session
+# authenticated as one tenant read a *different* tenant's row? They are
+# complementary — the inverted `auth.uid() IS NULL OR …` policy leaks to anon
+# but correctly scopes authenticated tenants, so it is a leak in `anon` mode
+# and isolated in `cross-tenant` mode.
+Mode = Literal["anon", "cross-tenant"]
+
+_PROVERS = {"anon": prove_anon_isolation, "cross-tenant": prove_cross_tenant_isolation}
+
+# Why a policy's USING got no claim, per mode. `cross-tenant` adds the
+# "no single tenant-scoping equality" boundary (the prover declines unless the
+# policy declares exactly one `<column> = <session identity>` axis).
+_UNVERIFIED_PREDICATE_REASON = {
+    "anon": "USING predicate outside the decidable fragment",
+    "cross-tenant": (
+        "no provable tenant-scoping equality (or outside the decidable fragment)"
+    ),
+}
+
 _READ_COMMANDS = ("ALL", "SELECT")
 
 _VERDICT_LABEL = {"isolated": "PROVEN", "leak": "LEAK", "unverified": "UNVERIFIED"}
+
+# Detail shown for a PROVEN table with no explanatory note, per threat model.
+_NO_READ_DETAIL = {"anon": "no anonymous read", "cross-tenant": "no cross-tenant read"}
 
 
 @dataclass(frozen=True)
@@ -76,6 +114,7 @@ class TableVerdict:
 @dataclass(frozen=True)
 class Verification:
     tables: tuple[TableVerdict, ...]
+    mode: Mode = "anon"
 
     @property
     def has_leak(self) -> bool:
@@ -100,17 +139,29 @@ def _rollup(proofs: list[PolicyProof]) -> Verdict:
 
 
 def build_verification(
-    schema: Schema, *, auth_functions: set[str] | None = None
+    schema: Schema,
+    *,
+    auth_functions: set[str] | None = None,
+    mode: Mode = "anon",
 ) -> Verification:
-    """Prove anonymous-read isolation for every RLS-enabled table in `schema`.
+    """Prove tenant isolation for every RLS-enabled table in `schema`.
 
-    `auth_functions`, when given, *replaces* the default anon-NULL function set
-    (auth.uid/role/jwt, current_setting) — every name in it is treated as NULL
-    under an anonymous session, and `None` uses the defaults. (The
+    `mode` selects the threat model: ``"anon"`` (default) proves no row is
+    readable by an *unauthenticated* session; ``"cross-tenant"`` proves no row
+    of one tenant is readable by a session authenticated as a *different*
+    tenant. The same table/policy walk, restrictive-floor handling, and rollup
+    apply to both — only the underlying Z3 prover and the "no claim" reasons
+    differ.
+
+    `auth_functions`, when given, *replaces* the default auth function set
+    (auth.uid/role/jwt, current_setting). In ``anon`` mode every name in it is
+    treated as NULL (the unauthenticated state); in ``cross-tenant`` mode each
+    is a free, non-null session identity. `None` uses the defaults. (The
     `pgrls verify --auth-function` CLI unions a project's helper with the
     defaults before calling this, which is why the *flag* extends rather than
     replaces.) Tables are sorted by qualified name for deterministic output.
     """
+    prove = _PROVERS[mode]
     tables: list[TableVerdict] = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         if not table.rls_enabled:
@@ -139,7 +190,7 @@ def build_verification(
                     PolicyProof(policy.name, "unverified", None, "USING not available")
                 )
                 continue
-            verdict, witness = prove_anon_isolation(policy.using_ast, auth_functions)
+            verdict, witness = prove(policy.using_ast, auth_functions)
             if verdict == "leak" and has_restrictive_floor:
                 # A restrictive read floor may block this row; v1 does not
                 # combine floors, so neither verdict is sound → no claim.
@@ -159,7 +210,7 @@ def build_verification(
                         policy.name,
                         "unverified",
                         None,
-                        "USING predicate outside the decidable fragment",
+                        _UNVERIFIED_PREDICATE_REASON[mode],
                     )
                 )
             else:
@@ -173,18 +224,45 @@ def build_verification(
         tables.append(
             TableVerdict(table.qualified_name, _rollup(proofs), note, tuple(proofs))
         )
-    return Verification(tuple(tables))
+    return Verification(tuple(tables), mode)
 
 
-def _witness_phrase(witness: dict[str, object] | None) -> str:
-    """Human phrase for a leak witness: a characterizing row, 'every row'
-    (unconditional), or a conditional leak with no single characterizing row."""
+def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> str:
+    """Human phrase for a leak witness, per threat model.
+
+    A characterizing row, the unconditional case (``{}`` — every row / a row of
+    any other tenant), or a conditional leak no single row characterizes
+    (``None``). The cross-tenant phrasing frames the row as another tenant's.
+    """
+    if mode == "cross-tenant":
+        if witness is None:
+            return "a conditional cross-tenant leak — no single row characterizes it"
+        if not witness:
+            return "a row of another tenant is readable"
+        pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
+        return f"a row of another tenant with {pairs} is readable"
     if witness is None:
         return "a conditional leak — no single row characterizes it"
     if not witness:
         return "every row is anonymously readable"
     pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
     return f"a row with {pairs} is anonymously readable"
+
+
+def _witness_scope(
+    verdict: Verdict, witness: dict[str, object] | None, mode: Mode
+) -> str | None:
+    """Machine-readable witness scope for JSON. ``None`` off the leak path,
+    ``conditional`` (no single row), ``row`` (a characterizing row), or the
+    unconditional bucket — ``all_rows`` for anon, ``any_other_tenant`` for
+    cross-tenant (an empty cross-tenant witness is NOT "every row")."""
+    if verdict != "leak":
+        return None
+    if witness is None:
+        return "conditional"
+    if not witness:
+        return "any_other_tenant" if mode == "cross-tenant" else "all_rows"
+    return "row"
 
 
 def _summary_line(v: Verification) -> str:
@@ -204,7 +282,7 @@ def render_text(v: Verification) -> str:
     for t in v.tables:
         if t.verdict == "leak":
             leak = next((p for p in t.proofs if p.verdict == "leak"), None)
-            detail = _witness_phrase(leak.witness if leak else None)
+            detail = _witness_phrase(leak.witness if leak else None, v.mode)
         elif t.verdict == "unverified":
             reason = next(
                 (p.reason for p in t.proofs if p.verdict == "unverified" and p.reason),
@@ -212,7 +290,7 @@ def render_text(v: Verification) -> str:
             )
             detail = reason
         else:
-            detail = t.note or "no anonymous read"
+            detail = t.note or _NO_READ_DETAIL[v.mode]
         rows.append((safe_location(t.qualified_name), _VERDICT_LABEL[t.verdict], detail))
     out = render_text_table(headers, rows)
     out.append("")
@@ -222,6 +300,7 @@ def render_text(v: Verification) -> str:
 
 def render_json(v: Verification) -> str:
     payload = {
+        "mode": v.mode,
         "summary": v.summary,
         "tables": [
             {
@@ -233,15 +312,7 @@ def render_json(v: Verification) -> str:
                         "policy": p.policy,
                         "verdict": p.verdict,
                         "witness": p.witness,
-                        "witness_scope": (
-                            None
-                            if p.verdict != "leak"
-                            else "conditional"
-                            if p.witness is None
-                            else "all_rows"
-                            if not p.witness
-                            else "row"
-                        ),
+                        "witness_scope": _witness_scope(p.verdict, p.witness, v.mode),
                         "reason": p.reason,
                     }
                     for p in t.proofs

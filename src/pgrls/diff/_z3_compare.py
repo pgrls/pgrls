@@ -249,10 +249,18 @@ _BOOL_TYPES = frozenset({"bool", "boolean"})
 _NULL_MARKER_PREFIX = "_isnull__"
 _OPAQUE_PREFIX = "_opaque__"
 _NULLFLAG_PREFIX = "_nullflag__"
+# Cross-tenant verifier (`prove_cross_tenant_isolation`) only: the free,
+# NON-NULL symbol that stands for an authenticated session's own tenant
+# identity (`auth.uid()` etc. under `session_mode`). Same anti-collision
+# rationale as the markers above — a real column literally named
+# `_session__auth.uid` must not alias the session symbol — so it joins the
+# reserved set and `_column_key` refuses to bind it.
+_SESSION_PREFIX = "_session__"
 _RESERVED_MARKER_PREFIXES: tuple[str, ...] = (
     _NULL_MARKER_PREFIX,
     _OPAQUE_PREFIX,
     _NULLFLAG_PREFIX,
+    _SESSION_PREFIX,
 )
 
 
@@ -282,6 +290,19 @@ class _Context:
         # `is_real_column` excludes them and `_decode_model` drops them
         # from the witness exactly like `_isnull__*` / `_opaque__*`.
         self._nullflag_vars: dict[str, Any] = {}
+        # Cross-tenant verifier only. `session_mode` flips the anon-NULL
+        # leaf (every auth call NULL) to a free NON-NULL *session symbol*
+        # (an authenticated session's own identity) — the ONLY behavioral
+        # change vs the anon path, so with `session_mode` False this
+        # context is byte-for-byte the anon/diff encoder. `_session_vars`
+        # is that symbol's namespace (decl-prefixed `_session__`, kept out
+        # of `_vars` so `_decode_model` drops it from the witness like the
+        # other synthetic vars). `tenant_pairs` records every
+        # `<column> = <session symbol>` scoping equality the encoder binds,
+        # so the prover can constrain the column != the session's tenant.
+        self.session_mode: bool = False
+        self._session_vars: dict[str, Any] = {}
+        self.tenant_pairs: list[tuple[Any, Any]] = []
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -350,6 +371,28 @@ class _Context:
         ``_isnull__x`` could otherwise spoof.
         """
         return name in self._vars
+
+    def session_var(self, key: str, sort: Any) -> Any:
+        """Free, NON-NULL Z3 symbol for the authenticated session's own
+        tenant identity (cross-tenant verifier only).
+
+        The dual of ``opaque``: same canonical-shape keying so every
+        reference to one auth call (e.g. ``auth.uid()``) shares one symbol,
+        but a SEPARATE namespace + ``_session__`` decl prefix so it never
+        enters ``_vars`` — ``is_real_column`` returns False for it and
+        ``_decode_model`` drops it from the witness, exactly like
+        ``_opaque__*``. Bound to ``sort`` on first use; a later call with a
+        different sort returns None (type-conflict abort), mirroring
+        ``column`` / ``opaque``.
+        """
+        existing = self._session_vars.get(key)
+        if existing is None:
+            var = z3.Const(f"{_SESSION_PREFIX}{key}", sort)
+            self._session_vars[key] = var
+            return var
+        if existing.sort() == sort:
+            return existing
+        return None  # type conflict — translation aborts
 
 
 def _column_key(node: ColumnRef) -> str:
@@ -1245,11 +1288,24 @@ def _anon_3vl(
     """
     node = _unwrap_scalar_sublink(node)
 
-    # --- anon-NULL leaf: auth.uid()/role()/jwt(), current_setting(...),
-    # current_user, session_user — forced to NULL under an anonymous
-    # session. Value is irrelevant (it's NULL); is_null is unconditionally
-    # True. (Checked before the generic FuncCall branch.)
+    # --- auth-context leaf: auth.uid()/role()/jwt(), current_setting(...),
+    # current_user, session_user. Checked before the generic FuncCall
+    # branch. Two contexts:
+    #   * anon (default) — forced to NULL: value is irrelevant, is_null
+    #     unconditionally True (an unauthenticated session has no identity).
+    #   * session_mode (cross-tenant verifier) — a free, NON-NULL symbol
+    #     standing for the authenticated session's own tenant identity, so
+    #     `auth.uid() IS NULL` is definitively FALSE. The inverted-auth
+    #     `... IS NULL OR ...` anon leak is a DIFFERENT threat (an
+    #     authenticated attacker, not an anonymous one) caught by the anon
+    #     path; here we ask only whether one tenant can read another's row.
     if _is_anon_null_leaf(node, auth_funcs):
+        if ctx.session_mode:
+            # `session_var` never returns None for a fresh StringSort key.
+            return _Val(
+                value=ctx.session_var(_canon(node), z3.StringSort()),
+                is_null=z3.BoolVal(False),
+            )
         return _Val(
             value=ctx.opaque(_canon(node), z3.StringSort()),
             is_null=z3.BoolVal(True),
@@ -1465,6 +1521,13 @@ def _anon_binop(
     )
     if left is None or right is None:
         return None
+
+    # Cross-tenant verifier: capture a `<column> = <session symbol>`
+    # scoping equality (the tenant predicate `pgrls generate` emits) so the
+    # prover can assert column != the session's own tenant. No-op on the
+    # anon/diff path (session_mode False).
+    if ctx.session_mode and op == "=":
+        _record_tenant_pair(ctx, left, right)
 
     if comparison_fn is not None:
         try:
@@ -1748,3 +1811,264 @@ def prove_anon_isolation(
         valid.add(a)
     valid.add(z3.Not(tv.is_true))
     return ("leak", {}) if valid.check() == z3.unsat else ("leak", None)
+
+
+def _is_real_column_term(ctx: _Context, term: Any) -> bool:
+    """True iff ``term`` is exactly a bound real-column Z3 const."""
+    return bool(z3.is_const(term)) and term.decl().name() in ctx._vars
+
+
+def _is_session_term(ctx: _Context, term: Any) -> bool:
+    """True iff ``term`` is exactly a minted session-tenant symbol.
+
+    Identity by decl-name against the actual ``_session_vars`` the encoder
+    minted — not a bare ``_session__`` prefix test — so nothing outside the
+    context's own session namespace can be mistaken for the session symbol.
+    """
+    if not z3.is_const(term):
+        return False
+    name = term.decl().name()
+    return name in {sv.decl().name() for sv in ctx._session_vars.values()}
+
+
+def _record_tenant_pair(ctx: _Context, left: Any, right: Any) -> None:
+    """Record a ``<real column> = <session tenant symbol>`` scoping equality.
+
+    Order-insensitive; ignores every other operand shape (column = column,
+    column = literal, opaque = session, …). The two terms are already
+    sort-matched (``_resolve_3vl_operands`` bound the column to the session
+    symbol's sort), but re-check defensively before storing ``(column,
+    session)``.
+    """
+    for col, sess in ((left.value, right.value), (right.value, left.value)):
+        if (
+            _is_real_column_term(ctx, col)
+            and _is_session_term(ctx, sess)
+            and col.sort() == sess.sort()
+        ):
+            ctx.tenant_pairs.append((col, sess))
+            return
+
+
+def _distinct_tenant_pairs(
+    pairs: list[tuple[Any, Any]],
+) -> list[tuple[Any, Any]]:
+    """De-duplicate recorded ``(column, session)`` pairs by decl-name.
+
+    A policy may state the same scoping equality more than once (a repeated
+    disjunct, or USING mirrored in WITH CHECK) — those collapse to one
+    tenant axis. Two DIFFERENT columns, or one column vs two different
+    session symbols, stay distinct; the prover declines (UNVERIFIED) on
+    anything but a single axis.
+    """
+    seen: dict[tuple[str, str], tuple[Any, Any]] = {}
+    for col, sess in pairs:
+        key = (col.decl().name(), sess.decl().name())
+        if key not in seen:
+            seen[key] = (col, sess)
+    return list(seen.values())
+
+
+def _is_z3_str_placeholder(value: object) -> bool:
+    """True for Z3's arbitrary string-model artifacts (``!0!``, ``!1!``, …).
+
+    Z3 renders an unconstrained String const as a bang-delimited internal
+    token. Such a value is a don't-care (any string satisfies), so it must
+    never be presented as a meaningful witness literal.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) >= 3
+        and value[0] == "!"
+        and value[-1] == "!"
+        and value[1:-1].isdigit()
+    )
+
+
+def _cross_tenant_witness_sufficient(
+    witness: dict[str, object],
+    column: Any,
+    session_tenant: Any,
+    is_true: Any,
+    ctx: _Context,
+    assertions: list[Any],
+) -> bool:
+    """True iff pinning ``witness``'s columns forces the cross-tenant leak for
+    ALL completions of the free (synthetic / unpinned) variables.
+
+    The cross-tenant dual of ``_anon_witness_is_sufficient``: a leaking row's
+    real-column projection is self-sufficient only when every other-tenant row
+    matching it leaks regardless of the unmodeled opaque values — i.e.
+    ``(assertions) ∧ (pins) ∧ (column != session) ∧ ¬is_true`` is UNSAT. A
+    leak that additionally needs an unpinned opaque/session value (an
+    ``OR (flag AND fn() = 'x')`` row condition, or an admin-role bypass that
+    depends on the *session* not the row) is NOT self-sufficient → the caller
+    reports a conditional leak (witness ``None``) rather than over-claim which
+    rows leak.
+
+    Each pinned column also pins its Kleene null-flag false: a witnessed
+    concrete value implies the column is non-null, so the check must not
+    consider the impossible ``value = 'x' ∧ x IS NULL`` state (which would
+    spuriously deem a value-scoped leak, e.g. a hardcoded ``tenant = 'X'``,
+    insufficient because a NULL ``tenant`` would not match).
+    """
+    pins = []
+    for key, val in witness.items():
+        var = ctx.column(key, _py_value_sort(val))
+        if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
+            return False
+        pins.append(var == val)
+        pins.append(z3.Not(ctx.null_flag(key)))
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
+    solver.add(column != session_tenant)
+    if pins:
+        solver.add(z3.And(*pins) if len(pins) >= 2 else pins[0])
+    solver.add(z3.Not(is_true))
+    return bool(solver.check() == z3.unsat)
+
+
+def _cross_tenant_witness(
+    model: Any,
+    row: dict[str, object],
+    column: Any,
+    session_tenant: Any,
+    is_true: Any,
+    ctx: _Context,
+    assertions: list[Any],
+) -> dict[str, object] | None:
+    """Refine a cross-tenant leak model into an honest characterizing row.
+
+    Characterizes the leaking ROW (the session side is "some authenticated
+    session of a different tenant"). The discriminator ``column`` is, by
+    construction, "a tenant other than the session's" — its model value
+    matters ONLY when the predicate pins the leak to that one value (a
+    hardcoded ``tenant = 'X'`` bypass: ``is_true ∧ column != session ∧
+    column != X`` is UNSAT). Otherwise (an ``OR is_public`` / admin bypass —
+    other tenants leak too) it is a don't-care and is dropped, leaving the
+    columns that actually characterize the bypass. Z3's arbitrary string
+    placeholders are scrubbed from any kept value.
+
+    The kept columns are then run through ``_cross_tenant_witness_sufficient``:
+    if pinning them (with ``column != session``) does not by itself force the
+    leak — the leak also needs an unpinned opaque value (``OR (flag AND fn() =
+    'x')``) or a session-only condition (an admin-role bypass) — the row is NOT
+    self-sufficient and ``None`` is returned (a conditional leak), mirroring
+    ``prove_anon_isolation`` / ``counterexample``. Returns the (possibly empty)
+    self-sufficient row — ``{}`` meaning "every other-tenant row is readable".
+    """
+    disc_name = column.decl().name()
+    # The discriminator is "pinned" iff its model value is the ONLY other-tenant
+    # value that leaks — i.e. no leaking row exists with a *different* such value
+    # (`is_true ∧ column != session ∧ column != model_value` is UNSAT). `column`
+    # is constrained ``!= session`` so the model always assigns it; ``eval`` with
+    # completion yields that concrete value.
+    probe = z3.Solver()
+    probe.set("timeout", 1000)
+    for a in assertions:
+        probe.add(a)
+    probe.add(is_true)
+    probe.add(column != session_tenant)
+    probe.add(column != model.eval(column, model_completion=True))
+    pinned = probe.check() == z3.unsat
+    witness: dict[str, object] = {}
+    for key, value in row.items():
+        if key == disc_name and not pinned:
+            continue  # don't-care: rows of any other tenant leak
+        if _is_z3_str_placeholder(value):
+            continue  # arbitrary Z3 string artifact — not characterizing
+        witness[key] = value
+    if not _cross_tenant_witness_sufficient(
+        witness, column, session_tenant, is_true, ctx, assertions
+    ):
+        return None  # conditional leak — no real-column row characterizes it
+    return witness
+
+
+def prove_cross_tenant_isolation(
+    using_node: Any, auth_functions: set[str] | None = None
+) -> tuple[str, dict[str, object] | None]:
+    """Prove whether one tenant's session can read another tenant's row.
+
+    The cross-tenant dual of ``prove_anon_isolation``. Encodes the USING
+    predicate under an AUTHENTICATED session — every auth function a free,
+    NON-NULL symbol standing for the session's own tenant identity — with
+    the same Kleene-3VL translator, then, for the single tenant-scoping
+    equality ``<column> = <session identity>`` the policy declares, asks
+    whether a VISIBLE row can carry ``column != the session's tenant``:
+
+        SAT(is_true ∧ column != session_tenant)  ⇒  cross-tenant LEAK
+        UNSAT                                     ⇒  ISOLATED (proven)
+
+    A visible row must belong to the session's own tenant, so isolation is
+    exactly the UNSAT case. SAT yields a concrete cross-tenant row when one
+    characterizes the leak (an ``OR is_public`` disjunct that lets another
+    tenant's row slip past the scoping equality), or a conditional leak with
+    no characterizing row when the bypass depends on the *session* (an
+    admin-role disjunct) rather than the row (see ``_cross_tenant_witness``).
+
+    Returns ``(verdict, witness)``:
+
+    - ``("isolated", None)`` — proven: no row of another tenant is visible.
+    - ``("leak", row)`` — a row of another tenant is visible. ``row`` is the
+      decoded counterexample (its discriminator column differs from the
+      session's tenant), or ``None`` if no real-column assignment
+      characterizes it.
+    - ``("unverified", None)`` — Z3 unavailable; the predicate is
+      untranslatable / timed out; or the policy carries no single
+      tenant-scoping equality to verify against (no discriminator, multiple
+      distinct discriminators, or a sort mismatch). No claim — the
+      "verifier degrades to a linter" boundary. ``USING (true)`` and other
+      total leaks have no scoping equality and land here; they are already
+      caught as anonymous-read leaks by ``prove_anon_isolation``.
+
+    Soundness over recall: never returns ``isolated`` unless ``is_true ∧
+    column != session_tenant`` is provably UNSAT, with ``column`` and
+    ``session_tenant`` the distinct, same-sorted terms the encoder actually
+    bound for the policy's own scoping equality (so the inequality is freely
+    satisfiable in isolation and UNSAT can only mean the predicate forces
+    the row into the session's tenant).
+    """
+    if not Z3_AVAILABLE:
+        return ("unverified", None)
+    auth = (
+        auth_functions
+        if auth_functions is not None
+        else set(_DEFAULT_AUTH_FUNCTIONS)
+    )
+    ctx = _Context()
+    ctx.session_mode = True
+    assertions: list[Any] = []
+    tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
+    if tv is None:
+        return ("unverified", None)
+
+    pairs = _distinct_tenant_pairs(ctx.tenant_pairs)
+    if len(pairs) != 1:
+        # No single tenant axis ⇒ nothing sound to prove against.
+        return ("unverified", None)
+    column, session_tenant = pairs[0]
+
+    solver = z3.Solver()
+    solver.set("timeout", 1000)
+    for a in assertions:
+        solver.add(a)
+    solver.add(tv.is_true)
+    try:
+        solver.add(column != session_tenant)
+    except z3.Z3Exception:  # pragma: no cover - sorts matched at record time
+        return ("unverified", None)
+    result = solver.check()
+    if result == z3.unsat:
+        return ("isolated", None)
+    if result != z3.sat:  # unknown / timeout — no claim
+        return ("unverified", None)
+
+    model = solver.model()
+    row = _decode_model(model, ctx)
+    witness = _cross_tenant_witness(
+        model, row, column, session_tenant, tv.is_true, ctx, assertions
+    )
+    return ("leak", witness)
