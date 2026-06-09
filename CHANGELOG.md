@@ -10,6 +10,17 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.23.2] - 2026-06-09
+
+### Fixed
+
+- `pgrls verify --mode cross-tenant` text/JSON output now phrases an
+  unconditional cross-tenant leak as "a row of **any other** tenant is
+  readable", matching the emitted `--emit-repro` reproduction and the README.
+  It previously read "a row of another tenant" — a wording divergence for the
+  same verdict across surfaces (the characterizing-row and conditional-leak
+  phrasings were already consistent). Output text only; verdicts unchanged.
+
 ## [0.23.1] - 2026-06-09
 
 ### Fixed

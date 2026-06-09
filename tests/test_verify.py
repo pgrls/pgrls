@@ -15,6 +15,7 @@ from pgrls.introspect import introspect
 from pgrls.model import Policy, Schema, Table
 from pgrls.verify import (
     Verification,
+    _witness_phrase,
     build_verification,
     render_json,
     render_text,
@@ -657,6 +658,24 @@ def test_cross_tenant_render_text_phrasing() -> None:
     assert "a row of another tenant with is_public=True is readable" in out
     # the anon-only phrasings must NOT appear in cross-tenant output
     assert "anonymously readable" not in out
+
+
+def test_cross_tenant_witness_phrase_unconditional_says_any_other_tenant() -> None:
+    # The unconditional cross-tenant leak ({} witness) must read "a row of ANY
+    # other tenant" — matching the emitted repro (repro.py) and the README.
+    # Regression: verify.py once said "another tenant" here while repro/README
+    # said "any other tenant", diverging for the same verdict across surfaces.
+    assert (
+        _witness_phrase({}, mode="cross-tenant")
+        == "a row of any other tenant is readable"
+    )
+    # the characterizing-row and conditional branches are unchanged
+    assert _witness_phrase({"is_public": True}, mode="cross-tenant") == (
+        "a row of another tenant with is_public=True is readable"
+    )
+    assert _witness_phrase(None, mode="cross-tenant") == (
+        "a conditional cross-tenant leak — no single row characterizes it"
+    )
 
 
 @requires_z3
