@@ -203,6 +203,16 @@ def test_conditional_leak_header_caveat() -> None:
     assert "CONDITIONAL leak" in art.sql  # the INSERT caveat
 
 
+def test_header_always_carries_cross_table_caveat() -> None:
+    # Every generated .sql header notes that placeholders are synthesized and a
+    # cross-table policy may need edits — unconditionally, even for a plain
+    # characterized leak.
+    pol = _policy("auth.uid() IS NULL OR tenant_id = auth.uid()")
+    art = build_repro(_table(pol, columns=_COLS), pol, {})
+    assert "cross-table" in art.sql
+    assert "referencing another table/subquery" in art.sql
+
+
 def test_placeholder_types() -> None:
     # NOT NULL columns of assorted types all get insertable literals.
     cols = (
