@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-06-09
+
+### Added
+
+- `pgrls verify --mode cross-tenant --emit-repro DIR` — the cross-tenant prover
+  now emits runnable reproductions too (previously `anon`-only). For each
+  cross-tenant `LEAK` it writes a `.sql` script and a pytest that recreate a
+  throwaway copy of the table + policy, **authenticate the session as tenant A**
+  (setting the JWT-claim GUC the policy's auth function reads, or a direct
+  `current_setting('<guc>')`), insert a row belonging to a **different tenant
+  B**, drop into a NOSUPERUSER/NOBYPASSRLS runner, and `SELECT` it back — the
+  cross-tenant leak, reproduced and rolled back. The runner is non-privileged so
+  a *fixed* policy returns zero rows (the reproduction is sound, not a
+  RLS-bypass). Tenant A/B values are synthesized for the discriminator's type
+  (the proof's pinned value for a hardcoded `tenant = 'X'` bypass); a custom
+  `--auth-function` helper's identity is set via the same JWT-claim GUC. The
+  default `--mode anon` reproduction is unchanged.
+
 ## [0.22.0] - 2026-06-09
 
 ### Added

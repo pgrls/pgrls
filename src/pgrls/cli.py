@@ -3389,7 +3389,8 @@ def matrix(
     help=(
         "For each LEAK, write a runnable reproduction (a .sql script and a "
         "pytest) to this directory — recreating the table + policy, inserting "
-        "the counterexample row, and SELECTing it as an anonymous session."
+        "the counterexample row, and SELECTing it back as an anonymous (anon) "
+        "or different-tenant (cross-tenant) session, per --mode."
     ),
 )
 @click.option(
@@ -3439,18 +3440,13 @@ def verify(
     non-zero on any leak — drop it in CI as a hard tenant-isolation gate.
     `--strict` also fails on UNVERIFIED. `--format json` emits the
     per-table/per-policy verdicts and counterexamples. `--emit-repro DIR`
-    (anon mode) writes, for each leak, a runnable `.sql` script and a pytest
-    that recreate the table + policy, insert the counterexample row, and SELECT
-    it as an anonymous session — the proof, made reproducible (re-running won't
+    writes, for each leak, a runnable `.sql` script and a pytest that recreate
+    the table + policy, insert the counterexample row, and SELECT it back — as
+    an anonymous session (`anon`) or as a session authenticated as a different
+    tenant (`cross-tenant`) — the proof, made reproducible (re-running won't
     clobber a hand-edited reproduction unless `--force`). See the README for
     scope.
     """
-    if emit_repro_dir is not None and mode != "anon":
-        # The reproduction generator models an anonymous SELECT; a cross-tenant
-        # repro (set the session tenant, insert an other-tenant row, SELECT as
-        # authenticated) is a different shape, out of scope for v1.
-        raise ToolError("--emit-repro is supported only with --mode anon.")
-
     _, schema = _connect_and_introspect(
         config_path=config_path,
         database_url=database_url,
@@ -3471,7 +3467,7 @@ def verify(
         from pgrls.repro import emit_repros
 
         out_dir = Path(emit_repro_dir)
-        artifacts = emit_repros(schema, verification, auth_functions=auth)
+        artifacts = emit_repros(schema, verification, auth_functions=auth, mode=mode)
         if not force:
             # Refuse to clobber a hand-edited reproduction (the artifacts tell
             # the developer to edit the INSERT for conditional/cross-table
