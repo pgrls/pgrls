@@ -228,6 +228,16 @@ def _policy_roles(policy: Policy) -> tuple[str, ...]:
     return policy.roles or ("public",)
 
 
+def _is_public(role: str) -> bool:
+    """True for the PUBLIC pseudo-role. Live introspection renders it as the
+    literal ``'PUBLIC'`` (``introspect`` maps polroles OID 0 to ``'PUBLIC'``),
+    while hand-built schemas use lowercase ``'public'`` — match either, so a
+    real ``TO public`` policy grants ``TO PUBLIC`` and runs as the dedicated
+    ``pgrls_repro_runner`` instead of inventing a spurious quoted ``"PUBLIC"``
+    role."""
+    return role.lower() == "public"
+
+
 _BUILTIN_AUTH_STUBBED = frozenset({"auth.uid", "auth.role", "auth.jwt"})
 _RUNNER_ROLE = "pgrls_repro_runner"
 # Schemas we never synthesize a stub in — they already exist with real
@@ -379,7 +389,7 @@ def _common_setup(
     builder appends its own INSERT, session establishment, and SET ROLE."""
     qtbl = quote_ident(repro_table)
     roles = _policy_roles(policy)
-    non_public = [r for r in roles if r != "public"]
+    non_public = [r for r in roles if not _is_public(r)]
 
     setup: list[str] = [_AUTH_STUB, "GRANT USAGE ON SCHEMA auth TO PUBLIC;"]
     col_types = {c.name: _base_type(c.data_type) for c in table.column_details}
@@ -420,14 +430,14 @@ def _common_setup(
     # it, otherwise grant the named target role.
     grant_roles = list(roles) if non_public else ["public", _RUNNER_ROLE]
     grant_to = ", ".join(
-        "PUBLIC" if r == "public" else quote_ident(r) for r in grant_roles
+        "PUBLIC" if _is_public(r) else quote_ident(r) for r in grant_roles
     )
     setup.append(f"GRANT SELECT ON {qtbl} TO {grant_to};")
     setup.append(f"ALTER TABLE {qtbl} ENABLE ROW LEVEL SECURITY;")
     setup.append(f"ALTER TABLE {qtbl} FORCE ROW LEVEL SECURITY;")
 
     to_clause = ", ".join(
-        "PUBLIC" if r == "public" else quote_ident(r) for r in roles
+        "PUBLIC" if _is_public(r) else quote_ident(r) for r in roles
     )
     setup.append(
         f"CREATE POLICY {quote_ident(policy.name)} ON {qtbl}\n"

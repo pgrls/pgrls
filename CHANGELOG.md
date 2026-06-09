@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-06-09
+
+### Fixed
+
+- `pgrls verify --emit-repro`: a `TO public` policy's reproduction no longer
+  invents a spurious quoted `"PUBLIC"` application role. Live introspection
+  renders the PUBLIC pseudo-role as the literal uppercase `'PUBLIC'`, but the
+  repro builder compared roles against lowercase `"public"` — so a
+  live-introspected `TO public` policy emitted `CREATE ROLE "PUBLIC"` /
+  `SET ROLE "PUBLIC"` (a distinct role) instead of granting `TO PUBLIC` and
+  running as the dedicated `pgrls_repro_runner`. The reproduction stayed sound
+  (`"PUBLIC"` was still NOSUPERUSER/NOBYPASSRLS) but was inelegant. Now matched
+  case-insensitively. Affects both anonymous-read and cross-tenant repros.
+
 ## [0.23.0] - 2026-06-09
 
 ### Added

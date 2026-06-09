@@ -114,6 +114,21 @@ def test_public_policy_runs_as_nonsuperuser_runner() -> None:
     assert "TO PUBLIC" in sql
 
 
+def test_uppercase_public_pseudo_role_is_not_a_named_role() -> None:
+    # Live introspection renders the PUBLIC pseudo-role as the literal 'PUBLIC'
+    # (introspect maps polroles OID 0 → 'PUBLIC'). The repro must treat it as
+    # PUBLIC, not invent a spurious quoted "PUBLIC" application role: grant
+    # TO PUBLIC + run as the dedicated pgrls_repro_runner.
+    pol = _policy("auth.uid() IS NULL OR tenant_id = auth.uid()", roles=("PUBLIC",))
+    sql = build_repro(_table(pol, columns=_COLS), pol, {}).sql
+    assert 'CREATE ROLE "PUBLIC"' not in sql  # no spurious quoted role
+    assert 'SET LOCAL ROLE "PUBLIC";' not in sql
+    assert "CREATE ROLE pgrls_repro_runner NOLOGIN NOSUPERUSER NOBYPASSRLS" in sql
+    assert "SET LOCAL ROLE pgrls_repro_runner;" in sql
+    assert "GRANT SELECT ON repro_docs TO PUBLIC, pgrls_repro_runner;" in sql
+    assert "FOR SELECT TO PUBLIC\n" in sql  # CREATE POLICY uses the PUBLIC keyword
+
+
 def test_custom_auth_function_is_stubbed() -> None:
     # A policy using a custom auth helper → the repro stubs it (else CREATE
     # POLICY fails with UndefinedFunction) + flags the return-type caveat.
