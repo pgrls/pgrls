@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -126,6 +127,27 @@ def test_characterizing_counterexample_row() -> None:
 
 
 @requires_z3
+def test_conditional_leak_has_none_witness() -> None:
+    # A conditional leak the prover can't pin to a single real-column row
+    # (the discriminator is a synthetic null-flag) → witness None, NOT {} —
+    # so callers don't claim "every row".
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("tenant_id = auth.uid() OR public_level IS NOT NULL"),),
+            ),
+        )
+    )
+    v = build_verification(schema)
+    [t] = v.tables
+    [p] = t.proofs
+    assert t.verdict == "leak"
+    assert p.witness is None  # conditional, uncharacterized (not {} = all-rows)
+    assert "conditional" in render_text(v)
+
+
+@requires_z3
 def test_undecidable_predicate_is_unverified() -> None:
     schema = Schema(
         tables=(
@@ -183,15 +205,15 @@ def test_isolated_permissive_with_restrictive_floor_stays_proven() -> None:
 
 
 @requires_z3
-def test_satisfiable_but_uncharacterized_leak_is_all_rows() -> None:
-    # A tautology that no real-column assignment characterizes (the witness
-    # sufficiency check fails) is a sound leak with the "all rows" ({}) artifact.
+def test_satisfiable_nullable_tautology_is_conditional() -> None:
+    # `flag OR NOT flag` is NOT a 3VL tautology — a NULL `flag` row evaluates to
+    # NULL (hidden) — so it's a conditional leak (witness None), not "all rows".
     schema = Schema(tables=(_table("t", policies=(_policy("flag OR NOT flag"),)),))
     v = build_verification(schema)
     [t] = v.tables
     [p] = t.proofs
     assert t.verdict == "leak"
-    assert p.witness == {}
+    assert p.witness is None
 
 
 def test_rls_on_no_permissive_policy_is_isolated() -> None:
@@ -332,6 +354,76 @@ def test_verify_cli_live_exit_code_and_output(
     )
     assert result.exit_code == 1, result.output
     assert "LEAK" in result.output and "public.docs" in result.output
+
+
+@requires_docker
+@requires_z3
+def test_verify_cli_emit_repro_force_guard(
+    pg_url: str, pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    # `--emit-repro` must not silently clobber a hand-edited reproduction: a
+    # second run without --force errors (exit 2) and preserves the edit; --force
+    # rewrites. Mirrors the generate/fix/init --output guard convention.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigint PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING (auth.uid() IS NULL OR tenant_id = auth.uid());"
+        )
+    out = tmp_path / "repro"
+    runner = CliRunner()
+    args = [
+        "verify", "--database-url", pg_url, "--schemas", "public",
+        "--emit-repro", str(out),
+    ]
+    r1 = runner.invoke(main, args)
+    assert r1.exit_code == 1, r1.output  # leak → exit 1 (files written first)
+    sqlf = out / "public_docs_p.sql"
+    assert sqlf.exists()
+    sqlf.write_text("-- HAND-EDITED\n" + sqlf.read_text(), encoding="utf-8")
+
+    # second run, no --force → refuses (ToolError exit 2), edit preserved
+    r2 = runner.invoke(main, args)
+    assert r2.exit_code == 2, r2.output
+    assert "already exists" in r2.output and "--force" in r2.output
+    assert "HAND-EDITED" in sqlf.read_text()
+
+    # --force → overwrites, back to the leak exit
+    r3 = runner.invoke(main, [*args, "--force"])
+    assert r3.exit_code == 1, r3.output
+    assert "HAND-EDITED" not in sqlf.read_text()
+
+
+@requires_docker
+@requires_z3
+def test_verify_cli_emit_repro_unwritable_dir_clean_error(
+    pg_url: str, pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    # An unwritable --emit-repro dir must surface a clean ToolError (exit 2),
+    # not a raw OSError traceback — matching init/fix/generate's write guard.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigint PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING (auth.uid() IS NULL OR tenant_id = auth.uid());"
+        )
+    # A regular file in the path → mkdir(parents=True) raises NotADirectoryError
+    # (an OSError), independent of uid/permissions.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+    result = CliRunner().invoke(
+        main,
+        ["verify", "--database-url", pg_url, "--schemas", "public",
+         "--emit-repro", str(blocker / "sub")],
+    )
+    assert result.exit_code == 2, result.output
+    assert "Cannot write reproduction files" in result.output
 
 
 @requires_docker

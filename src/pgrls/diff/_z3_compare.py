@@ -1698,9 +1698,11 @@ def prove_anon_isolation(
       no row is visible to an anonymous session.
     - ``("leak", row)`` — ``is_true`` is SAT: an anonymous session can read a
       row. ``row`` is a self-sufficient characterizing assignment of the real
-      columns (e.g. ``{"is_public": True}``), or ``{}`` when the leak is
-      unconditional (every row, ``USING (true)``) / characterized only by
-      synthetic markers — exactly SEC038's "all rows" artifact.
+      columns (e.g. ``{"is_public": True}``); ``{}`` when the leak is
+      unconditional — every row, ``USING (true)`` — (``NOT(is_true)`` is also
+      UNSAT); or ``None`` when the leak is *conditional* but no real-column
+      assignment characterizes it (some row escapes, yet the discriminating
+      value is a synthetic null-flag), so callers must not claim "every row".
     - ``("unverified", None)`` — Z3 unavailable, the predicate (or a
       sub-expression) is untranslatable, or the solver timed out. No claim is
       made (the "verifier degrades to a linter" boundary).
@@ -1736,4 +1738,13 @@ def prove_anon_isolation(
     row = _decode_model(model, ctx)
     if row and _anon_witness_is_sufficient(row, tv.is_true, ctx, assertions):
         return ("leak", row)
-    return ("leak", {})
+    # No real-column row characterizes the leak. Distinguish a genuine tautology
+    # (every row leaks → the honest "all rows" artifact {}) from a conditional
+    # leak we cannot pin to specific real columns (some row escapes → None), so
+    # callers don't claim "every row" for a leak that only some rows exhibit.
+    valid = z3.Solver()
+    valid.set("timeout", 1000)
+    for a in assertions:
+        valid.add(a)
+    valid.add(z3.Not(tv.is_true))
+    return ("leak", {}) if valid.check() == z3.unsat else ("leak", None)

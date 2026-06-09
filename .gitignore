@@ -25,6 +25,7 @@ htmlcov/
 .venv/
 .venv-*/
 venv/
+test_venv/
 .tox/
 .mypy_cache/
 .ruff_cache/

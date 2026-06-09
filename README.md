@@ -354,13 +354,16 @@ pgrls verify --database-url "$DATABASE_URL"                          # proof rep
 pgrls verify --database-url "$DATABASE_URL" --format json            # per-table / per-policy verdicts + counterexamples
 pgrls verify --database-url "$DATABASE_URL" --strict                 # also fail on UNVERIFIED
 pgrls verify --database-url "$DATABASE_URL" --auth-function auth.user_id   # add a custom auth helper
+pgrls verify --database-url "$DATABASE_URL" --emit-repro ./repro      # write a runnable repro per leak
 ```
 
 Each RLS-enabled table gets one of three **honest** verdicts:
 
 - **`PROVEN`** — the `USING` predicate is *unsatisfiable* under an anonymous session: Z3 proves no row is ever anonymously visible.
-- **`LEAK`** — a row *is* anonymously readable, with a concrete counterexample: a characterizing row (`a row with is_public=True is anonymously readable`) or *every row* for the unconditional cases (`USING (true)`, the `auth.uid() IS NULL OR …` inversion — the [signature Supabase bug](#the-signature-supabase-bug), now proven rather than guessed).
+- **`LEAK`** — a row *is* anonymously readable, with a concrete counterexample: a characterizing row (`a row with is_public=True is anonymously readable`), *every row* for the unconditional cases (`USING (true)`, the `auth.uid() IS NULL OR …` inversion — the [signature Supabase bug](#the-signature-supabase-bug), now proven rather than guessed), or — for a *conditional* leak the prover can't pin to a single row — the leak reported without a characterizing row.
 - **`UNVERIFIED`** — Z3 is unavailable, the predicate is outside the decidable fragment, or the solver timed out. This is the point where the **verifier degrades to the linter** — no claim is made; run `pgrls lint` for the heuristic rules.
+
+`--emit-repro DIR` turns a `LEAK` into something you can run: for each leak it writes a `.sql` script and a pytest that recreate a throwaway copy of the table from the introspected column types, install the leaking policy, insert the counterexample row, and `SELECT` it back as an anonymous session — the proof, reproduced (and rolled back). The pytest **passes while the leak exists and turns red once you fix the policy** — a runnable proof of the bug (invert the assertion to keep it as a green regression guard). For a characterized or unconditional leak the inserted row reliably triggers the policy; for a *conditional* leak (no pinned row) the placeholder row is best-effort and the `.sql` header flags it for a hand-edit. Re-running won't clobber a hand-edited reproduction unless `--force`.
 
 It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope (v1):** the anonymous-read threat model — the dominant Supabase/PostgREST RLS failure. It reasons over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` read floor is reported `UNVERIFIED` (v1 does not combine floors — an already-`PROVEN` policy stays proven, since a restrictive floor only narrows access), and RLS-disabled tables are out of scope (that is SEC001's job). Authenticated cross-tenant isolation (tenant A reading tenant B) is the next increment. Needs the `z3-solver` dependency (bundled).
 

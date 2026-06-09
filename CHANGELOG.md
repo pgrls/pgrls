@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-08
+
+### Added
+
+- `pgrls verify --emit-repro DIR` — for each `LEAK`, write a **runnable
+  reproduction** to `DIR`: a `.sql` script and a pytest that recreate a
+  throwaway copy of the table (from the introspected column types), install the
+  leaking policy verbatim, insert the counterexample row, drop into an
+  anonymous session, and `SELECT` the row back — turning verify's proof into
+  something you run and watch happen, then roll back. Counterexample columns the
+  proof pins are set to their leak-triggering values; other NOT NULL columns get
+  type-appropriate placeholders so the script runs (for a *conditional* leak the
+  proof can't pin to a single row, the placeholder row is best-effort and the
+  emitted header flags it for a hand-edit). The pytest asserts the anonymous
+  read returns the row (a red test that goes green once the policy is fixed).
+  Filenames are policy-inclusive so multiple leaks on one table don't collide;
+  re-running won't clobber a hand-edited reproduction unless `--force`.
+
 ## [0.20.0] - 2026-06-08
 
 ### Added
