@@ -238,7 +238,7 @@ def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> s
         if witness is None:
             return "a conditional cross-tenant leak — no single row characterizes it"
         if not witness:
-            return "a row of another tenant is readable"
+            return "a row of any other tenant is readable"
         pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
         return f"a row of another tenant with {pairs} is readable"
     if witness is None:
