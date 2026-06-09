@@ -7,8 +7,15 @@ import psycopg
 import pytest
 from pglast import parse_sql
 
+from pgrls.diff._z3_compare import cross_tenant_session_identity
 from pgrls.model import Column, Policy, Schema, Table
-from pgrls.repro import _row_columns, _witness_literal, build_repro, emit_repros
+from pgrls.repro import (
+    _UUID_RE,
+    _row_columns,
+    _witness_literal,
+    build_repro,
+    emit_repros,
+)
 from pgrls.verify import build_verification
 
 
@@ -602,3 +609,202 @@ def test_non_public_runner_forced_non_bypass_live(pg_url: str) -> None:
     finally:
         with psycopg.connect(pg_url, autocommit=True) as conn:
             conn.execute("DROP ROLE IF EXISTS app_user;")
+
+
+# --- cross-tenant reproductions -------------------------------------------
+
+
+def _xt(policy: Policy, witness: dict, *, columns: tuple[Column, ...] = _COLS):
+    """Build a cross-tenant repro, deriving the session identity like the CLI."""
+    table = _table(policy, columns=columns)
+    session = cross_tenant_session_identity(policy.using_ast)
+    return build_repro(table, policy, witness, stem="r", mode="cross-tenant", session=session)
+
+
+def test_cross_tenant_sql_structure() -> None:
+    art = _xt(_policy("tenant_id = auth.uid() OR is_public"), {"is_public": True})
+    assert "cross-tenant leak reproduction" in art.sql
+    assert "a row of another tenant with is_public=True is readable" in art.sql
+    # the session is authenticated as tenant A via the JWT-claim GUC ...
+    assert "set_config('request.jwt.claim.sub'" in art.sql
+    assert "SET LOCAL ROLE" in art.sql
+    # ... and the inserted row carries a (different) tenant_id + the bypass col
+    assert "INSERT INTO repro_docs" in art.sql and "is_public" in art.sql
+    assert "anonymous" not in art.sql  # not an anon repro
+    assert "def test_r_cross_tenant_leak()" in art.pytest
+
+
+def test_cross_tenant_current_setting_sets_that_guc() -> None:
+    # A current_setting('<guc>') identity sets THAT guc, not request.jwt.claim.sub.
+    art = _xt(
+        _policy("tenant_id = current_setting('app.tenant_id', true)::uuid OR is_public"),
+        {"is_public": True},
+    )
+    assert "set_config('app.tenant_id'" in art.sql
+    assert "request.jwt.claim.sub" not in art.sql.split("BEGIN;", 1)[1].split(
+        "set_config", 1
+    )[0] or "set_config('app.tenant_id'" in art.sql
+
+
+def test_cross_tenant_hardcoded_tenant_is_pinned_distinct() -> None:
+    # A hardcoded `tenant = 'X'` bypass: the row is tenant X, the session is a
+    # DIFFERENT tenant — both must appear and differ.
+    tid = "00000000-0000-0000-0000-0000000000ff"
+    art = _xt(
+        _policy(f"tenant_id = auth.uid() OR tenant_id = '{tid}'"),
+        {"tenant_id": tid},
+    )
+    insert = next(line for line in art.sql.splitlines() if line.startswith("INSERT"))
+    setcfg = next(line for line in art.sql.splitlines() if "set_config" in line)
+    assert tid in insert  # the row is the hardcoded leaking tenant
+    assert tid not in setcfg  # the session is a different tenant
+
+
+def test_cross_tenant_text_column_auth_uid_guc_is_a_uuid() -> None:
+    # The session GUC the auth.uid() stub casts ::uuid must carry a UUID string
+    # even when the discriminator COLUMN is text (a real `auth.uid()::text`
+    # scoping shape). Synthesizing the session value from the text column type
+    # ('tenant_a') made the stub's `'tenant_a'::uuid` cast crash before the leak
+    # SELECT could run. The row's tenant_id (text 'tenant_b') still uses the
+    # column type; only the session-identity value follows the uuid stub cast.
+    cols = (
+        _col("id", "bigint", nullable=False),
+        _col("tenant_id", "text"),
+        _col("is_public", "boolean", nullable=False),
+        _col("body", "text", nullable=False),
+    )
+    art = _xt(
+        _policy("tenant_id = auth.uid()::text OR is_public"),
+        {"is_public": True},
+        columns=cols,
+    )
+    setcfg = next(ln for ln in art.sql.splitlines() if "set_config" in ln)
+    assert _UUID_RE.match(setcfg.split("'request.jwt.claim.sub', '")[1].split("'")[0])
+    assert "'tenant_a'" not in setcfg  # NOT the text-pool value (would crash ::uuid)
+
+
+def test_cross_tenant_pytest_is_valid_python() -> None:
+    art = _xt(_policy("tenant_id = auth.uid() OR is_public"), {"is_public": True})
+    pyast.parse(art.pytest)  # must be importable Python
+    assert "cross-tenant RLS leak" in art.pytest
+    assert "authenticated tenant-A" in art.pytest
+
+
+def test_emit_repros_cross_tenant_mode() -> None:
+    schema = Schema(
+        tables=(_table(_policy("tenant_id = auth.uid() OR is_public"), columns=_COLS),)
+    )
+    v = build_verification(schema, mode="cross-tenant")
+    arts = emit_repros(schema, v, mode="cross-tenant")
+    assert len(arts) == 1
+    assert "cross-tenant leak reproduction" in arts[0].sql
+
+
+def test_emit_repros_default_mode_is_anon() -> None:
+    # Regression: the default path still emits the anonymous-read repro.
+    schema = Schema(
+        tables=(_table(_policy("auth.uid() IS NULL OR tenant_id = auth.uid()"), columns=_COLS),)
+    )
+    arts = emit_repros(schema, build_verification(schema))
+    assert len(arts) == 1
+    assert "anonymous-read leak reproduction" in arts[0].sql
+
+
+@requires_docker
+@pytest.mark.parametrize(
+    "using,witness",
+    [
+        ("tenant_id = auth.uid() OR is_public", {"is_public": True}),
+        (
+            "tenant_id = current_setting('app.tenant_id', true)::uuid OR is_public",
+            {"is_public": True},
+        ),
+        (
+            "tenant_id = auth.uid() OR tenant_id = '00000000-0000-0000-0000-0000000000ff'",
+            {"tenant_id": "00000000-0000-0000-0000-0000000000ff"},
+        ),
+    ],
+)
+def test_cross_tenant_repro_reproduces_live(
+    pg_url: str, using: str, witness: dict
+) -> None:
+    # RUN the cross-tenant repro against a real Postgres: authenticated as tenant
+    # A, the SELECT must return the (tenant-B) row the policy should have hidden.
+    rows = _run_setup_and_select(pg_url, _xt(_policy(using), witness))
+    assert rows, f"the cross-tenant reproduction did not leak for USING ({using})"
+
+
+@requires_docker
+def test_cross_tenant_repro_row_is_a_different_tenant_live(pg_url: str) -> None:
+    # The essence of the cross-tenant proof: the leaked row's tenant differs from
+    # the session's own identity. Run the setup, then read both in the same txn.
+    art = _xt(_policy("tenant_id = auth.uid() OR is_public"), {"is_public": True})
+    setup = art.sql.split("BEGIN;", 1)[1].split("SELECT * FROM repro_docs;")[0]
+    with psycopg.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(setup)
+            cur.execute("SELECT tenant_id::text FROM repro_docs;")
+            row_tenant = cur.fetchone()[0]
+            cur.execute("SELECT current_setting('request.jwt.claim.sub', true);")
+            session_tenant = cur.fetchone()[0]
+        conn.rollback()
+    assert row_tenant and session_tenant
+    assert row_tenant != session_tenant, (
+        "the reproduced row belongs to the SESSION's tenant — not a cross-tenant "
+        "leak"
+    )
+
+
+@requires_docker
+def test_cross_tenant_repro_is_sound_not_a_bypass(pg_url: str) -> None:
+    # Soundness: the cross-tenant repro runs as a NOSUPERUSER/NOBYPASSRLS runner,
+    # so a FIXED scoped policy returns 0 rows (the tenant-B row is correctly
+    # hidden from the tenant-A session). If it ran as the superuser it would
+    # bypass RLS and leak even the fixed policy. (`emit_repros` only emits for
+    # leaks, so build the fixed-policy repro directly.)
+    fixed = _policy("tenant_id = auth.uid()")
+    session = cross_tenant_session_identity(fixed.using_ast)
+    art = build_repro(
+        _table(fixed, columns=_COLS), fixed, {}, stem="fx",
+        mode="cross-tenant", session=session,
+    )
+    rows = _run_setup_and_select(pg_url, art)
+    assert not rows, "FIXED scoped policy leaked cross-tenant — runner bypassed RLS"
+
+
+_TEXT_DISC_COLS = (
+    _col("id", "bigint", nullable=False),
+    _col("tenant_id", "text"),
+    _col("is_public", "boolean", nullable=False),
+    _col("body", "text", nullable=False),
+)
+
+
+@requires_docker
+def test_cross_tenant_text_column_auth_uid_repro_reproduces_live(pg_url: str) -> None:
+    # A text tenant column scoped by `auth.uid()::text` (a real Supabase shape).
+    # The auth.uid() stub casts the session GUC ::uuid, so the session-tenant A
+    # value must be a UUID even though the COLUMN is text — synthesizing it from
+    # the text column type ('tenant_a') crashed `'tenant_a'::uuid` before the
+    # leak SELECT. The `OR is_public` row of a different tenant must come back.
+    leaky = _policy("tenant_id = auth.uid()::text OR is_public", roles=("public",))
+    rows = _run_setup_and_select(
+        pg_url, _xt(leaky, {"is_public": True}, columns=_TEXT_DISC_COLS)
+    )
+    assert rows, "text-column auth.uid()::text cross-tenant leak did not reproduce"
+
+
+@requires_docker
+def test_cross_tenant_text_column_auth_uid_fixed_is_sound_live(pg_url: str) -> None:
+    # The fixed counterpart of the above: a scoped `tenant_id = auth.uid()::text`
+    # must return 0 rows (the tenant-B text row is hidden from the tenant-A uuid
+    # session) — proving the repro is sound, not a bypass, for the mismatched
+    # column/identity-type case the leak path exercises.
+    fixed = _policy("tenant_id = auth.uid()::text", roles=("public",))
+    session = cross_tenant_session_identity(fixed.using_ast)
+    art = build_repro(
+        _table(fixed, columns=_TEXT_DISC_COLS), fixed, {}, stem="fx",
+        mode="cross-tenant", session=session,
+    )
+    rows = _run_setup_and_select(pg_url, art)
+    assert not rows, "FIXED text-column auth.uid()::text leaked — repro is unsound"

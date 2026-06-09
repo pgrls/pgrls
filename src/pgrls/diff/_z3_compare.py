@@ -2072,3 +2072,44 @@ def prove_cross_tenant_isolation(
         model, row, column, session_tenant, tv.is_true, ctx, assertions
     )
     return ("leak", witness)
+
+
+def cross_tenant_session_identity(
+    using_node: Any, auth_functions: set[str] | None = None
+) -> tuple[str, str] | None:
+    """The ``(discriminator column, session-identity SQL)`` of a policy's single
+    tenant-scoping equality — what `pgrls verify --mode cross-tenant
+    --emit-repro` needs to set the session's tenant and insert an other-tenant
+    row.
+
+    Re-runs the same session-mode encoding as ``prove_cross_tenant_isolation``
+    and reads the single recorded scoping pair, so it picks the EXACT axis the
+    prover verified (a LEAK verdict guarantees exactly one pair). The session
+    SQL is the canonical rendering of the auth expression the discriminator is
+    compared to — recovered from the session symbol's decl name (keyed by
+    ``_canon`` = the RawStream SQL) — e.g. ``auth.uid()`` or
+    ``current_setting('app.tenant_id', TRUE)``.
+
+    Returns None when Z3 is unavailable, the predicate is untranslatable, or
+    there is not exactly one scoping pair (the same boundary that makes
+    ``prove_cross_tenant_isolation`` decline to UNVERIFIED — so a real LEAK
+    always yields a pair here).
+    """
+    if not Z3_AVAILABLE:
+        return None
+    auth = (
+        auth_functions
+        if auth_functions is not None
+        else set(_DEFAULT_AUTH_FUNCTIONS)
+    )
+    ctx = _Context()
+    ctx.session_mode = True
+    assertions: list[Any] = []
+    tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
+    if tv is None:
+        return None
+    pairs = _distinct_tenant_pairs(ctx.tenant_pairs)
+    if len(pairs) != 1:
+        return None
+    column, session = pairs[0]
+    return (column.decl().name(), session.decl().name()[len(_SESSION_PREFIX):])

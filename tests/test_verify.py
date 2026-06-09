@@ -691,23 +691,37 @@ def test_verify_cli_mode_option_in_help() -> None:
     assert "--mode" in result.output and "cross-tenant" in result.output
 
 
-def test_verify_cli_emit_repro_rejects_cross_tenant() -> None:
-    # --emit-repro models an anonymous SELECT; cross-tenant is a different repro
-    # shape (out of scope v1) → a clean ToolError before any DB connection.
+@requires_docker
+@requires_z3
+def test_verify_cli_emit_repro_cross_tenant(
+    pg_url: str, pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    # `--mode cross-tenant --emit-repro` writes a cross-tenant reproduction for
+    # each leak (exit 1) — it is no longer rejected.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs "
+            "  (id bigint PRIMARY KEY, tenant_id uuid, is_public boolean);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid() OR is_public);"
+        )
+    out = tmp_path / "xt"
     result = CliRunner().invoke(
         main,
         [
-            "verify",
-            "--mode",
-            "cross-tenant",
-            "--emit-repro",
-            "/tmp/pgrls-xt-repro",
-            "--database-url",
-            "postgresql://unused",
+            "verify", "--mode", "cross-tenant", "--database-url", pg_url,
+            "--schemas", "public", "--emit-repro", str(out),
         ],
     )
-    assert result.exit_code == 2
-    assert "--emit-repro is supported only with --mode anon" in result.output
+    assert result.exit_code == 1, result.output  # leak → exit 1
+    sqlf = out / "public_docs_p.sql"
+    assert sqlf.exists()
+    body = sqlf.read_text()
+    assert "cross-tenant leak reproduction" in body
+    assert "set_config('request.jwt.claim.sub'" in body
 
 
 @requires_docker
