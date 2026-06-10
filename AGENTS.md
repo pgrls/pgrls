@@ -864,7 +864,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Fifty-one rules across four categories.** SEC001–SEC038,
+- **Fifty-two rules across four categories.** SEC001–SEC039,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

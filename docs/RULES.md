@@ -2509,6 +2509,55 @@ allowlist = ["public.announcements.public_read"]
 non-null auth guard, remove the inverting disjunct, or (for genuine
 public data) allowlist the policy. The choice isn't mechanical.
 
+<a id="rule-sec039"></a>
+
+## SEC039 — Permissive write policy grants the anonymous role write access
+
+**Severity:** error.
+
+**What it catches:** a PERMISSIVE policy for a write command — `INSERT`,
+`UPDATE`, `DELETE`, or `ALL` — whose role list includes the unauthenticated
+`anon` role. In Supabase / PostgREST the `anon` role serves requests carrying
+no JWT, so such a policy lets an anonymous client modify rows, gated only by
+that policy's clause.
+
+```sql
+-- Fires: anonymous clients can INSERT.
+CREATE POLICY posts_insert ON public.posts
+    FOR INSERT TO anon
+    WITH CHECK (true);
+```
+
+**Why it's separate from [SEC003](#rule-sec003).** SEC003 flags the `PUBLIC`
+*pseudo-role* (every connection) for any command. SEC039 covers the named
+`anon` *role* — a real role SEC003's `PUBLIC` check never sees — and narrows
+to *writes*: anonymous **read** (`FOR SELECT TO anon`) is a deliberate,
+common public-data pattern and is intentionally not flagged. A `FOR ALL TO
+PUBLIC` write is SEC003's job; a `FOR INSERT TO anon` write is SEC039's.
+
+**Why it matters.** Unauthenticated writes are rarely intended: a public form
+that should create rows through a service function instead lets anyone tamper
+with, overwrite, or delete data directly. The signal is the *grant of write
+intent to anon* — SEC039 fires on the role list regardless of the predicate,
+mirroring SEC003.
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC039]
+# Roles treated as unauthenticated. Replaces the default ["anon"] — set
+# this for a deployment that renames or adds unauthenticated roles.
+anon_roles = ["anon", "web_anon"]
+
+# Per-policy escape hatch for an intentional anonymous-write table.
+allowlist = ["public.contact_messages.anon_insert"]
+```
+
+**No auto-fix.** The right remediation depends on intent — restrict the policy
+`TO authenticated` (or a privileged role) and revoke `anon`'s table-level write
+grant, route the write through a `SECURITY DEFINER` function, or allowlist a
+genuinely public-write table. The choice isn't mechanical.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

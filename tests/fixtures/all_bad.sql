@@ -770,3 +770,21 @@ CREATE POLICY anon_read ON public.allbad_sec038
     FOR ALL TO postgres
     USING (NOT ((SELECT auth.uid()) IS NOT NULL) OR owner_id = (SELECT auth.uid()));
 CREATE INDEX ON public.allbad_sec038 (owner_id);
+
+-- SEC039: a permissive INSERT policy grants the unauthenticated `anon`
+-- role write access — anonymous clients can insert rows. `anon` is a
+-- real role (created here), NOT the PUBLIC pseudo-role, so SEC003 stays
+-- silent. It is a write command, so it is not the public-read pattern
+-- SEC039 deliberately ignores. The WITH CHECK references `id` (a non-
+-- trivial own-column predicate) so SEC005 / SEC028 / SEC006 stay quiet.
+-- SEC007 co-fires (only-permissive) but its pinned location is the
+-- dedicated SEC007 block, so the extra firing is silent-by-design. The
+-- role is dropped in the test's `finally` (after the schema CASCADE
+-- removes the policy that pins it).
+CREATE ROLE anon;
+CREATE TABLE public.allbad_sec039 (id int);
+ALTER TABLE public.allbad_sec039 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec039 FORCE ROW LEVEL SECURITY;
+CREATE POLICY anon_insert ON public.allbad_sec039
+    FOR INSERT TO anon
+    WITH CHECK (id > 0);

@@ -9,7 +9,7 @@
 **[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[Docs site](https://pgrls.github.io/pgrls-docs/)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
-> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 17 of 51 rules mechanically auto-fixable.
+> Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 17 of 52 rules mechanically auto-fixable.
 > `pgrls diff` classifies every migration **SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS** so CI gates on real regressions, not safe schema changes.
 > MIT, framework-agnostic (Supabase, PostgREST, Hasura, Django, raw SQL), CI-native (text / JSON / SARIF / Markdown / GitHub-PR-comment / GitHub annotations / JUnit XML).
 
@@ -28,7 +28,7 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 51 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 52 lint rules, 17 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all fifty-one rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), or JUnit XML (`--format junit`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC006, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tables that lack it — per-tenant (`tenant_id`) or per-user (`--model owner`, incl. the Supabase `auth.uid()` form): ENABLE + FORCE, an isolation policy, a restrictive floor, and the index, output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it.
@@ -621,6 +621,7 @@ pattern documentation.
 | [SEC036](docs/RULES.md#rule-sec036) | error | Policy `EXISTS (SELECT FROM auth.users WHERE …)` sub-select with no caller binding — checks "is there any admin at all" instead of "is THIS user an admin", so every authenticated user passes once any matching row exists |
 | [SEC037](docs/RULES.md#rule-sec037) | warning | Policy compares `auth.role()` to a value outside the known role set (`anon` / `authenticated` / `service_role`) — comparison never matches and silently denies every row, masking the broken policy |
 | [SEC038](docs/RULES.md#rule-sec038) | error | Semantic anonymous-read leak — Z3 proves the USING predicate is unconditionally TRUE for an unauthenticated session (all auth functions NULL), catching inverted-auth variants SEC004's syntactic match misses. |
+| [SEC039](docs/RULES.md#rule-sec039) | error | Permissive **write** policy (INSERT/UPDATE/DELETE/ALL) grants the unauthenticated `anon` role — anonymous PostgREST/Supabase clients can modify rows; the write-side analog of SEC003 for the named `anon` role (SELECT-only `anon` policies, the public-read pattern, are not flagged) |
 | [PERF001](docs/RULES.md#rule-perf001) | warning | Auth function called per-row in policy USING (unwrapped) |
 | [PERF002](docs/RULES.md#rule-perf002) | warning | Policy expression uses a VOLATILE function (`random()`, `clock_timestamp()`, …) |
 | [PERF003](docs/RULES.md#rule-perf003) | warning | Policy predicate column without a leading-column index (sequential scan on every query) |
