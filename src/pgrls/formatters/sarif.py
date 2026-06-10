@@ -107,9 +107,22 @@ def _help_uri_for(rule_id: str) -> str:
     "## Diff — `pgrls snapshot` + `pgrls diff`" heading) so a CI
     consumer clicking "View documentation" in GitHub Code Scanning
     lands on the table instead of a 404 deep link.
+
+    Verify prover rule_ids (`pgrls-anon-isolation` /
+    `pgrls-cross-tenant-isolation` — emitted by `pgrls verify
+    --format sarif`) are NOT in the per-rule `docs/RULES.md`
+    catalog (verify *proves* a property; it isn't a lint rule), so
+    a `rule-pgrls-anon-isolation` deep link there would 404. Route
+    the `pgrls-` prefix to the README verify section instead —
+    symmetric with the `DIFF_` branch above.
     """
     if rule_id.startswith("DIFF_"):
         return f"{_INFORMATION_URI}/blob/main/AGENTS.md#diff-rules"
+    if rule_id.startswith("pgrls-"):
+        return (
+            f"{_INFORMATION_URI}/blob/main/README.md"
+            "#prove-tenant-isolation--pgrls-verify"
+        )
     return (
         f"{_INFORMATION_URI}/blob/main/docs/RULES.md#"
         f"rule-{rule_id.lower()}"

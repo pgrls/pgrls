@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-06-10
+
+### Added
+
+- **`pgrls verify --format sarif`** — SARIF v2.1.0 output for GitHub Code
+  Scanning, sharing the schema, version, and `tool.driver` block with `pgrls
+  lint`'s SARIF formatter (the document is produced by the same
+  `format_sarif`, so the two can never drift). Each LEAK becomes an
+  `error`-level result located at `schema.table.policy` with the witness phrase
+  as its message; PROVEN tables emit no result; UNVERIFIED tables are omitted
+  unless `--strict`, where each becomes a `note`-level result — so the SARIF
+  result-set is non-empty exactly when the run would fail the gate. The prover
+  is one SARIF rule per `--mode` (`pgrls-anon-isolation` /
+  `pgrls-cross-tenant-isolation`), whose `helpUri` points at the README verify
+  section (verify rules are a *proof*, not the lint catalog).
+
 ## [0.25.0] - 2026-06-09
 
 ### Added

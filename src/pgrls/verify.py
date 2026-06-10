@@ -57,6 +57,8 @@ from pgrls.diff._z3_compare import (
 from pgrls.model import Schema
 from pgrls._render_common import make_dispatcher, pluralize, render_text_table
 from pgrls.formatters._common import safe_location
+from pgrls.formatters.sarif import format_sarif
+from pgrls.violations import Violation
 
 # The functions treated as NULL under an anonymous session (single source of
 # truth — the SEC038 / 3VL encoder's default). `pgrls verify --auth-function`
@@ -91,6 +93,25 @@ _VERDICT_LABEL = {"isolated": "PROVEN", "leak": "LEAK", "unverified": "UNVERIFIE
 
 # Detail shown for a PROVEN table with no explanatory note, per threat model.
 _NO_READ_DETAIL = {"anon": "no anonymous read", "cross-tenant": "no cross-tenant read"}
+
+# SARIF rule descriptor metadata for the prover, one per `--mode`. A given run
+# is single-mode, so only the active id ever appears in `tool.driver.rules`.
+# These are the *prover's* rule ids — deliberately NOT the lint catalog's
+# SEC###/PERF### ids: verify *proves* a property, lint *flags* a heuristic, and
+# a Code-Scanning consumer must be able to tell the two apart. They flow through
+# lint's `format_sarif` (via the projected `Violation`s below) so the SARIF
+# version / $schema / driver block / level mapping stay identical to `pgrls
+# lint`/`pgrls diff`. The ids satisfy SARIF §3.49.7 (`name` is an identifier,
+# no whitespace), and `_help_uri_for` routes the `pgrls-` prefix to the README
+# verify anchor (verify rules have no per-rule `docs/RULES.md` page).
+_SARIF_RULE_ID: dict[Mode, str] = {
+    "anon": "pgrls-anon-isolation",
+    "cross-tenant": "pgrls-cross-tenant-isolation",
+}
+_SARIF_RULE_TITLE: dict[Mode, str] = {
+    "anon": "Anonymous read-isolation proof",
+    "cross-tenant": "Cross-tenant read-isolation proof",
+}
 
 
 @dataclass(frozen=True)
@@ -324,6 +345,85 @@ def render_json(v: Verification) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+def render_sarif(v: Verification, *, strict: bool = False) -> str:
+    """Render a Verification as a SARIF v2.1.0 document for GitHub Code Scanning.
+
+    Reuses lint's `format_sarif` by projecting each *actionable* table verdict
+    into a `pgrls.violations.Violation` — the exact precedent `pgrls diff` sets
+    with `_change_to_violation`. This keeps the SARIF version, `$schema`,
+    `tool.driver` block, severity→level mapping, and the empty-location guard in
+    ONE place, so verify, lint, and diff can never drift.
+
+    The result-set mirrors verify's exit-code contract — a result is present iff
+    the run would fail the gate:
+
+    * **LEAK** → one `error`-level result per leaking table, located at
+      ``schema.table.policy`` (the leaking policy), message = the witness phrase.
+      Always fails the build.
+    * **PROVEN (isolated)** → no result (the SARIF "all clear" state).
+    * **UNVERIFIED** → no result by default (it does not fail a non-strict gate);
+      under ``strict`` one `note`-level result per unverified table, located at
+      ``schema.table``, message = the table's unverified reason — matching the
+      ``--strict`` gate, which *does* fail on UNVERIFIED.
+
+    The prover is one rule per ``--mode`` (`pgrls-anon-isolation` /
+    `pgrls-cross-tenant-isolation`); a strict UNVERIFIED note reuses the same
+    rule id (its `defaultConfiguration.level` stays `error` while the per-result
+    `level` is `note` — per-result level always wins, exactly as in lint).
+
+    `strict` is keyword-only with a `False` default so the function still
+    satisfies the 1-arg renderer signature `make_dispatcher` expects; the CLI
+    passes ``strict=`` through directly for the SARIF case (see cli.verify).
+    """
+    rule_id = _SARIF_RULE_ID[v.mode]
+    title = _SARIF_RULE_TITLE[v.mode]
+    violations: list[Violation] = []
+    for t in v.tables:
+        if t.verdict == "leak":
+            leak = next((p for p in t.proofs if p.verdict == "leak"), None)
+            violations.append(
+                Violation(
+                    rule_id=rule_id,
+                    severity="error",
+                    title=title,
+                    message=(
+                        f"{t.qualified_name}: "
+                        + _witness_phrase(leak.witness if leak else None, v.mode)
+                    ),
+                    # Pin the finding to the leaking policy (mirrors lint's
+                    # schema.table.policy fullyQualifiedName). Fall back to the
+                    # table when no representative leak proof exists (defensive —
+                    # a leak rollup always has at least one leak proof).
+                    location=(
+                        f"{t.qualified_name}.{leak.policy}"
+                        if leak
+                        else t.qualified_name
+                    ),
+                )
+            )
+        elif strict and t.verdict == "unverified":
+            # Same table-level reason render_text surfaces.
+            reason = next(
+                (p.reason for p in t.proofs if p.verdict == "unverified" and p.reason),
+                t.note or "no claim",
+            )
+            violations.append(
+                Violation(
+                    rule_id=rule_id,
+                    severity="info",  # → SARIF `note` (below-warning, lint-consistent)
+                    title=title,
+                    message=f"{t.qualified_name}: {reason}",
+                    location=t.qualified_name,
+                )
+            )
+    return format_sarif(violations)
+
+
+# `render_sarif`'s `strict` is keyword-only with a default, so it type-checks as
+# the 1-arg renderer `make_dispatcher` calls — the dispatcher path yields the
+# non-strict SARIF. The CLI special-cases `--strict` by calling
+# `render_sarif(v, strict=True)` directly rather than threading the flag through
+# the shared 1-arg dispatcher (which coverage/report/perf/history also use).
 render, VERIFY_FORMATS = make_dispatcher(
-    {"text": render_text, "json": render_json}
+    {"text": render_text, "json": render_json, "sarif": render_sarif}
 )

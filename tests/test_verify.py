@@ -25,7 +25,13 @@ from pgrls.verify import (
     _witness_phrase,
     build_verification,
     render_json,
+    render_sarif,
     render_text,
+)
+
+_SARIF_SCHEMA = (
+    "https://docs.oasis-open.org/sarif/sarif/v2.1.0/cos02/schemas/"
+    "sarif-schema-2.1.0.json"
 )
 
 requires_z3 = pytest.mark.skipif(not Z3_AVAILABLE, reason="z3-solver not installed")
@@ -299,6 +305,284 @@ def test_render_json_unicode_preserved() -> None:
     assert "café" in out and "\\u" not in out
 
 
+# --- SARIF renderer --------------------------------------------------------
+#
+# `pgrls verify --format sarif` reuses lint's `format_sarif` (the same precedent
+# `pgrls diff` sets) by projecting each *actionable* verdict into a Violation, so
+# these tests pin (a) the structural contract shared with lint — version /
+# $schema / tool.driver — exactly as tests/test_formatter_sarif.py does, and
+# (b) the verify-specific verdict→result mapping (the central contract): a result
+# is present iff the run would fail the gate.
+
+
+def _sarif(v: Verification, *, strict: bool = False) -> dict:
+    """Parse `render_sarif` output, asserting it is valid JSON first."""
+    out = render_sarif(v, strict=strict)
+    return json.loads(out)
+
+
+@requires_z3
+def test_render_sarif_is_valid_json_and_lint_consistent_top_level() -> None:
+    # Structural consistency with lint SARIF: same version, $schema, and
+    # tool.driver block (name / version / informationUri). This is the whole
+    # point of routing through `format_sarif` — verify, lint, and diff can never
+    # drift on the envelope.
+    from pgrls import __version__
+
+    doc = _sarif(_sample())
+    assert doc["version"] == "2.1.0"
+    assert doc["$schema"] == _SARIF_SCHEMA
+    assert len(doc["runs"]) == 1
+    driver = doc["runs"][0]["tool"]["driver"]
+    assert driver["name"] == "pgrls"
+    assert driver["version"] == __version__
+    assert driver["informationUri"].startswith("https://")
+
+
+@requires_z3
+def test_render_sarif_leak_is_error_result_with_location_and_witness() -> None:
+    # The central contract for a LEAK: exactly one `error`-level result, located
+    # at the leaking policy (schema.table.policy), carrying the witness phrase.
+    doc = _sarif(_sample())
+    results = doc["runs"][0]["results"]
+    # _sample() has one leaking table (public.leaky, USING true) and one proven
+    # isolated table (public.safe) → exactly one result.
+    assert len(results) == 1
+    [r] = results
+    assert r["ruleId"] == "pgrls-anon-isolation"
+    assert r["level"] == "error"
+    fqn = r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+    # public.leaky's only policy is named "p" → schema.table.policy.
+    assert fqn == "public.leaky.p"
+    # Message carries the table and the witness phrase render_text surfaces.
+    assert r["message"]["text"] == "public.leaky: every row is anonymously readable"
+
+
+@requires_z3
+def test_render_sarif_proven_only_schema_has_no_results() -> None:
+    # A PROVEN-only schema produces clean SARIF: a well-formed run with an empty
+    # results array (the SARIF "all clear" state) — and, since no rule fired,
+    # an empty rules array. Mirrors lint's zero-violations contract.
+    schema = Schema(tables=(_table("safe", policies=(_policy("tenant_id = auth.uid()"),)),))
+    doc = _sarif(build_verification(schema))
+    run = doc["runs"][0]
+    assert run["results"] == []
+    assert run["tool"]["driver"]["rules"] == []
+
+
+@requires_z3
+def test_render_sarif_rule_descriptor_shape_and_help_uri() -> None:
+    # Exactly one rule descriptor per run (single mode); `name == id` (SARIF
+    # §3.49.7 identifier, not the prose title); defaultConfiguration.level is
+    # `error`; helpUri routes the `pgrls-` prefix to the README verify anchor
+    # (NOT a docs/RULES.md per-rule page, which would 404).
+    doc = _sarif(_sample())
+    rules = doc["runs"][0]["tool"]["driver"]["rules"]
+    assert len(rules) == 1
+    [rule] = rules
+    assert rule["id"] == "pgrls-anon-isolation"
+    assert rule["name"] == "pgrls-anon-isolation"
+    assert rule["shortDescription"]["text"] == "Anonymous read-isolation proof"
+    assert rule["defaultConfiguration"]["level"] == "error"
+    assert rule["helpUri"].endswith(
+        "README.md#prove-tenant-isolation--pgrls-verify"
+    )
+
+
+@requires_z3
+def test_render_sarif_unverified_is_omitted_by_default() -> None:
+    # UNVERIFIED does not fail a non-strict gate, so it produces no result by
+    # default (it is not actionable). The run is still well-formed (empty
+    # results + rules).
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("tenant_id = ANY(string_to_array(current_setting('x'), ','))"),
+                ),
+            ),
+        )
+    )
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "unverified"
+    run = _sarif(v)["runs"][0]
+    assert run["results"] == []
+    assert run["tool"]["driver"]["rules"] == []
+
+
+@requires_z3
+def test_render_sarif_strict_emits_note_for_unverified() -> None:
+    # Under --strict, UNVERIFIED *does* fail the gate, so it surfaces as one
+    # `note`-level result (SARIF's below-warning level) per unverified table,
+    # located at the table (no policy suffix), message = the table's reason.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("tenant_id = ANY(string_to_array(current_setting('x'), ','))"),
+                ),
+            ),
+        )
+    )
+    v = build_verification(schema)
+    doc = _sarif(v, strict=True)
+    results = doc["runs"][0]["results"]
+    assert len(results) == 1
+    [r] = results
+    assert r["level"] == "note"
+    assert r["ruleId"] == "pgrls-anon-isolation"
+    fqn = r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+    assert fqn == "public.t"  # table, no .policy suffix
+    assert r["message"]["text"].startswith("public.t: ")
+    # With no leak in the run, the only severity observed for the rule is the
+    # strict-UNVERIFIED `info` → the descriptor's defaultConfiguration.level is
+    # `note` (it is derived from the first observed severity for that rule id, per
+    # lint's `format_sarif`). The mixed leak+strict case — where `error` is
+    # observed first and the descriptor stays `error` while the per-result level
+    # is `note` — is pinned separately below.
+    [rule] = doc["runs"][0]["tool"]["driver"]["rules"]
+    assert rule["defaultConfiguration"]["level"] == "note"
+
+
+@requires_z3
+def test_render_sarif_strict_leak_and_unverified_share_one_rule_descriptor() -> None:
+    # When a LEAK (error) and a strict-UNVERIFIED note coexist they reuse the
+    # SAME rule id → exactly one descriptor. `error` is observed first, so the
+    # descriptor's defaultConfiguration.level is `error`, while the unverified
+    # row's per-result level stays `note` (per-result level wins — lint's
+    # contract). This is the mixed case the design note describes.
+    schema = Schema(
+        tables=(
+            _table("leaky", policies=(_policy("true"),)),
+            _table(
+                "murky",
+                policies=(
+                    _policy("tenant_id = ANY(string_to_array(current_setting('x'), ','))"),
+                ),
+            ),
+        )
+    )
+    doc = _sarif(build_verification(schema), strict=True)
+    rules = doc["runs"][0]["tool"]["driver"]["rules"]
+    assert len(rules) == 1  # one descriptor, shared
+    assert rules[0]["defaultConfiguration"]["level"] == "error"
+    results = doc["runs"][0]["results"]
+    by_table = {
+        r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]: r["level"]
+        for r in results
+    }
+    assert by_table["public.leaky.p"] == "error"
+    assert by_table["public.murky"] == "note"
+
+
+@requires_z3
+def test_render_sarif_proven_schema_clean_even_under_strict() -> None:
+    # A PROVEN-only schema is clean under --strict too — strict only adds
+    # UNVERIFIED notes, never touches the isolated verdict.
+    schema = Schema(tables=(_table("safe", policies=(_policy("tenant_id = auth.uid()"),)),))
+    run = _sarif(build_verification(schema), strict=True)["runs"][0]
+    assert run["results"] == []
+
+
+@requires_z3
+def test_render_sarif_cross_tenant_rule_id_and_witness() -> None:
+    # In cross-tenant mode the rule id + witness phrasing switch: the leak is a
+    # cross-tenant one and the message frames the row as another tenant's.
+    schema = Schema(
+        tables=(_table("docs", policies=(_policy("tenant_id = auth.uid() OR is_public"),)),)
+    )
+    doc = _sarif(build_verification(schema, mode="cross-tenant"))
+    [r] = doc["runs"][0]["results"]
+    assert r["ruleId"] == "pgrls-cross-tenant-isolation"
+    assert r["level"] == "error"
+    assert r["message"]["text"] == (
+        "public.docs: a row of another tenant with is_public=True is readable"
+    )
+    [rule] = doc["runs"][0]["tool"]["driver"]["rules"]
+    assert rule["id"] == "pgrls-cross-tenant-isolation"
+    assert rule["shortDescription"]["text"] == "Cross-tenant read-isolation proof"
+
+
+@requires_z3
+def test_render_sarif_unicode_preserved() -> None:
+    # Inherited from lint's `format_sarif`: ensure_ascii=False, so a non-ASCII
+    # table name is preserved verbatim (not \uXXXX-escaped).
+    schema = Schema(tables=(_table("café", policies=(_policy("true"),)),))
+    out = render_sarif(build_verification(schema))
+    assert "café" in out and "\\u" not in out
+
+
+@requires_z3
+def test_render_sarif_ends_with_newline() -> None:
+    # Shell-friendliness — byte-compatible with lint's trailing-newline contract.
+    assert render_sarif(_sample()).endswith("\n")
+
+
+@requires_z3
+def test_render_sarif_every_leak_result_has_nonempty_fqn() -> None:
+    # GitHub Code Scanning rejects a result with an empty fullyQualifiedName. A
+    # leak rollup always has a representative leak proof, so every leak result
+    # pins to schema.table.policy — the `(schema-wide)` sentinel is never hit.
+    doc = _sarif(_sample())
+    for r in doc["runs"][0]["results"]:
+        fqn = r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+        assert fqn and fqn != "(schema-wide)"
+
+
+@requires_z3
+def test_render_sarif_and_json_agree_on_which_tables_leak() -> None:
+    # Cross-format consistency: the set of LEAK tables JSON reports must equal
+    # the set of tables SARIF pins a result to. SARIF deliberately omits the
+    # PROVEN/UNVERIFIED rows JSON carries (only actionable verdicts become
+    # results), but the *leaking* tables — the answer the gate turns on — must
+    # match across both machine surfaces.
+    schema = Schema(
+        tables=(
+            _table("safe", policies=(_policy("tenant_id = auth.uid()"),)),
+            _table("leaky_a", policies=(_policy("true"),)),
+            _table("leaky_b", policies=(_policy("auth.uid() IS NULL OR tenant_id = auth.uid()"),)),
+        )
+    )
+    v = build_verification(schema)
+    json_leak_tables = {
+        t["table"] for t in json.loads(render_json(v))["tables"] if t["verdict"] == "leak"
+    }
+    sarif_leak_tables = {
+        # fullyQualifiedName is schema.table[.policy]; the leak FQN is
+        # schema.table.policy, so strip the trailing policy segment.
+        r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"].rsplit(".", 1)[0]
+        for r in _sarif(v)["runs"][0]["results"]
+    }
+    assert json_leak_tables == {"public.leaky_a", "public.leaky_b"}
+    assert sarif_leak_tables == json_leak_tables
+
+
+@requires_z3
+def test_render_sarif_levels_are_only_error_or_note() -> None:
+    # The only severities verify projects are error (leak) and info→note
+    # (strict unverified). Pin that no `warning`/`none` ever leaks in, across a
+    # mixed schema under strict.
+    schema = Schema(
+        tables=(
+            _table("leaky", policies=(_policy("true"),)),
+            _table("safe", policies=(_policy("tenant_id = auth.uid()"),)),
+            _table(
+                "murky",
+                policies=(
+                    _policy("tenant_id = ANY(string_to_array(current_setting('x'), ','))"),
+                ),
+            ),
+        )
+    )
+    doc = _sarif(build_verification(schema), strict=True)
+    levels = {r["level"] for r in doc["runs"][0]["results"]}
+    assert levels <= {"error", "note"}
+    # Leak → error, the unverified table → note (under strict), safe → nothing.
+    assert levels == {"error", "note"}
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -317,7 +601,15 @@ def test_verify_cli_errors_without_database_url() -> None:
 def test_verify_cli_is_registered_format_list() -> None:
     from pgrls.verify import VERIFY_FORMATS
 
-    assert VERIFY_FORMATS == ("text", "json")
+    assert VERIFY_FORMATS == ("text", "json", "sarif")
+
+
+def test_verify_cli_help_lists_sarif_format() -> None:
+    # The `@output_format_options(list(VERIFY_FORMATS), …)` decorator must
+    # surface `sarif` in the `--format [text|json|sarif]` choice in --help.
+    result = CliRunner().invoke(main, ["verify", "--help"])
+    assert result.exit_code == 0
+    assert "text|json|sarif" in result.output
 
 
 # --- live introspection (Docker) ------------------------------------------
@@ -362,6 +654,69 @@ def test_verify_cli_live_exit_code_and_output(
     )
     assert result.exit_code == 1, result.output
     assert "LEAK" in result.output and "public.docs" in result.output
+
+
+@requires_docker
+@requires_z3
+def test_verify_cli_live_sarif_leak_end_to_end(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # End-to-end through the CLI: `pgrls verify --format sarif` on a leaking
+    # policy emits a valid SARIF document (parseable, lint-consistent envelope)
+    # with one `error` result pinned to the leaking policy, and still exits 1
+    # (the gate fires regardless of output format).
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigint PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING (auth.uid() IS NULL OR tenant_id = auth.uid());"
+        )
+    result = CliRunner().invoke(
+        main,
+        ["verify", "--database-url", pg_url, "--schemas", "public",
+         "--format", "sarif"],
+    )
+    assert result.exit_code == 1, result.output  # leak → exit 1
+    doc = json.loads(result.output)  # valid JSON
+    assert doc["version"] == "2.1.0"
+    assert doc["$schema"] == _SARIF_SCHEMA
+    assert doc["runs"][0]["tool"]["driver"]["name"] == "pgrls"
+    [r] = doc["runs"][0]["results"]
+    assert r["ruleId"] == "pgrls-anon-isolation"
+    assert r["level"] == "error"
+    assert (
+        r["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+        == "public.docs.p"
+    )
+
+
+@requires_docker
+@requires_z3
+def test_verify_cli_live_sarif_proven_is_clean_and_exits_zero(
+    pg_conn: psycopg.Connection, pg_url: str
+) -> None:
+    # The complement: a properly-scoped policy → SARIF with zero results and a
+    # zero exit code (the SARIF "all clear" gate state), end-to-end.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.acct (id bigint PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.acct ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.acct FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.acct FOR SELECT TO public "
+            "  USING (tenant_id = (select auth.uid()));"
+        )
+    result = CliRunner().invoke(
+        main,
+        ["verify", "--database-url", pg_url, "--schemas", "public",
+         "--format", "sarif"],
+    )
+    assert result.exit_code == 0, result.output
+    doc = json.loads(result.output)
+    assert doc["runs"][0]["results"] == []
 
 
 @requires_docker
