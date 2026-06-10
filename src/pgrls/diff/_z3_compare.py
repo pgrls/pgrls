@@ -1620,6 +1620,14 @@ def _anon_typecast(
     target sort matches the inner value's sort the cast is a no-op;
     otherwise the value is opaque under the target sort (an unknown
     target keeps a String opaque) but the null-flag is preserved.
+
+    One exception under the cross-tenant verifier (``session_mode``): a
+    sort-changing cast of the session identity stays a free, NON-NULL
+    *session* symbol of the target sort rather than an opaque one — so
+    ``<int column> = current_setting('app.tenant_id', true)::bigint`` (the
+    integer/bigint tenant predicate ``pgrls generate`` emits) still records
+    a tenant pair and can be PROVEN isolated instead of degrading to
+    UNVERIFIED. No effect on the anon/diff path (``session_mode`` False).
     """
     inner_raw = _anon_3vl(node.arg, ctx, auth_funcs, assertions)
     if inner_raw is None:
@@ -1636,6 +1644,19 @@ def _anon_typecast(
         )
     if inner.value.sort() == target_sort:
         return _Val(value=inner.value, is_null=inner.is_null)
+    if ctx.session_mode and _is_session_term(ctx, inner.value):
+        # Cross-tenant recall: keep a sort-changing cast of the session
+        # identity (`current_setting(...)::bigint`/`::int`) a free, non-null
+        # session symbol of the target sort, keyed by the cast's canonical
+        # rendering so `::bigint`/`::int`/the uncast String identity stay
+        # distinct. Sound: the cast of an arbitrary OTHER tenant's identity
+        # is itself an arbitrary value of the target sort, so a fresh free
+        # symbol over-approximates — it can only leave the leak check SAT
+        # (decline), never manufacture a false PROVEN.
+        return _Val(
+            value=ctx.session_var(_canon(node), target_sort),
+            is_null=inner.is_null,
+        )
     return _Val(
         value=ctx.opaque(_canon(node), target_sort),
         is_null=inner.is_null,

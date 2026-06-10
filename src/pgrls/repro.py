@@ -559,7 +559,15 @@ def _tenant_b_value(data_type: str, pinned: object | None) -> object:
 
 
 def _current_setting_guc(node: object) -> str | None:
-    """The GUC name in a ``current_setting('<guc>'[, …])`` call, else None."""
+    """The GUC name in a ``current_setting('<guc>'[, …])`` call, else None.
+
+    Unwraps an outer cast first, so a sort-changing session identity
+    (``current_setting('app.tenant_id', true)::bigint`` — the integer/bigint
+    tenant predicate ``pgrls generate`` emits, now cross-tenant-verifiable)
+    is recognized and its own GUC is set, exactly like the uncast text form.
+    """
+    if isinstance(node, TypeCast):  # `current_setting(...)::bigint` → unwrap
+        return _current_setting_guc(node.arg)
     if not isinstance(node, FuncCall):
         return None
     _, bare = func_name_parts(node)

@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-06-09
+
+### Added
+
+- `pgrls verify --mode cross-tenant` now proves isolation for **integer/bigint
+  tenant keys** scoped by a sort-changing cast on the session identity —
+  `tenant_id = current_setting('app.tenant_id', true)::bigint` (the predicate
+  `pgrls generate` emits for an `int`/`bigint` tenant column). Such policies
+  previously degraded to `UNVERIFIED` because the cast dropped the session
+  marker in the Z3 encoder; they are now `PROVEN` (or `LEAK`, with a runnable
+  `--emit-repro` reproduction that authenticates tenant A by setting the right
+  GUC *through* the cast). `uuid`/`text` tenant keys were already covered
+  (sort-preserving casts). Soundness is unchanged — the cast of an arbitrary
+  other tenant's identity is modeled as a fresh free symbol of the target
+  type, which can only leave the leak check satisfiable (decline), never
+  manufacture a false `PROVEN`. The default `--mode anon` path is
+  byte-for-byte unchanged.
+
 ## [0.23.2] - 2026-06-09
 
 ### Fixed

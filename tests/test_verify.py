@@ -642,6 +642,43 @@ def test_cross_tenant_scoped_is_anon_unverified_or_proven() -> None:
     assert _verdict(_xt(schema), "public.t") == "isolated"
 
 
+# --- cross-tenant int/bigint tenant recall ---------------------------------
+
+
+@requires_z3
+def test_cross_tenant_int_session_cast_is_proven_isolated() -> None:
+    # Recall: a sort-changing cast on the session identity
+    # (`current_setting(...)::bigint`/`::int` — the predicate pgrls generate
+    # emits for an integer/bigint tenant column) is now cross-tenant PROVEN
+    # rather than degrading to UNVERIFIED. uuid/text already worked (those
+    # casts preserve the String sort, so no session marker was lost).
+    for cast in ("bigint", "int", "integer", "smallint"):
+        using = f"tenant_id = current_setting('app.tenant_id', true)::{cast}"
+        schema = Schema(tables=(_table("t", policies=(_policy(using),)),))
+        assert _verdict(_xt(schema), "public.t") == "isolated", cast
+
+
+@requires_z3
+def test_cross_tenant_int_session_cast_leak_is_detected() -> None:
+    # The same int-cast identity with an `OR is_public` bypass is a real
+    # cross-tenant LEAK — previously invisible (the policy was UNVERIFIED).
+    using = "tenant_id = current_setting('app.tenant_id', true)::bigint OR is_public"
+    schema = Schema(tables=(_table("t", policies=(_policy(using),)),))
+    v = _xt(schema)
+    assert _verdict(v, "public.t") == "leak"
+    assert v.has_leak
+
+
+@requires_z3
+def test_int_session_cast_anon_path_unchanged() -> None:
+    # The recall fork is gated on session_mode, so the anon verdict for an
+    # int-cast scoped policy is unchanged: current_setting → NULL under anon,
+    # so the equality is never true → no anonymous leak → isolated.
+    using = "tenant_id = current_setting('app.tenant_id', true)::bigint"
+    schema = Schema(tables=(_table("t", policies=(_policy(using),)),))
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
 # --- cross-tenant renderers ------------------------------------------------
 
 
