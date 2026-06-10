@@ -75,6 +75,7 @@ from pgrls.matrix import MATRIX_FORMATS, build_matrix
 from pgrls.matrix import render as render_matrix
 from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, VERIFY_FORMATS, build_verification
 from pgrls.verify import render as render_verify
+from pgrls.verify import render_sarif as render_verify_sarif
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
@@ -3439,7 +3440,10 @@ def verify(
     cannot exhibit, and never reports isolated unless Z3 proves it. Exits
     non-zero on any leak — drop it in CI as a hard tenant-isolation gate.
     `--strict` also fails on UNVERIFIED. `--format json` emits the
-    per-table/per-policy verdicts and counterexamples. `--emit-repro DIR`
+    per-table/per-policy verdicts and counterexamples; `--format sarif` emits a
+    SARIF v2.1.0 document for GitHub Code Scanning (each LEAK an error result;
+    UNVERIFIED surfaces only under `--strict`), sharing lint's SARIF schema and
+    driver block. `--emit-repro DIR`
     writes, for each leak, a runnable `.sql` script and a pytest that recreate
     the table + policy, insert the counterexample row, and SELECT it back — as
     an anonymous session (`anon`) or as a session authenticated as a different
@@ -3459,7 +3463,15 @@ def verify(
         else None
     )
     verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
-    _emit(render_verify(verification, output_format), output_path)
+    # SARIF is the one format whose result-set depends on --strict (UNVERIFIED
+    # is omitted by default, a `note` under --strict), so it can't go through
+    # the 1-arg render() dispatcher — call render_sarif directly to thread the
+    # flag. text/json are strict-independent and dispatch normally.
+    if output_format == "sarif":
+        rendered = render_verify_sarif(verification, strict=strict)
+    else:
+        rendered = render_verify(verification, output_format)
+    _emit(rendered, output_path)
 
     if emit_repro_dir is not None:
         from pathlib import Path
