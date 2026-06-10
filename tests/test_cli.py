@@ -655,8 +655,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 51 rules ship today (catalog header should say so).
-    assert "<strong>51</strong> rules" in result.output
+    # 52 rules ship today (catalog header should say so).
+    assert "<strong>52</strong> rules" in result.output
     # Header carries the auto-fixable count (17 as of v0.6.20+).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -1995,6 +1995,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC030  public.allbad_sec030\n",
             "SEC031  public.allbad_sec031.restrictive_noop\n",
             "SEC032  public.allbad_sec032\n",
+            "SEC039  public.allbad_sec039.anon_insert\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF004  public.allbad_perf004.by_email\n",
@@ -2028,7 +2029,8 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "DROP SCHEMA IF EXISTS public CASCADE; "
             "CREATE SCHEMA public; "
             "DROP ROLE IF EXISTS allbad_sec029_member; "
-            "DROP ROLE IF EXISTS allbad_sec016_role"
+            "DROP ROLE IF EXISTS allbad_sec016_role; "
+            "DROP ROLE IF EXISTS anon"
         )
 
 

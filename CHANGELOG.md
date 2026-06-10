@@ -10,6 +10,21 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-09
+
+### Added
+
+- **SEC039** (error) — a permissive write policy (INSERT / UPDATE / DELETE /
+  ALL) that grants the unauthenticated `anon` role. In Supabase / PostgREST,
+  `anon` serves requests carrying no JWT, so such a policy lets anonymous
+  clients modify rows. It is the write-side analog of SEC003 for the named
+  `anon` role (which SEC003's `PUBLIC`-pseudo-role check never sees);
+  anonymous **read** (`FOR SELECT TO anon`) is a deliberate public-data
+  pattern and is intentionally not flagged. Configurable via
+  `[lint.rules.SEC039].anon_roles` (default `["anon"]`) for deployments that
+  rename or add unauthenticated roles. Brings the catalog to **52 lint rules**
+  (17 auto-fixable).
+
 ## [0.24.0] - 2026-06-09
 
 ### Added
