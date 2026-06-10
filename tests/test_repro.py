@@ -661,6 +661,29 @@ def test_cross_tenant_current_setting_sets_that_guc() -> None:
     )[0] or "set_config('app.tenant_id'" in art.sql
 
 
+def test_cross_tenant_bigint_column_sets_that_guc() -> None:
+    # int/bigint recall: an integer tenant key scoped by
+    # `current_setting('app.tenant_id', true)::bigint` (the predicate pgrls
+    # generate emits) now has a recognized session identity, so the repro sets
+    # THAT guc — extracting it through the outer ::bigint cast — rather than
+    # falling back to the request.jwt.claim.sub default (which would leave the
+    # session's tenant unset and the repro unfaithful).
+    cols = (
+        _col("id", "bigint", nullable=False),
+        _col("tenant_id", "bigint"),
+        _col("is_public", "boolean", nullable=False),
+        _col("body", "text", nullable=False),
+    )
+    art = _xt(
+        _policy("tenant_id = current_setting('app.tenant_id', true)::bigint OR is_public"),
+        {"is_public": True},
+        columns=cols,
+    )
+    setcfg = next(ln for ln in art.sql.splitlines() if "set_config" in ln)
+    assert "set_config('app.tenant_id'" in setcfg  # GUC extracted through the cast
+    assert "request.jwt.claim.sub" not in setcfg   # not the wrong default GUC
+
+
 def test_cross_tenant_hardcoded_tenant_is_pinned_distinct() -> None:
     # A hardcoded `tenant = 'X'` bypass: the row is tenant X, the session is a
     # DIFFERENT tenant — both must appear and differ.
@@ -747,6 +770,27 @@ def test_cross_tenant_repro_reproduces_live(
     # A, the SELECT must return the (tenant-B) row the policy should have hidden.
     rows = _run_setup_and_select(pg_url, _xt(_policy(using), witness))
     assert rows, f"the cross-tenant reproduction did not leak for USING ({using})"
+
+
+@requires_docker
+def test_cross_tenant_bigint_repro_is_sound_live(pg_url: str) -> None:
+    # End-to-end for int/bigint recall: an integer tenant key scoped by
+    # current_setting(...)::bigint. The LEAKING policy (OR is_public) returns
+    # the tenant-B row; the FIXED policy returns ZERO rows — proving the repro
+    # really authenticates as tenant A (its GUC set through the ::bigint cast)
+    # and is sound, not an RLS bypass.
+    cols = (
+        _col("id", "bigint", nullable=False),
+        _col("tenant_id", "bigint"),
+        _col("is_public", "boolean", nullable=False),
+        _col("body", "text", nullable=False),
+    )
+    leaky = _policy("tenant_id = current_setting('app.tenant_id', true)::bigint OR is_public")
+    fixed = _policy("tenant_id = current_setting('app.tenant_id', true)::bigint")
+    leak_rows = _run_setup_and_select(pg_url, _xt(leaky, {"is_public": True}, columns=cols))
+    safe_rows = _run_setup_and_select(pg_url, _xt(fixed, {}, columns=cols))
+    assert leak_rows, "bigint cross-tenant leak did not reproduce"
+    assert not safe_rows, "bigint fixed policy returned rows — the repro is unsound"
 
 
 @requires_docker
