@@ -1625,8 +1625,9 @@ def _anon_typecast(
     sort-changing cast of the session identity stays a free, NON-NULL
     *session* symbol of the target sort rather than an opaque one — so
     ``<int column> = current_setting('app.tenant_id', true)::bigint`` (the
-    integer/bigint tenant predicate ``pgrls generate`` emits) still records
-    a tenant pair and can be PROVEN isolated instead of degrading to
+    integer/bigint tenant scoping ``pgrls generate`` emits — wrapped in
+    ``(SELECT …)`` for index caching, which the encoder unwraps) still
+    records a tenant pair and can be PROVEN isolated instead of degrading to
     UNVERIFIED. No effect on the anon/diff path (``session_mode`` False).
     """
     inner_raw = _anon_3vl(node.arg, ctx, auth_funcs, assertions)

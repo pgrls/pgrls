@@ -10,7 +10,14 @@ from click.testing import CliRunner
 from pglast import parse_sql
 
 from pgrls.cli import main
-from pgrls.diff._z3_compare import Z3_AVAILABLE
+from pgrls.diff._z3_compare import (
+    Z3_AVAILABLE,
+    _Context,
+    _DEFAULT_AUTH_FUNCTIONS,
+    _anon_3vl,
+    _distinct_tenant_pairs,
+    _lift_to_tv,
+)
 from pgrls.introspect import introspect
 from pgrls.model import Policy, Schema, Table
 from pgrls.verify import (
@@ -677,6 +684,32 @@ def test_int_session_cast_anon_path_unchanged() -> None:
     using = "tenant_id = current_setting('app.tenant_id', true)::bigint"
     schema = Schema(tables=(_table("t", policies=(_policy(using),)),))
     assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_int_session_cast_recall_is_non_vacuous() -> None:
+    # The recall must be REAL, not vacuous: an int/bigint-cast scoped policy is
+    # `isolated` because the predicate forces same-tenant, NOT because it admits
+    # zero rows. Pin (a) exactly one tenant pair is recorded — the cast keeps
+    # the session marker — and (b) the cross-tenant `is_true` is satisfiable in
+    # isolation: a session CAN see its OWN tenant's rows, so the session
+    # identity is a real, non-null value. A regression making the cast a
+    # NULL-flagged or opaque symbol would still report `isolated` (vacuously /
+    # UNVERIFIED) but fail here.
+    import z3  # noqa: PLC0415
+
+    node = _using_ast("tenant_id = current_setting('app.tenant_id', true)::bigint")
+    ctx = _Context()
+    ctx.session_mode = True
+    assertions: list[object] = []
+    tv = _lift_to_tv(_anon_3vl(node, ctx, set(_DEFAULT_AUTH_FUNCTIONS), assertions), assertions)
+    assert tv is not None
+    assert len(_distinct_tenant_pairs(ctx.tenant_pairs)) == 1  # the pair was recorded
+    solver = z3.Solver()
+    for a in assertions:
+        solver.add(a)
+    solver.add(tv.is_true)
+    assert solver.check() == z3.sat  # the session sees its own rows — not vacuous
 
 
 # --- cross-tenant renderers ------------------------------------------------

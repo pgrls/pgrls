@@ -16,8 +16,9 @@ breaking changes — they will be called out in this file.
 
 - `pgrls verify --mode cross-tenant` now proves isolation for **integer/bigint
   tenant keys** scoped by a sort-changing cast on the session identity —
-  `tenant_id = current_setting('app.tenant_id', true)::bigint` (the predicate
-  `pgrls generate` emits for an `int`/`bigint` tenant column). Such policies
+  `tenant_id = (SELECT current_setting('app.tenant_id', true)::bigint)` (the
+  predicate `pgrls generate` emits for an integer tenant column —
+  `smallint`/`int`/`bigint`/…). Such policies
   previously degraded to `UNVERIFIED` because the cast dropped the session
   marker in the Z3 encoder; they are now `PROVEN` (or `LEAK`, with a runnable
   `--emit-repro` reproduction that authenticates tenant A by setting the right
