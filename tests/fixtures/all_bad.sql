@@ -835,3 +835,18 @@ CREATE POLICY tenant_scope ON public.allbad_sec041
 CREATE TABLE public.allbad_sec041_p1 PARTITION OF public.allbad_sec041
     FOR VALUES IN (1);
 GRANT SELECT ON public.allbad_sec041_p1 TO allbad_sec041_role;
+
+-- SEC042: a SECURITY DEFINER function owned by the (superuser) test role,
+-- left at the default EXECUTE TO PUBLIC. An unauthenticated PostgREST caller
+-- can invoke it and run owner-privileged, RLS-exempt code. owner_bypasses_rls
+-- is true (the test role is a superuser) and execute_roles contains PUBLIC
+-- (the default), so SEC042 fires here. SEC014 also flags it (every SECDEF
+-- function) and SEC015 flags its inherited search_path, but neither is pinned
+-- to a location. The function body is trivial -- SEC042 flags the exposure,
+-- not the body. The DROP SCHEMA CASCADE in the test finally removes it.
+CREATE FUNCTION public.allbad_sec042_rpc() RETURNS int
+    LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+-- Revoke PUBLIC EXECUTE on the VIEW004 fixture function so SEC042 maps to a
+-- single location (allbad_sec042_rpc). VIEW004 / SEC014 / SEC015 still flag
+-- it -- they are static and do not depend on the EXECUTE grant.
+REVOKE EXECUTE ON FUNCTION public.allbad_view004_read() FROM PUBLIC;
