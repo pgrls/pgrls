@@ -170,6 +170,24 @@ def test_fires_on_write_only_grant() -> None:
     assert v.location == "public.events_t1"
 
 
+def test_fires_on_dormant_policy_child_under_rls_parent() -> None:
+    # A granted, RLS-off child that carries its OWN policies under an RLS
+    # parent is still bypassable: the policies are dormant while RLS is off,
+    # so the child returns every row. SEC032 cedes any child with an RLS
+    # ancestor, so SEC041 must own this (else it falls through BOTH rules).
+    # This is the more dangerous shape — the dormant policy makes the child
+    # look scoped in code review while enforcing nothing.
+    parent = _t("events", rls=True)
+    child = _t(
+        "events_t1",
+        rls=False,
+        partition_of=("public", "events"),
+        policies=(_bare_policy(),),
+    )
+    [v] = _check(parent, child)
+    assert v.location == "public.events_t1"
+
+
 def test_message_carries_all_three_remediations() -> None:
     parent = _t("events", rls=True)
     child = _t("events_t1", rls=False, partition_of=("public", "events"))
@@ -243,8 +261,12 @@ def test_silent_when_no_ancestor_has_rls() -> None:
     assert _check(parent, child) == []
 
 
-def test_silent_when_child_has_own_policies_ceded_to_sec032() -> None:
-    parent = _t("events", rls=True)
+def test_silent_on_dormant_policy_child_without_rls_ancestor() -> None:
+    # RLS-off child with its OWN dormant policies but NO RLS ancestor: SEC032
+    # owns this (the policy-bearing complement of SEC001). SEC041 cedes —
+    # there is nothing upstream to bypass. This is the ONLY case SEC041 cedes
+    # to SEC032, and it is where SEC032 actually fires.
+    parent = _t("events", rls=False)
     child = _t(
         "events_t1",
         rls=False,

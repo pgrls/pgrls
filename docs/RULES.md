@@ -2710,14 +2710,18 @@ are reachable by name — notably PostgREST/Supabase (`GET /events_t1` for any
 granted child in the exposed schema) and ORMs or jobs that target a partition
 directly.
 
-**Relationship to [SEC001](#rule-sec001).** SEC001 ("RLS not enabled")
-deliberately *skips* a partition child when an ancestor has RLS — it avoids a
-false "enable RLS" error on the common parent-only pattern and documents the
-direct-access caveat. SEC041 promotes that caveat to a checkable finding. The
-two are mutually exclusive on a partition child: SEC001 fires when **no**
-ancestor has RLS, SEC041 when **an** ancestor does. A child that is RLS-off
-but carries its own (dormant) policies is ceded to [SEC032](#rule-sec032),
-exactly as SEC001 cedes it.
+**Relationship to [SEC001](#rule-sec001) and [SEC032](#rule-sec032).** Both
+SEC001 ("RLS not enabled") and SEC032 ("policies but RLS not enabled")
+deliberately *skip* a partition child when an ancestor has RLS — they avoid a
+false "enable RLS" finding on the common parent-only pattern and document the
+direct-access caveat. SEC041 promotes that caveat to a checkable finding,
+including for a child that carries its own **dormant** policies: SEC032 skips
+it (RLS ancestor) and SEC001 skips it (it has policies), so without SEC041
+such a child would fall through *both* — yet while RLS is off those policies
+enforce nothing and the granted child is fully bypassable. SEC041 fires on it
+and cedes to SEC032 only when there is **no** RLS ancestor (where SEC032
+actually fires). The three are mutually exclusive on any partition child:
+SEC041 fires iff an ancestor has RLS, SEC001/SEC032 iff none does.
 
 **Why the direct grant matters.** A privilege grant on the partitioned
 parent does **not** cascade to a child for direct access (Postgres does not

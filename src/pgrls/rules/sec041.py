@@ -27,21 +27,28 @@ name — notably PostgREST/Supabase, which expose every granted table in the
 schema (`GET /events_t1`), and ORMs or jobs that target a partition
 directly.
 
-**Relationship to SEC001.** SEC001 ("RLS not enabled") deliberately
-*skips* a partition child when any ancestor has RLS enabled — it assumes
-the parent covers query-through-parent access and avoids a false "enable
-RLS" error on the common parent-only pattern. SEC041 covers the other half
-of that caveat: the child is still directly bypassable. The two are
-mutually exclusive on a partition child — SEC001 fires when **no** ancestor
-has RLS, SEC041 when **an** ancestor does — so they never double-report. A
-child that has RLS off but carries its own (dormant) policies is ceded to
-SEC032, exactly as SEC001 cedes it.
+**Relationship to SEC001 and SEC032.** Both SEC001 ("RLS not enabled") and
+SEC032 ("policies but RLS not enabled") deliberately *skip* a partition child
+when any ancestor has RLS enabled — they assume the parent covers
+query-through-parent access and avoid a false "enable RLS" finding on the
+common parent-only pattern. SEC041 covers the other half of that caveat: the
+child is still directly bypassable. Crucially, this includes a child that
+carries its **own dormant policies** — SEC032 skips it (it has an RLS
+ancestor) and SEC001 skips it (it has policies), so without SEC041 such a
+child would fall through *both*, even though the dormant policies enforce
+nothing while RLS is off. SEC041 therefore fires on it too, and cedes to
+SEC032 only when there is **no** RLS ancestor (where SEC032 actually fires).
+The three rules are mutually exclusive on any given partition child: SEC041
+fires iff an ancestor has RLS; SEC001/SEC032 fire iff none does — so they
+never double-report.
 
-SEC041 fires when a table has RLS **disabled**, has **no** policies of its
-own, has an ancestor in its `partition_of` chain with RLS **enabled**, and
-carries a direct **row-access grant** to a non-owner role — a table-level or
-column-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` (a `GRANT SELECT (col)` on
-the child is enough to read the whole partition by name). That grant is what
+SEC041 fires when a table has RLS **disabled**, has an ancestor in its
+`partition_of` chain with RLS **enabled**, and carries a direct **row-access
+grant** to a non-owner role — a table-level or column-level
+`SELECT`/`INSERT`/`UPDATE`/`DELETE` (a `GRANT SELECT (col)` on the child is
+enough to read the whole partition by name). It fires **regardless of whether
+the child carries its own policies**: those policies are dormant while RLS is
+disabled, so the child still returns every row. That grant is what
 makes the bypass *reachable*: a privilege grant on the partitioned parent
 does **not** cascade to a child for direct access (Postgres does not inherit
 privileges to partitions — a parent-granted role gets "permission denied" on
@@ -125,12 +132,6 @@ class SEC041:
         for table in schema.tables:
             if table.rls_enabled:
                 continue
-            if table.policies:
-                # RLS off but the child carries its own policies → dormant
-                # policies, SEC032's higher-confidence finding. Cede it so
-                # the two don't double-fire (mirrors SEC001's SEC032 cede);
-                # SEC032's "enable RLS" remedy closes the bypass anyway.
-                continue
             if not _is_directly_reachable(table):
                 # The child is not directly reachable by a row-access query.
                 # A grant on the PARTITIONED PARENT does NOT cascade to a child
@@ -151,10 +152,21 @@ class SEC041:
                 None,
             )
             if rls_ancestor is None:
-                # No RLS-enforcing ancestor: either a standalone table or a
-                # partition whose chain has no RLS anywhere — SEC001's case,
-                # not SEC041's.
+                # No RLS-enforcing ancestor: nothing upstream to bypass. A
+                # child with no policies is SEC001's case; one with dormant
+                # policies is SEC032's. Either way it is not a partition-RLS
+                # bypass, so SEC041 cedes. (This is the ONLY case SEC041 cedes
+                # to SEC032 — note SEC032 itself fires only when there is no
+                # RLS ancestor, so a policy-bearing child WITH an RLS ancestor,
+                # handled below, would otherwise fall through both rules.)
                 continue
+            # rls_ancestor is not None → the child is directly bypassable. This
+            # holds even if the child carries its OWN policies: they are
+            # dormant while RLS is disabled (RLS off ⇒ no policy is enforced),
+            # so the child still returns every row, and SEC032 cedes it (it
+            # cedes any child with an RLS ancestor). SEC041 therefore owns this
+            # case rather than ceding it — the more dangerous shape, since a
+            # dormant child policy makes the table *look* scoped in review.
             out.append(
                 Violation(
                     rule_id=self.id,
@@ -169,11 +181,13 @@ class SEC041:
                         f"query that names {table.qualified_name} directly "
                         "(e.g. a PostgREST request on it, or a direct SELECT) "
                         f"bypasses {rls_ancestor.qualified_name}'s policies "
-                        "and returns every row. Enable RLS and add a policy "
-                        f"on {table.qualified_name} (usually the parent's), "
-                        "revoke the direct (table- or column-level) grant so "
-                        "it is reached only through the parent, or allowlist "
-                        "it in [lint.rules.SEC041]."
+                        "and returns every row. Enable RLS on "
+                        f"{table.qualified_name} (adding a scoping policy, "
+                        "usually the parent's, if it has none — any policy it "
+                        "already carries is dormant while RLS is off), revoke "
+                        "the direct (table- or column-level) grant so it is "
+                        "reached only through the parent, or allowlist it in "
+                        "[lint.rules.SEC041]."
                     ),
                     location=table.qualified_name,
                 )

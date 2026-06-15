@@ -48,3 +48,15 @@ GRANT SELECT ON app.uc92_events_t2 TO app_authenticated;
 CREATE TABLE app.uc92_events_t3 PARTITION OF app.uc92_events
     FOR VALUES IN (3);
 GRANT SELECT (body) ON app.uc92_events_t3 TO app_authenticated;
+
+-- A fourth child that carries its OWN policy but leaves RLS disabled. The
+-- policy is dormant (Postgres enforces nothing while RLS is off), so a direct
+-- query still bypasses the parent. SEC032 cedes any child with an RLS
+-- ancestor, so SEC041 owns this -- the most dangerous shape, since the dormant
+-- policy makes the child look scoped in code review while enforcing nothing.
+CREATE TABLE app.uc92_events_t4 PARTITION OF app.uc92_events
+    FOR VALUES IN (4);
+GRANT SELECT ON app.uc92_events_t4 TO app_authenticated;
+CREATE POLICY uc92_tenant_t4 ON app.uc92_events_t4
+    FOR ALL TO app_authenticated
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::bigint));

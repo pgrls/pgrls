@@ -21,3 +21,11 @@ def test_uc92_column_granted_child_fires_sec041(lint_output: str) -> None:
     # the whole partition by name, so SEC041 fires on the live introspected
     # child — pinning the column-grant reachability path end-to-end.
     assert "SEC041  app.uc92_events_t3\n" in lint_output
+
+
+def test_uc92_dormant_policy_child_fires_sec041(lint_output: str) -> None:
+    # This child carries its OWN policy but never enables RLS — the policy is
+    # dormant, so a direct query still bypasses the parent. SEC032 cedes any
+    # child with an RLS ancestor, so SEC041 must own this case (else it falls
+    # through both rules). Pins the dormant-policy interaction live.
+    assert "SEC041  app.uc92_events_t4\n" in lint_output

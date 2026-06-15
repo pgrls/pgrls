@@ -24,13 +24,16 @@ breaking changes — they will be called out in this file.
   grant is what makes the bypass reachable: an un-granted child can only be
   reached *through* the parent (a parent grant does not cascade), where the
   parent's RLS applies — which is also why `pgrls generate` lints clean. It is
-  the complement of SEC001, which deliberately *skips* a parent-covered
-  partition child (to avoid a false "enable RLS" error on the common
-  parent-only pattern) and documents the direct-access caveat; SEC041 promotes
-  that caveat to a checkable finding. The two are mutually exclusive (SEC001
-  fires when no ancestor has RLS, SEC041 when an ancestor does); a child with
-  its own dormant policies is ceded to SEC032. Configurable via
-  `[lint.rules.SEC041].allowlist` for children never reached directly.
+  the complement of SEC001/SEC032, which deliberately *skip* a parent-covered
+  partition child (to avoid a false "enable RLS" finding on the common
+  parent-only pattern) and document the direct-access caveat; SEC041 promotes
+  that caveat to a checkable finding — including a child carrying its own
+  **dormant** policies, which SEC032 also skips (RLS ancestor) and SEC001
+  skips (it has policies), so without SEC041 it would fall through both even
+  though the dormant policies enforce nothing. The three are mutually
+  exclusive (SEC041 fires iff an ancestor has RLS; SEC001/SEC032 iff none
+  does). Configurable via `[lint.rules.SEC041].allowlist` for children never
+  reached directly.
   Catalog is now **54 rules**. No auto-fix — the right policy is the
   application's own scoping predicate (usually the parent's).
 
