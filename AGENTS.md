@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **fifty-three rules across four
+In the current release it ships **fifty-four rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -80,6 +80,11 @@ column at all — a FOR ALL insert is governed by WITH CHECK alone, so a
 caller can INSERT a row stamped with another tenant's id; bare FOR
 UPDATE is excluded as Postgres re-checks the new row, and the "read
 team, write own" asymmetry is not flagged),
+`SEC041` (declarative partition child has RLS disabled while its
+partitioned parent enforces it, and is granted directly to a non-owner
+role — Postgres inherits neither RLS nor grants to partitions, so a query
+naming the granted child directly bypasses the parent's policies; the
+complement of SEC001, which cedes this case),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -872,7 +877,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Fifty-three rules across four categories.** SEC001–SEC040,
+- **Fifty-four rules across four categories.** SEC001–SEC041,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

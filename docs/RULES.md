@@ -2677,6 +2677,80 @@ ownership equality — the one `USING` already carries — but transplanting a
 `USING` sub-expression into `WITH CHECK` across casts and boolean structure
 needs a human eye, so SEC040 reports rather than edits.
 
+<a id="rule-sec041"></a>
+
+## SEC041 — Partition child bypasses the partitioned parent's RLS
+
+**Severity:** warning.
+
+**What it catches:** a declarative partition **child** whose row-level
+security is **disabled** while an ancestor in its partition chain has RLS
+**enabled**, *and* which is **granted directly to a non-owner role** (so it can
+be queried by name). Postgres does not propagate `relrowsecurity` from a
+partitioned parent to its children — it is per-table. Queries routed *through
+the parent* apply the parent's policies, but a query that names a granted
+partition child **directly** is governed by the child's own RLS; with none, it
+returns every row, bypassing the parent.
+
+```sql
+CREATE TABLE events (tenant_id int, body text) PARTITION BY LIST (tenant_id);
+CREATE TABLE events_t1 PARTITION OF events FOR VALUES IN (1);   -- no RLS!
+ALTER TABLE events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE events FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant ON events
+    USING (tenant_id = current_setting('app.tenant_id', true)::int);
+
+-- as tenant 2:
+SELECT * FROM events;       -- only tenant 2's rows (parent RLS applies)
+SELECT * FROM events_t1;    -- ALL of tenant 1's rows — RLS bypassed
+```
+
+This is verified Postgres behaviour. It matters wherever partition children
+are reachable by name — notably PostgREST/Supabase (`GET /events_t1` for any
+granted child in the exposed schema) and ORMs or jobs that target a partition
+directly.
+
+**Relationship to [SEC001](#rule-sec001) and [SEC032](#rule-sec032).** Both
+SEC001 ("RLS not enabled") and SEC032 ("policies but RLS not enabled")
+deliberately *skip* a partition child when an ancestor has RLS — they avoid a
+false "enable RLS" finding on the common parent-only pattern and document the
+direct-access caveat. SEC041 promotes that caveat to a checkable finding,
+including for a child that carries its own **dormant** policies: SEC032 skips
+it (RLS ancestor) and SEC001 skips it (it has policies), so without SEC041
+such a child would fall through *both* — yet while RLS is off those policies
+enforce nothing and the granted child is fully bypassable. SEC041 fires on it
+and cedes to SEC032 only when there is **no** RLS ancestor (where SEC032
+actually fires). The three are mutually exclusive on any partition child:
+SEC041 fires iff an ancestor has RLS, SEC001/SEC032 iff none does.
+
+**Why the direct grant matters.** A privilege grant on the partitioned
+parent does **not** cascade to a child for direct access (Postgres does not
+inherit privileges to partitions — a parent-granted role gets "permission
+denied" on the child). So an un-granted child can only be reached *through*
+the parent, where the parent's RLS applies — no bypass. SEC041 therefore
+fires only when the child carries its own **row-access** grant — a table- or
+column-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` to a non-owner role (a
+`GRANT SELECT (col)` is enough to read the whole partition by name; a grant
+of only `REFERENCES`/`TRIGGER`/`TRUNCATE` is not row access and does not
+count). This is also why `pgrls generate` lints clean: it secures the parent
+and does not grant the children.
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC041]
+# Children only ever reached through the parent (never named directly) — the
+# bypass is unreachable, so silence them.
+allowlist = ["public.events_t1", "public.events_t2"]
+```
+
+**Severity: warning** — like the other "RLS can be bypassed via X" rules
+(SEC013, SEC014/SEC016, SEC025). The direct grant proves the child is
+reachable by name; whether the application actually issues such a query is
+its own behaviour, so SEC041 warns rather than errors. No auto-fix: enable
+RLS and add a policy on the child (usually the parent's own scoping
+predicate), which pgrls does not synthesize.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING
