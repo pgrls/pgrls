@@ -5,10 +5,11 @@
 -- row-level security to partitions, so a query that names the child
 -- directly (a PostgREST request on it, or a direct SELECT) bypasses
 -- the parent's policy and returns every row. SEC041 fires on the
--- RLS-off child. A sibling child that enables RLS (with its own
--- policy) stays SILENT — the rule's boundary, pinned through live
--- introspection. SEC001 cedes both children because the parent has
--- RLS, so SEC041 is the only rule that surfaces the bypass.
+-- RLS-off child (whether reached via a table grant or a column-level
+-- grant). A sibling child that enables RLS (with its own policy) stays
+-- SILENT — the rule's boundary, pinned through live introspection.
+-- SEC001 cedes every child because the parent has RLS, so SEC041 is the
+-- only rule that surfaces the bypass.
 -- ============================================================
 
 CREATE TABLE app.uc92_events (
@@ -39,3 +40,11 @@ CREATE POLICY uc92_tenant_t2 ON app.uc92_events_t2
 -- Granted directly like t1, but its own RLS is enabled — so SEC041 stays
 -- silent here (the silence is the RLS, not the absence of a grant).
 GRANT SELECT ON app.uc92_events_t2 TO app_authenticated;
+
+-- A third child reachable only through a COLUMN-level grant (no table-level
+-- grant at all). A GRANT SELECT(body) still lets a direct query read the
+-- whole partition by name, so SEC041 fires here too -- table grants are not
+-- the only reachability path.
+CREATE TABLE app.uc92_events_t3 PARTITION OF app.uc92_events
+    FOR VALUES IN (3);
+GRANT SELECT (body) ON app.uc92_events_t3 TO app_authenticated;

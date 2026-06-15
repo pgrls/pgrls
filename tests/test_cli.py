@@ -2033,6 +2033,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "DROP ROLE IF EXISTS allbad_sec029_member; "
             "DROP ROLE IF EXISTS allbad_sec016_role; "
             "DROP ROLE IF EXISTS allbad_sec040_role; "
+            "DROP ROLE IF EXISTS allbad_sec041_role; "
             "DROP ROLE IF EXISTS anon"
         )
 

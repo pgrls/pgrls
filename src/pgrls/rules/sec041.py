@@ -39,15 +39,19 @@ SEC032, exactly as SEC001 cedes it.
 
 SEC041 fires when a table has RLS **disabled**, has **no** policies of its
 own, has an ancestor in its `partition_of` chain with RLS **enabled**, and
-is **directly granted** to a non-owner role. The last condition is what
+carries a direct **row-access grant** to a non-owner role — a table-level or
+column-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` (a `GRANT SELECT (col)` on
+the child is enough to read the whole partition by name). That grant is what
 makes the bypass *reachable*: a privilege grant on the partitioned parent
-does **not** cascade to a child for direct access (verified — `SELECT FROM
-child` as a parent-granted role is "permission denied"), so a child with no
-grant of its own can only be reached *through* the parent, where the
-parent's RLS applies. This is also why `pgrls generate` lints clean: it
-secures the parent and does not grant the children, so they are not
-directly reachable. (The introspector excludes the owner's own ACL row, so
-any captured grant is a real non-owner grant.)
+does **not** cascade to a child for direct access (Postgres does not inherit
+privileges to partitions — a parent-granted role gets "permission denied" on
+the child), so a child with no grant of its own can only be reached *through*
+the parent, where the parent's RLS applies. A grant of only a non-row-access
+privilege (`REFERENCES`/`TRIGGER`/`TRUNCATE`) does not count — it neither
+reads nor writes rows. This is also why `pgrls generate` lints clean: it
+secures the parent and does not grant the children, so they are not directly
+reachable. (The introspector excludes the owner's own ACL row, so any
+captured grant is a real non-owner grant.)
 
 Remediate by enabling RLS and adding a policy on the child
 (`ALTER TABLE <child> ENABLE ROW LEVEL SECURITY` + `CREATE POLICY … ON
@@ -70,9 +74,44 @@ from __future__ import annotations
 
 from typing import Any
 
-from pgrls.model import Schema
+from pgrls.model import Schema, Table
 from pgrls.rules._allowlist import parse_table_ref_allowlist, table_in_allowlist
 from pgrls.violations import Severity, Violation
+
+# RLS governs only these commands, so a grant of one of them on the child is
+# what makes the partition's missing RLS *exploitable* by a direct query: a
+# SELECT leaks rows, and INSERT/UPDATE/DELETE skip the parent's WITH CHECK /
+# USING. A grant of only REFERENCES / TRIGGER / TRUNCATE / MAINTAIN neither
+# reads nor writes row contents, so it is not a bypass (a REFERENCES grantee
+# is still "permission denied" on a plain SELECT). DELETE/TRUNCATE/TRIGGER are
+# table-only; column grants only ever carry SELECT/INSERT/UPDATE/REFERENCES.
+_ROW_ACCESS_PRIVILEGES: frozenset[str] = frozenset(
+    {"SELECT", "INSERT", "UPDATE", "DELETE"}
+)
+
+
+def _is_directly_reachable(table: Table) -> bool:
+    """True if a non-owner role can name ``table`` in a row-access query.
+
+    Reachability comes from a direct grant of a row-access privilege — either
+    table-level (``pg_class.relacl`` → ``Table.grants``) or column-level
+    (``pg_attribute.attacl`` → ``Table.column_grants``; a ``GRANT SELECT (col)``
+    is enough to read the whole partition by name). A grant on the partitioned
+    *parent* does not cascade to a child for direct access, so only the child's
+    own grants count. The introspector already excludes the owner's own ACL
+    row, so any captured grant is a real non-owner grant.
+    """
+    if any(
+        p.upper() in _ROW_ACCESS_PRIVILEGES
+        for grant in table.grants
+        for p in grant.privileges
+    ):
+        return True
+    return any(
+        p.upper() in _ROW_ACCESS_PRIVILEGES
+        for cgrant in table.column_grants
+        for p in cgrant.privileges
+    )
 
 
 class SEC041:
@@ -92,17 +131,18 @@ class SEC041:
                 # the two don't double-fire (mirrors SEC001's SEC032 cede);
                 # SEC032's "enable RLS" remedy closes the bypass anyway.
                 continue
-            if not table.grants:
-                # The child is not directly reachable: a grant on the
-                # PARTITIONED PARENT does NOT cascade to a child for direct
-                # access (verified — `SELECT FROM child` as a parent-granted
-                # role is "permission denied"; a child's `relacl` stays NULL).
-                # With no direct grant, the only access path is *through* the
-                # parent, which applies the parent's RLS — so there is no
+            if not _is_directly_reachable(table):
+                # The child is not directly reachable by a row-access query.
+                # A grant on the PARTITIONED PARENT does NOT cascade to a child
+                # for direct access (Postgres does not inherit privileges to
+                # partitions — a parent-granted role gets "permission denied"
+                # on the child), and a child granted only a non-row-access
+                # privilege (REFERENCES/TRIGGER/TRUNCATE) cannot read or write
+                # its rows. With no row-access grant the only path is *through*
+                # the parent, which applies the parent's RLS — so there is no
                 # bypass to flag. This is also why `pgrls generate`, which
                 # secures the parent and does not grant the children, lints
-                # clean. (The introspector already excludes the owner's own
-                # ACL row, so any entry here is a real non-owner grant.)
+                # clean.
                 continue
             if table_in_allowlist(table, allowlist):
                 continue
@@ -131,8 +171,9 @@ class SEC041:
                         f"bypasses {rls_ancestor.qualified_name}'s policies "
                         "and returns every row. Enable RLS and add a policy "
                         f"on {table.qualified_name} (usually the parent's), "
-                        "revoke the direct grant so it is reached only through "
-                        "the parent, or allowlist it in [lint.rules.SEC041]."
+                        "revoke the direct (table- or column-level) grant so "
+                        "it is reached only through the parent, or allowlist "
+                        "it in [lint.rules.SEC041]."
                     ),
                     location=table.qualified_name,
                 )

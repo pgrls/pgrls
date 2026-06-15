@@ -2720,12 +2720,16 @@ but carries its own (dormant) policies is ceded to [SEC032](#rule-sec032),
 exactly as SEC001 cedes it.
 
 **Why the direct grant matters.** A privilege grant on the partitioned
-parent does **not** cascade to a child for direct access (verified — `SELECT
-FROM child` as a parent-granted role is "permission denied"). So an
-un-granted child can only be reached *through* the parent, where the parent's
-RLS applies — no bypass. SEC041 therefore fires only when the child has its
-own grant to a non-owner role. This is also why `pgrls generate` lints clean:
-it secures the parent and does not grant the children.
+parent does **not** cascade to a child for direct access (Postgres does not
+inherit privileges to partitions — a parent-granted role gets "permission
+denied" on the child). So an un-granted child can only be reached *through*
+the parent, where the parent's RLS applies — no bypass. SEC041 therefore
+fires only when the child carries its own **row-access** grant — a table- or
+column-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` to a non-owner role (a
+`GRANT SELECT (col)` is enough to read the whole partition by name; a grant
+of only `REFERENCES`/`TRIGGER`/`TRUNCATE` is not row access and does not
+count). This is also why `pgrls generate` lints clean: it secures the parent
+and does not grant the children.
 
 **Configuration.**
 
