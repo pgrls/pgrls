@@ -14,26 +14,29 @@ breaking changes — they will be called out in this file.
 
 ### Added
 
-- **SEC040** (warning) — a permissive `UPDATE`/`ALL` policy whose `USING`
-  scopes rows by a tenant/owner discriminator equality (`col = <auth value>`)
-  but whose **explicit** `WITH CHECK` binds **no** identity/discriminator
-  column at all (it validates only non-identity columns like `status`).
-  Because an explicit `WITH CHECK` replaces the implicit reuse of `USING`, the
-  write side carries no ownership binding: a caller can write a row with any
-  tenant/owner — `UPDATE` an existing row to change the discriminator and
-  migrate it out of scope, and on `FOR ALL` `INSERT` a row stamped for another
-  tenant. It is the asymmetry the other write-side rules miss — SEC006 fires on
-  an *absent* `WITH CHECK` (there `USING` is reused, preserving the scope), and
-  SEC028 / SEC020 fire on a *constant-true* one (SEC040 cedes constant-
-  `true`/`false` checks to them). The common, legitimate "read your team
-  (`USING team_id = …`), write your own (`WITH CHECK user_id = …`)" asymmetry —
-  where the write side binds a *different* identity column — is **not** flagged.
-  Detection reuses SEC030's scoping-equality extraction over `USING` and
-  `WITH CHECK` separately: it fires when `USING` yields a scope and `WITH CHECK`
-  yields none. Configurable via `[lint.rules.SEC040]` (`auth_functions`,
-  `identity_columns`, `allowlist`). Catalog is now **53 rules**. No auto-fix —
-  the correct re-assertion is the application's own tenant/ownership equality,
-  whose transplant into `WITH CHECK` needs a human eye.
+- **SEC040** (warning) — a permissive `FOR ALL` policy whose `USING` scopes
+  rows by a tenant/owner discriminator equality (`col = <auth value>`) but
+  whose **explicit** `WITH CHECK` binds **no** identity/discriminator column at
+  all (it validates only non-identity columns like `status`). An explicit
+  `WITH CHECK` replaces the implicit reuse of `USING`, so the write side
+  carries no ownership binding. The reliable consequence is on **INSERT**: a
+  `FOR ALL` insert is governed by `WITH CHECK` alone, so a caller can `INSERT`
+  a row **stamped with another tenant's id** — a cross-tenant write (a
+  column-free blind `UPDATE` migrates an existing row too). Bare `FOR UPDATE`
+  is intentionally **not** flagged: Postgres re-checks the new row against the
+  SELECT-applicable `USING` on any column-reading update (every PostgREST/ORM
+  update), so UPDATE row-migration is blocked in practice. It is the asymmetry
+  the other write-side rules miss — SEC006 fires on an *absent* `WITH CHECK`
+  (there `USING` is reused), and SEC028 / SEC020 on a *constant-true* one
+  (SEC040 cedes constant-`true`/`false` to them). The common, legitimate "read
+  your team (`USING team_id = …`), write your own (`WITH CHECK user_id = …`)"
+  asymmetry — where the write side binds a *different* identity column — is
+  **not** flagged. Detection reuses SEC030's scoping-equality extraction
+  (recognizing `=`, `IS NOT DISTINCT FROM`, and `= ANY` membership as
+  bindings) over `USING` and `WITH CHECK` separately: it fires when `USING`
+  yields a scope and `WITH CHECK` yields none. Configurable via
+  `[lint.rules.SEC040]` (`auth_functions`, `identity_columns`, `allowlist`).
+  Catalog is now **53 rules**. No auto-fix.
 
 ## [0.26.0] - 2026-06-10
 

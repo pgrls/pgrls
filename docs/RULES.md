@@ -2564,22 +2564,22 @@ genuinely public-write table. The choice isn't mechanical.
 
 **Severity:** warning.
 
-**What it catches:** a PERMISSIVE `UPDATE` or `ALL` policy whose `USING`
-clause scopes rows by a tenant/owner discriminator equality
-(`col = <auth value>`) but whose **explicit** `WITH CHECK` clause binds **no**
-tenant/owner column at all — it validates only non-identity columns like
-`status`. `USING` controls which existing rows the caller may read and update;
-`WITH CHECK` validates the *new* row image on write. Postgres treats the two
-independently — an explicit `WITH CHECK` **replaces** the implicit reuse of
-`USING` an omitted clause would get — so when the write side carries no
-ownership binding, a caller can `UPDATE` a row to change the discriminator and
-move it out of their tenant/owner scope (a cross-scope row migration). On a
-`FOR ALL` policy the same gap also lets an `INSERT` stamp a row with another
-tenant's id.
+**What it catches:** a PERMISSIVE `FOR ALL` policy whose `USING` clause scopes
+rows by a tenant/owner discriminator equality (`col = <auth value>`) but whose
+**explicit** `WITH CHECK` clause binds **no** tenant/owner column at all — it
+validates only non-identity columns like `status`. `USING` proves the table is
+tenant-scoped on the read side; `WITH CHECK` validates the *new* row image on
+write, and an explicit clause **replaces** the implicit reuse of `USING` an
+omitted clause would get. The reliable consequence is on **INSERT**: a `FOR
+ALL` insert is governed by `WITH CHECK` alone (no prior row, `USING` does not
+apply to inserts), so a caller can `INSERT` a row **stamped with another
+tenant's id** — a cross-tenant write. (A column-free blind `UPDATE … SET
+tenant_id = <other>` migrates an existing row too.)
 
 ```sql
 -- Fires: USING scopes by tenant_id, but WITH CHECK only validates status —
--- so `UPDATE documents SET tenant_id = <other tenant>` is accepted.
+-- so `INSERT INTO documents(tenant_id, status) VALUES (<other tenant>, 'draft')`
+-- is accepted (WITH CHECK alone governs the insert).
 CREATE POLICY tenant_rw ON public.documents
     FOR ALL TO authenticated
     USING      (tenant_id = current_setting('app.tenant_id', true)::int)
@@ -2592,6 +2592,15 @@ CREATE POLICY tenant_rw ON public.documents
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::int
                 AND status IN ('draft', 'published'));
 ```
+
+**Why `FOR ALL` and not bare `FOR UPDATE`.** On `UPDATE`, Postgres re-checks
+the *new* row against the SELECT-applicable `USING` whenever the statement
+reads a column — which every `WHERE`/`RETURNING` update does (i.e. every
+PostgREST/ORM update) — so UPDATE row-migration is blocked in practice. The
+durable hole is the INSERT path, which only a `FOR ALL` (or `FOR INSERT`)
+policy carries. SEC040 therefore targets `FOR ALL`, where the `USING` scope
+also proves the table is tenant-scoped on the read side; a bare `FOR UPDATE`
+policy is not flagged.
 
 **Not flagged — the asymmetric "read team, write own" pattern.** When
 `WITH CHECK` binds a *different* identity column than `USING` scopes by — read
@@ -2628,9 +2637,11 @@ write, so it is skipped too). SEC040 covers the subtler shape they all miss: a
 *real* `WITH CHECK` predicate that simply forgot the tenant key.
 
 **Why it matters.** This is the classic multi-tenant write-escape: reads are
-correctly isolated, but the write side lets a row be re-parented to another
-tenant. It is the lint-side companion to `pgrls verify --mode cross-tenant`,
-which *proves* read isolation; SEC040 is a heuristic catch on the write side.
+correctly isolated, but the write side lets a caller create a row belonging to
+another tenant (an INSERT stamps another tenant's id; a column-free UPDATE
+re-parents an existing one). It is the lint-side companion to `pgrls verify
+--mode cross-tenant`, which *proves* read isolation; SEC040 is a heuristic
+catch on the write side.
 
 **Configuration.**
 
@@ -2644,17 +2655,18 @@ auth_functions = ["auth.uid", "current_setting", "request.jwt.claim"]
 # identity set (tenant_id, user_id, org_id, …).
 identity_columns = ["tenant_id", "workspace", "region"]
 
-# Per-policy escape hatch: the discriminator is immutable (a BEFORE UPDATE
-# trigger or generated column enforces it) or a restrictive floor covers the
-# write side.
+# Per-policy escape hatch: the discriminator is set by a trigger or
+# generated column (so the caller can't stamp it), it is pinned via a form
+# the extraction doesn't unwrap (e.g. COALESCE), or a restrictive floor
+# covers the write side.
 allowlist = ["public.documents.tenant_rw"]
 ```
 
 **Known limitation.** SEC040 reasons about a single policy. If a sibling
 RESTRICTIVE policy re-imposes the tenant predicate in its own `WITH CHECK`, the
-migration is in practice blocked even though the permissive policy dropped the
-scope — SEC040 still flags the permissive policy (re-asserting the scope where
-the read-side lives is the clearer fix). Allowlist such a case.
+cross-tenant write is in practice blocked even though the permissive policy
+dropped the scope — SEC040 still flags the permissive policy (re-asserting the
+scope where the read-side lives is the clearer fix). Allowlist such a case.
 
 **No auto-fix.** The correct re-assertion is the application's own tenant /
 ownership equality — the one `USING` already carries — but transplanting a

@@ -3,14 +3,14 @@
 -- A permissive FOR ALL policy whose USING scopes rows by the tenant
 -- key, but whose EXPLICIT WITH CHECK validates only a non-tenant
 -- column. Because an explicit WITH CHECK replaces the implicit reuse
--- of USING, the write side drops the tenant scope: a caller can
--- UPDATE a row to change tenant_id and migrate it to another tenant
--- (and, on FOR ALL, INSERT a row stamped for another tenant). SEC040
--- fires on it (warning). The sibling table re-asserts the tenant
--- scope in its WITH CHECK, so SEC040 stays SILENT there — the rule's
--- defining boundary, pinned through live introspection. SEC006 (absent
--- WITH CHECK) and SEC028 (constant-true WITH CHECK) do not fire on
--- either: the clause is present and a real predicate.
+-- of USING, the write side drops the tenant scope. A FOR ALL insert is
+-- governed by WITH CHECK alone, so a caller can INSERT a row stamped
+-- with another tenant's id (a cross-tenant write). SEC040 fires on it
+-- (warning). The sibling table re-asserts the tenant scope in its WITH
+-- CHECK, so SEC040 stays SILENT there — the rule's defining boundary,
+-- pinned through live introspection. SEC006 (absent WITH CHECK) and
+-- SEC028 (constant-true WITH CHECK) do not fire on either: the clause
+-- is present and a real predicate.
 -- ============================================================
 
 -- The bug: USING scopes by tenant_id, WITH CHECK only checks status.

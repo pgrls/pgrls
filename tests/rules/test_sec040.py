@@ -1,13 +1,16 @@
-"""Unit tests for SEC040 — write-side WITH CHECK drops USING's row scope.
+"""Unit tests for SEC040 — FOR ALL WITH CHECK drops USING's row scope.
 
-SEC040 (warning) fires when a permissive UPDATE/ALL policy has a USING
-that scopes by a discriminator equality `col = <auth value>` and an
-explicit, non-constant WITH CHECK that does NOT re-assert that same
-`col` — so a caller can UPDATE a row to change `col`, migrating it out
-of their tenant/owner scope. It is the asymmetry SEC006 (absent WITH
-CHECK), SEC028/SEC020 (constant-true WITH CHECK) miss. Detection reuses
-SEC030's `_scoping_columns` over USING and WITH CHECK separately; the
-finding is `using_scope - check_scope`.
+SEC040 (warning) fires when a permissive FOR ALL policy has a USING that
+scopes by a discriminator equality `col = <auth value>` and an explicit,
+non-constant WITH CHECK that binds NO identity column to an auth value.
+A FOR ALL insert is governed by WITH CHECK alone, so a caller can INSERT a
+row stamped with another tenant's `col` (a column-free UPDATE migrates one
+too). Bare FOR UPDATE is excluded — Postgres re-checks the new row against
+the SELECT-applicable USING on any column-reading update, so migration is
+blocked in practice. It is the asymmetry SEC006 (absent WITH CHECK) and
+SEC028/SEC020 (constant-true WITH CHECK) miss. Detection reuses SEC030's
+`_scoping_columns(..., broaden_equality=True)` over USING and WITH CHECK
+separately: it fires when USING yields a scope and WITH CHECK yields none.
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ _AUTH = "current_setting('app.tenant_id', true)::int"
 def _policy(
     *,
     name: str = "tenant_rw",
-    command: str = "UPDATE",
+    command: str = "ALL",
     permissive: bool = True,
     roles: tuple[str, ...] = ("authenticated",),
     using: str | None = None,
@@ -75,17 +78,14 @@ def test_fires_when_with_check_drops_the_tenant_scope() -> None:
     assert v.location == "public.documents.tenant_rw"
     assert "'tenant_id'" in v.message
     assert "WITH CHECK" in v.message
-    assert "migration" in v.message.lower()
+    assert "cross-tenant" in v.message.lower()
 
 
-def test_fires_on_for_all_policy() -> None:
-    # FOR ALL carries both USING (read scope) and WITH CHECK (write image),
-    # so the same drop applies to its UPDATE/INSERT write path.
-    [v] = _check(
-        _policy(command="ALL", using=f"tenant_id = {_AUTH}", with_check="status = 'x'")
-    )
-    assert v.location == "public.documents.tenant_rw"
-    assert "ALL" in v.message
+def test_message_describes_the_insert_stamp_escape() -> None:
+    # The reliable escape is the FOR ALL INSERT path (WITH CHECK alone
+    # governs inserts), not UPDATE migration — the message must say so.
+    [v] = _check(_policy(using=f"tenant_id = {_AUTH}", with_check="status = 'x'"))
+    assert "INSERT" in v.message
 
 
 def test_fires_when_using_scope_is_wrapped_in_fromless_subselect() -> None:
@@ -127,10 +127,23 @@ def test_fires_when_using_is_null_safe_but_check_drops_scope() -> None:
     assert "'tenant_id'" in v.message
 
 
+def test_fires_when_using_is_membership_but_check_drops_scope() -> None:
+    # USING scopes by membership (still a recognized read-scope) while WITH
+    # CHECK validates only status — the write side drops the scope, so a
+    # caller can write a row outside the tenant set. SEC040 fires.
+    [v] = _check(
+        _policy(
+            using="tenant_id = ANY(current_setting('app.tenants', true)::int[])",
+            with_check="status = 'x'",
+        )
+    )
+    assert "'tenant_id'" in v.message
+
+
 def test_fires_when_check_references_column_without_constraining_it() -> None:
-    # `tenant_id <> 'x'` is not a scoping equality (`= <auth>`), so the
-    # scope is not re-asserted: a caller can still set tenant_id to most
-    # other tenants. Fire.
+    # `tenant_id <> 0` is not a scoping equality (`= <auth>`), so the scope
+    # is not re-asserted: a caller can still INSERT a row with most other
+    # tenant ids. Fire.
     [v] = _check(
         _policy(using=f"tenant_id = {_AUTH}", with_check="tenant_id <> 0")
     )
@@ -185,19 +198,6 @@ def test_silent_when_check_reasserts_via_membership() -> None:
     )
 
 
-def test_fires_when_using_is_membership_but_check_drops_scope() -> None:
-    # USING scopes by membership (still a recognized read-scope) while WITH
-    # CHECK validates only status — the write side drops the scope, so a
-    # caller can write a row outside the tenant set. SEC040 fires.
-    [v] = _check(
-        _policy(
-            using="tenant_id = ANY(current_setting('app.tenants', true)::int[])",
-            with_check="status = 'x'",
-        )
-    )
-    assert "'tenant_id'" in v.message
-
-
 def test_silent_when_check_binds_a_different_identity_column() -> None:
     # The "read your team, write your own" pattern: USING scopes by team_id
     # but WITH CHECK binds user_id to the caller. The write side still
@@ -226,7 +226,7 @@ def test_silent_on_constant_true_with_check_ceded_to_sec028_sec020() -> None:
 
 
 def test_silent_on_constant_false_with_check_blocks_all_writes() -> None:
-    # WITH CHECK (false) rejects every write — no migration is possible,
+    # WITH CHECK (false) rejects every write — no escape is possible,
     # so SEC040 must stay silent (not treat the empty scope as a drop).
     assert _check(_policy(using=f"tenant_id = {_AUTH}", with_check="false")) == []
 
@@ -242,16 +242,28 @@ def test_silent_when_using_is_not_a_scope() -> None:
     assert _check(_policy(using="true", with_check="status = 'x'")) == []
 
 
-def test_silent_on_insert_policy() -> None:
-    # INSERT has no USING, so there is no read-scope to drop. An open
-    # INSERT WITH CHECK is SEC028's concern.
-    assert _check(_policy(command="INSERT", using=None, with_check="status = 'x'")) == []
-
-
-def test_silent_on_update_with_check_but_no_using() -> None:
-    # An UPDATE/ALL policy with an explicit WITH CHECK but no USING has no
+def test_silent_on_all_with_check_but_no_using() -> None:
+    # A FOR ALL policy with an explicit WITH CHECK but no USING has no
     # read-scope to compare against, so there is nothing to "drop" — silent.
-    assert _check(_policy(command="UPDATE", using=None, with_check="status = 'x'")) == []
+    # (Exercises the `using_ast is None` guard under an in-scope command.)
+    assert _check(_policy(command="ALL", using=None, with_check="status = 'x'")) == []
+
+
+def test_silent_on_bare_update_policy() -> None:
+    # Bare FOR UPDATE is out of scope: Postgres re-checks the new row against
+    # the SELECT-applicable USING on any column-reading update, so migration
+    # is blocked in practice. The scope-dropping shape that fires on FOR ALL
+    # must stay SILENT on FOR UPDATE.
+    assert (
+        _check(_policy(command="UPDATE", using=f"tenant_id = {_AUTH}", with_check="status = 'x'"))
+        == []
+    )
+
+
+def test_silent_on_insert_policy() -> None:
+    # INSERT carries no USING, so there is no read-scope asymmetry to key on.
+    # An open INSERT WITH CHECK is SEC028's concern.
+    assert _check(_policy(command="INSERT", using=None, with_check="status = 'x'")) == []
 
 
 def test_silent_on_select_policy() -> None:
@@ -282,7 +294,7 @@ def test_silent_when_scoped_by_non_identity_column() -> None:
     # tenant/owner key — not an identity column, so no scope is recognised.
     p = Policy(
         name="snapshot",
-        command="UPDATE",
+        command="ALL",
         permissive=True,
         roles=("authenticated",),
         using_sql="created_at = current_setting('app.snapshot', true)::timestamptz",

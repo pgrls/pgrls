@@ -4,9 +4,9 @@ from __future__ import annotations
 
 def test_uc91_scope_dropping_policy_fires_sec040(lint_output: str) -> None:
     # USING scopes by tenant_id but the explicit WITH CHECK validates only
-    # status, so a caller can UPDATE a row to change tenant_id and migrate
-    # it cross-tenant. SEC040 (warning) fires on the live introspected
-    # policy.
+    # status. A FOR ALL insert is governed by WITH CHECK alone, so a caller
+    # can INSERT a row stamped with another tenant's id. SEC040 (warning)
+    # fires on the live introspected policy.
     assert (
         "SEC040  app.uc91_documents.uc91_documents_rw\n"
         in lint_output

@@ -74,11 +74,12 @@ membership — an escalation path that disables every policy),
 `SEC035` (UNIQUE constraint not scoped to the tenant discriminator —
 a global `UNIQUE(email)` leaks cross-tenant existence via duplicate-key
 errors; make it `UNIQUE(tenant_id, email)`),
-`SEC040` (permissive UPDATE/ALL policy whose `USING` scopes by a
+`SEC040` (permissive `FOR ALL` policy whose `USING` scopes by a
 tenant/owner key but whose explicit `WITH CHECK` binds no identity
-column at all — a caller can write a row with any tenant/owner and
-migrate it cross-scope; the "read team, write own" asymmetry, where
-WITH CHECK binds a different identity, is not flagged),
+column at all — a FOR ALL insert is governed by WITH CHECK alone, so a
+caller can INSERT a row stamped with another tenant's id; bare FOR
+UPDATE is excluded as Postgres re-checks the new row, and the "read
+team, write own" asymmetry is not flagged),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —

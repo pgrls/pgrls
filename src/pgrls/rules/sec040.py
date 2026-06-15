@@ -1,25 +1,33 @@
 """SEC040 — Write-side policy WITH CHECK drops USING's row scope.
 
-A row-scoping policy keys visibility off a tenant/owner discriminator
-compared to a per-request auth value:
+A `FOR ALL` policy keys read visibility off a tenant/owner discriminator
+but fails to constrain it on the write side:
 
 ```sql
 CREATE POLICY tenant_rw ON documents
     FOR ALL TO authenticated
     USING      (tenant_id = current_setting('app.tenant_id', true)::int)
-    WITH CHECK (status IN ('draft', 'published'));   -- tenant_id NOT re-asserted!
+    WITH CHECK (status IN ('draft', 'published'));   -- tenant_id NOT constrained!
 ```
 
-`USING` restricts which existing rows a caller may *read* and update
-(`tenant_id` must be theirs). `WITH CHECK` validates the *new* row image
-on INSERT/UPDATE. Postgres treats the two clauses independently: an
-explicit `WITH CHECK` **replaces** the implicit reuse of `USING` that an
-omitted clause would get. So when the explicit `WITH CHECK` binds **no**
-tenant/owner column at all — it validates only non-identity columns like
-`status` — an authenticated caller can `UPDATE documents SET tenant_id =
-<some other tenant>` and the write passes: the row **migrates out of the
-caller's tenant**, a cross-tenant (or cross-owner) write/escape. The same
-gap lets a `FOR ALL` policy INSERT a row stamped with another tenant's id.
+`USING` restricts which rows a caller may read; `WITH CHECK` validates the
+*new* row image on INSERT/UPDATE. An explicit `WITH CHECK` **replaces** the
+implicit reuse of `USING` an omitted clause would get, so when it binds
+**no** tenant/owner column — it validates only non-identity columns like
+`status` — the write side is unscoped. The reliable consequence is on
+**INSERT**: a `FOR ALL` insert is governed by `WITH CHECK` alone (there is
+no prior row, and `USING` does not apply to inserts), so a caller can
+`INSERT` a row **stamped with another tenant's id** — a cross-tenant write.
+(A column-free blind `UPDATE … SET tenant_id = <other>` migrates an
+existing row too.)
+
+Why `FOR ALL` and not bare `FOR UPDATE`: on UPDATE, Postgres re-checks the
+*new* row against the SELECT-applicable `USING` whenever the statement
+reads a column — which every `WHERE`/`RETURNING` update does (i.e. every
+PostgREST/ORM update). So UPDATE row-migration is blocked in practice; the
+durable hole is the INSERT path, which only a `FOR ALL` (or a `FOR INSERT`)
+policy carries. SEC040 therefore targets `FOR ALL`, where the `USING`
+scope also proves the table is tenant-scoped on the read side.
 
 An *asymmetric* policy that binds a **different** identity column on the
 write side — the common "read your team (`USING team_id = …`), write rows
@@ -39,8 +47,8 @@ This is the asymmetry the existing write-side rules miss:
   them; it covers the subtler shape where `WITH CHECK` is a *real*
   predicate that simply forgot the tenant key.
 
-SEC040 fires when a **permissive** `UPDATE`/`ALL` policy has a `USING`
-that scopes by a discriminator equality `col = <auth value>` and an
+SEC040 fires when a **permissive** `FOR ALL` policy has a `USING` that
+scopes by a discriminator equality `col = <auth value>` and an
 **explicit, non-constant** `WITH CHECK` that binds **no** identity/
 discriminator column to an auth value. Detection reuses SEC030's
 `_scoping_columns` (the same direct-operand, own-column, fromless-sub-
@@ -50,9 +58,14 @@ select-aware scoping-equality extraction), run over `USING` and over
 
 Scope (intentional, kept tight to stay low-noise):
 
-* **Permissive UPDATE/ALL only.** `INSERT` carries no `USING`, so there
-  is no read-scope to drop (an open INSERT WITH CHECK is SEC028's). A
-  `SELECT`/`DELETE` policy has no `WITH CHECK`. Restrictive policies
+* **Permissive FOR ALL only.** `FOR ALL` is the command that carries both
+  a `USING` (proving the table is tenant-scoped on the read side) and an
+  INSERT path governed by `WITH CHECK` alone — the reliable escape. Bare
+  `FOR UPDATE` is excluded (its new-row gets re-checked against the
+  SELECT-applicable `USING` on any column-reading update, so migration is
+  blocked in practice). `INSERT` carries no `USING`, so there is no
+  read-scope asymmetry to key on (an open INSERT WITH CHECK is SEC028's).
+  A `SELECT`/`DELETE` policy has no `WITH CHECK`. Restrictive policies
   AND-combine and are SEC006/SEC028's restrictive framing, not an escape
   on their own — out of scope, as in those rules.
 * **Explicit, non-constant WITH CHECK.** An *omitted* WITH CHECK reuses
@@ -130,10 +143,16 @@ from pgrls.rules.sec021 import _DEFAULT_IDENTITY_COLUMNS
 from pgrls.rules.sec030 import _DEFAULT_AUTH_FUNCTIONS, _scoping_columns
 from pgrls.violations import Severity, Violation
 
-# UPDATE and ALL are the only commands with BOTH a USING (read scope) and
-# a WITH CHECK (write image) — the precondition for a drop to matter.
-# INSERT has no USING; SELECT/DELETE have no WITH CHECK.
-_SCOPED_WRITE_COMMANDS: frozenset[str] = frozenset({"UPDATE", "ALL"})
+# FOR ALL only. It is the one command with a USING (proving the table is
+# tenant-scoped on the read side) AND an INSERT path governed by WITH CHECK
+# alone — so an under-constrained WITH CHECK lets a caller INSERT a row
+# stamped for another tenant, the reliable escape (verified against
+# Postgres). A bare FOR UPDATE is deliberately excluded: Postgres re-checks
+# the *new* row against the SELECT-applicable USING whenever the UPDATE
+# reads a column (every WHERE/RETURNING — i.e. every PostgREST/ORM update),
+# so UPDATE row-migration is blocked in practice and firing on it would be
+# noise. See the module docstring.
+_SCOPED_WRITE_COMMANDS: frozenset[str] = frozenset({"ALL"})
 
 
 def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
@@ -243,16 +262,17 @@ class SEC040:
         cols = ", ".join(repr(c) for c in dropped)
         plural = "s" if len(dropped) > 1 else ""
         return (
-            f"Permissive {policy.command} policy {policy.name!r} on "
-            f"{qualified_name} scopes row access by the discriminator "
-            f"column{plural} {cols} in USING, but its WITH CHECK does not pin "
+            f"Permissive ALL policy {policy.name!r} on {qualified_name} "
+            f"scopes reads by the discriminator column{plural} {cols} in "
+            "USING, but its WITH CHECK does not pin "
             f"{cols} to the caller with a recognized equality (`=`, `IS NOT "
-            "DISTINCT FROM`, or `= ANY`). Unless the write side constrains "
-            f"{cols} another way, a caller can write a row outside their "
-            "tenant/owner scope (cross-scope row migration). Add "
-            f"`{dropped[0]} = <session value>` to WITH CHECK, or allowlist "
-            "this policy in [lint.rules.SEC040] if it already pins the "
-            "discriminator another way (e.g. COALESCE), the column is "
-            "immutable (a trigger or generated column), or a restrictive "
-            "floor covers the write side."
+            "DISTINCT FROM`, or `= ANY`). A FOR ALL insert is governed by "
+            f"WITH CHECK alone, so unless the write side constrains {cols} "
+            "another way, a caller can INSERT a row stamped with another "
+            f"tenant's {cols} (a cross-tenant write; a column-free UPDATE can "
+            f"migrate an existing row too). Add `{dropped[0]} = <session "
+            "value>` to WITH CHECK, or allowlist this policy in "
+            "[lint.rules.SEC040] if it already pins the discriminator another "
+            "way (e.g. COALESCE), the column is set by a trigger or generated "
+            "column, or a restrictive floor covers the write side."
         )
