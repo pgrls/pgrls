@@ -189,6 +189,12 @@ def test_silent_on_insert_policy() -> None:
     assert _check(_policy(command="INSERT", using=None, with_check="status = 'x'")) == []
 
 
+def test_silent_on_update_with_check_but_no_using() -> None:
+    # An UPDATE/ALL policy with an explicit WITH CHECK but no USING has no
+    # read-scope to compare against, so there is nothing to "drop" — silent.
+    assert _check(_policy(command="UPDATE", using=None, with_check="status = 'x'")) == []
+
+
 def test_silent_on_select_policy() -> None:
     assert _check(_policy(command="SELECT", using=f"tenant_id = {_AUTH}", with_check=None)) == []
 

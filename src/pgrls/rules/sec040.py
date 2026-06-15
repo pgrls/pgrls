@@ -109,7 +109,7 @@ from __future__ import annotations
 from typing import Any
 
 from pgrls.ast_utils import is_literal_false, is_literal_true
-from pgrls.model import Schema, policy_id
+from pgrls.model import Policy, Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
 # Reuse SEC021's identity/discriminator column-name set and SEC030's
 # scoping-equality extraction + auth-function default, so SEC040's notion
@@ -224,7 +224,7 @@ class SEC040:
         return out
 
     @staticmethod
-    def _message(qualified_name: str, policy: Any, dropped: list[str]) -> str:
+    def _message(qualified_name: str, policy: Policy, dropped: list[str]) -> str:
         cols = ", ".join(repr(c) for c in dropped)
         plural = "s" if len(dropped) > 1 else ""
         return (
