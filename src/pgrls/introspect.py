@@ -533,6 +533,16 @@ ORDER BY i.indrelid, c.relname
 # (whose bodies start with `DECLARE`/`BEGIN` and are not pglast-parseable
 # as a top-level statement). VIEW004 uses the language to decide whether
 # to attempt parsing or skip with a less-alarming "non-SQL language" warning.
+# `owner_bypasses_rls` is the function owner's `rolsuper OR rolbypassrls`
+# (joined from `pg_roles`): a SECDEF function only bypasses RLS when its
+# owner is itself RLS-exempt — an ordinary owner under FORCE RLS is still
+# subject to policies (verified live). `execute_roles` is the set of
+# NON-owner roles holding EXECUTE, with PUBLIC rendered as the literal
+# "PUBLIC". Unlike table `relacl` (default = owner-only), a function's
+# DEFAULT ACL (`proacl IS NULL`) grants EXECUTE to PUBLIC, so
+# `acldefault('f', proowner)` is substituted to expand the default — this
+# captures the "forgot to REVOKE EXECUTE FROM PUBLIC" case that leaves a
+# function anon-callable. Both feed SEC042.
 _SECDEF_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
@@ -541,10 +551,24 @@ SELECT
     p.prosrc AS body,
     l.lanname AS lang,
     p.proconfig AS config,
-    pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature
+    pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature,
+    (po.rolsuper OR po.rolbypassrls) AS owner_bypasses_rls,
+    COALESCE((
+        SELECT array_agg(DISTINCT CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+                                       ELSE COALESCE(ar.rolname,
+                                                     'oid:' || ax.grantee::text)
+                                  END)
+        FROM aclexplode(
+                 COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))
+             ) ax
+        LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+        WHERE ax.privilege_type = 'EXECUTE'
+          AND ax.grantee <> p.proowner
+    ), '{}') AS execute_roles
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+JOIN pg_catalog.pg_roles po ON po.oid = p.proowner
 WHERE p.prosecdef = TRUE
   AND n.nspname = ANY(%s)
 ORDER BY qname, signature
@@ -707,8 +731,9 @@ def _fetch_secdef_functions(
     trip.
 
     Each record carries `body` + `language` (for VIEW004's body
-    parsing) and `search_path` (for SEC015's pg_temp-shadowing
-    check, decoded from `pg_proc.proconfig`).
+    parsing), `search_path` (for SEC015's pg_temp-shadowing check,
+    decoded from `pg_proc.proconfig`), and `execute_roles` +
+    `owner_bypasses_rls` (for SEC042's anon-executable-bypass check).
     """
     cur.execute(_SECDEF_FUNCS_SQL, [list(schemas)])
     return tuple(
@@ -720,6 +745,8 @@ def _fetch_secdef_functions(
             signature=row["signature"] or "",
             schema_name=row["schema_name"],
             function_name=row["function_name"],
+            execute_roles=tuple(sorted(row["execute_roles"] or ())),
+            owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
         )
         for row in cur.fetchall()
     )

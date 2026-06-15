@@ -77,7 +77,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 15,
+        "version": 16,
         "tables": [
             {
                 "schema": "public",
@@ -235,14 +235,14 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_fifteen_after_column_grants() -> None:
-    # SNAPSHOT_VERSION bumped 14 → 15 to add per-table column_grants
-    # (pg_attribute.attacl), so the diff flags a PUBLIC column grant on a
-    # no-RLS table. Pin the new version so a future bump is deliberate.
-    # (v14 added separate schema_name/function_name to SecdefFunction /
-    # LeakproofFunction.)
+def test_snapshot_version_is_sixteen_after_secdef_execute_capture() -> None:
+    # SNAPSHOT_VERSION bumped 15 → 16 to add SecdefFunction.execute_roles
+    # (PUBLIC-expanded EXECUTE grantees) + owner_bypasses_rls, so SEC042 can
+    # flag an anon-executable SECDEF function owned by an RLS-exempt role.
+    # Pin the new version so a future bump is deliberate. (v15 added
+    # per-table column_grants from pg_attribute.attacl.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 15
+    assert snap["version"] == 16
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -493,7 +493,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
     }
-    assert snap["version"] == 15
+    assert snap["version"] == 16
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -811,7 +811,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 15
+    assert snap["version"] == SNAPSHOT_VERSION == 16
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

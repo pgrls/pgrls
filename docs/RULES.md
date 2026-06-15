@@ -2751,6 +2751,71 @@ its own behaviour, so SEC041 warns rather than errors. No auto-fix: enable
 RLS and add a policy on the child (usually the parent's own scoping
 predicate), which pgrls does not synthesize.
 
+<a id="rule-sec042"></a>
+## SEC042 — Anonymously-executable SECURITY DEFINER function bypasses RLS
+
+**Severity:** error.
+
+**What it catches:** a `SECURITY DEFINER` function that is **executable by a
+low-trust role** (`anon` or `PUBLIC`) **and** whose **owner bypasses RLS** (a
+superuser or a `BYPASSRLS` role). A `SECURITY DEFINER` function runs as its
+owner; when the owner is RLS-exempt, the body's table access skips every
+policy. Exposed to `anon`/`PUBLIC`, it becomes an *unauthenticated
+privilege-escalation endpoint* — in PostgREST/Supabase a single
+`POST /rpc/<function>` with the anon key runs owner-privileged, RLS-exempt
+code and returns (or mutates) data no policy would release directly.
+
+```sql
+-- owned by `postgres` (superuser), so RLS does not apply inside it:
+CREATE FUNCTION public.all_orders() RETURNS SETOF orders
+    LANGUAGE sql SECURITY DEFINER AS 'SELECT * FROM orders';
+-- ...and no `REVOKE EXECUTE ... FROM PUBLIC`, so anon can call it.
+
+-- as the anon role (no row visibility of its own):
+SELECT * FROM public.all_orders();   -- every tenant's orders — RLS bypassed
+```
+
+**The default is the footgun.** Unlike a table (default ACL = owner-only), a
+function's **default `EXECUTE` is granted to `PUBLIC`**. A `SECURITY DEFINER`
+function created without an explicit `REVOKE EXECUTE ... FROM PUBLIC` is
+anon-callable *by default* — the silent mistake this rule exists to catch.
+
+**Both conditions are required (verified empirically).** SECURITY DEFINER
+alone is not a bypass: if the owner is an *ordinary* role and the tables it
+reads have `FORCE ROW LEVEL SECURITY` (which pgrls itself recommends), the
+owner is still subject to RLS and the function returns only the owner's
+policy-scoped rows. SEC042 fires only when the owner is RLS-exempt **and** a
+low-trust role can execute it — keeping the finding high-confidence.
+
+**Relationship to [SEC014](#rule-sec014).** SEC014 surfaces *every* SECURITY
+DEFINER function (`warning`) for an audit decision, regardless of caller or
+owner. SEC042 is the sharp, high-severity subset — provably an unauthenticated
+RLS-bypass endpoint — exactly as [SEC039](#rule-sec039) (anon write policy)
+sharpens [SEC003](#rule-sec003) (PUBLIC grant). [VIEW004](#rule-view004)
+covers the view-mediated SECDEF path; [SEC013](#rule-sec013) the
+trigger-mediated path.
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC042]
+# Low-trust executors (default ["anon", "PUBLIC"]); "public" matches the
+# PUBLIC pseudo-role case-insensitively. Add "authenticated" to also flag
+# SECDEF functions any signed-in user can call.
+anon_roles = ["anon", "PUBLIC"]
+# Deliberately-public, audited functions:
+allowlist = ["public.safe_signup"]
+```
+
+**Remediate** by `REVOKE EXECUTE ON FUNCTION ... FROM PUBLIC` (and from
+`anon`), granting `EXECUTE` only to trusted roles; or rewrite the function as
+`SECURITY INVOKER` so the caller's RLS applies; or reassign it to a
+non-RLS-exempt owner. **No auto-fix** — REVOKE vs re-own vs rewrite is an
+architectural decision. The finding establishes the *exposure* (anon runs
+RLS-exempt owner code); it does not enumerate which tables the body reaches
+(it may use dynamic SQL or PL/pgSQL), and an ordinary owner's bypass of a
+non-`FORCE` table it owns is [SEC002](#rule-sec002)'s finding, not this one.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

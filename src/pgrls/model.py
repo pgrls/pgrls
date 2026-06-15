@@ -47,7 +47,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 15  # v15: per-table column_grants (pg_attribute.attacl)
+SNAPSHOT_VERSION = 16  # v16: SecdefFunction.execute_roles + owner_bypasses_rls
 # — emitted only when present, so a schema with no column-level grants
 # round-trips byte-identically apart from this version bump. v14:
 # SecdefFunction/LeakproofFunction gain separate schema_name +
@@ -547,6 +547,26 @@ class SecdefFunction:
     # — the SEC015 fixer abstains rather than guess a wrong target.
     schema_name: str = ""
     function_name: str = ""
+    # Roles (non-owner) that hold EXECUTE on the function, with the
+    # PUBLIC pseudo-role rendered as "PUBLIC" (snapshot v16+). Critically,
+    # this EXPANDS the function default: a function with no explicit
+    # GRANT/REVOKE (``pg_proc.proacl IS NULL``) grants EXECUTE to PUBLIC
+    # by default — unlike a table, whose default ACL is owner-only — so
+    # such a function loads with ``execute_roles=("PUBLIC",)``, capturing
+    # the common "forgot to REVOKE EXECUTE FROM PUBLIC" footgun. SEC042
+    # reads this. v4-v15 snapshots have no key and load with ``()`` →
+    # SEC042 abstains (fail-closed) until the snapshot is re-captured.
+    execute_roles: tuple[str, ...] = ()
+    # True when the function's owner bypasses RLS — ``pg_roles.rolsuper``
+    # OR ``pg_roles.rolbypassrls`` (snapshot v16+). A SECURITY DEFINER
+    # function runs as its owner, so the body's table access is RLS-exempt
+    # ONLY when the owner itself is exempt; an ordinary owner under FORCE
+    # ROW LEVEL SECURITY is still subject to RLS (verified — such a
+    # function returns the owner's RLS-scoped rows, not every row). SEC042
+    # requires this to be true before flagging an anon-executable SECDEF
+    # function as an RLS bypass. v4-v15 snapshots load with ``False`` →
+    # SEC042 abstains (fail-closed).
+    owner_bypasses_rls: bool = False
 
 
 @dataclass(frozen=True)
@@ -999,6 +1019,10 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         # v14 additions; v4-v13 snapshots have no keys -> "".
         schema_name=f.get("schema_name", ""),
         function_name=f.get("function_name", ""),
+        # v16 additions; v4-v15 snapshots have no keys -> () / False, so
+        # SEC042 abstains (fail-closed) until the snapshot is re-captured.
+        execute_roles=tuple(f.get("execute_roles", [])),
+        owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
     )
 
 
@@ -1250,6 +1274,10 @@ class Schema:
                     # never split the ambiguous qualified_name.
                     "schema_name": f.schema_name,
                     "function_name": f.function_name,
+                    # v16 — EXECUTE grantees (PUBLIC-expanded default) +
+                    # owner RLS-exemption, for SEC042.
+                    "execute_roles": list(f.execute_roles),
+                    "owner_bypasses_rls": f.owner_bypasses_rls,
                 }
                 for f in self.security_definer_functions
             ],
@@ -1369,11 +1397,11 @@ class Schema:
                 f"{type(payload).__name__}"
             )
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15. v1 / v2 snapshots must be "
+                "10, 11, 12, 13, 14, 15, 16. v1 / v2 snapshots must be "
                 "regenerated against the current schema."
             )
 

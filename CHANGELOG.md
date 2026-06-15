@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-06-15
+
+### Added
+
+- **SEC042** (error) — a `SECURITY DEFINER` function that is **executable by a
+  low-trust role** (`anon` or `PUBLIC`) **and** whose **owner bypasses RLS** (a
+  superuser or `BYPASSRLS` role). The function runs as its owner, so when the
+  owner is RLS-exempt its body skips every policy; exposed to `anon`/`PUBLIC`
+  it is an unauthenticated privilege-escalation endpoint — a PostgREST/Supabase
+  `POST /rpc/<fn>` with the anon key runs owner-privileged, RLS-exempt code.
+  Critically, a function's `EXECUTE` privilege **defaults to `PUBLIC`**, so a
+  SECDEF function with no explicit `REVOKE EXECUTE ... FROM PUBLIC` fires even
+  with no `GRANT` — the common silent mistake. Both conditions are required:
+  SECURITY DEFINER alone is not a bypass (an ordinary owner under `FORCE ROW
+  LEVEL SECURITY` is still subject to RLS — verified empirically), so SEC042
+  stays high-confidence rather than re-flagging every SECDEF function. It is
+  the anon-exposure sharpening of SEC014 (which audits all SECDEF functions),
+  exactly as SEC039 sharpens SEC003. Configurable via
+  `[lint.rules.SEC042].anon_roles` (default `["anon", "PUBLIC"]`) and
+  `.allowlist`. No auto-fix (REVOKE vs re-own vs rewrite is architectural).
+  Catalog is now **55 rules**.
+- **Snapshot v16** — `SecdefFunction` gains `execute_roles` (the non-owner
+  `EXECUTE` grantees, with the `PUBLIC`-default expanded) and
+  `owner_bypasses_rls` (`rolsuper OR rolbypassrls` of the function owner), both
+  for SEC042. Additive: v3–v15 snapshots load with `()` / `False` (SEC042
+  abstains, fail-closed, until re-captured).
+
 ## [0.28.0] - 2026-06-15
 
 ### Added
