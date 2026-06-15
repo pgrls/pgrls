@@ -71,6 +71,13 @@ Scope / known limits (intentional, fail-closed):
   finding; enable ``FORCE`` and the bypass closes.
 * **Cross-scope functions** in a schema outside ``--schemas`` are invisible,
   the same false-negative path SEC014/VIEW004 document.
+* **Transitive group grants are not expanded.** ``execute_roles`` lists the
+  literal EXECUTE grantees, so EXECUTE granted to a *group* role that a
+  low-trust role is merely a member of is not flagged — mirroring SEC003 /
+  SEC039, which check ``PUBLIC`` / ``anon`` literally against the policy's
+  role list. Grant EXECUTE to the low-trust role directly (or revoke the
+  group grant) to surface it; the membership closure exists (SEC029 computes
+  it) if a future opt-in wants it.
 * Snapshots predating v16 carry no ``execute_roles`` / ``owner_bypasses_rls``;
   SEC042 abstains on them (fail-closed) until re-captured.
 """

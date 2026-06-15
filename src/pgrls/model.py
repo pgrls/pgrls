@@ -1334,7 +1334,12 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v13 snapshot dict.
+        """Reconstruct a Schema from a v3-v16 snapshot dict.
+
+        v16 (current): adds ``execute_roles`` + ``owner_bypasses_rls`` to each
+        ``SecdefFunction`` for SEC042. v3-v15 snapshots have neither key; they
+        load with ``()`` / ``False`` so SEC042 abstains (fail-closed). v14/v15
+        added ``schema_name``/``function_name`` and per-table ``column_grants``.
 
         v13 (current): adds ``is_primary`` to each ``Index`` for
         SEC035. v3-v12 snapshots have no key; they load with
