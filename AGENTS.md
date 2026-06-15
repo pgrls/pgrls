@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **fifty-two rules across four
+In the current release it ships **fifty-three rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -27,7 +27,9 @@ proves the USING predicate is unconditionally TRUE for an
 unauthenticated session under Kleene 3VL, catching the NOT-wrapped
 and cast-wrapped inverted-auth variants SEC004's syntactic match
 misses; requires the optional `pgrls[diff-z3]` extra and NO-OPs
-without it), `HYG001`
+without it), `SEC039` (permissive write policy — INSERT/UPDATE/
+DELETE/ALL — grants the unauthenticated `anon` role, so anonymous
+PostgREST/Supabase clients can modify rows), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
@@ -72,6 +74,12 @@ membership — an escalation path that disables every policy),
 `SEC035` (UNIQUE constraint not scoped to the tenant discriminator —
 a global `UNIQUE(email)` leaks cross-tenant existence via duplicate-key
 errors; make it `UNIQUE(tenant_id, email)`),
+`SEC040` (permissive `FOR ALL` policy whose `USING` scopes by a
+tenant/owner key but whose explicit `WITH CHECK` binds no identity
+column at all — a FOR ALL insert is governed by WITH CHECK alone, so a
+caller can INSERT a row stamped with another tenant's id; bare FOR
+UPDATE is excluded as Postgres re-checks the new row, and the "read
+team, write own" asymmetry is not flagged),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
@@ -864,7 +872,7 @@ These are intentional in the current release. Do not invent capabilities.
 
 - **Live database only.** `pgrls lint` reads from a running Postgres
   instance. There is no `--from-sql-file` or static migration parser.
-- **Fifty-two rules across four categories.** SEC001–SEC039,
+- **Fifty-three rules across four categories.** SEC001–SEC040,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the

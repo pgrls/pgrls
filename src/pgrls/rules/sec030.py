@@ -274,6 +274,8 @@ def _scoping_columns(
     table: Table,
     auth_functions: set[str],
     identity_columns: set[str],
+    *,
+    broaden_equality: bool = False,
 ) -> set[str]:
     """Own *discriminator* columns compared with `=` against an auth value.
 
@@ -283,6 +285,21 @@ def _scoping_columns(
     side are scoping keys. Requiring the two on opposite operands
     distinguishes a scoping predicate (`tenant_id = current_setting(…)`)
     from an auth call used elsewhere.
+
+    `broaden_equality` (default False — SEC030's behaviour is unchanged)
+    also treats two NULL-/set-aware equality shapes as a scoping match:
+    NULL-safe equality `col IS NOT DISTINCT FROM <auth value>`
+    (`AEXPR_NOT_DISTINCT`) and array membership `col = ANY(<auth value>)`
+    (`AEXPR_OP_ANY`) — both with operator `=`. SEC030 leaves it off on
+    purpose: a nullable column scoped by `IS NOT DISTINCT FROM` is the
+    dangerous NULL-tolerant *leak* form, not the silent-row-hiding `=`
+    form SEC030 flags, and membership is a different access model than a
+    scalar discriminator. SEC040 turns it on because there the *presence*
+    of any write-side binding clears the finding: a NULL-safe re-assertion
+    (strictly stronger than `=`) and a membership pin to the caller's
+    tenant set (`tenant_id = ANY(current_setting('app.tenants')::int[])`)
+    both genuinely constrain the write, so omitting them would false-fire
+    on a hardened policy.
 
     The own column must additionally be an identity/discriminator name
     (`identity_columns`) — SEC030's hazard is specific to a tenant/user
@@ -315,8 +332,18 @@ def _scoping_columns(
             return
         if (
             isinstance(n, A_Expr)
-            and n.kind == A_Expr_Kind.AEXPR_OP
             and _expr_op(n) == "="
+            and (
+                n.kind == A_Expr_Kind.AEXPR_OP
+                or (
+                    broaden_equality
+                    and n.kind
+                    in (
+                        A_Expr_Kind.AEXPR_NOT_DISTINCT,
+                        A_Expr_Kind.AEXPR_OP_ANY,
+                    )
+                )
+            )
         ):
             lhs, rhs = n.lexpr, n.rexpr
             if _side_has_auth_call(lhs, auth_functions):
