@@ -2558,6 +2558,102 @@ allowlist = ["public.contact_messages.anon_insert"]
 grant, route the write through a `SECURITY DEFINER` function, or allowlist a
 genuinely public-write table. The choice isn't mechanical.
 
+<a id="rule-sec040"></a>
+
+## SEC040 — Write-side policy WITH CHECK drops USING's row scope
+
+**Severity:** warning.
+
+**What it catches:** a PERMISSIVE `UPDATE` or `ALL` policy whose `USING`
+clause scopes rows by a tenant/owner discriminator equality
+(`col = <auth value>`) but whose **explicit** `WITH CHECK` clause binds **no**
+tenant/owner column at all — it validates only non-identity columns like
+`status`. `USING` controls which existing rows the caller may read and update;
+`WITH CHECK` validates the *new* row image on write. Postgres treats the two
+independently — an explicit `WITH CHECK` **replaces** the implicit reuse of
+`USING` an omitted clause would get — so when the write side carries no
+ownership binding, a caller can `UPDATE` a row to change the discriminator and
+move it out of their tenant/owner scope (a cross-scope row migration). On a
+`FOR ALL` policy the same gap also lets an `INSERT` stamp a row with another
+tenant's id.
+
+```sql
+-- Fires: USING scopes by tenant_id, but WITH CHECK only validates status —
+-- so `UPDATE documents SET tenant_id = <other tenant>` is accepted.
+CREATE POLICY tenant_rw ON public.documents
+    FOR ALL TO authenticated
+    USING      (tenant_id = current_setting('app.tenant_id', true)::int)
+    WITH CHECK (status IN ('draft', 'published'));
+
+-- Clean: WITH CHECK re-asserts the same tenant scope.
+CREATE POLICY tenant_rw ON public.documents
+    FOR ALL TO authenticated
+    USING      (tenant_id = current_setting('app.tenant_id', true)::int)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::int
+                AND status IN ('draft', 'published'));
+```
+
+**Not flagged — the asymmetric "read team, write own" pattern.** When
+`WITH CHECK` binds a *different* identity column than `USING` scopes by — read
+your team, write rows you own — the write side still carries an ownership
+binding, so it is a deliberate model and SEC040 stays silent:
+
+```sql
+-- Clean: USING scopes reads by team, WITH CHECK binds writes to the caller.
+CREATE POLICY tickets_rw ON public.tickets
+    FOR ALL TO authenticated
+    USING      (team_id = current_setting('app.team', true)::uuid)
+    WITH CHECK (user_id = current_setting('app.user', true));
+```
+
+SEC040 fires only when the write side binds **no** identity column whatsoever.
+This deliberately under-reports the rarer "write side binds a *different*
+tenant level than the read side" migration in exchange for not flagging the
+common, legitimate asymmetric pattern.
+
+**Why it's separate from the other write-side rules.**
+[SEC006](#rule-sec006) fires when `WITH CHECK` is *absent* — there Postgres
+reuses `USING` as the implicit check, preserving the scope, so an explicit
+clause is required for SEC040. [SEC028](#rule-sec028) and
+[SEC020](#rule-sec020) fire when `WITH CHECK` is constant `true`; SEC040 cedes
+both constant-`true` cases to them (a constant-`false` check blocks every
+write, so it is skipped too). SEC040 covers the subtler shape they all miss: a
+*real* `WITH CHECK` predicate that simply forgot the tenant key.
+
+**Why it matters.** This is the classic multi-tenant write-escape: reads are
+correctly isolated, but the write side lets a row be re-parented to another
+tenant. It is the lint-side companion to `pgrls verify --mode cross-tenant`,
+which *proves* read isolation; SEC040 is a heuristic catch on the write side.
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC040]
+# Auth-context functions whose `=` comparison marks a column as a scope.
+# Replaces the default ["auth.uid", "auth.role", "auth.jwt", "current_setting"].
+auth_functions = ["auth.uid", "current_setting", "request.jwt.claim"]
+
+# Column names treated as tenant/owner discriminators. Replaces the default
+# identity set (tenant_id, user_id, org_id, …).
+identity_columns = ["tenant_id", "workspace", "region"]
+
+# Per-policy escape hatch: the discriminator is immutable (a BEFORE UPDATE
+# trigger or generated column enforces it) or a restrictive floor covers the
+# write side.
+allowlist = ["public.documents.tenant_rw"]
+```
+
+**Known limitation.** SEC040 reasons about a single policy. If a sibling
+RESTRICTIVE policy re-imposes the tenant predicate in its own `WITH CHECK`, the
+migration is in practice blocked even though the permissive policy dropped the
+scope — SEC040 still flags the permissive policy (re-asserting the scope where
+the read-side lives is the clearer fix). Allowlist such a case.
+
+**No auto-fix.** The correct re-assertion is the application's own tenant /
+ownership equality — the one `USING` already carries — but transplanting a
+`USING` sub-expression into `WITH CHECK` across casts and boolean structure
+needs a human eye, so SEC040 reports rather than edits.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

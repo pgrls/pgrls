@@ -788,3 +788,24 @@ ALTER TABLE public.allbad_sec039 FORCE ROW LEVEL SECURITY;
 CREATE POLICY anon_insert ON public.allbad_sec039
     FOR INSERT TO anon
     WITH CHECK (id > 0);
+
+-- SEC040: a permissive FOR UPDATE policy whose USING scopes by the tenant
+-- key, but whose explicit WITH CHECK validates only a non-tenant column
+-- (status). A caller can UPDATE a row to change tenant_id, migrating it
+-- out of their tenant. SEC006 stays silent (WITH CHECK is present) and
+-- SEC028 stays silent (it is not constant true). The session value is wrapped in
+-- a fromless sub-select (the PERF001-recommended form) so PERF001 stays
+-- quiet. tenant_id is NOT NULL so SEC030 stays quiet. A dedicated real role
+-- keeps SEC003 (PUBLIC-only) and SEC039 (anon-only) quiet. SEC007
+-- (only-permissive) co-fires but its pinned location is the dedicated
+-- SEC007 block. The role is dropped in the test finally after the schema
+-- CASCADE removes the policy that pins it.
+DROP ROLE IF EXISTS allbad_sec040_role;
+CREATE ROLE allbad_sec040_role;
+CREATE TABLE public.allbad_sec040 (id int, tenant_id int NOT NULL, status text);
+ALTER TABLE public.allbad_sec040 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec040 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_update ON public.allbad_sec040
+    FOR UPDATE TO allbad_sec040_role
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::int))
+    WITH CHECK (status IN ('draft', 'published'));
