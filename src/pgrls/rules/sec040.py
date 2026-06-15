@@ -61,15 +61,21 @@ Scope (intentional, kept tight to stay low-noise):
   `false` one blocks every write (no migration is possible), so both
   literal-boolean shapes are skipped.
 * **Discriminator equality, identity column names only.** Reusing
-  SEC030's extraction (with `null_safe=True`), a scalar `col = <auth
-  value>` or the NULL-safe `col IS NOT DISTINCT FROM <auth value>` on an
-  identity/discriminator-named own column (`tenant_id`, `user_id`, … —
-  the SEC021 default set, overridable via `identity_columns`) is treated
-  as a scope/binding. A non-identity column or a non-equality comparison
-  is not a row scope, so it never trips the rule. Recognizing the NULL-
-  safe form on the write side matters specifically here: it is a
-  *stronger* re-assertion than `=`, so a hardened `WITH CHECK (tenant_id
-  IS NOT DISTINCT FROM …)` must clear the finding, not trip it.
+  SEC030's extraction (with `broaden_equality=True`), a scalar
+  `col = <auth value>`, the NULL-safe `col IS NOT DISTINCT FROM <auth
+  value>`, or the membership `col = ANY(<auth value>)` on an identity/
+  discriminator-named own column (`tenant_id`, `user_id`, … — the SEC021
+  default set, overridable via `identity_columns`) is treated as a
+  scope/binding. A non-identity column or a non-equality comparison is
+  not a row scope, so it never trips the rule. Recognizing the NULL-safe
+  and membership forms on the write side matters specifically here: both
+  genuinely pin the write to the caller (the membership form to the
+  caller's tenant *set*, e.g. `tenant_id = ANY(current_setting('app.
+  tenants')::int[])`), so a hardened `WITH CHECK` using them must clear
+  the finding, not trip it. A column re-asserted through a wrapper the
+  extraction does not unwrap (e.g. `COALESCE(tenant_id, 0) = <auth>`) is
+  not recognized — a conservative residual that an `allowlist` entry
+  silences.
 * **Any write-side identity binding clears it.** If `WITH CHECK` binds
   *any* identity column to an auth value — including one `USING` does not
   use — the asymmetry is treated as an intentional ownership model (the
@@ -196,7 +202,7 @@ class SEC040:
                     table,
                     auth_functions,
                     identity_columns,
-                    null_safe=True,
+                    broaden_equality=True,
                 )
                 if not using_scope:
                     continue
@@ -213,7 +219,7 @@ class SEC040:
                     table,
                     auth_functions,
                     identity_columns,
-                    null_safe=True,
+                    broaden_equality=True,
                 )
                 if check_scope:
                     continue
@@ -239,13 +245,14 @@ class SEC040:
         return (
             f"Permissive {policy.command} policy {policy.name!r} on "
             f"{qualified_name} scopes row access by the discriminator "
-            f"column{plural} {cols} in USING, but its WITH CHECK pins no "
-            f"tenant/owner column to the caller. A write is therefore not "
-            f"constrained to the caller's {cols}, so a row can be created or "
-            "moved outside their tenant/owner scope (cross-scope row "
-            f"migration). Add the same `{dropped[0]} = <session value>` "
-            "equality USING uses to WITH CHECK, or allowlist this policy in "
-            "[lint.rules.SEC040] if the column is immutable (enforced by a "
-            "trigger or generated column) or a restrictive floor covers the "
-            "write side."
+            f"column{plural} {cols} in USING, but its WITH CHECK does not pin "
+            f"{cols} to the caller with a recognized equality (`=`, `IS NOT "
+            "DISTINCT FROM`, or `= ANY`). Unless the write side constrains "
+            f"{cols} another way, a caller can write a row outside their "
+            "tenant/owner scope (cross-scope row migration). Add "
+            f"`{dropped[0]} = <session value>` to WITH CHECK, or allowlist "
+            "this policy in [lint.rules.SEC040] if it already pins the "
+            "discriminator another way (e.g. COALESCE), the column is "
+            "immutable (a trigger or generated column), or a restrictive "
+            "floor covers the write side."
         )

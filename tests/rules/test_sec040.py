@@ -168,6 +168,36 @@ def test_silent_when_check_reasserts_via_is_not_distinct_from() -> None:
     )
 
 
+def test_silent_when_check_reasserts_via_membership() -> None:
+    # The multi-tenant membership pattern: WITH CHECK pins the write to the
+    # caller's tenant *set* (`tenant_id = ANY(current_setting('app.tenants')
+    # ::int[])`). A row cannot escape that set, so SEC040 must stay silent.
+    assert (
+        _check(
+            _policy(
+                using=f"tenant_id = {_AUTH}",
+                with_check=(
+                    "tenant_id = ANY(current_setting('app.tenants', true)::int[])"
+                ),
+            )
+        )
+        == []
+    )
+
+
+def test_fires_when_using_is_membership_but_check_drops_scope() -> None:
+    # USING scopes by membership (still a recognized read-scope) while WITH
+    # CHECK validates only status — the write side drops the scope, so a
+    # caller can write a row outside the tenant set. SEC040 fires.
+    [v] = _check(
+        _policy(
+            using="tenant_id = ANY(current_setting('app.tenants', true)::int[])",
+            with_check="status = 'x'",
+        )
+    )
+    assert "'tenant_id'" in v.message
+
+
 def test_silent_when_check_binds_a_different_identity_column() -> None:
     # The "read your team, write your own" pattern: USING scopes by team_id
     # but WITH CHECK binds user_id to the caller. The write side still

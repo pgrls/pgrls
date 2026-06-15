@@ -2610,9 +2610,13 @@ SEC040 fires only when the write side binds **no** identity column whatsoever.
 This deliberately under-reports the rarer "write side binds a *different*
 tenant level than the read side" migration in exchange for not flagging the
 common, legitimate asymmetric pattern. A NULL-safe re-assertion
-(`WITH CHECK (tenant_id IS NOT DISTINCT FROM <session>)`) is recognized as a
-binding too — it is strictly stronger than `=`, so a hardened policy is not
-flagged.
+(`WITH CHECK (tenant_id IS NOT DISTINCT FROM <session>)`) and a membership pin
+to the caller's tenant set
+(`WITH CHECK (tenant_id = ANY(current_setting('app.tenants')::int[]))`) are
+recognized as bindings too — both genuinely constrain the write, so a hardened
+policy is not flagged. A re-assertion wrapped in a form the extraction does not
+unwrap (e.g. `COALESCE(tenant_id, 0) = <session>`) is not recognized; allowlist
+such a policy.
 
 **Why it's separate from the other write-side rules.**
 [SEC006](#rule-sec006) fires when `WITH CHECK` is *absent* — there Postgres
