@@ -1,15 +1,18 @@
 """Unit tests for SEC041 — partition child bypasses the parent's RLS.
 
-SEC041 (warning) fires when a table has RLS disabled, no policies of its
-own, an ancestor in its `partition_of` chain has RLS enabled, AND the child
-carries a direct row-access grant (table- or column-level SELECT / INSERT /
-UPDATE / DELETE) to a non-owner role, so it is reachable by name — a grant
-on the parent does not cascade to a child for direct access. It is the
-complement of SEC001, which deliberately skips the parent-covered case; the
-has-own-policies case is ceded to SEC032; an un-granted child (e.g. `pgrls
-generate`'s output), or one granted only a non-row-access privilege
-(REFERENCES/TRIGGER/TRUNCATE), is reachable only through the parent, so it
-is not flagged.
+SEC041 (warning) fires when a table has RLS disabled, an ancestor in its
+`partition_of` chain has RLS enabled, AND the child carries a direct
+row-access grant (table- or column-level SELECT / INSERT / UPDATE / DELETE)
+to a non-owner role, so it is reachable by name — a grant on the parent does
+not cascade to a child for direct access. It fires regardless of whether the
+child carries its own policies: while RLS is off those policies are dormant,
+so the child still returns every row (and SEC032 cedes any child with an RLS
+ancestor, so SEC041 must own this case or it falls through both rules). It is
+the complement of SEC001/SEC032, which deliberately skip the parent-covered
+case; SEC041 cedes to them only when there is no RLS ancestor (nothing to
+bypass). An un-granted child (e.g. `pgrls generate`'s output), or one granted
+only a non-row-access privilege (REFERENCES/TRIGGER/TRUNCATE), is reachable
+only through the parent, so it is not flagged.
 """
 from __future__ import annotations
 
