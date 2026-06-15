@@ -810,3 +810,28 @@ CREATE POLICY tenant_rw ON public.allbad_sec040
     FOR ALL TO allbad_sec040_role
     USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::int))
     WITH CHECK (status IN ('draft', 'published'));
+
+-- SEC041: a declarative partition CHILD with RLS disabled whose
+-- partitioned parent enforces RLS, and which is granted directly to a
+-- non-owner role. Postgres does not inherit RLS to partitions (nor does a
+-- grant on the parent reach the child), so a direct query against the
+-- granted child bypasses the parent's policy. SEC001 stays silent because
+-- an ancestor has RLS (it cedes the child), and SEC041 catches the
+-- direct-access bypass. The parent has RLS + FORCE + a policy to a
+-- dedicated role, so SEC003 (PUBLIC-only) stays quiet. SEC007
+-- (only-permissive) co-fires but its pinned location is the dedicated
+-- SEC007 block. The child has no policy of its own (a policy would cede it
+-- to SEC032). The role is dropped in the test finally after the schema
+-- CASCADE removes the policy and grant that pin it.
+DROP ROLE IF EXISTS allbad_sec041_role;
+CREATE ROLE allbad_sec041_role;
+CREATE TABLE public.allbad_sec041 (tenant_id int NOT NULL, body text)
+    PARTITION BY LIST (tenant_id);
+ALTER TABLE public.allbad_sec041 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec041 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec041
+    FOR ALL TO allbad_sec041_role
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::int));
+CREATE TABLE public.allbad_sec041_p1 PARTITION OF public.allbad_sec041
+    FOR VALUES IN (1);
+GRANT SELECT ON public.allbad_sec041_p1 TO allbad_sec041_role;

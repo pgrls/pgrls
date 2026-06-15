@@ -10,6 +10,30 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-15
+
+### Added
+
+- **SEC041** (warning) — a declarative partition **child** whose row-level
+  security is disabled while an ancestor in its partition chain has RLS
+  enabled, *and* which is granted directly to a non-owner role. Postgres
+  inherits neither `relrowsecurity` nor privilege grants to partitions, so a
+  query that names the granted child directly (PostgREST `GET /child`, a
+  direct `SELECT`, an ORM/job targeting a partition) bypasses the parent's
+  policies and returns every row — verified Postgres behaviour. The direct
+  grant is what makes the bypass reachable: an un-granted child can only be
+  reached *through* the parent (a parent grant does not cascade), where the
+  parent's RLS applies — which is also why `pgrls generate` lints clean. It is
+  the complement of SEC001, which deliberately *skips* a parent-covered
+  partition child (to avoid a false "enable RLS" error on the common
+  parent-only pattern) and documents the direct-access caveat; SEC041 promotes
+  that caveat to a checkable finding. The two are mutually exclusive (SEC001
+  fires when no ancestor has RLS, SEC041 when an ancestor does); a child with
+  its own dormant policies is ceded to SEC032. Configurable via
+  `[lint.rules.SEC041].allowlist` for children never reached directly.
+  Catalog is now **54 rules**. No auto-fix — the right policy is the
+  application's own scoping predicate (usually the parent's).
+
 ## [0.27.0] - 2026-06-15
 
 ### Added
