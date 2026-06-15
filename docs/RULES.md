@@ -2609,7 +2609,10 @@ CREATE POLICY tickets_rw ON public.tickets
 SEC040 fires only when the write side binds **no** identity column whatsoever.
 This deliberately under-reports the rarer "write side binds a *different*
 tenant level than the read side" migration in exchange for not flagging the
-common, legitimate asymmetric pattern.
+common, legitimate asymmetric pattern. A NULL-safe re-assertion
+(`WITH CHECK (tenant_id IS NOT DISTINCT FROM <session>)`) is recognized as a
+binding too — it is strictly stronger than `=`, so a hardened policy is not
+flagged.
 
 **Why it's separate from the other write-side rules.**
 [SEC006](#rule-sec006) fires when `WITH CHECK` is *absent* — there Postgres

@@ -61,11 +61,15 @@ Scope (intentional, kept tight to stay low-noise):
   `false` one blocks every write (no migration is possible), so both
   literal-boolean shapes are skipped.
 * **Discriminator equality, identity column names only.** Reusing
-  SEC030's extraction, only a scalar `col = <auth value>` on an
+  SEC030's extraction (with `null_safe=True`), a scalar `col = <auth
+  value>` or the NULL-safe `col IS NOT DISTINCT FROM <auth value>` on an
   identity/discriminator-named own column (`tenant_id`, `user_id`, … —
   the SEC021 default set, overridable via `identity_columns`) is treated
-  as a scope. A non-identity column or a non-equality comparison is not a
-  row scope, so it never trips the rule.
+  as a scope/binding. A non-identity column or a non-equality comparison
+  is not a row scope, so it never trips the rule. Recognizing the NULL-
+  safe form on the write side matters specifically here: it is a
+  *stronger* re-assertion than `=`, so a hardened `WITH CHECK (tenant_id
+  IS NOT DISTINCT FROM …)` must clear the finding, not trip it.
 * **Any write-side identity binding clears it.** If `WITH CHECK` binds
   *any* identity column to an auth value — including one `USING` does not
   use — the asymmetry is treated as an intentional ownership model (the
@@ -188,7 +192,11 @@ class SEC040:
                 if policy.using_ast is None:
                     continue
                 using_scope = _scoping_columns(
-                    policy.using_ast, table, auth_functions, identity_columns
+                    policy.using_ast,
+                    table,
+                    auth_functions,
+                    identity_columns,
+                    null_safe=True,
                 )
                 if not using_scope:
                     continue
@@ -205,6 +213,7 @@ class SEC040:
                     table,
                     auth_functions,
                     identity_columns,
+                    null_safe=True,
                 )
                 if check_scope:
                     continue
@@ -230,12 +239,13 @@ class SEC040:
         return (
             f"Permissive {policy.command} policy {policy.name!r} on "
             f"{qualified_name} scopes row access by the discriminator "
-            f"column{plural} {cols} in USING, but its WITH CHECK constrains "
-            "no tenant/owner column. An authenticated caller can write a row "
-            f"with any value for {cols}, migrating it outside their "
-            "tenant/owner scope (cross-scope row migration). Add the same "
-            f"`{dropped[0]} = <session value>` equality USING uses to WITH "
-            "CHECK, or allowlist this policy in [lint.rules.SEC040] if the "
-            "column is immutable (enforced by a trigger or generated column) "
-            "or a restrictive floor covers the write side."
+            f"column{plural} {cols} in USING, but its WITH CHECK pins no "
+            f"tenant/owner column to the caller. A write is therefore not "
+            f"constrained to the caller's {cols}, so a row can be created or "
+            "moved outside their tenant/owner scope (cross-scope row "
+            f"migration). Add the same `{dropped[0]} = <session value>` "
+            "equality USING uses to WITH CHECK, or allowlist this policy in "
+            "[lint.rules.SEC040] if the column is immutable (enforced by a "
+            "trigger or generated column) or a restrictive floor covers the "
+            "write side."
         )

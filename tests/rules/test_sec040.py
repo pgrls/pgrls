@@ -114,6 +114,19 @@ def test_fires_naming_all_scoped_columns_when_check_binds_none() -> None:
     assert "'user_id'" in v.message
 
 
+def test_fires_when_using_is_null_safe_but_check_drops_scope() -> None:
+    # USING scopes NULL-safely (`IS NOT DISTINCT FROM`) — still a recognized
+    # read-scope — while WITH CHECK validates only status. The scope is
+    # dropped on the write side, so SEC040 fires.
+    [v] = _check(
+        _policy(
+            using=f"tenant_id IS NOT DISTINCT FROM {_AUTH}",
+            with_check="status = 'x'",
+        )
+    )
+    assert "'tenant_id'" in v.message
+
+
 def test_fires_when_check_references_column_without_constraining_it() -> None:
     # `tenant_id <> 'x'` is not a scoping equality (`= <auth>`), so the
     # scope is not re-asserted: a caller can still set tenant_id to most
@@ -133,6 +146,22 @@ def test_silent_when_with_check_reasserts_the_scope() -> None:
             _policy(
                 using=f"tenant_id = {_AUTH}",
                 with_check=f"tenant_id = {_AUTH} AND status = 'x'",
+            )
+        )
+        == []
+    )
+
+
+def test_silent_when_check_reasserts_via_is_not_distinct_from() -> None:
+    # A NULL-safe re-assertion (`tenant_id IS NOT DISTINCT FROM <session>`)
+    # is strictly stronger than `=` — it pins the write to the caller's
+    # tenant. SEC040 must recognize it as a binding and stay silent (else it
+    # would false-fire on a *hardened* policy).
+    assert (
+        _check(
+            _policy(
+                using=f"tenant_id = {_AUTH}",
+                with_check=f"tenant_id IS NOT DISTINCT FROM {_AUTH}",
             )
         )
         == []
