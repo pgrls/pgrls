@@ -2570,16 +2570,15 @@ rows by a tenant/owner discriminator equality (`col = <auth value>`) but whose
 validates only non-identity columns like `status`. `USING` proves the table is
 tenant-scoped on the read side; `WITH CHECK` validates the *new* row image on
 write, and an explicit clause **replaces** the implicit reuse of `USING` an
-omitted clause would get. The reliable consequence is on **INSERT**: a `FOR
-ALL` insert is governed by `WITH CHECK` alone (no prior row, `USING` does not
-apply to inserts), so a caller can `INSERT` a row **stamped with another
-tenant's id** — a cross-tenant write. (A column-free blind `UPDATE … SET
-tenant_id = <other>` migrates an existing row too.)
+omitted clause would get. The escape is on **INSERT**: a `FOR ALL` insert
+that does not read back the new row is governed by `WITH CHECK` alone, so a
+caller can `INSERT` a row **stamped with another tenant's id** — a cross-tenant
+write.
 
 ```sql
 -- Fires: USING scopes by tenant_id, but WITH CHECK only validates status —
--- so `INSERT INTO documents(tenant_id, status) VALUES (<other tenant>, 'draft')`
--- is accepted (WITH CHECK alone governs the insert).
+-- so a non-RETURNING `INSERT INTO documents(tenant_id, status)
+-- VALUES (<other tenant>, 'draft')` is accepted (WITH CHECK alone governs it).
 CREATE POLICY tenant_rw ON public.documents
     FOR ALL TO authenticated
     USING      (tenant_id = current_setting('app.tenant_id', true)::int)
@@ -2593,13 +2592,18 @@ CREATE POLICY tenant_rw ON public.documents
                 AND status IN ('draft', 'published'));
 ```
 
-**Why `FOR ALL` and not bare `FOR UPDATE`.** On `UPDATE`, Postgres re-checks
-the *new* row against the SELECT-applicable `USING` whenever the statement
-reads a column — which every `WHERE`/`RETURNING` update does (i.e. every
-PostgREST/ORM update) — so UPDATE row-migration is blocked in practice. The
-durable hole is the INSERT path, which only a `FOR ALL` (or `FOR INSERT`)
-policy carries. SEC040 therefore targets `FOR ALL`, where the `USING` scope
-also proves the table is tenant-scoped on the read side; a bare `FOR UPDATE`
+**Why `FOR ALL` and the one escape condition.** Postgres applies the
+SELECT-applicable `USING` to the *new* row whenever a statement reads it —
+`INSERT … RETURNING`, and any column-reading `UPDATE` (every `WHERE`/`RETURNING`,
+i.e. every PostgREST/ORM update). So `INSERT … RETURNING` and ordinary UPDATE
+row-migration are **blocked**; the reachable escape is a non-`RETURNING` insert
+(`Prefer: return=minimal`, bulk loads, `INSERT … ON CONFLICT DO NOTHING`; a
+column-free blind `UPDATE` migrates one too). That re-check is incidental and
+client-controlled — the caller chooses whether to add `RETURNING` — so it is no
+substitute for a tenant-scoped `WITH CHECK`. Only a `FOR ALL` (or `FOR INSERT`)
+policy carries this INSERT path. SEC040 therefore targets `FOR ALL`, where the
+`USING` scope also proves the table is tenant-scoped on the read side; a bare
+`FOR UPDATE`
 policy is not flagged.
 
 **Not flagged — the asymmetric "read team, write own" pattern.** When

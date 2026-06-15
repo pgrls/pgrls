@@ -14,20 +14,24 @@ CREATE POLICY tenant_rw ON documents
 *new* row image on INSERT/UPDATE. An explicit `WITH CHECK` **replaces** the
 implicit reuse of `USING` an omitted clause would get, so when it binds
 **no** tenant/owner column — it validates only non-identity columns like
-`status` — the write side is unscoped. The reliable consequence is on
-**INSERT**: a `FOR ALL` insert is governed by `WITH CHECK` alone (there is
-no prior row, and `USING` does not apply to inserts), so a caller can
-`INSERT` a row **stamped with another tenant's id** — a cross-tenant write.
-(A column-free blind `UPDATE … SET tenant_id = <other>` migrates an
-existing row too.)
+`status` — the write side is unscoped. The escape is on **INSERT**: a
+`FOR ALL` insert that does not read back the new row is governed by
+`WITH CHECK` alone, so a caller can `INSERT` a row **stamped with another
+tenant's id** — a cross-tenant write.
 
-Why `FOR ALL` and not bare `FOR UPDATE`: on UPDATE, Postgres re-checks the
-*new* row against the SELECT-applicable `USING` whenever the statement
-reads a column — which every `WHERE`/`RETURNING` update does (i.e. every
-PostgREST/ORM update). So UPDATE row-migration is blocked in practice; the
-durable hole is the INSERT path, which only a `FOR ALL` (or a `FOR INSERT`)
-policy carries. SEC040 therefore targets `FOR ALL`, where the `USING`
-scope also proves the table is tenant-scoped on the read side.
+The escape's one condition: the write must not require *read* access to the
+new row. Postgres applies the SELECT-applicable `USING` to the new row
+whenever a statement reads it — `INSERT … RETURNING`, and any column-reading
+`UPDATE` (every `WHERE`/`RETURNING`, i.e. every PostgREST/ORM update). So an
+`INSERT … RETURNING` and ordinary UPDATE row-migration are **blocked**; the
+reachable escape is a non-`RETURNING` insert — `Prefer: return=minimal`,
+bulk loads, `INSERT … ON CONFLICT DO NOTHING` (a column-free blind `UPDATE`
+migrates one too). That protection is incidental and entirely
+client-controlled — the caller chooses whether to add `RETURNING` — so it is
+not a substitute for a tenant-scoped `WITH CHECK`. Only a `FOR ALL` (or
+`FOR INSERT`) policy carries this INSERT path; a bare `FOR UPDATE` is **not**
+flagged (its migration is blocked in practice). SEC040 targets `FOR ALL`,
+where the `USING` scope also proves the table is tenant-scoped on reads.
 
 An *asymmetric* policy that binds a **different** identity column on the
 write side — the common "read your team (`USING team_id = …`), write rows
@@ -266,12 +270,13 @@ class SEC040:
             f"scopes reads by the discriminator column{plural} {cols} in "
             "USING, but its WITH CHECK does not pin "
             f"{cols} to the caller with a recognized equality (`=`, `IS NOT "
-            "DISTINCT FROM`, or `= ANY`). A FOR ALL insert is governed by "
-            f"WITH CHECK alone, so unless the write side constrains {cols} "
+            "DISTINCT FROM`, or `= ANY`). A FOR ALL insert that doesn't read "
+            "back the new row (a non-RETURNING INSERT — bulk, "
+            "`Prefer: return=minimal`, `ON CONFLICT DO NOTHING`) is governed "
+            f"by WITH CHECK alone, so unless the write side constrains {cols} "
             "another way, a caller can INSERT a row stamped with another "
-            f"tenant's {cols} (a cross-tenant write; a column-free UPDATE can "
-            f"migrate an existing row too). Add `{dropped[0]} = <session "
-            "value>` to WITH CHECK, or allowlist this policy in "
+            f"tenant's {cols} — a cross-tenant write. Add `{dropped[0]} = "
+            "<session value>` to WITH CHECK, or allowlist this policy in "
             "[lint.rules.SEC040] if it already pins the discriminator another "
             "way (e.g. COALESCE), the column is set by a trigger or generated "
             "column, or a restrictive floor covers the write side."
