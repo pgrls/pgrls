@@ -102,7 +102,9 @@ PUBLIC` auto-grants every *future* table to `PUBLIC`, so a new table whose
 author forgets `ENABLE ROW LEVEL SECURITY` is silently exposed — a standing
 least-privilege posture flagged on the `pg_default_acl` entry; grantee set is
 configurable, with `anon`/`authenticated` excluded by default as the RLS-gated
-Supabase pattern; complements SEC003/SEC001),
+Supabase pattern; the remediation names the `FOR ROLE <grantor>` the default
+was created for, since a bare `REVOKE` clears only the running role's own
+default; complements SEC003/SEC001),
 `PERF001` (unwrapped auth function in `USING`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
