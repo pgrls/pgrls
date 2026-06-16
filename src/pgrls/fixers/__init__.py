@@ -71,6 +71,7 @@ def default_fixers() -> list[Fixer]:
     from pgrls.fixers.perf004 import PERF004Fixer
     from pgrls.fixers.sec001 import SEC001Fixer
     from pgrls.fixers.sec002 import SEC002Fixer
+    from pgrls.fixers.sec004 import SEC004Fixer
     from pgrls.fixers.sec006 import SEC006Fixer
     from pgrls.fixers.sec011 import SEC011Fixer
     from pgrls.fixers.sec019 import SEC019Fixer
@@ -86,6 +87,7 @@ def default_fixers() -> list[Fixer]:
     return [
         SEC001Fixer(),
         SEC002Fixer(),
+        SEC004Fixer(),
         SEC006Fixer(),
         SEC011Fixer(),
         SEC015Fixer(),
@@ -191,7 +193,7 @@ def generate_fixes(
 # Fixers that re-emit a `WITH CHECK` from a non-trivial predicate (a real
 # narrowing of the write side); they must win a clause contest so their
 # strip / mirror is never clobbered by a clause-regenerating fixer.
-_NARROWING_RULE_IDS = frozenset({"SEC011", "SEC020"})
+_NARROWING_RULE_IDS = frozenset({"SEC004", "SEC011", "SEC020"})
 
 
 def _suppress_clobbering_clause_rewrites(fixes: list[Fix]) -> list[Fix]:

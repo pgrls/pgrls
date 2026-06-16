@@ -19,6 +19,7 @@ from pgrls.fixers.perf003 import PERF003Fixer
 from pgrls.fixers.perf004 import PERF004Fixer
 from pgrls.fixers.sec001 import SEC001Fixer
 from pgrls.fixers.sec002 import SEC002Fixer
+from pgrls.fixers.sec004 import SEC004Fixer
 from pgrls.fixers.sec006 import SEC006Fixer
 from pgrls.fixers.sec011 import SEC011Fixer
 from pgrls.fixers.sec019 import SEC019Fixer
@@ -4212,3 +4213,137 @@ def test_sec017_fix_abstains_when_schema_function_fields_missing() -> None:
         ),
     )
     assert SEC017Fixer().fix(schema, {}) == []
+
+
+# ---------- SEC004 fixer (strip inverted-auth IS NULL disjunct) ----------
+
+
+def test_sec004_fix_strips_is_null_keeps_real_check() -> None:
+    schema = _wrap_policy(
+        _policy("auth.uid() IS NULL OR owner_id = auth.uid()")
+    )
+    fixes = SEC004Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC004"
+    assert f.location == "public.t.p"
+    assert f.clauses == frozenset({"using"})
+    assert "ALTER POLICY p ON public.t" in f.sql
+    assert "USING (owner_id = auth.uid())" in f.sql
+    # The anonymous-read disjunct is gone; WITH CHECK is never emitted.
+    assert "IS NULL" not in f.sql
+    assert "WITH CHECK" not in f.sql
+
+
+def test_sec004_fix_collapses_nested_or() -> None:
+    # OR is associative; the rule flattens the nested OR, the fixer collapses
+    # `a OR (auth.uid() IS NULL OR b)` to `a OR b`.
+    schema = _wrap_policy(_policy("a OR (auth.uid() IS NULL OR b)"))
+    [f] = SEC004Fixer().fix(schema, {})
+    assert "USING (a OR b)" in f.sql
+    assert "IS NULL" not in f.sql
+
+
+def test_sec004_fix_strips_multiple_is_null_disjuncts() -> None:
+    schema = _wrap_policy(
+        _policy(
+            "auth.uid() IS NULL OR auth.role() IS NULL "
+            "OR owner_id = auth.uid()"
+        )
+    )
+    [f] = SEC004Fixer().fix(schema, {})
+    assert "USING (owner_id = auth.uid())" in f.sql
+    assert "IS NULL" not in f.sql
+
+
+def test_sec004_fix_abstains_when_is_null_is_sole_disjunct() -> None:
+    # `USING (auth.uid() IS NULL)` — no real check survives the strip, so
+    # there is nothing to fall back to. Leave the finding for human review.
+    schema = _wrap_policy(_policy("auth.uid() IS NULL"))
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
+def test_sec004_fix_abstains_when_remainder_is_literal_true() -> None:
+    # Stripping the IS NULL leaves a bare `true` — still wide open, no real
+    # predicate to restore. SEC011 owns `OR true`; SEC004 declines.
+    schema = _wrap_policy(_policy("auth.uid() IS NULL OR true"))
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
+def test_sec004_fix_no_op_when_is_null_gated_by_and() -> None:
+    # The rule does not flatten through AND, so an IS NULL under an AND is not
+    # a standalone hole and never fired; the fixer must not touch it (never
+    # descend past AND — tightening there could broaden access).
+    schema = _wrap_policy(
+        _policy("active AND (auth.uid() IS NULL OR owner_id = auth.uid())")
+    )
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
+def test_sec004_fix_strips_nullable_current_setting() -> None:
+    schema = _wrap_policy(
+        _policy(
+            "current_setting('app.uid', true) IS NULL "
+            "OR owner_id = current_setting('app.uid', true)"
+        )
+    )
+    [f] = SEC004Fixer().fix(schema, {})
+    # RawStream renders the boolean literal uppercase.
+    assert "USING (owner_id = current_setting('app.uid', TRUE))" in f.sql
+    assert "IS NULL" not in f.sql
+
+
+def test_sec004_fix_skips_never_null_current_setting() -> None:
+    # The 1-arg `current_setting('x')` raises (never NULL) for an unset GUC,
+    # so its IS NULL is a dead disjunct, not an anon hole — the rule doesn't
+    # fire and the fixer must not strip it.
+    schema = _wrap_policy(
+        _policy("current_setting('app.uid') IS NULL OR owner_id = x")
+    )
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
+def test_sec004_fix_no_op_on_clean_policy() -> None:
+    schema = _wrap_policy(_policy("owner_id = auth.uid()"))
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
+def test_sec004_fix_clears_the_finding_and_is_idempotent() -> None:
+    # The form the fixer produces must itself be clean (SEC004 no longer
+    # fires) and the fixer must not re-fire on it (idempotent / converged).
+    from pgrls.rules.sec004 import SEC004
+
+    before = _wrap_policy(
+        _policy("auth.uid() IS NULL OR owner_id = auth.uid()")
+    )
+    assert SEC004().check(before, {})  # fires on the original
+    fixed = _wrap_policy(_policy("owner_id = auth.uid()"))
+    assert SEC004().check(fixed, {}) == []  # the fixed form is clean
+    assert SEC004Fixer().fix(fixed, {}) == []  # no second rewrite
+
+
+def test_sec004_fix_touches_only_using_on_for_all_policy() -> None:
+    # SEC004 inspects only USING; a FOR ALL policy's WITH CHECK must be left
+    # untouched even when USING is rewritten.
+    schema = _wrap_policy(
+        _policy(
+            "auth.uid() IS NULL OR owner_id = auth.uid()",
+            command="ALL",
+            with_check="owner_id = auth.uid()",
+        )
+    )
+    [f] = SEC004Fixer().fix(schema, {})
+    assert "USING (owner_id = auth.uid())" in f.sql
+    assert "WITH CHECK" not in f.sql
+    assert f.clauses == frozenset({"using"})
+
+
+def test_sec004_fix_honors_auth_functions_config() -> None:
+    # A custom auth function configured on the rule is strippable by the
+    # fixer; the default set would leave it (so this also proves the fixer
+    # reads the same auth_functions option the rule does).
+    schema = _wrap_policy(_policy("my.uid() IS NULL OR owner_id = my.uid()"))
+    assert SEC004Fixer().fix(schema, {}) == []  # not in default set
+    [f] = SEC004Fixer().fix(schema, {"auth_functions": ["my.uid"]})
+    assert "USING (owner_id = my.uid())" in f.sql
+    assert "IS NULL" not in f.sql

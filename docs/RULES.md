@@ -171,11 +171,16 @@ caused real CVEs across hundreds of AI-generated apps.
 
 **What it catches:** policies whose `USING` clause contains a top-level
 `OR` disjunct shaped as `auth_func() IS NULL` for one of: `auth.uid`,
-`auth.role`, `auth.jwt`, `current_user`, `session_user`, or
-`current_setting`. The intent was usually "let unauthenticated requests
-through to a downstream check"; the bug is that the disjunct evaluates
-to `true` for anonymous connections, satisfying the `OR` and exposing
-every row.
+`auth.role`, `auth.jwt`, or `current_setting`. The intent was usually
+"let unauthenticated requests through to a downstream check"; the bug is
+that the disjunct evaluates to `true` for anonymous connections,
+satisfying the `OR` and exposing every row. (`current_user` /
+`session_user` are deliberately **not** in the default set: Postgres has
+no unauthenticated backend, so they never return NULL — a
+`current_user IS NULL` disjunct is dead, not a leak, and flagging it
+would be a false positive. The role-identity hazard for those functions
+is a column *comparison* (`owner = current_user`), which is SEC018's
+job.)
 
 **The bad pattern:**
 
@@ -202,6 +207,16 @@ CREATE POLICY scoped ON public.invoices
 (The `(SELECT auth.uid())` wrap is the same one PERF001 recommends —
 keeping it here means the SEC004 fix doesn't itself trigger PERF001.)
 
+**Auto-fixable.** `pgrls fix` performs the standard fix mechanically — it
+strips the `auth_func() IS NULL` disjunct from `USING`, leaving the real
+check (`a OR (auth.uid() IS NULL OR b)` → `a OR b`). It removes only a
+top-level `OR` disjunct, so the rewrite can only *narrow* the policy, never
+broaden it. It abstains — leaving the finding for human review — when no
+real check would survive the strip (the `IS NULL` was the whole clause, or
+only a literal `true` remains). The semantically-disguised variants
+(`NOT … IS NOT NULL`, a `COALESCE` wrapper) are SEC038's domain and are not
+auto-fixed.
+
 If anonymous read access is intentional for a specific table, model it
 explicitly with a separate policy granted to `anon` — don't bake the
 "anonymous → see everything" behavior into a tenant policy.
@@ -213,17 +228,16 @@ the stock ones if you still use them:
 
 ```toml
 [lint.rules.SEC004]
-# Includes the stock set (auth.uid, auth.role, auth.jwt, current_setting,
-# current_user, session_user) plus the custom helper.
+# Includes the stock set (auth.uid, auth.role, auth.jwt, current_setting)
+# plus the custom helper.
 auth_functions = [
     "auth.uid", "auth.role", "auth.jwt", "current_setting",
-    "current_user", "session_user", "my.current_user_id",
+    "my.current_user_id",
 ]
 ```
 
-The default set already covers Supabase (`auth.*`), session GUCs
-(`current_setting`), and stock Postgres (`current_user`,
-`session_user`).
+The default set already covers Supabase (`auth.*`) and session GUCs
+(`current_setting`).
 
 <a id="rule-sec005"></a>
 
