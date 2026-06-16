@@ -190,9 +190,11 @@ def generate_fixes(
     return sorted(out, key=lambda f: (f.rule_id, f.location))
 
 
-# Fixers that re-emit a `WITH CHECK` from a non-trivial predicate (a real
-# narrowing of the write side); they must win a clause contest so their
-# strip / mirror is never clobbered by a clause-regenerating fixer.
+# Fixers that re-emit a policy clause from a non-trivial predicate — a real
+# narrowing of access: SEC004 / SEC011 strip a disjunct from `USING` (read
+# side), SEC020 mirrors `USING` into `WITH CHECK` (write side). They must win
+# a clause contest so their strip / mirror is never clobbered by a
+# clause-regenerating fixer.
 _NARROWING_RULE_IDS = frozenset({"SEC004", "SEC011", "SEC020"})
 
 

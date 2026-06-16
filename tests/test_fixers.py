@@ -4270,6 +4270,17 @@ def test_sec004_fix_abstains_when_remainder_is_literal_true() -> None:
     assert SEC004Fixer().fix(schema, {}) == []
 
 
+def test_sec004_fix_abstains_when_true_survives_among_disjuncts() -> None:
+    # `auth.uid() IS NULL OR <real> OR true` — stripping the IS NULL leaves
+    # `<real> OR true`, which is STILL wide open. A literal `true` surviving as
+    # any top-level OR disjunct (not just a bare `true`) means no real check
+    # remains, so the fixer must abstain rather than emit a still-open
+    # `USING (… OR true)` and falsely clear the finding. SEC011 (`OR true`)
+    # owns that rewrite.
+    schema = _wrap_policy(_policy("auth.uid() IS NULL OR owner_id = 1 OR true"))
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
 def test_sec004_fix_no_op_when_is_null_gated_by_and() -> None:
     # The rule does not flatten through AND, so an IS NULL under an AND is not
     # a standalone hole and never fired; the fixer must not touch it (never

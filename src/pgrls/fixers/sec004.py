@@ -67,7 +67,11 @@ from typing import Any
 from pglast.ast import BoolExpr
 from pglast.enums import BoolExprType
 
-from pgrls.ast_utils import is_literal_true, match_is_null
+from pgrls.ast_utils import (
+    flatten_or_disjuncts,
+    is_literal_true,
+    match_is_null,
+)
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
@@ -139,7 +143,8 @@ def _strip_null_auth(node: Any, auth_functions: set[str]) -> tuple[Any, bool]:
 def _strip_using(ast: Any, auth_functions: set[str]) -> tuple[Any, bool]:
     """Deep-copy and strip the `USING` AST. Returns `(new_ast, changed)`;
     raises `_CannotStrip` when no real check survives (empty OR, a bare
-    `IS NULL` that was the whole clause, or a surviving literal `true`)."""
+    `IS NULL` that was the whole clause, or a literal `true` left as a
+    top-level OR disjunct — alone or alongside others)."""
     if ast is None:
         return None, False
     candidate = copy.deepcopy(ast)
@@ -149,9 +154,17 @@ def _strip_using(ast: Any, auth_functions: set[str]) -> tuple[Any, bool]:
     if _is_null_auth_disjunct(candidate, auth_functions):
         raise _CannotStrip()
     new_ast, changed = _strip_null_auth(candidate, auth_functions)
-    # If only the literal `true` survives, the policy is still wide open and
-    # there is no real predicate to restore — decline (SEC011 owns `OR true`).
-    if changed and is_literal_true(new_ast):
+    # If a literal `true` survives as a top-level OR disjunct — whether the
+    # whole clause reduced to a bare `true` (`auth() IS NULL OR true`) or a
+    # `true` remains alongside others (`auth() IS NULL OR x OR true`) — the
+    # result still admits every row, so there is no real predicate to restore.
+    # Decline; SEC011 (`OR true`) owns that rewrite. `flatten_or_disjuncts`
+    # only flattens top-level ORs, so a constant-true buried under an AND
+    # (which is not always-true, and which `_strip_null_auth` never descended
+    # into) is correctly left alone.
+    if changed and any(
+        is_literal_true(d) for d in flatten_or_disjuncts(new_ast)
+    ):
         raise _CannotStrip()
     return new_ast, changed
 
