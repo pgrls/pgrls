@@ -6,6 +6,7 @@ from pgrls.model import (
     BypassRlsEscalation,
     BypassRlsRole,
     Column,
+    DefaultPrivilege,
     Grant,
     Index,
     LeakproofFunction,
@@ -77,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 17,
+        "version": 18,
         "tables": [
             {
                 "schema": "public",
@@ -110,6 +111,7 @@ def test_schema_to_snapshot_shape() -> None:
         "bypassrls_roles": [],
         "leakproof_functions": [],
         "bypassrls_escalation_roles": [],
+        "default_privileges": [],
     }
 
 
@@ -235,14 +237,14 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_seventeen_after_inherits_capture() -> None:
-    # SNAPSHOT_VERSION bumped 16 → 17 to add Table.inherits (classic-INHERITS
-    # parents) so SEC043 can flag a directly-bypassable classic-inheritance
-    # child of an RLS-enforcing parent. Pin the new version so a future bump
-    # is deliberate. (v16 added SecdefFunction.execute_roles +
-    # owner_bypasses_rls for SEC042.)
+def test_snapshot_version_is_eighteen_after_default_privileges_capture() -> None:
+    # SNAPSHOT_VERSION bumped 17 → 18 to add top-level default_privileges
+    # (from pg_default_acl) so SEC044 can flag a default-privilege grant that
+    # auto-exposes future tables to a low-trust role. Pin the new version so a
+    # future bump is deliberate. (v17 added Table.inherits for SEC043; v16
+    # added SecdefFunction.execute_roles + owner_bypasses_rls for SEC042.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 17
+    assert snap["version"] == 18
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -692,6 +694,42 @@ def test_snapshot_omits_inherits_key_when_empty() -> None:
     assert "inherits" not in snap["tables"][0]
 
 
+def test_default_privileges_round_trip_through_snapshot() -> None:
+    # v18: top-level default_privileges (from pg_default_acl) serialize and
+    # decode for SEC044, including a cluster-wide entry (schema=None → null).
+    schema = Schema(
+        default_privileges=(
+            DefaultPrivilege(
+                schema="public", grantee="PUBLIC", privileges=("SELECT",)
+            ),
+            DefaultPrivilege(
+                schema=None,
+                grantee="anon",
+                privileges=("SELECT", "INSERT"),
+            ),
+        )
+    )
+    snap = schema.to_snapshot()
+    assert snap["default_privileges"] == [
+        {"schema": "public", "grantee": "PUBLIC", "privileges": ["SELECT"]},
+        {
+            "schema": None,
+            "grantee": "anon",
+            "privileges": ["SELECT", "INSERT"],
+        },
+    ]
+    restored = Schema.from_snapshot(snap)
+    assert restored.default_privileges == schema.default_privileges
+    # The cluster-wide entry round-trips back to schema=None.
+    assert restored.default_privileges[1].schema is None
+
+
+def test_default_privileges_absent_in_pre_v18_snapshot_loads_empty() -> None:
+    # A v17 snapshot has no default_privileges key → loads as ().
+    snap = {"version": 17, "tables": [], "policies": []}
+    assert Schema.from_snapshot(snap).default_privileges == ()
+
+
 def test_table_with_list_partition_of_is_unhashable() -> None:
     # Contract: `partition_of` must be a tuple (or None). The type hint
     # says so; the frozen dataclass auto-hash will fail loudly if
@@ -744,11 +782,12 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
     # consumer reading the JSON depends on these names). Pin
     # `version`, `tables`, `policies`, `views`,
     # `security_definer_functions`, `bypassrls_roles`,
-    # `leakproof_functions`, `bypassrls_escalation_roles` so a quiet
-    # refactor that renames or drops a key fails this test rather
-    # than slipping past CI. v12 adds per-overload `signature` to
-    # SecdefFunction and LeakproofFunction (a per-entry field, not a
-    # top-level key) so the set is unchanged from v11.
+    # `leakproof_functions`, `bypassrls_escalation_roles`,
+    # `default_privileges` so a quiet refactor that renames or drops a
+    # key fails this test rather than slipping past CI. v18 adds the
+    # top-level `default_privileges` array (from pg_default_acl) for
+    # SEC044. (v12 added per-overload `signature` to SecdefFunction /
+    # LeakproofFunction — a per-entry field, not a top-level key.)
     snap = Schema(tables=()).to_snapshot()
     assert set(snap.keys()) == {
         "version",
@@ -759,8 +798,9 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "bypassrls_roles",
         "leakproof_functions",
         "bypassrls_escalation_roles",
+        "default_privileges",
     }
-    assert snap["version"] == 17
+    assert snap["version"] == 18
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1078,7 +1118,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 17
+    assert snap["version"] == SNAPSHOT_VERSION == 18
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

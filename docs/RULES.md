@@ -2899,6 +2899,77 @@ SEC043 warns rather than errors. No auto-fix: enable RLS and add a policy on
 the child (usually the parent's own scoping predicate), which pgrls does not
 synthesize.
 
+<a id="rule-sec044"></a>
+
+## SEC044 — Default privileges grant future tables to a low-trust role
+
+**Severity:** warning.
+
+**What it catches:** a `pg_default_acl` entry for **tables** that grants a
+**row-access** privilege (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) to a
+**low-trust grantee** (default set `{PUBLIC}`). `ALTER DEFAULT PRIVILEGES [IN
+SCHEMA s] [FOR ROLE r] GRANT … ON TABLES TO PUBLIC` does not touch any
+existing table — it records a standing rule that **every table created after
+it** (in scope) is automatically granted the privilege. So a developer who
+later adds a table and forgets `ENABLE ROW LEVEL SECURITY` has silently
+exposed it to every role, including `anon` in a PostgREST/Supabase
+deployment, without writing a single `GRANT`:
+
+```sql
+-- a standing config decision, made once:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
+
+-- weeks later, a new table — RLS forgotten:
+CREATE TABLE public.invoices (tenant_id int, amount numeric);
+SELECT * FROM public.invoices;   -- readable by anon via the PUBLIC default
+```
+
+This is verified Postgres behaviour: the new table's `relacl` carries `=r/owner`
+(PUBLIC `SELECT`) the moment it is created. Default privileges are **not
+retroactive** — they affect only *future* tables — so SEC044 fires on the
+`pg_default_acl` entry itself, whether or not any table has been created under
+it yet. It is the standing posture that is unsafe.
+
+**Why `PUBLIC` by default — and why `anon` / `authenticated` are excluded.**
+`PUBLIC` is the genuine footgun: every role, including ones that do not exist
+yet, broader than any single app role. Granting future tables to the named
+`anon` / `authenticated` roles, by contrast, is the **deliberate, RLS-gated
+Supabase pattern** — Supabase ships default privileges to those roles
+precisely so PostgREST can see new tables, and RLS (not the grant) is what
+scopes access. Flagging that would fire on essentially every Supabase project,
+so the default low-trust set is `{PUBLIC}` only.
+
+**Relationship to [SEC003](#rule-sec003) / [SEC001](#rule-sec001).** SEC003
+flags a *policy* that lists `PUBLIC`, and SEC001 flags an *existing* table
+with RLS off — both are after-the-fact findings on a table that already
+exists. SEC044 is the *standing config* finding that makes the SEC001 case
+**happen by default**: the PUBLIC grant is already in place before the table
+is created, so the only thing between a new table and exposure is the author
+remembering RLS. SEC044 catches the posture so the per-table mistake never
+lands.
+
+A schema-scoped entry is reported at its **schema name** (e.g. `public`); a
+cluster-wide entry (set without `IN SCHEMA`, which applies in every schema) is
+reported at the sentinel location `(cluster-wide)`.
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC044]
+# Widen the low-trust grantee set (default ["PUBLIC"]). A "public" entry is
+# normalized case-insensitively to the PUBLIC pseudo-role.
+grantees = ["PUBLIC", "anon"]
+# Allowlist a deliberate default by schema name (or "(cluster-wide)").
+allowlist = ["reporting"]
+```
+
+**Severity: warning** — a least-privilege / defense-in-depth posture; the
+exposure only lands if a future table also forgets RLS. No auto-fix: whether
+to revoke the default or keep it scoped to a role is a deployment decision
+pgrls cannot make safely. Remediate with
+`ALTER DEFAULT PRIVILEGES [IN SCHEMA s] REVOKE <priv> ON TABLES FROM PUBLIC`,
+scoping default grants to specific roles and relying on RLS.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

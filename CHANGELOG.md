@@ -10,6 +10,42 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-06-15
+
+### Added
+
+- **SEC044** (warning) — a `pg_default_acl` entry for **tables** that grants a
+  **row-access** privilege (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) to a
+  **low-trust grantee** (default set `{PUBLIC}`). `ALTER DEFAULT PRIVILEGES [IN
+  SCHEMA s] [FOR ROLE r] GRANT … ON TABLES TO PUBLIC` does not touch any
+  existing table — it records a standing rule that **every table created after
+  it** (in scope) is automatically granted the privilege, so a developer who
+  later adds a table and forgets `ENABLE ROW LEVEL SECURITY` silently exposes
+  it to every role (including `anon` in a PostgREST/Supabase deployment).
+  Default privileges are **not retroactive** — they affect only future tables —
+  so SEC044 fires on the `pg_default_acl` entry itself, whether or not a table
+  has been created under it yet: it is the standing config posture that is the
+  footgun. A least-privilege / defense-in-depth finding that complements
+  **SEC003** (PUBLIC policy) and **SEC001** (RLS-off table, after the fact).
+  The grantee set is configurable via `[lint.rules.SEC044].grantees` (default
+  `["PUBLIC"]`; a `"public"` entry is normalized case-insensitively to the
+  PUBLIC pseudo-role) — `anon` / `authenticated` are **excluded by default**
+  because granting future tables to those is the deliberate, RLS-gated Supabase
+  pattern (flagging it would fire on every Supabase project). A schema-scoped
+  entry is reported at its schema name; a cluster-wide entry (set without `IN
+  SCHEMA`) at the sentinel location `(cluster-wide)`. Allowlist a deliberate
+  default by schema name (or `(cluster-wide)`) in `[lint.rules.SEC044]`. No
+  auto-fix: whether to revoke the default or scope it to a role is a deployment
+  decision. Brings the catalog to **57 rules**.
+
+### Changed
+
+- **Snapshot format v18.** Adds a top-level `default_privileges` array (from
+  `pg_default_acl`, `defaclobjtype='r'`) for SEC044, always emitted like the
+  other top-level arrays. Additive and fail-closed: snapshots from v3–v17 load
+  with `default_privileges=()` (SEC044 abstains on them until re-captured), and
+  `Schema.from_snapshot` still accepts versions 3 through 18.
+
 ## [0.30.0] - 2026-06-15
 
 ### Added

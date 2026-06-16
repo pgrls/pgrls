@@ -1,0 +1,35 @@
+-- ============================================================
+-- Use case 95: default privileges expose future tables to PUBLIC — SEC044
+-- `ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC`
+-- does not touch any existing table -- it records a standing rule in
+-- pg_default_acl that every table created AFTER it (in schema app) is
+-- automatically granted SELECT to PUBLIC. A developer who later adds a table
+-- and forgets ENABLE ROW LEVEL SECURITY has silently exposed it to every
+-- role, incl. anon. SEC044 (warning) fires on the pg_default_acl entry
+-- itself, with location `app` -- it is the standing config posture that is
+-- the footgun, not any one table, so the rule does not need a future table to
+-- exist. This is a least-privilege / defense-in-depth finding, complementing
+-- SEC003 (PUBLIC policy) and SEC001 (RLS-off table, after the fact).
+--
+-- Boundary: SEC044's default low-trust grantee set is {PUBLIC} only. A
+-- default privilege granting future tables to `anon` / `authenticated` is the
+-- deliberate, RLS-gated Supabase pattern and stays SILENT by default (it
+-- would otherwise fire on every Supabase project); widen via
+-- [lint.rules.SEC044].grantees if a project wants it flagged. The commented
+-- ALTER below shows that silent case.
+--
+-- IMPORTANT (load order): the demo loads all cases into one shared DB in
+-- numeric-prefix order, and default privileges affect only tables created
+-- AFTER they are set. Case 95 sorts last, so this ALTER runs after every
+-- other case's tables already exist -- no retroactive PUBLIC grant lands on
+-- them, and the rest of the demo suite stays unaffected.
+-- ============================================================
+
+-- The bug: a standing default-privilege grant of SELECT on future tables to
+-- PUBLIC in schema app. SEC044 fires on this entry (location `app`).
+ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+
+-- The boundary (NOT applied -- shown for documentation): a default privilege
+-- to the named `anon` role is the deliberate, RLS-gated Supabase pattern and
+-- would be SILENT under SEC044's default {PUBLIC}-only grantee set:
+--   ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO anon;
