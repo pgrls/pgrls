@@ -2967,8 +2967,12 @@ allowlist = ["reporting"]
 exposure only lands if a future table also forgets RLS. No auto-fix: whether
 to revoke the default or keep it scoped to a role is a deployment decision
 pgrls cannot make safely. Remediate with
-`ALTER DEFAULT PRIVILEGES [IN SCHEMA s] REVOKE <priv> ON TABLES FROM PUBLIC`,
-scoping default grants to specific roles and relying on RLS.
+`ALTER DEFAULT PRIVILEGES FOR ROLE <grantor> [IN SCHEMA s] REVOKE <priv> ON
+TABLES FROM PUBLIC`, scoping default grants to specific roles and relying on
+RLS. The `FOR ROLE <grantor>` clause is required: `pg_default_acl` is keyed on
+the creating role (`defaclrole`), so a bare `REVOKE` clears only the *running*
+role's own default and silently no-ops against another role's — pgrls names the
+grantor in the finding so the emitted REVOKE actually clears the entry.
 
 <a id="rule-perf001"></a>
 
