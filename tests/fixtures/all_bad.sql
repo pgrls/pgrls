@@ -850,3 +850,27 @@ CREATE FUNCTION public.allbad_sec042_rpc() RETURNS int
 -- single location (allbad_sec042_rpc). VIEW004 / SEC014 / SEC015 still flag
 -- it -- they are static and do not depend on the EXECUTE grant.
 REVOKE EXECUTE ON FUNCTION public.allbad_view004_read() FROM PUBLIC;
+
+-- SEC043: a classic-INHERITS child (NOT a declarative partition) with RLS
+-- disabled whose parent enforces RLS, and which is granted directly to a
+-- non-owner role. Postgres does not inherit RLS to inheritance children (nor
+-- does a grant on the parent reach the child), so a direct query against the
+-- granted child bypasses the parent's policy. This is the classic-INHERITS
+-- analogue of SEC041. Unlike the partition case, SEC001 also fires on this
+-- child (the deliberate double-report -- SEC001/SEC032 do not walk classic
+-- inheritance, so they do not cede it) and both point to the same fix (enable
+-- RLS on the child). The parent has RLS + FORCE + a policy to a dedicated
+-- role, so SEC003 (PUBLIC-only) stays quiet. SEC007 (only-permissive)
+-- co-fires but its pinned location is the dedicated SEC007 block. The child
+-- has no policy of its own. The role is dropped in the test finally after the
+-- schema CASCADE removes the policy and grant that pin it.
+DROP ROLE IF EXISTS allbad_sec043_role;
+CREATE ROLE allbad_sec043_role;
+CREATE TABLE public.allbad_sec043_parent (tenant_id int NOT NULL, body text);
+ALTER TABLE public.allbad_sec043_parent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec043_parent FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec043_parent
+    FOR ALL TO allbad_sec043_role
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::int));
+CREATE TABLE public.allbad_sec043_child () INHERITS (public.allbad_sec043_parent);
+GRANT SELECT ON public.allbad_sec043_child TO allbad_sec043_role;
