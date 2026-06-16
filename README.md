@@ -39,11 +39,13 @@
 
 ## Install
 
+pgrls needs **Python 3.11+** (and Postgres 15+ to lint against) — check `python --version` first. On an older Python, `pip install pgrls` fails with the cryptic `Could not find a version that satisfies the requirement pgrls` rather than a clear version error.
+
 ```bash
-pip install pgrls
+pip install pgrls   # requires Python 3.11+
 ```
 
-Requires Python 3.11+ and Postgres 15+. pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
+pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
 
 ## Lint without a live database
 
