@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-06-16
+
+### Added
+
+- **`pgrls fix` now auto-remediates SEC004** (the flagship inverted-auth
+  anonymous-read leak — the Lovable-CVE `auth_func() IS NULL OR <check>`
+  pattern). The fixer strips the `auth_func() IS NULL` disjunct from the
+  policy's `USING`, restoring the real check (`a OR (auth.uid() IS NULL OR b)`
+  → `a OR b`). It is a **security-narrowing** rewrite: SEC004 only ever fires
+  on a top-level `OR` disjunct (the rule never flattens through `AND`/`NOT`),
+  so the fixer descends only through `OR` and removing the disjunct can only
+  narrow the policy, never broaden it. It abstains — leaving the finding for
+  human review — when no real check would survive the strip (the `IS NULL`
+  was the whole clause, or only a literal `true` remains). The
+  semantically-disguised variants (`NOT … IS NOT NULL`, `COALESCE`) remain
+  SEC038's domain and are not auto-fixed. Brings the auto-fixable count to
+  **18 of 57** rules.
+
 ## [0.31.0] - 2026-06-15
 
 ### Added
