@@ -33,8 +33,11 @@ breaking changes — they will be called out in this file.
   because granting future tables to those is the deliberate, RLS-gated Supabase
   pattern (flagging it would fire on every Supabase project). A schema-scoped
   entry is reported at its schema name; a cluster-wide entry (set without `IN
-  SCHEMA`) at the sentinel location `(cluster-wide)`. Allowlist a deliberate
-  default by schema name (or `(cluster-wide)`) in `[lint.rules.SEC044]`. No
+  SCHEMA`) at the sentinel location `(cluster-wide)` — and, because a
+  cluster-wide default applies in every schema, it is reported on every
+  `--schemas`-scoped run (not leakage; revoke or allowlist it to silence).
+  Allowlist a deliberate default by schema name (or `(cluster-wide)`) in
+  `[lint.rules.SEC044]`. No
   auto-fix: whether to revoke the default or scope it to a role is a deployment
   decision. Brings the catalog to **57 rules**.
 

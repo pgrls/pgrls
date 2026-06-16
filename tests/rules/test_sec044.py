@@ -216,6 +216,22 @@ def test_dedupes_per_schema_grantee() -> None:
     assert vs[0].location == "public"
 
 
+def test_cluster_wide_and_namesake_schema_are_distinct_findings() -> None:
+    # Dedup keys on the raw schema (None vs str), not the rendered location.
+    # Postgres *does* permit CREATE SCHEMA "(cluster-wide)" via a quoted
+    # identifier, so a real schema of that name and a true cluster-wide entry
+    # (schema=None) both render to the "(cluster-wide)" sentinel — they must
+    # still be reported as two distinct exposures, not silently collapsed.
+    vs = _check(
+        _dp(schema=None, grantee="PUBLIC", privileges=("SELECT",)),
+        _dp(schema="(cluster-wide)", grantee="PUBLIC", privileges=("SELECT",)),
+    )
+    assert len(vs) == 2
+    # Both happen to render the same display location (intended), but the two
+    # underlying entries were not deduped away.
+    assert [v.location for v in vs] == ["(cluster-wide)", "(cluster-wide)"]
+
+
 def test_metadata() -> None:
     rule = SEC044()
     assert rule.id == "SEC044"

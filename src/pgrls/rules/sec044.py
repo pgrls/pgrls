@@ -106,10 +106,16 @@ _ROW_ACCESS_PRIVILEGES: frozenset[str] = frozenset(
 # every Supabase project). Widen via [lint.rules.SEC044].grantees.
 _DEFAULT_GRANTEES = ("PUBLIC",)
 
-# Location string for a cluster-wide entry (ALTER DEFAULT PRIVILEGES with no
-# IN SCHEMA). A real schema can never be named this — pg_namespace.nspname
-# rejects parentheses at CREATE time — so it is an unambiguous sentinel that
-# also works as an allowlist key.
+# Display/allowlist location for a cluster-wide entry (ALTER DEFAULT PRIVILEGES
+# with no IN SCHEMA, schema is None). This is a *rendering* choice for output
+# and allowlist matching only — dedup keys on the raw `schema` (None vs str),
+# never this string, so a cluster-wide entry and a real (if pathological) schema
+# quoted into existence as "(cluster-wide)" stay distinct findings. (Postgres
+# does accept CREATE SCHEMA "(cluster-wide)" via a quoted identifier; the
+# sentinel is not relied on as an impossible name.) The only residual ambiguity
+# is cosmetic: a user who allowlists the literal "(cluster-wide)" while such a
+# schema exists would suppress both — an accepted edge for a name no real
+# deployment uses.
 _CLUSTER_WIDE_LOCATION = "(cluster-wide)"
 
 
@@ -162,8 +168,10 @@ class SEC044:
         # produces one pg_default_acl row per (scope, grantee) already, and
         # introspection folds privileges into one DefaultPrivilege per pair,
         # but dedupe defensively so a hand-built Schema with two records for
-        # the same pair still reports once.
-        seen: set[tuple[str, str]] = set()
+        # the same pair still reports once. Key on the raw `schema` (str | None,
+        # not the rendered location) so a cluster-wide entry never aliases a
+        # real schema that happens to render to the same sentinel string.
+        seen: set[tuple[str | None, str]] = set()
         for entry in schema.default_privileges:
             if entry.grantee not in grantees:
                 continue
@@ -177,7 +185,7 @@ class SEC044:
             location = _location(entry)
             if location in allowlist:
                 continue
-            key = (location, entry.grantee)
+            key = (entry.schema, entry.grantee)
             if key in seen:
                 continue
             seen.add(key)
