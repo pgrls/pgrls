@@ -14,7 +14,7 @@
 -- Unlike the partition case, SEC001 ALSO fires on the RLS-off child
 -- here: SEC001/SEC032 do not walk classic inheritance, so they do not
 -- cede it. Both findings are correct and point to the same fix (enable
--- RLS on the child); SEC043 adds the bypass/reachability context. These
+-- RLS on the child) and SEC043 adds the bypass/reachability context. These
 -- tests assert SEC043's own firing/silence — the SEC001 double-report is
 -- expected and documented.
 -- ============================================================
