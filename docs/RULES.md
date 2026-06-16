@@ -2816,6 +2816,89 @@ RLS-exempt owner code); it does not enumerate which tables the body reaches
 (it may use dynamic SQL or PL/pgSQL), and an ordinary owner's bypass of a
 non-`FORCE` table it owns is [SEC002](#rule-sec002)'s finding, not this one.
 
+<a id="rule-sec043"></a>
+
+## SEC043 — Legacy-inheritance child bypasses the parent's RLS
+
+**Severity:** warning.
+
+**What it catches:** the classic-`INHERITS` analogue of
+[SEC041](#rule-sec041) — a table created with `CREATE TABLE child () INHERITS
+(parent)` (classic inheritance, **not** a declarative partition) whose
+row-level security is **disabled** while an ancestor in its inheritance DAG
+has RLS **enabled**, *and* which is **granted directly to a non-owner role**
+(so it can be queried by name). Postgres does not propagate `relrowsecurity`
+to inheritance children — it is per-table. Queries routed *through the parent*
+apply the parent's policies, but a query that names a granted child
+**directly** is governed by the child's own RLS; with none, it returns every
+row, bypassing the parent.
+
+```sql
+CREATE TABLE events (tenant_id int, body text);
+ALTER TABLE events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE events FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant ON events
+    USING (tenant_id = current_setting('app.tenant_id', true)::int);
+CREATE TABLE events_legacy () INHERITS (events);   -- no RLS!
+
+-- as tenant 2:
+SELECT * FROM events;           -- only tenant 2's rows (parent RLS applies)
+SELECT * FROM events_legacy;    -- ALL of tenant 1's rows — RLS bypassed
+```
+
+This is verified Postgres behaviour. It matters wherever inheritance children
+are reachable by name — notably PostgREST/Supabase (`GET /events_legacy` for
+any granted child in the exposed schema) and ORMs or jobs that target the
+child directly. Unlike a partition's single parent, a classic-inheritance
+child may inherit from **multiple** parents (a DAG); SEC043 fires if **any**
+ancestor enforces RLS.
+
+**Relationship to [SEC041](#rule-sec041).** The two are the halves of the
+same inheritance-bypass: SEC041 covers a **declarative partition** child
+(`pg_inherits` with `relispartition = true`), SEC043 a **classic-`INHERITS`**
+child (`relispartition = false`). A table is one or the other, never both — a
+partition child XOR a classic-inheritance child — so the rules are mutually
+exclusive and never double-report the same table. The shared mechanism (RLS
+and privileges do not inherit to children; a direct query on the child is
+governed by the child's own, absent, RLS) is identical.
+
+**Relationship to [SEC001](#rule-sec001) / [SEC032](#rule-sec032) — a
+deliberate over-report, not a false negative.** Unlike the partition case
+(where SEC001/SEC032 *cede* the child by walking the `partition_of` chain),
+SEC001/SEC032 do **not** walk classic inheritance. So an RLS-off
+classic-inheritance child also trips SEC001 ("enable RLS"), and a
+dormant-policy one also trips SEC032. Both findings are correct and point to
+the **same fix** (enable RLS on the child); SEC043 adds the
+bypass/reachability context — that an RLS-enforcing ancestor exists and the
+child is directly bypassable. pgrls reports both rather than teaching
+SEC001/SEC032 a second inheritance axis.
+
+**Why the direct grant matters.** A privilege grant on the parent does
+**not** cascade to an inheritance child for direct access (Postgres does not
+inherit privileges to children — a parent-granted role gets "permission
+denied" on the child). So an un-granted child can only be reached *through*
+the parent, where the parent's RLS applies — no bypass. SEC043 therefore
+fires only when the child carries its own **row-access** grant — a table- or
+column-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` to a non-owner role (a
+`GRANT SELECT (col)` is enough to read the whole child by name; a grant of
+only `REFERENCES`/`TRIGGER`/`TRUNCATE` is not row access and does not count).
+
+**Configuration.**
+
+```toml
+[lint.rules.SEC043]
+# Children only ever reached through the parent (never named directly) — the
+# bypass is unreachable, so silence them.
+allowlist = ["public.events_legacy"]
+```
+
+**Severity: warning** — like [SEC041](#rule-sec041) and the other "RLS can be
+bypassed via X" rules. The direct grant proves the child is reachable by name;
+whether the application actually issues such a query is its own behaviour, so
+SEC043 warns rather than errors. No auto-fix: enable RLS and add a policy on
+the child (usually the parent's own scoping predicate), which pgrls does not
+synthesize.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

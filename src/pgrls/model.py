@@ -47,9 +47,13 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 16  # v16: SecdefFunction.execute_roles + owner_bypasses_rls
-# — emitted only when present, so a schema with no column-level grants
-# round-trips byte-identically apart from this version bump. v14:
+SNAPSHOT_VERSION = 17  # v17: Table.inherits (classic-INHERITS parents) for
+# SEC043 — emitted only when non-empty, so a table with no classic
+# inheritance round-trips byte-identically apart from this version bump
+# (distinct from partition_of, which is declarative-only). v16:
+# SecdefFunction.execute_roles + owner_bypasses_rls — emitted only when
+# present, so a schema with no column-level grants round-trips
+# byte-identically apart from this version bump. v14:
 # SecdefFunction/LeakproofFunction gain separate schema_name +
 # function_name (the ambiguous qualified_name join cannot be split when a
 # component contains a dot).
@@ -439,9 +443,22 @@ class Table:
     # Immediate parent for declarative partition children — `(schema, name)`
     # of the partitioned table this row is `PARTITION OF`. None for
     # standalone tables, partitioned-table parents themselves, and classic
-    # `INHERITS` children. The chain may be deeper than one level; rules
-    # walk it via the resolved Schema.
+    # `INHERITS` children (those record their parents in `inherits` instead).
+    # The chain may be deeper than one level; rules walk it via the resolved
+    # Schema (`Schema.ancestors_of`).
     partition_of: tuple[str, str] | None = None
+    # Classic-`INHERITS` parents — each `(schema, name)` of a table this row
+    # is `CREATE TABLE child () INHERITS (...)` from. Populated in snapshot
+    # v17+; emitted only when non-empty so a table with no classic
+    # inheritance round-trips byte-identically. Distinct from `partition_of`,
+    # which is declarative-partitioning only: a table is a partition child
+    # XOR a classic-inheritance child (Postgres records the edge in
+    # `pg_inherits` with `relispartition = false` for the latter). Unlike a
+    # partition child's single parent, a classic-inheritance child may have
+    # MULTIPLE parents (a DAG), so this is a tuple. SEC043 walks it via
+    # `Schema.inheritance_ancestors_of`; pre-v17 baselines round-trip with
+    # `inherits=()`.
+    inherits: tuple[tuple[str, str], ...] = ()
     # Privilege grants on this table — populated from `pg_class.relacl` in
     # snapshot v3+. Default `()` keeps existing call sites that construct
     # `Table(...)` without grants working unchanged. A v2 baseline loaded
@@ -927,6 +944,9 @@ def _table_from_dict(
         column_grants=tuple(
             _column_grant_from_dict(cg) for cg in t.get("column_grants", [])
         ),
+        # v17+ classic-INHERITS parents; pre-v17 baselines have no key and
+        # round-trip to (). Each entry is a [schema, name] pair → tuple.
+        inherits=tuple(tuple(p) for p in t.get("inherits", [])),
     )
 
 
@@ -1145,6 +1165,68 @@ class Schema:
             yield parent
             current = parent
 
+    def inheritance_ancestors_of(self, table: Table) -> Iterator[Table]:
+        """Yield classic-`INHERITS` ancestors of `table`, each once.
+
+        Mirrors `ancestors_of`, but walks `Table.inherits` instead of
+        `partition_of`. Classic inheritance is a DAG, not a single-parent
+        chain — a child may inherit from several parents, and two paths may
+        reconverge on a common grandparent — so this does a depth-first walk
+        with a visited-set and yields each distinct ancestor exactly once (no
+        duplicates even on a diamond). Order is depth-first in `inherits`
+        order: the first parent's whole subtree before the second parent.
+        SEC043 only needs "does ANY ancestor have RLS", so the precise
+        visitation order is not load-bearing.
+
+        Terminates at out-of-scope gaps: a parent reference not resolvable in
+        the introspected schemas is simply not expanded (its own ancestors
+        are unreachable), matching `ancestors_of`. Rules check
+        `table.inherits` themselves to distinguish "no ancestor" from
+        "ancestor outside scope" when the messaging differs.
+
+        Raises ValueError on a cycle. Postgres rejects inheritance cycles in
+        `pg_inherits`, so the only path here is corrupted introspection
+        state — silent truncation would mask the bug; raising surfaces it
+        loudly, same as `ancestors_of`. Detection uses white/grey/black DFS
+        colouring: a back-edge to a node on the *current* recursion path
+        (grey) is a cycle, while re-reaching an already-finished node (black)
+        via a second DAG path is a benign diamond and is skipped — so a
+        diamond does NOT falsely raise.
+        """
+        # `on_path` is the grey set (ancestors on the active DFS stack);
+        # `done` is the black set (fully-explored, already-yielded). The
+        # start table seeds `on_path` so a parent ref pointing back to it is
+        # caught as a 1-cycle, exactly as `ancestors_of`'s `seen` seed does.
+        on_path: set[str] = {table.qualified_name}
+        done: set[str] = set()
+
+        def _walk(node: Table) -> Iterator[Table]:
+            for pschema, pname in node.inherits:
+                qname = f"{pschema}.{pname}"
+                if qname in on_path:
+                    raise ValueError(
+                        f"inherits cycle detected at {qname!r}; "
+                        "Postgres does not produce cycles in pg_inherits — "
+                        "this indicates corrupted introspection state."
+                    )
+                if qname in done:
+                    # Re-reached via a second DAG path (diamond): already
+                    # yielded, already cycle-checked — skip silently.
+                    continue
+                parent = self._by_qname.get(qname)
+                if parent is None:
+                    # Out-of-scope parent: mark done (so a duplicate ref does
+                    # not re-trigger the lookup) but do not expand or yield.
+                    done.add(qname)
+                    continue
+                yield parent
+                on_path.add(qname)
+                yield from _walk(parent)
+                on_path.discard(qname)
+                done.add(qname)
+
+        yield from _walk(table)
+
     def to_snapshot(self) -> Snapshot:
         return {
             "version": SNAPSHOT_VERSION,
@@ -1227,6 +1309,16 @@ class Schema:
                             ]
                         }
                         if t.column_grants
+                        else {}
+                    ),
+                    # v17: classic-INHERITS parents. Emitted ONLY when
+                    # non-empty so every table without classic inheritance
+                    # (the overwhelming majority) serializes byte-identically
+                    # apart from the version bump — no golden churn. Distinct
+                    # from `partition_of` above, which is declarative-only.
+                    **(
+                        {"inherits": [list(p) for p in t.inherits]}
+                        if t.inherits
                         else {}
                     ),
                 }
@@ -1334,9 +1426,14 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v16 snapshot dict.
+        """Reconstruct a Schema from a v3-v17 snapshot dict.
 
-        v16 (current): adds ``execute_roles`` + ``owner_bypasses_rls`` to each
+        v17 (current): adds per-table ``inherits`` (classic-``INHERITS``
+        parents) for SEC043. Emitted only when non-empty; pre-v17 snapshots
+        have no key and load with ``inherits=()`` so SEC043 finds no
+        classic-inheritance ancestor until the snapshot is re-captured.
+
+        v16: adds ``execute_roles`` + ``owner_bypasses_rls`` to each
         ``SecdefFunction`` for SEC042. v3-v15 snapshots have neither key; they
         load with ``()`` / ``False`` so SEC042 abstains (fail-closed). v14/v15
         added ``schema_name``/``function_name`` and per-table ``column_grants``.
@@ -1402,11 +1499,11 @@ class Schema:
                 f"{type(payload).__name__}"
             )
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16):
+        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16. v1 / v2 snapshots must be "
+                "10, 11, 12, 13, 14, 15, 16, 17. v1 / v2 snapshots must be "
                 "regenerated against the current schema."
             )
 

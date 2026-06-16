@@ -77,7 +77,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 16,
+        "version": 17,
         "tables": [
             {
                 "schema": "public",
@@ -235,14 +235,14 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_sixteen_after_secdef_execute_capture() -> None:
-    # SNAPSHOT_VERSION bumped 15 → 16 to add SecdefFunction.execute_roles
-    # (PUBLIC-expanded EXECUTE grantees) + owner_bypasses_rls, so SEC042 can
-    # flag an anon-executable SECDEF function owned by an RLS-exempt role.
-    # Pin the new version so a future bump is deliberate. (v15 added
-    # per-table column_grants from pg_attribute.attacl.)
+def test_snapshot_version_is_seventeen_after_inherits_capture() -> None:
+    # SNAPSHOT_VERSION bumped 16 → 17 to add Table.inherits (classic-INHERITS
+    # parents) so SEC043 can flag a directly-bypassable classic-inheritance
+    # child of an RLS-enforcing parent. Pin the new version so a future bump
+    # is deliberate. (v16 added SecdefFunction.execute_roles +
+    # owner_bypasses_rls for SEC042.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 16
+    assert snap["version"] == 17
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -425,6 +425,273 @@ def test_ancestors_of_raises_on_self_cycle_without_yielding_self() -> None:
         next(iterator)
 
 
+# --- inheritance_ancestors_of (classic INHERITS DAG walk) ----------------
+
+
+def test_inheritance_ancestors_of_yields_nothing_for_standalone() -> None:
+    t = Table(
+        schema="public",
+        name="t",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    schema = Schema(tables=(t,))
+    assert list(schema.inheritance_ancestors_of(t)) == []
+
+
+def test_inheritance_ancestors_of_walks_immediate_parent() -> None:
+    parent = Table(
+        schema="public",
+        name="events",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    child = Table(
+        schema="public",
+        name="events_legacy",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "events"),),
+    )
+    schema = Schema(tables=(parent, child))
+    chain = list(schema.inheritance_ancestors_of(child))
+    assert [t.qualified_name for t in chain] == ["public.events"]
+
+
+def test_inheritance_ancestors_of_walks_multi_level_chain() -> None:
+    grandparent = Table(
+        schema="public",
+        name="events",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    middle = Table(
+        schema="public",
+        name="events_mid",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "events"),),
+    )
+    leaf = Table(
+        schema="public",
+        name="events_leaf",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "events_mid"),),
+    )
+    schema = Schema(tables=(grandparent, middle, leaf))
+    chain = [t.qualified_name for t in schema.inheritance_ancestors_of(leaf)]
+    # Depth-first: the single chain yields mid then events.
+    assert chain == ["public.events_mid", "public.events"]
+
+
+def test_inheritance_ancestors_of_walks_multiple_parents_dag() -> None:
+    # Classic inheritance is a DAG: a child may inherit from several parents.
+    # All distinct ancestors are yielded (order is depth-first in `inherits`
+    # order). This is the case a partition's single-parent walk can't reach.
+    p1 = Table(
+        schema="public",
+        name="audited",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    p2 = Table(
+        schema="public",
+        name="timestamped",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+    )
+    child = Table(
+        schema="public",
+        name="records",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "audited"), ("public", "timestamped")),
+    )
+    schema = Schema(tables=(p1, p2, child))
+    chain = {t.qualified_name for t in schema.inheritance_ancestors_of(child)}
+    assert chain == {"public.audited", "public.timestamped"}
+
+
+def test_inheritance_ancestors_of_dedupes_diamond() -> None:
+    # A diamond (two parents reconverging on a common grandparent) must yield
+    # the grandparent exactly ONCE — re-reaching an already-finished node via
+    # a second path is benign and must not duplicate or (crucially) raise as
+    # if it were a cycle.
+    root = Table(
+        schema="public",
+        name="root",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    left = Table(
+        schema="public",
+        name="left",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "root"),),
+    )
+    right = Table(
+        schema="public",
+        name="right",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "root"),),
+    )
+    leaf = Table(
+        schema="public",
+        name="leaf",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "left"), ("public", "right")),
+    )
+    schema = Schema(tables=(root, left, right, leaf))
+    chain = [t.qualified_name for t in schema.inheritance_ancestors_of(leaf)]
+    # root appears once despite two reachable paths.
+    assert chain.count("public.root") == 1
+    assert set(chain) == {"public.left", "public.right", "public.root"}
+
+
+def test_inheritance_ancestors_of_terminates_at_out_of_scope_gap() -> None:
+    # A parent in an unscoped schema isn't in `Schema.tables` — the walk
+    # ends at the gap without yielding it, mirroring `ancestors_of`.
+    child = Table(
+        schema="public",
+        name="records",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("private", "base"),),
+    )
+    schema = Schema(tables=(child,))
+    assert list(schema.inheritance_ancestors_of(child)) == []
+
+
+def test_inheritance_ancestors_of_raises_on_two_node_cycle() -> None:
+    # Postgres rejects inheritance cycles; only corrupted state can produce
+    # one. A two-node cycle (a → b → a) must raise, not silently truncate.
+    a = Table(
+        schema="public",
+        name="a",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "b"),),
+    )
+    b = Table(
+        schema="public",
+        name="b",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "a"),),
+    )
+    schema = Schema(tables=(a, b))
+    with pytest.raises(ValueError, match="cycle"):
+        list(schema.inheritance_ancestors_of(a))
+
+
+def test_inheritance_ancestors_of_raises_on_deep_cycle_below_start() -> None:
+    # The cycle does NOT pass through the starting table (leaf → p → q → p).
+    # The white/grey/black DFS colouring must still catch it — seeding only
+    # the start node in the active-path set would miss this, so pin it.
+    p = Table(
+        schema="public",
+        name="p",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "q"),),
+    )
+    q = Table(
+        schema="public",
+        name="q",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "p"),),
+    )
+    leaf = Table(
+        schema="public",
+        name="leaf",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "p"),),
+    )
+    schema = Schema(tables=(p, q, leaf))
+    with pytest.raises(ValueError, match="cycle"):
+        list(schema.inheritance_ancestors_of(leaf))
+
+
+def test_inheritance_ancestors_of_raises_on_self_cycle_without_yielding() -> None:
+    # A table whose `inherits` points back to itself is a length-1 cycle.
+    # The active-path set is seeded with the start table specifically so this
+    # raises before yielding the table as its own ancestor.
+    self_ref = Table(
+        schema="public",
+        name="loop",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "loop"),),
+    )
+    schema = Schema(tables=(self_ref,))
+    iterator = schema.inheritance_ancestors_of(self_ref)
+    with pytest.raises(ValueError, match="cycle"):
+        next(iterator)
+
+
+def test_snapshot_includes_inherits_when_set() -> None:
+    # v17: `inherits` is emitted (and round-trips) only when non-empty.
+    child = Table(
+        schema="public",
+        name="records",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        inherits=(("public", "audited"), ("public", "timestamped")),
+    )
+    schema = Schema(tables=(child,))
+    snap = schema.to_snapshot()
+    [t] = snap["tables"]
+    assert t["inherits"] == [["public", "audited"], ["public", "timestamped"]]
+    # round-trips list-of-lists back to tuple-of-tuples
+    restored = Schema.from_snapshot(snap)
+    assert restored.tables[0].inherits == (
+        ("public", "audited"),
+        ("public", "timestamped"),
+    )
+
+
+def test_snapshot_omits_inherits_key_when_empty() -> None:
+    # A table with no classic inheritance must serialize byte-identically to
+    # before v17 (no `inherits` key) — the conditional-emit / no-churn
+    # contract, mirroring column_grants.
+    t = Table(
+        schema="public",
+        name="standalone",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    snap = Schema(tables=(t,)).to_snapshot()
+    assert "inherits" not in snap["tables"][0]
+
+
 def test_table_with_list_partition_of_is_unhashable() -> None:
     # Contract: `partition_of` must be a tuple (or None). The type hint
     # says so; the frozen dataclass auto-hash will fail loudly if
@@ -493,7 +760,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
     }
-    assert snap["version"] == 16
+    assert snap["version"] == 17
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -811,7 +1078,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 16
+    assert snap["version"] == SNAPSHOT_VERSION == 17
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

@@ -135,6 +135,29 @@ WHERE cc.relispartition = true
   AND inh.inhrelid = ANY(%s)
 """
 
+# Classic-`INHERITS` parents — the complement of `_PARTITION_PARENTS_SQL`
+# (which filters `relispartition = true`). `pg_inherits` records BOTH a
+# declarative partition's parent and a legacy `CREATE TABLE child ()
+# INHERITS (parent)` edge; the child's `pg_class.relispartition` is the
+# discriminator (`false` for classic inheritance). A classic-inheritance
+# child may inherit from MULTIPLE parents (a DAG), so one child OID can
+# appear in several rows here — unlike a partition child, which has exactly
+# one parent. SEC043 reads these: a direct query on a classic-inheritance
+# child whose own RLS is off bypasses an RLS-enforcing ancestor's policy,
+# exactly as SEC041 covers for partitions.
+_INHERITANCE_PARENTS_SQL = """
+SELECT
+    inh.inhrelid AS child_oid,
+    pn.nspname AS parent_schema,
+    pc.relname AS parent_name
+FROM pg_catalog.pg_inherits inh
+JOIN pg_catalog.pg_class cc ON cc.oid = inh.inhrelid
+JOIN pg_catalog.pg_class pc ON pc.oid = inh.inhparent
+JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
+WHERE cc.relispartition = false
+  AND inh.inhrelid = ANY(%s)
+"""
+
 # Role-name resolution layers three concerns into one subquery:
 #   * `polroles` may contain duplicates — Postgres stores `TO r1, r1`
 #     verbatim. DISTINCT collapses them so `Policy.roles` is a set in
@@ -1095,6 +1118,8 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         policy_rows = cur.fetchall()
         cur.execute(_PARTITION_PARENTS_SQL, (oids,))
         partition_rows = cur.fetchall()
+        cur.execute(_INHERITANCE_PARENTS_SQL, (oids,))
+        inheritance_rows = cur.fetchall()
         cur.execute(_TRIGGERS_SQL, (oids,))
         trigger_rows = cur.fetchall()
         cur.execute(_INDEXES_SQL, (oids,))
@@ -1146,6 +1171,18 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     partition_parent_by_oid: dict[int, tuple[str, str]] = {
         row["child_oid"]: (row["parent_schema"], row["parent_name"])
         for row in partition_rows
+    }
+
+    # Classic-`INHERITS` parents — aggregated per child because a child may
+    # inherit from MULTIPLE parents (a DAG). Sort each child's parent list so
+    # the snapshot is deterministic regardless of `pg_inherits` row order.
+    inherits_acc: dict[int, set[tuple[str, str]]] = defaultdict(set)
+    for row in inheritance_rows:
+        inherits_acc[row["child_oid"]].add(
+            (row["parent_schema"], row["parent_name"])
+        )
+    inherits_by_oid: dict[int, tuple[tuple[str, str], ...]] = {
+        oid: tuple(sorted(parents)) for oid, parents in inherits_acc.items()
     }
 
     indexes_by_oid: dict[int, list[Index]] = defaultdict(list)
@@ -1253,6 +1290,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             policies=tuple(by_oid.get(row["table_oid"], [])),
             columns=tuple(columns_by_oid.get(row["table_oid"], [])),
             partition_of=partition_parent_by_oid.get(row["table_oid"]),
+            inherits=inherits_by_oid.get(row["table_oid"], ()),
             grants=tuple(
                 Grant(role=role, privileges=tuple(privileges))
                 for role, privileges in sorted(

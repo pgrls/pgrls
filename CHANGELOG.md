@@ -10,6 +10,35 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-06-15
+
+### Added
+
+- **SEC043** (warning) — a classic-`INHERITS` child (`CREATE TABLE child ()
+  INHERITS (parent)`, **not** a declarative partition) whose row-level
+  security is **disabled** while an ancestor in its inheritance DAG has RLS
+  **enabled**, *and* which carries a direct **row-access** grant (table- or
+  column-level `SELECT`/`INSERT`/`UPDATE`/`DELETE`) to a non-owner role.
+  Postgres does not inherit RLS (or privileges) to inheritance children, so a
+  query naming the granted child directly (e.g. a PostgREST `GET /child`, or a
+  direct `SELECT`) bypasses the parent's policies and returns every row, while
+  queries routed through the parent stay scoped. This is the classic-`INHERITS`
+  analogue of **SEC041** (declarative partitions) — the two are mutually
+  exclusive (a table is a partition child XOR a classic-inheritance child) and
+  never double-report. Unlike a partition's single parent, an inheritance child
+  may have multiple parents (a DAG); SEC043 fires if any ancestor enforces RLS.
+  Note: unlike the partition case, SEC001 (and SEC032 for a dormant-policy
+  child) also fires on the same child, because SEC001/SEC032 do not walk
+  classic inheritance — a deliberate over-report; both findings point to the
+  same fix (enable RLS on the child). Configurable via
+  `[lint.rules.SEC043].allowlist`. No auto-fix. Catalog is now **56 rules**.
+- **Snapshot v17** — `Table` gains `inherits` (the classic-`INHERITS` parents,
+  as `(schema, name)` pairs), captured from `pg_inherits` rows whose child has
+  `relispartition = false`, for SEC043. Emitted only when non-empty, so a table
+  with no classic inheritance round-trips byte-identically apart from the
+  version bump. Additive: v3–v16 snapshots load with `inherits=()` (SEC043
+  finds no classic-inheritance ancestor until re-captured).
+
 ## [0.29.0] - 2026-06-15
 
 ### Added

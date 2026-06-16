@@ -483,11 +483,11 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_sixteen():
-    # Bumped 15 → 16 to add SecdefFunction.execute_roles + owner_bypasses_rls
-    # (for SEC042's anon-executable-SECDEF-bypass check). Pin so a future
-    # bump is deliberate.
-    assert SNAPSHOT_VERSION == 16
+def test_snapshot_version_is_seventeen():
+    # Bumped 16 → 17 to add Table.inherits (classic-INHERITS parents) for
+    # SEC043's classic-inheritance-RLS-bypass check. Pin so a future bump is
+    # deliberate.
+    assert SNAPSHOT_VERSION == 17
 
 
 def test_to_snapshot_emits_column_details_array():
