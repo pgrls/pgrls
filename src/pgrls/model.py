@@ -29,6 +29,7 @@ __all__ = [
     "BypassRlsRole",
     "Column",
     "ColumnGrant",
+    "DefaultPrivilege",
     "Grant",
     "Index",
     "LeakproofFunction",
@@ -47,7 +48,12 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 17  # v17: Table.inherits (classic-INHERITS parents) for
+SNAPSHOT_VERSION = 18  # v18: top-level default_privileges (from
+# pg_default_acl, defaclobjtype='r') for SEC044 — the standing default-
+# privilege grants on future tables. Always emitted (like the other
+# top-level arrays), so a database with no default privileges round-trips
+# with an empty array apart from this version bump. v17: Table.inherits
+# (classic-INHERITS parents) for
 # SEC043 — emitted only when non-empty, so a table with no classic
 # inheritance round-trips byte-identically apart from this version bump
 # (distinct from partition_of, which is declarative-only). v16:
@@ -732,6 +738,58 @@ class LeakproofFunction:
     function_name: str = ""
 
 
+@dataclass(frozen=True)
+class DefaultPrivilege:
+    """A default-privilege grant on TABLES, from `pg_default_acl`.
+
+    Captured in snapshot v18+ for SEC044. ``ALTER DEFAULT PRIVILEGES
+    [IN SCHEMA s] [FOR ROLE r] GRANT <priv> ON TABLES TO <grantee>`` records
+    one ``pg_default_acl`` row (``defaclobjtype = 'r'``); every table CREATED
+    AFTER that statement (in scope) is automatically granted the privilege.
+    Default privileges are NOT retroactive — they affect only future tables —
+    so a row granting a row-access privilege to a low-trust grantee is a
+    standing footgun: a developer who creates a new table and forgets to
+    ``ENABLE ROW LEVEL SECURITY`` silently exposes it.
+
+    Captured fields are the minimum SEC044 needs:
+
+    * ``schema`` — the schema the default applies in, or ``None`` for a
+      **cluster-wide** entry (``ALTER DEFAULT PRIVILEGES`` without
+      ``IN SCHEMA``, stored with ``defaclnamespace = 0``), which affects
+      tables in every schema. Introspection restricts schema-scoped entries
+      to the ``--schemas`` set but always captures cluster-wide ones.
+    * ``grantee`` — the role the privilege is granted to, with the PUBLIC
+      pseudo-role rendered as the literal ``"PUBLIC"`` (mirroring
+      ``Grant.role`` / ``Policy.roles``). The owning role's own self-grant is
+      excluded at the introspection layer (``ax.grantee <> defaclrole``), the
+      same owner-exclusion ``Grant`` applies, so every captured record is a
+      real non-owner default grant.
+    * ``privileges`` — the privilege types granted to this grantee in this
+      scope, as Postgres's canonical strings (``SELECT``/``INSERT``/
+      ``UPDATE``/``DELETE``/``TRUNCATE``/``REFERENCES``/``TRIGGER``). ALL
+      privileges are captured (not just row-access ones); SEC044 filters to
+      the row-access subset, and capturing broadly keeps the model faithful.
+    * ``grantor`` — the role whose object creation triggers this default
+      (``pg_default_acl.defaclrole``: the ``FOR ROLE`` target, defaulting to
+      the role that ran ``ALTER DEFAULT PRIVILEGES``). It is part of the
+      ``pg_default_acl`` identity — ``(defaclrole, defaclnamespace,
+      defaclobjtype)`` — so two defaults differing only by grantor are
+      *distinct* standing rules, each needing its own ``FOR ROLE <grantor>``
+      REVOKE (a bare REVOKE only clears the running role's default, and
+      silently no-ops against another role's). SEC044 keys its dedup on it
+      and names it in the remediation. ``None`` for a hand-built model or a
+      pre-grantor v18 snapshot (the rule then emits a grantor-less REVOKE).
+
+    Not feeding ``Schema.to_sql()`` (``pgrls diff --apply`` replays table-
+    level GRANTs, not default privileges); SEC044 is the only consumer.
+    """
+
+    schema: str | None
+    grantee: str
+    privileges: tuple[str, ...]
+    grantor: str | None = None
+
+
 # --- Snapshot decoders -------------------------------------------------
 #
 # One per-entity decoder for each top-level array `to_snapshot` emits, so
@@ -1082,6 +1140,23 @@ def _escalation_from_dict(e: dict[str, Any]) -> BypassRlsEscalation:
     )
 
 
+def _default_privilege_from_dict(d: dict[str, Any]) -> DefaultPrivilege:
+    # `schema` is None for a cluster-wide entry (to_snapshot emits null);
+    # `.get("schema")` yields None for both the explicit null and a missing
+    # key. Default privileges are not interpolated into any executed DDL
+    # (Schema.to_sql() ignores them), so no value-injection validation is
+    # needed — unlike grants/columns/signatures.
+    return DefaultPrivilege(
+        schema=d.get("schema"),
+        grantee=d["grantee"],
+        privileges=tuple(d["privileges"]),
+        # `grantor` joined v18 alongside the rest of the entry (v18 is
+        # unreleased), so it always rides current snapshots; `.get` still
+        # tolerates a grantor-less entry from an in-flight pre-grantor v18.
+        grantor=d.get("grantor"),
+    )
+
+
 @dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
@@ -1115,6 +1190,15 @@ class Schema:
     # SEC029 finds nothing to flag against a pre-v11 snapshot until
     # it is re-captured.
     bypassrls_escalation_roles: tuple[BypassRlsEscalation, ...] = ()
+    # Default privileges on TABLES (`pg_default_acl`, `defaclobjtype='r'`) —
+    # populated in snapshot v18+. SEC044 walks this; introspection captures
+    # the schema-scoped entries within `--schemas` plus all cluster-wide
+    # entries (which affect every schema). Default `()` keeps callers that
+    # construct `Schema(...)` without it (unit tests, older snapshots)
+    # working unchanged; v3-v17 baselines round-trip with
+    # `default_privileges=()` so SEC044 finds nothing to flag against a
+    # pre-v18 snapshot until it is re-captured against a live database.
+    default_privileges: tuple[DefaultPrivilege, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1422,13 +1506,35 @@ class Schema:
                 }
                 for e in self.bypassrls_escalation_roles
             ],
+            # v18 extension — emit default privileges on TABLES (from
+            # pg_default_acl). SEC044 reads this. Order matches
+            # `Schema.default_privileges` (sorted by schema then grantee at
+            # introspection time) for snapshot determinism. A cluster-wide
+            # entry's schema is emitted as null. v3-v17 baselines round-trip
+            # with `default_privileges=()` → empty array (always emitted, like
+            # the other top-level arrays above).
+            "default_privileges": [
+                {
+                    "schema": dp.schema,
+                    "grantee": dp.grantee,
+                    "privileges": list(dp.privileges),
+                    "grantor": dp.grantor,
+                }
+                for dp in self.default_privileges
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v17 snapshot dict.
+        """Reconstruct a Schema from a v3-v18 snapshot dict.
 
-        v17 (current): adds per-table ``inherits`` (classic-``INHERITS``
+        v18 (current): adds top-level ``default_privileges`` (from
+        ``pg_default_acl``, ``defaclobjtype='r'``) for SEC044. v3-v17
+        snapshots have no key and load with ``default_privileges=()`` so
+        SEC044 finds nothing to flag until the snapshot is re-captured against
+        a live database. A cluster-wide entry's ``schema`` is ``null``.
+
+        v17: adds per-table ``inherits`` (classic-``INHERITS``
         parents) for SEC043. Emitted only when non-empty; pre-v17 snapshots
         have no key and load with ``inherits=()`` so SEC043 finds no
         classic-inheritance ancestor until the snapshot is re-captured.
@@ -1499,12 +1605,14 @@ class Schema:
                 f"{type(payload).__name__}"
             )
         version = payload.get("version")
-        if version not in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
+        if version not in (
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17. v1 / v2 snapshots must be "
-                "regenerated against the current schema."
+                "10, 11, 12, 13, 14, 15, 16, 17, 18. v1 / v2 snapshots must "
+                "be regenerated against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -1552,6 +1660,11 @@ class Schema:
             _escalation_from_dict(e)
             for e in payload.get("bypassrls_escalation_roles", [])
         )
+        # v18+ default privileges; a v3-v17 snapshot has no key → ().
+        default_privileges = tuple(
+            _default_privilege_from_dict(d)
+            for d in payload.get("default_privileges", [])
+        )
 
         return cls(
             tables=tables,
@@ -1560,6 +1673,7 @@ class Schema:
             bypassrls_roles=bypassrls_roles,
             leakproof_functions=leakproof_functions,
             bypassrls_escalation_roles=bypassrls_escalation_roles,
+            default_privileges=default_privileges,
         )
 
     def to_sql(self) -> str:

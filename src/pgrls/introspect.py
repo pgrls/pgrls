@@ -15,6 +15,7 @@ from pgrls.model import (
     BypassRlsRole,
     Column,
     ColumnGrant,
+    DefaultPrivilege,
     Grant,
     Index,
     LeakproofFunction,
@@ -716,6 +717,64 @@ WHERE p.proleakproof = TRUE
 ORDER BY qname, signature
 """
 
+# Default privileges on TABLES from `pg_default_acl` (`defaclobjtype = 'r'`).
+# `ALTER DEFAULT PRIVILEGES [IN SCHEMA s] [FOR ROLE r] GRANT <priv> ON TABLES
+# TO <grantee>` records one row here; every table CREATED AFTER it (in scope)
+# is automatically granted the privilege. SEC044 flags a row that grants a
+# row-access privilege to a low-trust grantee (PUBLIC by default), because a
+# new table whose author forgets `ENABLE ROW LEVEL SECURITY` is then silently
+# exposed.
+#
+# `aclexplode(defaclacl)` expands the aclitem[] into one (grantee, privilege)
+# row each, and grantee 0 is rendered as the literal "PUBLIC" — mirroring
+# `_GRANTS_SQL`. Role-name resolution joins the world-readable `pg_roles`
+# (not `pg_authid`), COALESCE-ing an unresolved grantee to a stable `oid:N`
+# sentinel so the `str` contract holds.
+#
+# `defaclnamespace` is the schema OID, or 0 for a CLUSTER-WIDE entry (one set
+# without `IN SCHEMA`, which affects every schema). The LEFT JOIN to
+# pg_namespace yields the schema name, or NULL for the cluster-wide case —
+# `_fetch_default_privileges` maps NULL to `schema=None`.
+#
+# `ax.grantee <> d.defaclrole` drops the self-grant the owning role always
+# carries (a cluster-wide `... TO PUBLIC` stores `{=r/owner,
+# owner=arwdDxt/owner}`, so the owner's full self-ACL would otherwise surface
+# as a phantom grant) — the same owner-exclusion `_GRANTS_SQL` applies to
+# `relacl`. The captured set is therefore the real non-owner default grants.
+#
+# `defaclrole` is the GRANTOR: the role whose table creation triggers this
+# default (the `FOR ROLE` target, or the role that ran the statement). It is
+# part of the pg_default_acl identity — `(defaclrole, defaclnamespace,
+# defaclobjtype)` — so two defaults differing only by grantor are distinct
+# standing rules, each revoked only by a `FOR ROLE <grantor>` REVOKE; we
+# capture it (rendered via pg_roles, `oid:N` sentinel if unresolved) so SEC044
+# keys dedup on it and emits a precise remediation. `defaclrole` is never 0.
+#
+# Scope: schema-scoped entries are restricted to the introspected `--schemas`,
+# but cluster-wide entries (`defaclnamespace = 0`) are ALWAYS captured because
+# they affect tables in every schema. ALL grantees and ALL privileges are
+# captured (the rule filters); capturing broadly keeps the model faithful and
+# lets config widen the grantee set. ORDER BY for snapshot determinism.
+_DEFAULT_PRIVILEGES_SQL = """
+SELECT DISTINCT
+    dn.nspname AS schema_name,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS grantee,
+    ax.privilege_type,
+    COALESCE(gr.rolname, 'oid:' || d.defaclrole::text) AS grantor
+FROM pg_catalog.pg_default_acl d
+LEFT JOIN pg_catalog.pg_namespace dn ON dn.oid = d.defaclnamespace
+LEFT JOIN LATERAL aclexplode(d.defaclacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+LEFT JOIN pg_catalog.pg_roles gr ON gr.oid = d.defaclrole
+WHERE d.defaclobjtype = 'r'
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> d.defaclrole
+  AND (d.defaclnamespace = 0 OR dn.nspname = ANY(%s))
+ORDER BY schema_name, grantee, grantor, ax.privilege_type
+"""
+
 
 def _extract_search_path(config: list[str] | None) -> str | None:
     """Pull the `search_path` value out of a `pg_proc.proconfig` array.
@@ -850,6 +909,46 @@ def _fetch_leakproof_functions(
             function_name=row["function_name"],
         )
         for row in cur.fetchall()
+    )
+
+
+def _fetch_default_privileges(
+    cur: Any, schemas: list[str]
+) -> tuple[DefaultPrivilege, ...]:
+    """Fetch default privileges on TABLES from `pg_default_acl`.
+
+    Returns one `DefaultPrivilege` per (schema, grantee, grantor) — privileges
+    granted to the same grantee in the same scope by the same grantor are
+    folded into a single record's `privileges` tuple. The grantor
+    (`defaclrole`) is part of the entry's identity, so two defaults differing
+    only by grantor stay distinct records. Schema-scoped entries are restricted
+    to `schemas`; cluster-wide entries (`defaclnamespace = 0`, set without `IN
+    SCHEMA`) are always captured and represented with `schema=None`, because
+    they affect tables in every schema. SEC044 reads this.
+
+    The SQL `ORDER BY schema_name, grantee, grantor, privilege_type` makes both
+    the grouping iteration order and each record's `privileges` tuple
+    deterministic across runs for byte-stable snapshots.
+    """
+    cur.execute(_DEFAULT_PRIVILEGES_SQL, [list(schemas)])
+    # Group by (schema, grantee, grantor). The SQL renders a cluster-wide
+    # entry's schema as NULL → psycopg surfaces it as None, which becomes
+    # `DefaultPrivilege.schema = None`.
+    acc: dict[tuple[str | None, str, str], list[str]] = defaultdict(list)
+    order: list[tuple[str | None, str, str]] = []
+    for row in cur.fetchall():
+        key = (row["schema_name"], row["grantee"], row["grantor"])
+        if key not in acc:
+            order.append(key)
+        acc[key].append(row["privilege_type"])
+    return tuple(
+        DefaultPrivilege(
+            schema=schema,
+            grantee=grantee,
+            privileges=tuple(acc[(schema, grantee, grantor)]),
+            grantor=grantor,
+        )
+        for (schema, grantee, grantor) in order
     )
 
 
@@ -1095,6 +1194,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         bypassrls_roles = _fetch_bypassrls_roles(cur)
         leakproof_funcs = _fetch_leakproof_functions(cur, schemas)
         bypassrls_escalation = _fetch_bypassrls_escalation_roles(cur)
+        default_privileges = _fetch_default_privileges(cur, schemas)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1109,6 +1209,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 bypassrls_roles=bypassrls_roles,
                 leakproof_functions=leakproof_funcs,
                 bypassrls_escalation_roles=bypassrls_escalation,
+                default_privileges=default_privileges,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1316,4 +1417,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         bypassrls_roles=bypassrls_roles,
         leakproof_functions=leakproof_funcs,
         bypassrls_escalation_roles=bypassrls_escalation,
+        default_privileges=default_privileges,
     )

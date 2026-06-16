@@ -843,6 +843,105 @@ def test_introspect_diff_no_phantom_owner_grant_on_first_grant(
     )
 
 
+# --- default privileges (pg_default_acl) for SEC044 ----------------------
+#
+# These are the first focused live tests of `_fetch_default_privileges`. They
+# validate the production `_DEFAULT_PRIVILEGES_SQL` against a real Postgres,
+# not a hand-built assumption — capture, grantor identity, the owner-self-grant
+# exclusion, multi-grantor distinctness, and the cluster-wide (schema=None)
+# mapping. `apply_sql` splits on `;`, so no `;` inside SQL comments.
+
+
+def test_introspect_captures_default_privileges(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A schema-scoped `... ON TABLES TO PUBLIC` default is captured with its
+    # schema, grantee, privileges, and grantor (the role that ran ALTER
+    # DEFAULT PRIVILEGES — here current_user, with no FOR ROLE). A default
+    # `... TO PUBLIC` stores `{=r/owner, owner=arwdDxt/owner}` in defaclacl;
+    # the owner's own self-entry is filtered (ax.grantee <> defaclrole),
+    # mirroring the relacl owner-exclusion, so only the PUBLIC grant surfaces.
+    # (Schema-scoped on public → cleaned by the pg_conn DROP SCHEMA reset.)
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT current_user")
+        row = cur.fetchone()
+        assert row is not None
+        actor = row[0]
+
+    apply_sql(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "GRANT SELECT ON TABLES TO PUBLIC"
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    by_grantee = {
+        d.grantee: d
+        for d in schema.default_privileges
+        if d.schema == "public"
+    }
+    assert "PUBLIC" in by_grantee
+    assert "SELECT" in by_grantee["PUBLIC"].privileges
+    assert by_grantee["PUBLIC"].grantor == actor
+    # The owner's materialized self-grant must NOT surface as a grantee.
+    assert actor not in by_grantee
+
+
+def test_introspect_default_privileges_distinct_grantors(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # pg_default_acl is keyed on (defaclrole, namespace, objtype). Two
+    # defaults to PUBLIC in one schema created FOR ROLE different grantors are
+    # distinct rows; capture must keep them distinct (not fold by
+    # schema+grantee), so SEC044 reports each and emits a per-grantor FOR ROLE
+    # REVOKE. (FOR ROLE entries on public → cleaned by the DROP SCHEMA reset;
+    # the leftover NOLOGIN roles are dropped defensively on the next run.)
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS dp_grantor_a;
+        DROP ROLE IF EXISTS dp_grantor_b;
+        CREATE ROLE dp_grantor_a NOLOGIN;
+        CREATE ROLE dp_grantor_b NOLOGIN;
+        ALTER DEFAULT PRIVILEGES FOR ROLE dp_grantor_a IN SCHEMA public
+            GRANT SELECT ON TABLES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES FOR ROLE dp_grantor_b IN SCHEMA public
+            GRANT SELECT ON TABLES TO PUBLIC;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    grantors = sorted(
+        d.grantor
+        for d in schema.default_privileges
+        if d.schema == "public"
+        and d.grantee == "PUBLIC"
+        and d.grantor in ("dp_grantor_a", "dp_grantor_b")
+    )
+    assert grantors == ["dp_grantor_a", "dp_grantor_b"]
+
+
+def test_introspect_default_privileges_cluster_wide(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # A cluster-wide default (no IN SCHEMA, defaclnamespace=0) is captured
+    # with schema=None and is always returned even under a narrow --schemas
+    # scope, because it affects tables in every schema. It is NOT tied to a
+    # schema, so the pg_conn DROP SCHEMA reset does NOT remove it — clean it
+    # up in a finally so it can't leak a PUBLIC grant onto every table created
+    # by later tests.
+    apply_sql("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC")
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        cluster_wide = [
+            d
+            for d in schema.default_privileges
+            if d.schema is None and d.grantee == "PUBLIC"
+        ]
+        assert len(cluster_wide) == 1
+        assert "SELECT" in cluster_wide[0].privileges
+    finally:
+        apply_sql(
+            "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM PUBLIC"
+        )
+
+
 def test_introspect_captures_views(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

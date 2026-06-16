@@ -18,11 +18,11 @@ from pgrls.model import (
 )
 
 
-def test_snapshot_version_is_17() -> None:
-    # Bumped 16 → 17 to add Table.inherits (classic-INHERITS parents,
-    # for SEC043). v3–v16 baselines still load (Schema.from_snapshot
-    # accepts 3 through 17).
-    assert SNAPSHOT_VERSION == 17
+def test_snapshot_version_is_18() -> None:
+    # Bumped 17 → 18 to add top-level default_privileges (from
+    # pg_default_acl, for SEC044). v3–v17 baselines still load
+    # (Schema.from_snapshot accepts 3 through 18).
+    assert SNAPSHOT_VERSION == 18
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -47,7 +47,7 @@ def test_to_snapshot_emits_views_field() -> None:
     # added bypassrls_roles; v10 added leakproof_functions; v11
     # added bypassrls_escalation_roles (all additive and orthogonal
     # to the views field this test exercises).
-    assert snap["version"] == 17
+    assert snap["version"] == 18
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -429,7 +429,7 @@ def test_to_snapshot_emits_bypassrls_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_roles" in snap
-    assert snap["version"] == 17
+    assert snap["version"] == 18
     assert snap["bypassrls_roles"] == [
         {"name": "etl_worker", "superuser": False, "can_login": True}
     ]
@@ -488,7 +488,7 @@ def test_to_snapshot_emits_leakproof_functions_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "leakproof_functions" in snap
-    assert snap["version"] == 17
+    assert snap["version"] == 18
     # `signature` is the v12 addition — defaults to "" when the
     # LeakproofFunction is constructed without it (as here).
     assert snap["leakproof_functions"] == [
@@ -553,7 +553,7 @@ def test_to_snapshot_emits_bypassrls_escalation_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_escalation_roles" in snap
-    assert snap["version"] == 17
+    assert snap["version"] == 18
     assert snap["bypassrls_escalation_roles"] == [
         {
             "member": "app",

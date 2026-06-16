@@ -874,3 +874,16 @@ CREATE POLICY tenant_scope ON public.allbad_sec043_parent
     USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::int));
 CREATE TABLE public.allbad_sec043_child () INHERITS (public.allbad_sec043_parent);
 GRANT SELECT ON public.allbad_sec043_child TO allbad_sec043_role;
+
+-- SEC044: default privileges in schema public auto-grant SELECT on every
+-- future table to PUBLIC, so any table created later without RLS is silently
+-- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl
+-- entry itself, with location `public`. This statement MUST stay at the very
+-- END of the file: default privileges are NOT retroactive, so placing it last
+-- means no existing all_bad table gets a retroactive PUBLIC grant (which would
+-- otherwise cascade into SEC041/SEC043 reachability and the diff PUBLIC-grant
+-- paths). The DROP SCHEMA public CASCADE in the test finally removes this
+-- pg_default_acl row (verified on PG16), so it does not leak into the next
+-- test. SEC044's default low-trust set is {PUBLIC} only -- granting to anon
+-- or authenticated would be silent (the RLS-gated Supabase pattern).
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
