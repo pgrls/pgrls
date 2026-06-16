@@ -37,17 +37,24 @@ breaking changes — they will be called out in this file.
   cluster-wide default applies in every schema, it is reported on every
   `--schemas`-scoped run (not leakage; revoke or allowlist it to silence).
   Allowlist a deliberate default by schema name (or `(cluster-wide)`) in
-  `[lint.rules.SEC044]`. No
-  auto-fix: whether to revoke the default or scope it to a role is a deployment
-  decision. Brings the catalog to **57 rules**.
+  `[lint.rules.SEC044]`. The remediation names the entry's **grantor** in a
+  `FOR ROLE <grantor>` REVOKE (`pg_default_acl` is keyed on the creating role,
+  so a bare REVOKE clears only the running role's own default and silently
+  no-ops against another's; two same-grantee defaults from different grantors
+  are reported separately). No auto-fix: whether to revoke the default or scope
+  it to a role is a deployment decision. Brings the catalog to **57 rules**.
 
 ### Changed
 
 - **Snapshot format v18.** Adds a top-level `default_privileges` array (from
   `pg_default_acl`, `defaclobjtype='r'`) for SEC044, always emitted like the
-  other top-level arrays. Additive and fail-closed: snapshots from v3–v17 load
-  with `default_privileges=()` (SEC044 abstains on them until re-captured), and
-  `Schema.from_snapshot` still accepts versions 3 through 18.
+  other top-level arrays. Each entry carries `schema` (null for a cluster-wide
+  default), `grantee`, `privileges`, and `grantor` (the `defaclrole` whose
+  table creation triggers the default — part of the entry's identity, so
+  same-grantee defaults from different grantors stay distinct). Additive and
+  fail-closed: snapshots from v3–v17 load with `default_privileges=()` (SEC044
+  abstains on them until re-captured), and `Schema.from_snapshot` still accepts
+  versions 3 through 18.
 
 ## [0.30.0] - 2026-06-15
 

@@ -696,38 +696,67 @@ def test_snapshot_omits_inherits_key_when_empty() -> None:
 
 def test_default_privileges_round_trip_through_snapshot() -> None:
     # v18: top-level default_privileges (from pg_default_acl) serialize and
-    # decode for SEC044, including a cluster-wide entry (schema=None → null).
+    # decode for SEC044, including a cluster-wide entry (schema=None → null)
+    # and the grantor (defaclrole, part of the entry's identity).
     schema = Schema(
         default_privileges=(
             DefaultPrivilege(
-                schema="public", grantee="PUBLIC", privileges=("SELECT",)
+                schema="public",
+                grantee="PUBLIC",
+                privileges=("SELECT",),
+                grantor="app_owner",
             ),
             DefaultPrivilege(
                 schema=None,
                 grantee="anon",
                 privileges=("SELECT", "INSERT"),
+                grantor="postgres",
             ),
         )
     )
     snap = schema.to_snapshot()
     assert snap["default_privileges"] == [
-        {"schema": "public", "grantee": "PUBLIC", "privileges": ["SELECT"]},
+        {
+            "schema": "public",
+            "grantee": "PUBLIC",
+            "privileges": ["SELECT"],
+            "grantor": "app_owner",
+        },
         {
             "schema": None,
             "grantee": "anon",
             "privileges": ["SELECT", "INSERT"],
+            "grantor": "postgres",
         },
     ]
     restored = Schema.from_snapshot(snap)
     assert restored.default_privileges == schema.default_privileges
     # The cluster-wide entry round-trips back to schema=None.
     assert restored.default_privileges[1].schema is None
+    # The grantor round-trips.
+    assert restored.default_privileges[0].grantor == "app_owner"
 
 
 def test_default_privileges_absent_in_pre_v18_snapshot_loads_empty() -> None:
     # A v17 snapshot has no default_privileges key → loads as ().
     snap = {"version": 17, "tables": [], "policies": []}
     assert Schema.from_snapshot(snap).default_privileges == ()
+
+
+def test_default_privilege_grantor_absent_loads_none() -> None:
+    # An entry without a "grantor" key (a hand-built or in-flight pre-grantor
+    # v18 snapshot) decodes with grantor=None — the rule then emits a
+    # grantor-less REVOKE rather than crashing.
+    snap = {
+        "version": 18,
+        "tables": [],
+        "policies": [],
+        "default_privileges": [
+            {"schema": "public", "grantee": "PUBLIC", "privileges": ["SELECT"]}
+        ],
+    }
+    [dp] = Schema.from_snapshot(snap).default_privileges
+    assert dp.grantor is None
 
 
 def test_table_with_list_partition_of_is_unhashable() -> None:

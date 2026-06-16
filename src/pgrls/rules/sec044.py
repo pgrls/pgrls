@@ -47,10 +47,15 @@ after-the-fact findings on a table that already exists. SEC044 is the
 the PUBLIC grant is already in place before the table is created, so the only
 thing standing between a new table and exposure is the author remembering
 RLS. SEC044 catches the posture so the per-table mistake never lands;
-remediate by scoping default privileges to specific roles and relying on RLS:
+remediate by scoping default privileges to specific roles and relying on RLS.
+The REVOKE must name the same ``FOR ROLE`` grantor the default was created for
+(``pg_default_acl.defaclrole``) — a bare REVOKE only clears the *running*
+role's own default and silently no-ops against another role's, so SEC044 names
+the grantor in its remediation:
 
 ```sql
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    REVOKE SELECT ON TABLES FROM PUBLIC;
 ```
 
 Allowlist a deliberate default by its schema name (or ``(cluster-wide)`` for a
@@ -76,6 +81,13 @@ Scope / known limits (intentional):
   SEC042: a default granted to a *group* role that a low-trust role merely
   belongs to is not flagged. Grant to the low-trust role directly (or list the
   group in ``grantees``) to surface it.
+* **The grantor is part of the entry's identity.** ``pg_default_acl`` is keyed
+  on ``(defaclrole, defaclnamespace, defaclobjtype)``, so two defaults to the
+  same grantee in the same schema but created ``FOR ROLE`` different grantors
+  are *distinct* standing rules: each is reported separately and each needs its
+  own ``FOR ROLE <grantor>`` REVOKE. ``DefaultPrivilege.grantor`` carries it;
+  it is ``None`` only for a hand-built model or a pre-grantor v18 snapshot, in
+  which case the remediation omits the ``FOR ROLE`` clause.
 * **Schema-scoped entries outside ``--schemas`` are invisible**, the same
   out-of-scope blind spot the other schema-scoped rules document; cluster-wide
   defaults are always captured because they affect every schema.
@@ -164,14 +176,17 @@ class SEC044:
             )
         )
         out: list[Violation] = []
-        # One finding per (schema, grantee): a single ALTER DEFAULT PRIVILEGES
-        # produces one pg_default_acl row per (scope, grantee) already, and
-        # introspection folds privileges into one DefaultPrivilege per pair,
-        # but dedupe defensively so a hand-built Schema with two records for
-        # the same pair still reports once. Key on the raw `schema` (str | None,
-        # not the rendered location) so a cluster-wide entry never aliases a
-        # real schema that happens to render to the same sentinel string.
-        seen: set[tuple[str | None, str]] = set()
+        # One finding per (schema, grantee, grantor): a single ALTER DEFAULT
+        # PRIVILEGES produces one pg_default_acl row per (grantor, scope,
+        # grantee) already, and introspection folds privileges into one
+        # DefaultPrivilege per triple, but dedupe defensively so a hand-built
+        # Schema with two records for the same triple still reports once. The
+        # grantor (defaclrole) is part of the entry's identity — two defaults
+        # differing only by grantor are distinct standing rules with distinct
+        # `FOR ROLE` remediations — so it belongs in the key. Key on the raw
+        # `schema` (str | None, not the rendered location) so a cluster-wide
+        # entry never aliases a real schema rendering to the same sentinel.
+        seen: set[tuple[str | None, str, str | None]] = set()
         for entry in schema.default_privileges:
             if entry.grantee not in grantees:
                 continue
@@ -185,7 +200,7 @@ class SEC044:
             location = _location(entry)
             if location in allowlist:
                 continue
-            key = (entry.schema, entry.grantee)
+            key = (entry.schema, entry.grantee, entry.grantor)
             if key in seen:
                 continue
             seen.add(key)
@@ -209,6 +224,21 @@ class SEC044:
             if entry.schema is not None
             else ""
         )
+        # `FOR ROLE <grantor>` must precede `IN SCHEMA` (Postgres grammar) and
+        # is what makes the REVOKE actually clear THIS default: a bare REVOKE
+        # only touches the running role's own default, so without it the
+        # statement silently no-ops when run by anyone but the grantor.
+        for_role = (
+            f"FOR ROLE {entry.grantor} " if entry.grantor is not None else ""
+        )
+        grantor_clause = (
+            f" (run it as a superuser or as {entry.grantor}; the FOR ROLE "
+            "clause targets the role whose future tables carry this default — "
+            "a bare REVOKE clears only the running role's own default and "
+            "silently no-ops otherwise)"
+            if entry.grantor is not None
+            else ""
+        )
         return Violation(
             rule_id=self.id,
             severity=self.severity,
@@ -221,8 +251,9 @@ class SEC044:
                 "table is created, with no per-table GRANT and nothing but the "
                 "author remembering RLS standing in the way. Scope default "
                 "privileges to specific roles and rely on RLS, and run "
-                f"ALTER DEFAULT PRIVILEGES {revoke_scope}REVOKE {privs} ON "
-                f"TABLES FROM {entry.grantee}; or allowlist {location!r} in "
+                f"ALTER DEFAULT PRIVILEGES {for_role}{revoke_scope}REVOKE "
+                f"{privs} ON TABLES FROM {entry.grantee}{grantor_clause}; or "
+                f"allowlist {location!r} in "
                 "[lint.rules.SEC044]. (Complements SEC003, which flags a "
                 "PUBLIC policy, and SEC001, which flags an RLS-off table after "
                 "the fact — SEC044 is the standing config posture that makes "

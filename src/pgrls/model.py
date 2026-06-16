@@ -769,6 +769,16 @@ class DefaultPrivilege:
       ``UPDATE``/``DELETE``/``TRUNCATE``/``REFERENCES``/``TRIGGER``). ALL
       privileges are captured (not just row-access ones); SEC044 filters to
       the row-access subset, and capturing broadly keeps the model faithful.
+    * ``grantor`` — the role whose object creation triggers this default
+      (``pg_default_acl.defaclrole``: the ``FOR ROLE`` target, defaulting to
+      the role that ran ``ALTER DEFAULT PRIVILEGES``). It is part of the
+      ``pg_default_acl`` identity — ``(defaclrole, defaclnamespace,
+      defaclobjtype)`` — so two defaults differing only by grantor are
+      *distinct* standing rules, each needing its own ``FOR ROLE <grantor>``
+      REVOKE (a bare REVOKE only clears the running role's default, and
+      silently no-ops against another role's). SEC044 keys its dedup on it
+      and names it in the remediation. ``None`` for a hand-built model or a
+      pre-grantor v18 snapshot (the rule then emits a grantor-less REVOKE).
 
     Not feeding ``Schema.to_sql()`` (``pgrls diff --apply`` replays table-
     level GRANTs, not default privileges); SEC044 is the only consumer.
@@ -777,6 +787,7 @@ class DefaultPrivilege:
     schema: str | None
     grantee: str
     privileges: tuple[str, ...]
+    grantor: str | None = None
 
 
 # --- Snapshot decoders -------------------------------------------------
@@ -1139,6 +1150,10 @@ def _default_privilege_from_dict(d: dict[str, Any]) -> DefaultPrivilege:
         schema=d.get("schema"),
         grantee=d["grantee"],
         privileges=tuple(d["privileges"]),
+        # `grantor` joined v18 alongside the rest of the entry (v18 is
+        # unreleased), so it always rides current snapshots; `.get` still
+        # tolerates a grantor-less entry from an in-flight pre-grantor v18.
+        grantor=d.get("grantor"),
     )
 
 
@@ -1503,6 +1518,7 @@ class Schema:
                     "schema": dp.schema,
                     "grantee": dp.grantee,
                     "privileges": list(dp.privileges),
+                    "grantor": dp.grantor,
                 }
                 for dp in self.default_privileges
             ],

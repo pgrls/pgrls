@@ -33,9 +33,13 @@ def _dp(
     schema: str | None = "public",
     grantee: str = "PUBLIC",
     privileges: tuple[str, ...] = ("SELECT",),
+    grantor: str | None = None,
 ) -> DefaultPrivilege:
     return DefaultPrivilege(
-        schema=schema, grantee=grantee, privileges=privileges
+        schema=schema,
+        grantee=grantee,
+        privileges=privileges,
+        grantor=grantor,
     )
 
 
@@ -190,6 +194,20 @@ def test_allowlist_cluster_wide_sentinel_exempts() -> None:
     )
 
 
+def test_allowlist_suppresses_all_grantors_in_a_schema() -> None:
+    # The allowlist matches on the rendered location, so allowlisting a schema
+    # suppresses every default in it regardless of grantor — a deliberate
+    # default is a per-schema decision, not a per-grantor one.
+    assert (
+        _check(
+            _dp(schema="reporting", grantor="a"),
+            _dp(schema="reporting", grantor="b"),
+            options={"allowlist": ["reporting"]},
+        )
+        == []
+    )
+
+
 def test_allowlist_bad_type_raises_typeerror() -> None:
     with pytest.raises(TypeError):
         _check(_dp(schema="public"), options={"allowlist": "public"})
@@ -230,6 +248,65 @@ def test_cluster_wide_and_namesake_schema_are_distinct_findings() -> None:
     # Both happen to render the same display location (intended), but the two
     # underlying entries were not deduped away.
     assert [v.location for v in vs] == ["(cluster-wide)", "(cluster-wide)"]
+
+
+# --- grantor (defaclrole) ------------------------------------------------
+
+
+def test_distinct_grantors_in_same_scope_are_distinct_findings() -> None:
+    # pg_default_acl is keyed on (defaclrole, namespace, objtype), so two
+    # defaults to PUBLIC in the same schema created FOR ROLE different grantors
+    # are distinct standing rules, each needing its own FOR ROLE REVOKE — so
+    # SEC044 must report both, not fold them.
+    vs = _check(
+        _dp(schema="public", grantee="PUBLIC", grantor="app_owner"),
+        _dp(schema="public", grantee="PUBLIC", grantor="migrator"),
+    )
+    assert len(vs) == 2
+    grantors = sorted(
+        "app_owner" if "app_owner" in v.message else "migrator" for v in vs
+    )
+    assert grantors == ["app_owner", "migrator"]
+
+
+def test_same_grantor_dedupes() -> None:
+    # Same (schema, grantee, grantor) across two records still reports once.
+    vs = _check(
+        _dp(schema="public", grantee="PUBLIC", grantor="app_owner",
+            privileges=("SELECT",)),
+        _dp(schema="public", grantee="PUBLIC", grantor="app_owner",
+            privileges=("INSERT",)),
+    )
+    assert len(vs) == 1
+
+
+def test_remediation_names_grantor_with_for_role_in_schema() -> None:
+    # The REVOKE must carry FOR ROLE <grantor> (before IN SCHEMA, per the
+    # Postgres grammar) so it actually clears the right role's default rather
+    # than silently no-opping.
+    [v] = _check(_dp(schema="reporting", grantee="PUBLIC", grantor="app_owner"))
+    assert (
+        "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA reporting "
+        "REVOKE" in v.message
+    )
+    assert "app_owner" in v.message
+
+
+def test_remediation_names_grantor_for_cluster_wide() -> None:
+    # A cluster-wide entry's REVOKE carries FOR ROLE but no IN SCHEMA.
+    [v] = _check(_dp(schema=None, grantee="PUBLIC", grantor="postgres"))
+    assert (
+        "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE SELECT ON TABLES"
+        in v.message
+    )
+
+
+def test_remediation_omits_for_role_when_grantor_absent() -> None:
+    # A grantor-less entry (hand-built / pre-grantor snapshot) emits the
+    # grantor-free REVOKE — no dangling "FOR ROLE None".
+    [v] = _check(_dp(schema="reporting", grantee="PUBLIC", grantor=None))
+    assert "ALTER DEFAULT PRIVILEGES IN SCHEMA reporting REVOKE" in v.message
+    assert "FOR ROLE" not in v.message
 
 
 def test_metadata() -> None:

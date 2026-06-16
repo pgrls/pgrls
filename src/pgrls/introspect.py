@@ -742,6 +742,14 @@ ORDER BY qname, signature
 # as a phantom grant) — the same owner-exclusion `_GRANTS_SQL` applies to
 # `relacl`. The captured set is therefore the real non-owner default grants.
 #
+# `defaclrole` is the GRANTOR: the role whose table creation triggers this
+# default (the `FOR ROLE` target, or the role that ran the statement). It is
+# part of the pg_default_acl identity — `(defaclrole, defaclnamespace,
+# defaclobjtype)` — so two defaults differing only by grantor are distinct
+# standing rules, each revoked only by a `FOR ROLE <grantor>` REVOKE; we
+# capture it (rendered via pg_roles, `oid:N` sentinel if unresolved) so SEC044
+# keys dedup on it and emits a precise remediation. `defaclrole` is never 0.
+#
 # Scope: schema-scoped entries are restricted to the introspected `--schemas`,
 # but cluster-wide entries (`defaclnamespace = 0`) are ALWAYS captured because
 # they affect tables in every schema. ALL grantees and ALL privileges are
@@ -753,16 +761,18 @@ SELECT DISTINCT
     CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
          ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
     END AS grantee,
-    ax.privilege_type
+    ax.privilege_type,
+    COALESCE(gr.rolname, 'oid:' || d.defaclrole::text) AS grantor
 FROM pg_catalog.pg_default_acl d
 LEFT JOIN pg_catalog.pg_namespace dn ON dn.oid = d.defaclnamespace
 LEFT JOIN LATERAL aclexplode(d.defaclacl) ax ON true
 LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+LEFT JOIN pg_catalog.pg_roles gr ON gr.oid = d.defaclrole
 WHERE d.defaclobjtype = 'r'
   AND ax.grantee IS NOT NULL
   AND ax.grantee <> d.defaclrole
   AND (d.defaclnamespace = 0 OR dn.nspname = ANY(%s))
-ORDER BY schema_name, grantee, ax.privilege_type
+ORDER BY schema_name, grantee, grantor, ax.privilege_type
 """
 
 
@@ -907,25 +917,27 @@ def _fetch_default_privileges(
 ) -> tuple[DefaultPrivilege, ...]:
     """Fetch default privileges on TABLES from `pg_default_acl`.
 
-    Returns one `DefaultPrivilege` per (schema, grantee) — privileges granted
-    to the same grantee in the same scope are folded into a single record's
-    `privileges` tuple. Schema-scoped entries are restricted to `schemas`;
-    cluster-wide entries (`defaclnamespace = 0`, set without `IN SCHEMA`)
-    are always captured and represented with `schema=None`, because they
-    affect tables in every schema. SEC044 reads this.
+    Returns one `DefaultPrivilege` per (schema, grantee, grantor) — privileges
+    granted to the same grantee in the same scope by the same grantor are
+    folded into a single record's `privileges` tuple. The grantor
+    (`defaclrole`) is part of the entry's identity, so two defaults differing
+    only by grantor stay distinct records. Schema-scoped entries are restricted
+    to `schemas`; cluster-wide entries (`defaclnamespace = 0`, set without `IN
+    SCHEMA`) are always captured and represented with `schema=None`, because
+    they affect tables in every schema. SEC044 reads this.
 
-    The SQL `ORDER BY schema_name, grantee, privilege_type` makes both the
-    grouping iteration order and each record's `privileges` tuple
+    The SQL `ORDER BY schema_name, grantee, grantor, privilege_type` makes both
+    the grouping iteration order and each record's `privileges` tuple
     deterministic across runs for byte-stable snapshots.
     """
     cur.execute(_DEFAULT_PRIVILEGES_SQL, [list(schemas)])
-    # Group by (schema, grantee). The SQL renders a cluster-wide entry's
-    # schema as NULL → psycopg surfaces it as None, which becomes
+    # Group by (schema, grantee, grantor). The SQL renders a cluster-wide
+    # entry's schema as NULL → psycopg surfaces it as None, which becomes
     # `DefaultPrivilege.schema = None`.
-    acc: dict[tuple[str | None, str], list[str]] = defaultdict(list)
-    order: list[tuple[str | None, str]] = []
+    acc: dict[tuple[str | None, str, str], list[str]] = defaultdict(list)
+    order: list[tuple[str | None, str, str]] = []
     for row in cur.fetchall():
-        key = (row["schema_name"], row["grantee"])
+        key = (row["schema_name"], row["grantee"], row["grantor"])
         if key not in acc:
             order.append(key)
         acc[key].append(row["privilege_type"])
@@ -933,9 +945,10 @@ def _fetch_default_privileges(
         DefaultPrivilege(
             schema=schema,
             grantee=grantee,
-            privileges=tuple(acc[(schema, grantee)]),
+            privileges=tuple(acc[(schema, grantee, grantor)]),
+            grantor=grantor,
         )
-        for (schema, grantee) in order
+        for (schema, grantee, grantor) in order
     )
 
 
