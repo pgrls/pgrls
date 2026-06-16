@@ -133,6 +133,27 @@ def test_sarif_handles_empty_string_location_with_schema_placeholder() -> None:
     )
 
 
+def test_sarif_preserves_schema_only_and_cluster_wide_locations() -> None:
+    # SEC044's location is a bare schema name (e.g. `public`) or the
+    # `(cluster-wide)` sentinel — non-empty strings that are NOT the formatter's
+    # own empty-location `(schema-wide)` placeholder, and are not `schema.table`
+    # shaped. They must pass through verbatim as a non-empty fullyQualifiedName
+    # (GitHub rejects empty ones), and the parentheses in `(cluster-wide)` must
+    # survive JSON encoding intact. (Pins the table-less-location SARIF contract
+    # against this repo's history of empty-fqn / mangled-location regressions.)
+    for location in ("public", "(cluster-wide)"):
+        out = format_violations(
+            [_v(rule_id="SEC044", severity="warning", location=location)],
+            format="sarif",
+        )
+        result = json.loads(out)["runs"][0]["results"][0]
+        fqn = result["locations"][0]["logicalLocations"][0][
+            "fullyQualifiedName"
+        ]
+        assert fqn == location, location
+        assert fqn  # non-empty, so GitHub Code Scanning accepts it
+
+
 def test_sarif_zero_violations_emits_valid_empty_run() -> None:
     out = format_violations([], format="sarif")
     parsed = json.loads(out)
