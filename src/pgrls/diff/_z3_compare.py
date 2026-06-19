@@ -146,6 +146,7 @@ except ImportError:  # pragma: no cover — exercised by the no-z3 install path
     z3 = None  # noqa: F811  # rebind to None when import failed
 
 from pglast.ast import (
+    A_ArrayExpr,
     A_Const,
     A_Expr,
     Boolean,
@@ -1354,8 +1355,12 @@ def _anon_3vl(
     if isinstance(node, A_Expr):
         if node.kind == A_Expr_Kind.AEXPR_OP:
             return _anon_binop(node, ctx, auth_funcs, assertions)
-        # IN / BETWEEN / others: soundness abort in v1 (SEC004 still
-        # guards the literal IS NULL shape syntactically).
+        if node.kind == A_Expr_Kind.AEXPR_OP_ANY:
+            # `col = ANY(ARRAY[lit, ...])` membership (and every `IN (...)`,
+            # which normalizes to this form). Gated to literal arrays + `=`.
+            return _anon_any_array(node, ctx, auth_funcs, assertions)
+        # IN / BETWEEN / ALL / others: soundness abort (SEC004 still guards
+        # the literal IS NULL shape syntactically).
         return None
 
     # --- NULL tests. The arg is resolved as a SCALAR (_Val) so
@@ -1479,16 +1484,79 @@ def _anon_boolexpr(
             return tvs[0]
         acc = tvs[0]
         for y in tvs[1:]:
-            is_true = z3.Or(acc.is_true, y.is_true)
-            is_null = z3.And(
-                z3.Or(acc.is_null, y.is_null),
-                z3.Not(acc.is_true),
-                z3.Not(y.is_true),
-            )
-            acc = _TV(is_true=is_true, is_null=is_null)
+            acc = _kleene_or(acc, y)
         return acc
 
     return None
+
+
+def _kleene_or(acc: _TV, y: _TV) -> _TV:
+    """Pairwise Kleene (SQL three-valued) OR of two truths.
+
+    `is_true = aᵀ ∨ yᵀ`; `is_null = (aᴺ ∨ yᴺ) ∧ ¬aᵀ ∧ ¬yᵀ` — i.e.
+    `NULL OR TRUE = TRUE`, `NULL OR NULL = NULL`, `NULL OR FALSE = NULL`.
+    Single source of truth for the OR table, shared by the `OR_EXPR` fold
+    above and `= ANY(ARRAY[...])` membership below, so the two can never
+    drift.
+    """
+    return _TV(
+        is_true=z3.Or(acc.is_true, y.is_true),
+        is_null=z3.And(
+            z3.Or(acc.is_null, y.is_null),
+            z3.Not(acc.is_true),
+            z3.Not(y.is_true),
+        ),
+    )
+
+
+def _anon_any_array(
+    node: A_Expr, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
+) -> Any:
+    """Kleene `lexpr = ANY(ARRAY[lit, ...])` membership.
+
+    Modeled as the *exact* desugaring `lexpr = lit₁ OR lexpr = lit₂ OR …`,
+    which is what SQL `= ANY(array)` means and what every `IN (...)` list
+    normalizes to on introspection (`pg_get_expr` rewrites `IN` →
+    `= ANY (ARRAY[...])`). Each element comparison is built as a synthetic
+    `lexpr = elemᵢ` and routed through the existing `_anon_binop`, so column
+    binding, null-flags, element casts, and the Kleene comparison rule are
+    byte-for-byte identical to a hand-written `=`; the results are combined
+    with `_kleene_or`. This is an exact desugaring onto trusted machinery,
+    not a new approximation.
+
+    Abstains (`None`) on anything else, because a wrong guess could flip the
+    predicate and risk a false PROVEN:
+    * operator other than `=` — notably `<> ALL`, the `NOT IN` normalization,
+      which is the *complement* of membership;
+    * RHS that is not an `A_ArrayExpr` literal (a column / function /
+      subquery array needs array-containment reasoning we don't model);
+    * an empty array, or any element `_anon_binop` itself can't translate.
+    """
+    op_names = list(node.name or ())
+    if len(op_names) != 1 or not isinstance(op_names[0], String):
+        return None
+    if op_names[0].sval != "=":
+        return None
+    arr = node.rexpr
+    if not isinstance(arr, A_ArrayExpr):
+        return None
+    elements = list(arr.elements or ())
+    if not elements:
+        return None
+    acc: _TV | None = None
+    for elem in elements:
+        cmp_node = A_Expr(
+            kind=A_Expr_Kind.AEXPR_OP,
+            name=(String(sval="="),),
+            lexpr=node.lexpr,
+            rexpr=elem,
+        )
+        tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
+        # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
+        if not isinstance(tv, _TV):
+            return None
+        acc = tv if acc is None else _kleene_or(acc, tv)
+    return acc
 
 
 def _anon_binop(

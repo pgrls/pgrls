@@ -177,6 +177,86 @@ def test_undecidable_predicate_is_unverified() -> None:
 
 
 @requires_z3
+def test_any_array_membership_now_proves_isolated() -> None:
+    # `status = ANY(ARRAY[...])` used to abstain (UNVERIFIED); now modeled, so a
+    # genuinely anon-safe policy that happens to use a membership allowlist is
+    # PROVEN isolated. Anon: auth.uid() is NULL → `tenant_id = auth.uid()` is
+    # Kleene-U, and `U AND <membership>` can never be TRUE → no row leaks.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "tenant_id = auth.uid() "
+                        "AND status = ANY(ARRAY['active','pending'])"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_any_array_open_allowlist_is_anon_leak() -> None:
+    # A membership predicate with no identity gate admits matching rows to
+    # everyone, anon included → a real leak the verifier now proves (was
+    # UNVERIFIED).
+    schema = Schema(
+        tables=(
+            _table("t", policies=(_policy("role = ANY(ARRAY['admin','editor'])"),)),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_any_array_cast_elements_match_uncast() -> None:
+    # The introspected form casts every element (`'admin'::text`); it must reach
+    # the same verdict as the bare-literal form (elements route through the
+    # existing TypeCast resolver, not a raw literal extractor).
+    cast = _table(
+        "c",
+        policies=(_policy("role = ANY(ARRAY['admin'::text,'editor'::text])"),),
+    )
+    bare = _table("b", policies=(_policy("role = ANY(ARRAY['admin','editor'])"),))
+    v = build_verification(Schema(tables=(cast, bare)))
+    assert _verdict(v, "public.c") == _verdict(v, "public.b") == "leak"
+
+
+@requires_z3
+def test_not_in_normalization_stays_unverified() -> None:
+    # `<> ALL(ARRAY[...])` is the NOT-IN normalization (AEXPR_OP_ALL, op `<>`) —
+    # the COMPLEMENT of membership. The encoder must NOT mistake it for `= ANY`;
+    # it abstains, so the verdict stays UNVERIFIED (soundness over recall).
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("tenant_id = auth.uid() OR role <> ALL(ARRAY['a','b'])"),
+                ),
+            ),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "unverified"
+    assert _verdict(_xt(schema), "public.t") == "unverified"
+
+
+@requires_z3
+def test_any_array_over_a_column_stays_unverified() -> None:
+    # `= ANY(<array column>)` needs array-containment reasoning we don't model;
+    # the encoder abstains rather than guess, so the literal-array gate is real.
+    schema = Schema(
+        tables=(
+            _table("t", policies=(_policy("auth.uid() = ANY(member_ids)"),)),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "unverified"
+
+
+@requires_z3
 def test_restrictive_floor_downgrades_leak_to_unverified() -> None:
     # A permissive leak + a restrictive read floor: v1 cannot soundly combine,
     # so it makes no claim rather than a possibly-wrong leak.
@@ -854,6 +934,28 @@ def test_cross_tenant_or_public_is_leak_with_row_witness() -> None:
 
 
 @requires_z3
+def test_cross_tenant_or_any_array_public_is_leak() -> None:
+    # The `= ANY(ARRAY[...])` analog of the `OR is_public` bypass: an unscoped
+    # membership disjunct exposes another tenant's matching rows. Was UNVERIFIED
+    # before the membership encoding; now a proven leak with a row witness.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("tenant_id = auth.uid() OR status = ANY(ARRAY['public'])"),
+                ),
+            ),
+        )
+    )
+    v = _xt(schema)
+    [t] = v.tables
+    assert t.verdict == "leak"
+    leak = next(p for p in t.proofs if p.verdict == "leak")
+    assert leak.witness == {"status": "public"}
+
+
+@requires_z3
 def test_cross_tenant_admin_bypass_is_conditional_leak() -> None:
     # An admin disjunct lets an admin session read every tenant, but the leak
     # is conditional on the SESSION's role (not any row column) — so the row
@@ -1065,6 +1167,44 @@ def test_int_session_cast_recall_is_non_vacuous() -> None:
         solver.add(a)
     solver.add(tv.is_true)
     assert solver.check() == z3.sat  # the session sees its own rows — not vacuous
+
+
+@requires_z3
+def test_any_array_membership_is_exactly_or_of_equalities() -> None:
+    # Soundness heart: `x = ANY(ARRAY[a,b,c])` is encoded as the EXACT
+    # desugaring `x = a OR x = b OR x = c`, not an approximation. Build both in
+    # ONE context (so `x` and the literals share Z3 vars) and assert their
+    # Kleene truth AND null are logically equivalent (the negation is UNSAT) —
+    # the membership branch can never drift from a hand-written OR chain.
+    import z3  # noqa: PLC0415
+
+    # Cover both the bare-literal form and the per-element-cast form that
+    # `pg_get_expr` actually emits for an introspected `IN (…)`
+    # (`= ANY (ARRAY['a'::text, 'b'::text])`) — the cast elements must resolve
+    # through the same path as the hand-written `=`.
+    pairs = (
+        ("x = ANY(ARRAY[1,2,3])", "x = 1 OR x = 2 OR x = 3"),
+        (
+            "x = ANY(ARRAY['a'::text,'b'::text])",
+            "x = 'a'::text OR x = 'b'::text",
+        ),
+    )
+    for any_sql, or_sql in pairs:
+        ctx = _Context()
+        assertions: list[object] = []
+        any_tv = _anon_3vl(_using_ast(any_sql), ctx, set(), assertions)
+        or_tv = _anon_3vl(_using_ast(or_sql), ctx, set(), assertions)
+        assert any_tv is not None and or_tv is not None
+        solver = z3.Solver()
+        for a in assertions:
+            solver.add(a)
+        for field in ("is_true", "is_null"):
+            solver.push()
+            solver.add(z3.Not(getattr(any_tv, field) == getattr(or_tv, field)))
+            assert solver.check() == z3.unsat, (
+                f"{field} of {any_sql!r} must match the OR chain"
+            )
+            solver.pop()
 
 
 # --- cross-tenant renderers ------------------------------------------------
