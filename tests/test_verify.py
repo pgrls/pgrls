@@ -66,7 +66,12 @@ def _using_ast(sql: str):
 
 
 def _policy(
-    using: str, *, name: str = "p", permissive: bool = True, command: str = "ALL"
+    using: str | None,
+    *,
+    name: str = "p",
+    permissive: bool = True,
+    command: str = "ALL",
+    with_check: str | None = None,
 ) -> Policy:
     return Policy(
         name=name,
@@ -74,9 +79,9 @@ def _policy(
         permissive=permissive,
         roles=("authenticated",),
         using_sql=using,
-        with_check_sql=None,
+        with_check_sql=with_check,
         using_ast=_using_ast(using) if using is not None else None,
-        with_check_ast=None,
+        with_check_ast=_using_ast(with_check) if with_check is not None else None,
     )
 
 
@@ -738,6 +743,57 @@ def test_verify_cli_live_exit_code_and_output(
 
 @requires_docker
 @requires_z3
+def test_verify_cli_live_write_mode_leak_exits_one(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # End-to-end: a FOR INSERT WITH CHECK with an unscoped disjunct lets a
+    # caller stamp a row for another tenant → `verify --mode write` exits 1.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs "
+            "  (id bigint PRIMARY KEY, tenant_id uuid, is_public boolean);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR INSERT TO public "
+            "  WITH CHECK (is_public OR tenant_id = (select auth.uid()));"
+        )
+    result = CliRunner().invoke(
+        main,
+        ["verify", "--database-url", pg_url, "--schemas", "public",
+         "--mode", "write"],
+    )
+    assert result.exit_code == 1, result.output
+    assert "LEAK" in result.output and "public.docs" in result.output
+
+
+@requires_docker
+@requires_z3
+def test_verify_cli_live_write_mode_scoped_exits_zero(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # A FOR INSERT WITH CHECK that binds the tenant to the session is proven
+    # write-isolated → `verify --mode write` exits 0.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigint PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR INSERT TO public "
+            "  WITH CHECK (tenant_id = (select auth.uid()));"
+        )
+    result = CliRunner().invoke(
+        main,
+        ["verify", "--database-url", pg_url, "--schemas", "public",
+         "--mode", "write"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "PROVEN" in result.output
+
+
+@requires_docker
+@requires_z3
 def test_verify_cli_live_sarif_leak_end_to_end(
     pg_url: str, pg_conn: psycopg.Connection
 ) -> None:
@@ -892,9 +948,238 @@ def _xt(schema: Schema) -> Verification:
     return build_verification(schema, mode="cross-tenant")
 
 
+def _wr(schema: Schema) -> Verification:
+    return build_verification(schema, mode="write")
+
+
 def test_build_verification_default_mode_is_anon() -> None:
     v = build_verification(Schema(tables=(_table("t", policies=()),)))
     assert v.mode == "anon"
+
+
+# --- write mode (WITH CHECK isolation) -------------------------------------
+
+
+@requires_z3
+def test_write_insert_with_check_scoped_is_isolated() -> None:
+    # FOR INSERT with a tenant-scoped WITH CHECK → a caller cannot stamp a row
+    # for another tenant. PROVEN write-isolated.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        None, command="INSERT", with_check="tenant_id = auth.uid()"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_write_update_using_fallback_is_isolated() -> None:
+    # FOR UPDATE with NO WITH CHECK: Postgres reuses USING as the new-row check,
+    # so a scoped USING write-isolates. The soundness-critical fallback — if the
+    # encoder ignored USING here it would falsely prove a re-stamp impossible.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("tenant_id = auth.uid()", command="UPDATE"),),
+            ),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_write_all_using_fallback_is_isolated() -> None:
+    schema = Schema(
+        tables=(
+            _table("t", policies=(_policy("tenant_id = auth.uid()", command="ALL"),)),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_write_with_check_overrides_using() -> None:
+    # WITH CHECK FULLY overrides USING for the new row (NOT AND-combined). A
+    # scoped USING with `WITH CHECK (true)` lets a caller write any tenant's row,
+    # so the prover must see the constant-true WITH CHECK → unverified, NOT
+    # isolated. A regression that AND-ed USING in would wrongly say isolated.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "tenant_id = auth.uid()", command="UPDATE", with_check="true"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "unverified"
+
+
+@requires_z3
+def test_write_unscoped_with_check_true_is_unverified_not_isolated() -> None:
+    # An unscoped `WITH CHECK (true)` carries no tenant-scoping equality → the
+    # prover declines (unverified), never isolated. SEC006/020/028/040 are the
+    # linter fallback for this constant-true write-check.
+    schema = Schema(
+        tables=(
+            _table("t", policies=(_policy(None, command="INSERT", with_check="true"),)),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "unverified"
+
+
+@requires_z3
+def test_write_cross_tenant_disjunct_is_leak_with_witness() -> None:
+    # A write-check with an unscoped disjunct lets a caller stamp another
+    # tenant's row → proven write LEAK with a characterizing witness.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        None,
+                        command="INSERT",
+                        with_check="is_public OR tenant_id = (select auth.uid())",
+                    ),
+                ),
+            ),
+        )
+    )
+    v = _wr(schema)
+    [t] = v.tables
+    assert t.verdict == "leak"
+    leak = next(p for p in t.proofs if p.verdict == "leak")
+    assert leak.witness == {"is_public": True}
+
+
+@requires_z3
+def test_write_select_only_table_is_isolated_no_write_policy() -> None:
+    # A SELECT-only policy never gates a write → no permissive write policy →
+    # Postgres default-denies writes → trivially isolated (no proofs emitted).
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("tenant_id = auth.uid()", command="SELECT"),)),)
+    )
+    v = _wr(schema)
+    [t] = v.tables
+    assert t.verdict == "isolated"
+    assert t.proofs == ()
+    assert t.note == "no permissive write policy — RLS default-denies writes"
+
+
+@requires_z3
+def test_write_delete_only_table_is_isolated() -> None:
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("tenant_id = auth.uid()", command="DELETE"),)),)
+    )
+    assert _verdict(_wr(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_write_bare_insert_is_skipped_and_isolated() -> None:
+    # A bare FOR INSERT (no WITH CHECK) grants no write path (Postgres
+    # default-denies it), so it emits NO proof — not a spurious "unverified".
+    schema = Schema(
+        tables=(_table("t", policies=(_policy(None, command="INSERT"),)),)
+    )
+    v = _wr(schema)
+    [t] = v.tables
+    assert t.verdict == "isolated"
+    assert t.proofs == ()  # the bare insert contributed nothing
+
+
+@requires_z3
+def test_write_missing_ast_on_update_is_unverified() -> None:
+    # A FOR UPDATE policy whose ASTs are absent (snapshot without parsed ASTs)
+    # cannot be checked → unverified "write-check not available" (distinct from
+    # the bare-insert skip above).
+    policy = Policy(
+        name="p",
+        command="UPDATE",
+        permissive=True,
+        roles=("authenticated",),
+        using_sql=None,
+        with_check_sql=None,
+        using_ast=None,
+        with_check_ast=None,
+    )
+    schema = Schema(tables=(_table("t", policies=(policy,)),))
+    v = _wr(schema)
+    [t] = v.tables
+    assert t.verdict == "unverified"
+    [proof] = t.proofs
+    assert proof.reason == "write-check not available"
+
+
+@requires_z3
+def test_write_restrictive_floor_downgrades_leak_to_unverified() -> None:
+    # A permissive unscoped write-check + a restrictive scoped write floor: v1
+    # does not combine floors, so the would-be leak is downgraded to unverified
+    # with the write-floor note.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(None, command="INSERT", with_check="true"),
+                    _policy(
+                        None,
+                        name="floor",
+                        permissive=False,
+                        command="INSERT",
+                        with_check="tenant_id = auth.uid()",
+                    ),
+                ),
+            ),
+        )
+    )
+    v = _wr(schema)
+    [t] = v.tables
+    assert t.verdict == "unverified"
+    assert t.note == "restrictive write floor present — not combined in v1"
+
+
+@requires_z3
+def test_write_mode_carried_in_json_and_sarif() -> None:
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        None,
+                        command="INSERT",
+                        with_check="is_public OR tenant_id = (select auth.uid())",
+                    ),
+                ),
+            ),
+        )
+    )
+    v = _wr(schema)
+    payload = json.loads(render_json(v))
+    assert payload["mode"] == "write"
+    scopes = [
+        p["witness_scope"]
+        for tbl in payload["tables"]
+        for p in tbl["policies"]
+    ]
+    assert "any_other_tenant" in scopes or "row" in scopes
+    sarif = json.loads(render_sarif(v))
+    rule_ids = {
+        r["ruleId"] for r in sarif["runs"][0]["results"]
+    }
+    assert rule_ids == {"pgrls-write-isolation"}
 
 
 @requires_z3

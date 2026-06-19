@@ -12,6 +12,14 @@ complementary threat models (`--mode`):
   *different* tenant's row? For the policy's own tenant-scoping equality
   ``<column> = <session identity>``, a row is exposed iff it can be visible
   while ``column`` differs from the session's tenant.
+* ``write`` — can a session authenticated as *one* tenant **write** (INSERT or
+  UPDATE) a row stamped for a *different* tenant? Same satisfiability question
+  as ``cross-tenant``, but proven over each write policy's *effective
+  write-check* — its ``WITH CHECK`` when present, else (for ``FOR UPDATE`` /
+  ``FOR ALL``) the ``USING`` that Postgres reuses as the new-row check. This is
+  the most CVE-adjacent footgun (CVE-2025-48757): a policy that scopes reads but
+  not writes lets a tenant stamp data for another tenant. The write-side lint
+  rules SEC006 / SEC020 / SEC028 / SEC040 are its heuristic fallback.
 
 They are complementary: the inverted ``auth.uid() IS NULL OR …`` policy leaks
 to anon yet correctly scopes authenticated tenants — a ``leak`` in ``anon``,
@@ -47,14 +55,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from pgrls.diff._z3_compare import (
     _DEFAULT_AUTH_FUNCTIONS,
     prove_anon_isolation,
     prove_cross_tenant_isolation,
 )
-from pgrls.model import Schema
+from pgrls.model import Policy, Schema
 from pgrls._render_common import make_dispatcher, pluralize, render_text_table
 from pgrls.formatters._common import safe_location
 from pgrls.formatters.sarif import format_sarif
@@ -67,32 +75,105 @@ DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset(_DEFAULT_AUTH_FUNCTIONS)
 
 Verdict = Literal["isolated", "leak", "unverified"]
 
-# The two threat models `pgrls verify` can prove. `anon` (default): can an
+# The threat models `pgrls verify` can prove. `anon` (default): can an
 # *unauthenticated* session read any row? `cross-tenant`: can a session
-# authenticated as one tenant read a *different* tenant's row? They are
+# authenticated as one tenant read a *different* tenant's row? `write`: can such
+# a session *write* (INSERT/UPDATE) a row stamped for another tenant? They are
 # complementary — the inverted `auth.uid() IS NULL OR …` policy leaks to anon
 # but correctly scopes authenticated tenants, so it is a leak in `anon` mode
 # and isolated in `cross-tenant` mode.
-Mode = Literal["anon", "cross-tenant"]
+Mode = Literal["anon", "cross-tenant", "write"]
 
-_PROVERS = {"anon": prove_anon_isolation, "cross-tenant": prove_cross_tenant_isolation}
+# `write` reuses the cross-tenant prover verbatim — write-isolation is the same
+# satisfiability question (`is_true ∧ column != session_tenant` SAT?), just
+# applied to the policy's effective WRITE-check instead of its USING.
+_PROVERS = {
+    "anon": prove_anon_isolation,
+    "cross-tenant": prove_cross_tenant_isolation,
+    "write": prove_cross_tenant_isolation,
+}
 
-# Why a policy's USING got no claim, per mode. `cross-tenant` adds the
-# "no single tenant-scoping equality" boundary (the prover declines unless the
-# policy declares exactly one `<column> = <session identity>` axis).
+# Why a policy got no claim, per mode. `cross-tenant`/`write` add the "no single
+# tenant-scoping equality" boundary (the prover declines unless the checked
+# predicate declares exactly one `<column> = <session identity>` axis).
 _UNVERIFIED_PREDICATE_REASON = {
     "anon": "USING predicate outside the decidable fragment",
     "cross-tenant": (
         "no provable tenant-scoping equality (or outside the decidable fragment)"
     ),
+    "write": (
+        "no provable tenant-scoping write-check "
+        "(or outside the decidable fragment)"
+    ),
+}
+
+# Reason when the AST the prover needs is absent (snapshot without parsed ASTs).
+_NO_AST_REASON = {
+    "anon": "USING not available",
+    "cross-tenant": "USING not available",
+    "write": "write-check not available",
 }
 
 _READ_COMMANDS = ("ALL", "SELECT")
+# Commands whose policies can gate a WRITE (new-row check). SELECT/DELETE carry
+# no write-check and never gate INSERT/UPDATE, so they are excluded from `write`.
+_WRITE_COMMANDS = ("ALL", "INSERT", "UPDATE")
+
+# Which commands' policies participate, per mode.
+_MODE_COMMANDS: dict[Mode, tuple[str, ...]] = {
+    "anon": _READ_COMMANDS,
+    "cross-tenant": _READ_COMMANDS,
+    "write": _WRITE_COMMANDS,
+}
 
 _VERDICT_LABEL = {"isolated": "PROVEN", "leak": "LEAK", "unverified": "UNVERIFIED"}
 
 # Detail shown for a PROVEN table with no explanatory note, per threat model.
-_NO_READ_DETAIL = {"anon": "no anonymous read", "cross-tenant": "no cross-tenant read"}
+_NO_READ_DETAIL = {
+    "anon": "no anonymous read",
+    "cross-tenant": "no cross-tenant read",
+    "write": "no cross-tenant write",
+}
+
+# Detail when a table has RLS on but no permissive policy for the mode's
+# commands → Postgres default-denies, so it is trivially isolated.
+_NO_PERMISSIVE_DETAIL = {
+    "anon": "no permissive read policy — RLS default-denies",
+    "cross-tenant": "no permissive read policy — RLS default-denies",
+    "write": "no permissive write policy — RLS default-denies writes",
+}
+
+
+def effective_write_check(policy: Policy) -> Any:
+    """The AST that gates the NEW row for a write policy, per Postgres's
+    live-validated fallback rules:
+
+    * ``WITH CHECK`` when present **fully overrides** ``USING`` for the new row
+      (it is NOT AND-combined with USING) — rows 1/3/5b of the fallback table.
+    * a ``FOR UPDATE`` / ``FOR ALL`` policy with NO ``WITH CHECK`` **reuses
+      its ``USING``** as the new-row check — rows 4/5a (the soundness-critical
+      fallback: omitting it would falsely prove a re-stamp impossible).
+    * a bare ``FOR INSERT`` (neither clause) Postgres default-denies — it grants
+      no write path, so there is nothing to prove → ``None`` (the caller skips
+      it; it contributes no proof, neither leak nor isolated claim).
+    * ``SELECT`` / ``DELETE`` never gate a write → ``None`` (excluded upstream).
+
+    Returns the chosen AST, or ``None`` when the policy grants no write path
+    (bare ``FOR INSERT``) or is not a write policy.
+    """
+    if policy.command not in _WRITE_COMMANDS:
+        return None
+    if policy.with_check_ast is not None:
+        return policy.with_check_ast
+    if policy.command in ("UPDATE", "ALL"):
+        return policy.using_ast  # PG reuses USING as the new-row check
+    return None  # bare FOR INSERT — default-deny, no write path
+
+
+def _checked_ast(policy: Policy, mode: Mode) -> Any:
+    """The AST the prover should check for `policy` under `mode`: the effective
+    write-check for ``write``, else the policy's ``USING``."""
+    return effective_write_check(policy) if mode == "write" else policy.using_ast
 
 # SARIF rule descriptor metadata for the prover, one per `--mode`. A given run
 # is single-mode, so only the active id ever appears in `tool.driver.rules`.
@@ -107,10 +188,12 @@ _NO_READ_DETAIL = {"anon": "no anonymous read", "cross-tenant": "no cross-tenant
 _SARIF_RULE_ID: dict[Mode, str] = {
     "anon": "pgrls-anon-isolation",
     "cross-tenant": "pgrls-cross-tenant-isolation",
+    "write": "pgrls-write-isolation",
 }
 _SARIF_RULE_TITLE: dict[Mode, str] = {
     "anon": "Anonymous read-isolation proof",
     "cross-tenant": "Cross-tenant read-isolation proof",
+    "write": "Cross-tenant write-isolation proof",
 }
 
 
@@ -170,9 +253,12 @@ def build_verification(
     `mode` selects the threat model: ``"anon"`` (default) proves no row is
     readable by an *unauthenticated* session; ``"cross-tenant"`` proves no row
     of one tenant is readable by a session authenticated as a *different*
-    tenant. The same table/policy walk, restrictive-floor handling, and rollup
-    apply to both — only the underlying Z3 prover and the "no claim" reasons
-    differ.
+    tenant; ``"write"`` proves no such session can *write* a row stamped for
+    another tenant. The same table/policy walk, restrictive-floor handling, and
+    rollup apply to all three — what differs is which policy commands
+    participate (``write`` looks at INSERT/UPDATE/ALL, not SELECT/DELETE), which
+    AST the prover checks (``write`` checks the effective write-check, not
+    USING), the prover, and the "no claim" reasons.
 
     `auth_functions`, when given, *replaces* the default auth function set
     (auth.uid/role/jwt, current_setting). In ``anon`` mode every name in it is
@@ -183,22 +269,24 @@ def build_verification(
     replaces.) Tables are sorted by qualified name for deterministic output.
     """
     prove = _PROVERS[mode]
+    commands = _MODE_COMMANDS[mode]
+    floor_kind = "write" if mode == "write" else "read"
     tables: list[TableVerdict] = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         if not table.rls_enabled:
             continue  # not an isolation claim — SEC001's domain, not verify's
-        read_policies = [p for p in table.policies if p.command in _READ_COMMANDS]
-        permissive = [p for p in read_policies if p.permissive]
-        has_restrictive_floor = any(not p.permissive for p in read_policies)
+        relevant = [p for p in table.policies if p.command in commands]
+        permissive = [p for p in relevant if p.permissive]
+        has_restrictive_floor = any(not p.permissive for p in relevant)
 
         if not permissive:
-            # RLS on with no permissive read policy → Postgres default-denies
-            # every read → trivially isolated.
+            # RLS on with no permissive policy for this mode's commands →
+            # Postgres default-denies → trivially isolated.
             tables.append(
                 TableVerdict(
                     table.qualified_name,
                     "isolated",
-                    "no permissive read policy — RLS default-denies",
+                    _NO_PERMISSIVE_DETAIL[mode],
                     (),
                 )
             )
@@ -206,21 +294,29 @@ def build_verification(
 
         proofs: list[PolicyProof] = []
         for policy in permissive:
-            if policy.using_ast is None:
+            ast = _checked_ast(policy, mode)
+            if ast is None:
+                # A bare FOR INSERT (no WITH CHECK) grants no write path —
+                # Postgres default-denies it, so it contributes no proof. Any
+                # other missing AST is a genuine "can't check" → unverified.
+                if mode == "write" and policy.command == "INSERT":
+                    continue
                 proofs.append(
-                    PolicyProof(policy.name, "unverified", None, "USING not available")
+                    PolicyProof(
+                        policy.name, "unverified", None, _NO_AST_REASON[mode]
+                    )
                 )
                 continue
-            verdict, witness = prove(policy.using_ast, auth_functions)
+            verdict, witness = prove(ast, auth_functions)
             if verdict == "leak" and has_restrictive_floor:
-                # A restrictive read floor may block this row; v1 does not
-                # combine floors, so neither verdict is sound → no claim.
+                # A restrictive floor may block this row; v1 does not combine
+                # floors, so neither verdict is sound → no claim.
                 proofs.append(
                     PolicyProof(
                         policy.name,
                         "unverified",
                         None,
-                        "restrictive read floor not combined in v1",
+                        f"restrictive {floor_kind} floor not combined in v1",
                     )
                 )
             elif verdict == "leak":
@@ -238,7 +334,7 @@ def build_verification(
                 proofs.append(PolicyProof(policy.name, "isolated", None, None))
 
         note = (
-            "restrictive read floor present — not combined in v1"
+            f"restrictive {floor_kind} floor present — not combined in v1"
             if has_restrictive_floor
             else None
         )
@@ -253,8 +349,18 @@ def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> s
 
     A characterizing row, the unconditional case (``{}`` — every row / a row of
     any other tenant), or a conditional leak no single row characterizes
-    (``None``). The cross-tenant phrasing frames the row as another tenant's.
+    (``None``). The cross-tenant phrasing frames the row as another tenant's;
+    the write phrasing frames it as a row stamped for another tenant.
     """
+    if mode == "write":
+        if witness is None:
+            return (
+                "a conditional cross-tenant write — no single row characterizes it"
+            )
+        if not witness:
+            return "a row stamped for any other tenant can be written"
+        pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
+        return f"a row stamped for another tenant with {pairs} can be written"
     if mode == "cross-tenant":
         if witness is None:
             return "a conditional cross-tenant leak — no single row characterizes it"
@@ -276,13 +382,13 @@ def _witness_scope(
     """Machine-readable witness scope for JSON. ``None`` off the leak path,
     ``conditional`` (no single row), ``row`` (a characterizing row), or the
     unconditional bucket — ``all_rows`` for anon, ``any_other_tenant`` for
-    cross-tenant (an empty cross-tenant witness is NOT "every row")."""
+    cross-tenant / write (an empty such witness is NOT "every row")."""
     if verdict != "leak":
         return None
     if witness is None:
         return "conditional"
     if not witness:
-        return "any_other_tenant" if mode == "cross-tenant" else "all_rows"
+        return "any_other_tenant" if mode in ("cross-tenant", "write") else "all_rows"
     return "row"
 
 
