@@ -10,6 +10,26 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-19
+
+### Added
+
+- **`pgrls verify` now proves policies that use `= ANY(ARRAY[…])` / `IN (…)`
+  membership.** The Z3 anonymous-read and cross-tenant provers previously
+  abstained (returned `unverified`) on any policy whose `USING` contained a
+  membership test — even though `IN (…)` is one of the most common predicate
+  shapes, and every `IN` list normalizes to `= ANY (ARRAY[…])` on
+  introspection. The 3VL encoder now models `col = ANY(ARRAY[<literals>])` as
+  the exact desugaring `col = lit₁ OR col = lit₂ OR …`, so such policies get a
+  definitive `isolated` / `leak` verdict (with a row witness) instead of
+  `unverified`. This is a recall improvement only — it is an *exact* desugaring
+  onto the existing, trusted Kleene comparison machinery, never an
+  approximation, so it cannot produce a false `isolated`. The encoder
+  deliberately still abstains (soundness over recall) on `<> ALL(…)` (the
+  `NOT IN` normalization, the complement of membership), on `= ANY(<array
+  column>)` / `= ANY(<function>)` (which need array-containment reasoning), and
+  on any element it cannot translate.
+
 ## [0.32.0] - 2026-06-16
 
 ### Added
