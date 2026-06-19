@@ -3354,14 +3354,18 @@ def matrix(
 @click.option(
     "--mode",
     "mode",
-    type=click.Choice(["anon", "cross-tenant"]),
+    type=click.Choice(["anon", "cross-tenant", "write"]),
     default="anon",
     show_default=True,
     help=(
         "Threat model to prove. 'anon': no row is readable by an "
         "unauthenticated session. 'cross-tenant': no row of one tenant is "
         "readable by a session authenticated as a different tenant (verifies "
-        "the `<column> = <session identity>` scoping equality)."
+        "the `<column> = <session identity>` scoping equality). 'write': no "
+        "such session can WRITE (INSERT/UPDATE) a row stamped for another "
+        "tenant — proven over each write policy's effective WITH CHECK (or the "
+        "USING that FOR UPDATE/ALL reuses); SEC006/SEC020/SEC028/SEC040 are the "
+        "linter fallback."
     ),
 )
 @click.option(
@@ -3391,7 +3395,8 @@ def matrix(
         "For each LEAK, write a runnable reproduction (a .sql script and a "
         "pytest) to this directory — recreating the table + policy, inserting "
         "the counterexample row, and SELECTing it back as an anonymous (anon) "
-        "or different-tenant (cross-tenant) session, per --mode."
+        "or different-tenant (cross-tenant) session, per --mode. Not supported "
+        "with --mode write (write-side repro is a follow-on)."
     ),
 )
 @click.option(
@@ -3427,12 +3432,16 @@ def verify(
     function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — NULL)
     read any row? `--mode cross-tenant`: can a session authenticated as one
     tenant read a **different** tenant's row (against the policy's
-    `<column> = <session identity>` scoping equality)? Three honest verdicts:
-    `PROVEN` (the read is unsatisfiable under the threat model), `LEAK` (a row
-    *is* readable — with a concrete counterexample), or `UNVERIFIED` (Z3
+    `<column> = <session identity>` scoping equality)? `--mode write`: can such
+    a session **write** (INSERT/UPDATE) a row stamped for another tenant —
+    proven over each write policy's effective `WITH CHECK` (or the `USING` that
+    `FOR UPDATE`/`FOR ALL` reuses as the new-row check)? Three honest verdicts:
+    `PROVEN` (the property is unsatisfiable under the threat model), `LEAK` (it
+    *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
-    or — cross-tenant — there is no single scoping equality to verify; here the
-    verifier degrades to the linter, run `pgrls lint`).
+    or — cross-tenant/write — there is no single scoping equality to verify;
+    here the verifier degrades to the linter, run `pgrls lint` — for write, the
+    SEC006/SEC020/SEC028/SEC040 write-check rules).
 
     The two modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
@@ -3451,6 +3460,16 @@ def verify(
     clobber a hand-edited reproduction unless `--force`). See the README for
     scope.
     """
+    if mode == "write" and emit_repro_dir is not None:
+        # The repro emitter only knows the anon / cross-tenant read templates;
+        # a write-side repro (set the session tenant, attempt a cross-tenant
+        # INSERT, observe it succeed) is a follow-on. Fail fast rather than
+        # silently emit a wrong (read-shaped) reproduction.
+        raise click.UsageError(
+            "--emit-repro is not supported with --mode write yet "
+            "(write-side reproductions are a follow-on)."
+        )
+
     _, schema = _connect_and_introspect(
         config_path=config_path,
         database_url=database_url,

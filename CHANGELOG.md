@@ -10,6 +10,31 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-06-19
+
+### Added
+
+- **`pgrls verify --mode write`** — a Z3 proof that a session authenticated as
+  one tenant cannot **write** (INSERT/UPDATE) a row stamped for a *different*
+  tenant. The write side is the most CVE-adjacent RLS footgun (CVE-2025-48757):
+  a policy that scopes reads but leaves its `WITH CHECK` unbound lets a caller
+  stamp data for another tenant, and no other tool proves it. Write-isolation
+  is the same satisfiability question as `--mode cross-tenant`, so it reuses the
+  cross-tenant prover verbatim — applied to each write policy's **effective
+  write-check**: its `WITH CHECK` when present (which fully overrides `USING`
+  for the new row), else the `USING` that Postgres reuses as the new-row check
+  for `FOR UPDATE` / `FOR ALL`. `FOR SELECT` / `FOR DELETE` policies (no
+  write-check) and bare `FOR INSERT` policies (default-denied) are excluded.
+  Verdicts mirror the read modes: `isolated` (proven — no cross-tenant row can
+  be written), `leak` (a row stamped for another tenant can be written, with a
+  witness), `unverified` (no provable scoping equality — e.g. an unscoped
+  `WITH CHECK (true)`; run `pgrls lint` for SEC006 / SEC020 / SEC028 / SEC040,
+  the write-check rules). Sound by construction: every Postgres write-check
+  fallback is encoded so any modeling error degrades toward `unverified` /
+  `leak`, never a false `isolated`. `--format json` / `sarif` carry the new mode
+  (`pgrls-write-isolation` SARIF rule). `--emit-repro` is not yet supported with
+  `--mode write`.
+
 ## [0.33.0] - 2026-06-19
 
 ### Added
