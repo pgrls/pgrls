@@ -17,6 +17,7 @@ from pgrls.model import (
     ColumnGrant,
     DefaultPrivilege,
     Grant,
+    ImmutableFunction,
     Index,
     LeakproofFunction,
     Policy,
@@ -775,6 +776,43 @@ WHERE d.defaclobjtype = 'r'
 ORDER BY schema_name, grantee, grantor, ax.privilege_type
 """
 
+# User-defined functions declared IMMUTABLE (`pg_proc.provolatile = 'i'`) in
+# the configured schemas. An IMMUTABLE function promises the planner a fixed
+# result per argument set, so the planner may CONSTANT-FOLD the call into a
+# cached/reused plan. SEC046 flags one whose body reads session/identity state
+# (`current_setting`, `auth.*`, `current_user`, `session_user`) or a table,
+# because the folded value frozen for one caller is then served to the next
+# under any reused plan (pooling, PostgREST, prepared statements, PL/pgSQL) —
+# a cross-user wrong-row leak when the function is used in an RLS policy.
+#
+# `WHERE p.provolatile = 'i'` filters to the audit-relevant subset (mirroring
+# `_LEAKPROOF_FUNCS_SQL`'s `WHERE p.proleakproof = TRUE` and
+# `_SECDEF_FUNCS_SQL`'s `WHERE p.prosecdef = TRUE`). STABLE ('s') and VOLATILE
+# ('v') functions are NOT folded (verified live) and are excluded.
+# Postgres's own built-in IMMUTABLE functions live in `pg_catalog`, which is
+# never in the linted `--schemas`, so they never appear — what remains is the
+# user-defined IMMUTABLE functions a developer wrote.
+#
+# `prosrc` is the function body and `l.lanname` the language (mirroring
+# `_SECDEF_FUNCS_SQL`); SEC046 parses a `sql` body to decide whether it reads
+# session state or a table, and abstains on an empty/unparseable/non-SQL body
+# (fail-closed). Each overload is captured as its OWN row (no DISTINCT): the
+# body governs the verdict, so capturing each overload's body is faithful;
+# SEC046 reports per qualified name. ORDER BY qname, signature for snapshot
+# determinism across overloads.
+_IMMUTABLE_FUNCS_SQL = """
+SELECT
+    n.nspname || '.' || p.proname AS qname,
+    p.prosrc AS body,
+    l.lanname AS lang
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+WHERE p.provolatile = 'i'
+  AND n.nspname = ANY(%s)
+ORDER BY qname, pg_catalog.pg_get_function_identity_arguments(p.oid)
+"""
+
 
 def _extract_search_path(config: list[str] | None) -> str | None:
     """Pull the `search_path` value out of a `pg_proc.proconfig` array.
@@ -907,6 +945,28 @@ def _fetch_leakproof_functions(
             signature=row["signature"] or "",
             schema_name=row["schema_name"],
             function_name=row["function_name"],
+        )
+        for row in cur.fetchall()
+    )
+
+
+def _fetch_immutable_functions(
+    cur: Any, schemas: list[str]
+) -> tuple[ImmutableFunction, ...]:
+    """Fetch every user-defined IMMUTABLE function in `schemas`.
+
+    Returns a tuple of `ImmutableFunction` records sorted by
+    `(qualified_name, signature)` (the SQL `ORDER BY` provides the
+    determinism). Each overload is a separate entry; SEC046 reports per
+    qualified name. The body (`prosrc`) and language (`lanname`) are captured
+    so SEC046 can inspect the body for a session/identity or table read.
+    """
+    cur.execute(_IMMUTABLE_FUNCS_SQL, [list(schemas)])
+    return tuple(
+        ImmutableFunction(
+            qualified_name=row["qname"],
+            body=row["body"] or "",
+            language=row["lang"],
         )
         for row in cur.fetchall()
     )
@@ -1195,6 +1255,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         leakproof_funcs = _fetch_leakproof_functions(cur, schemas)
         bypassrls_escalation = _fetch_bypassrls_escalation_roles(cur)
         default_privileges = _fetch_default_privileges(cur, schemas)
+        immutable_funcs = _fetch_immutable_functions(cur, schemas)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1210,6 +1271,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 leakproof_functions=leakproof_funcs,
                 bypassrls_escalation_roles=bypassrls_escalation,
                 default_privileges=default_privileges,
+                immutable_functions=immutable_funcs,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1418,4 +1480,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         leakproof_functions=leakproof_funcs,
         bypassrls_escalation_roles=bypassrls_escalation,
         default_privileges=default_privileges,
+        immutable_functions=immutable_funcs,
     )

@@ -78,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 18,
+        "version": 19,
         "tables": [
             {
                 "schema": "public",
@@ -112,6 +112,7 @@ def test_schema_to_snapshot_shape() -> None:
         "leakproof_functions": [],
         "bypassrls_escalation_roles": [],
         "default_privileges": [],
+        "immutable_functions": [],
     }
 
 
@@ -237,14 +238,15 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_eighteen_after_default_privileges_capture() -> None:
-    # SNAPSHOT_VERSION bumped 17 → 18 to add top-level default_privileges
-    # (from pg_default_acl) so SEC044 can flag a default-privilege grant that
-    # auto-exposes future tables to a low-trust role. Pin the new version so a
-    # future bump is deliberate. (v17 added Table.inherits for SEC043; v16
-    # added SecdefFunction.execute_roles + owner_bypasses_rls for SEC042.)
+def test_snapshot_version_is_nineteen_after_immutable_functions_capture() -> None:
+    # SNAPSHOT_VERSION bumped 18 → 19 to add top-level immutable_functions
+    # (user-defined functions with provolatile='i') so SEC046 can flag an
+    # IMMUTABLE function whose body reads session state (constant-folded into a
+    # cached plan → cross-user leak). Pin the new version so a future bump is
+    # deliberate. (v18 added default_privileges for SEC044; v17 added
+    # Table.inherits for SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 18
+    assert snap["version"] == 19
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -812,11 +814,13 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
     # `version`, `tables`, `policies`, `views`,
     # `security_definer_functions`, `bypassrls_roles`,
     # `leakproof_functions`, `bypassrls_escalation_roles`,
-    # `default_privileges` so a quiet refactor that renames or drops a
-    # key fails this test rather than slipping past CI. v18 adds the
-    # top-level `default_privileges` array (from pg_default_acl) for
-    # SEC044. (v12 added per-overload `signature` to SecdefFunction /
-    # LeakproofFunction — a per-entry field, not a top-level key.)
+    # `default_privileges`, `immutable_functions` so a quiet refactor that
+    # renames or drops a key fails this test rather than slipping past CI. v19
+    # adds the top-level `immutable_functions` array (user-defined
+    # provolatile='i' functions) for SEC046; v18 added `default_privileges`
+    # (from pg_default_acl) for SEC044. (v12 added per-overload `signature` to
+    # SecdefFunction / LeakproofFunction — a per-entry field, not a top-level
+    # key.)
     snap = Schema(tables=()).to_snapshot()
     assert set(snap.keys()) == {
         "version",
@@ -828,8 +832,9 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "leakproof_functions",
         "bypassrls_escalation_roles",
         "default_privileges",
+        "immutable_functions",
     }
-    assert snap["version"] == 18
+    assert snap["version"] == 19
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1147,7 +1152,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 18
+    assert snap["version"] == SNAPSHOT_VERSION == 19
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

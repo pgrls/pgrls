@@ -483,11 +483,12 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_eighteen():
-    # Bumped 17 → 18 to add top-level default_privileges (from pg_default_acl)
-    # for SEC044's default-privilege-exposes-future-tables check. Pin so a
-    # future bump is deliberate.
-    assert SNAPSHOT_VERSION == 18
+def test_snapshot_version_is_nineteen():
+    # Bumped 18 → 19 to add top-level immutable_functions (user-defined
+    # functions with provolatile='i') for SEC046's constant-folded-session-read
+    # check. (v18 added default_privileges for SEC044.) Pin so a future bump is
+    # deliberate.
+    assert SNAPSHOT_VERSION == 19
 
 
 def test_to_snapshot_emits_column_details_array():

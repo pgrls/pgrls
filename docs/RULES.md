@@ -3037,6 +3037,76 @@ patterns = ["mrn", "policy_number"]               # extra PII tokens (added to d
 allowlist = ["public.profiles.email"]             # a deliberate public-email column
 ```
 
+<a id="rule-sec046"></a>
+
+## SEC046 — Policy calls an IMMUTABLE function that reads session state
+
+**Severity:** error
+
+A function declared `IMMUTABLE` promises the planner it returns the same result
+for the same arguments *forever*, so the planner may **constant-fold** the call
+at plan time — evaluate it once and bake the literal into the plan. When the
+body of such a function actually reads *session / identity state*
+(`current_setting(...)`, an `auth.*` helper, `current_user` / `session_user`) or
+a *table*, that promise is false: the value frozen for the connection that first
+planned the statement is reused for every later caller of any **reused or cached
+plan** — a connection pooler reusing a backend (Supavisor / PgBouncer),
+PostgREST, a prepared statement, a PL/pgSQL plan cache.
+
+Used in a row-level-security policy, this is a silent cross-user data leak:
+
+```sql
+-- a USER-DEFINED IMMUTABLE wrapper that reads the per-request tenant GUC:
+CREATE FUNCTION app.cur_tenant() RETURNS text
+    LANGUAGE sql IMMUTABLE              -- WRONG: must be STABLE
+    AS $$ SELECT current_setting('app.tenant', true) $$;
+
+CREATE POLICY tenant_iso ON docs FOR SELECT
+    USING (tenant = app.cur_tenant());   -- SEC046
+```
+
+Once one connection plans `SELECT … FROM docs` under that policy, the planner
+folds `app.cur_tenant()` to *that connection's* tenant and caches the plan. A
+different user reusing the same pooled backend then runs the cached plan and is
+served the **first user's** rows — RLS silently scopes them to someone else's
+tenant. (Verified live: with the function marked `IMMUTABLE` a second connection
+sees the first connection's rows; marked `STABLE` it does not.)
+
+This is a *correctness* finding distinct from its neighbours: SEC024 surfaces a
+policy that reads a session GUC at all; PERF004 flags a function-wrapped
+discriminator that defeats an index. SEC046 is the one that proves the wrapper's
+`IMMUTABLE` marking makes the row filter return the *wrong user's* rows under
+plan reuse.
+
+**Not a false positive on the obvious-looking cases** (all live-validated):
+
+- **Inline `current_setting('app.uid', true)` used directly in a policy is SAFE
+  and is not flagged.** `current_setting` is a built-in marked `STABLE`, so it is
+  not constant-folded — the next user gets their own value. SEC046 fires only on
+  a **user-defined `IMMUTABLE` wrapper**.
+- **A pure `IMMUTABLE` function** (deterministic on its arguments, no session or
+  table read, e.g. `is_even(int)`) is legitimate and is not flagged.
+- **`STABLE` and `VOLATILE` functions are not flagged** — `STABLE` is the
+  *correct* label and `VOLATILE` also defeats folding; only `provolatile='i'`
+  reaches this rule.
+
+**Remediation:** declare the function `STABLE` —
+`ALTER FUNCTION app.cur_tenant(...) STABLE` — so it is re-evaluated per
+execution. No auto-fix: pgrls cannot prove a given function is *meant* to be
+volatility-downgraded versus genuinely pure; the operator confirms and
+re-declares it.
+
+SEC046 abstains (fail-closed) on a PL/pgSQL / empty / unparseable function body,
+and on a snapshot predating the `immutable_functions` capture (re-capture to
+enable it).
+
+**Configuration** (`[lint.rules.SEC046]`):
+
+```toml
+[lint.rules.SEC046]
+allowlist = ["app.cur_tenant"]   # a function proven safe to constant-fold (schema.function)
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING
