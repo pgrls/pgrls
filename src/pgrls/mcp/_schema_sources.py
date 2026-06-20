@@ -33,7 +33,9 @@ from typing import Any, Literal
 
 import pglast
 import pglast.parser
+from pglast import ast as _pgast
 from pglast.enums.parsenodes import (
+    A_Expr_Kind,
     AlterTableType,
     GrantTargetType,
     ObjectType,
@@ -42,7 +44,7 @@ from pglast.enums.parsenodes import (
 from pglast.stream import RawStream
 
 from pgrls import ast_utils
-from pgrls.model import Column, Grant, Policy, Schema, Table
+from pgrls.model import Column, ColumnGrant, Grant, Policy, Schema, Table
 
 SchemaSource = Literal["sql", "database_url", "snapshot"]
 
@@ -90,6 +92,68 @@ _GRANT_ALL_PRIVILEGES: tuple[str, ...] = (
     "REFERENCES",
     "TRIGGER",
 )
+
+# `GRANT ALL (col) ON <table>` grants every *column*-applicable privilege on
+# that column. Postgres column ACLs only carry SELECT / INSERT / UPDATE /
+# REFERENCES, so that is the expansion (the analog of `_GRANT_ALL_PRIVILEGES`
+# for the column-level path).
+_COLUMN_GRANT_ALL_PRIVILEGES: tuple[str, ...] = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "REFERENCES",
+)
+
+
+def _normalize_in_membership(node: Any) -> Any:
+    """Rewrite ``x IN (...)`` / ``x NOT IN (...)`` to the canonical form
+    Postgres's ``pg_get_expr`` emits, in place, recursively.
+
+    Introspection feeds the rules and the Z3 encoder predicates as rendered by
+    ``pg_get_expr``, which normalizes a value-list membership test to ``x = v``
+    (single) / ``x = ANY (ARRAY[...])`` (multi) — and the negated forms to
+    ``x <> v`` / ``x <> ALL (ARRAY[...])``. The rules/encoder only recognize
+    *those* shapes; a raw ``A_Expr(AEXPR_IN)`` (which the offline ``sql=`` parse
+    preserves, the one place ``pg_get_expr`` never runs) would be missed —
+    making `verify` under-claim (``unverified`` instead of ``leak``) and
+    silencing SEC038 on the flagship anon-read shape. Normalizing here keeps the
+    offline path faithful to a live database.
+    """
+    if node is None or isinstance(node, (str, int, float, bool)):
+        return node
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            _normalize_in_membership(item)
+        return node
+    if isinstance(node, _pgast.Node):
+        for field_name in node:
+            _normalize_in_membership(getattr(node, field_name, None))
+        if (
+            isinstance(node, _pgast.A_Expr)
+            and node.kind == A_Expr_Kind.AEXPR_IN
+            and isinstance(node.rexpr, (list, tuple))
+        ):
+            elems = list(node.rexpr)
+            negated = bool(node.name) and node.name[0].sval == "<>"
+            if len(elems) == 1:
+                node.kind = A_Expr_Kind.AEXPR_OP
+                node.rexpr = elems[0]
+            else:
+                node.kind = (
+                    A_Expr_Kind.AEXPR_OP_ALL
+                    if negated
+                    else A_Expr_Kind.AEXPR_OP_ANY
+                )
+                node.rexpr = _pgast.A_ArrayExpr(elements=tuple(elems))
+    return node
+
+
+def _parse_clause(sql_text: str, *, location: str, clause: str) -> Any:
+    """Parse a policy USING / WITH CHECK fragment, normalizing ``IN`` membership
+    to the introspect-canonical form so the offline `sql=` AST matches a live
+    DB's (see `_normalize_in_membership`)."""
+    expr = ast_utils.parse_expr(sql_text, location=location, clause=clause)
+    return _normalize_in_membership(expr)
 
 
 def resolve_schema(
@@ -228,13 +292,13 @@ def _reparse_policy_asts(schema: Schema) -> Schema:
             using_ast = policy.using_ast
             check_ast = policy.with_check_ast
             if using_ast is None and policy.using_sql:
-                using_ast = ast_utils.parse_expr(
+                using_ast = _parse_clause(
                     policy.using_sql,
                     location=f"{table.qualified_name}.{policy.name}",
                     clause="USING",
                 )
             if check_ast is None and policy.with_check_sql:
-                check_ast = ast_utils.parse_expr(
+                check_ast = _parse_clause(
                     policy.with_check_sql,
                     location=f"{table.qualified_name}.{policy.name}",
                     clause="WITH CHECK",
@@ -342,6 +406,7 @@ class _TableBuilder:
         self.columns: list[Column] = []
         self.policies: list[Policy] = []
         self.grants: list[Grant] = []
+        self.column_grants: list[ColumnGrant] = []
 
     def build(self) -> Table:
         return Table(
@@ -353,6 +418,7 @@ class _TableBuilder:
             columns=tuple(c.name for c in self.columns),
             column_details=tuple(self.columns),
             grants=tuple(self.grants),
+            column_grants=tuple(self.column_grants),
         )
 
 
@@ -455,12 +521,12 @@ def _apply_create_policy(
     check_sql = _deparse_or_none(getattr(stmt, "with_check", None))
     location = f"{key[0]}.{key[1]}.{name}"
     using_ast = (
-        ast_utils.parse_expr(using_sql, location=location, clause="USING")
+        _parse_clause(using_sql, location=location, clause="USING")
         if using_sql is not None
         else None
     )
     check_ast = (
-        ast_utils.parse_expr(check_sql, location=location, clause="WITH CHECK")
+        _parse_clause(check_sql, location=location, clause="WITH CHECK")
         if check_sql is not None
         else None
     )
@@ -499,8 +565,8 @@ def _apply_grant(
     if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
         return  # schema / function / sequence grant
 
-    privileges = _grant_privileges(stmt)
-    if not privileges:
+    table_privs, column_privs = _grant_privileges(stmt)
+    if not table_privs and not column_privs:
         return
     grantees = _role_specs(getattr(stmt, "grantees", None))
     if not grantees:
@@ -517,28 +583,51 @@ def _apply_grant(
             # GRANT references a table not declared in this DDL — skip.
             continue
         for role in grantees:
-            builder.grants.append(Grant(role=role, privileges=privileges))
+            if table_privs:
+                builder.grants.append(Grant(role=role, privileges=table_privs))
+            for column, privs in column_privs.items():
+                builder.column_grants.append(
+                    ColumnGrant(
+                        role=role,
+                        column=column,
+                        privileges=tuple(sorted(privs)),
+                    )
+                )
 
 
-def _grant_privileges(stmt: Any) -> tuple[str, ...]:
-    """Privilege names on a GrantStmt, uppercased; empty list ⇒ `GRANT ALL`.
+def _grant_privileges(
+    stmt: Any,
+) -> tuple[tuple[str, ...], dict[str, set[str]]]:
+    """Split a GrantStmt's privileges into table-level and column-level.
 
-    Column-scoped privileges (`GRANT SELECT (col) …`) are skipped here — they
-    belong to `ColumnGrant`, which this v1 builder does not model; a
-    table-level grant in the same statement still records.
+    Returns ``(table_privileges, {column: {privileges}})``. An empty privilege
+    list is Postgres's ``GRANT ALL`` (table-level). A column-scoped privilege
+    (``GRANT SELECT (col) …``) feeds `ColumnGrant` — the SEC045 PII-exposure
+    rule reads those; ``GRANT ALL (col)`` expands to the column-applicable set.
     """
     privs = stmt.privileges
     if not privs:
-        # Empty privilege list is Postgres's `GRANT ALL`.
-        return _GRANT_ALL_PRIVILEGES
-    out: list[str] = []
+        # Empty privilege list is Postgres's `GRANT ALL` (whole table).
+        return _GRANT_ALL_PRIVILEGES, {}
+    table_out: list[str] = []
+    column_out: dict[str, set[str]] = {}
     for ap in privs:
-        if getattr(ap, "cols", None):
-            continue  # column-level grant — not modeled in v1
+        cols = getattr(ap, "cols", None)
         name = getattr(ap, "priv_name", None)
+        if cols:
+            col_privs = (
+                {name.upper()}
+                if name
+                else set(_COLUMN_GRANT_ALL_PRIVILEGES)  # GRANT ALL (col)
+            )
+            for col in cols:
+                colname = getattr(col, "sval", None)
+                if colname:
+                    column_out.setdefault(colname, set()).update(col_privs)
+            continue
         if name:
-            out.append(name.upper())
-    return tuple(out)
+            table_out.append(name.upper())
+    return tuple(table_out), column_out
 
 
 def _role_specs(roles: Any) -> tuple[str, ...]:

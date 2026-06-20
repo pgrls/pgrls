@@ -133,6 +133,49 @@ def test_verify_sql_clean_policy_anon_isolated() -> None:
     assert result["summary"]["isolated"] == 1
 
 
+def test_in_membership_normalizes_to_canonical_form() -> None:
+    # Regression (review CRITICAL #1): `col IN (auth.uid())` is an idiomatic
+    # single-value membership form. pg_get_expr normalizes it to `col = …` (the
+    # only shape the rules / Z3 encoder recognize), but the offline parse
+    # preserved the raw `IN`, so verify under-claimed `unverified` and SEC038
+    # went silent. The offline path must match a live DB.
+    leak_ddl = (
+        "CREATE TABLE public.docs (id uuid, tenant_id uuid);"
+        "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+        "CREATE POLICY p ON public.docs FOR SELECT TO authenticated "
+        "  USING (auth.uid() IS NULL OR tenant_id IN (auth.uid()));"
+    )
+    verify_result = server.verify(sql=leak_ddl, mode="anon")
+    assert verify_result["tables"][0]["verdict"] == "leak"  # not "unverified"
+    ids = {v["rule_id"] for v in server.lint(sql=leak_ddl)["violations"]}
+    assert "SEC038" in ids
+    # A clean single-value-IN scoping must prove isolated (not under-claim).
+    clean_ddl = (
+        "CREATE TABLE public.acct (id uuid, tenant_id uuid);"
+        "ALTER TABLE public.acct ENABLE ROW LEVEL SECURITY;"
+        "CREATE POLICY p ON public.acct FOR SELECT TO authenticated "
+        "  USING (tenant_id IN (auth.uid()));"
+    )
+    clean = server.verify(sql=clean_ddl, mode="cross-tenant")
+    assert clean["tables"][0]["verdict"] == "isolated"
+
+
+def test_column_grant_of_pii_to_low_trust_flags_sec045() -> None:
+    # Regression (review CRITICAL #2): a column-level GRANT of a PII column to a
+    # low-trust role is the exact SEC045 trigger. The offline builder dropped
+    # column grants, so SEC045 was silent (a false-clean) AND it was not in the
+    # catalog-only inert set, so no warning told the agent.
+    ddl = (
+        "CREATE TABLE public.users (id uuid, ssn text, tenant_id uuid);"
+        "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;"
+        "CREATE POLICY p ON public.users FOR SELECT TO authenticated "
+        "  USING (tenant_id = auth.uid());"
+        "GRANT SELECT (ssn) ON public.users TO anon;"
+    )
+    ids = {v["rule_id"] for v in server.lint(sql=ddl)["violations"]}
+    assert "SEC045" in ids
+
+
 def test_schema_from_sql_maps_ddl_faithfully() -> None:
     """Regression net for the DDL→model mapping (the false-clean risk)."""
     schema = schema_from_sql(
