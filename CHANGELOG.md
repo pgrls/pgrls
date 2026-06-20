@@ -10,6 +10,46 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-06-19
+
+### Added
+
+- **`pgrls mcp`** — an optional Model Context Protocol server (stdio) that
+  exposes pgrls's analysis to AI coding agents. The headline is **offline**
+  analysis of the raw DDL an agent just wrote: pass the `CREATE TABLE` /
+  `CREATE POLICY` SQL as `sql=` and pgrls lints it and runs the full Z3
+  isolation prover with **no database** — `pglast` builds a `Schema` with
+  populated policy ASTs straight from the DDL. Four read-only tools:
+  - `lint(sql= | database_url= | snapshot=, …)` → the lint findings (same JSON
+    violation shape as `pgrls lint --format json`), plus `schema_source` and a
+    `warnings` list.
+  - `verify(sql= | database_url= | snapshot=, mode=anon|cross-tenant|write, …)`
+    → the per-table/per-policy verdicts and leak witnesses (`pgrls verify
+    --format json`'s payload).
+  - `explain_rule(rule_id)` and `list_rules()` → the rule catalog / a single
+    rule's reference (same payloads as `pgrls explain --format json`).
+- The three schema sources are mutually exclusive (exactly one per call), and
+  each tool returns a **structured error object** (`{"error": {"kind", …}}`,
+  kinds: `bad_sql` / `db_unreachable` / `unknown_rule` / `no_schema_source` /
+  `multiple_schema_sources` / `z3_unavailable`) instead of raising, so a bad
+  input never breaks the stdio loop.
+- The server is **read-only / diagnostic-only**: it never mutates a database and
+  never auto-applies SQL (`fix` / `generate` / `diff --apply` / `verify
+  --probe` are deliberately not exposed). `database_url` is treated as a
+  credential — it is never logged and database errors are sanitized so the DSN
+  can't leak. Introspection issues only SELECTs over a short-lived connection.
+- **Caveat surfaced in the response, not hidden:** on the `sql=` path the
+  `warnings` list notes that catalog-only rules (those needing pg_catalog state
+  not expressible in DDL — BYPASSRLS roles, `pg_default_acl`, SECDEF owners,
+  FKs, indexes, triggers) cannot fire, so an empty `violations` list is **not**
+  a proof of safety. A `snapshot=` schema's policy ASTs are re-parsed on load so
+  `verify` returns real verdicts rather than all-`unverified`.
+- Requires the optional `pgrls[mcp]` extra (`pip install 'pgrls[mcp]'`, which
+  adds FastMCP). FastMCP is **not** a core dependency — the normal CLI path
+  never imports it; `pgrls mcp` imports the server lazily and prints a clear
+  install hint when the extra is absent. Point an MCP client at it with
+  `{"mcpServers": {"pgrls": {"command": "pgrls", "args": ["mcp"]}}}`.
+
 ## [0.39.0] - 2026-06-19
 
 ### Added

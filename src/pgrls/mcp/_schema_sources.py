@@ -1,0 +1,627 @@
+"""Resolve a `pgrls.model.Schema` from one of three sources, for the MCP server.
+
+This module is the FastMCP-agnostic core of `pgrls mcp`: it has NO dependency
+on the `fastmcp` extra, so the schema-resolution + DDL-parsing logic can be
+unit-tested with a plain `pip install pgrls`.
+
+Three sources, EXACTLY ONE per call (`resolve_schema` enforces this):
+
+* ``database_url`` — connect read-only, introspect, close. Mirrors
+  `cli._connect_and_introspect`. Any psycopg error is sanitized so the DSN /
+  credentials never leak into the message returned to the agent.
+* ``snapshot`` — a `pgrls snapshot` JSON path. Loaded via
+  `Schema.from_snapshot`, then each policy's USING / WITH CHECK is **re-parsed**
+  into `using_ast` / `with_check_ast`: a snapshot serializes only
+  `using_sql` / `with_check_sql` (see `model.from_snapshot`'s docstring), so
+  without the re-parse `verify` would return all-``unverified``. This mirrors
+  the on-demand re-parse `diff/columns.py` already does.
+* ``sql`` — the NEW offline path (`schema_from_sql`): parse raw DDL with
+  `pglast` and build a `Schema` directly, no database. THE crux of the server.
+
+Correctness posture (the dangerous direction): a ``sql=`` input that parses but
+yields an *empty or wrong* Schema would make `lint` return "no findings" and
+falsely reassure the agent. `schema_from_sql` is therefore deliberately
+faithful, and `schema_source_warnings` surfaces the catalog-only rules that are
+structurally inert on a `sql=`-built schema — so the server can tell the agent
+that absence-of-finding is NOT proof.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from typing import Any, Literal
+
+import pglast
+import pglast.parser
+from pglast.enums.parsenodes import (
+    AlterTableType,
+    GrantTargetType,
+    ObjectType,
+    RoleSpecType,
+)
+from pglast.stream import RawStream
+
+from pgrls import ast_utils
+from pgrls.model import Column, Grant, Policy, Schema, Table
+
+SchemaSource = Literal["sql", "database_url", "snapshot"]
+
+
+class SchemaSourceError(Exception):
+    """A typed error from `resolve_schema` / `schema_from_sql`.
+
+    `kind` is one of the stable structured-error kinds the MCP tools surface to
+    the agent (`bad_sql`, `db_unreachable`, `no_schema_source`,
+    `multiple_schema_sources`). The server maps this straight onto the
+    `{"error": {"kind": ..., "message": ...}}` response shape.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+# pglast's `cmd_name` on a CreatePolicyStmt is the lowercased command word
+# ("select"/"insert"/"update"/"delete"/"all") — the offline analog of
+# `introspect._POLICY_CMD_MAP` (which maps `pg_policy.polcmd`'s single letters).
+# An omitted `FOR` clause parses as "all" (Postgres's default), matching the
+# `*` → "ALL" introspect mapping.
+_POLICY_CMD_WORD_MAP: dict[str, str] = {
+    "all": "ALL",
+    "select": "SELECT",
+    "insert": "INSERT",
+    "update": "UPDATE",
+    "delete": "DELETE",
+}
+
+# `GRANT ALL ON <table>` carries an empty privileges list in the AST; expand it
+# to the privilege set `aclexplode` would materialize on a live database so the
+# GRANT-dependent rules (SEC041 / SEC045 / SEC047) see the real grant. MAINTAIN
+# (PG17+) is omitted to match the canonical pre-17 `GRANT ALL` expansion; the
+# rules test membership, so an over- vs under-expansion here only ever makes a
+# write/content privilege *more* visible, never hides one.
+_GRANT_ALL_PRIVILEGES: tuple[str, ...] = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "TRUNCATE",
+    "REFERENCES",
+    "TRIGGER",
+)
+
+
+def resolve_schema(
+    *,
+    sql: str | None = None,
+    database_url: str | None = None,
+    snapshot: str | None = None,
+    schemas: tuple[str, ...] | None = None,
+) -> tuple[Schema, SchemaSource]:
+    """Build a `Schema` from EXACTLY ONE of `sql` / `database_url` / `snapshot`.
+
+    Returns `(schema, source)` where `source` is the kind that was used (for the
+    `schema_source` field the tools echo back). Raises `SchemaSourceError` with
+    a structured `kind` on zero sources (`no_schema_source`), more than one
+    (`multiple_schema_sources`), a pglast parse failure (`bad_sql`), or a
+    database error (`db_unreachable`, sanitized).
+
+    `schemas` applies to the `database_url` (which schemas to introspect) and
+    `sql` (which schema an unqualified relation defaults into) paths; it is
+    ignored for `snapshot` (a snapshot already pins its captured schemas).
+    Defaults to `("public",)`.
+    """
+    provided = [
+        name
+        for name, value in (
+            ("sql", sql),
+            ("database_url", database_url),
+            ("snapshot", snapshot),
+        )
+        if value is not None
+    ]
+    if not provided:
+        raise SchemaSourceError(
+            "no_schema_source",
+            "exactly one schema source is required: pass `sql` (raw DDL to "
+            "analyze offline), `database_url` (a live Postgres connection), or "
+            "`snapshot` (a path to a pgrls snapshot JSON).",
+        )
+    if len(provided) > 1:
+        raise SchemaSourceError(
+            "multiple_schema_sources",
+            "exactly one schema source is allowed, but "
+            f"{', '.join(provided)} were all given. Pass only one of `sql`, "
+            "`database_url`, or `snapshot`.",
+        )
+
+    effective_schemas = schemas if schemas else ("public",)
+
+    if sql is not None:
+        return schema_from_sql(sql, schemas=effective_schemas), "sql"
+    if snapshot is not None:
+        return _schema_from_snapshot(snapshot), "snapshot"
+    assert database_url is not None  # guaranteed by the guards above
+    return _schema_from_database(database_url, effective_schemas), "database_url"
+
+
+def _schema_from_database(database_url: str, schemas: tuple[str, ...]) -> Schema:
+    """Connect read-only, introspect, close. Mirrors `cli._connect_and_introspect`.
+
+    The connection is short-lived and issues only SELECTs (`introspect` reads
+    the catalogs). On any psycopg error the message is sanitized — the
+    connection string can embed credentials, so the raw error (which may echo
+    the DSN) is never returned to the agent.
+    """
+    # psycopg is imported lazily so a `sql=` / `snapshot=` call never pays for
+    # the driver import — and so this module imports cleanly even where psycopg
+    # is unavailable.
+    import psycopg
+
+    from pgrls.introspect import introspect
+
+    try:
+        with psycopg.connect(database_url) as conn:
+            return introspect(conn, schemas=list(schemas))
+    except psycopg.Error as exc:
+        # NEVER include `exc` verbatim or `database_url` — either can leak
+        # credentials. Surface only the exception class name.
+        raise SchemaSourceError(
+            "db_unreachable",
+            "could not introspect the database "
+            f"({type(exc).__name__}). Check the connection and that the role "
+            "can read the catalogs. (Connection details are withheld so "
+            "credentials are not echoed.)",
+        ) from exc
+    except ValueError as exc:
+        # e.g. a reserved schema name passed in `schemas`. Safe to surface.
+        raise SchemaSourceError("db_unreachable", str(exc)) from exc
+
+
+def _schema_from_snapshot(snapshot_path: str) -> Schema:
+    """Load a snapshot JSON and rebuild policy ASTs so `verify` works.
+
+    `Schema.from_snapshot` leaves `using_ast` / `with_check_ast` as `None`
+    (snapshots serialize only the SQL). `verify` reads the ASTs, so without this
+    re-parse every table comes back `unverified`. Re-parse each policy's
+    USING / WITH CHECK via `ast_utils.parse_expr` — the same on-demand parse
+    `diff/columns.py` does for snapshot-fed diffs.
+    """
+    try:
+        with open(snapshot_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError as exc:
+        raise SchemaSourceError(
+            "bad_sql",
+            f"snapshot file not found: {snapshot_path!r}.",
+        ) from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SchemaSourceError(
+            "bad_sql",
+            f"could not read snapshot {snapshot_path!r}: {exc}.",
+        ) from exc
+
+    try:
+        schema = Schema.from_snapshot(payload)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SchemaSourceError(
+            "bad_sql",
+            f"{snapshot_path!r} is not a valid pgrls snapshot: {exc}.",
+        ) from exc
+
+    return _reparse_policy_asts(schema)
+
+
+def _reparse_policy_asts(schema: Schema) -> Schema:
+    """Return a copy of `schema` with every policy's USING / WITH CHECK parsed.
+
+    Tables (and the Schema) are frozen dataclasses, so this rebuilds via
+    `dataclasses.replace`. Policies that already carry ASTs (e.g. a Schema not
+    from a snapshot) are passed through untouched.
+    """
+    new_tables: list[Table] = []
+    for table in schema.tables:
+        new_policies: list[Policy] = []
+        rebuilt = False
+        for policy in table.policies:
+            using_ast = policy.using_ast
+            check_ast = policy.with_check_ast
+            if using_ast is None and policy.using_sql:
+                using_ast = ast_utils.parse_expr(
+                    policy.using_sql,
+                    location=f"{table.qualified_name}.{policy.name}",
+                    clause="USING",
+                )
+            if check_ast is None and policy.with_check_sql:
+                check_ast = ast_utils.parse_expr(
+                    policy.with_check_sql,
+                    location=f"{table.qualified_name}.{policy.name}",
+                    clause="WITH CHECK",
+                )
+            if using_ast is not policy.using_ast or check_ast is not policy.with_check_ast:
+                new_policies.append(
+                    replace(policy, using_ast=using_ast, with_check_ast=check_ast)
+                )
+                rebuilt = True
+            else:
+                new_policies.append(policy)
+        if rebuilt:
+            new_tables.append(replace(table, policies=tuple(new_policies)))
+        else:
+            new_tables.append(table)
+    return replace(schema, tables=tuple(new_tables))
+
+
+def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
+    """Build a `Schema` from raw DDL — the offline analysis path. THE crux.
+
+    Parses `sql` with `pglast` and walks the statements TOLERANTLY: any
+    statement shape this builder doesn't model (functions, views, indexes, FKs,
+    roles, ALTER DEFAULT PRIVILEGES, …) is silently skipped. The ONLY thing that
+    raises is a pglast `ParseError` on the whole input — surfaced as a
+    `bad_sql` `SchemaSourceError` so the agent learns its DDL didn't parse
+    rather than receiving a falsely-clean "no findings".
+
+    What IS modeled:
+
+    * ``CREATE TABLE`` → a `Table` with `Column`s (name + Postgres data type).
+      An unqualified relation defaults to the first entry in `schemas`
+      (``public`` by default), keyed on ``(schema, name)``.
+    * ``ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`` → sets the table's
+      `rls_enabled` / `force_rls`.
+    * ``CREATE POLICY`` → a `Policy` (name, command, permissive vs
+      ``AS RESTRICTIVE``, ``TO`` roles, and USING / WITH CHECK parsed into the
+      ASTs `verify` and the AST rules need).
+    * ``GRANT <privs> ON <table> TO <roles>`` → a `Grant` so the
+      GRANT-dependent rules fire.
+
+    What is intentionally absent (the documented v1 scope): anything the offline
+    AST cannot express — BYPASSRLS roles, `pg_default_acl`, SECURITY DEFINER
+    function owners, foreign keys, indexes, triggers. The catalog-only rules
+    that read those fields fail closed on the missing data and abstain quietly;
+    `schema_source_warnings` names them so the caller doesn't mistake their
+    silence for a clean bill of health.
+    """
+    try:
+        statements = pglast.parse_sql(sql)
+    except pglast.parser.ParseError as exc:
+        raise SchemaSourceError(
+            "bad_sql",
+            f"could not parse the provided SQL: {exc}.",
+        ) from exc
+
+    default_schema = schemas[0] if schemas else "public"
+
+    # Build tables first (CREATE TABLE), then layer ALTER / CREATE POLICY /
+    # GRANT onto them, so a policy or grant that precedes its table in the input
+    # still attaches. Two passes keep that order-independent.
+    tables: dict[tuple[str, str], _TableBuilder] = {}
+
+    # Pass 1: CREATE TABLE.
+    for raw in statements:
+        stmt = raw.stmt
+        if type(stmt).__name__ != "CreateStmt":
+            continue
+        key = _relation_key(stmt.relation, default_schema)
+        if key is None:
+            continue
+        tables.setdefault(key, _TableBuilder(schema=key[0], name=key[1]))
+        builder = tables[key]
+        for elt in stmt.tableElts or ():
+            if type(elt).__name__ != "ColumnDef":
+                continue
+            colname = elt.colname
+            data_type = _column_type(elt)
+            if colname and data_type:
+                builder.columns.append(Column(name=colname, data_type=data_type))
+
+    # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT.
+    for raw in statements:
+        stmt = raw.stmt
+        kind = type(stmt).__name__
+        if kind == "AlterTableStmt":
+            _apply_alter_table(stmt, tables, default_schema)
+        elif kind == "CreatePolicyStmt":
+            _apply_create_policy(stmt, tables, default_schema)
+        elif kind == "GrantStmt":
+            _apply_grant(stmt, tables, default_schema)
+        # Every other statement shape is skipped tolerantly.
+
+    return Schema(tables=tuple(b.build() for b in tables.values()))
+
+
+class _TableBuilder:
+    """Mutable accumulator for one table while walking the DDL statements."""
+
+    def __init__(self, *, schema: str, name: str) -> None:
+        self.schema = schema
+        self.name = name
+        self.rls_enabled = False
+        self.force_rls = False
+        self.columns: list[Column] = []
+        self.policies: list[Policy] = []
+        self.grants: list[Grant] = []
+
+    def build(self) -> Table:
+        return Table(
+            schema=self.schema,
+            name=self.name,
+            rls_enabled=self.rls_enabled,
+            force_rls=self.force_rls,
+            policies=tuple(self.policies),
+            columns=tuple(c.name for c in self.columns),
+            column_details=tuple(self.columns),
+            grants=tuple(self.grants),
+        )
+
+
+def _relation_key(
+    relation: Any, default_schema: str
+) -> tuple[str, str] | None:
+    """`(schema, name)` for a RangeVar, defaulting an unqualified schema."""
+    if relation is None:
+        return None
+    name = getattr(relation, "relname", None)
+    if not name:
+        return None
+    schema = getattr(relation, "schemaname", None) or default_schema
+    return (schema, name)
+
+
+def _column_type(column_def: Any) -> str | None:
+    """Render a ColumnDef's typeName back to its `CREATE TABLE` text form.
+
+    Uses pglast's deparser on the `TypeName` node — the same round-trip the
+    introspect path's data types take — so e.g. ``numeric(10,2)`` and
+    ``timestamp with time zone`` survive intact. The deparser maps pglast's
+    internal aliases (``int4`` → ``integer``) to the canonical Postgres
+    spelling, matching what introspection captures.
+    """
+    type_name = getattr(column_def, "typeName", None)
+    if type_name is None:
+        return None
+    try:
+        # `str(...)` pins the result type — pglast's RawStream is untyped
+        # (mypy override), so the bare call returns `Any`.
+        return str(RawStream()(type_name))
+    except Exception:
+        # Defensive: an exotic type the deparser can't render is dropped rather
+        # than aborting the whole table (tolerant-walk contract). The column
+        # name is still captured by the caller only when a type renders.
+        return None
+
+
+def _apply_alter_table(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    key = _relation_key(stmt.relation, default_schema)
+    if key is None:
+        return
+    builder = tables.get(key)
+    if builder is None:
+        # An ALTER on a table we never saw a CREATE for (e.g. the agent pasted
+        # only the ALTER). Create a shell so the RLS toggle still records — a
+        # table with RLS on and no columns/policies is a legitimate (if
+        # incomplete) thing to lint.
+        builder = _TableBuilder(schema=key[0], name=key[1])
+        tables[key] = builder
+    for cmd in stmt.cmds or ():
+        subtype = getattr(cmd, "subtype", None)
+        if subtype == AlterTableType.AT_EnableRowSecurity:
+            builder.rls_enabled = True
+        elif subtype == AlterTableType.AT_ForceRowSecurity:
+            builder.force_rls = True
+        elif subtype == AlterTableType.AT_DisableRowSecurity:
+            builder.rls_enabled = False
+        elif subtype == AlterTableType.AT_NoForceRowSecurity:
+            builder.force_rls = False
+        elif subtype == AlterTableType.AT_AddColumn:
+            col = getattr(cmd, "def_", None)
+            if col is not None and type(col).__name__ == "ColumnDef":
+                colname = col.colname
+                data_type = _column_type(col)
+                if colname and data_type:
+                    builder.columns.append(
+                        Column(name=colname, data_type=data_type)
+                    )
+        # Other ALTER subcommands are ignored.
+
+
+def _apply_create_policy(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    key = _relation_key(getattr(stmt, "table", None), default_schema)
+    if key is None:
+        return
+    builder = tables.get(key)
+    if builder is None:
+        builder = _TableBuilder(schema=key[0], name=key[1])
+        tables[key] = builder
+
+    name = getattr(stmt, "policy_name", None)
+    if not name:
+        return
+    command = _POLICY_CMD_WORD_MAP.get((stmt.cmd_name or "all").lower())
+    if command is None:
+        # An unrecognized command word — skip rather than guess.
+        return
+
+    using_sql = _deparse_or_none(getattr(stmt, "qual", None))
+    check_sql = _deparse_or_none(getattr(stmt, "with_check", None))
+    location = f"{key[0]}.{key[1]}.{name}"
+    using_ast = (
+        ast_utils.parse_expr(using_sql, location=location, clause="USING")
+        if using_sql is not None
+        else None
+    )
+    check_ast = (
+        ast_utils.parse_expr(check_sql, location=location, clause="WITH CHECK")
+        if check_sql is not None
+        else None
+    )
+
+    builder.policies.append(
+        Policy(
+            name=name,
+            command=command,  # type: ignore[arg-type]
+            permissive=bool(getattr(stmt, "permissive", True)),
+            roles=_role_specs(getattr(stmt, "roles", None)),
+            using_sql=using_sql,
+            with_check_sql=check_sql,
+            using_ast=using_ast,
+            with_check_ast=check_ast,
+        )
+    )
+
+
+def _apply_grant(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    """Record a direct `GRANT <privs> ON <table> TO <roles>` as a `Grant`.
+
+    Only a GRANT (not REVOKE), targeting a specific table object (not
+    ``ALL TABLES IN SCHEMA``), on a TABLE (not a schema / function / sequence)
+    is modeled. Everything else is skipped tolerantly. A grant naming a table
+    we never saw a CREATE for is dropped — there is no table to attach it to and
+    fabricating a shell would invent a relation the user didn't declare.
+    """
+    if not getattr(stmt, "is_grant", False):
+        return  # REVOKE
+    if getattr(stmt, "targtype", None) != GrantTargetType.ACL_TARGET_OBJECT:
+        return  # ALL TABLES IN SCHEMA, etc.
+    if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
+        return  # schema / function / sequence grant
+
+    privileges = _grant_privileges(stmt)
+    if not privileges:
+        return
+    grantees = _role_specs(getattr(stmt, "grantees", None))
+    if not grantees:
+        return
+
+    for obj in stmt.objects or ():
+        if type(obj).__name__ != "RangeVar":
+            continue
+        key = _relation_key(obj, default_schema)
+        if key is None:
+            continue
+        builder = tables.get(key)
+        if builder is None:
+            # GRANT references a table not declared in this DDL — skip.
+            continue
+        for role in grantees:
+            builder.grants.append(Grant(role=role, privileges=privileges))
+
+
+def _grant_privileges(stmt: Any) -> tuple[str, ...]:
+    """Privilege names on a GrantStmt, uppercased; empty list ⇒ `GRANT ALL`.
+
+    Column-scoped privileges (`GRANT SELECT (col) …`) are skipped here — they
+    belong to `ColumnGrant`, which this v1 builder does not model; a
+    table-level grant in the same statement still records.
+    """
+    privs = stmt.privileges
+    if not privs:
+        # Empty privilege list is Postgres's `GRANT ALL`.
+        return _GRANT_ALL_PRIVILEGES
+    out: list[str] = []
+    for ap in privs:
+        if getattr(ap, "cols", None):
+            continue  # column-level grant — not modeled in v1
+        name = getattr(ap, "priv_name", None)
+        if name:
+            out.append(name.upper())
+    return tuple(out)
+
+
+def _role_specs(roles: Any) -> tuple[str, ...]:
+    """Role names from a list of pglast RoleSpec nodes.
+
+    `ROLESPEC_PUBLIC` becomes the literal ``"PUBLIC"`` (the convention
+    `Policy.roles` / `Grant.role` use); a named role yields its `rolename`. The
+    session pseudo-roles (`CURRENT_USER` / `SESSION_USER` / `CURRENT_ROLE`) are
+    rendered as their SQL keyword so they are at least visible to the rules.
+    """
+    out: list[str] = []
+    for role in roles or ():
+        roletype = getattr(role, "roletype", None)
+        if roletype == RoleSpecType.ROLESPEC_PUBLIC:
+            out.append("PUBLIC")
+        elif roletype == RoleSpecType.ROLESPEC_CURRENT_USER:
+            out.append("CURRENT_USER")
+        elif roletype == RoleSpecType.ROLESPEC_SESSION_USER:
+            out.append("SESSION_USER")
+        elif roletype == RoleSpecType.ROLESPEC_CURRENT_ROLE:
+            out.append("CURRENT_ROLE")
+        else:
+            name = getattr(role, "rolename", None)
+            if name:
+                out.append(name)
+    return tuple(out)
+
+
+def _deparse_or_none(node: Any) -> str | None:
+    """Render a policy USING / WITH CHECK expression node back to SQL text.
+
+    Returns the deparsed fragment (which `parse_expr` then re-parses into the
+    canonical AST shape the rules expect), or `None` when the clause is absent.
+    """
+    if node is None:
+        return None
+    try:
+        # `str(...)`: RawStream is untyped (mypy override) → bare call is `Any`.
+        return str(RawStream()(node))
+    except Exception:
+        return None
+
+
+# Catalog-only rules whose inputs the offline `sql=` builder cannot populate
+# (the data lives in pg_catalog, not in CREATE/ALTER/GRANT DDL). They abstain
+# silently on a `sql=`-built schema; `schema_source_warnings` names them so the
+# caller never reads their silence as a proof of safety. Keyed to the model
+# fields `schema_from_sql` leaves empty.
+_CATALOG_ONLY_INERT: tuple[tuple[str, str], ...] = (
+    ("SEC013", "triggers on RLS tables"),
+    ("SEC014", "SECURITY DEFINER functions"),
+    ("SEC015", "SECURITY DEFINER function search_path"),
+    ("SEC016", "BYPASSRLS roles"),
+    ("SEC017", "LEAKPROOF functions"),
+    ("SEC029", "SET ROLE → BYPASSRLS escalation"),
+    ("SEC042", "anon-exposed SECURITY DEFINER functions"),
+    ("SEC044", "ALTER DEFAULT PRIVILEGES (pg_default_acl)"),
+    ("SEC046", "user-defined IMMUTABLE functions"),
+    ("SEC047", "foreign keys to RLS-enabled parents"),
+    ("PERF005", "observed runtime seq-scans"),
+    ("VIEW001", "views over RLS tables"),
+    ("VIEW003", "view ownership chains"),
+    ("VIEW004", "SECURITY DEFINER calls from view bodies"),
+)
+
+
+def schema_source_warnings(source: SchemaSource) -> list[str]:
+    """Warnings to attach to a `lint` / `verify` response, per schema source.
+
+    For the offline `sql=` path, returns a leading caveat plus a note naming the
+    catalog-only rule families that are structurally inert (their inputs aren't
+    expressible in DDL) — so a "no findings" result is not mistaken for a clean
+    bill of health. The `database_url` and `snapshot` paths see the full
+    catalog, so they get no warnings.
+    """
+    if source != "sql":
+        return []
+    inert = ", ".join(rule_id for rule_id, _ in _CATALOG_ONLY_INERT)
+    return [
+        "Analysis is of the provided SQL only — no live database. Rules that "
+        "depend on catalog state not expressible in CREATE/ALTER/GRANT DDL "
+        "cannot fire here, so an absence of findings is NOT a proof of safety. "
+        "For full coverage, run pgrls against a live database_url or a "
+        "snapshot.",
+        f"Inert on sql= input (catalog-only): {inert}.",
+    ]
