@@ -76,6 +76,8 @@ from pgrls.matrix import render as render_matrix
 from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, VERIFY_FORMATS, build_verification
 from pgrls.verify import render as render_verify
 from pgrls.verify import render_sarif as render_verify_sarif
+from pgrls.probe import run_probe
+from pgrls.probe import render as render_probe
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
@@ -3409,6 +3411,35 @@ def matrix(
         "(otherwise an existing file is left untouched and the run errors)."
     ),
 )
+@click.option(
+    "--probe",
+    "probe",
+    is_flag=True,
+    default=False,
+    help=(
+        "Confirm the static proof against the LIVE database: connect as the "
+        "threat-model session, seed a throwaway row, run the real query, and "
+        "diff observed behavior against the Z3 verdict — all inside a "
+        "rolled-back transaction (nothing is committed). Reports AGREE / "
+        "MISMATCH / LEAK CONFIRMED per table; upgrades an UNVERIFIED policy that "
+        "leaks live to a reproduced leak. Exits non-zero on any mismatch or "
+        "live-confirmed leak. Requires a live --database-url and a connection "
+        "that can create a role (CREATEROLE / superuser); abstains cleanly "
+        "otherwise. Not supported with --format sarif or --emit-repro yet."
+    ),
+)
+@click.option(
+    "--probe-role",
+    "probe_role",
+    default="pgrls_probe_runner",
+    show_default=True,
+    help=(
+        "Name of the unprivileged (NOLOGIN/NOSUPERUSER/NOBYPASSRLS) role the "
+        "--probe creates and runs each probe query as. It is created and "
+        "dropped inside the rolled-back probe transaction; pass a name not "
+        "already taken in the database."
+    ),
+)
 @output_format_options(
     list(VERIFY_FORMATS),
     output_help="Write the proof report to this file instead of stdout.",
@@ -3422,6 +3453,8 @@ def verify(
     strict: bool,
     emit_repro_dir: str | None,
     force: bool,
+    probe: bool,
+    probe_role: str,
     output_path: str | None,
     output_format: str,
 ) -> None:
@@ -3459,7 +3492,23 @@ def verify(
     tenant (`cross-tenant`) — the proof, made reproducible (re-running won't
     clobber a hand-edited reproduction unless `--force`). See the README for
     scope.
+
+    `--probe` keeps the static proof honest by confirming it against the LIVE
+    database: it connects as the threat-model session, seeds a throwaway row,
+    runs the real query, and diffs the observed behavior against the Z3 verdict
+    — all inside a transaction that is rolled back, so nothing is committed. It
+    reports AGREE / MISMATCH / LEAK CONFIRMED per table and, crucially, upgrades
+    an UNVERIFIED policy that turns out to leak live into a reproduced leak.
+    With `--probe`, `pgrls verify` exits non-zero on any proof↔reality mismatch
+    or live-confirmed leak (and, under `--strict`, on any abstain). It needs a
+    connection that can create a role; anything it cannot reproduce live it
+    abstains on cleanly. `--probe` is not (yet) supported with `--format sarif`
+    or `--emit-repro` — run those separately.
     """
+    if probe and output_format == "sarif":
+        raise click.UsageError("probe output does not support SARIF yet")
+    if probe and emit_repro_dir is not None:
+        raise click.UsageError("run --probe and --emit-repro separately")
     if mode == "write" and emit_repro_dir is not None:
         # The repro emitter only knows the anon / cross-tenant read templates;
         # a write-side repro (set the session tenant, attempt a cross-tenant
@@ -3470,17 +3519,48 @@ def verify(
             "(write-side reproductions are a follow-on)."
         )
 
+    auth = (
+        set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
+        if auth_functions
+        else None
+    )
+
+    if probe:
+        # The probe needs the SAME connection still open after introspection (to
+        # seed + query + roll back), so use the open-connection context manager
+        # rather than the read-only `_connect_and_introspect` that closes it.
+        with _connect_introspect_ctx(
+            config_path=config_path,
+            database_url=database_url,
+            schemas_csv=schemas,
+        ) as (_cfg, conn, schema):
+            verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
+            probe_result = run_probe(
+                conn, schema, verification,
+                mode=mode,  # type: ignore[arg-type]
+                auth_functions=auth, probe_role=probe_role,
+            )
+        # Text shows the static proof and the live probe section stacked; JSON is
+        # the self-contained probe document (it carries each table's
+        # static_verdict, so the static JSON would be redundant).
+        if output_format == "json":
+            _emit(render_probe(probe_result, "json"), output_path)
+        else:
+            static_text = render_verify(verification, "text")
+            probe_text = render_probe(probe_result, "text")
+            _emit(f"{static_text}\n\n{probe_text}", output_path)
+        if probe_result.has_mismatch or probe_result.has_confirmed_leak:
+            sys.exit(1)
+        if strict and any(r.agreement == "abstained" for r in probe_result.results):
+            sys.exit(1)
+        return
+
     _, schema = _connect_and_introspect(
         config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
     )
 
-    auth = (
-        set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
-        if auth_functions
-        else None
-    )
     verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
     # SARIF is the one format whose result-set depends on --strict (UNVERIFIED
     # is omitted by default, a `note` under --strict), so it can't go through
