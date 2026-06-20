@@ -73,6 +73,7 @@ def default_fixers() -> list[Fixer]:
     from pgrls.fixers.sec002 import SEC002Fixer
     from pgrls.fixers.sec004 import SEC004Fixer
     from pgrls.fixers.sec006 import SEC006Fixer
+    from pgrls.fixers.sec010 import SEC010Fixer
     from pgrls.fixers.sec011 import SEC011Fixer
     from pgrls.fixers.sec019 import SEC019Fixer
     from pgrls.fixers.sec020 import SEC020Fixer
@@ -89,6 +90,7 @@ def default_fixers() -> list[Fixer]:
         SEC002Fixer(),
         SEC004Fixer(),
         SEC006Fixer(),
+        SEC010Fixer(),
         SEC011Fixer(),
         SEC015Fixer(),
         SEC017Fixer(),
@@ -166,24 +168,34 @@ def generate_fixes(
         opts = rule_options.get(fixer.rule_id, {})
         out.extend(fixer.fix(schema, opts))
 
-    # HYG003 is the only fixer that DROPs a policy. Any ALTER fix that
-    # targets a policy HYG003 will drop would be applied against a
-    # now-nonexistent policy (depending on emit order) and fail. Drop
-    # those ALTERs: the dropped policy's surviving duplicate gets the
-    # same ALTER, so nothing is lost. `location` is the qualified
-    # policy id (`schema.table.policy`) for every per-policy fixer, so
-    # it is the right join key. (HYG003 also emits per-policy
-    # `location`s, hence the rule_id guard so a drop never suppresses
-    # itself.)
+    # Coordinate the policy-DROP fixers (HYG003 / SEC031 / SEC010, see
+    # `_DROP_FIXER_IDS`) with the clause-ALTER fixers. Any ALTER fix that
+    # targets a policy a drop fixer will DROP would be applied against a
+    # now-nonexistent policy (depending on emit order) and fail — e.g. SEC006
+    # mirrors `USING (false)` into a `WITH CHECK (false)` on the very policy
+    # SEC010 then drops. Suppress those ALTERs: dropping the dead policy is the
+    # actual remedy and the ALTER was redundant. `location` is the qualified
+    # policy id (`schema.table.policy`) for every per-policy fixer, the right
+    # join key. Also dedup the DROPs themselves so two drop fixers targeting the
+    # same policy (rare: a constant-false policy that is also a duplicate) don't
+    # emit `DROP POLICY` twice — the second would fail on the already-dropped
+    # policy.
     dropped_policy_ids = {
-        f.location for f in out if f.rule_id == "HYG003"
+        f.location for f in out if f.rule_id in _DROP_FIXER_IDS
     }
     if dropped_policy_ids:
-        out = [
-            f
-            for f in out
-            if f.rule_id == "HYG003" or f.location not in dropped_policy_ids
-        ]
+        kept: list[Fix] = []
+        seen_drops: set[str] = set()
+        for f in out:
+            if f.rule_id in _DROP_FIXER_IDS:
+                if f.location in seen_drops:
+                    continue  # one DROP per policy
+                seen_drops.add(f.location)
+                kept.append(f)
+            elif f.location not in dropped_policy_ids:
+                kept.append(f)
+            # else: a non-drop fix targeting a to-be-dropped policy → suppress
+        out = kept
 
     out = _suppress_clobbering_clause_rewrites(out)
 
@@ -196,6 +208,14 @@ def generate_fixes(
 # a clause contest so their strip / mirror is never clobbered by a
 # clause-regenerating fixer.
 _NARROWING_RULE_IDS = frozenset({"SEC004", "SEC011", "SEC020"})
+
+# Fixers that emit `DROP POLICY` rather than rewrite a clause: HYG003 (drops a
+# duplicate policy), SEC031 (drops a restrictive `USING (true)` no-op floor),
+# SEC010 (drops a permissive constant-`false` no-op). `generate_fixes`
+# coordinates these with the clause-ALTER fixers so a sibling ALTER never lands
+# on a policy a drop removes, and dedups DROPs so the same policy is never
+# dropped twice.
+_DROP_FIXER_IDS = frozenset({"HYG003", "SEC031", "SEC010"})
 
 
 def _suppress_clobbering_clause_rewrites(fixes: list[Fix]) -> list[Fix]:

@@ -27,6 +27,7 @@ from pgrls.fixers.sec020 import SEC020Fixer
 from pgrls.fixers.sec015 import SEC015Fixer
 from pgrls.fixers.sec017 import SEC017Fixer
 from pgrls.fixers.sec030 import SEC030Fixer
+from pgrls.fixers.sec010 import SEC010Fixer
 from pgrls.fixers.sec031 import SEC031Fixer
 from pgrls.fixers.sec032 import SEC032Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
@@ -1812,6 +1813,83 @@ def test_sec030_fix_raises_on_malformed_allowlist() -> None:
 
 
 # ---------- SEC031 fixer ----------
+
+
+# --- SEC010 fixer (drop a permissive constant-false no-op policy) ---------
+
+
+def test_sec010_fix_drops_permissive_using_false_select() -> None:
+    schema = _wrap_policy(_policy("false", command="SELECT", name="dead"))
+    fixes = SEC010Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    f = fixes[0]
+    assert f.rule_id == "SEC010"
+    assert f.location == "public.t.dead"
+    assert f.sql == "DROP POLICY dead ON public.t;"
+    assert f.clauses == frozenset()  # a DROP re-emits no policy clause
+
+
+def test_sec010_fix_drops_permissive_insert_with_check_false() -> None:
+    schema = _wrap_policy(
+        _policy(command="INSERT", with_check="false", name="dead")
+    )
+    assert len(SEC010Fixer().fix(schema, {})) == 1
+
+
+def test_sec010_fix_drops_permissive_all_using_false_no_with_check() -> None:
+    schema = _wrap_policy(_policy("false", command="ALL", name="dead"))
+    assert len(SEC010Fixer().fix(schema, {})) == 1
+
+
+def test_sec010_fix_abstains_on_restrictive_using_false() -> None:
+    # A restrictive USING (false) is a hard deny floor — dropping it BROADENS
+    # access. Never drop it.
+    schema = _wrap_policy(
+        _policy("false", command="ALL", name="floor", permissive=False)
+    )
+    assert SEC010Fixer().fix(schema, {}) == []
+
+
+def test_sec010_fix_abstains_on_all_using_false_with_check_true() -> None:
+    # USING(false) blocks reads/updates/deletes, but a non-false WITH CHECK
+    # still admits INSERTs — the policy is NOT inert; dropping it would remove
+    # the insert grant. Abstain.
+    schema = _wrap_policy(
+        _policy("false", command="ALL", with_check="true", name="ins")
+    )
+    assert SEC010Fixer().fix(schema, {}) == []
+
+
+def test_sec010_fix_abstains_on_using_true() -> None:
+    # USING(true) is not constant-false (SEC008's territory), not SEC010.
+    schema = _wrap_policy(_policy("true", command="SELECT", name="open"))
+    assert SEC010Fixer().fix(schema, {}) == []
+
+
+def test_sec010_fix_abstains_on_insert_without_with_check() -> None:
+    # An absent WITH CHECK is not constant-false → not inert → don't drop.
+    schema = _wrap_policy(_policy(command="INSERT", name="p"))
+    assert SEC010Fixer().fix(schema, {}) == []
+
+
+def test_sec010_fix_allowlist_skips_policy() -> None:
+    schema = _wrap_policy(_policy("false", command="SELECT", name="dead"))
+    assert SEC010Fixer().fix(schema, {"allowlist": ["public.t.dead"]}) == []
+
+
+def test_generate_fixes_sec010_drop_suppresses_sec006_alter_on_same_policy() -> None:
+    # SEC006 mirrors a missing WITH CHECK on a permissive FOR UPDATE USING
+    # (false) policy, but SEC010 drops that same inert policy — the ALTER would
+    # land on a now-dropped policy. generate_fixes must suppress the SEC006
+    # ALTER and keep only the SEC010 DROP (no redundant / order-fragile
+    # migration). Regression for the drop-coordination gap (review MED).
+    schema = _wrap_policy(_policy("false", command="UPDATE", name="u"))
+    fixes = generate_fixes(schema, {})
+    rule_ids = {f.rule_id for f in fixes}
+    assert "SEC010" in rule_ids
+    assert "SEC006" not in rule_ids  # ALTER on the to-be-dropped policy suppressed
+    drops = [f for f in fixes if f.sql.startswith("DROP POLICY")]
+    assert len(drops) == 1  # exactly one DROP, no duplicate
 
 
 def test_sec031_fix_emits_drop_policy_for_restrictive_true() -> None:

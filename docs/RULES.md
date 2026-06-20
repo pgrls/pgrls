@@ -494,6 +494,17 @@ DROP POLICY block_all ON public.invoices;
 REVOKE ALL ON TABLE public.invoices FROM PUBLIC;
 ```
 
+**Auto-fixable** (`pgrls fix`): for a **permissive** constant-`false` policy —
+the dual of the SEC031 fixer — pgrls emits `DROP POLICY` (the policy grants
+nothing: permissive policies OR-combine, so `… OR false` adds no access, and
+with RLS on that is the same default-deny as no policy, so the drop is
+behavior-preserving). The fixer is a strict subset of what the rule reports: it
+**never** drops a **restrictive** constant-`false` policy (a hard deny floor —
+dropping it would *broaden* access) and abstains on any permissive policy that
+still grants on another axis (e.g. `FOR ALL USING (false) WITH CHECK (true)`
+still admits inserts). Re-express the denial at the GRANT layer as above; the
+drop just removes the misleading no-op.
+
 If you really do need to express "deny" via policy form (rare but
 legal — e.g., a temporary block coordinated with a feature flag),
 allowlist the policy by qualified ID:
