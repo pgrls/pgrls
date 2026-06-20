@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-06-19
+
+### Added
+
+- **`pgrls fix` now auto-remediates SEC010** (policy clause is constant
+  `false`) — the **19th** auto-fixable rule and the dual of the SEC031 fixer. A
+  **permissive** policy whose access is constant-`false` grants nothing
+  (permissive policies OR-combine, so `… OR false` adds no row, and `WITH CHECK
+  (false)` admits no write; with RLS on it is the same default-deny as no
+  policy), so the fixer emits `DROP POLICY` — a behavior-preserving cleanup. It
+  is a strict subset of what the rule reports and **never broadens access**: a
+  **restrictive** constant-`false` policy is a hard deny floor and is never
+  dropped, and the fixer abstains on any permissive policy still granting on
+  another axis (e.g. `FOR ALL USING (false) WITH CHECK (true)` still admits
+  inserts). Brings the auto-fixable count to **19 of 60** rules.
+
 ## [0.37.0] - 2026-06-19
 
 ### Added
