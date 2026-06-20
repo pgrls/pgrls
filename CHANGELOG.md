@@ -10,6 +10,42 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-19
+
+### Added
+
+- **SEC046** (error) — a policy's `USING` / `WITH CHECK` calls a **user-defined
+  function declared `IMMUTABLE`** whose body reads session/identity state
+  (`current_setting(...)`, an `auth.*` helper, `current_user` / `session_user`)
+  or a table. `IMMUTABLE` lets Postgres **constant-fold** the call at plan time,
+  so under any reused or cached plan — a connection pooler reusing a backend
+  (Supavisor / PgBouncer), PostgREST, a prepared statement, a PL/pgSQL plan
+  cache — the value frozen for the connection that first planned the query is
+  served to every later caller. Used in a row policy that is a silent
+  cross-user wrong-row leak: the first user's tenant/identity value scopes
+  another user's rows (verified live on PG16 — a second connection on the same
+  backend sees the first's rows; the same body marked `STABLE` does not). The
+  fix is to declare the function `STABLE`. A *correctness* finding distinct from
+  SEC024 (policy reads a GUC) and PERF004 (function-wrapped discriminator
+  defeats an index). False-positive boundary (all live-validated): an inline
+  `current_setting` used directly in a policy is **safe** (a `STABLE` built-in
+  that does not fold — only user-defined `IMMUTABLE` wrappers are flagged); a
+  pure `IMMUTABLE` function (no session/table read) is **not** flagged; `STABLE`
+  / `VOLATILE` functions never reach the rule (only `provolatile='i'` is
+  captured). Abstains (fail-closed) on a PL/pgSQL / empty / unparseable body and
+  on a pre-v19 snapshot. Configurable `allowlist` (`schema.function`); no
+  auto-fix (pgrls cannot prove a function is meant to be volatility-downgraded
+  vs. genuinely pure). Brings the catalog to **59 rules**.
+
+### Changed
+
+- **Snapshot format → v19.** Adds a top-level `immutable_functions` array (the
+  user-defined functions with `pg_proc.provolatile='i'` in the introspected
+  schemas, each with its `body` and `language`), the capture SEC046 reads.
+  Additive and fail-closed: a v3–v18 snapshot has no key and loads with
+  `immutable_functions=()`, so SEC046 finds nothing until the snapshot is
+  re-captured against a live database.
+
 ## [0.35.0] - 2026-06-19
 
 ### Added

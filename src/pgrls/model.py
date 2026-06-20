@@ -31,6 +31,7 @@ __all__ = [
     "ColumnGrant",
     "DefaultPrivilege",
     "Grant",
+    "ImmutableFunction",
     "Index",
     "LeakproofFunction",
     "Policy",
@@ -48,7 +49,13 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 18  # v18: top-level default_privileges (from
+SNAPSHOT_VERSION = 19  # v19: top-level immutable_functions (user-defined
+# functions WHERE pg_proc.provolatile='i') for SEC046 — an IMMUTABLE
+# function whose body reads session/identity state or a table is
+# constant-folded into a cached/reused plan, serving one user's frozen
+# value to the next. Always emitted (like the other top-level arrays), so
+# a database with no IMMUTABLE user functions round-trips with an empty
+# array apart from this version bump. v18: top-level default_privileges (from
 # pg_default_acl, defaclobjtype='r') for SEC044 — the standing default-
 # privilege grants on future tables. Always emitted (like the other
 # top-level arrays), so a database with no default privileges round-trips
@@ -790,6 +797,56 @@ class DefaultPrivilege:
     grantor: str | None = None
 
 
+@dataclass(frozen=True)
+class ImmutableFunction:
+    """A user-defined function declared ``IMMUTABLE`` (``provolatile='i'``).
+
+    Captured in snapshot v19+ for SEC046. An ``IMMUTABLE`` function promises
+    the planner that it returns the same result for the same arguments forever,
+    so the planner is free to **constant-fold** the call at plan time. When such
+    a function's body actually reads *session/identity state*
+    (``current_setting(...)``, an ``auth.*`` helper, ``current_user`` /
+    ``session_user``) or a *table*, that promise is false: the value the planner
+    freezes for one caller is reused for every later caller of any reused or
+    cached plan (connection pooling — Supavisor / PgBouncer; PostgREST;
+    prepared statements; PL/pgSQL). Used in a row-level-security policy, that
+    means one user's tenant/identity value silently scopes another user's rows
+    — a cross-user wrong-row leak (verified live: a ``USING (tenant =
+    immutable_wrapper())`` policy returns the *first* connection's rows to a
+    later connection on the same backend; the same body marked ``STABLE`` does
+    not). The remedy is to declare the function ``STABLE``.
+
+    Introspection captures only functions whose ``pg_proc.provolatile = 'i'``
+    in the introspected schemas — the audit-relevant subset, mirroring how
+    ``leakproof_functions`` captures only ``proleakproof`` functions and
+    ``security_definer_functions`` only ``prosecdef`` ones. Postgres's own
+    built-in IMMUTABLE functions live in ``pg_catalog``, outside the linted
+    ``--schemas``, so they never appear; ``STABLE`` and ``VOLATILE`` functions
+    are excluded (neither is constant-folded — verified live).
+
+    Captured fields are the minimum SEC046 needs to inspect the body:
+
+    * ``qualified_name`` — ``pg_namespace.nspname || '.' || pg_proc.proname``;
+      the SEC046 message + allowlist key (``schema.function``). Overloads of the
+      same qualified name appear as separate entries (one per ``pg_proc`` row);
+      SEC046 resolves a policy's function call to ANY captured overload of the
+      named function and reports per qualified name.
+    * ``body`` — ``pg_proc.prosrc``. SEC046 parses this (for a ``sql`` body) to
+      decide whether it reads session/identity state or a table; it abstains
+      (does not fire) on an empty or unparseable body (fail-closed).
+    * ``language`` — ``pg_language.lanname`` (e.g. ``sql``, ``plpgsql``). SEC046
+      only attempts pglast parsing for ``sql`` bodies, mirroring VIEW004 /
+      SecdefFunction; a ``plpgsql`` body (starting ``DECLARE`` / ``BEGIN``) is
+      not a parseable top-level statement, so it is abstained on.
+
+    Not feeding ``Schema.to_sql()``; SEC046 is the only consumer.
+    """
+
+    qualified_name: str
+    body: str
+    language: str
+
+
 # --- Snapshot decoders -------------------------------------------------
 #
 # One per-entity decoder for each top-level array `to_snapshot` emits, so
@@ -1157,6 +1214,18 @@ def _default_privilege_from_dict(d: dict[str, Any]) -> DefaultPrivilege:
     )
 
 
+def _immutable_from_dict(f: dict[str, Any]) -> ImmutableFunction:
+    # `body`/`language` are required keys of every v19 immutable_functions
+    # entry. The body is parsed by SEC046 (not interpolated into executed
+    # DDL — Schema.to_sql() ignores it), so no value-injection validation is
+    # needed, unlike grants/columns/signatures.
+    return ImmutableFunction(
+        qualified_name=f["qualified_name"],
+        body=f["body"],
+        language=f["language"],
+    )
+
+
 @dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
@@ -1199,6 +1268,15 @@ class Schema:
     # `default_privileges=()` so SEC044 finds nothing to flag against a
     # pre-v18 snapshot until it is re-captured against a live database.
     default_privileges: tuple[DefaultPrivilege, ...] = ()
+    # User-defined functions declared IMMUTABLE (`pg_proc.provolatile='i'`) —
+    # populated in snapshot v19+. SEC046 walks this; introspection captures
+    # only IMMUTABLE functions in the introspected schemas (the audit-relevant
+    # subset, mirroring leakproof_functions). Default `()` keeps callers that
+    # construct `Schema(...)` without it (unit tests, older snapshots) working
+    # unchanged; v3-v18 baselines round-trip with `immutable_functions=()` so
+    # SEC046 finds nothing to flag against a pre-v19 snapshot until it is
+    # re-captured against a live database (fail-closed).
+    immutable_functions: tuple[ImmutableFunction, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1522,13 +1600,33 @@ class Schema:
                 }
                 for dp in self.default_privileges
             ],
+            # v19 extension — emit user-defined IMMUTABLE functions
+            # (pg_proc.provolatile='i'). SEC046 reads this. Order matches
+            # `Schema.immutable_functions` (sorted by qualified name then
+            # signature at introspection time) for snapshot determinism. v3-v18
+            # baselines round-trip with `immutable_functions=()` → empty array
+            # (always emitted, like the other top-level arrays above).
+            "immutable_functions": [
+                {
+                    "qualified_name": f.qualified_name,
+                    "body": f.body,
+                    "language": f.language,
+                }
+                for f in self.immutable_functions
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v18 snapshot dict.
+        """Reconstruct a Schema from a v3-v19 snapshot dict.
 
-        v18 (current): adds top-level ``default_privileges`` (from
+        v19 (current): adds top-level ``immutable_functions`` (user-defined
+        functions WHERE ``pg_proc.provolatile='i'``) for SEC046. v3-v18
+        snapshots have no key and load with ``immutable_functions=()`` so
+        SEC046 finds nothing to flag until the snapshot is re-captured against
+        a live database (fail-closed).
+
+        v18: adds top-level ``default_privileges`` (from
         ``pg_default_acl``, ``defaclobjtype='r'``) for SEC044. v3-v17
         snapshots have no key and load with ``default_privileges=()`` so
         SEC044 finds nothing to flag until the snapshot is re-captured against
@@ -1606,13 +1704,13 @@ class Schema:
             )
         version = payload.get("version")
         if version not in (
-            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18. v1 / v2 snapshots must "
-                "be regenerated against the current schema."
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19. v1 / v2 snapshots "
+                "must be regenerated against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
@@ -1665,6 +1763,12 @@ class Schema:
             _default_privilege_from_dict(d)
             for d in payload.get("default_privileges", [])
         )
+        # v19+ user-defined IMMUTABLE functions; a v3-v18 snapshot has no
+        # key → () so SEC046 finds nothing until re-captured (fail-closed).
+        immutable_functions = tuple(
+            _immutable_from_dict(f)
+            for f in payload.get("immutable_functions", [])
+        )
 
         return cls(
             tables=tables,
@@ -1674,6 +1778,7 @@ class Schema:
             leakproof_functions=leakproof_functions,
             bypassrls_escalation_roles=bypassrls_escalation_roles,
             default_privileges=default_privileges,
+            immutable_functions=immutable_functions,
         )
 
     def to_sql(self) -> str:

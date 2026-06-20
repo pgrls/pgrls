@@ -53,7 +53,7 @@ inline so the *why* travels with the *where*.
 
 ## 4. Auto-fix the mechanical findings
 
-18 of the 58 rules are mechanically fixable. `pgrls fix` emits the
+18 of the 59 rules are mechanically fixable. `pgrls fix` emits the
 remediation to stdout or to a migration-ready `.sql`:
 
 ```bash

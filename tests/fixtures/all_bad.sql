@@ -897,6 +897,36 @@ CREATE POLICY tenant_scope ON public.allbad_sec045 FOR ALL TO allbad_sec043_role
 CREATE INDEX ON public.allbad_sec045 (tenant_id);
 GRANT SELECT (email) ON public.allbad_sec045 TO PUBLIC;
 
+-- SEC046: a user-defined function declared IMMUTABLE whose body reads the
+-- per-request tenant GUC (current_setting), called from a row-policy. Because
+-- IMMUTABLE lets Postgres constant-fold the call into a reused/cached plan, the
+-- tenant value frozen for one connection is served to the next (pooling,
+-- PostgREST, prepared statements, PL/pgSQL) -- the policy then returns one
+-- user's rows to another (verified live on PG16: a second connection on the
+-- same backend sees the first connection's rows, while the same body marked
+-- STABLE does not). SEC046 fires at location public.allbad_sec046.tenant_scope
+-- and the fix is to declare the function STABLE. The table is otherwise
+-- correctly RLS-scoped (FORCE + an indexed tenant policy to a non-low-trust
+-- role), so no SEC001 / SEC003 / PERF003 noise. SEC007 (only-permissive)
+-- co-fires but its pinned location is the dedicated SEC007 block. Reuses
+-- allbad_sec043_role (created
+-- above, dropped in the test's finally). The function is removed by the
+-- DROP SCHEMA public CASCADE in the test's finally.
+CREATE FUNCTION public.allbad_sec046_cur_tenant() RETURNS uuid
+    LANGUAGE sql IMMUTABLE
+    AS 'SELECT current_setting(''app.tenant_id'', true)::uuid';
+CREATE TABLE public.allbad_sec046 (
+    id bigint PRIMARY KEY,
+    tenant_id uuid NOT NULL,
+    body text
+);
+ALTER TABLE public.allbad_sec046 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec046 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec046 FOR ALL TO allbad_sec043_role
+    USING (tenant_id = public.allbad_sec046_cur_tenant())
+    WITH CHECK (tenant_id = public.allbad_sec046_cur_tenant());
+CREATE INDEX ON public.allbad_sec046 (tenant_id);
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl
