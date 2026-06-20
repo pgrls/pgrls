@@ -30,6 +30,7 @@ __all__ = [
     "Column",
     "ColumnGrant",
     "DefaultPrivilege",
+    "ForeignKey",
     "Grant",
     "ImmutableFunction",
     "Index",
@@ -49,7 +50,14 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 19  # v19: top-level immutable_functions (user-defined
+SNAPSHOT_VERSION = 20  # v20: per-table foreign_keys (pg_constraint
+# contype='f' on the CHILD table) for SEC047 — a FOREIGN KEY to an
+# RLS-enabled parent is a cross-tenant existence covert channel when a
+# low-trust role can write the child, because FK validation bypasses RLS
+# (the FK-validation analog of SEC035's UNIQUE-index oracle). Emitted only
+# when non-empty, so a table with no foreign keys round-trips
+# byte-identically apart from this version bump. v19: top-level
+# immutable_functions (user-defined
 # functions WHERE pg_proc.provolatile='i') for SEC046 — an IMMUTABLE
 # function whose body reads session/identity state or a table is
 # constant-folded into a cached/reused plan, serving one user's frozen
@@ -510,6 +518,16 @@ class Table:
     # granularity. Default `()` keeps test fixtures and pre-v8 baselines
     # working unchanged (they round-trip with `column_grants=()`).
     column_grants: tuple[ColumnGrant, ...] = ()
+    # FOREIGN KEY constraints carried ON this (child / referencing) table —
+    # populated in snapshot v20+. SEC047 reads these on every table whose
+    # FK references an RLS-enabled parent; the parent is resolved via the
+    # schema's qualified-name lookup. Emitted only when non-empty so a table
+    # with no foreign keys round-trips byte-identically apart from the
+    # version bump (mirrors `inherits` / `column_grants`). Default `()`
+    # keeps callers that construct `Table(...)` without FKs (unit tests)
+    # working unchanged; pre-v20 baselines round-trip with `foreign_keys=()`
+    # so SEC047 finds nothing to flag (fail-closed) until re-captured.
+    foreign_keys: tuple[ForeignKey, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -847,6 +865,50 @@ class ImmutableFunction:
     language: str
 
 
+@dataclass(frozen=True)
+class ForeignKey:
+    """A FOREIGN KEY constraint carried on the CHILD (referencing) table.
+
+    Captured per-table in snapshot v20+ for SEC047. A foreign key is
+    validated by Postgres as a *system integrity check* — the existence
+    probe of the referenced (parent) row runs with RLS suspended, not as
+    the invoking role. So when the parent table has RLS enabled and a
+    low-trust role can write the child, inserting/updating a child row that
+    references a *guessed* parent key reveals whether that parent row
+    exists (write succeeds) or not (foreign-key-violation error) — even
+    though RLS hides that parent row from the role's own ``SELECT``. That
+    is a cross-tenant existence covert channel (the FK-validation analog of
+    SEC035's UNIQUE-index existence oracle); SEC047 flags it.
+
+    Captured fields are the minimum SEC047 needs to resolve the parent in
+    the snapshot and message clearly:
+
+    * ``name`` — ``pg_constraint.conname``. Combined with the child table's
+      qualified name it forms the SEC047 allowlist key
+      (``schema.table.constraint_name``); also the second allowlist shape
+      (a bare constraint name).
+    * ``columns`` — the child columns the FK is defined on, in
+      ``pg_constraint.conkey`` order (a multi-column FK lists them all).
+    * ``ref_schema`` + ``ref_table`` — the referenced (parent) table, via
+      ``pg_constraint.confrelid``. SEC047 resolves this against the
+      schema's qualified-name lookup to read the parent's ``rls_enabled``;
+      it abstains (fail-closed) when the parent is outside ``--schemas``
+      and so cannot be resolved.
+    * ``ref_columns`` — the parent columns referenced, in
+      ``pg_constraint.confkey`` order (parallel to ``columns``).
+
+    Never interpolated into executed DDL (``Schema.to_sql()`` ignores
+    foreign keys, like ``DefaultPrivilege``), so no value-injection
+    validation is needed at decode — unlike grants / columns / signatures.
+    """
+
+    name: str
+    columns: tuple[str, ...]
+    ref_schema: str
+    ref_table: str
+    ref_columns: tuple[str, ...]
+
+
 # --- Snapshot decoders -------------------------------------------------
 #
 # One per-entity decoder for each top-level array `to_snapshot` emits, so
@@ -1018,6 +1080,21 @@ def _index_from_dict(idx: dict[str, Any]) -> Index:
     )
 
 
+def _foreign_key_from_dict(fk: dict[str, Any]) -> ForeignKey:
+    # `foreign_keys` is a v20 addition; pre-v20 snapshots have no key, so
+    # `_table_from_dict` defaults to () (fail-closed → SEC047 silent). A
+    # ForeignKey is never interpolated into executed DDL (Schema.to_sql()
+    # ignores it), so no value-injection validation is needed here, unlike
+    # grants / columns / signatures.
+    return ForeignKey(
+        name=fk["name"],
+        columns=tuple(fk["columns"]),
+        ref_schema=fk["ref_schema"],
+        ref_table=fk["ref_table"],
+        ref_columns=tuple(fk["ref_columns"]),
+    )
+
+
 def _table_from_dict(
     t: dict[str, Any],
     top_level_policies: dict[tuple[str, str], list[dict[str, Any]]],
@@ -1062,6 +1139,11 @@ def _table_from_dict(
         # v17+ classic-INHERITS parents; pre-v17 baselines have no key and
         # round-trip to (). Each entry is a [schema, name] pair → tuple.
         inherits=tuple(tuple(p) for p in t.get("inherits", [])),
+        # v20+ foreign keys on this child table; pre-v20 baselines have no
+        # key and round-trip to () (fail-closed → SEC047 silent).
+        foreign_keys=tuple(
+            _foreign_key_from_dict(fk) for fk in t.get("foreign_keys", [])
+        ),
     )
 
 
@@ -1483,6 +1565,28 @@ class Schema:
                         if t.inherits
                         else {}
                     ),
+                    # v20: foreign keys carried on this child table. Emitted
+                    # ONLY when non-empty (and already sorted by constraint
+                    # name at introspection time) so every FK-free table —
+                    # the overwhelming majority for an RLS audit — serializes
+                    # byte-identically apart from the version bump, mirroring
+                    # `inherits` / `column_grants` above.
+                    **(
+                        {
+                            "foreign_keys": [
+                                {
+                                    "name": fk.name,
+                                    "columns": list(fk.columns),
+                                    "ref_schema": fk.ref_schema,
+                                    "ref_table": fk.ref_table,
+                                    "ref_columns": list(fk.ref_columns),
+                                }
+                                for fk in t.foreign_keys
+                            ]
+                        }
+                        if t.foreign_keys
+                        else {}
+                    ),
                 }
                 for t in self.tables
             ],
@@ -1618,9 +1722,15 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v19 snapshot dict.
+        """Reconstruct a Schema from a v3-v20 snapshot dict.
 
-        v19 (current): adds top-level ``immutable_functions`` (user-defined
+        v20 (current): adds per-table ``foreign_keys`` (``pg_constraint``
+        ``contype='f'`` on the child table) for SEC047. Emitted only when
+        non-empty; pre-v20 snapshots have no key and load with
+        ``foreign_keys=()`` so SEC047 finds no FK to flag until the snapshot
+        is re-captured (fail-closed).
+
+        v19: adds top-level ``immutable_functions`` (user-defined
         functions WHERE ``pg_proc.provolatile='i'``) for SEC046. v3-v18
         snapshots have no key and load with ``immutable_functions=()`` so
         SEC046 finds nothing to flag until the snapshot is re-captured against
@@ -1704,13 +1814,13 @@ class Schema:
             )
         version = payload.get("version")
         if version not in (
-            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19. v1 / v2 snapshots "
-                "must be regenerated against the current schema."
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20. v1 / v2 "
+                "snapshots must be regenerated against the current schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the

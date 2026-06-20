@@ -16,6 +16,7 @@ from pgrls.model import (
     Column,
     ColumnGrant,
     DefaultPrivilege,
+    ForeignKey,
     Grant,
     ImmutableFunction,
     Index,
@@ -548,6 +549,63 @@ WHERE i.indisvalid
 ORDER BY i.indrelid, c.relname
 """
 
+# FOREIGN KEY constraints carried on the captured (child / referencing)
+# tables. SEC047 walks the captured `Table.foreign_keys` to flag a FK whose
+# *parent* (referenced) table has RLS enabled when a low-trust role can write
+# the child: FK validation runs as a system integrity check that bypasses
+# RLS, so writing a child row that references a guessed parent key reveals
+# whether that parent row exists — a cross-tenant existence covert channel
+# (the FK-validation analog of SEC035's UNIQUE-index oracle).
+#
+# Keyed on the already-fetched child table OIDs (`con.conrelid = ANY(%s)`),
+# the same pattern as `_INDEXES_SQL` / `_TRIGGERS_SQL`. The child columns are
+# resolved via `unnest(con.conkey) WITH ORDINALITY` joined to `pg_attribute`
+# on the CHILD relation (`conrelid`); the parent columns via
+# `unnest(con.confkey) WITH ORDINALITY` joined to `pg_attribute` on the
+# PARENT relation (`confrelid`). `WITH ORDINALITY` preserves the column order
+# within each composite key and lines child columns up with the parent
+# columns they reference (verified live, incl. multi-column FKs). The two
+# ordered column arrays are built as correlated subqueries so a multi-row FK
+# stays a single output row.
+#
+# The parent schema/table come from `confrelid` → `pg_class` / `pg_namespace`
+# and are captured even when the parent lives in a schema OUTSIDE `--schemas`
+# (no parent-namespace filter here): SEC047 resolves the parent in the
+# snapshot and ABSTAINS (fail-closed) when it cannot — so capturing the
+# parent identity unconditionally is correct, and the rule decides scope.
+#
+# Only validated constraints are relevant for the oracle, but an unvalidated
+# (`NOT VALID`) FK still enforces the existence check on NEW rows — which is
+# exactly the write path the oracle uses — so `convalidated` is NOT filtered.
+# ORDER BY (conrelid, conname) for snapshot determinism.
+_FOREIGN_KEYS_SQL = """
+SELECT
+    con.conrelid AS table_oid,
+    con.conname AS name,
+    rns.nspname AS ref_schema,
+    rcl.relname AS ref_table,
+    (
+        SELECT COALESCE(array_agg(ca.attname ORDER BY k.ord), ARRAY[]::text[])
+        FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+        JOIN pg_catalog.pg_attribute ca
+            ON ca.attrelid = con.conrelid
+           AND ca.attnum = k.attnum
+    ) AS columns,
+    (
+        SELECT COALESCE(array_agg(fa.attname ORDER BY k.ord), ARRAY[]::text[])
+        FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+        JOIN pg_catalog.pg_attribute fa
+            ON fa.attrelid = con.confrelid
+           AND fa.attnum = k.attnum
+    ) AS ref_columns
+FROM pg_catalog.pg_constraint con
+JOIN pg_catalog.pg_class rcl ON rcl.oid = con.confrelid
+JOIN pg_catalog.pg_namespace rns ON rns.oid = rcl.relnamespace
+WHERE con.contype = 'f'
+  AND con.conrelid = ANY(%s)
+ORDER BY con.conrelid, con.conname
+"""
+
 # Functions with SECURITY DEFINER set in the configured schemas. Used to
 # match view bodies against — VIEW004 flags views whose definitions call
 # any of these functions because a SECDEF call inside a non-invoker view
@@ -972,6 +1030,37 @@ def _fetch_immutable_functions(
     )
 
 
+def _fetch_foreign_keys(
+    cur: Any, table_oids: list[int]
+) -> dict[int, list[ForeignKey]]:
+    """Fetch FOREIGN KEY constraints, grouped per child table OID.
+
+    Each `pg_constraint` row (contype='f') on a captured table becomes one
+    `ForeignKey` on that child table, carrying its child columns (conkey
+    order), the referenced parent schema/table (confrelid), and the parent
+    columns (confkey order). Returns `{child_oid: [ForeignKey, ...]}`; a
+    table with no foreign keys is simply absent from the dict (callers
+    default to `()`). The SQL's `ORDER BY (conrelid, conname)` keeps each
+    table's FK list sorted by constraint name for snapshot determinism.
+
+    The parent is captured even when it lives outside `--schemas`; SEC047
+    resolves it in the snapshot and abstains (fail-closed) when it can't.
+    """
+    cur.execute(_FOREIGN_KEYS_SQL, (table_oids,))
+    by_oid: dict[int, list[ForeignKey]] = defaultdict(list)
+    for row in cur.fetchall():
+        by_oid[row["table_oid"]].append(
+            ForeignKey(
+                name=row["name"],
+                columns=tuple(row["columns"]),
+                ref_schema=row["ref_schema"],
+                ref_table=row["ref_table"],
+                ref_columns=tuple(row["ref_columns"]),
+            )
+        )
+    return by_oid
+
+
 def _fetch_default_privileges(
     cur: Any, schemas: list[str]
 ) -> tuple[DefaultPrivilege, ...]:
@@ -1287,6 +1376,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         trigger_rows = cur.fetchall()
         cur.execute(_INDEXES_SQL, (oids,))
         index_rows = cur.fetchall()
+        foreign_keys_by_oid = _fetch_foreign_keys(cur, oids)
         cur.execute(_GRANTS_SQL, (schemas,))
         grants_by_oid: dict[int, dict[str, list[str]]] = defaultdict(
             lambda: defaultdict(list)
@@ -1467,6 +1557,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             indexes=tuple(indexes_by_oid.get(row["table_oid"], [])),
             column_grants=tuple(
                 column_grants_by_oid.get(row["table_oid"], [])
+            ),
+            foreign_keys=tuple(
+                foreign_keys_by_oid.get(row["table_oid"], [])
             ),
         )
         for row in table_rows

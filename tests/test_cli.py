@@ -655,8 +655,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 59 rules ship today (catalog header should say so).
-    assert "<strong>59</strong> rules" in result.output
+    # 60 rules ship today (catalog header should say so).
+    assert "<strong>60</strong> rules" in result.output
     # Header carries the auto-fixable count (18 as of v0.32.0; SEC004 fixer).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -2003,6 +2003,8 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC044  public\n",
             "SEC045  public.allbad_sec045.email\n",
             "SEC046  public.allbad_sec046.tenant_scope\n",
+            "SEC047  public.allbad_sec047_child "
+            "(allbad_sec047_child_parent_id_fkey)\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF004  public.allbad_perf004.by_email\n",
