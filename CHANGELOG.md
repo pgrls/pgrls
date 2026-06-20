@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-06-20
+
+### Added
+
+- **`pgrls verify --probe --format sarif`** — the live runtime probe now emits a
+  SARIF v2.1.0 document for GitHub Code Scanning, alongside `text` and `json`. A
+  **MISMATCH** (the static proof and the live database disagree) and a **LEAK
+  CONFIRMED** (a live-reproduced leak) each become an `error`-level result —
+  located at `schema.table` and `schema.table.policy` respectively; AGREE /
+  skipped produce no result; under `--strict` an abstain becomes a `note`. One
+  rule per `--mode` (`pgrls-probe-anon` / `-cross-tenant` / `-write`), kept
+  distinct from the static `verify` SARIF rules. Reuses lint's `format_sarif`
+  projection, so the SARIF schema and driver block stay in one place.
+
 ## [0.40.1] - 2026-06-20
 
 ### Fixed

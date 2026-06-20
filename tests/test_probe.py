@@ -661,13 +661,38 @@ def test_probe_cli_requires_database_url() -> None:
     assert "No database connection" in result.output
 
 
-def test_probe_cli_sarif_is_usage_error() -> None:
-    result = CliRunner().invoke(
-        main,
-        ["verify", "--probe", "--format", "sarif", "--database-url", "postgresql://x/y"],
+def test_probe_render_sarif_projects_actionable_results() -> None:
+    # Offline unit test of the probe SARIF projection (F1): LEAK CONFIRMED +
+    # MISMATCH → `error` results; AGREE / skipped → nothing; abstained → a `note`
+    # only under --strict. (No DB — render_sarif is pure over a Probe.)
+    import json as _json
+
+    from pgrls.probe import ProbeResult, render_sarif
+
+    probe = Probe(
+        results=(
+            ProbeResult("public.a", "p", "anon", "leak", "rows_visible",
+                        "leak_confirmed", "static LEAK reproduced live", None),
+            ProbeResult("public.b", "q", "anon", "isolated", "rows_visible",
+                        "mismatch", "proof contradicts reality", None),
+            ProbeResult("public.c", "r", "anon", "isolated", "no_rows",
+                        "agree", "PROVEN and hidden", None),
+            ProbeResult("public.d", None, "anon", "unverified", "abstained",
+                        "abstained", "cannot create probe role", None),
+        ),
+        mode="anon",
     )
-    assert result.exit_code == 2
-    assert "does not support SARIF" in result.output
+    results = _json.loads(render_sarif(probe))["runs"][0]["results"]
+    # leak_confirmed + mismatch only; agree + abstained omitted by default.
+    assert len(results) == 2
+    assert sorted(r["level"] for r in results) == ["error", "error"]
+    assert {r["ruleId"] for r in results} == {"pgrls-probe-anon"}
+    # --strict surfaces the abstain as a `note`.
+    strict_results = _json.loads(render_sarif(probe, strict=True))["runs"][0][
+        "results"
+    ]
+    assert len(strict_results) == 3
+    assert sum(r["level"] == "note" for r in strict_results) == 1
 
 
 def test_probe_cli_emit_repro_is_usage_error() -> None:

@@ -865,10 +865,89 @@ def render_json(p: Probe) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
-PROBE_FORMATS: tuple[str, ...] = ("text", "json")
+# One SARIF rule per `--mode` — the probe's analog of verify's
+# `_SARIF_RULE_ID`, kept distinct (`-probe`) so a probe result is never
+# conflated with a static verify result in a combined Code Scanning view.
+_PROBE_SARIF_RULE_ID: dict[Mode, str] = {
+    "anon": "pgrls-probe-anon",
+    "cross-tenant": "pgrls-probe-cross-tenant",
+    "write": "pgrls-probe-write",
+}
+_PROBE_SARIF_RULE_TITLE: dict[Mode, str] = {
+    "anon": "Live probe: anonymous read isolation",
+    "cross-tenant": "Live probe: cross-tenant read isolation",
+    "write": "Live probe: cross-tenant write isolation",
+}
+
+
+def render_sarif(p: Probe, *, strict: bool = False) -> str:
+    """Render a Probe as a SARIF v2.1.0 document for GitHub Code Scanning.
+
+    Reuses lint's `format_sarif` by projecting each *actionable* probe result
+    into a `pgrls.violations.Violation` — the same precedent verify / diff set —
+    so the SARIF version, `$schema`, `tool.driver` block, severity→level
+    mapping, and the empty-location guard stay in ONE place and can never drift.
+
+    The result-set mirrors the probe's exit-code contract (a result is present
+    iff the run fails the gate):
+
+    * **MISMATCH** → one `error` result at ``schema.table`` (the static proof and
+      the live database disagree). Always fails.
+    * **LEAK CONFIRMED** → one `error` result at ``schema.table.policy`` (a
+      live-reproduced leak). Always fails.
+    * **AGREE / skipped** → no result (the SARIF "all clear" state).
+    * **abstained** → no result by default; under ``strict`` one `note` result at
+      ``schema.table`` (matching the ``--strict`` gate, which fails on abstain).
+
+    `strict` is keyword-only (default False) so this still satisfies a 1-arg
+    renderer signature; the CLI threads ``strict=`` through for the SARIF case.
+    """
+    from pgrls.formatters.sarif import format_sarif
+    from pgrls.violations import Violation
+
+    rule_id = _PROBE_SARIF_RULE_ID[p.mode]
+    title = _PROBE_SARIF_RULE_TITLE[p.mode]
+    violations: list[Violation] = []
+    for r in p.results:
+        if r.agreement in ("mismatch", "leak_confirmed"):
+            violations.append(
+                Violation(
+                    rule_id=rule_id,
+                    severity="error",
+                    title=title,
+                    message=(
+                        f"{r.qualified_name}: {_RESULT_LABEL[r.agreement]} "
+                        f"— {r.detail}"
+                    ),
+                    # leak_confirmed pins the leaking policy (schema.table.policy,
+                    # mirroring lint/verify); mismatch is a table-level proof↔
+                    # reality disagreement, so it pins the table.
+                    location=(
+                        f"{r.qualified_name}.{r.policy}"
+                        if r.agreement == "leak_confirmed" and r.policy
+                        else r.qualified_name
+                    ),
+                )
+            )
+        elif strict and r.agreement == "abstained":
+            violations.append(
+                Violation(
+                    rule_id=rule_id,
+                    severity="info",  # → SARIF `note`
+                    title=title,
+                    message=f"{r.qualified_name}: abstained — {r.detail}",
+                    location=r.qualified_name,
+                )
+            )
+    return format_sarif(violations)
+
+
+PROBE_FORMATS: tuple[str, ...] = ("text", "json", "sarif")
 
 
 def render(p: Probe, output_format: str) -> str:
     if output_format == "json":
         return render_json(p)
+    if output_format == "sarif":
+        return render_sarif(p)
     return render_text(p)

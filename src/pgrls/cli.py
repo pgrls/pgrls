@@ -78,6 +78,7 @@ from pgrls.verify import render as render_verify
 from pgrls.verify import render_sarif as render_verify_sarif
 from pgrls.probe import run_probe
 from pgrls.probe import render as render_probe
+from pgrls.probe import render_sarif as render_probe_sarif
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
@@ -3502,11 +3503,10 @@ def verify(
     With `--probe`, `pgrls verify` exits non-zero on any proof↔reality mismatch
     or live-confirmed leak (and, under `--strict`, on any abstain). It needs a
     connection that can create a role; anything it cannot reproduce live it
-    abstains on cleanly. `--probe` is not (yet) supported with `--format sarif`
-    or `--emit-repro` — run those separately.
+    abstains on cleanly. `--probe` supports `--format text` / `json` / `sarif`
+    (probe MISMATCH / LEAK CONFIRMED → SARIF `error` results for GitHub Code
+    Scanning); it is not supported with `--emit-repro` — run those separately.
     """
-    if probe and output_format == "sarif":
-        raise click.UsageError("probe output does not support SARIF yet")
     if probe and emit_repro_dir is not None:
         raise click.UsageError("run --probe and --emit-repro separately")
     if mode == "write" and emit_repro_dir is not None:
@@ -3545,6 +3545,10 @@ def verify(
         # static_verdict, so the static JSON would be redundant).
         if output_format == "json":
             _emit(render_probe(probe_result, "json"), output_path)
+        elif output_format == "sarif":
+            # SARIF threads --strict (abstains become `note` results), so call
+            # the probe SARIF renderer directly (mirrors verify's SARIF path).
+            _emit(render_probe_sarif(probe_result, strict=strict), output_path)
         else:
             static_text = render_verify(verification, "text")
             probe_text = render_probe(probe_result, "text")
