@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-06-19
+
+### Added
+
+- **SEC045** (warning) — a **column-level** `GRANT` of a content privilege
+  (`SELECT`/`INSERT`/`UPDATE`) on a PII / secret-named column (`email`, `ssn`,
+  `phone`, `date_of_birth`, `credit_card`, `password`, `api_key`, …) to a
+  **low-trust** role (`PUBLIC` / `anon`). A column grant is a deliberate,
+  targeted act — nobody column-grants by accident — so handing the most
+  sensitive field in a table to the least-trusted role is almost always an
+  over-share. It is the column-grant + PII-sensitivity finding the other rules
+  miss: SEC003 flags a PUBLIC *policy*, SEC001 a no-RLS *table*, SEC004/SEC038
+  an anonymous-readable *policy* — none inspect column-level grants
+  (`pg_attribute.attacl` → `Table.column_grants`) or weigh column sensitivity. A
+  least-privilege / defense-in-depth posture finding (fires on the grant itself,
+  like SEC044), so column grants only, content privileges only (a column-level
+  `REFERENCES` exposes no content), default grantee set `{PUBLIC, anon}`, and a
+  curated case-insensitive PII pattern set. Configurable `grantees` / `patterns`
+  / `allowlist`; no auto-fix (whether a sensitively-named column is a deliberate
+  public field is a product decision). Brings the catalog to **58 rules** (no
+  snapshot bump — column grants are already captured).
+
 ## [0.34.0] - 2026-06-19
 
 ### Added

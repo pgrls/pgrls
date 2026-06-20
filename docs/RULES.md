@@ -2988,6 +2988,55 @@ the creating role (`defaclrole`), so a bare `REVOKE` clears only the *running*
 role's own default and silently no-ops against another role's — pgrls names the
 grantor in the finding so the emitted REVOKE actually clears the entry.
 
+<a id="rule-sec045"></a>
+
+## SEC045 — Sensitive column granted to a low-trust role
+
+**Severity:** warning
+
+A **column-level** `GRANT` — `GRANT SELECT (ssn) ON users TO anon` — exposes
+exactly one column to the grantee, independent of the table's general access.
+Unlike a table grant, a column grant is a deliberate, targeted act: nobody
+column-grants by accident. When the grantee is a **low-trust** role (`PUBLIC` /
+`anon`) and the column holds sensitive data — `email`, `ssn`, `phone`,
+`date_of_birth`, `credit_card`, `password`, `api_key`, … — that targeted grant
+is almost always an over-share: the most sensitive field in the table has been
+handed to the role with the least trust.
+
+```sql
+-- the table is owner-scoped by RLS, but one column was exposed:
+GRANT SELECT (email, ssn) ON public.users TO anon;   -- SEC045
+```
+
+SEC045 is the column-grant + PII-sensitivity finding the other rules miss:
+SEC003 flags a *policy* that lists `PUBLIC`, SEC001 flags a table with RLS
+*off*, SEC004 / SEC038 prove an *anonymous-readable policy* — none inspect
+column-level `GRANT`s (`pg_attribute.attacl` → `Table.column_grants`) or weigh
+the sensitivity of the exposed column. It is the same least-privilege posture
+family as SEC044 (default privileges) and SEC042 (anon-EXECUTE SECDEF), and
+fires on the *grant itself* regardless of whether RLS currently gates which rows
+the grantee can reach (policies change; the grant outlives them).
+
+Only **column** grants are inspected, only **content** privileges count
+(`SELECT` / `INSERT` / `UPDATE` — a column-level `REFERENCES` exposes no
+content), and the default low-trust grantee set is `{PUBLIC, anon}` (a column
+grant to `anon` is *not* a standard Supabase pattern — Supabase scopes via table
+grants + RLS, never column grants). The PII match is a curated, case-insensitive
+substring set.
+
+**Remediation:** confirm the column is meant to be public, or
+`REVOKE <priv> (<column>) ON <table> FROM <role>`. No auto-fix — whether a
+sensitively-named column is a deliberate public field is a product decision.
+
+**Configuration** (`[lint.rules.SEC045]`):
+
+```toml
+[lint.rules.SEC045]
+grantees = ["PUBLIC", "anon", "authenticated"]   # widen the low-trust set
+patterns = ["mrn", "policy_number"]               # extra PII tokens (added to defaults)
+allowlist = ["public.profiles.email"]             # a deliberate public-email column
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

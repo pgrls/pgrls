@@ -875,6 +875,28 @@ CREATE POLICY tenant_scope ON public.allbad_sec043_parent
 CREATE TABLE public.allbad_sec043_child () INHERITS (public.allbad_sec043_parent);
 GRANT SELECT ON public.allbad_sec043_child TO allbad_sec043_role;
 
+-- SEC045: a column-level GRANT of a PII column (email) to the low-trust PUBLIC
+-- pseudo-role over-shares that field. The table is otherwise correctly
+-- RLS-scoped (FORCE + a tenant policy scoped to a non-low-trust role + an
+-- index), so only SEC045 fires, at location public.allbad_sec045.email. The
+-- column grant to PUBLIC is not a table grant, so it does not trip SEC003 (a
+-- PUBLIC *policy*), and the policy's role has no anon access so no rows are
+-- reachable — this is the standing over-share posture SEC045 flags. Reuses
+-- allbad_sec043_role (created above, dropped in the test's finally) so the
+-- policy needs no new role.
+CREATE TABLE public.allbad_sec045 (
+    id bigint PRIMARY KEY,
+    tenant_id uuid NOT NULL,
+    email text
+);
+ALTER TABLE public.allbad_sec045 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec045 FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec045 FOR ALL TO allbad_sec043_role
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
+    WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+CREATE INDEX ON public.allbad_sec045 (tenant_id);
+GRANT SELECT (email) ON public.allbad_sec045 TO PUBLIC;
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl
