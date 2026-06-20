@@ -35,6 +35,7 @@ __all__ = [
     "ImmutableFunction",
     "Index",
     "LeakproofFunction",
+    "OwnerReachableMember",
     "Policy",
     "PolicyCommand",
     "SNAPSHOT_VERSION",
@@ -50,7 +51,15 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 20  # v20: per-table foreign_keys (pg_constraint
+SNAPSHOT_VERSION = 21  # v21: per-table owner (pg_get_userbyid(relowner))
+# plus top-level owner_reachable_members for SEC048 — a low-trust role that
+# is a transitive pg_auth_members member of a table owner that is NOT
+# superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
+# (owner privileges, unlike the BYPASSRLS attribute SEC029 covers, ARE
+# reachable through membership). `Table.owner` defaults to "" and
+# `owner_reachable_members` defaults to () so a pre-v21 snapshot decodes
+# fail-closed (SEC048 abstains until re-captured). v20: per-table
+# foreign_keys (pg_constraint
 # contype='f' on the CHILD table) for SEC047 — a FOREIGN KEY to an
 # RLS-enabled parent is a cross-tenant existence covert channel when a
 # low-trust role can write the child, because FK validation bypasses RLS
@@ -528,6 +537,18 @@ class Table:
     # working unchanged; pre-v20 baselines round-trip with `foreign_keys=()`
     # so SEC047 finds nothing to flag (fail-closed) until re-captured.
     foreign_keys: tuple[ForeignKey, ...] = ()
+    # The role that OWNS this table (`pg_get_userbyid(pg_class.relowner)`) —
+    # populated in snapshot v21+. A table owner bypasses that table's RLS
+    # unless `FORCE ROW LEVEL SECURITY` is set (the SEC002 boundary). SEC048
+    # reads this to find which owners have enabled-not-forced RLS tables, then
+    # flags low-trust roles that can reach that owner through membership.
+    # Default `""` keeps callers that construct `Table(...)` without an owner
+    # (unit tests for other rules) working unchanged; pre-v21 baselines
+    # round-trip with `owner=""` so SEC048 finds no owned table to flag
+    # (fail-closed) until the snapshot is re-captured. Emitted unconditionally
+    # (like `rls_enabled`/`force_rls`) since every real table has an owner;
+    # the empty-string default only arises for hand-built or pre-v21 inputs.
+    owner: str = ""
 
     @property
     def qualified_name(self) -> str:
@@ -702,6 +723,55 @@ class BypassRlsEscalation:
 
     member: str
     via: tuple[str, ...]
+    member_can_login: bool
+
+
+@dataclass(frozen=True)
+class OwnerReachableMember:
+    """A low-trust role that can reach a non-FORCE'd table's owner.
+
+    Captured in snapshot v21+ for SEC048. A role that OWNS a table
+    bypasses that table's RLS unless ``FORCE ROW LEVEL SECURITY`` is
+    set (the SEC002 boundary). Owner *privileges* — unlike the
+    BYPASSRLS role *attribute* that SEC029 covers — ARE reachable
+    through role membership: a member of the owning role inherits its
+    ownership (with ``INHERIT``, automatically; with ``NOINHERIT``,
+    after a ``SET ROLE``) and so bypasses RLS on the owner's
+    enabled-but-not-forced tables.
+
+    Introspection computes the transitive ``pg_auth_members`` closure
+    of every role that owns an enabled-not-forced RLS table in the
+    scanned schemas and keeps the reachable members, EXCLUDING:
+
+    * owners that are superuser or BYPASSRLS (SEC016/SEC029 territory
+      — excluding them keeps SEC048 disjoint from SEC029), and
+    * members that are superuser or BYPASSRLS (they already bypass
+      unconditionally — SEC016/SEC029 again).
+
+    This mirrors ``BypassRlsEscalation`` (SEC029's structure): a
+    role-graph finding keyed on the member, naming the reachable
+    owner(s) as ``via_owners``. Roles are cluster-global, so this
+    capture is independent of the introspector's ``--schemas`` set
+    EXCEPT that the owner set is restricted to owners of tables in the
+    scanned schemas — an owner whose only enabled-not-forced table is
+    outside scope does not appear.
+
+    Captured fields:
+
+    * ``member`` — ``pg_roles.rolname`` of the reachable role. The
+      SEC048 allowlist key (roles are unqualified).
+    * ``via_owners`` — the owner role names reachable from ``member``
+      through membership (sorted), so the finding names which owner(s)
+      the member can become to bypass RLS.
+    * ``member_can_login`` — ``pg_roles.rolcanlogin`` of the member.
+      A LOGIN member is directly connectable (an application
+      authenticating as it bypasses RLS directly); a NOLOGIN member is
+      reached only by something that can already become it. Shapes the
+      SEC048 message, not the verdict.
+    """
+
+    member: str
+    via_owners: tuple[str, ...]
     member_can_login: bool
 
 
@@ -1144,6 +1214,9 @@ def _table_from_dict(
         foreign_keys=tuple(
             _foreign_key_from_dict(fk) for fk in t.get("foreign_keys", [])
         ),
+        # v21+ table owner; pre-v21 baselines have no key and round-trip to
+        # "" (fail-closed → SEC048 finds no owned table to flag).
+        owner=t.get("owner", ""),
     )
 
 
@@ -1279,6 +1352,16 @@ def _escalation_from_dict(e: dict[str, Any]) -> BypassRlsEscalation:
     )
 
 
+def _owner_reachable_member_from_dict(
+    m: dict[str, Any],
+) -> OwnerReachableMember:
+    return OwnerReachableMember(
+        member=m["member"],
+        via_owners=tuple(m["via_owners"]),
+        member_can_login=m["member_can_login"],
+    )
+
+
 def _default_privilege_from_dict(d: dict[str, Any]) -> DefaultPrivilege:
     # `schema` is None for a cluster-wide entry (to_snapshot emits null);
     # `.get("schema")` yields None for both the explicit null and a missing
@@ -1359,6 +1442,19 @@ class Schema:
     # SEC046 finds nothing to flag against a pre-v19 snapshot until it is
     # re-captured against a live database (fail-closed).
     immutable_functions: tuple[ImmutableFunction, ...] = ()
+    # Low-trust roles that can reach a table owner that is not FORCE'd —
+    # populated in snapshot v21+. SEC048 walks this; introspection computes
+    # the transitive `pg_auth_members` closure of every role that owns an
+    # enabled-not-forced RLS table in the scanned schemas, keeping the
+    # reachable members (one `OwnerReachableMember` each, naming the owner(s)
+    # as `via_owners`), and EXCLUDING superuser/BYPASSRLS owners and members
+    # (which keeps SEC048 disjoint from SEC016/SEC029). Default `()` keeps
+    # callers that construct `Schema(...)` without it (unit tests, older
+    # snapshots) working unchanged; v3-v20 baselines round-trip with
+    # `owner_reachable_members=()` so SEC048 finds nothing to flag against a
+    # pre-v21 snapshot until it is re-captured against a live database
+    # (fail-closed).
+    owner_reachable_members: tuple[OwnerReachableMember, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1480,6 +1576,12 @@ class Schema:
                     "name": t.name,
                     "rls_enabled": t.rls_enabled,
                     "force_rls": t.force_rls,
+                    # v21 — table owner (`pg_get_userbyid(relowner)`) for
+                    # SEC048. Emitted unconditionally like the other scalar
+                    # table fields; a hand-built or pre-v21 table carries the
+                    # empty-string default, which SEC048 treats as "no owner
+                    # known" and abstains on (fail-closed).
+                    "owner": t.owner,
                     "columns": list(t.columns),
                     "partition_of": (
                         list(t.partition_of)
@@ -1718,13 +1820,35 @@ class Schema:
                 }
                 for f in self.immutable_functions
             ],
+            # v21 extension — emit low-trust roles that can reach a
+            # non-FORCE'd table owner through membership. SEC048 reads this.
+            # Order matches `Schema.owner_reachable_members` (sorted by member
+            # name at introspection time) for snapshot determinism. v3-v20
+            # baselines round-trip with `owner_reachable_members=()` → empty
+            # array (always emitted, like the other top-level arrays above).
+            "owner_reachable_members": [
+                {
+                    "member": m.member,
+                    "via_owners": list(m.via_owners),
+                    "member_can_login": m.member_can_login,
+                }
+                for m in self.owner_reachable_members
+            ],
         }
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v20 snapshot dict.
+        """Reconstruct a Schema from a v3-v21 snapshot dict.
 
-        v20 (current): adds per-table ``foreign_keys`` (``pg_constraint``
+        v21 (current): adds per-table ``owner``
+        (``pg_get_userbyid(relowner)``) plus top-level
+        ``owner_reachable_members`` for SEC048. A pre-v21 snapshot has no
+        ``owner`` key on tables (loads ``owner=""``) and no
+        ``owner_reachable_members`` key (loads ``()``), so SEC048 finds no
+        owned table and no reachable member to flag until the snapshot is
+        re-captured against a live database (fail-closed).
+
+        v20: adds per-table ``foreign_keys`` (``pg_constraint``
         ``contype='f'`` on the child table) for SEC047. Emitted only when
         non-empty; pre-v20 snapshots have no key and load with
         ``foreign_keys=()`` so SEC047 finds no FK to flag until the snapshot
@@ -1814,12 +1938,13 @@ class Schema:
             )
         version = payload.get("version")
         if version not in (
-            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20. v1 / v2 "
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21. v1 / v2 "
                 "snapshots must be regenerated against the current schema."
             )
 
@@ -1879,6 +2004,12 @@ class Schema:
             _immutable_from_dict(f)
             for f in payload.get("immutable_functions", [])
         )
+        # v21+ owner-reachable members; a v3-v20 snapshot has no key → () so
+        # SEC048 finds nothing until re-captured (fail-closed).
+        owner_reachable_members = tuple(
+            _owner_reachable_member_from_dict(m)
+            for m in payload.get("owner_reachable_members", [])
+        )
 
         return cls(
             tables=tables,
@@ -1889,6 +2020,7 @@ class Schema:
             bypassrls_escalation_roles=bypassrls_escalation_roles,
             default_privileges=default_privileges,
             immutable_functions=immutable_functions,
+            owner_reachable_members=owner_reachable_members,
         )
 
     def to_sql(self) -> str:

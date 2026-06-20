@@ -483,12 +483,13 @@ def test_to_sql_round_trips_through_real_postgres(pg_url, apply_sql):
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_version_is_nineteen():
-    # Bumped 18 → 19 to add top-level immutable_functions (user-defined
-    # functions with provolatile='i') for SEC046's constant-folded-session-read
-    # check. (v18 added default_privileges for SEC044.) Pin so a future bump is
-    # deliberate.
-    assert SNAPSHOT_VERSION == 20
+def test_snapshot_version_is_twenty_one():
+    # Bumped 20 → 21 to add per-table owner (pg_get_userbyid(relowner)) plus
+    # top-level owner_reachable_members for SEC048's not-FORCE'd-owner
+    # reachability check. (v20 added foreign_keys for SEC047; v19 added
+    # immutable_functions for SEC046; v18 added default_privileges for SEC044.)
+    # Pin so a future bump is deliberate.
+    assert SNAPSHOT_VERSION == 21
 
 
 def test_to_snapshot_emits_column_details_array():

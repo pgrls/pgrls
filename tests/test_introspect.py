@@ -1289,6 +1289,153 @@ def test_introspect_bypassrls_escalation_dedups_multipath(
         )
 
 
+def test_introspect_captures_table_owner(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC048 reads `Table.owner` (pg_get_userbyid(relowner)). Confirm
+    # `_TABLES_SQL` decodes the owner of a table owned by a non-bootstrap
+    # role against a live catalog.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS pgrls_sec048_owner;
+        CREATE ROLE pgrls_sec048_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        GRANT ALL ON SCHEMA public TO pgrls_sec048_owner;
+        SET ROLE pgrls_sec048_owner;
+        CREATE TABLE public.owned (id int);
+        RESET ROLE;
+        """
+    )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        owned = next(t for t in schema.tables if t.name == "owned")
+        assert owned.owner == "pgrls_sec048_owner"
+    finally:
+        # The schema GRANT creates a dependency that blocks DROP ROLE; revoke
+        # it (and drop the owned table) before dropping the role.
+        apply_sql(
+            "DROP TABLE IF EXISTS public.owned; "
+            "REVOKE ALL ON SCHEMA public FROM pgrls_sec048_owner; "
+            "DROP ROLE IF EXISTS pgrls_sec048_owner;"
+        )
+
+
+def test_introspect_captures_owner_reachable_members(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # SEC048 reads `Schema.owner_reachable_members` — the transitive
+    # `pg_auth_members` closure of every role that owns an enabled-not-forced
+    # RLS table in the scanned schemas, computed by
+    # `_OWNER_REACHABLE_MEMBERS_SQL`. This is the end-to-end check that the
+    # recursive CTE decodes a live catalog: a direct member, a transitive
+    # (member -> mid -> owner) hop, the LOGIN flag, and both exclusions (a
+    # superuser member and a BYPASSRLS member are SEC016/SEC029's surface, not
+    # SEC048's). It then FORCEs the table and re-snapshots to confirm the
+    # closure drops the members entirely — FORCE is the exact non-leak
+    # boundary. Roles are cluster-global, so the DROP bookends keep the shared
+    # container clean.
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS pgrls_sec048_member;
+        DROP ROLE IF EXISTS pgrls_sec048_mid;
+        DROP ROLE IF EXISTS pgrls_sec048_deep;
+        DROP ROLE IF EXISTS pgrls_sec048_super;
+        DROP ROLE IF EXISTS pgrls_sec048_bypass;
+        DROP ROLE IF EXISTS pgrls_sec048_supmember;
+        DROP ROLE IF EXISTS pgrls_sec048_super2;
+        DROP ROLE IF EXISTS pgrls_sec048_o;
+        CREATE ROLE pgrls_sec048_o NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        GRANT ALL ON SCHEMA public TO pgrls_sec048_o;
+        CREATE ROLE pgrls_sec048_member LOGIN NOSUPERUSER NOBYPASSRLS;
+        CREATE ROLE pgrls_sec048_mid NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        CREATE ROLE pgrls_sec048_deep LOGIN NOSUPERUSER NOBYPASSRLS;
+        CREATE ROLE pgrls_sec048_super SUPERUSER LOGIN;
+        CREATE ROLE pgrls_sec048_bypass BYPASSRLS LOGIN NOSUPERUSER;
+        CREATE ROLE pgrls_sec048_super2 SUPERUSER LOGIN;
+        CREATE ROLE pgrls_sec048_supmember LOGIN NOSUPERUSER NOBYPASSRLS;
+        GRANT pgrls_sec048_o TO pgrls_sec048_member;
+        GRANT pgrls_sec048_o TO pgrls_sec048_mid;
+        GRANT pgrls_sec048_mid TO pgrls_sec048_deep;
+        GRANT pgrls_sec048_o TO pgrls_sec048_super;
+        GRANT pgrls_sec048_o TO pgrls_sec048_bypass;
+        GRANT pgrls_sec048_super2 TO pgrls_sec048_supmember;
+        SET ROLE pgrls_sec048_o;
+        CREATE TABLE public.scoped (id int);
+        ALTER TABLE public.scoped ENABLE ROW LEVEL SECURITY;
+        RESET ROLE;
+        -- A superuser owner of an enabled-not-forced table (the dominant
+        -- real-world shape: Supabase/managed-PG tables owned by `postgres`).
+        -- Its sole member must NOT appear in the closure — condition 3 excludes
+        -- superuser owners, which is what keeps the corpus precision gate clean.
+        SET ROLE pgrls_sec048_super2;
+        CREATE TABLE public.super_scoped (id int);
+        ALTER TABLE public.super_scoped ENABLE ROW LEVEL SECURITY;
+        RESET ROLE;
+        """
+    )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        by_member = {
+            m.member: m for m in schema.owner_reachable_members
+        }
+        # Direct member reaches the owner; LOGIN flag captured.
+        assert "pgrls_sec048_member" in by_member
+        assert by_member["pgrls_sec048_member"].via_owners == (
+            "pgrls_sec048_o",
+        )
+        assert by_member["pgrls_sec048_member"].member_can_login is True
+        # The intermediate hop is itself a member of the owner (NOLOGIN).
+        assert "pgrls_sec048_mid" in by_member
+        assert by_member["pgrls_sec048_mid"].member_can_login is False
+        # Transitive member -> mid -> owner reaches the owner too.
+        assert "pgrls_sec048_deep" in by_member
+        assert by_member["pgrls_sec048_deep"].via_owners == (
+            "pgrls_sec048_o",
+        )
+        # Exclusions: a superuser bypasses unconditionally and a BYPASSRLS
+        # holder is SEC016/SEC029's surface — neither is an SEC048 finding.
+        assert "pgrls_sec048_super" not in by_member
+        assert "pgrls_sec048_bypass" not in by_member
+        # Super-OWNER exclusion (the corpus-cleanliness property): a member of a
+        # SUPERUSER owner of an enabled-not-forced table is NOT flagged — the
+        # superuser owner is excluded from the candidate set, so the closure has
+        # no edge to it. This is why SEC048 stays silent on the dominant
+        # `postgres`-owned real-world schema.
+        assert "pgrls_sec048_supmember" not in by_member
+        # The owner itself is not a member-with-a-path.
+        assert "pgrls_sec048_o" not in by_member
+
+        # FORCE the only enabled-not-forced table the owner owns → the owner
+        # drops out of the candidate set → the closure is empty for it.
+        apply_sql(
+            "ALTER TABLE public.scoped FORCE ROW LEVEL SECURITY;"
+        )
+        forced = introspect(pg_conn, schemas=["public"])
+        forced_members = {
+            m.member for m in forced.owner_reachable_members
+        }
+        assert "pgrls_sec048_member" not in forced_members
+        assert "pgrls_sec048_deep" not in forced_members
+        assert "pgrls_sec048_mid" not in forced_members
+    finally:
+        # Drop the owned table and revoke the owner's schema GRANT (a
+        # dependency that blocks DROP ROLE) before dropping the roles.
+        apply_sql(
+            """
+            DROP TABLE IF EXISTS public.scoped;
+            DROP TABLE IF EXISTS public.super_scoped;
+            REVOKE ALL ON SCHEMA public FROM pgrls_sec048_o;
+            DROP ROLE IF EXISTS pgrls_sec048_member;
+            DROP ROLE IF EXISTS pgrls_sec048_mid;
+            DROP ROLE IF EXISTS pgrls_sec048_deep;
+            DROP ROLE IF EXISTS pgrls_sec048_super;
+            DROP ROLE IF EXISTS pgrls_sec048_bypass;
+            DROP ROLE IF EXISTS pgrls_sec048_supmember;
+            DROP ROLE IF EXISTS pgrls_sec048_super2;
+            DROP ROLE IF EXISTS pgrls_sec048_o;
+            """
+        )
+
+
 def test_introspect_captures_leakproof_functions(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
