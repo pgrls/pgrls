@@ -44,7 +44,10 @@ from typing import Any, Literal
 
 import psycopg
 
-from pgrls.diff._z3_compare import cross_tenant_session_identity
+from pgrls.diff._z3_compare import (
+    _unwrap_scalar_sublink,
+    cross_tenant_session_identity,
+)
 from pgrls.fixers._idents import quote_ident
 from pgrls.model import Column, Policy, Schema, Table
 from pgrls.repro import (
@@ -212,8 +215,15 @@ def _checked_ast(policy: Policy, mode: Mode) -> Any:
 def _references_other_tables(policy_ast: Any) -> bool:
     """True if the predicate references another table / subquery, so a single
     synthesized row in the probed table cannot characterize its behavior (the
-    same boundary repro flags as "needs a hand-edit"). Detected by the presence
-    of a sub-select node (`SubLink` / `RangeSubselect` / `SelectStmt`)."""
+    same boundary repro flags as "needs a hand-edit").
+
+    A bare scalar ``(SELECT <expr>)`` — the dominant Supabase / PERF001 idiom,
+    e.g. ``(SELECT auth.uid())`` — references NO table, so it is unwrapped and
+    its projection walked instead of treated as a foreign reference (mirrors the
+    Z3 encoder's `_unwrap_scalar_sublink`). Only a real sub-select (``EXISTS``,
+    an ``IN``-subquery, a multi-target / FROM-bearing select), a
+    ``RangeSubselect``, or a ``SelectStmt`` counts as referencing another
+    table."""
     from pglast.ast import Node, RangeSubselect, SelectStmt, SubLink
 
     found = False
@@ -226,7 +236,18 @@ def _references_other_tables(policy_ast: Any) -> bool:
             for item in n:
                 walk(item)
             return
-        if isinstance(n, (SubLink, RangeSubselect, SelectStmt)):
+        if isinstance(n, SubLink):
+            unwrapped = _unwrap_scalar_sublink(n)
+            if unwrapped is n:
+                # A genuine subquery (EXISTS / IN / FROM-bearing) → references
+                # another table; cannot characterize with one synthesized row.
+                found = True
+                return
+            # A bare scalar `(SELECT <expr>)` references no table — descend into
+            # the projected expression, skipping the SELECT wrapper.
+            walk(unwrapped)
+            return
+        if isinstance(n, (RangeSubselect, SelectStmt)):
             found = True
             return
         if isinstance(n, Node):
@@ -681,6 +702,18 @@ def run_probe(
         conn.rollback()
 
 
+# Policy `TO` entries that need no GRANT to make a policy apply to the probe
+# role: PUBLIC applies to every role, and the session pseudo-roles are not real
+# grantable roles. Everything else is a named role the probe role must be a
+# member of for a `TO <role>` policy to apply.
+_NON_GRANTABLE_ROLES: frozenset[str] = frozenset({
+    "PUBLIC",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "CURRENT_ROLE",
+})
+
+
 def _setup_probe_role(
     conn: psycopg.Connection[Any],
     schema: Schema,
@@ -730,6 +763,32 @@ def _setup_probe_role(
         for t in tables:
             qtbl = f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
             cur.execute(f"GRANT SELECT, INSERT ON {qtbl} TO {qrole}")
+        # Make each policy's named `TO` role apply to the probe role: an RLS
+        # policy `TO authenticated` only applies to a session that is (a member
+        # of) `authenticated`, so without this a `TO <role>` policy would
+        # default-deny the unprivileged probe role and the probe would
+        # mis-report (the dominant Supabase shape scopes policies `TO
+        # authenticated`). Best-effort + savepoint-guarded per role: a role that
+        # does not exist, or that the connection cannot administer, is skipped —
+        # the probe then falls back to its prior behavior for that policy. The
+        # probe role stays NOSUPERUSER/NOBYPASSRLS (membership confers neither),
+        # so RLS still decides row visibility.
+        policy_roles = {
+            role
+            for t in tables
+            for policy in t.policies
+            for role in policy.roles
+            if role not in _NON_GRANTABLE_ROLES
+        }
+        for role in sorted(policy_roles):
+            rsp = f"probe_role_{secrets.token_hex(4)}"
+            cur.execute(f"SAVEPOINT {rsp}")
+            try:
+                cur.execute(f"GRANT {quote_ident(role)} TO {qrole}")
+            except psycopg.Error:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {rsp}")
+            else:
+                cur.execute(f"RELEASE SAVEPOINT {rsp}")
     return None
 
 

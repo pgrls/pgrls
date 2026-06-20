@@ -122,6 +122,51 @@ def test_inverted_auth_is_proven_leak() -> None:
 
 
 @requires_z3
+def test_never_null_current_setting_is_null_disjunct_is_isolated() -> None:
+    # Regression (review MED-1): `current_setting('app.x') IS NULL` is a DEAD
+    # disjunct under anon — the one-arg form RAISES on an unset GUC and is
+    # otherwise non-NULL, so the policy is genuinely isolated. The anon
+    # satisfiability path must not manufacture a leak from a free null-flag
+    # (SEC038 already stays silent on this; verify must agree).
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "current_setting('app.x') IS NULL "
+                        "OR tenant_id = auth.uid()"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_nullable_two_arg_current_setting_is_null_stays_leak() -> None:
+    # Precision control for MED-1: the two-arg current_setting(name, true) form
+    # IS NULLable under anon (returns NULL on an unset GUC), so `… IS NULL OR …`
+    # is a real anon leak and must stay reported — the never-NULL pin must not
+    # over-reach into the nullable form (that would be a false PROVEN).
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "current_setting('app.x', true) IS NULL "
+                        "OR tenant_id = auth.uid()"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
 def test_using_true_is_leak_all_rows() -> None:
     schema = Schema(tables=(_table("t", policies=(_policy("true"),)),))
     v = build_verification(schema)
