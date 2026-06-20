@@ -314,6 +314,101 @@ def test_write_scoped_with_check_agrees(
     assert r.agreement == "agree"
 
 
+@requires_docker
+@requires_z3
+def test_cross_tenant_agrees_despite_real_rows_at_synthetic_tenants(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # Regression (review C1): the read-observe must count only the row the probe
+    # planted (tenant B), not the whole table. An integer tenant key whose live
+    # data already holds rows for the small synthetic tenant pool the probe
+    # picks A/B from must still AGREE — seeing a real, correctly-scoped row for
+    # the *session* tenant the probe authenticates as is RLS working, not a leak.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.acct "
+            "  (id bigserial PRIMARY KEY, tenant_id integer NOT NULL, body text);"
+            "ALTER TABLE public.acct ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.acct FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.acct FOR ALL TO public "
+            "  USING (tenant_id = current_setting('app.tenant_id', true)::int) "
+            "  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::int);"
+            "GRANT SELECT, INSERT ON public.acct TO public;"
+            # Real committed rows across the synthetic pool — whichever value the
+            # probe authenticates as (A), one of these is its own visible row.
+            "INSERT INTO public.acct (tenant_id, body) "
+            "  VALUES (1, 'real 1'), (2, 'real 2'), (3, 'real 3');"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="cross-tenant")
+    r = _result(probe, "public.acct")
+    assert r.static_verdict == "isolated"
+    assert r.observed == "no_rows"  # the planted tenant-B row is hidden from A
+    assert r.agreement == "agree"  # NOT a false mismatch from the real A row
+
+
+@requires_docker
+@requires_z3
+def test_write_probe_abstains_on_fk_violation_instead_of_crashing(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # Regression (review H1): a synthesized cross-tenant write row that trips a
+    # non-RLS constraint (an outgoing FK with no matching parent) must ABSTAIN
+    # cleanly, not crash the run with an aborted transaction.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.parent (id integer PRIMARY KEY);"
+            "CREATE TABLE public.child "
+            "  (id bigserial PRIMARY KEY, tenant_id uuid NOT NULL, "
+            "   parent_id integer NOT NULL REFERENCES public.parent(id));"
+            "ALTER TABLE public.child ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.child FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p_read ON public.child FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid());"
+            "CREATE POLICY p_write ON public.child FOR INSERT TO public "
+            "  WITH CHECK (true);"  # unscoped → UNVERIFIED write verdict
+            "GRANT SELECT, INSERT ON public.child TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="write")  # must not raise
+    r = _result(probe, "public.child")
+    assert r.observed == "abstained"
+    assert r.agreement == "abstained"
+    assert "non-RLS constraint" in r.detail
+
+
+@requires_docker
+@requires_z3
+def test_write_probe_abstains_when_check_constraint_masks_rls(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # Regression (review M1): an orthogonal table CHECK the synthesized row trips
+    # must not be miscredited as an RLS write-rejection (which would mask the
+    # real WITH CHECK (true) write-leak as a clean "skipped") — abstain instead.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs "
+            "  (id bigserial PRIMARY KEY, tenant_id uuid NOT NULL, "
+            "   qty integer NOT NULL CHECK (qty > 100));"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p_read ON public.docs FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid());"
+            "CREATE POLICY p_write ON public.docs FOR INSERT TO public "
+            "  WITH CHECK (true);"
+            "GRANT SELECT, INSERT ON public.docs TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="write")
+    r = _result(probe, "public.docs")
+    assert r.observed == "abstained"
+    assert r.agreement == "abstained"
+    assert "non-RLS constraint" in r.detail
+
+
 # --- non-destructiveness / lifecycle ---------------------------------------
 
 

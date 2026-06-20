@@ -529,10 +529,39 @@ def _run_probe_steps(
     try:
         if mode == "write":
             return _observe_write(cur, table, row)
-        seen = _row_count(cur.connection, f"SELECT * FROM {qtbl}")
+        # Observe ONLY the row the probe planted, never the whole table. A
+        # cross-tenant probe counts rows stamped for tenant B (the seeded
+        # discriminator value) so a correctly-scoped table that merely holds a
+        # real row for the synthetic *session* tenant A — e.g. an integer key
+        # where tenant `1` exists — is not miscounted as a leak. Anon counts any
+        # visible row: under an isolated anon verdict the session must see
+        # nothing, so any row at all (planted or real) is the leak.
+        if mode == "cross-tenant" and disc_col is not None:
+            disc_lit = next((v for n, v in row if n == disc_col), None)
+            if disc_lit is None:  # no stamped discriminator → can't scope safely
+                raise _ProbeAbstain(
+                    "could not stamp the probe row's tenant discriminator"
+                )
+            query = (
+                f"SELECT 1 FROM {qtbl} "
+                f"WHERE {quote_ident(disc_col)} = {disc_lit}"
+            )
+        else:
+            query = f"SELECT * FROM {qtbl}"
+        try:
+            seen = _row_count(cur.connection, query)
+        except psycopg.Error as exc:
+            raise _ProbeAbstain(f"probe query failed: {_short(exc)}") from exc
         return "rows_visible" if seen > 0 else "no_rows"
     finally:
-        cur.execute("RESET ROLE")
+        # The observe may have aborted the transaction (an abstain on a failed
+        # query); the caller's ROLLBACK TO SAVEPOINT — taken before the SET ROLE
+        # — resets the role regardless, so don't let a failed RESET ROLE mask the
+        # original outcome.
+        try:
+            cur.execute("RESET ROLE")
+        except psycopg.Error:
+            pass
 
 
 def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
@@ -557,16 +586,28 @@ def _observe_write(
 ) -> Observed:
     """Try the cross-tenant INSERT as the threat session, savepoint-guarded.
 
-    write_rejected on InsufficientPrivilege (RLS WITH CHECK denial → SQLSTATE
-    42501) or a check-constraint violation; write_admitted if it succeeds. The
-    inner savepoint keeps a denial from poisoning the outer rollback."""
+    ``write_rejected`` only on ``InsufficientPrivilege`` (SQLSTATE 42501, "new
+    row violates row-level security policy" — the RLS ``WITH CHECK`` denial we
+    are probing for); ``write_admitted`` if it succeeds. Any *other* error (a
+    FK / UNIQUE / NOT NULL / table ``CHECK`` the synthesized row happens to
+    trip) tells us nothing about the RLS outcome — RLS may even have admitted
+    the row before the constraint fired — so we ABSTAIN rather than miscredit it
+    as a rejection (which would mask a real write-leak) or let the aborted
+    transaction cascade into a crash. The savepoint rollback recovers the
+    transaction on every path."""
     w = f"w_{secrets.token_hex(4)}"
     cur.execute(f"SAVEPOINT {w}")
     try:
         cur.execute(_insert_sql(table, row))
-    except (psycopg.errors.InsufficientPrivilege, psycopg.errors.CheckViolation):
+    except psycopg.errors.InsufficientPrivilege:
         cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
         return "write_rejected"
+    except psycopg.Error as exc:
+        cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
+        raise _ProbeAbstain(
+            "cross-tenant write hit a non-RLS constraint, so the RLS outcome "
+            f"is inconclusive: {_short(exc)}"
+        ) from exc
     cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
     return "write_admitted"
 
