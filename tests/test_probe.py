@@ -409,6 +409,89 @@ def test_write_probe_abstains_when_check_constraint_masks_rls(
     assert "non-RLS constraint" in r.detail
 
 
+@requires_docker
+@requires_z3
+def test_probe_confirms_select_wrapped_auth_uid_leak(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # Regression (review MED-2): the dominant Supabase / PERF001 idiom wraps the
+    # auth call as `(SELECT auth.uid())`. The probe must NOT treat that bare
+    # scalar sub-select as "references other tables" and skip — it must run and
+    # confirm the inverted-auth anon leak.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING ((SELECT auth.uid()) IS NULL "
+            "         OR tenant_id = (SELECT auth.uid()));"
+            "GRANT SELECT, INSERT ON public.docs TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="anon")
+    r = _result(probe, "public.docs")
+    assert r.observed != "skipped"  # not abstained as "references other tables"
+    assert r.agreement == "leak_confirmed"
+
+
+@requires_docker
+@requires_z3
+def test_probe_confirms_select_wrapped_scoped_policy_agrees(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # The wrapped scalar form on a correctly-scoped policy must AGREE, not skip.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.acct "
+            "  (id bigserial PRIMARY KEY, tenant_id uuid NOT NULL);"
+            "ALTER TABLE public.acct ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.acct FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.acct FOR ALL TO public "
+            "  USING (tenant_id = (SELECT auth.uid())) "
+            "  WITH CHECK (tenant_id = (SELECT auth.uid()));"
+            "GRANT SELECT, INSERT ON public.acct TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="cross-tenant")
+    r = _result(probe, "public.acct")
+    assert r.observed != "skipped"
+    assert r.agreement == "agree"
+
+
+@requires_docker
+@requires_z3
+def test_probe_applies_role_scoped_policy(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # Regression (review LOW-1): a policy scoped `TO authenticated` only applies
+    # to a session that is a member of `authenticated`. The probe best-effort
+    # grants its throwaway role that membership, so a leaky `TO authenticated`
+    # policy is CONFIRMED — without it the probe role isn't `authenticated`, the
+    # policy doesn't apply, FORCE RLS default-denies, and the static leak is
+    # mis-reported as a MISMATCH.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "DROP ROLE IF EXISTS pgrls_probe_authn;"
+            "CREATE ROLE pgrls_probe_authn NOLOGIN;"
+            "CREATE TABLE public.docs "
+            "  (id bigserial PRIMARY KEY, tenant_id uuid, is_public boolean);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.docs FOR SELECT TO pgrls_probe_authn "
+            "  USING (tenant_id = auth.uid() OR is_public);"
+            "GRANT SELECT, INSERT ON public.docs TO pgrls_probe_authn;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="cross-tenant")
+    r = _result(probe, "public.docs")
+    assert r.agreement == "leak_confirmed"
+    _drop_role(pg_conn, "pgrls_probe_authn")
+
+
 # --- non-destructiveness / lifecycle ---------------------------------------
 
 

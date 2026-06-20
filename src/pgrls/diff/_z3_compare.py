@@ -1342,6 +1342,19 @@ def _anon_3vl(
             if _anon_3vl(arg, ctx, auth_funcs, assertions) is None:
                 return None
         key = _canon(node)
+        # A never-NULL builtin current_setting (the one-arg form, or two-arg
+        # current_setting(name, false)) RAISES on an unset GUC and is otherwise
+        # a non-NULL string — it is NEVER NULL. Pin is_null=False so the
+        # *satisfiability* path can't pick a free null-flag and manufacture a
+        # `current_setting('x') IS NULL OR …` anon "leak": the disjunct is
+        # genuinely dead. This is the same guard `_is_anon_null_leaf` applies
+        # (it returns False for these, routing them here) and that SEC004 /
+        # SEC038 already use, so `verify --mode anon` and the linter agree.
+        if is_never_null_current_setting(node):
+            return _Val(
+                value=ctx.opaque(key, z3.StringSort()),
+                is_null=z3.BoolVal(False),
+            )
         return _Val(
             value=ctx.opaque(key, z3.StringSort()),
             is_null=ctx.null_flag(key),

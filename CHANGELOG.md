@@ -10,6 +10,36 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-06-20
+
+### Fixed
+
+- **`pgrls verify --mode anon` no longer reports a false `leak` on a never-NULL
+  `current_setting(...) IS NULL` disjunct.** A predicate like
+  `current_setting('app.x') IS NULL OR tenant_id = auth.uid()` is genuinely safe
+  under anon — the one-arg (and two-arg `missing_ok=false`) `current_setting`
+  raises on an unset GUC and is otherwise non-NULL, so the disjunct is dead. The
+  Z3 satisfiability path was assigning it a free null-flag and manufacturing a
+  leak, disagreeing with SEC038 (which correctly stayed silent); the anon
+  encoder now pins these never-NULL calls to non-NULL, matching the linter.
+- **`pgrls verify --probe` now confirms `(SELECT auth.uid())`-wrapped policies.**
+  The dominant Supabase / PERF001 idiom wraps the auth call in a scalar
+  sub-select; the probe treated *any* sub-select as "references other tables" and
+  abstained, neutering it on most real schemas. A bare scalar `(SELECT <expr>)`
+  is now unwrapped (mirroring the Z3 encoder), so the probe runs; genuine
+  subqueries (`EXISTS`, `IN`, FROM-bearing) still abstain.
+- **`pgrls verify --probe` now applies role-scoped policies.** The throwaway
+  probe role is best-effort granted each policy's named `TO` roles (e.g.
+  `authenticated`), so a `TO authenticated` policy actually applies to it instead
+  of being default-denied and mis-reported; the role stays
+  `NOSUPERUSER`/`NOBYPASSRLS` so RLS still decides visibility.
+
+### Docs
+
+- Corrected stale rule counts in `README.md` and `AGENTS.md` (fifty-seven →
+  sixty; `SEC001–SEC044` → `SEC001–SEC047`) and added `SEC010` to the README
+  auto-fixable rule list.
+
 ## [0.40.0] - 2026-06-19
 
 ### Added
