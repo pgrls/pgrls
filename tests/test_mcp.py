@@ -176,6 +176,22 @@ def test_column_grant_of_pii_to_low_trust_flags_sec045() -> None:
     assert "SEC045" in ids
 
 
+def test_column_grants_merge_per_role_column_like_introspection() -> None:
+    # Two separate GRANT (col) statements on the same (role, column) must merge
+    # into one ColumnGrant with unioned privileges — as introspection groups
+    # them — so SEC045 reports one finding per exposed column, not one per
+    # GRANT statement.
+    schema = schema_from_sql(
+        "CREATE TABLE public.users (id uuid, ssn text);"
+        "GRANT SELECT (ssn) ON public.users TO anon;"
+        "GRANT UPDATE (ssn) ON public.users TO anon;"
+    )
+    table = schema.tables[0]
+    ssn_grants = [g for g in table.column_grants if g.column == "ssn"]
+    assert len(ssn_grants) == 1
+    assert set(ssn_grants[0].privileges) == {"SELECT", "UPDATE"}
+
+
 def test_schema_from_sql_maps_ddl_faithfully() -> None:
     """Regression net for the DDL→model mapping (the false-clean risk)."""
     schema = schema_from_sql(

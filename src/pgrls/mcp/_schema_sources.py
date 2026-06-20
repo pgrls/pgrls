@@ -418,8 +418,33 @@ class _TableBuilder:
             columns=tuple(c.name for c in self.columns),
             column_details=tuple(self.columns),
             grants=tuple(self.grants),
-            column_grants=tuple(self.column_grants),
+            column_grants=_merge_column_grants(self.column_grants),
         )
+
+
+def _merge_column_grants(
+    grants: list[ColumnGrant],
+) -> tuple[ColumnGrant, ...]:
+    """Merge grants sharing a ``(role, column)`` into one with unioned
+    privileges, preserving first-seen order.
+
+    Introspection groups column ACLs per ``(role, column)``, so two separate
+    ``GRANT … (col) … TO r`` statements appear live as a single `ColumnGrant`.
+    Mirror that here so the offline `sql=` path produces the same model — and
+    SEC045 reports one finding per exposed column, not one per GRANT statement.
+    """
+    merged: dict[tuple[str, str], set[str]] = {}
+    order: list[tuple[str, str]] = []
+    for g in grants:
+        key = (g.role, g.column)
+        if key not in merged:
+            merged[key] = set()
+            order.append(key)
+        merged[key].update(g.privileges)
+    return tuple(
+        ColumnGrant(role=r, column=c, privileges=tuple(sorted(merged[(r, c)])))
+        for (r, c) in order
+    )
 
 
 def _relation_key(
