@@ -10,6 +10,37 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-06-19
+
+### Added
+
+- **`pgrls verify --probe`** — a live runtime probe that confirms the static Z3
+  proof against the real database. It connects as the threat-model session
+  (anonymous, or authenticated as one tenant), seeds a throwaway row, runs the
+  actual query the proof reasons about, and diffs the **observed** behavior
+  against the verdict — all inside a transaction that is **rolled back**, so
+  nothing is committed (the probe role it creates does not survive the rollback
+  either). Per table × `--mode` it reports **AGREE** (proof and reality concur),
+  **MISMATCH** (proof↔reality broken — a soundness break, or schema drift since
+  the proof was computed), or **LEAK CONFIRMED**. The headline: an **UNVERIFIED**
+  policy that turns out to leak live (e.g. reads scoped but `INSERT … WITH CHECK
+  (true)`) is upgraded to a reproduced, exit-non-zero leak — the verifier's
+  honest "no claim" turned into a live witness. Works in all three modes
+  (`anon` / `cross-tenant` / `write`). It reuses `pgrls verify --emit-repro`'s
+  GUC / identity / tenant-value synthesis verbatim, so the session it
+  establishes is identical to the one the emitted reproduction would.
+- With `--probe`, `pgrls verify` **exits non-zero on any proof↔reality mismatch
+  or live-confirmed leak** (and, under `--strict`, on any table the probe had to
+  abstain on). It needs a live `--database-url` and a connection that can create
+  a role (CREATEROLE / superuser); anything it cannot reproduce live — no
+  CREATEROLE, no INSERT path, no tenant-scoping axis, a conditional witness, a
+  cross-table predicate, an exotic column type — it **abstains** on cleanly,
+  per table, with a one-line reason (never a crash). `--probe` output supports
+  `--format text` (the static proof stacked above the live AGREE/MISMATCH/LEAK
+  CONFIRMED table) and `--format json`; **SARIF for the probe is deferred** and
+  `--probe --format sarif` / `--probe --emit-repro` are rejected (run them
+  separately).
+
 ## [0.38.0] - 2026-06-19
 
 ### Added

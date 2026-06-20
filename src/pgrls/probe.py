@@ -1,0 +1,774 @@
+"""Live runtime probe for `pgrls verify --probe`.
+
+`pgrls verify` *proves* a tenant-isolation property with Z3 — a static
+verdict over the introspected policy AST. `--probe` keeps that static proof
+honest by running it against the live database: it connects as the threat-model
+session (anonymous, or authenticated as one tenant), seeds a throwaway row, runs
+the real query the proof reasons about, and diffs the *observed* behavior
+against the Z3 verdict. The whole dance happens inside a transaction that is
+**always rolled back** — no committed row is added, changed, or removed, and the
+probe role it creates does not survive the rollback.
+
+Three things can come out of the comparison (per table × `--mode`):
+
+* **agree** — static and live concur (PROVEN ⇒ no rows / write rejected; LEAK ⇒
+  rows visible / write admitted). The proof is backed by reality.
+* **mismatch** — static and live *disagree*. Either the proof says isolated but
+  the live policy leaks (a soundness break, or — more often — schema drift since
+  the proof was computed), or the proof says leak but the synthesized row did not
+  reproduce it (a conditional witness, or the policy changed). Either way the
+  static report can no longer be trusted on its own.
+* **leak_confirmed** — the money case. A LEAK reproduced live, *or* an
+  UNVERIFIED policy (the verifier made no claim) turned out to leak when probed —
+  upgrading an honest "no claim" into a reproduced, exit-non-zero leak.
+
+The probe is deliberately conservative: anything it cannot model live it
+**abstains** on (per table, with a one-line reason — never a crash). It cannot
+create its probe role (no CREATEROLE / not superuser), cannot seed (no INSERT),
+finds no scoping axis to pivot a cross-tenant probe on, the leak witness is
+conditional (no single characterizing row), the policy references other tables,
+or a column has an exotic type the placeholder synthesis can't fill — all of
+these yield a clean `abstained` / `skipped`, not a false signal.
+
+It reuses `pgrls.repro`'s GUC / identity / tenant-value synthesis verbatim (the
+same machinery `--emit-repro` uses to build a runnable reproduction), so the
+session the probe establishes is byte-identical to the one the emitted `.sql`
+would — there is one definition of "become tenant A" / "stamp a row for tenant
+B" across both surfaces.
+"""
+from __future__ import annotations
+
+import secrets
+from dataclasses import dataclass
+from typing import Any, Literal
+
+import psycopg
+
+from pgrls.diff._z3_compare import cross_tenant_session_identity
+from pgrls.fixers._idents import quote_ident
+from pgrls.model import Column, Policy, Schema, Table
+from pgrls.repro import (
+    _AUTH_IDENTITY_GUC,
+    _current_setting_guc,
+    _funccall_qualified,
+    _identity_value_type,
+    _row_columns,
+    _session_a_value,
+    _session_identity_setup,
+    _sql_str,
+    _tenant_b_value,
+)
+from pgrls.testing.assertions import _row_count
+from pgrls.verify import (
+    Mode,
+    PolicyProof,
+    TableVerdict,
+    Verdict,
+    Verification,
+    effective_write_check,
+)
+from pgrls._render_common import pluralize, render_text_table
+from pgrls.formatters._common import safe_location
+
+# The observable outcome of the live probe for one (table, policy, mode).
+Observed = Literal[
+    "no_rows",
+    "rows_visible",
+    "write_rejected",
+    "write_admitted",
+    "skipped",
+    "abstained",
+]
+# How the observed outcome relates to the static Z3 verdict.
+Agreement = Literal["agree", "mismatch", "leak_confirmed", "skipped", "abstained"]
+
+# JWT-claim GUCs the auth.* stubs read (see repro._AUTH_STUB). Clearing them
+# (set to '') makes auth.uid()/role()/jwt() return NULL — the anonymous state
+# the `anon` threat model probes under. A policy reading a different GUC via a
+# direct current_setting(...) adds its own GUC to this set per table.
+_ANON_BASELINE_GUCS = (
+    "request.jwt.claim.sub",
+    "request.jwt.claim.role",
+    "request.jwt.claims",
+)
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """The live-vs-static result for one table under one threat model.
+
+    `policy` is the leaking / scoping policy the probe pivoted on (None when the
+    table has no permissive policy for the mode and is trivially isolated, or
+    when the probe abstained before selecting one). `seeded` is the witness /
+    discriminator row the probe inserted (None when nothing was seeded — an
+    abstain, or a bare write-mode insert attempt)."""
+
+    qualified_name: str
+    policy: str | None
+    mode: Mode
+    static_verdict: Verdict
+    observed: Observed
+    agreement: Agreement
+    detail: str
+    seeded: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class Probe:
+    results: tuple[ProbeResult, ...]
+    mode: Mode
+
+    @property
+    def has_mismatch(self) -> bool:
+        return any(r.agreement == "mismatch" for r in self.results)
+
+    @property
+    def has_confirmed_leak(self) -> bool:
+        return any(r.agreement == "leak_confirmed" for r in self.results)
+
+    @property
+    def summary(self) -> dict[str, int]:
+        counts = {
+            "agree": 0,
+            "mismatch": 0,
+            "leak_confirmed": 0,
+            "skipped": 0,
+            "abstained": 0,
+        }
+        for r in self.results:
+            counts[r.agreement] += 1
+        return {"tables": len(self.results), **counts}
+
+
+# --- helpers ---------------------------------------------------------------
+
+
+class _ProbeAbstain(Exception):
+    """Raised inside a per-table probe to bail out with a clean reason.
+
+    The caller turns it into a `ProbeResult` with ``observed`` /
+    ``agreement`` of ``abstained`` (or ``skipped`` for a "nothing to prove"
+    boundary) — never a traceback. The whole point of the probe is that it
+    degrades gracefully, exactly like the verifier degrades to the linter."""
+
+    def __init__(self, reason: str, *, skipped: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.skipped = skipped
+
+
+def _short(exc: Exception) -> str:
+    """A one-line rendering of a Postgres error for an abstain detail (the
+    first line of the message, whitespace-collapsed)."""
+    msg = str(exc).strip().splitlines()
+    return msg[0].strip() if msg else exc.__class__.__name__
+
+
+def _column_map(table: Table) -> dict[str, Column]:
+    return {c.name: c for c in table.column_details}
+
+
+def _anon_gucs(policy_ast: Any) -> list[str]:
+    """The GUCs to clear so every auth value in `policy_ast` reads NULL.
+
+    The baseline Supabase JWT-claim GUCs, plus any GUC a direct
+    ``current_setting('<guc>')`` in the predicate reads (so a non-Supabase
+    policy scoping on ``current_setting('app.tenant_id')`` is anonymized too).
+    Reuses repro's `_current_setting_guc` / `_AUTH_IDENTITY_GUC` so the GUC
+    mapping is the single source of truth shared with the emitted repro."""
+    from pglast.ast import FuncCall, Node
+
+    gucs = set(_ANON_BASELINE_GUCS)
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, FuncCall):
+            guc = _current_setting_guc(n)
+            if guc is not None:
+                gucs.add(guc)
+            qualified = _funccall_qualified(n)
+            if qualified in _AUTH_IDENTITY_GUC:
+                gucs.add(_AUTH_IDENTITY_GUC[qualified])
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(policy_ast)
+    return sorted(gucs)
+
+
+def _checked_ast(policy: Policy, mode: Mode) -> Any:
+    """The AST the static prover checked for `policy` under `mode` — the
+    effective write-check for ``write``, else the USING. Mirrors
+    `verify._checked_ast` (kept local to avoid importing a private helper)."""
+    return effective_write_check(policy) if mode == "write" else policy.using_ast
+
+
+def _references_other_tables(policy_ast: Any) -> bool:
+    """True if the predicate references another table / subquery, so a single
+    synthesized row in the probed table cannot characterize its behavior (the
+    same boundary repro flags as "needs a hand-edit"). Detected by the presence
+    of a sub-select node (`SubLink` / `RangeSubselect` / `SelectStmt`)."""
+    from pglast.ast import Node, RangeSubselect, SelectStmt, SubLink
+
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, (SubLink, RangeSubselect, SelectStmt)):
+            found = True
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(policy_ast)
+    return found
+
+
+def _write_axis(
+    table: Table, auth_functions: set[str] | None
+) -> tuple[str, str] | None:
+    """The ``(discriminator column, session-auth SQL)`` for a WRITE probe,
+    derived from the table's READ scoping.
+
+    A write-check is often unscoped (`WITH CHECK (true)` — the headline footgun
+    verify reports UNVERIFIED), so it carries no tenant axis of its own. But the
+    table's permissive SELECT/ALL policy USING usually does declare one
+    (`tenant_id = auth.uid()`), and that is the column that stamps the tenant
+    and the identity to authenticate as. Returns the first such axis, or None
+    when no read policy declares a single scoping equality."""
+    for policy in table.policies:
+        if not policy.permissive or policy.command not in ("SELECT", "ALL"):
+            continue
+        if policy.using_ast is None:
+            continue
+        axis = cross_tenant_session_identity(policy.using_ast, auth_functions)
+        if axis is not None:
+            return axis
+    return None
+
+
+def _seed_row(
+    table: Table,
+    policy: Policy,
+    proof: PolicyProof,
+    mode: Mode,
+    *,
+    disc_col: str | None,
+    auth_sql: str | None,
+) -> tuple[list[tuple[str, str]], dict[str, object], str | None]:
+    """Build the (column, literal) pairs for the row the probe inserts, the
+    machine-readable ``seeded`` dict, and the session-A value to authenticate
+    as (cross-tenant / write only; None for anon).
+
+    Reuses repro's row / tenant-value synthesis verbatim: a cross-tenant probe
+    stamps the discriminator for tenant B (≠ the session's tenant A) plus the
+    leak witness's other columns; an anon probe inserts the witness row (or a
+    placeholder row for an isolated / unverified table). Raises `_ProbeAbstain`
+    when an exotic column type forces a NULL into a NOT NULL column (the INSERT
+    would fail) — better to abstain than crash mid-transaction.
+    """
+    witness = proof.witness or {}
+    if mode in ("cross-tenant", "write"):
+        assert disc_col is not None and auth_sql is not None
+        disc = _column_map(table).get(disc_col)
+        disc_type = disc.data_type if disc is not None else "text"
+        b_val = _tenant_b_value(disc_type, witness.get(disc_col))
+        a_val = _session_a_value(_identity_value_type(auth_sql) or disc_type, b_val)
+        row_witness: dict[str, object] = {
+            k: v for k, v in witness.items() if k != disc_col
+        }
+        if disc is not None:
+            row_witness[disc_col] = b_val
+        row, _unpinned, null_fallback = _row_columns(table, row_witness)
+        if null_fallback:
+            raise _ProbeAbstain(
+                f"NOT NULL column(s) {', '.join(null_fallback)} have a type the "
+                "probe cannot synthesize a value for"
+            )
+        return row, row_witness, str(a_val)
+    # anon: seed the witness row (a leak's characterizing row, or {} → a bare
+    # placeholder row for an isolated/unverified table we expect anon NOT to see)
+    row, _unpinned, null_fallback = _row_columns(table, witness)
+    if null_fallback:
+        raise _ProbeAbstain(
+            f"NOT NULL column(s) {', '.join(null_fallback)} have a type the "
+            "probe cannot synthesize a value for"
+        )
+    return row, dict(witness), None
+
+
+def _insert_sql(table: Table, row: list[tuple[str, str]]) -> str:
+    qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    if not row:
+        return f"INSERT INTO {qtbl} DEFAULT VALUES"
+    cols = ", ".join(quote_ident(n) for n, _ in row)
+    vals = ", ".join(v for _, v in row)
+    return f"INSERT INTO {qtbl} ({cols}) VALUES ({vals})"
+
+
+def _classify(
+    static: Verdict, observed: Observed, mode: Mode
+) -> tuple[Agreement, str]:
+    """The AGREE / MISMATCH / LEAK_CONFIRMED contract (per the spec table).
+
+    Reads (anon / cross-tenant): no_rows / rows_visible. Writes: write_rejected
+    / write_admitted. The two columns are symmetric (a "negative" observation =
+    no_rows or write_rejected; a "positive" one = rows_visible or
+    write_admitted), so they collapse to one truth value here.
+    """
+    positive = observed in ("rows_visible", "write_admitted")
+    if static == "isolated":
+        if positive:
+            return (
+                "mismatch",
+                "static PROVEN but the live policy exposed the row — "
+                "proof contradicts reality (or the schema drifted)",
+            )
+        return ("agree", "PROVEN and the live policy hid the row")
+    if static == "leak":
+        if positive:
+            return ("leak_confirmed", "static LEAK reproduced live")
+        return (
+            "mismatch",
+            "static LEAK but the probe row was not exposed — the leak is "
+            "conditional (see --emit-repro) or the policy changed",
+        )
+    # unverified — the verifier made no claim
+    if positive:
+        return (
+            "leak_confirmed",
+            "static UNVERIFIED but the live policy exposed the row — "
+            "a reproduced leak the static proof could not claim",
+        )
+    return (
+        "skipped",
+        "static UNVERIFIED; the probe saw no leak — not a proof, run "
+        "`pgrls lint` for the heuristic rules",
+    )
+
+
+def _probe_one(
+    conn: psycopg.Connection[Any],
+    table: Table,
+    tv: TableVerdict,
+    mode: Mode,
+    auth_functions: set[str] | None,
+    probe_role: str,
+    n: int,
+) -> ProbeResult:
+    """Probe one table, inside its own savepoint (rolled back by the caller).
+
+    Selects the representative permissive policy proof, synthesizes the threat
+    session + seed row (reusing repro's helpers), runs the live query, and
+    classifies the result against the static verdict. Any `_ProbeAbstain`
+    becomes a clean abstained/skipped result; the savepoint guarantees the seed
+    + session changes never escape this call."""
+    # A table with no permissive policy for the mode (RLS default-deny) is
+    # trivially isolated and carries no proof — nothing live to pivot on.
+    if not tv.proofs:
+        return ProbeResult(
+            tv.qualified_name, None, mode, tv.verdict, "skipped", "skipped",
+            "no permissive policy for this mode — RLS default-denies", None,
+        )
+
+    # The representative proof: a leak proof if the table leaks (it pins the
+    # witness), else the first proof (isolated/unverified all share the verdict).
+    proof = next(
+        (p for p in tv.proofs if p.verdict == "leak"),
+        tv.proofs[0],
+    )
+    policy = next((p for p in table.policies if p.name == proof.policy), None)
+    if policy is None:  # pragma: no cover - proof always names a real policy
+        return ProbeResult(
+            tv.qualified_name, proof.policy, mode, tv.verdict, "abstained",
+            "abstained", "internal: proof references an unknown policy", None,
+        )
+
+    policy_ast = _checked_ast(policy, mode)
+    sp = f"probe_{n}"
+    with conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT {sp}")
+        try:
+            if policy_ast is None:
+                raise _ProbeAbstain(
+                    "no checkable predicate for this policy under this mode"
+                )
+            if proof.verdict == "leak" and proof.witness is None:
+                raise _ProbeAbstain(
+                    "leak is conditional — no single row characterizes it; "
+                    "see --emit-repro"
+                )
+            if _references_other_tables(policy_ast):
+                raise _ProbeAbstain(
+                    "policy references other tables/subqueries; cannot "
+                    "synthesize a probe row",
+                    skipped=True,
+                )
+
+            disc_col: str | None = None
+            auth_sql: str | None = None
+            if mode == "cross-tenant":
+                session = cross_tenant_session_identity(policy_ast, auth_functions)
+                if session is None:
+                    raise _ProbeAbstain(
+                        "no single tenant-scoping axis to pivot a "
+                        "cross-tenant probe on",
+                        skipped=True,
+                    )
+                disc_col, auth_sql = session
+            elif mode == "write":
+                # The write-check itself may be unscoped (`WITH CHECK (true)` is
+                # the headline footgun → UNVERIFIED), so the tenant axis comes
+                # from the table's READ scoping (a permissive SELECT/ALL USING
+                # that declares `<column> = <session identity>`). That tells us
+                # which column stamps the tenant and how to authenticate as one,
+                # so we can attempt a cross-tenant write.
+                axis = _write_axis(table, auth_functions)
+                if axis is None:
+                    raise _ProbeAbstain(
+                        "no read-scoping axis to pivot a write probe on "
+                        "(no permissive SELECT/ALL policy declares a single "
+                        "tenant column)",
+                        skipped=True,
+                    )
+                disc_col, auth_sql = axis
+
+            row, seeded, a_val = _seed_row(
+                table, policy, proof, mode,
+                disc_col=disc_col, auth_sql=auth_sql,
+            )
+            observed = _run_probe_steps(
+                cur, table, policy_ast, mode, row,
+                disc_col=disc_col, auth_sql=auth_sql, a_val=a_val,
+                probe_role=probe_role,
+            )
+            agreement, detail = _classify(tv.verdict, observed, mode)
+            return ProbeResult(
+                tv.qualified_name, policy.name, mode, tv.verdict,
+                observed, agreement, detail, seeded,
+            )
+        except _ProbeAbstain as exc:
+            kind: Observed = "skipped" if exc.skipped else "abstained"
+            agree: Agreement = "skipped" if exc.skipped else "abstained"
+            return ProbeResult(
+                tv.qualified_name, policy.name, mode, tv.verdict,
+                kind, agree, exc.reason, None,
+            )
+        finally:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+
+
+def _run_probe_steps(
+    cur: psycopg.Cursor[Any],
+    table: Table,
+    policy_ast: Any,
+    mode: Mode,
+    row: list[tuple[str, str]],
+    *,
+    disc_col: str | None,
+    auth_sql: str | None,
+    a_val: str | None,
+    probe_role: str,
+) -> Observed:
+    """Seed → become the threat session → observe. Returns the live outcome.
+
+    SEED runs as the privileged connection role (the only non-superuser-safe
+    seed under FORCE RLS: stamp the identity GUC so the SELECT-applicable check
+    on the NEW row passes); then we drop the identity to the threat session and
+    SET LOCAL ROLE into the unprivileged probe role so RLS + the policy — not a
+    privileged connection — decide visibility. RESET ROLE at the end so the
+    outer rollback runs as the connection role."""
+    qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+
+    try:
+        if mode in ("cross-tenant", "write"):
+            assert auth_sql is not None
+            if mode == "cross-tenant":
+                # Seed a tenant-B row: set the session identity to B (so the
+                # SELECT-applicable USING admits the INSERT under FORCE RLS),
+                # insert as the privileged role, then leave. B's identity value
+                # is recovered from the seeded row's discriminator literal so it
+                # matches the row.
+                b_id_stmts, _caveat = _session_identity_setup(
+                    auth_sql, _row_disc_text(row, disc_col)
+                )
+                for s in b_id_stmts:
+                    cur.execute(s)
+                cur.execute(_insert_sql(table, row))
+            # Become tenant A and drop into the unprivileged probe role.
+            a_id_stmts, _ = _session_identity_setup(auth_sql, a_val or "")
+            for s in a_id_stmts:
+                cur.execute(s)
+            cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+        else:  # anon
+            cur.execute(_insert_sql(table, row))  # seed as the privileged role
+            for guc in _anon_gucs(policy_ast):
+                cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
+            cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+    except psycopg.Error as exc:
+        # A seed INSERT denied (e.g. no permissive write path under FORCE RLS for
+        # a non-superuser owner), or the GUC/SET ROLE failed. Abstain cleanly —
+        # the outer savepoint rollback recovers the aborted transaction.
+        raise _ProbeAbstain(
+            f"cannot seed/become the threat session: {_short(exc)}"
+        ) from exc
+
+    try:
+        if mode == "write":
+            return _observe_write(cur, table, row)
+        seen = _row_count(cur.connection, f"SELECT * FROM {qtbl}")
+        return "rows_visible" if seen > 0 else "no_rows"
+    finally:
+        cur.execute("RESET ROLE")
+
+
+def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
+    """The session-identity text for tenant B, recovered from the seeded row's
+    discriminator literal so the seed INSERT is admitted under FORCE RLS.
+
+    The row literal is rendered for the COLUMN type (e.g. ``'…'::uuid``); strip
+    a trailing ``::type`` cast and the surrounding quotes so it can be re-set as
+    the GUC string the auth stub re-casts."""
+    if disc_col is None:  # pragma: no cover - cross-tenant always has a disc
+        return ""
+    lit = next((v for n, v in row if n == disc_col), "")
+    if "::" in lit:
+        lit = lit.rsplit("::", 1)[0]
+    if len(lit) >= 2 and lit[0] == "'" and lit[-1] == "'":
+        lit = lit[1:-1].replace("''", "'")
+    return lit
+
+
+def _observe_write(
+    cur: psycopg.Cursor[Any], table: Table, row: list[tuple[str, str]]
+) -> Observed:
+    """Try the cross-tenant INSERT as the threat session, savepoint-guarded.
+
+    write_rejected on InsufficientPrivilege (RLS WITH CHECK denial → SQLSTATE
+    42501) or a check-constraint violation; write_admitted if it succeeds. The
+    inner savepoint keeps a denial from poisoning the outer rollback."""
+    w = f"w_{secrets.token_hex(4)}"
+    cur.execute(f"SAVEPOINT {w}")
+    try:
+        cur.execute(_insert_sql(table, row))
+    except (psycopg.errors.InsufficientPrivilege, psycopg.errors.CheckViolation):
+        cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
+        return "write_rejected"
+    cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
+    return "write_admitted"
+
+
+def _abstain_all(
+    verification: Verification, mode: Mode, reason: str
+) -> Probe:
+    """Every probed table → abstained, with `reason` (the one-time gate failed —
+    e.g. the connection cannot create the probe role)."""
+    results = tuple(
+        ProbeResult(
+            tv.qualified_name, None, mode, tv.verdict,
+            "abstained", "abstained", reason, None,
+        )
+        for tv in verification.tables
+    )
+    return Probe(results, mode)
+
+
+# --- public API ------------------------------------------------------------
+
+
+def run_probe(
+    conn: psycopg.Connection[Any],
+    schema: Schema,
+    verification: Verification,
+    *,
+    mode: Mode,
+    auth_functions: set[str] | None = None,
+    probe_role: str = "pgrls_probe_runner",
+) -> Probe:
+    """Probe each verified table live and diff it against the static verdict.
+
+    `conn` MUST be a non-autocommit connection: the whole probe runs in one
+    transaction that is **rolled back** in a `finally`, so nothing it seeds or
+    creates is committed. The one-time gate creates an unprivileged
+    NOLOGIN/NOSUPERUSER/NOBYPASSRLS probe role and grants it USAGE + SELECT,
+    INSERT on each probed table; if the connection cannot create a role (no
+    CREATEROLE and not superuser) the whole run abstains cleanly.
+
+    `verification` is the static result for `mode` (built by
+    `build_verification`); `auth_functions` mirrors what that used so the probe
+    pivots on the same scoping axis. Returns a `Probe` whose `results` parallel
+    the verification's tables in order.
+    """
+    tables = {t.qualified_name: t for t in schema.tables}
+    try:
+        gate_error = _setup_probe_role(conn, schema, verification, probe_role)
+        if gate_error is not None:
+            return _abstain_all(verification, mode, gate_error)
+
+        results: list[ProbeResult] = []
+        for n, tv in enumerate(verification.tables):
+            table = tables.get(tv.qualified_name)
+            if table is None:  # pragma: no cover - verification built from schema
+                results.append(
+                    ProbeResult(
+                        tv.qualified_name, None, mode, tv.verdict,
+                        "abstained", "abstained",
+                        "table not found in schema", None,
+                    )
+                )
+                continue
+            results.append(
+                _probe_one(conn, table, tv, mode, auth_functions, probe_role, n)
+            )
+        return Probe(tuple(results), mode)
+    finally:
+        # Non-destructiveness invariant: revert the probe role, every grant, and
+        # all seed rows. The probe never commits.
+        conn.rollback()
+
+
+def _setup_probe_role(
+    conn: psycopg.Connection[Any],
+    schema: Schema,
+    verification: Verification,
+    probe_role: str,
+) -> str | None:
+    """Create the unprivileged probe role and grant it read/seed access.
+
+    Returns None on success, or a one-line abstain reason when the connection
+    cannot create the role (no CREATEROLE and not superuser). Savepoint-guarded
+    so a denial leaves the transaction usable for the abstain path.
+    """
+    probed = {tv.qualified_name for tv in verification.tables}
+    schemas = sorted(
+        {t.schema for t in schema.tables if t.qualified_name in probed}
+    )
+    tables = [t for t in schema.tables if t.qualified_name in probed]
+    qrole = quote_ident(probe_role)
+    sp = f"probe_setup_{secrets.token_hex(4)}"
+    with conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT {sp}")
+        try:
+            cur.execute(
+                f"CREATE ROLE {qrole} NOLOGIN NOSUPERUSER NOBYPASSRLS"
+            )
+        except psycopg.errors.InsufficientPrivilege:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            return (
+                "cannot create probe role (connection lacks CREATEROLE / "
+                "not superuser)"
+            )
+        except psycopg.errors.DuplicateObject:
+            # A stale role of the same name already exists (a prior aborted
+            # probe that somehow committed, or a real role). Roll back the
+            # savepoint and abstain rather than reuse a role we did not create
+            # (its privileges are unknown — reusing it could be unsound).
+            cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            return (
+                f"probe role {probe_role!r} already exists; pass --probe-role "
+                "with an unused name"
+            )
+        cur.execute(f"RELEASE SAVEPOINT {sp}")
+        # A non-superuser must be a member of the role to SET ROLE into it.
+        cur.execute(f"GRANT {qrole} TO CURRENT_USER")
+        for s in schemas:
+            cur.execute(f"GRANT USAGE ON SCHEMA {quote_ident(s)} TO {qrole}")
+        for t in tables:
+            qtbl = f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
+            cur.execute(f"GRANT SELECT, INSERT ON {qtbl} TO {qrole}")
+    return None
+
+
+# --- renderers -------------------------------------------------------------
+
+_STATIC_LABEL = {"isolated": "PROVEN", "leak": "LEAK", "unverified": "UNVERIFIED"}
+_OBSERVED_LABEL = {
+    "no_rows": "no rows",
+    "rows_visible": "rows visible",
+    "write_rejected": "write rejected",
+    "write_admitted": "write admitted",
+    "skipped": "skipped",
+    "abstained": "abstained",
+}
+_RESULT_LABEL = {
+    "agree": "AGREE",
+    "mismatch": "MISMATCH",
+    "leak_confirmed": "LEAK CONFIRMED",
+    "skipped": "skipped",
+    "abstained": "abstained",
+}
+
+
+def _summary_line(p: Probe) -> str:
+    s = p.summary
+    return (
+        f"{s['tables']} {pluralize(s['tables'], 'table')} probed: "
+        f"{s['agree']} agree, {s['mismatch']} mismatch, "
+        f"{s['leak_confirmed']} leak confirmed, {s['skipped']} skipped, "
+        f"{s['abstained']} abstained."
+    )
+
+
+def render_text(p: Probe) -> str:
+    if not p.results:
+        return "No RLS-enabled tables to probe."
+    headers = ("TABLE", "MODE", "STATIC", "OBSERVED", "RESULT")
+    rows = [
+        (
+            safe_location(r.qualified_name),
+            r.mode,
+            _STATIC_LABEL[r.static_verdict],
+            _OBSERVED_LABEL[r.observed],
+            _RESULT_LABEL[r.agreement],
+        )
+        for r in p.results
+    ]
+    out = render_text_table(headers, rows)
+    out.append("")
+    out.append(_summary_line(p))
+    return "\n".join(out)
+
+
+def render_json(p: Probe) -> str:
+    import json
+
+    payload = {
+        "mode": p.mode,
+        "probe": True,
+        "summary": p.summary,
+        "tables": [
+            {
+                "table": r.qualified_name,
+                "policy": r.policy,
+                "static_verdict": r.static_verdict,
+                "observed": r.observed,
+                "agreement": r.agreement,
+                "seeded": r.seeded,
+                "detail": r.detail,
+            }
+            for r in p.results
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+PROBE_FORMATS: tuple[str, ...] = ("text", "json")
+
+
+def render(p: Probe, output_format: str) -> str:
+    if output_format == "json":
+        return render_json(p)
+    return render_text(p)
