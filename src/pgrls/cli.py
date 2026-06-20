@@ -3623,6 +3623,33 @@ def verify(
 
 
 @main.command()
+def mcp() -> None:
+    """Run the pgrls MCP server (stdio) for AI coding agents. Requires pgrls[mcp].
+
+    Starts a Model Context Protocol server over stdio that exposes pgrls's
+    static analysis — `lint`, `verify`, `explain_rule`, `list_rules` — as MCP
+    tools. The headline is OFFLINE analysis of raw DDL: an agent passes the
+    `CREATE TABLE` / `CREATE POLICY` SQL it just wrote and pgrls lints +
+    Z3-verifies it with no database. The server is read-only / diagnostic-only
+    — it never mutates a database and never auto-applies SQL.
+
+    Point an MCP client at it with:
+    `{"mcpServers": {"pgrls": {"command": "pgrls", "args": ["mcp"]}}}`.
+    """
+    # Import the server LAZILY (it imports the optional `fastmcp` extra). The
+    # normal CLI path must never import FastMCP — this mirrors the
+    # `pgrls[diff-apply]` extra's import-guard pattern above.
+    try:
+        from pgrls.mcp.server import run_stdio
+    except ImportError as exc:
+        raise ToolError(
+            "the MCP server requires the `pgrls[mcp]` extra. "
+            "Install with `pip install 'pgrls[mcp]'`."
+        ) from exc
+    run_stdio()
+
+
+@main.command()
 @common_db_options
 @click.option(
     "--coverage",

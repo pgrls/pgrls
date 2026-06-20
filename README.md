@@ -398,6 +398,27 @@ The probe is deliberately conservative — anything it cannot reproduce live it 
 
 It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope:** both modes reason over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` read floor is reported `UNVERIFIED` (v1 does not combine floors — an already-`PROVEN` policy stays proven, since a restrictive floor only narrows access), and RLS-disabled tables are out of scope (that is SEC001's job). `cross-tenant` mode verifies the single `<column> = <session identity>` scoping equality `pgrls generate` emits — including when that identity is cast to the tenant column's type (`current_setting(...)::uuid`, `::bigint`/`::int`, …); a policy with no such equality (or two competing ones) is `UNVERIFIED` there. `--emit-repro` works in both modes. Needs the `z3-solver` dependency (bundled).
 
+## MCP server — `pgrls mcp`
+
+`pgrls mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io/) server (over stdio) that gives AI coding agents pgrls's analysis as tools. The headline is **offline** analysis of the DDL the agent just wrote: it passes the `CREATE TABLE` / `CREATE POLICY` SQL as `sql=` and pgrls lints it **and** runs the full Z3 isolation prover with no database.
+
+```bash
+pip install 'pgrls[mcp]'   # FastMCP is an optional extra; the plain install stays slim
+```
+
+Point an MCP client at it:
+
+```json
+{"mcpServers": {"pgrls": {"command": "pgrls", "args": ["mcp"]}}}
+```
+
+The server is **read-only / diagnostic-only** — it never touches or mutates a database beyond read-only introspection, and never auto-applies SQL. It exposes four tools:
+
+- **`lint`** / **`verify`** — accept exactly one schema source: `sql=` (raw DDL, analyzed offline), `database_url=` (a live connection, read-only introspection), or `snapshot=` (a `pgrls snapshot` JSON). `lint` returns the same JSON violation shape as `pgrls lint --format json`; `verify` returns the per-table verdicts and leak witnesses (modes `anon` / `cross-tenant` / `write`).
+- **`explain_rule`** / **`list_rules`** — the rule catalog and a single rule's reference.
+
+On the `sql=` path the response's `warnings` list flags that catalog-only rules (those needing live catalog state — BYPASSRLS roles, `pg_default_acl`, SECURITY DEFINER owners, FKs, indexes, triggers) can't fire, so an empty findings list is **not** a clean bill of health. A `database_url` is treated as a credential: it is never logged, and connection errors are sanitized so the DSN can't leak.
+
 ## Tracking trends — `pgrls history`
 
 Pair a daily cron with `pgrls lint --format json -o snapshots/$(date -u +%FT%H%M%SZ).json` and ask `pgrls history snapshots/` weekly — "are we gaining ground over time, or is the findings count creeping up?"

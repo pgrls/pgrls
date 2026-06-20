@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.39.0"
+version = "0.40.0"
 description = "Static analyzer for Postgres Row-Level Security — 60 lint rules for tenant and per-user row-scoping bugs, performance traps, and hygiene (19 auto-fixable); a Z3 tenant-isolation prover (pgrls verify) that proves no row leaks to an anonymous session or across tenants, or shows the leaking row; gold-standard RLS scaffolding (pgrls generate); runtime seq-scan analysis (pgrls perf); a semantic policy-diff command for CI gating; and a pytest plugin for RLS isolation tests."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -67,6 +67,12 @@ diff-apply = ["testcontainers[postgres]>=4.0"]
 # testcontainers dependency as diff-apply; aliased so the feature's install
 # hint reads `pip install pgrls[ephemeral]`.
 ephemeral = ["testcontainers[postgres]>=4.0"]
+# `pgrls mcp` runs an optional Model Context Protocol server (stdio) that
+# exposes pgrls's lint / verify / explain analysis to AI coding agents.
+# FastMCP is NOT a core dependency — the CLI stays slim and `pgrls.cli`
+# never imports it; `pgrls mcp` imports `pgrls.mcp.server` lazily and
+# raises a clear "install pgrls[mcp]" error when the extra is absent.
+mcp = ["fastmcp>=2.0"]
 # `hatchling` is the build backend (declared in [build-system]) and
 # is installed automatically by `python -m build` / pip's PEP 517
 # isolated env. Don't list it here — including it would suggest to
