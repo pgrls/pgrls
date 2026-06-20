@@ -927,6 +927,40 @@ CREATE POLICY tenant_scope ON public.allbad_sec046 FOR ALL TO allbad_sec043_role
     WITH CHECK (tenant_id = public.allbad_sec046_cur_tenant());
 CREATE INDEX ON public.allbad_sec046 (tenant_id);
 
+-- SEC047: a FOREIGN KEY whose parent (referenced) table has RLS enabled is a
+-- cross-tenant existence covert channel when a low-trust role can write the
+-- child. FK validation runs as a system integrity check that bypasses RLS, so
+-- `anon` inserting a child row that references a guessed parent key learns
+-- whether that parent row exists (write succeeds) or not (FK-violation error)
+-- even though RLS hides the parent row from anon's SELECT — the FK-validation
+-- analog of SEC035's UNIQUE-index oracle (live-proven on PG16). SEC047 fires at
+-- location `public.allbad_sec047_child (<fk name>)`.
+--
+-- The parent is RLS-enabled with NO policy and NO grant (the locked-down state)
+-- so it draws no other finding. The child is writable by `anon` via an `anon`
+-- INSERT grant plus a permissive `anon` INSERT policy with a non-trivial WITH
+-- CHECK (`id > 0`, so SEC005 / SEC020 / SEC028 / SEC006 stay quiet). That anon
+-- INSERT policy co-fires SEC039 (anon-only write) and SEC007 (only-permissive),
+-- but each is pinned to its own dedicated block, so the extra firing is
+-- silent-by-design — exactly the convention the SEC039/SEC040 blocks use. The
+-- child keeps RLS ON (an RLS-off child would instead trip SEC001). Reuses the
+-- `anon` role created for the SEC039 block above (dropped in the test's
+-- `finally` after the schema CASCADE removes the policies that pin it).
+CREATE TABLE public.allbad_sec047_parent (
+    id bigint PRIMARY KEY,
+    tenant_id uuid NOT NULL
+);
+ALTER TABLE public.allbad_sec047_parent ENABLE ROW LEVEL SECURITY;
+CREATE TABLE public.allbad_sec047_child (
+    id bigint PRIMARY KEY,
+    parent_id bigint REFERENCES public.allbad_sec047_parent(id)
+);
+ALTER TABLE public.allbad_sec047_child ENABLE ROW LEVEL SECURITY;
+CREATE POLICY anon_insert ON public.allbad_sec047_child
+    FOR INSERT TO anon
+    WITH CHECK (id > 0);
+GRANT INSERT ON public.allbad_sec047_child TO anon;
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl

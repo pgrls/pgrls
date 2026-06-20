@@ -78,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 19,
+        "version": 20,
         "tables": [
             {
                 "schema": "public",
@@ -238,15 +238,15 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_nineteen_after_immutable_functions_capture() -> None:
-    # SNAPSHOT_VERSION bumped 18 → 19 to add top-level immutable_functions
-    # (user-defined functions with provolatile='i') so SEC046 can flag an
-    # IMMUTABLE function whose body reads session state (constant-folded into a
-    # cached plan → cross-user leak). Pin the new version so a future bump is
-    # deliberate. (v18 added default_privileges for SEC044; v17 added
-    # Table.inherits for SEC043.)
+def test_snapshot_version_is_twenty_after_foreign_keys_capture() -> None:
+    # SNAPSHOT_VERSION bumped 19 → 20 to add per-table foreign_keys
+    # (pg_constraint contype='f' on the child) so SEC047 can flag a FK to an
+    # RLS-enabled parent (an existence covert channel via FK validation, which
+    # bypasses RLS). Pin the new version so a future bump is deliberate. (v19
+    # added immutable_functions for SEC046; v18 added default_privileges for
+    # SEC044; v17 added Table.inherits for SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 19
+    assert snap["version"] == 20
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -696,6 +696,76 @@ def test_snapshot_omits_inherits_key_when_empty() -> None:
     assert "inherits" not in snap["tables"][0]
 
 
+def test_snapshot_includes_foreign_keys_when_set() -> None:
+    # v20: `foreign_keys` is emitted (and round-trips) only when non-empty,
+    # mirroring `inherits` / `column_grants`. A multi-column FK preserves both
+    # the child and parent column lists in order.
+    from pgrls.model import ForeignKey
+
+    child = Table(
+        schema="public",
+        name="child",
+        rls_enabled=False,
+        force_rls=False,
+        policies=(),
+        foreign_keys=(
+            ForeignKey(
+                name="child_fk",
+                columns=("pa", "pb"),
+                ref_schema="public",
+                ref_table="parent",
+                ref_columns=("a", "b"),
+            ),
+        ),
+    )
+    snap = Schema(tables=(child,)).to_snapshot()
+    [t] = snap["tables"]
+    assert t["foreign_keys"] == [
+        {
+            "name": "child_fk",
+            "columns": ["pa", "pb"],
+            "ref_schema": "public",
+            "ref_table": "parent",
+            "ref_columns": ["a", "b"],
+        }
+    ]
+    restored = Schema.from_snapshot(snap)
+    assert restored.tables[0].foreign_keys == child.foreign_keys
+
+
+def test_snapshot_omits_foreign_keys_key_when_empty() -> None:
+    # A table with no foreign keys must serialize byte-identically to before
+    # v20 (no `foreign_keys` key) — the conditional-emit / no-churn contract.
+    t = Table(
+        schema="public",
+        name="standalone",
+        rls_enabled=True,
+        force_rls=False,
+        policies=(),
+    )
+    snap = Schema(tables=(t,)).to_snapshot()
+    assert "foreign_keys" not in snap["tables"][0]
+
+
+def test_foreign_keys_absent_in_pre_v20_snapshot_loads_empty() -> None:
+    # A v19 snapshot has no foreign_keys key on a table → loads as () so SEC047
+    # finds nothing to flag (fail-closed) until re-captured.
+    snap = {
+        "version": 19,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "child",
+                "rls_enabled": False,
+                "force_rls": False,
+            }
+        ],
+        "policies": [],
+    }
+    [t] = Schema.from_snapshot(snap).tables
+    assert t.foreign_keys == ()
+
+
 def test_default_privileges_round_trip_through_snapshot() -> None:
     # v18: top-level default_privileges (from pg_default_acl) serialize and
     # decode for SEC044, including a cluster-wide entry (schema=None → null)
@@ -834,7 +904,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "default_privileges",
         "immutable_functions",
     }
-    assert snap["version"] == 19
+    assert snap["version"] == 20
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1152,7 +1222,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 19
+    assert snap["version"] == SNAPSHOT_VERSION == 20
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

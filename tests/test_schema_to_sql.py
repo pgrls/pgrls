@@ -488,7 +488,7 @@ def test_snapshot_version_is_nineteen():
     # functions with provolatile='i') for SEC046's constant-folded-session-read
     # check. (v18 added default_privileges for SEC044.) Pin so a future bump is
     # deliberate.
-    assert SNAPSHOT_VERSION == 19
+    assert SNAPSHOT_VERSION == 20
 
 
 def test_to_snapshot_emits_column_details_array():

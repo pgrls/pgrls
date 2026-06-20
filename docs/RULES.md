@@ -3107,6 +3107,93 @@ enable it).
 allowlist = ["app.cur_tenant"]   # a function proven safe to constant-fold (schema.function)
 ```
 
+<a id="rule-sec047"></a>
+
+## SEC047 — Foreign key to an RLS parent is a cross-tenant existence oracle
+
+**Severity:** warning
+
+A foreign key is validated by Postgres as a **system integrity check**: when a
+row is written to the child (referencing) table, the existence of the matching
+parent row is probed with row-level security *suspended* — the check runs with
+the privileges of the integrity machinery, not as the invoking role. So when the
+**parent** table has RLS enabled and a **low-trust role can write the child**,
+that role learns whether a *guessed* parent key exists by trying to reference it:
+the write **succeeds** if the parent row exists and raises a
+**foreign-key-violation error** if it does not — *even though RLS hides that
+parent row from the role's own `SELECT`*.
+
+```sql
+-- parent has RLS; anon sees only its own tenant's rows
+ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON accounts FOR SELECT TO anon USING (tenant_id = ...);
+
+-- child references it, and anon can INSERT the child
+CREATE TABLE events (id bigint PRIMARY KEY,
+                     account_id bigint REFERENCES accounts(id));
+GRANT INSERT ON events TO anon;
+
+-- anon, probing a parent key it cannot SELECT:
+INSERT INTO events VALUES (1, 5000);  -- SUCCESS  → account 5000 exists
+INSERT INTO events VALUES (2, 5001);  -- FK ERROR → account 5001 does not
+```
+
+The caller cannot read the other tenant's row, but it can **enumerate which
+parent keys exist** across the isolation boundary — a cross-tenant existence
+covert channel (verified live on PostgreSQL 16, via both `INSERT` and `UPDATE`
+of the child).
+
+This completes SEC035's arc. **SEC035** is the *UNIQUE-index* existence oracle —
+inserting a value already taken by an invisible tenant raises a duplicate-key
+error, leaking existence on the *same* table. **SEC047** is the *FK-validation*
+existence oracle — the same mechanism (an integrity check that bypasses RLS leaks
+cross-tenant existence), on a *different* catalog object and *across* tables
+(child → parent). `UNIQUE` leaks existence on the table you write; the foreign
+key leaks existence on the table you *reference*.
+
+**The detection is deliberately narrow** — foreign keys to RLS parents are
+ubiquitous, so SEC047 fires only when **all** hold:
+
+1. the FK's **parent** table (resolved in the snapshot) has RLS enabled (plain
+   `ENABLE` — `FORCE` is *not* required; plain `ENABLE` already scopes a
+   non-owner low-trust role, live-confirmed), **and**
+2. the **child** is writable by a configured low-trust role (default `anon` /
+   `PUBLIC`): it has a *table-level* `INSERT` / `UPDATE` / `ALL` grant to that
+   role **and** either has RLS off **or** a permissive `INSERT` / `UPDATE` /
+   `ALL` policy whose roles literally include that low-trust role (the SEC003
+   literal-role idiom — no group expansion), **and**
+3. the FK is not allowlisted.
+
+**Deliberate posture over-approximation** (unsound by design, like SEC044 /
+SEC045): SEC047 does **not** try to prove the low-trust role's RLS visibility on
+the parent is narrower than all rows. That proof is unsound — a role holding
+plain table `SELECT` on the parent still has its reads RLS-scoped, so it can
+*still* distinguish "exists in another tenant" from "does not exist" via the FK
+even though it cannot `SELECT` that row (live-proven). Narrowing the rule by the
+role's parent-visibility would therefore *miss* real oracles. So SEC047 fires on
+the structural condition and accepts that some findings are on FKs the operator
+considers acceptable — allowlist those. If the parent table cannot be resolved
+in the snapshot (typically a schema outside `--schemas`), SEC047 **abstains**
+(fail-closed) for that FK; a snapshot predating the `foreign_keys` capture
+carries none, so the rule finds nothing until re-captured.
+
+**Remediation:** drop the foreign key, mediate parent existence through a
+`SECURITY DEFINER` function that enforces the tenant scope, or accept the leak
+and allowlist it. No auto-fix — the choice is a design decision pgrls cannot make
+safely.
+
+**Configuration** (`[lint.rules.SEC047]`):
+
+```toml
+[lint.rules.SEC047]
+# Roles whose child-write access makes the FK an oracle. Default
+# ["anon", "PUBLIC"]; "public" (any case) normalizes to the PUBLIC pseudo-role.
+low_trust_roles = ["anon", "PUBLIC"]
+# Allowlist a deliberate FK by the child table (schema.table — silences all its
+# FKs) or by a specific FK constraint name.
+allowlist = ["public.events", "events_account_id_fkey"]
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

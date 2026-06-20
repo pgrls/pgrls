@@ -10,6 +10,47 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-06-19
+
+### Added
+
+- **SEC047** (warning) — a **foreign key whose parent (referenced) table has RLS
+  enabled** is a cross-tenant *existence* covert channel when a low-trust role
+  can write the child. Postgres validates a foreign key as a **system integrity
+  check** that runs with RLS suspended, so a low-trust caller inserting or
+  updating a child row that references a *guessed* parent key learns whether that
+  parent row exists (the write **succeeds**) or not (a **foreign-key-violation
+  error**) — even though RLS hides that parent row from the caller's own
+  `SELECT`. The caller cannot read the other tenant's row but can enumerate which
+  parent keys exist across the isolation boundary (verified live on PG16 via both
+  `INSERT` and `UPDATE`). This completes SEC035's arc: SEC035 is the UNIQUE-index
+  existence oracle (same table), SEC047 is the FK-validation existence oracle
+  (across tables, child → parent) — same mechanism, different catalog object. The
+  detection is deliberately narrow (FKs to RLS parents are ubiquitous): it fires
+  only when the parent has RLS enabled (plain `ENABLE` suffices — `FORCE` is not
+  required) **and** the child is writable by a configured low-trust role (default
+  `anon` / `PUBLIC`) — an `INSERT`/`UPDATE`/`ALL` table grant to that role, plus
+  either RLS off or a permissive `INSERT`/`UPDATE`/`ALL` policy literally listing
+  it. A deliberate posture over-approximation (like SEC044/SEC045): it does
+  **not** prove the role's RLS visibility on the parent is narrower than all rows
+  — that is unsound, since a role with plain table `SELECT` still leaks RLS-scoped
+  rows via the FK (live-proven) — so narrowing by parent-visibility would *miss*
+  real oracles. Abstains (fail-closed) when the parent can't be resolved in the
+  snapshot (e.g. outside `--schemas`). Configurable `low_trust_roles` and
+  `allowlist` (child `schema.table` or FK constraint name); no auto-fix (drop the
+  FK, mediate via a SECURITY DEFINER existence check, or accept the leak — a
+  design decision). Brings the catalog to **60 rules**.
+
+### Changed
+
+- **Snapshot format → v20.** Adds a per-table `foreign_keys` array (the
+  `pg_constraint` `contype='f'` constraints on the child table — each with its
+  child columns, referenced schema/table, and parent columns), the capture
+  SEC047 reads. Emitted only when non-empty, so a table with no foreign keys
+  round-trips byte-identically apart from the version bump. Additive and
+  fail-closed: a v3–v19 snapshot has no key and loads with `foreign_keys=()`, so
+  SEC047 finds nothing until the snapshot is re-captured against a live database.
+
 ## [0.36.0] - 2026-06-19
 
 ### Added
