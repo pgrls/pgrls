@@ -82,6 +82,7 @@ def default_fixers() -> list[Fixer]:
     from pgrls.fixers.sec030 import SEC030Fixer
     from pgrls.fixers.sec031 import SEC031Fixer
     from pgrls.fixers.sec032 import SEC032Fixer
+    from pgrls.fixers.sec044 import SEC044Fixer
     from pgrls.fixers.view001 import VIEW001Fixer
     from pgrls.fixers.view002 import VIEW002Fixer
 
@@ -99,6 +100,7 @@ def default_fixers() -> list[Fixer]:
         SEC030Fixer(),
         SEC031Fixer(),
         SEC032Fixer(),
+        SEC044Fixer(),
         PERF001Fixer(),
         PERF003Fixer(),
         PERF004Fixer(),

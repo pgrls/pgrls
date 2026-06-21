@@ -2989,15 +2989,25 @@ allowlist = ["reporting"]
 ```
 
 **Severity: warning** — a least-privilege / defense-in-depth posture; the
-exposure only lands if a future table also forgets RLS. No auto-fix: whether
-to revoke the default or keep it scoped to a role is a deployment decision
-pgrls cannot make safely. Remediate with
+exposure only lands if a future table also forgets RLS. Remediate with
 `ALTER DEFAULT PRIVILEGES FOR ROLE <grantor> [IN SCHEMA s] REVOKE <priv> ON
 TABLES FROM PUBLIC`, scoping default grants to specific roles and relying on
 RLS. The `FOR ROLE <grantor>` clause is required: `pg_default_acl` is keyed on
 the creating role (`defaclrole`), so a bare `REVOKE` clears only the *running*
 role's own default and silently no-ops against another role's — pgrls names the
 grantor in the finding so the emitted REVOKE actually clears the entry.
+
+**Auto-fixable** (`pgrls fix`): pgrls emits exactly that
+`ALTER DEFAULT PRIVILEGES [FOR ROLE <grantor>] [IN SCHEMA s] REVOKE
+<row-access privs> ON TABLES FROM <grantee>`. The fix is strictly *narrowing*
+— it removes a future-facing grant and never widens access — and, because
+default privileges are not retroactive, changes no *existing* table; only the
+row-access privileges the rule flags are revoked (a co-granted
+REFERENCES/TRIGGER/TRUNCATE default is left alone). Like every fixer it is
+dry-run by default; review before `--apply`. The fix removes the default
+outright — if you instead want to *keep* a default but scope it to a specific
+role, do that manually (`ALTER DEFAULT PRIVILEGES … GRANT … TO <role>`) rather
+than applying this REVOKE.
 
 <a id="rule-sec045"></a>
 
