@@ -412,9 +412,10 @@ Point an MCP client at it:
 {"mcpServers": {"pgrls": {"command": "pgrls", "args": ["mcp"]}}}
 ```
 
-The server is **read-only / diagnostic-only** — it never touches or mutates a database beyond read-only introspection, and never auto-applies SQL. It exposes four tools:
+The server **never mutates a database** — it only ever issues read-only introspection SELECTs, and never auto-applies SQL. The remediation tools (`fix` / `generate`) are **emit-only**: they return SQL text for the agent to review and run through its own channel. It exposes six tools:
 
 - **`lint`** / **`verify`** — accept exactly one schema source: `sql=` (raw DDL, analyzed offline), `database_url=` (a live connection, read-only introspection), or `snapshot=` (a `pgrls snapshot` JSON). `lint` returns the same JSON violation shape as `pgrls lint --format json`; `verify` returns the per-table verdicts and leak witnesses (modes `anon` / `cross-tenant` / `write`).
+- **`fix`** / **`generate`** — *emit-only* remediation. `fix` returns the auto-fix SQL for the mechanically-fixable findings (the remediation counterpart of `lint`); `generate` scaffolds gold-standard RLS for unprotected multi-tenant / row-owner tables. Both take the same schema sources as `lint` and return both structured statements and a copy-pasteable `migration` — but never execute it.
 - **`explain_rule`** / **`list_rules`** — the rule catalog and a single rule's reference.
 
 On the `sql=` path the response's `warnings` list flags that catalog-only rules (those needing live catalog state — BYPASSRLS roles, `pg_default_acl`, SECURITY DEFINER owners, FKs, indexes, triggers) can't fire, so an empty findings list is **not** a clean bill of health. A `database_url` is treated as a credential: it is never logged, and connection errors are sanitized so the DSN can't leak.
