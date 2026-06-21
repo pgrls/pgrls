@@ -369,7 +369,7 @@ def generate(
     database_url: str | None = None,
     snapshot: str | None = None,
     schemas: list[str] | None = None,
-    tenant_column: str = "tenant_id",
+    tenant_column: str | None = None,
     model: str = "tenant",
     convention: str = "app-guc",
     setting_name: str | None = None,
@@ -392,9 +392,11 @@ def generate(
     and reported in ``skipped``.
 
     Provide EXACTLY ONE schema source (``sql`` / ``database_url`` / ``snapshot``).
-    Knobs (all optional): ``tenant_column`` (default ``tenant_id``); ``model``
+    Knobs (all optional): ``tenant_column`` (the discriminator column; defaults
+    to ``user_id`` for ``model='owner'`` else ``tenant_id``); ``model``
     (``tenant`` | ``owner``); ``convention`` (``app-guc`` | ``postgrest`` |
-    ``supabase``) selecting the session-value source; ``setting_name`` to
+    ``supabase``) selecting the session-value source — ``supabase`` is for the
+    ``owner`` model only (it emits ``(SELECT auth.uid())``); ``setting_name`` to
     override the derived GUC/claim; ``auth_function`` (owner/supabase model;
     default ``auth.uid``); ``role`` (default ``authenticated`` — never
     ``PUBLIC``); ``restrictive`` (emit the restrictive floor, default true);
@@ -419,6 +421,21 @@ def generate(
             f"unknown convention {convention!r}. Use 'app-guc', 'postgrest', "
             "or 'supabase'.",
         )
+    # Parity with the CLI: `supabase` is the owner-model convention (it emits
+    # `(SELECT auth.uid())`); pairing it with the tenant model would scaffold a
+    # policy comparing a tenant key to a user id — silently-wrong RLS.
+    if convention == "supabase" and model != "owner":
+        return _error(
+            "bad_sql",
+            "convention 'supabase' is for model 'owner' (it emits "
+            "(SELECT auth.uid())). For tenant scoping use 'app-guc' or "
+            "'postgrest'.",
+        )
+    # The discriminator column default depends on the model (matches the CLI):
+    # `user_id` for the owner model, `tenant_id` otherwise.
+    resolved_column = tenant_column or (
+        "user_id" if model == "owner" else "tenant_id"
+    )
 
     schema, source = resolve_schema(
         sql=sql,
@@ -430,7 +447,7 @@ def generate(
     from pgrls import cli
 
     options = GenerateOptions(
-        tenant_column=tenant_column,
+        tenant_column=resolved_column,
         model="owner" if model == "owner" else "tenant",
         convention=convention,  # type: ignore[arg-type]
         setting_name=setting_name,

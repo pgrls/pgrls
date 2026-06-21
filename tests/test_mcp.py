@@ -466,6 +466,23 @@ def test_generate_bad_convention_is_structured_error() -> None:
     assert result["error"]["kind"] == "bad_sql"
 
 
+def test_generate_supabase_with_tenant_model_is_rejected() -> None:
+    # Parity with the CLI: `supabase` is an owner-model convention; pairing it
+    # with the (default) tenant model would scaffold silently-wrong RLS.
+    result = server.generate(sql=_BARE_TENANT_DDL, convention="supabase")
+    assert result["error"]["kind"] == "bad_sql"
+    assert "owner" in result["error"]["message"]
+
+
+def test_generate_owner_model_defaults_user_id_column() -> None:
+    # The discriminator column defaults to user_id for the owner model.
+    ddl = "CREATE TABLE public.notes (id uuid, user_id uuid NOT NULL);"
+    result = server.generate(sql=ddl, model="owner", convention="supabase")
+    assert result["count"] > 0
+    sqls = [s["sql"] for s in result["statements"]]
+    assert any("user_id = (SELECT auth.uid())" in s for s in sqls), sqls
+
+
 def test_generate_zero_sources_is_structured_error() -> None:
     assert server.generate()["error"]["kind"] == "no_schema_source"
 
