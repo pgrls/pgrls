@@ -23,6 +23,22 @@ breaking changes — they will be called out in this file.
   rule per `--mode` (`pgrls-probe-anon` / `-cross-tenant` / `-write`), kept
   distinct from the static `verify` SARIF rules. Reuses lint's `format_sarif`
   projection, so the SARIF schema and driver block stay in one place.
+- **SEC048 (61st rule, warning)** — *low-trust role can reach an RLS table's
+  owner that is not FORCE'd*. A role that OWNS a table bypasses that table's RLS
+  unless `FORCE ROW LEVEL SECURITY` is set, and owner privileges (unlike the
+  `BYPASSRLS` attribute SEC029 covers) ARE reachable through role membership: a
+  member of the owning role inherits its ownership — automatically with
+  `INHERIT`, or after a `SET ROLE` with `NOINHERIT` — and so bypasses RLS on the
+  owner's enabled-but-not-`FORCE`'d tables (live-proven on PG16; `FORCE` is the
+  exact non-leak boundary). The table-owner analog of SEC029, it fires once per
+  reachable member role (location = the member name), restricted to owners and
+  members that are NOT superuser/`BYPASSRLS` (which keeps it disjoint from
+  SEC016/SEC029), and co-fires with SEC002 — which reports the table — on the
+  same missing-`FORCE` misconfiguration by design. Configurable via
+  `[lint.rules.SEC048]` `allowlist` (trusted member roles) and
+  `trusted_owner_roles` (expected shared owners); no auto-fix. Snapshot v21 adds
+  per-table `owner` and the top-level `owner_reachable_members` closure
+  (additive, fail-closed: a pre-v21 snapshot abstains until re-captured).
 
 ## [0.40.1] - 2026-06-20
 

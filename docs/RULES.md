@@ -3205,6 +3205,83 @@ low_trust_roles = ["anon", "PUBLIC"]
 allowlist = ["public.events", "events_account_id_fkey"]
 ```
 
+<a id="rule-sec048"></a>
+
+## SEC048 — Low-trust role can reach an RLS table's owner that is not FORCE'd
+
+**Severity:** warning
+
+A role that **owns** a table bypasses that table's row-level security
+unless `FORCE ROW LEVEL SECURITY` is set (the same boundary
+[SEC002](#rule-sec002) flags on the table). The `BYPASSRLS` *attribute*
+[SEC029](#rule-sec029) covers is never inherited through role
+membership — but owner *privileges* are: a role that is a member,
+directly or transitively, of the owning role inherits its ownership
+(with `INHERIT` automatically; with `NOINHERIT` after a single
+`SET ROLE`) and so bypasses RLS on every one of that owner's
+enabled-but-not-forced tables. SEC048 is the **table-owner analog of
+SEC029**:
+
+```sql
+CREATE ROLE app_owner NOLOGIN;          -- owns the tables
+CREATE ROLE app LOGIN;                   -- the application's login role
+GRANT app_owner TO app;                  -- app inherits ownership
+-- app_owner owns `orders` with RLS ENABLEd but NOT FORCEd
+--   → `app` reads every tenant's rows of `orders`, RLS notwithstanding
+```
+
+`app` holds no `BYPASSRLS` attribute (SEC016/SEC029 stay silent —
+attributes aren't inherited), yet because it is a member of the table
+owner it bypasses RLS on the owner's not-forced tables. Live-proven on
+PostgreSQL 16: a non-superuser/non-`BYPASSRLS` LOGIN member of the
+owner read **all** rows of an `ENABLE`d-but-not-`FORCE`'d table; after
+`ALTER TABLE … FORCE ROW LEVEL SECURITY` the same role saw **zero**
+rows — `FORCE` is the exact non-leak boundary.
+
+SEC048 fires once per reachable member role `M` such that **all** hold:
+
+1. there is a table `T` in the scanned schemas with RLS enabled and
+   `FORCE` off;
+2. `M` is in the transitive `pg_auth_members` closure of `owner(T)`
+   (any membership edge — `INHERIT` or not, since `NOINHERIT` still
+   permits `SET ROLE`, matching SEC029's stance);
+3. `owner(T)` is **not** superuser and **not** `BYPASSRLS` (those are
+   [SEC016](#rule-sec016)/SEC029 territory — excluding them keeps
+   SEC048 disjoint from SEC029); and
+4. `M` is **not** superuser and **not** `BYPASSRLS` (it already
+   bypasses unconditionally — SEC016/SEC029 again).
+
+The finding's `location` is the member role name (a role-graph rule,
+like SEC029). SEC048 is **mutually independent of SEC002** and the two
+co-fire on the same missing-`FORCE` misconfiguration by design: SEC002
+(error) reports the table, SEC048 (warning) reports each role that can
+reach its owner — the same intentional over-report as the
+SEC001/SEC032/SEC043 co-fire. SEC048 cedes nothing, so no rule-
+interaction gap can open.
+
+**Remediation.** Run `ALTER TABLE … FORCE ROW LEVEL SECURITY` on the
+owner's tables (re-applies RLS even to the owner and its members),
+revoke the membership, or allowlist the member / owner. There is no
+auto-fix — whether to `FORCE` the tables, revoke the membership, or
+accept the route is an operational decision pgrls cannot make.
+
+The reachable-member closure is computed at introspection time and
+stored on the snapshot (v21+); a pre-v21 snapshot loads it empty and
+SEC048 abstains until the snapshot is re-captured against a live
+database (fail-closed).
+
+**Configuration** (`[lint.rules.SEC048]`):
+
+```toml
+[lint.rules.SEC048]
+# Member role names trusted to reach an owner (unqualified — roles are
+# cluster-global). Default empty.
+allowlist = ["ops_admin"]
+# Owning roles whose reachability is expected (a deliberately shared owner),
+# suppressing every member that reaches only such owners. Default empty.
+trusted_owner_roles = ["app_owner"]
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

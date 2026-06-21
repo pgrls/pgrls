@@ -961,6 +961,44 @@ CREATE POLICY anon_insert ON public.allbad_sec047_child
     WITH CHECK (id > 0);
 GRANT INSERT ON public.allbad_sec047_child TO anon;
 
+-- SEC048: a low-trust role that is a member of a table owner that is NOT
+-- superuser/BYPASSRLS bypasses RLS on that owner's enabled-but-not-FORCE'd
+-- tables. The BYPASSRLS attribute SEC029 covers is never inherited through
+-- membership, but owner PRIVILEGES are: a member of the owning role inherits
+-- its ownership (with INHERIT automatically, or with NOINHERIT after a SET
+-- ROLE) and reads every row regardless of policy (live-proven on PG16, where
+-- FORCE is the exact non-leak boundary). SEC048 fires per reachable member,
+-- location = the member role name `allbad_sec048_member`.
+--
+-- `allbad_sec048_owner` is a non-superuser/non-BYPASSRLS role (so it is
+-- distinct from the SEC016/SEC029 BYPASSRLS surface — keeping SEC048 disjoint
+-- from SEC029). It OWNS `allbad_sec048_owned`, which has RLS ENABLEd but NOT
+-- FORCE'd. The table is created by the (superuser) migration role and then
+-- `ALTER TABLE ... OWNER TO` the owner — so the owner needs no schema GRANT
+-- (no DROP ROLE dependency, since the DROP SCHEMA public CASCADE in the
+-- test's finally drops the table, then the roles are dropped there too). The
+-- table carries a tenant-scoped policy on a NOT NULL indexed column so
+-- SEC005/SEC009/SEC030/PERF003 stay quiet, leaving only SEC002 on it (RLS on,
+-- FORCE off — exactly the missing-FORCE misconfig SEC048 reports from the
+-- role side, the documented SEC002/SEC048 co-fire). SEC002's pinned location
+-- stays `public.allbad_sec002`, so the extra SEC002 firing here is
+-- silent-by-design, like the SEC047 block's SEC039/SEC007 co-firings.
+DROP ROLE IF EXISTS allbad_sec048_member;
+DROP ROLE IF EXISTS allbad_sec048_owner;
+CREATE ROLE allbad_sec048_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
+CREATE ROLE allbad_sec048_member LOGIN NOSUPERUSER NOBYPASSRLS;
+GRANT allbad_sec048_owner TO allbad_sec048_member;
+CREATE TABLE public.allbad_sec048_owned (
+    id bigint PRIMARY KEY,
+    tenant_id uuid NOT NULL
+);
+CREATE INDEX ON public.allbad_sec048_owned (tenant_id);
+ALTER TABLE public.allbad_sec048_owned OWNER TO allbad_sec048_owner;
+ALTER TABLE public.allbad_sec048_owned ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.allbad_sec048_owned
+    FOR SELECT
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl

@@ -78,13 +78,14 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 20,
+        "version": 21,
         "tables": [
             {
                 "schema": "public",
                 "name": "orders",
                 "rls_enabled": True,
                 "force_rls": False,
+                "owner": "",
                 "columns": [],
                 "partition_of": None,
                 "grants": [],
@@ -113,6 +114,7 @@ def test_schema_to_snapshot_shape() -> None:
         "bypassrls_escalation_roles": [],
         "default_privileges": [],
         "immutable_functions": [],
+        "owner_reachable_members": [],
     }
 
 
@@ -238,15 +240,17 @@ def test_snapshot_includes_table_columns() -> None:
     assert snap["tables"][0]["columns"] == ["id", "email"]
 
 
-def test_snapshot_version_is_twenty_after_foreign_keys_capture() -> None:
-    # SNAPSHOT_VERSION bumped 19 → 20 to add per-table foreign_keys
-    # (pg_constraint contype='f' on the child) so SEC047 can flag a FK to an
-    # RLS-enabled parent (an existence covert channel via FK validation, which
-    # bypasses RLS). Pin the new version so a future bump is deliberate. (v19
-    # added immutable_functions for SEC046; v18 added default_privileges for
-    # SEC044; v17 added Table.inherits for SEC043.)
+def test_snapshot_version_is_twenty_one_after_owner_capture() -> None:
+    # SNAPSHOT_VERSION bumped 20 → 21 to add per-table owner
+    # (pg_get_userbyid(relowner)) plus top-level owner_reachable_members so
+    # SEC048 can flag a low-trust role that reaches a non-FORCE'd table owner
+    # through membership (owner privileges, unlike the BYPASSRLS attribute, are
+    # inherited). Pin the new version so a future bump is deliberate. (v20
+    # added foreign_keys for SEC047; v19 added immutable_functions for SEC046;
+    # v18 added default_privileges for SEC044; v17 added Table.inherits for
+    # SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 20
+    assert snap["version"] == 21
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -766,6 +770,91 @@ def test_foreign_keys_absent_in_pre_v20_snapshot_loads_empty() -> None:
     assert t.foreign_keys == ()
 
 
+def test_v21_table_owner_and_owner_reachable_members_round_trip() -> None:
+    # v21: per-table `owner` (emitted unconditionally, like rls_enabled) plus
+    # top-level `owner_reachable_members` (always emitted, like the other role
+    # arrays) for SEC048. A schema carrying both must encode byte-stably and
+    # decode back to an equal Schema.
+    import json
+
+    from pgrls.model import OwnerReachableMember
+
+    schema = Schema(
+        tables=(
+            Table(
+                schema="public",
+                name="orders",
+                rls_enabled=True,
+                force_rls=False,
+                policies=(),
+                owner="app_owner",
+            ),
+        ),
+        owner_reachable_members=(
+            OwnerReachableMember(
+                member="app",
+                via_owners=("app_owner", "report_owner"),
+                member_can_login=True,
+            ),
+            OwnerReachableMember(
+                member="batch",
+                via_owners=("app_owner",),
+                member_can_login=False,
+            ),
+        ),
+    )
+    snap = schema.to_snapshot()
+    assert snap["version"] == 21
+    assert snap["tables"][0]["owner"] == "app_owner"
+    assert snap["owner_reachable_members"] == [
+        {
+            "member": "app",
+            "via_owners": ["app_owner", "report_owner"],
+            "member_can_login": True,
+        },
+        {
+            "member": "batch",
+            "via_owners": ["app_owner"],
+            "member_can_login": False,
+        },
+    ]
+    # Byte-stable JSON encode→decode→re-encode is an identity (no tuple/ASCII
+    # leakage), and from_snapshot reconstructs an equal Schema.
+    encoded = json.dumps(snap, ensure_ascii=False)
+    restored = Schema.from_snapshot(json.loads(encoded))
+    assert restored == schema
+    assert json.dumps(restored.to_snapshot(), ensure_ascii=False) == encoded
+
+
+def test_v21_owner_reachable_members_always_emitted_when_empty() -> None:
+    # The top-level array is always present (an empty list when there are no
+    # reachable members), like bypassrls_escalation_roles / default_privileges
+    # — not conditionally omitted like per-table inherits/foreign_keys.
+    snap = Schema().to_snapshot()
+    assert snap["owner_reachable_members"] == []
+
+
+def test_pre_v21_snapshot_loads_empty_owner_and_members() -> None:
+    # A v20 snapshot has no per-table `owner` key and no
+    # `owner_reachable_members` key → table owner loads as "" and the closure
+    # loads as () so SEC048 abstains (fail-closed) until re-captured.
+    snap = {
+        "version": 20,
+        "tables": [
+            {
+                "schema": "public",
+                "name": "orders",
+                "rls_enabled": True,
+                "force_rls": False,
+            }
+        ],
+        "policies": [],
+    }
+    restored = Schema.from_snapshot(snap)
+    assert restored.tables[0].owner == ""
+    assert restored.owner_reachable_members == ()
+
+
 def test_default_privileges_round_trip_through_snapshot() -> None:
     # v18: top-level default_privileges (from pg_default_acl) serialize and
     # decode for SEC044, including a cluster-wide entry (schema=None → null)
@@ -903,8 +992,9 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "bypassrls_escalation_roles",
         "default_privileges",
         "immutable_functions",
+        "owner_reachable_members",
     }
-    assert snap["version"] == 20
+    assert snap["version"] == 21
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -923,6 +1013,7 @@ def test_snapshot_v7_table_entry_keys_are_stable() -> None:
         "name",
         "rls_enabled",
         "force_rls",
+        "owner",
         "columns",
         "partition_of",
         "grants",
@@ -1222,7 +1313,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 20
+    assert snap["version"] == SNAPSHOT_VERSION == 21
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

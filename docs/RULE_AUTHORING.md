@@ -334,7 +334,7 @@ needed, but worth knowing the tests exist):
 | [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours — *unless* your rule is opt-in / artifact-gated (it fires only when lint is handed an artifact, like HYG004 and PERF005), in which case add its ID to that test's exemption set. The `test_explain_covers_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
-count (`57 lint rules`, `fifty-seven rules`, etc. — the phrasing
+count (`61 lint rules`, `sixty-one rules`, etc. — the phrasing
 that actually appears in README.md and AGENTS.md) is cheap insurance
 against missing a doc spot.
 

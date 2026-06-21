@@ -655,8 +655,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 60 rules ship today (catalog header should say so).
-    assert "<strong>60</strong> rules" in result.output
+    # 61 rules ship today (catalog header should say so).
+    assert "<strong>61</strong> rules" in result.output
     # Header carries the auto-fixable count (18 as of v0.32.0; SEC004 fixer).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -2005,6 +2005,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC046  public.allbad_sec046.tenant_scope\n",
             "SEC047  public.allbad_sec047_child "
             "(allbad_sec047_child_parent_id_fkey)\n",
+            "SEC048  allbad_sec048_member\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF004  public.allbad_perf004.by_email\n",
@@ -2042,6 +2043,11 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "DROP ROLE IF EXISTS allbad_sec040_role; "
             "DROP ROLE IF EXISTS allbad_sec041_role; "
             "DROP ROLE IF EXISTS allbad_sec043_role; "
+            # SEC048 owner+member roles. The schema CASCADE above already
+            # dropped the owner's table (`ALTER TABLE … OWNER TO` gave the
+            # role no schema GRANT, so no DROP ROLE dependency survives).
+            "DROP ROLE IF EXISTS allbad_sec048_member; "
+            "DROP ROLE IF EXISTS allbad_sec048_owner; "
             "DROP ROLE IF EXISTS anon"
         )
 

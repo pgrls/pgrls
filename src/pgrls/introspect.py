@@ -21,6 +21,7 @@ from pgrls.model import (
     ImmutableFunction,
     Index,
     LeakproofFunction,
+    OwnerReachableMember,
     Policy,
     Schema,
     SecdefFunction,
@@ -113,6 +114,7 @@ SELECT
     c.relname AS table_name,
     c.relrowsecurity AS rls_enabled,
     c.relforcerowsecurity AS force_rls,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
     c.oid AS table_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -738,6 +740,68 @@ WHERE tgt.rolbypassrls
 ORDER BY mem.rolname, tgt.rolname
 """
 
+# Low-trust roles that can reach a table owner that is NOT FORCE'd — the
+# SEC048 surface. A role that OWNS a table bypasses that table's RLS unless
+# `FORCE ROW LEVEL SECURITY` is set (the SEC002 boundary). Owner *privileges*
+# — unlike the BYPASSRLS role *attribute* SEC029 covers — ARE reachable
+# through membership: a member of the owning role inherits its ownership (with
+# INHERIT automatically; with NOINHERIT after a SET ROLE) and so bypasses RLS
+# on the owner's enabled-but-not-forced tables (live-proven: a non-super/
+# non-bypassrls LOGIN member of the owner read ALL rows of an ENABLEd-but-not-
+# FORCEd table; FORCE is the exact non-leak boundary).
+#
+# `owner_roles` is the set of roles that own an enabled-not-forced RLS table
+# IN the scanned schemas, EXCLUDING superuser/BYPASSRLS owners — those are
+# SEC016/SEC029 territory, and excluding them keeps SEC048 strictly disjoint
+# from SEC029. `reach(member, roleid)` is the transitive `pg_auth_members`
+# closure (member can SET ROLE to / inherit roleid); the final join keeps only
+# members that reach an `owner_roles` member, EXCLUDING superuser/BYPASSRLS
+# members (they already bypass unconditionally — SEC016/SEC029 again).
+#
+# All `pg_auth_members` edges are treated as reachable, exactly as
+# `_BYPASSRLS_ESCALATION_SQL`: on PG16+ a `WITH SET FALSE` membership does not
+# permit SET ROLE, so this can over-approximate there — the same deliberate
+# warning-bias (a false positive is one allowlist entry; a false negative is a
+# missed bypass). `pg_auth_members`, `pg_roles`, and `pg_class` are readable by
+# every connected role, so no superuser is needed. The schema list is the only
+# parameter (owners are restricted to tables in scope); members are
+# cluster-global. ORDER BY for snapshot determinism.
+_OWNER_REACHABLE_MEMBERS_SQL = """
+WITH RECURSIVE owner_roles AS (
+    SELECT DISTINCT c.relowner AS owner_oid
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_roles o ON o.oid = c.relowner
+    WHERE c.relkind IN ('r', 'p')
+      AND c.relrowsecurity
+      AND NOT c.relforcerowsecurity
+      AND n.nspname = ANY(%s)
+      AND NOT o.rolsuper
+      AND NOT o.rolbypassrls
+),
+memberships(member, roleid) AS (
+    SELECT member, roleid FROM pg_catalog.pg_auth_members
+),
+reach(member, roleid) AS (
+    SELECT member, roleid FROM memberships
+    UNION
+    SELECT r.member, m.roleid
+    FROM reach r
+    JOIN memberships m ON m.member = r.roleid
+)
+SELECT
+    mem.rolname AS member,
+    mem.rolcanlogin AS member_can_login,
+    own.rolname AS via_owner
+FROM reach
+JOIN owner_roles orl ON orl.owner_oid = reach.roleid
+JOIN pg_catalog.pg_roles mem ON mem.oid = reach.member
+JOIN pg_catalog.pg_roles own ON own.oid = reach.roleid
+WHERE NOT mem.rolsuper
+  AND NOT mem.rolbypassrls
+ORDER BY mem.rolname, own.rolname
+"""
+
 # Functions carrying the LEAKPROOF attribute in the configured
 # schemas. A LEAKPROOF function tells the planner it has no side
 # channels, so the planner may evaluate it below a security barrier
@@ -976,6 +1040,42 @@ def _fetch_bypassrls_escalation_roles(
         BypassRlsEscalation(
             member=member,
             via=tuple(by_member[member]["via"]),
+            member_can_login=by_member[member]["can_login"],
+        )
+        for member in order
+    )
+
+
+def _fetch_owner_reachable_members(
+    cur: Any, schemas: list[str]
+) -> tuple[OwnerReachableMember, ...]:
+    """Fetch low-trust roles that can reach a non-FORCE'd table's owner.
+
+    The SQL returns one (member, via_owner) row per reachable owner,
+    ordered by member then owner. Group consecutive rows by member into
+    one `OwnerReachableMember` each, preserving the owner ordering as the
+    `via_owners` tuple (mirrors `_fetch_bypassrls_escalation_roles`).
+
+    Takes the scanned `schemas` because the owner set is restricted to
+    owners of enabled-not-forced RLS tables in those schemas; the
+    membership closure over those owners is otherwise cluster-global.
+    """
+    cur.execute(_OWNER_REACHABLE_MEMBERS_SQL, [list(schemas)])
+    by_member: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in cur.fetchall():
+        member = row["member"]
+        if member not in by_member:
+            by_member[member] = {
+                "via_owners": [],
+                "can_login": row["member_can_login"],
+            }
+            order.append(member)
+        by_member[member]["via_owners"].append(row["via_owner"])
+    return tuple(
+        OwnerReachableMember(
+            member=member,
+            via_owners=tuple(by_member[member]["via_owners"]),
             member_can_login=by_member[member]["can_login"],
         )
         for member in order
@@ -1345,6 +1445,12 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         bypassrls_escalation = _fetch_bypassrls_escalation_roles(cur)
         default_privileges = _fetch_default_privileges(cur, schemas)
         immutable_funcs = _fetch_immutable_functions(cur, schemas)
+        # SEC048's owner-reachability closure is schema-scoped (its owner set
+        # is restricted to enabled-not-forced RLS tables in `schemas`) but
+        # independent of the per-table OID queries below, so fetch it here
+        # alongside the other role/schema-scoped sets and share it across both
+        # the no-tables early return and the main path.
+        owner_reachable = _fetch_owner_reachable_members(cur, schemas)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1361,6 +1467,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 bypassrls_escalation_roles=bypassrls_escalation,
                 default_privileges=default_privileges,
                 immutable_functions=immutable_funcs,
+                owner_reachable_members=owner_reachable,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1561,6 +1668,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             foreign_keys=tuple(
                 foreign_keys_by_oid.get(row["table_oid"], [])
             ),
+            owner=row["owner_name"],
         )
         for row in table_rows
     ]
@@ -1574,4 +1682,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         bypassrls_escalation_roles=bypassrls_escalation,
         default_privileges=default_privileges,
         immutable_functions=immutable_funcs,
+        owner_reachable_members=owner_reachable,
     )

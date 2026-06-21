@@ -39,7 +39,7 @@ def test_to_snapshot_emits_grants_field() -> None:
     # 13 → 14 (separate schema_name/function_name on those functions).
     # The grants test is about content, not version — pin the
     # latest so a future bump is deliberate.
-    assert snap["version"] == 20
+    assert snap["version"] == 21
     table = snap["tables"][0]
     assert table["grants"] == [
         {"role": "authenticated", "privileges": ["SELECT", "INSERT"]}
