@@ -68,8 +68,12 @@ allowlist = ["reporting"]
 
 Severity: warning — a least-privilege / defense-in-depth posture, like the
 other "RLS can be bypassed via X" rules; the exposure only lands if a future
-table also forgets RLS. No auto-fix: whether to REVOKE the default or keep it
-(scoping to a role) is a deployment decision pgrls cannot make safely.
+table also forgets RLS. Auto-fixable (``pgrls fix``, via ``fixers/sec044.py``):
+pgrls emits the matching ``REVOKE`` — a strictly *narrowing* fix that, since
+default privileges are not retroactive, changes no existing table. It is
+dry-run by default; the REVOKE removes the default outright, so an operator who
+instead wants to keep a default *scoped* to a specific role does that manually
+rather than applying it.
 
 Scope / known limits (intentional):
 

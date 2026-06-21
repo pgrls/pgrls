@@ -23,6 +23,16 @@ breaking changes — they will be called out in this file.
   rule per `--mode` (`pgrls-probe-anon` / `-cross-tenant` / `-write`), kept
   distinct from the static `verify` SARIF rules. Reuses lint's `format_sarif`
   projection, so the SARIF schema and driver block stay in one place.
+- **`pgrls fix` now auto-remediates SEC044** (default privileges grant future
+  tables to a low-trust role) — the **20th** auto-fixable rule. It emits the
+  matching `ALTER DEFAULT PRIVILEGES [FOR ROLE <grantor>] [IN SCHEMA <s>] REVOKE
+  <row-access privs> ON TABLES FROM <grantee>`, a strictly *narrowing* fix that
+  never widens access and — because default privileges are not retroactive —
+  changes no existing table (only the standing future-facing grant). Only the
+  row-access privileges the rule flags are revoked; a co-granted
+  REFERENCES/TRIGGER/TRUNCATE default is left alone. The `FOR ROLE <grantor>`
+  clause is emitted whenever the grantor is known (a bare REVOKE clears only the
+  running role's own default). Auto-fixable count → **20 of 61** rules.
 - **SEC048 (61st rule, warning)** — *low-trust role can reach an RLS table's
   owner that is not FORCE'd*. A role that OWNS a table bypasses that table's RLS
   unless `FORCE ROW LEVEL SECURITY` is set, and owner privileges (unlike the

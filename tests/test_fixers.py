@@ -30,9 +30,19 @@ from pgrls.fixers.sec030 import SEC030Fixer
 from pgrls.fixers.sec010 import SEC010Fixer
 from pgrls.fixers.sec031 import SEC031Fixer
 from pgrls.fixers.sec032 import SEC032Fixer
+from pgrls.fixers.sec044 import SEC044Fixer
 from pgrls.fixers.view001 import VIEW001Fixer
 from pgrls.fixers.view002 import VIEW002Fixer
-from pgrls.model import Column, Index, Policy, Schema, Table, View
+from pgrls.model import (
+    Column,
+    DefaultPrivilege,
+    Index,
+    Policy,
+    Schema,
+    Table,
+    View,
+)
+from pgrls.rules.sec044 import SEC044
 
 
 # ---------- SEC002 fixer ----------
@@ -4436,3 +4446,157 @@ def test_sec004_fix_honors_auth_functions_config() -> None:
     [f] = SEC004Fixer().fix(schema, {"auth_functions": ["my.uid"]})
     assert "USING (owner_id = my.uid())" in f.sql
     assert "IS NULL" not in f.sql
+
+
+# --- SEC044 fixer (REVOKE a default-privilege grant to a low-trust role) ---
+
+
+def _dp(
+    *,
+    schema: str | None = "public",
+    grantee: str = "PUBLIC",
+    privileges: tuple[str, ...] = ("SELECT",),
+    grantor: str | None = "app_owner",
+) -> DefaultPrivilege:
+    return DefaultPrivilege(
+        schema=schema,
+        grantee=grantee,
+        privileges=privileges,
+        grantor=grantor,
+    )
+
+
+def _dp_schema(*entries: DefaultPrivilege) -> Schema:
+    return Schema(tables=(), default_privileges=entries)
+
+
+def test_sec044_fix_revokes_public_schema_default() -> None:
+    schema = _dp_schema(_dp())
+    [f] = SEC044Fixer().fix(schema, {})
+    assert f.rule_id == "SEC044"
+    assert f.location == "public"
+    assert f.sql == (
+        "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public "
+        "REVOKE SELECT ON TABLES FROM PUBLIC;"
+    )
+    # A REVOKE re-emits no policy clause, so the clause-clobber resolver
+    # leaves it alone (mirrors the DROP fixers).
+    assert f.clauses == frozenset()
+
+
+def test_sec044_fix_only_revokes_row_access_privileges() -> None:
+    # A default of SELECT + REFERENCES is flagged for SELECT only; the fix
+    # must revoke SELECT and leave the (non-row-access) REFERENCES default.
+    schema = _dp_schema(_dp(privileges=("SELECT", "REFERENCES")))
+    [f] = SEC044Fixer().fix(schema, {})
+    assert "REVOKE SELECT ON TABLES" in f.sql
+    assert "REFERENCES" not in f.sql
+
+
+def test_sec044_fix_preserves_multiple_row_access_privileges() -> None:
+    schema = _dp_schema(_dp(privileges=("INSERT", "UPDATE", "DELETE")))
+    [f] = SEC044Fixer().fix(schema, {})
+    assert "REVOKE INSERT, UPDATE, DELETE ON TABLES FROM PUBLIC" in f.sql
+
+
+def test_sec044_fix_cluster_wide_no_grantor_omits_for_role_and_schema() -> None:
+    # schema=None → no IN SCHEMA, location is the sentinel; grantor=None →
+    # no FOR ROLE clause (the operator must run it as the creating role).
+    schema = _dp_schema(
+        _dp(schema=None, privileges=("INSERT",), grantor=None)
+    )
+    [f] = SEC044Fixer().fix(schema, {})
+    assert f.location == "(cluster-wide)"
+    assert f.sql == (
+        "ALTER DEFAULT PRIVILEGES REVOKE INSERT ON TABLES FROM PUBLIC;"
+    )
+    assert "FOR ROLE" in f.description or "grantor is unknown" in f.description
+
+
+def test_sec044_fix_abstains_on_non_default_grantee() -> None:
+    # anon is NOT in the default low-trust set ({PUBLIC}); the rule wouldn't
+    # fire, so neither does the fixer.
+    schema = _dp_schema(_dp(grantee="anon"))
+    assert SEC044Fixer().fix(schema, {}) == []
+
+
+def test_sec044_fix_honors_grantees_option() -> None:
+    # Widen the low-trust set to include anon → the anon default now fixes.
+    schema = _dp_schema(_dp(grantee="anon"))
+    [f] = SEC044Fixer().fix(schema, {"grantees": ["PUBLIC", "anon"]})
+    assert "FROM anon" in f.sql
+
+
+def test_sec044_fix_abstains_on_only_non_row_access_privileges() -> None:
+    # A default of only REFERENCES/TRIGGER neither reads nor writes rows →
+    # not a row-exposure → no fix.
+    schema = _dp_schema(_dp(privileges=("REFERENCES", "TRIGGER")))
+    assert SEC044Fixer().fix(schema, {}) == []
+
+
+def test_sec044_fix_allowlist_skips_schema() -> None:
+    schema = _dp_schema(_dp(schema="public"))
+    assert SEC044Fixer().fix(schema, {"allowlist": ["public"]}) == []
+
+
+def test_sec044_fix_dedupes_same_triple() -> None:
+    # Two records for the same (schema, grantee, grantor) collapse to one fix.
+    schema = _dp_schema(_dp(), _dp())
+    assert len(SEC044Fixer().fix(schema, {})) == 1
+
+
+def test_sec044_fix_distinct_grantor_emits_two_fixes() -> None:
+    # Same schema + grantee but different grantor are distinct pg_default_acl
+    # rows, each needing its own FOR ROLE REVOKE.
+    schema = _dp_schema(_dp(grantor="owner_a"), _dp(grantor="owner_b"))
+    fixes = SEC044Fixer().fix(schema, {})
+    assert len(fixes) == 2
+    assert {f.sql for f in fixes} == {
+        "ALTER DEFAULT PRIVILEGES FOR ROLE owner_a IN SCHEMA public "
+        "REVOKE SELECT ON TABLES FROM PUBLIC;",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE owner_b IN SCHEMA public "
+        "REVOKE SELECT ON TABLES FROM PUBLIC;",
+    }
+
+
+def test_sec044_fix_quotes_identifiers_needing_quoting() -> None:
+    # A grantor / schema / real-role grantee that needs quoting is
+    # identifier-quoted; PUBLIC is never quoted (it's a keyword).
+    schema = _dp_schema(
+        _dp(
+            schema="My Schema",
+            grantee="Weird Role",
+            grantor="The Owner",
+        )
+    )
+    [f] = SEC044Fixer().fix(
+        schema, {"grantees": ["PUBLIC", "Weird Role"]}
+    )
+    assert '"My Schema"' in f.sql
+    assert '"Weird Role"' in f.sql
+    assert '"The Owner"' in f.sql
+
+
+def test_sec044_fixer_fires_on_exactly_the_rule_findings() -> None:
+    # Parity: across a mixed schema, the fixer's locations equal the rule's
+    # violation locations (no over- or under-fixing).
+    schema = _dp_schema(
+        _dp(),  # public PUBLIC SELECT → flagged + fixed
+        _dp(schema=None, privileges=("INSERT",), grantor=None),  # cluster-wide
+        _dp(grantee="anon"),  # not low-trust → neither
+        _dp(privileges=("TRIGGER",)),  # non-row-access → neither
+    )
+    rule_locs = {v.location for v in SEC044().check(schema, {})}
+    fix_locs = {f.location for f in SEC044Fixer().fix(schema, {})}
+    assert fix_locs == rule_locs == {"public", "(cluster-wide)"}
+
+
+def test_generate_fixes_includes_sec044_revoke() -> None:
+    # End-to-end through the default fixer set: a SEC044-triggering default
+    # produces the REVOKE (confirms the fixer is wired in and not suppressed).
+    schema = _dp_schema(_dp())
+    sqls = [f.sql for f in generate_fixes(schema, {})]
+    assert any(
+        s.startswith("ALTER DEFAULT PRIVILEGES") and "REVOKE SELECT" in s
+        for s in sqls
+    )
