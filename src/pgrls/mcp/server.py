@@ -6,16 +6,19 @@ existing pgrls internals (`rules`, `verify`, `formatters`). Importing this
 module pulls in the optional `fastmcp` extra, so `pgrls.cli` imports it lazily,
 inside `pgrls mcp` — a plain `pip install pgrls` never touches FastMCP.
 
-SAFETY POSTURE — READ-ONLY / DIAGNOSTIC-ONLY (hard constraints):
+SAFETY POSTURE — NEVER MUTATES A DATABASE (hard constraint):
 
-* The server NEVER mutates a database. It exposes only `lint`, `verify`,
-  `explain_rule`, and `list_rules`. `fix` / `generate` / `diff --apply` /
-  `verify --probe` (anything that writes SQL or mutates state) are deliberately
-  NOT exposed.
+* The server NEVER executes a statement that changes database state. It exposes
+  `lint`, `verify`, `explain_rule`, `list_rules` (analysis), plus `fix` and
+  `generate`, which are **emit-only**: they RETURN remediation / scaffold SQL as
+  text for the agent to review and run itself — they never apply it. The actual
+  mutation paths (`fix --apply`, `generate --apply`, `diff --apply`,
+  `verify --probe`) remain deliberately unexposed; an agent that wants to apply
+  the returned SQL does so through its own reviewed channel.
 * `database_url` is treated as a credential: it is never logged, never echoed
   back, and database errors are sanitized (see `_schema_sources`). The
-  introspection it triggers issues only SELECTs against the catalogs over a
-  short-lived connection.
+  introspection it triggers — on every tool, including `fix` / `generate` —
+  issues only SELECTs against the catalogs over a short-lived connection.
 * Every tool wraps its body so any failure returns a STRUCTURED error object
   (`{"error": {"kind": ..., "message": ...}}`) rather than raising — a raised
   exception would otherwise break the stdio JSON-RPC loop.
@@ -283,6 +286,195 @@ def verify(
 
 
 # ---------------------------------------------------------------------------
+# Remediation tools — EMIT-ONLY (return SQL text, never execute it)
+# ---------------------------------------------------------------------------
+
+
+@_safe_tool
+def fix(
+    sql: str | None = None,
+    database_url: str | None = None,
+    snapshot: str | None = None,
+    schemas: list[str] | None = None,
+    rules: list[str] | None = None,
+    exclude_rules: list[str] | None = None,
+) -> dict[str, Any]:
+    """Emit auto-fix SQL for the mechanically-fixable RLS findings.
+
+    The remediation counterpart of ``lint``: for every finding pgrls can fix
+    mechanically (20 of the rules — SEC001/SEC002/SEC004/SEC006/SEC010/SEC011/
+    SEC015/SEC017/SEC019/SEC020/SEC030/SEC031/SEC032/SEC044/PERF001/PERF003/
+    PERF004/HYG003/VIEW001/VIEW002), returns the exact SQL that closes it.
+
+    EMIT-ONLY: this returns SQL text for you to review and apply yourself — it
+    never touches the database (the live path issues read-only introspection
+    SELECTs only, same as ``lint``). Each fix is strictly remediating: pgrls's
+    fixers only ever narrow access (close a leak / drop an inert policy / revoke
+    an over-broad grant), never broaden it.
+
+    Provide EXACTLY ONE schema source (``sql`` / ``database_url`` / ``snapshot``
+    — same semantics as ``lint``). ``rules`` / ``exclude_rules`` restrict which
+    rules' fixes are emitted (rule ids; non-fixable ids simply produce nothing).
+
+    Returns ``{schema_source, count, fixes: [{rule_id, location, sql,
+    description}], migration, warnings}``. ``migration`` is the same statements
+    rendered as one copy-pasteable ``.sql`` file (header + body); it is ``""``
+    when there is nothing to fix. As with ``lint``, on the ``sql`` path
+    ``warnings`` notes that catalog-only rules cannot fire, so an empty
+    ``fixes`` list is NOT a proof that the schema is clean.
+    """
+    from pgrls import __version__
+    from pgrls.fixers import generate_fixes, render_migration
+
+    schema, source = resolve_schema(
+        sql=sql,
+        database_url=database_url,
+        snapshot=snapshot,
+        schemas=tuple(schemas) if schemas else None,
+    )
+
+    rule_filter, exclude_filter, err = _resolve_rule_filters(rules, exclude_rules)
+    if err is not None:
+        return err
+
+    # `generate_fixes` validates each fixer's allowlist option with the rule's
+    # strict parser; pass empty rule options (the server has no config-file
+    # concept on this path) so every fixer runs with its defaults.
+    fixes = generate_fixes(schema, {}, rule_filter=rule_filter)
+    if exclude_filter:
+        fixes = [f for f in fixes if f.rule_id not in exclude_filter]
+
+    return {
+        "schema_source": source,
+        "count": len(fixes),
+        "fixes": [
+            {
+                "rule_id": f.rule_id,
+                "location": f.location,
+                "sql": f.sql,
+                "description": f.description,
+            }
+            for f in fixes
+        ],
+        "migration": (
+            render_migration(fixes, tool_version=__version__) if fixes else ""
+        ),
+        "warnings": schema_source_warnings(source),
+    }
+
+
+@_safe_tool
+def generate(
+    sql: str | None = None,
+    database_url: str | None = None,
+    snapshot: str | None = None,
+    schemas: list[str] | None = None,
+    tenant_column: str = "tenant_id",
+    model: str = "tenant",
+    convention: str = "app-guc",
+    setting_name: str | None = None,
+    auth_function: str = "auth.uid",
+    role: str = "authenticated",
+    restrictive: bool = True,
+    tables: list[str] | None = None,
+) -> dict[str, Any]:
+    """Scaffold gold-standard RLS for unprotected multi-tenant / row-owner tables.
+
+    For every table that has the discriminator column but no row security yet,
+    emits ``ENABLE`` + ``FORCE ROW LEVEL SECURITY``, a permissive tenant- (or
+    owner-) isolation policy, a restrictive floor, and a supporting index — SQL
+    that lints clean by construction. The headline use for an agent: stop
+    hand-writing RLS, generate the correct shape and lint it.
+
+    EMIT-ONLY: returns SQL text for you to review and apply yourself; it never
+    touches the database (the live path is read-only introspection, same as
+    ``lint``). A table that already has ANY policy is skipped (never clobbered)
+    and reported in ``skipped``.
+
+    Provide EXACTLY ONE schema source (``sql`` / ``database_url`` / ``snapshot``).
+    Knobs (all optional): ``tenant_column`` (default ``tenant_id``); ``model``
+    (``tenant`` | ``owner``); ``convention`` (``app-guc`` | ``postgrest`` |
+    ``supabase``) selecting the session-value source; ``setting_name`` to
+    override the derived GUC/claim; ``auth_function`` (owner/supabase model;
+    default ``auth.uid``); ``role`` (default ``authenticated`` — never
+    ``PUBLIC``); ``restrictive`` (emit the restrictive floor, default true);
+    ``tables`` for per-table column overrides, each ``"schema.table:column"``.
+
+    Returns ``{schema_source, count, statements: [{rule_id, location, sql,
+    description}], migration, skipped: [{table, reason}], notes, warnings}``.
+    ``migration`` is the statements as one copy-pasteable ``.sql`` file (``""``
+    when nothing matched).
+    """
+    from pgrls import __version__
+    from pgrls.fixers import render_migration
+    from pgrls.generate import GenerateOptions, plan_generation
+
+    if model not in ("tenant", "owner"):
+        return _error(
+            "bad_sql", f"unknown model {model!r}. Use 'tenant' or 'owner'."
+        )
+    if convention not in ("app-guc", "postgrest", "supabase"):
+        return _error(
+            "bad_sql",
+            f"unknown convention {convention!r}. Use 'app-guc', 'postgrest', "
+            "or 'supabase'.",
+        )
+
+    schema, source = resolve_schema(
+        sql=sql,
+        database_url=database_url,
+        snapshot=snapshot,
+        schemas=tuple(schemas) if schemas else None,
+    )
+
+    from pgrls import cli
+
+    options = GenerateOptions(
+        tenant_column=tenant_column,
+        model="owner" if model == "owner" else "tenant",
+        convention=convention,  # type: ignore[arg-type]
+        setting_name=setting_name,
+        auth_function=auth_function,
+        role=role,
+        restrictive=restrictive,
+        tables=cli._parse_generate_tables(tuple(tables) if tables else ()),
+    )
+
+    try:
+        result = plan_generation(schema, options)
+    except ValueError as exc:
+        # session_predicate rejects an unsafe / unknown column type before it
+        # reaches a `::<type>` cast — surface it as a clean structured error.
+        return _error("bad_sql", str(exc))
+
+    statements = list(result.statements)
+    return {
+        "schema_source": source,
+        "count": len(statements),
+        "statements": [
+            {
+                "rule_id": f.rule_id,
+                "location": f.location,
+                "sql": f.sql,
+                "description": f.description,
+            }
+            for f in statements
+        ],
+        "migration": (
+            render_migration(statements, tool_version=__version__)
+            if statements
+            else ""
+        ),
+        "skipped": [
+            {"table": qname, "reason": reason}
+            for qname, reason in result.skipped
+        ],
+        "notes": list(result.notes),
+        "warnings": schema_source_warnings(source),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers (kept module-private; the tools above are the public surface)
 # ---------------------------------------------------------------------------
 
@@ -365,6 +557,8 @@ mcp.tool(list_rules)
 mcp.tool(explain_rule)
 mcp.tool(lint)
 mcp.tool(verify)
+mcp.tool(fix)
+mcp.tool(generate)
 
 
 def run_stdio() -> None:

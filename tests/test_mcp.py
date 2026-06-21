@@ -345,6 +345,131 @@ def test_lint_rule_filter_restricts() -> None:
     assert ids == {"SEC004"}
 
 
+# --- fix / generate tools (EMIT-ONLY remediation) --------------------------
+
+# A schema with several mechanically-fixable findings: RLS enabled but not
+# FORCE'd (SEC002), an inverted-auth SEC004 disjunct, a missing WITH CHECK on
+# the permissive FOR ALL policy (SEC006), and no index on the discriminator.
+_FIXABLE_DDL = """
+CREATE TABLE public.t (id int, tenant_id int);
+ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON public.t FOR ALL TO authenticated
+  USING (auth.uid() IS NULL OR tenant_id = 1);
+"""
+
+# Bare multi-tenant tables with no row security — the `generate` target shape.
+_BARE_TENANT_DDL = (
+    "CREATE TABLE public.posts (id uuid, tenant_id uuid NOT NULL, body text);"
+)
+
+
+def test_fix_sql_emits_narrowing_remediation() -> None:
+    """The crux: fix returns SQL that closes the offline findings, emit-only."""
+    result = server.fix(sql=_FIXABLE_DDL)
+    assert result["schema_source"] == "sql"
+    assert result["count"] == len(result["fixes"]) > 0
+    ids = {f["rule_id"] for f in result["fixes"]}
+    # The flagship inverted-auth strip is among the emitted fixes.
+    assert "SEC004" in ids
+    for f in result["fixes"]:
+        assert set(f) == {"rule_id", "location", "sql", "description"}
+        assert f["sql"].strip()
+    # The migration bundles the statements as a copy-pasteable .sql file.
+    assert result["migration"].startswith("--")
+    # sql= path warns that an empty result is not a proof of clean.
+    assert any("NOT a proof" in w for w in result["warnings"])
+
+
+def test_fix_rule_filter_restricts() -> None:
+    result = server.fix(sql=_FIXABLE_DDL, rules=["SEC004"])
+    assert {f["rule_id"] for f in result["fixes"]} == {"SEC004"}
+
+
+def test_fix_exclude_rules_drops_a_rule() -> None:
+    result = server.fix(sql=_FIXABLE_DDL, exclude_rules=["SEC004"])
+    ids = {f["rule_id"] for f in result["fixes"]}
+    assert "SEC004" not in ids
+    assert ids  # other fixable findings remain
+
+
+def test_fix_nothing_to_fix_has_empty_migration() -> None:
+    # SEC004 does not fire on the clean policy → no fixes, empty migration.
+    result = server.fix(sql=CLEAN_DDL, rules=["SEC004"])
+    assert result["count"] == 0
+    assert result["fixes"] == []
+    assert result["migration"] == ""
+
+
+def test_fix_unknown_rule_filter_is_structured_error() -> None:
+    result = server.fix(sql=_FIXABLE_DDL, rules=["SEC999"])
+    assert result["error"]["kind"] == "unknown_rule"
+
+
+def test_fix_zero_sources_is_structured_error() -> None:
+    assert server.fix()["error"]["kind"] == "no_schema_source"
+
+
+def test_fix_never_executes_only_emits() -> None:
+    # Emit-only contract: a bad DSN means introspection is *attempted* (and
+    # fails cleanly), never a mutation — the same db_unreachable lint returns,
+    # with the credential scrubbed.
+    secret = "postgresql://u:TOPSECRET@127.0.0.1:1/none"
+    result = server.fix(database_url=secret)
+    assert result["error"]["kind"] == "db_unreachable"
+    assert "TOPSECRET" not in result["error"]["message"]
+
+
+def test_generate_sql_scaffolds_gold_standard() -> None:
+    result = server.generate(sql=_BARE_TENANT_DDL)
+    assert result["schema_source"] == "sql"
+    assert result["count"] == len(result["statements"]) > 0
+    sqls = [s["sql"] for s in result["statements"]]
+    assert any("FORCE ROW LEVEL SECURITY" in s for s in sqls)
+    assert any(
+        "current_setting('app.tenant_id'" in s for s in sqls
+    ), sqls
+    # Restrictive floor is emitted by default.
+    assert any("AS RESTRICTIVE" in s for s in sqls)
+    # Never scaffolds a PUBLIC policy (would trip SEC003).
+    assert not any("TO PUBLIC" in s for s in sqls)
+    assert result["migration"].startswith("--")
+
+
+def test_generate_postgrest_convention_uses_jwt_claim() -> None:
+    result = server.generate(sql=_BARE_TENANT_DDL, convention="postgrest")
+    sqls = [s["sql"] for s in result["statements"]]
+    assert any("request.jwt.claim.tenant_id" in s for s in sqls), sqls
+
+
+def test_generate_skips_already_policied_table() -> None:
+    # A table that already has a policy is reported in `skipped`, never
+    # clobbered, and produces no statements.
+    result = server.generate(sql=CLEAN_DDL)
+    assert result["count"] == 0
+    assert any("public.docs" in s["table"] for s in result["skipped"])
+
+
+def test_generate_table_override_uses_named_column() -> None:
+    ddl = "CREATE TABLE public.orders (id uuid, org_id uuid NOT NULL);"
+    result = server.generate(sql=ddl, tables=["public.orders:org_id"])
+    sqls = [s["sql"] for s in result["statements"]]
+    assert any("org_id" in s for s in sqls), sqls
+
+
+def test_generate_bad_model_is_structured_error() -> None:
+    result = server.generate(sql=_BARE_TENANT_DDL, model="nope")
+    assert result["error"]["kind"] == "bad_sql"
+
+
+def test_generate_bad_convention_is_structured_error() -> None:
+    result = server.generate(sql=_BARE_TENANT_DDL, convention="nope")
+    assert result["error"]["kind"] == "bad_sql"
+
+
+def test_generate_zero_sources_is_structured_error() -> None:
+    assert server.generate()["error"]["kind"] == "no_schema_source"
+
+
 def test_resolve_schema_zero_sources_raises_typed() -> None:
     with pytest.raises(SchemaSourceError) as exc:
         resolve_schema()

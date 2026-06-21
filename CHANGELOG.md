@@ -33,6 +33,17 @@ breaking changes — they will be called out in this file.
   REFERENCES/TRIGGER/TRUNCATE default is left alone. The `FOR ROLE <grantor>`
   clause is emitted whenever the grantor is known (a bare REVOKE clears only the
   running role's own default). Auto-fixable count → **20 of 61** rules.
+- **MCP server — two emit-only remediation tools (`fix`, `generate`).** The
+  `pgrls mcp` server now exposes **six** tools (was four). `fix` returns the
+  auto-fix SQL for the mechanically-fixable findings — the remediation
+  counterpart of `lint`; `generate` scaffolds gold-standard RLS (ENABLE +
+  FORCE + tenant/owner policy + restrictive floor + index) for unprotected
+  tables. Both accept the same schema sources as `lint` (`sql` / `database_url`
+  / `snapshot`) and return structured statements plus a copy-pasteable
+  `migration`. They are **emit-only**: like the rest of the server they never
+  mutate a database (only read-only introspection on the live path) and never
+  apply the SQL they return — `fix --apply` / `generate --apply` /
+  `diff --apply` / `verify --probe` remain unexposed.
 - **SEC048 (61st rule, warning)** — *low-trust role can reach an RLS table's
   owner that is not FORCE'd*. A role that OWNS a table bypasses that table's RLS
   unless `FORCE ROW LEVEL SECURITY` is set, and owner privileges (unlike the
