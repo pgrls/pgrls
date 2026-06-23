@@ -67,6 +67,18 @@
           "enum": ["safe", "breaking", "requires-review", "dangerous"],
           "description": "Change classification at or above which `pgrls diff` exits non-zero.",
           "default": "dangerous"
+        },
+        "rename_detection": {
+          "type": "string",
+          "enum": ["off", "strict", "relaxed"],
+          "default": "strict",
+          "description": "How `pgrls diff` reports a renamed policy. 'strict' collapses a name-only rename; 'relaxed' also collapses a rename+edit (graded); 'off' keeps drop+add. A detected rename is reported as a DIFF_POLICY_RENAMED change; the old and new policy names appear in the human-readable message field (no separate structured old-name field yet)."
+        },
+        "rename_classification": {
+          "type": "string",
+          "enum": ["safe", "requires-review"],
+          "default": "safe",
+          "description": "Classification for a name-only policy rename."
         }
       }
     }

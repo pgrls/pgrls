@@ -42,6 +42,8 @@ from pgrls.baseline import (
 )
 from pgrls.config import (
     DIFF_FAIL_ON_VALUES,
+    DIFF_RENAME_CLASSIFICATION_VALUES,
+    DIFF_RENAME_DETECTION_VALUES,
     Config,
     ConfigError,
     load_config,
@@ -2376,6 +2378,10 @@ def _apply_migration_for_diff(
 
 _DIFF_FAIL_ON_VALUES = list(DIFF_FAIL_ON_VALUES)
 _DIFF_FORMAT_VALUES = list(DIFF_SUPPORTED_FORMATS)
+# Pre-computed lists for click.Choice — mirrors _DIFF_FAIL_ON_VALUES
+# and stays in sync with the config constants automatically.
+_DIFF_RENAME_DETECTION_VALUES = list(DIFF_RENAME_DETECTION_VALUES)
+_DIFF_RENAME_CLASSIFICATION_VALUES = list(DIFF_RENAME_CLASSIFICATION_VALUES)
 
 
 # Dispatch table for `pgrls diff --format <choice>`. Each entry
@@ -2502,6 +2508,30 @@ _DIFF_FORMATTERS: dict[str, tuple[Callable[[list[Change]], str], bool]] = {
         "only — JSON / SARIF already carry the classification tag."
     ),
 )
+@click.option(
+    "--rename-detection",
+    type=click.Choice(list(DIFF_RENAME_DETECTION_VALUES), case_sensitive=False),
+    default=None,
+    help=(
+        "Policy-rename detection mode. 'strict' (default) reports a "
+        "name-only rename as one change (SAFE by default; see "
+        "--rename-classification) and leaves a rename+edit as drop+add; "
+        "'relaxed' also collapses a rename+edit into one POLICY_RENAMED "
+        "graded by predicate direction; 'off' restores the prior "
+        "drop+add behavior. Overrides [diff].rename_detection."
+    ),
+)
+@click.option(
+    "--rename-classification",
+    type=click.Choice(list(DIFF_RENAME_CLASSIFICATION_VALUES), case_sensitive=False),
+    default=None,
+    help=(
+        "Classification for a name-only policy rename. 'safe' (default) "
+        "since row access is unchanged; 'requires-review' if a policy "
+        "name is part of your external contract. Overrides "
+        "[diff].rename_classification."
+    ),
+)
 def diff(
     base: str,
     head: str | None,
@@ -2514,6 +2544,8 @@ def diff(
     extensions: tuple[str, ...],
     verbose: bool,
     explain: bool,
+    rename_detection: str | None,
+    rename_classification: str | None,
 ) -> None:
     """Diff two RLS schema snapshots — report semantic changes with classification."""
     try:
@@ -2550,6 +2582,21 @@ def diff(
     # CLI flag default takes precedence — defeating the point of
     # configuring it in TOML.
     effective_fail_on: str = fail_on if fail_on is not None else config.diff_fail_on
+
+    # `--rename-detection` / `--rename-classification` fallback chains
+    # mirror `--fail-on`: CLI flag wins, else the [diff] config value,
+    # else the built-in default. Click lower-cases Choice values; the
+    # classification's hyphen normalizes to the internal underscore form.
+    effective_rename_detection: str = (
+        rename_detection
+        if rename_detection is not None
+        else config.diff_rename_detection
+    )
+    effective_rename_classification: str = (
+        rename_classification.replace("-", "_")
+        if rename_classification is not None
+        else config.diff_rename_classification
+    )
 
     # Resolve --schemas (CSV) — only passed to URL-source resolution.
     if schemas:
@@ -2625,7 +2672,12 @@ def diff(
         assert head is not None  # guaranteed by the fallback chain above
         head_schema = _resolve_diff_source(head, schemas=schema_list)
 
-    changes = diff_schemas(base_schema, head_schema)
+    changes = diff_schemas(
+        base_schema,
+        head_schema,
+        rename_detection=effective_rename_detection,
+        rename_classification=effective_rename_classification,
+    )
 
     # --fail-on filter
     threshold_classifications = _classifications_at_or_above(effective_fail_on)

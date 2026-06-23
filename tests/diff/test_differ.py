@@ -1332,6 +1332,165 @@ def test_diff_schemas_no_counterexample_on_syntactic_loosen() -> None:
     assert loosened[0].counterexample is None
 
 
+# ---------------------------------------------------------------------------
+# Policy rename detection (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _table_with(*policies):
+    return _t(rls=True, policies=tuple(policies))
+
+
+def test_pure_rename_is_single_safe_change_strict_default():
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 1")),))
+    head = Schema(tables=(_table_with(_p("new", using_sql="tenant_id = 1")),))
+    changes = diff_schemas(base, head)
+    assert len(changes) == 1
+    assert changes[0].kind is ChangeKind.POLICY_RENAMED
+    assert changes[0].classification == "safe"
+    assert "old" in changes[0].message and "new" in changes[0].message
+
+
+def test_pure_rename_normalization_still_safe():
+    # Whitespace-only diff in USING; compare_predicates normalizes to "unchanged".
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 1")),))
+    head = Schema(tables=(_table_with(_p("new", using_sql="tenant_id   =   1")),))
+    changes = diff_schemas(base, head)
+    assert [c.kind for c in changes] == [ChangeKind.POLICY_RENAMED]
+    assert changes[0].classification == "safe"
+
+
+def test_pure_rename_semantic_equivalent_still_safe() -> None:
+    # Z3 returns "semantic_equivalent" for logically-equivalent but syntactically
+    # reordered predicates (e.g. "a AND b" vs "b AND a").  A rename whose predicate
+    # pair compares as semantic_equivalent must still be a single SAFE POLICY_RENAMED.
+    pytest.importorskip("z3")
+    base = Schema(tables=(_table_with(_p("old", using_sql="a AND b")),))
+    head = Schema(tables=(_table_with(_p("new", using_sql="b AND a")),))
+    changes = diff_schemas(base, head)
+    assert [c.kind for c in changes] == [ChangeKind.POLICY_RENAMED]
+    assert changes[0].classification == "safe"
+
+
+def test_rename_plus_loosen_is_drop_add_under_strict():
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 1")),))
+    head = Schema(tables=(_table_with(
+        _p("new", using_sql="tenant_id = 1 OR is_admin()")),))
+    changes = diff_schemas(base, head)  # strict default
+    kinds = {c.kind for c in changes}
+    assert ChangeKind.POLICY_RENAMED not in kinds
+    assert ChangeKind.POLICY_DROPPED_RESTRICTIVE in kinds
+    assert ChangeKind.POLICY_ADDED_RESTRICTIVE in kinds
+
+
+def test_rename_plus_loosen_is_dangerous_under_relaxed():
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 1")),))
+    head = Schema(tables=(_table_with(
+        _p("new", using_sql="tenant_id = 1 OR is_admin()")),))
+    changes = diff_schemas(base, head, rename_detection="relaxed")
+    assert [c.kind for c in changes] == [ChangeKind.POLICY_RENAMED]
+    assert changes[0].classification == "dangerous"
+
+
+def test_rename_with_z3_incompatible_predicate_degrades_to_requires_review() -> None:
+    # Regression for the crash surfaced by this feature (PR #229) and guarded
+    # upstream in #230: a renamed policy whose predicate edit OR/AND-combines an
+    # Int comparison with a bare boolean function call reaches Z3 with mismatched
+    # sorts. Unlike the `tenant_id = 1` -> `tenant_id = 1 OR is_admin()` loosen
+    # fixtures (a clean syntactic subset that never reaches Z3), `tenant_id = 2`
+    # is NOT a subset of the head disjuncts, so the comparator falls through to
+    # Z3 and must DEGRADE to `requires_review` (the safe direction), not raise
+    # `z3.Z3Exception`. Guarded with importorskip so the crash path is actually
+    # exercised when z3 is present.
+    pytest.importorskip("z3")
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 2")),))
+    head = Schema(tables=(_table_with(
+        _p("new", using_sql="tenant_id = 1 OR is_admin()")),))
+
+    # strict (default): not a pure rename -> clean drop+add, no crash.
+    strict = diff_schemas(base, head)
+    strict_kinds = {c.kind for c in strict}
+    assert ChangeKind.POLICY_RENAMED not in strict_kinds
+    assert ChangeKind.POLICY_DROPPED_RESTRICTIVE in strict_kinds
+    assert ChangeKind.POLICY_ADDED_RESTRICTIVE in strict_kinds
+
+    # relaxed: the rename path collapses the pair and the degraded predicate
+    # verdict grades to requires_review (never crashes, never safe/dangerous).
+    relaxed = diff_schemas(base, head, rename_detection="relaxed")
+    assert [c.kind for c in relaxed] == [ChangeKind.POLICY_RENAMED]
+    assert relaxed[0].classification == "requires_review"
+
+
+def test_rename_plus_tighten_is_safe_under_relaxed():
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 1")),))
+    head = Schema(tables=(_table_with(
+        _p("new", using_sql="tenant_id = 1 AND active")),))
+    changes = diff_schemas(base, head, rename_detection="relaxed")
+    assert [c.kind for c in changes] == [ChangeKind.POLICY_RENAMED]
+    assert changes[0].classification == "safe"
+
+
+def test_rename_classification_requires_review_for_pure_rename():
+    base = Schema(tables=(_table_with(_p("old", using_sql="tenant_id = 1")),))
+    head = Schema(tables=(_table_with(_p("new", using_sql="tenant_id = 1")),))
+    changes = diff_schemas(base, head, rename_classification="requires_review")
+    assert [c.kind for c in changes] == [ChangeKind.POLICY_RENAMED]
+    assert changes[0].classification == "requires_review"
+
+
+def test_two_policies_swapping_names_no_rename():
+    # Both names present on both sides -> never one-sided -> no rename.
+    base = Schema(tables=(_table_with(
+        _p("a", using_sql="x = 1"), _p("b", using_sql="y = 2")),))
+    head = Schema(tables=(_table_with(
+        _p("a", using_sql="y = 2"), _p("b", using_sql="x = 1")),))
+    changes = diff_schemas(base, head)
+    assert all(c.kind is not ChangeKind.POLICY_RENAMED for c in changes)
+
+
+def test_ambiguous_bucket_falls_back_to_drop_add():
+    # 2 base-only + 1 head-only, identical shape -> cannot pair uniquely.
+    base = Schema(tables=(_table_with(
+        _p("old1", using_sql="x = 1"), _p("old2", using_sql="x = 1")),))
+    head = Schema(tables=(_table_with(_p("new", using_sql="x = 1")),))
+    changes = diff_schemas(base, head)
+    assert all(c.kind is not ChangeKind.POLICY_RENAMED for c in changes)
+    assert sum(c.kind is ChangeKind.POLICY_DROPPED_RESTRICTIVE
+               for c in changes) == 2
+
+
+def test_off_mode_keeps_drop_add_for_identical_rename():
+    base = Schema(tables=(_table_with(_p("old", using_sql="x = 1")),))
+    head = Schema(tables=(_table_with(_p("new", using_sql="x = 1")),))
+    changes = diff_schemas(base, head, rename_detection="off")
+    kinds = {c.kind for c in changes}
+    assert ChangeKind.POLICY_RENAMED not in kinds
+    assert ChangeKind.POLICY_DROPPED_RESTRICTIVE in kinds
+    assert ChangeKind.POLICY_ADDED_RESTRICTIVE in kinds
+
+
+def test_rename_with_role_change_not_paired():
+    base = Schema(tables=(_table_with(
+        _p("old", roles=("alice",), using_sql="x = 1")),))
+    head = Schema(tables=(_table_with(
+        _p("new", roles=("bob",), using_sql="x = 1")),))
+    changes = diff_schemas(base, head)  # different bucket -> no rename
+    assert all(c.kind is not ChangeKind.POLICY_RENAMED for c in changes)
+
+
+def test_clause_added_is_not_pure_rename():
+    # USING equal but WITH CHECK added (None -> non-empty): not pure.
+    base = Schema(tables=(_table_with(
+        _p("old", using_sql="x = 1", with_check_sql=None)),))
+    head = Schema(tables=(_table_with(
+        _p("new", using_sql="x = 1", with_check_sql="x = 1")),))
+    strict = diff_schemas(base, head)
+    assert all(c.kind is not ChangeKind.POLICY_RENAMED for c in strict)
+    relaxed = diff_schemas(base, head, rename_detection="relaxed")
+    assert [c.kind for c in relaxed] == [ChangeKind.POLICY_RENAMED]
+    assert relaxed[0].classification == "requires_review"
+
+
 def test_text_and_json_render_empty_counterexample_as_any_row() -> None:
     # An empty-dict counterexample is the H1 verifier's "every row leaks"
     # witness (the old predicate rejected everything). Pin both renderings.
@@ -1351,3 +1510,94 @@ def test_text_and_json_render_empty_counterexample_as_any_row() -> None:
     assert "example leaking row: (any row" in format_diff_text([c])
     payload = _json.loads(format_diff_json([c]))
     assert payload["violations"][0]["counterexample"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix 9 — Determinism: POLICY_RENAMED appears before add/drop in output list
+# ---------------------------------------------------------------------------
+
+
+def test_renamed_policy_appears_before_add_drop_in_output() -> None:
+    # A table with BOTH a renamed policy AND a genuinely added policy:
+    # the POLICY_RENAMED change must appear before the POLICY_ADDED_*
+    # change in the output list (rename pass runs first, sorted by
+    # location; add/drop loop follows).
+    base = Schema(
+        tables=(
+            _t(
+                rls=True,
+                policies=(
+                    _p("old_name", using_sql="tenant_id = 1"),
+                    _p("stays", using_sql="x = 2"),
+                ),
+            ),
+        )
+    )
+    head = Schema(
+        tables=(
+            _t(
+                rls=True,
+                policies=(
+                    _p("new_name", using_sql="tenant_id = 1"),
+                    _p("stays", using_sql="x = 2"),
+                    _p("brand_new", permissive=True, using_sql="true"),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    renamed = [c for c in changes if c.kind is ChangeKind.POLICY_RENAMED]
+    added = [c for c in changes if c.kind is ChangeKind.POLICY_ADDED_PERMISSIVE]
+    assert len(renamed) == 1
+    assert len(added) == 1
+    # POLICY_RENAMED must come before POLICY_ADDED_PERMISSIVE.
+    assert changes.index(renamed[0]) < changes.index(added[0])
+
+
+# ---------------------------------------------------------------------------
+# Fix 11 — Pure rename with both USING and WITH CHECK set (name-only, safe)
+# ---------------------------------------------------------------------------
+
+
+def test_pure_rename_with_both_clauses_is_single_safe_change() -> None:
+    # A policy with command="ALL" and BOTH using_sql and with_check_sql set
+    # identically on both sides except for the name — must produce a single
+    # POLICY_RENAMED SAFE change, not a drop+add.
+    base = Schema(
+        tables=(
+            _t(
+                rls=True,
+                policies=(
+                    _p(
+                        "old",
+                        command="ALL",
+                        using_sql="tenant_id = current_setting('app.tenant')",
+                        with_check_sql="tenant_id = current_setting('app.tenant')",
+                    ),
+                ),
+            ),
+        )
+    )
+    head = Schema(
+        tables=(
+            _t(
+                rls=True,
+                policies=(
+                    _p(
+                        "new",
+                        command="ALL",
+                        using_sql="tenant_id = current_setting('app.tenant')",
+                        with_check_sql="tenant_id = current_setting('app.tenant')",
+                    ),
+                ),
+            ),
+        )
+    )
+    changes = diff_schemas(base, head)
+    assert len(changes) == 1
+    c = changes[0]
+    assert c.kind is ChangeKind.POLICY_RENAMED
+    assert c.classification == "safe"
+    # Pure rename: no predicate block.
+    assert c.before_sql is None
+    assert c.after_sql is None

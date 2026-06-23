@@ -708,12 +708,21 @@ the output without blocking CI.
 | Policy dropped, RESTRICTIVE | DANGEROUS |
 | Policy dropped, PERMISSIVE | BREAKING |
 
-> **Rename detection not yet implemented.** A policy renamed in any
-> v0.x release surfaces as one drop + one add — both classifications
-> fire independently. The `POLICY_RENAMED` enum value is reserved in
-> `pgrls.diff.differ.ChangeKind` for forward compatibility, but no
-> current detection rule emits it. (Originally targeted for v0.3;
-> still unimplemented through v0.5.10.)
+> **Rename detection** (shipped in 0.42.0). When `[diff].rename_detection`
+> is `strict` (default), a unique 1:1 policy pair that matches on
+> (permissive, command, roles) with predicate-equal USING/WITH CHECK is
+> collapsed into a single `POLICY_RENAMED` change instead of a drop + add.
+> In `relaxed` mode, a rename whose predicate also changed is still
+> collapsed and graded by predicate direction. Set to `off` to restore the
+> pre-0.42.0 drop+add behaviour. The classification for a name-only rename
+> is controlled by `[diff].rename_classification` (`safe` by default; set
+> `requires-review` if a policy name is part of your external contract).
+> Note: relaxed pairing is a coarse heuristic (unique match on permissive/command/roles);
+> an unrelated drop+add sharing those attributes can be treated as a rename and a
+> coincidental pairing could grade a real restrictive drop as `safe`. For security-gating
+> CI keep the default `strict` mode — relaxed mode trades this soundness for fewer
+> findings and has no reliable `--fail-on` threshold that catches only the coincidental-
+> pairing case.
 
 #### Policies — shape changes
 
@@ -763,11 +772,8 @@ each produces its own `Change` entry, classified independently.
 
 - One change ⇒ one `Change` entry. A policy widening both predicate and
   roles produces two entries.
-- No release through v0.5.10 implements rename detection — a renamed
-  policy surfaces as a drop + add with their independent classifications.
-  A future release may collapse these into a single `POLICY_RENAMED`
-  entry when every other attribute matches; the enum value is reserved
-  in `pgrls.diff.differ.ChangeKind` for that behavior.
+- As of 0.42.0, a renamed policy is detected and reported as a single
+  `POLICY_RENAMED` change (see `[diff].rename_detection`).
 - "Roles widened" includes adding `PUBLIC`; already the most-severe
   classification, no escalation needed.
 

@@ -801,3 +801,38 @@ def test_extends_chain_too_deep_errors(
         (tmp_path / f"c{i}.toml").write_text(nxt)
     with pytest.raises(ConfigError, match="too deep"):
         load_config(path=tmp_path / "c0.toml")
+
+
+def test_diff_rename_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    cfg = load_config(None)
+    assert cfg.diff_rename_detection == "strict"
+    assert cfg.diff_rename_classification == "safe"
+
+
+def test_diff_rename_parsed_from_toml(tmp_path: Path) -> None:
+    p = tmp_path / "pgrls.toml"
+    p.write_text(
+        "[diff]\n"
+        'rename_detection = "relaxed"\n'
+        'rename_classification = "requires-review"\n'
+    )
+    cfg = load_config(p)
+    assert cfg.diff_rename_detection == "relaxed"
+    # user-facing hyphen normalizes to the internal underscore form
+    assert cfg.diff_rename_classification == "requires_review"
+
+
+def test_diff_rename_detection_bad_value_raises(tmp_path: Path) -> None:
+    p = tmp_path / "pgrls.toml"
+    p.write_text('[diff]\nrename_detection = "fuzzy"\n')
+    with pytest.raises(ConfigError, match="rename_detection"):
+        load_config(p)
+
+
+def test_diff_rename_classification_bad_value_raises(tmp_path: Path) -> None:
+    p = tmp_path / "pgrls.toml"
+    p.write_text('[diff]\nrename_classification = "maybe"\n')
+    with pytest.raises(ConfigError, match="rename_classification"):
+        load_config(p)

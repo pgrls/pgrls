@@ -68,12 +68,11 @@ _MOD_KINDS: frozenset[ChangeKind] = frozenset(
         ChangeKind.ROLES_WIDENED,
         ChangeKind.ROLES_NARROWED,
         ChangeKind.ROLES_DISJOINT_REPLACED,
-        # POLICY_RENAMED is reserved in the ChangeKind enum but no
-        # detection rule through v0.5.10 emits it — rename detection
-        # remains unimplemented (see `_diff_policies` docstring).
-        # Classify as a modification anyway so a future detection
-        # rule (or programmatic Change construction in tests) doesn't
-        # crash the formatter with "unknown ChangeKind".
+        # POLICY_RENAMED is emitted by `_detect_policy_renames` in
+        # `pgrls.diff.policies` (introduced in 0.42+). A pure rename
+        # carries no before/after SQL (the predicate is unchanged); a
+        # relaxed-mode rename+edit carries the clause that drove the
+        # worst classification in before_sql / after_sql.
         ChangeKind.POLICY_RENAMED,
     }
 )
@@ -296,15 +295,28 @@ _RATIONALE_BY_KIND_AND_CLASSIFICATION: dict[
         "swap matches intent depends on the migration; pgrls cannot "
         "decide automatically."
     ),
-    # POLICY_RENAMED is reserved in ChangeKind but no detection rule
-    # through v0.5.42 emits it (a rename surfaces as drop+add). The
-    # entry is here for forward compatibility — a future emitter
-    # picking this kind doesn't crash --explain.
+    # POLICY_RENAMED is emitted by the rename-detection pass in
+    # `pgrls.diff.policies._diff_policies` (0.42+). A name-only rename
+    # carries the configured pure-rename Classification ("safe" default,
+    # or "requires_review"); a relaxed-mode rename whose predicate also
+    # changed is graded by predicate direction (safe / requires_review /
+    # dangerous). All three (kind, classification) pairs need an entry.
+    (ChangeKind.POLICY_RENAMED, "safe"): (
+        "Policy was renamed with no change to its row-access shape "
+        "(roles, command, permissive flag, and USING / WITH CHECK "
+        "predicates are all equal). Row access is unchanged; only the "
+        "policy's name differs."
+    ),
     (ChangeKind.POLICY_RENAMED, "requires_review"): (
-        "Policy was renamed. Through v0.5.42 the differ never emits "
-        "this kind (a rename surfaces as a drop + add with their "
-        "independent classifications); the entry exists for forward "
-        "compatibility when rename detection ships."
+        "Policy was renamed. Either the pure-rename classification is "
+        "configured to require review, or (in relaxed mode) the rename "
+        "coincided with a predicate change the classifier cannot prove "
+        "tighter or looser. Confirm the change is intended."
+    ),
+    (ChangeKind.POLICY_RENAMED, "dangerous"): (
+        "Policy was renamed and (in relaxed mode) its USING / WITH "
+        "CHECK predicate was loosened in the same change — more rows "
+        "pass than before. Treated as a security regression."
     ),
     # ---------- Predicate changes ----------
     (ChangeKind.USING_TIGHTENED, "safe"): (
@@ -394,7 +406,9 @@ _EXPECTED_RATIONALE_KEYS: frozenset[tuple[ChangeKind, Classification]] = (
             (ChangeKind.ROLES_WIDENED, "dangerous"),
             (ChangeKind.ROLES_NARROWED, "safe"),
             (ChangeKind.ROLES_DISJOINT_REPLACED, "requires_review"),
+            (ChangeKind.POLICY_RENAMED, "safe"),
             (ChangeKind.POLICY_RENAMED, "requires_review"),
+            (ChangeKind.POLICY_RENAMED, "dangerous"),
             (ChangeKind.USING_TIGHTENED, "safe"),
             (ChangeKind.USING_LOOSENED, "dangerous"),
             (ChangeKind.USING_REQUIRES_REVIEW, "requires_review"),
@@ -531,8 +545,14 @@ def _render_stanza(change: Change, *, explain: bool = False) -> list[str]:
     summary = _SUMMARY_BY_KIND.get(change.kind, "change")
     lines.append(f"  {summary}")
 
-    # Predicate block (only for USING_* / WITH_CHECK_* kinds)
-    if change.kind in _PREDICATE_KINDS:
+    # Predicate block: USING_* / WITH_CHECK_* kinds always carry
+    # before/after SQL; POLICY_RENAMED renders it only for a graded
+    # rename+edit (before_sql is not None) — a pure rename has no
+    # predicate change to show.
+    if change.kind in _PREDICATE_KINDS or (
+        change.kind is ChangeKind.POLICY_RENAMED
+        and change.before_sql is not None
+    ):
         before = change.before_sql if change.before_sql is not None else "(no clause)"
         after = change.after_sql if change.after_sql is not None else "(no clause)"
         lines.append(f"- {before}")
@@ -1010,10 +1030,16 @@ def format_diff_html(
             # an offline reviewer reading the archive sees what the
             # predicate actually changed to — the single most
             # useful detail for a "is this migration safe?" review.
+            # POLICY_RENAMED also renders the block when it carries
+            # a predicate diff (graded rename+edit); a pure rename
+            # has before_sql=None and is silently skipped.
             # The text formatter has the same block (lines starting
             # with `- before` / `+ after`); HTML renders it as a
             # `<pre>` element so multi-line SQL displays correctly.
-            if change.kind in _PREDICATE_KINDS:
+            if change.kind in _PREDICATE_KINDS or (
+                change.kind is ChangeKind.POLICY_RENAMED
+                and change.before_sql is not None
+            ):
                 before = (
                     change.before_sql if change.before_sql is not None
                     else "(no clause)"

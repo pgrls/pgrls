@@ -35,6 +35,22 @@ DIFF_FAIL_ON_VALUES: tuple[str, ...] = (
     "dangerous",
 )
 
+# User-facing values for `[diff].rename_detection`. Mirrors the CLI's
+# `--rename-detection` choices; imported by the CLI for `click.Choice`.
+DIFF_RENAME_DETECTION_VALUES: tuple[str, ...] = (
+    "off",
+    "strict",
+    "relaxed",
+)
+
+# User-facing values for `[diff].rename_classification`. Hyphenated like
+# `DIFF_FAIL_ON_VALUES`; normalized to the internal underscore
+# Classification form on load.
+DIFF_RENAME_CLASSIFICATION_VALUES: tuple[str, ...] = (
+    "safe",
+    "requires-review",
+)
+
 
 @dataclass(frozen=True)
 class Config:
@@ -62,6 +78,18 @@ class Config:
     # precedence when supplied. Defaults to "dangerous" (only
     # security regressions block CI).
     diff_fail_on: str = "dangerous"
+    # `[diff].rename_detection` — how `pgrls diff` treats a policy that
+    # exists on one side only. "off" (drop+add, the pre-0.42 behavior),
+    # "strict" (default; collapse a name-only rename, leave a
+    # rename+edit as drop+add), "relaxed" (also collapse a rename+edit
+    # into one POLICY_RENAMED graded by predicate direction).
+    diff_rename_detection: str = "strict"
+    # `[diff].rename_classification` — Classification for a name-only
+    # rename. User writes the hyphenated form in TOML ("safe" |
+    # "requires-review"); stored internally as the underscore form
+    # ("safe" | "requires_review"). Default "safe" (row access is
+    # unchanged).
+    diff_rename_classification: str = "safe"
     # `[lint].extra_rules` — dotted Python module paths that expose
     # additional Rule-protocol objects via a `RULES` attribute.
     # See `pgrls.rules.load_extra_rules` for the loader contract
@@ -432,6 +460,35 @@ def _build_config(raw: dict[str, Any]) -> Config:
             f"got {diff_fail_on_raw!r}"
         )
 
+    diff_rename_detection_raw = diff.get("rename_detection", "strict")
+    if not isinstance(diff_rename_detection_raw, str):
+        raise ConfigError(
+            f"[diff].rename_detection must be a string, got "
+            f"{type(diff_rename_detection_raw).__name__}"
+        )
+    diff_rename_detection = diff_rename_detection_raw.lower()
+    if diff_rename_detection not in DIFF_RENAME_DETECTION_VALUES:
+        raise ConfigError(
+            f"[diff].rename_detection must be one of "
+            f"{DIFF_RENAME_DETECTION_VALUES}, got {diff_rename_detection_raw!r}"
+        )
+
+    diff_rename_classification_raw = diff.get("rename_classification", "safe")
+    if not isinstance(diff_rename_classification_raw, str):
+        raise ConfigError(
+            f"[diff].rename_classification must be a string, got "
+            f"{type(diff_rename_classification_raw).__name__}"
+        )
+    diff_rename_classification_user = diff_rename_classification_raw.lower()
+    if diff_rename_classification_user not in DIFF_RENAME_CLASSIFICATION_VALUES:
+        raise ConfigError(
+            f"[diff].rename_classification must be one of "
+            f"{DIFF_RENAME_CLASSIFICATION_VALUES}, got "
+            f"{diff_rename_classification_raw!r}"
+        )
+    # Normalize hyphenated user value to the internal Classification form.
+    diff_rename_classification = diff_rename_classification_user.replace("-", "_")
+
     return Config(
         database_url=database_url,
         schemas=list(schemas),
@@ -440,6 +497,8 @@ def _build_config(raw: dict[str, Any]) -> Config:
         rule_options=rule_options,
         severity_overrides=severity_overrides,
         diff_fail_on=diff_fail_on,
+        diff_rename_detection=diff_rename_detection,
+        diff_rename_classification=diff_rename_classification,
         extra_rules=extra_rules,
         database_url_error=database_url_error,
     )

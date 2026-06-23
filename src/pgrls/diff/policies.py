@@ -17,6 +17,9 @@ Module-private helpers and dispatch tables live here too.
 """
 from __future__ import annotations
 
+from collections import defaultdict
+from typing import cast
+
 from pgrls.diff.ast_compare import compare_predicates, counterexample_for
 from pgrls.diff.differ import Change, ChangeKind, Classification
 from pgrls.model import Policy, Table
@@ -64,8 +67,189 @@ _PREDICATE_RESULT_MESSAGES: dict[str, str] = {
     ),
 }
 
+# compare_predicates results that mean "predicates are equal" (no change).
+_EQUAL_RESULTS: tuple[str, ...] = ("unchanged", "semantic_equivalent")
 
-def _diff_policies(base_table: Table, head_table: Table) -> list[Change]:
+# compare_predicates result -> Classification, for relaxed-mode rename
+# grading. Clause-independent: USING and WITH CHECK map a given result to
+# the same Classification (only the ChangeKind differs, which a rename
+# doesn't use). "unchanged"/"semantic_equivalent" are absent — handled as
+# "no contribution" by the caller.
+_RESULT_TO_CLASSIFICATION: dict[str, Classification] = {
+    "tightened_and":      "safe",
+    "tightened_or_drop":  "safe",
+    "semantic_tightened": "safe",
+    "loosened_and_drop":  "dangerous",
+    "loosened_or":        "dangerous",
+    "semantic_loosened":  "dangerous",
+    "requires_review":    "requires_review",
+}
+
+# Severity order for picking the worst of two clause classifications.
+_CLASSIFICATION_RANK: dict[Classification, int] = {
+    "safe": 0,
+    "requires_review": 1,
+    "dangerous": 2,
+}
+
+
+def _grade_rename(using_result: str, check_result: str) -> Classification:
+    """Worst-of Classification for a relaxed-mode rename whose predicate changed.
+
+    Each clause result that isn't an "equal" verdict contributes its
+    Classification; the most severe wins. At least one of the two results is
+    non-equal when this is called (a pure rename is handled separately).
+    """
+    worst: Classification = "safe"
+    for result in (using_result, check_result):
+        if result in _EQUAL_RESULTS:
+            continue
+        classification = _RESULT_TO_CLASSIFICATION[result]
+        if _CLASSIFICATION_RANK[classification] > _CLASSIFICATION_RANK[worst]:
+            worst = classification
+    return worst
+
+
+def _detect_policy_renames(
+    base_table: Table,
+    head_table: Table,
+    rename_detection: str,
+    rename_classification: str,
+) -> tuple[list[Change], set[str], set[str]]:
+    """Match one-sided policies as renames; return (changes, consumed_base, consumed_head).
+
+    `consumed_base` holds every base-side old name that was matched, and
+    `consumed_head` holds every head-side new name, so the add/drop loop in
+    `_diff_policies` skips each name on the correct side. Caller must only
+    invoke this when `rename_detection != "off"`.
+
+    Matching: bucket base-only and head-only policies by
+    `(permissive, command, frozenset(roles))`; a bucket with exactly one
+    policy on each side is a rename candidate (the uniqueness guard — ambiguous
+    buckets are left as drop+add). Predicate equality is decided by
+    `compare_predicates` (so normalization / Z3-equivalence still count). A
+    pure rename (both predicates equal) carries `rename_classification`; a
+    rename whose predicate changed is dropped (strict) or graded (relaxed).
+    """
+    assert rename_detection in ("off", "strict", "relaxed")
+    assert rename_classification in ("safe", "requires_review")
+
+    base_by_name = {p.name: p for p in base_table.policies}
+    head_by_name = {p.name: p for p in head_table.policies}
+    qname = base_table.qualified_name
+
+    base_buckets: dict[tuple[bool, str, frozenset[str]], list[Policy]] = (
+        defaultdict(list)
+    )
+    head_buckets: dict[tuple[bool, str, frozenset[str]], list[Policy]] = (
+        defaultdict(list)
+    )
+    for p in base_table.policies:
+        if p.name not in head_by_name:
+            base_buckets[(p.permissive, p.command, frozenset(p.roles))].append(p)
+    for p in head_table.policies:
+        if p.name not in base_by_name:
+            head_buckets[(p.permissive, p.command, frozenset(p.roles))].append(p)
+
+    changes: list[Change] = []
+    consumed_base: set[str] = set()
+    consumed_head: set[str] = set()
+
+    for key, b_list in base_buckets.items():
+        h_list = head_buckets.get(key, [])
+        if len(b_list) != 1 or len(h_list) != 1:
+            continue  # ambiguous / unmatched — leave for add/drop
+        base_pol, head_pol = b_list[0], h_list[0]
+        location = f"{qname}.{head_pol.name}"
+
+        using_result = compare_predicates(
+            base_pol.using_sql, head_pol.using_sql,
+            location=location, clause="USING",
+        )
+        check_result = compare_predicates(
+            base_pol.with_check_sql, head_pol.with_check_sql,
+            location=location, clause="WITH CHECK",
+        )
+        pure = (
+            using_result in _EQUAL_RESULTS and check_result in _EQUAL_RESULTS
+        )
+
+        if pure:
+            # rename_classification has already been normalized to the
+            # internal underscore Classification form by the CLI / config
+            # layer (e.g. "requires_review", not "requires-review").
+            classification: Classification = cast(
+                Classification,
+                rename_classification,
+            )
+            message = (
+                f"Policy {qname}.{base_pol.name} renamed to {head_pol.name}"
+                " (name-only change; row access unchanged)."
+            )
+            before_sql: str | None = None
+            after_sql: str | None = None
+        else:
+            if rename_detection != "relaxed":
+                continue  # strict/off: don't collapse a rename+edit
+            classification = _grade_rename(using_result, check_result)
+            # Show the clause whose individual classification equals the
+            # worst-of result (the one that drove the overall grade).
+            # USING is checked first; if both share the worst class,
+            # USING-first is the tie-break.
+            worst_rank = _CLASSIFICATION_RANK[classification]
+            using_cls = (
+                _RESULT_TO_CLASSIFICATION.get(using_result)
+                if using_result not in _EQUAL_RESULTS
+                else None
+            )
+            if (
+                using_cls is not None
+                and _CLASSIFICATION_RANK[using_cls] == worst_rank
+            ):
+                before_sql, after_sql = base_pol.using_sql, head_pol.using_sql
+            else:
+                before_sql, after_sql = (
+                    base_pol.with_check_sql, head_pol.with_check_sql,
+                )
+            if classification == "dangerous":
+                detail = "predicate loosened — broader row set"
+            elif classification == "safe":
+                detail = "predicate tightened"
+            else:
+                detail = (
+                    "predicate changed in a way the classifier can't analyze"
+                    " — review required"
+                )
+            message = (
+                f"Policy {qname}.{base_pol.name} renamed to {head_pol.name};"
+                f" {detail}."
+            )
+
+        changes.append(
+            Change(
+                kind=ChangeKind.POLICY_RENAMED,
+                classification=classification,
+                location=location,
+                message=message,
+                before_sql=before_sql,
+                after_sql=after_sql,
+            )
+        )
+        consumed_base.add(base_pol.name)
+        consumed_head.add(head_pol.name)
+
+    # Deterministic output: matches are 1:1 (unambiguous), so the only
+    # nondeterminism is emission order — fix it by sorting on location.
+    changes.sort(key=lambda c: c.location)
+    return changes, consumed_base, consumed_head
+
+
+def _diff_policies(
+    base_table: Table,
+    head_table: Table,
+    rename_detection: str = "strict",
+    rename_classification: str = "safe",
+) -> list[Change]:
     """Return Changes for policies added or dropped between two table snapshots.
 
     Classification rationale:
@@ -75,17 +259,30 @@ def _diff_policies(base_table: Table, head_table: Table) -> list[Change]:
       (dangerous — previously-blocked rows become visible); dropping one
       narrows it (breaking — previously-visible rows may disappear).
 
-    No release through v0.5.10 implements rename detection; each rename
-    appears here as one drop + one add. The `POLICY_RENAMED` enum value
-    is reserved in `ChangeKind` for a future implementation.
+    Policy renames are detected first (unless ``rename_detection ==
+    "off"``) by ``_detect_policy_renames``; matched names are excluded
+    from the add/drop loop below. See that helper and the design spec
+    for the matching rules and the strict/relaxed grading.
     """
     base_by_name: dict[str, Policy] = {p.name: p for p in base_table.policies}
     head_by_name: dict[str, Policy] = {p.name: p for p in head_table.policies}
 
     changes: list[Change] = []
+    consumed_base: set[str] = set()
+    consumed_head: set[str] = set()
+    if rename_detection != "off":
+        rename_changes, consumed_base, consumed_head = _detect_policy_renames(
+            base_table, head_table, rename_detection, rename_classification
+        )
+        changes.extend(rename_changes)
     for name in sorted(set(base_by_name) | set(head_by_name)):
         in_base = name in base_by_name
         in_head = name in head_by_name
+        # Skip names consumed by the rename pass on the correct side.
+        if not in_base and in_head and name in consumed_head:
+            continue
+        if in_base and not in_head and name in consumed_base:
+            continue
 
         if not in_base and in_head:
             # Policy added.

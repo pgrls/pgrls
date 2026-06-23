@@ -32,6 +32,20 @@ fail_on = "warning"
 # per-invocation with `--fail-on`.
 fail_on = "dangerous"
 
+# How `pgrls diff` treats a policy that exists on one side only.
+#   "strict"  (default) — a name-only rename is reported as one change;
+#                         a rename that also edits a predicate stays as
+#                         a separate drop + add (keeping real severities).
+#   "relaxed"           — also collapse a rename+edit into one
+#                         POLICY_RENAMED, graded by predicate direction.
+#   "off"               — no rename detection (drop + add, as before).
+rename_detection = "strict"
+
+# Classification for a name-only rename. "safe" (default) since row
+# access is unchanged; set "requires-review" if a policy name is part of
+# your external contract (migrations, dashboards, audit logs).
+rename_classification = "safe"
+
 # Per-rule options. Each rule reads its own table. Section names
 # are case-insensitive (`[lint.rules.sec001]` is equivalent to
 # `[lint.rules.SEC001]`), and a typo'd section is rejected at

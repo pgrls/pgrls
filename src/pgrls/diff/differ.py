@@ -114,7 +114,13 @@ class Change:
     )
 
 
-def diff_schemas(base: Schema, head: Schema) -> list[Change]:
+def diff_schemas(
+    base: Schema,
+    head: Schema,
+    *,
+    rename_detection: str = "strict",
+    rename_classification: str = "safe",
+) -> list[Change]:
     """Compute the list of changes from base to head.
 
     Output ordering is deterministic:
@@ -124,7 +130,9 @@ def diff_schemas(base: Schema, head: Schema) -> list[Change]:
 
         1. `RLS_FLIPPED`
         2. `FORCE_RLS_FLIPPED`
-        3. `_diff_policies`         (sorted policy names; add/drop)
+        3. `_diff_policies`         (rename matches first, sorted by
+                                     location; then sorted policy names:
+                                     add/drop)
         4. `_diff_policy_shapes`    (sorted policy names; per policy:
                                      permissive → command → roles →
                                      predicate diff: USING then WITH CHECK)
@@ -234,7 +242,9 @@ def diff_schemas(base: Schema, head: Schema) -> list[Change]:
                     after_sql=None,
                 )
             )
-        changes.extend(_diff_policies(b, h))
+        changes.extend(
+            _diff_policies(b, h, rename_detection, rename_classification)
+        )
         changes.extend(_diff_policy_shapes(b, h))
         changes.extend(_diff_columns(b, h))
         changes.extend(_diff_grants(b, h))
