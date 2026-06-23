@@ -10,6 +10,18 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pgrls diff` no longer crashes on a policy predicate that OR/AND-combines a
+  column comparison with a bare boolean function call** (e.g. `tenant_id = 1 OR
+  is_admin()`). The Z3 comparator translated the function call as an opaque
+  String marker, so building `z3.Or` / `z3.And` over the mismatched sorts raised
+  an uncaught `z3.Z3Exception: sort mismatch` and aborted the diff. The
+  boolean-connective translator now catches it at its source and degrades the
+  predicate to `requires_review` — the safe direction — exactly like every other
+  untranslatable operator. (A genuine loosening is still detected; only the
+  un-encodable case degrades.)
+
 ## [0.41.0] - 2026-06-21
 
 ### Added

@@ -148,6 +148,21 @@ def test_different_columns_with_same_constant_are_incomparable():
     assert _classify("foo = 'a'", "bar = 'a'") is None
 
 
+def test_or_mixing_comparison_and_bare_boolean_funccall_returns_none():
+    # Regression: `is_admin()` translates as an opaque String marker, so
+    # `z3.Or(<Int-comparison Bool>, <String opaque>)` raised an uncaught
+    # `z3.Z3Exception: sort mismatch` and crashed `pgrls diff` on a
+    # realistic policy edit. `_to_z3` now catches it at the boolean-
+    # connective site and degrades to None (→ requires_review), like
+    # every other untranslatable operator.
+    assert _classify("tenant_id = 2", "tenant_id = 1 OR is_admin()") is None
+
+
+def test_and_mixing_comparison_and_bare_boolean_funccall_returns_none():
+    # Same sort-mismatch guard for the AND connective.
+    assert _classify("tenant_id = 2", "tenant_id = 1 AND is_admin()") is None
+
+
 # ---------------------------------------------------------------------------
 # IN list (literal RHS)
 # ---------------------------------------------------------------------------

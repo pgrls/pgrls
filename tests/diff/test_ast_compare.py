@@ -34,6 +34,25 @@ def test_parse_failure_returns_requires_review():
     assert compare_predicates("WHERE :::", "a = 1") == "requires_review"
 
 
+def test_or_with_untranslatable_funccall_operand_returns_requires_review():
+    # Regression: `tenant_id = 1 OR is_admin()` OR-combines an Int
+    # comparison (Bool sort) with a bare boolean function call (opaque
+    # String sort). Building `z3.Or(...)` over the mismatched sorts raised
+    # an uncaught `z3.Z3Exception: sort mismatch` that crashed `pgrls diff`
+    # on a realistic policy edit (and is what PR #229's rename detection
+    # would have routed into). The comparator now degrades to
+    # requires_review — the safe direction — instead of aborting. Holds
+    # whether or not the diff-z3 extra is installed (no-z3 already returns
+    # requires_review; with z3 the new guard does).
+    assert (
+        compare_predicates("tenant_id = 2", "tenant_id = 1 OR is_admin()")
+        == "requires_review"
+    )
+    # The guard must NOT mask a genuine loosening: a plain OR-disjunct add
+    # is still detected as loosened_or.
+    assert compare_predicates("a = 1", "a = 1 OR b = 2") == "loosened_or"
+
+
 def test_whitespace_only_diff_returns_unchanged():
     assert compare_predicates("a = 1", "a   =   1") == "unchanged"
 

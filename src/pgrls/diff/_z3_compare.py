@@ -472,18 +472,28 @@ def _to_z3(node: Any, ctx: _Context) -> Any:
         args = [_to_z3(a, ctx) for a in (node.args or ())]
         if any(a is None for a in args):
             return None
-        if node.boolop == BoolExprType.AND_EXPR:
-            if len(args) >= 2:
-                return z3.And(*args)
-            return args[0] if args else None  # pragma: no cover
-        if node.boolop == BoolExprType.OR_EXPR:
-            if len(args) >= 2:
-                return z3.Or(*args)
-            return args[0] if args else None  # pragma: no cover
-        if node.boolop == BoolExprType.NOT_EXPR:
-            if len(args) != 1:
-                return None
-            return z3.Not(args[0])
+        # z3.And/Or/Not raise z3.Z3Exception when an arg is not Bool-sorted
+        # — e.g. a bare boolean function call (translated as an opaque
+        # String marker) OR-combined with a real comparison
+        # (`tenant_id = 1 OR is_admin()`). Degrade to None (untranslatable
+        # -> requires_review) exactly like every other operator site in
+        # this module, rather than letting the sort mismatch escape and
+        # crash the whole `pgrls diff`.
+        try:
+            if node.boolop == BoolExprType.AND_EXPR:
+                if len(args) >= 2:
+                    return z3.And(*args)
+                return args[0] if args else None  # pragma: no cover
+            if node.boolop == BoolExprType.OR_EXPR:
+                if len(args) >= 2:
+                    return z3.Or(*args)
+                return args[0] if args else None  # pragma: no cover
+            if node.boolop == BoolExprType.NOT_EXPR:
+                if len(args) != 1:
+                    return None
+                return z3.Not(args[0])
+        except (z3.Z3Exception, TypeError):
+            return None
         return None
 
     # NULL tests — opaque Bool markers; not related to comparison
