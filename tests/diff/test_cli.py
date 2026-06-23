@@ -497,6 +497,83 @@ def test_diff_no_changes_emits_no_changes_summary(tmp_path: Path) -> None:
     assert result.output.rstrip("\n").endswith("pgrls diff: no changes.")
 
 
+# ---------------------------------------------------------------------------
+# pgrls diff — --rename-detection / --rename-classification flags
+# ---------------------------------------------------------------------------
+
+
+def _rename_policy(name, *, command="ALL", permissive=False,
+                   roles=("app_user",), using_sql=None, with_check_sql=None):
+    return {
+        "name": name,
+        "command": command,
+        "permissive": permissive,
+        "roles": list(roles),
+        "using_sql": using_sql,
+        "with_check_sql": with_check_sql,
+    }
+
+
+def _snap_one_policy(policy):
+    # Per-table "policies" key — the legacy fixture form accepted by
+    # Schema.from_snapshot (see the module header comment).
+    return {
+        "version": 3,
+        "tables": [{
+            "schema": "public",
+            "name": "t",
+            "rls_enabled": True,
+            "force_rls": False,
+            "policies": [policy],
+            "columns": [],
+            "partition_of": None,
+            "grants": [],
+        }],
+    }
+
+
+def _run_rename_diff(tmp_path, base_policy, head_policy, extra_args):
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_snap_one_policy(base_policy)))
+    head.write_text(json.dumps(_snap_one_policy(head_policy)))
+    return CliRunner().invoke(
+        main, ["diff", str(base), str(head), *extra_args]
+    )
+
+
+def test_diff_rename_detection_relaxed_flag(tmp_path: Path) -> None:
+    result = _run_rename_diff(
+        tmp_path,
+        _rename_policy("old", using_sql="tenant_id = 1"),
+        _rename_policy("new", using_sql="tenant_id = 1 OR is_admin()"),
+        ["--rename-detection", "relaxed", "--format", "json"],
+    )
+    assert "DIFF_POLICY_RENAMED" in result.output
+
+
+def test_diff_rename_detection_default_strict(tmp_path: Path) -> None:
+    result = _run_rename_diff(
+        tmp_path,
+        _rename_policy("old", using_sql="tenant_id = 1"),
+        _rename_policy("new", using_sql="tenant_id = 1 OR is_admin()"),
+        ["--format", "json"],
+    )
+    # strict default: a rename+loosen stays drop+add — no POLICY_RENAMED.
+    assert "DIFF_POLICY_RENAMED" not in result.output
+
+
+def test_diff_rename_classification_flag(tmp_path: Path) -> None:
+    result = _run_rename_diff(
+        tmp_path,
+        _rename_policy("old", using_sql="tenant_id = 1"),
+        _rename_policy("new", using_sql="tenant_id = 1"),
+        ["--rename-classification", "requires-review", "--format", "json"],
+    )
+    assert "DIFF_POLICY_RENAMED" in result.output
+    assert "requires_review" in result.output
+
+
 def test_diff_uses_diff_fail_on_from_pgrls_toml(tmp_path: Path) -> None:
     """[diff].fail_on in pgrls.toml is honored when --fail-on is not
     on the CLI. Pin the fallback chain end-to-end.
@@ -832,3 +909,43 @@ def test_diff_explain_no_changes_emits_only_no_changes_summary(
     assert result.exit_code == 0, result.output
     assert "  -> " not in result.output
     assert result.output.rstrip("\n").endswith("pgrls diff: no changes.")
+
+
+def test_diff_rename_detection_from_toml_config(tmp_path: Path) -> None:
+    """[diff].rename_detection = "relaxed" in pgrls.toml is honored without
+    the --rename-detection CLI flag.
+
+    Fixture: a rename+loosen (old → new with a loosened USING predicate).
+    With the default 'strict' detection this would produce drop+add (no
+    DIFF_POLICY_RENAMED); with 'relaxed' from TOML it must collapse into
+    a single DIFF_POLICY_RENAMED change.
+    """
+    base_policy = _rename_policy(
+        "old", using_sql="tenant_id = 1"
+    )
+    head_policy = _rename_policy(
+        "new", using_sql="tenant_id = 1 OR is_admin()"
+    )
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    base.write_text(json.dumps(_snap_one_policy(base_policy)), encoding="utf-8")
+    head.write_text(json.dumps(_snap_one_policy(head_policy)), encoding="utf-8")
+
+    toml_path = tmp_path / "pgrls.toml"
+    toml_path.write_text('[diff]\nrename_detection = "relaxed"\n', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "diff",
+            str(base),
+            str(head),
+            "--config",
+            str(toml_path),
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 1, result.output  # dangerous change → exit 1
+    assert "DIFF_POLICY_RENAMED" in result.output

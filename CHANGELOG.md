@@ -10,6 +10,28 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- `pgrls diff` now detects a **renamed RLS policy** and reports it as a single
+  `POLICY_RENAMED` change instead of an independent drop + add (the long-reserved
+  `ChangeKind.POLICY_RENAMED` is now produced). Configurable via
+  `[diff].rename_detection` (`off` | `strict` (default) | `relaxed`) and
+  `[diff].rename_classification` (`safe` (default) | `requires-review`), with
+  matching `--rename-detection` / `--rename-classification` CLI flags.
+  Matching is sound: only a unique 1:1 policy pair identical on
+  (permissive, command, roles) with predicate-equal USING/WITH CHECK is treated
+  as a rename; ambiguous cases fall back to drop+add.
+
+### Changed
+- In `relaxed` mode, a rename whose predicate also changed is graded by predicate
+  direction (loosen → DANGEROUS, tighten → SAFE, otherwise REQUIRES_REVIEW) rather
+  than a blanket REQUIRES_REVIEW, so a loosening still trips `--fail-on dangerous`.
+  Note: relaxed pairing is a coarse heuristic (unique match on permissive/command/roles);
+  an unrelated drop+add sharing those attributes can be treated as a rename and a
+  coincidental pairing could grade a real restrictive drop as `safe`. For security-gating
+  CI keep the default `strict` mode — relaxed mode trades this soundness for fewer
+  findings and has no reliable `--fail-on` threshold that catches only the coincidental-
+  pairing case.
+
 ### Fixed
 
 - **`pgrls diff` no longer crashes on a policy predicate that OR/AND-combines a

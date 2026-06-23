@@ -6,6 +6,8 @@ import pytest
 from pgrls.diff.differ import Change, ChangeKind
 from pgrls.diff.formatters import (
     EMPTY_OR_ZERO_WIDTH_SENTINEL,
+    _EXPECTED_RATIONALE_KEYS,
+    _RATIONALE_BY_KIND_AND_CLASSIFICATION,
     _trailing_summary,
     format_diff_text,
 )
@@ -1214,3 +1216,18 @@ def test_html_predicate_block_escapes_sql() -> None:
     inner = pred_block.replace("<span", "").replace("</span>", "").replace(
         'class="pred-minus">', "").replace('class="pred-plus">', "")
     assert "<" not in inner.replace("&lt;", "")
+
+
+# ---------------------------------------------------------------------------
+# POLICY_RENAMED rationale exhaustiveness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "classification", ["safe", "requires_review", "dangerous"]
+)
+def test_policy_renamed_has_rationale_for_every_emitted_class(classification: str) -> None:
+    key = (ChangeKind.POLICY_RENAMED, classification)
+    assert key in _EXPECTED_RATIONALE_KEYS
+    assert key in _RATIONALE_BY_KIND_AND_CLASSIFICATION
+    assert _RATIONALE_BY_KIND_AND_CLASSIFICATION[key]  # non-empty text
