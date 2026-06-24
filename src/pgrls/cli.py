@@ -114,6 +114,13 @@ from pgrls.violations import (
     coerce_severity,
     is_at_or_above,
 )
+from pgrls.schema_sources import (
+    SchemaSource,
+    SchemaSourceError,
+    WarnCommand,
+    resolve_schema,
+    schema_source_warnings,
+)
 
 
 class ToolError(click.ClickException):
@@ -273,6 +280,39 @@ def migration_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
             "Lint a schema built from these migration files in a throwaway "
             "Postgres (no live database needed): a directory or a .sql file. "
             "Requires Docker and the pgrls[ephemeral] extra."
+        ),
+    )(func)
+    return func
+
+
+def offline_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Stack the offline schema-source options --sql-file / --snapshot.
+
+    Analyze raw DDL or a snapshot artifact with no live Postgres and no Docker.
+    Mutually exclusive with --database-url / --migrations (enforced per
+    command). Declared bottom-up so --help lists --sql-file first.
+    """
+    func = click.option(
+        "--snapshot",
+        "snapshot",
+        type=click.Path(exists=True, dir_okay=False),
+        default=None,
+        help=(
+            "Read a schema from a `pgrls snapshot` artifact (input only) and "
+            "analyze it offline — no live database. Mutually exclusive with "
+            "--sql-file / --database-url."
+        ),
+    )(func)
+    func = click.option(
+        "--sql-file",
+        "sql_file",
+        type=click.Path(allow_dash=True, dir_okay=False),
+        multiple=True,
+        help=(
+            "Analyze raw DDL from this file offline (no live database); repeat "
+            "for several files (concatenated in order — declare tables before "
+            "the policies/grants that reference them); '-' reads stdin. "
+            "Mutually exclusive with --snapshot / --database-url."
         ),
     )(func)
     return func
@@ -750,6 +790,114 @@ def _load_effective_config(
             or "No database connection: pass --database-url or set DATABASE_URL."
         )
     return effective
+
+
+_OFFLINE_MAX_BYTES = 8 * 1024 * 1024  # reject pathological untrusted input early
+
+
+def _offline_effective_config(
+    *, config_path: str | None, schemas_csv: str | None
+) -> Config:
+    """Effective config for an offline run — like `_load_effective_config` but
+    WITHOUT the live-DB-required guard (offline never connects)."""
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+    return _merge_overrides(
+        config, database_url=None, schemas_csv=schemas_csv, fail_on=None
+    )
+
+
+def _guard_offline_exclusivity(
+    ctx: click.Context, *, command: str
+) -> None:
+    """Reject an offline source combined with an explicit --database-url.
+
+    Ambient $DATABASE_URL is fine (the common CI setup) — only an explicit
+    command-line --database-url collides, mirroring the --migrations guard.
+    """
+    if (
+        ctx.get_parameter_source("database_url")
+        is click.core.ParameterSource.COMMANDLINE
+    ):
+        raise ToolError(
+            "choose one schema source: an offline source (--sql-file / "
+            "--snapshot) or a live database (--database-url), not both."
+        )
+
+
+def _reject_apply_offline(apply: bool, command: str) -> None:
+    if apply:
+        raise ToolError(
+            f"--apply needs a live database connection and cannot be used with "
+            f"an offline source (--sql-file / --snapshot). Offline {command} is "
+            "emit-only: pipe stdout to a migration, or use --output."
+        )
+
+
+def _resolve_offline_schema(
+    *,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
+    schemas_csv: str | None,
+    command: WarnCommand,
+) -> tuple[Schema, SchemaSource] | None:
+    """Build a Schema from --sql-file / --snapshot, or return None.
+
+    None when neither flag was given (caller keeps its live path). --sql-file is
+    repeatable and concatenated in order; '-' reads stdin. Input is byte-capped;
+    a pathological-depth parse (RecursionError) and any SchemaSourceError map to
+    a ToolError. Prints the command-appropriate soundness caveat to stderr.
+    """
+    if not sql_file and snapshot is None:
+        return None
+    schemas = (
+        tuple(s.strip() for s in schemas_csv.split(",") if s.strip())
+        if schemas_csv
+        else None
+    )
+    sql_text: str | None = None
+    if sql_file:
+        parts: list[str] = []
+        total = 0
+        for entry in sql_file:
+            if entry == "-":
+                chunk = sys.stdin.read()
+            else:
+                try:
+                    with open(entry, encoding="utf-8") as fh:
+                        chunk = fh.read()
+                except OSError as exc:
+                    raise ToolError(
+                        f"cannot read --sql-file {entry!r}: {exc}"
+                    ) from exc
+            total += len(chunk.encode("utf-8"))
+            if total > _OFFLINE_MAX_BYTES:
+                raise ToolError(
+                    "offline SQL input exceeds "
+                    f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB; split it or "
+                    "lint against a live database."
+                )
+            parts.append(chunk)
+        sql_text = "\n".join(parts)
+    try:
+        schema, source = resolve_schema(
+            sql=sql_text, snapshot=snapshot, schemas=schemas
+        )
+    except SchemaSourceError as exc:
+        where = (
+            " ".join(repr(p) for p in sql_file) if sql_file else repr(snapshot)
+        )
+        raise ToolError(f"{exc.message} (source: {where})") from exc
+    except RecursionError as exc:
+        raise ToolError(
+            "the provided schema has a pathologically deep policy expression "
+            "and could not be parsed offline."
+        ) from exc
+    for line in schema_source_warnings(source, command=command):
+        click.echo(f"pgrls: {line}", err=True)
+    return schema, source
 
 
 def _connect_and_introspect(
