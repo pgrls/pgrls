@@ -718,19 +718,51 @@ _CATALOG_ONLY_INERT: tuple[tuple[str, str], ...] = (
     ("VIEW004", "SECURITY DEFINER calls from view bodies"),
 )
 
+WarnCommand = Literal["lint", "fix", "generate"]
 
-def schema_source_warnings(source: SchemaSource) -> list[str]:
-    """Warnings to attach to a `lint` / `verify` response, per schema source.
 
-    For the offline `sql=` path, returns a leading caveat plus a note naming the
-    catalog-only rule families that are structurally inert (their inputs aren't
-    expressible in DDL) — so a "no findings" result is not mistaken for a clean
-    bill of health. The `database_url` and `snapshot` paths see the full
-    catalog, so they get no warnings.
+def inert_rule_ids(source: SchemaSource) -> frozenset[str]:
+    """Rule IDs that cannot fire on this source and must be explicitly skipped.
+
+    Both offline sources are conservative: the `sql=` builder leaves catalog
+    fields empty, and a `snapshot` may have been captured by an older pgrls that
+    never serialized a given field (decoded back as empty) — so a catalog-only
+    rule would silently no-op. We skip-and-report the same set for both rather
+    than risk a false "covered" signal; `database_url` is the live catalog and
+    skips nothing. (Per-snapshot-version narrowing is a tracked follow-up.)
     """
-    if source != "sql":
+    if source in ("sql", "snapshot"):
+        return frozenset(rule_id for rule_id, _ in _CATALOG_ONLY_INERT)
+    return frozenset()
+
+
+def schema_source_warnings(
+    source: SchemaSource, *, command: WarnCommand | None = None
+) -> list[str]:
+    """Soundness caveats for an offline response, per source + command.
+
+    `command=None` (the MCP default) preserves the original lint-flavored text
+    verbatim. The CLI passes its command so `generate` gets a generation-scoped
+    caveat. A `snapshot` source warns that fields not captured in the artifact
+    are skipped. A live `database_url` sees the full catalog → no warnings.
+    """
+    if source not in ("sql", "snapshot"):
         return []
+    if command == "generate":
+        return [
+            "Generation reflects only the tables and policies in the provided "
+            "schema — roles, grants, and policies defined elsewhere are not "
+            "seen. Review the output against your full schema before applying.",
+        ]
     inert = ", ".join(rule_id for rule_id, _ in _CATALOG_ONLY_INERT)
+    if source == "snapshot":
+        return [
+            "Analysis is of the snapshot only — no live database. Rules needing "
+            "catalog state a snapshot may not carry are skipped, so an absence "
+            "of findings is NOT a proof of safety. Re-run against a live "
+            "database for full coverage.",
+            f"Skipped (catalog-only): {inert}.",
+        ]
     return [
         "Analysis is of the provided SQL only — no live database. Rules that "
         "depend on catalog state not expressible in CREATE/ALTER/GRANT DDL "

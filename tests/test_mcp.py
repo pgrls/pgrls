@@ -287,8 +287,8 @@ def test_snapshot_path_reparses_asts(tmp_path) -> None:
     # lint works.
     lint_result = server.lint(snapshot=str(path))
     assert lint_result["schema_source"] == "snapshot"
-    # snapshot path sees the full catalog → no sql-only caveat warnings.
-    assert lint_result["warnings"] == []
+    # snapshot path warns conservatively (catalog fields may be absent in older snapshots).
+    assert any("snapshot" in w.lower() for w in lint_result["warnings"])
 
     # verify gives a real verdict (NOT unverified — the trap).
     verify_result = server.verify(snapshot=str(path), mode="anon")
@@ -589,3 +589,10 @@ def test_database_url_error_is_sanitized() -> None:
     # The credential must never appear in the returned message.
     assert "SUPERSECRET" not in result["error"]["message"]
     assert secret_url not in result["error"]["message"]
+
+
+def test_mcp_warnings_name_every_inert_rule():
+    from pgrls.schema_sources import inert_rule_ids, schema_source_warnings
+    text = " ".join(schema_source_warnings("sql"))
+    for rid in inert_rule_ids("sql"):
+        assert rid in text
