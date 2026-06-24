@@ -1,8 +1,8 @@
-"""Resolve a `pgrls.model.Schema` from one of three sources, for the MCP server.
+"""Resolve a `pgrls.model.Schema` from one of three sources (sql / database_url / snapshot).
 
-This module is the FastMCP-agnostic core of `pgrls mcp`: it has NO dependency
-on the `fastmcp` extra, so the schema-resolution + DDL-parsing logic can be
-unit-tested with a plain `pip install pgrls`.
+This module is the FastMCP-agnostic schema-resolution core shared by the CLI
+(`pgrls lint/fix/generate --sql-file/--snapshot`) and the MCP server; it has
+NO dependency on the `fastmcp` extra.
 
 Three sources, EXACTLY ONE per call (`resolve_schema` enforces this):
 

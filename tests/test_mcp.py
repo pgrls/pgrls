@@ -2,7 +2,7 @@
 
 Most tests are OFFLINE — they call the MCP tool functions
 (`pgrls.mcp.server.lint` / `verify` / `explain_rule` / `list_rules`) and the
-`pgrls.mcp._schema_sources` helpers directly, with no live MCP client and no
+`pgrls.schema_sources` helpers directly, with no live MCP client and no
 database. The headline crux is the offline `sql=` analysis path: pgrls lints +
 Z3-verifies raw DDL with no Postgres.
 
@@ -22,7 +22,7 @@ import sys
 import pytest
 
 from pgrls.mcp import server
-from pgrls.mcp._schema_sources import (
+from pgrls.schema_sources import (
     SchemaSourceError,
     resolve_schema,
     schema_from_sql,

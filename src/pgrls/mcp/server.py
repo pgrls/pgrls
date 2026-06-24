@@ -1,7 +1,7 @@
 """The thin FastMCP layer for `pgrls mcp` — isolate ALL FastMCP API here.
 
 This is the only pgrls module that imports `fastmcp`; everything substantive
-lives in `pgrls.mcp._schema_sources` (schema resolution / DDL parsing) and the
+lives in `pgrls.schema_sources` (schema resolution / DDL parsing) and the
 existing pgrls internals (`rules`, `verify`, `formatters`). Importing this
 module pulls in the optional `fastmcp` extra, so `pgrls.cli` imports it lazily,
 inside `pgrls mcp` — a plain `pip install pgrls` never touches FastMCP.
@@ -16,7 +16,7 @@ SAFETY POSTURE — NEVER MUTATES A DATABASE (hard constraint):
   `verify --probe`) remain deliberately unexposed; an agent that wants to apply
   the returned SQL does so through its own reviewed channel.
 * `database_url` is treated as a credential: it is never logged, never echoed
-  back, and database errors are sanitized (see `_schema_sources`). The
+  back, and database errors are sanitized (see `schema_sources`). The
   introspection it triggers — on every tool, including `fix` / `generate` —
   issues only SELECTs against the catalogs over a short-lived connection.
 * Every tool wraps its body so any failure returns a STRUCTURED error object
@@ -32,7 +32,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from pgrls.config import Config
-from pgrls.mcp._schema_sources import (
+from pgrls.schema_sources import (
     SchemaSourceError,
     resolve_schema,
     schema_source_warnings,
