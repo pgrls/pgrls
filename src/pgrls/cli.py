@@ -1475,6 +1475,70 @@ def _fix_emit_and_maybe_apply(
         )
 
 
+_OFFLINE_SQL_HEADER = (
+    "-- pgrls: generated offline from --sql-file/--snapshot; not validated "
+    "against live catalog state (BYPASSRLS / SECURITY DEFINER / FK context) "
+    "-- review before applying."
+)
+
+
+def _fix_dispatch(
+    fixes, *, conn, check: bool, output_path: str | None,
+    force: bool, apply: bool,
+) -> None:
+    if check:
+        _fix_check(fixes)
+        return
+    if output_path is not None:
+        _fix_write_migration(fixes, output_path, force=force)
+        return
+    _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
+
+
+def _generate_dispatch(
+    result, stmts, *, conn, output_path: str | None,
+    force: bool, apply: bool, offline: bool,
+) -> None:
+    if output_path is not None:
+        path = Path(output_path)
+        if path.exists() and not force:
+            raise ToolError(
+                f"{output_path} already exists. Pass --force to overwrite it."
+            )
+        migration = render_migration(stmts, tool_version=__version__)
+        try:
+            path.write_text(migration, encoding="utf-8", newline="")
+        except OSError as exc:
+            raise ToolError(
+                f"cannot write generated SQL to {output_path}: {exc}"
+            ) from exc
+        click.echo(
+            f"pgrls: wrote {len(stmts)} statement(s) to {output_path}.",
+            err=True,
+        )
+        return
+    if offline:
+        click.echo(_OFFLINE_SQL_HEADER + "\n" + render_fixes(stmts))
+    else:
+        click.echo(render_fixes(stmts))
+    if apply:
+        _apply_statements(conn, stmts, lock_key="pgrls.generate")
+        click.echo(
+            f"pgrls: applied {len(stmts)} statement(s). Run `pgrls lint` to "
+            "confirm a clean result.",
+            err=True,
+        )
+    else:
+        msg = (
+            f"pgrls: {len(stmts)} statement(s) ready (offline, emit-only). "
+            "Pipe to a migration or use --output FILE."
+            if offline
+            else f"pgrls: {len(stmts)} statement(s) ready (dry-run). Re-run "
+            "with --apply to execute, or --output FILE to write a migration."
+        )
+        click.echo(msg, err=True)
+
+
 @main.command()
 @common_db_options
 @click.option(
@@ -1659,20 +1723,7 @@ def fix(
             )
             return
 
-        # Four mutually exclusive output modes (the flag conflicts are
-        # rejected above): --check (CI gate), --output (migration file),
-        # dry-run (default), and --apply. Each is its own helper.
-        if check:
-            _fix_check(fixes)
-            return  # unreachable (_fix_check exits 1); pins control flow
-
-        if output_path is not None:
-            # `--apply` is already rejected alongside `--output`, so
-            # reaching here means a pure dry-run-to-file.
-            _fix_write_migration(fixes, output_path, force=force)
-            return
-
-        _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
+        _fix_dispatch(fixes, conn=conn, check=check, output_path=output_path, force=force, apply=apply)
 
 def _parse_generate_tables(
     raw: tuple[str, ...],
@@ -1904,45 +1955,7 @@ def generate(
             )
             return
 
-        stmts = list(result.statements)
-
-        if output_path is not None:
-            path = Path(output_path)
-            if path.exists() and not force:
-                raise ToolError(
-                    f"{output_path} already exists. Pass --force to "
-                    "overwrite it."
-                )
-            migration = render_migration(stmts, tool_version=__version__)
-            try:
-                path.write_text(migration, encoding="utf-8", newline="")
-            except OSError as exc:
-                raise ToolError(
-                    f"cannot write generated SQL to {output_path}: {exc}"
-                ) from exc
-            click.echo(
-                f"pgrls: wrote {len(stmts)} statement(s) to "
-                f"{output_path}.",
-                err=True,
-            )
-            return
-
-        click.echo(render_fixes(stmts))
-
-        if apply:
-            _apply_statements(conn, stmts, lock_key="pgrls.generate")
-            click.echo(
-                f"pgrls: applied {len(stmts)} statement(s). "
-                "Run `pgrls lint` to confirm a clean result.",
-                err=True,
-            )
-        else:
-            click.echo(
-                f"pgrls: {len(stmts)} statement(s) ready (dry-run). "
-                "Re-run with --apply to execute, or --output FILE to "
-                "write a migration.",
-                err=True,
-            )
+        _generate_dispatch(result, list(result.statements), conn=conn, output_path=output_path, force=force, apply=apply, offline=False)
 
 
 @main.command()
