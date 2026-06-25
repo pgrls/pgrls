@@ -585,3 +585,168 @@ def test_live_render_migration_header_unchanged():
     assert "generated offline" not in result.lower(), (
         "Live render_migration must NOT contain offline caveat:\n" + result
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave-4 tests: fix/generate snapshot, multi-file, stdin, conflicts, check
+# ---------------------------------------------------------------------------
+
+
+def test_fix_snapshot_emits_enable_rls(tmp_path):
+    """fix --snapshot snap.json --rule SEC001 → exit 0, stdout has ENABLE ROW LEVEL SECURITY
+    and 'generated offline'."""
+    from pgrls.schema_sources import schema_from_sql
+
+    snap = schema_from_sql(ENABLE_ME_DDL).to_snapshot()
+    path = tmp_path / "snap.json"
+    path.write_text(json.dumps(snap), encoding="utf-8")
+
+    res = CliRunner().invoke(
+        main, ["fix", "--snapshot", str(path), "--rule", "SEC001"]
+    )
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    assert "ENABLE ROW LEVEL SECURITY" in res.stdout
+    assert "generated offline" in res.stdout
+
+
+def test_generate_snapshot_emits_policy(tmp_path):
+    """generate --snapshot snap.json → exit 0, stdout has CREATE POLICY and
+    'generated offline'."""
+    from pgrls.schema_sources import schema_from_sql
+
+    snap = schema_from_sql(GEN_DDL).to_snapshot()
+    path = tmp_path / "snap.json"
+    path.write_text(json.dumps(snap), encoding="utf-8")
+
+    res = CliRunner().invoke(main, ["generate", "--snapshot", str(path)])
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    assert "CREATE POLICY" in res.stdout
+    assert "generated offline" in res.stdout
+
+
+def test_fix_multi_file_sql_file_rls_already_enabled(tmp_path):
+    """fix --sql-file a.sql --sql-file b.sql where a.sql creates table and
+    b.sql enables RLS → SEC001 does NOT fire (RLS enabled by concatenation),
+    so 'no auto-fixable violations found' appears on stderr."""
+    a = tmp_path / "a.sql"
+    a.write_text("CREATE TABLE public.docs2 (id int);\n")
+    b = tmp_path / "b.sql"
+    b.write_text("ALTER TABLE public.docs2 ENABLE ROW LEVEL SECURITY;\n")
+
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(a), "--sql-file", str(b), "--rule", "SEC001"]
+    )
+    assert res.exit_code == 0
+    assert "no auto-fixable violations found" in res.stderr.lower()
+
+
+def test_generate_multi_file_sql_file_emits_policy(tmp_path):
+    """generate --sql-file a.sql --sql-file b.sql combining into a tenant table
+    lacking policies → CREATE POLICY emitted."""
+    a = tmp_path / "a.sql"
+    a.write_text("CREATE TABLE public.tenants2 (id uuid);\n")
+    b = tmp_path / "b.sql"
+    b.write_text("ALTER TABLE public.tenants2 ADD COLUMN tenant_id uuid;\n")
+
+    res = CliRunner().invoke(
+        main, ["generate", "--sql-file", str(a), "--sql-file", str(b)]
+    )
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    assert "CREATE POLICY" in res.stdout
+
+
+def test_fix_database_url_conflict(tmp_path):
+    """fix --sql-file x --database-url postgres://x/y → non-zero exit, stderr
+    contains 'offline' or 'one schema source'."""
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--database-url", "postgres://x/y"]
+    )
+    assert res.exit_code != 0
+    assert "offline" in res.stderr.lower() or "one schema source" in res.stderr.lower()
+
+
+def test_generate_database_url_conflict(tmp_path):
+    """generate --sql-file x --database-url postgres://x/y → non-zero exit, stderr
+    contains 'offline' or 'one schema source'."""
+    f = tmp_path / "s.sql"
+    f.write_text(GEN_DDL)
+
+    res = CliRunner().invoke(
+        main, ["generate", "--sql-file", str(f), "--database-url", "postgres://x/y"]
+    )
+    assert res.exit_code != 0
+    assert "offline" in res.stderr.lower() or "one schema source" in res.stderr.lower()
+
+
+def test_fix_check_offline_exits_one_no_sql_emitted(tmp_path):
+    """fix --sql-file x --check → exit 1 AND stdout does NOT contain
+    ENABLE ROW LEVEL SECURITY (--check lists violations but emits no SQL)."""
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--check"]
+    )
+    assert res.exit_code == 1, (
+        f"Expected exit code 1 from fix --check, got {res.exit_code}"
+    )
+    assert "ENABLE ROW LEVEL SECURITY" not in res.stdout
+
+
+def test_fix_stdin_emits_enable_rls():
+    """fix --sql-file - with input=DDL → emits the fix to stdout
+    (has ENABLE ROW LEVEL SECURITY)."""
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", "-", "--rule", "SEC001"],
+        input=ENABLE_ME_DDL,
+    )
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    assert "ENABLE ROW LEVEL SECURITY" in res.stdout
+
+
+def test_generate_stdin_emits_policy():
+    """generate --sql-file - with input=DDL → emits CREATE POLICY."""
+    res = CliRunner().invoke(
+        main, ["generate", "--sql-file", "-"],
+        input=GEN_DDL,
+    )
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    assert "CREATE POLICY" in res.stdout
+
+
+def test_lint_require_full_coverage_snapshot(tmp_path):
+    """lint --snapshot snap.json --require-full-coverage → non-zero exit,
+    stderr mentions coverage (catalog-only rules are inert on a snapshot)."""
+    from pgrls.schema_sources import schema_from_sql
+
+    snap = schema_from_sql("CREATE TABLE public.t (id int);\n").to_snapshot()
+    path = tmp_path / "snap.json"
+    path.write_text(json.dumps(snap), encoding="utf-8")
+
+    res = CliRunner().invoke(
+        main, ["lint", "--snapshot", str(path), "--require-full-coverage"]
+    )
+    assert res.exit_code != 0
+    assert "coverage" in res.stderr.lower()
+
+
+def test_fix_offline_soundness_caveat_on_stderr(tmp_path):
+    """fix --sql-file x → a soundness caveat reaches stderr (matches the
+    'no live database' / 'not a proof' / 'offline' text from
+    schema_source_warnings for command='fix')."""
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--rule", "SEC001"]
+    )
+    assert res.exit_code == 0
+    err_lower = res.stderr.lower()
+    assert (
+        "no live database" in err_lower
+        or "not a proof" in err_lower
+        or "offline" in err_lower
+    ), f"Soundness caveat missing from stderr:\n{res.stderr}"
