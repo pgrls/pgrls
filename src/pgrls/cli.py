@@ -1855,7 +1855,9 @@ def _parse_generate_tables(
 
 
 @main.command()
+@click.pass_context
 @common_db_options
+@offline_source_options
 @click.option(
     "--model",
     type=click.Choice(["tenant", "owner"], case_sensitive=False),
@@ -1947,9 +1949,12 @@ def _parse_generate_tables(
     help="Execute the generated SQL. Default: dry-run (print SQL only).",
 )
 def generate(
+    ctx: click.Context,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
     model: str,
     column: str | None,
     tables: tuple[str, ...],
@@ -2006,11 +2011,15 @@ def generate(
     # then db-url-missing, then --table syntax). The context manager
     # below re-resolves + connects; this up-front call exists only to
     # pin that precedence (the analogue of fix()'s up-front parse).
-    _load_effective_config(
-        config_path=config_path,
-        database_url=database_url,
-        schemas_csv=schemas,
-    )
+    # Guard: skip on the offline path — no db-url required offline, and
+    # calling it would raise "No database connection" before the offline
+    # branch is reached.
+    if not sql_file and snapshot is None:
+        _load_effective_config(
+            config_path=config_path,
+            database_url=database_url,
+            schemas_csv=schemas,
+        )
 
     options = GenerateOptions(
         tenant_column=resolved_column,
@@ -2022,6 +2031,35 @@ def generate(
         restrictive=restrictive,
         tables=_parse_generate_tables(tables),
     )
+
+    offline = _resolve_offline_schema(
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas,
+        command="generate",
+    )
+    if offline is not None:
+        _reject_apply_offline(apply, "generate")
+        _guard_offline_exclusivity(ctx, command="generate")
+        schema, _ = offline
+        try:
+            result = plan_generation(schema, options)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        for note in result.notes:
+            click.echo(f"pgrls: note: {note}", err=True)
+        for qname, reason in result.skipped:
+            click.echo(f"pgrls: skipped {qname} — {reason}", err=True)
+        if not result.statements:
+            click.echo(
+                "pgrls: nothing to generate (no unprotected tables with the "
+                "discriminator column).",
+                err=True,
+            )
+            return
+        _generate_dispatch(
+            result, list(result.statements), conn=None, output_path=output_path,
+            force=force, apply=False, offline=True,
+        )
+        return
 
     with _connect_introspect_ctx(
         config_path=config_path,

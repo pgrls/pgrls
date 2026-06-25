@@ -205,3 +205,38 @@ def test_fix_apply_rejected_offline(tmp_path):
     )
     assert res.exit_code != 0
     assert "apply" in res.stderr.lower() and "offline" in res.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# CLI integration tests: generate offline wiring
+# ---------------------------------------------------------------------------
+
+GEN_DDL = "CREATE TABLE public.orgs (id uuid, tenant_id uuid, name text);\n"
+
+
+def test_generate_sql_file_emits_policy(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(GEN_DDL)
+    res = CliRunner().invoke(main, ["generate", "--sql-file", str(f)])
+    assert res.exit_code == 0
+    assert "CREATE POLICY" in res.stdout
+    assert "generated offline" in res.stdout  # provenance header
+    assert "generation reflects only" in res.stderr.lower()
+
+
+def test_generate_apply_rejected_offline(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(GEN_DDL)
+    res = CliRunner().invoke(
+        main, ["generate", "--sql-file", str(f), "--apply"]
+    )
+    assert res.exit_code != 0
+    assert "apply" in res.stderr.lower() and "offline" in res.stderr.lower()
+
+
+def test_verify_rejects_offline_flags():
+    # R2.5: the deliberate verify exclusion must not be silently undone.
+    res = CliRunner().invoke(
+        main, ["verify", "--sql-file", "-"], input="CREATE TABLE t (id int);"
+    )
+    assert res.exit_code != 0  # Click: "no such option: --sql-file"
