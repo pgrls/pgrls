@@ -6,8 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from pgrls.cli import _resolve_offline_schema
-# Confirm ToolError's module first: `grep -n "class ToolError" src/pgrls/*.py`
-from pgrls.cli import main, ToolError  # re-exported in cli; adjust if needed
+from pgrls.cli import main, ToolError
 
 DOCS_DDL = """
 CREATE TABLE public.docs (id uuid, tenant_id uuid, body text);
@@ -180,7 +179,9 @@ def test_lint_live_json_unchanged_has_no_coverage_keys():
     # Backward-compat: a non-offline json payload must NOT gain the new keys.
     from pgrls.formatters.json import format_json
 
-    assert "schema_source" not in json.loads(format_json([]))
+    payload = json.loads(format_json([]))
+    assert "schema_source" not in payload
+    assert "skipped_rules" not in payload
 
 
 ENABLE_ME_DDL = "CREATE TABLE public.t (id int);\n"  # SEC001
