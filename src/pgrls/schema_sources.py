@@ -766,6 +766,16 @@ def schema_source_warnings(
             "database for full coverage.",
             f"Skipped (catalog-only): {inert}.",
         ]
+    if command in {"lint", "fix"}:
+        return [
+            "Analysis is of the provided SQL only — no live database. Rules that "
+            "depend on catalog state (BYPASSRLS roles, SECURITY DEFINER functions, "
+            "triggers, indexes, and foreign keys) cannot fire here, so an absence "
+            "of findings is NOT a proof of safety. "
+            "For full coverage, run against a live database "
+            "(--database-url or $DATABASE_URL).",
+            f"Inert on sql= input (catalog-only): {inert}.",
+        ]
     return [
         "Analysis is of the provided SQL only — no live database. Rules that "
         "depend on catalog state not expressible in CREATE/ALTER/GRANT DDL "

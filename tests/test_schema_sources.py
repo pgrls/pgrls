@@ -41,3 +41,34 @@ def test_warnings_snapshot_source_is_nonempty():
 
 def test_warnings_live_source_is_empty():
     assert schema_source_warnings("database_url", command="lint") == []
+
+
+def test_warnings_lint_command_uses_corrected_wording():
+    """CLI lint/fix path gets corrected wording: --database-url, no snapshot recommendation."""
+    msgs = schema_source_warnings("sql", command="lint")
+    assert len(msgs) == 2
+    # Must mention --database-url or $DATABASE_URL (not the internal arg name)
+    assert "--database-url" in msgs[0] or "$DATABASE_URL" in msgs[0], (
+        "CLI warning must name --database-url or $DATABASE_URL, not internal arg name"
+    )
+    # Must NOT recommend snapshot as "full coverage"
+    assert "snapshot" not in msgs[0].lower(), (
+        "CLI warning must not recommend a snapshot for full coverage"
+    )
+    # The "absence of findings" text must still be present
+    assert "absence of findings is NOT a proof" in msgs[0]
+
+
+def test_warnings_fix_command_uses_corrected_wording():
+    """CLI fix path gets the same corrected wording as lint."""
+    msgs = schema_source_warnings("sql", command="fix")
+    assert "--database-url" in msgs[0] or "$DATABASE_URL" in msgs[0]
+    assert "snapshot" not in msgs[0].lower()
+
+
+def test_warnings_none_command_legacy_text_unchanged():
+    """command=None (MCP) keeps exact legacy text — pinned for backward compat."""
+    msgs = schema_source_warnings("sql", command=None)
+    # The legacy text references database_url (the internal arg name) and snapshot
+    assert "database_url" in msgs[0]
+    assert "snapshot" in msgs[0].lower()

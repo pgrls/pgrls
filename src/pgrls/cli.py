@@ -299,9 +299,10 @@ def offline_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
         type=click.Path(exists=True, dir_okay=False),
         default=None,
         help=(
-            "Read a schema from a `pgrls snapshot` artifact (input only) and "
-            "analyze it offline — no live database. Mutually exclusive with "
-            "--sql-file / --database-url."
+            "Input artifact produced by `pgrls snapshot` (not an output flag) — "
+            "analyze it offline, no live database. Mutually exclusive with "
+            "--sql-file / --database-url. "
+            "Add --require-full-coverage (lint) to fail a partial offline run."
         ),
     )(func)
     func = click.option(
@@ -313,7 +314,8 @@ def offline_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
             "Analyze raw DDL from this file offline (no live database); repeat "
             "for several files (concatenated in order — declare tables before "
             "the policies/grants that reference them); '-' reads stdin. "
-            "Mutually exclusive with --snapshot / --database-url."
+            "Mutually exclusive with --snapshot / --database-url. "
+            "Add --require-full-coverage (lint) to fail a partial offline run."
         ),
     )(func)
     return func
@@ -1503,7 +1505,7 @@ def _fix_check(fixes: list[Any]) -> None:
 
 
 def _fix_write_migration(
-    fixes: list[Any], output_path: str, *, force: bool
+    fixes: list[Any], output_path: str, *, force: bool, offline: bool = False
 ) -> None:
     """`pgrls fix --output FILE`: write the migration script, note it.
 
@@ -1516,13 +1518,17 @@ def _fix_write_migration(
     overwrite guard `pgrls generate --output` and `pgrls init` use, so a
     re-run of `pgrls fix -o migration.sql` can't silently destroy a
     hand-edited migration.
+
+    When `offline=True`, the migration file carries an offline caveat
+    header instead of the default "generated from a snapshot of the
+    database" header — the offline provenance travels into the artifact.
     """
     path = Path(output_path)
     if path.exists() and not force:
         raise ToolError(
             f"{output_path} already exists. Pass --force to overwrite it."
         )
-    migration = render_migration(fixes, tool_version=__version__)
+    migration = render_migration(fixes, tool_version=__version__, offline=offline)
     try:
         # newline="" so the LF render_migration emits is written
         # verbatim — without it, text mode on Windows rewrites \n to
@@ -1579,14 +1585,16 @@ _OFFLINE_SQL_HEADER = (
 
 def _fix_dispatch(
     fixes, *, conn, check: bool, output_path: str | None,
-    force: bool, apply: bool,
+    force: bool, apply: bool, offline: bool = False,
 ) -> None:
     if check:
         _fix_check(fixes)
         return
     if output_path is not None:
-        _fix_write_migration(fixes, output_path, force=force)
+        _fix_write_migration(fixes, output_path, force=force, offline=offline)
         return
+    if offline:
+        click.echo(_OFFLINE_SQL_HEADER)
     _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
 
 
@@ -1600,7 +1608,7 @@ def _generate_dispatch(
             raise ToolError(
                 f"{output_path} already exists. Pass --force to overwrite it."
             )
-        migration = render_migration(stmts, tool_version=__version__)
+        migration = render_migration(stmts, tool_version=__version__, offline=offline)
         try:
             path.write_text(migration, encoding="utf-8", newline="")
         except OSError as exc:
@@ -1824,19 +1832,12 @@ def fix(
         if not fixes:
             click.echo("pgrls: no auto-fixable violations found.", err=True)
             return
-        # Emit-only offline: dispatch with conn=None, apply=False. The provenance
-        # header rides the stdout SQL (the --output path keeps _fix_write_migration's
-        # own header).
-        if check:
-            _fix_check(fixes)
-            return
-        if output_path is not None:
-            _fix_write_migration(fixes, output_path, force=force)
-            return
-        click.echo(_OFFLINE_SQL_HEADER, err=False)
+        # Emit-only offline: dispatch with conn=None, apply=False, offline=True.
+        # The offline provenance header travels into --output files (Fix 1) and
+        # is prepended to stdout on the emit path (Fix 2).
         _fix_dispatch(
-            fixes, conn=None, check=False, output_path=None, force=force,
-            apply=False,
+            fixes, conn=None, check=check, output_path=output_path, force=force,
+            apply=False, offline=True,
         )
         return
 

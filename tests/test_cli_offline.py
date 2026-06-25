@@ -494,3 +494,94 @@ def test_lint_update_baseline_with_require_full_coverage_rejected(tmp_path):
     assert "update-baseline" in res.stderr.lower() or "update_baseline" in res.stderr.lower(), (
         "Error message should mention --update-baseline"
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave-3 fixes: Fix 1 — offline provenance reaches --output files
+# ---------------------------------------------------------------------------
+
+
+def test_fix_sql_file_output_carries_offline_caveat(tmp_path):
+    """fix --sql-file x --output out.sql → file must contain offline caveat.
+
+    The persisted migration is the highest-risk artifact. It must carry the
+    offline provenance header, not the false "snapshot of the database" header.
+    """
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+    out = tmp_path / "out.sql"
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--rule", "SEC001",
+               "--output", str(out)]
+    )
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    content = out.read_text(encoding="utf-8")
+    assert "generated offline" in content.lower() or "not validated" in content.lower(), (
+        f"Offline caveat missing from --output file:\n{content}"
+    )
+    assert "snapshot of the database" not in content, (
+        f"False live-DB header must not appear in offline --output file:\n{content}"
+    )
+
+
+def test_generate_sql_file_output_carries_offline_caveat(tmp_path):
+    """generate --sql-file x --output out.sql → file must contain offline caveat."""
+    f = tmp_path / "s.sql"
+    f.write_text(GEN_DDL)
+    out = tmp_path / "out.sql"
+    res = CliRunner().invoke(
+        main, ["generate", "--sql-file", str(f), "--output", str(out)]
+    )
+    assert res.exit_code == 0, f"Expected exit 0; stderr: {res.stderr}"
+    content = out.read_text(encoding="utf-8")
+    assert "generated offline" in content.lower() or "not validated" in content.lower(), (
+        f"Offline caveat missing from generate --output file:\n{content}"
+    )
+    assert "snapshot of the database" not in content, (
+        f"False live-DB header must not appear in offline generate --output file:\n{content}"
+    )
+
+
+def test_fix_sql_file_stdout_provenance_appears_exactly_once(tmp_path):
+    """Offline fix stdout emit path: 'generated offline' appears exactly once."""
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--rule", "SEC001"]
+    )
+    assert res.exit_code == 0
+    count = res.stdout.lower().count("generated offline")
+    assert count == 1, (
+        f"'generated offline' should appear exactly once on stdout, got {count}:\n{res.stdout}"
+    )
+
+
+def test_generate_sql_file_stdout_provenance_appears_exactly_once(tmp_path):
+    """Offline generate stdout emit path: 'generated offline' appears exactly once."""
+    f = tmp_path / "s.sql"
+    f.write_text(GEN_DDL)
+    res = CliRunner().invoke(main, ["generate", "--sql-file", str(f)])
+    assert res.exit_code == 0
+    count = res.stdout.lower().count("generated offline")
+    assert count == 1, (
+        f"'generated offline' should appear exactly once on stdout, got {count}:\n{res.stdout}"
+    )
+
+
+def test_live_render_migration_header_unchanged():
+    """Live render_migration (offline=False default) must produce the canonical header."""
+    from pgrls.fixers import Fix, render_migration
+
+    fix = Fix(
+        rule_id="SEC001",
+        location="public.t",
+        sql="ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;",
+        description="Enable RLS",
+    )
+    result = render_migration([fix], tool_version="0.0.0-test")
+    assert "snapshot of the database" in result, (
+        "Live render_migration must still contain 'snapshot of the database':\n" + result
+    )
+    assert "generated offline" not in result.lower(), (
+        "Live render_migration must NOT contain offline caveat:\n" + result
+    )
