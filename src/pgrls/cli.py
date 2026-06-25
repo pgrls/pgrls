@@ -670,9 +670,10 @@ def lint(
         gating_skipped = sorted(inert & would_run)
     else:
         gating_skipped = []
-    # For backward compatibility, the full inert set is still used in the
-    # skipped_rules json field (so consumers see the complete catalog picture).
-    # The gating_skipped is what drives the notice and the coverage gate.
+    # `gating_skipped` drives all three consistently — the stderr notice, the
+    # json `skipped_rules` field, and the `--require-full-coverage` gate — so
+    # each reflects only inert rules that would have run. A scoped run like
+    # `--rule SEC004` therefore neither reports nor fails on unrelated skips.
     skipped = gating_skipped
     if skipped:
         click.echo(
