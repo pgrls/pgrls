@@ -118,6 +118,7 @@ from pgrls.schema_sources import (
     SchemaSource,
     SchemaSourceError,
     WarnCommand,
+    inert_rule_ids,
     resolve_schema,
     schema_source_warnings,
 )
@@ -322,6 +323,7 @@ def offline_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
 @click.pass_context
 @common_db_options
 @migration_source_options
+@offline_source_options
 @click.option(
     "--rule",
     "rules",
@@ -390,6 +392,16 @@ def offline_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
     help="Severity threshold that triggers nonzero exit.",
 )
 @click.option(
+    "--require-full-coverage",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fail (exit 1) if an offline source (--sql-file / --snapshot) could "
+        "not evaluate every rule — so a partial offline run cannot pass CI "
+        "silently. No effect on a live-database run."
+    ),
+)
+@click.option(
     "--format",
     "output_format",
     type=click.Choice(SUPPORTED_FORMATS, case_sensitive=False),
@@ -444,6 +456,7 @@ def lint(
     explain: bool,
     update_baseline: bool,
     fail_on: str | None,
+    require_full_coverage: bool,
     output_format: str,
     baseline_path: Path | None,
     coverage_path: str | None,
@@ -454,6 +467,8 @@ def lint(
     supabase: bool,
     create_roles: tuple[str, ...],
     pg_image: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
     if update_baseline and baseline_path is None:
@@ -540,6 +555,22 @@ def lint(
                 "--migrations or --supabase (or drop these options)."
             )
 
+    # Offline schema source: raw DDL (--sql-file) or a snapshot artifact
+    # (--snapshot). Mutually exclusive with live-database and ephemeral paths.
+    schema_source: SchemaSource | None = None
+    offline = _resolve_offline_schema(
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint"
+    )
+    if offline is not None:
+        if use_migrations or db_url_explicit:
+            raise ToolError(
+                "choose one schema source: an offline source (--sql-file / "
+                "--snapshot), a live database (--database-url), or an "
+                "ephemeral build (--migrations), not more than one."
+            )
+        schema, schema_source = offline
+        exclude_ids |= inert_rule_ids(schema_source)
+
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
     # feeds HYG004 (policy has no behavioral test), inert otherwise.
     # Loaded before connecting so a bad path fails fast.
@@ -574,32 +605,33 @@ def lint(
                 f"Cannot read perf artifact {perf_path!r}: {exc}"
             ) from exc
 
-    if use_migrations:
-        schema = _schema_from_migrations(
-            migrations_path=migrations_path,
-            migrations_layout=migrations_layout,
-            migrations_glob=migrations_glob,
-            supabase=supabase,
-            create_roles=create_roles,
-            pg_image=pg_image,
-            schemas=effective.schemas,
-        )
-    else:
-        if effective.database_url is None:
-            # If `[database].url` was set but its env-var interpolation
-            # failed, surface that specific cause (deferred from
-            # load_config) instead of the generic guidance.
-            raise ToolError(
-                effective.database_url_error
-                or "No database connection: pass --database-url or set DATABASE_URL."
+    if offline is None:
+        if use_migrations:
+            schema = _schema_from_migrations(
+                migrations_path=migrations_path,
+                migrations_layout=migrations_layout,
+                migrations_glob=migrations_glob,
+                supabase=supabase,
+                create_roles=create_roles,
+                pg_image=pg_image,
+                schemas=effective.schemas,
             )
-        try:
-            with psycopg.connect(effective.database_url) as conn:
-                schema = introspect(conn, schemas=effective.schemas)
-        except psycopg.Error as exc:
-            raise ToolError(f"Database error: {exc}") from exc
-        except ValueError as exc:
-            raise ToolError(str(exc)) from exc
+        else:
+            if effective.database_url is None:
+                # If `[database].url` was set but its env-var interpolation
+                # failed, surface that specific cause (deferred from
+                # load_config) instead of the generic guidance.
+                raise ToolError(
+                    effective.database_url_error
+                    or "No database connection: pass --database-url or set DATABASE_URL."
+                )
+            try:
+                with psycopg.connect(effective.database_url) as conn:
+                    schema = introspect(conn, schemas=effective.schemas)
+            except psycopg.Error as exc:
+                raise ToolError(f"Database error: {exc}") from exc
+            except ValueError as exc:
+                raise ToolError(str(exc)) from exc
 
     try:
         violations = _run_rules(
@@ -612,6 +644,16 @@ def lint(
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
+
+    # Offline runs skip catalog-only rules; emit a notice so operators can
+    # see which rules were not evaluated.
+    skipped = sorted(inert_rule_ids(schema_source)) if schema_source else []
+    if skipped:
+        click.echo(
+            f"pgrls: skipped {len(skipped)} catalog-only rule(s) not "
+            f"analyzable offline: {', '.join(skipped)}.",
+            err=True,
+        )
 
     if update_baseline:
         # `--update-baseline` makes the current findings the new
@@ -665,10 +707,16 @@ def lint(
             if r.id in rules_in_use
         }
 
+    extra_json = (
+        {"schema_source": schema_source, "skipped_rules": skipped}
+        if schema_source is not None and output_format == "json"
+        else None
+    )
     report = format_violations(
         displayed,
         format=output_format,
         rationale_map=rationale_map,
+        extra_json=extra_json,
     )
     if output_path is not None:
         # Write byte-for-byte what stdout would have received, so a
@@ -686,7 +734,15 @@ def lint(
     else:
         click.echo(report, nl=False)
 
-    if _should_fail(violations, threshold=effective.fail_on):
+    fail = _should_fail(violations, threshold=effective.fail_on)
+    if require_full_coverage and skipped:
+        click.echo(
+            "pgrls: --require-full-coverage: offline run skipped "
+            f"{len(skipped)} rule(s); failing.",
+            err=True,
+        )
+        fail = True
+    if fail:
         sys.exit(1)
 
 
