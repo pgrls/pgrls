@@ -1596,7 +1596,9 @@ def _generate_dispatch(
 
 
 @main.command()
+@click.pass_context
 @common_db_options
+@offline_source_options
 @click.option(
     "--rule",
     "rules",
@@ -1637,9 +1639,12 @@ def _generate_dispatch(
     ),
 )
 def fix(
+    ctx: click.Context,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
     rules: tuple[str, ...],
     apply: bool,
     output_path: str | None,
@@ -1753,6 +1758,42 @@ def fix(
     # `--fail-on`). Mirrors `pgrls lint --rule`.
     auto_fixable = {fixer.rule_id for fixer in default_fixers()}
     rules = _validate_rule_filter(rules, auto_fixable, kind="auto-fixable ")
+
+    offline = _resolve_offline_schema(
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="fix"
+    )
+    if offline is not None:
+        _reject_apply_offline(apply, "fix")
+        _guard_offline_exclusivity(ctx, command="fix")
+        schema, _ = offline
+        effective = _offline_effective_config(
+            config_path=config_path, schemas_csv=schemas
+        )
+        try:
+            fixes = generate_fixes(
+                schema, rule_options=effective.rule_options,
+                rule_filter=set(rules) if rules else None,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+        if not fixes:
+            click.echo("pgrls: no auto-fixable violations found.", err=True)
+            return
+        # Emit-only offline: dispatch with conn=None, apply=False. The provenance
+        # header rides the stdout SQL (the --output path keeps _fix_write_migration's
+        # own header).
+        if check:
+            _fix_check(fixes)
+            return
+        if output_path is not None:
+            _fix_write_migration(fixes, output_path, force=force)
+            return
+        click.echo(_OFFLINE_SQL_HEADER, err=False)
+        _fix_dispatch(
+            fixes, conn=None, check=False, output_path=None, force=force,
+            apply=False,
+        )
+        return
 
     with _connect_introspect_ctx(
         config_path=config_path,

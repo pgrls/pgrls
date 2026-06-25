@@ -181,3 +181,27 @@ def test_lint_live_json_unchanged_has_no_coverage_keys():
     from pgrls.formatters.json import format_json
 
     assert "schema_source" not in json.loads(format_json([]))
+
+
+ENABLE_ME_DDL = "CREATE TABLE public.t (id int);\n"  # SEC001
+
+
+def test_fix_sql_file_emits_enable_rls(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--rule", "SEC001"]
+    )
+    assert res.exit_code == 0
+    assert "ENABLE ROW LEVEL SECURITY" in res.stdout
+    assert "generated offline" in res.stdout  # provenance header
+
+
+def test_fix_apply_rejected_offline(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(ENABLE_ME_DDL)
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f), "--apply"]
+    )
+    assert res.exit_code != 0
+    assert "apply" in res.stderr.lower() and "offline" in res.stderr.lower()
