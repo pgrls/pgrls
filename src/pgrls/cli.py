@@ -913,6 +913,21 @@ def _resolve_offline_schema(
         if schemas_csv
         else None
     )
+    if snapshot is not None:
+        try:
+            snap_size = os.path.getsize(snapshot)
+        except OSError as exc:
+            raise ToolError(
+                f"cannot read --snapshot {snapshot!r}: {exc}"
+            ) from exc
+        if snap_size > _OFFLINE_MAX_BYTES:
+            raise ToolError(
+                f"snapshot file {snapshot!r} is "
+                f"{snap_size // (1024 * 1024)} MiB, which exceeds the "
+                f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB limit. "
+                "Use a smaller snapshot or re-capture with a scoped "
+                "--schemas filter."
+            )
     sql_text: str | None = None
     if sql_file:
         parts: list[str] = []
@@ -1765,7 +1780,7 @@ def fix(
     if offline is not None:
         _reject_apply_offline(apply, "fix")
         _guard_offline_exclusivity(ctx, command="fix")
-        schema, _ = offline
+        schema, offline_source = offline
         effective = _offline_effective_config(
             config_path=config_path, schemas_csv=schemas
         )
@@ -1776,6 +1791,12 @@ def fix(
             )
         except (TypeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
+        # Filter out any fixer whose rule is inert offline — it would emit a
+        # bogus statement (e.g. a CREATE INDEX for an index it can't see via
+        # DDL parsing). This preserves the under-report contract: offline fix
+        # never emits a statement that isn't grounded in observed DDL.
+        inert = inert_rule_ids(offline_source)
+        fixes = [f for f in fixes if f.rule_id not in inert]
         if not fixes:
             click.echo("pgrls: no auto-fixable violations found.", err=True)
             return

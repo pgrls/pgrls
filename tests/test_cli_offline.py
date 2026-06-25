@@ -241,3 +241,115 @@ def test_verify_rejects_offline_flags():
         main, ["verify", "--sql-file", "-"], input="CREATE TABLE t (id int);"
     )
     assert res.exit_code != 0  # Click: "no such option: --sql-file"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — PERF003 must NOT fire offline (table.indexes is always empty offline)
+# ---------------------------------------------------------------------------
+
+TENANT_POLICY_NO_INDEX_DDL = """
+CREATE TABLE public.tenant_docs (
+    id uuid,
+    tenant_id uuid,
+    body text
+);
+ALTER TABLE public.tenant_docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_scope ON public.tenant_docs
+    FOR SELECT
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+"""
+
+
+def test_lint_sql_file_does_not_emit_perf003_offline(tmp_path):
+    """Offline lint must NOT fire PERF003 — table.indexes is always empty
+    after sql parsing, so any PERF003 finding would be a false positive
+    (we can't see CREATE INDEX in missing DDL). The under-report contract
+    requires PERF003 be inert offline."""
+    f = tmp_path / "schema.sql"
+    f.write_text(TENANT_POLICY_NO_INDEX_DDL)
+    res = CliRunner().invoke(
+        main, ["lint", "--sql-file", str(f), "--format", "json"]
+    )
+    payload = json.loads(res.stdout)
+    rule_ids = [v["rule_id"] for v in payload["violations"]]
+    assert "PERF003" not in rule_ids, (
+        "PERF003 fired offline — false positive; table.indexes is always empty "
+        "after DDL-only parsing, so no-index is not meaningful."
+    )
+    assert "PERF003" in payload["skipped_rules"], (
+        "PERF003 should appear in skipped_rules when running offline."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — offline `fix` must NOT emit a bogus PERF003 CREATE INDEX
+# ---------------------------------------------------------------------------
+
+
+def test_fix_sql_file_does_not_emit_perf003_create_index(tmp_path):
+    """Offline fix --sql-file must not emit a CREATE INDEX for PERF003.
+    PERF003 is inert offline (no indexes visible), so its fixer would
+    generate a bogus statement. It must be filtered out before output."""
+    f = tmp_path / "schema.sql"
+    f.write_text(TENANT_POLICY_NO_INDEX_DDL)
+    res = CliRunner().invoke(
+        main, ["fix", "--sql-file", str(f)]
+    )
+    assert "CREATE INDEX" not in res.stdout, (
+        "fix --sql-file must not emit a CREATE INDEX (PERF003 is inert offline)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — SEC023 and VIEW002 in inert list for accurate skipped_rules
+# ---------------------------------------------------------------------------
+
+
+def test_sec023_is_in_inert_rule_ids():
+    """SEC023 reads schema.bypassrls_roles which is never populated offline."""
+    from pgrls.schema_sources import inert_rule_ids
+    assert "SEC023" in inert_rule_ids("sql"), (
+        "SEC023 reads bypassrls_roles (never populated offline) — "
+        "it must be in the inert set."
+    )
+
+
+def test_view002_is_in_inert_rule_ids():
+    """VIEW002 reads schema.views which is never populated offline."""
+    from pgrls.schema_sources import inert_rule_ids
+    assert "VIEW002" in inert_rule_ids("sql"), (
+        "VIEW002 reads schema.views (never populated offline) — "
+        "it must be in the inert set."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — --snapshot byte-cap (reuse _OFFLINE_MAX_BYTES)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_snapshot_rejects_oversize_file(tmp_path):
+    """A snapshot file larger than _OFFLINE_MAX_BYTES must raise ToolError
+    with a size/MiB message BEFORE json.load is attempted (DoS guard).
+    A valid JSON would parse fine but we must never attempt to load > 8 MiB."""
+    import json as _json
+    from pgrls.cli import _resolve_offline_schema, ToolError
+    from pgrls.schema_sources import schema_from_sql
+
+    # Write a VALID snapshot JSON that is over 8 MiB by padding the content.
+    # We put the real schema payload inside + big padding so json.load would
+    # succeed if called, but we want the size check to fire first.
+    snap_payload = schema_from_sql(
+        "CREATE TABLE public.t (id int);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    ).to_snapshot()
+    # Pad the JSON to exceed 8 MiB — add a big dummy key the parser ignores.
+    snap_payload["_pad"] = "x" * (9 * 1024 * 1024)
+    snap = tmp_path / "big.json"
+    snap.write_text(_json.dumps(snap_payload), encoding="utf-8")
+    assert snap.stat().st_size > 8 * 1024 * 1024  # sanity
+
+    with pytest.raises(ToolError, match="[Mm][Ii][Bb]|exceed|[Ss]napshot.*size|size.*[Ss]napshot"):
+        _resolve_offline_schema(
+            sql_file=(), snapshot=str(snap), schemas_csv=None, command="lint"
+        )
