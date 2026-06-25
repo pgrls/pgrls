@@ -353,3 +353,144 @@ def test_resolve_snapshot_rejects_oversize_file(tmp_path):
         _resolve_offline_schema(
             sql_file=(), snapshot=str(snap), schemas_csv=None, command="lint"
         )
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 fixes: Fix 1 — gating_skipped scoped to rules-in-play
+# ---------------------------------------------------------------------------
+
+
+def test_lint_rule_sec004_require_full_coverage_passes(tmp_path):
+    """--rule SEC004 --require-full-coverage must not fail due to coverage gate offline.
+
+    SEC004 is analyzable offline (it is NOT in the inert set), so
+    gating_skipped for a --rule SEC004 run should be empty, meaning
+    --require-full-coverage must NOT cause a coverage failure.
+    Use DDL that doesn't trigger a SEC004 violation so the exit code
+    is purely governed by the coverage gate (not the violation path).
+    """
+    # A table with RLS enabled and a safe policy — no SEC004 violation
+    safe_ddl = (
+        "CREATE TABLE public.t (id uuid, tenant_id uuid);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.t FOR SELECT TO anon\n"
+        "  USING (tenant_id = auth.uid());\n"
+    )
+    f = tmp_path / "s.sql"
+    f.write_text(safe_ddl)
+    res = CliRunner().invoke(
+        main,
+        ["lint", "--sql-file", str(f), "--rule", "SEC004",
+         "--require-full-coverage", "--format", "json"],
+    )
+    payload = json.loads(res.stdout)
+    # gating_skipped for a --rule SEC004 run should be empty
+    assert payload.get("skipped_rules", []) == [], (
+        "skipped_rules should be empty when only running SEC004 (analyzable offline)"
+    )
+    assert res.exit_code == 0, (
+        f"Expected exit 0 (SEC004 analyzable; coverage gate should pass), "
+        f"got {res.exit_code}.\nstderr: {res.stderr}"
+    )
+
+
+def test_lint_rule_sec016_offline_surfaces_in_notice_and_json(tmp_path):
+    """--rule SEC016 offline must surface SEC016 in the skip notice and json.
+
+    SEC016 is inert offline (catalog-only), so a --rule SEC016 run should:
+    - exit 0 (no violations, no coverage failure)
+    - emit SEC016 in the stderr skip notice
+    - include SEC016 in json skipped_rules
+    Previously it was silent (empty gating set → no notice).
+    """
+    f = tmp_path / "s.sql"
+    f.write_text("CREATE TABLE public.t (id int);\n")
+    # Text output — check stderr notice
+    res_text = CliRunner().invoke(
+        main, ["lint", "--sql-file", str(f), "--rule", "SEC016"]
+    )
+    assert res_text.exit_code == 0, f"Expected exit 0, got {res_text.exit_code}"
+    assert "SEC016" in res_text.stderr, (
+        "stderr skip notice must mention SEC016 when --rule SEC016 is inert offline"
+    )
+    # JSON output — check skipped_rules
+    res_json = CliRunner().invoke(
+        main, ["lint", "--sql-file", str(f), "--rule", "SEC016", "--format", "json"]
+    )
+    payload = json.loads(res_json.stdout)
+    assert "SEC016" in payload.get("skipped_rules", []), (
+        "json skipped_rules must contain SEC016 for an offline --rule SEC016 run"
+    )
+
+
+def test_lint_require_full_coverage_with_rule_sec016_fails(tmp_path):
+    """--rule SEC016 --require-full-coverage offline must fail.
+
+    SEC016 is inert, so gating_skipped is non-empty and the flag must reject.
+    """
+    f = tmp_path / "s.sql"
+    f.write_text("CREATE TABLE public.t (id int);\n")
+    res = CliRunner().invoke(
+        main,
+        ["lint", "--sql-file", str(f), "--rule", "SEC016",
+         "--require-full-coverage"],
+    )
+    assert res.exit_code != 0, "Expected non-zero exit when only inert rule requested"
+    assert "coverage" in res.stderr.lower(), (
+        "Coverage failure message expected in stderr"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 fixes: Fix 2 — offline generate validates --config
+# ---------------------------------------------------------------------------
+
+
+def test_generate_offline_bad_config_is_error(tmp_path):
+    """generate --sql-file --config <broken.toml> must exit non-zero.
+
+    Previously, offline generate skipped config loading entirely, so a
+    broken --config silently exited 0.  Fix 2 adds an unconditional
+    validation step.
+    """
+    f = tmp_path / "s.sql"
+    f.write_text(GEN_DDL)
+    bad_config = tmp_path / "bad.toml"
+    bad_config.write_text("[lint\n")  # malformed TOML
+    res = CliRunner().invoke(
+        main, ["generate", "--sql-file", str(f), "--config", str(bad_config)]
+    )
+    assert res.exit_code != 0, (
+        "generate --sql-file with a broken --config must exit non-zero"
+    )
+    assert res.stderr or res.output, "Some error output expected"
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 fixes: Fix 3 — reject --update-baseline + --require-full-coverage
+# ---------------------------------------------------------------------------
+
+
+def test_lint_update_baseline_with_require_full_coverage_rejected(tmp_path):
+    """--update-baseline and --require-full-coverage cannot be combined.
+
+    --update-baseline exits 0 after recording findings (before the coverage
+    gate), so combining the flags silently swallows --require-full-coverage.
+    The pair must be rejected up-front with a descriptive error.
+    """
+    f = tmp_path / "s.sql"
+    f.write_text("CREATE TABLE public.t (id int);\n")
+    baseline = tmp_path / "b.json"
+    res = CliRunner().invoke(
+        main,
+        ["lint", "--sql-file", str(f),
+         "--update-baseline", "--baseline", str(baseline),
+         "--require-full-coverage"],
+    )
+    assert res.exit_code != 0, (
+        "Expected non-zero exit when --update-baseline and "
+        "--require-full-coverage are combined"
+    )
+    assert "update-baseline" in res.stderr.lower() or "update_baseline" in res.stderr.lower(), (
+        "Error message should mention --update-baseline"
+    )

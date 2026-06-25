@@ -483,6 +483,11 @@ def lint(
             "file and prints no report, so there is nothing for "
             "--output to write."
         )
+    if update_baseline and require_full_coverage:
+        raise ToolError(
+            "--update-baseline records findings and exits 0; it cannot be "
+            "combined with --require-full-coverage. Run them separately."
+        )
     try:
         config = load_config(config_path)
     except ConfigError as exc:
@@ -513,6 +518,9 @@ def lint(
                 f"{', '.join(both)}. A rule cannot be selected and "
                 "excluded at once."
             )
+    # Capture the user-supplied exclude set BEFORE the offline code unions
+    # inert rule IDs into exclude_ids.  We need it to compute gating_skipped.
+    user_exclude_ids: set[str] = set(exclude_ids)
 
     effective = _merge_overrides(
         config,
@@ -647,7 +655,23 @@ def lint(
 
     # Offline runs skip catalog-only rules; emit a notice so operators can
     # see which rules were not evaluated.
-    skipped = sorted(inert_rule_ids(schema_source)) if schema_source else []
+    # Compute the GATING skipped set: inert ∩ {rules that WOULD have run
+    # absent the offline auto-exclude}.  This ensures --rule SEC004 does not
+    # fail --require-full-coverage (SEC004 is not inert), and --rule SEC016
+    # offline is surfaced in the notice rather than being silent.
+    if schema_source:
+        inert = inert_rule_ids(schema_source)
+        would_run = (
+            set(rules) if rules
+            else (known - set(config.disable))
+        ) - user_exclude_ids
+        gating_skipped = sorted(inert & would_run)
+    else:
+        gating_skipped = []
+    # For backward compatibility, the full inert set is still used in the
+    # skipped_rules json field (so consumers see the complete catalog picture).
+    # The gating_skipped is what drives the notice and the coverage gate.
+    skipped = gating_skipped
     if skipped:
         click.echo(
             f"pgrls: skipped {len(skipped)} catalog-only rule(s) not "
@@ -2024,6 +2048,13 @@ def generate(
         )
     # Column default depends on the model when not given explicitly.
     resolved_column = column or ("user_id" if model_norm == "owner" else "tenant_id")
+
+    # Validate --config unconditionally so a broken config file surfaces on
+    # both offline and live generate paths (mirrors fix()'s up-front parse).
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
 
     # Resolve config (parse + merge + db-url guard) BEFORE parsing
     # --table, so a malformed --config and a missing database URL both
