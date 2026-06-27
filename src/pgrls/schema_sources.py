@@ -772,6 +772,10 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
     "SEC047": ("foreign keys to RLS-enabled parents", 20),
     "SEC048": ("owner-reachable members that bypass RLS", 21),
     "PERF003": ("policy-predicate column indexes", 7),
+    # PERF004 reaches `Table.indexes` (v7) through `perf003._has_leading_column_index`
+    # — same shared-helper path as SEC041/SEC043; the helper reads only
+    # `Index.columns` (v7 baseline), not `is_primary` (v13), so the threshold is 7.
+    "PERF004": ("policy-predicate function-wrapped column indexes", 7),
     "VIEW001": ("views over RLS tables", 4),
     "VIEW002": ("non-security-barrier view over RLS table", 4),
     "VIEW003": ("view ownership chains", 4),
