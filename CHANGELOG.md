@@ -52,8 +52,25 @@ breaking changes — they will be called out in this file.
   any restrictive policy not provably `true`, is treated as protection, so the
   normal RLS-gated Supabase grant is **not** flagged. Configurable `schemas` /
   `grantees` / `allowlist`; no auto-fix. Catalog now **62 rules**. (#234)
+- **SEC051 (warning) — Realtime-published table has RLS disabled.** Flags a
+  table in the Supabase `supabase_realtime` publication (membership resolved via
+  `pg_publication_tables`, so `FOR ALL TABLES` / schema publications are
+  expanded) with row level security off — Supabase Realtime then broadcasts every
+  row change to all subscribed clients without policy filtering, a side channel
+  past the table's REST-API row filtering. The Realtime-channel analog of SEC001,
+  sharpened to the broadcast consequence; co-fires with SEC001. RLS-enabled
+  members are filtered by Realtime per-policy and not flagged; only the
+  configured `publications` set (default `supabase_realtime`) counts. Needs new
+  publication introspection (snapshot **v22**); inert on the offline `--sql-file`
+  source. Configurable `publications` / `allowlist`; no auto-fix. Catalog now
+  **64 rules**. (#233)
 
 ### Changed
+- **Snapshot format → v22.** Adds a per-table `in_publications` array (the
+  publications a table belongs to, resolved via `pg_publication_tables`) for
+  SEC051. Additive and fail-closed: a pre-v22 snapshot loads with
+  `in_publications = ()`, so SEC051 finds nothing until the snapshot is
+  re-captured.
 - In `relaxed` mode, a rename whose predicate also changed is graded by predicate
   direction (loosen → DANGEROUS, tighten → SAFE, otherwise REQUIRES_REVIEW) rather
   than a blanket REQUIRES_REVIEW, so a loosening still trips `--fail-on dangerous`.

@@ -119,6 +119,38 @@ def test_filters_by_schema(pg_conn: psycopg.Connection, apply_sql) -> None:
     }
 
 
+def test_captures_publication_membership(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # in_publications (v22, for SEC051) is resolved via pg_publication_tables,
+    # so a FOR ALL TABLES publication expands the same as an explicit member.
+    apply_sql(
+        """
+        CREATE TABLE public.streamed (id INT);
+        CREATE TABLE public.other (id INT);
+        CREATE PUBLICATION supabase_realtime FOR TABLE public.streamed;
+        CREATE PUBLICATION pub_all FOR ALL TABLES;
+        """
+    )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        by_name = {t.name: t for t in schema.tables}
+        # Explicit member + FOR ALL TABLES → both, sorted.
+        assert by_name["streamed"].in_publications == (
+            "pub_all",
+            "supabase_realtime",
+        )
+        # `other` is only swept up by the FOR ALL TABLES publication.
+        assert by_name["other"].in_publications == ("pub_all",)
+    finally:
+        # Publications are per-database and survive the schema reset — drop
+        # them so they don't leak into other introspection tests.
+        apply_sql(
+            "DROP PUBLICATION IF EXISTS supabase_realtime; "
+            "DROP PUBLICATION IF EXISTS pub_all"
+        )
+
+
 def test_views_routed_to_schema_views_not_tables(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

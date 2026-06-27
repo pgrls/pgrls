@@ -935,6 +935,23 @@ WHERE p.provolatile = 'i'
 ORDER BY qname, pg_catalog.pg_get_function_identity_arguments(p.oid)
 """
 
+# Per-table publication membership for SEC051 (snapshot v22). The built-in
+# `pg_publication_tables` view resolves membership the way the server does —
+# expanding `FOR ALL TABLES` and (PG15+) `FOR TABLES IN SCHEMA` publications,
+# not just explicit `ADD TABLE` members — and is available on every supported
+# Postgres (the view has existed since PG10). Restricted to the introspected
+# schemas; aggregated to one sorted publication-name array per table so the
+# snapshot is deterministic.
+_PUBLICATION_MEMBERSHIP_SQL = """
+SELECT
+    pt.schemaname AS schema_name,
+    pt.tablename AS table_name,
+    array_agg(pt.pubname ORDER BY pt.pubname) AS publications
+FROM pg_catalog.pg_publication_tables pt
+WHERE pt.schemaname = ANY(%s)
+GROUP BY pt.schemaname, pt.tablename
+"""
+
 
 def _extract_search_path(config: list[str] | None) -> str | None:
     """Pull the `search_path` value out of a `pg_proc.proconfig` array.
@@ -1513,6 +1530,15 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             for oid, rolecol in col_grants_acc.items()
         }
 
+        # Publication memberships (resolved via `pg_publication_tables`) per
+        # table, keyed by (schema, name) since the view reports names — read by
+        # SEC051. A table in no publication is simply absent from the map.
+        cur.execute(_PUBLICATION_MEMBERSHIP_SQL, (schemas,))
+        publications_by_qname: dict[tuple[str, str], tuple[str, ...]] = {
+            (row["schema_name"], row["table_name"]): tuple(row["publications"])
+            for row in cur.fetchall()
+        }
+
         secdef_funcs = _fetch_secdef_functions(cur, schemas)
         views = _build_views(cur, schemas, secdef_funcs)
 
@@ -1651,6 +1677,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
             columns=tuple(columns_by_oid.get(row["table_oid"], [])),
             partition_of=partition_parent_by_oid.get(row["table_oid"]),
             inherits=inherits_by_oid.get(row["table_oid"], ()),
+            in_publications=publications_by_qname.get(
+                (row["schema_name"], row["table_name"]), ()
+            ),
             grants=tuple(
                 Grant(role=role, privileges=tuple(privileges))
                 for role, privileges in sorted(

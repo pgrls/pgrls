@@ -3452,6 +3452,69 @@ captured policy data; no introspection or snapshot change.
 allowlist = ["storage.objects.public_read"]
 ```
 
+<a id="rule-sec051"></a>
+
+## SEC051 — Realtime-published table has RLS disabled (unfiltered broadcast)
+
+**Severity:** warning
+
+In Supabase Realtime, a table added to the `supabase_realtime` publication has
+its row changes streamed to subscribed clients over the Realtime websocket.
+Realtime's "Postgres Changes" feature applies the table's RLS policies to each
+change — evaluated as the *subscribed* role — before delivering it, but only
+when RLS is **enabled**. A published table with RLS **off** has no policy to
+apply, so every `INSERT` / `UPDATE` / `DELETE` is broadcast to every subscriber
+verbatim, regardless of tenant — a side channel that bypasses the row filtering
+the REST API would have enforced on the same table.
+
+```sql
+CREATE TABLE public.messages (id bigint, room_id uuid, body text);  -- RLS off
+ALTER PUBLICATION supabase_realtime ADD TABLE public.messages;
+-- Every connected client now receives every room's messages in real time.
+```
+
+SEC051 fires on a table that is a member of a Realtime publication (default
+`supabase_realtime`) and has row level security disabled. Membership is resolved
+via `pg_publication_tables` at introspection time, so a `FOR ALL TABLES` or
+(PG15+) `FOR TABLES IN SCHEMA` publication is expanded, not just explicit
+`ADD TABLE` members. It is the Realtime-channel analog of
+[SEC001](#rule-sec001) (RLS disabled), sharpened to name the broadcast
+consequence — much as [SEC049](#rule-sec049) sharpens the PostgREST-read case —
+and deliberately co-fires with SEC001.
+
+It is deliberately narrow to stay low-FP:
+
+* **RLS-enabled members are not flagged.** With RLS on, Realtime checks each
+  change against the table's policies for the subscribed role, so the rows are
+  filtered (this holds whether or not `FORCE` is set, since the subscriber is
+  not the table owner). A permissive `USING (true)` policy that defeats that
+  filtering is [SEC008](#rule-sec008)'s domain, not duplicated here.
+* **Gated to Realtime publications.** Only the configured `publications` set
+  (default `["supabase_realtime"]`) counts as broadcasting; a table in some
+  other logical-replication publication is not flagged. A database with no such
+  publication (the non-Supabase case) produces no findings — the same "don't
+  flood every project" discipline as [SEC044](#rule-sec044) /
+  [SEC050](#rule-sec050).
+* It needs publication introspection (`pg_publication_tables`, snapshot v22+).
+  On an offline `--sql-file` source — which cannot model `CREATE PUBLICATION` —
+  SEC051 is reported as **skipped** rather than silently passing.
+
+**Remediation.** Enable RLS with a row-scoping policy (Realtime then evaluates
+policies against each change), remove the table from the publication
+(`ALTER PUBLICATION supabase_realtime DROP TABLE …`), or allowlist a table that
+is intentionally broadcast without RLS. There is no auto-fix — the right fix
+depends on whether the broadcast is intended.
+
+**Configuration** (`[lint.rules.SEC051]`):
+
+```toml
+[lint.rules.SEC051]
+# Publication names treated as Realtime broadcast channels.
+publications = ["supabase_realtime"]
+# Table ids (schema.table) deliberately broadcast without RLS.
+allowlist = ["public.presence"]
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK
