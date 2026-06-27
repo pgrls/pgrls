@@ -1,15 +1,26 @@
-"""PERF001 — Unwrapped auth function in policy USING.
+"""PERF001 — Unwrapped auth function in a policy predicate.
 
 Calls like `auth.uid()` and `current_setting('app.user')` in a policy's
-USING clause are evaluated for every candidate row Postgres scans.
-Wrapping the call in `(SELECT auth.uid())` forces evaluation once per
-statement; the planner caches the result. The benefit is material on
-large tables and the rewrite is mechanical.
+USING or WITH CHECK clause are evaluated for every row Postgres
+processes — every candidate row scanned (USING) and every row written
+(WITH CHECK). Wrapping the call in `(SELECT auth.uid())` forces
+evaluation once per statement; the planner caches the result. The
+benefit is material on large scans and bulk writes, and the rewrite is
+mechanical.
 
-Detection: walk the USING AST and look for FuncCall / SQLValueFunction
-nodes whose name is in the configured set, but skip anything reached via
-a SubLink — calls inside `(SELECT ...)`, `IN (SELECT ...)`, etc. are
-already wrapped.
+Both clauses are in scope. A 1000-row INSERT or UPDATE re-evaluates a
+bare `auth.uid()` in WITH CHECK once per row; the `(SELECT …)` wrap
+collapses that to a single InitPlan call — identical to USING. (This was
+verified empirically with a call-counting STABLE function: bare WITH
+CHECK = 1000 calls, wrapped = 1, for both bulk INSERT and bulk UPDATE.
+An earlier belief that "Postgres optimizes WITH CHECK differently" was
+wrong.)
+
+Detection: walk the USING and WITH CHECK ASTs and look for FuncCall /
+SQLValueFunction nodes whose name is in the configured set, but skip
+anything reached via a SubLink — calls inside `(SELECT ...)`,
+`IN (SELECT ...)`, etc. are already wrapped. One violation per policy,
+naming the clause(s) where an unwrapped call was found.
 """
 from __future__ import annotations
 
@@ -49,7 +60,7 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
 class PERF001:
     id: str = "PERF001"
     severity: Severity = "warning"
-    title: str = "Auth function called per-row in policy USING"
+    title: str = "Auth function called per-row in policy USING/WITH CHECK"
 
     def check(
         self, schema: Schema, options: dict[str, Any]
@@ -59,18 +70,25 @@ class PERF001:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                if policy.using_ast is None:
-                    continue
-                matches = find_func_calls(
+                clauses: list[str] = []
+                if policy.using_ast is not None and find_func_calls(
                     policy.using_ast,
                     auth_functions,
                     exclude_sublinks=True,
-                )
-                if not matches:
+                ):
+                    clauses.append("USING")
+                if policy.with_check_ast is not None and find_func_calls(
+                    policy.with_check_ast,
+                    auth_functions,
+                    exclude_sublinks=True,
+                ):
+                    clauses.append("WITH CHECK")
+                if not clauses:
                     continue
                 pid = policy_id(table, policy)
                 if pid in allowlist:
                     continue
+                where = " and ".join(clauses)
                 out.append(
                     Violation(
                         rule_id="PERF001",
@@ -79,7 +97,7 @@ class PERF001:
                         message=(
                             f"Policy {policy.name!r} on "
                             f"{table.qualified_name} calls an auth "
-                            "function in USING without wrapping it in "
+                            f"function in {where} without wrapping it in "
                             "a subquery. Postgres re-evaluates the call "
                             "per row. Wrap as e.g. "
                             "(SELECT auth.uid()) so the planner caches "

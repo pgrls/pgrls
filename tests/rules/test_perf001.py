@@ -1,4 +1,4 @@
-"""Unit tests for PERF001 — unwrapped auth function in USING."""
+"""Unit tests for PERF001 — unwrapped auth function in USING / WITH CHECK."""
 from __future__ import annotations
 
 import pytest
@@ -100,13 +100,46 @@ def test_perf001_emits_only_one_violation_per_policy() -> None:
     assert len(PERF001().check(schema, {})) == 1
 
 
-def test_perf001_does_not_fire_on_with_check_only() -> None:
-    # Rule is USING-only by design.
+def test_perf001_fires_on_with_check_only() -> None:
+    # An INSERT policy whose only auth call is in WITH CHECK: a bare
+    # auth.uid() there is re-evaluated per written row (verified live —
+    # a 1000-row INSERT calls it 1000 times, the (SELECT …) wrap once),
+    # so PERF001 must fire, exactly like USING.
     schema = _wrap(
         _policy(
             None,
             command="INSERT",
             with_check="auth.uid() = user_id",
+        )
+    )
+    violations = PERF001().check(schema, {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.p"
+    assert "WITH CHECK" in violations[0].message
+
+
+def test_perf001_fires_once_when_both_clauses_unwrapped() -> None:
+    # FOR ALL with a bare auth call in BOTH USING and WITH CHECK →
+    # still ONE violation, message naming both clauses.
+    schema = _wrap(
+        _policy(
+            "auth.uid() = user_id",
+            command="ALL",
+            with_check="auth.uid() = user_id",
+        )
+    )
+    violations = PERF001().check(schema, {})
+    assert len(violations) == 1
+    assert "USING and WITH CHECK" in violations[0].message
+
+
+def test_perf001_does_not_fire_on_wrapped_with_check() -> None:
+    # Already-wrapped WITH CHECK (and no USING) → silent.
+    schema = _wrap(
+        _policy(
+            None,
+            command="INSERT",
+            with_check="(SELECT auth.uid()) = user_id",
         )
     )
     assert PERF001().check(schema, {}) == []

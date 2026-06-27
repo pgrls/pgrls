@@ -105,7 +105,7 @@ configurable, with `anon`/`authenticated` excluded by default as the RLS-gated
 Supabase pattern; the remediation names the `FOR ROLE <grantor>` the default
 was created for, since a bare `REVOKE` clears only the running role's own
 default; complements SEC003/SEC001),
-`PERF001` (unwrapped auth function in `USING`), `PERF002`
+`PERF001` (unwrapped auth function in `USING`/`WITH CHECK`), `PERF002`
 (VOLATILE function in policy expression),
 `PERF003` (policy predicate column without leading-column index —
 sequential scan per query), `PERF004` (policy predicate wraps an
@@ -408,10 +408,12 @@ Currently fixable:
   PERF003 documents; the description points at `pgrls fix --output`
   + `CREATE INDEX CONCURRENTLY` for large tables.
 * **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
-  and emits `ALTER POLICY <name> ON <schema>.<table> USING
-  (new_expr) [WITH CHECK (original)];`. WITH CHECK is preserved
-  verbatim — PERF001 is USING-only, the fix doesn't touch what
-  it wasn't asked to fix.
+  and emits `ALTER POLICY <name> ON <schema>.<table>` with the
+  rewritten `USING` and/or `WITH CHECK` clause. It covers both
+  clauses (an unwrapped auth call in `WITH CHECK` re-evaluates
+  per written row too) but emits ONLY the clause(s) it changed —
+  an unchanged clause is omitted, so it never clobbers a sibling
+  fixer's rewrite of the other clause.
 * **PERF003** — emits `CREATE INDEX ON <schema>.<table>
   (<column>);` for a policy-predicate column with no
   leading-column index. One index per offending column,

@@ -69,7 +69,7 @@ numeric order).
 | 18 | Soft-delete pattern (`deleted_at IS NULL`) | (none) | passes (column-IS-NULL is not auth-IS-NULL) |
 | 19 | Supabase `auth.uid() IS NULL` (Lovable CVE shape) | SEC004 + PERF001 | fires |
 | 20 | Supabase `auth.uid()` unwrapped | PERF001 | fires |
-| 21 | `auth.uid()` in WITH CHECK only | (none) | passes (PERF001 is USING-only by design) |
+| 21 | `auth.uid()` in WITH CHECK only | PERF001 | fires (rule walks both clauses) |
 | 22 | Orphaned column referenced only in WITH CHECK | HYG001 | fires (rule walks both clauses) |
 | 23 | Three-level partition with RLS at root | (none) | passes (multi-level ancestor walk) |
 | 24 | RLS pushed down to leaf only | SEC001 | fires on parent only; leaf clean |

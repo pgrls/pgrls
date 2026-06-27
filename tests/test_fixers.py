@@ -789,12 +789,13 @@ def test_perf001_fix_wraps_multiple_calls_in_one_expression() -> None:
     assert "(SELECT auth.role())" in sql
 
 
-def test_perf001_fix_emits_only_using_not_unchanged_with_check() -> None:
-    # PERF001 rewrites only USING, so it must emit ONLY the USING clause.
-    # Re-emitting the unchanged WITH CHECK (an `ALTER POLICY` replaces the
-    # whole clause) would clobber — and silently revert — a WITH CHECK fix
-    # another fixer makes on the same policy in one migration (SEC020's
-    # mirror, SEC011's strip). Matches SEC011/SEC019's minimal-diff rule.
+def test_perf001_fix_emits_only_changed_clause_not_unchanged_with_check() -> None:
+    # The WITH CHECK here is already wrapped (no unwrapped call), so the
+    # fixer leaves it alone and emits ONLY the USING clause it rewrote.
+    # Re-emitting an unchanged clause (an `ALTER POLICY` replaces the whole
+    # clause) would clobber — silently revert — a WITH CHECK fix another
+    # fixer makes on the same policy in one migration (SEC020's mirror,
+    # SEC011's strip). Matches SEC011/SEC019's minimal-diff rule.
     p = _policy(
         "user_id = auth.uid()",
         command="ALL",
@@ -807,11 +808,29 @@ def test_perf001_fix_emits_only_using_not_unchanged_with_check() -> None:
     assert fix.clauses == frozenset({"using"})
 
 
-def test_perf001_fix_silent_when_using_is_none() -> None:
+def test_perf001_fix_wraps_with_check_when_using_is_none() -> None:
+    # INSERT policy: no USING, a bare auth call in WITH CHECK. The fixer
+    # wraps WITH CHECK and emits only that clause.
     p = _policy(None, command="INSERT", with_check="user_id = auth.uid()")
     schema = _wrap_policy(p)
-    # PERF001 is USING-only — no USING means no fix.
-    assert PERF001Fixer().fix(schema, {}) == []
+    fix = PERF001Fixer().fix(schema, {})[0]
+    assert "WITH CHECK (user_id = (SELECT auth.uid()))" in fix.sql
+    assert "USING" not in fix.sql
+    assert fix.clauses == frozenset({"with_check"})
+
+
+def test_perf001_fix_wraps_both_clauses() -> None:
+    # FOR ALL with a bare auth call in BOTH clauses → one ALTER POLICY
+    # rewriting USING and WITH CHECK.
+    p = _policy(
+        "user_id = auth.uid()",
+        command="ALL",
+        with_check="user_id = auth.uid()",
+    )
+    fix = PERF001Fixer().fix(_wrap_policy(p), {})[0]
+    assert "USING (user_id = (SELECT auth.uid()))" in fix.sql
+    assert "WITH CHECK (user_id = (SELECT auth.uid()))" in fix.sql
+    assert fix.clauses == frozenset({"using", "with_check"})
 
 
 def test_perf001_fix_wraps_auth_call_on_sublink_testexpr() -> None:
@@ -3154,16 +3173,19 @@ def test_perf001_fix_emits_one_alter_policy_per_offending_policy() -> None:
     assert {f.location for f in fixes} == {"public.t.p1", "public.t.p2"}
 
 
-def test_perf001_fix_silent_when_auth_unwrapped_only_in_with_check() -> None:
-    # PERF001 is USING-only. If WITH CHECK has an unwrapped auth
-    # call but USING does not, PERF001Fixer must not generate a
-    # fix — there's nothing for it to repair.
+def test_perf001_fix_wraps_with_check_when_using_is_clean() -> None:
+    # USING has no unwrapped call but WITH CHECK does → the fixer wraps
+    # WITH CHECK and emits only that clause (the clean USING is left
+    # untouched, never re-emitted).
     p = _policy(
-        "id > 0",  # USING is clean
+        "id > 0",  # USING is clean — not re-emitted
         with_check="user_id = auth.uid()",  # WITH CHECK is unwrapped
     )
     schema = _wrap_policy(p)
-    assert PERF001Fixer().fix(schema, {}) == []
+    fix = PERF001Fixer().fix(schema, {})[0]
+    assert "WITH CHECK (user_id = (SELECT auth.uid()))" in fix.sql
+    assert "USING" not in fix.sql
+    assert fix.clauses == frozenset({"with_check"})
 
 
 def test_generate_fixes_with_empty_schema() -> None:
@@ -3281,12 +3303,11 @@ def test_quote_ident_quotes_embedded_control_chars_postgres_permits() -> None:
         parse_sql(f"CREATE TABLE {quoted} (id integer)")
 
 
-def test_perf001_fix_never_emits_with_check_even_with_content() -> None:
-    # PERF001 never changes WITH CHECK, so it must not re-emit it even when
-    # the WITH CHECK carries non-trivial content. Re-emitting it would
-    # clobber a sibling fixer's WITH CHECK rewrite in the same migration
-    # (the critical clobber bug). PERF001 also no longer round-trips WITH
-    # CHECK, so it presents no WITH CHECK injection surface at all.
+def test_perf001_fix_does_not_reemit_with_check_with_no_unwrapped_call() -> None:
+    # A WITH CHECK with no unwrapped auth call (here: already-wrapped auth
+    # plus extra content) is left untouched — the fixer emits only the USING
+    # clause it changed. Re-emitting an unchanged clause would clobber a
+    # sibling fixer's WITH CHECK rewrite in the same migration.
     p = _policy(
         "user_id = auth.uid()",
         command="ALL",
