@@ -15,19 +15,25 @@ which the rule uses.
 intentionally NOT wrapped: see `_funccall_matches` for the
 rationale. PERF001's *check* walks them; the fixer does not.
 
-The new SQL is round-tripped via `pglast.stream.RawStream`. Output:
+The new SQL is round-tripped via `pglast.stream.RawStream`. Output
+emits only the clause(s) actually rewritten:
 
     ALTER POLICY <name> ON <schema>.<table>
-        USING (<new expression>)
-        [WITH CHECK (<original with-check>)];
+        [USING (<new USING>)]
+        [WITH CHECK (<new WITH CHECK>)];
 
-WITH CHECK is preserved verbatim — PERF001's scope is USING-only,
-matching the rule's check shape. Unwrapped auth calls in WITH CHECK
-are left alone because PERF001's check doesn't fire on them either
-(see `tests/rules/test_perf001.py::test_perf001_does_not_fire_on_with_check_only`).
-A future PERF003 (or a wider PERF001 scope) could fix WITH CHECK
-too; today, this fixer mirrors the rule's USING-only scope so the
-"fixer fixes exactly what the rule reports" contract holds.
+Both USING and WITH CHECK are in scope — the rule fires on an
+unwrapped auth call in either, so the fixer rewrites either. A bare
+`auth.uid()` in WITH CHECK is re-evaluated per written row exactly
+like USING (see `pgrls.rules.perf001`'s module docstring for the
+empirical confirmation). A clause with no unwrapped call is omitted,
+never re-emitted: `ALTER POLICY ... USING (x)` replaces just that
+clause, so re-emitting an unchanged one would clobber — silently
+revert — a fix another fixer made on it in the same migration
+(SEC020's mirror, SEC011's strip). `Fix.clauses` records exactly
+which clauses this emits, and `generate_fixes` keeps one writer per
+(policy, clause): a narrowing fixer (SEC011/SEC020) rewriting the
+same clause wins, and PERF001's wrap re-fires on the next run.
 
 Identifiers are double-quoted via `_idents.quote_ident` /
 `_idents.quote_qualified` when Postgres syntax requires it (mixed
@@ -189,53 +195,61 @@ class PERF001Fixer:
         out: list[Fix] = []
         for table in schema.tables:
             for policy in table.policies:
-                if policy.using_ast is None:
-                    continue
                 pid = policy_id(table, policy)
                 if pid in skip:
                     continue
 
-                # `_wrap_unwrapped_calls` mutates pglast Node
-                # fields in place (setattr via setitem on tuple-
-                # of-children parents). Policy is a frozen
-                # dataclass but `frozen=True` does NOT freeze the
-                # AST node graph it holds. Without the deepcopy
-                # here, the fixer would visibly alter
-                # `policy.using_ast` for any rule that re-walks
-                # the Schema after `pgrls fix` runs (snapshot
-                # tests, programmatic API, future
-                # `pgrls fix && pgrls lint` chain). The
-                # invariant is "fixer is read-only over Schema";
-                # honor it by working on a copy.
-                ast_copy = copy.deepcopy(policy.using_ast)
-                new_using_ast, changed = _wrap_unwrapped_calls(
-                    ast_copy, names
-                )
-                if not changed:
+                # `_wrap_unwrapped_calls` mutates pglast Node fields in
+                # place (setattr via setitem on tuple-of-children
+                # parents). Policy is a frozen dataclass but
+                # `frozen=True` does NOT freeze the AST node graph it
+                # holds — so work on a deepcopy per clause. Without it
+                # the fixer would visibly alter `policy.using_ast` /
+                # `with_check_ast` for any rule that re-walks the Schema
+                # after `pgrls fix` runs (snapshot tests, programmatic
+                # API, the `pgrls fix && pgrls lint` chain). The invariant
+                # is "fixer is read-only over Schema"; honor it.
+                new_clauses: dict[str, str] = {}
+                for key, ast in (
+                    ("using", policy.using_ast),
+                    ("with_check", policy.with_check_ast),
+                ):
+                    if ast is None:
+                        continue
+                    new_ast, changed = _wrap_unwrapped_calls(
+                        copy.deepcopy(ast), names
+                    )
+                    if changed:
+                        new_clauses[key] = RawStream()(new_ast)
+                if not new_clauses:
                     continue
 
-                new_using_sql = RawStream()(new_using_ast)
-                # Emit ONLY the USING clause PERF001 rewrites. An
-                # `ALTER POLICY ... USING (x)` replaces just the USING
-                # clause and leaves WITH CHECK untouched, so re-emitting an
-                # unchanged WITH CHECK here would gain nothing AND clobber —
-                # silently reverting — a WITH CHECK fix another fixer made
-                # on the same policy in the same migration (e.g. SEC020's
-                # mirror or SEC011's strip). PERF001 never changes
-                # WITH CHECK; omitting it is the correct minimal diff,
-                # matching SEC011 / SEC019.
-                stmt = (
+                # Emit ONLY the clause(s) actually rewritten. An
+                # `ALTER POLICY ... USING (x)` replaces just that clause
+                # and leaves the other untouched, so re-emitting an
+                # unchanged clause would gain nothing AND clobber —
+                # silently reverting — a fix another fixer made on it in
+                # the same migration (SEC020's mirror, SEC011's strip).
+                # `Fix.clauses` lets `generate_fixes` keep one writer per
+                # (policy, clause); see that module's docstring.
+                lines = [
                     f"ALTER POLICY {quote_ident(policy.name)} "
-                    f"ON {quote_qualified(table.schema, table.name)}\n"
-                    f"    USING ({new_using_sql});"
-                )
+                    f"ON {quote_qualified(table.schema, table.name)}"
+                ]
+                if "using" in new_clauses:
+                    lines.append(f"    USING ({new_clauses['using']})")
+                if "with_check" in new_clauses:
+                    lines.append(
+                        f"    WITH CHECK ({new_clauses['with_check']})"
+                    )
+                stmt = "\n".join(lines) + ";"
 
                 out.append(
                     Fix(
                         rule_id="PERF001",
                         location=pid,
                         sql=stmt,
-                        clauses=frozenset({"using"}),
+                        clauses=frozenset(new_clauses),
                         description=(
                             f"Wrap auth function call(s) in policy "
                             f"{policy.name!r} on "

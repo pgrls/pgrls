@@ -3388,21 +3388,28 @@ allowlist = ["public.countries"]
 
 <a id="rule-perf001"></a>
 
-## PERF001 — Auth function called per-row in policy USING
+## PERF001 — Auth function called per-row in policy USING/WITH CHECK
 
 **Severity:** warning.
 
-**What it catches:** policies whose `USING` clause calls an auth
-function (default set: `auth.uid`, `auth.role`, `auth.jwt`,
-`current_setting`) without wrapping the call in a subquery. Postgres
-re-evaluates the call once per candidate row — on a million-row scan
+**What it catches:** policies whose `USING` or `WITH CHECK` clause
+calls an auth function (default set: `auth.uid`, `auth.role`,
+`auth.jwt`, `current_setting`) without wrapping the call in a
+subquery. Postgres re-evaluates the call once per row it processes —
+every candidate row scanned (`USING`) and every row written
+(`WITH CHECK`). On a million-row scan, or a bulk `INSERT` / `UPDATE`,
 that is a million calls. Wrapping as `(SELECT auth.uid())` lets the
 planner cache the result for the whole statement.
 
-The rule walks `USING` only — `WITH CHECK` runs once per modified
-row regardless of wrapping, so the optimization does not apply.
-Calls reached via a `SubLink` (`(SELECT ...)`, `IN (SELECT ...)`,
-`EXISTS (SELECT ...)`) are skipped — those are already wrapped.
+The rule walks both `USING` and `WITH CHECK`. `WITH CHECK` is
+optimized identically — a bare `auth.uid()` there is re-evaluated
+once per written row, and the `(SELECT …)` wrap collapses it to a
+single InitPlan call (verified with a call-counting function: a
+1000-row INSERT or UPDATE calls a bare WITH-CHECK function 1000
+times, the wrapped form once). Calls reached via a `SubLink`
+(`(SELECT ...)`, `IN (SELECT ...)`, `EXISTS (SELECT ...)`) are
+skipped — those are already wrapped. One finding per policy, naming
+the clause(s) involved.
 
 **The bad pattern:**
 

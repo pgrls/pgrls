@@ -332,12 +332,12 @@ allowlist = []
 allowlist = []
 
 [lint.rules.PERF001]
-# Policies allowed to call an auth function unwrapped in USING. Reach
+# Policies allowed to call an auth function unwrapped in USING/WITH CHECK. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
 # mechanical and always safe (and `pgrls fix --rule PERF001` does
 # it for you). Entries are fully-qualified policy IDs.
 allowlist = []
-# Functions whose unwrapped call in USING triggers PERF001. Defaults:
+# Functions whose unwrapped call in USING/WITH CHECK triggers PERF001. Defaults:
 # auth.uid, auth.role, auth.jwt, current_setting. Override REPLACES
 # the default — list every function you want covered.
 # auth_functions = ["auth.uid", "current_setting", "my.current_user_id"]

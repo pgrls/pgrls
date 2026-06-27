@@ -52,6 +52,17 @@ breaking changes — they will be called out in this file.
   CI keep the default `strict` mode — relaxed mode trades this soundness for fewer
   findings and has no reliable `--fail-on` threshold that catches only the coincidental-
   pairing case.
+- **PERF001 now flags unwrapped auth-function calls in `WITH CHECK`, not just
+  `USING`.** A bare `auth.uid()` / `current_setting(…)` in a policy's `WITH CHECK`
+  is re-evaluated once per written row — a 1000-row `INSERT` or `UPDATE` calls it
+  1000 times; wrapping it as `(SELECT …)` collapses that to a single InitPlan
+  call, exactly as for `USING` (verified empirically with a call-counting
+  function — the earlier "Postgres optimizes `WITH CHECK` differently" assumption
+  was wrong). The rule emits one finding per policy, naming the clause(s)
+  involved, and `pgrls fix --rule PERF001` now wraps `WITH CHECK` too, emitting
+  only the clause(s) it changes. This raises PERF001's recall on
+  `INSERT` / `UPDATE` / `ALL` policies; allowlist a policy or scope
+  `auth_functions` to tune.
 
 ### Fixed
 
