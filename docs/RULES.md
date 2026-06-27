@@ -3386,6 +3386,72 @@ grantees = ["anon", "authenticated", "PUBLIC"]
 allowlist = ["public.countries"]
 ```
 
+<a id="rule-sec050"></a>
+
+## SEC050 — Storage policy not scoped to a bucket (cross-bucket access)
+
+**Severity:** warning
+
+In Supabase Storage every object operation is authorized by an RLS policy on
+the single table `storage.objects`; the bucket a row belongs to is its
+`bucket_id` column. Supabase's own guidance is explicit: *"your RLS policy must
+explicitly specify the `bucket_id` condition … preventing cross-bucket
+access."* A permissive policy that scopes by owner or path but omits a
+`bucket_id` predicate therefore applies to **every** bucket — a caller
+authorized for one bucket can read (or write) objects in another.
+
+```sql
+-- FOOTGUN: scopes by the per-user folder but not the bucket, so it authorizes
+-- that folder in EVERY bucket, not just `avatars`.
+CREATE POLICY user_files ON storage.objects FOR SELECT TO authenticated
+    USING ((storage.foldername(name))[1] = auth.uid()::text);
+
+-- SAFE: the bucket_id predicate confines it to one bucket.
+CREATE POLICY user_files ON storage.objects FOR SELECT TO authenticated
+    USING (bucket_id = 'avatars'
+           AND (storage.foldername(name))[1] = auth.uid()::text);
+```
+
+SEC050 fires once per permissive `storage.objects` policy whose **row-reach
+clause** — the `USING` of a SELECT/UPDATE/DELETE/ALL policy, the `WITH CHECK` of
+an INSERT policy — has a non-trivial predicate that does not reference
+`bucket_id`. Checking the row-reach clause specifically catches an `ALL` policy
+that scopes the bucket only in `WITH CHECK` while its `USING` reads across every
+bucket; the converse (bucket-scoped `USING`, unscoped `WITH CHECK`) is a
+cross-bucket *write* footgun left to recall.
+
+It is deliberately narrow to stay low-FP:
+
+* A literal `USING (true)` / `WITH CHECK (true)` is ceded to
+  [SEC008](#rule-sec008) / [SEC006](#rule-sec006) — this rule targets the
+  subtler case of a policy that scopes by *something*, just not by bucket.
+* If any **restrictive** policy on `storage.objects` constrains `bucket_id`,
+  the table is bucket-floored regardless of the permissive policies, so SEC050
+  stays silent.
+* It only examines `storage.objects` (the Supabase convention), so a database
+  with no `storage` schema produces no findings — the same "don't flood every
+  project" discipline as [SEC044](#rule-sec044) / [SEC048](#rule-sec048).
+
+> **Scan the `storage` schema.** `pgrls lint` defaults to `public` only, so
+> point it at the storage schema to surface this rule:
+> `pgrls lint --schemas public,storage` (or set `[database].schemas =
+> ["public", "storage"]` in `pgrls.toml`).
+
+**Remediation.** Add a `bucket_id = '<bucket>'` predicate to the policy's
+row-reach clause (the recommended Supabase pattern pairs it with a
+`storage.foldername(name)` path check). There is no auto-fix — pgrls cannot know
+which bucket the policy is meant to confine. Pure rule logic over already-
+captured policy data; no introspection or snapshot change.
+
+**Configuration** (`[lint.rules.SEC050]`):
+
+```toml
+[lint.rules.SEC050]
+# Policy ids (schema.table.policyname) for a deliberately single-bucket or
+# cross-bucket deployment.
+allowlist = ["storage.objects.public_read"]
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK

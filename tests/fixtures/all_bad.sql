@@ -1017,6 +1017,29 @@ CREATE TABLE public.allbad_sec049 (
 );
 GRANT SELECT ON public.allbad_sec049 TO anon;
 
+-- SEC050: a Supabase storage.objects policy scoped to the object owner but with
+-- NO bucket_id predicate authorizes that owner's objects in EVERY bucket
+-- (cross-bucket access). The `storage` schema + `objects` table mimic the
+-- Supabase platform shape -- pgrls scans all user schemas by default, so
+-- storage.objects is analyzed. SEC050 (warning) fires at the policy location
+-- storage.objects.owner_any_bucket. SEC007 co-fires (only-permissive, no
+-- restrictive). owner_id is NOT NULL so SEC030 stays quiet, and the predicate
+-- references owner_id (not bucket_id) via a wrapped current_setting so PERF001
+-- stays quiet too. The real Supabase predicate uses storage.foldername()/
+-- auth.uid(), which don't exist on a vanilla server -- current_setting is the
+-- runnable stand-in. The `storage` schema is dropped in the test's finally so
+-- it cannot leak into the clean-DB e2e test. Reuses the `anon` role above.
+CREATE SCHEMA IF NOT EXISTS storage;
+CREATE TABLE storage.objects (
+    id uuid PRIMARY KEY,
+    bucket_id text,
+    name text,
+    owner_id uuid NOT NULL
+);
+ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+CREATE POLICY owner_any_bucket ON storage.objects FOR SELECT TO anon
+    USING (owner_id = (SELECT current_setting('app.user_id', true)::uuid));
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl
