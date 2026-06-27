@@ -19,7 +19,7 @@ from pgrls.diff._z3_compare import (
     _lift_to_tv,
 )
 from pgrls.introspect import introspect
-from pgrls.model import Policy, Schema, Table
+from pgrls.model import OwnerReachableMember, Policy, Schema, Table
 from pgrls.verify import (
     Verification,
     _witness_phrase,
@@ -1688,3 +1688,176 @@ def test_verify_live_cross_tenant_scoped_is_isolated(
         )
     schema = introspect(pg_conn, schemas=["public"])
     assert _verdict(_xt(schema), "public.acct") == "isolated"
+
+
+# --- escalation mode (SEC048 owner-reachability) ---------------------------
+
+
+def _owned(
+    name: str,
+    owner: str,
+    *,
+    force: bool = False,
+    policies: tuple[Policy, ...] = (),
+    rls: bool = True,
+) -> Table:
+    """A table with an explicit owner + FORCE flag, for escalation tests."""
+    return Table(
+        schema="public",
+        name=name,
+        rls_enabled=rls,
+        force_rls=force,
+        owner=owner,
+        policies=policies,
+    )
+
+
+def _reach(*members_to_owners: tuple[str, tuple[str, ...]]) -> tuple[OwnerReachableMember, ...]:
+    return tuple(
+        OwnerReachableMember(member=m, via_owners=owners, member_can_login=True)
+        for m, owners in members_to_owners
+    )
+
+
+def _esc(schema: Schema) -> Verification:
+    return build_verification(schema, mode="escalation")
+
+
+@requires_z3
+def test_escalation_isolated_table_reachable_owner_is_leak() -> None:
+    # A cross-tenant-isolated table owned by a reachable owner, not FORCE'd:
+    # the reachable low-trust role bypasses the proven isolation -> LEAK.
+    schema = Schema(
+        tables=(_owned("docs", "app_owner", policies=(_policy("tenant_id = auth.uid()"),)),),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    v = _esc(schema)
+    assert v.mode == "escalation"
+    assert _verdict(v, "public.docs") == "leak"
+    assert v.has_leak
+    [t] = v.tables
+    # The reaching role + owner are carried in the note (surfaced in text/sarif).
+    assert t.note is not None and "lowtrust" in t.note and "app_owner" in t.note
+    [proof] = t.proofs
+    assert proof.witness == {}  # every row (unconditional bypass)
+
+
+@requires_z3
+def test_escalation_forced_table_is_no_finding() -> None:
+    # FORCE'd: the owner is itself RLS-scoped -> no bypass (SEC048 wouldn't fire).
+    schema = Schema(
+        tables=(
+            _owned("docs", "app_owner", force=True, policies=(_policy("tenant_id = auth.uid()"),)),
+        ),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    assert _esc(schema).tables == ()
+
+
+@requires_z3
+def test_escalation_owner_not_reachable_is_no_finding() -> None:
+    # No low-trust role reaches this table's owner -> not a candidate.
+    schema = Schema(
+        tables=(_owned("docs", "other_owner", policies=(_policy("tenant_id = auth.uid()"),)),),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    assert _esc(schema).tables == ()
+
+
+@requires_z3
+def test_escalation_default_deny_table_is_leak() -> None:
+    # RLS on, no permissive policy (default-deny — the strongest isolation):
+    # the owner bypass exposes every row the default-deny hid -> LEAK.
+    schema = Schema(
+        tables=(_owned("docs", "app_owner", policies=()),),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    assert _verdict(_esc(schema), "public.docs") == "leak"
+
+
+@requires_z3
+def test_escalation_non_scoping_policy_is_unverified() -> None:
+    # USING(true) has no provable tenant-scoping equality -> the cross-tenant
+    # prover abstains, so escalation cannot prove a cross-tenant leak -> UNVERIFIED.
+    schema = Schema(
+        tables=(_owned("docs", "app_owner", policies=(_policy("true"),)),),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    assert _verdict(_esc(schema), "public.docs") == "unverified"
+
+
+@requires_z3
+def test_escalation_partial_cross_tenant_leak_is_still_a_leak() -> None:
+    # The policy is scoped but only PARTIALLY leaks cross-tenant (an is_public
+    # escape): a direct cross-tenant session reads only the public rows, but the
+    # owner bypass reads EVERY row — incl. the other tenants' private rows. The
+    # bypass therefore exposes strictly more than the cross-tenant leak -> LEAK,
+    # not a false "exposes nothing new" clear.
+    schema = Schema(
+        tables=(
+            _owned("docs", "app_owner", policies=(_policy("tenant_id = auth.uid() OR is_public"),)),
+        ),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    [t] = _esc(schema).tables
+    assert t.verdict == "leak"
+    assert t.note is not None and "non-public" in t.note  # explains the excess
+
+
+@requires_z3
+def test_escalation_total_cross_tenant_leak_is_ceded_isolated() -> None:
+    # The policy leaks EVERY row cross-tenant (an `OR true` tautology — the
+    # prover's witness is {}): the RLS already exposes all rows to a direct
+    # session, so the owner bypass exposes nothing new -> ISOLATED, ceded to
+    # verify --mode cross-tenant.
+    schema = Schema(
+        tables=(
+            _owned("docs", "app_owner", policies=(_policy("tenant_id = auth.uid() OR true"),)),
+        ),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    [t] = _esc(schema).tables
+    assert t.verdict == "isolated"
+    assert t.note is not None and "every row cross-tenant" in t.note
+
+
+@requires_z3
+def test_escalation_rls_off_table_is_no_finding() -> None:
+    schema = Schema(
+        tables=(_owned("docs", "app_owner", rls=False, policies=()),),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    assert _esc(schema).tables == ()
+
+
+@requires_z3
+def test_escalation_lists_all_reaching_roles() -> None:
+    schema = Schema(
+        tables=(_owned("docs", "app_owner", policies=(_policy("tenant_id = auth.uid()"),)),),
+        owner_reachable_members=_reach(
+            ("anon", ("app_owner",)), ("authenticated", ("app_owner",))
+        ),
+    )
+    [t] = _esc(schema).tables
+    assert t.note is not None and "anon" in t.note and "authenticated" in t.note
+
+
+def test_escalation_empty_result_renders_mode_specific_message() -> None:
+    schema = Schema(tables=(), owner_reachable_members=())
+    assert "owner-bypass" in render_text(_esc(schema))
+
+
+@requires_z3
+def test_escalation_text_and_sarif_surface_the_path() -> None:
+    schema = Schema(
+        tables=(_owned("docs", "app_owner", policies=(_policy("tenant_id = auth.uid()"),)),),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+    )
+    v = _esc(schema)
+    text = render_text(v)
+    assert "LEAK" in text and "app_owner" in text and "lowtrust" in text
+    sarif = json.loads(render_sarif(v))
+    [result] = sarif["runs"][0]["results"]
+    assert result["ruleId"] == "pgrls-escalation-isolation"
+    assert result["level"] == "error"
+    assert "app_owner" in result["message"]["text"]

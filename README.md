@@ -367,16 +367,18 @@ Per command it evaluates the clause Postgres actually applies — `WITH CHECK` f
 
 ## Prove tenant isolation — `pgrls verify`
 
-`pgrls lint` *flags* a suspicious policy; `pgrls verify` **proves** — with the Z3 SMT solver — an isolation property, and hands back the offending row (not just a warning) when it fails. Three threat models via `--mode`:
+`pgrls lint` *flags* a suspicious policy; `pgrls verify` **proves** — with the Z3 SMT solver — an isolation property, and hands back the offending row (not just a warning) when it fails. Four threat models via `--mode`:
 
 - **`anon`** (default) — an **anonymous** session (every auth function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — returning `NULL`, the unauthenticated state) cannot read any row.
 - **`cross-tenant`** — a session authenticated as *one* tenant cannot read a *different* tenant's row, checked against the policy's own `<column> = <session identity>` scoping equality (the predicate [`pgrls generate`](#scaffold-rls--pgrls-generate) emits).
 - **`write`** — such a session cannot **write** (INSERT/UPDATE) a row stamped for *another* tenant, checked against each write policy's effective `WITH CHECK` (or the `USING` that `FOR UPDATE`/`FOR ALL` reuses as the new-row check). The write side is the most CVE-adjacent footgun ([CVE-2025-48757](https://nvd.nist.gov/vuln/detail/CVE-2025-48757)): a policy that scopes reads but not writes lets a tenant stamp data for another. `SEC006`/`SEC020`/`SEC028`/`SEC040` are the heuristic fallback.
+- **`escalation`** — proves the static [`SEC048`](docs/RULES.md#rule-sec048) reachability finding: a low-trust role that is a member of a table's **owner** (and the owner is not superuser/`BYPASSRLS`) can `SET ROLE` to it and, on the owner's RLS-enabled-but-not-`FORCE`'d tables, bypass RLS entirely (reading *every row*). It composes the role-reachability closure with the `cross-tenant` prover — **`LEAK`** when the table's RLS provably isolates tenants (the bypass defeats it) *or* only partially leaks (the bypass also exposes the other tenants' rows the partial leak hides); **`ISOLATED`** only when the table already leaks every row cross-tenant anyway (the bypass adds nothing); **`UNVERIFIED`** when the predicate is unprovable. Turns a noisy SEC048 warning into an evidenced leak — or clears it.
 
 ```bash
 pgrls verify --database-url "$DATABASE_URL"                          # anon proof, exits 1 on any leak
 pgrls verify --database-url "$DATABASE_URL" --mode cross-tenant       # prove no tenant reads another tenant's rows
 pgrls verify --database-url "$DATABASE_URL" --mode write              # prove no tenant writes a row for another tenant
+pgrls verify --database-url "$DATABASE_URL" --mode escalation         # prove the SEC048 reachable owner-bypass actually leaks
 pgrls verify --database-url "$DATABASE_URL" --format json            # per-table / per-policy verdicts + counterexamples
 pgrls verify --database-url "$DATABASE_URL" --format sarif            # SARIF v2.1.0 for GitHub Code Scanning
 pgrls verify --database-url "$DATABASE_URL" --strict                 # also fail on UNVERIFIED

@@ -82,7 +82,7 @@ Verdict = Literal["isolated", "leak", "unverified"]
 # complementary — the inverted `auth.uid() IS NULL OR …` policy leaks to anon
 # but correctly scopes authenticated tenants, so it is a leak in `anon` mode
 # and isolated in `cross-tenant` mode.
-Mode = Literal["anon", "cross-tenant", "write"]
+Mode = Literal["anon", "cross-tenant", "write", "escalation"]
 
 # `write` reuses the cross-tenant prover verbatim — write-isolation is the same
 # satisfiability question (`is_true ∧ column != session_tenant` SAT?), just
@@ -133,6 +133,7 @@ _NO_READ_DETAIL = {
     "anon": "no anonymous read",
     "cross-tenant": "no cross-tenant read",
     "write": "no cross-tenant write",
+    "escalation": "no reachable owner bypass",
 }
 
 # Detail when a table has RLS on but no permissive policy for the mode's
@@ -189,11 +190,13 @@ _SARIF_RULE_ID: dict[Mode, str] = {
     "anon": "pgrls-anon-isolation",
     "cross-tenant": "pgrls-cross-tenant-isolation",
     "write": "pgrls-write-isolation",
+    "escalation": "pgrls-escalation-isolation",
 }
 _SARIF_RULE_TITLE: dict[Mode, str] = {
     "anon": "Anonymous read-isolation proof",
     "cross-tenant": "Cross-tenant read-isolation proof",
     "write": "Cross-tenant write-isolation proof",
+    "escalation": "Reachable owner-bypass escalation proof",
 }
 
 
@@ -267,7 +270,13 @@ def build_verification(
     `pgrls verify --auth-function` CLI unions a project's helper with the
     defaults before calling this, which is why the *flag* extends rather than
     replaces.) Tables are sorted by qualified name for deterministic output.
+
+    ``escalation`` is a different shape — it composes the cross-tenant result
+    with the role-reachability graph rather than walking policies directly — so
+    it is dispatched to `build_escalation`.
     """
+    if mode == "escalation":
+        return build_escalation(schema, auth_functions=auth_functions)
     prove = _PROVERS[mode]
     commands = _MODE_COMMANDS[mode]
     floor_kind = "write" if mode == "write" else "read"
@@ -344,6 +353,129 @@ def build_verification(
     return Verification(tuple(tables), mode)
 
 
+def build_escalation(
+    schema: Schema, *, auth_functions: set[str] | None = None
+) -> Verification:
+    """Prove/refute the SEC048 owner-reachability escalation paths.
+
+    A low-trust role that is a *member* of a table's owner (via the
+    `pg_auth_members` closure already computed in `Schema.owner_reachable_members`)
+    can ``SET ROLE`` to that owner; if the owner is not superuser / ``BYPASSRLS``
+    (SEC048 filters those out at introspection time) and the table is RLS-enabled
+    but **not** ``FORCE``'d, the owner is exempt from the table's RLS — so the
+    member reads every row. Whether that is a *leak* depends on whether the
+    table's RLS was actually isolating tenants, which is exactly what the
+    ``cross-tenant`` prover decides. So escalation = the cross-tenant verdict ⋈
+    the reachability graph, per affected table:
+
+    * cross-tenant **isolated** (the RLS genuinely scopes rows, incl. the
+      default-deny "no permissive policy" case) → the bypass defeats real
+      isolation → **leak**, witness ``{}`` (every row; the bypass is
+      unconditional). The reaching roles + owner are carried in the note.
+    * cross-tenant **leak**, *total* (witness ``{}`` — every row already leaks
+      cross-tenant) → the owner bypass exposes nothing the direct path didn't →
+      **isolated** (ceded to ``verify --mode cross-tenant``).
+    * cross-tenant **leak**, *partial / conditional* (a characterizing-row
+      witness, e.g. only ``is_public`` rows, or a no-single-row ``None``
+      witness) → a direct cross-tenant session reads only the leaking subset,
+      but the owner bypass reads EVERY row — incl. the other tenants' rows the
+      partial leak hides → **leak**, witness ``{}``.
+    * cross-tenant **unverified** (the predicate is outside the decidable
+      fragment) → cannot claim the RLS was isolating → **unverified** (abstain).
+
+    Only tables owned by a reachable owner appear in the result (the SEC048
+    population); a table no low-trust role can reach its owner of is simply not a
+    candidate. SECDEF-body escalation (SEC042 / VIEW004) is out of this v1 scope.
+    """
+    xt = build_verification(schema, auth_functions=auth_functions, mode="cross-tenant")
+    xt_by_table = {t.qualified_name: t for t in xt.tables}
+
+    # owner role name -> sorted distinct low-trust members that reach it.
+    reachers_by_owner: dict[str, set[str]] = {}
+    for m in schema.owner_reachable_members:
+        for owner in m.via_owners:
+            reachers_by_owner.setdefault(owner, set()).add(m.member)
+
+    tables: list[TableVerdict] = []
+    for table in sorted(schema.tables, key=lambda t: t.qualified_name):
+        if not table.rls_enabled or table.force_rls:
+            # FORCE'd → the owner is itself RLS-scoped → no bypass (and SEC048
+            # would not have fired). RLS-off is SEC001's domain, not an
+            # isolation/escalation claim.
+            continue
+        reaching = reachers_by_owner.get(table.owner)
+        if not reaching:
+            continue  # no low-trust role reaches this table's owner
+        roles_phrase = ", ".join(sorted(reaching))
+        path = f"reachable by {roles_phrase} via owner {table.owner} (RLS not FORCE'd)"
+        xtv = xt_by_table.get(table.qualified_name)
+        # Every escalation candidate is RLS-enabled, so it always has a
+        # cross-tenant verdict; treat a defensive miss as "isolated" (the
+        # strongest, leak-direction assumption).
+        xt_verdict = xtv.verdict if xtv is not None else "isolated"
+
+        if xt_verdict == "isolated":
+            proof = PolicyProof(table.owner, "leak", {}, None)
+            tables.append(TableVerdict(table.qualified_name, "leak", path, (proof,)))
+        elif xt_verdict == "leak":
+            # The owner bypass reads EVERY row, unconditionally. A cross-tenant
+            # leak "exposes nothing new" ONLY when it was already *total* — the
+            # prover signals that with an empty `{}` witness (every row leaks
+            # cross-tenant). A *partial* cross-tenant leak (a characterizing-row
+            # witness — e.g. only `is_public` rows leak) still hides the other
+            # tenants' NON-public rows from a direct session, but the owner
+            # bypass reads those too, so the bypass is a real *additional* leak.
+            xt_leak = next(
+                (p for p in (xtv.proofs if xtv else ()) if p.verdict == "leak"),
+                None,
+            )
+            if xt_leak is not None and xt_leak.witness == {}:
+                proof = PolicyProof(table.owner, "isolated", None, None)
+                tables.append(
+                    TableVerdict(
+                        table.qualified_name,
+                        "isolated",
+                        "table RLS already leaks every row cross-tenant "
+                        "(see verify --mode cross-tenant) — owner bypass exposes "
+                        "nothing new",
+                        (proof,),
+                    )
+                )
+            else:
+                # Partial (or conditional) cross-tenant leak: the bypass exposes
+                # rows the direct cross-tenant query cannot reach.
+                proof = PolicyProof(table.owner, "leak", {}, None)
+                tables.append(
+                    TableVerdict(
+                        table.qualified_name,
+                        "leak",
+                        f"{path} — the owner bypass also exposes rows the "
+                        "cross-tenant leak does not (e.g. other tenants' "
+                        "non-public rows)",
+                        (proof,),
+                    )
+                )
+        else:  # unverified
+            reason = next(
+                (
+                    p.reason
+                    for p in (xtv.proofs if xtv else ())
+                    if p.verdict == "unverified" and p.reason
+                ),
+                "cross-tenant isolation unproven",
+            )
+            proof = PolicyProof(table.owner, "unverified", None, reason)
+            tables.append(
+                TableVerdict(
+                    table.qualified_name,
+                    "unverified",
+                    f"cannot prove the table isolates tenants ({reason}); {path}",
+                    (proof,),
+                )
+            )
+    return Verification(tuple(tables), "escalation")
+
+
 def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> str:
     """Human phrase for a leak witness, per threat model.
 
@@ -352,6 +484,13 @@ def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> s
     (``None``). The cross-tenant phrasing frames the row as another tenant's;
     the write phrasing frames it as a row stamped for another tenant.
     """
+    if mode == "escalation":
+        # The bypass is unconditional (witness is always ``{}`` — every row);
+        # the *path* (which roles, via which owner) is carried in the table note.
+        return (
+            "every row is readable by a reachable low-trust role by assuming the "
+            "table owner (RLS is not enforced for the owner)"
+        )
     if mode == "write":
         if witness is None:
             return (
@@ -385,6 +524,8 @@ def _witness_scope(
     cross-tenant / write (an empty such witness is NOT "every row")."""
     if verdict != "leak":
         return None
+    if mode == "escalation":
+        return "owner_bypass"  # every row, via the reachable owner's RLS exemption
     if witness is None:
         return "conditional"
     if not witness:
@@ -403,6 +544,8 @@ def _summary_line(v: Verification) -> str:
 
 def render_text(v: Verification) -> str:
     if not v.tables:
+        if v.mode == "escalation":
+            return "No reachable owner-bypass escalation paths to verify."
         return "No RLS-enabled tables to verify."
     headers = ("TABLE", "VERDICT", "DETAIL")
     rows = []
@@ -410,6 +553,8 @@ def render_text(v: Verification) -> str:
         if t.verdict == "leak":
             leak = next((p for p in t.proofs if p.verdict == "leak"), None)
             detail = _witness_phrase(leak.witness if leak else None, v.mode)
+            if t.note:  # escalation carries the reach path here (else None)
+                detail = f"{detail} — {t.note}"
         elif t.verdict == "unverified":
             reason = next(
                 (p.reason for p in t.proofs if p.verdict == "unverified" and p.reason),
@@ -495,6 +640,7 @@ def render_sarif(v: Verification, *, strict: bool = False) -> str:
                     message=(
                         f"{t.qualified_name}: "
                         + _witness_phrase(leak.witness if leak else None, v.mode)
+                        + (f" — {t.note}" if t.note else "")
                     ),
                     # Pin the finding to the leaking policy (mirrors lint's
                     # schema.table.policy fullyQualifiedName). Fall back to the
