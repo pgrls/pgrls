@@ -19,7 +19,13 @@ from pgrls.diff._z3_compare import (
     _lift_to_tv,
 )
 from pgrls.introspect import introspect
-from pgrls.model import OwnerReachableMember, Policy, Schema, Table
+from pgrls.model import (
+    OwnerReachableMember,
+    Policy,
+    Schema,
+    SecdefFunction,
+    Table,
+)
 from pgrls.verify import (
     Verification,
     _witness_phrase,
@@ -1861,3 +1867,117 @@ def test_escalation_text_and_sarif_surface_the_path() -> None:
     assert result["ruleId"] == "pgrls-escalation-isolation"
     assert result["level"] == "error"
     assert "app_owner" in result["message"]["text"]
+
+
+# --- escalation mode: SEC042 anon-callable SECDEF bodies -------------------
+
+
+def _anon_tbl(name: str, using: str) -> Table:
+    return Table(
+        schema="public",
+        name=name,
+        rls_enabled=True,
+        force_rls=False,
+        policies=(_policy(using),),
+    )
+
+
+def _secdef(
+    body: str,
+    *,
+    qname: str = "public.read_secret",
+    roles: tuple[str, ...] = ("anon",),
+    bypass: bool = True,
+    lang: str = "sql",
+) -> SecdefFunction:
+    return SecdefFunction(
+        qualified_name=qname, body=body, language=lang,
+        execute_roles=roles, owner_bypasses_rls=bypass,
+    )
+
+
+@requires_z3
+def test_escalation_anon_secdef_reading_isolated_table_is_leak() -> None:
+    # An anon-EXECUTE-able SECURITY DEFINER function owned by an RLS-exempt role
+    # whose body reads an anon-ISOLATED table → an anon caller reads rows its
+    # own RLS would deny → LEAK.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.read_secret"
+    assert t.verdict == "leak"
+    assert t.note is not None and "SECURITY DEFINER" in t.note and "anon" in t.note
+    assert "secret" in t.note
+
+
+@requires_z3
+def test_escalation_opaque_plpgsql_secdef_is_unverified() -> None:
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("BEGIN RETURN; END", lang="plpgsql"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+    assert t.note is not None and "opaque" in t.note
+
+
+@requires_z3
+def test_escalation_secdef_not_anon_executable_is_no_finding() -> None:
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret", roles=("authenticated",)),),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_secdef_owner_not_rls_exempt_is_no_finding() -> None:
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret", bypass=False),),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_secdef_reading_total_anon_leak_is_ceded_isolated() -> None:
+    # The read table already leaks every row to anon (USING true), so the
+    # function exposes nothing new → ISOLATED (ceded to verify --mode anon).
+    schema = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "isolated"
+    assert t.note is not None and "nothing new" in t.note
+
+
+@requires_z3
+def test_escalation_secdef_reading_partial_anon_leak_is_leak() -> None:
+    # The read table only partially leaks to anon (is_public rows); the SECDEF
+    # bypass exposes the rest → LEAK.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "is_public"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak"
+
+
+@requires_z3
+def test_escalation_combines_owner_and_secdef_findings() -> None:
+    # One escalation run surfaces both an owner-reachability LEAK and a SECDEF
+    # LEAK, sorted by location.
+    schema = Schema(
+        tables=(
+            _owned("docs", "app_owner", policies=(_policy("tenant_id = auth.uid()"),)),
+            _anon_tbl("secret", "tenant_id = auth.uid()"),
+        ),
+        owner_reachable_members=_reach(("lowtrust", ("app_owner",))),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    v = build_verification(schema, mode="escalation")
+    locs = {t.qualified_name: t.verdict for t in v.tables}
+    assert locs == {"public.docs": "leak", "public.read_secret": "leak"}

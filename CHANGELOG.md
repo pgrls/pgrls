@@ -23,9 +23,13 @@ breaking changes — they will be called out in this file.
   when the table already leaks every row cross-tenant anyway (the bypass adds
   nothing — ceded to `--mode cross-tenant`), **UNVERIFIED** when the predicate is
   unprovable. Turns a noisy SEC048 warning
-  into an evidenced leak — or clears it. No snapshot change. The SECDEF-body
-  cases (SEC042 / VIEW004) and `--probe` / `--emit-repro` for this mode are
-  follow-ons. (#232)
+  into an evidenced leak — or clears it. No snapshot change. It also proves the
+  **SEC042** case — an anon / `PUBLIC`-EXECUTE-able SECURITY DEFINER function
+  owned by an RLS-exempt role whose SQL body reads an RLS table — against that
+  table's `anon` verdict (same total-vs-partial witness discrimination; an
+  opaque PL/pgSQL or dynamic-SQL body → UNVERIFIED). The VIEW004 case (needs the
+  view's grants, which the model does not capture) and `--probe` / `--emit-repro`
+  for this mode remain follow-ons. (#232)
 - `pgrls diff` now detects a **renamed RLS policy** and reports it as a single
   `POLICY_RENAMED` change instead of an independent drop + add (the long-reserved
   `ChangeKind.POLICY_RENAMED` is now produced). Configurable via

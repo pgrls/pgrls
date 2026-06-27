@@ -473,7 +473,127 @@ def build_escalation(
                     (proof,),
                 )
             )
+    # SEC042: anon-callable SECURITY DEFINER functions owned by an RLS-exempt
+    # role, whose body reads an RLS table the anon caller's own RLS would deny.
+    tables.extend(_escalation_secdef_findings(schema, auth_functions))
+    tables.sort(key=lambda t: t.qualified_name)
     return Verification(tuple(tables), "escalation")
+
+
+def _sql_body_parses(secdef_fn: Any) -> bool:
+    """Whether a SECDEF function body is a parseable SQL statement — the same
+    analyzability gate VIEW004 uses, checked WITHOUT emitting its warnings (the
+    body parser is only called below when this is True)."""
+    if secdef_fn.language != "sql":
+        return False
+    import pglast  # noqa: PLC0415 — lazy; pglast is a heavy optional path
+
+    try:
+        pglast.parse_sql(secdef_fn.body)
+    except pglast.parser.ParseError:
+        return False
+    return True
+
+
+def _escalation_anon_rollup(
+    reads: set[str], an_by_table: dict[str, TableVerdict]
+) -> tuple[Verdict, dict[str, object] | None, str]:
+    """Roll up the escalation verdict for a SECDEF body that reads `reads`
+    (RLS-table qnames), from each read table's ``anon`` verdict. Same witness
+    discrimination as the owner-bypass case: an anon-isolated table → leak (the
+    function exposes rows anon couldn't read); a *total* anon leak (witness ``{}``)
+    → the function exposes nothing new; a *partial* anon leak → leak; an
+    unprovable predicate → unverified."""
+    verdicts: list[Verdict] = []
+    for tq in sorted(reads):
+        tv = an_by_table.get(tq)
+        if tv is None or tv.verdict == "isolated":
+            verdicts.append("leak")
+        elif tv.verdict == "leak":
+            leak = next((p for p in tv.proofs if p.verdict == "leak"), None)
+            verdicts.append("isolated" if leak and leak.witness == {} else "leak")
+        else:
+            verdicts.append("unverified")
+    if "leak" in verdicts:
+        return "leak", {}, " — an anonymous caller of the function reads rows its own RLS would deny"
+    if "unverified" in verdicts:
+        return "unverified", None, " — anon isolation is unprovable on a read table"
+    return (
+        "isolated",
+        None,
+        " — anon already reads those rows directly; the function exposes nothing new",
+    )
+
+
+def _escalation_secdef_findings(
+    schema: Schema, auth_functions: set[str] | None
+) -> list[TableVerdict]:
+    """SEC042 escalation: an anon / ``PUBLIC``-EXECUTE-able SECURITY DEFINER
+    function owned by an RLS-exempt role (superuser / ``BYPASSRLS``) runs its
+    body with the owner's RLS exemption, so an anonymous caller (``POST
+    /rpc/fn``) reads whatever RLS tables the body touches — rows its own RLS
+    would deny. We prove that against each read table's ``anon`` verdict.
+
+    Reuses VIEW004's body parser to extract the RLS tables a SQL body reads; an
+    opaque body (PL/pgSQL or dynamic SQL) is **unverified** (we can't see what it
+    reads). Reads no RLS table → not a finding. The VIEW004 case (view-mediated)
+    needs the view's grants to know whether it is anon-selectable, which the
+    model does not capture, so it is out of this scope.
+    """
+    secdef_fns = schema.security_definer_functions
+    rls_tables = {(t.schema, t.name) for t in schema.tables if t.rls_enabled}
+    if not secdef_fns or not rls_tables:
+        return []
+    an = build_verification(schema, auth_functions=auth_functions, mode="anon")
+    an_by_table = {t.qualified_name: t for t in an.tables}
+    bare_to_qual: dict[str, list[tuple[str, str]]] = {}
+    for s, n in sorted(rls_tables):
+        bare_to_qual.setdefault(n, []).append((s, n))
+    from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415 — body parser reuse
+
+    anon_roles = {"anon", "PUBLIC"}  # mirror SEC042's default exposure set
+    by_qname: dict[str, list[Any]] = {}
+    for f in secdef_fns:
+        by_qname.setdefault(f.qualified_name, []).append(f)
+
+    findings: list[TableVerdict] = []
+    for qname in sorted(by_qname):
+        # Candidate iff some overload is owner-RLS-exempt AND anon-executable.
+        candidate = [
+            f
+            for f in by_qname[qname]
+            if f.owner_bypasses_rls and (set(f.execute_roles) & anon_roles)
+        ]
+        if not candidate:
+            continue
+        reads: set[str] = set()
+        any_opaque = False
+        for f in candidate:
+            if _sql_body_parses(f):
+                reads |= _secdef_fn_leaks(f, qname, rls_tables, bare_to_qual)
+            else:
+                any_opaque = True
+        roles = ", ".join(
+            sorted({r for f in candidate for r in (set(f.execute_roles) & anon_roles)})
+        )
+        head = (
+            f"SECURITY DEFINER function EXECUTE-able by {roles}, owned by an "
+            "RLS-exempt role"
+        )
+        if reads:
+            verdict, witness, tail = _escalation_anon_rollup(reads, an_by_table)
+            note = f"{head}, reads {', '.join(sorted(reads))}{tail}"
+            reason = tail.strip(" —") if verdict == "unverified" else None
+            proof = PolicyProof(sorted(reads)[0], verdict, witness, reason)
+            findings.append(TableVerdict(qname, verdict, note, (proof,)))
+        elif any_opaque:
+            note = f"{head}, has an opaque body — cannot prove what it reads"
+            proof = PolicyProof(
+                qname, "unverified", None, "opaque SECURITY DEFINER body"
+            )
+            findings.append(TableVerdict(qname, "unverified", note, (proof,)))
+        # else: analyzable body reading no RLS table → not a finding.
+    return findings
 
 
 def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> str:
@@ -486,10 +606,11 @@ def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> s
     """
     if mode == "escalation":
         # The bypass is unconditional (witness is always ``{}`` — every row);
-        # the *path* (which roles, via which owner) is carried in the table note.
+        # the *path* (owner reachability, or an anon-callable SECDEF function) is
+        # carried in the table note.
         return (
-            "every row is readable by a reachable low-trust role by assuming the "
-            "table owner (RLS is not enforced for the owner)"
+            "every row is readable through a reachable escalation path that "
+            "bypasses RLS"
         )
     if mode == "write":
         if witness is None:
