@@ -465,7 +465,7 @@ def test_immutable_functions_snapshot_round_trip() -> None:
         )
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 21
+    assert snap["version"] == 22
     assert snap["immutable_functions"] == [
         {
             "qualified_name": "app.cur_tenant",

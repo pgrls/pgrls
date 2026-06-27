@@ -51,7 +51,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 21  # v21: per-table owner (pg_get_userbyid(relowner))
+SNAPSHOT_VERSION = 22  # v22: per-table in_publications (pg_publication_tables)
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -549,6 +549,18 @@ class Table:
     # (like `rls_enabled`/`force_rls`) since every real table has an owner;
     # the empty-string default only arises for hand-built or pre-v21 inputs.
     owner: str = ""
+    # Names of the publications this table belongs to, resolved via
+    # `pg_publication_tables` (so `FOR ALL TABLES` and `FOR TABLES IN SCHEMA`
+    # publications are expanded, not just explicit `ADD TABLE` members) —
+    # populated in snapshot v22+. SEC051 reads this to flag an RLS-off table in
+    # the Supabase `supabase_realtime` publication (whose row changes Realtime
+    # then broadcasts unfiltered). Sorted for snapshot determinism; emitted only
+    # when non-empty so a table in no publication round-trips byte-identically
+    # apart from the version bump (mirrors `inherits` / `foreign_keys`). Default
+    # `()` keeps callers that construct `Table(...)` without it (unit tests)
+    # working unchanged; pre-v22 baselines round-trip with `in_publications=()`
+    # so SEC051 finds nothing to flag (fail-closed) until re-captured.
+    in_publications: tuple[str, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -1217,6 +1229,9 @@ def _table_from_dict(
         # v21+ table owner; pre-v21 baselines have no key and round-trip to
         # "" (fail-closed → SEC048 finds no owned table to flag).
         owner=t.get("owner", ""),
+        # v22+ publication memberships; pre-v22 baselines have no key and
+        # round-trip to () (fail-closed → SEC051 silent).
+        in_publications=tuple(t.get("in_publications", [])),
     )
 
 
@@ -1689,6 +1704,17 @@ class Schema:
                         if t.foreign_keys
                         else {}
                     ),
+                    # v22: publication memberships (resolved via
+                    # `pg_publication_tables`). Emitted ONLY when non-empty
+                    # (already sorted at introspection time) so every table in
+                    # no publication — the overwhelming majority — serializes
+                    # byte-identically apart from the version bump, mirroring
+                    # `inherits` / `foreign_keys` above.
+                    **(
+                        {"in_publications": list(t.in_publications)}
+                        if t.in_publications
+                        else {}
+                    ),
                 }
                 for t in self.tables
             ],
@@ -1939,12 +1965,12 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21,
+            21, 22,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21. v1 / v2 "
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22. v1 / v2 "
                 "snapshots must be regenerated against the current schema."
             )
 

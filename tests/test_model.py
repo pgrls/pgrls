@@ -78,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 21,
+        "version": 22,
         "tables": [
             {
                 "schema": "public",
@@ -245,12 +245,44 @@ def test_snapshot_version_is_twenty_one_after_owner_capture() -> None:
     # (pg_get_userbyid(relowner)) plus top-level owner_reachable_members so
     # SEC048 can flag a low-trust role that reaches a non-FORCE'd table owner
     # through membership (owner privileges, unlike the BYPASSRLS attribute, are
-    # inherited). Pin the new version so a future bump is deliberate. (v20
+    # inherited). Pin the new version so a future bump is deliberate. (v22
+    # added Table.in_publications for SEC051; v21 added Table.owner; v20
     # added foreign_keys for SEC047; v19 added immutable_functions for SEC046;
     # v18 added default_privileges for SEC044; v17 added Table.inherits for
     # SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 21
+    assert snap["version"] == 22
+
+
+def test_snapshot_in_publications_round_trip() -> None:
+    # v22 per-table `in_publications` (SEC051): emitted only when non-empty,
+    # round-trips losslessly, and a pre-v22 snapshot fails closed to ().
+    member = Table(
+        schema="public", name="messages", rls_enabled=False, force_rls=False,
+        policies=(), in_publications=("supabase_realtime",),
+    )
+    plain = Table(
+        schema="public", name="plain", rls_enabled=True, force_rls=False,
+        policies=(),
+    )
+    snap = Schema(tables=(member, plain)).to_snapshot()
+    assert snap["tables"][0]["in_publications"] == ["supabase_realtime"]
+    # A table in no publication omits the key entirely (byte-stable).
+    assert "in_publications" not in snap["tables"][1]
+    back = Schema.from_snapshot(snap)
+    assert back.tables[0].in_publications == ("supabase_realtime",)
+    assert back.tables[1].in_publications == ()
+    # A pre-v22 snapshot (no key) decodes to () so SEC051 stays silent.
+    legacy = {
+        "version": 21,
+        "tables": [
+            {
+                "schema": "public", "name": "messages",
+                "rls_enabled": False, "force_rls": False,
+            }
+        ],
+    }
+    assert Schema.from_snapshot(legacy).tables[0].in_publications == ()
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -804,7 +836,7 @@ def test_v21_table_owner_and_owner_reachable_members_round_trip() -> None:
         ),
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 21
+    assert snap["version"] == 22
     assert snap["tables"][0]["owner"] == "app_owner"
     assert snap["owner_reachable_members"] == [
         {
@@ -994,7 +1026,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "immutable_functions",
         "owner_reachable_members",
     }
-    assert snap["version"] == 21
+    assert snap["version"] == 22
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1313,7 +1345,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 21
+    assert snap["version"] == SNAPSHOT_VERSION == 22
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

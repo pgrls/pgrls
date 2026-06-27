@@ -655,8 +655,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 63 rules ship today (catalog header should say so).
-    assert "<strong>63</strong> rules" in result.output
+    # 64 rules ship today (catalog header should say so).
+    assert "<strong>64</strong> rules" in result.output
     # Header carries the auto-fixable count (18 as of v0.32.0; SEC004 fixer).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -2013,6 +2013,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "SEC048  allbad_sec048_member\n",
             "SEC049  public.allbad_sec049\n",
             "SEC050  storage.objects.owner_any_bucket\n",
+            "SEC051  public.allbad_sec051_realtime\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF004  public.allbad_perf004.by_email\n",
@@ -2048,6 +2049,10 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             # SEC050's storage.objects lives in its own schema — drop it so it
             # cannot leak into the clean-DB e2e test.
             "DROP SCHEMA IF EXISTS storage CASCADE; "
+            # SEC051's supabase_realtime publication is per-database and
+            # survives the schema drop — drop it so it can't leak into the
+            # clean-DB e2e test (or fail the next run's CREATE PUBLICATION).
+            "DROP PUBLICATION IF EXISTS supabase_realtime; "
             "DROP ROLE IF EXISTS allbad_sec029_member; "
             "DROP ROLE IF EXISTS allbad_sec016_role; "
             "DROP ROLE IF EXISTS allbad_sec040_role; "

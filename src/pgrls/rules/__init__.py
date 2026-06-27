@@ -1,6 +1,6 @@
 """Rule protocol and registry.
 
-Every built-in rule (SEC001-SEC050, PERF001-PERF005, HYG001-HYG004,
+Every built-in rule (SEC001-SEC051, PERF001-PERF005, HYG001-HYG004,
 VIEW001-VIEW004) is registered lazily on the first call to
 `default_registry()` or `all_rules()`. When a new rule lands, add its
 import + `registry.register(...)` call to `_build_default_registry()`
@@ -173,6 +173,7 @@ def _build_default_registry() -> RuleRegistry:
     from pgrls.rules.sec048 import SEC048
     from pgrls.rules.sec049 import SEC049
     from pgrls.rules.sec050 import SEC050
+    from pgrls.rules.sec051 import SEC051
     from pgrls.rules.view001 import VIEW001
     from pgrls.rules.view002 import VIEW002
     from pgrls.rules.view003 import VIEW003
@@ -229,6 +230,7 @@ def _build_default_registry() -> RuleRegistry:
     registry.register(SEC048())
     registry.register(SEC049())
     registry.register(SEC050())
+    registry.register(SEC051())
     registry.register(PERF001())
     registry.register(PERF002())
     registry.register(PERF003())

@@ -1040,6 +1040,17 @@ ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
 CREATE POLICY owner_any_bucket ON storage.objects FOR SELECT TO anon
     USING (owner_id = (SELECT current_setting('app.user_id', true)::uuid));
 
+-- SEC051: a table with RLS off that is a member of the supabase_realtime
+-- publication -- Supabase Realtime broadcasts every row change on it to all
+-- subscribed clients without policy filtering (one tenant's rows reach every
+-- subscriber). SEC051 (warning) fires at location public.allbad_sec051_realtime,
+-- and SEC001 co-fires (RLS off) -- both intended. The publication is dropped in
+-- the test's finally so it cannot leak into the clean-DB e2e test (publications
+-- are per-database and survive a schema drop). The CREATE emits a harmless
+-- wal_level WARNING on a default server, which does not abort the apply.
+CREATE TABLE public.allbad_sec051_realtime (id int PRIMARY KEY, body text);
+CREATE PUBLICATION supabase_realtime FOR TABLE public.allbad_sec051_realtime;
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl

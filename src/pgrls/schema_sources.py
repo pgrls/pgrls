@@ -771,6 +771,7 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
     "SEC046": ("user-defined IMMUTABLE functions", 19),
     "SEC047": ("foreign keys to RLS-enabled parents", 20),
     "SEC048": ("owner-reachable members that bypass RLS", 21),
+    "SEC051": ("Realtime publication membership (pg_publication_tables)", 22),
     "PERF003": ("policy-predicate column indexes", 7),
     # PERF004 reaches `Table.indexes` (v7) through `perf003._has_leading_column_index`
     # — same shared-helper path as SEC041/SEC043; the helper reads only
