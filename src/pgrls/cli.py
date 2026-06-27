@@ -58,13 +58,14 @@ from pgrls.diff.formatters import (
     format_diff_text,
 )
 from pgrls.fixers import (
+    Fix,
     default_fixers,
     generate_fixes,
     render_fixes,
     render_migration,
 )
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
-from pgrls.generate import GenerateOptions, plan_generation
+from pgrls.generate import GenerateOptions, GenerateResult, plan_generation
 from pgrls.history import (
     HISTORY_FORMATS,
     build_rows,
@@ -113,6 +114,14 @@ from pgrls.violations import (
     Violation,
     coerce_severity,
     is_at_or_above,
+)
+from pgrls.schema_sources import (
+    SchemaSource,
+    SchemaSourceError,
+    WarnCommand,
+    inert_rule_ids,
+    resolve_schema,
+    schema_source_warnings,
 )
 
 
@@ -278,10 +287,46 @@ def migration_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
     return func
 
 
+def offline_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Stack the offline schema-source options --sql-file / --snapshot.
+
+    Analyze raw DDL or a snapshot artifact with no live Postgres and no Docker.
+    Mutually exclusive with --database-url / --migrations (enforced per
+    command). Declared bottom-up so --help lists --sql-file first.
+    """
+    func = click.option(
+        "--snapshot",
+        "snapshot",
+        type=click.Path(exists=True, dir_okay=False),
+        default=None,
+        help=(
+            "Input artifact produced by `pgrls snapshot` (not an output flag) — "
+            "analyze it offline, no live database. Mutually exclusive with "
+            "--sql-file / --database-url. "
+            "Add --require-full-coverage (lint) to fail a partial offline run."
+        ),
+    )(func)
+    func = click.option(
+        "--sql-file",
+        "sql_file",
+        type=click.Path(allow_dash=True, dir_okay=False),
+        multiple=True,
+        help=(
+            "Analyze raw DDL from this file offline (no live database); repeat "
+            "for several files (concatenated in order — declare tables before "
+            "the policies/grants that reference them); '-' reads stdin. "
+            "Mutually exclusive with --snapshot / --database-url. "
+            "Add --require-full-coverage (lint) to fail a partial offline run."
+        ),
+    )(func)
+    return func
+
+
 @main.command()
 @click.pass_context
 @common_db_options
 @migration_source_options
+@offline_source_options
 @click.option(
     "--rule",
     "rules",
@@ -350,6 +395,16 @@ def migration_source_options(func: Callable[..., Any]) -> Callable[..., Any]:
     help="Severity threshold that triggers nonzero exit.",
 )
 @click.option(
+    "--require-full-coverage",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fail (exit 1) if an offline source (--sql-file / --snapshot) could "
+        "not evaluate every rule — so a partial offline run cannot pass CI "
+        "silently. No effect on a live-database run."
+    ),
+)
+@click.option(
     "--format",
     "output_format",
     type=click.Choice(SUPPORTED_FORMATS, case_sensitive=False),
@@ -404,6 +459,7 @@ def lint(
     explain: bool,
     update_baseline: bool,
     fail_on: str | None,
+    require_full_coverage: bool,
     output_format: str,
     baseline_path: Path | None,
     coverage_path: str | None,
@@ -414,6 +470,8 @@ def lint(
     supabase: bool,
     create_roles: tuple[str, ...],
     pg_image: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
 ) -> None:
     """Lint Postgres RLS policies for security and hygiene issues."""
     if update_baseline and baseline_path is None:
@@ -427,6 +485,11 @@ def lint(
             "--update-baseline records findings into the baseline "
             "file and prints no report, so there is nothing for "
             "--output to write."
+        )
+    if update_baseline and require_full_coverage:
+        raise ToolError(
+            "--update-baseline records findings and exits 0; it cannot be "
+            "combined with --require-full-coverage. Run them separately."
         )
     try:
         config = load_config(config_path)
@@ -458,6 +521,9 @@ def lint(
                 f"{', '.join(both)}. A rule cannot be selected and "
                 "excluded at once."
             )
+    # Capture the user-supplied exclude set BEFORE the offline code unions
+    # inert rule IDs into exclude_ids.  We need it to compute gating_skipped.
+    user_exclude_ids: set[str] = set(exclude_ids)
 
     effective = _merge_overrides(
         config,
@@ -500,6 +566,29 @@ def lint(
                 "--migrations or --supabase (or drop these options)."
             )
 
+    # Offline schema source: raw DDL (--sql-file) or a snapshot artifact
+    # (--snapshot). Mutually exclusive with live-database and ephemeral paths.
+    schema_source: SchemaSource | None = None
+    # Rules inert on this offline source — computed once and reused for both the
+    # auto-exclude (so they don't run) and the gating-skipped notice / coverage
+    # gate below, keeping the two consistent.
+    schema_source_inert: frozenset[str] = frozenset()
+    offline = _resolve_offline_schema(
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint"
+    )
+    if offline is not None:
+        if use_migrations or db_url_explicit:
+            raise ToolError(
+                "choose one schema source: an offline source (--sql-file / "
+                "--snapshot), a live database (--database-url), or an "
+                "ephemeral build (--migrations), not more than one."
+            )
+        schema, schema_source, schema_source_version = offline
+        schema_source_inert = inert_rule_ids(
+            schema_source, snapshot_version=schema_source_version
+        )
+        exclude_ids |= schema_source_inert
+
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
     # feeds HYG004 (policy has no behavioral test), inert otherwise.
     # Loaded before connecting so a bad path fails fast.
@@ -534,32 +623,33 @@ def lint(
                 f"Cannot read perf artifact {perf_path!r}: {exc}"
             ) from exc
 
-    if use_migrations:
-        schema = _schema_from_migrations(
-            migrations_path=migrations_path,
-            migrations_layout=migrations_layout,
-            migrations_glob=migrations_glob,
-            supabase=supabase,
-            create_roles=create_roles,
-            pg_image=pg_image,
-            schemas=effective.schemas,
-        )
-    else:
-        if effective.database_url is None:
-            # If `[database].url` was set but its env-var interpolation
-            # failed, surface that specific cause (deferred from
-            # load_config) instead of the generic guidance.
-            raise ToolError(
-                effective.database_url_error
-                or "No database connection: pass --database-url or set DATABASE_URL."
+    if offline is None:
+        if use_migrations:
+            schema = _schema_from_migrations(
+                migrations_path=migrations_path,
+                migrations_layout=migrations_layout,
+                migrations_glob=migrations_glob,
+                supabase=supabase,
+                create_roles=create_roles,
+                pg_image=pg_image,
+                schemas=effective.schemas,
             )
-        try:
-            with psycopg.connect(effective.database_url) as conn:
-                schema = introspect(conn, schemas=effective.schemas)
-        except psycopg.Error as exc:
-            raise ToolError(f"Database error: {exc}") from exc
-        except ValueError as exc:
-            raise ToolError(str(exc)) from exc
+        else:
+            if effective.database_url is None:
+                # If `[database].url` was set but its env-var interpolation
+                # failed, surface that specific cause (deferred from
+                # load_config) instead of the generic guidance.
+                raise ToolError(
+                    effective.database_url_error
+                    or "No database connection: pass --database-url or set DATABASE_URL."
+                )
+            try:
+                with psycopg.connect(effective.database_url) as conn:
+                    schema = introspect(conn, schemas=effective.schemas)
+            except psycopg.Error as exc:
+                raise ToolError(f"Database error: {exc}") from exc
+            except ValueError as exc:
+                raise ToolError(str(exc)) from exc
 
     try:
         violations = _run_rules(
@@ -572,6 +662,33 @@ def lint(
         )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ToolError(str(exc)) from exc
+
+    # Offline runs skip catalog-only rules; emit a notice so operators can
+    # see which rules were not evaluated.
+    # Compute the GATING skipped set: inert ∩ {rules that WOULD have run
+    # absent the offline auto-exclude}.  This ensures --rule SEC004 does not
+    # fail --require-full-coverage (SEC004 is not inert), and --rule SEC016
+    # offline is surfaced in the notice rather than being silent.
+    if schema_source:
+        inert = schema_source_inert
+        would_run = (
+            set(rules) if rules
+            else (known - set(config.disable))
+        ) - user_exclude_ids
+        gating_skipped = sorted(inert & would_run)
+    else:
+        gating_skipped = []
+    # `gating_skipped` drives all three consistently — the stderr notice, the
+    # json `skipped_rules` field, and the `--require-full-coverage` gate — so
+    # each reflects only inert rules that would have run. A scoped run like
+    # `--rule SEC004` therefore neither reports nor fails on unrelated skips.
+    skipped = gating_skipped
+    if skipped:
+        click.echo(
+            f"pgrls: skipped {len(skipped)} catalog-only rule(s) not "
+            f"analyzable offline: {', '.join(skipped)}.",
+            err=True,
+        )
 
     if update_baseline:
         # `--update-baseline` makes the current findings the new
@@ -625,10 +742,16 @@ def lint(
             if r.id in rules_in_use
         }
 
+    extra_json = (
+        {"schema_source": schema_source, "skipped_rules": skipped}
+        if schema_source is not None and output_format == "json"
+        else None
+    )
     report = format_violations(
         displayed,
         format=output_format,
         rationale_map=rationale_map,
+        extra_json=extra_json,
     )
     if output_path is not None:
         # Write byte-for-byte what stdout would have received, so a
@@ -646,7 +769,15 @@ def lint(
     else:
         click.echo(report, nl=False)
 
-    if _should_fail(violations, threshold=effective.fail_on):
+    fail = _should_fail(violations, threshold=effective.fail_on)
+    if require_full_coverage and skipped:
+        click.echo(
+            "pgrls: --require-full-coverage: offline run skipped "
+            f"{len(skipped)} rule(s); failing.",
+            err=True,
+        )
+        fail = True
+    if fail:
         sys.exit(1)
 
 
@@ -750,6 +881,135 @@ def _load_effective_config(
             or "No database connection: pass --database-url or set DATABASE_URL."
         )
     return effective
+
+
+_OFFLINE_MAX_BYTES = 8 * 1024 * 1024  # reject pathological untrusted input early
+
+
+def _offline_effective_config(
+    *, config_path: str | None, schemas_csv: str | None
+) -> Config:
+    """Effective config for an offline run — like `_load_effective_config` but
+    WITHOUT the live-DB-required guard (offline never connects)."""
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+    return _merge_overrides(
+        config, database_url=None, schemas_csv=schemas_csv, fail_on=None
+    )
+
+
+def _guard_offline_exclusivity(
+    ctx: click.Context, *, command: str
+) -> None:
+    """Reject an offline source combined with an explicit --database-url.
+
+    Ambient $DATABASE_URL is fine (the common CI setup) — only an explicit
+    command-line --database-url collides, mirroring the --migrations guard.
+    """
+    if (
+        ctx.get_parameter_source("database_url")
+        is click.core.ParameterSource.COMMANDLINE
+    ):
+        raise ToolError(
+            "choose one schema source: an offline source (--sql-file / "
+            "--snapshot) or a live database (--database-url), not both."
+        )
+
+
+def _reject_apply_offline(apply: bool, command: str) -> None:
+    if apply:
+        raise ToolError(
+            f"--apply needs a live database connection and cannot be used with "
+            f"an offline source (--sql-file / --snapshot). Offline {command} is "
+            "emit-only: pipe stdout to a migration, or use --output."
+        )
+
+
+def _resolve_offline_schema(
+    *,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
+    schemas_csv: str | None,
+    command: WarnCommand,
+) -> tuple[Schema, SchemaSource, int | None] | None:
+    """Build a Schema from --sql-file / --snapshot, or return None.
+
+    Returns `(schema, source, snapshot_version)` — `snapshot_version` is the
+    declared format version of a --snapshot source (used to scope which
+    catalog-only rules it can run) and `None` for --sql-file.
+
+    None when neither flag was given (caller keeps its live path). --sql-file is
+    repeatable and concatenated in order; '-' reads stdin. Input is byte-capped;
+    a pathological-depth parse (RecursionError) and any SchemaSourceError map to
+    a ToolError. Prints the command-appropriate soundness caveat to stderr.
+    """
+    if not sql_file and snapshot is None:
+        return None
+    schemas = (
+        tuple(s.strip() for s in schemas_csv.split(",") if s.strip())
+        if schemas_csv
+        else None
+    )
+    if snapshot is not None:
+        try:
+            snap_size = os.path.getsize(snapshot)
+        except OSError as exc:
+            raise ToolError(
+                f"cannot read --snapshot {snapshot!r}: {exc}"
+            ) from exc
+        if snap_size > _OFFLINE_MAX_BYTES:
+            raise ToolError(
+                f"snapshot file {snapshot!r} is "
+                f"{snap_size // (1024 * 1024)} MiB, which exceeds the "
+                f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB limit. "
+                "Use a smaller snapshot or re-capture with a scoped "
+                "--schemas filter."
+            )
+    sql_text: str | None = None
+    if sql_file:
+        parts: list[str] = []
+        total = 0
+        for entry in sql_file:
+            if entry == "-":
+                chunk = sys.stdin.read()
+            else:
+                try:
+                    with open(entry, encoding="utf-8") as fh:
+                        chunk = fh.read()
+                except OSError as exc:
+                    raise ToolError(
+                        f"cannot read --sql-file {entry!r}: {exc}"
+                    ) from exc
+            total += len(chunk.encode("utf-8"))
+            if total > _OFFLINE_MAX_BYTES:
+                raise ToolError(
+                    "offline SQL input exceeds "
+                    f"{_OFFLINE_MAX_BYTES // (1024 * 1024)} MiB; split it or "
+                    "lint against a live database."
+                )
+            parts.append(chunk)
+        sql_text = "\n".join(parts)
+    try:
+        schema, source, snapshot_version = resolve_schema(
+            sql=sql_text, snapshot=snapshot, schemas=schemas
+        )
+    except SchemaSourceError as exc:
+        where = (
+            " ".join(repr(p) for p in sql_file) if sql_file else repr(snapshot)
+        )
+        raise ToolError(f"{exc.message} (source: {where})") from exc
+    except RecursionError as exc:
+        raise ToolError(
+            "the provided schema has a pathologically deep policy expression "
+            "and could not be parsed offline."
+        ) from exc
+    for line in schema_source_warnings(
+        source, command=command, snapshot_version=snapshot_version
+    ):
+        click.echo(f"pgrls: {line}", err=True)
+    return schema, source, snapshot_version
 
 
 def _connect_and_introspect(
@@ -1260,7 +1520,7 @@ def _fix_check(fixes: list[Any]) -> None:
 
 
 def _fix_write_migration(
-    fixes: list[Any], output_path: str, *, force: bool
+    fixes: list[Any], output_path: str, *, force: bool, offline: bool = False
 ) -> None:
     """`pgrls fix --output FILE`: write the migration script, note it.
 
@@ -1273,13 +1533,17 @@ def _fix_write_migration(
     overwrite guard `pgrls generate --output` and `pgrls init` use, so a
     re-run of `pgrls fix -o migration.sql` can't silently destroy a
     hand-edited migration.
+
+    When `offline=True`, the migration file carries an offline caveat
+    header instead of the default "generated from a snapshot of the
+    database" header — the offline provenance travels into the artifact.
     """
     path = Path(output_path)
     if path.exists() and not force:
         raise ToolError(
             f"{output_path} already exists. Pass --force to overwrite it."
         )
-    migration = render_migration(fixes, tool_version=__version__)
+    migration = render_migration(fixes, tool_version=__version__, offline=offline)
     try:
         # newline="" so the LF render_migration emits is written
         # verbatim — without it, text mode on Windows rewrites \n to
@@ -1300,7 +1564,7 @@ def _fix_write_migration(
 
 def _fix_emit_and_maybe_apply(
     fixes: list[Any],
-    conn: psycopg.Connection[Any],
+    conn: psycopg.Connection[Any] | None,
     *,
     apply: bool,
 ) -> None:
@@ -1314,6 +1578,9 @@ def _fix_emit_and_maybe_apply(
     """
     click.echo(render_fixes(fixes))
     if apply:
+        # `--apply` is rejected on the offline path (the only caller that passes
+        # conn=None), so a live connection is guaranteed whenever apply is set.
+        assert conn is not None
         _apply_statements(conn, fixes, lock_key="pgrls.fix")
         click.echo(
             f"pgrls: applied {len(fixes)} {_plural_fixes(len(fixes))}.",
@@ -1327,8 +1594,80 @@ def _fix_emit_and_maybe_apply(
         )
 
 
+_OFFLINE_SQL_HEADER = (
+    "-- pgrls: generated offline from --sql-file/--snapshot; not validated "
+    "against live catalog state (BYPASSRLS / SECURITY DEFINER / FK context) "
+    "-- review before applying."
+)
+
+
+def _fix_dispatch(
+    fixes: list[Fix], *, conn: psycopg.Connection[Any] | None, check: bool,
+    output_path: str | None, force: bool, apply: bool, offline: bool = False,
+) -> None:
+    if check:
+        _fix_check(fixes)
+        return
+    if output_path is not None:
+        _fix_write_migration(fixes, output_path, force=force, offline=offline)
+        return
+    if offline:
+        click.echo(_OFFLINE_SQL_HEADER)
+    _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
+
+
+def _generate_dispatch(
+    result: GenerateResult, stmts: list[Fix], *,
+    conn: psycopg.Connection[Any] | None, output_path: str | None,
+    force: bool, apply: bool, offline: bool,
+) -> None:
+    if output_path is not None:
+        path = Path(output_path)
+        if path.exists() and not force:
+            raise ToolError(
+                f"{output_path} already exists. Pass --force to overwrite it."
+            )
+        migration = render_migration(stmts, tool_version=__version__, offline=offline)
+        try:
+            path.write_text(migration, encoding="utf-8", newline="")
+        except OSError as exc:
+            raise ToolError(
+                f"cannot write generated SQL to {output_path}: {exc}"
+            ) from exc
+        click.echo(
+            f"pgrls: wrote {len(stmts)} statement(s) to {output_path}.",
+            err=True,
+        )
+        return
+    if offline:
+        click.echo(_OFFLINE_SQL_HEADER + "\n" + render_fixes(stmts))
+    else:
+        click.echo(render_fixes(stmts))
+    if apply:
+        # `--apply` is rejected on the offline path (the only caller that passes
+        # conn=None), so a live connection is guaranteed whenever apply is set.
+        assert conn is not None
+        _apply_statements(conn, stmts, lock_key="pgrls.generate")
+        click.echo(
+            f"pgrls: applied {len(stmts)} statement(s). Run `pgrls lint` to "
+            "confirm a clean result.",
+            err=True,
+        )
+    else:
+        msg = (
+            f"pgrls: {len(stmts)} statement(s) ready (offline, emit-only). "
+            "Pipe to a migration or use --output FILE."
+            if offline
+            else f"pgrls: {len(stmts)} statement(s) ready (dry-run). Re-run "
+            "with --apply to execute, or --output FILE to write a migration."
+        )
+        click.echo(msg, err=True)
+
+
 @main.command()
+@click.pass_context
 @common_db_options
+@offline_source_options
 @click.option(
     "--rule",
     "rules",
@@ -1369,9 +1708,12 @@ def _fix_emit_and_maybe_apply(
     ),
 )
 def fix(
+    ctx: click.Context,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
     rules: tuple[str, ...],
     apply: bool,
     output_path: str | None,
@@ -1486,6 +1828,41 @@ def fix(
     auto_fixable = {fixer.rule_id for fixer in default_fixers()}
     rules = _validate_rule_filter(rules, auto_fixable, kind="auto-fixable ")
 
+    offline = _resolve_offline_schema(
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="fix"
+    )
+    if offline is not None:
+        _reject_apply_offline(apply, "fix")
+        _guard_offline_exclusivity(ctx, command="fix")
+        schema, offline_source, offline_version = offline
+        effective = _offline_effective_config(
+            config_path=config_path, schemas_csv=schemas
+        )
+        try:
+            fixes = generate_fixes(
+                schema, rule_options=effective.rule_options,
+                rule_filter=set(rules) if rules else None,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+        # Filter out any fixer whose rule is inert offline — it would emit a
+        # bogus statement (e.g. a CREATE INDEX for an index it can't see via
+        # DDL parsing). This preserves the under-report contract: offline fix
+        # never emits a statement that isn't grounded in observed DDL.
+        inert = inert_rule_ids(offline_source, snapshot_version=offline_version)
+        fixes = [f for f in fixes if f.rule_id not in inert]
+        if not fixes:
+            click.echo("pgrls: no auto-fixable violations found.", err=True)
+            return
+        # Emit-only offline: dispatch with conn=None, apply=False, offline=True.
+        # The offline provenance header travels into --output files (Fix 1) and
+        # is prepended to stdout on the emit path (Fix 2).
+        _fix_dispatch(
+            fixes, conn=None, check=check, output_path=output_path, force=force,
+            apply=False, offline=True,
+        )
+        return
+
     with _connect_introspect_ctx(
         config_path=config_path,
         database_url=database_url,
@@ -1511,20 +1888,7 @@ def fix(
             )
             return
 
-        # Four mutually exclusive output modes (the flag conflicts are
-        # rejected above): --check (CI gate), --output (migration file),
-        # dry-run (default), and --apply. Each is its own helper.
-        if check:
-            _fix_check(fixes)
-            return  # unreachable (_fix_check exits 1); pins control flow
-
-        if output_path is not None:
-            # `--apply` is already rejected alongside `--output`, so
-            # reaching here means a pure dry-run-to-file.
-            _fix_write_migration(fixes, output_path, force=force)
-            return
-
-        _fix_emit_and_maybe_apply(fixes, conn, apply=apply)
+        _fix_dispatch(fixes, conn=conn, check=check, output_path=output_path, force=force, apply=apply)
 
 def _parse_generate_tables(
     raw: tuple[str, ...],
@@ -1559,7 +1923,9 @@ def _parse_generate_tables(
 
 
 @main.command()
+@click.pass_context
 @common_db_options
+@offline_source_options
 @click.option(
     "--model",
     type=click.Choice(["tenant", "owner"], case_sensitive=False),
@@ -1651,9 +2017,12 @@ def _parse_generate_tables(
     help="Execute the generated SQL. Default: dry-run (print SQL only).",
 )
 def generate(
+    ctx: click.Context,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
     model: str,
     column: str | None,
     tables: tuple[str, ...],
@@ -1703,6 +2072,13 @@ def generate(
     # Column default depends on the model when not given explicitly.
     resolved_column = column or ("user_id" if model_norm == "owner" else "tenant_id")
 
+    # Validate --config unconditionally so a broken config file surfaces on
+    # both offline and live generate paths (mirrors fix()'s up-front parse).
+    try:
+        load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
     # Resolve config (parse + merge + db-url guard) BEFORE parsing
     # --table, so a malformed --config and a missing database URL both
     # surface ahead of a bad --table value — matching the pre-refactor
@@ -1710,11 +2086,15 @@ def generate(
     # then db-url-missing, then --table syntax). The context manager
     # below re-resolves + connects; this up-front call exists only to
     # pin that precedence (the analogue of fix()'s up-front parse).
-    _load_effective_config(
-        config_path=config_path,
-        database_url=database_url,
-        schemas_csv=schemas,
-    )
+    # Guard: skip on the offline path — no db-url required offline, and
+    # calling it would raise "No database connection" before the offline
+    # branch is reached.
+    if not sql_file and snapshot is None:
+        _load_effective_config(
+            config_path=config_path,
+            database_url=database_url,
+            schemas_csv=schemas,
+        )
 
     options = GenerateOptions(
         tenant_column=resolved_column,
@@ -1726,6 +2106,35 @@ def generate(
         restrictive=restrictive,
         tables=_parse_generate_tables(tables),
     )
+
+    offline = _resolve_offline_schema(
+        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas,
+        command="generate",
+    )
+    if offline is not None:
+        _reject_apply_offline(apply, "generate")
+        _guard_offline_exclusivity(ctx, command="generate")
+        schema, _, _ = offline
+        try:
+            result = plan_generation(schema, options)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        for note in result.notes:
+            click.echo(f"pgrls: note: {note}", err=True)
+        for qname, reason in result.skipped:
+            click.echo(f"pgrls: skipped {qname} — {reason}", err=True)
+        if not result.statements:
+            click.echo(
+                "pgrls: nothing to generate (no unprotected tables with the "
+                "discriminator column).",
+                err=True,
+            )
+            return
+        _generate_dispatch(
+            result, list(result.statements), conn=None, output_path=output_path,
+            force=force, apply=False, offline=True,
+        )
+        return
 
     with _connect_introspect_ctx(
         config_path=config_path,
@@ -1756,45 +2165,7 @@ def generate(
             )
             return
 
-        stmts = list(result.statements)
-
-        if output_path is not None:
-            path = Path(output_path)
-            if path.exists() and not force:
-                raise ToolError(
-                    f"{output_path} already exists. Pass --force to "
-                    "overwrite it."
-                )
-            migration = render_migration(stmts, tool_version=__version__)
-            try:
-                path.write_text(migration, encoding="utf-8", newline="")
-            except OSError as exc:
-                raise ToolError(
-                    f"cannot write generated SQL to {output_path}: {exc}"
-                ) from exc
-            click.echo(
-                f"pgrls: wrote {len(stmts)} statement(s) to "
-                f"{output_path}.",
-                err=True,
-            )
-            return
-
-        click.echo(render_fixes(stmts))
-
-        if apply:
-            _apply_statements(conn, stmts, lock_key="pgrls.generate")
-            click.echo(
-                f"pgrls: applied {len(stmts)} statement(s). "
-                "Run `pgrls lint` to confirm a clean result.",
-                err=True,
-            )
-        else:
-            click.echo(
-                f"pgrls: {len(stmts)} statement(s) ready (dry-run). "
-                "Re-run with --apply to execute, or --output FILE to "
-                "write a migration.",
-                err=True,
-            )
+        _generate_dispatch(result, list(result.statements), conn=conn, output_path=output_path, force=force, apply=apply, offline=False)
 
 
 @main.command()

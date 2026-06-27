@@ -2,7 +2,7 @@
 
 Most tests are OFFLINE — they call the MCP tool functions
 (`pgrls.mcp.server.lint` / `verify` / `explain_rule` / `list_rules`) and the
-`pgrls.mcp._schema_sources` helpers directly, with no live MCP client and no
+`pgrls.schema_sources` helpers directly, with no live MCP client and no
 database. The headline crux is the offline `sql=` analysis path: pgrls lints +
 Z3-verifies raw DDL with no Postgres.
 
@@ -22,7 +22,8 @@ import sys
 import pytest
 
 from pgrls.mcp import server
-from pgrls.mcp._schema_sources import (
+from pgrls.model import SNAPSHOT_VERSION
+from pgrls.schema_sources import (
     SchemaSourceError,
     resolve_schema,
     schema_from_sql,
@@ -279,16 +280,17 @@ def test_snapshot_path_reparses_asts(tmp_path) -> None:
     path = tmp_path / "snap.json"
     path.write_text(json.dumps(snap), encoding="utf-8")
 
-    schema, source = resolve_schema(snapshot=str(path))
+    schema, source, version = resolve_schema(snapshot=str(path))
     assert source == "snapshot"
+    assert version == SNAPSHOT_VERSION
     # ASTs were rebuilt on load.
     assert schema.tables[0].policies[0].using_ast is not None
 
     # lint works.
     lint_result = server.lint(snapshot=str(path))
     assert lint_result["schema_source"] == "snapshot"
-    # snapshot path sees the full catalog → no sql-only caveat warnings.
-    assert lint_result["warnings"] == []
+    # snapshot path warns conservatively (catalog fields may be absent in older snapshots).
+    assert any("snapshot" in w.lower() for w in lint_result["warnings"])
 
     # verify gives a real verdict (NOT unverified — the trap).
     verify_result = server.verify(snapshot=str(path), mode="anon")
@@ -589,3 +591,10 @@ def test_database_url_error_is_sanitized() -> None:
     # The credential must never appear in the returned message.
     assert "SUPERSECRET" not in result["error"]["message"]
     assert secret_url not in result["error"]["message"]
+
+
+def test_mcp_warnings_name_every_inert_rule():
+    from pgrls.schema_sources import inert_rule_ids, schema_source_warnings
+    text = " ".join(schema_source_warnings("sql"))
+    for rid in inert_rule_ids("sql"):
+        assert rid in text

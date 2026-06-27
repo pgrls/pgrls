@@ -1,7 +1,7 @@
 """The thin FastMCP layer for `pgrls mcp` — isolate ALL FastMCP API here.
 
 This is the only pgrls module that imports `fastmcp`; everything substantive
-lives in `pgrls.mcp._schema_sources` (schema resolution / DDL parsing) and the
+lives in `pgrls.schema_sources` (schema resolution / DDL parsing) and the
 existing pgrls internals (`rules`, `verify`, `formatters`). Importing this
 module pulls in the optional `fastmcp` extra, so `pgrls.cli` imports it lazily,
 inside `pgrls mcp` — a plain `pip install pgrls` never touches FastMCP.
@@ -16,7 +16,7 @@ SAFETY POSTURE — NEVER MUTATES A DATABASE (hard constraint):
   `verify --probe`) remain deliberately unexposed; an agent that wants to apply
   the returned SQL does so through its own reviewed channel.
 * `database_url` is treated as a credential: it is never logged, never echoed
-  back, and database errors are sanitized (see `_schema_sources`). The
+  back, and database errors are sanitized (see `schema_sources`). The
   introspection it triggers — on every tool, including `fix` / `generate` —
   issues only SELECTs against the catalogs over a short-lived connection.
 * Every tool wraps its body so any failure returns a STRUCTURED error object
@@ -32,7 +32,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from pgrls.config import Config
-from pgrls.mcp._schema_sources import (
+from pgrls.schema_sources import (
     SchemaSourceError,
     resolve_schema,
     schema_source_warnings,
@@ -175,7 +175,7 @@ def lint(
     from pgrls.formatters.json import format_json
     from pgrls.violations import coerce_severity, is_at_or_above
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -204,7 +204,7 @@ def lint(
         "schema_source": source,
         "summary": base["summary"],
         "violations": base["violations"],
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 
@@ -251,7 +251,7 @@ def verify(
             "'write'.",
         )
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -281,7 +281,7 @@ def verify(
         "strict": strict,
         "summary": base["summary"],
         "tables": base["tables"],
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 
@@ -326,7 +326,7 @@ def fix(
     from pgrls import __version__
     from pgrls.fixers import generate_fixes, render_migration
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -359,7 +359,7 @@ def fix(
         "migration": (
             render_migration(fixes, tool_version=__version__) if fixes else ""
         ),
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 
@@ -437,7 +437,7 @@ def generate(
         "user_id" if model == "owner" else "tenant_id"
     )
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -487,7 +487,7 @@ def generate(
             for qname, reason in result.skipped
         ],
         "notes": list(result.notes),
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 

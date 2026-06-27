@@ -59,6 +59,24 @@ pgrls lint --supabase                   # shortcut for ./supabase/migrations + t
 
 `--migrations` takes a directory or a single `.sql` file; the layout is auto-detected (override with `--migrations-layout` / `--migrations-glob`), and `--create-role NAME` pre-creates any role your policies reference. It's the zero-setup way to gate RLS in CI — no service container, no `DATABASE_URL`, just Docker.
 
+**No Docker either?** Hand pgrls the DDL directly — it parses it offline (no
+Postgres, no container) and checks what it can determine from the SQL alone:
+
+```bash
+pgrls lint --sql-file schema.sql                 # repeat --sql-file per file (order matters)
+cat migrations/*.sql | pgrls lint --sql-file -   # or pipe a concatenated diff
+pgrls snapshot > schema.json && pgrls lint --snapshot schema.json
+pgrls fix --sql-file schema.sql > fixes.sql      # emit-only offline
+pgrls generate --sql-file schema.sql             # scaffold RLS offline
+```
+
+Offline analysis is **sound but partial**: rules that need live catalog state
+(BYPASSRLS roles, SECURITY DEFINER functions, triggers, …) can't fire, so
+pgrls *skips and lists them* (`skipped_rules` in `--format json`). **An offline
+exit 0 is not a clean bill of health** — add `--require-full-coverage` to make
+a partial offline run fail your CI gate. It's the zero-dependency way to lint
+the RLS in a PR's `.sql` diff.
+
 ## Real-world bugs pgrls catches
 
 The kind of mistake that ships to prod despite policy review:

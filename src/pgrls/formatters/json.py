@@ -34,11 +34,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from typing import Any
 
 from pgrls.violations import Severity, Violation
 
 
-def format_json(violations: list[Violation]) -> str:
+def format_json(
+    violations: list[Violation], *, extra: dict[str, Any] | None = None
+) -> str:
     payload = {
         "violations": [
             {
@@ -73,6 +76,10 @@ def format_json(violations: list[Violation]) -> str:
         ],
         "summary": _summary(violations),
     }
+    # Additive top-level keys (e.g. offline coverage signal). Only present
+    # when an offline source is used; live output is unchanged.
+    if extra:
+        payload.update(extra)
     # `ensure_ascii=False` so non-ASCII characters in messages stay
     # readable instead of being escaped to `\uXXXX`. Consumers
     # parse with any standard JSON library; bytes are UTF-8.

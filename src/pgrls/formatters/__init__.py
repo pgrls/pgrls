@@ -26,6 +26,7 @@ synchronized — see the cross-reference comments in
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from pgrls.formatters.github import format_github
 from pgrls.formatters.html import format_html
@@ -56,6 +57,7 @@ def format_violations(
     *,
     format: str,
     rationale_map: dict[str, str] | None = None,
+    extra_json: dict[str, Any] | None = None,
 ) -> str:
     """Render `violations` in the requested output `format`.
 
@@ -64,6 +66,10 @@ def format_violations(
     paragraph beneath its finding. Honoured by the text formatter
     only; every other format (json, sarif, markdown, github)
     ignores it to keep their output stable.
+
+    `extra_json` is an optional dict of additive top-level keys to
+    include in the JSON output (e.g. offline coverage signal). Only
+    honoured by the json formatter; ignored by all other formats.
     """
     if format not in _FORMATTERS:
         raise ValueError(
@@ -72,4 +78,6 @@ def format_violations(
         )
     if format == "text":
         return format_text(violations, rationale_map=rationale_map)
+    if format == "json":
+        return format_json(violations, extra=extra_json)
     return _FORMATTERS[format](violations)

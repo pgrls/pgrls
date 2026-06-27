@@ -901,8 +901,15 @@ ask the human user — the lint failure is signalling a real design question.
 
 These are intentional in the current release. Do not invent capabilities.
 
-- **Live database only.** `pgrls lint` reads from a running Postgres
-  instance. There is no `--from-sql-file` or static migration parser.
+- **Offline or live.** `pgrls lint` / `fix` / `generate` read from a running
+  Postgres, an ephemeral `--migrations` build, OR an offline source —
+  `--sql-file` (raw DDL, repeatable, `-` for stdin) / `--snapshot` (a `pgrls
+  snapshot` artifact) — with no live database and no Docker. Offline analysis
+  can only *under*-report: catalog-only rules abstain and are explicitly
+  skipped and listed (in `--format json` as `skipped_rules`, gateable with
+  `--require-full-coverage`), so an absence of findings offline is not a proof
+  of safety. `pgrls verify` stays live/ephemeral only (its proof is framed
+  against a complete schema).
 - **Sixty-one rules across four categories.** SEC001–SEC048,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
@@ -934,8 +941,9 @@ These are intentional in the current release. Do not invent capabilities.
   `::error` / `::warning` / `::notice` — so findings surface as
   run annotations; severity maps error→error, warning→warning,
   info→notice, and a clean run emits nothing). The github format
-  carries no `file=`/`line=` because pgrls lints a live database,
-  not source text, so annotations land in the run summary rather
+  carries no `file=`/`line=` source ranges yet — even with
+  `--sql-file` (where source text exists), range-pinned annotations are a
+  follow-on (see #227); annotations currently land in the run summary rather
   than pinned to a diff hunk. `--format junit` emits a JUnit XML
   report (one `<testcase>` per finding under a `pgrls` suite) so
   findings show in a CI run's test-report UI; the process exit code

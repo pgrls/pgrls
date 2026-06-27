@@ -8,7 +8,7 @@ database.
 
 This package is split so the only module that touches the FastMCP API is
 `server`; all the schema-resolution / DDL-parsing logic lives in
-`_schema_sources` (FastMCP-agnostic, unit-testable without the extra).
+`pgrls.schema_sources` (FastMCP-agnostic, unit-testable without the extra).
 
 FastMCP is an OPTIONAL dependency (`pip install 'pgrls[mcp]'`). Importing
 `pgrls.mcp.server` (which imports `fastmcp`) is deferred — `pgrls.cli` never

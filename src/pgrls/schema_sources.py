@@ -1,8 +1,8 @@
-"""Resolve a `pgrls.model.Schema` from one of three sources, for the MCP server.
+"""Resolve a `pgrls.model.Schema` from one of three sources (sql / database_url / snapshot).
 
-This module is the FastMCP-agnostic core of `pgrls mcp`: it has NO dependency
-on the `fastmcp` extra, so the schema-resolution + DDL-parsing logic can be
-unit-tested with a plain `pip install pgrls`.
+This module is the FastMCP-agnostic schema-resolution core shared by the CLI
+(`pgrls lint/fix/generate --sql-file/--snapshot`) and the MCP server; it has
+NO dependency on the `fastmcp` extra.
 
 Three sources, EXACTLY ONE per call (`resolve_schema` enforces this):
 
@@ -44,7 +44,15 @@ from pglast.enums.parsenodes import (
 from pglast.stream import RawStream
 
 from pgrls import ast_utils
-from pgrls.model import Column, ColumnGrant, Grant, Policy, Schema, Table
+from pgrls.model import (
+    SNAPSHOT_VERSION,
+    Column,
+    ColumnGrant,
+    Grant,
+    Policy,
+    Schema,
+    Table,
+)
 
 SchemaSource = Literal["sql", "database_url", "snapshot"]
 
@@ -162,12 +170,15 @@ def resolve_schema(
     database_url: str | None = None,
     snapshot: str | None = None,
     schemas: tuple[str, ...] | None = None,
-) -> tuple[Schema, SchemaSource]:
+) -> tuple[Schema, SchemaSource, int | None]:
     """Build a `Schema` from EXACTLY ONE of `sql` / `database_url` / `snapshot`.
 
-    Returns `(schema, source)` where `source` is the kind that was used (for the
-    `schema_source` field the tools echo back). Raises `SchemaSourceError` with
-    a structured `kind` on zero sources (`no_schema_source`), more than one
+    Returns `(schema, source, snapshot_version)`. `source` is the kind that was
+    used (for the `schema_source` field the tools echo back). `snapshot_version`
+    is the declared format version of a `snapshot` source (which `inert_rule_ids`
+    uses to decide which catalog-only rules that snapshot can run), or `None` for
+    the `sql` / `database_url` sources. Raises `SchemaSourceError` with a
+    structured `kind` on zero sources (`no_schema_source`), more than one
     (`multiple_schema_sources`), a pglast parse failure (`bad_sql`), or a
     database error (`db_unreachable`, sanitized).
 
@@ -203,11 +214,16 @@ def resolve_schema(
     effective_schemas = schemas if schemas else ("public",)
 
     if sql is not None:
-        return schema_from_sql(sql, schemas=effective_schemas), "sql"
+        return schema_from_sql(sql, schemas=effective_schemas), "sql", None
     if snapshot is not None:
-        return _schema_from_snapshot(snapshot), "snapshot"
+        schema, version = _schema_from_snapshot(snapshot)
+        return schema, "snapshot", version
     assert database_url is not None  # guaranteed by the guards above
-    return _schema_from_database(database_url, effective_schemas), "database_url"
+    return (
+        _schema_from_database(database_url, effective_schemas),
+        "database_url",
+        None,
+    )
 
 
 def _schema_from_database(database_url: str, schemas: tuple[str, ...]) -> Schema:
@@ -243,8 +259,13 @@ def _schema_from_database(database_url: str, schemas: tuple[str, ...]) -> Schema
         raise SchemaSourceError("db_unreachable", str(exc)) from exc
 
 
-def _schema_from_snapshot(snapshot_path: str) -> Schema:
+def _schema_from_snapshot(snapshot_path: str) -> tuple[Schema, int]:
     """Load a snapshot JSON and rebuild policy ASTs so `verify` works.
+
+    Returns `(schema, version)`; `version` is the snapshot's declared format
+    version (`Schema.from_snapshot` has already validated it is a supported int),
+    which `inert_rule_ids` uses to decide which catalog-only rules the snapshot
+    can run.
 
     `Schema.from_snapshot` leaves `using_ast` / `with_check_ast` as `None`
     (snapshots serialize only the SQL). `verify` reads the ASTs, so without this
@@ -274,7 +295,8 @@ def _schema_from_snapshot(snapshot_path: str) -> Schema:
             f"{snapshot_path!r} is not a valid pgrls snapshot: {exc}.",
         ) from exc
 
-    return _reparse_policy_asts(schema)
+    # `from_snapshot` accepted the payload, so `version` is a supported int.
+    return _reparse_policy_asts(schema), int(payload["version"])
 
 
 def _reparse_policy_asts(schema: Schema) -> Schema:
@@ -696,41 +718,155 @@ def _deparse_or_none(node: Any) -> str | None:
         return None
 
 
-# Catalog-only rules whose inputs the offline `sql=` builder cannot populate
-# (the data lives in pg_catalog, not in CREATE/ALTER/GRANT DDL). They abstain
-# silently on a `sql=`-built schema; `schema_source_warnings` names them so the
-# caller never reads their silence as a proof of safety. Keyed to the model
-# fields `schema_from_sql` leaves empty.
-_CATALOG_ONLY_INERT: tuple[tuple[str, str], ...] = (
-    ("SEC013", "triggers on RLS tables"),
-    ("SEC014", "SECURITY DEFINER functions"),
-    ("SEC015", "SECURITY DEFINER function search_path"),
-    ("SEC016", "BYPASSRLS roles"),
-    ("SEC017", "LEAKPROOF functions"),
-    ("SEC029", "SET ROLE → BYPASSRLS escalation"),
-    ("SEC042", "anon-exposed SECURITY DEFINER functions"),
-    ("SEC044", "ALTER DEFAULT PRIVILEGES (pg_default_acl)"),
-    ("SEC046", "user-defined IMMUTABLE functions"),
-    ("SEC047", "foreign keys to RLS-enabled parents"),
-    ("PERF005", "observed runtime seq-scans"),
-    ("VIEW001", "views over RLS tables"),
-    ("VIEW003", "view ownership chains"),
-    ("VIEW004", "SECURITY DEFINER calls from view bodies"),
-)
+# Catalog-dependent rules: each reads a model field that an offline schema
+# source may not carry. Each maps to a human label and the SNAPSHOT VERSION at
+# which a `pgrls snapshot` first serializes every field that rule needs (the
+# LATEST version across all fields it reads — e.g. SEC035 needs `indexes` (v7)
+# AND `Index.is_primary` (v13), so its threshold is 13).
+#
+# CAUTION when adding/editing a rule: the threshold is the max over EVERY field
+# the rule's `check` consumes — including a field it reaches only through a
+# shared helper (SEC041/SEC043 gate on `sec041._is_directly_reachable`, which
+# reads `Table.column_grants` (v8), so neither may be below 8 however early its
+# own marquee field landed). A threshold set BELOW a field the rule actually
+# reads is a silent false-clean: an older snapshot decodes that field as empty,
+# the rule runs, finds nothing, and is wrongly reported as covered. The
+# `test_offline_noop_rule_*` regression tests fire each rule at its threshold to
+# catch this. The inert decision is
+# SOURCE-AWARE (see `inert_rule_ids`) rather than a hardcoded blanket list:
+#
+#   * a `sql=` schema carries NONE of these — `schema_from_sql` models only RLS
+#     flags, policies, columns and grants from DDL — so every rule here is inert
+#     on it (the data lives in pg_catalog, not in CREATE/ALTER/GRANT text);
+#   * a `snapshot` declares the introspector version that wrote it; a rule is
+#     inert only when that version predates the rule's threshold (the field was
+#     not captured and decodes back as an empty default — a silent no-op). A
+#     current snapshot meets every threshold, so it exercises the full rule set
+#     and an absence of findings on it is real coverage, not "couldn't run".
+#
+# Keying on the declared version (not on whether a field happens to be empty) is
+# what lets a complete snapshot of a feature-light database — no triggers, no
+# BYPASSRLS roles — still count those rules as *run and clean* rather than
+# *skipped*, while a pre-threshold snapshot fails closed.
+#
+# PERF005 is deliberately ABSENT: it reads the `--perf` runtime-stats artifact,
+# not a schema field, so it no-ops without `--perf` on EVERY source (exactly as
+# on a live database) and is never a coverage gap of the schema source itself.
+_CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
+    "SEC013": ("triggers on RLS tables", 6),
+    "SEC014": ("SECURITY DEFINER functions", 4),
+    "SEC015": ("SECURITY DEFINER function search_path", 8),
+    "SEC016": ("BYPASSRLS roles", 9),
+    "SEC017": ("LEAKPROOF functions", 10),
+    "SEC023": ("policy TO clause names a BYPASSRLS role", 9),
+    "SEC029": ("SET ROLE → BYPASSRLS escalation", 11),
+    "SEC035": ("UNIQUE-index cross-tenant existence oracle", 13),
+    # SEC041/SEC043 gate every emission on `sec041._is_directly_reachable`,
+    # which reads `Table.grants` (v3) AND `Table.column_grants` (v8) — so their
+    # threshold is the max over partition_of/inherits AND that reachability gate.
+    "SEC041": ("partition of an RLS-enabled parent", 8),
+    "SEC042": ("anon-exposed SECURITY DEFINER functions", 16),
+    "SEC043": ("classic-INHERITS child of an RLS parent", 17),
+    "SEC044": ("ALTER DEFAULT PRIVILEGES (pg_default_acl)", 18),
+    "SEC046": ("user-defined IMMUTABLE functions", 19),
+    "SEC047": ("foreign keys to RLS-enabled parents", 20),
+    "SEC048": ("owner-reachable members that bypass RLS", 21),
+    "PERF003": ("policy-predicate column indexes", 7),
+    # PERF004 reaches `Table.indexes` (v7) through `perf003._has_leading_column_index`
+    # — same shared-helper path as SEC041/SEC043; the helper reads only
+    # `Index.columns` (v7 baseline), not `is_primary` (v13), so the threshold is 7.
+    "PERF004": ("policy-predicate function-wrapped column indexes", 7),
+    "VIEW001": ("views over RLS tables", 4),
+    "VIEW002": ("non-security-barrier view over RLS table", 4),
+    "VIEW003": ("view ownership chains", 4),
+    "VIEW004": ("SECURITY DEFINER calls from view bodies", 4),
+}
+
+# Every threshold must be reachable by the current snapshot format, or that rule
+# would be permanently inert on snapshots (a silent coverage gap). Pinned here
+# so adding a rule whose field lands in a future version can't slip through.
+assert all(v <= SNAPSHOT_VERSION for _, v in _CATALOG_DEPENDENT_RULES.values())
+
+WarnCommand = Literal["lint", "fix", "generate"]
 
 
-def schema_source_warnings(source: SchemaSource) -> list[str]:
-    """Warnings to attach to a `lint` / `verify` response, per schema source.
+def inert_rule_ids(
+    source: SchemaSource, *, snapshot_version: int | None = None
+) -> frozenset[str]:
+    """Rule IDs that cannot fire on this source and must be explicitly skipped.
 
-    For the offline `sql=` path, returns a leading caveat plus a note naming the
-    catalog-only rule families that are structurally inert (their inputs aren't
-    expressible in DDL) — so a "no findings" result is not mistaken for a clean
-    bill of health. The `database_url` and `snapshot` paths see the full
-    catalog, so they get no warnings.
+    Source-aware so an offline run can never read a silent no-op as coverage,
+    while a complete snapshot still exercises its full rule set:
+
+    * ``sql`` — `schema_from_sql` models only RLS flags, policies, columns and
+      grants, so every catalog-dependent rule is inert (the data it reads lives
+      in pg_catalog, never in CREATE/ALTER/GRANT DDL).
+    * ``snapshot`` — a rule is inert when `snapshot_version` predates the
+      version that first serialized the field it needs (an older snapshot never
+      wrote it, so it decodes as an empty default and the rule would silently
+      no-op). A current snapshot meets every threshold → this set is empty. An
+      unknown version (`None`) fails closed: every catalog-dependent rule is
+      treated as inert.
+    * ``database_url`` — the live catalog has everything → nothing is inert.
     """
-    if source != "sql":
+    if source == "sql":
+        return frozenset(_CATALOG_DEPENDENT_RULES)
+    if source == "snapshot":
+        version = snapshot_version if snapshot_version is not None else 0
+        return frozenset(
+            rule_id
+            for rule_id, (_, min_version) in _CATALOG_DEPENDENT_RULES.items()
+            if version < min_version
+        )
+    return frozenset()
+
+
+def schema_source_warnings(
+    source: SchemaSource,
+    *,
+    command: WarnCommand | None = None,
+    snapshot_version: int | None = None,
+) -> list[str]:
+    """Soundness caveats for an offline response, per source + command.
+
+    `command=None` (the MCP default) preserves the original lint-flavored text
+    verbatim. The CLI passes its command so `generate` gets a generation-scoped
+    caveat. The skipped-rule list is computed via `inert_rule_ids`, so a current
+    snapshot reports nothing skipped. A live `database_url` → no warnings.
+    """
+    if source not in ("sql", "snapshot"):
         return []
-    inert = ", ".join(rule_id for rule_id, _ in _CATALOG_ONLY_INERT)
+    if command == "generate":
+        return [
+            "Generation reflects only the tables and policies in the provided "
+            "schema — roles, grants, and policies defined elsewhere are not "
+            "seen. Review the output against your full schema before applying.",
+        ]
+    inert = ", ".join(
+        sorted(inert_rule_ids(source, snapshot_version=snapshot_version))
+    )
+    if source == "snapshot":
+        lines = [
+            "Analysis is of the snapshot only — no live database. A snapshot is "
+            "a point-in-time capture, so re-run against a live database for "
+            "runtime checks (--perf) and the latest catalog state.",
+        ]
+        if inert:
+            lines.append(
+                "Skipped (this snapshot predates these rules' inputs; "
+                f"re-capture to cover them): {inert}."
+            )
+        return lines
+    if command in {"lint", "fix"}:
+        return [
+            "Analysis is of the provided SQL only — no live database. Rules that "
+            "depend on catalog state (BYPASSRLS roles, SECURITY DEFINER functions, "
+            "triggers, indexes, and foreign keys) cannot fire here, so an absence "
+            "of findings is NOT a proof of safety. "
+            "For full coverage, run against a live database "
+            "(--database-url or $DATABASE_URL).",
+            f"Inert on sql= input (catalog-only): {inert}.",
+        ]
     return [
         "Analysis is of the provided SQL only — no live database. Rules that "
         "depend on catalog state not expressible in CREATE/ALTER/GRANT DDL "
