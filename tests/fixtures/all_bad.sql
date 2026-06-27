@@ -999,6 +999,24 @@ CREATE POLICY tenant_scope ON public.allbad_sec048_owned
     FOR SELECT
     USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
 
+-- SEC049: the canonical PostgREST data-exposure incident. A public-schema
+-- table with RLS left OFF and SELECT granted to the unauthenticated `anon`
+-- role is directly readable at GET /rest/v1/allbad_sec049 -- anon can page
+-- every row over the REST API. SEC049 fires at location public.allbad_sec049,
+-- naming the HTTP-reachable consequence. SEC001 co-fires (RLS not enabled):
+-- SEC049 is the warning-level conjunction that adds the "and it is granted to
+-- a low-trust role + lives in an exposed schema" conclusion on top of SEC001's
+-- precondition. No policies exist, so SEC002 / SEC003 / SEC007 / SEC008 /
+-- SEC032 stay quiet, and the grant is to anon (not the PUBLIC pseudo-role) so
+-- SEC003's PUBLIC-policy path is untouched. Reuses the `anon` role created in
+-- the SEC039 block above. MUST stay before the SEC044 default-privilege
+-- statement so the cluster default ACL does not retroactively touch it.
+CREATE TABLE public.allbad_sec049 (
+    id bigint PRIMARY KEY,
+    body text
+);
+GRANT SELECT ON public.allbad_sec049 TO anon;
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl

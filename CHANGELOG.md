@@ -27,6 +27,20 @@ breaking changes — they will be called out in this file.
   explicitly skipped and surfaced (`skipped_rules` in `--format json`;
   `lint --require-full-coverage` fails a partial run). `--apply` is rejected
   offline (emit-only). (#225)
+- **SEC049 (warning) — PostgREST-exposed table readable by a low-trust role.**
+  Flags a table in an API-exposed schema (default `public`) that grants SELECT
+  (table- or column-level) to `anon` / `authenticated` / `PUBLIC` **and** has no
+  effective row filter — RLS off, or RLS on with only a permissive `USING (true)`
+  `SELECT`/`ALL` policy that **applies to the granted role** and nothing
+  restrictive to constrain it — so it is directly readable at
+  `GET /rest/v1/<table>`. (Evaluated per grantee, so a `USING (true)` policy
+  scoped to a different role — the `TO service_role` backend bypass — does not
+  trip it on the granted `anon`/`authenticated`.) The *conjunction* that SEC001 /
+  SEC003 / SEC008 each report a precondition of in isolation; fires once, naming
+  the HTTP-reachable consequence. Conservative by construction: a real policy, or
+  any restrictive policy not provably `true`, is treated as protection, so the
+  normal RLS-gated Supabase grant is **not** flagged. Configurable `schemas` /
+  `grantees` / `allowlist`; no auto-fix. Catalog now **62 rules**. (#234)
 
 ### Changed
 - In `relaxed` mode, a rename whose predicate also changed is graded by predicate
