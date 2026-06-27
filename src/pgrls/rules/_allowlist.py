@@ -41,10 +41,12 @@ from __future__ import annotations
 from typing import Any
 
 
-def _list_of_strings(rule_id: str, raw: Any, shape_hint: str) -> list[str]:
+def _list_of_strings(
+    rule_id: str, raw: Any, shape_hint: str, option: str = "allowlist"
+) -> list[str]:
     if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
         raise TypeError(
-            f"[lint.rules.{rule_id}].allowlist must be a list of "
+            f"[lint.rules.{rule_id}].{option} must be a list of "
             f"strings ({shape_hint})"
         )
     # Surface accidental leading/trailing whitespace early. Postgres
@@ -58,7 +60,7 @@ def _list_of_strings(rule_id: str, raw: Any, shape_hint: str) -> list[str]:
     for entry in raw:
         if entry != entry.strip():
             raise TypeError(
-                f"[lint.rules.{rule_id}].allowlist entry {entry!r} "
+                f"[lint.rules.{rule_id}].{option} entry {entry!r} "
                 "has leading or trailing whitespace. pgrls compares "
                 "entries with byte-exact equality against built "
                 "location strings, which never carry surrounding "

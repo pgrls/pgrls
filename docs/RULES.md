@@ -3292,6 +3292,100 @@ allowlist = ["ops_admin"]
 trusted_owner_roles = ["app_owner"]
 ```
 
+<a id="rule-sec049"></a>
+
+## SEC049 — PostgREST-exposed table readable by a low-trust role
+
+**Severity:** warning
+
+In a PostgREST / Supabase deployment, a table grant plus schema exposure
+*is* an HTTP endpoint. A table in an API-exposed schema (PostgREST's
+default is `public`), granted a row-reading privilege to a low-trust
+role — `anon` (unauthenticated), `authenticated` (any logged-in user),
+or the `PUBLIC` pseudo-role — is reachable at `GET /rest/v1/<table>`.
+Row-level security is then the only thing between that request and the
+rows, so a table that is **exposed, granted, and has no effective row
+filter** is directly readable:
+
+```sql
+CREATE TABLE public.invoices (id bigint, tenant_id bigint, amount numeric);
+GRANT SELECT ON public.invoices TO anon;     -- exposed + granted …
+-- … and RLS left off:  GET /rest/v1/invoices  returns every tenant's rows.
+```
+
+"No effective row filter" means one of:
+
+* **RLS is disabled** — every granted row is returned (any policies are
+  dormant while RLS is off; that dormancy is [SEC032](#rule-sec032)'s
+  domain).
+* **RLS is enabled but unrestricted for the granted role** — a *permissive*
+  `SELECT` / `ALL` policy that **applies to the granted low-trust role**
+  (lists it, or is `TO PUBLIC`) and whose `USING` is the literal `true`
+  admits every row, and no *restrictive* policy applying to that role
+  constrains them.
+
+The determination is **per grantee**, so a `USING (true)` policy scoped
+`TO` some *other* role — the ubiquitous `TO service_role` backend bypass —
+leaves the granted role (`anon` / `authenticated`) at default-deny and is
+**not** read as exposing it. (Were role scoping ignored, SEC049 would fire
+on a large fraction of production Supabase tables, which pair a
+`service_role USING (true)` policy with Supabase's default
+`GRANT … TO anon, authenticated`.)
+
+The second branch is conservative by construction: an admitting
+permissive policy must be provably `true`, and any restrictive policy
+whose `USING` is *not* provably `true` (a real predicate, or one that
+did not parse) is assumed to filter rows — so the table is treated as
+protected and **not** flagged. This is the soundness-over-recall
+direction: SEC049 stays silent unless it is confident the rows are
+unscoped. A column-level `GRANT SELECT (col)` counts as a read grant
+(PostgREST honours column privileges), so it can trip the rule too.
+
+SEC049 is a **conjunction**: pgrls already has the ingredients
+separately — [SEC001](#rule-sec001) flags RLS being off,
+[SEC003](#rule-sec003) a `PUBLIC` policy, [SEC008](#rule-sec008) a
+permissive `USING (true)`, [SEC044](#rule-sec044) a default-ACL grant —
+and SEC049 fires once on the combination, naming the actual
+HTTP-reachable consequence where those rules each report a precondition
+in isolation. It is a `warning` and deliberately co-fires with those
+error-level findings (the SEC001/SEC032/SEC043 co-fire precedent): it
+adds the "and it is reachable over the API" conclusion rather than a new
+precondition, and cedes nothing, so no rule-interaction gap can open.
+
+This is the single most common Supabase data-exposure incident. The
+conjunction keeps it from flooding the normal RLS-gated pattern: a table
+granted to `anon` / `authenticated` with a *real* row-scoping policy is
+protected, so SEC049 stays silent there.
+
+**Scope / known limits (intentional).** Transitive group grants are not
+expanded — a grant to a group role a low-trust role merely belongs to is
+not flagged (mirroring SEC003 / SEC044); grant to the low-trust role
+directly, or list the group in `grantees`. Schema exposure is *assumed*,
+not verified: pgrls does not read `PGRST_DB_SCHEMAS` or the role's schema
+`USAGE`, so the `schemas` option is the user's declaration of the API
+surface. The rule is pure logic over already-captured data (grants, RLS
+state, policies) — no snapshot-version dependency.
+
+**Remediation.** Enable RLS with a row-scoping policy (e.g. from
+`pgrls generate`), restrict or `REVOKE` the grant, or — if the table is
+intentionally public reference data (a list of countries, say) —
+allowlist it. There is no auto-fix: whether to add a policy or drop the
+grant is an intent decision pgrls cannot make.
+
+**Configuration** (`[lint.rules.SEC049]`):
+
+```toml
+[lint.rules.SEC049]
+# The PostgREST-exposed schema list. Default ["public"]; set it to match
+# PGRST_DB_SCHEMAS when the API exposes more than `public`.
+schemas = ["public", "api"]
+# The low-trust role set. Default ["anon", "authenticated", "PUBLIC"];
+# "public" is normalised to the PUBLIC pseudo-role.
+grantees = ["anon", "authenticated", "PUBLIC"]
+# Table ids (schema.table) that are intentionally public, exempted.
+allowlist = ["public.countries"]
+```
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING

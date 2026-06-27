@@ -169,6 +169,29 @@ CASES: list[Case] = [
     # discriminator — which would obscure the SEC038-stays-clean signal the
     # corpus negative is meant to isolate. The existing negatives below
     # already prove SEC038 stays silent on real safe shapes.)
+    Case(
+        name="postgrest-grant-but-rls-scoped",
+        kind="negative",
+        expect=frozenset(),
+        note="The normal Supabase shape: a gold-standard tenant table that is "
+        "ALSO granted SELECT to `authenticated`. SEC049 sees the low-trust "
+        "grant and the exposed `public` schema, but the real tenant policy "
+        "filters rows, so it must stay silent — firing here would flood every "
+        "RLS-gated Supabase project.",
+        sql=_clean_tenant("psql_scoped")
+        + "\nGRANT SELECT ON public.psql_scoped TO authenticated;",
+    ),
+    Case(
+        name="postgrest-column-grant-rls-scoped",
+        kind="negative",
+        expect=frozenset(),
+        note="As above but a column-level GRANT SELECT (body) to "
+        "`authenticated`. The real policy still filters rows, so SEC049 stays "
+        "silent on the column-grant path too (the grant exposes a column, not "
+        "unscoped rows).",
+        sql=_clean_tenant("psql_colscoped")
+        + "\nGRANT SELECT (body) ON public.psql_colscoped TO authenticated;",
+    ),
     # ============================ positives ============================
     Case(
         name="sec001-no-rls",
@@ -399,6 +422,19 @@ CREATE POLICY flags_floor ON public.flags AS RESTRICTIVE FOR ALL TO authenticate
     USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid))
     WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
 CREATE INDEX ON public.flags (tenant_id);
+""",
+    ),
+    Case(
+        name="postgrest-exposed-rls-off",
+        kind="positive",
+        expect=frozenset({"SEC001", "SEC049"}),
+        note="The canonical PostgREST data-exposure incident: a public table "
+        "with RLS off and SELECT granted to `authenticated` is readable at "
+        "GET /rest/v1/psql_exposed. SEC049 names the HTTP-reachable "
+        "consequence; SEC001 co-fires on the missing RLS.",
+        sql="""
+CREATE TABLE public.psql_exposed (id uuid PRIMARY KEY, body text);
+GRANT SELECT ON public.psql_exposed TO authenticated;
 """,
     ),
 ]
