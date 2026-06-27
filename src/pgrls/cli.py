@@ -3780,7 +3780,7 @@ def matrix(
 @click.option(
     "--mode",
     "mode",
-    type=click.Choice(["anon", "cross-tenant", "write"]),
+    type=click.Choice(["anon", "cross-tenant", "write", "escalation"]),
     default="anon",
     show_default=True,
     help=(
@@ -3791,7 +3791,11 @@ def matrix(
         "such session can WRITE (INSERT/UPDATE) a row stamped for another "
         "tenant — proven over each write policy's effective WITH CHECK (or the "
         "USING that FOR UPDATE/ALL reuses); SEC006/SEC020/SEC028/SEC040 are the "
-        "linter fallback."
+        "linter fallback. 'escalation': prove the SEC048 finding — a low-trust "
+        "role that reaches a table's owner (not superuser/BYPASSRLS) bypasses "
+        "the RLS on that owner's enabled-but-not-FORCE'd tables; LEAK when the "
+        "table's RLS provably isolates tenants (so the bypass defeats real "
+        "isolation), ISOLATED when it does not."
     ),
 )
 @click.option(
@@ -3940,6 +3944,20 @@ def verify(
         raise click.UsageError(
             "--emit-repro is not supported with --mode write yet "
             "(write-side reproductions are a follow-on)."
+        )
+    if mode == "escalation" and emit_repro_dir is not None:
+        # A SET-ROLE-chain reproduction is Phase 3, not the read/write templates
+        # the emitter knows. Fail fast rather than emit a wrong repro.
+        raise click.UsageError(
+            "--emit-repro is not supported with --mode escalation yet "
+            "(SET ROLE reproductions are a follow-on)."
+        )
+    if mode == "escalation" and probe:
+        # Live SET-ROLE confirmation (create member+owner roles, grant
+        # membership, observe the bypass) is Phase 3.
+        raise click.UsageError(
+            "--probe is not supported with --mode escalation yet "
+            "(live SET ROLE confirmation is a follow-on)."
         )
 
     auth = (

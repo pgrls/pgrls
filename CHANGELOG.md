@@ -11,6 +11,21 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Added
+- **`pgrls verify --mode escalation`** — a fourth threat model that proves or
+  refutes the static **SEC048** reachability finding. A low-trust role that is a
+  member of a table's owner (and the owner is not superuser / `BYPASSRLS`) can
+  `SET ROLE` to it and, on the owner's RLS-enabled-but-not-`FORCE`'d tables,
+  bypass RLS entirely. The mode composes the role-reachability closure
+  (`Schema.owner_reachable_members`) with the cross-tenant prover: **LEAK** when
+  the table's RLS provably isolates tenants (the reachable bypass defeats it) or
+  only *partially* leaks cross-tenant (the bypass additionally exposes the other
+  tenants' rows the partial leak hides — witnessing every row), **ISOLATED** only
+  when the table already leaks every row cross-tenant anyway (the bypass adds
+  nothing — ceded to `--mode cross-tenant`), **UNVERIFIED** when the predicate is
+  unprovable. Turns a noisy SEC048 warning
+  into an evidenced leak — or clears it. No snapshot change. The SECDEF-body
+  cases (SEC042 / VIEW004) and `--probe` / `--emit-repro` for this mode are
+  follow-ons. (#232)
 - `pgrls diff` now detects a **renamed RLS policy** and reports it as a single
   `POLICY_RENAMED` change instead of an independent drop + add (the long-reserved
   `ChangeKind.POLICY_RENAMED` is now produced). Configurable via
