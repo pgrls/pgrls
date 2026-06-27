@@ -655,8 +655,8 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 62 rules ship today (catalog header should say so).
-    assert "<strong>62</strong> rules" in result.output
+    # 63 rules ship today (catalog header should say so).
+    assert "<strong>63</strong> rules" in result.output
     # Header carries the auto-fixable count (18 as of v0.32.0; SEC004 fixer).
     # Use the actual value via the python API to avoid hard-coding.
     from pgrls.cli import _fixable_rule_ids
@@ -1935,7 +1935,12 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
     try:
         apply_sql((FIXTURES_DIR / "all_bad.sql").read_text())
         runner = CliRunner()
-        result = runner.invoke(main, ["lint", "--database-url", pg_url])
+        # SEC050 targets the Supabase `storage.objects` table, which lives in
+        # the `storage` schema — outside lint's default `public`-only scan.
+        # Scan it explicitly so the combined fixture exercises that rule too.
+        result = runner.invoke(
+            main, ["lint", "--database-url", pg_url, "--schemas", "public,storage"]
+        )
         assert result.exit_code == 1, result.output
         from pgrls.diff._z3_compare import Z3_AVAILABLE
         from pgrls.rules import all_rules
@@ -2007,6 +2012,7 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
             "(allbad_sec047_child_parent_id_fkey)\n",
             "SEC048  allbad_sec048_member\n",
             "SEC049  public.allbad_sec049\n",
+            "SEC050  storage.objects.owner_any_bucket\n",
             "PERF001  public.allbad_sec004.inverted\n",
             "PERF003  public.allbad_perf003.tenant_unindexed\n",
             "PERF004  public.allbad_perf004.by_email\n",
@@ -2039,6 +2045,9 @@ def test_lint_fires_every_registered_rule_in_combined_fixture(
         apply_sql(
             "DROP SCHEMA IF EXISTS public CASCADE; "
             "CREATE SCHEMA public; "
+            # SEC050's storage.objects lives in its own schema — drop it so it
+            # cannot leak into the clean-DB e2e test.
+            "DROP SCHEMA IF EXISTS storage CASCADE; "
             "DROP ROLE IF EXISTS allbad_sec029_member; "
             "DROP ROLE IF EXISTS allbad_sec016_role; "
             "DROP ROLE IF EXISTS allbad_sec040_role; "

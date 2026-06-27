@@ -35,7 +35,18 @@ breaking changes — they will be called out in this file.
   restrictive to constrain it — so it is directly readable at
   `GET /rest/v1/<table>`. (Evaluated per grantee, so a `USING (true)` policy
   scoped to a different role — the `TO service_role` backend bypass — does not
-  trip it on the granted `anon`/`authenticated`.) The *conjunction* that SEC001 /
+  trip it on the granted `anon`/`authenticated`.)
+- **SEC050 (warning) — Supabase Storage policy not scoped to a bucket.** In
+  `storage.objects` (where all object access is RLS-enforced), flags a permissive
+  policy whose row-reach clause (`USING` for SELECT/UPDATE/DELETE/ALL, `WITH
+  CHECK` for INSERT) authorizes by owner or path but references no `bucket_id`
+  condition — so it applies to **every** bucket, letting a caller authorized for
+  one bucket reach objects in another (Supabase's own guidance: *"your RLS
+  policy must explicitly specify the `bucket_id` condition"*). Literal
+  `USING (true)` is ceded to SEC008/SEC006; a restrictive `bucket_id` floor keeps
+  it silent; only `storage.objects` is examined (no `storage` schema → no
+  findings). Allowlist by policy id; no auto-fix. Pure rule logic — no
+  introspection or snapshot change. Catalog now **63 rules**. (#233) The *conjunction* that SEC001 /
   SEC003 / SEC008 each report a precondition of in isolation; fires once, naming
   the HTTP-reachable consequence. Conservative by construction: a real policy, or
   any restrictive policy not provably `true`, is treated as protection, so the
