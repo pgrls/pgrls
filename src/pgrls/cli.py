@@ -58,13 +58,14 @@ from pgrls.diff.formatters import (
     format_diff_text,
 )
 from pgrls.fixers import (
+    Fix,
     default_fixers,
     generate_fixes,
     render_fixes,
     render_migration,
 )
 from pgrls.formatters import SUPPORTED_FORMATS, format_violations
-from pgrls.generate import GenerateOptions, plan_generation
+from pgrls.generate import GenerateOptions, GenerateResult, plan_generation
 from pgrls.history import (
     HISTORY_FORMATS,
     build_rows,
@@ -568,6 +569,10 @@ def lint(
     # Offline schema source: raw DDL (--sql-file) or a snapshot artifact
     # (--snapshot). Mutually exclusive with live-database and ephemeral paths.
     schema_source: SchemaSource | None = None
+    # Rules inert on this offline source — computed once and reused for both the
+    # auto-exclude (so they don't run) and the gating-skipped notice / coverage
+    # gate below, keeping the two consistent.
+    schema_source_inert: frozenset[str] = frozenset()
     offline = _resolve_offline_schema(
         sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas, command="lint"
     )
@@ -578,8 +583,11 @@ def lint(
                 "--snapshot), a live database (--database-url), or an "
                 "ephemeral build (--migrations), not more than one."
             )
-        schema, schema_source = offline
-        exclude_ids |= inert_rule_ids(schema_source)
+        schema, schema_source, schema_source_version = offline
+        schema_source_inert = inert_rule_ids(
+            schema_source, snapshot_version=schema_source_version
+        )
+        exclude_ids |= schema_source_inert
 
     # Load the RLS test-coverage artifact if `--coverage` was passed. It
     # feeds HYG004 (policy has no behavioral test), inert otherwise.
@@ -662,7 +670,7 @@ def lint(
     # fail --require-full-coverage (SEC004 is not inert), and --rule SEC016
     # offline is surfaced in the notice rather than being silent.
     if schema_source:
-        inert = inert_rule_ids(schema_source)
+        inert = schema_source_inert
         would_run = (
             set(rules) if rules
             else (known - set(config.disable))
@@ -925,8 +933,12 @@ def _resolve_offline_schema(
     snapshot: str | None,
     schemas_csv: str | None,
     command: WarnCommand,
-) -> tuple[Schema, SchemaSource] | None:
+) -> tuple[Schema, SchemaSource, int | None] | None:
     """Build a Schema from --sql-file / --snapshot, or return None.
+
+    Returns `(schema, source, snapshot_version)` — `snapshot_version` is the
+    declared format version of a --snapshot source (used to scope which
+    catalog-only rules it can run) and `None` for --sql-file.
 
     None when neither flag was given (caller keeps its live path). --sql-file is
     repeatable and concatenated in order; '-' reads stdin. Input is byte-capped;
@@ -980,7 +992,7 @@ def _resolve_offline_schema(
             parts.append(chunk)
         sql_text = "\n".join(parts)
     try:
-        schema, source = resolve_schema(
+        schema, source, snapshot_version = resolve_schema(
             sql=sql_text, snapshot=snapshot, schemas=schemas
         )
     except SchemaSourceError as exc:
@@ -993,9 +1005,11 @@ def _resolve_offline_schema(
             "the provided schema has a pathologically deep policy expression "
             "and could not be parsed offline."
         ) from exc
-    for line in schema_source_warnings(source, command=command):
+    for line in schema_source_warnings(
+        source, command=command, snapshot_version=snapshot_version
+    ):
         click.echo(f"pgrls: {line}", err=True)
-    return schema, source
+    return schema, source, snapshot_version
 
 
 def _connect_and_introspect(
@@ -1550,7 +1564,7 @@ def _fix_write_migration(
 
 def _fix_emit_and_maybe_apply(
     fixes: list[Any],
-    conn: psycopg.Connection[Any],
+    conn: psycopg.Connection[Any] | None,
     *,
     apply: bool,
 ) -> None:
@@ -1564,6 +1578,9 @@ def _fix_emit_and_maybe_apply(
     """
     click.echo(render_fixes(fixes))
     if apply:
+        # `--apply` is rejected on the offline path (the only caller that passes
+        # conn=None), so a live connection is guaranteed whenever apply is set.
+        assert conn is not None
         _apply_statements(conn, fixes, lock_key="pgrls.fix")
         click.echo(
             f"pgrls: applied {len(fixes)} {_plural_fixes(len(fixes))}.",
@@ -1585,8 +1602,8 @@ _OFFLINE_SQL_HEADER = (
 
 
 def _fix_dispatch(
-    fixes, *, conn, check: bool, output_path: str | None,
-    force: bool, apply: bool, offline: bool = False,
+    fixes: list[Fix], *, conn: psycopg.Connection[Any] | None, check: bool,
+    output_path: str | None, force: bool, apply: bool, offline: bool = False,
 ) -> None:
     if check:
         _fix_check(fixes)
@@ -1600,7 +1617,8 @@ def _fix_dispatch(
 
 
 def _generate_dispatch(
-    result, stmts, *, conn, output_path: str | None,
+    result: GenerateResult, stmts: list[Fix], *,
+    conn: psycopg.Connection[Any] | None, output_path: str | None,
     force: bool, apply: bool, offline: bool,
 ) -> None:
     if output_path is not None:
@@ -1626,6 +1644,9 @@ def _generate_dispatch(
     else:
         click.echo(render_fixes(stmts))
     if apply:
+        # `--apply` is rejected on the offline path (the only caller that passes
+        # conn=None), so a live connection is guaranteed whenever apply is set.
+        assert conn is not None
         _apply_statements(conn, stmts, lock_key="pgrls.generate")
         click.echo(
             f"pgrls: applied {len(stmts)} statement(s). Run `pgrls lint` to "
@@ -1813,7 +1834,7 @@ def fix(
     if offline is not None:
         _reject_apply_offline(apply, "fix")
         _guard_offline_exclusivity(ctx, command="fix")
-        schema, offline_source = offline
+        schema, offline_source, offline_version = offline
         effective = _offline_effective_config(
             config_path=config_path, schemas_csv=schemas
         )
@@ -1828,7 +1849,7 @@ def fix(
         # bogus statement (e.g. a CREATE INDEX for an index it can't see via
         # DDL parsing). This preserves the under-report contract: offline fix
         # never emits a statement that isn't grounded in observed DDL.
-        inert = inert_rule_ids(offline_source)
+        inert = inert_rule_ids(offline_source, snapshot_version=offline_version)
         fixes = [f for f in fixes if f.rule_id not in inert]
         if not fixes:
             click.echo("pgrls: no auto-fixable violations found.", err=True)
@@ -2093,7 +2114,7 @@ def generate(
     if offline is not None:
         _reject_apply_offline(apply, "generate")
         _guard_offline_exclusivity(ctx, command="generate")
-        schema, _ = offline
+        schema, _, _ = offline
         try:
             result = plan_generation(schema, options)
         except ValueError as exc:

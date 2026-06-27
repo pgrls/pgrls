@@ -1,20 +1,64 @@
 """Unit tests for the shared offline schema-source helpers."""
+from pgrls.model import SNAPSHOT_VERSION
 from pgrls.schema_sources import (
-    _CATALOG_ONLY_INERT,
+    _CATALOG_DEPENDENT_RULES,
     inert_rule_ids,
     schema_source_warnings,
 )
 
-ALL_INERT = frozenset(rid for rid, _ in _CATALOG_ONLY_INERT)
+ALL_INERT = frozenset(_CATALOG_DEPENDENT_RULES)
 
 
 def test_inert_rule_ids_sql_is_catalog_only_set():
+    # A sql= schema carries no catalog field → every catalog rule is inert.
     assert inert_rule_ids("sql") == ALL_INERT
 
 
-def test_inert_rule_ids_snapshot_is_conservative_same_as_sql():
-    # R2.2: a snapshot may omit catalog fields; skip-and-report, never silently no-op.
-    assert inert_rule_ids("snapshot") == ALL_INERT
+def test_inert_rule_ids_perf005_is_not_a_catalog_rule():
+    # PERF005 reads the --perf runtime artifact, not a schema field, so it is
+    # never treated as a coverage gap of the schema source (matches live).
+    assert "PERF005" not in ALL_INERT
+    assert "PERF005" not in inert_rule_ids("sql")
+
+
+def test_inert_rule_ids_current_snapshot_skips_nothing():
+    # A current snapshot meets every rule's field-version threshold → the full
+    # rule set runs and an absence of findings is real coverage.
+    assert inert_rule_ids("snapshot", snapshot_version=SNAPSHOT_VERSION) == frozenset()
+
+
+def test_inert_rule_ids_snapshot_is_version_gated():
+    # A v15 snapshot predates SEC042's fields (v16) and SEC047's (v20), so they
+    # are inert — but runs the rules whose fields it does carry (e.g. SEC035 v13).
+    inert = inert_rule_ids("snapshot", snapshot_version=15)
+    assert "SEC042" in inert and "SEC047" in inert
+    assert "SEC035" not in inert  # is_primary landed in v13
+
+
+def test_reachability_gated_rules_threshold_covers_column_grants():
+    # SEC041/SEC043 reach `Table.column_grants` (snapshot v8) through the shared
+    # `sec041._is_directly_reachable` gate, so a threshold below 8 would let a
+    # v3-v7 snapshot run them against empty column_grants and silently miss a
+    # column-grant-only partition/inheritance RLS bypass (a false-clean).
+    for rule in ("SEC041", "SEC043"):
+        assert _CATALOG_DEPENDENT_RULES[rule][1] >= 8, (
+            f"{rule} reads column_grants (v8) via _is_directly_reachable; "
+            "its inert threshold must be >= 8 or it false-cleans on v3-v7 "
+            "snapshots."
+        )
+    assert "SEC041" in inert_rule_ids("snapshot", snapshot_version=7)
+    assert "SEC041" not in inert_rule_ids("snapshot", snapshot_version=8)
+
+
+def test_inert_rule_ids_unknown_snapshot_version_fails_closed():
+    # An unknown version is conservative: every catalog rule is treated as inert.
+    assert inert_rule_ids("snapshot", snapshot_version=None) == ALL_INERT
+
+
+def test_inert_rule_ids_thresholds_are_reachable():
+    # Every threshold must be serializable by the current snapshot format, else
+    # that rule would be permanently inert on snapshots (a silent coverage gap).
+    assert all(v <= SNAPSHOT_VERSION for _, v in _CATALOG_DEPENDENT_RULES.values())
 
 
 def test_inert_rule_ids_live_is_empty():
@@ -35,8 +79,22 @@ def test_warnings_generate_is_generation_scoped():
 
 
 def test_warnings_snapshot_source_is_nonempty():
-    msgs = schema_source_warnings("snapshot", command="lint")
+    msgs = schema_source_warnings("snapshot", command="lint", snapshot_version=8)
     assert msgs and any("snapshot" in m.lower() for m in msgs)
+
+
+def test_warnings_current_snapshot_reports_nothing_skipped():
+    # A current snapshot leaves no rule inert, so no "Skipped" line is emitted.
+    msgs = schema_source_warnings(
+        "snapshot", command="lint", snapshot_version=SNAPSHOT_VERSION
+    )
+    assert msgs  # the point-in-time caveat still fires
+    assert all("Skipped" not in m for m in msgs)
+
+
+def test_warnings_old_snapshot_lists_skipped_rules():
+    msgs = schema_source_warnings("snapshot", command="lint", snapshot_version=8)
+    assert any("Skipped" in m and "SEC042" in m for m in msgs)
 
 
 def test_warnings_live_source_is_empty():

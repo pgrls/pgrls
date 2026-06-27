@@ -26,6 +26,7 @@ synchronized — see the cross-reference comments in
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from pgrls.formatters.github import format_github
 from pgrls.formatters.html import format_html
@@ -56,7 +57,7 @@ def format_violations(
     *,
     format: str,
     rationale_map: dict[str, str] | None = None,
-    extra_json: dict | None = None,
+    extra_json: dict[str, Any] | None = None,
 ) -> str:
     """Render `violations` in the requested output `format`.
 

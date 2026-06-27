@@ -34,11 +34,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from typing import Any
 
 from pgrls.violations import Severity, Violation
 
 
-def format_json(violations: list[Violation], *, extra: dict | None = None) -> str:
+def format_json(
+    violations: list[Violation], *, extra: dict[str, Any] | None = None
+) -> str:
     payload = {
         "violations": [
             {

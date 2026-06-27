@@ -175,7 +175,7 @@ def lint(
     from pgrls.formatters.json import format_json
     from pgrls.violations import coerce_severity, is_at_or_above
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -204,7 +204,7 @@ def lint(
         "schema_source": source,
         "summary": base["summary"],
         "violations": base["violations"],
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 
@@ -251,7 +251,7 @@ def verify(
             "'write'.",
         )
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -281,7 +281,7 @@ def verify(
         "strict": strict,
         "summary": base["summary"],
         "tables": base["tables"],
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 
@@ -326,7 +326,7 @@ def fix(
     from pgrls import __version__
     from pgrls.fixers import generate_fixes, render_migration
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -359,7 +359,7 @@ def fix(
         "migration": (
             render_migration(fixes, tool_version=__version__) if fixes else ""
         ),
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 
@@ -437,7 +437,7 @@ def generate(
         "user_id" if model == "owner" else "tenant_id"
     )
 
-    schema, source = resolve_schema(
+    schema, source, snapshot_version = resolve_schema(
         sql=sql,
         database_url=database_url,
         snapshot=snapshot,
@@ -487,7 +487,7 @@ def generate(
             for qname, reason in result.skipped
         ],
         "notes": list(result.notes),
-        "warnings": schema_source_warnings(source),
+        "warnings": schema_source_warnings(source, snapshot_version=snapshot_version),
     }
 
 

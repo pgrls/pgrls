@@ -22,6 +22,7 @@ import sys
 import pytest
 
 from pgrls.mcp import server
+from pgrls.model import SNAPSHOT_VERSION
 from pgrls.schema_sources import (
     SchemaSourceError,
     resolve_schema,
@@ -279,8 +280,9 @@ def test_snapshot_path_reparses_asts(tmp_path) -> None:
     path = tmp_path / "snap.json"
     path.write_text(json.dumps(snap), encoding="utf-8")
 
-    schema, source = resolve_schema(snapshot=str(path))
+    schema, source, version = resolve_schema(snapshot=str(path))
     assert source == "snapshot"
+    assert version == SNAPSHOT_VERSION
     # ASTs were rebuilt on load.
     assert schema.tables[0].policies[0].using_ast is not None
 

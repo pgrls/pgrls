@@ -7,6 +7,7 @@ from click.testing import CliRunner
 
 from pgrls.cli import _resolve_offline_schema
 from pgrls.cli import main, ToolError
+from pgrls.schema_sources import _CATALOG_DEPENDENT_RULES
 
 DOCS_DDL = """
 CREATE TABLE public.docs (id uuid, tenant_id uuid, body text);
@@ -25,7 +26,7 @@ def test_resolve_returns_none_when_no_offline_flag():
 def test_resolve_reads_sql_file(tmp_path):
     f = tmp_path / "schema.sql"
     f.write_text(DOCS_DDL)
-    schema, source = _resolve_offline_schema(
+    schema, source, _ = _resolve_offline_schema(
         sql_file=(str(f),), snapshot=None, schemas_csv=None, command="lint"
     )
     assert source == "sql"
@@ -37,7 +38,7 @@ def test_resolve_concatenates_multiple_files_in_order(tmp_path):
     a.write_text("CREATE TABLE public.docs (id uuid);\n")
     b = tmp_path / "b.sql"
     b.write_text("ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n")
-    schema, _ = _resolve_offline_schema(
+    schema, _, _ = _resolve_offline_schema(
         sql_file=(str(a), str(b)), snapshot=None, schemas_csv=None, command="lint"
     )
     docs = next(t for t in schema.tables if t.name == "docs")
@@ -46,7 +47,7 @@ def test_resolve_concatenates_multiple_files_in_order(tmp_path):
 
 def test_resolve_reads_stdin(monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO(DOCS_DDL))
-    schema, source = _resolve_offline_schema(
+    schema, source, _ = _resolve_offline_schema(
         sql_file=("-",), snapshot=None, schemas_csv=None, command="lint"
     )
     assert source == "sql" and any(t.name == "docs" for t in schema.tables)
@@ -122,10 +123,15 @@ def test_lint_reports_skipped_on_stderr(tmp_path):
 
 
 def test_lint_snapshot_skips_and_reports(tmp_path):
-    """Lint via --snapshot: skip notice fires on stderr; JSON includes coverage keys."""
+    """Lint via an OLD-version --snapshot: rules whose fields the snapshot
+    predates are skipped on stderr; JSON includes coverage keys.
+
+    SEC016 needs `bypassrls_roles` (snapshot v9), so a v8 snapshot must skip and
+    report it rather than silently no-op."""
     from pgrls.schema_sources import schema_from_sql
 
     snap = schema_from_sql(SEC004_DDL).to_snapshot()
+    snap["version"] = 8  # predates SEC016's bypassrls_roles (v9)
     path = tmp_path / "snap.json"
     path.write_text(json.dumps(snap), encoding="utf-8")
 
@@ -143,6 +149,27 @@ def test_lint_snapshot_skips_and_reports(tmp_path):
     payload = json.loads(res_json.stdout)
     assert payload["schema_source"] == "snapshot"
     assert "SEC016" in payload["skipped_rules"]
+
+
+def test_lint_current_snapshot_runs_full_rule_set(tmp_path):
+    """A current-version snapshot meets every field threshold, so NO catalog
+    rule is skipped — the coverage gate is usable on it (the HIGH fix)."""
+    from pgrls.schema_sources import schema_from_sql
+
+    # A clean, RLS-correct table so the only thing the gate can fail on is a
+    # skipped rule (there are none on a current snapshot).
+    snap = schema_from_sql("CREATE TABLE public.t (id int);\n").to_snapshot()
+    path = tmp_path / "snap.json"
+    path.write_text(json.dumps(snap), encoding="utf-8")
+
+    res = CliRunner().invoke(
+        main,
+        ["lint", "--snapshot", str(path), "--rule", "SEC047",
+         "--require-full-coverage", "--format", "json"],
+    )
+    payload = json.loads(res.stdout)
+    assert payload["skipped_rules"] == []  # SEC047 (v20) runs on a current snapshot
+    assert res.exit_code == 0  # nothing skipped → coverage gate passes
 
 
 def test_lint_require_full_coverage_fails_offline(tmp_path):
@@ -321,6 +348,51 @@ def test_view002_is_in_inert_rule_ids():
         "VIEW002 reads schema.views (never populated offline) — "
         "it must be in the inert set."
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: every catalog-dependent rule must be SURFACED in skipped_rules on
+# an offline sql= run (never silently no-op + falsely pass coverage). Locks in
+# the SEC035/SEC041/SEC043/SEC048 false-clean fix and guards the whole set.
+# ---------------------------------------------------------------------------
+
+# A schema with RLS on but nothing a catalog rule reads (no triggers, indexes,
+# FKs, BYPASSRLS roles, views, …). Offline, EVERY catalog-dependent rule should
+# report itself skipped rather than produce a misleading clean result.
+_CATALOG_PROBE_DDL = (
+    "CREATE TABLE public.accounts (id uuid, tenant_id integer, email text);\n"
+    "ALTER TABLE public.accounts ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.accounts USING (tenant_id = 1);\n"
+    "CREATE UNIQUE INDEX accounts_email_key ON public.accounts (email);\n"
+)
+
+
+@pytest.mark.parametrize("rule", sorted(_CATALOG_DEPENDENT_RULES))
+def test_offline_noop_rule_lands_in_skipped_rules(tmp_path, rule):
+    f = tmp_path / "probe.sql"
+    f.write_text(_CATALOG_PROBE_DDL)
+    res = CliRunner().invoke(
+        main, ["lint", "--sql-file", str(f), "--rule", rule, "--format", "json"]
+    )
+    payload = json.loads(res.stdout)
+    assert payload["skipped_rules"] == [rule], (
+        f"{rule} is inert offline and must be surfaced in skipped_rules, not "
+        f"silently no-op (got {payload['skipped_rules']!r})."
+    )
+
+
+@pytest.mark.parametrize("rule", ["SEC035", "SEC041", "SEC043", "SEC048"])
+def test_offline_noop_rule_fails_require_full_coverage(tmp_path, rule):
+    """The reviewer's blocker: an offline sql= run of a rule whose live verdict
+    would matter must FAIL --require-full-coverage, never exit 0 as clean."""
+    f = tmp_path / "probe.sql"
+    f.write_text(_CATALOG_PROBE_DDL)
+    res = CliRunner().invoke(
+        main,
+        ["lint", "--sql-file", str(f), "--rule", rule, "--require-full-coverage"],
+    )
+    assert res.exit_code != 0
+    assert "coverage" in res.stderr.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -717,12 +789,13 @@ def test_generate_stdin_emits_policy():
     assert "CREATE POLICY" in res.stdout
 
 
-def test_lint_require_full_coverage_snapshot(tmp_path):
-    """lint --snapshot snap.json --require-full-coverage → non-zero exit,
-    stderr mentions coverage (catalog-only rules are inert on a snapshot)."""
+def test_lint_require_full_coverage_old_snapshot(tmp_path):
+    """An OLD-version snapshot lacks fields newer rules need, so
+    --require-full-coverage fails closed and stderr names the coverage gap."""
     from pgrls.schema_sources import schema_from_sql
 
     snap = schema_from_sql("CREATE TABLE public.t (id int);\n").to_snapshot()
+    snap["version"] = 8  # predates SEC016 (v9), SEC047 (v20), …
     path = tmp_path / "snap.json"
     path.write_text(json.dumps(snap), encoding="utf-8")
 
@@ -731,6 +804,27 @@ def test_lint_require_full_coverage_snapshot(tmp_path):
     )
     assert res.exit_code != 0
     assert "coverage" in res.stderr.lower()
+
+
+def test_lint_require_full_coverage_current_snapshot_no_coverage_failure(tmp_path):
+    """A current-version snapshot meets every field threshold, so
+    --require-full-coverage never fails on a *coverage* gap (the HIGH fix).
+
+    Findings may still fail the run, but the coverage-gate message must not fire.
+    """
+    from pgrls.schema_sources import schema_from_sql
+
+    snap = schema_from_sql("CREATE TABLE public.t (id int);\n").to_snapshot()
+    path = tmp_path / "snap.json"
+    path.write_text(json.dumps(snap), encoding="utf-8")
+
+    res = CliRunner().invoke(
+        main,
+        ["lint", "--snapshot", str(path), "--rule", "SEC047",
+         "--require-full-coverage"],
+    )
+    assert res.exit_code == 0
+    assert "require-full-coverage" not in res.stderr
 
 
 def test_fix_offline_soundness_caveat_on_stderr(tmp_path):
