@@ -2136,3 +2136,37 @@ def test_escalation_qualified_read_inside_shadowing_cte_is_leak() -> None:
     )
     [t] = build_verification(schema, mode="escalation").tables
     assert t.verdict == "leak"
+
+
+@requires_z3
+def test_escalation_secdef_leak_renders_in_text_and_sarif() -> None:
+    # A SEC042 SECDEF LEAK and an opaque-body UNVERIFIED render correctly across
+    # text and SARIF (SARIF: LEAK is one error result at the function, located
+    # via logicalLocations; the UNVERIFIED is omitted by default and a note
+    # under --strict — its ruleId defined in the driver).
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", qname="public.read_iso"),
+            _secdef("BEGIN END", qname="public.opaque_fn", lang="plpgsql"),
+        ),
+    )
+    v = build_verification(schema, mode="escalation")
+    text = render_text(v)
+    assert "public.read_iso" in text and "LEAK" in text
+    assert "public.opaque_fn" in text and "UNVERIFIED" in text
+
+    run = json.loads(render_sarif(v))["runs"][0]
+    leaks = [r for r in run["results"] if r["level"] == "error"]
+    assert len(leaks) == 1
+    assert leaks[0]["ruleId"] == "pgrls-escalation-isolation"
+    fqn = leaks[0]["locations"][0]["logicalLocations"][0]["fullyQualifiedName"]
+    assert fqn.startswith("public.read_iso")
+    # default: the UNVERIFIED opaque fn is not a result
+    assert all("opaque_fn" not in json.dumps(r) for r in run["results"])
+
+    strict = json.loads(render_sarif(v, strict=True))["runs"][0]
+    notes = [r for r in strict["results"] if r["level"] == "note"]
+    assert len(notes) == 1 and "opaque_fn" in json.dumps(notes[0])
+    defined = {r["id"] for r in strict["tool"]["driver"]["rules"]}
+    assert all(r["ruleId"] in defined for r in strict["results"])
