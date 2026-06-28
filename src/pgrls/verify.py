@@ -534,31 +534,10 @@ def _escalation_anon_rollup(
     )
 
 
-def _secdef_body_unresolved(
-    parsed: Any,
-    base_quals: set[tuple[str, str]],
-    base_bares: set[str],
-    cte_names: set[str],
-) -> bool:
-    """Whether a SECDEF body reads from a data source we cannot see through — a
-    *view*, a relation outside the introspected base tables, or a set-returning
-    *function* call in ``FROM``. Such a source may transitively read an RLS
-    table the range-var walk never sees (a view over an RLS table, a function
-    whose body reads one), so a body that has one must be treated as opaque
-    (UNVERIFIED) rather than cleared. A reference whose name matches a CTE
-    defined in the body is a local alias, not a data source."""
-    from pgrls.ast_utils import extract_range_vars  # noqa: PLC0415
-
-    for schemaname, relname in extract_range_vars(parsed):
-        if relname in cte_names:
-            continue
-        if schemaname is not None:
-            if (schemaname, relname) not in base_quals:
-                return True
-        elif relname not in base_bares:
-            return True
-    # A set-returning function call as a FROM source is a RangeFunction, not a
-    # RangeVar, so extract_range_vars never surfaces it — walk for it directly.
+def _has_range_function(stmt: Any) -> bool:
+    """Whether `stmt` has a set-returning function call as a ``FROM`` source (a
+    ``RangeFunction``). Such a source is not a ``RangeVar``, so extract_range_vars
+    never surfaces it — walk for it directly."""
     from pglast.ast import Node, RangeFunction  # noqa: PLC0415
 
     found = False
@@ -578,8 +557,47 @@ def _secdef_body_unresolved(
             for field_name in n:
                 walk(getattr(n, field_name, None))
 
-    walk(parsed)
+    walk(stmt)
     return found
+
+
+def _secdef_body_unresolved(
+    parsed: Any,
+    base_quals: set[tuple[str, str]],
+    base_bares: set[str],
+) -> bool:
+    """Whether a SECDEF body reads from a data source we cannot see through — a
+    *view*, a relation outside the introspected base tables, or a set-returning
+    *function* call in ``FROM``. Such a source may transitively read an RLS table
+    the range-var walk never sees, so a body that has one must be treated as
+    opaque (UNVERIFIED) rather than cleared.
+
+    CTE names are a local alias, not a data source — but they scope **only
+    within their own statement** (a CTE in one statement of a multi-statement
+    body does not bind a later statement's relation refs), so they are collected
+    per-statement, mirroring VIEW004's body parser. And a CTE whose name
+    *collides with a base table* shadows it: the body parser then treats a bare
+    ref to that name as the CTE, hiding any read of the real table inside the
+    CTE definition — a blind spot we cannot reason about, so we abstain."""
+    from pgrls.ast_utils import extract_range_vars  # noqa: PLC0415
+    from pgrls.rules.view004 import _cte_names  # noqa: PLC0415
+
+    for raw in parsed:
+        stmt = getattr(raw, "stmt", raw)
+        cte_names = _cte_names(stmt)
+        if cte_names & base_bares:
+            return True
+        for schemaname, relname in extract_range_vars(stmt):
+            if relname in cte_names:
+                continue
+            if schemaname is not None:
+                if (schemaname, relname) not in base_quals:
+                    return True
+            elif relname not in base_bares:
+                return True
+        if _has_range_function(stmt):
+            return True
+    return False
 
 
 def _escalation_secdef_findings(
@@ -615,10 +633,7 @@ def _escalation_secdef_findings(
     base_quals = {(t.schema, t.name) for t in schema.tables}
     base_bares = {t.name for t in schema.tables}
     import pglast  # noqa: PLC0415 — heavy optional parser path
-    from pgrls.rules.view004 import (  # noqa: PLC0415 — body parser reuse
-        _cte_names,
-        _secdef_fn_leaks,
-    )
+    from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415 — body parser reuse
 
     by_qname: dict[str, list[Any]] = {}
     for f in secdef_fns:
@@ -643,7 +658,7 @@ def _escalation_secdef_findings(
                 continue
             reads |= _secdef_fn_leaks(f, qname, rls_tables, bare_to_qual)
             parsed = pglast.parse_sql(f.body)
-            if _secdef_body_unresolved(parsed, base_quals, base_bares, _cte_names(parsed)):
+            if _secdef_body_unresolved(parsed, base_quals, base_bares):
                 any_unseen = True
         inconclusive = any_opaque or any_unseen
         roles = ", ".join(

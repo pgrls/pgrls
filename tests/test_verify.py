@@ -2070,3 +2070,69 @@ def test_escalation_honors_configured_anon_roles() -> None:
         schema, mode="escalation", anon_roles={"web_anon"}
     ).tables
     assert t.verdict == "leak"
+
+
+@requires_z3
+def test_escalation_same_named_cte_shadowing_rls_table_is_unverified() -> None:
+    # `WITH secret AS (SELECT * FROM secret) ...` — the body parser treats the
+    # bare ref as the CTE and hides the real read of the protected table inside
+    # the CTE definition. A CTE whose name collides with a base table is a blind
+    # spot → abstain (UNVERIFIED), never silently clear a real leak.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            _secdef("WITH secret AS (SELECT * FROM secret) SELECT * FROM secret"),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+
+
+@requires_z3
+def test_escalation_cte_name_does_not_bleed_across_statements() -> None:
+    # A CTE defined in statement 1 must not suppress a same-named *relation* ref
+    # in statement 2 (CTE scope is per-statement). Here statement 2 reads an
+    # unseen view → UNVERIFIED, not a silent clear.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_view("secret_view"),),
+        security_definer_functions=(
+            _secdef("WITH secret_view AS (SELECT 1) SELECT 1; SELECT * FROM secret_view"),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+
+
+@requires_z3
+def test_escalation_benign_cte_over_base_table_still_resolves() -> None:
+    # A CTE whose name does NOT collide with a base table, reading only a known
+    # non-RLS base table, is still provably clean → no finding (no over-abstain).
+    public_cfg = Table(
+        schema="public", name="app_config", rls_enabled=False,
+        force_rls=False, policies=(),
+    )
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"), public_cfg),
+        security_definer_functions=(
+            _secdef("WITH cfg AS (SELECT * FROM app_config) SELECT * FROM cfg"),
+        ),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_qualified_read_inside_shadowing_cte_is_leak() -> None:
+    # If the read inside a same-named CTE is schema-QUALIFIED, the body parser
+    # resolves it unambiguously to the RLS table (the shadow only affects bare
+    # refs) → proven LEAK, the stronger correct verdict (not just UNVERIFIED).
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            _secdef(
+                "WITH secret AS (SELECT * FROM public.secret) SELECT * FROM secret"
+            ),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak"
