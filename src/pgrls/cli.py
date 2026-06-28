@@ -3952,14 +3952,6 @@ def verify(
             "--emit-repro is not supported with --mode escalation yet "
             "(SET ROLE reproductions are a follow-on)."
         )
-    if mode == "escalation" and probe:
-        # Live SET-ROLE confirmation (create member+owner roles, grant
-        # membership, observe the bypass) is Phase 3.
-        raise click.UsageError(
-            "--probe is not supported with --mode escalation yet "
-            "(live SET ROLE confirmation is a follow-on)."
-        )
-
     auth = (
         set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
         if auth_functions
@@ -3975,7 +3967,17 @@ def verify(
             database_url=database_url,
             schemas_csv=schemas,
         ) as (_cfg, conn, schema):
-            verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
+            probe_anon_roles: set[str] | None = None
+            if mode == "escalation":
+                from pgrls.rules.sec042 import _parse_anon_roles
+
+                try:
+                    probe_anon_roles = _parse_anon_roles(
+                        _cfg.rule_options.get("SEC042", {})
+                    )
+                except TypeError as exc:
+                    raise click.UsageError(str(exc)) from exc
+            verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=probe_anon_roles)  # type: ignore[arg-type]
             probe_result = run_probe(
                 conn, schema, verification,
                 mode=mode,  # type: ignore[arg-type]
