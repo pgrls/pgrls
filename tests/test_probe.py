@@ -774,3 +774,96 @@ def test_probe_cli_write_headline_exit_one_and_json(
     assert payload["mode"] == "write"
     agreements = {t["agreement"] for t in payload["tables"]}
     assert "leak_confirmed" in agreements
+
+
+# --- escalation: SEC048 owner-bypass via SET ROLE chain --------------------
+
+
+@requires_docker
+@requires_z3
+def test_escalation_inherit_member_owner_bypass_is_leak_confirmed(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # A low-trust INHERIT member of the table's owner already carries the
+    # owner's RLS exemption: it reads tenant B's row a scoped tenant-A session
+    # cannot. Static LEAK, live rows_visible → leak_confirmed.
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "CREATE ROLE esc_owner NOLOGIN;"
+                "CREATE ROLE esc_member NOLOGIN;"  # INHERIT by default
+                "GRANT esc_owner TO esc_member;"
+                "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid);"
+                "ALTER TABLE public.docs OWNER TO esc_owner;"
+                "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"  # NOT FORCE
+                "CREATE POLICY p ON public.docs FOR ALL TO esc_member "
+                "  USING (tenant_id = current_setting('app.tenant', true)::uuid);"
+                "GRANT SELECT, INSERT ON public.docs TO esc_member;"
+            )
+        schema = introspect(pg_conn, schemas=["public"])
+        probe = _probe(pg_url, schema, mode="escalation")
+        r = _result(probe, "public.docs")
+        assert r.static_verdict == "leak"
+        assert r.observed == "rows_visible"
+        assert r.agreement == "leak_confirmed"
+        assert "esc_member" in r.detail and "esc_owner" in r.detail
+        assert probe.has_confirmed_leak
+    finally:
+        _drop_role(pg_conn, "esc_member")
+        _drop_role(pg_conn, "esc_owner")
+
+
+@requires_docker
+@requires_z3
+def test_escalation_noinherit_member_via_set_role_owner_is_leak_confirmed(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # A NOINHERIT member is scoped until it SET ROLEs to the owner — the probe's
+    # member→owner chain reaches the bypass and confirms the leak.
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "CREATE ROLE esc_owner NOLOGIN;"
+                "CREATE ROLE esc_ni NOLOGIN NOINHERIT;"
+                "GRANT esc_owner TO esc_ni;"
+                "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid);"
+                "ALTER TABLE public.docs OWNER TO esc_owner;"
+                "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+                "CREATE POLICY p ON public.docs FOR ALL TO esc_ni "
+                "  USING (tenant_id = current_setting('app.tenant', true)::uuid);"
+                "GRANT SELECT, INSERT ON public.docs TO esc_ni;"
+            )
+        schema = introspect(pg_conn, schemas=["public"])
+        probe = _probe(pg_url, schema, mode="escalation")
+        r = _result(probe, "public.docs")
+        assert r.static_verdict == "leak"
+        assert r.observed == "rows_visible"
+        assert r.agreement == "leak_confirmed"
+    finally:
+        _drop_role(pg_conn, "esc_ni")
+        _drop_role(pg_conn, "esc_owner")
+
+
+@requires_z3
+def test_escalation_probe_sarif_renders_without_keyerror() -> None:
+    # Regression: the escalation mode must have a probe-SARIF rule id/title (the
+    # CLI's `verify --mode escalation --probe --format sarif` path), else it
+    # KeyErrors. No DB needed — render a constructed Probe.
+    from pgrls.probe import ProbeResult, render_sarif
+
+    probe = Probe(
+        (
+            ProbeResult(
+                "public.docs", "app_owner", "escalation", "leak",
+                "rows_visible", "leak_confirmed",
+                "static LEAK reproduced live (via member m → owner app_owner)",
+                None,
+            ),
+        ),
+        "escalation",
+    )
+    run = json.loads(render_sarif(probe))["runs"][0]
+    assert [r["id"] for r in run["tool"]["driver"]["rules"]] == ["pgrls-probe-escalation"]
+    assert [(r["level"], r["ruleId"]) for r in run["results"]] == [
+        ("error", "pgrls-probe-escalation")
+    ]

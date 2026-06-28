@@ -651,6 +651,201 @@ def _abstain_all(
 # --- public API ------------------------------------------------------------
 
 
+def _scoping_policy_and_axis(
+    table: Table, auth_functions: set[str] | None
+) -> tuple[Policy, str, str] | None:
+    """The first permissive SELECT/ALL policy that declares a single tenant
+    scoping equality, plus its ``(discriminator column, session-auth SQL)``.
+    Like `_write_axis` but also returns the policy (needed to seed the row)."""
+    for policy in table.policies:
+        if not policy.permissive or policy.command not in ("SELECT", "ALL"):
+            continue
+        if policy.using_ast is None:
+            continue
+        axis = cross_tenant_session_identity(policy.using_ast, auth_functions)
+        if axis is not None:
+            return policy, axis[0], axis[1]
+    return None
+
+
+def _run_escalation_steps(
+    cur: psycopg.Cursor[Any],
+    table: Table,
+    row: list[tuple[str, str]],
+    *,
+    disc_col: str,
+    auth_sql: str,
+    a_val: str | None,
+    member: str,
+    owner: str,
+) -> Observed:
+    """Seed a tenant-B row, authenticate the session as a *different* tenant A,
+    then ``SET ROLE`` to the reaching member and ``SET ROLE`` from there to the
+    owner. A correctly-scoped tenant-A session is denied tenant B's row, so
+    *either* role seeing it confirms the owner bypass:
+
+    * an **INHERIT** member already carries the owner's RLS exemption (Postgres
+      bypasses RLS for any role that ``has_privs_of_role`` the owner), so it sees
+      tenant B's row directly — no ``SET ROLE`` needed;
+    * a **NOINHERIT** member is scoped until it ``SET ROLE``s to the owner, which
+      then bypasses RLS on the not-FORCE'd table.
+
+    The member→owner ``SET ROLE`` chain also confirms the static reachability: if
+    the member cannot reach the owner the chain raises and the probe abstains.
+    ``RESET ROLE`` in a finally; the caller's savepoint rollback resets the role
+    and reverts the seed regardless."""
+    qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    try:
+        # Seed a tenant-B row: set the session identity to B (so a FORCE-RLS
+        # write check, if any, admits it), insert as the privileged connection.
+        b_stmts, _ = _session_identity_setup(auth_sql, _row_disc_text(row, disc_col))
+        for s in b_stmts:
+            cur.execute(s)
+        cur.execute(_insert_sql(table, row))
+        # Authenticate as tenant A — a correctly-scoped A session is denied B's
+        # row, so any role that still reads it is bypassing RLS.
+        a_stmts, _ = _session_identity_setup(auth_sql, a_val or "")
+        for s in a_stmts:
+            cur.execute(s)
+    except psycopg.Error as exc:
+        raise _ProbeAbstain(
+            f"cannot seed/become the threat session: {_short(exc)}"
+        ) from exc
+
+    disc_lit = next((v for n, v in row if n == disc_col), None)
+    if disc_lit is None:
+        raise _ProbeAbstain("could not stamp the probe row's tenant discriminator")
+    query = f"SELECT 1 FROM {qtbl} WHERE {quote_ident(disc_col)} = {disc_lit}"
+    try:
+        try:
+            cur.execute(f"SET ROLE {quote_ident(member)}")
+            member_seen = _row_count(cur.connection, query)
+            # The heart of the escalation: the member reaches the owner.
+            cur.execute(f"SET ROLE {quote_ident(owner)}")
+            owner_seen = _row_count(cur.connection, query)
+        except psycopg.Error as exc:
+            raise _ProbeAbstain(
+                f"SET ROLE chain (member {member} → owner {owner}) or probe "
+                f"query failed: {_short(exc)}"
+            ) from exc
+    finally:
+        try:
+            cur.execute("RESET ROLE")
+        except psycopg.Error:  # pragma: no cover - savepoint rollback also resets
+            pass
+
+    # Tenant B's row is denied to a scoped tenant-A session, so the member
+    # (directly, if it inherits the owner) OR the owner (via SET ROLE) reading
+    # it is the bypass.
+    return "rows_visible" if (member_seen > 0 or owner_seen > 0) else "no_rows"
+
+
+def _escalation_probe_one(
+    conn: psycopg.Connection[Any],
+    tables: dict[str, Table],
+    reachers: dict[str, list[str]],
+    tv: TableVerdict,
+    auth_functions: set[str] | None,
+    n: int,
+) -> ProbeResult:
+    """Live-confirm one escalation finding. Only the SEC048 owner-reachability
+    LEAKs are probed; a SEC042 SECDEF-body finding (a function qname, absent
+    from `tables`) is skipped (its live confirmation is a follow-on)."""
+    qn = tv.qualified_name
+    table = tables.get(qn)
+    if table is None:
+        return ProbeResult(
+            qn, None, "escalation", tv.verdict, "skipped", "skipped",
+            "SECDEF-body escalation (SEC042) live confirmation is a follow-on",
+            None,
+        )
+    if tv.verdict != "leak":
+        return ProbeResult(
+            qn, None, "escalation", tv.verdict, "skipped", "skipped",
+            "no proven owner-bypass leak to confirm", None,
+        )
+    owner = table.owner
+    members = reachers.get(owner or "", [])
+    proof = next((p for p in tv.proofs if p.verdict == "leak"), None)
+    sp = f"esc_probe_{n}"
+    with conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT {sp}")
+        try:
+            if not owner or not members:
+                raise _ProbeAbstain(
+                    "no reachable low-trust member for the table owner"
+                )
+            if proof is None:  # pragma: no cover - a leak verdict has a leak proof
+                raise _ProbeAbstain("no leak proof to pivot on")
+            # Need a tenant-scoping SELECT/ALL policy: it gives the column to
+            # stamp tenant B and the identity to authenticate as tenant A, so a
+            # correctly-scoped session is provably denied B's row.
+            picked = _scoping_policy_and_axis(table, auth_functions)
+            if picked is None:
+                raise _ProbeAbstain(
+                    "no permissive SELECT/ALL policy declares a single tenant "
+                    "axis to pivot the bypass on",
+                    skipped=True,
+                )
+            policy, disc_col, auth_sql = picked
+            if _references_other_tables(policy.using_ast):
+                raise _ProbeAbstain(
+                    "scoping policy references other tables/subqueries; cannot "
+                    "synthesize a probe row",
+                    skipped=True,
+                )
+            member = sorted(members)[0]
+            row, seeded, a_val = _seed_row(
+                table, policy, proof, "cross-tenant",
+                disc_col=disc_col, auth_sql=auth_sql,
+            )
+            observed = _run_escalation_steps(
+                cur, table, row,
+                disc_col=disc_col, auth_sql=auth_sql, a_val=a_val,
+                member=member, owner=owner,
+            )
+            agreement, detail = _classify(tv.verdict, observed, "escalation")
+            return ProbeResult(
+                qn, owner, "escalation", tv.verdict, observed, agreement,
+                f"{detail} (via member {member} → owner {owner})", seeded,
+            )
+        except _ProbeAbstain as exc:
+            kind: Observed = "skipped" if exc.skipped else "abstained"
+            agree: Agreement = "skipped" if exc.skipped else "abstained"
+            return ProbeResult(
+                qn, owner, "escalation", tv.verdict, kind, agree, exc.reason, None,
+            )
+        finally:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+
+
+def _run_escalation_probe(
+    conn: psycopg.Connection[Any],
+    schema: Schema,
+    verification: Verification,
+    *,
+    auth_functions: set[str] | None,
+) -> Probe:
+    """Probe escalation findings against the live DB. Unlike the anon /
+    cross-tenant / write probe it needs no synthetic probe role — it reaches the
+    bypass through the *real* member and owner roles `owner_reachable_members`
+    found, via a ``SET ROLE`` chain. One transaction, rolled back in a finally."""
+    tables = {t.qualified_name: t for t in schema.tables}
+    reachers: dict[str, list[str]] = {}
+    for m in schema.owner_reachable_members:
+        for o in m.via_owners:
+            reachers.setdefault(o, []).append(m.member)
+    try:
+        results = [
+            _escalation_probe_one(conn, tables, reachers, tv, auth_functions, n)
+            for n, tv in enumerate(verification.tables)
+        ]
+        return Probe(tuple(results), "escalation")
+    finally:
+        # Non-destructiveness invariant: never commit the seed rows or SET ROLE.
+        conn.rollback()
+
+
 def run_probe(
     conn: psycopg.Connection[Any],
     schema: Schema,
@@ -673,7 +868,15 @@ def run_probe(
     `build_verification`); `auth_functions` mirrors what that used so the probe
     pivots on the same scoping axis. Returns a `Probe` whose `results` parallel
     the verification's tables in order.
+
+    ``escalation`` is a different live shape — it reaches the bypass through the
+    *real* member/owner roles via a ``SET ROLE`` chain rather than a synthetic
+    probe role — so it is dispatched to `_run_escalation_probe`.
     """
+    if mode == "escalation":
+        return _run_escalation_probe(
+            conn, schema, verification, auth_functions=auth_functions
+        )
     tables = {t.qualified_name: t for t in schema.tables}
     try:
         gate_error = _setup_probe_role(conn, schema, verification, probe_role)
@@ -872,11 +1075,13 @@ _PROBE_SARIF_RULE_ID: dict[Mode, str] = {
     "anon": "pgrls-probe-anon",
     "cross-tenant": "pgrls-probe-cross-tenant",
     "write": "pgrls-probe-write",
+    "escalation": "pgrls-probe-escalation",
 }
 _PROBE_SARIF_RULE_TITLE: dict[Mode, str] = {
     "anon": "Live probe: anonymous read isolation",
     "cross-tenant": "Live probe: cross-tenant read isolation",
     "write": "Live probe: cross-tenant write isolation",
+    "escalation": "Live probe: reachable owner-bypass escalation",
 }
 
 

@@ -31,9 +31,15 @@ breaking changes — they will be called out in this file.
   dynamic-SQL body, or a body that reads via a view, a function call, or a
   relation outside the analyzed schema — and honors the same
   `[lint.rules.SEC042].anon_roles` exposure set the lint rule uses (default
-  `{anon, PUBLIC}`). The VIEW004 *caller* case (needs the view's grants, which
-  the model does not capture) and `--probe` / `--emit-repro` for this mode remain
-  follow-ons. (#232)
+  `{anon, PUBLIC}`). `--probe` **confirms the SEC048 owner-bypass live**: it
+  seeds a tenant-B row, authenticates the session as a different tenant A, then
+  `SET ROLE`s to the reaching member and on to the owner — a correctly-scoped
+  tenant-A session is denied B's row, so the member reading it (directly when it
+  `INHERIT`s the owner, else via the `SET ROLE` to the owner) is a
+  `leak_confirmed`; it abstains on any permission error and never commits (one
+  rolled-back transaction). The VIEW004 *caller* case (needs the view's grants,
+  which the model does not capture), the SEC042 SECDEF `--probe`, and
+  `--emit-repro` for this mode remain follow-ons. (#232)
 - `pgrls diff` now detects a **renamed RLS policy** and reports it as a single
   `POLICY_RENAMED` change instead of an independent drop + add (the long-reserved
   `ChangeKind.POLICY_RENAMED` is now produced). Configurable via
