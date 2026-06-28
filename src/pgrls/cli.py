@@ -4000,13 +4000,25 @@ def verify(
             sys.exit(1)
         return
 
-    _, schema = _connect_and_introspect(
+    cfg, schema = _connect_and_introspect(
         config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
     )
 
-    verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
+    # `escalation` proves the SEC042 anon-callable-SECDEF case against the same
+    # low-trust EXECUTE-role set SEC042 lints, so honor its configured
+    # `[lint.rules.SEC042].anon_roles` (default {anon, PUBLIC}).
+    anon_roles: set[str] | None = None
+    if mode == "escalation":
+        from pgrls.rules.sec042 import _parse_anon_roles
+
+        try:
+            anon_roles = _parse_anon_roles(cfg.rule_options.get("SEC042", {}))
+        except TypeError as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
     # SARIF is the one format whose result-set depends on --strict (UNVERIFIED
     # is omitted by default, a `note` under --strict), so it can't go through
     # the 1-arg render() dispatcher — call render_sarif directly to thread the
