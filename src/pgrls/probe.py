@@ -68,6 +68,7 @@ from pgrls.verify import (
     TableVerdict,
     Verdict,
     Verification,
+    build_verification,
     effective_write_check,
 )
 from pgrls._render_common import pluralize, render_text_table
@@ -744,6 +745,7 @@ def _escalation_probe_one(
     conn: psycopg.Connection[Any],
     tables: dict[str, Table],
     reachers: dict[str, list[str]],
+    xt_verdicts: dict[str, Verdict],
     tv: TableVerdict,
     auth_functions: set[str] | None,
     n: int,
@@ -777,6 +779,19 @@ def _escalation_probe_one(
                 )
             if proof is None:  # pragma: no cover - a leak verdict has a leak proof
                 raise _ProbeAbstain("no leak proof to pivot on")
+            # Sound-witness gate: confirm a seeded tenant-B row is hidden from a
+            # correctly-scoped tenant-A session, which holds only when the table
+            # provably *isolates* tenants. When the table itself partially leaks
+            # cross-tenant, a single seeded row may be visible to a scoped
+            # session too (e.g. an unstamped nullable column the policy admits as
+            # NULL), so the owner bypass cannot be cleanly isolated — abstain and
+            # defer to `--mode cross-tenant`. (The static SEC048 LEAK stands.)
+            if xt_verdicts.get(qn) != "isolated":
+                raise _ProbeAbstain(
+                    "table also leaks cross-tenant, so a seeded row is not a "
+                    "clean owner-bypass witness — see `verify --mode cross-tenant`",
+                    skipped=True,
+                )
             # Need a tenant-scoping SELECT/ALL policy: it gives the column to
             # stamp tenant B and the identity to authenticate as tenant A, so a
             # correctly-scoped session is provably denied B's row.
@@ -835,9 +850,16 @@ def _run_escalation_probe(
     for m in schema.owner_reachable_members:
         for o in m.via_owners:
             reachers.setdefault(o, []).append(m.member)
+    # The owner-bypass witness is clean only on a table that provably isolates
+    # tenants; a table that itself leaks cross-tenant contaminates the seeded
+    # row, so gate on its cross-tenant verdict.
+    xt = build_verification(schema, auth_functions=auth_functions, mode="cross-tenant")
+    xt_verdicts = {t.qualified_name: t.verdict for t in xt.tables}
     try:
         results = [
-            _escalation_probe_one(conn, tables, reachers, tv, auth_functions, n)
+            _escalation_probe_one(
+                conn, tables, reachers, xt_verdicts, tv, auth_functions, n
+            )
             for n, tv in enumerate(verification.tables)
         ]
         return Probe(tuple(results), "escalation")

@@ -867,3 +867,38 @@ def test_escalation_probe_sarif_renders_without_keyerror() -> None:
     assert [(r["level"], r["ruleId"]) for r in run["results"]] == [
         ("error", "pgrls-probe-escalation")
     ]
+
+
+@requires_docker
+@requires_z3
+def test_escalation_partial_cross_tenant_leak_table_is_skipped(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # When the table itself leaks cross-tenant (here `OR is_public`), a single
+    # seeded row is not a clean owner-bypass witness (a scoped session may see it
+    # too), so the probe abstains rather than credit the bypass — the static
+    # SEC048 LEAK still stands.
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(_AUTH_STUB)
+            cur.execute(
+                "CREATE ROLE esc_owner NOLOGIN;"
+                "CREATE ROLE esc_member NOLOGIN;"
+                "GRANT esc_owner TO esc_member;"
+                "CREATE TABLE public.docs "
+                "  (id bigserial PRIMARY KEY, tenant_id uuid, is_public boolean);"
+                "ALTER TABLE public.docs OWNER TO esc_owner;"
+                "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+                "CREATE POLICY p ON public.docs FOR ALL TO esc_member "
+                "  USING (tenant_id = auth.uid() OR is_public);"
+                "GRANT SELECT, INSERT ON public.docs TO esc_member;"
+            )
+        schema = introspect(pg_conn, schemas=["public"])
+        probe = _probe(pg_url, schema, mode="escalation")
+        r = _result(probe, "public.docs")
+        assert r.static_verdict == "leak"  # SEC048 finding still stands
+        assert r.agreement == "skipped"
+        assert "cross-tenant" in r.detail
+    finally:
+        _drop_role(pg_conn, "esc_member")
+        _drop_role(pg_conn, "esc_owner")
