@@ -25,6 +25,7 @@ from pgrls.model import (
     Schema,
     SecdefFunction,
     Table,
+    View,
 )
 from pgrls.verify import (
     Verification,
@@ -1850,7 +1851,7 @@ def test_escalation_lists_all_reaching_roles() -> None:
 
 def test_escalation_empty_result_renders_mode_specific_message() -> None:
     schema = Schema(tables=(), owner_reachable_members=())
-    assert "owner-bypass" in render_text(_esc(schema))
+    assert "No reachable escalation paths" in render_text(_esc(schema))
 
 
 @requires_z3
@@ -1981,3 +1982,91 @@ def test_escalation_combines_owner_and_secdef_findings() -> None:
     v = build_verification(schema, mode="escalation")
     locs = {t.qualified_name: t.verdict for t in v.tables}
     assert locs == {"public.docs": "leak", "public.read_secret": "leak"}
+
+
+@requires_z3
+def test_escalation_opaque_overload_blocks_isolated_cede() -> None:
+    # Two anon-exposed RLS-exempt overloads of one function: the analyzable SQL
+    # body reads a table anon already leaks totally (would cede to ISOLATED),
+    # but the sibling PL/pgSQL overload is opaque and might read a different
+    # protected table — so the function must NOT be cleared. UNVERIFIED, not a
+    # false ISOLATED.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", qname="public.f"),
+            _secdef("BEGIN RETURN; END", qname="public.f", lang="plpgsql"),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.f"
+    assert t.verdict == "unverified"
+    assert t.note is not None and "opaque" in t.note
+
+
+def _view(name: str, base: str = "secret") -> "View":
+    return View(
+        schema="public", name=name, is_materialized=False,
+        security_invoker=False, security_barrier=False,
+        definition=f"SELECT * FROM {base}", references=(("public", base),),
+        security_definer_calls=(),
+    )
+
+
+@requires_z3
+def test_escalation_secdef_reading_via_view_is_unverified_not_cleared() -> None:
+    # A SECDEF body that reads an RLS table THROUGH A VIEW (the dominant
+    # PostgREST/Supabase shape) must not be silently cleared — the view is a
+    # source we can't see through, so abstain (UNVERIFIED), never "no finding".
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_view("secret_view"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret_view"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+    assert t.note is not None and "view" in t.note
+
+
+@requires_z3
+def test_escalation_secdef_reading_via_function_call_is_unverified() -> None:
+    # A set-returning function call in FROM is a source we can't see through.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("SELECT * FROM inner_reader()"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+
+
+@requires_z3
+def test_escalation_secdef_reading_only_non_rls_table_is_no_finding() -> None:
+    # Precision retained: a body whose every source is a known NON-RLS base
+    # table provably reads no protected data → not a finding (not UNVERIFIED).
+    public_cfg = Table(
+        schema="public", name="app_config", rls_enabled=False,
+        force_rls=False, policies=(),
+    )
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"), public_cfg),
+        security_definer_functions=(_secdef("SELECT * FROM app_config"),),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_honors_configured_anon_roles() -> None:
+    # SEC042's anon_roles is configurable; escalation must honor it. A function
+    # EXECUTE-able only by a renamed anon role (web_anon) is missed under the
+    # default {anon, PUBLIC} but proven when web_anon is the configured set.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("web_anon",)),
+        ),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+    [t] = build_verification(
+        schema, mode="escalation", anon_roles={"web_anon"}
+    ).tables
+    assert t.verdict == "leak"

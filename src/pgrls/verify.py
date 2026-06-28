@@ -196,7 +196,7 @@ _SARIF_RULE_TITLE: dict[Mode, str] = {
     "anon": "Anonymous read-isolation proof",
     "cross-tenant": "Cross-tenant read-isolation proof",
     "write": "Cross-tenant write-isolation proof",
-    "escalation": "Reachable owner-bypass escalation proof",
+    "escalation": "Reachable RLS-bypass escalation proof",
 }
 
 
@@ -250,6 +250,7 @@ def build_verification(
     *,
     auth_functions: set[str] | None = None,
     mode: Mode = "anon",
+    anon_roles: set[str] | None = None,
 ) -> Verification:
     """Prove tenant isolation for every RLS-enabled table in `schema`.
 
@@ -276,7 +277,9 @@ def build_verification(
     it is dispatched to `build_escalation`.
     """
     if mode == "escalation":
-        return build_escalation(schema, auth_functions=auth_functions)
+        return build_escalation(
+            schema, auth_functions=auth_functions, anon_roles=anon_roles
+        )
     prove = _PROVERS[mode]
     commands = _MODE_COMMANDS[mode]
     floor_kind = "write" if mode == "write" else "read"
@@ -354,7 +357,10 @@ def build_verification(
 
 
 def build_escalation(
-    schema: Schema, *, auth_functions: set[str] | None = None
+    schema: Schema,
+    *,
+    auth_functions: set[str] | None = None,
+    anon_roles: set[str] | None = None,
 ) -> Verification:
     """Prove/refute the SEC048 owner-reachability escalation paths.
 
@@ -475,7 +481,10 @@ def build_escalation(
             )
     # SEC042: anon-callable SECURITY DEFINER functions owned by an RLS-exempt
     # role, whose body reads an RLS table the anon caller's own RLS would deny.
-    tables.extend(_escalation_secdef_findings(schema, auth_functions))
+    resolved_anon_roles = anon_roles if anon_roles is not None else {"anon", "PUBLIC"}
+    tables.extend(
+        _escalation_secdef_findings(schema, auth_functions, resolved_anon_roles)
+    )
     tables.sort(key=lambda t: t.qualified_name)
     return Verification(tuple(tables), "escalation")
 
@@ -525,8 +534,56 @@ def _escalation_anon_rollup(
     )
 
 
+def _secdef_body_unresolved(
+    parsed: Any,
+    base_quals: set[tuple[str, str]],
+    base_bares: set[str],
+    cte_names: set[str],
+) -> bool:
+    """Whether a SECDEF body reads from a data source we cannot see through — a
+    *view*, a relation outside the introspected base tables, or a set-returning
+    *function* call in ``FROM``. Such a source may transitively read an RLS
+    table the range-var walk never sees (a view over an RLS table, a function
+    whose body reads one), so a body that has one must be treated as opaque
+    (UNVERIFIED) rather than cleared. A reference whose name matches a CTE
+    defined in the body is a local alias, not a data source."""
+    from pgrls.ast_utils import extract_range_vars  # noqa: PLC0415
+
+    for schemaname, relname in extract_range_vars(parsed):
+        if relname in cte_names:
+            continue
+        if schemaname is not None:
+            if (schemaname, relname) not in base_quals:
+                return True
+        elif relname not in base_bares:
+            return True
+    # A set-returning function call as a FROM source is a RangeFunction, not a
+    # RangeVar, so extract_range_vars never surfaces it — walk for it directly.
+    from pglast.ast import Node, RangeFunction  # noqa: PLC0415
+
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, RangeFunction):
+            found = True
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(parsed)
+    return found
+
+
 def _escalation_secdef_findings(
-    schema: Schema, auth_functions: set[str] | None
+    schema: Schema, auth_functions: set[str] | None, anon_roles: set[str]
 ) -> list[TableVerdict]:
     """SEC042 escalation: an anon / ``PUBLIC``-EXECUTE-able SECURITY DEFINER
     function owned by an RLS-exempt role (superuser / ``BYPASSRLS``) runs its
@@ -534,11 +591,17 @@ def _escalation_secdef_findings(
     /rpc/fn``) reads whatever RLS tables the body touches — rows its own RLS
     would deny. We prove that against each read table's ``anon`` verdict.
 
-    Reuses VIEW004's body parser to extract the RLS tables a SQL body reads; an
-    opaque body (PL/pgSQL or dynamic SQL) is **unverified** (we can't see what it
-    reads). Reads no RLS table → not a finding. The VIEW004 case (view-mediated)
-    needs the view's grants to know whether it is anon-selectable, which the
-    model does not capture, so it is out of this scope.
+    Reuses VIEW004's body parser to extract the RLS tables a SQL body reads. A
+    body is **unverified** when it is opaque (PL/pgSQL or dynamic SQL) *or* when
+    it reads from a source we cannot see through — a view, a function-call FROM,
+    or a relation outside the introspected base tables — since that source may
+    transitively read a protected table. Only a body whose every data source is
+    a known *non-RLS* base table is cleared (not a finding). ``anon_roles`` is
+    the SEC042 exposure set (default ``{anon, PUBLIC}``).
+
+    The VIEW004 view-mediated *caller* case (a view selecting a SECDEF call)
+    needs the view's grants to know whether the view is anon-selectable, which
+    the model does not capture, so it is out of this scope.
     """
     secdef_fns = schema.security_definer_functions
     rls_tables = {(t.schema, t.name) for t in schema.tables if t.rls_enabled}
@@ -549,9 +612,14 @@ def _escalation_secdef_findings(
     bare_to_qual: dict[str, list[tuple[str, str]]] = {}
     for s, n in sorted(rls_tables):
         bare_to_qual.setdefault(n, []).append((s, n))
-    from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415 — body parser reuse
+    base_quals = {(t.schema, t.name) for t in schema.tables}
+    base_bares = {t.name for t in schema.tables}
+    import pglast  # noqa: PLC0415 — heavy optional parser path
+    from pgrls.rules.view004 import (  # noqa: PLC0415 — body parser reuse
+        _cte_names,
+        _secdef_fn_leaks,
+    )
 
-    anon_roles = {"anon", "PUBLIC"}  # mirror SEC042's default exposure set
     by_qname: dict[str, list[Any]] = {}
     for f in secdef_fns:
         by_qname.setdefault(f.qualified_name, []).append(f)
@@ -568,11 +636,16 @@ def _escalation_secdef_findings(
             continue
         reads: set[str] = set()
         any_opaque = False
+        any_unseen = False  # reads via a view / function / unknown relation
         for f in candidate:
-            if _sql_body_parses(f):
-                reads |= _secdef_fn_leaks(f, qname, rls_tables, bare_to_qual)
-            else:
+            if not _sql_body_parses(f):
                 any_opaque = True
+                continue
+            reads |= _secdef_fn_leaks(f, qname, rls_tables, bare_to_qual)
+            parsed = pglast.parse_sql(f.body)
+            if _secdef_body_unresolved(parsed, base_quals, base_bares, _cte_names(parsed)):
+                any_unseen = True
+        inconclusive = any_opaque or any_unseen
         roles = ", ".join(
             sorted({r for f in candidate for r in (set(f.execute_roles) & anon_roles)})
         )
@@ -582,17 +655,35 @@ def _escalation_secdef_findings(
         )
         if reads:
             verdict, witness, tail = _escalation_anon_rollup(reads, an_by_table)
+            if inconclusive and verdict == "isolated":
+                # The reads we *can* see prove "nothing new", but the function
+                # also has an opaque overload or reads via a view/function we
+                # cannot see through, which may read a protected table — so we
+                # cannot clear it. Abstain rather than false-clear.
+                verdict, witness, tail = (
+                    "unverified",
+                    None,
+                    " — but it also reads via an opaque body or an unseen "
+                    "view/function that may read an RLS table",
+                )
             note = f"{head}, reads {', '.join(sorted(reads))}{tail}"
             reason = tail.strip(" —") if verdict == "unverified" else None
             proof = PolicyProof(sorted(reads)[0], verdict, witness, reason)
             findings.append(TableVerdict(qname, verdict, note, (proof,)))
-        elif any_opaque:
-            note = f"{head}, has an opaque body — cannot prove what it reads"
-            proof = PolicyProof(
-                qname, "unverified", None, "opaque SECURITY DEFINER body"
+        elif inconclusive:
+            why = (
+                "has an opaque body (PL/pgSQL or dynamic SQL)"
+                if any_opaque and not any_unseen
+                else "reads via a view, a function, or a relation outside the "
+                "analyzed schema"
+                if any_unseen and not any_opaque
+                else "has an opaque body and reads via an unseen view/function"
             )
+            note = f"{head}, {why} — cannot prove what it reads"
+            proof = PolicyProof(qname, "unverified", None, why)
             findings.append(TableVerdict(qname, "unverified", note, (proof,)))
-        # else: analyzable body reading no RLS table → not a finding.
+        # else: every data source is a known non-RLS base table → the body
+        # provably reads no protected data → not a finding.
     return findings
 
 
@@ -666,7 +757,7 @@ def _summary_line(v: Verification) -> str:
 def render_text(v: Verification) -> str:
     if not v.tables:
         if v.mode == "escalation":
-            return "No reachable owner-bypass escalation paths to verify."
+            return "No reachable escalation paths to verify."
         return "No RLS-enabled tables to verify."
     headers = ("TABLE", "VERDICT", "DETAIL")
     rows = []
