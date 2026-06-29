@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-06-29
+
 ### Added
 - **`pgrls verify --mode escalation`** — a fourth threat model that proves or
   refutes the static **SEC048** reachability finding. A low-trust role that is a
