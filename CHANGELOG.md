@@ -10,6 +10,22 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Changed
+- **PERF001** now also flags — and `pgrls fix` wraps — an auth-function call
+  nested inside a **correlated** subquery, the common RLS membership pattern
+  `EXISTS (SELECT 1 FROM members m WHERE m.org_id = t.org_id AND m.user_id =
+  auth.uid())`. A correlated subselect is re-executed once per outer row, so a
+  bare `auth.uid()` / `current_setting(…)` inside it is evaluated per row
+  exactly like a top-level call; the `(SELECT …)` wrap collapses it to one
+  InitPlan call. An **uncorrelated** subquery (`user_id IN (SELECT auth.uid())`)
+  runs once regardless of the outer row and is left alone, so detection is
+  scoped to where the rewrite helps. An already-wrapped call inside a
+  correlated subquery stays silent — no false positive — pinned by the corpus
+  `sec004-is-null-in-subquery-safe` case; the new correlated detection is
+  covered by unit tests and verified end-to-end on a live Postgres
+  introspection. Closes a recall gap that AI code reviewers repeatedly flagged
+  on `pgrls fix` output. No snapshot or configuration-schema change.
+
 ## [0.47.0] - 2026-06-29
 
 ### Added

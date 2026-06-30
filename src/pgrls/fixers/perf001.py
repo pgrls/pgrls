@@ -3,13 +3,16 @@ emit an `ALTER POLICY` statement.
 
 The rewrite walks the policy's USING expression AST. Each FuncCall
 matching the rule's auth_functions set is replaced with a SubLink
-wrapping it — `auth.uid()` becomes `(SELECT auth.uid())`. A
-SubLink's subselect is skipped so an already-wrapped call stays as
-it is, but the SubLink's `testexpr` (the LHS of `x IN (SELECT …)` /
-`ANY` / `ALL`) IS walked — an unwrapped auth call there re-evaluates
-per row and PERF001's rule flags it, so the fixer must rewrite it
-too. This mirrors `ast_utils.find_func_calls(exclude_sublinks=True)`,
-which the rule uses.
+wrapping it — `auth.uid()` becomes `(SELECT auth.uid())`. The
+SubLink's `testexpr` (the LHS of `x IN (SELECT …)` / `ANY` / `ALL`)
+IS walked — an unwrapped auth call there re-evaluates per row. An
+UNCORRELATED subselect is skipped (a call inside it already runs
+once), but a CORRELATED subselect IS descended into — an unwrapped
+auth call inside `EXISTS (SELECT … WHERE … = t.col AND … =
+auth.uid())` re-evaluates per outer row, so PERF001's rule flags it
+and the fixer must wrap it. This mirrors
+`ast_utils.find_func_calls(descend_correlated_sublinks=True)`, which
+the rule uses.
 
 `SQLValueFunction` nodes (`current_user`, `session_user`) are
 intentionally NOT wrapped: see `_funccall_matches` for the
@@ -49,6 +52,7 @@ from pglast.ast import FuncCall, Node, ResTarget, SelectStmt, String, SubLink
 from pglast.enums import LimitOption, SetOperation, SubLinkType
 from pglast.stream import RawStream
 
+from pgrls.ast_utils import subselect_is_correlated
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema, policy_id
@@ -136,22 +140,33 @@ def _wrap_unwrapped_calls(node: Any, names: set[str]) -> tuple[Any, bool]:
     if _funccall_matches(node, names):
         return _wrap_funccall(node), True
     if isinstance(node, SubLink):
-        # The subselect is already a `(SELECT …)` — any auth call
-        # inside it is wrapped, so leave it alone. But the SubLink's
-        # `testexpr` (the LHS of `x IN (SELECT …)` / `ANY` / `ALL`)
-        # is the policy's own expression, NOT inside the subquery:
-        # an unwrapped `auth.uid() IN (SELECT …)` re-evaluates the
-        # auth call per row. PERF001's RULE flags it (its
-        # `find_func_calls(exclude_sublinks=True)` walks `testexpr`),
-        # so the fixer must rewrite it too or it leaves a reported
-        # violation unfixed. Recurse into `testexpr` only; the
-        # subselect stays untouched. Mirrors
-        # `ast_utils.find_func_calls`'s SubLink handling.
-        if node.testexpr is None:
-            return node, False
-        new_testexpr, changed = _wrap_unwrapped_calls(node.testexpr, names)
-        if changed:
-            node.testexpr = new_testexpr
+        # The SubLink's `testexpr` (the LHS of `x IN (SELECT …)` /
+        # `ANY` / `ALL`) is the policy's own expression, NOT inside the
+        # subquery: an unwrapped `auth.uid() IN (SELECT …)` re-evaluates
+        # the auth call per row, so rewrite it. The subselect is a
+        # `(SELECT …)`: a call inside an UNCORRELATED one already runs
+        # once and is left alone, but a CORRELATED subselect re-executes
+        # per outer row — an unwrapped auth call inside
+        # `EXISTS (SELECT … WHERE … = t.col AND … = auth.uid())`
+        # re-evaluates per row and must be wrapped too. Mirrors
+        # `ast_utils.find_func_calls(descend_correlated_sublinks=True)`,
+        # which the rule uses. A freshly-wrapped `(SELECT auth.uid())`
+        # is uncorrelated, so re-running the fixer is idempotent.
+        changed = False
+        if node.testexpr is not None:
+            new_testexpr, t_changed = _wrap_unwrapped_calls(
+                node.testexpr, names
+            )
+            if t_changed:
+                node.testexpr = new_testexpr
+                changed = True
+        if node.subselect is not None and subselect_is_correlated(
+            node.subselect
+        ):
+            new_sub, s_changed = _wrap_unwrapped_calls(node.subselect, names)
+            if s_changed:
+                node.subselect = new_sub
+                changed = True
         return node, changed
     if not isinstance(node, Node):
         return node, False

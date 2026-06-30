@@ -854,6 +854,104 @@ def test_perf001_fix_wraps_auth_call_on_sublink_testexpr() -> None:
     assert sql.count("SELECT auth.uid()") == 1
 
 
+def test_perf001_fix_wraps_auth_in_correlated_exists() -> None:
+    # A bare auth call inside a CORRELATED EXISTS — the subquery
+    # references the outer table via `m.t_id = t.id` — re-evaluates per
+    # outer row, so PERF001 fires and the fixer descends into the
+    # subselect to wrap the nested call. This is the gap CodeRabbit /
+    # cubic-dev-ai flagged on the goodwill PRs `pgrls fix` produced.
+    schema = _wrap_policy(
+        _policy(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql
+    assert "m.user_id = (SELECT auth.uid())" in sql
+    assert sql.count("SELECT auth.uid()") == 1
+
+
+def test_perf001_fix_wraps_current_setting_in_correlated_exists() -> None:
+    # The descent applies to current_setting nested in a correlated
+    # subselect, not just auth.uid().
+    schema = _wrap_policy(
+        _policy(
+            "EXISTS (SELECT 1 FROM members m WHERE m.t_id = t.id "
+            "AND m.token = current_setting('app.user'))"
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert "(SELECT current_setting('app.user'))" in fixes[0].sql
+
+
+def test_perf001_fix_wraps_both_top_level_and_correlated_nested() -> None:
+    # One policy with an unwrapped top-level call AND an unwrapped call
+    # in a correlated EXISTS — the single rewrite wraps both.
+    schema = _wrap_policy(
+        _policy(
+            "auth.uid() = user_id AND EXISTS "
+            "(SELECT 1 FROM members m WHERE m.uid = auth.uid() "
+            "AND m.t_id = t.id)"
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert fixes[0].sql.count("(SELECT auth.uid())") == 2
+
+
+def test_perf001_fix_wraps_correlated_nested_in_with_check() -> None:
+    # The correlated-subselect descent applies to WITH CHECK too.
+    schema = _wrap_policy(
+        _policy(
+            command="INSERT",
+            with_check=(
+                "EXISTS (SELECT 1 FROM members m "
+                "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+            ),
+        )
+    )
+    fixes = PERF001Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    assert "WITH CHECK (" in fixes[0].sql
+    assert "m.user_id = (SELECT auth.uid())" in fixes[0].sql
+    assert fixes[0].clauses == frozenset({"with_check"})
+
+
+def test_perf001_fix_silent_on_uncorrelated_subquery() -> None:
+    # An UNCORRELATED EXISTS runs once; the auth call inside already
+    # evaluates once. The rule stays quiet, so the fixer emits nothing —
+    # it must not descend into an uncorrelated subselect. (Also pins
+    # that `user_id IN (SELECT auth.uid())` — the recommended wrap — is
+    # never re-wrapped.)
+    schema = _wrap_policy(
+        _policy(
+            "EXISTS (SELECT 1 FROM admins a WHERE a.user_id = auth.uid())"
+        )
+    )
+    assert PERF001Fixer().fix(schema, {}) == []
+    assert PERF001Fixer().fix(
+        _wrap_policy(_policy("user_id IN (SELECT auth.uid())")), {}
+    ) == []
+
+
+def test_perf001_fix_correlated_nested_is_idempotent() -> None:
+    # After wrapping, the nested `(SELECT auth.uid())` is uncorrelated,
+    # so a second `pgrls fix` pass finds nothing to do.
+    schema = _wrap_policy(
+        _policy(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+        )
+    )
+    inner = (
+        PERF001Fixer().fix(schema, {})[0].sql.split("USING (", 1)[1]
+    ).rsplit(");", 1)[0]
+    assert PERF001Fixer().fix(_wrap_policy(_policy(inner)), {}) == []
+
+
 def test_perf001_fix_respects_allowlist() -> None:
     schema = _wrap_policy(_policy("user_id = auth.uid()"))
     options = {"allowlist": ["public.t.p"]}
