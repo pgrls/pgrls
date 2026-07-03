@@ -76,7 +76,15 @@ from pgrls.introspect import introspect
 from pgrls.model import Schema
 from pgrls.matrix import MATRIX_FORMATS, build_matrix
 from pgrls.matrix import render as render_matrix
-from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, VERIFY_FORMATS, build_verification
+from pgrls.verify import (
+    DEFAULT_AUTH_FUNCTIONS,
+    VERIFY_FORMATS,
+    Verification,
+    build_verification,
+    diff_verifications,
+    render_delta_json,
+    render_delta_text,
+)
 from pgrls.verify import render as render_verify
 from pgrls.verify import render_sarif as render_verify_sarif
 from pgrls.probe import run_probe
@@ -120,6 +128,7 @@ from pgrls.schema_sources import (
     SchemaSourceError,
     WarnCommand,
     inert_rule_ids,
+    reparse_policy_asts,
     resolve_schema,
     schema_source_warnings,
 )
@@ -3817,6 +3826,22 @@ def matrix(
     help="Also exit non-zero when any table is UNVERIFIED (not just on a leak).",
 )
 @click.option(
+    "--against",
+    "against",
+    metavar="BASE",
+    default=None,
+    help=(
+        "Compare against a baseline schema (a snapshot JSON or a DB URL) and "
+        "report only the leaks this change *introduced*: a table proven ISOLATED "
+        "in BASE (or absent from it) that the live schema now proves LEAK. Exits "
+        "non-zero only on a NEW leak — pre-existing leaks don't fail the gate — "
+        "so it's the 'no new provable leak' PR check (pair a committed `pgrls "
+        "snapshot` of main as BASE with the PR branch's live DB). A BASE table "
+        "that was UNVERIFIED is never counted as newly-leaking (soundness). "
+        "--format text/json/sarif; SARIF carries only the new leaks."
+    ),
+)
+@click.option(
     "--emit-repro",
     "emit_repro_dir",
     type=click.Path(file_okay=False),
@@ -3879,6 +3904,7 @@ def verify(
     mode: str,
     auth_functions: tuple[str, ...],
     strict: bool,
+    against: str | None,
     emit_repro_dir: str | None,
     force: bool,
     probe: bool,
@@ -3952,6 +3978,16 @@ def verify(
             "--emit-repro is not supported with --mode escalation yet "
             "(SET ROLE reproductions are a follow-on)."
         )
+    if against is not None and probe:
+        raise click.UsageError(
+            "--against and --probe cannot be combined: --against compares two "
+            "static schemas, --probe live-confirms one database."
+        )
+    if against is not None and emit_repro_dir is not None:
+        raise click.UsageError(
+            "--against and --emit-repro cannot be combined (emit a reproduction "
+            "for the head schema in a separate run)."
+        )
     auth = (
         set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
         if auth_functions
@@ -4021,6 +4057,41 @@ def verify(
             raise click.UsageError(str(exc)) from exc
 
     verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
+
+    if against is not None:
+        # Compose the head verdicts with a baseline schema and report only the
+        # leaks THIS change introduced — the "no new provable leak" PR gate.
+        schema_list = (
+            [s.strip() for s in schemas.split(",") if s.strip()]
+            if schemas
+            else cfg.schemas
+        )
+        # A snapshot base serializes only policy SQL, not the parsed AST that
+        # the verifier walks; reparse it (a no-op for a live-URL base, whose
+        # ASTs introspection already populated).
+        base_schema = reparse_policy_asts(
+            _resolve_diff_source(against, schemas=schema_list)
+        )
+        base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
+        delta = diff_verifications(base_verification, verification)
+        if output_format == "sarif":
+            # The gate is "no NEW leak", so only the introduced leaks become
+            # SARIF results (pre-existing leaks are the baseline, not this
+            # change's regressions).
+            rendered = render_verify_sarif(
+                Verification(delta.new_leaks, verification.mode), strict=strict
+            )
+        elif output_format == "json":
+            rendered = render_delta_json(delta)
+        else:
+            rendered = render_delta_text(delta)
+        _emit(rendered, output_path)
+        if delta.new_leaks:
+            sys.exit(1)
+        if strict and delta.new_unverified:
+            sys.exit(1)
+        return
+
     # SARIF is the one format whose result-set depends on --strict (UNVERIFIED
     # is omitted by default, a `note` under --strict), so it can't go through
     # the 1-arg render() dispatcher — call render_sarif directly to thread the

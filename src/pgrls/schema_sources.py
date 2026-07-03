@@ -296,10 +296,10 @@ def _schema_from_snapshot(snapshot_path: str) -> tuple[Schema, int]:
         ) from exc
 
     # `from_snapshot` accepted the payload, so `version` is a supported int.
-    return _reparse_policy_asts(schema), int(payload["version"])
+    return reparse_policy_asts(schema), int(payload["version"])
 
 
-def _reparse_policy_asts(schema: Schema) -> Schema:
+def reparse_policy_asts(schema: Schema) -> Schema:
     """Return a copy of `schema` with every policy's USING / WITH CHECK parsed.
 
     Tables (and the Schema) are frozen dataclasses, so this rebuilds via

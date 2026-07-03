@@ -385,6 +385,7 @@ pgrls verify --database-url "$DATABASE_URL" --strict                 # also fail
 pgrls verify --database-url "$DATABASE_URL" --auth-function auth.user_id   # add a custom auth helper
 pgrls verify --database-url "$DATABASE_URL" --emit-repro ./repro      # runnable repro per leak (anon / cross-tenant)
 pgrls verify --database-url "$DATABASE_URL" --probe                   # confirm the static proof against the live DB
+pgrls verify --database-url "$DATABASE_URL" --against main.pgrls.json  # gate: fail only on leaks THIS change introduced
 ```
 
 The two modes are complementary. The signature inverted-auth policy `auth.uid() IS NULL OR tenant_id = auth.uid()` is an anon **`LEAK`** (an unauthenticated client sees every row) yet cross-tenant **`PROVEN`** (an authenticated tenant only ever sees its own rows — the `IS NULL` branch is false once authenticated). Conversely a `tenant_id = auth.uid() OR is_public` policy is anon-`LEAK` *and* cross-tenant-`LEAK` (another tenant's public rows leak), while `USING (true)` is an anon-`LEAK` but cross-tenant-`UNVERIFIED` (no scoping equality to verify against — already caught by anon mode). Run both for full coverage.
@@ -398,6 +399,29 @@ Each RLS-enabled table gets one of three **honest** verdicts (the phrasing below
 `--format sarif` emits a SARIF v2.1.0 document for GitHub Code Scanning that shares the schema and `tool.driver` block with `pgrls lint --format sarif`: each `LEAK` is an `error`-level result located at `schema.table.policy` with the witness phrase as its message; `PROVEN` tables emit nothing; `UNVERIFIED` tables are omitted unless `--strict`, where each becomes a `note`-level result — so the result-set is non-empty exactly when the run would fail the gate. The prover is one rule per `--mode` (`pgrls-anon-isolation` / `pgrls-cross-tenant-isolation` / `pgrls-write-isolation`).
 
 `--emit-repro DIR` turns a `LEAK` into something you can run: for each leak it writes a `.sql` script and a pytest that recreate a throwaway copy of the table from the introspected column types, install the leaking policy, insert the counterexample row, and `SELECT` it back — as an anonymous session (`anon`) or, for `--mode cross-tenant`, as a session **authenticated as tenant A** with the inserted row belonging to a **different tenant B** (the session identity is set via the GUC the policy reads — the JWT-claim GUC for an `auth.*` helper, or a direct `current_setting('<guc>')`). Either way the SELECT runs as a NOSUPERUSER/NOBYPASSRLS runner, so the reproduction is sound (a *fixed* policy returns zero rows) — the proof, reproduced and rolled back. The pytest **passes while the leak exists and turns red once you fix the policy** — a runnable proof of the bug (invert the assertion to keep it as a green regression guard). For a characterized or unconditional leak the inserted row reliably triggers the policy; for a *conditional* leak (no pinned row) the placeholder row is best-effort and the `.sql` header flags it for a hand-edit. Re-running won't clobber a hand-edited reproduction unless `--force`.
+
+### Gate on newly-introduced leaks — `--against`
+
+Adopting `verify` on a database that already has a backlog of leaks is the same
+ratchet problem `pgrls lint --baseline` solves. `--against BASE` verifies the
+live schema, then compares against a committed baseline and **fails only on the
+leaks this change introduced** — a table proven `PROVEN` in `BASE` (or absent
+from it) that the head now proves `LEAK`. Pre-existing leaks are reported but
+don't fail the gate, so a team can drop `verify` into CI without first clearing
+the whole backlog.
+
+```bash
+pgrls snapshot --database-url "$MAIN_DB_URL" --output main.pgrls.json   # once, on main
+git add main.pgrls.json && git commit -m "pgrls: verify baseline"
+# in PR CI — build the branch DB, then:
+pgrls verify --database-url "$PR_DB_URL" --against main.pgrls.json      # exit 1 ⇔ a NEW leak
+```
+
+`BASE` is a `pgrls snapshot` JSON or a DB URL. A `BASE` table that was
+`UNVERIFIED` is **never** counted as newly-leaking — soundness: a leak is only
+attributed to the change when the base *proved* isolation. `--against` honors
+every `--mode`; `--format text`/`json` also list the leaks the change *fixed*,
+and `--format sarif` carries just the new leaks for GitHub Code Scanning.
 
 ### Confirm the proof against the live database — `--probe`
 
