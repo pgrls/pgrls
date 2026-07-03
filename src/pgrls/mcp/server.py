@@ -223,12 +223,17 @@ def verify(
     For every RLS-enabled table, returns one of three honest verdicts per
     policy: ``isolated`` (PROVEN), ``leak`` (with a concrete counterexample
     witness), or ``unverified`` (Z3 can't decide, or there's no single scoping
-    equality). Three threat models via ``mode``:
+    equality). Four threat models via ``mode``:
 
     * ``anon`` (default) — can an unauthenticated session read any row?
     * ``cross-tenant`` — can a session authenticated as one tenant read a
       different tenant's row?
     * ``write`` — can such a session WRITE a row stamped for another tenant?
+    * ``escalation`` — proves the static SEC048 reachability finding: can a
+      low-trust role that is a member of a table's owner bypass RLS on the
+      owner's not-``FORCE``'d tables (and the SEC042 anon-callable SECDEF case)?
+      Needs a ``database_url`` or a snapshot ≥ v21 (the role/owner graph is
+      introspected); an ``sql`` source has no role graph, so it finds nothing.
 
     Provide EXACTLY ONE schema source (``sql`` / ``database_url`` / ``snapshot``
     — same semantics as ``lint``). ``auth_functions`` extends the default auth
@@ -244,11 +249,11 @@ def verify(
     from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, build_verification
     from pgrls.verify import render_json as verify_render_json
 
-    if mode not in ("anon", "cross-tenant", "write"):
+    if mode not in ("anon", "cross-tenant", "write", "escalation"):
         return _error(
             "bad_sql",
-            f"unknown verify mode {mode!r}. Use 'anon', 'cross-tenant', or "
-            "'write'.",
+            f"unknown verify mode {mode!r}. Use 'anon', 'cross-tenant', "
+            "'write', or 'escalation'.",
         )
 
     schema, source, snapshot_version = resolve_schema(
