@@ -161,6 +161,27 @@ def test_in_membership_normalizes_to_canonical_form() -> None:
     assert clean["tables"][0]["verdict"] == "isolated"
 
 
+def test_verify_accepts_escalation_mode() -> None:
+    # Regression (0.47.0): the CLI grew a fourth `escalation` threat model, but
+    # the MCP verify() mode allowlist still rejected it. build_verification
+    # already dispatches escalation -> build_escalation, so the tool only needs
+    # to let it through. An `sql` source carries no role graph, so escalation
+    # finds nothing — but it must return a clean payload, not a bad_sql error.
+    ddl = (
+        "CREATE TABLE public.docs (id uuid, tenant_id uuid);"
+        "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+        "CREATE POLICY p ON public.docs FOR SELECT TO authenticated "
+        "  USING (tenant_id = auth.uid());"
+    )
+    result = server.verify(sql=ddl, mode="escalation")
+    assert result["mode"] == "escalation"
+    assert result["summary"]["tables"] == 0
+    # A genuinely unknown mode is still rejected, now naming all four.
+    bad = server.verify(sql=ddl, mode="bogus")
+    assert bad["error"]["kind"] == "bad_sql"
+    assert "escalation" in bad["error"]["message"]
+
+
 def test_column_grant_of_pii_to_low_trust_flags_sec045() -> None:
     # Regression (review CRITICAL #2): a column-level GRANT of a PII column to a
     # low-trust role is the exact SEC045 trigger. The offline builder dropped
