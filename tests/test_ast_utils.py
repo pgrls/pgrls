@@ -9,6 +9,7 @@ from pgrls.ast_utils import (
     is_literal_true,
     match_is_null,
     parse_expr,
+    subselect_is_correlated,
 )
 
 
@@ -187,6 +188,113 @@ def test_find_func_calls_finds_multiple() -> None:
     matches = find_func_calls(node, {"auth.uid"})
     assert len(matches) == 2
 
+
+def _subselect_of(sql: str):
+    # parse_expr on an `EXISTS (…)` / `x IN (…)` fragment returns a
+    # SubLink whose `.subselect` is the inner SelectStmt.
+    return parse_expr(sql).subselect
+
+
+def test_subselect_is_correlated_true_for_outer_qualified_ref() -> None:
+    # `m.t_id = t.id` references the outer table `t`, not in the
+    # subselect's own FROM — correlated.
+    assert subselect_is_correlated(
+        _subselect_of(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+        )
+    ) is True
+
+
+def test_subselect_is_correlated_false_for_self_contained() -> None:
+    # Every ref resolves inside the subselect's own FROM — uncorrelated.
+    assert subselect_is_correlated(
+        _subselect_of(
+            "EXISTS (SELECT 1 FROM admins a WHERE a.user_id = auth.uid())"
+        )
+    ) is False
+
+
+def test_subselect_is_correlated_false_for_scalar_subquery() -> None:
+    assert subselect_is_correlated(
+        _subselect_of("user_id IN (SELECT auth.uid())")
+    ) is False
+
+
+def test_subselect_is_correlated_three_part_outer_ref() -> None:
+    # A 3-part `schema.table.col` outer reference is correlated — the
+    # table qualifier (`t`) is not bound in the subselect's own scope.
+    # Pins the `s.t.col` claim in the docstring (Postgres emits this form
+    # via pg_get_expr when the policy's schema-qualified table is the
+    # correlated relation).
+    assert subselect_is_correlated(
+        _subselect_of(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.t_id = public.t.id AND m.uid = auth.uid())"
+        )
+    ) is True
+
+
+def test_subselect_is_correlated_aliased_relname_is_outer() -> None:
+    # `FROM public.shares s2` binds ONLY `s2`; a later `shares.id` is an
+    # OUTER reference, not a self-reference. Pins the alias rule the
+    # corpus `sec004-is-null-in-subquery-safe` case relies on.
+    assert subselect_is_correlated(
+        _subselect_of(
+            "EXISTS (SELECT 1 FROM public.shares s2 "
+            "WHERE s2.id = shares.id)"
+        )
+    ) is True
+
+
+def test_subselect_is_correlated_false_for_set_operation() -> None:
+    # UNION arms each have their own FROM; conservatively uncorrelated.
+    assert subselect_is_correlated(
+        _subselect_of("id IN (SELECT a FROM x UNION SELECT b FROM y)")
+    ) is False
+
+
+def test_subselect_is_correlated_false_through_lateral_documented_limit() -> None:
+    # DOCUMENTED LIMITATION: a correlation reaching the outer query only
+    # THROUGH a LATERAL subquery in the FROM is conservatively NOT
+    # detected — `RangeSubselect` subqueries aren't descended into. A
+    # sound under-report (never a false positive), pinned so the
+    # conservative behavior stays intentional. Rare shape; no corpus case.
+    assert subselect_is_correlated(
+        _subselect_of(
+            "EXISTS (SELECT 1 FROM members m, "
+            "LATERAL (SELECT auth.uid() AS u WHERE m.id = t.owner_id) s "
+            "WHERE m.user_id = s.u)"
+        )
+    ) is False
+
+
+def test_find_func_calls_descends_into_correlated_sublink_opt_in() -> None:
+    node = parse_expr(
+        "EXISTS (SELECT 1 FROM members m "
+        "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+    )
+    # Default: the correlated subselect is skipped.
+    assert find_func_calls(node, {"auth.uid"}, exclude_sublinks=True) == []
+    # Opt-in: the nested call is found.
+    assert len(
+        find_func_calls(
+            node,
+            {"auth.uid"},
+            exclude_sublinks=True,
+            descend_correlated_sublinks=True,
+        )
+    ) == 1
+
+
+def test_find_func_calls_skips_uncorrelated_sublink_when_opted_in() -> None:
+    node = parse_expr("user_id IN (SELECT auth.uid())")
+    assert find_func_calls(
+        node,
+        {"auth.uid"},
+        exclude_sublinks=True,
+        descend_correlated_sublinks=True,
+    ) == []
 
 
 def test_match_is_null_matches_is_null() -> None:

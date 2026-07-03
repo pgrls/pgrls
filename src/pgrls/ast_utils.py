@@ -14,8 +14,8 @@ from collections.abc import Callable
 from typing import Any
 
 import pglast
-from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, Node, NullTest, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
-from pglast.enums import BoolExprType, NullTestType, SQLValueFunctionOp
+from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
+from pglast.enums import BoolExprType, NullTestType, SetOperation, SQLValueFunctionOp
 
 
 _LINT_AST_RULES_TAIL = (
@@ -233,7 +233,8 @@ def transform_tree(
       `changed` bubbles up. Use this both to rewrite a matched node
       (`(replacement, True)`) and to deliberately skip a subtree
       without changing it (`(node, False)` — e.g. PERF001 declines to
-      descend into an already-wrapped `SubLink`).
+      descend into an *uncorrelated* `SubLink` subselect, whose calls
+      already run once per statement).
     * `None` — not terminal: recurse into this node's children.
 
     On the recursive path, every `Node`-typed field and every item of
@@ -305,8 +306,125 @@ def func_name_parts(node: Any) -> tuple[str | None, str | None]:
     return ".".join(parts), parts[-1]
 
 
+def _from_scope_relations(from_clause: Any, with_clause: Any) -> set[str]:
+    """Relation names and aliases bound in a single SELECT's own scope.
+
+    Used to decide whether a qualified column reference points at an
+    OUTER query level (correlation). An aliased table contributes ONLY
+    its alias: `FROM public.shares s2` binds `s2`, so a later `shares.id`
+    is an outer reference, not a self-reference. CTE names from a `WITH`
+    clause are in-scope too.
+    """
+    names: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if item is None:
+            return
+        if isinstance(item, RangeVar):
+            if item.alias is not None and item.alias.aliasname:
+                names.add(item.alias.aliasname)
+            elif item.relname:
+                names.add(item.relname)
+        elif isinstance(item, (RangeSubselect, RangeFunction)):
+            # A subquery / set-returning-function in FROM is a deeper
+            # scope; only its alias is visible at this level.
+            if item.alias is not None and item.alias.aliasname:
+                names.add(item.alias.aliasname)
+        elif isinstance(item, JoinExpr):
+            visit(item.larg)
+            visit(item.rarg)
+
+    for item in from_clause or ():
+        visit(item)
+    for cte in getattr(with_clause, "ctes", None) or ():
+        ctename = getattr(cte, "ctename", None)
+        if ctename:
+            names.add(ctename)
+    return names
+
+
+def subselect_is_correlated(select_stmt: Any) -> bool:
+    """True iff a SubLink subselect references an enclosing query level.
+
+    A correlated subselect is re-executed once per outer row (a
+    SubPlan), so a STABLE call like `auth.uid()` inside it is evaluated
+    per row — wrapping it in `(SELECT …)` collapses that to one InitPlan
+    call, exactly as for a top-level call. An UNCORRELATED subselect runs
+    once (its own InitPlan); a call inside it already evaluates once, so
+    wrapping buys nothing and PERF001 must stay quiet (e.g.
+    `user_id IN (SELECT auth.uid())`).
+
+    Sound heuristic, biased toward *not* correlated on ambiguity: a
+    qualified `ColumnRef` (`t.col`, `s.t.col`) whose table-qualifier is
+    not a relation, alias, or CTE bound in this select's own scope is an
+    outer reference. Bare unqualified refs are taken as in-scope
+    (Postgres resolves them to the nearest level that has the column).
+    This is exactly the form pgrls lints: `pg_get_expr` qualifies a
+    correlated outer reference with the outer relation's name when it
+    deparses a stored policy (a bare `id` resolving to the outer table is
+    emitted as `teams.id`), so the introspection path — pgrls's real
+    input — always presents correlation as a qualified ref. A *hand-
+    written* bare-ref fragment (`WHERE tm.fk = outer_col`) parsed
+    directly is conservatively treated as uncorrelated.
+    Deeper scopes — nested `SubLink` subselects and `RangeSubselect`
+    subqueries (including a `LATERAL` subquery in the FROM) — are not
+    descended into when collecting evidence for THIS level, so a
+    correlation that reaches the outer query *only* through a `LATERAL`
+    is conservatively treated as uncorrelated (a sound under-report, not
+    a false positive). Set-operation selects (UNION/INTERSECT/EXCEPT),
+    where each arm has its own FROM, are likewise treated as
+    uncorrelated.
+    """
+    if not isinstance(select_stmt, SelectStmt):
+        return False
+    if select_stmt.op != SetOperation.SETOP_NONE:
+        return False
+    own = _from_scope_relations(
+        select_stmt.fromClause, select_stmt.withClause
+    )
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, SubLink):
+            # Deeper scope — its subselect's refs are relative to its own
+            # level; only the testexpr lives in THIS scope.
+            walk(n.testexpr)
+            return
+        if isinstance(n, RangeSubselect):
+            return  # deeper scope
+        if isinstance(n, ColumnRef):
+            parts = [
+                f.sval for f in (n.fields or ()) if isinstance(f, String)
+            ]
+            if len(parts) >= 2 and parts[-2] not in own:
+                found = True
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                value = getattr(n, field_name, None)
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        walk(item)
+                elif isinstance(value, Node):
+                    walk(value)
+
+    walk(select_stmt)
+    return found
+
+
 def find_func_calls(
-    node: Any, names: set[str], *, exclude_sublinks: bool = False
+    node: Any,
+    names: set[str],
+    *,
+    exclude_sublinks: bool = False,
+    descend_correlated_sublinks: bool = False,
 ) -> list[Any]:
     """Find FuncCall and SQLValueFunction nodes whose name matches `names`.
 
@@ -323,6 +441,13 @@ def find_func_calls(
     correctly skipped, while `auth.uid() IN (SELECT ...)` keeps firing
     because the auth call is on the LHS, not in the subselect. Mirrors
     `extract_column_refs`'s shape.
+
+    `descend_correlated_sublinks=True` (only meaningful alongside
+    `exclude_sublinks=True`) additionally descends into a SubLink's
+    subselect when it is CORRELATED (`subselect_is_correlated`): a bare
+    auth call inside a correlated `EXISTS (SELECT … WHERE … = t.col)` is
+    re-evaluated per outer row, so PERF001 must flag it. An uncorrelated
+    subselect runs once and stays skipped.
     """
     matches: list[Any] = []
 
@@ -341,6 +466,10 @@ def find_func_calls(
             return
         if exclude_sublinks and isinstance(n, SubLink):
             walk(n.testexpr)
+            if descend_correlated_sublinks and subselect_is_correlated(
+                n.subselect
+            ):
+                walk(n.subselect)
             return
         if isinstance(n, FuncCall):
             qualified, bare = func_name_parts(n)

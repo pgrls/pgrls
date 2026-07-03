@@ -17,10 +17,14 @@ An earlier belief that "Postgres optimizes WITH CHECK differently" was
 wrong.)
 
 Detection: walk the USING and WITH CHECK ASTs and look for FuncCall /
-SQLValueFunction nodes whose name is in the configured set, but skip
-anything reached via a SubLink — calls inside `(SELECT ...)`,
-`IN (SELECT ...)`, etc. are already wrapped. One violation per policy,
-naming the clause(s) where an unwrapped call was found.
+SQLValueFunction nodes whose name is in the configured set. A call in an
+UNCORRELATED SubLink — `user_id IN (SELECT auth.uid())` — already runs
+once and is skipped. But a call inside a CORRELATED subselect — e.g.
+`EXISTS (SELECT 1 FROM members m WHERE m.org_id = t.org_id AND m.user_id
+= auth.uid())` — re-evaluates per outer row exactly like a top-level
+call, so it is flagged too (the SubLink's `testexpr` is always walked).
+One violation per policy, naming the clause(s) where an unwrapped call
+was found.
 """
 from __future__ import annotations
 
@@ -75,12 +79,14 @@ class PERF001:
                     policy.using_ast,
                     auth_functions,
                     exclude_sublinks=True,
+                    descend_correlated_sublinks=True,
                 ):
                     clauses.append("USING")
                 if policy.with_check_ast is not None and find_func_calls(
                     policy.with_check_ast,
                     auth_functions,
                     exclude_sublinks=True,
+                    descend_correlated_sublinks=True,
                 ):
                     clauses.append("WITH CHECK")
                 if not clauses:

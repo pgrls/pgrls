@@ -71,6 +71,124 @@ def test_perf001_fires_on_unwrapped_auth_on_in_lhs() -> None:
     assert len(PERF001().check(schema, {})) == 1
 
 
+def test_perf001_fires_on_unwrapped_auth_in_correlated_exists() -> None:
+    # The common RLS membership-join pattern: a bare auth.uid() inside a
+    # CORRELATED EXISTS — the subquery references the outer table via
+    # `m.t_id = t.id` — re-evaluates once per outer row scanned. Wrapping
+    # it `(SELECT auth.uid())` makes it a per-statement InitPlan, the same
+    # win as a top-level call, so PERF001 must fire. (CodeRabbit and
+    # cubic-dev-ai flagged exactly this on the goodwill PRs `pgrls fix`
+    # generated; it is the gap descend_correlated_sublinks closes.)
+    schema = _wrap(
+        _policy(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+        )
+    )
+    assert len(PERF001().check(schema, {})) == 1
+
+
+def test_perf001_does_not_fire_on_uncorrelated_exists() -> None:
+    # An UNCORRELATED EXISTS (no reference to the outer table) is an
+    # InitPlan Postgres runs ONCE, so the auth.uid() inside already
+    # evaluates once — wrapping buys nothing. Soundness: stay quiet.
+    schema = _wrap(
+        _policy(
+            "EXISTS (SELECT 1 FROM admins a WHERE a.user_id = auth.uid())"
+        )
+    )
+    assert PERF001().check(schema, {}) == []
+
+
+def test_perf001_does_not_fire_on_correlated_exists_already_wrapped() -> None:
+    # A correlated EXISTS whose nested auth call is ALREADY wrapped
+    # `(SELECT auth.uid())` is in the recommended form — no finding. The
+    # outer reference `s2.id = t.id` makes the subselect correlated (so
+    # the walk descends), but the only auth call inside is wrapped.
+    # Mirrors the corpus `sec004-is-null-in-subquery-safe` shape, which
+    # guards this against regression at the corpus level too.
+    schema = _wrap(
+        _policy(
+            "owner_id = (SELECT auth.uid()) OR EXISTS "
+            "(SELECT 1 FROM public.shares s2 "
+            "WHERE s2.id = t.id AND (SELECT auth.uid()) IS NULL)"
+        )
+    )
+    assert PERF001().check(schema, {}) == []
+
+
+def test_perf001_fires_on_correlated_nested_in_with_check() -> None:
+    # The correlated-subselect rule applies to WITH CHECK too — the write
+    # path re-evaluates the nested call per written row.
+    schema = _wrap(
+        _policy(
+            None,
+            command="INSERT",
+            with_check=(
+                "EXISTS (SELECT 1 FROM members m "
+                "WHERE m.user_id = auth.uid() AND m.t_id = t.id)"
+            ),
+        )
+    )
+    assert len(PERF001().check(schema, {})) == 1
+
+
+def test_perf001_fires_on_postgres_normalized_correlated_exists() -> None:
+    # The exact shape `pg_get_expr` stores for a correlated membership
+    # EXISTS — schema-qualified FROM, AS-less alias, doubled parens. Pins
+    # that correlation detection survives Postgres normalization (the
+    # introspection path), verified end-to-end against a live PG16:
+    # `pgrls lint` reports PERF001 and `pgrls fix` wraps the nested call.
+    schema = _wrap(
+        _policy(
+            "(EXISTS ( SELECT 1 FROM public.team_members tm "
+            "WHERE ((tm.team_id = t.id) AND (tm.user_id = auth.uid()))))"
+        )
+    )
+    assert len(PERF001().check(schema, {})) == 1
+
+
+def test_perf001_fires_on_current_setting_nested_in_correlated_exists() -> None:
+    # `current_setting` (the headline non-auth.uid call the docs cite) in
+    # a correlated EXISTS re-evaluates per outer row exactly like
+    # auth.uid(), so it fires too.
+    schema = _wrap(
+        _policy(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.t_id = t.id "
+            "AND m.token = current_setting('app.user'))"
+        )
+    )
+    assert len(PERF001().check(schema, {})) == 1
+
+
+def test_perf001_fires_on_auth_jwt_nested_in_correlated_exists() -> None:
+    # auth.jwt() (a default auth function) nested in a correlated EXISTS
+    # fires the same as auth.uid() — including when the JSON is projected
+    # via `->>`.
+    schema = _wrap(
+        _policy(
+            "EXISTS (SELECT 1 FROM members m "
+            "WHERE m.t_id = t.id "
+            "AND m.role = (auth.jwt() ->> 'role'))"
+        )
+    )
+    assert len(PERF001().check(schema, {})) == 1
+
+
+def test_perf001_fires_on_auth_in_correlated_any_subquery() -> None:
+    # A correlated subselect reached via `= ANY (SELECT …)` (not just
+    # EXISTS) is descended into too — the testexpr is walked and the
+    # correlated subselect is descended when it references the outer row.
+    schema = _wrap(
+        _policy(
+            "t.id = ANY (SELECT m.doc_id FROM members m "
+            "WHERE m.t_id = t.id AND m.user_id = auth.uid())"
+        )
+    )
+    assert len(PERF001().check(schema, {})) == 1
+
+
 def test_perf001_fires_on_unwrapped_current_setting() -> None:
     schema = _wrap(
         _policy("current_setting('app.user') = user_id")

@@ -3535,9 +3535,13 @@ optimized identically — a bare `auth.uid()` there is re-evaluated
 once per written row, and the `(SELECT …)` wrap collapses it to a
 single InitPlan call (verified with a call-counting function: a
 1000-row INSERT or UPDATE calls a bare WITH-CHECK function 1000
-times, the wrapped form once). Calls reached via a `SubLink`
-(`(SELECT ...)`, `IN (SELECT ...)`, `EXISTS (SELECT ...)`) are
-skipped — those are already wrapped. One finding per policy, naming
+times, the wrapped form once). A call reached via an UNCORRELATED
+`SubLink` — `user_id IN (SELECT auth.uid())` — already runs once and
+is skipped. But a call inside a CORRELATED subselect — the common
+membership pattern `EXISTS (SELECT 1 FROM members m WHERE m.org_id =
+t.org_id AND m.user_id = auth.uid())`, whose subquery references the
+outer row — re-evaluates once per outer row scanned, exactly like a
+top-level call, so it is flagged too. One finding per policy, naming
 the clause(s) involved.
 
 **The bad pattern:**
@@ -3561,6 +3565,24 @@ CREATE POLICY tenant_read ON public.invoices
 `auth.uid()`, `auth.role()`, `auth.jwt()` get the same treatment.
 This is a mechanical rewrite — semantics are unchanged, the planner
 just gets to cache.
+
+**Correlated subqueries.** A bare auth call inside a *correlated*
+`EXISTS` / `IN (SELECT …)` — one whose subquery references the outer
+row, the membership-join pattern — is re-executed per outer row, so
+PERF001 flags it and `pgrls fix` wraps the nested call:
+
+```sql
+-- flagged: auth.uid() re-runs once per `teams` row scanned
+USING (EXISTS (SELECT 1 FROM team_members tm
+              WHERE tm.team_id = teams.id AND tm.user_id = auth.uid()));
+-- fixed:
+USING (EXISTS (SELECT 1 FROM team_members tm
+              WHERE tm.team_id = teams.id AND tm.user_id = (SELECT auth.uid())));
+```
+
+An *uncorrelated* subquery — `user_id IN (SELECT auth.uid())` — runs
+once regardless of the outer row, so it is already optimal and left
+alone.
 
 **Configuring the auth function set.** If your stack uses a custom
 helper, replace the default set:
