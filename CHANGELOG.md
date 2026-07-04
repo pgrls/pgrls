@@ -22,6 +22,18 @@ breaking changes — they will be called out in this file.
   when the base *proved* isolation). Works with every `--mode`; `--format
   text`/`json`/`sarif` (SARIF carries only the new leaks). The text/JSON report
   also lists leaks the change *fixed*.
+- **`pgrls verify --mode write --emit-repro`** now emits a runnable
+  reproduction (previously write-mode was rejected as a follow-on). For a
+  cross-tenant *write* leak the generated `.sql` + pytest authenticate as tenant
+  A and **INSERT a row stamped for tenant B**, asserting the write is *admitted*
+  — the leaking `WITH CHECK` let a cross-tenant row through; a fixed check
+  rejects it (SQLSTATE 42501), turning the test red. The leak signal is
+  admission, not a returned row (RLS hides `RETURNING` even for an admitted
+  write). Runs as a `NOSUPERUSER`/`NOBYPASSRLS` runner, so a fixed policy
+  provably rejects the INSERT (live-validated). Covers `FOR INSERT` / `FOR ALL`
+  leaks; a `FOR UPDATE`-only leak is skipped (not mis-reproduced by an INSERT).
+  `--mode escalation --emit-repro` now points to `--probe` (the SET-ROLE chain
+  has no static reproduction).
 
 ### Changed
 - **PERF001** now also flags — and `pgrls fix` wraps — an auth-function call
