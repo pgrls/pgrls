@@ -1,21 +1,43 @@
+# pgrls as a pre-commit hook — https://github.com/pgrls/pgrls#pre-commit
+#
+# pgrls reasons over your WHOLE schema (RLS is cross-file: a table may be
+# created in one migration and its policy in another), so BOTH hooks run
+# project-level — `pass_filenames: false` — rather than per-changed-file.
+# Consumers pick one and configure the schema source via `args:`.
+
+# Live-database hook: lints the schema at $DATABASE_URL (or [database].url in
+# pgrls.toml). The schema state lives in the database — a commit can change it
+# via a separately-applied migration — so it runs on every invocation. Many
+# teams scope this to `pre-push` (needs a reachable database).
 - id: pgrls-lint
-  name: pgrls lint
-  description: Lint Postgres Row-Level Security policies for security and hygiene issues.
+  name: pgrls lint (live database)
+  description: Lint Postgres Row-Level Security policies against a live database.
   entry: pgrls lint
   language: python
-  # pgrls scans a live database, not files. pre-commit must not pass
-  # changed-file paths as arguments (`pgrls lint` rejects positional
-  # args).
   pass_filenames: false
-  # The schema state lives in the database, not in tracked files —
-  # any commit can have changed it via a separately-applied
-  # migration. Run on every invocation rather than only when matching
-  # files changed.
   always_run: true
-  # The CLI invokes a single lint pass with one DB connection; no
-  # benefit to running concurrent invocations in the same hook.
   require_serial: true
-  # `pgrls lint` requires `--database-url` (or `$DATABASE_URL` in the
-  # environment). Consumers configure that via `args:` and `env:` in
-  # their own `.pre-commit-config.yaml`.
+  minimum_pre_commit_version: "2.9.2"
+
+# Offline hook: analyzes raw DDL with NO database (pgrls ≥ 0.24), so it runs at
+# commit time without Docker or a connection — point it at your schema with
+# `args: ["--sql-file", "schema.sql"]` (repeatable; declare tables before the
+# policies that reference them) or `["--snapshot", ".pgrls-snapshot.json"]`.
+# Fires when any *.sql changes; still whole-schema (pass_filenames: false) —
+# pgrls needs cross-file context, not the individual changed files. Example:
+#
+#   repos:
+#     - repo: https://github.com/pgrls/pgrls
+#       rev: v0.47.0
+#       hooks:
+#         - id: pgrls-lint-sql
+#           args: ["--sql-file", "schema.sql", "--fail-on", "error"]
+- id: pgrls-lint-sql
+  name: pgrls lint (offline SQL)
+  description: Lint Postgres Row-Level Security policies from raw DDL, no database.
+  entry: pgrls lint
+  language: python
+  files: \.sql$
+  pass_filenames: false
+  require_serial: true
   minimum_pre_commit_version: "2.9.2"
