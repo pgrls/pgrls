@@ -235,6 +235,74 @@ class Verification:
         return {"tables": len(self.tables), **counts}
 
 
+@dataclass(frozen=True)
+class LeakDelta:
+    """The leak-level delta between a base and a head Verification (same mode).
+
+    ``new_leaks`` is the CI gate: a table this change turned from proven
+    ``isolated`` (or absent from base) into a proven ``leak``. A base
+    ``unverified`` table is deliberately NOT a baseline for "new" — a head leak
+    there is reported ``preexisting`` (not attributable to the change), because
+    the base never *proved* isolation. Soundness: never cry "you introduced a
+    leak" off an unprovable base.
+    """
+
+    mode: Mode
+    new_leaks: tuple[TableVerdict, ...]
+    preexisting_leaks: tuple[TableVerdict, ...]
+    fixed_leaks: tuple[str, ...]  # qualified names, sorted
+    new_unverified: tuple[TableVerdict, ...]  # base isolated/absent → head unverified
+
+    @property
+    def summary(self) -> dict[str, int]:
+        return {
+            "new_leaks": len(self.new_leaks),
+            "preexisting_leaks": len(self.preexisting_leaks),
+            "fixed_leaks": len(self.fixed_leaks),
+            "new_unverified": len(self.new_unverified),
+        }
+
+
+def diff_verifications(base: Verification, head: Verification) -> LeakDelta:
+    """Classify a head Verification against a base one (same threat model).
+
+    A *new* leak is a proven ``leak`` in head whose table was proven ``isolated``
+    in base, or is absent from base entirely (a table the change added). A base
+    ``unverified`` table is not a baseline: a head leak there is ``preexisting``,
+    never new. ``fixed_leaks`` are base leaks that head no longer proves leaking
+    (isolated now, unverified now, or the table was dropped).
+    """
+    base_by = {t.qualified_name: t for t in base.tables}
+    head_by = {t.qualified_name: t for t in head.tables}
+    new_leaks: list[TableVerdict] = []
+    preexisting: list[TableVerdict] = []
+    new_unverified: list[TableVerdict] = []
+    for t in head.tables:
+        b = base_by.get(t.qualified_name)
+        if t.verdict == "leak":
+            if b is None or b.verdict == "isolated":
+                new_leaks.append(t)
+            else:  # base leaked or was unverifiable → not caused by this change
+                preexisting.append(t)
+        elif t.verdict == "unverified" and (b is None or b.verdict == "isolated"):
+            new_unverified.append(t)
+    fixed = tuple(
+        sorted(
+            name
+            for name, b in base_by.items()
+            if b.verdict == "leak"
+            and (name not in head_by or head_by[name].verdict != "leak")
+        )
+    )
+    return LeakDelta(
+        head.mode,
+        tuple(new_leaks),
+        tuple(preexisting),
+        fixed,
+        tuple(new_unverified),
+    )
+
+
 def _rollup(proofs: list[PolicyProof]) -> Verdict:
     """A table is a leak if any policy leaks; else unverified if any policy is
     unverified; else (every policy proven isolated) isolated."""
@@ -769,56 +837,125 @@ def _summary_line(v: Verification) -> str:
     )
 
 
+def _verdict_detail(t: TableVerdict, mode: Mode) -> str:
+    """The DETAIL cell for a table verdict — the witness phrase (leak), the
+    abstain reason (unverified), or the no-read note (isolated)."""
+    if t.verdict == "leak":
+        leak = next((p for p in t.proofs if p.verdict == "leak"), None)
+        detail = _witness_phrase(leak.witness if leak else None, mode)
+        if t.note:  # escalation carries the reach path here (else None)
+            detail = f"{detail} — {t.note}"
+        return detail
+    if t.verdict == "unverified":
+        return next(
+            (p.reason for p in t.proofs if p.verdict == "unverified" and p.reason),
+            t.note or "no claim",
+        )
+    return t.note or _NO_READ_DETAIL[mode]
+
+
 def render_text(v: Verification) -> str:
     if not v.tables:
         if v.mode == "escalation":
             return "No reachable escalation paths to verify."
         return "No RLS-enabled tables to verify."
     headers = ("TABLE", "VERDICT", "DETAIL")
-    rows = []
-    for t in v.tables:
-        if t.verdict == "leak":
-            leak = next((p for p in t.proofs if p.verdict == "leak"), None)
-            detail = _witness_phrase(leak.witness if leak else None, v.mode)
-            if t.note:  # escalation carries the reach path here (else None)
-                detail = f"{detail} — {t.note}"
-        elif t.verdict == "unverified":
-            reason = next(
-                (p.reason for p in t.proofs if p.verdict == "unverified" and p.reason),
-                t.note or "no claim",
-            )
-            detail = reason
-        else:
-            detail = t.note or _NO_READ_DETAIL[v.mode]
-        rows.append((safe_location(t.qualified_name), _VERDICT_LABEL[t.verdict], detail))
+    rows = [
+        (
+            safe_location(t.qualified_name),
+            _VERDICT_LABEL[t.verdict],
+            _verdict_detail(t, v.mode),
+        )
+        for t in v.tables
+    ]
     out = render_text_table(headers, rows)
     out.append("")
     out.append(_summary_line(v))
     return "\n".join(out)
 
 
+def _table_json(t: TableVerdict, mode: Mode) -> dict[str, object]:
+    """One table's verdict as a JSON-serializable dict (shared by ``render_json``
+    and the ``--against`` delta renderer)."""
+    return {
+        "table": t.qualified_name,
+        "verdict": t.verdict,
+        "note": t.note,
+        "policies": [
+            {
+                "policy": p.policy,
+                "verdict": p.verdict,
+                "witness": p.witness,
+                "witness_scope": _witness_scope(p.verdict, p.witness, mode),
+                "reason": p.reason,
+            }
+            for p in t.proofs
+        ],
+    }
+
+
 def render_json(v: Verification) -> str:
     payload = {
         "mode": v.mode,
         "summary": v.summary,
-        "tables": [
-            {
-                "table": t.qualified_name,
-                "verdict": t.verdict,
-                "note": t.note,
-                "policies": [
-                    {
-                        "policy": p.policy,
-                        "verdict": p.verdict,
-                        "witness": p.witness,
-                        "witness_scope": _witness_scope(p.verdict, p.witness, v.mode),
-                        "reason": p.reason,
-                    }
-                    for p in t.proofs
-                ],
-            }
-            for t in v.tables
+        "tables": [_table_json(t, v.mode) for t in v.tables],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def render_delta_text(delta: LeakDelta) -> str:
+    """Human report for ``verify --against`` — which leaks this change
+    introduced, which pre-existed, which it fixed."""
+    out = [f"pgrls verify --against  (mode: {delta.mode})", ""]
+    if delta.new_leaks:
+        out.append(f"NEW leaks introduced by this change ({len(delta.new_leaks)}):")
+        rows = [
+            (safe_location(t.qualified_name), _verdict_detail(t, delta.mode))
+            for t in delta.new_leaks
+        ]
+        out.extend(render_text_table(("TABLE", "DETAIL"), rows))
+    else:
+        out.append("No new leaks introduced by this change.")
+    out.append("")
+    if delta.new_unverified:
+        names = ", ".join(safe_location(t.qualified_name) for t in delta.new_unverified)
+        out.append(
+            f"Newly unverified (was proven isolated) "
+            f"({len(delta.new_unverified)}): {names}"
+        )
+    if delta.preexisting_leaks:
+        names = ", ".join(
+            safe_location(t.qualified_name) for t in delta.preexisting_leaks
+        )
+        out.append(
+            f"Pre-existing leaks, not from this change "
+            f"({len(delta.preexisting_leaks)}): {names}"
+        )
+    if delta.fixed_leaks:
+        out.append(
+            f"Leaks fixed by this change ({len(delta.fixed_leaks)}): "
+            f"{', '.join(delta.fixed_leaks)}"
+        )
+    s = delta.summary
+    out.append("")
+    out.append(
+        f"{s['new_leaks']} new, {s['preexisting_leaks']} pre-existing, "
+        f"{s['fixed_leaks']} fixed."
+    )
+    return "\n".join(out)
+
+
+def render_delta_json(delta: LeakDelta) -> str:
+    payload = {
+        "mode": delta.mode,
+        "against": True,
+        "summary": delta.summary,
+        "new_leaks": [_table_json(t, delta.mode) for t in delta.new_leaks],
+        "preexisting_leaks": [
+            _table_json(t, delta.mode) for t in delta.preexisting_leaks
         ],
+        "fixed_leaks": list(delta.fixed_leaks),
+        "new_unverified": [_table_json(t, delta.mode) for t in delta.new_unverified],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 

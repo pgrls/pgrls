@@ -28,9 +28,14 @@ from pgrls.model import (
     View,
 )
 from pgrls.verify import (
+    PolicyProof,
+    TableVerdict,
     Verification,
     _witness_phrase,
     build_verification,
+    diff_verifications,
+    render_delta_json,
+    render_delta_text,
     render_json,
     render_sarif,
     render_text,
@@ -2170,3 +2175,175 @@ def test_escalation_secdef_leak_renders_in_text_and_sarif() -> None:
     assert len(notes) == 1 and "opaque_fn" in json.dumps(notes[0])
     defined = {r["id"] for r in strict["tool"]["driver"]["rules"]}
     assert all(r["ruleId"] in defined for r in strict["results"])
+
+
+# --- verify --against : leak diff / "no new provable leak" PR gate ----------
+
+
+def _iso_schema() -> Schema:
+    return Schema(
+        tables=(_table("docs", policies=(_policy("tenant_id = auth.uid()", command="SELECT"),)),)
+    )
+
+
+def _leak_schema() -> Schema:
+    return Schema(
+        tables=(
+            _table(
+                "docs",
+                policies=(
+                    _policy(
+                        "auth.uid() IS NULL OR tenant_id = auth.uid()", command="SELECT"
+                    ),
+                ),
+            ),
+        )
+    )
+
+
+@requires_z3
+def test_against_reports_a_newly_introduced_leak() -> None:
+    delta = diff_verifications(
+        build_verification(_iso_schema()), build_verification(_leak_schema())
+    )
+    assert delta.summary == {
+        "new_leaks": 1,
+        "preexisting_leaks": 0,
+        "fixed_leaks": 0,
+        "new_unverified": 0,
+    }
+    assert delta.new_leaks[0].qualified_name == "public.docs"
+
+
+@requires_z3
+def test_against_a_preexisting_leak_is_not_new() -> None:
+    delta = diff_verifications(
+        build_verification(_leak_schema()), build_verification(_leak_schema())
+    )
+    assert delta.summary["new_leaks"] == 0
+    assert delta.summary["preexisting_leaks"] == 1
+
+
+@requires_z3
+def test_against_a_fixed_leak_is_reported() -> None:
+    delta = diff_verifications(
+        build_verification(_leak_schema()), build_verification(_iso_schema())
+    )
+    assert delta.summary["new_leaks"] == 0
+    assert delta.fixed_leaks == ("public.docs",)
+
+
+@requires_z3
+def test_against_a_new_leaking_table_counts_as_new() -> None:
+    # base has no RLS tables; head adds a leaking one → the leak is introduced.
+    base = build_verification(Schema(tables=(_table("unrelated", rls=False),)))
+    delta = diff_verifications(base, build_verification(_leak_schema()))
+    assert delta.summary["new_leaks"] == 1
+
+
+def test_against_base_unverified_is_never_counted_new() -> None:
+    # Soundness: a base that could not be PROVEN isolated is not a baseline —
+    # a head leak there is pre-existing, never attributed to the change.
+    base = Verification(
+        (
+            TableVerdict(
+                "public.docs",
+                "unverified",
+                None,
+                (PolicyProof("p", "unverified", None, "outside fragment"),),
+            ),
+        ),
+        "anon",
+    )
+    head = Verification(
+        (TableVerdict("public.docs", "leak", None, (PolicyProof("p", "leak", {}, None),)),),
+        "anon",
+    )
+    delta = diff_verifications(base, head)
+    assert delta.summary["new_leaks"] == 0
+    assert delta.summary["preexisting_leaks"] == 1
+
+
+def test_against_isolated_to_unverified_is_new_unverified() -> None:
+    base = Verification((TableVerdict("public.docs", "isolated", None, ()),), "anon")
+    head = Verification(
+        (
+            TableVerdict(
+                "public.docs", "unverified", None, (PolicyProof("p", "unverified", None, "r"),)
+            ),
+        ),
+        "anon",
+    )
+    delta = diff_verifications(base, head)
+    assert delta.summary["new_unverified"] == 1
+    assert delta.summary["new_leaks"] == 0
+
+
+@requires_z3
+def test_render_delta_text_flags_new_and_clean() -> None:
+    dirty = render_delta_text(
+        diff_verifications(
+            build_verification(_iso_schema()), build_verification(_leak_schema())
+        )
+    )
+    assert "NEW leaks introduced" in dirty and "public.docs" in dirty
+    clean = render_delta_text(
+        diff_verifications(
+            build_verification(_iso_schema()), build_verification(_iso_schema())
+        )
+    )
+    assert "No new leaks introduced" in clean
+
+
+@requires_z3
+def test_render_delta_json_shape() -> None:
+    d = json.loads(
+        render_delta_json(
+            diff_verifications(
+                build_verification(_leak_schema()), build_verification(_iso_schema())
+            )
+        )
+    )
+    assert d["against"] is True
+    assert d["mode"] == "anon"
+    assert d["fixed_leaks"] == ["public.docs"]
+    assert d["summary"]["new_leaks"] == 0
+
+
+@requires_z3
+def test_verify_against_cli_new_leak_exits_one(tmp_path, monkeypatch) -> None:
+    # End-to-end CLI glue, offline: head is the live schema (monkeypatched),
+    # base is a committed snapshot. A newly-introduced leak exits 1.
+    from pgrls import cli
+    from pgrls.config import load_config
+
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps(_iso_schema().to_snapshot()), encoding="utf-8")
+    cfg = load_config(None)
+    monkeypatch.setattr(
+        cli, "_connect_and_introspect", lambda **kw: (cfg, _leak_schema())
+    )
+    result = CliRunner().invoke(
+        main, ["verify", "--database-url", "postgres://x", "--against", str(base)]
+    )
+    assert result.exit_code == 1, result.output
+    assert "NEW leaks" in result.output and "public.docs" in result.output
+
+
+@requires_z3
+def test_verify_against_cli_no_new_leak_exits_zero(tmp_path, monkeypatch) -> None:
+    # Base already leaks; head leaks the same → nothing NEW → gate passes (0).
+    from pgrls import cli
+    from pgrls.config import load_config
+
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps(_leak_schema().to_snapshot()), encoding="utf-8")
+    cfg = load_config(None)
+    monkeypatch.setattr(
+        cli, "_connect_and_introspect", lambda **kw: (cfg, _leak_schema())
+    )
+    result = CliRunner().invoke(
+        main, ["verify", "--database-url", "postgres://x", "--against", str(base)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "No new leaks introduced" in result.output

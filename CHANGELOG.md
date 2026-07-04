@@ -10,6 +10,19 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pgrls verify --against BASE`** — the "no new provable leak" PR gate. Verify
+  the live schema, then compare against a baseline (`BASE` is a committed `pgrls
+  snapshot` JSON or a DB URL) and report only the leaks *this change introduced*:
+  a table proven `ISOLATED` in `BASE` (or absent from it) that the head now
+  proves `LEAK`. Exits non-zero **only** on a newly-introduced leak — pre-existing
+  leaks don't fail the gate — so a team can adopt `verify` in CI without first
+  clearing its whole backlog. A `BASE` table that was `UNVERIFIED` is never
+  counted as newly-leaking (soundness: a leak is attributed to the change only
+  when the base *proved* isolation). Works with every `--mode`; `--format
+  text`/`json`/`sarif` (SARIF carries only the new leaks). The text/JSON report
+  also lists leaks the change *fixed*.
+
 ### Changed
 - **PERF001** now also flags — and `pgrls fix` wraps — an auth-function call
   nested inside a **correlated** subquery, the common RLS membership pattern
