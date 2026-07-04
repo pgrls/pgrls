@@ -781,19 +781,25 @@ introspects, and exits non-zero if any rule at or above
 
 ### pre-commit
 
+Two [pre-commit](https://pre-commit.com) hooks are published from this repo. `pgrls-lint-sql` analyzes raw DDL with **no database** — it runs at commit time with no Docker and no connection, so it's the usual choice — while `pgrls-lint` targets a live database (scope it to `pre-push`). Both reason over your *whole* schema, so point them at the source with `args` rather than relying on changed-file paths.
+
 ```yaml
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.5.7
+    rev: v0.47.0
     hooks:
+      # Offline — lints raw DDL, no database. Repeat --sql-file for several
+      # files (declare tables before the policies that reference them), or
+      # use --snapshot for a committed `pgrls snapshot`.
+      - id: pgrls-lint-sql
+        args: ["--sql-file", "schema.sql", "--fail-on", "error"]
+      # Live database — needs a reachable DB, so most teams use pre-push.
+      # $DATABASE_URL is read from the environment (don't pass it in args —
+      # pre-commit does not expand shell variables there).
       - id: pgrls-lint
-        # pgrls hits a real database, so most teams scope this to
-        # `pre-push` rather than every commit.
         stages: [pre-push]
-        args:
-          - --database-url=$DATABASE_URL
-          - --config=pgrls.toml
+        args: ["--config", "pgrls.toml"]
 ```
 
 ### GitHub Actions

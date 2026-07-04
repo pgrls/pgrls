@@ -11,6 +11,7 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Added
+<<<<<<< HEAD
 - **`pgrls verify --against BASE`** — the "no new provable leak" PR gate. Verify
   the live schema, then compare against a baseline (`BASE` is a committed `pgrls
   snapshot` JSON or a DB URL) and report only the leaks *this change introduced*:
@@ -34,6 +35,13 @@ breaking changes — they will be called out in this file.
   leaks; a `FOR UPDATE`-only leak is skipped (not mis-reproduced by an INSERT).
   `--mode escalation --emit-repro` now points to `--probe` (the SET-ROLE chain
   has no static reproduction).
+- **pre-commit**: a second published hook, **`pgrls-lint-sql`**, lints raw DDL
+  **offline** (`--sql-file` / `--snapshot`) — so pgrls now runs as a *commit-time*
+  pre-commit hook with no Docker and no database, not only the live-DB
+  `pgrls-lint` (which stays for `pre-push`). Both are whole-schema
+  (`pass_filenames: false`). Refreshed the stale README example (bumped `rev`,
+  dropped the non-expanding `--database-url=$DATABASE_URL` arg — `$DATABASE_URL`
+  is read from the environment).
 
 ### Changed
 - **PERF001** now also flags — and `pgrls fix` wraps — an auth-function call
