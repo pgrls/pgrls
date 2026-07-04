@@ -11,7 +11,6 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Added
-<<<<<<< HEAD
 - **`pgrls verify --against BASE`** — the "no new provable leak" PR gate. Verify
   the live schema, then compare against a baseline (`BASE` is a committed `pgrls
   snapshot` JSON or a DB URL) and report only the leaks *this change introduced*:
@@ -44,6 +43,16 @@ breaking changes — they will be called out in this file.
   is read from the environment).
 
 ### Changed
+- **`pgrls verify` now composes restrictive floors into the proof.** A leaking
+  permissive policy on a table that also carries a `RESTRICTIVE` policy was
+  previously reported `UNVERIFIED` ("floors not combined in v1"). The prover now
+  re-proves `permissive ∧ (all restrictive)` — a row is visible only if it
+  satisfies *some* permissive **and** *all* restrictive policies — and returns a
+  real verdict: `ISOLATED` when the floor provably blocks the leaking row,
+  `LEAK` when it doesn't (only a floor predicate outside the decidable fragment,
+  or a `cross-tenant`/`write` floor the prover can't reduce to a scoping
+  equality, stays `UNVERIFIED`). Live-validated against real Postgres RLS. No
+  new false PROVEN/LEAK — soundness unchanged; strictly fewer abstains.
 - **PERF001** now also flags — and `pgrls fix` wraps — an auth-function call
   nested inside a **correlated** subquery, the common RLS membership pattern
   `EXISTS (SELECT 1 FROM members m WHERE m.org_id = t.org_id AND m.user_id =

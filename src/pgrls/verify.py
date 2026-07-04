@@ -176,6 +176,18 @@ def _checked_ast(policy: Policy, mode: Mode) -> Any:
     write-check for ``write``, else the policy's ``USING``."""
     return effective_write_check(policy) if mode == "write" else policy.using_ast
 
+
+def _compose_with_floor(permissive: Any, floor_asts: list[Any]) -> Any:
+    """AND a permissive policy's predicate with the table's restrictive-floor
+    predicates. A row is visible only if it satisfies (*some* permissive) AND
+    (*all* restrictive), so proving ``permissive AND floor_1 AND … AND floor_k``
+    decides whether the restrictive floor blocks that permissive policy's leak —
+    reusing the same single-predicate prover on the composed AST."""
+    from pglast.ast import BoolExpr  # noqa: PLC0415
+    from pglast.enums import BoolExprType  # noqa: PLC0415
+
+    return BoolExpr(boolop=BoolExprType.AND_EXPR, args=(permissive, *floor_asts))
+
 # SARIF rule descriptor metadata for the prover, one per `--mode`. A given run
 # is single-mode, so only the active id ever appears in `tool.driver.rules`.
 # These are the *prover's* rule ids — deliberately NOT the lint catalog's
@@ -389,16 +401,48 @@ def build_verification(
                 continue
             verdict, witness = prove(ast, auth_functions)
             if verdict == "leak" and has_restrictive_floor:
-                # A restrictive floor may block this row; v1 does not combine
-                # floors, so neither verdict is sound → no claim.
-                proofs.append(
-                    PolicyProof(
-                        policy.name,
-                        "unverified",
-                        None,
-                        f"restrictive {floor_kind} floor not combined in v1",
+                # Compose the leaking permissive policy with the table's
+                # restrictive floor (a row is visible only if it satisfies some
+                # permissive AND all restrictive) and re-prove: the floor may
+                # block the leaking row (→ isolated) or not (→ the leak stands).
+                floor_asts = [
+                    _checked_ast(r, mode) for r in relevant if not r.permissive
+                ]
+                if any(fa is None for fa in floor_asts):
+                    # A floor whose predicate can't be modeled → can't compose
+                    # soundly → no claim (never a possibly-wrong verdict).
+                    proofs.append(
+                        PolicyProof(
+                            policy.name,
+                            "unverified",
+                            None,
+                            f"restrictive {floor_kind} floor predicate could not "
+                            "be modeled",
+                        )
                     )
-                )
+                else:
+                    c_verdict, c_witness = prove(
+                        _compose_with_floor(ast, floor_asts), auth_functions
+                    )
+                    if c_verdict == "leak":
+                        proofs.append(
+                            PolicyProof(policy.name, "leak", c_witness, None)
+                        )
+                    elif c_verdict == "isolated":
+                        # The restrictive floor provably blocks the leaking row.
+                        proofs.append(
+                            PolicyProof(policy.name, "isolated", None, None)
+                        )
+                    else:
+                        proofs.append(
+                            PolicyProof(
+                                policy.name,
+                                "unverified",
+                                None,
+                                f"restrictive {floor_kind} floor predicate is "
+                                "outside the decidable fragment",
+                            )
+                        )
             elif verdict == "leak":
                 proofs.append(PolicyProof(policy.name, "leak", witness, None))
             elif verdict == "unverified":
@@ -414,7 +458,7 @@ def build_verification(
                 proofs.append(PolicyProof(policy.name, "isolated", None, None))
 
         note = (
-            f"restrictive {floor_kind} floor present — not combined in v1"
+            f"restrictive {floor_kind} floor composed into the proof"
             if has_restrictive_floor
             else None
         )

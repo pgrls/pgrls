@@ -319,9 +319,11 @@ def test_any_array_over_a_column_stays_unverified() -> None:
 
 
 @requires_z3
-def test_restrictive_floor_downgrades_leak_to_unverified() -> None:
-    # A permissive leak + a restrictive read floor: v1 cannot soundly combine,
-    # so it makes no claim rather than a possibly-wrong leak.
+def test_restrictive_floor_that_does_not_block_the_leak_is_proven_leak() -> None:
+    # Composition: `USING (true)` leaks, and the restrictive floor
+    # `tenant_id IS NOT NULL` does NOT block an anon read of a non-null-tenant
+    # row — so `true AND tenant_id IS NOT NULL` is a proven LEAK (was UNVERIFIED
+    # before the floor was composed into the proof).
     schema = Schema(
         tables=(
             _table(
@@ -334,8 +336,52 @@ def test_restrictive_floor_downgrades_leak_to_unverified() -> None:
         )
     )
     v = build_verification(schema)
-    assert _verdict(v, "public.t") == "unverified"
-    assert not v.has_leak  # the floor downgrade must not count as a leak
+    assert _verdict(v, "public.t") == "leak"
+    assert v.has_leak
+
+
+@requires_z3
+def test_restrictive_floor_that_blocks_the_leak_is_proven_isolated() -> None:
+    # Composition: `USING (true)` leaks in isolation, but a restrictive
+    # `USING (false)` floor blocks every row — so `true AND false` is UNSAT and
+    # the table is proven ISOLATED (was UNVERIFIED before composition).
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("true", name="perm"),
+                    _policy("false", name="floor", permissive=False),
+                ),
+            ),
+        )
+    )
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "isolated"
+    assert not v.has_leak
+
+
+@requires_z3
+def test_restrictive_scoping_floor_blocks_the_anon_leak() -> None:
+    # A permissive anon leak (`is_public OR tenant_id = auth.uid()`) that a
+    # restrictive tenant-scoping floor (`tenant_id = auth.uid()`) closes: under
+    # anon, auth.uid() is NULL so the floor is false, so the composed predicate
+    # is unsatisfiable → ISOLATED.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("is_public OR tenant_id = auth.uid()", name="perm"),
+                    _policy(
+                        "tenant_id = auth.uid()", name="floor", permissive=False
+                    ),
+                ),
+            ),
+        )
+    )
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "isolated"
 
 
 @requires_z3
@@ -1180,10 +1226,13 @@ def test_write_missing_ast_on_update_is_unverified() -> None:
 
 
 @requires_z3
-def test_write_restrictive_floor_downgrades_leak_to_unverified() -> None:
-    # A permissive unscoped write-check + a restrictive scoped write floor: v1
-    # does not combine floors, so the would-be leak is downgraded to unverified
-    # with the write-floor note.
+def test_write_restrictive_floor_composed_but_prover_abstains() -> None:
+    # A permissive unscoped write-check + a restrictive scoped write floor: the
+    # floor IS composed into the proof, but the cross-tenant WRITE prover needs a
+    # single `<column> = <session identity>` scoping equality and can't extract
+    # one from the composed `true AND tenant_id = auth.uid()` — so it abstains
+    # (unverified). Sound: no possibly-wrong verdict, and the note reflects that
+    # composition was attempted.
     schema = Schema(
         tables=(
             _table(
@@ -1204,7 +1253,7 @@ def test_write_restrictive_floor_downgrades_leak_to_unverified() -> None:
     v = _wr(schema)
     [t] = v.tables
     assert t.verdict == "unverified"
-    assert t.note == "restrictive write floor present — not combined in v1"
+    assert t.note == "restrictive write floor composed into the proof"
 
 
 @requires_z3
@@ -2347,3 +2396,53 @@ def test_verify_against_cli_no_new_leak_exits_zero(tmp_path, monkeypatch) -> Non
     )
     assert result.exit_code == 0, result.output
     assert "No new leaks introduced" in result.output
+
+
+@requires_docker
+@requires_z3
+def test_restrictive_floor_composition_matches_postgres(pg_url: str) -> None:
+    # Soundness of the whole-table composition: the composed permissive ∧
+    # restrictive verdict must match what a real anonymous session actually
+    # sees — a blocking floor → ISOLATED (0 rows), a non-blocking one → LEAK.
+    cases = [
+        ("USING (true)", "USING (false)", "isolated"),
+        ("USING (true)", "USING (tenant_id IS NOT NULL)", "leak"),
+        (
+            "USING (is_public OR tenant_id = auth.uid())",
+            "USING (tenant_id = auth.uid())",
+            "isolated",
+        ),
+    ]
+    for perm, floor, expected in cases:
+        with psycopg.connect(pg_url, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS t CASCADE;")
+            cur.execute(_AUTH_STUB)
+            cur.execute(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE "
+                "rolname='anon') THEN CREATE ROLE anon NOLOGIN NOSUPERUSER "
+                "NOBYPASSRLS; END IF; END $$;"
+            )
+            cur.execute("CREATE TABLE t (id int, tenant_id uuid, is_public boolean);")
+            cur.execute("GRANT SELECT ON t TO anon;")
+            cur.execute(
+                "ALTER TABLE t ENABLE ROW LEVEL SECURITY;"
+                "ALTER TABLE t FORCE ROW LEVEL SECURITY;"
+            )
+            cur.execute(f"CREATE POLICY perm ON t FOR SELECT TO anon {perm};")
+            cur.execute(
+                f"CREATE POLICY floor ON t AS RESTRICTIVE FOR SELECT TO anon {floor};"
+            )
+            cur.execute("INSERT INTO t VALUES (1, gen_random_uuid(), true);")
+            schema = introspect(conn, schemas=["public"])
+        verdict = _verdict(build_verification(schema), "public.t")
+        assert verdict == expected, f"{perm} + {floor}: pgrls proved {verdict}"
+        # ...and it must match what a live anonymous session sees (rolled back).
+        with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL ROLE anon;")
+            cur.execute("SELECT count(*) FROM t;")
+            observed = "leak" if cur.fetchone()[0] else "isolated"
+            conn.rollback()
+        assert verdict == observed, (
+            f"{perm} + {floor}: pgrls={verdict} but a live anon session saw "
+            f"{observed} — the composition is unsound"
+        )
