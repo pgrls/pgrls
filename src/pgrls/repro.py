@@ -381,12 +381,21 @@ def _common_setup(
     policy: Policy,
     repro_table: str,
     auth_functions: set[str],
+    *,
+    for_write: bool = False,
 ) -> tuple[list[str], str]:
-    """The setup statements shared by the anon and cross-tenant reproductions —
-    everything up to (but not including) the INSERT: the auth-function stubs, a
-    NOSUPERUSER/NOBYPASSRLS runner role, the throwaway table, its SELECT grant,
-    ENABLE/FORCE RLS, and the leaking policy. Returns ``(setup, runner)``; each
-    builder appends its own INSERT, session establishment, and SET ROLE."""
+    """The setup statements shared by the anon, cross-tenant, and write
+    reproductions — everything up to (but not including) the leak action: the
+    auth-function stubs, a NOSUPERUSER/NOBYPASSRLS runner role, the throwaway
+    table, its grant, ENABLE/FORCE RLS, and the leaking policy. Returns
+    ``(setup, runner)``; each builder appends its own row/INSERT, session
+    establishment, and SET ROLE.
+
+    ``for_write`` recreates the *actual* write policy (its effective ``WITH
+    CHECK``, or the ``USING`` a ``FOR ALL`` reuses as the new-row check) with an
+    ``INSERT`` grant, so the write reproduction's cross-tenant INSERT is decided
+    by the real check; the default recreates a ``FOR SELECT`` read policy with a
+    ``SELECT`` grant."""
     qtbl = quote_ident(repro_table)
     roles = _policy_roles(policy)
     non_public = [r for r in roles if not _is_public(r)]
@@ -432,29 +441,52 @@ def _common_setup(
     grant_to = ", ".join(
         "PUBLIC" if _is_public(r) else quote_ident(r) for r in grant_roles
     )
-    setup.append(f"GRANT SELECT ON {qtbl} TO {grant_to};")
+    # The write reproduction needs INSERT (to attempt the cross-tenant write);
+    # the read reproductions need SELECT (to observe the leaked row).
+    setup.append(
+        f"GRANT {'INSERT' if for_write else 'SELECT'} ON {qtbl} TO {grant_to};"
+    )
     setup.append(f"ALTER TABLE {qtbl} ENABLE ROW LEVEL SECURITY;")
     setup.append(f"ALTER TABLE {qtbl} FORCE ROW LEVEL SECURITY;")
 
     to_clause = ", ".join(
         "PUBLIC" if _is_public(r) else quote_ident(r) for r in roles
     )
-    setup.append(
-        f"CREATE POLICY {quote_ident(policy.name)} ON {qtbl}\n"
-        f"    FOR SELECT TO {to_clause}\n"
-        f"    USING ({policy.using_sql});"
-    )
+    if for_write:
+        # Recreate the actual write policy so its effective WITH CHECK (or the
+        # USING a FOR ALL / FOR UPDATE reuses as the new-row check) decides the
+        # cross-tenant INSERT. FOR INSERT takes no USING clause.
+        command = (policy.command or "ALL").upper()
+        clauses: list[str] = []
+        if policy.using_sql and command != "INSERT":
+            clauses.append(f"    USING ({policy.using_sql})")
+        if policy.with_check_sql:
+            clauses.append(f"    WITH CHECK ({policy.with_check_sql})")
+        setup.append(
+            f"CREATE POLICY {quote_ident(policy.name)} ON {qtbl}\n"
+            f"    FOR {command} TO {to_clause}\n" + "\n".join(clauses) + ";"
+        )
+    else:
+        setup.append(
+            f"CREATE POLICY {quote_ident(policy.name)} ON {qtbl}\n"
+            f"    FOR SELECT TO {to_clause}\n"
+            f"    USING ({policy.using_sql});"
+        )
     return setup, runner
+
+
+def _insert_stmt(qtbl: str, row: list[tuple[str, str]]) -> str:
+    """The INSERT for a row (or ``DEFAULT VALUES`` when the proof pinned none)."""
+    if row:
+        cols_sql = ", ".join(quote_ident(n) for n, _ in row)
+        vals_sql = ", ".join(v for _, v in row)
+        return f"INSERT INTO {qtbl} ({cols_sql}) VALUES ({vals_sql});"
+    return f"INSERT INTO {qtbl} DEFAULT VALUES;"
 
 
 def _insert_row(setup: list[str], qtbl: str, row: list[tuple[str, str]]) -> None:
     """Append the INSERT for the leaking row (or DEFAULT VALUES when empty)."""
-    if row:
-        cols_sql = ", ".join(quote_ident(n) for n, _ in row)
-        vals_sql = ", ".join(v for _, v in row)
-        setup.append(f"INSERT INTO {qtbl} ({cols_sql}) VALUES ({vals_sql});")
-    else:
-        setup.append(f"INSERT INTO {qtbl} DEFAULT VALUES;")
+    setup.append(_insert_stmt(qtbl, row))
 
 
 def _build_statements(
@@ -693,11 +725,70 @@ def _build_cross_tenant_statements(
     return setup, leak_query, unpinned, null_fallback, id_caveat
 
 
+def _build_write_statements(
+    table: Table,
+    policy: Policy,
+    witness: dict[str, object],
+    repro_table: str,
+    auth_functions: set[str],
+    session: tuple[str, str],
+) -> tuple[list[str], str, list[str], list[str], str | None]:
+    """(setup, leak_query, unpinned, null_columns, identity_caveat) for the WRITE
+    reproduction. `session` is (discriminator column, session-auth SQL). The
+    session is authenticated as tenant A and attempts to INSERT a row stamped for
+    a DIFFERENT tenant B, which the leaking policy's effective ``WITH CHECK``
+    admits. The leak signal is the INSERT being *admitted* (no RLS 42501
+    rejection) — NOT a returned row: RLS hides ``RETURNING`` even for an admitted
+    write, so the pytest observes the write succeeding, not reading it back."""
+    qtbl = quote_ident(repro_table)
+    setup, runner = _common_setup(
+        table, policy, repro_table, auth_functions, for_write=True
+    )
+    disc_col, auth_sql = session
+    disc = _column_map(table).get(disc_col)
+    disc_type = disc.data_type if disc is not None else "text"
+    # B is the row we try to stamp (synthesized for the COLUMN type so the INSERT
+    # parses); A is the session's tenant (synthesized for the IDENTITY type the
+    # auth stub casts the GUC to). Kept distinct so a FIXED WITH CHECK rejects it.
+    b_val = _tenant_b_value(disc_type, witness.get(disc_col))
+    a_val = _session_a_value(_identity_value_type(auth_sql) or disc_type, b_val)
+
+    row_witness = {k: v for k, v in witness.items() if k != disc_col}
+    if disc is not None:
+        row_witness[disc_col] = b_val
+    row, unpinned, null_fallback = _row_columns(table, row_witness)
+
+    # Become an authenticated session whose tenant is A, then drop into the
+    # non-superuser runner so FORCE RLS + the policy's WITH CHECK decide whether
+    # the cross-tenant INSERT is admitted.
+    id_stmts, id_caveat = _session_identity_setup(auth_sql, str(a_val))
+    setup.extend(id_stmts)
+    setup.append(f"SET LOCAL ROLE {quote_ident(runner)};")
+
+    leak_query = _insert_stmt(qtbl, row)
+    if disc is None:
+        id_caveat = (
+            f"discriminator column {disc_col} is not in the table's columns; "
+            "the INSERT may not stamp a distinct tenant — hand-edit it"
+        )
+    return setup, leak_query, unpinned, null_fallback, id_caveat
+
+
 def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
 def _witness_phrase(witness: dict[str, object] | None, mode: str = "anon") -> str:
+    if mode == "write":
+        if witness is None:
+            return (
+                "a conditional cross-tenant write — the proof could not isolate a "
+                "single row, so the synthesized INSERT may not reproduce it"
+            )
+        if not witness:
+            return "a row stamped for any other tenant can be written"
+        pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
+        return f"a row stamped for another tenant with {pairs} can be written"
     if mode == "cross-tenant":
         if witness is None:
             return (
@@ -795,15 +886,23 @@ def build_repro(
         stem = _compute_stem(table.schema, table.name, policy.name)
     repro_table = f"repro_{table.name}"
 
-    if mode == "cross-tenant" and session is None:
+    if mode in ("cross-tenant", "write") and session is None:
         raise ValueError(
-            "build_repro(mode='cross-tenant') requires session — the "
+            f"build_repro(mode={mode!r}) requires session — the "
             "(discriminator, session-auth SQL) pair from "
             "cross_tenant_session_identity()."
         )
     is_xt = mode == "cross-tenant"
+    is_write = mode == "write"
     id_caveat: str | None = None
-    if is_xt:
+    if is_write:
+        assert session is not None  # the guard above ensures this
+        setup, leak_query, unpinned, null_fallback, id_caveat = (
+            _build_write_statements(
+                table, policy, witness or {}, repro_table, stub_auth, session
+            )
+        )
+    elif is_xt:
         assert session is not None  # the guard above ensures this
         setup, leak_query, unpinned, null_fallback, id_caveat = (
             _build_cross_tenant_statements(
@@ -815,23 +914,37 @@ def build_repro(
             table, policy, witness or {}, repro_table, stub_auth
         )
 
-    kind = "cross-tenant" if is_xt else "anonymous-read"
-    kind_article = "a" if is_xt else "an"  # "a cross-tenant" / "an anonymous-read"
-    test_suffix = "cross_tenant_leak" if is_xt else "anon_leak"
-    actor = "authenticated tenant-A" if is_xt else "anonymous"
-    session_line = (
-        (
+    if is_write:
+        kind = "cross-tenant write"
+        kind_article = "a"
+        test_suffix = "write_leak"
+        actor = "authenticated tenant-A"
+        session_line = (
+            "-- The INSERT runs as a non-superuser session authenticated as tenant\n"
+            "-- A and stamps the row for a DIFFERENT tenant — which the policy's\n"
+            "-- WITH CHECK should have rejected. Runs in a throwaway database\n"
+            "-- (everything is rolled back).\n"
+        )
+    elif is_xt:
+        kind = "cross-tenant"
+        kind_article = "a"
+        test_suffix = "cross_tenant_leak"
+        actor = "authenticated tenant-A"
+        session_line = (
             "-- The final SELECT runs as a non-superuser session authenticated as\n"
             "-- tenant A; the row(s) below belong to a DIFFERENT tenant — which RLS\n"
             "-- should have hidden. Runs in a throwaway database (rolled back).\n"
         )
-        if is_xt
-        else (
+    else:
+        kind = "anonymous-read"
+        kind_article = "an"
+        test_suffix = "anon_leak"
+        actor = "anonymous"
+        session_line = (
             "-- The final SELECT runs as an anonymous, non-superuser session and\n"
             "-- returns the row(s) below — which RLS should have hidden. Runs in a\n"
             "-- throwaway database (everything is rolled back).\n"
         )
-    )
 
     custom_auth = _custom_auth_functions(stub_auth)
     caveats = (
@@ -861,7 +974,7 @@ def build_repro(
     if custom_auth:
         stub_desc = (
             "stubbed to read the session tenant (the JWT-claim GUC set above)"
-            if is_xt
+            if is_xt or is_write
             else "stubbed to return NULL"
         )
         caveats += (
@@ -871,26 +984,53 @@ def build_repro(
         )
     if id_caveat:
         caveats += f"-- NOTE: {id_caveat}.\n"
+    if is_write:
+        policy_clause = (
+            f"WITH CHECK ({_one_line(policy.with_check_sql or policy.using_sql or '')})"
+        )
+    else:
+        policy_clause = f"USING ({_one_line(policy.using_sql or '')})"
     header = (
         f"-- pgrls verify --emit-repro: {kind} leak reproduction\n"
         f"-- Table:  {table.qualified_name}\n"
-        f"-- Policy: {policy.name}  USING ({_one_line(policy.using_sql or '')})\n"
+        f"-- Policy: {policy.name}  {policy_clause}\n"
         f"-- Leak:   {_witness_phrase(witness, mode)}\n"
         f"{session_line}"
         f"{caveats}"
+    )
+    leak_comment = (
+        "⇐ LEAK: the INSERT is admitted (WITH CHECK did not reject the "
+        "cross-tenant row)"
+        if is_write
+        else "⇐ LEAK: returns the row"
     )
     sql = (
         header
         + "\nBEGIN;\n\n"
         + "\n".join(setup)
-        + f"\n\n{leak_query}  -- ⇐ LEAK: returns the row\n\nROLLBACK;\n"
+        + f"\n\n{leak_query}  -- {leak_comment}\n\nROLLBACK;\n"
     )
 
     setup_repr = "[\n" + "".join(
         f"    {_py_str(s)},\n" for s in setup
     ) + "]"
     pytest_filename = f"test_{stem}.py"
-    if witness is None:
+    if is_write:
+        if witness is None:
+            assert_doc = (
+                "The test asserts the tenant-A session's INSERT of a tenant-B row is\n"
+                "ADMITTED. NOTE: this is a CONDITIONAL leak (see the Leak line above)\n"
+                "— the synthesized row may not satisfy the WITH CHECK, so the test can\n"
+                "fail until you hand-edit it. Everything is rolled back."
+            )
+        else:
+            assert_doc = (
+                "The test asserts the tenant-A session's INSERT of a tenant-B row is\n"
+                "ADMITTED — i.e. it PASSES while the leak exists and FAILS once the\n"
+                "policy's WITH CHECK is fixed (the INSERT is then rejected). Everything\n"
+                "is rolled back."
+            )
+    elif witness is None:
         # A conditional leak: the synthesized placeholder row may not satisfy the
         # predicate, so the test can fail even though the leak is real. Don't
         # claim the crisp PASSES/FAILS contract (mirrors the .sql header caveat).
@@ -906,10 +1046,37 @@ def build_repro(
             "while the leak exists and FAILS once the policy is fixed. Everything is\n"
             "rolled back."
         )
+    if is_write:
+        # The write leak signal is the INSERT being ADMITTED — not a returned row
+        # (RLS hides RETURNING even for an admitted write). A fixed WITH CHECK
+        # rejects the cross-tenant row with SQLSTATE 42501 (InsufficientPrivilege).
+        leak_body = (
+            "            try:\n"
+            "                cur.execute(_LEAK_QUERY)\n"
+            "                admitted = cur.rowcount == 1\n"
+            "            except psycopg.errors.InsufficientPrivilege:\n"
+            "                admitted = False  # WITH CHECK rejected the cross-tenant INSERT\n"
+            "        conn.rollback()\n"
+            "    assert admitted, (\n"
+            '        "cross-tenant write leak did NOT reproduce — the WITH CHECK "\n'
+            '        "rejected the tenant-B INSERT (the policy may already be fixed, "\n'
+            '        "or the reproduction needs a hand-edit)."\n'
+            "    )"
+        )
+    else:
+        leak_body = (
+            "            cur.execute(_LEAK_QUERY)\n"
+            "            rows = cur.fetchall()\n"
+            "        conn.rollback()\n"
+            "    assert rows, (\n"
+            f'        "{kind} leak did NOT reproduce (0 rows) — the policy may "\n'
+            '        "already be fixed, or the reproduction needs a hand-edit."\n'
+            "    )"
+        )
     pytest = f'''"""Reproduction of {kind_article} {kind} RLS leak proven by `pgrls verify`.
 
 Table:  {_doc_safe(table.qualified_name)}
-Policy: {_doc_safe(policy.name)}  USING ({_doc_safe(_one_line(policy.using_sql or ''))})
+Policy: {_doc_safe(policy.name)}  {_doc_safe(policy_clause)}
 Leak:   {_doc_safe(_witness_phrase(witness, mode))}
 
 Run against a throwaway Postgres:
@@ -936,13 +1103,7 @@ def test_{stem}_{test_suffix}() -> None:
         with conn.cursor() as cur:
             for stmt in _SETUP:
                 cur.execute(stmt)
-            cur.execute(_LEAK_QUERY)
-            rows = cur.fetchall()
-        conn.rollback()
-    assert rows, (
-        "{kind} leak did NOT reproduce (0 rows) — the policy may "
-        "already be fixed, or the reproduction needs a hand-edit."
-    )
+{leak_body}
 '''
     return ReproArtifact(
         stem=stem,
@@ -974,7 +1135,11 @@ def emit_repros(
     helper referenced by a policy is stubbed in the reproduction. `mode` selects
     the threat model (must match the verification's): ``"cross-tenant"`` derives
     each leak's ``(discriminator, session identity)`` and emits a cross-tenant
-    reproduction; ``"anon"`` (default) emits the anonymous-read reproduction.
+    reproduction; ``"write"`` derives the session from the write policy's
+    ``WITH CHECK`` and emits a cross-tenant-INSERT reproduction (only for
+    INSERT-representable ``FOR INSERT`` / ``FOR ALL`` leaks — a ``FOR UPDATE``
+    /``DELETE``-only leak is skipped, not mis-reproduced by an INSERT);
+    ``"anon"`` (default) emits the anonymous-read reproduction.
     """
     tables = {t.qualified_name: t for t in schema.tables}
     artifacts: list[ReproArtifact] = []
@@ -1000,6 +1165,19 @@ def emit_repros(
                 # mislabeled anon repro for a cross-tenant leak.
                 session = cross_tenant_session_identity(
                     policy.using_ast, auth_functions
+                )
+                if session is None:  # pragma: no cover - leak guarantees a pair
+                    continue
+            elif mode == "write":
+                # The write leak is reproduced as an INSERT stamped for tenant B,
+                # gated by the WITH CHECK (or the USING a FOR ALL reuses as the
+                # new-row check). A FOR UPDATE/DELETE-only leak is not reproduced
+                # by an INSERT, so skip it rather than emit a wrong repro.
+                command = (policy.command or "ALL").upper()
+                if command not in ("INSERT", "ALL"):
+                    continue
+                session = cross_tenant_session_identity(
+                    policy.with_check_ast or policy.using_ast, auth_functions
                 )
                 if session is None:  # pragma: no cover - leak guarantees a pair
                     continue

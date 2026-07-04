@@ -3848,10 +3848,11 @@ def matrix(
     default=None,
     help=(
         "For each LEAK, write a runnable reproduction (a .sql script and a "
-        "pytest) to this directory — recreating the table + policy, inserting "
-        "the counterexample row, and SELECTing it back as an anonymous (anon) "
-        "or different-tenant (cross-tenant) session, per --mode. Not supported "
-        "with --mode write (write-side repro is a follow-on)."
+        "pytest) to this directory — recreating the table + policy and "
+        "demonstrating the leak per --mode: reading the counterexample row back "
+        "as an anonymous (anon) or different-tenant (cross-tenant) session, or "
+        "(write) INSERTing a row stamped for another tenant and observing it "
+        "admitted. Not supported with --mode escalation (use --probe)."
     ),
 )
 @click.option(
@@ -3941,11 +3942,13 @@ def verify(
     UNVERIFIED surfaces only under `--strict`), sharing lint's SARIF schema and
     driver block. `--emit-repro DIR`
     writes, for each leak, a runnable `.sql` script and a pytest that recreate
-    the table + policy, insert the counterexample row, and SELECT it back — as
-    an anonymous session (`anon`) or as a session authenticated as a different
-    tenant (`cross-tenant`) — the proof, made reproducible (re-running won't
-    clobber a hand-edited reproduction unless `--force`). See the README for
-    scope.
+    the table + policy and demonstrate the leak per `--mode`: reading the
+    counterexample row back as an anonymous (`anon`) or different-tenant
+    (`cross-tenant`) session, or — `--mode write` — as tenant A INSERTing a row
+    stamped for tenant B and observing it admitted (rejected once the WITH CHECK
+    is fixed). The proof, made reproducible (re-running won't clobber a
+    hand-edited reproduction unless `--force`). Not supported with `--mode
+    escalation` (use `--probe`). See the README for scope.
 
     `--probe` keeps the static proof honest by confirming it against the LIVE
     database: it connects as the threat-model session, seeds a throwaway row,
@@ -3962,21 +3965,14 @@ def verify(
     """
     if probe and emit_repro_dir is not None:
         raise click.UsageError("run --probe and --emit-repro separately")
-    if mode == "write" and emit_repro_dir is not None:
-        # The repro emitter only knows the anon / cross-tenant read templates;
-        # a write-side repro (set the session tenant, attempt a cross-tenant
-        # INSERT, observe it succeed) is a follow-on. Fail fast rather than
-        # silently emit a wrong (read-shaped) reproduction.
-        raise click.UsageError(
-            "--emit-repro is not supported with --mode write yet "
-            "(write-side reproductions are a follow-on)."
-        )
     if mode == "escalation" and emit_repro_dir is not None:
-        # A SET-ROLE-chain reproduction is Phase 3, not the read/write templates
-        # the emitter knows. Fail fast rather than emit a wrong repro.
+        # The escalation bypass is a SET-ROLE role-reachability chain, not a
+        # single policy predicate the emitter can template; --probe live-confirms
+        # it instead. Fail fast rather than emit a wrong repro.
         raise click.UsageError(
-            "--emit-repro is not supported with --mode escalation yet "
-            "(SET ROLE reproductions are a follow-on)."
+            "--emit-repro is not supported with --mode escalation "
+            "(the SET ROLE chain has no static reproduction template — use "
+            "--probe, which live-confirms the escalation bypass)."
         )
     if against is not None and probe:
         raise click.UsageError(

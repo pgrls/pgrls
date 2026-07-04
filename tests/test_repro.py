@@ -867,3 +867,91 @@ def test_cross_tenant_text_column_auth_uid_fixed_is_sound_live(pg_url: str) -> N
     )
     rows = _run_setup_and_select(pg_url, art)
     assert not rows, "FIXED text-column auth.uid()::text leaked — repro is unsound"
+
+
+# --- write reproduction (--mode write) -------------------------------------
+
+
+def _write_policy(
+    check: str,
+    *,
+    command: str = "INSERT",
+    name: str = "p",
+    roles: tuple[str, ...] = ("authenticated",),
+) -> Policy:
+    return Policy(
+        name=name, command=command, permissive=True, roles=roles,
+        using_sql=None, with_check_sql=check,
+        using_ast=None, with_check_ast=_ast(check),
+    )
+
+
+def _write_repro(check: str, witness: dict, *, command: str = "INSERT"):
+    pol = _write_policy(check, command=command)
+    session = cross_tenant_session_identity(pol.with_check_ast, None)
+    return build_repro(
+        _table(pol, columns=_COLS), pol, witness, session=session, mode="write"
+    )
+
+
+def test_write_sql_recreates_the_write_policy_and_inserts_tenant_b() -> None:
+    art = _write_repro("is_public OR tenant_id = auth.uid()", {"is_public": True})
+    sql = art.sql
+    assert "FOR INSERT TO authenticated" in sql
+    assert "WITH CHECK (is_public OR tenant_id = auth.uid())" in sql
+    assert "GRANT INSERT ON repro_docs" in sql
+    assert "INSERT INTO repro_docs" in sql
+    assert "the INSERT is admitted" in sql
+    assert "SET LOCAL ROLE authenticated;" in sql
+    # header frames the leak as a writable cross-tenant row, not a readable one
+    assert "can be written" in sql
+
+
+def test_write_pytest_asserts_the_insert_is_admitted() -> None:
+    art = _write_repro("is_public OR tenant_id = auth.uid()", {"is_public": True})
+    py = art.pytest
+    assert "except psycopg.errors.InsufficientPrivilege" in py
+    assert "assert admitted" in py
+    assert "_write_leak() -> None" in py
+    pyast.parse(py)  # the generated pytest must be valid Python
+
+
+def test_emit_repros_write_skips_update_only_leak() -> None:
+    # A FOR UPDATE-only write leak is not reproduced by an INSERT — the emitter
+    # skips it rather than emit a wrong (INSERT-shaped) repro.
+    pol = _write_policy("is_public OR tenant_id = auth.uid()", command="UPDATE")
+    schema = Schema(tables=(_table(pol, columns=_COLS),))
+    v = build_verification(schema, mode="write")
+    assert any(t.verdict == "leak" for t in v.tables)  # the leak IS proven
+    assert emit_repros(schema, v, mode="write") == []  # but not reproduced
+
+
+def _run_write_insert(pg_url: str, art) -> bool:
+    inner = art.sql.split("BEGIN;\n\n", 1)[1].rsplit("\n\nROLLBACK;", 1)[0]
+    setup, leak_line = inner.rsplit("\n\n", 1)
+    leak = leak_line.split("  -- ")[0].strip()
+    with psycopg.connect(pg_url) as conn:  # autocommit=False so SET LOCAL applies
+        with conn.cursor() as cur:
+            cur.execute(setup)
+            try:
+                cur.execute(leak)
+                admitted = cur.rowcount == 1
+            except psycopg.errors.InsufficientPrivilege:
+                admitted = False
+        conn.rollback()
+    return admitted
+
+
+@requires_docker
+def test_write_repro_is_sound_live(pg_url: str) -> None:
+    # Soundness: the LEAKING write policy admits the tenant-B INSERT, and a FIXED
+    # WITH CHECK rejects it (SQLSTATE 42501) — run as a NOSUPERUSER/NOBYPASSRLS
+    # runner, so the reproduction is a real proof, not a superuser bypass.
+    leaky = _write_repro("is_public OR tenant_id = auth.uid()", {"is_public": True})
+    fixed = _write_repro("tenant_id = auth.uid()", {})
+    assert _run_write_insert(pg_url, leaky) is True, (
+        "leaking write policy did not reproduce (INSERT was rejected)"
+    )
+    assert _run_write_insert(pg_url, fixed) is False, (
+        "fixed write policy admitted the tenant-B INSERT — the repro is unsound"
+    )
