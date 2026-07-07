@@ -10,6 +10,16 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **SEC049** now honors an **unqualified (bare) table name** in
+  `[lint.rules.SEC049].allowlist`. The allowlist validator accepts both `table`
+  and `schema.table`, but the match compared only against the qualified name, so
+  a bare entry (e.g. `allowlist = ["countries"]`) validated fine yet silently
+  failed to exempt the table — SEC049 kept flagging a table the user had
+  explicitly allowlisted. It now uses the shared `table_in_allowlist` helper
+  (bare name **or** `schema.table`), consistent with the other table-scoped
+  rules (SEC001/SEC002/SEC030/…). No snapshot or configuration-schema change.
+
 ## [0.48.0] - 2026-07-04
 
 ### Added
