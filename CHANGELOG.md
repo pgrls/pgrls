@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-07-04
+
 ### Added
 - **`pgrls verify --against BASE`** — the "no new provable leak" PR gate. Verify
   the live schema, then compare against a baseline (`BASE` is a committed `pgrls
