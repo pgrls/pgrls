@@ -449,10 +449,34 @@ def test_allowlist_exempts_intentionally_public_table() -> None:
     )
 
 
+def test_allowlist_accepts_a_bare_table_name() -> None:
+    # Regression: parse_table_ref_allowlist validates a bare (unqualified)
+    # entry as legal, so the membership test must honor it. It previously
+    # compared against `schema.table` only, silently no-op'ing a bare-name
+    # exemption and leaving the table flagged. Now uses the shared
+    # `table_in_allowlist` helper (bare name OR schema.table), like the
+    # other table-scoped rules.
+    assert (
+        _check(
+            _table(name="countries", grants=_GRANT_ANON),
+            options={"allowlist": ["countries"]},
+        )
+        == []
+    )
+
+
 def test_allowlist_does_not_exempt_a_different_table() -> None:
     [v] = _check(
         _table(name="invoices", grants=_GRANT_ANON),
         options={"allowlist": ["public.countries"]},
+    )
+    assert v.location == "public.invoices"
+
+
+def test_allowlist_bare_name_does_not_exempt_a_different_table() -> None:
+    [v] = _check(
+        _table(name="invoices", grants=_GRANT_ANON),
+        options={"allowlist": ["countries"]},
     )
     assert v.location == "public.invoices"
 

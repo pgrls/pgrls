@@ -44,8 +44,9 @@ Severity: warning. Configurable via ``[lint.rules.SEC049]``:
   it to match ``PGRST_DB_SCHEMAS`` when the API exposes more than ``public``).
 * ``grantees`` — the low-trust role set (default ``["anon", "authenticated",
   "PUBLIC"]``; ``"public"`` is normalised to the ``PUBLIC`` pseudo-role).
-* ``allowlist`` — table ids (``schema.table``) that are intentionally public
-  (e.g. a reference table of countries), exempted from the rule.
+* ``allowlist`` — table ids (unqualified ``table`` or ``schema.table``) that are
+  intentionally public (e.g. a reference table of countries), exempted from the
+  rule.
 
 Scope / known limits (intentional):
 
@@ -68,7 +69,11 @@ from typing import Any
 
 from pgrls.ast_utils import is_literal_true
 from pgrls.model import Policy, Schema, Table
-from pgrls.rules._allowlist import _list_of_strings, parse_table_ref_allowlist
+from pgrls.rules._allowlist import (
+    _list_of_strings,
+    parse_table_ref_allowlist,
+    table_in_allowlist,
+)
 from pgrls.violations import Severity, Violation
 
 # PostgREST exposes a configured set of schemas; its default is `public`.
@@ -183,7 +188,7 @@ class SEC049:
         for table in schema.tables:
             if table.schema not in exposed:
                 continue
-            if table.qualified_name in allowlist:
+            if table_in_allowlist(table, allowlist):
                 continue
             granted = _select_grantees(table, grantees)
             # A granted role is only exposed if it can actually read every row:
