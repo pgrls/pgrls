@@ -84,12 +84,13 @@ def _policy(
     permissive: bool = True,
     command: str = "ALL",
     with_check: str | None = None,
+    roles: tuple[str, ...] = ("authenticated",),
 ) -> Policy:
     return Policy(
         name=name,
         command=command,
         permissive=permissive,
-        roles=("authenticated",),
+        roles=roles,
         using_sql=using,
         with_check_sql=with_check,
         using_ast=_using_ast(using) if using is not None else None,
@@ -404,6 +405,66 @@ def test_isolated_permissive_with_restrictive_floor_stays_proven() -> None:
     [t] = v.tables
     assert t.verdict == "isolated"
     assert t.note and "restrictive read floor" in t.note
+
+
+@requires_z3
+def test_floor_scoped_to_a_role_the_permissive_outreaches_is_not_composed() -> None:
+    # SOUNDNESS (role coverage): a permissive `TO public` leaks to anon via
+    # `is_public`; a restrictive floor scoped `TO authenticated` does NOT
+    # constrain an anon session, so it must not be AND-ed into the anon proof —
+    # the leak stands. A role-blind composition would compose the inapplicable
+    # floor (`is_public AND tenant_id = auth.uid()`, false under anon) and
+    # falsely prove ISOLATED.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("is_public", name="perm", roles=("PUBLIC",)),
+                    _policy(
+                        "tenant_id = auth.uid()",
+                        name="floor",
+                        permissive=False,
+                        roles=("authenticated",),
+                    ),
+                ),
+            ),
+        )
+    )
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "leak"
+    assert v.has_leak
+
+
+@requires_z3
+def test_floor_for_a_different_write_command_is_not_composed() -> None:
+    # SOUNDNESS (command coverage): a FOR INSERT write leak (WITH CHECK admits a
+    # cross-tenant row via `is_public`) is not constrained by a FOR UPDATE
+    # restrictive floor — a FOR UPDATE policy never gates an INSERT. Composing it
+    # would falsely prove the write ISOLATED; the leak must stand.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        None,
+                        name="perm",
+                        command="INSERT",
+                        with_check="tenant_id = auth.uid() OR is_public",
+                    ),
+                    _policy(
+                        None,
+                        name="floor",
+                        permissive=False,
+                        command="UPDATE",
+                        with_check="tenant_id = auth.uid()",
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "leak"
 
 
 @requires_z3

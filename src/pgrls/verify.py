@@ -41,11 +41,13 @@ to a linter" stance:
   *degrades to the linter* — run `pgrls lint` for the heuristic rules.
 
 Scope: both modes reason over each table's permissive ``SELECT`` / ``ALL``
-policies. A *leaking* permissive policy on a table that also carries a
-``RESTRICTIVE`` read floor is reported ``unverified`` rather than risk an
-unsound verdict — v1 does not combine restrictive floors into the proof; an
-already-proven-``isolated`` permissive policy stays ``isolated`` (a restrictive
-floor only narrows access). ``cross-tenant`` mode verifies the single
+policies. When a *leaking* permissive policy shares a table with a
+``RESTRICTIVE`` floor, the floor is AND-ed into the proof and re-verified — but
+only a floor that constrains *every* role and write-operation the permissive
+admits (see ``_floor_applies``): a floor scoped to a role or command the
+permissive outreaches is not composed, so the leak stands rather than risk a
+false ``isolated``. An already-proven-``isolated`` permissive policy stays
+``isolated`` (a restrictive floor only narrows access). ``cross-tenant`` mode verifies the single
 ``<column> = <session identity>`` shape `pgrls generate` emits; a total leak
 (``USING (true)``) carries no scoping equality and is ``unverified`` there —
 but is already caught as an anon leak. Tables with RLS disabled are out of
@@ -325,6 +327,44 @@ def _rollup(proofs: list[PolicyProof]) -> Verdict:
     return "isolated"
 
 
+def _write_ops(command: str) -> frozenset[str]:
+    """The write operations a policy of this command gates. SELECT/DELETE carry
+    no new-row check and are already excluded from the write bucket."""
+    if command == "ALL":
+        return frozenset({"INSERT", "UPDATE"})
+    return frozenset({command})
+
+
+def _floor_applies(permissive: Policy, restrictive: Policy, mode: Mode) -> bool:
+    """Whether a ``RESTRICTIVE`` floor provably narrows *every* row the leaking
+    ``permissive`` policy admits — the precondition for soundly AND-ing it into
+    the proof.
+
+    A floor that constrains only *some* of the permissive's sessions or write
+    operations must NOT be composed: AND-ing it in would over-restrict the
+    predicate and could turn a real leak into a false ``isolated``. When a floor
+    does not cover the permissive we simply skip it, so the leak stands.
+
+    - **Role coverage:** the floor must constrain every session that can
+      exercise the permissive. ``TO PUBLIC`` covers everyone; otherwise the
+      permissive's roles must be a subset of the floor's — and a ``PUBLIC``
+      permissive (usable by every role) is only covered by a ``PUBLIC`` floor.
+    - **Command coverage (write mode):** the floor must gate every write
+      operation the permissive gates. A ``FOR UPDATE`` floor never constrains a
+      ``FOR INSERT`` leak (and vice-versa); a ``FOR ALL`` permissive is only
+      covered by a ``FOR ALL`` floor. Read modes act on ``SELECT`` alone, where
+      every relevant policy co-applies.
+    """
+    r_roles = set(restrictive.roles)
+    if "PUBLIC" not in r_roles:
+        p_roles = set(permissive.roles)
+        if "PUBLIC" in p_roles or not p_roles <= r_roles:
+            return False
+    if mode == "write":
+        return _write_ops(permissive.command) <= _write_ops(restrictive.command)
+    return True
+
+
 def build_verification(
     schema: Schema,
     *,
@@ -369,7 +409,7 @@ def build_verification(
             continue  # not an isolation claim — SEC001's domain, not verify's
         relevant = [p for p in table.policies if p.command in commands]
         permissive = [p for p in relevant if p.permissive]
-        has_restrictive_floor = any(not p.permissive for p in relevant)
+        restrictives = [p for p in relevant if not p.permissive]
 
         if not permissive:
             # RLS on with no permissive policy for this mode's commands →
@@ -400,14 +440,18 @@ def build_verification(
                 )
                 continue
             verdict, witness = prove(ast, auth_functions)
-            if verdict == "leak" and has_restrictive_floor:
-                # Compose the leaking permissive policy with the table's
+            # Only floors that constrain *every* role and write-operation this
+            # permissive admits may be soundly AND-ed in (see `_floor_applies`);
+            # a partially-applicable floor would over-restrict → false PROVEN.
+            applicable_floors = [
+                r for r in restrictives if _floor_applies(policy, r, mode)
+            ]
+            if verdict == "leak" and applicable_floors:
+                # Compose the leaking permissive policy with the applicable
                 # restrictive floor (a row is visible only if it satisfies some
                 # permissive AND all restrictive) and re-prove: the floor may
                 # block the leaking row (→ isolated) or not (→ the leak stands).
-                floor_asts = [
-                    _checked_ast(r, mode) for r in relevant if not r.permissive
-                ]
+                floor_asts = [_checked_ast(r, mode) for r in applicable_floors]
                 if any(fa is None for fa in floor_asts):
                     # A floor whose predicate can't be modeled → can't compose
                     # soundly → no claim (never a possibly-wrong verdict).
@@ -459,7 +503,11 @@ def build_verification(
 
         note = (
             f"restrictive {floor_kind} floor composed into the proof"
-            if has_restrictive_floor
+            if any(
+                _floor_applies(p, r, mode)
+                for p in permissive
+                for r in restrictives
+            )
             else None
         )
         tables.append(

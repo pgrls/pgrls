@@ -11,6 +11,21 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`pgrls verify` — soundness fix for restrictive-floor composition (a false
+  `PROVEN`).** When a leaking permissive policy shared a table with a
+  `RESTRICTIVE` floor (0.48.0's composition feature), the floor was AND-ed into
+  the proof without checking that it actually applies to the same **role** and
+  **write operation** — so two shapes were wrongly proven `ISOLATED`: (1) a
+  floor scoped `TO authenticated` composed into an **anon** proof it doesn't
+  govern (e.g. permissive `TO public USING (is_public)` + restrictive
+  `TO authenticated USING (tenant_id = auth.uid())`); and (2) in `--mode write`,
+  a `FOR UPDATE` floor composed into a `FOR INSERT` leak proof (a `FOR UPDATE`
+  policy never gates an `INSERT`). A floor is now composed only when it covers
+  **every** role and write-operation the permissive admits (`p.roles ⊆ r.roles`
+  or the floor is `TO PUBLIC`; and `ops(p) ⊆ ops(r)`); otherwise the leak stands
+  rather than risk a false `ISOLATED`. Soundness-preserving — legitimately
+  covering floors still upgrade to `ISOLATED`. No snapshot or configuration
+  change.
 - **SEC049** now honors an **unqualified (bare) table name** in
   `[lint.rules.SEC049].allowlist`. The allowlist validator accepts both `table`
   and `schema.table`, but the match compared only against the qualified name, so
