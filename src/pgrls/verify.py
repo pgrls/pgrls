@@ -721,16 +721,67 @@ def _has_range_function(stmt: Any) -> bool:
     return found
 
 
+def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -> bool:
+    """Whether `stmt` contains a *scalar* function call (a ``FuncCall``, not a
+    ``FROM``-clause ``RangeFunction``) to a function we cannot see through — one
+    that is neither a known auth/session function nor a ``pg_catalog`` /
+    ``information_schema`` builtin. Such a call may transitively read an RLS
+    table (through the SECDEF owner's bypass) that the range-var walk never
+    surfaces — e.g. ``SELECT get_secret()`` or ``SELECT 1 WHERE leaks()`` — so a
+    body containing one is opaque (UNVERIFIED), the same treatment a
+    set-returning function in ``FROM`` already gets. Auth/session calls
+    (``auth.uid()``) and pure builtins (``count``, ``lower`` via ``pg_catalog``)
+    do not read user tables and so do not, by themselves, force abstention."""
+    from pglast.ast import FuncCall, Node  # noqa: PLC0415
+
+    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
+
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, FuncCall):
+            qualified, bare = func_name_parts(n)
+            fn_schema = (
+                qualified.rsplit(".", 1)[0]
+                if qualified and "." in qualified
+                else None
+            )
+            if not (
+                qualified in auth_functions
+                or bare in auth_functions
+                or fn_schema in ("pg_catalog", "information_schema")
+            ):
+                found = True
+                return
+            # A recognized-safe outer call may still wrap an opaque call in its
+            # arguments (``coalesce(get_secret(), 0)``) — keep walking children.
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(stmt)
+    return found
+
+
 def _secdef_body_unresolved(
     parsed: Any,
     base_quals: set[tuple[str, str]],
     base_bares: set[str],
+    auth_functions: frozenset[str] | set[str],
 ) -> bool:
     """Whether a SECDEF body reads from a data source we cannot see through — a
-    *view*, a relation outside the introspected base tables, or a set-returning
-    *function* call in ``FROM``. Such a source may transitively read an RLS table
-    the range-var walk never sees, so a body that has one must be treated as
-    opaque (UNVERIFIED) rather than cleared.
+    *view*, a relation outside the introspected base tables, a set-returning
+    *function* call in ``FROM``, or a *scalar* function call (``SELECT
+    get_secret()``) to a non-builtin, non-auth function. Such a source may
+    transitively read an RLS table the range-var walk never sees, so a body that
+    has one must be treated as opaque (UNVERIFIED) rather than cleared.
 
     CTE names are a local alias, not a data source — but they scope **only
     within their own statement** (a CTE in one statement of a multi-statement
@@ -756,6 +807,8 @@ def _secdef_body_unresolved(
             elif relname not in base_bares:
                 return True
         if _has_range_function(stmt):
+            return True
+        if _has_opaque_funccall(stmt, auth_functions):
             return True
     return False
 
@@ -792,6 +845,12 @@ def _escalation_secdef_findings(
         bare_to_qual.setdefault(n, []).append((s, n))
     base_quals = {(t.schema, t.name) for t in schema.tables}
     base_bares = {t.name for t in schema.tables}
+    # Auth/session calls in a body don't read user tables — exclude them (and
+    # pg_catalog builtins) from the opaque-scalar-call abstention. `None` means
+    # "use the default set", matching the provers' resolution.
+    resolved_auth = (
+        auth_functions if auth_functions is not None else DEFAULT_AUTH_FUNCTIONS
+    )
     import pglast  # noqa: PLC0415 — heavy optional parser path
     from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415 — body parser reuse
 
@@ -818,7 +877,9 @@ def _escalation_secdef_findings(
                 continue
             reads |= _secdef_fn_leaks(f, qname, rls_tables, bare_to_qual)
             parsed = pglast.parse_sql(f.body)
-            if _secdef_body_unresolved(parsed, base_quals, base_bares):
+            if _secdef_body_unresolved(
+                parsed, base_quals, base_bares, resolved_auth
+            ):
                 any_unseen = True
         inconclusive = any_opaque or any_unseen
         roles = ", ".join(
