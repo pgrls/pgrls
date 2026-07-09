@@ -2155,6 +2155,42 @@ def test_escalation_secdef_reading_via_function_call_is_unverified() -> None:
 
 
 @requires_z3
+def test_escalation_secdef_scalar_function_call_read_is_unverified() -> None:
+    # SOUNDNESS: a scalar function call (`SELECT get_secret()`) is a data source
+    # the range-var walk never surfaces — get_secret may read a protected table
+    # through the SECDEF owner's bypass. It must abstain (UNVERIFIED), not be
+    # silently cleared. (A `RangeFunction` in FROM was already abstained; a
+    # scalar `FuncCall` in the target list / WHERE was not.)
+    for body in (
+        "SELECT get_secret()",
+        "SELECT 1 WHERE secret_leaks()",
+        "SELECT coalesce(get_secret(), 0)",
+    ):
+        schema = Schema(
+            tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+            security_definer_functions=(_secdef(body),),
+        )
+        [t] = build_verification(schema, mode="escalation").tables
+        assert t.verdict == "unverified", body
+
+
+@requires_z3
+def test_escalation_secdef_auth_call_in_body_does_not_block_a_real_read() -> None:
+    # Recall preserved: an auth/session call (`auth.uid()`) does not read a user
+    # table, so it must NOT trigger the scalar-call abstention — a body that
+    # directly reads an isolated table while filtering on auth.uid() is still a
+    # proven LEAK, not downgraded to UNVERIFIED.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret WHERE tenant_id = auth.uid()"),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak"
+
+
+@requires_z3
 def test_escalation_secdef_reading_only_non_rls_table_is_no_finding() -> None:
     # Precision retained: a body whose every source is a known NON-RLS base
     # table provably reads no protected data → not a finding (not UNVERIFIED).

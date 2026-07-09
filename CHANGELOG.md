@@ -11,6 +11,19 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`pgrls verify --mode escalation` — soundness fix for the SEC042 SECDEF-body
+  check (a false-clear).** A `SECURITY DEFINER` function that reads a protected
+  table through a **scalar function call** (`SELECT get_secret()`, `SELECT 1
+  WHERE leaks()`) was silently reported clean: the abstention gate only looked
+  for a set-returning function in `FROM`, so a scalar `FuncCall` in the target
+  list / `WHERE` slipped through and the body was cleared — exit 0, empty SARIF —
+  while an unauthenticated `POST /rpc/fn` could read RLS-protected rows via the
+  owner's bypass. The body is now treated as opaque (`UNVERIFIED`) when it
+  contains any scalar call to a function that is not a known auth/session
+  function or a `pg_catalog` / `information_schema` builtin. Auth calls
+  (`auth.uid()`) and builtins do not read user tables, so a direct read filtered
+  by `auth.uid()` is still a proven `LEAK` (recall preserved). No snapshot or
+  configuration change.
 - **`pgrls verify` — soundness fix for restrictive-floor composition (a false
   `PROVEN`).** When a leaking permissive policy shared a table with a
   `RESTRICTIVE` floor (0.48.0's composition feature), the floor was AND-ed into
