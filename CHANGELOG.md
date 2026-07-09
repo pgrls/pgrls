@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.48.1] - 2026-07-08
+
 ### Fixed
 - **`pgrls verify --mode escalation` — soundness fix for the SEC042 SECDEF-body
   check (a false-clear).** A `SECURITY DEFINER` function that reads a protected
