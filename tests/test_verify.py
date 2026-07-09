@@ -2206,6 +2206,24 @@ def test_escalation_secdef_reading_only_non_rls_table_is_no_finding() -> None:
 
 
 @requires_z3
+def test_escalation_secdef_bare_builtin_over_non_rls_table_is_no_finding() -> None:
+    # A bare built-in (`count`) reads no user table — an introspected body stores
+    # builtins UNqualified, so the opaque-funccall check must recognize them or
+    # it would wrongly abstain (UNVERIFIED) on a benign `SELECT count(*) FROM
+    # <non-RLS table>`. Still no finding, not UNVERIFIED.
+    public_cfg = Table(
+        schema="public", name="app_config", rls_enabled=False,
+        force_rls=False, policies=(),
+    )
+    for body in ("SELECT count(*) FROM app_config", "SELECT max(id) FROM app_config"):
+        schema = Schema(
+            tables=(_anon_tbl("secret", "tenant_id = auth.uid()"), public_cfg),
+            security_definer_functions=(_secdef(body),),
+        )
+        assert build_verification(schema, mode="escalation").tables == (), body
+
+
+@requires_z3
 def test_escalation_honors_configured_anon_roles() -> None:
     # SEC042's anon_roles is configurable; escalation must honor it. A function
     # EXECUTE-able only by a renamed anon role (web_anon) is missed under the
@@ -2408,6 +2426,31 @@ def test_against_base_unverified_is_never_counted_new() -> None:
     delta = diff_verifications(base, head)
     assert delta.summary["new_leaks"] == 0
     assert delta.summary["preexisting_leaks"] == 1
+
+
+def test_against_a_leak_that_became_unverified_is_not_reported_fixed() -> None:
+    # Symmetric to the base-unverified guard: a base LEAK whose head verdict is
+    # merely UNVERIFIED (the change made it unprovable, not proven isolated) is
+    # NOT "fixed" — it may still leak. Only a proven-ISOLATED (or dropped) head
+    # counts as fixed.
+    base = Verification(
+        (TableVerdict("public.docs", "leak", None, (PolicyProof("p", "leak", {}, None),)),),
+        "anon",
+    )
+    head = Verification(
+        (
+            TableVerdict(
+                "public.docs",
+                "unverified",
+                None,
+                (PolicyProof("p", "unverified", None, "outside fragment"),),
+            ),
+        ),
+        "anon",
+    )
+    delta = diff_verifications(base, head)
+    assert delta.fixed_leaks == ()
+    assert delta.summary["fixed_leaks"] == 0
 
 
 def test_against_isolated_to_unverified_is_new_unverified() -> None:

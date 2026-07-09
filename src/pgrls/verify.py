@@ -283,8 +283,11 @@ def diff_verifications(base: Verification, head: Verification) -> LeakDelta:
     A *new* leak is a proven ``leak`` in head whose table was proven ``isolated``
     in base, or is absent from base entirely (a table the change added). A base
     ``unverified`` table is not a baseline: a head leak there is ``preexisting``,
-    never new. ``fixed_leaks`` are base leaks that head no longer proves leaking
-    (isolated now, unverified now, or the table was dropped).
+    never new. ``fixed_leaks`` are base leaks that head now proves ``isolated``
+    (or the table was dropped); a base leak that became merely ``unverified`` in
+    head is NOT counted as fixed — it may still leak, we just can no longer prove
+    it (the symmetric counterpart of never crediting an unprovable base with a
+    new leak).
     """
     base_by = {t.qualified_name: t for t in base.tables}
     head_by = {t.qualified_name: t for t in head.tables}
@@ -305,7 +308,7 @@ def diff_verifications(base: Verification, head: Verification) -> LeakDelta:
             name
             for name, b in base_by.items()
             if b.verdict == "leak"
-            and (name not in head_by or head_by[name].verdict != "leak")
+            and (name not in head_by or head_by[name].verdict == "isolated")
         )
     )
     return LeakDelta(
@@ -721,17 +724,71 @@ def _has_range_function(stmt: Any) -> bool:
     return found
 
 
+# Common built-in scalar/aggregate functions that operate on their arguments (or
+# system state) and never read a user table — safe to see in a SECDEF body even
+# unqualified. An introspected function body (raw `pg_proc.prosrc`) stores
+# builtins as the author wrote them — normally WITHOUT a schema (a bare
+# `count(*)`, not `pg_catalog.count(*)`) — so the schema check alone can't
+# recognize them. A builtin *missing* from this set merely falls back to
+# abstention (sound). The set holds only genuine `pg_catalog` builtins and omits
+# anything that touches data (`nextval`, `query_to_xml`, …); the one residual
+# trust widening is a user function deliberately *named after* a builtin and
+# called bare — it would be cleared rather than abstained, negligible in
+# practice and in line with how bare auth-function names are already trusted.
+_SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
+    # aggregates
+    "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "json_agg",
+    "jsonb_agg", "json_object_agg", "jsonb_object_agg", "bool_and", "bool_or",
+    "every", "bit_and", "bit_or", "stddev", "stddev_pop", "stddev_samp",
+    "variance", "var_pop", "var_samp",
+    # string
+    "lower", "upper", "initcap", "length", "char_length", "character_length",
+    "bit_length", "octet_length", "trim", "btrim", "ltrim", "rtrim", "substr",
+    "substring", "left", "right", "lpad", "rpad", "replace", "translate",
+    "split_part", "concat", "concat_ws", "format", "reverse", "repeat",
+    "position", "strpos", "overlay", "md5", "starts_with", "to_hex", "ascii",
+    "chr", "quote_ident", "quote_literal", "quote_nullable",
+    # numeric
+    "abs", "ceil", "ceiling", "floor", "round", "trunc", "sign", "mod", "power",
+    "sqrt", "cbrt", "exp", "ln", "log", "log10", "div", "gcd", "lcm",
+    "greatest", "least", "width_bucket",
+    # null / conditional
+    "coalesce", "nullif",
+    # date / time
+    "now", "current_date", "current_time", "current_timestamp", "localtime",
+    "localtimestamp", "clock_timestamp", "statement_timestamp",
+    "transaction_timestamp", "age", "date_part", "date_trunc", "extract",
+    "make_date", "make_time", "make_timestamp", "make_timestamptz",
+    "make_interval", "to_char", "to_date", "to_timestamp", "to_number",
+    # json / jsonb
+    "to_json", "to_jsonb", "json_build_object", "jsonb_build_object",
+    "json_build_array", "jsonb_build_array", "json_object", "jsonb_object",
+    "json_extract_path", "jsonb_extract_path", "json_extract_path_text",
+    "jsonb_extract_path_text", "jsonb_set", "jsonb_insert", "jsonb_strip_nulls",
+    "jsonb_pretty", "json_typeof", "jsonb_typeof", "json_array_length",
+    "jsonb_array_length", "row_to_json", "array_to_json",
+    # array
+    "array_length", "cardinality", "array_append", "array_prepend", "array_cat",
+    "array_remove", "array_replace", "array_position", "array_positions",
+    "array_to_string", "string_to_array", "array_ndims", "array_lower",
+    "array_upper",
+    # type / misc (read no user data)
+    "pg_typeof", "format_type", "gen_random_uuid",
+})
+
+
 def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     """Whether `stmt` contains a *scalar* function call (a ``FuncCall``, not a
     ``FROM``-clause ``RangeFunction``) to a function we cannot see through — one
-    that is neither a known auth/session function nor a ``pg_catalog`` /
-    ``information_schema`` builtin. Such a call may transitively read an RLS
-    table (through the SECDEF owner's bypass) that the range-var walk never
-    surfaces — e.g. ``SELECT get_secret()`` or ``SELECT 1 WHERE leaks()`` — so a
-    body containing one is opaque (UNVERIFIED), the same treatment a
-    set-returning function in ``FROM`` already gets. Auth/session calls
-    (``auth.uid()``) and pure builtins (``count``, ``lower`` via ``pg_catalog``)
-    do not read user tables and so do not, by themselves, force abstention."""
+    that is neither a known auth/session function nor a recognized built-in.
+    Such a call may transitively read an RLS table (through the SECDEF owner's
+    bypass) that the range-var walk never surfaces — e.g. ``SELECT get_secret()``
+    or ``SELECT 1 WHERE leaks()`` — so a body containing one is opaque
+    (UNVERIFIED), the same treatment a set-returning function in ``FROM`` already
+    gets. Auth/session calls (``auth.uid()``), ``pg_catalog`` /
+    ``information_schema``-qualified calls, and bare calls to a known built-in
+    (``count``, ``lower`` — see ``_SAFE_BUILTIN_FUNCS``) do not read user tables
+    and so do not, by themselves, force abstention."""
     from pglast.ast import FuncCall, Node  # noqa: PLC0415
 
     from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
@@ -757,6 +814,7 @@ def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -
                 qualified in auth_functions
                 or bare in auth_functions
                 or fn_schema in ("pg_catalog", "information_schema")
+                or (fn_schema is None and bare in _SAFE_BUILTIN_FUNCS)
             ):
                 found = True
                 return
@@ -1073,7 +1131,7 @@ def render_delta_text(delta: LeakDelta) -> str:
     if delta.new_unverified:
         names = ", ".join(safe_location(t.qualified_name) for t in delta.new_unverified)
         out.append(
-            f"Newly unverified (was proven isolated) "
+            f"Newly unverified (was proven isolated or absent in the baseline) "
             f"({len(delta.new_unverified)}): {names}"
         )
     if delta.preexisting_leaks:

@@ -4071,11 +4071,16 @@ def verify(
         base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
         delta = diff_verifications(base_verification, verification)
         if output_format == "sarif":
-            # The gate is "no NEW leak", so only the introduced leaks become
-            # SARIF results (pre-existing leaks are the baseline, not this
-            # change's regressions).
+            # The gate is "no NEW leak", so introduced leaks become SARIF error
+            # results (pre-existing leaks are the baseline, not this change's
+            # regressions). Under --strict a newly-unverified table also fails
+            # the gate (exit 1 below), so include those too — as note results —
+            # otherwise a red check would carry zero alerts.
+            projected = list(delta.new_leaks)
+            if strict:
+                projected += list(delta.new_unverified)
             rendered = render_verify_sarif(
-                Verification(delta.new_leaks, verification.mode), strict=strict
+                Verification(tuple(projected), verification.mode), strict=strict
             )
         elif output_format == "json":
             rendered = render_delta_json(delta)

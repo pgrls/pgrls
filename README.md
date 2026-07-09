@@ -458,7 +458,7 @@ Point an MCP client at it:
 
 The server **never mutates a database** — it only ever issues read-only introspection SELECTs, and never auto-applies SQL. The remediation tools (`fix` / `generate`) are **emit-only**: they return SQL text for the agent to review and run through its own channel. It exposes six tools:
 
-- **`lint`** / **`verify`** — accept exactly one schema source: `sql=` (raw DDL, analyzed offline), `database_url=` (a live connection, read-only introspection), or `snapshot=` (a `pgrls snapshot` JSON). `lint` returns the same JSON violation shape as `pgrls lint --format json`; `verify` returns the per-table verdicts and leak witnesses (modes `anon` / `cross-tenant` / `write`).
+- **`lint`** / **`verify`** — accept exactly one schema source: `sql=` (raw DDL, analyzed offline), `database_url=` (a live connection, read-only introspection), or `snapshot=` (a `pgrls snapshot` JSON). `lint` returns the same JSON violation shape as `pgrls lint --format json`; `verify` returns the per-table verdicts and leak witnesses (modes `anon` / `cross-tenant` / `write` / `escalation`).
 - **`fix`** / **`generate`** — *emit-only* remediation. `fix` returns the auto-fix SQL for the mechanically-fixable findings (the remediation counterpart of `lint`); `generate` scaffolds gold-standard RLS for unprotected multi-tenant / row-owner tables. Both take the same schema sources as `lint` and return both structured statements and a copy-pasteable `migration` — but never execute it.
 - **`explain_rule`** / **`list_rules`** — the rule catalog and a single rule's reference.
 
@@ -787,7 +787,7 @@ Two [pre-commit](https://pre-commit.com) hooks are published from this repo. `pg
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.47.0
+    rev: v0.48.1
     hooks:
       # Offline — lints raw DDL, no database. Repeat --sql-file for several
       # files (declare tables before the policies that reference them), or

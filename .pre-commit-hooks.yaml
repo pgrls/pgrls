@@ -28,7 +28,7 @@
 #
 #   repos:
 #     - repo: https://github.com/pgrls/pgrls
-#       rev: v0.47.0
+#       rev: v0.48.1
 #       hooks:
 #         - id: pgrls-lint-sql
 #           args: ["--sql-file", "schema.sql", "--fail-on", "error"]
