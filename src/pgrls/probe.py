@@ -499,14 +499,18 @@ def _rls_active_for_probe_role(cur: psycopg.Cursor[Any], table: Table) -> bool:
     RLS — e.g. an owner-equivalent role (a member of the table's owner) on a
     table without ``FORCE ROW LEVEL SECURITY`` — in which case any row/write it
     observes is permitted for a non-policy reason and must not be read as a leak.
-    On an unexpected error we proceed (return True) rather than mask a real
-    leak; the builtin does not error for a valid regclass."""
+    On an unexpected error we fail *closed* (return False → abstain): this gate
+    exists to withhold judgment when we cannot tell a policy leak from an owner
+    bypass, so uncertainty must resolve to abstain, never to a possible false
+    MISMATCH. (A statically proven leak is failed regardless, by the gate in the
+    CLI — abstaining here cannot mask one.) The builtin does not error for a
+    valid granted regclass, so this branch is defensive."""
     qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
     try:
         cur.execute("SELECT row_security_active(%s::regclass)", (qtbl,))
         row = cur.fetchone()
     except psycopg.Error:
-        return True
+        return False
     return bool(row and row[0])
 
 
@@ -1192,11 +1196,12 @@ def render_sarif(p: Probe, *, strict: bool = False) -> str:
                 )
             )
         elif r.static_verdict == "leak":
-            # A statically PROVEN leak the live probe did not itself flag — it
-            # reproduced it (agree) or could not (abstained / skipped). The
-            # proven leak still fails the gate (`--probe` is never weaker than
-            # plain verify), so it must appear as an error — otherwise a red
-            # check would carry no alert.
+            # A statically PROVEN leak the live probe did not itself confirm:
+            # here the agreement is `abstained` or `skipped` (a reproduced leak
+            # is `leak_confirmed`, handled by the branch above). The proven leak
+            # still fails the gate (`--probe` is never weaker than plain verify),
+            # so it must appear as an error — otherwise a red check carries no
+            # alert.
             violations.append(
                 Violation(
                     rule_id=rule_id,
