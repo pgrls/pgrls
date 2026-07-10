@@ -327,14 +327,14 @@ needed, but worth knowing the tests exist):
 | File                                  | Update                                                                 |
 | ------------------------------------- | ---------------------------------------------------------------------- |
 | [`AGENTS.md`](../AGENTS.md)           | Add a per-rule section under the right family with the docstring text. |
-| [`README.md`](../README.md)           | Bump the rule count (`64 lint rules` → `65`) in the badges/intro/feature line, and add a row to the rules table. |
+| [`README.md`](../README.md)           | Bump the rule count (`65 lint rules` → `66`) in the badges/intro/feature line, and add a row to the rules table. |
 | [`pyproject.toml`](../pyproject.toml) | Same: the `description` field cites the rule count.                    |
 | [`CHANGELOG.md`](../CHANGELOG.md)     | An `### Added` bullet under `[Unreleased]` with the rule + severity + one-line summary. |
 | [`pgrls.schema.json`](../pgrls.schema.json) | If your rule has its own option name (`auth_functions`, `placeholder_words`, etc.) and you want it to surface in the JSON-schema example, the example in `pgrls.schema.json` may also need a touch. |
 | [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours — *unless* your rule is opt-in / artifact-gated (it fires only when lint is handed an artifact, like HYG004 and PERF005), in which case add its ID to that test's exemption set. The `test_explain_covers_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
-count (`64 lint rules`, `sixty-four rules`, etc. — the phrasing
+count (`65 lint rules`, `sixty-five rules`, etc. — the phrasing
 that actually appears in README.md and AGENTS.md) is cheap insurance
 against missing a doc spot.
 

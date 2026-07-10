@@ -35,6 +35,17 @@ def test_inert_rule_ids_snapshot_is_version_gated():
     assert "SEC035" not in inert  # is_primary landed in v13
 
 
+def test_sec052_is_gated_on_view_grants_v23():
+    # SEC052's firing decision reads `View.grants` (v23). It must be inert on a
+    # pre-v23 snapshot (and a view-less SQL source) so a stale-snapshot lint
+    # doesn't silently false-clean an auth.users-exposing view past
+    # --require-full-coverage.
+    assert _CATALOG_DEPENDENT_RULES["SEC052"][1] == 23
+    assert "SEC052" in inert_rule_ids("snapshot", snapshot_version=22)
+    assert "SEC052" not in inert_rule_ids("snapshot", snapshot_version=23)
+    assert "SEC052" in inert_rule_ids("sql")
+
+
 def test_reachability_gated_rules_threshold_covers_column_grants():
     # SEC041/SEC043 reach `Table.column_grants` (snapshot v8) through the shared
     # `sec041._is_directly_reachable` gate, so a threshold below 8 would let a

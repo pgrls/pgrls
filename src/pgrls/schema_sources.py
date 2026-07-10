@@ -772,6 +772,11 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
     "SEC047": ("foreign keys to RLS-enabled parents", 20),
     "SEC048": ("owner-reachable members that bypass RLS", 21),
     "SEC051": ("Realtime publication membership (pg_publication_tables)", 22),
+    # SEC052 gates every emission on `View.grants` (v23) — a view REVOKE'd from
+    # low-trust roles isn't flagged — so on a pre-v23 snapshot (or a view-less
+    # SQL-file source) it must be inert *loudly*, not silently no-op past
+    # --require-full-coverage.
+    "SEC052": ("view grants that expose auth.users (relacl)", 23),
     "PERF003": ("policy-predicate column indexes", 7),
     # PERF004 reaches `Table.indexes` (v7) through `perf003._has_leading_column_index`
     # — same shared-helper path as SEC041/SEC043; the helper reads only

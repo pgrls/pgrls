@@ -3515,6 +3515,88 @@ publications = ["supabase_realtime"]
 allowlist = ["public.presence"]
 ```
 
+<a id="rule-sec052"></a>
+
+## SEC052 — Auth user table exposed through an API-schema view
+
+**Severity:** error
+
+A view in a PostgREST-exposed schema (default `public`) that selects from
+`auth.users` runs — unless it opts into `security_invoker` — with the **view
+owner's** privileges, not the caller's. The owner (`postgres` / a migration
+role) can read `auth.users`, so any low-trust caller who can reach the view over
+the API reads every user's row: email, phone, `encrypted_password`,
+`raw_user_meta_data`. This is Supabase Security Advisor
+`0002_auth_users_exposed`.
+
+```sql
+-- The classic leak: "expose the users to the frontend"
+CREATE VIEW public.users AS SELECT * FROM auth.users;
+--  GET /rest/v1/users  ->  every account's email + metadata.
+```
+
+The bypass is *structural*, not a policy question — `auth.users` is protected by
+**grants** (`anon` / `authenticated` hold no `SELECT` on it), and a
+non-`security_invoker` view launders exactly that grant boundary.
+
+**Why this is not [VIEW001](#rule-view001).** VIEW001 flags a
+non-`security_invoker` view over a table with *RLS enabled*. `auth.users` has no
+RLS — it is grant-protected — and it typically lives outside the scanned schema,
+so it is never in VIEW001's RLS-table set. SEC052 is the auth-schema-PII
+counterpart.
+
+SEC052 fires when, for a view (or materialized view) in an exposed schema:
+
+* it is a regular view **without** `security_invoker` (an invoker view runs as
+  the caller, who lacks `SELECT` on `auth.users` → the query errors, it does not
+  leak), **or** a materialized view (matview rows are physically captured and
+  read with the reader's grant, so `security_invoker` is moot);
+* its body **directly** reads a sensitive table (default `auth.users`) as a
+  FROM-clause source — top-level, through a JOIN, or in a derived table, so its
+  columns can reach the output; **and**
+* that read is **not** scoped to the calling user.
+
+The caller-binding analysis is shared verbatim with [SEC036](#rule-sec036) (via
+`pgrls.rules._auth_binding`): a view filtered to `id = auth.uid()` — the
+canonical "my account" view — binds the read to the caller and is **not**
+flagged. Only an *unfiltered* (or non-caller-bound) read of the whole table
+fires.
+
+Conservative by design (soundness over recall, no false positives):
+
+* An **unparseable** view body → abstain (no finding).
+* A **transitive** re-exposer (`CREATE VIEW public.a AS SELECT * FROM public.b`
+  where `b` reads `auth.users`) is not flagged on `a` — its own body doesn't
+  read the sensitive table, so `b`'s caller-binding can't be judged from `a`.
+  The **direct** reader `b` is flagged; fixing it fixes the chain.
+* `auth.users` used only to *filter* (a `WHERE owner_id IN (SELECT id FROM
+  auth.users …)` membership test), not as a FROM source whose columns reach the
+  output, is not a PII exposure and is not flagged.
+
+**Remediation.** There is no auto-fix — the right remedy depends on intent:
+set `WITH (security_invoker = on)` and re-grant, drop the sensitive columns,
+scope the body to `auth.uid()`, or move the view out of the exposed schema.
+
+**Configuration** (`[lint.rules.SEC052]`):
+
+```toml
+[lint.rules.SEC052]
+# PostgREST-exposed schemas.
+schemas = ["public"]
+# Low-trust roles whose SELECT on the view means "API-reachable".
+grantees = ["anon", "authenticated", "PUBLIC"]
+# Sensitive schema.table sources (add e.g. "auth.identities").
+tables = ["auth.users"]
+# Caller-binding signals (shared default with SEC036).
+binding_functions = ["auth.uid", "current_setting"]
+# Qualified view names that intentionally expose the table.
+allowlist = ["public.public_profiles"]
+```
+
+SEC052 reads the view's grants (`relacl`), captured in snapshot **v23+**. On an
+older snapshot the grants are absent (`grants=()`), so the rule finds nothing on
+that view — the fail-closed direction.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK

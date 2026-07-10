@@ -51,7 +51,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 22  # v22: per-table in_publications (pg_publication_tables)
+SNAPSHOT_VERSION = 23  # v23: per-view grants (View.grants from relacl) — SEC052
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -323,6 +323,12 @@ class View:
     `security_definer_calls` is the sorted, de-duplicated tuple of
     qualified function names called by the view body that have
     `pg_proc.prosecdef = true`. Both default to empty.
+
+    `grants` is the view's own `pg_class.relacl` privilege grants (v23+),
+    captured the same way as `Table.grants` (owner self-grant excluded,
+    `PUBLIC` pseudo-role rendered as `role="PUBLIC"`). SEC052 reads it to
+    confirm a low-trust role can actually reach the view over the API; a
+    pre-v23 snapshot round-trips with `grants=()`.
     """
 
     schema: str
@@ -333,6 +339,7 @@ class View:
     definition: str
     references: tuple[tuple[str, str], ...]
     security_definer_calls: tuple[str, ...]
+    grants: tuple[Grant, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -1245,6 +1252,9 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         definition=v["definition"],
         references=tuple(tuple(r) for r in v["references"]),
         security_definer_calls=tuple(v["security_definer_calls"]),
+        # v23+; a pre-v23 snapshot has no "grants" key → () (SEC052 then
+        # finds nothing on that view, the fail-closed direction).
+        grants=tuple(_grant_from_dict(g) for g in v.get("grants", [])),
     )
 
 
@@ -1743,6 +1753,10 @@ class Schema:
                     "definition": v.definition,
                     "references": [list(ref) for ref in v.references],
                     "security_definer_calls": list(v.security_definer_calls),
+                    "grants": [
+                        {"role": g.role, "privileges": list(g.privileges)}
+                        for g in v.grants
+                    ],
                 }
                 for v in self.views
             ],
@@ -1965,13 +1979,14 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22,
+            21, 22, 23,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22. v1 / v2 "
-                "snapshots must be regenerated against the current schema."
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23. "
+                "v1 / v2 snapshots must be regenerated against the current "
+                "schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the
