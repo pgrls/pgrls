@@ -236,6 +236,67 @@ def test_mismatch_makes_cli_exit_one(
     assert "LEAK CONFIRMED" in result.output
 
 
+@requires_docker
+@requires_z3
+def test_scoped_policy_to_owner_on_non_forced_table_abstains_not_mismatch(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # A genuinely-scoped policy whose `TO` role is the table owner, on a table
+    # with RLS enabled but NOT FORCE'd. To reach the policy the probe grants its
+    # role membership in the owner — which (pre-fix) conferred the owner's RLS
+    # exemption on the non-forced table and read every row, a FALSE mismatch on
+    # a PROVEN table. The probe must abstain: RLS is not enforced for that
+    # session, so it can measure nothing.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute("CREATE ROLE app NOSUPERUSER NOLOGIN;")
+        cur.execute(
+            "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid);"
+            "ALTER TABLE public.docs OWNER TO app;"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"  # NOT FORCE'd
+            "CREATE POLICY p ON public.docs FOR ALL TO app "
+            "  USING (tenant_id = auth.uid());"
+        )
+    try:
+        schema = introspect(pg_conn, schemas=["public"])
+        probe = _probe(pg_url, schema, mode="cross-tenant")
+        r = _result(probe, "public.docs")
+        assert r.static_verdict == "isolated"
+        assert r.agreement == "abstained"  # NOT "mismatch"
+        assert not probe.has_mismatch
+    finally:
+        _drop_role(pg_conn, "app")
+
+
+@requires_docker
+@requires_z3
+def test_probe_is_never_weaker_than_verify_on_an_unreproducible_leak(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # A proven static anon LEAK the live probe cannot reproduce — an un-seedable
+    # NOT NULL bytea column makes the seed INSERT abstain. `--probe` must still
+    # fail (exit 1), never green-light a schema plain `verify` fails, and its
+    # SARIF must carry the proven leak as an error rather than an empty report.
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE public.blobs "
+            "  (id bigserial PRIMARY KEY, payload bytea NOT NULL);"
+            "ALTER TABLE public.blobs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.blobs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.blobs FOR SELECT TO public USING (true);"
+            "GRANT SELECT, INSERT ON public.blobs TO public;"
+        )
+    args = ["verify", "--probe", "--database-url", pg_url, "--schemas", "public",
+            "--mode", "anon"]
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 1, result.output
+    # the probe abstained (could not seed bytea), but the static leak still fails
+    assert "LEAK" in result.output and "LEAK CONFIRMED" not in result.output
+    sarif = CliRunner().invoke(main, [*args, "--format", "sarif"])
+    doc = json.loads(sarif.output)
+    assert "error" in [r["level"] for r in doc["runs"][0]["results"]]
+
+
 # --- agree -----------------------------------------------------------------
 
 
@@ -710,13 +771,17 @@ def test_probe_cli_emit_repro_is_usage_error() -> None:
 def test_probe_cli_nocreaterole_strict_exits_one(
     pg_url: str, pg_conn: psycopg.Connection
 ) -> None:
-    # Abstain is exit 0 by default, but exit 1 under --strict.
+    # Abstain is exit 0 by default, but exit 1 under --strict. The table is
+    # scoped (static ISOLATED) so the *only* thing that can fail the gate is the
+    # abstain — a leaking table would fail exit 1 regardless of the probe.
     with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
         cur.execute(
             "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid);"
             "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
             "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
-            "CREATE POLICY p ON public.docs FOR SELECT TO public USING (true);"
+            "CREATE POLICY p ON public.docs FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid());"
             "GRANT SELECT, INSERT ON public.docs TO public;"
             "DROP ROLE IF EXISTS pgrls_weak;"
             "CREATE ROLE pgrls_weak LOGIN PASSWORD 'weak' "

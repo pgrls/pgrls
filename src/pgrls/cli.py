@@ -4028,7 +4028,14 @@ def verify(
             static_text = render_verify(verification, "text")
             probe_text = render_probe(probe_result, "text")
             _emit(f"{static_text}\n\n{probe_text}", output_path)
-        if probe_result.has_mismatch or probe_result.has_confirmed_leak:
+        # --probe must never be *less* strict than plain verify: a soundly
+        # proven static leak still fails the gate even when the live probe could
+        # not reproduce it (e.g. it abstained on an un-seedable NOT NULL column).
+        if (
+            verification.has_leak
+            or probe_result.has_mismatch
+            or probe_result.has_confirmed_leak
+        ):
             sys.exit(1)
         if strict and any(r.agreement == "abstained" for r in probe_result.results):
             sys.exit(1)

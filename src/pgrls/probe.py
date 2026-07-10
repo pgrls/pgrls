@@ -493,6 +493,23 @@ def _probe_one(
             cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
 
 
+def _rls_active_for_probe_role(cur: psycopg.Cursor[Any], table: Table) -> bool:
+    """Whether RLS is actually enforced for the *current* (probe) role on this
+    table. ``row_security_active(regclass)`` returns False when the role bypasses
+    RLS — e.g. an owner-equivalent role (a member of the table's owner) on a
+    table without ``FORCE ROW LEVEL SECURITY`` — in which case any row/write it
+    observes is permitted for a non-policy reason and must not be read as a leak.
+    On an unexpected error we proceed (return True) rather than mask a real
+    leak; the builtin does not error for a valid regclass."""
+    qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    try:
+        cur.execute("SELECT row_security_active(%s::regclass)", (qtbl,))
+        row = cur.fetchone()
+    except psycopg.Error:
+        return True
+    return bool(row and row[0])
+
+
 def _run_probe_steps(
     cur: psycopg.Cursor[Any],
     table: Table,
@@ -549,6 +566,19 @@ def _run_probe_steps(
         ) from exc
 
     try:
+        # The probe measures a *policy* leak only if RLS is actually enforced for
+        # the probe role. If that role is owner-equivalent (a member of the
+        # table's owner) and the table is not FORCE'd, Postgres exempts it from
+        # RLS entirely — every row/write it then sees is permitted for a
+        # non-policy reason. Abstain rather than credit that as a leak. (The
+        # membership can be one the probe itself granted to reach a policy's
+        # `TO <role>`, so this guard is essential, not hypothetical.)
+        if not _rls_active_for_probe_role(cur, table):
+            raise _ProbeAbstain(
+                "RLS is not enforced for the probe session (an owner-equivalent "
+                "role on a table without FORCE ROW LEVEL SECURITY) — the probe "
+                "cannot measure a policy leak here"
+            )
         if mode == "write":
             return _observe_write(cur, table, row)
         # Observe ONLY the row the probe planted, never the whole table. A
@@ -1122,9 +1152,14 @@ def render_sarif(p: Probe, *, strict: bool = False) -> str:
       the live database disagree). Always fails.
     * **LEAK CONFIRMED** → one `error` result at ``schema.table.policy`` (a
       live-reproduced leak). Always fails.
-    * **AGREE / skipped** → no result (the SARIF "all clear" state).
-    * **abstained** → no result by default; under ``strict`` one `note` result at
-      ``schema.table`` (matching the ``--strict`` gate, which fails on abstain).
+    * **static LEAK** (whatever the live outcome — reproduced, or the probe
+      abstained) → one `error` result: a soundly proven leak fails the gate even
+      when the probe cannot reproduce it, so `--probe` is never weaker than plain
+      `verify`.
+    * **AGREE / skipped** (non-leak static verdict) → no result (all clear).
+    * **abstained** (non-leak static verdict) → no result by default; under
+      ``strict`` one `note` result at ``schema.table`` (matching the ``--strict``
+      gate, which fails on abstain).
 
     `strict` is keyword-only (default False) so this still satisfies a 1-arg
     renderer signature; the CLI threads ``strict=`` through for the SARIF case.
@@ -1152,6 +1187,28 @@ def render_sarif(p: Probe, *, strict: bool = False) -> str:
                     location=(
                         f"{r.qualified_name}.{r.policy}"
                         if r.agreement == "leak_confirmed" and r.policy
+                        else r.qualified_name
+                    ),
+                )
+            )
+        elif r.static_verdict == "leak":
+            # A statically PROVEN leak the live probe did not itself flag — it
+            # reproduced it (agree) or could not (abstained / skipped). The
+            # proven leak still fails the gate (`--probe` is never weaker than
+            # plain verify), so it must appear as an error — otherwise a red
+            # check would carry no alert.
+            violations.append(
+                Violation(
+                    rule_id=rule_id,
+                    severity="error",
+                    title=title,
+                    message=(
+                        f"{r.qualified_name}: static verdict LEAK "
+                        f"(live probe: {r.agreement}) — {r.detail}"
+                    ),
+                    location=(
+                        f"{r.qualified_name}.{r.policy}"
+                        if r.policy
                         else r.qualified_name
                     ),
                 )
