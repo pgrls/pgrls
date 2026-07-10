@@ -11,6 +11,24 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`pgrls verify --probe` no longer manufactures a false `LEAK CONFIRMED` /
+  `MISMATCH`.** To reach a policy's `TO <role>`, the probe grants its throwaway
+  role membership in that role — but if the role is (or inherits) the table
+  owner, then on a table with RLS enabled **but not `FORCE`'d** (the Postgres
+  default) the probe role acquires the owner's RLS exemption and reads every
+  row, so a *genuinely-isolated* policy (`FOR ALL TO app USING (tenant_id =
+  auth.uid())` on an `app`-owned table) was reported as a live-reproduced leak.
+  The probe now gates every observation on `row_security_active()` for the probe
+  session and **abstains** when RLS isn't actually enforced, rather than
+  crediting a fabricated bypass.
+- **`pgrls verify --probe` is no longer *weaker* than plain `pgrls verify`.** A
+  soundly proven static `LEAK` the live probe couldn't reproduce (e.g. it
+  abstained on an un-seedable `NOT NULL bytea` column) flipped the exit code
+  1 → 0 — a CI job that added `--probe` for extra rigor silently green-lit a
+  schema `verify` fails. The probe gate now also fails on any proven static
+  leak (text/JSON/SARIF and exit code), so `--probe` is always at least as
+  strict as `verify`; a static leak the probe can't reproduce appears as a
+  SARIF `error` (no more empty red check).
 - **`pgrls verify --mode escalation` no longer over-abstains on a benign
   built-in call.** 0.48.1's scalar-`FuncCall` abstention only recognized a
   built-in when it was `pg_catalog`-qualified, but an introspected function
