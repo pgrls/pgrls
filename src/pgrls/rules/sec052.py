@@ -289,12 +289,27 @@ class SEC052:
     def _violation(self, view: View, leaked: list[str]) -> Violation:
         kind = "materialized view" if view.is_materialized else "view"
         tables = ", ".join(leaked)
-        invoker_note = (
-            ""
-            if view.is_materialized
-            else "set `WITH (security_invoker = on)` so it runs as the caller "
-            "(who cannot read auth.users), "
-        )
+        if view.is_materialized:
+            # A matview's WHERE runs once at REFRESH (as the refreshing role),
+            # not per caller, so neither `security_invoker` nor an `id =
+            # auth.uid()` filter scopes it — and adding such a filter would only
+            # SILENCE this finding while the capture still leaks. Offer only
+            # remedies that actually work for a matview (the "printed
+            # remediation must work" discipline).
+            remedy = (
+                "REVOKE the low-trust SELECT grant, restrict the selected "
+                "columns, or drop the matview / move it out of the exposed "
+                "schema (a matview's WHERE runs at REFRESH, not per caller, so "
+                "a security_invoker option or an `id = auth.uid()` filter does "
+                "not scope it)"
+            )
+        else:
+            remedy = (
+                "set `WITH (security_invoker = on)` so it runs as the caller "
+                "(who cannot read auth.users), restrict the selected columns, "
+                "add a `WHERE id = auth.uid()` caller filter, or move the view "
+                "out of the exposed schema"
+            )
         return Violation(
             rule_id=self.id,
             severity=self.severity,
@@ -306,11 +321,9 @@ class SEC052:
                 "so it runs with the view owner's privileges and discloses "
                 f"{tables} rows the caller is not scoped to (typically email, "
                 "phone, encrypted_password, metadata) to any REST caller at "
-                f"GET /rest/v1/{view.name}. Remedy: {invoker_note}"
-                "restrict the selected columns, add a `WHERE id = auth.uid()` "
-                "caller filter, or move the view out of the exposed schema. If "
-                f"the exposure is intentional, allowlist {view.qualified_name!r} "
-                "in [lint.rules.SEC052]."
+                f"GET /rest/v1/{view.name}. Remedy: {remedy}. If the exposure "
+                f"is intentional, allowlist {view.qualified_name!r} in "
+                "[lint.rules.SEC052]."
             ),
             location=view.qualified_name,
         )

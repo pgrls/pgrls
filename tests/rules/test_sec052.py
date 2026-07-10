@@ -105,6 +105,23 @@ def test_fires_on_materialized_view_even_with_invoker_flag() -> None:
     assert _check(v) == ["public.users_mv"]
 
 
+def test_materialized_view_remedy_omits_the_nonworking_auth_uid_filter() -> None:
+    # A matview's WHERE runs at REFRESH, not per caller, so the message must NOT
+    # tell the user to add `auth.uid()` (which wouldn't scope it and would only
+    # silence the finding). It should point at the remedies that actually work.
+    v = _view(
+        name="mv", definition="SELECT * FROM auth.users", is_materialized=True
+    )
+    (out,) = SEC052().check(Schema(views=(v,)), {})
+    assert "auth.uid() caller filter" not in out.message
+    assert "REVOKE" in out.message
+    # A regular view still gets the security_invoker + caller-filter remedy.
+    rv = _view(name="v", definition="SELECT * FROM auth.users")
+    (rout,) = SEC052().check(Schema(views=(rv,)), {})
+    assert "security_invoker" in rout.message
+    assert "auth.uid()" in rout.message
+
+
 def test_fires_on_derived_table_exposure() -> None:
     v = _view(
         name="d",
