@@ -3583,6 +3583,8 @@ scope the body to `auth.uid()`, or move the view out of the exposed schema.
 [lint.rules.SEC052]
 # PostgREST-exposed schemas.
 schemas = ["public"]
+# Low-trust roles whose SELECT on the view means "API-reachable".
+grantees = ["anon", "authenticated", "PUBLIC"]
 # Sensitive schema.table sources (add e.g. "auth.identities").
 tables = ["auth.users"]
 # Caller-binding signals (shared default with SEC036).
@@ -3590,6 +3592,10 @@ binding_functions = ["auth.uid", "current_setting"]
 # Qualified view names that intentionally expose the table.
 allowlist = ["public.public_profiles"]
 ```
+
+SEC052 reads the view's grants (`relacl`), captured in snapshot **v23+**. On an
+older snapshot the grants are absent (`grants=()`), so the rule finds nothing on
+that view — the fail-closed direction.
 
 <a id="rule-perf001"></a>
 

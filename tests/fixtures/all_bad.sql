@@ -685,6 +685,9 @@ CREATE POLICY any_admin_exists ON public.allbad_sec036
 -- security_invoker view or a caller-scoped WHERE would be silent.)
 CREATE VIEW public.allbad_sec052 AS
     SELECT id, raw_app_meta_data FROM auth.users;
+-- The grant to a low-trust role (PUBLIC here) is the API-reachability signal
+-- SEC052 gates on — without it a public-schema view is not flagged.
+GRANT SELECT ON public.allbad_sec052 TO PUBLIC;
 
 -- SEC034: the policy gates rows by `auth.email()`. Email-based
 -- scoping has three silent failure modes (email change flow leaves

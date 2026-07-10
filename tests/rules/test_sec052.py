@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import pytest
 
-from pgrls.model import Schema, View
+from pgrls.model import Grant, Schema, View
 from pgrls.rules.sec052 import SEC052
+
+# Default: granted SELECT to PUBLIC — the API-reachability signal SEC052 gates
+# on. The grant-gate tests below override this to pin the REVOKE'd / backend-
+# only cases.
+_PUBLIC_SELECT: tuple[Grant, ...] = (Grant(role="PUBLIC", privileges=("SELECT",)),)
 
 
 def _view(
@@ -23,6 +28,7 @@ def _view(
     is_materialized: bool = False,
     security_invoker: bool = False,
     references: tuple[tuple[str, str], ...] = (("auth", "users"),),
+    grants: tuple[Grant, ...] = _PUBLIC_SELECT,
 ) -> View:
     return View(
         schema=schema,
@@ -33,6 +39,7 @@ def _view(
         definition=definition,
         references=references,
         security_definer_calls=(),
+        grants=grants,
     )
 
 
@@ -211,6 +218,57 @@ def test_no_fire_on_transitive_reexposer() -> None:
         references=(("auth", "users"), ("public", "b")),
     )
     assert _check(a) == []
+
+
+# --- grant gate (API-reachability; the true exposure signal) ---------------
+
+
+def test_no_fire_when_view_not_granted_to_low_trust() -> None:
+    # A public-schema view over auth.users REVOKE'd from anon/authenticated
+    # (readable only by postgres/service_role) is NOT API-reachable → no fire,
+    # even though it sits in the exposed schema and reads auth.users unbound.
+    v = _view(name="internal", definition="SELECT * FROM auth.users", grants=())
+    assert _check(v) == []
+
+
+def test_no_fire_when_granted_only_to_backend_role() -> None:
+    v = _view(
+        name="dump",
+        definition="SELECT * FROM auth.users",
+        grants=(Grant(role="service_role", privileges=("SELECT",)),),
+    )
+    assert _check(v) == []
+
+
+def test_no_fire_when_low_trust_grant_lacks_select() -> None:
+    # A non-SELECT grant (e.g. an oddly-granted TRIGGER) does not expose rows.
+    v = _view(
+        name="odd",
+        definition="SELECT * FROM auth.users",
+        grants=(Grant(role="anon", privileges=("TRIGGER",)),),
+    )
+    assert _check(v) == []
+
+
+def test_fires_when_granted_to_anon() -> None:
+    v = _view(
+        name="u",
+        definition="SELECT * FROM auth.users",
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+    assert _check(v) == ["public.u"]
+
+
+def test_config_grantees_custom() -> None:
+    v = _view(
+        name="u",
+        definition="SELECT * FROM auth.users",
+        grants=(Grant(role="reporting", privileges=("SELECT",)),),
+    )
+    # `reporting` isn't a default low-trust grantee → no fire.
+    assert _check(v) == []
+    # Declaring it makes the view API-reachable in this deployment → fires.
+    assert _check(v, grantees=["reporting"]) == ["public.u"]
 
 
 # --- configuration ---------------------------------------------------------

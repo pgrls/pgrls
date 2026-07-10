@@ -26,6 +26,11 @@ Detection (sound, reuses SEC036's caller-binding analysis via
 ``pgrls.rules._auth_binding``):
 
 * the view is in an exposed schema (``schemas``, default ``["public"]``);
+* a low-trust role holds ``SELECT`` on the view (``grantees``, default
+  ``anon`` / ``authenticated`` / ``PUBLIC``) — the true API-reachability signal,
+  read from the view's ``relacl`` (v23+). A view REVOKE'd from those roles
+  (readable only by a backend role) is **not** flagged even though it sits in
+  the exposed schema — the same grant gate SEC049 applies to a table;
 * it is a regular view **without** ``security_invoker`` (an invoker view runs as
   the caller, who lacks ``SELECT`` on ``auth.users`` → the query errors, it does
   not leak), **or** a materialized view (matview data is physically captured and
@@ -46,6 +51,19 @@ Conservative by design (soundness over recall, no false positives):
   body doesn't read the sensitive table, so the caller-binding of ``b`` can't be
   judged from ``a``. The **direct** reader ``b`` is flagged; fixing it fixes the
   chain.
+* A read reached through a **CTE** (``WITH u AS (SELECT * FROM auth.users)
+  SELECT * FROM u``) is not seen — the body scan inspects FROM items, not the
+  ``WITH`` list (the same conservative stance SEC036 documents). Inline the
+  reference to get the check.
+* In a **set operation** (``UNION`` etc.) the caller-binding scan is any-arm: if
+  one arm reads ``auth.users`` unbound but another arm binds the caller, the view
+  is treated as bound and not flagged (inherited from SEC036's existence-test
+  logic; a projection miss here, never a false positive). Bind (or drop) the
+  ``auth.users`` read in its own arm to be safe.
+* For a **materialized view** the ``WHERE`` runs once at ``REFRESH`` (as the
+  refreshing role), not per caller, so a ``WHERE id = auth.uid()`` filter does
+  *not* actually scope to the caller — a caller-bound matview over ``auth.users``
+  is a conservative miss, not a "safe" view.
 * Any caller-binding auth call (``auth.uid()`` etc.) present in the view's
   effective WHERE / JOIN-ON / derived-table quals is treated as scoping the read
   to the caller — the same presence-based binding signal SEC036 uses.
@@ -56,6 +74,8 @@ user's PII to any (even unauthenticated) caller.
 Configuration ``[lint.rules.SEC052]``:
 
 * ``schemas`` — PostgREST-exposed schemas (default ``["public"]``).
+* ``grantees`` — low-trust roles whose SELECT on the view means "API-reachable"
+  (default ``["anon", "authenticated", "PUBLIC"]``).
 * ``tables`` — sensitive ``schema.table`` sources (default ``["auth.users"]``;
   add e.g. ``"auth.identities"`` if you treat it as equally sensitive).
 * ``binding_functions`` — caller-binding signals (default the ``auth.uid`` /
@@ -91,6 +111,12 @@ _DEFAULT_EXPOSED_SCHEMAS = ("public",)
 _DEFAULT_SENSITIVE_TABLES: frozenset[tuple[str, str]] = frozenset({
     ("auth", "users"),
 })
+# Low-trust grantees whose SELECT on the view means "reachable over the API"
+# — the same set SEC049 gates on. A view granted only to a backend role
+# (service_role / postgres) or REVOKE'd from anon/authenticated is not
+# API-reachable and is NOT flagged (the grant is the true exposure signal;
+# schema membership alone is not).
+_DEFAULT_GRANTEES = ("anon", "authenticated", "PUBLIC")
 
 
 def _parse_exposed_schemas(options: dict[str, Any]) -> set[str]:
@@ -136,6 +162,29 @@ def _parse_binding_functions(options: dict[str, Any]) -> set[str]:
             '["auth.uid", "current_setting"]'
         )
     return set(raw)
+
+
+def _parse_grantees(options: dict[str, Any]) -> set[str]:
+    raw = options.get("grantees")
+    if raw is None:
+        return set(_DEFAULT_GRANTEES)
+    # Validate + normalize the public pseudo-role to the stored "PUBLIC"
+    # form (mirrors SEC049).
+    items = _list_of_strings("SEC052", raw, "role names", option="grantees")
+    return {"PUBLIC" if s.lower() == "public" else s for s in items}
+
+
+def _view_reachable_by(view: View, grantees: set[str]) -> bool:
+    """Whether a low-trust role in `grantees` holds SELECT on the view.
+
+    This is the true API-exposure signal (the same one SEC049 gates a table
+    on): a view granted only to a backend role, or REVOKE'd from
+    anon/authenticated, is not reachable over the REST API and must not be
+    flagged even though it sits in the exposed schema.
+    """
+    return any(
+        g.role in grantees and "SELECT" in g.privileges for g in view.grants
+    )
 
 
 def _view_selects(definition: str) -> list[SelectStmt]:
@@ -191,6 +240,7 @@ class SEC052:
         exposed = _parse_exposed_schemas(options)
         sensitive = _parse_sensitive_tables(options)
         binding_functions = _parse_binding_functions(options)
+        grantees = _parse_grantees(options)
         allowlist = parse_qualified_view_allowlist("SEC052", options)
 
         out: list[Violation] = []
@@ -198,6 +248,12 @@ class SEC052:
             if v.schema not in exposed:
                 continue
             if v.qualified_name in allowlist:
+                continue
+            # The view is only an exposure if a low-trust role can actually
+            # read it — a view REVOKE'd from anon/authenticated (readable only
+            # by a backend role) is not reachable over the API. Gate on the
+            # grant, exactly as SEC049 does for a table.
+            if not _view_reachable_by(v, grantees):
                 continue
             # A regular view WITH security_invoker runs as the caller, who has
             # no SELECT on auth.users → the query errors, it does not leak.
@@ -238,10 +294,11 @@ class SEC052:
             title=self.title,
             message=(
                 f"The {kind} {view.qualified_name} is in the API-exposed "
-                f"schema {view.schema} and reads {tables} without scoping the "
-                "read to the calling user, so it runs with the view owner's "
-                f"privileges and discloses every row of {tables} (email, phone, "
-                "encrypted_password, user metadata) to any REST caller at "
+                f"schema {view.schema}, grants a low-trust role SELECT, and "
+                f"reads {tables} without scoping the read to the calling user, "
+                "so it runs with the view owner's privileges and discloses "
+                f"{tables} rows the caller is not scoped to (typically email, "
+                "phone, encrypted_password, metadata) to any REST caller at "
                 f"GET /rest/v1/{view.name}. Remedy: {invoker_note}"
                 "restrict the selected columns, add a `WHERE id = auth.uid()` "
                 "caller filter, or move the view out of the exposed schema. If "

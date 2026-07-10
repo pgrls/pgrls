@@ -19,12 +19,19 @@ breaking changes — they will be called out in this file.
   `0002_auth_users_exposed`. A regular view with `security_invoker` is safe (it
   runs as the caller, who cannot read `auth.users`); a view filtered to
   `id = auth.uid()` is a legitimate "my account" view and is not flagged (the
-  caller-binding analysis is shared verbatim with SEC036). Unparseable bodies
-  and transitive re-exposers abstain (soundness over recall). Distinct from
-  VIEW001, which requires the referenced table to have RLS enabled;
-  `auth.users` is grant-protected, not RLS-protected. Configurable
-  (`schemas` / `tables` / `binding_functions` / `allowlist`); no auto-fix. This
-  brings the catalog to **65 rules**. No snapshot-format change.
+  caller-binding analysis is shared verbatim with SEC036). Like SEC049, it
+  gates on the view actually granting a low-trust role SELECT — a view
+  REVOKE'd from `anon`/`authenticated` (readable only by a backend role) is not
+  API-reachable and is not flagged. Unparseable bodies and transitive
+  re-exposers abstain (soundness over recall). Distinct from VIEW001, which
+  requires the referenced table to have RLS enabled; `auth.users` is
+  grant-protected, not RLS-protected. Configurable (`schemas` / `grantees` /
+  `tables` / `binding_functions` / `allowlist`); no auto-fix. This brings the
+  catalog to **65 rules**.
+- **Snapshot v22 → v23**: adds per-view `View.grants` (from `pg_class.relacl`)
+  so SEC052 can confirm API-reachability. Additive and fail-closed — a pre-v23
+  snapshot round-trips with `grants=()`, so SEC052 finds nothing on a view
+  until the snapshot is regenerated against a live database.
 - Extracted SEC036's caller-binding AST analysis into
   `pgrls.rules._auth_binding` so SEC036 (policy `EXISTS` sub-selects) and SEC052
   (view bodies) share one implementation — the "reads `auth.users` without

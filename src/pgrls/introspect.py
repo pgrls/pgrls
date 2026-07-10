@@ -336,12 +336,39 @@ SELECT
          WHERE split_part(o.opt, '=', 1) = 'security_barrier'),
         FALSE
     ) AS security_barrier,
-    pg_get_viewdef(c.oid, true) AS definition
+    pg_get_viewdef(c.oid, true) AS definition,
+    c.oid AS view_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('v', 'm')
   AND n.nspname = ANY(%s)
 ORDER BY n.nspname, c.relname
+"""
+
+# View/matview privilege grants from `pg_class.relacl` — the parallel of
+# `_GRANTS_SQL` for relkind 'v'/'m' (kept separate so the table-grant query
+# stays untouched). SEC052 reads these to confirm a low-trust role can
+# actually reach the view over the API before flagging an auth.users
+# exposure. Same shape and hardening as `_GRANTS_SQL`: SELECT DISTINCT drops
+# aclexplode's per-grantor multiplicity, grantee 0 renders as PUBLIC, and the
+# owner's own self-grant is excluded (it always holds the privilege).
+_VIEW_GRANTS_SQL = """
+SELECT DISTINCT
+    c.oid AS view_oid,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN LATERAL aclexplode(c.relacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+WHERE c.relkind IN ('v', 'm')
+  AND n.nspname = ANY(%s)
+  AND c.relacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> c.relowner
+ORDER BY c.oid, role_name, ax.privilege_type
 """
 
 _VIEW_DEPS_SQL = """
@@ -1400,6 +1427,24 @@ def _build_views(
         (row["schema_name"], row["view_name"]) for row in view_rows
     }
     secdef_index = _build_secdef_calls_index(secdef_functions, view_rows)
+    # Per-view relacl grants (v23+), keyed by view OID. Fetched here so both
+    # `introspect` paths (the no-tables early return and the main path) get
+    # them without threading the table-grant map through.
+    cur.execute(_VIEW_GRANTS_SQL, (schemas,))
+    view_grants_acc: dict[int, dict[str, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in cur.fetchall():
+        view_grants_acc[row["view_oid"]][row["role_name"]].append(
+            row["privilege_type"]
+        )
+    view_grants_by_oid: dict[int, tuple[Grant, ...]] = {
+        oid: tuple(
+            Grant(role=role, privileges=tuple(privs))
+            for role, privs in sorted(roles.items())
+        )
+        for oid, roles in view_grants_acc.items()
+    }
     return tuple(
         View(
             schema=row["schema_name"],
@@ -1418,6 +1463,7 @@ def _build_views(
             security_definer_calls=secdef_index.get(
                 (row["schema_name"], row["view_name"]), ()
             ),
+            grants=view_grants_by_oid.get(row["view_oid"], ()),
         )
         for row in view_rows
     )
