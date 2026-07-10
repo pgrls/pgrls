@@ -303,6 +303,9 @@ class SEC052:
                 "a security_invoker option or an `id = auth.uid()` filter does "
                 "not scope it)"
             )
+            # A matview is not a definer-view at query time: its rows are
+            # captured at REFRESH and served with the reader's own grant.
+            mechanism = "so its materialized rows expose"
         else:
             remedy = (
                 "set `WITH (security_invoker = on)` so it runs as the caller "
@@ -310,6 +313,7 @@ class SEC052:
                 "add a `WHERE id = auth.uid()` caller filter, or move the view "
                 "out of the exposed schema"
             )
+            mechanism = "so it runs with the view owner's privileges and exposes"
         return Violation(
             rule_id=self.id,
             severity=self.severity,
@@ -318,7 +322,7 @@ class SEC052:
                 f"The {kind} {view.qualified_name} is in the API-exposed "
                 f"schema {view.schema}, grants a low-trust role SELECT, and "
                 f"reads {tables} without scoping the read to the calling user, "
-                "so it runs with the view owner's privileges and discloses "
+                f"{mechanism} "
                 f"{tables} rows the caller is not scoped to (typically email, "
                 "phone, encrypted_password, metadata) to any REST caller at "
                 f"GET /rest/v1/{view.name}. Remedy: {remedy}. If the exposure "

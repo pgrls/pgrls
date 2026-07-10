@@ -113,13 +113,16 @@ def test_materialized_view_remedy_omits_the_nonworking_auth_uid_filter() -> None
         name="mv", definition="SELECT * FROM auth.users", is_materialized=True
     )
     (out,) = SEC052().check(Schema(views=(v,)), {})
-    assert "auth.uid() caller filter" not in out.message
+    # Must NOT suggest the (backtick-exact) regular-view caller-filter remedy…
+    assert "add a `WHERE id = auth.uid()` caller filter" not in out.message
+    # …and must carry the matview-specific "why it doesn't work" explanation.
+    assert "does not scope it" in out.message
     assert "REVOKE" in out.message
     # A regular view still gets the security_invoker + caller-filter remedy.
     rv = _view(name="v", definition="SELECT * FROM auth.users")
     (rout,) = SEC052().check(Schema(views=(rv,)), {})
     assert "security_invoker" in rout.message
-    assert "auth.uid()" in rout.message
+    assert "add a `WHERE id = auth.uid()` caller filter" in rout.message
 
 
 def test_fires_on_derived_table_exposure() -> None:
