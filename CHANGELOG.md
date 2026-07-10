@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.48.2] - 2026-07-10
+
 ### Fixed
 - **`pgrls verify --probe` no longer manufactures a false `LEAK CONFIRMED` /
   `MISMATCH`.** To reach a policy's `TO <role>`, the probe grants its throwaway
