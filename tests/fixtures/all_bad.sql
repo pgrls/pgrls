@@ -675,6 +675,17 @@ CREATE POLICY any_admin_exists ON public.allbad_sec036
         WHERE raw_app_meta_data ->> 'role' = 'admin'
     ));
 
+-- SEC052: a view in the API-exposed `public` schema selects from
+-- `auth.users` (stubbed above) WITHOUT scoping to the calling user and
+-- WITHOUT `security_invoker`, so it runs with the view owner's privileges
+-- and exposes every user's row at GET /rest/v1/allbad_sec052. VIEW001 can't
+-- catch this — auth.users lives outside the scanned schema, so it isn't in
+-- VIEW001's RLS-table set — which is exactly why SEC052 exists. No
+-- `WHERE id = auth.uid()` binding, so the read is unbound → fires. (A
+-- security_invoker view or a caller-scoped WHERE would be silent.)
+CREATE VIEW public.allbad_sec052 AS
+    SELECT id, raw_app_meta_data FROM auth.users;
+
 -- SEC034: the policy gates rows by `auth.email()`. Email-based
 -- scoping has three silent failure modes (email change flow leaves
 -- users locked out, SQL = is case-sensitive while emails aren't,

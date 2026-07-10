@@ -10,6 +10,26 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **SEC052 (error) — Auth user table exposed through an API-schema view.** A
+  view (or matview) in a PostgREST-exposed schema (default `public`) that reads
+  `auth.users` as a FROM-clause source **without** scoping to the calling user
+  runs with the view owner's privileges, so a REST caller reads every user's
+  email / metadata at `GET /rest/v1/<view>` — Supabase advisor
+  `0002_auth_users_exposed`. A regular view with `security_invoker` is safe (it
+  runs as the caller, who cannot read `auth.users`); a view filtered to
+  `id = auth.uid()` is a legitimate "my account" view and is not flagged (the
+  caller-binding analysis is shared verbatim with SEC036). Unparseable bodies
+  and transitive re-exposers abstain (soundness over recall). Distinct from
+  VIEW001, which requires the referenced table to have RLS enabled;
+  `auth.users` is grant-protected, not RLS-protected. Configurable
+  (`schemas` / `tables` / `binding_functions` / `allowlist`); no auto-fix. This
+  brings the catalog to **65 rules**. No snapshot-format change.
+- Extracted SEC036's caller-binding AST analysis into
+  `pgrls.rules._auth_binding` so SEC036 (policy `EXISTS` sub-selects) and SEC052
+  (view bodies) share one implementation — the "reads `auth.users` without
+  binding the caller" primitive is now defined once.
+
 ## [0.48.2] - 2026-07-10
 
 ### Fixed

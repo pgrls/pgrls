@@ -31,6 +31,11 @@ caller-binding signal — by default any FuncCall whose name is
 `auth.uid`, `auth.role`, `auth.jwt`, `current_user`, `session_user`,
 or `current_setting`. Absent any such reference, the rule fires.
 
+The target-detection and caller-binding primitives live in
+`pgrls.rules._auth_binding` (shared with SEC052, which asks the same
+"reads auth.users without binding the caller" question of a *view body*);
+this module keeps only the EXISTS-sublink-specific glue.
+
 The `IN (SELECT ...)` / `ANY (SELECT ...)` variant against
 `auth.users` is a related but distinct hazard class (the outer
 `testexpr` already binds an outer-row column to the sub-result, so
@@ -78,33 +83,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import (
-    JoinExpr,
-    Node,
-    RangeSubselect,
-    RangeVar,
-    SelectStmt,
-    SubLink,
-)
-from pglast.enums import SetOperation, SubLinkType
+from pglast.ast import SubLink
+from pglast.enums import SubLinkType
 
-from pgrls.ast_utils import find_func_calls
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
+from pgrls.rules._auth_binding import (
+    DEFAULT_BINDING_FUNCTIONS as _DEFAULT_BINDING_FUNCTIONS,
+)
+from pgrls.rules._auth_binding import (
+    from_clause_targets as _from_clause_targets,
+)
+from pgrls.rules._auth_binding import (
+    select_binds_caller as _select_binds_caller,
+)
 from pgrls.violations import Severity, Violation
 
 
 _DEFAULT_TARGET_TABLES: frozenset[tuple[str, str]] = frozenset({
     ("auth", "users"),
-})
-
-_DEFAULT_BINDING_FUNCTIONS: frozenset[str] = frozenset({
-    "auth.uid",
-    "auth.role",
-    "auth.jwt",
-    "current_user",
-    "session_user",
-    "current_setting",
 })
 
 
@@ -147,149 +144,6 @@ def _parse_binding_functions(options: dict[str, Any]) -> set[str]:
     return set(raw)
 
 
-def _select_from_items(sel: Any) -> list[Any]:
-    """A SelectStmt's effective FROM-clause items.
-
-    A set operation (UNION / INTERSECT / EXCEPT) leaves `fromClause`
-    None and stores the real FROM items in `larg` / `rarg`, so flatten
-    those arms' FROM items. This is the single place the set-op split is
-    handled, so the target scan (`_from_clause_targets` and the derived-
-    table descent in `_from_item_range_vars`) stays in lockstep with the
-    set-op-aware binding scan (`_from_clause_binding_quals`). Returns []
-    for a non-SelectStmt.
-    """
-    if not isinstance(sel, SelectStmt):
-        return []
-    if sel.op != SetOperation.SETOP_NONE:
-        return [
-            *_select_from_items(sel.larg),
-            *_select_from_items(sel.rarg),
-        ]
-    return list(sel.fromClause or ())
-
-
-def _from_item_range_vars(from_item: Any) -> list[RangeVar]:
-    """RangeVars reachable from a single FROM-clause item.
-
-    A bare `FROM auth.users` is a `RangeVar`; `FROM a JOIN b ON …` is a
-    `JoinExpr` whose `larg` / `rarg` hold the (possibly further-nested)
-    operands. The original walk inspected only top-level `RangeVar`s,
-    so an `auth.users` reached through a JOIN was invisible and the
-    binding-free EXISTS bypass slipped through. Recurse into `JoinExpr`
-    arms so the target table is found however it's joined in.
-    """
-    out: list[RangeVar] = []
-
-    def walk(item: Any) -> None:
-        if isinstance(item, RangeVar):
-            out.append(item)
-        elif isinstance(item, JoinExpr):
-            walk(item.larg)
-            walk(item.rarg)
-        elif isinstance(item, RangeSubselect):
-            # `FROM (SELECT ... FROM auth.users) sub` — the target
-            # table is one level down in the sub-select's own FROM.
-            # Recurse its effective FROM items so an EXISTS that reaches
-            # the target through a derived table is still detected —
-            # including when the derived table is itself a set operation
-            # (`FROM (SELECT … FROM auth.users UNION SELECT …) sub`),
-            # whose FROM items live in larg/rarg, not fromClause.
-            for fc in _select_from_items(item.subquery):
-                walk(fc)
-
-    walk(from_item)
-    return out
-
-
-def _matches_target(
-    rv: RangeVar, target_tables: set[tuple[str, str]]
-) -> bool:
-    # `schemaname` is None for unqualified references (`FROM users`) —
-    # those default to whatever's on the caller's `search_path`. We
-    # can't statically tell whether an unqualified `users` resolves to
-    # `auth.users` or `public.users`, so we require an explicit
-    # `auth.users` qualification. (Users who want bare-`users` matching
-    # can add `["public.users"]` etc. to target_tables.)
-    return (
-        rv.schemaname is not None
-        and (rv.schemaname.lower(), rv.relname.lower()) in target_tables
-    )
-
-
-def _from_clause_targets(
-    sel: Any, target_tables: set[tuple[str, str]]
-) -> list[RangeVar]:
-    """Target RangeVars in a sub-select's FROM clause (JOINs included).
-
-    `_select_from_items` flattens a top-level set operation
-    (UNION / INTERSECT / EXCEPT) into its arms' FROM items — so an
-    `EXISTS (SELECT 1 FROM auth.users … UNION …)` is examined — and
-    `_from_item_range_vars` descends JOINs and derived tables (the latter
-    set-op-aware too). The binding scan is set-op-aware in lockstep so a
-    correctly-bound set-op policy never begins to false-fire.
-    """
-    out: list[RangeVar] = []
-    for from_item in _select_from_items(sel):
-        for rv in _from_item_range_vars(from_item):
-            if _matches_target(rv, target_tables):
-                out.append(rv)
-    return out
-
-
-def _from_clause_binding_quals(sel: Any) -> list[Any]:
-    """Every qual in `sel`'s FROM clause where a caller binding can live.
-
-    JOIN `ON` clauses (`JOIN auth.users u ON u.id = auth.uid()`), AND —
-    because target detection recurses into derived tables
-    (`_from_item_range_vars` handles RangeSubselect) — the WHERE and JOIN
-    ONs of those derived tables too, recursively. Without the
-    derived-table descent a policy that binds the caller INSIDE a derived
-    table (`FROM (SELECT id FROM auth.users WHERE id = auth.uid()) sub`)
-    false-fires: the target is found one level down but the binding there
-    is never inspected (asymmetry with target detection).
-    """
-    quals: list[Any] = []
-
-    def walk_select(s: Any) -> None:
-        if s is None:
-            return
-        # Set operation: the binding quals live in the arms, not here.
-        if s.op != SetOperation.SETOP_NONE:
-            walk_select(s.larg)
-            walk_select(s.rarg)
-            return
-        if s.whereClause is not None:
-            quals.append(s.whereClause)
-        if s.havingClause is not None:
-            quals.append(s.havingClause)
-        for from_item in s.fromClause or ():
-            walk_item(from_item)
-
-    def walk_item(item: Any) -> None:
-        if isinstance(item, JoinExpr):
-            if item.quals is not None:
-                quals.append(item.quals)
-            walk_item(item.larg)
-            walk_item(item.rarg)
-        elif isinstance(item, RangeSubselect):
-            sub = item.subquery
-            if isinstance(sub, SelectStmt):
-                walk_select(sub)
-
-    if sel is not None:
-        if sel.op != SetOperation.SETOP_NONE:
-            # Top-level set-op: collect the binding quals of both arms
-            # (their WHERE / HAVING / JOIN-ONs) so a set-op EXISTS that
-            # binds the caller in an arm is recognized, in lockstep with
-            # target detection above.
-            walk_select(sel.larg)
-            walk_select(sel.rarg)
-        else:
-            for from_item in sel.fromClause or ():
-                walk_item(from_item)
-    return quals
-
-
 def _exists_sublinks_against_target(
     node: Any, target_tables: set[tuple[str, str]]
 ) -> list[SubLink]:
@@ -302,7 +156,7 @@ def _exists_sublinks_against_target(
 
     The target table is matched whether it appears as a top-level FROM
     item or through a JOIN (`FROM a JOIN auth.users …`) — see
-    `_from_clause_targets`.
+    `from_clause_targets`.
     """
     out: list[SubLink] = []
 
@@ -326,171 +180,6 @@ def _exists_sublinks_against_target(
 
     walk(node)
     return out
-
-
-def _scalar_value_subselects(qual: Any) -> list[Any]:
-    """Sub-selects of SCALAR (EXPR_SUBLINK) sub-links reachable in
-    `qual` without crossing a non-scalar (EXISTS/ANY/ALL) sub-link.
-
-    A scalar `(SELECT auth.uid())` used as a value genuinely binds the
-    caller (the PERF001-recommended wrap). A nested EXISTS/ANY/ALL is a
-    SEPARATE existence test, not a binding of the outer EXISTS, so we
-    must not look inside it — else an admin-any bypass whose WHERE
-    merely contains an unrelated nested auth call (e.g. a correlated
-    audit sub-select) would be treated as caller-bound and the real
-    leak suppressed (the SEC036 false negative).
-    """
-    out: list[Any] = []
-
-    def walk(n: Any) -> None:
-        if n is None:
-            return
-        if isinstance(n, (list, tuple)):
-            for item in n:
-                walk(item)
-            return
-        if isinstance(n, SubLink):
-            walk(n.testexpr)
-            if (
-                n.subLinkType == SubLinkType.EXPR_SUBLINK
-                and n.subselect is not None
-            ):
-                out.append(n.subselect)
-                walk(n.subselect)
-            return
-        if isinstance(n, Node):
-            for field_name in n:
-                walk(getattr(n, field_name, None))
-
-    walk(qual)
-    return out
-
-
-def _is_single_auth_target_select(
-    subselect: Any, binding_functions: set[str]
-) -> bool:
-    """True if `subselect` is a single-target ``SELECT <auth call>`` whose
-    sole target expression is a binding auth call.
-
-    A multi-target select, or one whose lone target is NOT the auth call
-    (e.g. a membership lookup ``SELECT user_id FROM m WHERE u = auth.uid()``
-    where the auth call lives in the WHERE), returns False — this keeps the
-    ANY/IN binding exception below as tight as the scalar form and never
-    descends into a body looking for an arbitrary nested auth call.
-    """
-    if not isinstance(subselect, SelectStmt):
-        return False
-    targets = subselect.targetList
-    if not targets or len(targets) != 1:
-        return False
-    return bool(
-        find_func_calls(
-            getattr(targets[0], "val", None),
-            binding_functions,
-            exclude_sublinks=True,
-        )
-    )
-
-
-def _any_subselect_binds_caller(
-    qual: Any, binding_functions: set[str]
-) -> bool:
-    """True if `qual` binds the caller via an IN / ``= ANY`` sub-query
-    whose sub-select projects EXACTLY a single binding auth call —
-    ``<expr> IN (SELECT auth.uid())`` / ``<expr> = ANY (SELECT auth.uid())``.
-
-    Postgres parses BOTH forms as ``ANY_SUBLINK``, which
-    `_scalar_value_subselects` deliberately does not descend into (so an
-    unrelated auth call buried in a nested ANY/ALL/EXISTS body cannot mask
-    a real admin-any leak — the SEC036 false negative). This is the
-    narrow, sound exception: a single-target sub-select whose sole target
-    IS the auth call genuinely constrains the row to the caller, exactly
-    like the scalar ``col = (SELECT auth.uid())`` (EXPR_SUBLINK) form. The
-    single-target gate keeps the FN-avoidance intact.
-    """
-    found = False
-
-    def walk(n: Any) -> None:
-        nonlocal found
-        if found or n is None:
-            return
-        if isinstance(n, (list, tuple)):
-            for item in n:
-                walk(item)
-            return
-        if isinstance(n, SubLink):
-            # Walk the testexpr (the LHS of IN/ANY) for nested sub-links,
-            # but do NOT descend into the sub-select body except for the
-            # tight single-target binding check — preserving the
-            # FN-avoidance that `_scalar_value_subselects` documents.
-            walk(n.testexpr)
-            if (
-                n.subLinkType == SubLinkType.ANY_SUBLINK
-                and _is_single_auth_target_select(
-                    n.subselect, binding_functions
-                )
-            ):
-                found = True
-            return
-        if isinstance(n, Node):
-            for field_name in n:
-                walk(getattr(n, field_name, None))
-
-    walk(qual)
-    return found
-
-
-def _qual_binds_caller(qual: Any, binding_functions: set[str]) -> bool:
-    """True if a binding auth call in `qual` constrains the EXISTS to
-    the calling user.
-
-    A binding call counts when it is (1) directly in the qual or in an
-    IN/ANY/ALL testexpr — `exclude_sublinks=True` stops the search at
-    every sub-select boundary; (2) inside a scalar value sub-select
-    (`col = (SELECT auth.uid())`); or (3) the target of a single-target
-    IN/ANY sub-query (`col IN (SELECT auth.uid())` / `= ANY (SELECT
-    auth.uid())`). A call inside a nested EXISTS/ANY/ALL body that is NOT
-    that tight single-target binding form is deliberately NOT counted
-    (see `_scalar_value_subselects` / `_any_subselect_binds_caller`).
-    """
-    if find_func_calls(qual, binding_functions, exclude_sublinks=True):
-        return True
-    if any(
-        find_func_calls(sub, binding_functions)
-        for sub in _scalar_value_subselects(qual)
-    ):
-        return True
-    return _any_subselect_binds_caller(qual, binding_functions)
-
-
-def _has_binding_reference(
-    sublink: SubLink, binding_functions: set[str]
-) -> bool:
-    """True if the sub-select binds the caller anywhere it can.
-
-    Checks the sub-select's top-level WHERE *and* every JOIN `ON`
-    clause — a binding predicate (`u.id = auth.uid()`) is equally
-    valid in either position. The search descends into scalar
-    `(SELECT …)` value sub-selects (the PERF001 wrap) but NOT into a
-    nested EXISTS/ANY/ALL body, so an unrelated auth call in a deeper
-    existence sub-select cannot mask an unbound admin-any check.
-    """
-    sel = sublink.subselect
-    if sel is None:
-        return False
-    # A HAVING binding constrains the EXISTS to the caller exactly like a
-    # WHERE binding — `… GROUP BY id HAVING id = auth.uid()`, or even the
-    # GROUP-BY-less `HAVING bool_or(id = auth.uid())`. Omitting it
-    # false-fired a correctly-bound policy at error severity.
-    candidates = [
-        sel.whereClause,
-        sel.havingClause,
-        *_from_clause_binding_quals(sel),
-    ]
-    return any(
-        c is not None and _qual_binds_caller(c, binding_functions)
-        for c in candidates
-    )
 
 
 class SEC036:
@@ -531,7 +220,9 @@ class SEC036:
                         tree, target_tables
                     )
                     for sublink in sublinks:
-                        if _has_binding_reference(sublink, binding_functions):
+                        if _select_binds_caller(
+                            sublink.subselect, binding_functions
+                        ):
                             continue
                         # Identify which target table the offending
                         # sub-link reads — useful in the finding
