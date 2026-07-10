@@ -10,6 +10,34 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`pgrls verify --mode escalation` no longer over-abstains on a benign
+  built-in call.** 0.48.1's scalar-`FuncCall` abstention only recognized a
+  built-in when it was `pg_catalog`-qualified, but an introspected function
+  body (raw `pg_proc.prosrc`) stores builtins **unqualified** — so a harmless
+  `SELECT count(*) FROM app_config` (a non-RLS table) was wrongly reported
+  `UNVERIFIED` with a note claiming it "reads via a view/function". Bare calls
+  to a recognized built-in (`count`, `now`, `lower`, …) are now treated as
+  reading no user data; only a call to an *unknown* (likely user-defined)
+  function forces abstention. A built-in missing from the set merely abstains
+  (sound); the set holds only genuine `pg_catalog` builtins.
+- **`pgrls verify --against` no longer reports a leak as "fixed" when it only
+  became *unprovable*.** A base table proven `LEAK` whose head verdict is
+  `UNVERIFIED` (e.g. the change added an opaque construct) was counted under
+  "Leaks fixed by this change" — falsely reassuring. A leak now counts as fixed
+  only when head proves it `ISOLATED` (or the table was dropped), the symmetric
+  counterpart of never crediting an unprovable *base* with a new leak.
+- **`pgrls verify --against --format sarif --strict`** now includes
+  newly-`UNVERIFIED` tables (as `note` results) — previously `--strict` could
+  exit non-zero on them while emitting an empty SARIF file (a red check with no
+  alerts). The text label for those tables was also corrected (they may have
+  been isolated *or absent* in the baseline).
+- **Docs**: refreshed the pre-commit example `rev` (`v0.47.0` → `v0.48.1`; the
+  `pgrls-lint-sql` hook it demonstrates only exists since 0.48.0), corrected two
+  stale `pgrls fix` auto-fix rule lists in `AGENTS.md` (now the full 20), and
+  added the `escalation` mode to the MCP `verify`-tool description in the
+  README.
+
 ## [0.48.1] - 2026-07-08
 
 ### Fixed
