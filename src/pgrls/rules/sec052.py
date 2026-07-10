@@ -26,11 +26,12 @@ Detection (sound, reuses SEC036's caller-binding analysis via
 ``pgrls.rules._auth_binding``):
 
 * the view is in an exposed schema (``schemas``, default ``["public"]``);
-* a low-trust role holds ``SELECT`` on the view (``grantees``, default
-  ``anon`` / ``authenticated`` / ``PUBLIC``) — the true API-reachability signal,
-  read from the view's ``relacl`` (v23+). A view REVOKE'd from those roles
-  (readable only by a backend role) is **not** flagged even though it sits in
-  the exposed schema — the same grant gate SEC049 applies to a table;
+* a low-trust role holds a table-level ``SELECT`` on the view (``grantees``,
+  default ``anon`` / ``authenticated`` / ``PUBLIC``) — the true API-reachability
+  signal, read from the view's ``relacl`` (v23+). A view REVOKE'd from those
+  roles (readable only by a backend role) is **not** flagged even though it sits
+  in the exposed schema — like SEC049's table-level grant gate (view *column*
+  grants are not modeled — see the conservative-miss note below);
 * it is a regular view **without** ``security_invoker`` (an invoker view runs as
   the caller, who lacks ``SELECT`` on ``auth.users`` → the query errors, it does
   not leak), **or** a materialized view (matview data is physically captured and
@@ -51,6 +52,12 @@ Conservative by design (soundness over recall, no false positives):
   body doesn't read the sensitive table, so the caller-binding of ``b`` can't be
   judged from ``a``. The **direct** reader ``b`` is flagged; fixing it fixes the
   chain.
+* A view exposed **only** through a column-level ``GRANT SELECT (col) ON <view>``
+  (with no table-level grant) is a conservative miss — view column grants are
+  not captured (only ``relacl`` table-level grants), unlike SEC049 which reads a
+  table's column grants too. The standard ``GRANT SELECT ON <view> TO anon`` is
+  captured. A group-role grant a low-trust role merely *inherits* is likewise
+  not expanded, mirroring SEC049.
 * A read reached through a **CTE** (``WITH u AS (SELECT * FROM auth.users)
   SELECT * FROM u``) is not seen — the body scan inspects FROM items, not the
   ``WITH`` list (the same conservative stance SEC036 documents). Inline the
