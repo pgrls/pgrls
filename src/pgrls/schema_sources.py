@@ -777,6 +777,10 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
     # SQL-file source) it must be inert *loudly*, not silently no-op past
     # --require-full-coverage.
     "SEC052": ("view grants that expose auth.users (relacl)", 23),
+    # SEC053 fires only on `Schema.foreign_tables` (v24), which a view/table-less
+    # SQL source never models and a pre-v24 snapshot lacks — so it must be inert
+    # *loudly* there, not silently pass --require-full-coverage.
+    "SEC053": ("foreign tables and their grants (relkind 'f')", 24),
     "PERF003": ("policy-predicate column indexes", 7),
     # PERF004 reaches `Table.indexes` (v7) through `perf003._has_leading_column_index`
     # — same shared-helper path as SEC041/SEC043; the helper reads only

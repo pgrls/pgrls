@@ -46,6 +46,17 @@ def test_sec052_is_gated_on_view_grants_v23():
     assert "SEC052" in inert_rule_ids("sql")
 
 
+def test_sec053_is_gated_on_foreign_tables_v24():
+    # SEC053 fires only on `Schema.foreign_tables` (v24), which a table/view-less
+    # SQL source never models and a pre-v24 snapshot lacks. It must be inert
+    # there so a stale-snapshot lint doesn't silently false-clean an
+    # anon-exposed foreign table past --require-full-coverage.
+    assert _CATALOG_DEPENDENT_RULES["SEC053"][1] == 24
+    assert "SEC053" in inert_rule_ids("snapshot", snapshot_version=23)
+    assert "SEC053" not in inert_rule_ids("snapshot", snapshot_version=24)
+    assert "SEC053" in inert_rule_ids("sql")
+
+
 def test_reachability_gated_rules_threshold_covers_column_grants():
     # SEC041/SEC043 reach `Table.column_grants` (snapshot v8) through the shared
     # `sec041._is_directly_reachable` gate, so a threshold below 8 would let a

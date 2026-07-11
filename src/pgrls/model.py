@@ -31,6 +31,7 @@ __all__ = [
     "ColumnGrant",
     "DefaultPrivilege",
     "ForeignKey",
+    "ForeignTable",
     "Grant",
     "ImmutableFunction",
     "Index",
@@ -51,7 +52,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 23  # v23: per-view grants (View.grants from relacl) — SEC052
+SNAPSHOT_VERSION = 24  # v24: foreign tables (Schema.foreign_tables) — SEC053
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -1258,6 +1259,14 @@ def _view_from_dict(v: dict[str, Any]) -> View:
     )
 
 
+def _foreign_table_from_dict(ft: dict[str, Any]) -> ForeignTable:
+    return ForeignTable(
+        schema=ft["schema"],
+        name=ft["name"],
+        grants=tuple(_grant_from_dict(g) for g in ft.get("grants", [])),
+    )
+
+
 def _is_safe_signature(signature: object) -> bool:
     """True iff `signature` is a single, injection-free function arg list.
 
@@ -1417,6 +1426,29 @@ def _immutable_from_dict(f: dict[str, Any]) -> ImmutableFunction:
 
 
 @dataclass(frozen=True)
+class ForeignTable:
+    """A foreign table (``pg_class.relkind = 'f'``) captured in snapshot v24+.
+
+    Foreign tables **cannot** carry RLS — Postgres rejects
+    ``ALTER TABLE <ft> ENABLE ROW LEVEL SECURITY`` ("not supported for foreign
+    tables") — so one exposed over the API with a low-trust grant is an
+    unfilterable read of the remote data. SEC053 reads this. It is modeled
+    separately from `Table` precisely so the table rules (SEC001 "RLS
+    disabled", SEC049, …) do NOT fire on foreign tables (which structurally
+    can't have RLS). `grants` mirrors `Table.grants` (from `relacl`; owner
+    self-grant excluded; the PUBLIC pseudo-role stored as `role="PUBLIC"`).
+    """
+
+    schema: str
+    name: str
+    grants: tuple[Grant, ...] = ()
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass(frozen=True)
 class Schema:
     tables: tuple[Table, ...] = ()
     views: tuple[View, ...] = ()
@@ -1480,6 +1512,13 @@ class Schema:
     # pre-v21 snapshot until it is re-captured against a live database
     # (fail-closed).
     owner_reachable_members: tuple[OwnerReachableMember, ...] = ()
+    # Foreign tables (`pg_class.relkind='f'`) in the scanned schemas with their
+    # relacl grants — populated in snapshot v24+. SEC053 walks this. Modeled
+    # separately from `tables` so the RLS-table rules never see foreign tables
+    # (which can't have RLS). Default `()` keeps `Schema(...)` construction and
+    # v3-v23 baselines round-tripping with `foreign_tables=()` (fail-closed —
+    # SEC053 finds nothing until re-captured against a live database).
+    foreign_tables: tuple[ForeignTable, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1874,6 +1913,17 @@ class Schema:
                 }
                 for m in self.owner_reachable_members
             ],
+            "foreign_tables": [
+                {
+                    "schema": ft.schema,
+                    "name": ft.name,
+                    "grants": [
+                        {"role": g.role, "privileges": list(g.privileges)}
+                        for g in ft.grants
+                    ],
+                }
+                for ft in self.foreign_tables
+            ],
         }
 
     @classmethod
@@ -1979,12 +2029,12 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23,
+            21, 22, 23, 24,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23. "
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
@@ -2051,6 +2101,12 @@ class Schema:
             _owner_reachable_member_from_dict(m)
             for m in payload.get("owner_reachable_members", [])
         )
+        # v24+ foreign tables; a pre-v24 snapshot has no key → () so SEC053
+        # finds nothing until re-captured (fail-closed).
+        foreign_tables = tuple(
+            _foreign_table_from_dict(ft)
+            for ft in payload.get("foreign_tables", [])
+        )
 
         return cls(
             tables=tables,
@@ -2062,6 +2118,7 @@ class Schema:
             default_privileges=default_privileges,
             immutable_functions=immutable_functions,
             owner_reachable_members=owner_reachable_members,
+            foreign_tables=foreign_tables,
         )
 
     def to_sql(self) -> str:

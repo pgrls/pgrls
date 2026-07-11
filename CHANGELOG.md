@@ -40,6 +40,30 @@ breaking changes — they will be called out in this file.
   `pgrls.rules._auth_binding` so SEC036 (policy `EXISTS` sub-selects) and SEC052
   (view bodies) share one implementation — the "reads `auth.users` without
   binding the caller" primitive is now defined once.
+- **SEC053 (error) — Foreign table exposed in an API schema.** A foreign table
+  (`pg_class.relkind = 'f'` — a `postgres_fdw` / `file_fdw` table or a Supabase
+  *Wrapper* over Stripe / S3 / an external database) in a PostgREST-exposed
+  schema (default `public`) that grants a table-level `SELECT` to a low-trust
+  role (`anon` / `authenticated` / `PUBLIC`) is directly readable at
+  `GET /rest/v1/<ft>` — Supabase advisor `0017_foreign_table_in_api`. A foreign
+  table **cannot carry RLS** (Postgres rejects `ENABLE ROW LEVEL SECURITY` on
+  it), so the read is unfilterable and every remote row is returned. The
+  foreign-table sibling of SEC049 (table) and SEC052 (view): the same "exposed
+  schema + low-trust grant = HTTP-reachable" conjunction, for the one relation
+  type that *structurally* cannot be row-filtered. Conservative — only a direct
+  table-level SELECT grant to a role in `grantees` counts (foreign-table column
+  grants are not modeled). Configurable (`schemas` / `grantees` / `allowlist`);
+  no auto-fix — `REVOKE` the grant, move the table out of the exposed schema, or
+  front it with a `security_invoker` view. This brings the catalog to
+  **66 rules**.
+- **Snapshot v23 → v24**: adds the top-level `foreign_tables` array (relkind
+  `'f'` relations and their grants) so SEC053 can see foreign tables — modeled
+  separately from `Schema.tables` so the table rules (SEC001, SEC049, …) never
+  fire on them. Additive and fail-closed — a pre-v24 snapshot round-trips with
+  `foreign_tables=()`. SEC053 is registered as a catalog-dependent rule, so on a
+  pre-v24 snapshot (or a foreign-table-less SQL-file source) it is reported as
+  **skipped** rather than silently passing — it does not slip past
+  `--require-full-coverage`.
 
 ## [0.48.2] - 2026-07-10
 

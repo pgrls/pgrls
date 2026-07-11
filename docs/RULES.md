@@ -3597,6 +3597,73 @@ SEC052 reads the view's grants (`relacl`), captured in snapshot **v23+**. On an
 older snapshot the grants are absent (`grants=()`), so the rule finds nothing on
 that view — the fail-closed direction.
 
+<a id="rule-sec053"></a>
+
+## SEC053 — Foreign table exposed in an API schema
+
+**Severity:** error
+
+A **foreign table** (`pg_class.relkind = 'f'` — a `postgres_fdw` / `file_fdw`
+table, or a Supabase *Wrapper* over Stripe / S3 / an external database) in a
+PostgREST-exposed schema (default `public`) that grants a table-level `SELECT`
+to a low-trust role (`anon` / `authenticated` / `PUBLIC`) is directly readable
+at `GET /rest/v1/<ft>` — every remote row is returned to any (even
+unauthenticated) caller. This is Supabase Security Advisor
+`0017_foreign_table_in_api`.
+
+```sql
+CREATE FOREIGN TABLE public.stripe_customers (...) SERVER stripe;
+GRANT SELECT ON public.stripe_customers TO anon;
+--  GET /rest/v1/stripe_customers  ->  every remote row, unfiltered.
+```
+
+The reason the exposure is unconditional: a foreign table **cannot carry RLS**.
+Postgres rejects `ALTER TABLE <ft> ENABLE ROW LEVEL SECURITY` outright ("not
+supported for foreign tables"), so there is no policy layer that could scope the
+read — whatever the FDW returns, the caller sees in full. The check is therefore
+a pure exposure test: no policy/predicate analysis is needed or possible.
+
+**Why this is the sibling of [SEC049](#rule-sec049) / [SEC052](#rule-sec052).**
+All three flag the same conjunction — a relation in an API-exposed schema plus a
+low-trust `SELECT` grant that makes it HTTP-reachable. SEC049 covers ordinary
+tables (unfiltered by RLS), SEC052 covers views that launder `auth.users`, and
+SEC053 covers foreign tables — the one relation type that structurally *cannot*
+be row-filtered. A foreign table is modeled separately from `Schema.tables`, so
+the table rules (SEC001, SEC049) never fire on it; SEC053 is its dedicated
+check.
+
+Conservative by design (soundness over recall, no false positives):
+
+* Only a **direct table-level** `SELECT` grant to a role in `grantees` counts. A
+  grant to a group role that a low-trust role merely inherits is not expanded,
+  and a **column-level** grant is a miss (foreign-table column grants are not
+  modeled).
+* A foreign table granted only to a backend role (`service_role`, `postgres`) is
+  not API-reachable and is not flagged.
+* A foreign table outside every exposed schema is not flagged.
+
+**Remediation.** There is no auto-fix — the right remedy depends on intent:
+`REVOKE` the low-trust grant, move the foreign table out of the exposed schema,
+or front it with a `security_invoker` view that filters rows (the view runs as
+the caller, so it can scope the read the foreign table itself cannot).
+
+**Configuration** (`[lint.rules.SEC053]`):
+
+```toml
+[lint.rules.SEC053]
+# PostgREST-exposed schemas.
+schemas = ["public"]
+# Low-trust roles whose SELECT means "API-reachable".
+grantees = ["anon", "authenticated", "PUBLIC"]
+# Foreign-table ids (bare name or schema.table) intentionally public.
+allowlist = ["public.public_feed"]
+```
+
+SEC053 reads foreign tables and their grants from snapshot **v24+** (relkind
+`'f'`). On an older snapshot the `foreign_tables` array is absent (loads as
+`()`), so the rule finds nothing — the fail-closed direction — and is reported
+as skipped rather than silently passing.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK
