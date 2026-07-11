@@ -1031,6 +1031,30 @@ CREATE TABLE public.allbad_sec049 (
 );
 GRANT SELECT ON public.allbad_sec049 TO anon;
 
+-- SEC053: a foreign table (relkind 'f') in the API-exposed public schema,
+-- granted SELECT to the unauthenticated `anon` role. A foreign table cannot
+-- carry RLS (Postgres rejects ENABLE ROW LEVEL SECURITY on it), so anon reads
+-- every remote row at GET /rest/v1/allbad_sec053 with no row filter possible.
+-- SEC053 fires at location public.allbad_sec053. Foreign tables are modeled
+-- separately from regular tables, so SEC001 / SEC049 do NOT co-fire (those scan
+-- schema.tables, which excludes relkind 'f'). The postgres_fdw server never
+-- connects -- introspection only reads catalog rows -- so a bogus host is fine.
+-- The global SERVER survives DROP SCHEMA CASCADE, so the test's finally drops
+-- it. Reuses the `anon` role created above. MUST stay before the SEC044
+-- default-privilege statement so the cluster default ACL does not retroactively
+-- grant it.
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE SERVER IF NOT EXISTS allbad_sec053_srv
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'example.invalid', dbname 'remote');
+CREATE FOREIGN TABLE public.allbad_sec053 (
+    id integer,
+    secret text
+)
+    SERVER allbad_sec053_srv
+    OPTIONS (schema_name 'public', table_name 'remote_secrets');
+GRANT SELECT ON public.allbad_sec053 TO anon;
+
 -- SEC050: a Supabase storage.objects policy scoped to the object owner but with
 -- NO bucket_id predicate authorizes that owner's objects in EVERY bucket
 -- (cross-bucket access). The `storage` schema + `objects` table mimic the

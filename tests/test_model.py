@@ -78,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 23,
+        "version": 24,
         "tables": [
             {
                 "schema": "public",
@@ -115,6 +115,7 @@ def test_schema_to_snapshot_shape() -> None:
         "default_privileges": [],
         "immutable_functions": [],
         "owner_reachable_members": [],
+        "foreign_tables": [],
     }
 
 
@@ -251,7 +252,7 @@ def test_snapshot_version_is_twenty_one_after_owner_capture() -> None:
     # immutable_functions for SEC046; v18 added default_privileges for SEC044;
     # v17 added Table.inherits for SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 23
+    assert snap["version"] == 24
 
 
 def test_snapshot_in_publications_round_trip() -> None:
@@ -836,7 +837,7 @@ def test_v21_table_owner_and_owner_reachable_members_round_trip() -> None:
         ),
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 23
+    assert snap["version"] == 24
     assert snap["tables"][0]["owner"] == "app_owner"
     assert snap["owner_reachable_members"] == [
         {
@@ -885,6 +886,65 @@ def test_pre_v21_snapshot_loads_empty_owner_and_members() -> None:
     restored = Schema.from_snapshot(snap)
     assert restored.tables[0].owner == ""
     assert restored.owner_reachable_members == ()
+
+
+def test_v24_foreign_tables_round_trip() -> None:
+    # v24: top-level `foreign_tables` (relkind 'f') with their grants serialize
+    # and decode for SEC053. A foreign table cannot carry RLS, so it is modeled
+    # separately from Table and only carries schema/name/grants.
+    import json
+
+    from pgrls.model import ForeignTable, Grant
+
+    schema = Schema(
+        foreign_tables=(
+            ForeignTable(
+                schema="public",
+                name="stripe_customers",
+                grants=(
+                    Grant(role="anon", privileges=("SELECT",)),
+                    Grant(role="service_role", privileges=("SELECT", "INSERT")),
+                ),
+            ),
+        ),
+    )
+    snap = schema.to_snapshot()
+    assert snap["version"] == 24
+    assert snap["foreign_tables"] == [
+        {
+            "schema": "public",
+            "name": "stripe_customers",
+            "grants": [
+                {"role": "anon", "privileges": ["SELECT"]},
+                {"role": "service_role", "privileges": ["SELECT", "INSERT"]},
+            ],
+        }
+    ]
+    # Byte-stable JSON encode→decode→re-encode is an identity, and from_snapshot
+    # reconstructs an equal Schema.
+    encoded = json.dumps(snap, ensure_ascii=False)
+    restored = Schema.from_snapshot(json.loads(encoded))
+    assert restored == schema
+    assert json.dumps(restored.to_snapshot(), ensure_ascii=False) == encoded
+
+
+def test_v24_foreign_tables_always_emitted_when_empty() -> None:
+    # The top-level array is always present (an empty list when there are no
+    # foreign tables), like owner_reachable_members — not conditionally omitted.
+    snap = Schema().to_snapshot()
+    assert snap["foreign_tables"] == []
+
+
+def test_pre_v24_snapshot_loads_empty_foreign_tables() -> None:
+    # A v23 snapshot has no `foreign_tables` key → loads as () so SEC053
+    # abstains (fail-closed) until the schema is re-captured at v24+.
+    snap = {
+        "version": 23,
+        "tables": [],
+        "policies": [],
+    }
+    restored = Schema.from_snapshot(snap)
+    assert restored.foreign_tables == ()
 
 
 def test_default_privileges_round_trip_through_snapshot() -> None:
@@ -1011,7 +1071,8 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
     # provolatile='i' functions) for SEC046; v18 added `default_privileges`
     # (from pg_default_acl) for SEC044. (v12 added per-overload `signature` to
     # SecdefFunction / LeakproofFunction — a per-entry field, not a top-level
-    # key.)
+    # key.) v24 adds the top-level `foreign_tables` array (relkind 'f') for
+    # SEC053; v21 added `owner_reachable_members` for SEC048.
     snap = Schema(tables=()).to_snapshot()
     assert set(snap.keys()) == {
         "version",
@@ -1025,8 +1086,9 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "default_privileges",
         "immutable_functions",
         "owner_reachable_members",
+        "foreign_tables",
     }
-    assert snap["version"] == 23
+    assert snap["version"] == 24
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1345,7 +1407,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 23
+    assert snap["version"] == SNAPSHOT_VERSION == 24
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]
@@ -1372,7 +1434,7 @@ def test_view_grants_round_trip_through_snapshot() -> None:
         grants=(Grant(role="anon", privileges=("SELECT",)),),
     )
     snap = Schema(views=(v,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 23
+    assert snap["version"] == SNAPSHOT_VERSION == 24
     assert snap["views"][0]["grants"] == [
         {"role": "anon", "privileges": ["SELECT"]}
     ]

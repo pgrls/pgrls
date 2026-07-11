@@ -17,6 +17,7 @@ from pgrls.model import (
     ColumnGrant,
     DefaultPrivilege,
     ForeignKey,
+    ForeignTable,
     Grant,
     ImmutableFunction,
     Index,
@@ -364,6 +365,40 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN LATERAL aclexplode(c.relacl) ax ON true
 LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
 WHERE c.relkind IN ('v', 'm')
+  AND n.nspname = ANY(%s)
+  AND c.relacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> c.relowner
+ORDER BY c.oid, role_name, ax.privilege_type
+"""
+
+# Foreign tables (relkind 'f') in the scanned schemas — read by SEC053. A
+# foreign table cannot carry RLS, so one exposed over the API with a low-trust
+# grant is an unfilterable read.
+_FOREIGN_TABLES_SQL = """
+SELECT c.oid AS ft_oid, n.nspname AS schema_name, c.relname AS ft_name
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'f'
+  AND n.nspname = ANY(%s)
+ORDER BY n.nspname, c.relname
+"""
+
+# Foreign-table relacl grants — the parallel of `_GRANTS_SQL`/`_VIEW_GRANTS_SQL`
+# for relkind 'f'. Same hardening: SELECT DISTINCT dedups per-grantor
+# multiplicity, grantee 0 renders as PUBLIC, owner self-grant excluded.
+_FOREIGN_TABLE_GRANTS_SQL = """
+SELECT DISTINCT
+    c.oid AS ft_oid,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN LATERAL aclexplode(c.relacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+WHERE c.relkind = 'f'
   AND n.nspname = ANY(%s)
   AND c.relacl IS NOT NULL
   AND ax.grantee IS NOT NULL
@@ -1469,6 +1504,39 @@ def _build_views(
     )
 
 
+def _fetch_foreign_tables(
+    cur: Any, schemas: list[str]
+) -> tuple[ForeignTable, ...]:
+    """Build the `ForeignTable` tuple (relkind 'f' + relacl grants) for
+    `schemas`. Depends only on the schema list, so it is shared by both
+    `introspect` return paths (the no-tables early return and the main path).
+    """
+    cur.execute(_FOREIGN_TABLE_GRANTS_SQL, (schemas,))
+    grants_acc: dict[int, dict[str, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in cur.fetchall():
+        grants_acc[row["ft_oid"]][row["role_name"]].append(
+            row["privilege_type"]
+        )
+    grants_by_oid: dict[int, tuple[Grant, ...]] = {
+        oid: tuple(
+            Grant(role=role, privileges=tuple(privs))
+            for role, privs in sorted(roles.items())
+        )
+        for oid, roles in grants_acc.items()
+    }
+    cur.execute(_FOREIGN_TABLES_SQL, (schemas,))
+    return tuple(
+        ForeignTable(
+            schema=row["schema_name"],
+            name=row["ft_name"],
+            grants=grants_by_oid.get(row["ft_oid"], ()),
+        )
+        for row in cur.fetchall()
+    )
+
+
 def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
     """Build a Schema from `pg_catalog` for the given schema list.
 
@@ -1514,11 +1582,12 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # alongside the other role/schema-scoped sets and share it across both
         # the no-tables early return and the main path.
         owner_reachable = _fetch_owner_reachable_members(cur, schemas)
+        foreign_tables = _fetch_foreign_tables(cur, schemas)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
         if not table_rows:
-            # No tables, but we still need to check for views.
+            # No tables, but we still need to check for views and foreign tables.
             secdef_funcs = _fetch_secdef_functions(cur, schemas)
             views = _build_views(cur, schemas, secdef_funcs)
             return Schema(
@@ -1531,6 +1600,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 default_privileges=default_privileges,
                 immutable_functions=immutable_funcs,
                 owner_reachable_members=owner_reachable,
+                foreign_tables=foreign_tables,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1758,4 +1828,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         default_privileges=default_privileges,
         immutable_functions=immutable_funcs,
         owner_reachable_members=owner_reachable,
+        foreign_tables=foreign_tables,
     )

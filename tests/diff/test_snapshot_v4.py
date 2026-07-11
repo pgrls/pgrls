@@ -22,7 +22,7 @@ def test_snapshot_version_is_19() -> None:
     # Bumped 18 → 19 to add top-level immutable_functions (user-defined
     # provolatile='i' functions, for SEC046). v3–v18 baselines still load
     # (Schema.from_snapshot accepts 3 through 21).
-    assert SNAPSHOT_VERSION == 23
+    assert SNAPSHOT_VERSION == 24
 
 
 def test_to_snapshot_emits_views_field() -> None:
@@ -47,7 +47,7 @@ def test_to_snapshot_emits_views_field() -> None:
     # added bypassrls_roles; v10 added leakproof_functions; v11
     # added bypassrls_escalation_roles (all additive and orthogonal
     # to the views field this test exercises).
-    assert snap["version"] == 23
+    assert snap["version"] == 24
     assert "views" in snap
     assert snap["views"][0]["name"] == "invoices_v"
     assert snap["views"][0]["security_invoker"] is True
@@ -429,7 +429,7 @@ def test_to_snapshot_emits_bypassrls_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_roles" in snap
-    assert snap["version"] == 23
+    assert snap["version"] == 24
     assert snap["bypassrls_roles"] == [
         {"name": "etl_worker", "superuser": False, "can_login": True}
     ]
@@ -488,7 +488,7 @@ def test_to_snapshot_emits_leakproof_functions_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "leakproof_functions" in snap
-    assert snap["version"] == 23
+    assert snap["version"] == 24
     # `signature` is the v12 addition — defaults to "" when the
     # LeakproofFunction is constructed without it (as here).
     assert snap["leakproof_functions"] == [
@@ -553,7 +553,7 @@ def test_to_snapshot_emits_bypassrls_escalation_roles_field() -> None:
     )
     snap = schema.to_snapshot()
     assert "bypassrls_escalation_roles" in snap
-    assert snap["version"] == 23
+    assert snap["version"] == 24
     assert snap["bypassrls_escalation_roles"] == [
         {
             "member": "app",

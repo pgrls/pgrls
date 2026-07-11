@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **sixty-five rules across four
+In the current release it ships **sixty-six rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -912,7 +912,7 @@ These are intentional in the current release. Do not invent capabilities.
   `--require-full-coverage`), so an absence of findings offline is not a proof
   of safety. `pgrls verify` stays live/ephemeral only (its proof is framed
   against a complete schema).
-- **Sixty-five rules across four categories.** SEC001–SEC052,
+- **Sixty-six rules across four categories.** SEC001–SEC053,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
