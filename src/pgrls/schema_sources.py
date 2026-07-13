@@ -781,6 +781,10 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
     # SQL source never models and a pre-v24 snapshot lacks — so it must be inert
     # *loudly* there, not silently pass --require-full-coverage.
     "SEC053": ("foreign tables and their grants (relkind 'f')", 24),
+    # SEC054 gates on `View.grants` (v23) to confirm the matview is
+    # API-reachable — like SEC052, it must be inert *loudly* on a pre-v23
+    # snapshot / view-less SQL source, not silently pass --require-full-coverage.
+    "SEC054": ("materialized-view grants (relacl)", 23),
     "PERF003": ("policy-predicate column indexes", 7),
     # PERF004 reaches `Table.indexes` (v7) through `perf003._has_leading_column_index`
     # — same shared-helper path as SEC041/SEC043; the helper reads only

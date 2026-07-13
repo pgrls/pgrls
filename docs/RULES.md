@@ -3664,6 +3664,84 @@ SEC053 reads foreign tables and their grants from snapshot **v24+** (relkind
 `()`), so the rule finds nothing — the fail-closed direction — and is reported
 as skipped rather than silently passing.
 
+<a id="rule-sec054"></a>
+
+## SEC054 — Materialized view exposed in an API schema
+
+**Severity:** error
+
+A **materialized view** captures its rows by running its body at `REFRESH` time
+and writing them to the matview's own physical heap. Queries against the matview
+read that heap directly — they do **not** re-evaluate the body, so they do
+**not** honor RLS on the source tables. Unlike a regular view, there is no
+`security_invoker` hook that could scope the read to the caller; the bypass is
+structural.
+
+So a matview in a PostgREST-exposed schema (default `public`) that grants a
+row-reading privilege to a low-trust role (`anon` / `authenticated` / `PUBLIC`)
+and whose body reads at least one **RLS-enabled** table serves every captured
+row — across every tenant — at `GET /rest/v1/<matview>` to any (even
+unauthenticated) caller. This is Supabase Security Advisor
+`0016_materialized_view_in_api`.
+
+```sql
+CREATE MATERIALIZED VIEW public.orders_summary AS SELECT * FROM public.orders;
+GRANT SELECT ON public.orders_summary TO anon;
+--  GET /rest/v1/orders_summary  ->  every tenant's orders, RLS bypassed.
+```
+
+**Relationship to [VIEW003](#rule-view003).** VIEW003 (`warning`) flags *any*
+matview reading an RLS table — a broad architectural caution ("verify `REFRESH`
+runs as a per-tenant role, or replicate the matview per-tenant"), which may be
+perfectly fine for an internal, un-exposed matview. SEC054 (`error`) is the
+sharpened, **confirmed-exposure** subset: the matview is *actually reachable over
+the API* by a low-trust role, so it is leaking now — `anon` cannot be "the
+per-tenant refresher". The two intentionally **co-fire** on an anon-exposed
+matview (the [SEC049](#rule-sec049)↔[SEC001](#rule-sec001) precedent); keeping
+them separate lets a team allowlist an internal matview from VIEW003 while still
+erroring on an exposed one here.
+
+**Why this is the sibling of [SEC049](#rule-sec049) / [SEC052](#rule-sec052) /
+[SEC053](#rule-sec053).** All four flag the same conjunction — a relation in an
+API-exposed schema plus a low-trust `SELECT` grant that makes it HTTP-reachable.
+SEC049 covers ordinary tables (unfiltered by RLS), SEC052 views that launder
+`auth.users`, SEC053 foreign tables (which cannot have RLS), and SEC054
+materialized views (whose physical rows are never RLS-filtered).
+
+Conservative by design (soundness over recall, no false positives):
+
+* Only a **direct table-level** `SELECT` grant to a role in `grantees` counts. A
+  matview exposed only via a **column-level** grant is a miss (view column
+  grants are not modeled).
+* A matview whose body reads **only non-RLS tables** (public reference data) is
+  not flagged — it exposes nothing RLS-protected. This is the zero-FP gate that
+  distinguishes SEC054 from the raw Supabase `0016` "any exposed matview"
+  heuristic.
+* A regular (non-materialized) view is not SEC054's domain — its RLS handling is
+  a `security_invoker` question ([VIEW001](#rule-view001) / SEC052).
+
+**Remediation.** There is no auto-fix — the right remedy depends on intent:
+`REVOKE` the low-trust grant, move the matview out of the exposed schema, run
+`REFRESH` as a per-tenant role so the captured rows are already scoped, or
+replicate the matview per-tenant.
+
+**Configuration** (`[lint.rules.SEC054]`):
+
+```toml
+[lint.rules.SEC054]
+# PostgREST-exposed schemas.
+schemas = ["public"]
+# Low-trust roles whose SELECT means "API-reachable".
+grantees = ["anon", "authenticated", "PUBLIC"]
+# Qualified matview names (schema.view) that intentionally expose data.
+allowlist = ["public.public_leaderboard"]
+```
+
+SEC054 confirms API-reachability from the matview's grants (`relacl`), captured
+in snapshot **v23+**. On an older snapshot the grants are absent (`grants=()`),
+so the rule finds nothing on that matview — the fail-closed direction — and is
+reported as skipped rather than silently passing.
+
 <a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK
