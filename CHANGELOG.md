@@ -90,7 +90,9 @@ breaking changes — they will be called out in this file.
   publishes findings as diagnostics **pinned to the exact `CREATE TABLE` /
   `CREATE POLICY` line** (mapping each finding's `schema.table[.policy]` back to
   its statement's `stmt_location`/`stmt_len` span) — the precise source ranges a
-  live-database lint can't produce. Diagnostic-only: it never connects to a
+  live-database lint can't produce. It reads the project's `pgrls.toml` from the
+  workspace root, so `disable`, per-rule `allowlist`s, `severity_overrides`, and
+  `extra_rules` match the CLI/CI gate. Diagnostic-only: it never connects to a
   database and never edits files. Rules that need live catalog state are skipped
   exactly as in `--sql-file` (quiet diagnostics are not a proof of safety — run
   `pgrls lint` in CI for full coverage). `pygls` is an optional extra; the CLI

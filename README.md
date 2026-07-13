@@ -466,7 +466,7 @@ On the `sql=` path the response's `warnings` list flags that catalog-only rules 
 
 ## Editor diagnostics — `pgrls lsp`
 
-`pgrls lsp` runs a [Language Server](https://microsoft.github.io/language-server-protocol/) (over stdio) that lints the `.sql` buffer you are editing **as you type**, in any LSP client — VS Code, Neovim, Helix, JetBrains. It runs the same **offline** engine as `pgrls lint --sql-file`, so findings appear inline, pinned to the exact `CREATE TABLE` / `CREATE POLICY` line, with the rule id and a link to its reference — no database, no save, no round-trip.
+`pgrls lsp` runs a [Language Server](https://microsoft.github.io/language-server-protocol/) (over stdio) that lints the `.sql` buffer you are editing **as you type**, in any LSP client — VS Code, Neovim, Helix, JetBrains. It runs the same **offline** engine as `pgrls lint --sql-file`, so findings appear inline, pinned to the exact `CREATE TABLE` / `CREATE POLICY` line, with the rule id and a link to its reference — no database, no save, no round-trip. It reads your project's `pgrls.toml` from the workspace root, so disabled rules, per-rule allowlists, and severity overrides match your CI gate.
 
 ```bash
 pip install 'pgrls[lsp]'   # pygls is an optional extra; the plain install stays slim

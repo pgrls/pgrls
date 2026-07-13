@@ -21,8 +21,9 @@ pytest.importorskip("lsprotocol")
 from lsprotocol import types as lsp  # noqa: E402
 from pygls.workspace import Workspace  # noqa: E402
 
+from pgrls.config import Config  # noqa: E402
 from pgrls.lsp.diagnostics import _LineIndex, diagnose  # noqa: E402
-from pgrls.lsp.server import create_server  # noqa: E402
+from pgrls.lsp.server import _discover_config, create_server  # noqa: E402
 
 _RLS_OFF = "CREATE TABLE public.users (id int, email text);"
 _PUBLIC_POLICY = (
@@ -102,15 +103,68 @@ def test_catalog_only_rules_are_skipped_like_sql_file() -> None:
     assert "SEC053" not in _codes(text)
 
 
-def test_finding_without_a_create_falls_back_to_document_start() -> None:
-    # A buffer that only ALTERs a table (defined elsewhere) still surfaces the
-    # finding — anchored at the AlterTable statement, not dropped.
-    text = "ALTER TABLE public.legacy ENABLE ROW LEVEL SECURITY;"
-    diags = diagnose(text)
-    # SEC009 (RLS on, no policy) fires; it must have a valid range.
-    assert diags
-    for d in diags:
-        assert d.range.start.line >= 0
+def test_alter_only_table_anchors_at_the_alter_statement() -> None:
+    # A table defined only by ALTER in this buffer (a migration file) still
+    # surfaces its findings, anchored at the ALTER statement (the fallback).
+    stmt = "ALTER TABLE public.legacy ENABLE ROW LEVEL SECURITY"
+    diags = diagnose(stmt + ";")
+    assert diags  # SEC009 (RLS on, no policy) fires
+    d = diags[0]
+    assert d.range.start.line == 0 and d.range.start.character == 0
+    assert d.range.end.character == len(stmt)  # spans the ALTER, not the `;`
+
+
+def test_statement_without_trailing_semicolon_gets_full_range() -> None:
+    # The common mid-keystroke / last-statement state: no `;` typed. pglast
+    # reports stmt_len == 0 there; the range must span the statement, not
+    # collapse to an invisible zero-width point.
+    stmt = "CREATE TABLE public.users (id int)"
+    d = diagnose(stmt)[0]
+    assert (d.range.start.character, d.range.end.character) == (0, len(stmt))
+    # And the last statement of a multi-statement buffer with no trailing `;`.
+    diags = diagnose("CREATE TABLE public.a (id int);\nCREATE TABLE public.b (id int)")
+    b = next(x for x in diags if x.code == "SEC001" and x.range.start.line == 1)
+    assert (b.range.start.character, b.range.end.character) == (0, 30)
+
+
+def test_leading_comment_is_excluded_from_the_range() -> None:
+    # pglast's stmt_location includes a leading comment/license header; the
+    # range should underline the CREATE, not the comment above it.
+    for header in ("/* license */\n", "-- a comment\n"):
+        d = diagnose(header + "CREATE TABLE public.t (id int);")[0]
+        assert d.range.start.line == 1 and d.range.start.character == 0
+
+
+# --- config awareness (honors pgrls.toml, like the CLI) --------------------
+
+
+def test_config_disable_suppresses_a_rule() -> None:
+    text = _RLS_OFF
+    assert _codes(text) == ["SEC001"]
+    assert diagnose(text, config=Config(disable=["SEC001"])) == []
+
+
+def test_config_allowlist_suppresses_a_finding() -> None:
+    text = _RLS_OFF
+    cfg = Config(rule_options={"SEC001": {"allowlist": ["public.users"]}})
+    assert diagnose(text, config=cfg) == []
+
+
+def test_config_severity_override_remaps_the_diagnostic_level() -> None:
+    cfg = Config(severity_overrides={"SEC001": "warning"})
+    (d,) = diagnose(_RLS_OFF, config=cfg)
+    assert d.severity == lsp.DiagnosticSeverity.Warning
+
+
+def test_discover_config_reads_pgrls_toml_from_workspace_root(tmp_path) -> None:
+    (tmp_path / "pgrls.toml").write_text(
+        "[lint]\ndisable = ['SEC001']\n", encoding="utf-8"
+    )
+    cfg = _discover_config(str(tmp_path))
+    assert "SEC001" in cfg.disable
+    # No file / no root → an unconfigured default, never an error.
+    assert _discover_config(str(tmp_path / "nope")).disable == []
+    assert _discover_config(None).disable == []
 
 
 # --- _LineIndex: UTF-16 position conversion --------------------------------
