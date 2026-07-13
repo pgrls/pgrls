@@ -314,6 +314,19 @@ Currently fixable:
   points the operator to add policies next.
 * **SEC002** — emits `ALTER TABLE <schema>.<table> FORCE ROW
   LEVEL SECURITY;` for every table with RLS but no FORCE.
+* **SEC004** — emits `ALTER POLICY <name> ON <schema>.<table>
+  USING (…)` with the inverted-auth `auth_func() IS NULL` disjunct
+  stripped — the flagship anon-read leak (the Lovable-CVE pattern).
+  It only removes a *top-level* `OR` disjunct — never descends into
+  AND / NOT / sub-selects — so the rewrite is strictly narrowing and
+  can never broaden the policy, and it abstains (leaving the finding)
+  when no real check survives, including a surviving top-level `true`.
+* **SEC010** — emits `DROP POLICY <name> ON <schema>.<table>;` for a
+  permissive policy whose clause is the literal `false`: it admits no
+  rows, so dropping it leaves access unchanged. One of the three
+  policy-DROP fixers (with HYG003 / SEC031). Abstains on the strict
+  subset where a drop would *broaden* what the policy governs; SEC010
+  still reports those for human review.
 * **SEC006** — emits `ALTER POLICY <name> ON <schema>.<table>
   WITH CHECK (<the USING predicate>);` for a permissive `FOR
   UPDATE` / `FOR ALL` policy that has a `USING` clause but no
@@ -378,6 +391,27 @@ Currently fixable:
   restrictive (its no-op `… AND true` write check becomes real).
   SEC006 and SEC020 never fire on the same policy — one needs
   `WITH CHECK` absent, the other needs it present.
+* **SEC015** — emits `ALTER FUNCTION <name>(<args>) SET search_path
+  = …;` per SECURITY DEFINER overload, pinning `pg_temp` last so a
+  search-path hijack can't reach a caller-planted temp object. One
+  ALTER per overload signature; abstains on pre-v12 snapshots (empty
+  signatures) and paths it can't tokenize safely (quoted commas).
+* **SEC017** — emits `ALTER FUNCTION <name>(<args>) NOT LEAKPROOF;`
+  per overload, revoking a LEAKPROOF marking that lets the function
+  observe rows an RLS predicate should have filtered first. Abstains
+  on pre-v12 empty signatures.
+* **SEC030** — emits `ALTER TABLE <schema>.<table> ALTER COLUMN
+  <col> SET NOT NULL;` for a nullable tenant discriminator — a NULL
+  tenant key slips past a `tenant = current_setting(…)` filter. The
+  Fix description warns to backfill existing `NULL`s first, or the
+  apply fails and rolls back the batch.
+* **SEC044** — emits `ALTER DEFAULT PRIVILEGES [FOR ROLE <grantor>]
+  [IN SCHEMA <s>] REVOKE <privs> ON TABLES FROM <role>;` withdrawing
+  a `pg_default_acl` grant of row access on *future* tables to a
+  low-trust role. Only the row-access privileges SEC044 flags
+  (SELECT / INSERT / UPDATE / DELETE), and keyed on the grantor
+  (`defaclrole`) so the REVOKE actually clears the catalog entry
+  rather than silently no-op'ing.
 * **SEC031** — emits `DROP POLICY <name> ON <schema>.<table>;` for a
   restrictive policy whose `USING` is constant `true`. The
   constant-true clause AND-combines to the identity, so dropping the
