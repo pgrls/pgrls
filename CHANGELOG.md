@@ -10,6 +10,20 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pgrls lint --format gitlab`** — a GitLab Code Quality (CodeClimate JSON)
+  report so findings surface in a merge request's Code Quality widget. Unlike
+  the existing `--format sarif` (which GitLab ingests only via its **SAST**
+  report — a GitLab *Ultimate*, paid-tier feature), the Code Quality report
+  works on **every** GitLab tier including Free, so this is the path for a
+  GitLab-CI pipeline to show pgrls findings in the MR UI without an Ultimate
+  subscription. Each finding carries a stable content-hash `fingerprint` (over
+  rule + location + message) so GitLab tracks it new-vs-resolved across pipeline
+  runs; severity maps error→critical, warning→major, info→info; the DB-object
+  location (`schema.table[.policy]`) is the report `path`. Wire it up with
+  `--output gl-code-quality.json` + `artifacts:reports:codequality` (README has
+  the `.gitlab-ci.yml` recipe).
+
 ## [0.51.0] - 2026-07-17
 
 ### Fixed

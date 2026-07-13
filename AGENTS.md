@@ -963,7 +963,7 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC001, SEC002, SEC004, SEC006, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
-- **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, and JUnit output.**
+- **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, JUnit, and GitLab-Code-Quality output.**
   `--format text` (human-readable, default), `--format json`
   (machine-readable, stable CI contract), `--format sarif` (SARIF
   v2.1.0 for GitHub Code Scanning and similar aggregators),
@@ -983,7 +983,13 @@ These are intentional in the current release. Do not invent capabilities.
   than pinned to a diff hunk. `--format junit` emits a JUnit XML
   report (one `<testcase>` per finding under a `pgrls` suite) so
   findings show in a CI run's test-report UI; the process exit code
-  (`--fail-on`), not the report, gates the build.
+  (`--fail-on`), not the report, gates the build. `--format gitlab`
+  emits a GitLab Code Quality (CodeClimate JSON) report so findings
+  surface in a merge request's Code Quality widget — the free-tier
+  path (GitLab's SARIF/SAST integration is Ultimate-only); each
+  finding carries a stable content-hash `fingerprint` so GitLab
+  tracks it new-vs-resolved across pipeline runs. Severity maps
+  error→critical, warning→major, info→info.
 - **Postgres only.** No support for other databases or for
   MySQL/MariaDB emulation layers.
 - **Postgres 15+.** Older PG releases (10–14) are no longer
