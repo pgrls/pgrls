@@ -135,6 +135,35 @@ def test_leading_comment_is_excluded_from_the_range() -> None:
         assert d.range.start.line == 1 and d.range.start.character == 0
 
 
+def test_column_grant_finding_points_at_the_grant_statement() -> None:
+    # SEC045's location is `schema.table.column` — a shape with no CREATE of its
+    # own. The finding must underline the offending GRANT, not collapse to the
+    # document start (which it did before column-grant spans were tracked).
+    text = (
+        "CREATE TABLE public.profiles (id int, email text, ssn text);\n"
+        "GRANT SELECT (email, ssn) ON public.profiles TO anon;"
+    )
+    sec045 = [d for d in diagnose(text) if d.code == "SEC045"]
+    assert sec045  # fires on the sensitive-column grant
+    for d in sec045:
+        assert d.range.start.line == 1  # the GRANT statement, not line 0
+        assert d.range.start.character == 0
+
+
+def test_column_grant_range_does_not_collide_with_a_same_named_policy() -> None:
+    # A policy named the same as the granted column shares the flat
+    # `schema.table.email` location string; the column finding must still land
+    # on the GRANT, never on the unrelated CREATE POLICY.
+    text = (
+        "CREATE TABLE public.t (id int, email text);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY email ON public.t USING (true);\n"
+        "GRANT SELECT (email) ON public.t TO anon;"
+    )
+    (d,) = [x for x in diagnose(text) if x.code == "SEC045"]
+    assert d.range.start.line == 3  # the GRANT, not the CREATE POLICY on line 2
+
+
 # --- config awareness (honors pgrls.toml, like the CLI) --------------------
 
 
@@ -165,6 +194,24 @@ def test_discover_config_reads_pgrls_toml_from_workspace_root(tmp_path) -> None:
     # No file / no root → an unconfigured default, never an error.
     assert _discover_config(str(tmp_path / "nope")).disable == []
     assert _discover_config(None).disable == []
+
+
+def test_discover_config_warns_on_malformed_toml_and_falls_back(tmp_path) -> None:
+    # A present-but-invalid pgrls.toml must not crash the session: the CLI
+    # hard-errors, so the LSP surfaces a one-time warning and lints with
+    # defaults rather than silently dropping the user's disable / extra_rules /
+    # severity_overrides (which would diverge from their CI gate with no signal).
+    (tmp_path / "pgrls.toml").write_text("[lint]\ndisable = [oops\n")
+    warnings: list = []
+
+    class _LS:
+        def window_show_message(self, params) -> None:
+            warnings.append(params)
+
+    cfg = _discover_config(str(tmp_path), _LS())
+    assert cfg == Config()  # default, not a crash
+    assert warnings and warnings[0].type == lsp.MessageType.Warning
+    assert "pgrls.toml" in warnings[0].message
 
 
 # --- _LineIndex: UTF-16 position conversion --------------------------------
@@ -244,6 +291,57 @@ def test_did_open_publishes_diagnostics() -> None:
     p = published[0]
     assert p.uri == uri
     assert [d.code for d in p.diagnostics] == ["SEC001"]
+
+
+def test_did_save_republishes_diagnostics() -> None:
+    uri = "file:///schema.sql"
+    s, published = _server_with_doc(uri, _RLS_OFF)
+    _fire(
+        s,
+        lsp.TEXT_DOCUMENT_DID_SAVE,
+        lsp.DidSaveTextDocumentParams(
+            text_document=lsp.TextDocumentIdentifier(uri=uri)
+        ),
+    )
+    assert [d.code for d in published[-1].diagnostics] == ["SEC001"]
+
+
+def test_published_diagnostics_carry_the_document_version() -> None:
+    # The version threads through so a client can discard diagnostics for a
+    # superseded buffer (the stale-diagnostics race).
+    uri = "file:///schema.sql"
+    s, published = _server_with_doc(uri, _RLS_OFF)  # put with version=1
+    _fire(
+        s,
+        lsp.TEXT_DOCUMENT_DID_OPEN,
+        lsp.DidOpenTextDocumentParams(
+            text_document=lsp.TextDocumentItem(
+                uri=uri, language_id="sql", version=1, text=""
+            )
+        ),
+    )
+    assert published[-1].version == 1
+
+
+def test_single_file_mode_uses_config_next_to_the_document(tmp_path) -> None:
+    # No workspace folder (root_path is None) — the config beside the opened
+    # file must still apply, matching the CLI's ./pgrls.toml lookup.
+    (tmp_path / "pgrls.toml").write_text(
+        "[lint]\ndisable = ['SEC001']\n", encoding="utf-8"
+    )
+    uri = (tmp_path / "schema.sql").as_uri()
+    s, published = _server_with_doc(uri, _RLS_OFF)
+    _fire(
+        s,
+        lsp.TEXT_DOCUMENT_DID_OPEN,
+        lsp.DidOpenTextDocumentParams(
+            text_document=lsp.TextDocumentItem(
+                uri=uri, language_id="sql", version=1, text=""
+            )
+        ),
+    )
+    # SEC001 would fire on _RLS_OFF, but the adjacent config disables it.
+    assert [d.code for d in published[-1].diagnostics] == []
 
 
 def test_did_close_clears_diagnostics() -> None:

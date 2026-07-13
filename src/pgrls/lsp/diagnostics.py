@@ -26,6 +26,7 @@ It reuses the exact offline path `pgrls lint --sql-file` runs:
 from __future__ import annotations
 
 import bisect
+from dataclasses import replace
 
 import pglast
 from lsprotocol import types as lsp
@@ -44,7 +45,7 @@ from pgrls.schema_sources import (
     inert_rule_ids,
     schema_from_sql,
 )
-from pgrls.violations import Severity, Violation
+from pgrls.violations import Violation
 
 _SOURCE = "pgrls"
 _RULES_DOC = "https://github.com/pgrls/pgrls/blob/main/docs/RULES.md#rule-"
@@ -89,19 +90,26 @@ def diagnose(text: str, *, config: Config | None = None) -> list[lsp.Diagnostic]
             # skips it offline too, so skip it here to keep parity.
             continue
         try:
-            violations.extend(
-                rule.check(schema, config.rule_options.get(rule.id, {}))
-            )
+            found = rule.check(schema, config.rule_options.get(rule.id, {}))
         except Exception:
             # A rule that trips over partial mid-edit DDL must not take down the
             # whole diagnostics pass (or the editor session).
             continue
+        # Apply the per-rule severity override exactly as `cli._run_rules` does:
+        # keyed on the *running* rule's id, before the level is mapped. Keeping
+        # the keying identical (rather than on each violation's `rule_id`) is
+        # what makes the diagnostics a faithful subset of `pgrls lint
+        # --sql-file` — a custom rule may emit a violation under a foreign id.
+        override = overrides.get(rule.id)
+        if override is not None:
+            found = [replace(v, severity=override) for v in found]
+        violations.extend(found)
 
     spans = _object_spans(text)
     index = _LineIndex(text)
     out: list[lsp.Diagnostic] = []
     for v in violations:
-        span = spans.get(v.location) if v.location else None
+        span = spans.resolve(v.location) if v.location else None
         rng = (
             lsp.Range(
                 start=index.position(span[0]),
@@ -110,12 +118,11 @@ def diagnose(text: str, *, config: Config | None = None) -> list[lsp.Diagnostic]
             if span is not None
             else _ZERO_RANGE
         )
-        severity: Severity = overrides.get(v.rule_id, v.severity)
         out.append(
             lsp.Diagnostic(
                 range=rng,
                 message=v.message,
-                severity=_SEVERITY.get(severity, lsp.DiagnosticSeverity.Error),
+                severity=_SEVERITY.get(v.severity, lsp.DiagnosticSeverity.Error),
                 source=_SOURCE,
                 code=v.rule_id,
                 code_description=lsp.CodeDescription(
@@ -147,21 +154,57 @@ def _rules_for(config: Config) -> list[Rule]:
     return list(registry.enabled(disabled_ids=config.disable))
 
 
-def _object_spans(text: str) -> dict[str, tuple[int, int]]:
-    """Map each defined object (`schema.table[.policy]`) to its buffer span.
+class _Spans:
+    """Buffer spans of a document's defined objects, grouped by the kind of
+    `Violation.location` that resolves to them.
 
-    Keys are formatted exactly as `Violation.location` is (`Table.qualified_name`
-    and `f"{table}.{policy}"`), so a finding looks its range up directly. First
-    occurrence wins, so a `CREATE` keeps its span even if a later `ALTER`
-    references the same object.
+    A `location` is a flat dotted string, so a policy name and a granted column
+    name of the same table would otherwise collide on one dict key. Grouping by
+    kind keeps them apart and lets `resolve` pick the right statement.
     """
+
+    def __init__(self) -> None:
+        self.table: dict[str, tuple[int, int]] = {}
+        self.policy: dict[str, tuple[int, int]] = {}
+        self.column: dict[str, tuple[int, int]] = {}
+
+    def resolve(self, location: str) -> tuple[int, int] | None:
+        """Best source span for a finding's `location` (None if the object is
+        not defined in this buffer).
+
+        A 2-part `schema.table` matches a table span. A 3-part `schema.table.X`
+        is ambiguous — `X` may be a policy or a granted column — so a
+        column-grant span is tried first (a SEC045 column finding must not
+        underline a policy that merely shares the column's name), then a policy
+        span, then the owning table's `CREATE` as a fallback so a finding never
+        silently collapses to the document start while its table sits right
+        there in the buffer.
+        """
+        if location in self.table:
+            return self.table[location]
+        if location in self.column:
+            return self.column[location]
+        if location in self.policy:
+            return self.policy[location]
+        head = location.rpartition(".")[0]
+        return self.table.get(head) if head else None
+
+
+def _object_spans(text: str) -> _Spans:
+    """Map each defined object to its buffer span, grouped by object kind.
+
+    Table spans are keyed `schema.table` (`Table.qualified_name`), policy spans
+    `schema.table.policy`, and column-grant spans `schema.table.column` — the
+    three shapes a `Violation.location` takes. First occurrence of a key wins,
+    so a `CREATE` keeps its span even if a later `ALTER` references the object.
+    """
+    spans = _Spans()
     try:
         statements = pglast.parse_sql(text)
     except pglast.parser.ParseError:
-        return {}
+        return spans
 
     default_schema = "public"
-    spans: dict[str, tuple[int, int]] = {}
     length = len(text)
     for raw in statements:
         stmt = raw.stmt
@@ -181,27 +224,41 @@ def _object_spans(text: str) -> dict[str, tuple[int, int]]:
             end -= 1
         if end < start:
             end = start
+        span = (start, end)
 
         kind = type(stmt).__name__
-        key: str | None = None
-        if kind == "CreateStmt":
+        if kind in ("CreateStmt", "AlterTableStmt"):
+            # AlterTableStmt covers a table defined only by ALTER in this buffer
+            # (a migration file); `setdefault` lets a CREATE win if present too.
             rk = _relation_key(stmt.relation, default_schema)
             if rk is not None:
-                key = f"{rk[0]}.{rk[1]}"
+                spans.table.setdefault(f"{rk[0]}.{rk[1]}", span)
         elif kind == "CreatePolicyStmt":
             rk = _relation_key(stmt.table, default_schema)
             pname = getattr(stmt, "policy_name", None)
             if rk is not None and pname:
-                key = f"{rk[0]}.{rk[1]}.{pname}"
-        elif kind == "AlterTableStmt":
-            # Fallback for a table defined only by ALTER in this buffer (a
-            # migration file). setdefault below lets a CREATE win if present.
-            rk = _relation_key(stmt.relation, default_schema)
-            if rk is not None:
-                key = f"{rk[0]}.{rk[1]}"
+                spans.policy.setdefault(f"{rk[0]}.{rk[1]}.{pname}", span)
+        elif kind == "GrantStmt" and stmt.is_grant:
+            # A column-level GRANT (`GRANT SELECT (col) ON t TO role`) is the
+            # precise site SEC045 flags — register each granted column so the
+            # finding underlines the GRANT itself, not the whole table or a
+            # policy that merely shares the column's name. REVOKEs
+            # (`is_grant` false) never create a grant a rule fires on.
+            columns = {
+                col.sval
+                for priv in (stmt.privileges or ())
+                for col in (priv.cols or ())
+                if col.sval
+            }
+            for obj in stmt.objects or ():
+                if type(obj).__name__ != "RangeVar":
+                    continue
+                rk = _relation_key(obj, default_schema)
+                if rk is None:
+                    continue
+                for column in columns:
+                    spans.column.setdefault(f"{rk[0]}.{rk[1]}.{column}", span)
 
-        if key is not None:
-            spans.setdefault(key, (start, end))
     return spans
 
 
