@@ -1055,6 +1055,29 @@ CREATE FOREIGN TABLE public.allbad_sec053 (
     OPTIONS (schema_name 'public', table_name 'remote_secrets');
 GRANT SELECT ON public.allbad_sec053 TO anon;
 
+-- SEC054: a materialized view over an RLS-protected table, in the API-exposed
+-- public schema, granted SELECT to anon. A matview stores its rows physically,
+-- so RLS on the source is NOT applied to a read -- anon pages every tenant's
+-- captured rows at GET /rest/v1/allbad_sec054. SEC054 fires (error) at
+-- public.allbad_sec054. VIEW003 co-fires (warning, the broad "matview over an
+-- RLS table" architectural caution) on the same matview -- intentional, the
+-- SEC049<->SEC001 precedent: SEC054 is the confirmed-anon-exposure subset.
+-- VIEW001 stays silent (it skips matviews). The source table + matview live in
+-- public, so the test's DROP SCHEMA public CASCADE cleans both up. MUST stay
+-- before the SEC044 default-privilege statement so the cluster default ACL does
+-- not retroactively grant the matview. Reuses the `anon` role created above.
+CREATE TABLE public.allbad_sec054_src (
+    id bigint PRIMARY KEY,
+    tenant_id uuid,
+    body text
+);
+ALTER TABLE public.allbad_sec054_src ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_iso ON public.allbad_sec054_src FOR SELECT TO anon
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)::uuid));
+CREATE MATERIALIZED VIEW public.allbad_sec054 AS
+    SELECT id, tenant_id, body FROM public.allbad_sec054_src;
+GRANT SELECT ON public.allbad_sec054 TO anon;
+
 -- SEC050: a Supabase storage.objects policy scoped to the object owner but with
 -- NO bucket_id predicate authorizes that owner's objects in EVERY bucket
 -- (cross-bucket access). The `storage` schema + `objects` table mimic the

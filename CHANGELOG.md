@@ -64,6 +64,25 @@ breaking changes — they will be called out in this file.
   pre-v24 snapshot (or a foreign-table-less SQL-file source) it is reported as
   **skipped** rather than silently passing — it does not slip past
   `--require-full-coverage`.
+- **SEC054 (error) — Materialized view exposed in an API schema.** A
+  materialized view in a PostgREST-exposed schema (default `public`) that grants
+  a table-level `SELECT` to a low-trust role (`anon` / `authenticated` /
+  `PUBLIC`) and whose body reads an RLS-enabled table serves every captured row
+  at `GET /rest/v1/<matview>` — Supabase advisor `0016_materialized_view_in_api`.
+  A matview stores its rows physically and is read without re-evaluating its
+  body, so RLS on the source tables is never applied, and there is no
+  `security_invoker` hook to scope the read. The matview sibling of SEC049
+  (table) / SEC052 (auth-users view) / SEC053 (foreign table). It is the
+  **confirmed-exposure sharpening of VIEW003** — which warns (`warning`) on *any*
+  matview over an RLS table, an architectural caution that may be fine for an
+  internal, un-exposed matview: the two intentionally co-fire on an anon-exposed
+  matview (the SEC049↔SEC001 precedent), with SEC054 flagging the API-reachable
+  subset at `error`. A matview reading only non-RLS tables (public reference
+  data) is not flagged (the zero-FP gate). Like SEC049, only a direct table-level
+  SELECT grant to a low-trust role counts (a matview column grant is a
+  conservative miss). Configurable (`schemas` / `grantees` / `allowlist`); no
+  auto-fix. No snapshot change — matviews are already captured as views with
+  their grants (v23). This brings the catalog to **67 rules**.
 
 ## [0.48.2] - 2026-07-10
 

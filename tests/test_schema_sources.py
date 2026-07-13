@@ -57,6 +57,17 @@ def test_sec053_is_gated_on_foreign_tables_v24():
     assert "SEC053" in inert_rule_ids("sql")
 
 
+def test_sec054_is_gated_on_matview_grants_v23():
+    # SEC054 confirms a matview is API-reachable via `View.grants` (v23), so it
+    # must be inert on a pre-v23 snapshot (and a view-less SQL source) — else a
+    # stale-snapshot lint silently false-cleans an anon-exposed matview past
+    # --require-full-coverage.
+    assert _CATALOG_DEPENDENT_RULES["SEC054"][1] == 23
+    assert "SEC054" in inert_rule_ids("snapshot", snapshot_version=22)
+    assert "SEC054" not in inert_rule_ids("snapshot", snapshot_version=23)
+    assert "SEC054" in inert_rule_ids("sql")
+
+
 def test_reachability_gated_rules_threshold_covers_column_grants():
     # SEC041/SEC043 reach `Table.column_grants` (snapshot v8) through the shared
     # `sec041._is_directly_reachable` gate, so a threshold below 8 would let a
