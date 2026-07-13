@@ -83,6 +83,19 @@ breaking changes — they will be called out in this file.
   conservative miss). Configurable (`schemas` / `grantees` / `allowlist`); no
   auto-fix. No snapshot change — matviews are already captured as views with
   their grants (v23). This brings the catalog to **67 rules**.
+- **`pgrls lsp`** — a stdio Language Server (optional `pgrls[lsp]` extra, via
+  `pygls`) that lints the `.sql` buffer you are editing **in real time**, in any
+  LSP client (VS Code, Neovim, Helix, JetBrains). It runs the same offline
+  `schema_from_sql` engine as `pgrls lint --sql-file` on each change and
+  publishes findings as diagnostics **pinned to the exact `CREATE TABLE` /
+  `CREATE POLICY` line** (mapping each finding's `schema.table[.policy]` back to
+  its statement's `stmt_location`/`stmt_len` span) — the precise source ranges a
+  live-database lint can't produce. Diagnostic-only: it never connects to a
+  database and never edits files. Rules that need live catalog state are skipped
+  exactly as in `--sql-file` (quiet diagnostics are not a proof of safety — run
+  `pgrls lint` in CI for full coverage). `pygls` is an optional extra; the CLI
+  never imports it, and `pgrls lsp` raises a clear "install pgrls[lsp]" error if
+  it is absent — the same lazy-import contract as `pgrls mcp`. Implements #227.
 
 ## [0.48.2] - 2026-07-10
 

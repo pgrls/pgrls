@@ -464,6 +464,29 @@ The server **never mutates a database** — it only ever issues read-only intros
 
 On the `sql=` path the response's `warnings` list flags that catalog-only rules (those needing live catalog state — BYPASSRLS roles, `pg_default_acl`, SECURITY DEFINER owners, FKs, indexes, triggers) can't fire, so an empty findings list is **not** a clean bill of health. A `database_url` is treated as a credential: it is never logged, and connection errors are sanitized so the DSN can't leak.
 
+## Editor diagnostics — `pgrls lsp`
+
+`pgrls lsp` runs a [Language Server](https://microsoft.github.io/language-server-protocol/) (over stdio) that lints the `.sql` buffer you are editing **as you type**, in any LSP client — VS Code, Neovim, Helix, JetBrains. It runs the same **offline** engine as `pgrls lint --sql-file`, so findings appear inline, pinned to the exact `CREATE TABLE` / `CREATE POLICY` line, with the rule id and a link to its reference — no database, no save, no round-trip.
+
+```bash
+pip install 'pgrls[lsp]'   # pygls is an optional extra; the plain install stays slim
+```
+
+Point an editor's LSP client at `pgrls lsp` for the `sql` filetype. Neovim:
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "sql",
+  callback = function(args)
+    vim.lsp.start({ name = "pgrls", cmd = { "pgrls", "lsp" }, root_dir = vim.fn.getcwd() }, { bufnr = args.buf })
+  end,
+})
+```
+
+VS Code / Helix / any LSP client: register a language server whose command is `pgrls lsp` for SQL files (see your client's "generic LSP" docs). The server is **diagnostic-only** — it never connects to a database and never edits your files.
+
+Because it reads a buffer, not a live catalog, the rules that need catalog state (BYPASSRLS roles, SECURITY DEFINER owners, triggers, indexes, …) are skipped exactly as in `--sql-file` — so quiet diagnostics are **not** a proof of safety. Run `pgrls lint` against a live database in CI for full coverage; the LSP is the fast in-editor first line.
+
 ## Tracking trends — `pgrls history`
 
 Pair a daily cron with `pgrls lint --format json -o snapshots/$(date -u +%FT%H%M%SZ).json` and ask `pgrls history snapshots/` weekly — "are we gaining ground over time, or is the findings count creeping up?"

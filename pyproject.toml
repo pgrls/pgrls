@@ -73,6 +73,12 @@ ephemeral = ["testcontainers[postgres]>=4.0"]
 # never imports it; `pgrls mcp` imports `pgrls.mcp.server` lazily and
 # raises a clear "install pgrls[mcp]" error when the extra is absent.
 mcp = ["fastmcp>=2.0"]
+# `pgrls lsp` runs an optional stdio Language Server (via pygls) that lints the
+# `.sql` buffer you are editing, in real time, in any LSP client. pygls is NOT
+# a core dependency — the CLI stays slim and `pgrls.cli` never imports it;
+# `pgrls lsp` imports `pgrls.lsp.server` lazily and raises a clear "install
+# pgrls[lsp]" error when the extra is absent.
+lsp = ["pygls>=2.0"]
 # `hatchling` is the build backend (declared in [build-system]) and
 # is installed automatically by `python -m build` / pip's PEP 517
 # isolated env. Don't list it here — including it would suggest to
