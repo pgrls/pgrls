@@ -27,6 +27,21 @@ breaking changes — they will be called out in this file.
   `$DATABASE_URL` is ignored when an offline source is given), mirroring
   `lint`/`fix`.
 
+### Fixed
+- **Offline DDL analysis now replays `ALTER POLICY` / `DROP POLICY` / `DROP
+  TABLE`.** `schema_from_sql` (the `--sql-file` / `sql=` engine behind
+  `lint`, `fix`, `snapshot`, the MCP server, and the LSP) previously honored a
+  policy's `CREATE` but silently discarded a later `ALTER POLICY` that loosened
+  it or a `DROP POLICY` / `DROP TABLE` that removed it. On a migration script
+  (`cat migrations/*.sql`) that meant a policy loosened after creation was
+  modeled as its **pre-`ALTER`** form — a silent false-negative, and a
+  false-SAFE for the DB-free `pgrls diff` gate (base and head snapshots came out
+  identical). The builder now applies these in source order, so a mid-migration
+  loosening or a dropped RLS guard is faithfully reflected; the diff gate exits
+  nonzero on it. (Unfaithful only for a `DROP TABLE` immediately followed by a
+  re-`CREATE TABLE` of the same name in one input — rare, and matching the
+  existing two-pass limitation.)
+
 ## [0.49.0] - 2026-07-14
 
 ### Added

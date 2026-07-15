@@ -359,6 +359,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     * ``CREATE POLICY`` → a `Policy` (name, command, permissive vs
       ``AS RESTRICTIVE``, ``TO`` roles, and USING / WITH CHECK parsed into the
       ASTs `verify` and the AST rules need).
+    * ``ALTER POLICY`` → updates the named policy's USING / WITH CHECK / roles
+      in place (a later ``ALTER POLICY … USING (true)`` loosening is honored,
+      not read as the policy's pre-ALTER form).
+    * ``DROP POLICY`` / ``DROP TABLE`` → removes the policy / table from the
+      model, so a dropped RLS guard is reflected. Statements replay in source
+      order.
     * ``GRANT <privs> ON <table> TO <roles>`` → a `Grant` so the
       GRANT-dependent rules fire.
 
@@ -410,6 +416,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_alter_table(stmt, tables, default_schema)
         elif kind == "CreatePolicyStmt":
             _apply_create_policy(stmt, tables, default_schema)
+        elif kind == "AlterPolicyStmt":
+            _apply_alter_policy(stmt, tables, default_schema)
+        elif kind == "DropStmt":
+            _apply_drop(stmt, tables, default_schema)
         elif kind == "GrantStmt":
             _apply_grant(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
@@ -590,6 +600,113 @@ def _apply_create_policy(
             with_check_ast=check_ast,
         )
     )
+
+
+def _apply_alter_policy(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    """Apply ``ALTER POLICY`` — replace the named policy's USING / WITH CHECK /
+    roles in place, leaving clauses the statement omits unchanged (Postgres
+    semantics). Without this, a migration that loosens a policy *after* creating
+    it (`ALTER POLICY p … USING (true)`) would be modeled as its pre-ALTER form
+    — a silent false-negative for the offline `sql=` path and the DB-free
+    `pgrls diff` gate built on it. Statements replay in source order (`CREATE`
+    then `ALTER` are both in pass 2), so the accumulated policy is the net one.
+    """
+    key = _relation_key(getattr(stmt, "table", None), default_schema)
+    if key is None:
+        return
+    builder = tables.get(key)
+    if builder is None:
+        return  # ALTER POLICY on a table this input never CREATEd.
+    name = getattr(stmt, "policy_name", None)
+    if not name:
+        return
+    location = f"{key[0]}.{key[1]}.{name}"
+    for i, policy in enumerate(builder.policies):
+        if policy.name != name:
+            continue
+        updates: dict[str, Any] = {}
+        roles = getattr(stmt, "roles", None)
+        if roles:
+            updates["roles"] = _role_specs(roles)
+        qual = getattr(stmt, "qual", None)
+        if qual is not None:
+            using_sql = _deparse_or_none(qual)
+            updates["using_sql"] = using_sql
+            updates["using_ast"] = (
+                _parse_clause(using_sql, location=location, clause="USING")
+                if using_sql is not None
+                else None
+            )
+        with_check = getattr(stmt, "with_check", None)
+        if with_check is not None:
+            check_sql = _deparse_or_none(with_check)
+            updates["with_check_sql"] = check_sql
+            updates["with_check_ast"] = (
+                _parse_clause(check_sql, location=location, clause="WITH CHECK")
+                if check_sql is not None
+                else None
+            )
+        if updates:
+            builder.policies[i] = replace(policy, **updates)
+        return
+    # No policy of that name — an ALTER before its CREATE (invalid SQL) or on a
+    # policy this input never modeled; nothing to update.
+
+
+def _apply_drop(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    """Apply ``DROP POLICY`` / ``DROP TABLE`` — remove the object from the model
+    so a dropped RLS guard (or whole table) is reflected offline. Other ``DROP``
+    object types (index, function, view, sequence, …) are not modeled and are
+    skipped, as before. The one unfaithful case is a ``DROP TABLE`` *followed
+    by* a re-``CREATE TABLE`` of the same name in the same input (`CREATE TABLE`
+    is resolved in pass 1) — the table is treated as dropped; this matches the
+    existing two-pass limitation and is rare in a single migration set.
+    """
+    remove_type = getattr(stmt, "removeType", None)
+    if remove_type == ObjectType.OBJECT_POLICY:
+        for namelist in stmt.objects or ():
+            parts = _drop_name_parts(namelist)
+            if len(parts) < 2:
+                continue  # a policy name is `[…table…, policy]`.
+            builder = tables.get(_drop_table_key(parts[:-1], default_schema))
+            if builder is not None:
+                policy_name = parts[-1]
+                builder.policies = [
+                    p for p in builder.policies if p.name != policy_name
+                ]
+    elif remove_type == ObjectType.OBJECT_TABLE:
+        for namelist in stmt.objects or ():
+            parts = _drop_name_parts(namelist)
+            if parts:
+                tables.pop(_drop_table_key(parts, default_schema), None)
+
+
+def _drop_name_parts(namelist: Any) -> list[str]:
+    """The string identifier parts of one ``DROP`` object name, or `[]` if any
+    part is missing (a shape we can't resolve — skip it rather than guess)."""
+    if not isinstance(namelist, (list, tuple)):
+        return []
+    parts = [getattr(n, "sval", None) for n in namelist]
+    return [p for p in parts if p] if all(parts) else []
+
+
+def _drop_table_key(
+    table_parts: list[str], default_schema: str
+) -> tuple[str, str]:
+    """`(schema, table)` from a table's name parts (`[schema, table]` or
+    `[table]`), defaulting an unqualified schema — the same keying as
+    `_relation_key`."""
+    if len(table_parts) == 1:
+        return (default_schema, table_parts[0])
+    return (table_parts[-2], table_parts[-1])
 
 
 def _apply_grant(
