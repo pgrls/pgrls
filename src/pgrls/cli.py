@@ -4188,6 +4188,40 @@ def mcp() -> None:
 
 
 @main.command()
+def lsp() -> None:
+    """Run the pgrls Language Server (stdio) for real-time editor diagnostics.
+    Requires pgrls[lsp].
+
+    Starts an LSP server over stdio that lints the `.sql` buffer you are editing
+    as you type — in any LSP client (VS Code, Neovim, Helix, JetBrains). It runs
+    the OFFLINE `schema_from_sql` engine (the same one `pgrls lint --sql-file`
+    uses) on each change and publishes findings as diagnostics pinned to the
+    exact `CREATE TABLE` / `CREATE POLICY` line. It never connects to a database
+    and never mutates anything — diagnostic-only.
+
+    Rules that need live catalog state (BYPASSRLS roles, SECURITY DEFINER
+    owners, triggers, indexes, …) cannot be analyzed from a buffer and are
+    skipped, exactly as in the `--sql-file` path — so an absence of diagnostics
+    is not a proof of safety; run `pgrls lint` against a live database for full
+    coverage.
+
+    Point an editor's LSP client at `pgrls lsp` for `sql` filetypes. Example
+    (Neovim): `vim.lsp.start({ name = 'pgrls', cmd = { 'pgrls', 'lsp' } })`.
+    """
+    # Import the server LAZILY (it imports the optional `pygls` extra). The
+    # normal CLI path must never import pygls — mirrors the `pgrls[mcp]`
+    # lazy-import contract above.
+    try:
+        from pgrls.lsp.server import run_stdio
+    except ImportError as exc:
+        raise ToolError(
+            "the Language Server requires the `pgrls[lsp]` extra. "
+            "Install with `pip install 'pgrls[lsp]'`."
+        ) from exc
+    run_stdio()
+
+
+@main.command()
 @common_db_options
 @click.option(
     "--coverage",
