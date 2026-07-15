@@ -1035,3 +1035,87 @@ def test_db_free_diff_catches_restrictive_drop_policy(tmp_path):
         main, ["diff", str(bj), str(hj), "--fail-on", "dangerous"]
     )
     assert res.exit_code == 1  # dropping a RESTRICTIVE filter loosens access
+
+
+# --- pgrls pr: unified base->head verdict (lint-on-head + diff) --------------
+
+_PR_CLEAN = (
+    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (tenant_id = current_setting('app.t')::uuid)\n"
+    "  WITH CHECK (tenant_id = current_setting('app.t')::uuid);\n"
+)
+_PR_LOOSENED = (
+    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (true) WITH CHECK (true);\n"
+)
+
+
+def _pr_snap(tmp_path, name, sql):
+    src = tmp_path / f"{name}.sql"
+    src.write_text(sql)
+    out = tmp_path / f"{name}.json"
+    r = CliRunner().invoke(
+        main, ["snapshot", "--sql-file", str(src), "-o", str(out)]
+    )
+    assert r.exit_code == 0, r.output
+    return str(out)
+
+
+def test_pr_passes_on_clean_no_change(tmp_path):
+    snap = _pr_snap(tmp_path, "clean", _PR_CLEAN)
+    res = CliRunner().invoke(main, ["pr", snap, snap])
+    assert res.exit_code == 0
+    assert "PASSED" in res.stdout
+    assert "No RLS policy changes" in res.stdout
+
+
+def test_pr_fails_on_dangerous_loosening(tmp_path):
+    base = _pr_snap(tmp_path, "base", _PR_CLEAN)
+    head = _pr_snap(tmp_path, "head", _PR_LOOSENED)
+    res = CliRunner().invoke(main, ["pr", base, head])
+    assert res.exit_code == 1
+    assert "FAILED" in res.stdout
+    assert "loosened" in res.stdout.lower()  # the diff (regression) section
+
+
+def test_pr_surfaces_lint_finding_in_head(tmp_path):
+    # head adds an RLS-off table — the lint section flags SEC001 (and the diff
+    # section its dangerous add); either alone fails the PR.
+    base = _pr_snap(tmp_path, "base", _PR_CLEAN)
+    head = _pr_snap(
+        tmp_path, "head", _PR_CLEAN + "CREATE TABLE public.leaky (id int);\n"
+    )
+    res = CliRunner().invoke(main, ["pr", base, head])
+    assert res.exit_code == 1
+    assert "SEC001" in res.stdout  # lint-on-head section
+    assert "Findings in the changed schema" in res.stdout
+
+
+def test_pr_diff_threshold_gates_independently(tmp_path):
+    # Dropping the only policy is a BREAKING diff change (not dangerous) and
+    # leaves RLS-on-no-policy (SEC009, a warning). Pin --lint-fail-on error so
+    # the incidental warning doesn't mask the DIFF threshold under test.
+    base = _pr_snap(tmp_path, "base", _PR_CLEAN)
+    head = _pr_snap(
+        tmp_path, "head", _PR_CLEAN + "DROP POLICY p ON public.t;\n"
+    )
+    passed = CliRunner().invoke(
+        main, ["pr", base, head, "--lint-fail-on", "error"]
+    )
+    assert passed.exit_code == 0  # breaking < dangerous; warning < error
+    failed = CliRunner().invoke(
+        main, ["pr", base, head, "--fail-on", "breaking", "--lint-fail-on", "error"]
+    )
+    assert failed.exit_code == 1  # now the breaking change trips the diff gate
+
+
+def test_pr_text_format(tmp_path):
+    snap = _pr_snap(tmp_path, "clean", _PR_CLEAN)
+    res = CliRunner().invoke(main, ["pr", snap, snap, "--format", "text"])
+    assert res.exit_code == 0 and "PASSED" in res.stdout

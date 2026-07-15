@@ -80,6 +80,14 @@ pgrls snapshot --sql-file schema.sql -o head.json
 pgrls diff base.json head.json --fail-on dangerous   # exit 1 on a DANGEROUS RLS change
 ```
 
+Or get **one PR verdict** — the regression check *and* a fresh lint of the changed
+schema, in a single Markdown report + exit code (the payload a CI check posts):
+
+```bash
+pgrls pr base.json head.json                 # markdown report; exit 1 if either gate trips
+pgrls pr base.json head.json --fail-on dangerous --lint-fail-on error
+```
+
 Offline analysis is **sound but partial**: rules that need live catalog state
 (BYPASSRLS roles, SECURITY DEFINER functions, triggers, …) can't fire, so
 pgrls *skips and lists them* (`skipped_rules` in `--format json`). **An offline

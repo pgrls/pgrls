@@ -11,6 +11,17 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Added
+- **`pgrls pr BASE HEAD` — one PR verdict combining lint + diff.** Runs the
+  regression check (`pgrls diff` — did this change loosen an existing policy?)
+  and the new-issue check (`pgrls lint` on the head — does the changed schema
+  have RLS problems?) against two `pgrls snapshot` artifacts, and emits a single
+  Markdown report (a policy-changes section + a findings section + a pass/fail
+  verdict) with a single exit code — the payload a CI PR check posts. `--fail-on`
+  gates the diff (default `dangerous`); `--lint-fail-on` gates the lint (default
+  `warning`); either crossing its threshold exits 1. Pair it with offline
+  snapshots (`pgrls snapshot --sql-file`/`--migrations`) to gate a PR on a
+  Z3-verified RLS regression **without ever touching the target database**.
+  `--format text` for a plain-text verdict.
 - **`pgrls snapshot --sql-file` — build a snapshot from raw DDL, offline.** The
   `snapshot` command now takes the same offline sources as `lint`/`fix`
   (`--sql-file`, repeatable, `-` for stdin; `--snapshot` to re-emit/upgrade an

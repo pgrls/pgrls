@@ -3105,6 +3105,197 @@ def diff(
         sys.exit(1)
 
 
+def _snapshot_version(path: str) -> int | None:
+    """The `version` of a `pgrls snapshot` artifact at `path`, or None if the
+    argument isn't a readable snapshot file (e.g. it's a database URL)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    version = data.get("version") if isinstance(data, dict) else None
+    return version if isinstance(version, int) else None
+
+
+def _render_pr_report(
+    changes: list[Change],
+    lint_violations: list[Violation],
+    *,
+    output_format: str,
+    diff_failing: int,
+    lint_failing: int,
+) -> str:
+    """Render the combined base→head PR verdict — a regressions section (diff)
+    plus a new-findings section (lint) plus a one-line pass/fail verdict."""
+    from pgrls.formatters.markdown import format_markdown
+
+    failed = bool(diff_failing or lint_failing)
+    if output_format == "markdown":
+        diff_body = (
+            format_diff_markdown(changes)
+            if changes
+            else "_No RLS policy changes._"
+        )
+        lint_body = (
+            format_markdown(lint_violations)
+            if lint_violations
+            else "_No findings in the changed schema._"
+        )
+        verdict = (
+            f"**pgrls PR check: FAILED** — {diff_failing} blocking policy "
+            f"change(s), {lint_failing} finding(s) at or above the threshold."
+            if failed
+            else "**pgrls PR check: PASSED** — no blocking RLS regressions or "
+            "findings."
+        )
+        return (
+            "## pgrls PR check\n\n"
+            "### RLS policy changes (base → head)\n\n"
+            f"{diff_body}\n\n"
+            "### Findings in the changed schema\n\n"
+            f"{lint_body}\n\n"
+            f"{verdict}\n"
+        )
+    diff_body = format_diff_text(changes) if changes else "No RLS policy changes."
+    lint_body = (
+        format_violations(lint_violations, format="text")
+        if lint_violations
+        else "No findings in the changed schema."
+    )
+    verdict = (
+        f"pgrls PR check: FAILED ({diff_failing} blocking change(s), "
+        f"{lint_failing} finding(s))"
+        if failed
+        else "pgrls PR check: PASSED"
+    )
+    return (
+        "RLS policy changes (base -> head):\n"
+        f"{diff_body}\n\n"
+        "Findings in the changed schema:\n"
+        f"{lint_body}\n\n"
+        f"{verdict}"
+    )
+
+
+@main.command(name="pr")
+@click.argument("base")
+@click.argument("head")
+@click.option(
+    "--fail-on",
+    type=click.Choice(
+        ["safe", "breaking", "requires-review", "dangerous"],
+        case_sensitive=False,
+    ),
+    default=None,
+    help="Diff classification at or above which the check fails. "
+    "Falls back to [diff].fail_on, then 'dangerous'.",
+)
+@click.option(
+    "--lint-fail-on",
+    type=click.Choice(["error", "warning", "info"], case_sensitive=False),
+    default=None,
+    help="Lint severity (on the head schema) at or above which the check "
+    "fails. Falls back to [lint].fail_on, then 'warning'.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["markdown", "text"], case_sensitive=False),
+    default="markdown",
+    show_default=True,
+    help="Report format — markdown is PR-comment ready.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Path to pgrls.toml. Defaults to ./pgrls.toml if present.",
+)
+@click.option(
+    "--schemas",
+    default=None,
+    help="Comma-separated schemas to introspect (URL sources only).",
+)
+def pr(
+    base: str,
+    head: str,
+    fail_on: str | None,
+    lint_fail_on: str | None,
+    output_format: str,
+    config_path: str | None,
+    schemas: str | None,
+) -> None:
+    """One PR verdict: lint the head schema AND diff base->head, in one gate.
+
+    BASE and HEAD are `pgrls snapshot` artifacts (or database URLs). This
+    combines the regression check (`pgrls diff` — did this PR loosen an existing
+    policy?) and the new-issue check (`pgrls lint` — does the changed schema
+    have RLS problems?) into a single Markdown report and a single exit code —
+    the payload a CI PR check posts. Build BASE / HEAD offline
+    (`pgrls snapshot --sql-file` / `--migrations`) and this never touches the
+    target database. Exits 1 when either the diff or the lint crosses its
+    threshold.
+    """
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+
+    schema_list = (
+        [s.strip() for s in schemas.split(",") if s.strip()]
+        if schemas
+        else config.schemas
+    )
+    base_schema = _resolve_diff_source(base, schemas=schema_list)
+    head_schema = _resolve_diff_source(head, schemas=schema_list)
+
+    # Lint the head. Skip rules inert on the head snapshot's version (a current
+    # snapshot skips nothing); a live-URL head sees the full catalog, no skip.
+    head_version = _snapshot_version(head)
+    inert = (
+        inert_rule_ids("snapshot", snapshot_version=head_version)
+        if head_version is not None
+        else frozenset()
+    )
+    try:
+        lint_violations = _run_rules(
+            head_schema,
+            config=config,
+            exclude_filter=set(inert) if inert else None,
+        )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ToolError(str(exc)) from exc
+    lint_floor: Severity = lint_fail_on or config.fail_on  # type: ignore[assignment]
+    lint_failing = [
+        v for v in lint_violations if is_at_or_above(v.severity, lint_floor)
+    ]
+
+    changes = diff_schemas(
+        base_schema,
+        head_schema,
+        rename_detection=config.diff_rename_detection,
+        rename_classification=config.diff_rename_classification,
+    )
+    diff_floor = fail_on if fail_on is not None else config.diff_fail_on
+    diff_failing = [
+        c
+        for c in changes
+        if c.classification in _classifications_at_or_above(diff_floor)
+    ]
+
+    click.echo(
+        _render_pr_report(
+            changes,
+            lint_violations,
+            output_format=output_format,
+            diff_failing=len(diff_failing),
+            lint_failing=len(lint_failing),
+        )
+    )
+    if diff_failing or lint_failing:
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # pgrls cache — manage the v0.5.2 baseline cache for `diff --apply`
 # ---------------------------------------------------------------------------
