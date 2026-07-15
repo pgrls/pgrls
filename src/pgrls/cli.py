@@ -2178,7 +2178,9 @@ def generate(
 
 
 @main.command()
+@click.pass_context
 @common_db_options
+@offline_source_options
 @click.option(
     "--output",
     "-o",
@@ -2188,12 +2190,15 @@ def generate(
     help="Path to write the JSON snapshot (default: stdout).",
 )
 def snapshot(
+    ctx: click.Context,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
+    sql_file: tuple[str, ...],
+    snapshot: str | None,
     output_path: str | None,
 ) -> None:
-    """Capture a JSON snapshot of the database's RLS state.
+    """Capture a JSON snapshot of a schema's RLS state.
 
     The snapshot format is documented in CHANGELOG.md and is
     intended to be consumed by `pgrls diff` (or stored as a
@@ -2201,6 +2206,14 @@ def snapshot(
     `Schema.to_snapshot()` produces — top-level `version` plus a
     `tables` list, deterministic within a single Postgres
     instance.
+
+    The default source is a live database (`--database-url` /
+    `$DATABASE_URL`). Pass `--sql-file` to build the snapshot from raw
+    DDL **offline** — no database and no Docker — so two migration
+    revisions can be captured and `pgrls diff`'d in CI with the target
+    database never touched (an offline snapshot carries only what DDL
+    expresses; see the caveat on stderr). `--snapshot IN` re-emits an
+    existing artifact, upgrading it to the current format version.
 
     Without `--output`, the snapshot is written to stdout. With
     `--output PATH`, it's written to the path with a trailing
@@ -2211,29 +2224,41 @@ def snapshot(
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
 
-    effective = _merge_overrides(
-        config,
-        database_url=database_url,
-        schemas_csv=schemas,
-        fail_on=None,
-    )
-
-    if effective.database_url is None:
-        # If `[database].url` was set but its env-var interpolation
-        # failed, surface that specific cause (deferred from
-        # load_config) instead of the generic guidance.
-        raise ToolError(
-            effective.database_url_error
-            or "No database connection: pass --database-url or set DATABASE_URL."
+    if sql_file or snapshot is not None:
+        # Offline source (raw DDL / an existing snapshot) — reject a
+        # colliding explicit --database-url before doing any work.
+        _guard_offline_exclusivity(ctx, command="snapshot")
+        offline = _resolve_offline_schema(
+            sql_file=sql_file,
+            snapshot=snapshot,
+            schemas_csv=schemas,
+            command="snapshot",
         )
-
-    try:
-        with psycopg.connect(effective.database_url) as conn:
-            schema = introspect(conn, schemas=effective.schemas)
-    except psycopg.Error as exc:
-        raise ToolError(f"Database error: {exc}") from exc
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
+        assert offline is not None  # a source was given
+        schema = offline[0]
+    else:
+        effective = _merge_overrides(
+            config,
+            database_url=database_url,
+            schemas_csv=schemas,
+            fail_on=None,
+        )
+        if effective.database_url is None:
+            # If `[database].url` was set but its env-var interpolation
+            # failed, surface that specific cause (deferred from
+            # load_config) instead of the generic guidance.
+            raise ToolError(
+                effective.database_url_error
+                or "No schema source: pass --database-url / set DATABASE_URL, "
+                "or build a snapshot offline with --sql-file / --snapshot."
+            )
+        try:
+            with psycopg.connect(effective.database_url) as conn:
+                schema = introspect(conn, schemas=effective.schemas)
+        except psycopg.Error as exc:
+            raise ToolError(f"Database error: {exc}") from exc
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
 
     payload = json.dumps(schema.to_snapshot(), indent=2, ensure_ascii=False)
     if output_path:

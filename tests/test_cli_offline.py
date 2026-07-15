@@ -844,3 +844,194 @@ def test_fix_offline_soundness_caveat_on_stderr(tmp_path):
         or "not a proof" in err_lower
         or "offline" in err_lower
     ), f"Soundness caveat missing from stderr:\n{res.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# CLI integration tests: snapshot offline wiring (the DB-free PR pipeline)
+# ---------------------------------------------------------------------------
+
+_TENANT_SCOPED = (
+    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (tenant_id = current_setting('app.tenant')::uuid)\n"
+    "  WITH CHECK (tenant_id = current_setting('app.tenant')::uuid);\n"
+)
+_UNSCOPED = (
+    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (true) WITH CHECK (true);\n"
+)
+
+
+def test_snapshot_sql_file_emits_offline_snapshot(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    out = tmp_path / "snap.json"
+    res = CliRunner().invoke(
+        main, ["snapshot", "--sql-file", str(f), "--output", str(out)]
+    )
+    assert res.exit_code == 0, res.output
+    payload = json.loads(out.read_text())
+    assert "version" in payload
+    assert any(t["name"] == "t" for t in payload["tables"])
+
+
+def test_snapshot_offline_caveat_on_stderr(tmp_path, capsys):
+    # The snapshot-flavored caveat (built from DDL; catalog state absent),
+    # distinct from lint's "not a proof of safety" wording.
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    _resolve_offline_schema(
+        sql_file=(str(f),), snapshot=None, schemas_csv=None, command="snapshot"
+    )
+    err = capsys.readouterr().err.lower()
+    assert "built from the provided sql offline" in err
+    assert "catalog-only state" in err
+
+
+def test_snapshot_offline_conflicts_with_database_url(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    res = CliRunner().invoke(
+        main,
+        ["snapshot", "--sql-file", str(f), "--database-url", "postgres://x/y"],
+    )
+    assert res.exit_code != 0 and "one schema source" in res.stderr.lower()
+
+
+def test_snapshot_roundtrips_via_snapshot_input(tmp_path):
+    # snapshot --snapshot IN re-emits an existing artifact (format upgrade).
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    first = tmp_path / "a.json"
+    assert (
+        CliRunner()
+        .invoke(main, ["snapshot", "--sql-file", str(f), "-o", str(first)])
+        .exit_code
+        == 0
+    )
+    second = tmp_path / "b.json"
+    res = CliRunner().invoke(
+        main, ["snapshot", "--snapshot", str(first), "-o", str(second)]
+    )
+    assert res.exit_code == 0, res.output
+    assert json.loads(first.read_text()) == json.loads(second.read_text())
+
+
+def test_db_free_snapshot_diff_catches_dangerous_regression(tmp_path):
+    # The keystone of the PR checker: build a snapshot from each migration
+    # revision with NO database, then diff base->head. Dropping the tenant
+    # predicate to USING(true) is a Z3-verified DANGEROUS loosening, so
+    # `--fail-on dangerous` exits nonzero — the CI gate the Action wires up.
+    base_sql = tmp_path / "base.sql"
+    base_sql.write_text(_TENANT_SCOPED)
+    head_sql = tmp_path / "head.sql"
+    head_sql.write_text(_UNSCOPED)
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    for src, dst in ((base_sql, base), (head_sql, head)):
+        r = CliRunner().invoke(
+            main, ["snapshot", "--sql-file", str(src), "-o", str(dst)]
+        )
+        assert r.exit_code == 0, r.output
+
+    res = CliRunner().invoke(
+        main,
+        ["diff", str(base), str(head), "--fail-on", "dangerous",
+         "--format", "json"],
+    )
+    assert res.exit_code == 1  # dangerous change present → gate fails
+    payload = json.loads(res.stdout)
+    classifications = {c["classification"] for c in payload["violations"]}
+    assert "dangerous" in classifications
+
+
+# --- schema_from_sql must REPLAY policy/table mutations (soundness) ----------
+# Without this, a migration that loosens a policy via ALTER POLICY (or removes
+# an RLS guard via DROP POLICY / DROP TABLE) would be modeled as its pre-change
+# form — a silent false-SAFE for the DB-free diff gate above.
+
+
+def _offline_schema(sql):
+    from pgrls.schema_sources import schema_from_sql
+
+    return schema_from_sql(sql)
+
+
+def test_schema_from_sql_applies_alter_policy_loosening():
+    s = _offline_schema(
+        _TENANT_SCOPED
+        + "ALTER POLICY p ON public.t USING (true) WITH CHECK (true);\n"
+    )
+    (t,) = [t for t in s.tables if t.name == "t"]
+    (p,) = t.policies
+    assert p.using_sql.lower() == "true"  # post-ALTER, not the tenant predicate
+    assert p.with_check_sql.lower() == "true"
+
+
+def test_schema_from_sql_alter_policy_preserves_omitted_clause():
+    # ALTER POLICY … TO role (no USING) must not wipe the existing USING.
+    s = _offline_schema(_TENANT_SCOPED + "ALTER POLICY p ON public.t TO anon;\n")
+    (t,) = [t for t in s.tables if t.name == "t"]
+    (p,) = t.policies
+    assert "tenant_id" in (p.using_sql or "")  # USING untouched
+
+
+def test_schema_from_sql_applies_drop_policy():
+    s = _offline_schema(_TENANT_SCOPED + "DROP POLICY p ON public.t;\n")
+    (t,) = [t for t in s.tables if t.name == "t"]
+    assert t.policies == ()  # policy removed
+    assert t.rls_enabled  # the table + its RLS state survive the policy drop
+
+
+def test_schema_from_sql_applies_drop_table():
+    s = _offline_schema(_TENANT_SCOPED + "DROP TABLE public.t;\n")
+    assert [t.name for t in s.tables] == []
+
+
+def test_db_free_diff_catches_alter_policy_loosening(tmp_path):
+    base = tmp_path / "b.sql"
+    base.write_text(_TENANT_SCOPED)
+    head = tmp_path / "h.sql"
+    head.write_text(
+        _TENANT_SCOPED
+        + "ALTER POLICY p ON public.t USING (true) WITH CHECK (true);\n"
+    )
+    bj, hj = tmp_path / "b.json", tmp_path / "h.json"
+    for src, dst in ((base, bj), (head, hj)):
+        assert (
+            CliRunner()
+            .invoke(main, ["snapshot", "--sql-file", str(src), "-o", str(dst)])
+            .exit_code
+            == 0
+        )
+    res = CliRunner().invoke(
+        main, ["diff", str(bj), str(hj), "--fail-on", "dangerous"]
+    )
+    assert res.exit_code == 1  # the ALTER-POLICY loosening is not silently dropped
+
+
+def test_db_free_diff_catches_restrictive_drop_policy(tmp_path):
+    restr = (
+        "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+        "  USING (true) WITH CHECK (true);\n"
+        "CREATE POLICY r ON public.t AS RESTRICTIVE FOR ALL TO authenticated\n"
+        "  USING (tenant_id = current_setting('app.tenant')::uuid);\n"
+    )
+    base = tmp_path / "b.sql"
+    base.write_text(restr)
+    head = tmp_path / "h.sql"
+    head.write_text(restr + "DROP POLICY r ON public.t;\n")
+    bj, hj = tmp_path / "b.json", tmp_path / "h.json"
+    for src, dst in ((base, bj), (head, hj)):
+        CliRunner().invoke(
+            main, ["snapshot", "--sql-file", str(src), "-o", str(dst)]
+        )
+    res = CliRunner().invoke(
+        main, ["diff", str(bj), str(hj), "--fail-on", "dangerous"]
+    )
+    assert res.exit_code == 1  # dropping a RESTRICTIVE filter loosens access

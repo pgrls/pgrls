@@ -65,9 +65,19 @@ Postgres, no container) and checks what it can determine from the SQL alone:
 ```bash
 pgrls lint --sql-file schema.sql                 # repeat --sql-file per file (order matters)
 cat migrations/*.sql | pgrls lint --sql-file -   # or pipe a concatenated diff
-pgrls snapshot > schema.json && pgrls lint --snapshot schema.json
+pgrls snapshot --sql-file schema.sql -o schema.json  # snapshot from DDL, no DB
 pgrls fix --sql-file schema.sql > fixes.sql      # emit-only offline
 pgrls generate --sql-file schema.sql             # scaffold RLS offline
+```
+
+Two migration revisions can be compared with **no database at all** — snapshot
+each side's DDL offline, then diff them, so a PR that silently drops a tenant
+predicate fails the gate without the target database ever being touched:
+
+```bash
+git show origin/main:schema.sql | pgrls snapshot --sql-file - -o base.json
+pgrls snapshot --sql-file schema.sql -o head.json
+pgrls diff base.json head.json --fail-on dangerous   # exit 1 on a DANGEROUS RLS change
 ```
 
 Offline analysis is **sound but partial**: rules that need live catalog state
