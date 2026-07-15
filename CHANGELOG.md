@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-07-14
+
 ### Added
 - **SEC052 (error) — Auth user table exposed through an API-schema view.** A
   view (or matview) in a PostgREST-exposed schema (default `public`) that reads
