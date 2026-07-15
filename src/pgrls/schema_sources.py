@@ -801,7 +801,7 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
 # so adding a rule whose field lands in a future version can't slip through.
 assert all(v <= SNAPSHOT_VERSION for _, v in _CATALOG_DEPENDENT_RULES.values())
 
-WarnCommand = Literal["lint", "fix", "generate"]
+WarnCommand = Literal["lint", "fix", "generate", "snapshot"]
 
 
 def inert_rule_ids(
@@ -871,6 +871,15 @@ def schema_source_warnings(
                 f"re-capture to cover them): {inert}."
             )
         return lines
+    if command == "snapshot":
+        return [
+            "This snapshot was built from the provided SQL offline — no live "
+            "database. It captures only what CREATE/ALTER/GRANT DDL expresses "
+            "(RLS flags, policies, columns, grants); catalog-only state "
+            "(BYPASSRLS roles, SECURITY DEFINER functions, triggers, indexes, "
+            "foreign keys) is absent, so diffing it against a live-database "
+            "snapshot may show spurious differences.",
+        ]
     if command in {"lint", "fix"}:
         return [
             "Analysis is of the provided SQL only — no live database. Rules that "

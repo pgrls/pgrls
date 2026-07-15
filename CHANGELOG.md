@@ -10,6 +10,23 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pgrls snapshot --sql-file` — build a snapshot from raw DDL, offline.** The
+  `snapshot` command now takes the same offline sources as `lint`/`fix`
+  (`--sql-file`, repeatable, `-` for stdin; `--snapshot` to re-emit/upgrade an
+  existing artifact), so a schema snapshot can be captured with **no database
+  and no Docker**. This unblocks the DB-free migration-review pipeline the
+  GitHub PR checker is built on: snapshot each revision's migrations, then
+  `pgrls diff base.json head.json --fail-on dangerous` gates a PR on a
+  Z3-verified RLS regression **without ever connecting to the target database**.
+  An offline snapshot carries only what CREATE/ALTER/GRANT DDL expresses (RLS
+  flags, policies, columns, grants); a soundness caveat noting the absent
+  catalog-only state is printed to stderr, and diffing an offline snapshot
+  against a live-database one may show spurious differences. An explicit
+  `--database-url` alongside an offline source is rejected (ambient
+  `$DATABASE_URL` is ignored when an offline source is given), mirroring
+  `lint`/`fix`.
+
 ## [0.49.0] - 2026-07-14
 
 ### Added

@@ -844,3 +844,105 @@ def test_fix_offline_soundness_caveat_on_stderr(tmp_path):
         or "not a proof" in err_lower
         or "offline" in err_lower
     ), f"Soundness caveat missing from stderr:\n{res.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# CLI integration tests: snapshot offline wiring (the DB-free PR pipeline)
+# ---------------------------------------------------------------------------
+
+_TENANT_SCOPED = (
+    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (tenant_id = current_setting('app.tenant')::uuid)\n"
+    "  WITH CHECK (tenant_id = current_setting('app.tenant')::uuid);\n"
+)
+_UNSCOPED = (
+    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (true) WITH CHECK (true);\n"
+)
+
+
+def test_snapshot_sql_file_emits_offline_snapshot(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    out = tmp_path / "snap.json"
+    res = CliRunner().invoke(
+        main, ["snapshot", "--sql-file", str(f), "--output", str(out)]
+    )
+    assert res.exit_code == 0, res.output
+    payload = json.loads(out.read_text())
+    assert "version" in payload
+    assert any(t["name"] == "t" for t in payload["tables"])
+
+
+def test_snapshot_offline_caveat_on_stderr(tmp_path, capsys):
+    # The snapshot-flavored caveat (built from DDL; catalog state absent),
+    # distinct from lint's "not a proof of safety" wording.
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    _resolve_offline_schema(
+        sql_file=(str(f),), snapshot=None, schemas_csv=None, command="snapshot"
+    )
+    err = capsys.readouterr().err.lower()
+    assert "built from the provided sql offline" in err
+    assert "catalog-only state" in err
+
+
+def test_snapshot_offline_conflicts_with_database_url(tmp_path):
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    res = CliRunner().invoke(
+        main,
+        ["snapshot", "--sql-file", str(f), "--database-url", "postgres://x/y"],
+    )
+    assert res.exit_code != 0 and "one schema source" in res.stderr.lower()
+
+
+def test_snapshot_roundtrips_via_snapshot_input(tmp_path):
+    # snapshot --snapshot IN re-emits an existing artifact (format upgrade).
+    f = tmp_path / "s.sql"
+    f.write_text(_TENANT_SCOPED)
+    first = tmp_path / "a.json"
+    assert (
+        CliRunner()
+        .invoke(main, ["snapshot", "--sql-file", str(f), "-o", str(first)])
+        .exit_code
+        == 0
+    )
+    second = tmp_path / "b.json"
+    res = CliRunner().invoke(
+        main, ["snapshot", "--snapshot", str(first), "-o", str(second)]
+    )
+    assert res.exit_code == 0, res.output
+    assert json.loads(first.read_text()) == json.loads(second.read_text())
+
+
+def test_db_free_snapshot_diff_catches_dangerous_regression(tmp_path):
+    # The keystone of the PR checker: build a snapshot from each migration
+    # revision with NO database, then diff base->head. Dropping the tenant
+    # predicate to USING(true) is a Z3-verified DANGEROUS loosening, so
+    # `--fail-on dangerous` exits nonzero — the CI gate the Action wires up.
+    base_sql = tmp_path / "base.sql"
+    base_sql.write_text(_TENANT_SCOPED)
+    head_sql = tmp_path / "head.sql"
+    head_sql.write_text(_UNSCOPED)
+    base = tmp_path / "base.json"
+    head = tmp_path / "head.json"
+    for src, dst in ((base_sql, base), (head_sql, head)):
+        r = CliRunner().invoke(
+            main, ["snapshot", "--sql-file", str(src), "-o", str(dst)]
+        )
+        assert r.exit_code == 0, r.output
+
+    res = CliRunner().invoke(
+        main,
+        ["diff", str(base), str(head), "--fail-on", "dangerous",
+         "--format", "json"],
+    )
+    assert res.exit_code == 1  # dangerous change present → gate fails
+    payload = json.loads(res.stdout)
+    classifications = {c["classification"] for c in payload["violations"]}
+    assert "dangerous" in classifications
