@@ -70,8 +70,15 @@ def create_server() -> LanguageServer:
         # analogue is the workspace root, or — when a lone file is opened with
         # no workspace folder (`root_path` is None) — the document's own
         # directory, so a project's config still applies in single-file mode.
+        # Only a real `file:` document has a directory on disk; a virtual buffer
+        # (`untitled:`, `inmemory:`, a notebook cell) has no project, so it must
+        # not reach into the filesystem — fall back to the default config.
         root = getattr(ls.workspace, "root_path", None)
-        doc_dir = os.path.dirname(doc.path) if doc.path else None
+        doc_dir = (
+            os.path.dirname(doc.path)
+            if doc.path and doc.uri.startswith("file:")
+            else None
+        )
         config_dir = root or doc_dir
         key = config_dir or ""
         if key not in config_cache:

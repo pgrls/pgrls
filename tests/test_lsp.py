@@ -344,6 +344,35 @@ def test_single_file_mode_uses_config_next_to_the_document(tmp_path) -> None:
     assert [d.code for d in published[-1].diagnostics] == []
 
 
+def test_virtual_buffers_do_not_probe_the_filesystem(monkeypatch) -> None:
+    # A virtual buffer (untitled / in-memory / notebook cell) has no on-disk
+    # directory, so config discovery must resolve to None (the default) rather
+    # than a bogus path like "/" derived from the URI's fake path component.
+    from pgrls.lsp import server as server_mod
+
+    seen: list = []
+
+    def _capture(config_dir, ls=None):
+        seen.append(config_dir)
+        return Config()
+
+    monkeypatch.setattr(server_mod, "_discover_config", _capture)
+    for uri in ("untitled:Untitled-1", "inmemory://model/1"):
+        s, published = _server_with_doc(uri, _RLS_OFF)
+        _fire(
+            s,
+            lsp.TEXT_DOCUMENT_DID_OPEN,
+            lsp.DidOpenTextDocumentParams(
+                text_document=lsp.TextDocumentItem(
+                    uri=uri, language_id="sql", version=1, text=""
+                )
+            ),
+        )
+        # Still lints (with defaults) — SEC001 fires, no crash.
+        assert [d.code for d in published[-1].diagnostics] == ["SEC001"]
+    assert seen == [None, None]  # never a filesystem directory
+
+
 def test_did_close_clears_diagnostics() -> None:
     uri = "file:///schema.sql"
     s, published = _server_with_doc(uri, _RLS_OFF)
