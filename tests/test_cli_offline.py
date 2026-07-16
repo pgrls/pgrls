@@ -1035,3 +1035,85 @@ def test_db_free_diff_catches_restrictive_drop_policy(tmp_path):
         main, ["diff", str(bj), str(hj), "--fail-on", "dangerous"]
     )
     assert res.exit_code == 1  # dropping a RESTRICTIVE filter loosens access
+
+
+# --- snapshot --migrations: offline, layout-ordered directory input ---------
+
+
+def _write_migrations(dir_path, files):
+    dir_path.mkdir(parents=True, exist_ok=True)
+    for name, body in files.items():
+        (dir_path / name).write_text(body)
+
+
+def test_snapshot_migrations_dir_builds_offline(tmp_path):
+    mig = tmp_path / "migrations"
+    _write_migrations(
+        mig,
+        {
+            "20240101000000_init.sql": (
+                "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+                "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+            ),
+            "20240102000000_policy.sql": (
+                "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+                "  USING (tenant_id = current_setting('app.tenant')::uuid);\n"
+            ),
+        },
+    )
+    out = tmp_path / "snap.json"
+    res = CliRunner().invoke(
+        main, ["snapshot", "--migrations", str(mig), "-o", str(out)]
+    )
+    assert res.exit_code == 0, res.output
+    payload = json.loads(out.read_text())
+    assert any(t["name"] == "t" for t in payload["tables"])
+    # The policy from file 2 attached to the table from file 1 (ordered concat).
+    policy_names = {
+        p["policy_name"] for p in payload["policies"] if p["table_name"] == "t"
+    }
+    assert "p" in policy_names
+
+
+def test_db_free_diff_via_migrations_catches_loosening(tmp_path):
+    # The realistic PR scenario: head adds a NEW migration file that loosens a
+    # policy created in an earlier one. The layout-ordered offline snapshot must
+    # reflect the net (loosened) state so the diff gate fails — no database.
+    common = {
+        "20240101000000_init.sql": _TENANT_SCOPED,
+    }
+    base = tmp_path / "base"
+    _write_migrations(base, common)
+    head = tmp_path / "head"
+    _write_migrations(
+        head,
+        {
+            **common,
+            "20240102000000_loosen.sql": (
+                "ALTER POLICY p ON public.t USING (true) WITH CHECK (true);\n"
+            ),
+        },
+    )
+    bj, hj = tmp_path / "b.json", tmp_path / "h.json"
+    for src, dst in ((base, bj), (head, hj)):
+        assert (
+            CliRunner()
+            .invoke(main, ["snapshot", "--migrations", str(src), "-o", str(dst)])
+            .exit_code
+            == 0
+        )
+    res = CliRunner().invoke(
+        main, ["diff", str(bj), str(hj), "--fail-on", "dangerous"]
+    )
+    assert res.exit_code == 1
+
+
+def test_snapshot_migrations_conflicts_with_sql_file(tmp_path):
+    mig = tmp_path / "migrations"
+    _write_migrations(mig, {"20240101000000_init.sql": _TENANT_SCOPED})
+    f = tmp_path / "extra.sql"
+    f.write_text(_TENANT_SCOPED)
+    res = CliRunner().invoke(
+        main, ["snapshot", "--migrations", str(mig), "--sql-file", str(f)]
+    )
+    assert res.exit_code != 0 and "one offline source" in res.stderr.lower()
