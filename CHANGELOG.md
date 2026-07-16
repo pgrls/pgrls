@@ -11,6 +11,21 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Added
+- **`pgrls pr BASE HEAD` — one PR verdict combining lint + diff.** Runs the
+  regression check (`pgrls diff` — did this change loosen an existing policy?)
+  and the new-issue check (`pgrls lint` on the head — does the changed schema
+  have RLS problems?) against two `pgrls snapshot` artifacts, and emits a single
+  Markdown report (a policy-changes section + a findings section + a pass/fail
+  verdict) with a single exit code — the payload a CI PR check posts. `--fail-on`
+  gates the diff (default `dangerous`); `--lint-fail-on` gates the lint (default
+  `warning`); either crossing its threshold exits 1. Pair it with offline
+  snapshots (`pgrls snapshot --sql-file`/`--migrations`) to gate a PR on a
+  Z3-verified RLS regression **without ever touching the target database**.
+  The head's policy predicates are re-parsed so predicate rules (SEC004/SEC038/
+  PERF001) run on a snapshot head just as they do on a live one; and when the
+  head is an offline snapshot the report notes the catalog-dependent rules that
+  could not be evaluated, so a clean verdict is never mistaken for full
+  coverage. `--format text` for a plain-text verdict.
 - **`pgrls snapshot --sql-file` — build a snapshot from raw DDL, offline.** The
   `snapshot` command now takes the same offline sources as `lint`/`fix`
   (`--sql-file`, repeatable, `-` for stdin; `--snapshot` to re-emit/upgrade an
@@ -25,10 +40,14 @@ breaking changes — they will be called out in this file.
   An offline snapshot carries only what CREATE/ALTER/GRANT DDL expresses (RLS
   flags, policies, columns, grants); a soundness caveat noting the absent
   catalog-only state is printed to stderr, and diffing an offline snapshot
-  against a live-database one may show spurious differences. An explicit
-  `--database-url` alongside an offline source is rejected (ambient
-  `$DATABASE_URL` is ignored when an offline source is given), mirroring
-  `lint`/`fix`.
+  against a live-database one may show spurious differences. The snapshot also
+  records its offline provenance (a `"source": "sql"` marker, preserved across a
+  `--snapshot` re-emit), so a later `lint --snapshot` / `pgrls pr` treats every
+  catalog-dependent rule as inert on it — the same rules `lint --sql-file`
+  skips — rather than firing them on absent inputs (a false positive) or reading
+  their silent no-op as coverage (a false clear). An explicit `--database-url`
+  alongside an offline source is rejected (ambient `$DATABASE_URL` is ignored
+  when an offline source is given), mirroring `lint`/`fix`.
 
 ### Fixed
 - **Offline DDL analysis now replays `ALTER POLICY` / `DROP POLICY` / `DROP
