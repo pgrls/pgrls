@@ -2177,10 +2177,46 @@ def generate(
         _generate_dispatch(result, list(result.statements), conn=conn, output_path=output_path, force=force, apply=apply, offline=False)
 
 
+def _offline_migration_options(func: Callable[..., Any]) -> Callable[..., Any]:
+    """The static subset of ``migration_source_options`` — resolve a migration
+    directory to its layout-ordered file list and read it OFFLINE (no ephemeral
+    Postgres). `snapshot` uses it for a DB-free, layout-aware source. Declared
+    bottom-up so `--help` lists `--migrations` first."""
+    from pgrls.migrations_layout import LAYOUTS
+
+    func = click.option(
+        "--migrations-glob",
+        default=None,
+        help="Explicit ordered glob for --migrations-layout glob (e.g. 'db/*.sql').",
+    )(func)
+    func = click.option(
+        "--migrations-layout",
+        type=click.Choice(list(LAYOUTS), case_sensitive=False),
+        default="auto",
+        show_default=True,
+        help="Migration layout for --migrations (auto-detected by default).",
+    )(func)
+    func = click.option(
+        "--migrations",
+        "migrations_path",
+        type=click.Path(exists=True),
+        default=None,
+        help=(
+            "Build the snapshot OFFLINE from a migration directory (or a single "
+            ".sql file): its layout-ordered files are concatenated and parsed — "
+            "no database, no Docker (unlike `lint --migrations`, which "
+            "provisions an ephemeral Postgres). Mutually exclusive with "
+            "--sql-file / --snapshot / --database-url."
+        ),
+    )(func)
+    return func
+
+
 @main.command()
 @click.pass_context
 @common_db_options
 @offline_source_options
+@_offline_migration_options
 @click.option(
     "--output",
     "-o",
@@ -2196,6 +2232,9 @@ def snapshot(
     schemas: str | None,
     sql_file: tuple[str, ...],
     snapshot: str | None,
+    migrations_path: str | None,
+    migrations_layout: str,
+    migrations_glob: str | None,
     output_path: str | None,
 ) -> None:
     """Capture a JSON snapshot of a schema's RLS state.
@@ -2223,6 +2262,29 @@ def snapshot(
         config = load_config(config_path)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
+
+    if migrations_path is not None:
+        # Static/offline migration-directory read: resolve the layout to an
+        # ordered file list and build the schema from their concatenated DDL —
+        # no database, no Docker (distinct from `lint --migrations`, which
+        # provisions an ephemeral Postgres). Feed the ordered files through the
+        # same offline `--sql-file` path below.
+        if sql_file or snapshot is not None:
+            raise ToolError(
+                "choose one offline source: --migrations, --sql-file, or "
+                "--snapshot."
+            )
+        from pgrls.migrations_layout import LayoutError, resolve_plan
+
+        try:
+            plan = resolve_plan(
+                Path(migrations_path),
+                layout=migrations_layout,
+                glob_pattern=migrations_glob,
+            )
+        except LayoutError as exc:
+            raise ToolError(str(exc)) from exc
+        sql_file = tuple(str(f) for f in plan.files)
 
     if sql_file or snapshot is not None:
         # Offline source (raw DDL / an existing snapshot) — reject a

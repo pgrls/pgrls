@@ -30,7 +30,10 @@ breaking changes — they will be called out in this file.
   `snapshot` command now takes the same offline sources as `lint`/`fix`
   (`--sql-file`, repeatable, `-` for stdin; `--snapshot` to re-emit/upgrade an
   existing artifact), so a schema snapshot can be captured with **no database
-  and no Docker**. This unblocks the DB-free migration-review pipeline the
+  and no Docker**. `--migrations <dir>` resolves a project's layout-ordered
+  migration files (Supabase / Prisma / Flyway / sqitch, auto-detected) and reads
+  them **statically** — distinct from `lint --migrations`, which provisions an
+  ephemeral Postgres. This unblocks the DB-free migration-review pipeline the
   GitHub PR checker is built on: snapshot each revision's migrations, then
   `pgrls diff base.json head.json --fail-on dangerous` gates a PR on a
   Z3-verified RLS regression **without ever connecting to the target database**.
