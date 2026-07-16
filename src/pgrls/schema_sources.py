@@ -216,8 +216,7 @@ def resolve_schema(
     if sql is not None:
         return schema_from_sql(sql, schemas=effective_schemas), "sql", None
     if snapshot is not None:
-        schema, version = _schema_from_snapshot(snapshot)
-        return schema, "snapshot", version
+        return _schema_from_snapshot(snapshot)
     assert database_url is not None  # guaranteed by the guards above
     return (
         _schema_from_database(database_url, effective_schemas),
@@ -259,13 +258,24 @@ def _schema_from_database(database_url: str, schemas: tuple[str, ...]) -> Schema
         raise SchemaSourceError("db_unreachable", str(exc)) from exc
 
 
-def _schema_from_snapshot(snapshot_path: str) -> tuple[Schema, int]:
+def _schema_from_snapshot(
+    snapshot_path: str,
+) -> tuple[Schema, SchemaSource, int | None]:
     """Load a snapshot JSON and rebuild policy ASTs so `verify` works.
 
-    Returns `(schema, version)`; `version` is the snapshot's declared format
-    version (`Schema.from_snapshot` has already validated it is a supported int),
-    which `inert_rule_ids` uses to decide which catalog-only rules the snapshot
-    can run.
+    Returns `(schema, source, version)`, matching `resolve_schema`'s shape.
+
+    A snapshot built offline from DDL (`snapshot --sql-file`) carries a
+    `"source": "sql"` provenance marker. It is stamped at the current format
+    version with empty catalog arrays — `schema_from_sql` can't express
+    indexes, roles, function bodies, foreign keys — so by version alone it is
+    indistinguishable from a live-database capture. Resolve it back to the
+    `sql` source so every catalog-dependent rule is treated as inert
+    downstream (`lint --snapshot`, `pgrls pr`, MCP): the same protection
+    `lint --sql-file` gets, so an offline run never reads a silent catalog-rule
+    no-op as coverage. Any other marker (or none) is a full capture →
+    `snapshot`, whose `version` `inert_rule_ids` uses to decide which
+    catalog-only rules that snapshot is new enough to run.
 
     `Schema.from_snapshot` leaves `using_ast` / `with_check_ast` as `None`
     (snapshots serialize only the SQL). `verify` reads the ASTs, so without this
@@ -296,7 +306,12 @@ def _schema_from_snapshot(snapshot_path: str) -> tuple[Schema, int]:
         ) from exc
 
     # `from_snapshot` accepted the payload, so `version` is a supported int.
-    return reparse_policy_asts(schema), int(payload["version"])
+    if payload.get("source") == "sql":
+        # Offline-built: resolve to `sql` (catalog rules inert). The `sql`
+        # source is version-independent, so pair it with `None` like every
+        # other `sql` resolution.
+        return reparse_policy_asts(schema), "sql", None
+    return reparse_policy_asts(schema), "snapshot", int(payload["version"])
 
 
 def reparse_policy_asts(schema: Schema) -> Schema:

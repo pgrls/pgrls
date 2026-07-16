@@ -1039,20 +1039,37 @@ def test_db_free_diff_catches_restrictive_drop_policy(tmp_path):
 
 # --- pgrls pr: unified base->head verdict (lint-on-head + diff) --------------
 
+# Error-clean (the only findings are info + PERF003, a warning — an offline
+# snapshot can't see indexes; gate "pass" tests at the error floor).
+# (SELECT current_setting(...)) is the PERF001-safe (InitPlan-cached) form.
 _PR_CLEAN = (
-    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
+    "CREATE TABLE public.t (id int, tenant_id uuid NOT NULL);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (tenant_id = (SELECT current_setting('app.t')::uuid))\n"
+    "  WITH CHECK (tenant_id = (SELECT current_setting('app.t')::uuid));\n"
+)
+_PR_LOOSENED = (
+    "CREATE TABLE public.t (id int, tenant_id uuid NOT NULL);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
+    "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (true) WITH CHECK (true);\n"  # loosened vs the scoped base
+)
+# A Z3-ANALYZABLE scoped base for the diff-loosening test: the discriminator
+# check is NOT wrapped in a (SELECT …) sub-select, so the classifier can prove
+# `scoped → USING(true)` is a semantic loosening (DANGEROUS) instead of falling
+# back to REQUIRES_REVIEW. (The sub-select form that keeps `_PR_CLEAN` PERF001-
+# clean is opaque to the Z3 differ — a deliberate, separate trade-off. The base
+# is never linted here, only diffed, so its unwrapped PERF001 shape is fine.)
+_PR_SCOPED_BARE = (
+    "CREATE TABLE public.t (id int, tenant_id uuid NOT NULL);\n"
     "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
     "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;\n"
     "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
     "  USING (tenant_id = current_setting('app.t')::uuid)\n"
     "  WITH CHECK (tenant_id = current_setting('app.t')::uuid);\n"
-)
-_PR_LOOSENED = (
-    "CREATE TABLE public.t (id int, tenant_id uuid);\n"
-    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"
-    "ALTER TABLE public.t FORCE ROW LEVEL SECURITY;\n"
-    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
-    "  USING (true) WITH CHECK (true);\n"
 )
 
 
@@ -1076,7 +1093,7 @@ def test_pr_passes_on_clean_no_change(tmp_path):
 
 
 def test_pr_fails_on_dangerous_loosening(tmp_path):
-    base = _pr_snap(tmp_path, "base", _PR_CLEAN)
+    base = _pr_snap(tmp_path, "base", _PR_SCOPED_BARE)
     head = _pr_snap(tmp_path, "head", _PR_LOOSENED)
     res = CliRunner().invoke(main, ["pr", base, head])
     assert res.exit_code == 1
@@ -1119,3 +1136,173 @@ def test_pr_text_format(tmp_path):
     snap = _pr_snap(tmp_path, "clean", _PR_CLEAN)
     res = CliRunner().invoke(main, ["pr", snap, snap, "--format", "text"])
     assert res.exit_code == 0 and "PASSED" in res.stdout
+    # Pin the TEXT-format offline caveat (snap is an offline head → catalog skip).
+    assert "not evaluated on this head" in res.stdout
+    assert "offline from DDL" in res.stdout
+
+
+# A schema whose only >=warning finding is SEC002 (RLS without FORCE); the
+# policy is PERF001-safe and the discriminator is NOT NULL so nothing else
+# above info fires (the catalog-dependent PERF003 is inert on an offline head).
+_PR_LINT_DIRTY = (
+    "CREATE TABLE public.t (id int, tenant_id uuid NOT NULL);\n"
+    "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n"  # no FORCE → SEC002
+    "CREATE POLICY p ON public.t FOR ALL TO authenticated\n"
+    "  USING (tenant_id = (SELECT current_setting('app.t')::uuid));\n"
+)
+
+
+def test_pr_fails_on_lint_only_when_diff_is_clean(tmp_path):
+    # Self-diff (no policy change) but the head has a lint error → the lint gate
+    # alone fails the PR; the diff section stays clean.
+    snap = _pr_snap(tmp_path, "dirty", _PR_LINT_DIRTY)
+    res = CliRunner().invoke(main, ["pr", snap, snap])
+    assert res.exit_code == 1
+    assert "No RLS policy changes" in res.stdout  # diff gate: nothing
+    assert "SEC002" in res.stdout  # lint gate: the finding
+
+
+def test_pr_honors_config_disable(tmp_path):
+    # `--config` flows through to the lint pass: disabling the only >=warning
+    # rule (SEC002) leaves just SEC007 (info) → the PR passes.
+    snap = _pr_snap(tmp_path, "dirty", _PR_LINT_DIRTY)
+    cfg = tmp_path / "pgrls.toml"
+    cfg.write_text("[lint]\ndisable = ['SEC002']\n", encoding="utf-8")
+    res = CliRunner().invoke(main, ["pr", snap, snap, "--config", str(cfg)])
+    assert res.exit_code == 0, res.stdout
+    assert "PASSED" in res.stdout
+
+
+def test_pr_markdown_has_both_sections_and_verdict(tmp_path):
+    snap = _pr_snap(tmp_path, "clean", _PR_CLEAN)
+    out = CliRunner().invoke(main, ["pr", snap, snap]).stdout
+    assert "RLS policy changes (base" in out  # regression section
+    assert "Findings in the changed schema" in out  # lint section
+    assert "pgrls PR check:" in out  # verdict line
+
+
+def test_pr_bad_snapshot_is_clean_error(tmp_path):
+    # A malformed BASE artifact fails with a ToolError (exit 2), not a traceback.
+    bad = tmp_path / "bad.json"
+    bad.write_text("this is not json", encoding="utf-8")
+    good = _pr_snap(tmp_path, "good", _PR_CLEAN)
+    res = CliRunner().invoke(main, ["pr", str(bad), good])
+    assert res.exit_code == 2
+    assert res.exception is None or isinstance(res.exception, SystemExit)
+
+
+def test_pr_old_snapshot_head_skips_catalog_rules_like_lint(tmp_path):
+    # The head snapshot's version drives the inert-rule skip (parity with
+    # `lint --snapshot`): a pre-SEC047 snapshot must not run SEC047, so the
+    # foreign-key rule can't spuriously fire (or crash) on absent fields.
+    from pgrls.schema_sources import schema_from_sql
+
+    snap = schema_from_sql("CREATE TABLE public.t (id int);\n").to_snapshot()
+    snap["version"] = 8  # predates most catalog fields
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps(snap), encoding="utf-8")
+    res = CliRunner().invoke(main, ["pr", str(old), str(old)])
+    # No crash; a RLS-off table still trips SEC001 (a non-catalog rule).
+    assert res.exit_code in (0, 1)
+    assert "SEC047" not in res.stdout  # the catalog rule was skipped, not run
+    # The caveat must name the TRUE reason — an older snapshot version, not an
+    # offline/DDL-built head (this snapshot is live-DB-shaped, just at version 8).
+    assert "older pgrls" in res.stdout
+    assert "offline from DDL" not in res.stdout
+
+
+def test_pr_lint_pass_sees_policy_predicates(tmp_path):
+    # Regression: the head's policy USING/WITH CHECK ASTs must be reparsed so
+    # PREDICATE rules fire in the lint pass (like `lint --snapshot`). Without
+    # the reparse, a real anon-read leak (SEC004: `auth.uid() IS NULL OR …`) in
+    # the head silently false-PASSes because every predicate rule no-ops.
+    leak = (
+        "CREATE TABLE public.docs (id uuid, owner_id uuid);\n"
+        "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n"
+        "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.docs FOR SELECT TO authenticated\n"
+        "  USING (auth.uid() IS NULL OR owner_id = auth.uid());\n"
+    )
+    snap = _pr_snap(tmp_path, "leak", leak)
+    res = CliRunner().invoke(main, ["pr", snap, snap, "--lint-fail-on", "error"])
+    assert res.exit_code == 1  # SEC004 is a predicate rule
+    assert "SEC004" in res.stdout
+
+
+def test_pr_offline_head_skips_catalog_rules_and_caveats(tmp_path):
+    # An offline (DDL-built) head can't model indexes / roles / function bodies
+    # / FKs, so its catalog-dependent rules (here PERF003, which wants an index
+    # on the tenant column) must be SKIPPED — neither fired on their empty
+    # inputs (a false positive that would spuriously fail every clean offline
+    # PR at the default warning floor) nor silently no-op'd and read as
+    # coverage (a false clear). The report must NAME the skip so a clean
+    # verdict is never mistaken for full coverage.
+    snap = _pr_snap(tmp_path, "clean", _PR_CLEAN)  # RLS table, no index
+    res = CliRunner().invoke(main, ["pr", snap, snap])  # default warning floor
+    assert res.exit_code == 0  # PERF003 skipped → no spurious warning gate
+    assert "PERF003" not in res.stdout
+    assert "not evaluated on this head" in res.stdout  # the coverage caveat
+    assert "catalog-dependent rule(s)" in res.stdout
+    assert "offline from DDL" in res.stdout  # the offline-specific reason
+
+
+def test_snapshot_offline_stamps_source_marker_and_reemit_preserves(tmp_path):
+    # `snapshot --sql-file` stamps the offline provenance marker so downstream
+    # lint / pr treat catalog rules as inert; re-emitting that snapshot
+    # (`--snapshot IN`) must PRESERVE the marker — it's still catalog-incomplete.
+    _pr_snap(tmp_path, "off", _PR_CLEAN)
+    off_json = json.loads((tmp_path / "off.json").read_text(encoding="utf-8"))
+    assert off_json["source"] == "sql"
+    reemit = tmp_path / "reemit.json"
+    r = CliRunner().invoke(
+        main, ["snapshot", "--snapshot", str(tmp_path / "off.json"), "-o", str(reemit)]
+    )
+    assert r.exit_code == 0, r.output
+    assert json.loads(reemit.read_text(encoding="utf-8"))["source"] == "sql"
+
+
+def test_pr_unmarked_snapshot_runs_catalog_rules(tmp_path):
+    # A snapshot WITHOUT the offline marker (a live-DB capture is catalog-
+    # complete) must still run catalog-dependent rules — the marker is what
+    # gates the skip, so its absence means full coverage, not a silent skip.
+    # Guards against over-skipping: the provenance fix must not weaken a real
+    # (DB-sourced) snapshot's rule coverage.
+    from pgrls.schema_sources import schema_from_sql
+
+    snap = schema_from_sql(_PR_CLEAN).to_snapshot()  # no "source" marker
+    assert "source" not in snap
+    p = tmp_path / "unmarked.json"
+    p.write_text(json.dumps(snap), encoding="utf-8")
+    res = CliRunner().invoke(main, ["pr", str(p), str(p)])
+    assert "PERF003" in res.stdout  # the catalog rule DID run (index missing)
+    assert "not evaluated on this head" not in res.stdout  # nothing skipped
+    assert res.exit_code == 1  # PERF003 (warning) trips the default floor
+
+
+def test_pr_file_url_head_strips_prefix_for_provenance_gating(tmp_path):
+    # `pr` accepts a `file://` snapshot path (`_resolve_diff_source` strips it).
+    # The provenance/version read (`_snapshot_meta`) MUST strip it the same way,
+    # else the offline / version-skew coverage gating silently vanishes on a
+    # `file://` head — a false clear the plain-path invocation would never show.
+    from pgrls.schema_sources import schema_from_sql
+
+    offline = _pr_snap(tmp_path, "off", _PR_CLEAN)  # source:"sql"
+    off_url = CliRunner().invoke(
+        main, ["pr", "file://" + offline, "file://" + offline]
+    )
+    assert off_url.exit_code == 0  # parity with the plain-path offline head
+    assert "PERF003" not in off_url.stdout  # catalog rule still skipped
+    assert "offline from DDL" in off_url.stdout  # offline caveat still emitted
+
+    # Version-skew head (old-format, no marker) via `file://` — the genuine
+    # false-clear direction the review found: version-gating must still fire.
+    skew = schema_from_sql(_PR_CLEAN).to_snapshot()
+    skew["version"] = 8
+    p = tmp_path / "skew.json"
+    p.write_text(json.dumps(skew), encoding="utf-8")
+    skew_url = CliRunner().invoke(
+        main, ["pr", "file://" + str(p), "file://" + str(p)]
+    )
+    assert "not evaluated on this head" in skew_url.stdout  # caveat present
+    assert "older pgrls" in skew_url.stdout  # correct version-skew reason
+    assert "offline from DDL" not in skew_url.stdout

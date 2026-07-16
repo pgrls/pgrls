@@ -2236,7 +2236,14 @@ def snapshot(
         )
         assert offline is not None  # a source was given
         schema = offline[0]
+        # Provenance: raw DDL (`--sql-file`), or a re-emitted offline snapshot
+        # that `resolve_schema` resolved back to `sql`. Stamped below so
+        # `pgrls pr` / `lint --snapshot` treat catalog-dependent rules as inert
+        # instead of reading their silent no-op (empty indexes/roles/FKs) as
+        # coverage. A live-DB re-emit stays `snapshot` → no marker.
+        offline_from_ddl = offline[1] == "sql"
     else:
+        offline_from_ddl = False
         effective = _merge_overrides(
             config,
             database_url=database_url,
@@ -2260,7 +2267,10 @@ def snapshot(
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
 
-    payload = json.dumps(schema.to_snapshot(), indent=2, ensure_ascii=False)
+    snap = schema.to_snapshot()
+    if offline_from_ddl:
+        snap["source"] = "sql"
+    payload = json.dumps(snap, indent=2, ensure_ascii=False)
     if output_path:
         try:
             Path(output_path).write_text(payload + "\n", encoding="utf-8")
@@ -3105,15 +3115,36 @@ def diff(
         sys.exit(1)
 
 
-def _snapshot_version(path: str) -> int | None:
-    """The `version` of a `pgrls snapshot` artifact at `path`, or None if the
-    argument isn't a readable snapshot file (e.g. it's a database URL)."""
+def _snapshot_meta(arg: str) -> tuple[str | None, int | None]:
+    """The `(source, version)` of a `pgrls snapshot` artifact at `arg`.
+
+    `source` is the provenance marker — `"sql"` for a `snapshot --sql-file`
+    offline capture (catalog-dependent rules can't be trusted → skip them like
+    `lint --sql-file` does), else None. `version` is the declared format version
+    (which scopes which catalog-only rules a live-DB snapshot is new enough to
+    run). Both None when `arg` isn't a readable snapshot file (e.g. a database
+    URL).
+
+    A single `file://` normalization, matching `_resolve_diff_source`, is the
+    whole point of reading `(source, version)` here in one place: `pr` accepts a
+    `file://`-prefixed snapshot path, and if these helpers read the raw
+    `file://…` string (which `Path.read_text` can't open) they'd fall through to
+    "no marker / no version" and silently drop the offline / version-skew
+    coverage gating on that head — a false clear the schema-load path
+    (`_resolve_diff_source`, which strips the prefix) would never show."""
+    arg = arg.removeprefix("file://")
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(arg).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    version = data.get("version") if isinstance(data, dict) else None
-    return version if isinstance(version, int) else None
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    source = data.get("source")
+    version = data.get("version")
+    return (
+        source if isinstance(source, str) else None,
+        version if isinstance(version, int) else None,
+    )
 
 
 def _render_pr_report(
@@ -3123,12 +3154,36 @@ def _render_pr_report(
     output_format: str,
     diff_failing: int,
     lint_failing: int,
+    skipped: frozenset[str] = frozenset(),
+    offline_head: bool = False,
 ) -> str:
     """Render the combined base→head PR verdict — a regressions section (diff)
-    plus a new-findings section (lint) plus a one-line pass/fail verdict."""
+    plus a new-findings section (lint) plus a one-line pass/fail verdict.
+
+    `skipped` is the catalog-dependent rules that could not run on this head. It
+    is surfaced as a coverage caveat so a clean report is never mistaken for
+    full coverage — the lint pass proves nothing about the rules it never ran.
+    `offline_head` distinguishes the two reasons a rule is skipped so the caveat
+    stays truthful: a DDL-built head (`snapshot --sql-file`) whose catalog state
+    can't be expressed at all, versus a live-DB snapshot captured by an older
+    pgrls that predates those rules' inputs — different causes, different fixes."""
     from pgrls.formatters.markdown import format_markdown
 
     failed = bool(diff_failing or lint_failing)
+    n_skipped = len(skipped)
+    # One truthful reason + remedy, reused by both output formats.
+    if offline_head:
+        skip_why = (
+            "it was captured offline from DDL, which can't express indexes, "
+            "roles, function bodies, or foreign keys"
+        )
+        skip_remedy = "Re-run against a live database for full coverage."
+    else:
+        skip_why = "it was captured by an older pgrls that predates those rules"
+        skip_remedy = (
+            "Re-capture the snapshot with a current pgrls (or run against a "
+            "live database) for full coverage."
+        )
     if output_format == "markdown":
         diff_body = (
             format_diff_markdown(changes)
@@ -3139,6 +3194,12 @@ def _render_pr_report(
             format_markdown(lint_violations)
             if lint_violations
             else "_No findings in the changed schema._"
+        )
+        caveat = (
+            f"\n> _{n_skipped} catalog-dependent rule(s) not evaluated on this "
+            f"head — {skip_why}. {skip_remedy}_\n"
+            if n_skipped
+            else ""
         )
         verdict = (
             f"**pgrls PR check: FAILED** — {diff_failing} blocking policy "
@@ -3152,7 +3213,8 @@ def _render_pr_report(
             "### RLS policy changes (base → head)\n\n"
             f"{diff_body}\n\n"
             "### Findings in the changed schema\n\n"
-            f"{lint_body}\n\n"
+            f"{lint_body}\n"
+            f"{caveat}\n"
             f"{verdict}\n"
         )
     diff_body = format_diff_text(changes) if changes else "No RLS policy changes."
@@ -3160,6 +3222,12 @@ def _render_pr_report(
         format_violations(lint_violations, format="text")
         if lint_violations
         else "No findings in the changed schema."
+    )
+    caveat = (
+        f"\nNote: {n_skipped} catalog-dependent rule(s) not evaluated on this "
+        f"head — {skip_why}. {skip_remedy}\n"
+        if n_skipped
+        else ""
     )
     verdict = (
         f"pgrls PR check: FAILED ({diff_failing} blocking change(s), "
@@ -3171,7 +3239,8 @@ def _render_pr_report(
         "RLS policy changes (base -> head):\n"
         f"{diff_body}\n\n"
         "Findings in the changed schema:\n"
-        f"{lint_body}\n\n"
+        f"{lint_body}\n"
+        f"{caveat}\n"
         f"{verdict}"
     )
 
@@ -3247,16 +3316,26 @@ def pr(
         else config.schemas
     )
     base_schema = _resolve_diff_source(base, schemas=schema_list)
-    head_schema = _resolve_diff_source(head, schemas=schema_list)
+    # `from_snapshot` leaves policy USING / WITH CHECK ASTs unpopulated; reparse
+    # them so the lint pass sees predicates (matching `lint --snapshot`) —
+    # otherwise every predicate rule (SEC004, SEC038, PERF001, …) silently
+    # no-ops and a real leak in the head would false-PASS. No-op for a URL head.
+    head_schema = reparse_policy_asts(_resolve_diff_source(head, schemas=schema_list))
 
-    # Lint the head. Skip rules inert on the head snapshot's version (a current
-    # snapshot skips nothing); a live-URL head sees the full catalog, no skip.
-    head_version = _snapshot_version(head)
-    inert = (
-        inert_rule_ids("snapshot", snapshot_version=head_version)
-        if head_version is not None
-        else frozenset()
-    )
+    # Lint the head. A head built offline from DDL (`snapshot --sql-file`)
+    # can't be trusted for catalog-dependent rules — their inputs (indexes,
+    # roles, function bodies, FKs) aren't expressed in DDL — so skip them like
+    # `lint --sql-file` does rather than read a silent no-op as coverage. A
+    # versioned live-DB snapshot skips only rules newer than its captured
+    # version; a live-URL head sees the full catalog, so nothing is skipped.
+    head_source, head_version = _snapshot_meta(head)
+    offline_head = head_source == "sql"
+    if offline_head:
+        inert = inert_rule_ids("sql")
+    elif head_version is not None:
+        inert = inert_rule_ids("snapshot", snapshot_version=head_version)
+    else:
+        inert = frozenset()
     try:
         lint_violations = _run_rules(
             head_schema,
@@ -3290,6 +3369,8 @@ def pr(
             output_format=output_format,
             diff_failing=len(diff_failing),
             lint_failing=len(lint_failing),
+            skipped=inert,
+            offline_head=offline_head,
         )
     )
     if diff_failing or lint_failing:
