@@ -8,6 +8,27 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
+## [Unreleased]
+
+### Fixed
+- **SEC004 no longer over-claims anonymous exposure on role-restricted
+  policies.** An `auth_func() IS NULL OR …` disjunct in a `USING` clause is only
+  an anonymous-read hole if the policy is reachable by a token-less session —
+  i.e. it applies to `anon` / `PUBLIC` (including the no-`TO` default). SEC004
+  now gates on the policy's roles: it stays an **error** when the policy reaches
+  `anon`/`PUBLIC`, and reports a **warning** when the policy is restricted to
+  non-anon roles such as `authenticated` — where it is a latent defect (it fires
+  for an `authenticated` token with a NULL `sub`, and becomes a full leak if the
+  role restriction is loosened) rather than a drive-by anonymous leak.
+  Previously every match was reported as an error claiming anonymous exposure,
+  which is inaccurate for a `TO authenticated` policy: an unauthenticated request
+  runs as `anon`, which the policy does not apply to, so Postgres default-denies.
+  Note the severity change — a `--fail-on error` gate will no longer fail on the
+  role-restricted case. The anon-role set is configurable via
+  `[lint.rules.SEC004].anon_roles` (default `["anon", "PUBLIC"]`, same as
+  SEC039 / SEC042) for a project whose anonymous role has a different name
+  (e.g. PostgREST's `web_anon`).
+
 ## [0.50.0] - 2026-07-16
 
 ### Added

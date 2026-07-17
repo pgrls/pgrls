@@ -239,6 +239,26 @@ auth_functions = [
 The default set already covers Supabase (`auth.*`) and session GUCs
 (`current_setting`).
 
+**Role-aware severity.** SEC004 is only a live anonymous-read hole when the
+policy is reachable by an unauthenticated (token-less) session — i.e. it applies
+to `anon` / `PUBLIC` (including a policy with no `TO` clause, which defaults to
+`PUBLIC`). Such a policy is reported as an **error**. A policy restricted to
+non-anonymous roles (e.g. `TO authenticated`) can't be reached by a token-less
+request — Postgres default-denies — so the disjunct is a *latent* defect rather
+than a drive-by leak: it still fires for an `authenticated` token whose `sub` is
+NULL, and becomes a full leak if the role restriction is loosened, so it is
+reported as a **warning**. Configure the anonymous-role set (default `["anon",
+"PUBLIC"]`, same convention as SEC039 / SEC042) when your project's anonymous
+role has a different name:
+
+```toml
+[lint.rules.SEC004]
+# e.g. PostgREST's canonical anonymous role, so a genuine anon-read hole on it
+# is reported as an error rather than a warning. "public" is matched
+# case-insensitively to the PUBLIC pseudo-role.
+anon_roles = ["web_anon", "PUBLIC"]
+```
+
 <a id="rule-sec005"></a>
 
 ## SEC005 — Policy expression has no own-column reference
