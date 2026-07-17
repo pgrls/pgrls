@@ -61,6 +61,31 @@ _DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset({
     "current_setting",
 })
 
+# Roles a token-less / unauthenticated session can act as. A policy whose role
+# list intersects this set is reachable by anonymous callers (so an IS-NULL auth
+# disjunct is a live anonymous-read hole); a policy restricted to other roles
+# (e.g. ``authenticated``) is not reachable that way. ``PUBLIC`` covers the
+# no-``TO`` case, which introspection resolves to ``("PUBLIC",)``. Configurable
+# per project via ``[lint.rules.SEC004].anon_roles`` — same convention as
+# SEC039 / SEC042 — so a project whose anonymous role is named e.g. ``web_anon``
+# is still reported as an error rather than downgraded to a warning.
+_DEFAULT_ANON_ROLES: tuple[str, ...] = ("anon", "PUBLIC")
+
+
+def _parse_anon_roles(options: dict[str, Any]) -> set[str]:
+    raw = options.get("anon_roles")
+    if raw is None:
+        return set(_DEFAULT_ANON_ROLES)
+    if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+        raise TypeError(
+            "[lint.rules.SEC004].anon_roles must be a list of role-name "
+            "strings (e.g. ['anon', 'PUBLIC'])."
+        )
+    # Normalize the public pseudo-role so a config entry of "public"/"Public"
+    # still matches the stored "PUBLIC" form (PUBLIC is a keyword, not a real
+    # role, so this is safe; real role names stay case-sensitive).
+    return {"PUBLIC" if s.lower() == "public" else s for s in raw}
+
 
 def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
     raw = options.get("auth_functions")
@@ -84,6 +109,7 @@ class SEC004:
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Violation]:
         auth_functions = _parse_auth_functions(options)
+        anon_roles = _parse_anon_roles(options)
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
@@ -98,22 +124,47 @@ class SEC004:
                         continue
                     if not _has_nullable_auth_call(inner, auth_functions):
                         continue
+                    # Only a policy reachable by an anonymous (token-less)
+                    # session is a live anon-read hole. One restricted to
+                    # non-anon roles (e.g. `authenticated`) can't be reached
+                    # that way, so the disjunct is a latent defect, not an
+                    # anonymous leak — report it, but don't over-claim.
+                    if anon_roles & set(policy.roles):
+                        severity: Severity = "error"
+                        message = (
+                            f"Policy {policy.name!r} on "
+                            f"{table.qualified_name} has a top-level "
+                            "`auth_func() IS NULL` disjunct in its USING "
+                            "clause, and the policy applies to anon / "
+                            "PUBLIC. For token-less connections that "
+                            "disjunct is true, satisfying the policy and "
+                            "exposing every row. Remove the IS NULL "
+                            "disjunct or replace with an explicit deny."
+                        )
+                    else:
+                        severity = "warning"
+                        roles_disp = ", ".join(sorted(policy.roles)) or "no role"
+                        message = (
+                            f"Policy {policy.name!r} on "
+                            f"{table.qualified_name} has a top-level "
+                            "`auth_func() IS NULL` disjunct in its USING "
+                            f"clause. It is restricted to {roles_disp} "
+                            "(not anon / PUBLIC), so a token-less request "
+                            "cannot reach it — but the disjunct still "
+                            "admits every row to any session in those "
+                            "roles whose auth context is NULL (e.g. an "
+                            "authenticated token with no `sub`), and "
+                            "becomes a full anonymous-read hole if the "
+                            "role restriction is loosened. Remove the IS "
+                            "NULL disjunct or replace with an explicit "
+                            "deny."
+                        )
                     out.append(
                         Violation(
                             rule_id="SEC004",
-                            severity="error",
+                            severity=severity,
                             title=self.title,
-                            message=(
-                                f"Policy {policy.name!r} on "
-                                f"{table.qualified_name} contains a "
-                                "top-level `auth_func() IS NULL` "
-                                "disjunct in its USING clause. For "
-                                "anonymous connections that disjunct "
-                                "evaluates to true, satisfying the "
-                                "policy and exposing every row. Remove "
-                                "the IS NULL disjunct or replace with "
-                                "an explicit deny."
-                            ),
+                            message=message,
                             location=(
                                 f"{table.schema}.{table.name}."
                                 f"{policy.name}"

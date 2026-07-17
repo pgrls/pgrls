@@ -6,12 +6,14 @@ from pgrls.model import Policy, Schema, Table
 from pgrls.rules.sec004 import SEC004
 
 
-def _policy_with_using(using: str) -> Policy:
+def _policy_with_using(
+    using: str, roles: tuple[str, ...] = ("authenticated",)
+) -> Policy:
     return Policy(
         name="p",
         command="SELECT",
         permissive=True,
-        roles=("authenticated",),
+        roles=roles,
         using_sql=using,
         with_check_sql=None,
         using_ast=parse_expr(using),
@@ -259,6 +261,104 @@ def test_sec004_fires_on_deeply_nested_or_disjunct() -> None:
         )
     )
     assert len(SEC004().check(schema, {})) == 1
+
+
+def test_sec004_error_when_policy_reaches_anon() -> None:
+    # A policy applying to PUBLIC (the no-`TO` default) or `anon` is
+    # reachable by a token-less request, so the IS NULL disjunct is a live
+    # anonymous-read hole: ERROR, with the anon/PUBLIC message.
+    for roles in (("PUBLIC",), ("anon",), ("anon", "authenticated")):
+        schema = _wrap(
+            _policy_with_using(
+                "auth.uid() IS NULL OR user_id = '1'", roles=roles
+            )
+        )
+        v = SEC004().check(schema, {})
+        assert len(v) == 1, roles
+        assert v[0].severity == "error", roles
+        assert "anon / PUBLIC" in v[0].message, roles
+
+
+def test_sec004_warning_when_restricted_to_authenticated() -> None:
+    # A `TO authenticated` policy can't be reached by a token-less request
+    # (that runs as `anon`), so it is NOT a drive-by anonymous leak. The
+    # disjunct is still a latent defect (null-`sub` token; loosening the
+    # restriction), so SEC004 reports it — but as WARNING, and the message
+    # must not claim anonymous exposure. Pins the fix for the false anon
+    # claim on role-restricted policies.
+    schema = _wrap(
+        _policy_with_using(
+            "auth.uid() IS NULL OR user_id = '1'", roles=("authenticated",)
+        )
+    )
+    v = SEC004().check(schema, {})
+    assert len(v) == 1
+    assert v[0].severity == "warning"
+    assert "cannot reach it" in v[0].message
+    assert "exposing every row" not in v[0].message
+
+
+def test_sec004_warns_on_custom_anon_role_by_default() -> None:
+    # A non-Supabase anonymous role (e.g. PostgREST's `web_anon`) is not in
+    # the default anon set, so by default it is treated like any non-anon
+    # role: WARNING, not error. Documents the default; the config below
+    # promotes it back to error.
+    schema = _wrap(
+        _policy_with_using(
+            "auth.uid() IS NULL OR user_id = '1'", roles=("web_anon",)
+        )
+    )
+    v = SEC004().check(schema, {})
+    assert len(v) == 1
+    assert v[0].severity == "warning"
+
+
+def test_sec004_error_on_custom_anon_role_when_configured() -> None:
+    # Configuring the project's anonymous role name restores the ERROR: the
+    # policy really is reachable by unauthenticated callers.
+    schema = _wrap(
+        _policy_with_using(
+            "auth.uid() IS NULL OR user_id = '1'", roles=("web_anon",)
+        )
+    )
+    v = SEC004().check(schema, {"anon_roles": ["web_anon", "PUBLIC"]})
+    assert len(v) == 1
+    assert v[0].severity == "error"
+
+
+def test_sec004_anon_roles_config_normalizes_public_keyword() -> None:
+    # A config entry of lowercase "public" matches the stored "PUBLIC" form.
+    schema = _wrap(
+        _policy_with_using(
+            "auth.uid() IS NULL OR user_id = '1'", roles=("PUBLIC",)
+        )
+    )
+    v = SEC004().check(schema, {"anon_roles": ["public"]})
+    assert len(v) == 1
+    assert v[0].severity == "error"
+
+
+def test_sec004_warns_with_no_role_label_on_empty_roles() -> None:
+    # Defensive: a policy with no resolved roles can't be reached by anon,
+    # so WARNING with a graceful "no role" label rather than a crash.
+    schema = _wrap(
+        _policy_with_using(
+            "auth.uid() IS NULL OR user_id = '1'", roles=()
+        )
+    )
+    v = SEC004().check(schema, {})
+    assert len(v) == 1
+    assert v[0].severity == "warning"
+    assert "no role" in v[0].message
+
+
+def test_sec004_bad_anon_roles_type_raises_clearly() -> None:
+    import pytest
+    schema = _wrap(_policy_with_using("auth.uid() IS NULL OR a = 1"))
+    with pytest.raises(TypeError, match="anon_roles"):
+        SEC004().check(
+            schema, {"anon_roles": "anon"}  # type: ignore[dict-item]
+        )
 
 
 def test_sec004_does_not_fire_on_is_null_gated_by_nested_and() -> None:
