@@ -139,11 +139,14 @@ def test_in_membership_normalizes_to_canonical_form() -> None:
     # single-value membership form. pg_get_expr normalizes it to `col = …` (the
     # only shape the rules / Z3 encoder recognize), but the offline parse
     # preserved the raw `IN`, so verify under-claimed `unverified` and SEC038
-    # went silent. The offline path must match a live DB.
+    # went silent. The offline path must match a live DB. `TO PUBLIC` so the
+    # anon leak is genuinely reachable (a `TO authenticated` policy the anon
+    # session cannot invoke is soundly abstained offline — see the anon role
+    # gate — which would mask the IN-normalization this test pins).
     leak_ddl = (
         "CREATE TABLE public.docs (id uuid, tenant_id uuid);"
         "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
-        "CREATE POLICY p ON public.docs FOR SELECT TO authenticated "
+        "CREATE POLICY p ON public.docs FOR SELECT TO PUBLIC "
         "  USING (auth.uid() IS NULL OR tenant_id IN (auth.uid()));"
     )
     verify_result = server.verify(sql=leak_ddl, mode="anon")
@@ -159,6 +162,29 @@ def test_in_membership_normalizes_to_canonical_form() -> None:
     )
     clean = server.verify(sql=clean_ddl, mode="cross-tenant")
     assert clean["tables"][0]["verdict"] == "isolated"
+
+
+def test_verify_anon_roles_gates_a_custom_anon_role() -> None:
+    # A project whose anonymous role is not named `anon` (PostgREST's `web_anon`)
+    # must be able to tell verify so — else a `TO web_anon` inverted-auth leak is
+    # mis-proven (offline: soundly abstained; a live DB: false `isolated`). The
+    # `anon_roles` param threads it, mirroring `[lint.rules.SEC004].anon_roles`.
+    leak_ddl = (
+        "CREATE TABLE public.docs (id uuid, tenant_id uuid);"
+        "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+        "CREATE POLICY p ON public.docs FOR SELECT TO web_anon "
+        "  USING (auth.uid() IS NULL OR tenant_id = auth.uid());"
+    )
+    # Default {anon, PUBLIC}: `web_anon` is not anon-reachable and the sql source
+    # carries no role graph → the leak is soundly abstained, never guessed.
+    default = server.verify(sql=leak_ddl, mode="anon")
+    assert default["tables"][0]["verdict"] == "unverified"
+    # Naming `web_anon` the anon role proves the leak.
+    named = server.verify(sql=leak_ddl, mode="anon", anon_roles=["web_anon"])
+    assert named["tables"][0]["verdict"] == "leak"
+    # A malformed anon_roles is a clean structured error, not a crash.
+    bad = server.verify(sql=leak_ddl, mode="anon", anon_roles="web_anon")  # type: ignore[arg-type]
+    assert bad["error"]
 
 
 def test_verify_accepts_escalation_mode() -> None:

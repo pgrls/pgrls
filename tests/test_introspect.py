@@ -361,6 +361,31 @@ def test_captures_multi_role_policy(
     assert set(p.roles) == {"role_a", "role_b"}
 
 
+def test_captures_role_memberships(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # The `pg_auth_members` graph is the closure input for
+    # `verify --mode anon`'s role gate (which roles an anon session can reach).
+    # Captured live only; a hand-built / offline Schema leaves it None → abstain.
+    from pgrls.model import RoleMembership
+
+    apply_sql(
+        """
+        DROP ROLE IF EXISTS mem_child;
+        DROP ROLE IF EXISTS mem_parent;
+        CREATE ROLE mem_parent NOLOGIN;
+        CREATE ROLE mem_child NOLOGIN;
+        GRANT mem_parent TO mem_child;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    assert schema.role_memberships is not None
+    assert (
+        RoleMembership(member="mem_child", role="mem_parent")
+        in schema.role_memberships
+    )
+
+
 def test_empty_schemas_list_returns_empty_schema(
     pg_conn: psycopg.Connection,
 ) -> None:

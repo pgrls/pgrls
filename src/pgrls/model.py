@@ -747,6 +747,32 @@ class BypassRlsEscalation:
 
 
 @dataclass(frozen=True)
+class RoleMembership:
+    """A single ``pg_auth_members`` edge: ``member`` has the privileges of
+    ``role`` (i.e. ``GRANT role TO member``).
+
+    Postgres applies a policy ``TO R`` to a session iff the session's role is
+    ``R`` or a transitive member of ``R`` — so ``verify --mode anon`` walks the
+    upward closure of the configured anon role(s) over these edges to decide
+    which policies an *anonymous* session can actually invoke. A `TO
+    authenticated` policy is NOT anon-reachable in the default Supabase layout
+    (anon and authenticated are siblings, not members of each other); a `GRANT
+    custom_role TO anon` makes a `TO custom_role` policy anon-reachable, which
+    the flat `{anon, PUBLIC}` name-match would miss.
+
+    Live-only: this is captured by live introspection but NOT serialized into a
+    snapshot. `Schema.role_memberships is None` therefore means "role graph not
+    captured" (an offline `--sql-file`/`--migrations` snapshot, a `--against`
+    snapshot, or a hand-built Schema) — in which case anon reachability of a
+    non-``{anon, PUBLIC}`` role can't be decided and `verify --mode anon`
+    abstains (UNVERIFIED) rather than risk a false ``isolated``. An empty tuple
+    `()` means "captured, and the anon role is a member of nothing extra"."""
+
+    member: str  # the role that inherits privileges (the "member")
+    role: str  # the role whose privileges are inherited (the "group")
+
+
+@dataclass(frozen=True)
 class OwnerReachableMember:
     """A low-trust role that can reach a non-FORCE'd table's owner.
 
@@ -1519,6 +1545,17 @@ class Schema:
     # v3-v23 baselines round-tripping with `foreign_tables=()` (fail-closed —
     # SEC053 finds nothing until re-captured against a live database).
     foreign_tables: tuple[ForeignTable, ...] = ()
+    # `pg_auth_members` edges (member → group), captured by LIVE introspection
+    # only — NOT serialized. `verify --mode anon` walks the upward closure of
+    # the configured anon role(s) over these to decide policy reachability. The
+    # tri-state `| None` is load-bearing: `None` = "role graph not captured"
+    # (offline snapshot / `--against` / hand-built Schema) → verify abstains
+    # (UNVERIFIED) on a policy whose roles are outside `{anon, PUBLIC}` rather
+    # than risk a false `isolated`; `()` = "captured, anon is a member of
+    # nothing extra" → a `TO authenticated` policy is provably not anon-reachable
+    # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
+    # and every snapshot decoding without it (all versions) fail-closed.
+    role_memberships: tuple[RoleMembership, ...] | None = None
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:

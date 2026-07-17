@@ -39,7 +39,7 @@ def _ast(using: str):
 
 
 def _policy(
-    using: str, *, name: str = "p", roles: tuple[str, ...] = ("authenticated",)
+    using: str, *, name: str = "p", roles: tuple[str, ...] = ("PUBLIC",)
 ) -> Policy:
     return Policy(
         name=name, command="SELECT", permissive=True, roles=roles,
@@ -106,7 +106,7 @@ def test_public_policy_runs_as_nonsuperuser_runner() -> None:
     # A PUBLIC policy must NOT run the leak SELECT as the (superuser) connection
     # role — that bypasses RLS and makes the repro unsound. It creates and
     # switches into a dedicated NOSUPERUSER runner.
-    pol = _policy("true", roles=("public",))
+    pol = _policy("true", roles=("PUBLIC",))
     sql = build_repro(_table(pol, columns=_COLS), pol, {}).sql
     assert "CREATE ROLE pgrls_repro_runner NOLOGIN NOSUPERUSER NOBYPASSRLS" in sql
     assert "SET LOCAL ROLE pgrls_repro_runner;" in sql
@@ -132,7 +132,7 @@ def test_uppercase_public_pseudo_role_is_not_a_named_role() -> None:
 def test_custom_auth_function_is_stubbed() -> None:
     # A policy using a custom auth helper → the repro stubs it (else CREATE
     # POLICY fails with UndefinedFunction) + flags the return-type caveat.
-    pol = _policy("auth.user_id() IS NULL OR tenant_id = body", roles=("public",))
+    pol = _policy("auth.user_id() IS NULL OR tenant_id = body", roles=("PUBLIC",))
     art = build_repro(
         _table(pol, columns=_COLS), pol, {},
         auth_functions={"auth.uid", "auth.role", "auth.jwt", "current_setting", "auth.user_id"},
@@ -145,7 +145,7 @@ def test_custom_auth_function_stubbed_without_explicit_flag() -> None:
     # R10 MED: the DEFAULT path (no --auth-function) must still stub a custom
     # helper the policy references — discovered from the USING AST — else the
     # generated CREATE POLICY fails with UndefinedFunction in the throwaway DB.
-    pol = _policy("auth.user_id() IS NULL OR is_public", roles=("public",))
+    pol = _policy("auth.user_id() IS NULL OR is_public", roles=("PUBLIC",))
     art = build_repro(_table(pol, columns=_COLS), pol, {})  # no auth_functions
     assert "CREATE OR REPLACE FUNCTION auth.user_id()" in art.sql
     assert "custom auth function(s) auth.user_id" in art.sql
@@ -162,7 +162,7 @@ def test_custom_auth_stub_return_type_inferred() -> None:
         _col("tenant_id", "uuid", nullable=False),
     )
     pol = _policy(
-        "tenant_id = auth.user_id() OR auth.user_id() IS NULL", roles=("public",)
+        "tenant_id = auth.user_id() OR auth.user_id() IS NULL", roles=("PUBLIC",)
     )
     sql = build_repro(_table(pol, columns=cols), pol, {}).sql
     assert "CREATE OR REPLACE FUNCTION auth.user_id() RETURNS uuid" in sql
@@ -178,7 +178,7 @@ def test_custom_auth_stub_matches_call_arity() -> None:
         _col("tenant_id", "uuid", nullable=False),
     )
     pol = _policy(
-        "auth.has_access(tenant_id) IS NULL OR auth.uid() IS NULL", roles=("public",)
+        "auth.has_access(tenant_id) IS NULL OR auth.uid() IS NULL", roles=("PUBLIC",)
     )
     sql = build_repro(_table(pol, columns=cols), pol, {}).sql
     assert "CREATE OR REPLACE FUNCTION auth.has_access(anyelement) RETURNS" in sql
@@ -219,7 +219,7 @@ def test_array_witness_falls_back_to_placeholder() -> None:
 def test_conditional_leak_header_caveat() -> None:
     # witness=None (conditional leak the prover couldn't pin) → no false
     # "unconditional" claim; a loud caveat that the row may not trigger it.
-    pol = _policy("true", roles=("public",))
+    pol = _policy("true", roles=("PUBLIC",))
     art = build_repro(_table(pol, columns=_COLS), pol, None)
     assert "conditional anonymous-read leak" in art.sql
     assert "CONDITIONAL leak" in art.sql  # the INSERT caveat
@@ -288,7 +288,7 @@ def test_generated_pytest_valid_with_triple_quote_in_policy_sql() -> None:
     # A policy whose SQL contains a `"""` run must not break the generated
     # pytest's docstring (would be invalid Python). _doc_safe neutralizes it.
     pol = Policy(
-        name="p", command="SELECT", permissive=True, roles=("public",),
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
         using_sql='is_public OR body = \'a"""b\'',
         with_check_sql=None, using_ast=_ast("is_public"), with_check_ast=None,
     )
@@ -312,7 +312,7 @@ def test_build_repro_requires_column_details(using: str) -> None:
     # CREATE POLICY for a column the throwaway table lacks (UndefinedColumn) — so
     # it raises rather than silently emit broken SQL, for BOTH the column-free
     # and the (common, inverted-auth) column-referencing shape.
-    pol = _policy(using, roles=("public",))
+    pol = _policy(using, roles=("PUBLIC",))
     table = Table(
         schema="public", name="docs", rls_enabled=True, force_rls=True,
         policies=(pol,), column_details=(),
@@ -326,11 +326,11 @@ def test_emit_repros_dedups_colliding_stems() -> None:
     # "my_doc") must get distinct filenames, not silently overwrite each other.
     t1 = Table(
         schema="public", name="my-doc", rls_enabled=True, force_rls=True,
-        policies=(_policy("true", roles=("public",)),), column_details=_COLS,
+        policies=(_policy("true", roles=("PUBLIC",)),), column_details=_COLS,
     )
     t2 = Table(
         schema="public", name="my_doc", rls_enabled=True, force_rls=True,
-        policies=(_policy("true", roles=("public",)),), column_details=_COLS,
+        policies=(_policy("true", roles=("PUBLIC",)),), column_details=_COLS,
     )
     schema = Schema(tables=(t1, t2))
     arts = emit_repros(schema, build_verification(schema))
@@ -369,7 +369,7 @@ def test_not_null_unrecognized_type_caveat() -> None:
         _col("id", "bigint", nullable=False),
         _col("status", "order_status", nullable=False),  # custom enum-like type
     )
-    pol = _policy("true", roles=("public",))
+    pol = _policy("true", roles=("PUBLIC",))
     table = _table(pol, columns=cols)
     art = build_repro(table, pol, {})
     insert = next(ln for ln in art.sql.splitlines() if ln.startswith("INSERT INTO"))
@@ -382,7 +382,7 @@ def test_not_null_unrecognized_type_caveat() -> None:
 def test_conditional_leak_pytest_docstring_caveat() -> None:
     # The pytest docstring must not claim the crisp "PASSES while the leak exists"
     # contract for a conditional leak (witness=None) — it carries the caveat.
-    pol = _policy("true", roles=("public",))
+    pol = _policy("true", roles=("PUBLIC",))
     cond = build_repro(_table(pol, columns=_COLS), pol, None).pytest
     assert "CONDITIONAL leak" in cond and "hand-edit" in cond
     # a characterized leak keeps the crisp wording, no caveat
@@ -488,8 +488,8 @@ def test_public_policy_repro_is_sound_not_a_bypass(pg_url: str) -> None:
     # NON-superuser runner, so a LEAKING PUBLIC policy returns the row AND a
     # FIXED one (USING(false)) returns 0 rows. If it ran as the superuser
     # connection role it would bypass RLS and BOTH would return the row.
-    leaky = _policy("auth.uid() IS NULL OR tenant_id = auth.uid()", roles=("public",))
-    fixed = _policy("tenant_id = auth.uid()", roles=("public",))
+    leaky = _policy("auth.uid() IS NULL OR tenant_id = auth.uid()", roles=("PUBLIC",))
+    fixed = _policy("tenant_id = auth.uid()", roles=("PUBLIC",))
     leak_rows = _run_setup_and_select(pg_url, build_repro(_table(leaky, columns=_COLS), leaky, {}))
     safe_rows = _run_setup_and_select(pg_url, build_repro(_table(fixed, columns=_COLS), fixed, {}))
     assert leak_rows, "PUBLIC leaking policy did not reproduce"
@@ -512,7 +512,7 @@ def test_symbolic_dontcare_witness_reproduces_via_pinned_driver_live(
     # ('!0!') timestamptz don't-cares. The repro must RUN (placeholders for the
     # symbolic values, not '!0!'::timestamptz which crashed the INSERT) AND
     # reproduce the leak via the pinned is_public=true disjunct.
-    pol = _policy("is_public OR created_at <> updated_at", roles=("public",))
+    pol = _policy("is_public OR created_at <> updated_at", roles=("PUBLIC",))
     art = build_repro(
         _table(pol, columns=_TS_COLS), pol,
         {"is_public": True, "created_at": "!0!", "updated_at": "!1!"},
@@ -528,7 +528,7 @@ def test_real_prover_symbolic_witness_repro_runs_live(pg_url: str) -> None:
     # must RUN without a type-conversion crash (the pre-fix '!0!'::timestamptz
     # bug). Whether it reproduces depends on which disjunct Z3 pinned — the
     # header caveats the don't-care columns — so we assert only that it runs.
-    pol = _policy("is_public OR created_at <> updated_at", roles=("public",))
+    pol = _policy("is_public OR created_at <> updated_at", roles=("PUBLIC",))
     schema = Schema(tables=(_table(pol, columns=_TS_COLS),))
     arts = emit_repros(schema, build_verification(schema))
     assert arts
@@ -541,7 +541,7 @@ def test_default_path_custom_auth_repro_runs_live(pg_url: str) -> None:
     # discovered from the AST and stubbed, so the generated CREATE POLICY runs
     # (no UndefinedFunction) and the leak reproduces (the anon stub → NULL makes
     # the `IS NULL` branch true).
-    pol = _policy("auth.user_id() IS NULL OR is_public", roles=("public",))
+    pol = _policy("auth.user_id() IS NULL OR is_public", roles=("PUBLIC",))
     schema = Schema(tables=(_table(pol, columns=_COLS),))
     arts = emit_repros(schema, build_verification(schema))  # default auth set
     assert arts
@@ -559,7 +559,7 @@ def test_custom_auth_typed_comparison_repro_runs_live(pg_url: str) -> None:
         _col("tenant_id", "uuid", nullable=False),
     )
     pol = _policy(
-        "tenant_id = auth.user_id() OR auth.user_id() IS NULL", roles=("public",)
+        "tenant_id = auth.user_id() OR auth.user_id() IS NULL", roles=("PUBLIC",)
     )
     schema = Schema(tables=(_table(pol, columns=cols),))
     arts = emit_repros(schema, build_verification(schema))
@@ -578,7 +578,7 @@ def test_custom_auth_arg_taking_repro_runs_live(pg_url: str) -> None:
         _col("tenant_id", "uuid", nullable=False),
     )
     pol = _policy(
-        "auth.has_access(tenant_id) IS NULL OR auth.uid() IS NULL", roles=("public",)
+        "auth.has_access(tenant_id) IS NULL OR auth.uid() IS NULL", roles=("PUBLIC",)
     )
     schema = Schema(tables=(_table(pol, columns=cols),))
     arts = emit_repros(schema, build_verification(schema))
@@ -597,7 +597,7 @@ def test_array_witness_repro_runs_live(pg_url: str) -> None:
         _col("is_public", "boolean", nullable=False),
         _col("tags", "text[]", nullable=False),
     )
-    pol = _policy("is_public OR id > 0", roles=("public",))
+    pol = _policy("is_public OR id > 0", roles=("PUBLIC",))
     art = build_repro(
         _table(pol, columns=cols), pol, {"is_public": True, "tags": "!0!"}
     )
@@ -846,7 +846,7 @@ def test_cross_tenant_text_column_auth_uid_repro_reproduces_live(pg_url: str) ->
     # value must be a UUID even though the COLUMN is text — synthesizing it from
     # the text column type ('tenant_a') crashed `'tenant_a'::uuid` before the
     # leak SELECT. The `OR is_public` row of a different tenant must come back.
-    leaky = _policy("tenant_id = auth.uid()::text OR is_public", roles=("public",))
+    leaky = _policy("tenant_id = auth.uid()::text OR is_public", roles=("PUBLIC",))
     rows = _run_setup_and_select(
         pg_url, _xt(leaky, {"is_public": True}, columns=_TEXT_DISC_COLS)
     )
@@ -859,7 +859,7 @@ def test_cross_tenant_text_column_auth_uid_fixed_is_sound_live(pg_url: str) -> N
     # must return 0 rows (the tenant-B text row is hidden from the tenant-A uuid
     # session) — proving the repro is sound, not a bypass, for the mismatched
     # column/identity-type case the leak path exercises.
-    fixed = _policy("tenant_id = auth.uid()::text", roles=("public",))
+    fixed = _policy("tenant_id = auth.uid()::text", roles=("PUBLIC",))
     session = cross_tenant_session_identity(fixed.using_ast)
     art = build_repro(
         _table(fixed, columns=_TEXT_DISC_COLS), fixed, {}, stem="fx",

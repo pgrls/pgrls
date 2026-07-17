@@ -22,6 +22,7 @@ from pgrls.introspect import introspect
 from pgrls.model import (
     OwnerReachableMember,
     Policy,
+    RoleMembership,
     Schema,
     SecdefFunction,
     Table,
@@ -84,7 +85,7 @@ def _policy(
     permissive: bool = True,
     command: str = "ALL",
     with_check: str | None = None,
-    roles: tuple[str, ...] = ("authenticated",),
+    roles: tuple[str, ...] = ("anon",),
 ) -> Policy:
     return Policy(
         name=name,
@@ -494,7 +495,7 @@ def test_rls_off_table_is_out_of_scope() -> None:
 
 def test_missing_using_ast_is_unverified() -> None:
     pol = Policy(
-        name="p", command="ALL", permissive=True, roles=("authenticated",),
+        name="p", command="ALL", permissive=True, roles=("anon",),
         using_sql="?", with_check_sql=None, using_ast=None, with_check_ast=None,
     )
     schema = Schema(tables=(_table("t", policies=(pol,)),))
@@ -507,6 +508,247 @@ def test_insert_only_policy_is_not_a_read_policy() -> None:
         tables=(_table("t", policies=(_policy("true", command="INSERT"),)),)
     )
     assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+# --- anon role gate (who can invoke the policy, not just what it says) ------
+#
+# `verify --mode anon` proves what an *anonymous session* can read. A permissive
+# policy an anon session cannot invoke (its roles are outside the anon-reachable
+# `pg_auth_members` closure) exposes nothing to anon, regardless of its
+# predicate — so a table whose only permissive policy is role-scoped away from
+# anon proves ISOLATED, not a false LEAK. Membership is decided from a
+# live-captured graph (`Schema.role_memberships`); when it is absent we abstain.
+
+
+def _mem(member: str, role: str) -> RoleMembership:
+    """`member` inherits the privileges of `role` (a pg_auth_members edge)."""
+    return RoleMembership(member=member, role=role)
+
+
+@requires_z3
+def test_anon_policy_inverted_auth_is_leak() -> None:
+    # The signature Supabase bug, exposed TO anon → a real, proven anon leak.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "auth.uid() IS NULL OR tenant_id = auth.uid()",
+                        roles=("anon",),
+                    ),
+                ),
+            ),
+        ),
+        role_memberships=(),
+    )
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "leak"
+    assert v.has_leak
+
+
+@requires_z3
+def test_public_policy_inverted_auth_is_leak() -> None:
+    # PUBLIC applies to every session incl. anon → the same leak stands.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "auth.uid() IS NULL OR tenant_id = auth.uid()",
+                        roles=("PUBLIC",),
+                    ),
+                ),
+            ),
+        ),
+        role_memberships=(),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_authenticated_inverted_auth_is_isolated_when_graph_present() -> None:
+    # THE FIX. The exact SEC004 shape, but scoped TO authenticated: an anon
+    # session is not a member of `authenticated`, so it can never invoke this
+    # policy → it exposes nothing to anon → ISOLATED. Before the role gate,
+    # verify Z3-checked the predicate blind to the role and reported a false
+    # LEAK — disagreeing with lint, which (post-#265) only WARNs on the
+    # non-anon role.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "auth.uid() IS NULL OR tenant_id = auth.uid()",
+                        roles=("authenticated",),
+                    ),
+                ),
+            ),
+        ),
+        role_memberships=(),  # captured, empty: anon reaches only itself + PUBLIC
+    )
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "isolated"
+    assert not v.has_leak
+
+
+@requires_z3
+def test_authenticated_open_policy_is_isolated_when_graph_present() -> None:
+    # Even a `USING (true)` blanket-read policy leaks nothing to *anon* when it
+    # is scoped TO authenticated and anon is not a member.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("authenticated",)),)),),
+        role_memberships=(),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_custom_role_anon_is_member_is_leak() -> None:
+    # `GRANT app_reader TO anon`: anon inherits app_reader, so a leaky policy
+    # TO app_reader IS anon-reachable → leak. The closure must follow the edge.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("app_reader",)),)),),
+        role_memberships=(_mem("anon", "app_reader"),),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_transitive_membership_reaches_leak() -> None:
+    # Two hops: anon → mid → app_reader. The upward closure must reach
+    # app_reader, so the leaky policy TO app_reader is still a leak.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("app_reader",)),)),),
+        role_memberships=(_mem("anon", "mid"), _mem("mid", "app_reader")),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_custom_role_anon_not_member_is_isolated() -> None:
+    # anon is NOT a member of app_reader (the only edge is unrelated), so the
+    # leaky policy TO app_reader is unreachable by anon → isolated.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("app_reader",)),)),),
+        role_memberships=(_mem("service_worker", "app_reader"),),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_mixed_anon_leak_dominates_unreachable_scoped_policy() -> None:
+    # A leaky TO anon policy alongside a scoped TO authenticated one: the anon
+    # leak dominates; the authenticated policy is dropped from the anon model.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("true", name="pub", roles=("anon",)),
+                    _policy(
+                        "tenant_id = auth.uid()",
+                        name="scoped",
+                        roles=("authenticated",),
+                    ),
+                ),
+            ),
+        ),
+        role_memberships=(),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_anon_roles_override_treats_named_role_as_anon() -> None:
+    # The [verify].anon_roles config (mirrors SEC004): naming `visitor` the anon
+    # role makes a leaky policy TO visitor a leak; by default it is isolated.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("visitor",)),)),),
+        role_memberships=(),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+    assert (
+        _verdict(build_verification(schema, anon_roles={"visitor"}), "public.t")
+        == "leak"
+    )
+
+
+def test_non_anon_role_is_unverified_when_graph_absent() -> None:
+    # A leaking predicate scoped to a non-anon role, offline / --against (no
+    # membership graph): we cannot decide whether anon reaches `authenticated`,
+    # so the *leak* is abstained (UNVERIFIED) — never guessed isolated. (A
+    # *scoped* predicate would prove isolated regardless — see the test below.)
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("authenticated",)),)),),
+    )  # role_memberships defaults to None
+    v = build_verification(schema)
+    assert _verdict(v, "public.t") == "unverified"
+    [t] = v.tables
+    assert any(
+        "role-membership graph was not captured" in (p.reason or "")
+        for p in t.proofs
+    )
+
+
+@requires_z3
+def test_scoped_non_anon_role_is_isolated_offline_via_predicate() -> None:
+    # The complement of the abstain above: a scoped policy proves ISOLATED under
+    # anon from its predicate alone (`auth.uid()` is NULL → no row matches),
+    # independent of role or graph. So an offline / snapshot schema with a
+    # `TO authenticated` scoped policy is soundly `isolated`, NOT abstained —
+    # the role gate only intercepts *leaking* predicates.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("tenant_id = auth.uid()", roles=("authenticated",)),
+                ),
+            ),
+        ),
+    )  # role_memberships defaults to None (offline)
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_empty_anon_roles_falls_back_to_default() -> None:
+    # A degenerate *empty* anon set must NOT collapse the reachable seed to just
+    # `{PUBLIC}` and false-clear a `TO anon` leak — the prover falls back to the
+    # default `{anon, PUBLIC}` (there is always at least PUBLIC = every session).
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("anon",)),)),),
+        role_memberships=(),
+    )
+    assert (
+        _verdict(build_verification(schema, anon_roles=set()), "public.t") == "leak"
+    )
+
+
+@requires_z3
+def test_leak_is_not_dropped_on_uncanonicalized_roles() -> None:
+    # Fail-open hardening: a hand-built Schema whose leaking policy carries an
+    # un-canonicalized role — lowercase `public` (Postgres reserves the name, so
+    # it is always the PUBLIC pseudo-role) or a degenerate empty role set — must
+    # NOT be silently dropped to `isolated` by the role gate. The leak stands.
+    for roles in (("public",), ()):
+        schema = Schema(
+            tables=(_table("t", policies=(_policy("true", roles=roles),)),),
+            role_memberships=(),  # graph captured → the gate is active
+        )
+        assert _verdict(build_verification(schema), "public.t") == "leak", roles
+
+
+def test_anon_and_non_anon_role_absent_graph_still_leaks() -> None:
+    # Soundness both ways: even with the graph absent, a policy that literally
+    # names anon is decidable → its predicate is checked and the leak stands
+    # (only the *non-anon* policy abstains).
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", roles=("anon", "staff")),)),),
+    )
+    assert _verdict(build_verification(schema), "public.t") == "leak"
 
 
 # --- renderers -------------------------------------------------------------
@@ -2585,4 +2827,77 @@ def test_restrictive_floor_composition_matches_postgres(pg_url: str) -> None:
         assert verdict == observed, (
             f"{perm} + {floor}: pgrls={verdict} but a live anon session saw "
             f"{observed} — the composition is unsound"
+        )
+
+
+@requires_docker
+@requires_z3
+def test_verify_anon_role_gate_matches_live_anon_session(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # The role gate, grounded in real Postgres RLS: `verify --mode anon` must
+    # agree with what an actual anonymous session sees.
+    #   docs_anon   — inverted-auth policy TO anon           → a real anon leak
+    #   docs_authed — the SAME shape but TO authenticated    → ISOLATED (the
+    #                 fix: anon is not a member of authenticated, so it can
+    #                 never invoke the policy; verify used to false-LEAK here)
+    #   docs_reader — USING(true) TO app_reader, GRANT app_reader TO anon → a
+    #                 leak the membership closure must find (anon inherits it)
+    def _ensure_role(cur: psycopg.Cursor, name: str) -> None:
+        cur.execute(
+            f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE "
+            f"rolname='{name}') THEN CREATE ROLE {name} NOLOGIN NOSUPERUSER "
+            f"NOBYPASSRLS; END IF; END $$;"
+        )
+
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        for role in ("anon", "authenticated", "app_reader"):
+            _ensure_role(cur, role)
+        cur.execute("GRANT app_reader TO anon;")  # anon inherits app_reader
+        for name in ("docs_anon", "docs_authed", "docs_reader"):
+            cur.execute(
+                f"CREATE TABLE {name} (id int, tenant_id uuid);"
+                f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY;"
+                f"INSERT INTO {name} VALUES (1, gen_random_uuid());"
+            )
+        cur.execute("GRANT SELECT ON docs_anon TO anon;")
+        cur.execute("GRANT SELECT ON docs_authed TO anon;")
+        cur.execute("GRANT SELECT ON docs_reader TO app_reader;")
+        cur.execute(
+            "CREATE POLICY p ON docs_anon FOR SELECT TO anon "
+            "  USING (auth.uid() IS NULL OR tenant_id = auth.uid());"
+            "CREATE POLICY p ON docs_authed FOR SELECT TO authenticated "
+            "  USING (auth.uid() IS NULL OR tenant_id = auth.uid());"
+            "CREATE POLICY p ON docs_reader FOR SELECT TO app_reader USING (true);"
+        )
+
+    schema = introspect(pg_conn, schemas=["public"])
+    # The `pg_auth_members` closure input must be captured on the live path.
+    assert schema.role_memberships is not None
+    assert any(
+        e.member == "anon" and e.role == "app_reader"
+        for e in schema.role_memberships
+    )
+
+    v = build_verification(schema, mode="anon")
+    static = {t.qualified_name: t.verdict for t in v.tables}
+    expected = {
+        "public.docs_anon": "leak",
+        "public.docs_authed": "isolated",  # the fix — was a false LEAK
+        "public.docs_reader": "leak",  # via the anon ∈ app_reader closure
+    }
+    assert {k: static.get(k) for k in expected} == expected, static
+
+    # Ground each static verdict in what a real anonymous session actually sees.
+    for name, verdict in expected.items():
+        table = name.split(".", 1)[1]
+        with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL ROLE anon;")
+            cur.execute(f"SELECT count(*) FROM {table};")
+            observed = "leak" if cur.fetchone()[0] else "isolated"
+            conn.rollback()
+        assert observed == verdict, (
+            f"{name}: pgrls proved {verdict} but a live anon session saw "
+            f"{observed} — the role gate is unsound"
         )
