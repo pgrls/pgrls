@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-07-17
+
 ### Fixed
 - **SEC004 no longer over-claims anonymous exposure on role-restricted
   policies.** An `auth_func() IS NULL OR …` disjunct in a `USING` clause is only
