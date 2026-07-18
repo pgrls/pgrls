@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.50.0"
+version = "0.51.0"
 description = "Static analyzer for Postgres Row-Level Security — 67 lint rules for tenant and per-user row-scoping bugs, performance traps, and hygiene (20 auto-fixable); a Z3 tenant-isolation prover (pgrls verify) that proves no row leaks to an anonymous session or across tenants, or shows the leaking row; gold-standard RLS scaffolding (pgrls generate); runtime seq-scan analysis (pgrls perf); a semantic policy-diff command for CI gating; and a pytest plugin for RLS isolation tests."
 readme = "README.md"
 license = { file = "LICENSE" }
