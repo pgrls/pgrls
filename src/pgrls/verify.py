@@ -368,6 +368,64 @@ def _floor_applies(permissive: Policy, restrictive: Policy, mode: Mode) -> bool:
     return True
 
 
+def _anon_reachable_roles(
+    schema: Schema, anon_roles: set[str]
+) -> tuple[frozenset[str], bool]:
+    """The roles an anonymous session's policies can be applied under, and
+    whether that set is COMPLETE (the role-membership graph was captured).
+
+    A policy ``TO R`` applies to a session iff its role is ``R`` or a transitive
+    member of ``R`` (or ``R`` is ``PUBLIC``). So the anon-reachable set is the
+    upward `pg_auth_members` closure of the configured anon role(s), plus
+    ``PUBLIC``. When `schema.role_memberships is None` (an offline / `--against`
+    / hand-built Schema) the graph is unavailable — the returned set is just the
+    seed and the bool is False, so `_anon_policy_reachability` reports
+    ``"unknown"`` (→ abstain) for a leaking policy outside the seed rather than
+    guess ``unreachable`` (a false ``isolated``).
+    """
+    seed = set(anon_roles) | {"PUBLIC"}
+    if schema.role_memberships is None:
+        return frozenset(seed), False
+    reachable = set(seed)
+    changed = True
+    while changed:  # transitive closure; role graphs are tiny
+        changed = False
+        for edge in schema.role_memberships:
+            if edge.member in reachable and edge.role not in reachable:
+                reachable.add(edge.role)
+                changed = True
+    return frozenset(reachable), True
+
+
+def _anon_policy_reachability(
+    schema: Schema, policy: Policy, anon_roles: set[str]
+) -> str:
+    """Whether an anonymous session can invoke `policy`.
+
+    ``"reachable"`` — its roles intersect the anon-reachable `pg_auth_members`
+    closure (so an anon leak in its predicate is real). ``"unreachable"`` — they
+    don't, and the closure is COMPLETE (the graph was captured), so anon can
+    never invoke it. ``"unknown"`` — the role graph was not captured (offline /
+    ``--against`` / hand-built schema) and the roles fall outside
+    ``{anon, PUBLIC}``, so reachability can't be decided → the caller abstains.
+
+    Consulted ONLY for a policy whose predicate already *leaks* under anon: an
+    isolated predicate admits no anon rows regardless of who invokes it, so its
+    reachability is moot. Restrictive floors need no separate gate either —
+    ``_floor_applies`` only composes a floor whose roles cover the (reachable)
+    leaking permissive, which implies the floor itself applies to anon.
+    """
+    reachable, graph_available = _anon_reachable_roles(schema, anon_roles)
+    # Canonicalize the public pseudo-role (Postgres reserves the name, so a
+    # lowercase ``public`` is always PUBLIC, never a real role) and fail OPEN on
+    # a degenerate empty role set — a leak is never silently dropped on an
+    # un-canonicalized or malformed hand-built Schema.
+    roles = {"PUBLIC" if r.lower() == "public" else r for r in policy.roles}
+    if not roles or roles & reachable:
+        return "reachable"
+    return "unreachable" if graph_available else "unknown"
+
+
 def build_verification(
     schema: Schema,
     *,
@@ -406,6 +464,11 @@ def build_verification(
     prove = _PROVERS[mode]
     commands = _MODE_COMMANDS[mode]
     floor_kind = "write" if mode == "write" else "read"
+    # An *empty* anon set is degenerate — there is always at least the PUBLIC
+    # pseudo-role (every session, anon included) — so fall back to the default
+    # rather than let it collapse the seed to `{PUBLIC}` and false-clear a
+    # `TO anon` leak. (Truthiness, not `is not None`.)
+    resolved_anon_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
     tables: list[TableVerdict] = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         if not table.rls_enabled:
@@ -443,6 +506,36 @@ def build_verification(
                 )
                 continue
             verdict, witness = prove(ast, auth_functions)
+            # In the anon threat model the predicate is not the whole story: a
+            # policy whose predicate *leaks* only leaks to anon if an anonymous
+            # session can actually invoke it. A leaking policy anon cannot reach
+            # (roles outside the anon-reachable closure) exposes nothing → the
+            # leak is spurious; when the role graph is unavailable we abstain
+            # rather than guess. An *isolated* predicate needs no such gate — it
+            # admits no anon rows regardless of who invokes it — so this only
+            # intercepts leaks.
+            if mode == "anon" and verdict == "leak":
+                reach = _anon_policy_reachability(
+                    schema, policy, resolved_anon_roles
+                )
+                if reach == "unreachable":
+                    proofs.append(PolicyProof(policy.name, "isolated", None, None))
+                    continue
+                if reach == "unknown":
+                    proofs.append(
+                        PolicyProof(
+                            policy.name,
+                            "unverified",
+                            None,
+                            "predicate leaks under anon, but the role-membership "
+                            "graph was not captured — cannot decide whether an "
+                            "anonymous session reaches this policy's role(s) "
+                            f"({', '.join(sorted(policy.roles))}); re-run against "
+                            "a live database",
+                        )
+                    )
+                    continue
+                # reach == "reachable" → the anon leak is real; fall through.
             # Only floors that constrain *every* role and write-operation this
             # permissive admits may be soundly AND-ed in (see `_floor_applies`);
             # a partially-applicable floor would over-restrict → false PROVEN.
@@ -644,7 +737,9 @@ def build_escalation(
             )
     # SEC042: anon-callable SECURITY DEFINER functions owned by an RLS-exempt
     # role, whose body reads an RLS table the anon caller's own RLS would deny.
-    resolved_anon_roles = anon_roles if anon_roles is not None else {"anon", "PUBLIC"}
+    # Empty → default (see `build_verification` — a `{PUBLIC}`-only seed would
+    # under-report the SEC042 anon exposure).
+    resolved_anon_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
     tables.extend(
         _escalation_secdef_findings(schema, auth_functions, resolved_anon_roles)
     )
@@ -896,7 +991,9 @@ def _escalation_secdef_findings(
     rls_tables = {(t.schema, t.name) for t in schema.tables if t.rls_enabled}
     if not secdef_fns or not rls_tables:
         return []
-    an = build_verification(schema, auth_functions=auth_functions, mode="anon")
+    an = build_verification(
+        schema, auth_functions=auth_functions, mode="anon", anon_roles=anon_roles
+    )
     an_by_table = {t.qualified_name: t for t in an.tables}
     bare_to_qual: dict[str, list[tuple[str, str]]] = {}
     for s, n in sorted(rls_tables):

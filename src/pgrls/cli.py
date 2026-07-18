@@ -4143,6 +4143,32 @@ def matrix(
     _emit(rendered, output_path)
 
 
+def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | None:
+    """The anon-role set the verifier should honor for `mode`, reusing the lint
+    rule's own `anon_roles` convention so lint and verify never disagree.
+
+    * ``anon`` gates every permissive policy to those an anonymous session can
+      invoke — honors ``[lint.rules.SEC004].anon_roles`` (the rule that WARNs vs
+      ERRORs on the very same inverted-auth shape).
+    * ``escalation`` proves the SEC042 anon-callable-SECDEF case — honors
+      ``[lint.rules.SEC042].anon_roles``.
+
+    Other modes (``cross-tenant`` / ``write``) don't role-gate → ``None``.
+    """
+    try:
+        if mode == "anon":
+            from pgrls.rules.sec004 import _parse_anon_roles
+
+            return _parse_anon_roles(rule_options.get("SEC004", {}))
+        if mode == "escalation":
+            from pgrls.rules.sec042 import _parse_anon_roles
+
+            return _parse_anon_roles(rule_options.get("SEC042", {}))
+    except TypeError as exc:
+        raise click.UsageError(str(exc)) from exc
+    return None
+
+
 @main.command()
 @common_db_options
 @click.option(
@@ -4358,16 +4384,7 @@ def verify(
             database_url=database_url,
             schemas_csv=schemas,
         ) as (_cfg, conn, schema):
-            probe_anon_roles: set[str] | None = None
-            if mode == "escalation":
-                from pgrls.rules.sec042 import _parse_anon_roles
-
-                try:
-                    probe_anon_roles = _parse_anon_roles(
-                        _cfg.rule_options.get("SEC042", {})
-                    )
-                except TypeError as exc:
-                    raise click.UsageError(str(exc)) from exc
+            probe_anon_roles = _verify_anon_roles(mode, _cfg.rule_options)
             verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=probe_anon_roles)  # type: ignore[arg-type]
             probe_result = run_probe(
                 conn, schema, verification,
@@ -4406,17 +4423,10 @@ def verify(
         schemas_csv=schemas,
     )
 
-    # `escalation` proves the SEC042 anon-callable-SECDEF case against the same
-    # low-trust EXECUTE-role set SEC042 lints, so honor its configured
-    # `[lint.rules.SEC042].anon_roles` (default {anon, PUBLIC}).
-    anon_roles: set[str] | None = None
-    if mode == "escalation":
-        from pgrls.rules.sec042 import _parse_anon_roles
-
-        try:
-            anon_roles = _parse_anon_roles(cfg.rule_options.get("SEC042", {}))
-        except TypeError as exc:
-            raise click.UsageError(str(exc)) from exc
+    # Both role-gated modes honor the anon-role set of the lint rule they prove,
+    # so `verify` and `lint` never disagree on which roles count as anonymous
+    # (`anon`→SEC004, `escalation`→SEC042; default {anon, PUBLIC}).
+    anon_roles = _verify_anon_roles(mode, cfg.rule_options)
 
     verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
 

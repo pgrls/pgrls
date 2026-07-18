@@ -28,6 +28,28 @@ breaking changes — they will be called out in this file.
   `[lint.rules.SEC004].anon_roles` (default `["anon", "PUBLIC"]`, same as
   SEC039 / SEC042) for a project whose anonymous role has a different name
   (e.g. PostgREST's `web_anon`).
+- **`pgrls verify --mode anon` no longer reports a false LEAK on a
+  role-restricted policy.** The anon prover Z3-checked every permissive policy's
+  predicate blind to *who can invoke it*, so an inverted-auth policy scoped
+  `TO authenticated` (or any role an anonymous session is not a member of) was
+  reported as a proven anonymous leak — the same shape lint (post the SEC004 fix
+  above) correctly downgrades to a warning. The prover now gates a *leaking*
+  predicate on whether an anonymous session can actually reach the policy: the
+  `pg_auth_members` closure of the configured anon role(s) plus `PUBLIC`. A
+  leaking policy no anon session can reach exposes nothing → **ISOLATED**; a
+  policy `TO` a role anon is a *member* of (e.g. `GRANT app_reader TO anon`)
+  still proves a **LEAK**. A *scoped* predicate (`tenant_id = auth.uid()`)
+  already proves isolated from the predicate alone under anon — `auth.uid()` is
+  NULL, so no row matches — so it stays **ISOLATED** regardless of role or graph;
+  the gate only intercepts leaks. The role graph is captured on the live
+  introspection path; when it is unavailable (an offline `--against` snapshot, a
+  hand-built schema, or a `--sql-file`/MCP source) only a *leaking* policy scoped
+  to a non-`{anon, PUBLIC}` role is **UNVERIFIED** — the prover abstains on that
+  one leak rather than guess isolation (soundness over recall), while every
+  scoped table still proves isolated. Reuses `[lint.rules.SEC004].anon_roles`
+  (and the MCP `verify` tool gains an `anon_roles` parameter), so `lint` and
+  `verify` never disagree on which roles count as anonymous. Snapshot format is
+  unchanged (the role graph is not serialized).
 
 ## [0.50.0] - 2026-07-16
 

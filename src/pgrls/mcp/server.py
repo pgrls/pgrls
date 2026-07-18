@@ -216,6 +216,7 @@ def verify(
     schemas: list[str] | None = None,
     mode: str = "anon",
     auth_functions: list[str] | None = None,
+    anon_roles: list[str] | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
     """Prove RLS tenant isolation with Z3 — and show a leaking row when it fails.
@@ -238,6 +239,10 @@ def verify(
     Provide EXACTLY ONE schema source (``sql`` / ``database_url`` / ``snapshot``
     — same semantics as ``lint``). ``auth_functions`` extends the default auth
     helper set (``auth.uid``/``role``/``jwt``, ``current_setting``).
+    ``anon_roles`` names the roles an ``anon`` proof treats as anonymous —
+    default ``["anon", "PUBLIC"]``; set it (e.g. ``["web_anon"]``) for a project
+    whose unauthenticated role has a different name, or a ``TO <that role>``
+    leak will be mis-proven ``isolated`` against a live DB.
     ``strict`` is advisory metadata here (the server reports verdicts; it does
     not set a process exit code).
 
@@ -268,9 +273,21 @@ def verify(
         if auth_functions
         else None
     )
+    # `anon` / `escalation` role-gate the prover to the anon-reachable role set;
+    # honor a project whose anonymous role isn't named `anon` (e.g. PostgREST's
+    # `web_anon`) — parity with the CLI's `[lint.rules.SEC004].anon_roles`. `None`
+    # keeps the default `{anon, PUBLIC}`. Normalized so `public` matches `PUBLIC`.
+    resolved_anon: set[str] | None = None
+    if anon_roles is not None:
+        from pgrls.rules.sec004 import _parse_anon_roles
+
+        try:
+            resolved_anon = _parse_anon_roles({"anon_roles": anon_roles})
+        except TypeError as exc:
+            return _error("bad_sql", str(exc))
 
     try:
-        verification = build_verification(schema, auth_functions=auth, mode=mode)  # type: ignore[arg-type]
+        verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=resolved_anon)  # type: ignore[arg-type]
     except Exception as exc:  # noqa: BLE001
         # The Z3 path is a core dependency, so this is unlikely; still, surface
         # a clean structured error rather than crashing the stdio loop.

@@ -23,6 +23,7 @@ from pgrls.model import (
     Index,
     LeakproofFunction,
     OwnerReachableMember,
+    RoleMembership,
     Policy,
     Schema,
     SecdefFunction,
@@ -1125,6 +1126,39 @@ def _fetch_bypassrls_escalation_roles(
     )
 
 
+# The raw `pg_auth_members` edge list (member → group). `verify --mode anon`
+# walks the transitive closure of the configured anon role(s) over these to
+# decide which policies an anonymous session can invoke — a `TO authenticated`
+# policy is anon-reachable only if `anon` is a (transitive) member of
+# `authenticated`, which the flat `{anon, PUBLIC}` name-match can't see. Roles
+# and their memberships are cluster-global, so this is unfiltered by schema.
+# `roleid` is the group; `member` inherits its privileges. Readable by every
+# connected role.
+_ROLE_MEMBERSHIPS_SQL = """
+    SELECT g.rolname AS role, m.rolname AS member
+    FROM pg_catalog.pg_auth_members am
+    JOIN pg_catalog.pg_roles g ON g.oid = am.roleid
+    JOIN pg_catalog.pg_roles m ON m.oid = am.member
+    ORDER BY member, role
+"""
+
+
+def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
+    """Fetch every `pg_auth_members` edge as a (member, role) pair.
+
+    Returns possibly `()` (a cluster with no non-default role grants) — which,
+    unlike a `None` `Schema.role_memberships`, means "captured, and there are no
+    memberships" so `verify --mode anon` can soundly conclude a non-anon policy
+    is unreachable. The `None` default (offline/`--against`/hand-built Schema)
+    means "not captured" → verify abstains instead.
+    """
+    cur.execute(_ROLE_MEMBERSHIPS_SQL)
+    return tuple(
+        RoleMembership(member=row["member"], role=row["role"])
+        for row in cur.fetchall()
+    )
+
+
 def _fetch_owner_reachable_members(
     cur: Any, schemas: list[str]
 ) -> tuple[OwnerReachableMember, ...]:
@@ -1583,6 +1617,10 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # the no-tables early return and the main path.
         owner_reachable = _fetch_owner_reachable_members(cur, schemas)
         foreign_tables = _fetch_foreign_tables(cur, schemas)
+        # The role-membership graph is cluster-global; captured live so
+        # `verify --mode anon` can role-gate the anon prover soundly (a `None`
+        # graph on an offline/snapshot Schema makes verify abstain instead).
+        role_memberships = _fetch_role_memberships(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1601,6 +1639,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 immutable_functions=immutable_funcs,
                 owner_reachable_members=owner_reachable,
                 foreign_tables=foreign_tables,
+                role_memberships=role_memberships,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1829,4 +1868,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         immutable_functions=immutable_funcs,
         owner_reachable_members=owner_reachable,
         foreign_tables=foreign_tables,
+        role_memberships=role_memberships,
     )
