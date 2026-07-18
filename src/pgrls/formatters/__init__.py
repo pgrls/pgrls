@@ -13,7 +13,11 @@ context — collapsible blocks, severity emoji in the summary line
 GitHub Actions workflow commands so findings show up as run
 annotations (shape documented in `formatters/github.py`). `junit`
 emits a JUnit XML report so findings surface in a CI run's test-
-report UI (shape documented in `formatters/junit.py`).
+report UI (shape documented in `formatters/junit.py`). `gitlab`
+emits a GitLab Code Quality (CodeClimate JSON) report so findings
+surface in a GitLab merge request's Code Quality widget — the
+free-tier alternative to the SARIF/SAST path (shape documented in
+`formatters/gitlab.py`).
 
 Adding a format = creating a sibling module and wiring it into
 `_FORMATTERS` here. The rule-link URL convention used by SARIF,
@@ -29,6 +33,7 @@ from collections.abc import Callable
 from typing import Any
 
 from pgrls.formatters.github import format_github
+from pgrls.formatters.gitlab import format_gitlab
 from pgrls.formatters.html import format_html
 from pgrls.formatters.json import format_json
 from pgrls.formatters.junit import format_junit
@@ -46,6 +51,7 @@ _FORMATTERS: dict[str, Callable[[list[Violation]], str]] = {
     "pr-comment": format_pr_comment,
     "github": format_github,
     "junit": format_junit,
+    "gitlab": format_gitlab,
     "html": format_html,
 }
 
