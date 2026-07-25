@@ -477,6 +477,38 @@ The probe is deliberately conservative — anything it cannot reproduce live it 
 
 It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope:** both modes reason over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` floor is **composed with that floor** and re-proven — a row is visible only if it satisfies *some* permissive **and** *all* restrictive policies, so the prover checks `permissive ∧ floor`: if the floor provably blocks the leaking row the table is `ISOLATED`, otherwise the `LEAK` stands (a floor predicate outside the decidable fragment — or a `cross-tenant`/`write` floor the prover can't reduce to a scoping equality — stays `UNVERIFIED`). RLS-disabled tables are out of scope (that is SEC001's job). `cross-tenant` mode verifies the single `<column> = <session identity>` scoping equality `pgrls generate` emits — including when that identity is cast to the tenant column's type (`current_setting(...)::uuid`, `::bigint`/`::int`, …); a policy with no such equality (or two competing ones) is `UNVERIFIED` there. `--emit-repro` works in both modes. Needs the `z3-solver` dependency (bundled).
 
+## RAG retrieval path — `pgrls vector`
+
+Audits the shape Supabase's own **RAG with Permissions** guide recommends: chunk embeddings in a `document_sections`-style table gated by RLS, retrieved through a `match_documents()` similarity-search function.
+
+The bypass this catches is invisible to every table-level check. RLS is enabled, `FORCE`'d, the policy is correct, and a direct `SELECT` as another tenant returns **zero rows** — yet the retrieval path still leaks, because a `SECURITY DEFINER` retrieval function (which the same ecosystem recommends for RLS *performance*) runs with the owner's privileges and hands back rows the caller's RLS denies. The pieces each look fine; the **composition** is what leaks.
+
+```bash
+pgrls vector --database-url "$DATABASE_URL" \
+  --probe-role authenticated --set request.jwt.claim.sub="<a-real-user-id>"
+```
+
+```
+LEAK        public.match_document_sections -> public.document_sections as authenticated
+            as authenticated, public.match_document_sections surfaced 1 row(s) whose key a direct
+            SELECT on public.document_sections denies — the retrieval path bypasses the table's RLS
+              leaked row: (id=1, content='TENANT A SECRET')
+NO LEAK     public.match_sections_safe -> public.document_sections as authenticated
+            as authenticated, no row public.match_sections_safe surfaced was denied by a direct
+            SELECT on public.document_sections (spot-check over 1 synthesized call(s); not a proof
+            of isolation for all arguments)
+
+2 retrieval-path probe(s): 1 leak, 1 no-leak, 0 unverified
+```
+
+That contrast is the point: **both** functions are `SECURITY DEFINER` over the same table, so a static rule ([`SEC014`](docs/RULES.md#rule-sec014)) flags them identically. Executing the path separates them — the one that omits the tenant filter hands back another tenant's chunk, the one that re-applies it in its own body does not.
+
+**How.** For each discovered (embeddings table → SECDEF retrieval function) pair it compares, as a low-trust role inside a force-rolled-back transaction, the **primary keys** the function surfaces against the keys a direct `SELECT` allows. The table's RLS *defines* what that role may see, so a surfaced-but-denied key is a proven bypass — policy-agnostic (a join-based ownership policy needs no special handling) and needing no seeded fixture data. Correlating on the primary key (not the whole row) is deliberate: a safe function that *transforms* a row it may return — `upper(content)`, a rounded score — would differ from the stored row and look "extra" under a naive full-row diff, but its key is unchanged, so it is not mistaken for a leak. `--probe-role` names the role your API retrieves under; without it every concrete `EXECUTE` grantee is probed, so a per-grantee `USING (true)` on one role can't mask a leak visible to another. `--set GUC=VALUE` stamps the session identity your policies read.
+
+**Detector, not prover.** The synthesized call is a *sample*, so a `LEAK` is sound (a surfaced-but-denied key that is a real row of this table is unambiguously a bypass) but `NO LEAK` is a clean spot-check, **not** a proof of isolation for every argument — hence the verdict is `NO LEAK`, never `PROVEN`. It issues only `SELECT`s and always rolls back, but it *executes* the retrieval function with the definer's privileges (a `statement_timeout` bounds a runaway body; a function that commits a side effect outside the transaction is not contained). Its "all rows" baseline is trustworthy only from an RLS-exempt connection, so **run it as a superuser or `BYPASSRLS` role** — it abstains rather than risk a false clear if the connection role is itself RLS-subject. Exits 1 on any leak. `--format text|json`. It **abstains**, too, when RLS does not restrict the probe role (a vacuous baseline), when the function does not return the table's primary key, when the data cannot discriminate, or when the call can't be synthesized; and it reports any non-SQL (PL/pgSQL) SECDEF functions it could not parse, so a recall gap is never a silent clean bill. Requires [pgvector](https://github.com/pgvector/pgvector).
+
+Runnable end-to-end reproduction (a disposable database, the leak, and the catch): [`examples/rag-retrieval-audit/`](examples/rag-retrieval-audit/).
+
 ## MCP server — `pgrls mcp`
 
 `pgrls mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io/) server (over stdio) that gives AI coding agents pgrls's analysis as tools. The headline is **offline** analysis of the DDL the agent just wrote: it passes the `CREATE TABLE` / `CREATE POLICY` SQL as `sql=` and pgrls lints it **and** runs the full Z3 isolation prover with no database.

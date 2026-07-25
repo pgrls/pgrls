@@ -4530,6 +4530,96 @@ def verify(
 
 
 @main.command()
+@common_db_options
+@click.option(
+    "--probe-role",
+    "probe_role",
+    default=None,
+    help=(
+        "Role to probe as — the low-trust role your API runs retrieval under "
+        "(e.g. `authenticated`). Defaults to the first concrete role holding "
+        "EXECUTE on the retrieval function."
+    ),
+)
+@click.option(
+    "--set",
+    "settings",
+    multiple=True,
+    metavar="GUC=VALUE",
+    help=(
+        "Session setting to stamp before probing, e.g. "
+        "--set request.jwt.claim.sub=<a-user-id>. Repeatable. This is the "
+        "identity your policies read; without it an identity-less session sees "
+        "no rows, so the comparison cannot discriminate and abstains."
+    ),
+)
+@output_format_options(
+    ["text", "json"], output_help="Write the retrieval-path audit here."
+)
+def vector(
+    config_path: str | None,
+    database_url: str | None,
+    schemas: str | None,
+    probe_role: str | None,
+    settings: tuple[str, ...],
+    output_format: str,
+    output_path: str | None,
+) -> None:
+    """Detect an RLS bypass on the RAG (pgvector) retrieval path.
+
+    Audits the Supabase *RAG with Permissions* shape: embeddings in a
+    `document_sections`-style table gated by RLS, retrieved through a
+    `match_documents()` similarity-search function. The bypass this catches is
+    invisible to table-level checks — RLS is on, `FORCE`'d, the policy is right,
+    and a direct SELECT as another tenant returns zero rows — because the leak
+    lives in the *composed path*: a `SECURITY DEFINER` retrieval function runs
+    with the owner's privileges and hands back rows the caller's RLS denies.
+
+    For each (embeddings table -> SECDEF retrieval function) pair it compares,
+    as a low-trust role inside a rolled-back transaction, the primary keys the
+    function surfaces against the keys a direct SELECT allows. The table's RLS
+    defines what that role may see, so a surfaced-but-denied key is a proven
+    bypass and the row is printed as evidence. This is a leak DETECTOR, not an
+    isolation prover: "no leak" means only that this spot-check came up clean,
+    never that the path is safe for every argument — which is why the clean
+    verdict is NO LEAK, not PROVEN.
+
+    Pass `--probe-role` for the low-trust role your API uses; without it every
+    concrete EXECUTE grantee is probed. `--set guc=value` stamps the session
+    identity the policies read (e.g. `--set request.jwt.claim.sub=<uuid>`).
+
+    It issues only SELECTs and always rolls back, but it *executes* the
+    retrieval function with the definer's privileges — a function that commits a
+    side effect outside the transaction (dblink, an FDW write) is not contained.
+    Exits 1 when any retrieval path leaks.
+    """
+    from pgrls.vector import render_json, render_text, run_vector_audit
+
+    parsed: dict[str, str] = {}
+    for item in settings:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise click.UsageError(
+                f"--set expects GUC=VALUE, got {item!r}"
+            )
+        parsed[key.strip()] = value
+
+    with _connect_introspect_ctx(
+        config_path=config_path,
+        database_url=database_url,
+        schemas_csv=schemas,
+    ) as (_cfg, conn, schema):
+        audit = run_vector_audit(
+            conn, schema, probe_role=probe_role, settings=parsed
+        )
+
+    rendered = render_json(audit) if output_format == "json" else render_text(audit)
+    _emit(rendered, output_path)
+    if audit.has_leak:
+        sys.exit(1)
+
+
+@main.command()
 def mcp() -> None:
     """Run the pgrls MCP server (stdio) for AI coding agents. Requires pgrls[mcp].
 
