@@ -55,6 +55,10 @@ jobs:
       # bug `tests/test_schema_to_sql.py::test_to_sql_round_trips_through_real_postgres`
       # caught in CI on PR #18.
       PGRLS_TEST_PG_IMAGE: postgres:${{ matrix.pg }}-alpine
+      # The `pgrls vector` probe keys on a real pgvector column, so its live
+      # tests spawn a pgvector image instead of the plain postgres one. Pin it
+      # to the same major as the matrix leg so all three versions are exercised.
+      PGRLS_TEST_PGVECTOR_IMAGE: pgvector/pgvector:pg${{ matrix.pg }}
     steps:
       - uses: actions/checkout@v6
 

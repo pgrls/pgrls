@@ -11,6 +11,45 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Added
+- **`pgrls vector` — detect an RLS bypass on the RAG (pgvector) retrieval
+  path.** Audits the shape Supabase's own *RAG with Permissions* guide
+  recommends: chunk embeddings in a `document_sections`-style table gated by
+  RLS, retrieved through a `match_documents()` similarity-search function. The
+  bypass it catches is invisible to every table-level check — RLS is enabled,
+  `FORCE`'d, the policy is correct, and a direct `SELECT` as another tenant
+  returns zero rows — because the leak lives in the *composed path*: a
+  `SECURITY DEFINER` retrieval function (which the same ecosystem recommends for
+  RLS performance) runs with the owner's privileges and returns rows the
+  caller's RLS denies. For each discovered (embeddings table → SECDEF retrieval
+  function) pair, the probe compares — as a low-trust role inside a
+  force-rolled-back transaction — the primary keys the function surfaces against
+  the keys a direct `SELECT` allows; the table's RLS defines what that role may
+  see, so a surfaced-but-denied key is a proven bypass and the row is printed as
+  evidence. Correlating on the **primary key** (not the whole row) means a safe
+  function that transforms a row it is allowed to return — `upper(content)`, a
+  rounded score — is never mistaken for a leak. It is a leak **detector**, not
+  an isolation prover: because the call is a synthesized sample, "no leak" means
+  only that this spot-check came up clean, never that the path is safe for every
+  argument — the clean verdict is **NO LEAK**, not PROVEN, where the static
+  `SEC014` warning cannot tell a leaking retrieval function from a safe one at
+  all. `--probe-role` names the role your API retrieves under; without it every
+  concrete `EXECUTE` grantee is probed (so a per-grantee `USING (true)` on one
+  role can't mask a leak visible to another). `--set GUC=VALUE` stamps the
+  session identity your policies read. It issues only `SELECT`s and always rolls
+  back, but it *executes* the retrieval function with the definer's privileges
+  (a `statement_timeout` bounds a runaway body). Its "all rows" baseline is only
+  trustworthy from an RLS-exempt connection, so it **must be run as a superuser
+  or `BYPASSRLS` role** and abstains (rather than risk a false clear) if the
+  connection role is itself RLS-subject. Abstains, too, when RLS does not
+  restrict the probe role (it owns the table, holds `BYPASSRLS`, or a
+  `USING (true)` policy grants it everything — a vacuous baseline), when the
+  function does not return the table's primary key, when the call can't be
+  synthesized, or when the data can't discriminate; and it reports any non-SQL
+  (PL/pgSQL) SECDEF functions it could not parse so a recall gap is never a
+  silent clean bill. A surfaced key is only reported as a leak once re-verified
+  to be a real row of *this* table (a function returning a same-named key from a
+  different relation is not a false positive). Exits 1 on any leak.
+  `--format text|json`.
 - **`pgrls lint --format gitlab`** — a GitLab Code Quality (CodeClimate JSON)
   report so findings surface in a merge request's Code Quality widget. Unlike
   the existing `--format sarif` (which GitLab ingests only via its **SAST**
