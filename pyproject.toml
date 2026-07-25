@@ -96,7 +96,14 @@ dev = [
     # locally via `uv run ruff check src/ tests/` / `uv run mypy
     # src/pgrls` — previously these gates ran only on contributors'
     # machines, never in CI (a linter that didn't lint itself).
-    "ruff>=0.15",
+    #
+    # Ruff is pinned to a minor series on purpose. An unpinned `>=0.15` let
+    # CI resolve 0.16.0 while uv.lock still held 0.15.15, so the lint gate
+    # failed on every PR over 314 findings from newly-added rules (UP017,
+    # ISC004, FURB192, RUF100 …) in files the PR never touched. A linter
+    # that changes its mind between runs isn't a gate. Bump this
+    # deliberately, in its own change, with the fixes alongside it.
+    "ruff>=0.15,<0.16",
     "mypy>=2.0",
 ]
 
