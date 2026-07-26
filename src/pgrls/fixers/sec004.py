@@ -55,9 +55,16 @@ SEC038's province — proved by the Z3 solver, not pattern-stripped — and are
 deliberately out of this fixer's scope: only the canonical, safely-strippable
 top-level `IS NULL` disjunct is auto-fixed.
 
-Only `USING` is rewritten (the only clause SEC004 inspects); `WITH CHECK` is
-never touched. The mutation happens on a deep copy so the rule's `Schema`
-view stays read-only.
+**Both clauses are rewritten**, matching the clauses SEC004 inspects. The
+monotonicity argument is identical on the write side: dropping an OR disjunct
+from `WITH CHECK` removes a way for a row to be *accepted*, so it can only
+narrow which writes succeed — exactly the write-side hole being closed. Each
+clause is stripped independently, so a policy whose `USING` can be safely
+stripped while its `WITH CHECK` cannot still gets the `USING` fix, and the
+SEC004 finding correctly stays up for the clause that was left alone. When
+both strip cleanly they are emitted as one `ALTER POLICY` carrying both
+clauses. The mutation happens on a deep copy so the rule's `Schema` view stays
+read-only.
 """
 from __future__ import annotations
 
@@ -140,11 +147,12 @@ def _strip_null_auth(node: Any, auth_functions: set[str]) -> tuple[Any, bool]:
     return node, True
 
 
-def _strip_using(ast: Any, auth_functions: set[str]) -> tuple[Any, bool]:
-    """Deep-copy and strip the `USING` AST. Returns `(new_ast, changed)`;
-    raises `_CannotStrip` when no real check survives (empty OR, a bare
-    `IS NULL` that was the whole clause, or a literal `true` left as a
-    top-level OR disjunct — alone or alongside others)."""
+def _strip_clause(ast: Any, auth_functions: set[str]) -> tuple[Any, bool]:
+    """Deep-copy and strip one policy clause (`USING` or `WITH CHECK`).
+    Returns `(new_ast, changed)`; raises `_CannotStrip` when no real check
+    survives (empty OR, a bare `IS NULL` that was the whole clause, or a
+    literal `true` left as a top-level OR disjunct — alone or alongside
+    others)."""
     if ast is None:
         return None, False
     candidate = copy.deepcopy(ast)
@@ -179,32 +187,54 @@ class SEC004Fixer:
         out: list[Fix] = []
         for table in schema.tables:
             for policy in table.policies:
+                # Strip each clause independently: one clause being
+                # un-strippable (no real check would survive) must not block
+                # closing the other. The SEC004 finding stays up for whatever
+                # is left, which is the honest outcome.
                 try:
-                    new_using, changed = _strip_using(
+                    new_using, using_changed = _strip_clause(
                         policy.using_ast, auth_functions
                     )
                 except _CannotStrip:
-                    # No real check survives the strip — leave the SEC004
-                    # finding for human review rather than emit a still-open
-                    # or empty USING.
-                    continue
-                if not changed:
+                    new_using, using_changed = None, False
+                try:
+                    new_check, check_changed = _strip_clause(
+                        policy.with_check_ast, auth_functions
+                    )
+                except _CannotStrip:
+                    new_check, check_changed = None, False
+                if not using_changed and not check_changed:
                     continue
 
+                clauses = set()
+                if using_changed:
+                    clauses.add("using")
+                if check_changed:
+                    clauses.add("with_check")
                 stmt = alter_policy(
-                    table, policy.name, using_ast=new_using
+                    table,
+                    policy.name,
+                    using_ast=new_using if using_changed else None,
+                    with_check_ast=new_check if check_changed else None,
                 )
+                if using_changed and check_changed:
+                    clause_disp = "USING and WITH CHECK checks"
+                elif using_changed:
+                    clause_disp = "USING check"
+                else:
+                    clause_disp = "WITH CHECK constraint"
                 out.append(
                     Fix(
                         rule_id="SEC004",
                         location=policy_id(table, policy),
                         sql=stmt,
-                        clauses=frozenset({"using"}),
+                        clauses=frozenset(clauses),
                         description=(
                             f"Remove the `auth_func() IS NULL` disjunct from "
                             f"policy {policy.name!r} on "
                             f"{table.qualified_name}, restoring the real "
-                            "USING check the anonymous-read hole was masking. "
+                            f"{clause_disp} the anonymous-access hole was "
+                            "masking. "
                             "This assumes the IS NULL branch was the inverted-"
                             "auth mistake SEC004 targets, not deliberate "
                             "anonymous access; if a policy genuinely means to "

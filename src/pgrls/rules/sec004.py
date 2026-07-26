@@ -5,8 +5,22 @@ auth_func() returns NULL for anonymous connections, so the IS NULL
 disjunct is true and the OR is satisfied without ever evaluating the
 real check. Anonymous clients see all rows.
 
-Detection flattens the OR disjuncts of the USING expression — including
-disjuncts nested by explicit parenthesization, since OR is associative
+The same inversion in **WITH CHECK** is the write-side twin: the disjunct
+is true for a token-less session, so the policy accepts any row that
+session writes — including rows stamped for another tenant. Both clauses
+are inspected. A policy that carries the hole in both is one finding
+naming both clauses (baseline identity is `(rule_id, location)`, so a
+second violation on the same policy would be indistinguishable from the
+first).
+
+Only an **explicit** WITH CHECK is inspected separately: Postgres reuses
+USING as the implicit WITH CHECK on UPDATE/ALL when WITH CHECK is
+omitted, so an absent clause adds no hole the USING report doesn't
+already cover. A `FOR INSERT` policy has no USING at all, which is why
+the WITH CHECK scan is the only thing that can see its hole.
+
+Detection flattens the OR disjuncts of each clause — including disjuncts
+nested by explicit parenthesization, since OR is associative
 (`A OR (B OR auth() IS NULL)` is the same hole as the flat form) — and
 flags any disjunct shaped as `auth_func() IS NULL` for one of a
 configurable set of auth-context functions. It does not flatten through
@@ -100,10 +114,27 @@ def _parse_auth_functions(options: dict[str, Any]) -> set[str]:
     return set(raw)
 
 
+def _clause_has_inverted_auth(ast: Any, auth_functions: set[str]) -> bool:
+    """True iff `ast` carries a top-level `<nullable-auth>() IS NULL`
+    OR-disjunct — the exact shape SEC004 flags, in either clause."""
+    if ast is None:
+        return False
+    for disjunct in flatten_or_disjuncts(ast):
+        matched = match_is_null(disjunct)
+        if matched is None:
+            continue
+        inner, is_null = matched
+        if not is_null:
+            continue
+        if _has_nullable_auth_call(inner, auth_functions):
+            return True
+    return False
+
+
 class SEC004:
     id: str = "SEC004"
     severity: Severity = "error"
-    title: str = "Inverted auth check (USING permits anonymous)"
+    title: str = "Inverted auth check (permits anonymous access)"
 
     def check(
         self, schema: Schema, options: dict[str, Any]
@@ -113,63 +144,90 @@ class SEC004:
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
-                if policy.using_ast is None:
+                in_using = _clause_has_inverted_auth(
+                    policy.using_ast, auth_functions
+                )
+                # Only an EXPLICIT WITH CHECK is a distinct hole. When it is
+                # omitted on UPDATE/ALL Postgres reuses USING as the implicit
+                # write check, so `with_check_ast is None` adds nothing the
+                # USING branch hasn't already reported.
+                in_check = _clause_has_inverted_auth(
+                    policy.with_check_ast, auth_functions
+                )
+                if not in_using and not in_check:
                     continue
-                for disjunct in flatten_or_disjuncts(policy.using_ast):
-                    matched = match_is_null(disjunct)
-                    if matched is None:
-                        continue
-                    inner, is_null = matched
-                    if not is_null:
-                        continue
-                    if not _has_nullable_auth_call(inner, auth_functions):
-                        continue
-                    # Only a policy reachable by an anonymous (token-less)
-                    # session is a live anon-read hole. One restricted to
-                    # non-anon roles (e.g. `authenticated`) can't be reached
-                    # that way, so the disjunct is a latent defect, not an
-                    # anonymous leak — report it, but don't over-claim.
-                    if anon_roles & set(policy.roles):
-                        severity: Severity = "error"
-                        message = (
-                            f"Policy {policy.name!r} on "
-                            f"{table.qualified_name} has a top-level "
-                            "`auth_func() IS NULL` disjunct in its USING "
-                            "clause, and the policy applies to anon / "
-                            "PUBLIC. For token-less connections that "
-                            "disjunct is true, satisfying the policy and "
-                            "exposing every row. Remove the IS NULL "
-                            "disjunct or replace with an explicit deny."
-                        )
-                    else:
-                        severity = "warning"
-                        roles_disp = ", ".join(sorted(policy.roles)) or "no role"
-                        message = (
-                            f"Policy {policy.name!r} on "
-                            f"{table.qualified_name} has a top-level "
-                            "`auth_func() IS NULL` disjunct in its USING "
-                            f"clause. It is restricted to {roles_disp} "
-                            "(not anon / PUBLIC), so a token-less request "
-                            "cannot reach it — but the disjunct still "
-                            "admits every row to any session in those "
-                            "roles whose auth context is NULL (e.g. an "
-                            "authenticated token with no `sub`), and "
-                            "becomes a full anonymous-read hole if the "
-                            "role restriction is loosened. Remove the IS "
-                            "NULL disjunct or replace with an explicit "
-                            "deny."
-                        )
-                    out.append(
-                        Violation(
-                            rule_id="SEC004",
-                            severity=severity,
-                            title=self.title,
-                            message=message,
-                            location=(
-                                f"{table.schema}.{table.name}."
-                                f"{policy.name}"
-                            ),
-                        )
+
+                if in_using and in_check:
+                    clauses = "USING and WITH CHECK"
+                    plural = "s"
+                    anon_impact = (
+                        "exposing every row and accepting every row it writes"
                     )
-                    break  # one violation per policy
+                    role_impact = (
+                        "admits every row to — and accepts every row written "
+                        "by — any session in those roles"
+                    )
+                elif in_using:
+                    clauses = "USING"
+                    plural = ""
+                    anon_impact = "exposing every row"
+                    role_impact = "admits every row to any session in those roles"
+                else:
+                    clauses = "WITH CHECK"
+                    plural = ""
+                    anon_impact = (
+                        "accepting every row it writes, including rows "
+                        "stamped for another tenant"
+                    )
+                    role_impact = (
+                        "accepts every row written by any session in those "
+                        "roles"
+                    )
+
+                # Only a policy reachable by an anonymous (token-less)
+                # session is a live anon hole. One restricted to
+                # non-anon roles (e.g. `authenticated`) can't be reached
+                # that way, so the disjunct is a latent defect, not an
+                # anonymous leak — report it, but don't over-claim.
+                if anon_roles & set(policy.roles):
+                    severity: Severity = "error"
+                    message = (
+                        f"Policy {policy.name!r} on "
+                        f"{table.qualified_name} has a top-level "
+                        f"`auth_func() IS NULL` disjunct in its {clauses} "
+                        f"clause{plural}, and the policy applies to anon / "
+                        "PUBLIC. For token-less connections that "
+                        "disjunct is true, satisfying the policy and "
+                        f"{anon_impact}. Remove the IS NULL "
+                        "disjunct or replace with an explicit deny."
+                    )
+                else:
+                    severity = "warning"
+                    roles_disp = ", ".join(sorted(policy.roles)) or "no role"
+                    message = (
+                        f"Policy {policy.name!r} on "
+                        f"{table.qualified_name} has a top-level "
+                        f"`auth_func() IS NULL` disjunct in its {clauses} "
+                        f"clause{plural}. It is restricted to {roles_disp} "
+                        "(not anon / PUBLIC), so a token-less request "
+                        f"cannot reach it — but the disjunct still "
+                        f"{role_impact} whose auth context is NULL (e.g. an "
+                        "authenticated token with no `sub`), and "
+                        "becomes a full anonymous hole if the "
+                        "role restriction is loosened. Remove the IS "
+                        "NULL disjunct or replace with an explicit "
+                        "deny."
+                    )
+                out.append(
+                    Violation(
+                        rule_id="SEC004",
+                        severity=severity,
+                        title=self.title,
+                        message=message,
+                        location=(
+                            f"{table.schema}.{table.name}."
+                            f"{policy.name}"
+                        ),
+                    )
+                )
         return out

@@ -60,9 +60,12 @@ remediation to stdout or to a migration-ready `.sql`:
 pgrls fix --output 001_rls_fixes.sql
 ```
 
-The non-mechanical findings (like SEC004 above — pgrls can't author your
-real auth check) need human judgement; `pgrls fix --check` lists what
-would and wouldn't be fixed without writing anything.
+Mechanical findings are rewritten for you — SEC004 above included: the
+fixer strips the `auth_func() IS NULL` disjunct, restoring the real check
+it was masking (and abstains when no real check would survive, rather
+than guess). Findings that need a predicate pgrls can't author for you
+still need human judgement; `pgrls fix --check` lists what would and
+wouldn't be fixed without writing anything.
 
 ## 5. Wire it into CI
 
