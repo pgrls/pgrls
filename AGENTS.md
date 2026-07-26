@@ -127,8 +127,29 @@ has an owner / user column that no policy scopes by — rows may be
 visible between users within the same tenant), `SEC030` (policy
 scopes by a nullable discriminator column — a NULL row escapes
 scoping and is a latent cross-tenant leak), and `HYG003`
-(policy is an exact duplicate of another on the same table). A
-`pgrls fix` subcommand
+(policy is an exact duplicate of another on the same table).
+
+The platform-surface and runtime rules added since: errors `SEC046`
+(policy calls an `IMMUTABLE` function that reads session state, so
+Postgres constant-folds it and one user's value is reused for everyone),
+`SEC052` (auth user table exposed through an API-schema view),
+`SEC053` (foreign table exposed in an API schema), and `SEC054`
+(materialized view exposed in an API schema — RLS never applies to a
+matview's stored rows, so this is the error-severity subset of
+VIEW003, which co-fires); warnings `SEC045` (sensitive column granted
+to a low-trust role), `SEC047` (foreign key to an RLS-protected parent
+is a cross-tenant existence oracle — the FK error message confirms a
+row the reader cannot select), `SEC048` (low-trust role can reach an
+RLS table's owner that is not `FORCE`'d, so `SET ROLE` bypasses every
+policy), `SEC049` (PostgREST-exposed table readable by a low-trust
+role), `SEC050` (Storage policy not scoped to a bucket — cross-bucket
+access), and `SEC051` (Realtime-published table has RLS disabled, so
+the WAL broadcast is unfiltered); and info `PERF005` (RLS table
+observed to sequentially scan in production — opt-in, inert without a
+`pgrls perf --snapshot` artifact) and `HYG004` (policy has no
+behavioral test — inert without a coverage artifact).
+
+A `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
 SEC004, SEC006, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A

@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **SEC004 now inspects `WITH CHECK`, not just `USING`** — closing a
+  write-side blind spot in the flagship rule. The same inverted-auth
+  disjunct (`auth_func() IS NULL OR <check>`) was reported in `USING` and
+  silently ignored in `WITH CHECK`, where it is a *write* hole: a session
+  whose auth context is NULL can insert or update rows stamped for another
+  tenant. A `FOR INSERT` policy carries no `USING` at all, so nothing in the
+  catalogue saw that shape before. Live-verified: the forged cross-tenant
+  INSERT that previously succeeded is now rejected after applying the fix,
+  while legitimate in-tenant writes still pass. Only an **explicit**
+  `WITH CHECK` is inspected separately — when it is omitted on `UPDATE`/`ALL`
+  Postgres reuses `USING` as the implicit write check, which the `USING`
+  report already covers — and a policy carrying the hole in both clauses is
+  one finding naming both (baseline identity is `(rule_id, location)`). The
+  SEC004 **auto-fixer** strips the disjunct from either clause, descending
+  `OR` only so the rewrite can never broaden a policy, and abstains per
+  clause when no real check would survive. Earlier releases pinned the
+  USING-only scope deliberately; this reverses that decision.
+
+### Changed
+- Docs corrected against the shipped catalogue: `docs/EXTRA_RULES.md` and the
+  README rule-catalogue pointer were 17 and 25 rules stale (both now 67);
+  the README link labelled "in AGENTS.md" pointed at `docs/RULES.md`;
+  `docs/QUICKSTART.md` described SEC004 as needing human judgement although
+  it has had an auto-fixer since 0.32.0; and the AGENTS.md rule enumeration
+  omitted SEC045–SEC054, PERF005 and HYG004 entirely.
+
 ### Added
 - **`pgrls vector` — detect an RLS bypass on the RAG (pgvector) retrieval
   path.** Audits the shape Supabase's own *RAG with Permissions* guide

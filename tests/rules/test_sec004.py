@@ -212,8 +212,11 @@ def test_sec004_emits_only_one_violation_per_policy() -> None:
 
 
 def test_sec004_fires_on_with_check_disjunct_not_just_using() -> None:
-    # Document current behavior: SEC004 inspects USING only, not WITH CHECK.
-    # This test pins that decision so a future change is intentional.
+    # The write-side twin of the Lovable pattern: the inverted-auth disjunct
+    # sits in WITH CHECK, so a session whose auth context is NULL can WRITE
+    # any row (including one stamped for another tenant). Nothing else in the
+    # catalogue catches this shape on a non-anon policy, so SEC004 owns it.
+    # (Earlier releases deliberately scanned USING only; this reverses that.)
     policy = Policy(
         name="p",
         command="UPDATE",
@@ -226,8 +229,106 @@ def test_sec004_fires_on_with_check_disjunct_not_just_using() -> None:
             "auth.uid() IS NULL OR user_id = '1'"
         ),
     )
-    schema = _wrap(policy)
-    assert SEC004().check(schema, {}) == []
+    violations = SEC004().check(_wrap(policy), {})
+    assert len(violations) == 1
+    assert violations[0].location == "public.t.p"
+    assert "WITH CHECK" in violations[0].message
+    assert "USING" not in violations[0].message
+    # TO authenticated is not anon-reachable, so it is the softer verdict.
+    assert violations[0].severity == "warning"
+
+
+def test_sec004_with_check_hole_on_anon_policy_is_error() -> None:
+    policy = Policy(
+        name="p",
+        command="INSERT",
+        permissive=True,
+        roles=("anon",),
+        using_sql=None,
+        with_check_sql="auth.uid() IS NULL OR user_id = '1'",
+        using_ast=None,
+        with_check_ast=parse_expr("auth.uid() IS NULL OR user_id = '1'"),
+    )
+    violations = SEC004().check(_wrap(policy), {})
+    assert len(violations) == 1
+    assert violations[0].severity == "error"
+    # A FOR INSERT policy has no USING at all — the WITH CHECK scan is the
+    # only thing that can see this hole.
+    assert "WITH CHECK" in violations[0].message
+    assert "stamped for another tenant" in violations[0].message
+
+
+def test_sec004_hole_in_both_clauses_is_one_finding_naming_both() -> None:
+    # Baseline identity is (rule_id, location), so two violations on one
+    # policy would be indistinguishable — report once, name both clauses.
+    hole = "auth.uid() IS NULL OR user_id = '1'"
+    policy = Policy(
+        name="p",
+        command="ALL",
+        permissive=True,
+        roles=("anon",),
+        using_sql=hole,
+        with_check_sql=hole,
+        using_ast=parse_expr(hole),
+        with_check_ast=parse_expr(hole),
+    )
+    violations = SEC004().check(_wrap(policy), {})
+    assert len(violations) == 1
+    assert "USING and WITH CHECK clauses" in violations[0].message
+
+
+def test_sec004_absent_with_check_is_not_double_reported() -> None:
+    # Postgres reuses USING as the implicit WITH CHECK on UPDATE/ALL when the
+    # clause is omitted, so an absent WITH CHECK adds no hole the USING
+    # report doesn't already cover.
+    hole = "auth.uid() IS NULL OR user_id = '1'"
+    policy = Policy(
+        name="p",
+        command="UPDATE",
+        permissive=True,
+        roles=("anon",),
+        using_sql=hole,
+        with_check_sql=None,
+        using_ast=parse_expr(hole),
+        with_check_ast=None,
+    )
+    violations = SEC004().check(_wrap(policy), {})
+    assert len(violations) == 1
+    assert "USING clause" in violations[0].message
+
+
+def test_sec004_clean_with_check_alongside_leaking_using() -> None:
+    # Only the offending clause is named.
+    policy = Policy(
+        name="p",
+        command="UPDATE",
+        permissive=True,
+        roles=("anon",),
+        using_sql="auth.uid() IS NULL OR user_id = '1'",
+        with_check_sql="user_id = '1'",
+        using_ast=parse_expr("auth.uid() IS NULL OR user_id = '1'"),
+        with_check_ast=parse_expr("user_id = '1'"),
+    )
+    violations = SEC004().check(_wrap(policy), {})
+    assert len(violations) == 1
+    assert "USING clause" in violations[0].message
+    assert "WITH CHECK" not in violations[0].message
+
+
+def test_sec004_ignores_and_gated_is_null_in_with_check() -> None:
+    # Same non-flattening discipline as USING: an IS NULL under an AND is
+    # not a standalone hole.
+    policy = Policy(
+        name="p",
+        command="INSERT",
+        permissive=True,
+        roles=("anon",),
+        using_sql=None,
+        with_check_sql="auth.uid() IS NULL AND user_id = '1'",
+        using_ast=None,
+        with_check_ast=parse_expr("auth.uid() IS NULL AND user_id = '1'"),
+    )
+    assert SEC004().check(_wrap(policy), {}) == []
 
 
 def test_sec004_default_set_covers_auth_role() -> None:

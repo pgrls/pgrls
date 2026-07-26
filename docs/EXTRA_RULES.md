@@ -1,6 +1,6 @@
 # Project-specific rules — `[lint].extra_rules`
 
-`pgrls` ships 50 built-in rules. You can add more — private to your
+`pgrls` ships 67 built-in rules. You can add more — private to your
 project, experimental, or domain-specific — without forking.
 
 This guide is for **consumers** writing rules used only by their own

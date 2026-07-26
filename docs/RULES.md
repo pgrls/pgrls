@@ -169,7 +169,8 @@ e.g. `["public.feature_flags.public_read"]`. Prefer this over
 **Severity:** error. **The marquee rule** — this is the pattern that
 caused real CVEs across hundreds of AI-generated apps.
 
-**What it catches:** policies whose `USING` clause contains a top-level
+**What it catches:** policies whose `USING` **or `WITH CHECK`** clause
+contains a top-level
 `OR` disjunct shaped as `auth_func() IS NULL` for one of: `auth.uid`,
 `auth.role`, `auth.jwt`, or `current_setting`. The intent was usually
 "let unauthenticated requests through to a downstream check"; the bug is
@@ -193,7 +194,29 @@ CREATE POLICY broken ON public.invoices
     );
 ```
 
-**Standard fix.** Drop the `IS NULL` disjunct entirely. Authentication
+**The write-side twin.** The same inversion in `WITH CHECK` is a write
+hole rather than a read one: the disjunct is true for a session with no
+auth context, so the policy *accepts* any row that session writes —
+including a row stamped for another tenant.
+
+```sql
+CREATE POLICY broken_write ON public.invoices
+    FOR INSERT TO authenticated
+    WITH CHECK (
+        auth.uid() IS NULL                       -- ← accepts any tenant_id
+        OR user_id = auth.uid()
+    );
+```
+
+A `FOR INSERT` policy carries no `USING` at all, so the `WITH CHECK`
+scan is the only thing that can see this shape. Only an **explicit**
+`WITH CHECK` is inspected separately — when it is omitted on
+`UPDATE`/`ALL`, Postgres reuses `USING` as the implicit write check, so
+the `USING` report already covers it. A policy carrying the hole in both
+clauses is reported once, naming both.
+
+**Standard fix.** Drop the `IS NULL` disjunct entirely, in whichever
+clause carries it. Authentication
 should be enforced upstream (PostgREST refuses unauth, the application
 fails before the query, etc.); RLS is the *last* line of defense, not a
 fallback for missing auth.
@@ -203,6 +226,10 @@ CREATE POLICY scoped ON public.invoices
     FOR SELECT TO authenticated
     USING (user_id = (SELECT auth.uid()));
 ```
+
+`pgrls fix` performs this strip automatically on both clauses (it
+descends `OR` only, so the rewrite can never broaden the policy), and
+abstains when no real check would survive.
 
 (The `(SELECT auth.uid())` wrap is the same one PERF001 recommends —
 keeping it here means the SEC004 fix doesn't itself trigger PERF001.)

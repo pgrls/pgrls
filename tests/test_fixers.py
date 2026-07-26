@@ -4488,6 +4488,63 @@ def test_sec004_fix_abstains_when_true_survives_among_disjuncts() -> None:
     assert SEC004Fixer().fix(schema, {}) == []
 
 
+def test_sec004_fix_strips_the_with_check_clause() -> None:
+    # The write-side twin: a FOR INSERT policy has no USING at all, so the
+    # WITH CHECK strip is the only thing that can close this hole.
+    schema = _wrap_policy(
+        _policy(
+            None,
+            command="INSERT",
+            with_check="auth.uid() IS NULL OR owner_id = auth.uid()",
+        )
+    )
+    [f] = SEC004Fixer().fix(schema, {})
+    assert f.clauses == frozenset({"with_check"})
+    assert "WITH CHECK (owner_id = auth.uid())" in f.sql
+    assert "IS NULL" not in f.sql
+    assert "USING" not in f.sql
+
+
+def test_sec004_fix_strips_both_clauses_in_one_alter() -> None:
+    hole = "auth.uid() IS NULL OR owner_id = auth.uid()"
+    schema = _wrap_policy(_policy(hole, command="ALL", with_check=hole))
+    [f] = SEC004Fixer().fix(schema, {})
+    assert f.clauses == frozenset({"using", "with_check"})
+    assert "USING (owner_id = auth.uid())" in f.sql
+    assert "WITH CHECK (owner_id = auth.uid())" in f.sql
+    assert "IS NULL" not in f.sql
+
+
+def test_sec004_fix_closes_using_even_when_with_check_cannot_strip() -> None:
+    # One clause being un-strippable must not block closing the other. The
+    # WITH CHECK here reduces to a bare hole with no real check to fall back
+    # on, so it is left for the operator — but USING is still fixed.
+    schema = _wrap_policy(
+        _policy(
+            "auth.uid() IS NULL OR owner_id = auth.uid()",
+            command="ALL",
+            with_check="auth.uid() IS NULL",
+        )
+    )
+    [f] = SEC004Fixer().fix(schema, {})
+    assert f.clauses == frozenset({"using"})
+    assert "USING (owner_id = auth.uid())" in f.sql
+    assert "WITH CHECK" not in f.sql
+
+
+def test_sec004_fix_never_descends_past_and_in_with_check() -> None:
+    # Same non-monotone discipline as USING: an IS NULL under an AND is not
+    # the hole the rule reported, and tightening there could broaden access.
+    schema = _wrap_policy(
+        _policy(
+            None,
+            command="INSERT",
+            with_check="auth.uid() IS NULL AND owner_id = auth.uid()",
+        )
+    )
+    assert SEC004Fixer().fix(schema, {}) == []
+
+
 def test_sec004_fix_no_op_when_is_null_gated_by_and() -> None:
     # The rule does not flatten through AND, so an IS NULL under an AND is not
     # a standalone hole and never fired; the fixer must not touch it (never

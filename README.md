@@ -137,7 +137,7 @@ CREATE POLICY tenant_scope ON documents
 
 Cross-tenant reads are blocked, so this passes a tenant-isolation review. But there's an `owner_id` column and nothing keys on it, so every user *in* a tenant reads every other user's documents. If that table holds drafts, DMs, or private uploads, it's a leak. **SEC027** (info) flags the table so you decide: add a per-user predicate, or confirm it's intentionally tenant-shared and allowlist it.
 
-[Browse the full rule catalogue in AGENTS.md](docs/RULES.md#rule-sec004) for the other 41 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
+[Browse the full rule catalogue](docs/RULES.md) for the other 65 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
 
 ## Usage
 
