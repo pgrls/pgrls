@@ -69,7 +69,7 @@ from pgrls.verify import (
     Verdict,
     Verification,
     build_verification,
-    effective_write_check,
+    checked_ast,
 )
 from pgrls._render_common import pluralize, render_text_table
 from pgrls.formatters._common import safe_location
@@ -204,13 +204,6 @@ def _anon_gucs(policy_ast: Any) -> list[str]:
 
     walk(policy_ast)
     return sorted(gucs)
-
-
-def _checked_ast(policy: Policy, mode: Mode) -> Any:
-    """The AST the static prover checked for `policy` under `mode` — the
-    effective write-check for ``write``, else the USING. Mirrors
-    `verify._checked_ast` (kept local to avoid importing a private helper)."""
-    return effective_write_check(policy) if mode == "write" else policy.using_ast
 
 
 def _references_other_tables(policy_ast: Any) -> bool:
@@ -419,7 +412,7 @@ def _probe_one(
             "abstained", "internal: proof references an unknown policy", None,
         )
 
-    policy_ast = _checked_ast(policy, mode)
+    policy_ast = checked_ast(policy, mode)
     sp = f"probe_{n}"
     with conn.cursor() as cur:
         cur.execute(f"SAVEPOINT {sp}")
