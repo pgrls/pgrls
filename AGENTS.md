@@ -348,16 +348,6 @@ Currently fixable:
   policy-DROP fixers (with HYG003 / SEC031). Abstains on the strict
   subset where a drop would *broaden* what the policy governs; SEC010
   still reports those for human review.
-* **SEC006** — emits `ALTER POLICY <name> ON <schema>.<table>
-  WITH CHECK (<the USING predicate>);` for a permissive `FOR
-  UPDATE` / `FOR ALL` policy that has a `USING` clause but no
-  `WITH CHECK`, mirroring USING into the write-side check.
-  Skipped, with the SEC006 finding left for human review:
-  restrictive policies (a missing `WITH CHECK` there is a dead
-  policy needing intent, not a mechanical copy), `FOR INSERT`
-  policies (Postgres forbids `FOR INSERT … USING`, so there is
-  no predicate to mirror), and any write policy written without
-  a `USING`.
 * **SEC011** — emits `ALTER POLICY <name> ON <schema>.<table>
   USING (…)` (and / or `WITH CHECK (…)`) with the `OR true`
   debug-bypass disjunct removed. An OR left with a single arg is
@@ -404,9 +394,9 @@ Currently fixable:
 * **SEC020** — emits `ALTER POLICY <name> ON <schema>.<table>
   WITH CHECK (<the USING predicate>);` for a policy that pairs a
   real `USING` predicate with an explicit `WITH CHECK (true)`,
-  replacing the constant-true write check with USING. Unlike the
-  SEC006 fixer, it also fixes restrictive policies: a SEC020
-  finding always has an explicit `WITH CHECK (true)` to replace,
+  replacing the constant-true write check with USING. It fixes
+  restrictive policies too: a SEC020 finding always has an
+  explicit `WITH CHECK (true)` to replace,
   so mirroring USING is a meaningful tightening whether the
   policy is permissive (the open write side becomes scoped) or
   restrictive (its no-op `… AND true` write check becomes real).
@@ -981,7 +971,7 @@ These are intentional in the current release. Do not invent capabilities.
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
   the planner may evaluate below the RLS barrier.
-- **Auto-fix for SEC001, SEC002, SEC004, SEC006, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
+- **Auto-fix for SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
 - **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, JUnit, and GitLab-Code-Quality output.**

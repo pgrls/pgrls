@@ -2970,10 +2970,14 @@ def test_fix_emits_sec001_enable_rls(pg_url: str, apply_sql) -> None:
     assert "dry-run" in result.output
 
 
-def test_fix_emits_sec006_with_check(pg_url: str, apply_sql) -> None:
-    # `pgrls fix` picks up the SEC006 fixer and emits an
-    # ALTER POLICY … WITH CHECK mirroring the USING predicate of a
-    # write-side policy that has no WITH CHECK.
+def test_fix_leaves_a_using_only_write_policy_alone(
+    pg_url: str, apply_sql
+) -> None:
+    # End-to-end guard for the removed SEC006 fixer. A write-side policy
+    # with a real USING and no WITH CHECK is CLOSED — Postgres reuses USING
+    # as the implicit WITH CHECK — so SEC006 does not fire on it and no
+    # fixer may rewrite it. The old SEC006 fixer did, which made
+    # `pgrls fix --check` exit 1 against a schema with no findings.
     apply_sql(
         """
         CREATE TABLE public.fix_sec006 (id INT);
@@ -2986,9 +2990,19 @@ def test_fix_emits_sec006_with_check(pg_url: str, apply_sql) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["fix", "--database-url", pg_url])
     assert result.exit_code == 0, result.output
-    assert "ALTER POLICY p ON public.fix_sec006" in result.output
-    assert "WITH CHECK (id > 0)" in result.output
-    assert "dry-run" in result.output
+    assert "ALTER POLICY p ON public.fix_sec006" not in result.output
+    assert "WITH CHECK (id > 0)" not in result.output
+
+
+def test_fix_rejects_sec006_as_an_auto_fixable_rule(pg_url: str) -> None:
+    # SEC006 is no longer auto-fixable, so `fix --rule SEC006` is a clean
+    # usage error rather than a silent no-op.
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["fix", "--database-url", pg_url, "--rule", "SEC006"]
+    )
+    assert result.exit_code != 0
+    assert "unknown auto-fixable rule(s): SEC006" in result.output
 
 
 def test_fix_emits_sec020_with_check(pg_url: str, apply_sql) -> None:

@@ -139,14 +139,14 @@ def strip_constant_true_for_mirror(ast: Any) -> Any | None:
     """Return a copy of `ast` safe to mirror into a NEW `WITH CHECK`,
     or `None` if no non-trivial predicate survives.
 
-    The SEC006 and SEC020 fixers mirror a policy's `USING` predicate
-    into `WITH CHECK`. A `USING` that contains a constant-true
-    disjunct (`x = 1 OR true`) is absorbing — mirrored verbatim it
-    produces a `WITH CHECK` that admits *every* write, the exact
-    wide-open write side those fixers exist to close. SEC011 runs in
-    the same `pgrls fix` pass but only ever rewrites `USING`, never a
-    `WITH CHECK` that SEC006/SEC020 just created, so the constant-true
-    write side would survive the pass.
+    The SEC020 fixer mirrors a policy's `USING` predicate into
+    `WITH CHECK`. A `USING` that contains a constant-true disjunct
+    (`x = 1 OR true`) is absorbing — mirrored verbatim it produces a
+    `WITH CHECK` that admits *every* write, the exact wide-open write
+    side that fixer exists to close. SEC011 runs in the same
+    `pgrls fix` pass but only ever rewrites `USING`, never a
+    `WITH CHECK` that SEC020 just created, so the constant-true write
+    side would survive the pass.
 
     This strips the constant-true disjunct (reusing SEC011's
     `_strip_or_true`, the single source of truth for the

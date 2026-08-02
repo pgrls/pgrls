@@ -342,33 +342,61 @@ allowlist = ["public.audit_log.admin_read"]
 **Severity:** error.
 
 **What it catches:** policies whose `command` is `INSERT`, `UPDATE`, or
-`ALL` and whose `WITH CHECK` clause is absent. `USING` filters reads;
-`WITH CHECK` validates writes.
+`ALL`, whose `WITH CHECK` clause is absent, **and** where Postgres has
+nothing to reuse in its place. `USING` filters reads; `WITH CHECK`
+validates writes.
 
-For **permissive** write policies the failure is read-write asymmetry:
-without `WITH CHECK` the policy admits every write, including ones
-that violate the policy's own `USING` predicate — silent cross-tenant
-data poisoning.
-
-For **restrictive** write policies the failure is different: Postgres
-defaults the missing `WITH CHECK` to `true` and AND-combines it into
-the restrictive group, so the policy imposes no constraint on new
-rows. The author wrote a restrictive intending to forbid something;
-they're forbidding nothing — a dead policy. SEC006 fires on both
-shapes; the violation message branches so the diagnosis matches the
-actual problem (security hole vs. dead policy).
-
-**Standard fix.** Add a `WITH CHECK` clause that matches `USING`. Wrap
-the auth-style call in `(SELECT …)` so it doesn't itself fire PERF001
-(per-row re-evaluation of stable functions):
+The qualifier matters. On an `UPDATE` / `ALL` policy with a real `USING`,
+Postgres reuses the `USING` expression as the implicit `WITH CHECK` — for
+permissive *and* restrictive policies alike — so the written row must
+still satisfy it. That shape is already closed and SEC006 does **not**
+fire on it:
 
 ```sql
+-- NOT a finding: PG reuses USING as the implicit WITH CHECK.
 CREATE POLICY tenant_write ON public.invoices
     FOR UPDATE
     TO authenticated
-    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid))
+    USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
+```
+
+The genuinely open shapes are `INSERT` (which carries no `USING` at all)
+and an `UPDATE` / `ALL` whose `USING` is absent or constant-`true` —
+nothing meaningful to reuse. The diagnosis then branches on permissivity:
+
+* **Permissive + open** — a concrete hole: the policy admits writes that
+  violate the read-side predicate.
+* **Restrictive + open** — the un-reusable missing `WITH CHECK` defaults
+  to `true` and AND-combines into the restrictive group, so the policy
+  constrains nothing. Not a hole on its own (other restrictives still
+  apply) but a bug: the author meant to forbid something and forbids
+  nothing.
+
+The violation message branches so the diagnosis matches the actual
+problem (security hole vs. dead policy).
+
+**Standard fix.** Write the `WITH CHECK` predicate the policy is meant to
+enforce. Wrap the auth-style call in `(SELECT …)` so it doesn't itself
+fire PERF001 (per-row re-evaluation of stable functions):
+
+```sql
+-- A finding (FOR INSERT has no USING to reuse) …
+CREATE POLICY tenant_insert ON public.invoices
+    FOR INSERT
+    TO authenticated;
+
+-- … and its fix:
+CREATE POLICY tenant_insert ON public.invoices
+    FOR INSERT
+    TO authenticated
     WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
+
+**Not auto-fixable.** Every shape SEC006 fires on is one where there is no
+`USING` worth copying, so the predicate has to come from human intent —
+which column, which scope. (A fixer that mirrored `USING` into
+`WITH CHECK` shipped briefly; it could only ever rewrite policies SEC006
+had *not* flagged, and was removed.)
 
 Asymmetric `USING` and `WITH CHECK` are valid (e.g. read your own and
 your team's, write your own only) but should carry an explanatory

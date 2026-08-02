@@ -10,6 +10,29 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Removed
+- **The SEC006 auto-fixer.** It mirrored a policy's `USING` into `WITH CHECK`,
+  but SEC006 only fires where there is nothing useful to mirror — `INSERT`
+  (which carries no `USING`), or an `UPDATE`/`ALL` whose `USING` is absent or
+  constant-`true`. Rule and fixer were **provably disjoint**: across all six
+  write-policy shapes, every shape the rule flagged the fixer skipped, and
+  every shape the fixer rewrote the rule had not flagged. So it could never
+  remediate a real finding, and instead rewrote *clean* policies — making
+  `pgrls fix --check` exit 1 on a schema with zero findings, and emitting a
+  semantic no-op `ALTER POLICY` (Postgres already reuses `USING` as the
+  implicit `WITH CHECK` on `UPDATE`/`ALL`).
+
+  The fixer predated the R3/R5 narrowing that stopped SEC006 false-positiving
+  on the closed `FOR UPDATE USING (…)` shape, and was never retired with it.
+  Auto-fixable rules: **20 → 19**. SEC006 keeps firing exactly as before; its
+  remediation needs the intended predicate, which is human intent. The
+  `USING`→`WITH CHECK` mirroring capability is unaffected for SEC020, where
+  the finding does supply a real `USING` to mirror.
+- `docs/RULES.md`'s SEC006 section had drifted the same way — it described the
+  pre-narrowing behaviour, claimed a `WITH CHECK`-less policy "admits every
+  write" (the premise R3 refuted), and used the *non-firing* shape as its
+  worked example. Rewritten to document the `_write_is_open` gate.
+
 ### Fixed
 - **`verify` no longer reports a LEAK on the canonical tenant policy.** In the
   default anon mode, `USING (tenant_id = current_setting('app.tenant'))` —

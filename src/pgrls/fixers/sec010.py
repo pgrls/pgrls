@@ -40,7 +40,7 @@ policy governs** (a strict subset of what SEC010 reports):
 Like every fixer this is dry-run by default — review before ``--apply``. The
 DROP re-emits no policy clause (``clauses`` is empty), so the clause-clobber
 resolver leaves it untouched; separately, ``generate_fixes`` coordinates the
-DROP fixers (``_DROP_FIXER_IDS``) so a sibling clause-ALTER (e.g. SEC006
+DROP fixers (``_DROP_FIXER_IDS``) so a sibling clause-ALTER (e.g. SEC020
 mirroring ``WITH CHECK (false)``) never lands on a policy this drops, and a
 policy is never dropped twice. Mirrors the SEC031 / HYG003 drop fixers.
 """
