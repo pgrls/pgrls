@@ -141,8 +141,8 @@ def alter_policy(
 ) -> str:
     """Assemble an `ALTER POLICY` statement with optional clauses.
 
-    Single source of truth for the shape the PERF001 / SEC006 /
-    SEC011 / SEC019 / SEC020 fixers all emit:
+    Single source of truth for the shape the PERF001 / SEC011 /
+    SEC019 / SEC020 fixers all emit:
 
         ALTER POLICY <name> ON <schema>.<table>
             [USING (<using_ast>)]

@@ -348,7 +348,7 @@ ready for the next migration; register it in
 [`src/pgrls/fixers/__init__.py`](../src/pgrls/fixers/__init__.py)'s
 `default_fixers()` list.
 
-Bump the auto-fixable count (`20 mechanically auto-fixable`) in:
+Bump the auto-fixable count (`19 mechanically auto-fixable`) in:
 * `pyproject.toml`'s `description` field — count only.
 * `README.md` — the count (in the intro / feature line, several
   spots) **and** its own `Currently fixable:` prose block (one

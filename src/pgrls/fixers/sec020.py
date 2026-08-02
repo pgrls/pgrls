@@ -14,22 +14,23 @@ same way reads are. The fixer emits:
 `ALTER POLICY … WITH CHECK (…)` replaces the existing
 constant-true clause, so the single statement is the whole fix.
 
-Unlike the SEC006 fixer, this one fixes restrictive policies too.
+This fixer handles restrictive policies too.
 A SEC020 finding always has an explicit `WITH CHECK (true)` and a
 real `USING`, so mirroring `USING` is a meaningful, correct
 tightening either way: for a permissive policy the wide-open
 write side becomes scoped; for a restrictive one its no-op write
 check (`restrictive AND true`) becomes a real constraint. There
-is no missing-clause / dead-policy ambiguity — that is the
-SEC006 fixer's concern, and SEC006 and SEC020 never fire on the
-same policy (one needs `WITH CHECK` absent, the other needs it
-present and constant-true).
+is no missing-clause / dead-policy ambiguity — an absent
+`WITH CHECK` is SEC006's concern, and SEC006 and SEC020 never
+fire on the same policy (one needs `WITH CHECK` absent, the
+other needs it present and constant-true). SEC006 has no fixer:
+every shape it fires on lacks a `USING` worth mirroring.
 
 Detection reuses the rule's own `_is_open_write_asymmetry` so the
 fixer flags exactly what SEC020 reports — a single definition of
 the finding. The `USING` predicate is round-tripped through
 `pglast.stream.RawStream` rather than echoed verbatim — symmetric
-with the SEC006 and PERF001 fixers, so pglast's escaping is
+with the PERF001 fixer, so pglast's escaping is
 applied consistently regardless of where the SQL originated.
 
 Before mirroring, a constant-true disjunct (`x = 1 OR true`) is

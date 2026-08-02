@@ -72,7 +72,6 @@ def default_fixers() -> list[Fixer]:
     from pgrls.fixers.sec001 import SEC001Fixer
     from pgrls.fixers.sec002 import SEC002Fixer
     from pgrls.fixers.sec004 import SEC004Fixer
-    from pgrls.fixers.sec006 import SEC006Fixer
     from pgrls.fixers.sec010 import SEC010Fixer
     from pgrls.fixers.sec011 import SEC011Fixer
     from pgrls.fixers.sec019 import SEC019Fixer
@@ -90,7 +89,6 @@ def default_fixers() -> list[Fixer]:
         SEC001Fixer(),
         SEC002Fixer(),
         SEC004Fixer(),
-        SEC006Fixer(),
         SEC010Fixer(),
         SEC011Fixer(),
         SEC015Fixer(),
@@ -128,7 +126,7 @@ def generate_fixes(
     VIEW`, `ALTER POLICY`) whose relative order does not affect the
     final state. The one exception is HYG003, the only fixer that
     `DROP`s an object: a `DROP POLICY p` and an `ALTER POLICY p`
-    (from PERF001 / SEC006 / SEC011 / SEC020 firing on the same
+    (from PERF001 / SEC011 / SEC019 / SEC020 firing on the same
     duplicate policy's shared predicate) are NOT order-independent —
     run the DROP first and the ALTER fails on a policy that no longer
     exists, leaving the emitted migration unrunnable mid-script.
@@ -173,7 +171,7 @@ def generate_fixes(
     # Coordinate the policy-DROP fixers (HYG003 / SEC031 / SEC010, see
     # `_DROP_FIXER_IDS`) with the clause-ALTER fixers. Any ALTER fix that
     # targets a policy a drop fixer will DROP would be applied against a
-    # now-nonexistent policy (depending on emit order) and fail — e.g. SEC006
+    # now-nonexistent policy (depending on emit order) and fail — e.g. SEC020
     # mirrors `USING (false)` into a `WITH CHECK (false)` on the very policy
     # SEC010 then drops. Suppress those ALTERs: dropping the dead policy is the
     # actual remedy and the ALTER was redundant. `location` is the qualified
