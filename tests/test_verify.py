@@ -180,6 +180,101 @@ def test_nullable_two_arg_current_setting_is_null_stays_leak() -> None:
     assert _verdict(build_verification(schema), "public.t") == "leak"
 
 
+# --- never-NULL current_setting as a tenant scope (MF5) --------------------
+#
+# The canonical multi-tenant policy `col = current_setting('app.tenant')` was
+# reported as a conditional LEAK (exit 1) in the DEFAULT anon mode. The
+# never-NULL routing correctly pinned `is_null=False` but left the value a
+# FREE opaque, so the anon satisfiability query existentially picked a GUC
+# value equal to a free row. An anonymous session has not run `SET`, so a
+# custom (dotted) GUC is unset and reading it RAISES — no rows come back.
+
+
+@requires_z3
+@pytest.mark.parametrize(
+    "pred",
+    [
+        # one-arg
+        "tenant_id = current_setting('app.tenant')",
+        # two-arg missing_ok=false — also raises on an unset GUC
+        "tenant_id = current_setting('app.tenant', false)",
+        # the PERF001-recommended (SELECT …) wrap
+        "tenant_id = (SELECT current_setting('app.tenant'))",
+        # cast — the marker must survive _anon_typecast
+        "tenant_id = current_setting('app.tenant')::uuid",
+        # the shape the CATALOG actually stores: pg_get_expr renders the
+        # literal as 'app.tenant'::text, so the name arg is a TypeCast, not
+        # a bare A_Const. A fix that only matched the bare literal is a
+        # silent no-op on every real policy.
+        "tenant_id = current_setting('app.tenant'::text)",
+    ],
+)
+def test_never_null_current_setting_tenant_scope_is_isolated(pred: str) -> None:
+    schema = Schema(tables=(_table("t", policies=(_policy(pred),)),))
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+@pytest.mark.parametrize(
+    "pred",
+    [
+        # A BUILT-IN GUC is always set and USERSET — the caller genuinely
+        # controls it, so this stays a real leak. Non-dotted is the gate.
+        "tenant_id = current_setting('search_path')",
+        # A computed name cannot be classified — stay conservative.
+        "tenant_id = current_setting(guc_name)",
+        # Short-circuit control: Postgres evaluates `true OR …` without ever
+        # reaching the raising call, so the open disjunct is a REAL leak.
+        # Kleene U on the erroring side must not swallow it.
+        "true OR tenant_id = current_setting('app.tenant')",
+        # NOT must not turn "the statement errored" into a visible row.
+        "NOT (tenant_id = current_setting('app.tenant')) OR true",
+    ],
+)
+def test_never_null_current_setting_precision_controls_stay_leak(pred: str) -> None:
+    schema = Schema(tables=(_table("t", policies=(_policy(pred),)),))
+    assert _verdict(build_verification(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_never_null_current_setting_under_not_is_isolated() -> None:
+    # Why the erroring read is modelled as Kleene U and not FALSE: `NOT U` is
+    # still U, so a NOT cannot flip the raising branch back into a visible row.
+    # Verified on live PG16 — an anon SELECT under
+    # `USING (NOT (tenant_id = current_setting('app.tenant')))` with the GUC
+    # unset raises `unrecognized configuration parameter` and returns no rows,
+    # so "no anonymous read" is the accurate verdict. Modelling the comparison
+    # as FALSE would report a leak here that cannot be exhibited.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy("NOT (tenant_id = current_setting('app.tenant'))"),
+                ),
+            ),
+        )
+    )
+    assert _verdict(build_verification(schema), "public.t") == "isolated"
+
+
+@requires_z3
+def test_never_null_current_setting_scope_is_cross_tenant_isolated() -> None:
+    # Same root cause on the cross-tenant path: the never-NULL call was not
+    # minted as the session identity symbol, so no tenant pair was recorded
+    # and the canonical policy degraded to UNVERIFIED purely because it spelled
+    # its identity read without `missing_ok`.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("tenant_id = current_setting('app.tenant')"),),
+            ),
+        )
+    )
+    assert _verdict(_xt(schema), "public.t") == "isolated"
+
+
 @requires_z3
 def test_using_true_is_leak_all_rows() -> None:
     schema = Schema(tables=(_table("t", policies=(_policy("true"),)),))
