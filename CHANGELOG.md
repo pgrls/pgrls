@@ -56,6 +56,19 @@ breaking changes — they will be called out in this file.
   docstring promising it mirrored `verify`. Both are now the one shared
   `verify.checked_ast`, so they cannot drift again — that drift is half of what
   made this bug.
+- **`verify --probe` under `--mode anon` made its own session authenticated,
+  then blamed the prover.** To make a `TO <role>` policy apply, the probe grants
+  its role every named role appearing in any policy's `TO` clause — schema-wide.
+  Under the anon threat model that is wrong: an anonymous caller is not a member
+  of `authenticated`. On a `FOR SELECT TO authenticated USING (true)` table the
+  static verdict PROVEN ("no anonymous read") is **correct**, yet the
+  over-privileged probe read the row and reported **MISMATCH — "proof
+  contradicts reality"** at error severity, exit 1. Under `anon` the probe now
+  holds only the configured anon roles (default `anon`; PUBLIC applies to
+  everyone and is not grantable), mirroring the role-gating the anon prover
+  already applies. The authenticated modes (`cross-tenant` / `write`) do model a
+  logged-in tenant and keep the full set. A real anon leak is still confirmed:
+  `TO anon USING (true)` and `TO PUBLIC USING (true)` both stay LEAK CONFIRMED.
 
 ### Removed
 - **The SEC006 auto-fixer.** It mirrored a policy's `USING` into `WITH CHECK`,

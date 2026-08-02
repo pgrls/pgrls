@@ -171,6 +171,63 @@ def test_write_with_check_true_upgrades_unverified_to_leak_confirmed(
     assert r.agreement == "leak_confirmed"
 
 
+@requires_docker
+@requires_z3
+def test_anon_probe_is_not_a_member_of_authenticated(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # The probe grants itself the named roles in policies' `TO` clauses so a
+    # `TO authenticated` policy applies. Under the ANON threat model that is
+    # wrong: an anonymous caller is not a member of `authenticated`. Granting it
+    # made the probe's "anon" session authenticated, so on this table — where
+    # the static PROVEN ("no anonymous read") is CORRECT — the probe read the
+    # row and reported MISMATCH, accusing a sound proof of contradicting
+    # reality at error severity, exit 1.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles "
+            "  WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated; "
+            "END IF; END $$;"
+            "CREATE TABLE public.feed (id bigserial PRIMARY KEY, body text);"
+            "ALTER TABLE public.feed ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.feed FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.feed FOR SELECT TO authenticated "
+            "  USING (true);"
+            "GRANT SELECT, INSERT ON public.feed TO authenticated;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    r = _result(_probe(pg_url, schema, mode="anon"), "public.feed")
+    assert r.static_verdict == "isolated"
+    assert r.observed == "no_rows"
+    assert r.agreement == "agree"
+
+
+@requires_docker
+@requires_z3
+def test_anon_probe_still_holds_the_anon_role_itself(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # Precision control for the above: the probe must still be granted the
+    # roles the anon threat model DOES cover, or narrowing the grants would
+    # hide a real leak. A `TO anon USING (true)` table stays leak_confirmed.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles "
+            "  WHERE rolname = 'anon') THEN CREATE ROLE anon; END IF; END $$;"
+            "CREATE TABLE public.anonread (id bigserial PRIMARY KEY, body text);"
+            "ALTER TABLE public.anonread ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.anonread FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.anonread FOR SELECT TO anon USING (true);"
+            "GRANT SELECT, INSERT ON public.anonread TO anon;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    r = _result(_probe(pg_url, schema, mode="anon"), "public.anonread")
+    assert r.static_verdict == "leak"
+    assert r.agreement == "leak_confirmed"
+
+
 # --- mismatch (proof ↔ reality broken) -------------------------------------
 
 
