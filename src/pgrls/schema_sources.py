@@ -37,6 +37,7 @@ from pglast import ast as _pgast
 from pglast.enums.parsenodes import (
     A_Expr_Kind,
     AlterTableType,
+    ConstrType,
     GrantTargetType,
     ObjectType,
     RoleSpecType,
@@ -413,17 +414,63 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         key = _relation_key(stmt.relation, default_schema)
         if key is None:
             continue
-        tables.setdefault(key, _TableBuilder(schema=key[0], name=key[1]))
-        builder = tables[key]
+        if key in tables:
+            # A second CREATE for the same relation: either `IF NOT EXISTS`
+            # (a no-op in Postgres) or DDL that would error outright. Either
+            # way the first definition stands — re-walking `tableElts` here
+            # would append the columns a second time and hand every
+            # column-keyed rule a duplicated list.
+            continue
+        builder = _TableBuilder(schema=key[0], name=key[1])
+        tables[key] = builder
+        # Declarative partition child (`PARTITION OF parent`) and classic
+        # `INHERITS (...)` children both arrive as `inhRelations`; the
+        # `partbound` clause is what distinguishes them. The model keeps them
+        # in separate fields because SEC001/SEC041/SEC043 branch on which
+        # kind of parent a table has.
+        parents = [
+            p
+            for p in (
+                _relation_key(rel, default_schema)
+                for rel in (stmt.inhRelations or ())
+            )
+            if p is not None
+        ]
+        if parents and getattr(stmt, "partbound", None) is not None:
+            builder.partition_of = parents[0]
+        elif parents:
+            builder.inherits = parents
+        # A child's columns come from its parent(s): `PARTITION OF` copies them
+        # wholesale (and forbids declaring more), `INHERITS` copies them and
+        # allows extras. Valid DDL defines the parent first, so its builder is
+        # already populated. Without this a partition child modelled offline
+        # has zero columns and every column-keyed rule silently skips it.
+        for parent_key in parents:
+            parent = tables.get(parent_key)
+            if parent is None:
+                continue
+            for col in parent.columns:
+                if not any(c.name == col.name for c in builder.columns):
+                    builder.columns.append(col)
         for elt in stmt.tableElts or ():
             if type(elt).__name__ != "ColumnDef":
                 continue
             colname = elt.colname
             data_type = _column_type(elt)
             if colname and data_type:
-                builder.columns.append(Column(name=colname, data_type=data_type))
+                builder.columns.append(
+                    Column(
+                        name=colname,
+                        data_type=data_type,
+                        is_nullable=not _column_def_is_not_null(elt),
+                    )
+                )
+        # A table-level `PRIMARY KEY (a, b)` constraint makes its columns NOT
+        # NULL just as an inline `PRIMARY KEY` does.
+        for pk_col in _table_constraint_pk_columns(stmt):
+            builder.set_not_null(pk_col)
 
-    # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT.
+    # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for raw in statements:
         stmt = raw.stmt
         kind = type(stmt).__name__
@@ -437,6 +484,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_drop(stmt, tables, default_schema)
         elif kind == "GrantStmt":
             _apply_grant(stmt, tables, default_schema)
+        elif kind == "RenameStmt":
+            _apply_rename(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
 
     return Schema(tables=tuple(b.build() for b in tables.values()))
@@ -454,6 +503,18 @@ class _TableBuilder:
         self.policies: list[Policy] = []
         self.grants: list[Grant] = []
         self.column_grants: list[ColumnGrant] = []
+        self.partition_of: tuple[str, str] | None = None
+        self.inherits: list[tuple[str, str]] = []
+
+    def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
+        """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
+        for i, col in enumerate(self.columns):
+            if col.name == colname:
+                self.columns[i] = replace(col, is_nullable=not not_null)
+                return
+
+    def drop_column(self, colname: str) -> None:
+        self.columns = [c for c in self.columns if c.name != colname]
 
     def build(self) -> Table:
         return Table(
@@ -466,7 +527,71 @@ class _TableBuilder:
             column_details=tuple(self.columns),
             grants=tuple(self.grants),
             column_grants=_merge_column_grants(self.column_grants),
+            partition_of=self.partition_of,
+            inherits=tuple(self.inherits),
         )
+
+
+def _column_def_is_not_null(column_def: Any) -> bool:
+    """Whether an inline `ColumnDef` is NOT NULL.
+
+    Both an explicit `NOT NULL` and an inline `PRIMARY KEY` make the column
+    non-nullable in Postgres. Losing this made every offline column nullable,
+    which fed SEC030 (nullable tenant discriminator) a false positive on every
+    DB-free path.
+    """
+    for con in getattr(column_def, "constraints", None) or ():
+        if type(con).__name__ != "Constraint":
+            continue
+        if getattr(con, "contype", None) in (
+            ConstrType.CONSTR_NOTNULL,
+            ConstrType.CONSTR_PRIMARY,
+        ):
+            return True
+    return False
+
+
+def _table_constraint_pk_columns(stmt: Any) -> list[str]:
+    """Column names named by a table-level `PRIMARY KEY (...)` constraint."""
+    out: list[str] = []
+    for elt in getattr(stmt, "tableElts", None) or ():
+        if type(elt).__name__ != "Constraint":
+            continue
+        if getattr(elt, "contype", None) != ConstrType.CONSTR_PRIMARY:
+            continue
+        for key in getattr(elt, "keys", None) or ():
+            name = getattr(key, "sval", None) or getattr(key, "str", None)
+            if isinstance(name, str):
+                out.append(name)
+    return out
+
+
+def _apply_rename(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    """Apply `ALTER TABLE <old> RENAME TO <new>`.
+
+    Without this the model keeps the pre-rename name, so every finding on the
+    table pointed at a relation that does not exist after the migration — a
+    `pgrls pr` annotation naming a phantom table. Renames of anything other
+    than a table (columns, policies, constraints) are left alone.
+    """
+    if getattr(stmt, "renameType", None) != ObjectType.OBJECT_TABLE:
+        return
+    old = _relation_key(stmt.relation, default_schema)
+    newname = getattr(stmt, "newname", None)
+    if old is None or not newname:
+        return
+    builder = tables.pop(old, None)
+    if builder is None:
+        return
+    new = (old[0], newname)
+    builder.name = newname
+    # A rename onto an occupied name cannot happen in valid DDL; if the input
+    # is invalid anyway, the later definition wins rather than being dropped.
+    tables[new] = builder
 
 
 def _merge_column_grants(
@@ -563,8 +688,27 @@ def _apply_alter_table(
                 data_type = _column_type(col)
                 if colname and data_type:
                     builder.columns.append(
-                        Column(name=colname, data_type=data_type)
+                        Column(
+                            name=colname,
+                            data_type=data_type,
+                            is_nullable=not _column_def_is_not_null(col),
+                        )
                     )
+        elif subtype == AlterTableType.AT_DropColumn:
+            # Without this the model keeps a column the migration removed, so
+            # column-keyed rules (SEC030's discriminator, SEC045's sensitive
+            # column) fire on a column that no longer exists.
+            name = getattr(cmd, "name", None)
+            if name:
+                builder.drop_column(name)
+        elif subtype == AlterTableType.AT_SetNotNull:
+            name = getattr(cmd, "name", None)
+            if name:
+                builder.set_not_null(name)
+        elif subtype == AlterTableType.AT_DropNotNull:
+            name = getattr(cmd, "name", None)
+            if name:
+                builder.set_not_null(name, not_null=False)
         # Other ALTER subcommands are ignored.
 
 

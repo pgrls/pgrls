@@ -11,6 +11,33 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **The offline DDL model now matches live introspection.** Differentially
+  testing `schema_from_sql` against `introspect` on the same DDL — parse it,
+  load it into a real Postgres, compare the two `Schema` objects field by
+  field — showed **23 divergences across 18 DDL shapes**. The DB-free path
+  (`lint --sql-file`, `pgrls pr`, `snapshot`, MCP, LSP) was modelling a
+  different schema than the one that ships. All are closed; the same harness
+  now reports **0 divergences**, and lint findings are identical offline and
+  live on every case.
+  - `NOT NULL` was lost on **every** column, so SEC030 (nullable tenant
+    discriminator) false-positived on every DB-free run. Both spellings are
+    now read — an inline constraint and a table-level `PRIMARY KEY (...)` —
+    as are `ALTER COLUMN SET/DROP NOT NULL`. A `PRIMARY KEY` column is NOT
+    NULL, which the model previously did not reflect.
+  - `ALTER TABLE ... RENAME TO` was ignored, so findings were reported against
+    the pre-rename name — a `pgrls pr` annotation naming a table that does not
+    exist after the migration.
+  - `ALTER TABLE ... DROP COLUMN` was ignored, so column-keyed rules fired on
+    a column the migration removed.
+  - `CREATE TABLE IF NOT EXISTS` for an existing relation re-walked the
+    column list and appended it a second time, handing every column-keyed rule
+    a duplicated set. The first definition now stands, matching Postgres.
+  - Declarative partition children and classic `INHERITS` children recorded
+    neither their parent nor their (inherited) columns. `partition_of` /
+    `inherits` are now populated and parent columns are materialised, so a
+    partition child no longer looks like a standalone RLS-off table — which
+    made SEC001 report an `error` offline where a live run correctly stays
+    silent and cedes to SEC041.
 - **SEC004 now inspects `WITH CHECK`, not just `USING`** — closing a
   write-side blind spot in the flagship rule. The same inverted-auth
   disjunct (`auth_func() IS NULL OR <check>`) was reported in `USING` and

@@ -1387,3 +1387,116 @@ def test_pr_file_url_head_strips_prefix_for_provenance_gating(tmp_path):
     assert "not evaluated on this head" in skew_url.stdout  # caveat present
     assert "older pgrls" in skew_url.stdout  # correct version-skew reason
     assert "offline from DDL" not in skew_url.stdout
+
+
+# --- offline model fidelity vs live introspection ---------------------------
+# Each of these pins a divergence found by differentially comparing
+# `schema_from_sql` against `introspect` on the same DDL loaded into a real
+# Postgres. Before these fixes the DB-free path (`lint --sql-file`, `pgrls pr`,
+# MCP, LSP, `snapshot`) modelled a different schema than the one that ships.
+
+
+def _only(sql: str):
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(sql, schemas=("public",))
+    assert len(schema.tables) == 1, [t.qualified_name for t in schema.tables]
+    return schema.tables[0]
+
+
+def test_offline_inline_not_null_is_captured():
+    # Every offline column used to come back nullable, which handed SEC030
+    # (nullable tenant discriminator) a false positive on every DB-free run.
+    t = _only("CREATE TABLE t (id int, tenant text NOT NULL);")
+    assert {c.name: c.is_nullable for c in t.column_details} == {
+        "id": True,
+        "tenant": False,
+    }
+
+
+def test_offline_primary_key_implies_not_null():
+    # Both spellings: inline and as a table-level constraint.
+    inline = _only("CREATE TABLE t (id int PRIMARY KEY, x text);")
+    assert {c.name: c.is_nullable for c in inline.column_details}["id"] is False
+    table_level = _only("CREATE TABLE t (id int, x text, PRIMARY KEY (id));")
+    assert {
+        c.name: c.is_nullable for c in table_level.column_details
+    }["id"] is False
+
+
+def test_offline_alter_column_set_and_drop_not_null():
+    setted = _only(
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ALTER COLUMN tenant SET NOT NULL;"
+    )
+    assert {c.name: c.is_nullable for c in setted.column_details}["tenant"] is False
+    dropped = _only(
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t ALTER COLUMN tenant DROP NOT NULL;"
+    )
+    assert {c.name: c.is_nullable for c in dropped.column_details}["tenant"] is True
+
+
+def test_offline_alter_table_drop_column_is_applied():
+    # A migration that drops a column left it in the model, so column-keyed
+    # rules fired on a column that no longer exists.
+    t = _only("CREATE TABLE t (id int, secret text); ALTER TABLE t DROP COLUMN secret;")
+    assert [c.name for c in t.column_details] == ["id"]
+
+
+def test_offline_alter_table_rename_is_applied():
+    # The finding used to be reported against the pre-rename name — a
+    # `pgrls pr` annotation naming a table that does not exist.
+    t = _only("CREATE TABLE staging (id int); ALTER TABLE staging RENAME TO users;")
+    assert t.qualified_name == "public.users"
+
+
+def test_offline_rename_carries_later_alters():
+    t = _only(
+        "CREATE TABLE staging (id int);"
+        " ALTER TABLE staging RENAME TO users;"
+        " ALTER TABLE users ENABLE ROW LEVEL SECURITY;"
+    )
+    assert t.qualified_name == "public.users"
+    assert t.rls_enabled is True
+
+
+def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
+    # The second CREATE re-walked tableElts and appended the columns again.
+    t = _only(
+        "CREATE TABLE t (id int PRIMARY KEY, tenant text);"
+        " CREATE TABLE IF NOT EXISTS t (id int);"
+    )
+    assert [c.name for c in t.column_details] == ["id", "tenant"]
+
+
+def test_offline_partition_child_records_parent_and_columns():
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE evt (id int, tenant text) PARTITION BY LIST (tenant);"
+        " ALTER TABLE evt ENABLE ROW LEVEL SECURITY;"
+        " CREATE TABLE evt_a PARTITION OF evt FOR VALUES IN ('a');",
+        schemas=("public",),
+    )
+    child = next(t for t in schema.tables if t.name == "evt_a")
+    # Without partition_of the child looked like a standalone RLS-off table and
+    # SEC001 false-positived on it, where live correctly cedes to SEC041.
+    assert child.partition_of == ("public", "evt")
+    assert [c.name for c in child.column_details] == ["id", "tenant"]
+
+
+def test_offline_inherits_child_records_parents_and_columns():
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE parent (id int PRIMARY KEY, tenant text);"
+        " CREATE TABLE child () INHERITS (parent);",
+        schemas=("public",),
+    )
+    child = next(t for t in schema.tables if t.name == "child")
+    assert child.inherits == (("public", "parent"),)
+    assert child.partition_of is None
+    assert [c.name for c in child.column_details] == ["id", "tenant"]
+    # Inherited nullability comes along too.
+    assert {c.name: c.is_nullable for c in child.column_details}["id"] is False
