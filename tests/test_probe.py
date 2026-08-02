@@ -724,8 +724,11 @@ def test_probe_cli_requires_database_url() -> None:
 
 def test_probe_render_sarif_projects_actionable_results() -> None:
     # Offline unit test of the probe SARIF projection (F1): LEAK CONFIRMED +
-    # MISMATCH → `error` results; AGREE / skipped → nothing; abstained → a `note`
-    # only under --strict. (No DB — render_sarif is pure over a Probe.)
+    # MISMATCH → `error` results; AGREE → nothing; abstained AND skipped → a
+    # `note` only under --strict. Both of the latter mean "no proof obtained"
+    # and both fail the --strict exit gate, so both must be reportable —
+    # otherwise Code Scanning shows nothing for a table that failed the build.
+    # (No DB — render_sarif is pure over a Probe.)
     import json as _json
 
     from pgrls.probe import ProbeResult, render_sarif
@@ -740,20 +743,28 @@ def test_probe_render_sarif_projects_actionable_results() -> None:
                         "agree", "PROVEN and hidden", None),
             ProbeResult("public.d", None, "anon", "unverified", "abstained",
                         "abstained", "cannot create probe role", None),
+            ProbeResult("public.e", None, "anon", "unverified", "no_rows",
+                        "skipped", "static UNVERIFIED; not a proof", None),
         ),
         mode="anon",
     )
     results = _json.loads(render_sarif(probe))["runs"][0]["results"]
-    # leak_confirmed + mismatch only; agree + abstained omitted by default.
+    # leak_confirmed + mismatch only; agree / abstained / skipped omitted.
     assert len(results) == 2
     assert sorted(r["level"] for r in results) == ["error", "error"]
     assert {r["ruleId"] for r in results} == {"pgrls-probe-anon"}
-    # --strict surfaces the abstain as a `note`.
+    # --strict surfaces BOTH the abstain and the skip as `note`s.
     strict_results = _json.loads(render_sarif(probe, strict=True))["runs"][0][
         "results"
     ]
-    assert len(strict_results) == 3
-    assert sum(r["level"] == "note" for r in strict_results) == 1
+    assert len(strict_results) == 4
+    assert sum(r["level"] == "note" for r in strict_results) == 2
+    noted = {
+        r["message"]["text"].split(":")[0]
+        for r in strict_results
+        if r["level"] == "note"
+    }
+    assert noted == {"public.d", "public.e"}
 
 
 def test_probe_cli_emit_repro_is_usage_error() -> None:
@@ -800,6 +811,45 @@ def test_probe_cli_nocreaterole_strict_exits_one(
     r_strict = runner.invoke(main, [*base, "--strict"])
     assert r_strict.exit_code == 1, r_strict.output
     _drop_role(pg_conn, "pgrls_weak")
+
+
+@requires_docker
+@requires_z3
+def test_probe_strict_is_never_weaker_than_plain_strict(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    # --probe adds evidence; it must never RELAX a gate. A statically
+    # UNVERIFIED table the probe ran on without seeing a leak is agreement
+    # `skipped`, which the old gate ignored — so `--strict --probe` exited 0
+    # where plain `--strict` exited 1, silently turning a failing CI gate
+    # green by adding a flag. A sampled row is not a proof.
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.undec (id bigserial PRIMARY KEY, tag text);"
+            "ALTER TABLE public.undec ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.undec FORCE ROW LEVEL SECURITY;"
+            # `LIKE` renders as `~~`, outside the decidable fragment, and the
+            # pattern denies the probe's seeded row → static UNVERIFIED + no
+            # rows observed → agreement `skipped`.
+            "CREATE POLICY p ON public.undec FOR SELECT TO public "
+            "  USING (tag LIKE 'zzz%');"
+            "GRANT SELECT, INSERT ON public.undec TO public;"
+        )
+    runner = CliRunner()
+    base = ["verify", "--database-url", pg_url, "--schemas", "public"]
+
+    plain = runner.invoke(main, [*base, "--strict"])
+    assert plain.exit_code == 1, plain.output
+    assert "UNVERIFIED" in plain.output
+
+    probed = runner.invoke(main, [*base, "--strict", "--probe"])
+    assert "skipped" in probed.output
+    assert probed.exit_code == 1, probed.output
+
+    # Without --strict no gate was requested, so the skip stays exit 0.
+    lenient = runner.invoke(main, [*base, "--probe"])
+    assert lenient.exit_code == 0, lenient.output
 
 
 @requires_docker

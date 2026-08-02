@@ -1218,13 +1218,20 @@ def render_sarif(p: Probe, *, strict: bool = False) -> str:
                     ),
                 )
             )
-        elif strict and r.agreement == "abstained":
+        elif strict and r.agreement in ("abstained", "skipped"):
+            # Both mean "no proof was obtained": `abstained` is the probe
+            # declining to run, `skipped` is a statically UNVERIFIED table the
+            # probe ran on without seeing a leak — which its own detail calls
+            # not a proof. Under --strict both fail the exit gate, so both must
+            # appear here; otherwise Code Scanning shows nothing for the very
+            # table that failed the build. Mirrors verify's SARIF, where
+            # UNVERIFIED surfaces as a `note` under --strict.
             violations.append(
                 Violation(
                     rule_id=rule_id,
                     severity="info",  # → SARIF `note`
                     title=title,
-                    message=f"{r.qualified_name}: abstained — {r.detail}",
+                    message=f"{r.qualified_name}: {r.agreement} — {r.detail}",
                     location=r.qualified_name,
                 )
             )

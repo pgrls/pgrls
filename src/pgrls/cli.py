@@ -4342,7 +4342,10 @@ def verify(
     reports AGREE / MISMATCH / LEAK CONFIRMED per table and, crucially, upgrades
     an UNVERIFIED policy that turns out to leak live into a reproduced leak.
     With `--probe`, `pgrls verify` exits non-zero on any proof↔reality mismatch
-    or live-confirmed leak (and, under `--strict`, on any abstain). It needs a
+    or live-confirmed leak. `--probe` only ever ADDS evidence, so it is never
+    weaker than plain `verify`: under `--strict` it still fails on any table
+    the verifier could not decide, whether the probe abstained or ran without
+    seeing a leak — one sampled row is not a proof. It needs a
     connection that can create a role; anything it cannot reproduce live it
     abstains on cleanly. `--probe` supports `--format text` / `json` / `sarif`
     (probe MISMATCH / LEAK CONFIRMED → SARIF `error` results for GitHub Code
@@ -4413,7 +4416,17 @@ def verify(
             or probe_result.has_confirmed_leak
         ):
             sys.exit(1)
-        if strict and any(r.agreement == "abstained" for r in probe_result.results):
+        # ...and that extends to --strict. The plain path fails on any table
+        # the verifier could not decide; the probe must fail on those too. A
+        # probe that saw no leak on a statically UNVERIFIED table is agreement
+        # `skipped`, whose own detail says "not a proof" — it is one sampled
+        # row, not a proof of isolation, so it cannot satisfy a gate that means
+        # "fail unless proven". Checking `verification.tables` rather than only
+        # the probe's own rows also covers a table the probe never reached.
+        if strict and (
+            any(t.verdict == "unverified" for t in verification.tables)
+            or any(r.agreement == "abstained" for r in probe_result.results)
+        ):
             sys.exit(1)
         return
 
