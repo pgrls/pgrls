@@ -1127,10 +1127,21 @@ class _TV:
 
 @dataclass
 class _Val:
-    """A non-boolean (scalar) value plus its Kleene null-flag."""
+    """A non-boolean (scalar) value plus its Kleene null-flag.
 
-    value: Any     # z3.ExprRef
-    is_null: Any   # z3.BoolRef
+    ``unset`` marks a value read from a GUC that is UNSET for the session
+    being modeled, so evaluating it RAISES instead of producing a value —
+    the statement errors and the caller gets no rows. It is deliberately
+    NOT the same thing as ``is_null``: the call never *returns* NULL (see
+    ``is_never_null_current_setting``), so ``is_null`` stays False and
+    ``current_setting('app.t') IS NULL OR …`` remains the dead disjunct
+    R12/R13 pinned — while comparisons against the value resolve to Kleene
+    U rather than a free existential. Only ever set on the anon path.
+    """
+
+    value: Any            # z3.ExprRef
+    is_null: Any          # z3.BoolRef
+    unset: bool = False
 
 
 # Auth-context functions forced to NULL under an anonymous session.
@@ -1196,6 +1207,51 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
         name = _ANON_SVFOP_NAMES.get(node.op)
         return name is not None and name in auth_funcs
     return False
+
+
+def _reads_unset_guc_under_anon(node: Any) -> bool:
+    """True iff ``node`` reads a *custom* GUC an anonymous session cannot
+    have set — so evaluating it RAISES rather than yielding a value.
+
+    A custom ("placeholder") GUC name MUST contain a dot — ``app.tenant_id``,
+    ``request.jwt.claims`` — and a stock server ships none of them set
+    (``SELECT count(*) FROM pg_settings WHERE name LIKE '%.%'`` is 0 on a
+    fresh PG16), so a session that never ran ``SET`` errors reading one.
+
+    A NON-dotted name is a BUILT-IN GUC: always set, and mostly ``USERSET``
+    (``search_path``, ``role``, ``timezone``), i.e. genuinely caller-
+    controlled — those keep a free value and go on reporting a leak. A
+    computed name (``current_setting(some_col)``) is unclassifiable and is
+    treated the same conservative way.
+
+    Only meaningful for a never-NULL ``current_setting`` (the one-arg and
+    two-arg ``missing_ok=false`` forms); the caller gates on that.
+
+    The name argument is unwrapped through any ``TypeCast`` first: a policy
+    read back from the catalog comes via ``pg_get_expr``, which renders the
+    literal as ``current_setting('app.tenant'::text)``, so the bare-literal
+    shape only ever appears in hand-written SQL.
+
+    THREAT MODEL: this assumes the auth-context GUC is set by the
+    application from a verified credential and an anonymous caller cannot
+    set it — a caller with raw SQL *can* (``SET app.tenant_id = …`` needs no
+    privilege). That is the same assumption that already makes
+    ``auth.uid()`` and ``current_setting(name, true)`` provably isolated
+    here; without it no GUC-based tenancy scheme is verifiable at all. The
+    point of this helper is that all four spellings now share it.
+    """
+    args = getattr(node, "args", None) or ()
+    if not args:
+        return False
+    name = args[0]
+    while isinstance(name, TypeCast):
+        name = name.arg
+    if not isinstance(name, A_Const):
+        return False
+    val = getattr(name, "val", None)
+    if not isinstance(val, String):
+        return False
+    return "." in (val.sval or "")
 
 
 def _unwrap_scalar_sublink(node: Any) -> Any:
@@ -1273,6 +1329,10 @@ def _lift_to_tv(x: Any, assertions: list[Any]) -> Any:
     if isinstance(x, _TV):
         return x
     if isinstance(x, _Val):
+        if x.unset:
+            # An unset-GUC read used directly as a predicate raises → no
+            # rows. U, not a free bool (same reasoning as `_anon_binop`).
+            return _TV(is_true=z3.BoolVal(False), is_null=z3.BoolVal(True))
         if x.value.sort() == z3.BoolSort():
             assertions.append(z3.Or(z3.Not(x.value), z3.Not(x.is_null)))
             return _TV(is_true=x.value, is_null=x.is_null)
@@ -1361,6 +1421,32 @@ def _anon_3vl(
         # (it returns False for these, routing them here) and that SEC004 /
         # SEC038 already use, so `verify --mode anon` and the linter agree.
         if is_never_null_current_setting(node):
+            if ctx.session_mode:
+                # Cross-tenant verifier: this IS the authenticated session's
+                # own identity, exactly like the nullable `auth.uid()` /
+                # `current_setting(name, true)` leaves handled above. Mint the
+                # SAME session symbol so `<tenant col> = current_setting('app.t')`
+                # records a tenant pair and can be PROVEN, instead of degrading
+                # to "no provable tenant-scoping equality" purely because the
+                # policy spelled its identity read without `missing_ok`.
+                return _Val(
+                    value=ctx.session_var(key, z3.StringSort()),
+                    is_null=z3.BoolVal(False),
+                )
+            if _reads_unset_guc_under_anon(node):
+                # Anon: the GUC is unset, so this RAISES — the statement
+                # errors and the caller gets NO rows. Keep `is_null` False
+                # (it never *returns* NULL, so the `... IS NULL OR …` dead
+                # disjunct R12/R13 pinned stays dead) and mark the value
+                # `unset`, which makes a comparison against it Kleene U.
+                # Without this the free opaque lets Z3 existentially pick a
+                # GUC value equal to a free row and report a phantom LEAK on
+                # the canonical `col = current_setting('app.tenant')` policy.
+                return _Val(
+                    value=ctx.opaque(key, z3.StringSort()),
+                    is_null=z3.BoolVal(False),
+                    unset=True,
+                )
             return _Val(
                 value=ctx.opaque(key, z3.StringSort()),
                 is_null=z3.BoolVal(False),
@@ -1621,6 +1707,16 @@ def _anon_binop(
         _record_tenant_pair(ctx, left, right)
 
     if comparison_fn is not None:
+        if left.unset or right.unset:
+            # One side reads a GUC that is unset for an anonymous session,
+            # so evaluating this comparison RAISES: the statement errors and
+            # no row comes back. Kleene U models that exactly — "not TRUE",
+            # and `NOT U` is still U, so an enclosing NOT cannot flip the
+            # erroring branch back into a visible row. A short-circuiting
+            # sibling is unaffected: `true OR U` is still TRUE, so a genuine
+            # `USING (true OR …)` leak keeps reporting. Anon path only
+            # (`unset` is never set under `session_mode`).
+            return _TV(is_true=z3.BoolVal(False), is_null=z3.BoolVal(True))
         try:
             cmp_z3 = comparison_fn(left.value, right.value)
         except (z3.Z3Exception, TypeError):
@@ -1733,9 +1829,12 @@ def _anon_typecast(
         return _Val(
             value=ctx.opaque(_canon(node), z3.StringSort()),
             is_null=inner.is_null,
+            unset=inner.unset,
         )
     if inner.value.sort() == target_sort:
-        return _Val(value=inner.value, is_null=inner.is_null)
+        return _Val(
+            value=inner.value, is_null=inner.is_null, unset=inner.unset
+        )
     if ctx.session_mode and _is_session_term(ctx, inner.value):
         # Cross-tenant recall: keep a sort-changing cast of the session
         # identity (`current_setting(...)::bigint`/`::int`) a free, non-null
@@ -1752,6 +1851,7 @@ def _anon_typecast(
     return _Val(
         value=ctx.opaque(_canon(node), target_sort),
         is_null=inner.is_null,
+        unset=inner.unset,
     )
 
 

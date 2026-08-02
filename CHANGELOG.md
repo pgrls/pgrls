@@ -8,6 +8,37 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
+## [Unreleased]
+
+### Fixed
+- **`verify` no longer reports a LEAK on the canonical tenant policy.** In the
+  default anon mode, `USING (tenant_id = current_setting('app.tenant'))` —
+  the scoping predicate a correct multi-tenant deployment writes — was
+  reported as a conditional leak and exited 1. The never-NULL routing pinned
+  `is_null = False` correctly (the one-arg and two-arg `missing_ok = false`
+  forms raise on an unset GUC rather than returning NULL, so the SEC004
+  `… IS NULL OR …` disjunct really is dead), but left the value a **free**
+  Z3 constant, so the anon satisfiability query existentially picked a GUC
+  value equal to a free row. The verdict was not exhibitable — `--emit-repro`
+  errored with `unrecognized configuration parameter` instead of returning a
+  row, and `--probe` abstained — and it contradicted the tool's own treatment
+  of `auth.uid()` and `current_setting(name, true)`, both already ISOLATED.
+  An anonymous session has not run `SET`, so a custom GUC is unset and the
+  read raises: the statement errors and no rows come back. That is now
+  modelled as Kleene U at the comparison, leaving the `IS NULL` dead-disjunct
+  guard intact. All four affected spellings — one-arg, `::uuid`-cast, the
+  PERF001 `(SELECT current_setting(...))` wrap, and two-arg `(…, false)` —
+  now verify as isolated.
+  - Scoped to what an anon caller genuinely cannot control: only a **custom
+    (dotted)** GUC name, which a stock server never ships set. A built-in
+    name is always set and mostly `USERSET` (`search_path`, `role`), so
+    `tenant_id = current_setting('search_path')` still reports a leak, as
+    does a computed name and any genuinely open predicate beside it
+    (`true OR …` still leaks — Postgres short-circuits past the raising call).
+  - The same call is now minted as the session identity on the **cross-tenant**
+    path, where it previously recorded no tenant pair and degraded the same
+    policy to UNVERIFIED purely because it omitted `missing_ok`.
+
 ## [0.52.0] - 2026-07-25
 
 ### Fixed
