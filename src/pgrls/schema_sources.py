@@ -406,22 +406,44 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # still attaches. Two passes keep that order-independent.
     tables: dict[tuple[str, str], _TableBuilder] = {}
 
-    # Pass 1: CREATE TABLE.
-    for raw in statements:
+    # Pass 1: CREATE TABLE (plus the two data-derived forms).
+    for index, raw in enumerate(statements):
         stmt = raw.stmt
-        if type(stmt).__name__ != "CreateStmt":
+        kind = type(stmt).__name__
+        if kind != "CreateStmt":
+            # `CREATE TABLE x AS SELECT …` and `SELECT … INTO x` create a REAL
+            # table — one with no RLS, which is exactly what SEC001 exists to
+            # catch — but neither is a CreateStmt, so both were invisible and
+            # the DB-free path reported nothing on them. Register the relation
+            # so the table-level rules see it. Its columns come from the SELECT
+            # and cannot be resolved without a catalog, so it is registered
+            # WITHOUT columns: column-keyed rules stay silent (honest) rather
+            # than guess a shape.
+            created = _data_derived_relation(stmt)
+            if created is None:
+                continue
+            key = _relation_key(created, default_schema)
+            if key is None or key in tables:
+                continue
+            tables[key] = _TableBuilder(
+                schema=key[0], name=key[1], created_at=index
+            )
             continue
         key = _relation_key(stmt.relation, default_schema)
         if key is None:
             continue
         if key in tables:
-            # A second CREATE for the same relation: either `IF NOT EXISTS`
-            # (a no-op in Postgres) or DDL that would error outright. Either
-            # way the first definition stands — re-walking `tableElts` here
-            # would append the columns a second time and hand every
-            # column-keyed rule a duplicated list.
+            # A second CREATE for the same relation: `IF NOT EXISTS` (a no-op
+            # in Postgres), a re-CREATE after an intervening DROP, or DDL that
+            # would error outright. The first definition's COLUMNS stand —
+            # re-walking `tableElts` would append them twice and hand every
+            # column-keyed rule a duplicated list — but `created_at` advances
+            # to this statement so the drop gate sees the LAST create. That
+            # makes existence correct for every ordering: `CREATE; DROP;
+            # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
+            tables[key].created_at = index
             continue
-        builder = _TableBuilder(schema=key[0], name=key[1])
+        builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
         tables[key] = builder
         # Declarative partition child (`PARTITION OF parent`) and classic
         # `INHERITS (...)` children both arrive as `inhRelations`; the
@@ -471,7 +493,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             builder.set_not_null(pk_col)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
-    for raw in statements:
+    for index, raw in enumerate(statements):
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
@@ -481,7 +503,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         elif kind == "AlterPolicyStmt":
             _apply_alter_policy(stmt, tables, default_schema)
         elif kind == "DropStmt":
-            _apply_drop(stmt, tables, default_schema)
+            _apply_drop(stmt, tables, default_schema, stmt_index=index)
         elif kind == "GrantStmt":
             _apply_grant(stmt, tables, default_schema)
         elif kind == "RenameStmt":
@@ -494,9 +516,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
 class _TableBuilder:
     """Mutable accumulator for one table while walking the DDL statements."""
 
-    def __init__(self, *, schema: str, name: str) -> None:
+    def __init__(self, *, schema: str, name: str, created_at: int = -1) -> None:
         self.schema = schema
         self.name = name
+        # Index of the statement that created this table, so a `DROP TABLE`
+        # appearing EARLIER in the input cannot remove a LATER re-CREATE.
+        self.created_at = created_at
         self.rls_enabled = False
         self.force_rls = False
         self.columns: list[Column] = []
@@ -617,6 +642,25 @@ def _merge_grants(grants: list[Grant]) -> tuple[Grant, ...]:
     return tuple(
         Grant(role=r, privileges=tuple(sorted(merged[r]))) for r in order
     )
+def _data_derived_relation(stmt: Any) -> Any:
+    """The target RangeVar of a `CREATE TABLE … AS` / `SELECT … INTO`, else None.
+
+    pglast models the two differently: `CREATE TABLE x AS SELECT` is a
+    `CreateTableAsStmt` carrying an `into` clause, while `SELECT … INTO x` stays
+    a `SelectStmt` with an `intoClause`. Both create an ordinary table. A
+    `CREATE MATERIALIZED VIEW`, which is also a `CreateTableAsStmt`, is excluded
+    by its `objtype` — it is a different relkind with its own rules.
+    """
+    kind = type(stmt).__name__
+    if kind == "CreateTableAsStmt":
+        if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
+            return None  # materialized view
+        into = getattr(stmt, "into", None)
+        return getattr(into, "rel", None)
+    if kind == "SelectStmt":
+        into = getattr(stmt, "intoClause", None)
+        return getattr(into, "rel", None)
+    return None
 
 
 def _merge_column_grants(
@@ -845,14 +889,21 @@ def _apply_drop(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    *,
+    stmt_index: int = 1 << 30,
 ) -> None:
     """Apply ``DROP POLICY`` / ``DROP TABLE`` — remove the object from the model
     so a dropped RLS guard (or whole table) is reflected offline. Other ``DROP``
     object types (index, function, view, sequence, …) are not modeled and are
-    skipped, as before. The one unfaithful case is a ``DROP TABLE`` *followed
-    by* a re-``CREATE TABLE`` of the same name in the same input (`CREATE TABLE`
-    is resolved in pass 1) — the table is treated as dropped; this matches the
-    existing two-pass limitation and is rare in a single migration set.
+    skipped, as before.
+
+    ``DROP TABLE`` is ORDER-AWARE. `CREATE TABLE` is resolved in pass 1 and
+    drops in pass 2, so without a guard a `DROP TABLE t;` that PRECEDES a
+    `CREATE TABLE t (…)` — the ordinary shape of a rebuild migration — removed
+    the table the later CREATE had just established, and the model reported no
+    table at all. That is a false clear: nothing lints a table that exists.
+    Comparing `stmt_index` against the builder's `created_at` drops only when
+    the DROP genuinely follows the CREATE.
     """
     remove_type = getattr(stmt, "removeType", None)
     if remove_type == ObjectType.OBJECT_POLICY:
@@ -869,8 +920,17 @@ def _apply_drop(
     elif remove_type == ObjectType.OBJECT_TABLE:
         for namelist in stmt.objects or ():
             parts = _drop_name_parts(namelist)
-            if parts:
-                tables.pop(_drop_table_key(parts, default_schema), None)
+            if not parts:
+                continue
+            key = _drop_table_key(parts, default_schema)
+            builder = tables.get(key)
+            if builder is None:
+                continue
+            if builder.created_at > stmt_index:
+                # The CREATE comes LATER in the input — this DROP removed a
+                # previous incarnation, and the table survives the migration.
+                continue
+            tables.pop(key, None)
 
 
 def _drop_name_parts(namelist: Any) -> list[str]:

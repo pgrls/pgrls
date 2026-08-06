@@ -1500,3 +1500,60 @@ def test_offline_inherits_child_records_parents_and_columns():
     assert [c.name for c in child.column_details] == ["id", "tenant"]
     # Inherited nullability comes along too.
     assert {c.name: c.is_nullable for c in child.column_details}["id"] is False
+
+
+# --- offline model: DROP ordering + data-derived tables (MF4) ---------------
+
+
+@pytest.mark.parametrize(
+    ("label", "sql", "expected"),
+    [
+        # A rebuild migration. `CREATE TABLE` resolves in pass 1 and drops in
+        # pass 2, so an EARLIER drop used to remove the table the LATER create
+        # had just established — the model reported no table at all, and
+        # nothing lints a table that isn't there.
+        ("rebuild", "DROP TABLE IF EXISTS public.t; CREATE TABLE public.t (id int);", ["public.t"]),
+        ("create-drop-create", "CREATE TABLE public.t (id int); DROP TABLE public.t; CREATE TABLE public.t (id int);", ["public.t"]),
+        # …while a genuine drop must still drop.
+        ("genuine drop", "CREATE TABLE public.t (id int); DROP TABLE public.t;", []),
+        ("create-create-drop", "CREATE TABLE public.t (id int); CREATE TABLE IF NOT EXISTS public.t (id int); DROP TABLE public.t;", []),
+        ("drop one of two", "CREATE TABLE public.a (id int); CREATE TABLE public.b (id int); DROP TABLE public.a;", ["public.b"]),
+    ],
+)
+def test_offline_drop_table_is_order_aware(label, sql, expected) -> None:
+    from pgrls.schema_sources import schema_from_sql
+
+    got = sorted(t.qualified_name for t in schema_from_sql(sql).tables)
+    assert got == sorted(expected), label
+
+
+def test_offline_model_registers_ctas_and_select_into() -> None:
+    # Both create a REAL table with no RLS — exactly what SEC001 catches — but
+    # neither is a CreateStmt, so both were invisible offline.
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE public.src (id int);"
+        "CREATE TABLE public.copy AS SELECT * FROM public.src;"
+        "SELECT * INTO public.copy2 FROM public.src;"
+    )
+    names = sorted(t.qualified_name for t in schema.tables)
+    assert names == ["public.copy", "public.copy2", "public.src"]
+    # Columns come from the SELECT and cannot be resolved without a catalog, so
+    # the relation is registered WITHOUT them — column-keyed rules stay silent
+    # rather than guess a shape.
+    copy = next(t for t in schema.tables if t.name == "copy")
+    assert copy.column_details == ()
+
+
+def test_offline_model_does_not_treat_a_matview_as_a_table() -> None:
+    # CREATE MATERIALIZED VIEW is also a CreateTableAsStmt; it is a different
+    # relkind with its own rules (VIEW003 / SEC054) and must not be registered
+    # as a table.
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE public.s (id int);"
+        "CREATE MATERIALIZED VIEW public.mv AS SELECT * FROM public.s;"
+    )
+    assert [t.qualified_name for t in schema.tables] == ["public.s"]
