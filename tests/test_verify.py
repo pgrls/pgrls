@@ -1506,12 +1506,114 @@ def test_write_all_using_fallback_is_isolated() -> None:
     assert _verdict(_wr(schema), "public.t") == "isolated"
 
 
+# --- write mode covers the OLD-row gate, not just the new-row check (MF3) ---
+#
+# A write crosses tenants two ways: stamping a NEW row for another tenant
+# (WITH CHECK), or reaching an EXISTING row of another tenant to take over or
+# delete it (USING). Checking only the first proved "no cross-tenant write" on
+# schemas where the second was wide open. Both exploits are live-verified on
+# PG16 with a statement that reads no column (bare `DELETE FROM t` /
+# `UPDATE t SET ...`), which escapes the SELECT-applicable re-check.
+
+
+@requires_z3
+def test_write_open_old_row_gate_lets_a_tenant_steal_a_row() -> None:
+    # `USING (true) WITH CHECK (tenant = me)`: the new-row check is scoped, so
+    # the old behaviour proved isolated — yet the open old-row gate lets a
+    # session re-stamp ANOTHER tenant's row to itself. Verified live: the row's
+    # owner changed and its body came with it.
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "true", command="UPDATE", with_check="tenant_id = auth.uid()"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "leak"
+
+
+@requires_z3
+def test_write_mode_covers_delete_policies() -> None:
+    # A FOR DELETE policy has no WITH CHECK at all, so it contributed nothing
+    # and the table proved "no cross-tenant write" while any tenant could wipe
+    # it. DELETE destroys an existing row and is gated solely by its USING.
+    leaky = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "tenant_id = auth.uid() OR is_public", command="DELETE"
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_wr(leaky), "public.t") == "leak"
+
+    scoped = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(_policy("tenant_id = auth.uid()", command="DELETE"),),
+            ),
+        )
+    )
+    assert _verdict(_wr(scoped), "public.t") == "isolated"
+
+
+@requires_z3
+def test_write_unscoped_open_delete_is_not_proven() -> None:
+    # `FOR DELETE USING (true)` carries no tenant axis, so the cross-tenant
+    # prover cannot characterize "another tenant's row" and declines — the same
+    # boundary it applies to an unscoped read. The point is that it is no
+    # longer PROVEN: an honest no-claim fails `--strict`, a false clear does not.
+    schema = Schema(
+        tables=(_table("t", policies=(_policy("true", command="DELETE"),)),)
+    )
+    assert _verdict(_wr(schema), "public.t") != "isolated"
+
+
+@requires_z3
+def test_write_gold_standard_all_policy_stays_isolated() -> None:
+    # Precision control: OR-composing the two gates must not manufacture a leak
+    # on the shape `pgrls generate` emits, where both gates are the same scoped
+    # predicate (they dedupe to one term).
+    schema = Schema(
+        tables=(
+            _table(
+                "t",
+                policies=(
+                    _policy(
+                        "tenant_id = auth.uid()",
+                        command="ALL",
+                        with_check="tenant_id = auth.uid()",
+                    ),
+                ),
+            ),
+        )
+    )
+    assert _verdict(_wr(schema), "public.t") == "isolated"
+
+
 @requires_z3
 def test_write_with_check_overrides_using() -> None:
     # WITH CHECK FULLY overrides USING for the new row (NOT AND-combined). A
     # scoped USING with `WITH CHECK (true)` lets a caller write any tenant's row,
-    # so the prover must see the constant-true WITH CHECK → unverified, NOT
-    # isolated. A regression that AND-ed USING in would wrongly say isolated.
+    # so the prover must NOT say isolated — a regression that AND-ed USING in
+    # would wrongly do so.
+    #
+    # This used to be `unverified`: checking the new-row gate alone left the
+    # prover a bare `true` with no tenant axis to reason about. Now that both
+    # write gates are OR-composed, the USING supplies the scoping equality and
+    # the constant-true WITH CHECK makes it satisfiable for a foreign tenant, so
+    # the leak is PROVEN rather than merely unclaimed — strictly stronger, and
+    # exactly what the policy does (take your own row, re-stamp it to anyone).
     schema = Schema(
         tables=(
             _table(
@@ -1524,7 +1626,7 @@ def test_write_with_check_overrides_using() -> None:
             ),
         )
     )
-    assert _verdict(_wr(schema), "public.t") == "unverified"
+    assert _verdict(_wr(schema), "public.t") == "leak"
 
 
 @requires_z3

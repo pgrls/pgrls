@@ -13,7 +13,7 @@ complementary threat models (`--mode`):
   ``<column> = <session identity>``, a row is exposed iff it can be visible
   while ``column`` differs from the session's tenant.
 * ``write`` — can a session authenticated as *one* tenant **write** (INSERT or
-  UPDATE) a row stamped for a *different* tenant? Same satisfiability question
+  UPDATE/DELETE) a row of a *different* tenant? Same satisfiability question
   as ``cross-tenant``, but proven over each write policy's *effective
   write-check* — its ``WITH CHECK`` when present, else (for ``FOR UPDATE`` /
   ``FOR ALL``) the ``USING`` that Postgres reuses as the new-row check. This is
@@ -80,7 +80,7 @@ Verdict = Literal["isolated", "leak", "unverified"]
 # The threat models `pgrls verify` can prove. `anon` (default): can an
 # *unauthenticated* session read any row? `cross-tenant`: can a session
 # authenticated as one tenant read a *different* tenant's row? `write`: can such
-# a session *write* (INSERT/UPDATE) a row stamped for another tenant? They are
+# a session *write* (INSERT/UPDATE/DELETE) another tenant's row? They are
 # complementary — the inverted `auth.uid() IS NULL OR …` policy leaks to anon
 # but correctly scopes authenticated tenants, so it is a leak in `anon` mode
 # and isolated in `cross-tenant` mode.
@@ -117,9 +117,24 @@ _NO_AST_REASON = {
 }
 
 _READ_COMMANDS = ("ALL", "SELECT")
-# Commands whose policies can gate a WRITE (new-row check). SELECT/DELETE carry
-# no write-check and never gate INSERT/UPDATE, so they are excluded from `write`.
-_WRITE_COMMANDS = ("ALL", "INSERT", "UPDATE")
+# Commands whose policies can gate a WRITE. A write has TWO gates and both
+# matter for isolation:
+#
+#   * the NEW-row gate (`WITH CHECK`, or a reused `USING`) — what row may be
+#     left behind, i.e. can the session stamp a row for another tenant; and
+#   * the OLD-row gate (`USING`) — which EXISTING rows the session may modify
+#     or destroy, i.e. can it take over or delete another tenant's row.
+#
+# Modelling only the new-row gate proved "no cross-tenant write" for a policy
+# with `USING (true) WITH CHECK (tenant = me)` — under which a session
+# re-stamps any other tenant's row to itself — and excluded `FOR DELETE`
+# entirely, so a `FOR DELETE USING (true)` policy that lets any tenant wipe the
+# table was invisible. Both are live-verified on PG16. (Each needs a statement
+# form that reads no column — a bare `DELETE FROM t` / `UPDATE t SET ...` with
+# no WHERE and no RETURNING — otherwise the SELECT-applicable policy re-checks
+# the row and blocks it; the same escape SEC040 documents.) DELETE is therefore
+# a write command, gated solely by its `USING`.
+_WRITE_COMMANDS = ("ALL", "INSERT", "UPDATE", "DELETE")
 
 # Which commands' policies participate, per mode.
 _MODE_COMMANDS: dict[Mode, tuple[str, ...]] = {
@@ -173,10 +188,64 @@ def effective_write_check(policy: Policy) -> Any:
     return None  # bare FOR INSERT — default-deny, no write path
 
 
-def _checked_ast(policy: Policy, mode: Mode) -> Any:
-    """The AST the prover should check for `policy` under `mode`: the effective
-    write-check for ``write``, else the policy's ``USING``."""
-    return effective_write_check(policy) if mode == "write" else policy.using_ast
+def old_row_write_gate(policy: Policy) -> Any:
+    """The AST gating which EXISTING rows a write policy may modify or destroy.
+
+    That is the policy's ``USING``, for every command that touches an existing
+    row: ``UPDATE`` (the row being changed), ``DELETE`` (the row being removed)
+    and ``ALL`` (both). ``INSERT`` creates a row and has no old-row gate.
+
+    This is the half `effective_write_check` does NOT cover, and omitting it was
+    unsound in both directions a write can cross tenants:
+
+    * ``FOR UPDATE USING (true) WITH CHECK (tenant = me)`` — the new-row check
+      is scoped, so checking only it proved "no cross-tenant write", yet the
+      open old-row gate lets a session re-stamp ANOTHER tenant's row to itself
+      (verified live on PG16: the row's owner changed and its body came along).
+    * ``FOR DELETE USING (true)`` — no new-row check exists at all, so the
+      policy contributed nothing while letting any tenant wipe the table.
+    """
+    if policy.command not in ("UPDATE", "DELETE", "ALL"):
+        return None
+    return policy.using_ast
+
+
+def _or_gates(gates: list[Any]) -> Any:
+    """Compose a policy's write gates into one predicate to prove.
+
+    A cross-tenant write exists if the new-row gate admits a foreign-tenant row
+    **or** the old-row gate does, so the isolation question is the disjunction:
+    ``OR`` is UNSAT for a foreign row exactly when BOTH gates are, and SAT
+    exactly when at least one leaks — with the witness characterizing whichever
+    one does. Identical gates (a ``FOR ALL USING (x)`` with no ``WITH CHECK``,
+    where both halves are ``x``) collapse to a single term so the common case
+    is byte-for-byte the predicate the prover saw before.
+    """
+    from pglast.ast import BoolExpr  # noqa: PLC0415
+    from pglast.enums import BoolExprType  # noqa: PLC0415
+
+    present = [g for g in gates if g is not None]
+    if not present:
+        return None
+    deduped: list[Any] = []
+    for gate in present:
+        if not any(gate is seen or gate == seen for seen in deduped):
+            deduped.append(gate)
+    if len(deduped) == 1:
+        return deduped[0]
+    return BoolExpr(boolop=BoolExprType.OR_EXPR, args=tuple(deduped))
+
+
+def checked_ast(policy: Policy, mode: Mode) -> Any:
+    """The AST the prover should check for `policy` under `mode`.
+
+    For ``write`` that is BOTH write gates OR-ed together — the new-row check
+    and the old-row gate (see `old_row_write_gate`) — so a leak through either
+    is proven. For the read modes it is the policy's ``USING``.
+    """
+    if mode != "write":
+        return policy.using_ast
+    return _or_gates([effective_write_check(policy), old_row_write_gate(policy)])
 
 
 def _compose_with_floor(permissive: Any, floor_asts: list[Any]) -> Any:
@@ -331,10 +400,11 @@ def _rollup(proofs: list[PolicyProof]) -> Verdict:
 
 
 def _write_ops(command: str) -> frozenset[str]:
-    """The write operations a policy of this command gates. SELECT/DELETE carry
-    no new-row check and are already excluded from the write bucket."""
+    """The write operations a policy of this command gates. DELETE counts: it
+    destroys an existing row, gated by the policy's USING. SELECT is excluded
+    from the write bucket upstream."""
     if command == "ALL":
-        return frozenset({"INSERT", "UPDATE"})
+        return frozenset({"INSERT", "UPDATE", "DELETE"})
     return frozenset({command})
 
 
@@ -438,7 +508,7 @@ def build_verification(
     `mode` selects the threat model: ``"anon"`` (default) proves no row is
     readable by an *unauthenticated* session; ``"cross-tenant"`` proves no row
     of one tenant is readable by a session authenticated as a *different*
-    tenant; ``"write"`` proves no such session can *write* a row stamped for
+    tenant; ``"write"`` proves no such session can *write or delete* a row of
     another tenant. The same table/policy walk, restrictive-floor handling, and
     rollup apply to all three — what differs is which policy commands
     participate (``write`` looks at INSERT/UPDATE/ALL, not SELECT/DELETE), which
@@ -492,7 +562,7 @@ def build_verification(
 
         proofs: list[PolicyProof] = []
         for policy in permissive:
-            ast = _checked_ast(policy, mode)
+            ast = checked_ast(policy, mode)
             if ast is None:
                 # A bare FOR INSERT (no WITH CHECK) grants no write path —
                 # Postgres default-denies it, so it contributes no proof. Any
@@ -547,7 +617,7 @@ def build_verification(
                 # restrictive floor (a row is visible only if it satisfies some
                 # permissive AND all restrictive) and re-prove: the floor may
                 # block the leaking row (→ isolated) or not (→ the leak stands).
-                floor_asts = [_checked_ast(r, mode) for r in applicable_floors]
+                floor_asts = [checked_ast(r, mode) for r in applicable_floors]
                 if any(fa is None for fa in floor_asts):
                     # A floor whose predicate can't be modeled → can't compose
                     # soundly → no claim (never a possibly-wrong verdict).
@@ -1084,7 +1154,8 @@ def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> s
     A characterizing row, the unconditional case (``{}`` — every row / a row of
     any other tenant), or a conditional leak no single row characterizes
     (``None``). The cross-tenant phrasing frames the row as another tenant's;
-    the write phrasing frames it as a row stamped for another tenant.
+    the write phrasing covers every way a write crosses tenants: stamping a new
+    row for one, taking over its existing row, or deleting it.
     """
     if mode == "escalation":
         # The bypass is unconditional (witness is always ``{}`` — every row);
@@ -1100,9 +1171,9 @@ def _witness_phrase(witness: dict[str, object] | None, mode: Mode = "anon") -> s
                 "a conditional cross-tenant write — no single row characterizes it"
             )
         if not witness:
-            return "a row stamped for any other tenant can be written"
+            return "another tenant's row can be written or deleted"
         pairs = ", ".join(f"{k}={v!r}" for k, v in sorted(witness.items()))
-        return f"a row stamped for another tenant with {pairs} can be written"
+        return f"another tenant's row with {pairs} can be written or deleted"
     if mode == "cross-tenant":
         if witness is None:
             return "a conditional cross-tenant leak — no single row characterizes it"

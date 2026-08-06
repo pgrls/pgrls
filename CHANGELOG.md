@@ -27,6 +27,35 @@ breaking changes — they will be called out in this file.
   GitHub Code Scanning showed nothing for the very table that failed the build.
   Mirrors `verify`'s SARIF, where UNVERIFIED surfaces as a `note` under
   `--strict`.
+- **`verify --mode write` proved "no cross-tenant write" on schemas where one
+  tenant could take over or destroy another's rows.** A write crosses tenants
+  two ways, and only one was modelled: the NEW-row gate (`WITH CHECK`) decides
+  what row may be left behind, but the OLD-row gate (`USING`) decides which
+  EXISTING rows a session may reach. Two exploitable false clears, both
+  reproduced live on PG16:
+  - `FOR UPDATE USING (true) WITH CHECK (tenant = me)` — the scoped new-row
+    check proved isolated, while the open old-row gate let a session re-stamp
+    another tenant's row to itself (the owner changed and the body came along).
+  - `FOR DELETE USING (true)` — `DELETE` was excluded from the write bucket
+    entirely, so the policy contributed no proof at all while letting any
+    tenant wipe the table.
+
+  Each needs a statement form that reads no column — a bare `DELETE FROM t` or
+  `UPDATE t SET …` with no `WHERE` and no `RETURNING`. With a `WHERE` the
+  SELECT-applicable policy re-checks the row and blocks it, which is why a
+  first attempt at either exploit looks safe; it is the same escape SEC040
+  documents. Write mode now proves the disjunction of both gates, so a leak
+  through either is caught, and `DELETE` is a write command gated by its
+  `USING`. Identical gates (the `pgrls generate` shape, where both are the same
+  scoped predicate) collapse to one term, so proven schemas stay proven.
+- Composing the gates also *strengthens* a verdict: `FOR UPDATE
+  USING (tenant = me) WITH CHECK (true)` was `unverified` because the bare
+  `true` left the prover no tenant axis. The `USING` now supplies it, so the
+  leak is proven rather than merely unclaimed.
+- The probe kept its own copy of "which predicate did the prover check", with a
+  docstring promising it mirrored `verify`. Both are now the one shared
+  `verify.checked_ast`, so they cannot drift again — that drift is half of what
+  made this bug.
 
 ### Removed
 - **The SEC006 auto-fixer.** It mirrored a policy's `USING` into `WITH CHECK`,
