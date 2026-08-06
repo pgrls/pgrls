@@ -47,7 +47,7 @@ from typing import Any
 import pglast
 from pglast.ast import CommonTableExpr, Node
 
-from pgrls.ast_utils import extract_range_vars
+from pgrls.ast_utils import function_body_sql, extract_range_vars
 from pgrls.model import Schema
 from pgrls.rules._allowlist import parse_qualified_view_allowlist
 from pgrls.violations import Severity, Violation
@@ -142,7 +142,7 @@ def _secdef_fn_leaks(
         )
         return set()
     try:
-        parsed = pglast.parse_sql(secdef_fn.body)
+        parsed = pglast.parse_sql(function_body_sql(secdef_fn.body))
     except pglast.parser.ParseError:
         print(
             f"pgrls: warning: could not parse "

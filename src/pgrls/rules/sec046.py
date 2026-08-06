@@ -90,6 +90,7 @@ import pglast
 from pglast.ast import CommonTableExpr, Node
 
 from pgrls.ast_utils import (
+    function_body_sql,
     extract_range_vars,
     find_func_calls,
     func_name_parts,
@@ -168,7 +169,7 @@ def _body_reads_session_or_table(body: str, language: str) -> bool:
     if not body.strip():
         return False
     try:
-        tree = pglast.parse_sql(body)
+        tree = pglast.parse_sql(function_body_sql(body))
     except Exception:
         # Unparseable body (e.g. a multi-statement or dialect pglast rejects).
         # Fail-closed: never fire on a body we cannot analyse.

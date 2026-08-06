@@ -9,6 +9,7 @@ stays internal until v1.0.
 """
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -669,3 +670,28 @@ def is_never_null_current_setting(node: Any) -> bool:
             second = second.arg
         return is_literal_false(second)
     return False
+
+
+def function_body_sql(body: str) -> str:
+    """The parseable statement text of a function body.
+
+    A SQL-standard ``BEGIN ATOMIC … END`` body (PG14+) is stored PARSED in
+    `pg_proc.prosqlbody`, and `pg_get_function_sqlbody` deparses it back with
+    the wrapper intact. pglast cannot parse that wrapper — ``BEGIN`` is a
+    transaction command in bare SQL, so it raises ``syntax error at or near
+    "ATOMIC"`` — and every caller catches the parse error and analyzes NOTHING.
+
+    Stripping the wrapper leaves the inner statement list, which parses. Only
+    the LEADING ``BEGIN ATOMIC`` and the TRAILING ``END`` are removed, so an
+    ``END`` closing a ``CASE`` inside the body is untouched. A classic
+    (``AS $$ … $$``) body contains no wrapper and is returned unchanged.
+    """
+    stripped = body.strip()
+    opener = re.match(r"(?is)^BEGIN\s+ATOMIC\b", stripped)
+    if opener is None:
+        return body
+    inner = stripped[opener.end():]
+    closer = re.search(r"(?is)\bEND\s*;?\s*$", inner)
+    if closer is not None:
+        inner = inner[: closer.start()]
+    return inner

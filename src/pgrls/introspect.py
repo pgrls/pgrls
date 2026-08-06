@@ -696,7 +696,16 @@ SELECT
     n.nspname || '.' || p.proname AS qname,
     n.nspname AS schema_name,
     p.proname AS function_name,
-    p.prosrc AS body,
+    -- A SQL-standard `BEGIN ATOMIC` body (PG14+) is stored PARSED in
+    -- `prosqlbody`, and `prosrc` is EMPTY — not NULL, so COALESCE alone would
+    -- not save us. Every body-reading consumer (VIEW004's table resolver, and
+    -- through it `pgrls vector`'s retrieval-path discovery) then sees nothing
+    -- and silently skips the function: two functionally identical SECDEF
+    -- retrieval functions over one pgvector table, one classic and one
+    -- `BEGIN ATOMIC`, yielded one path instead of two. Fall back to the
+    -- deparsed body so both spellings analyze the same.
+    COALESCE(NULLIF(p.prosrc, ''), pg_catalog.pg_get_function_sqlbody(p.oid))
+        AS body,
     l.lanname AS lang,
     p.proconfig AS config,
     pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature,
@@ -988,7 +997,9 @@ ORDER BY schema_name, grantee, grantor, ax.privilege_type
 _IMMUTABLE_FUNCS_SQL = """
 SELECT
     n.nspname || '.' || p.proname AS qname,
-    p.prosrc AS body,
+    -- `BEGIN ATOMIC` bodies live in `prosqlbody`; see the SECDEF query.
+    COALESCE(NULLIF(p.prosrc, ''), pg_catalog.pg_get_function_sqlbody(p.oid))
+        AS body,
     l.lanname AS lang
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
