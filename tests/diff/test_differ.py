@@ -1601,3 +1601,68 @@ def test_pure_rename_with_both_clauses_is_single_safe_change() -> None:
     # Pure rename: no predicate block.
     assert c.before_sql is None
     assert c.after_sql is None
+
+
+# --- multiple Grant rows per role (MF7) ------------------------------------
+
+
+def test_offline_model_merges_repeated_grants_to_one_role() -> None:
+    # `GRANT SELECT ...; GRANT INSERT ...;` to the same role appears live as ONE
+    # Grant with both privileges (introspection groups the ACL per role). The
+    # offline sql= path appended one Grant per statement, so every consumer
+    # keying on role kept only the LAST. Column grants were already merged; the
+    # table-level twin was missing.
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE public.t (id int);"
+        "GRANT SELECT ON public.t TO PUBLIC;"
+        "GRANT INSERT ON public.t TO PUBLIC;"
+    )
+    grants = schema.tables[0].grants
+    assert len(grants) == 1
+    assert grants[0].role == "PUBLIC"
+    assert set(grants[0].privileges) == {"SELECT", "INSERT"}
+
+
+def test_diff_reports_a_grant_added_alongside_an_existing_one() -> None:
+    # The bite: head adds `GRANT SELECT ... TO PUBLIC` — opening reads to
+    # everyone — beside an INSERT grant that both sides share. The overwrite
+    # made base and head compare EQUAL, so `pgrls diff` reported no change and
+    # the PR gate passed a migration that had just exposed the table.
+    from pgrls.diff.grants import _diff_grants
+    from pgrls.schema_sources import schema_from_sql
+
+    rls = (
+        "CREATE TABLE public.t (id int);"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;"
+    )
+    base = schema_from_sql(rls + "GRANT INSERT ON public.t TO PUBLIC;").tables[0]
+    head = schema_from_sql(
+        rls
+        + "GRANT SELECT ON public.t TO PUBLIC;"
+        + "GRANT INSERT ON public.t TO PUBLIC;"
+    ).tables[0]
+    kinds = [c.kind.value for c in _diff_grants(base, head)]
+    assert "DIFF_GRANT_ADDED" in kinds
+
+
+def test_diff_unions_duplicate_grant_rows_it_is_handed() -> None:
+    # Defense in depth at the consumer: a Schema from an older snapshot or a
+    # hand-built one may still carry unmerged duplicate rows, and the diff must
+    # not silently drop the earlier ones.
+    from pgrls.diff.grants import _diff_grants
+    from pgrls.model import Grant, Table
+
+    def tbl(*grants: Grant) -> Table:
+        return Table(
+            schema="public", name="t", rls_enabled=True,
+            force_rls=True, policies=(), grants=grants,
+        )
+
+    base = tbl(Grant(role="PUBLIC", privileges=("INSERT",)))
+    head = tbl(
+        Grant(role="PUBLIC", privileges=("SELECT",)),
+        Grant(role="PUBLIC", privileges=("INSERT",)),
+    )
+    assert [c.kind.value for c in _diff_grants(base, head)] == ["DIFF_GRANT_ADDED"]

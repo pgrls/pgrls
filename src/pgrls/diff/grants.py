@@ -7,6 +7,8 @@ connected role gains the privilege without a row filter).
 """
 from __future__ import annotations
 
+from typing import Any
+
 from pgrls.diff.differ import Change, ChangeKind
 from pgrls.model import Table
 
@@ -28,12 +30,14 @@ def _diff_grants(base_table: Table, head_table: Table) -> list[Change]:
     for determinism. Returns [] when no per-role privilege difference
     exists (including the trivial both-sides-empty case).
     """
-    base_grants_by_role: dict[str, set[str]] = {
-        g.role: set(g.privileges) for g in base_table.grants
-    }
-    head_grants_by_role: dict[str, set[str]] = {
-        g.role: set(g.privileges) for g in head_table.grants
-    }
+    # UNION per role rather than a dict comprehension keyed on role: a Schema
+    # may legitimately carry more than one `Grant` for the same role (a
+    # hand-built one, an older snapshot, or any producer that does not
+    # pre-merge), and `{g.role: ...}` silently keeps only the LAST — which made
+    # a head that added `GRANT SELECT ... TO PUBLIC` alongside an existing
+    # INSERT grant compare EQUAL to the base and report no change at all.
+    base_grants_by_role = _privileges_by_role(base_table.grants)
+    head_grants_by_role = _privileges_by_role(head_table.grants)
 
     all_roles = sorted(set(base_grants_by_role) | set(head_grants_by_role))
 
@@ -120,14 +124,9 @@ def _diff_column_grants(
     GRANT_PUBLIC_NO_RLS path, naming the exposed column. Keyed by
     `(role, column)`; iterated in sorted order for determinism.
     """
-    base_by_key: dict[tuple[str, str], set[str]] = {
-        (g.role, g.column): set(g.privileges)
-        for g in base_table.column_grants
-    }
-    head_by_key: dict[tuple[str, str], set[str]] = {
-        (g.role, g.column): set(g.privileges)
-        for g in head_table.column_grants
-    }
+    # Union per (role, column) — same overwrite hazard as `_diff_grants`.
+    base_by_key = _privileges_by_column_key(base_table.column_grants)
+    head_by_key = _privileges_by_column_key(head_table.column_grants)
 
     changes: list[Change] = []
     qname = head_table.qualified_name
@@ -189,3 +188,21 @@ def _diff_column_grants(
                 )
 
     return changes
+
+
+def _privileges_by_role(grants: Any) -> dict[str, set[str]]:
+    """Union each role's privileges across every `Grant` row for that role."""
+    out: dict[str, set[str]] = {}
+    for g in grants:
+        out.setdefault(g.role, set()).update(g.privileges)
+    return out
+
+
+def _privileges_by_column_key(
+    grants: Any,
+) -> dict[tuple[str, str], set[str]]:
+    """Union each `(role, column)`'s privileges across every `ColumnGrant`."""
+    out: dict[tuple[str, str], set[str]] = {}
+    for g in grants:
+        out.setdefault((g.role, g.column), set()).update(g.privileges)
+    return out
