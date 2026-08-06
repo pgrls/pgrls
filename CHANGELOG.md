@@ -10,6 +10,24 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`verify --strict --probe` no longer relaxes the gate it is meant to
+  reinforce.** `--strict` fails on any table the verifier could not decide, but
+  adding `--probe` silently dropped that: the probe path checked only its own
+  results for `abstained`, and a statically UNVERIFIED table the probe ran on
+  without seeing a leak is agreement **`skipped`** — whose own detail says
+  *"not a proof"*. So `--strict` exited 1 while `--strict --probe` exited 0 on
+  the same schema, meaning a flag that only ever *adds* evidence turned a
+  failing CI gate green. The strict gate now also checks the static verdicts,
+  which additionally covers a table the probe never reached. A probe is one
+  sampled row; it cannot satisfy a gate that means "fail unless proven".
+  `--probe` without `--strict` is unchanged (exit 0 — no gate was requested).
+- Probe SARIF under `--strict` now emits a `note` for `skipped` as well as
+  `abstained`. Both fail the exit gate, so both must be reportable — otherwise
+  GitHub Code Scanning showed nothing for the very table that failed the build.
+  Mirrors `verify`'s SARIF, where UNVERIFIED surfaces as a `note` under
+  `--strict`.
+
 ### Removed
 - **The SEC006 auto-fixer.** It mirrored a policy's `USING` into `WITH CHECK`,
   but SEC006 only fires where there is nothing useful to mirror — `INSERT`
