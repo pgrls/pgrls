@@ -42,6 +42,25 @@ breaking changes — they will be called out in this file.
   yielded **one** retrieval path before and **two** after. Only the leading
   `BEGIN ATOMIC` and trailing `END` are stripped, so an `END` closing a `CASE`
   survives, and a plpgsql `BEGIN … END` block (no `ATOMIC`) is left untouched.
+- **The offline DDL model lost tables that exist**, so the DB-free path
+  (`pgrls pr`, `lint --sql-file`, `snapshot --sql-file`) reported nothing on
+  them — a table that isn't in the model is a table nothing lints. Two shapes:
+  - **`DROP TABLE` was order-blind.** `CREATE TABLE` resolves in pass 1 and
+    drops apply in pass 2, so a `DROP TABLE t;` *preceding* a
+    `CREATE TABLE t (…)` — the ordinary shape of a rebuild migration — removed
+    the table the later CREATE had just established, and the model reported no
+    table at all. Drops now compare statement order against the table's last
+    CREATE, which makes existence correct for every ordering: `DROP; CREATE`
+    and `CREATE; DROP; CREATE` keep the table, `CREATE; DROP` and
+    `CREATE; CREATE; DROP` remove it.
+  - **`CREATE TABLE … AS SELECT` and `SELECT … INTO` were invisible.** Both
+    create a real table — one with **no RLS**, exactly what SEC001 exists to
+    catch — but neither is a `CreateStmt`. They are now registered. Their
+    columns come from the SELECT and cannot be resolved without a catalog, so
+    the relation is registered *without* columns: table-level rules see it,
+    column-keyed rules stay silent rather than guess a shape. A
+    `CREATE MATERIALIZED VIEW` (also a `CreateTableAsStmt`) is excluded by its
+    `objtype` — it is a different relkind with its own rules.
 
 ### Fixed
 - **`verify --strict --probe` no longer relaxes the gate it is meant to
