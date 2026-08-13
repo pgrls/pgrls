@@ -8,59 +8,7 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
-## [Unreleased]
-
-### Fixed
-- **`pgrls diff` reported no change when a migration granted a new privilege to
-  a role that already held another one** — so a PR that added
-  `GRANT SELECT ON t TO PUBLIC` alongside an existing `INSERT` grant passed the
-  gate silently. Two defects, one line apart:
-  - The offline `sql=` model appended one `Grant` per `GRANT` statement instead
-    of merging per role, so the model held `PUBLIC → {SELECT}` *and*
-    `PUBLIC → {INSERT}`. Live introspection groups a table's ACL per role, and
-    `_merge_column_grants` already mirrored that for COLUMN grants — the
-    table-level twin was simply missing. Added `_merge_grants`.
-  - `_diff_grants` keyed with `{g.role: set(g.privileges) for g in ...}`, which
-    keeps only the LAST row per role. Both it and `_diff_column_grants` now
-    UNION per key, so a Schema that still carries duplicate rows (an older
-    snapshot, a hand-built one) cannot silently lose privileges either.
-- **A `BEGIN ATOMIC` function body was analyzed as if it were empty**, so
-  `pgrls vector` silently skipped SQL-standard retrieval functions and the
-  SECDEF body rules saw nothing to check. Two layers were wrong:
-  - Introspection selected `p.prosrc`, which for a SQL-standard body (PG14+) is
-    **empty** — not NULL, so a plain `COALESCE` would not have helped. The body
-    lives parsed in `pg_proc.prosqlbody`; the queries now fall back to
-    `pg_get_function_sqlbody(p.oid)`.
-  - That deparses back to `BEGIN ATOMIC … END`, which pglast **cannot parse**
-    (`BEGIN` is a transaction command in bare SQL → `syntax error at or near
-    "ATOMIC"`), so every caller caught the ParseError and analyzed nothing. A
-    new `ast_utils.function_body_sql` strips the wrapper; the four body-parsing
-    sites (VIEW004, SEC046, and both in `verify`) share it.
-
-  Verified live on PG16 + pgvector: two functionally identical SECDEF retrieval
-  functions over one embeddings table — one classic, one `BEGIN ATOMIC` —
-  yielded **one** retrieval path before and **two** after. Only the leading
-  `BEGIN ATOMIC` and trailing `END` are stripped, so an `END` closing a `CASE`
-  survives, and a plpgsql `BEGIN … END` block (no `ATOMIC`) is left untouched.
-- **The offline DDL model lost tables that exist**, so the DB-free path
-  (`pgrls pr`, `lint --sql-file`, `snapshot --sql-file`) reported nothing on
-  them — a table that isn't in the model is a table nothing lints. Two shapes:
-  - **`DROP TABLE` was order-blind.** `CREATE TABLE` resolves in pass 1 and
-    drops apply in pass 2, so a `DROP TABLE t;` *preceding* a
-    `CREATE TABLE t (…)` — the ordinary shape of a rebuild migration — removed
-    the table the later CREATE had just established, and the model reported no
-    table at all. Drops now compare statement order against the table's last
-    CREATE, which makes existence correct for every ordering: `DROP; CREATE`
-    and `CREATE; DROP; CREATE` keep the table, `CREATE; DROP` and
-    `CREATE; CREATE; DROP` remove it.
-  - **`CREATE TABLE … AS SELECT` and `SELECT … INTO` were invisible.** Both
-    create a real table — one with **no RLS**, exactly what SEC001 exists to
-    catch — but neither is a `CreateStmt`. They are now registered. Their
-    columns come from the SELECT and cannot be resolved without a catalog, so
-    the relation is registered *without* columns: table-level rules see it,
-    column-keyed rules stay silent rather than guess a shape. A
-    `CREATE MATERIALIZED VIEW` (also a `CreateTableAsStmt`) is excluded by its
-    `objtype` — it is a different relkind with its own rules.
+## [0.53.0] - 2026-08-13
 
 ### Fixed
 - **`verify --strict --probe` no longer relaxes the gate it is meant to
@@ -121,31 +69,6 @@ breaking changes — they will be called out in this file.
   already applies. The authenticated modes (`cross-tenant` / `write`) do model a
   logged-in tenant and keep the full set. A real anon leak is still confirmed:
   `TO anon USING (true)` and `TO PUBLIC USING (true)` both stay LEAK CONFIRMED.
-
-### Removed
-- **The SEC006 auto-fixer.** It mirrored a policy's `USING` into `WITH CHECK`,
-  but SEC006 only fires where there is nothing useful to mirror — `INSERT`
-  (which carries no `USING`), or an `UPDATE`/`ALL` whose `USING` is absent or
-  constant-`true`. Rule and fixer were **provably disjoint**: across all six
-  write-policy shapes, every shape the rule flagged the fixer skipped, and
-  every shape the fixer rewrote the rule had not flagged. So it could never
-  remediate a real finding, and instead rewrote *clean* policies — making
-  `pgrls fix --check` exit 1 on a schema with zero findings, and emitting a
-  semantic no-op `ALTER POLICY` (Postgres already reuses `USING` as the
-  implicit `WITH CHECK` on `UPDATE`/`ALL`).
-
-  The fixer predated the R3/R5 narrowing that stopped SEC006 false-positiving
-  on the closed `FOR UPDATE USING (…)` shape, and was never retired with it.
-  Auto-fixable rules: **20 → 19**. SEC006 keeps firing exactly as before; its
-  remediation needs the intended predicate, which is human intent. The
-  `USING`→`WITH CHECK` mirroring capability is unaffected for SEC020, where
-  the finding does supply a real `USING` to mirror.
-- `docs/RULES.md`'s SEC006 section had drifted the same way — it described the
-  pre-narrowing behaviour, claimed a `WITH CHECK`-less policy "admits every
-  write" (the premise R3 refuted), and used the *non-firing* shape as its
-  worked example. Rewritten to document the `_write_is_open` gate.
-
-### Fixed
 - **`verify` no longer reports a LEAK on the canonical tenant policy.** In the
   default anon mode, `USING (tenant_id = current_setting('app.tenant'))` —
   the scoping predicate a correct multi-tenant deployment writes — was
@@ -173,6 +96,79 @@ breaking changes — they will be called out in this file.
   - The same call is now minted as the session identity on the **cross-tenant**
     path, where it previously recorded no tenant pair and degraded the same
     policy to UNVERIFIED purely because it omitted `missing_ok`.
+- **`pgrls diff` reported no change when a migration granted a new privilege to
+  a role that already held another one** — so a PR that added
+  `GRANT SELECT ON t TO PUBLIC` alongside an existing `INSERT` grant passed the
+  gate silently. Two defects, one line apart:
+  - The offline `sql=` model appended one `Grant` per `GRANT` statement instead
+    of merging per role, so the model held `PUBLIC → {SELECT}` *and*
+    `PUBLIC → {INSERT}`. Live introspection groups a table's ACL per role, and
+    `_merge_column_grants` already mirrored that for COLUMN grants — the
+    table-level twin was simply missing. Added `_merge_grants`.
+  - `_diff_grants` keyed with `{g.role: set(g.privileges) for g in ...}`, which
+    keeps only the LAST row per role. Both it and `_diff_column_grants` now
+    UNION per key, so a Schema that still carries duplicate rows (an older
+    snapshot, a hand-built one) cannot silently lose privileges either.
+- **A `BEGIN ATOMIC` function body was analyzed as if it were empty**, so
+  `pgrls vector` silently skipped SQL-standard retrieval functions and the
+  SECDEF body rules saw nothing to check. Two layers were wrong:
+  - Introspection selected `p.prosrc`, which for a SQL-standard body (PG14+) is
+    **empty** — not NULL, so a plain `COALESCE` would not have helped. The body
+    lives parsed in `pg_proc.prosqlbody`; the queries now fall back to
+    `pg_get_function_sqlbody(p.oid)`.
+  - That deparses back to `BEGIN ATOMIC … END`, which pglast **cannot parse**
+    (`BEGIN` is a transaction command in bare SQL → `syntax error at or near
+    "ATOMIC"`), so every caller caught the ParseError and analyzed nothing. A
+    new `ast_utils.function_body_sql` strips the wrapper; the four body-parsing
+    sites (VIEW004, SEC046, and both in `verify`) share it.
+
+  Verified live on PG16 + pgvector: two functionally identical SECDEF retrieval
+  functions over one embeddings table — one classic, one `BEGIN ATOMIC` —
+  yielded **one** retrieval path before and **two** after. Only the leading
+  `BEGIN ATOMIC` and trailing `END` are stripped, so an `END` closing a `CASE`
+  survives, and a plpgsql `BEGIN … END` block (no `ATOMIC`) is left untouched.
+- **The offline DDL model lost tables that exist**, so the DB-free path
+  (`pgrls pr`, `lint --sql-file`, `snapshot --sql-file`) reported nothing on
+  them — a table that isn't in the model is a table nothing lints. Two shapes:
+  - **`DROP TABLE` was order-blind.** `CREATE TABLE` resolves in pass 1 and
+    drops apply in pass 2, so a `DROP TABLE t;` *preceding* a
+    `CREATE TABLE t (…)` — the ordinary shape of a rebuild migration — removed
+    the table the later CREATE had just established, and the model reported no
+    table at all. Drops now compare statement order against the table's last
+    CREATE, which makes existence correct for every ordering: `DROP; CREATE`
+    and `CREATE; DROP; CREATE` keep the table, `CREATE; DROP` and
+    `CREATE; CREATE; DROP` remove it.
+  - **`CREATE TABLE … AS SELECT` and `SELECT … INTO` were invisible.** Both
+    create a real table — one with **no RLS**, exactly what SEC001 exists to
+    catch — but neither is a `CreateStmt`. They are now registered. Their
+    columns come from the SELECT and cannot be resolved without a catalog, so
+    the relation is registered *without* columns: table-level rules see it,
+    column-keyed rules stay silent rather than guess a shape. A
+    `CREATE MATERIALIZED VIEW` (also a `CreateTableAsStmt`) is excluded by its
+    `objtype` — it is a different relkind with its own rules.
+
+### Removed
+- **The SEC006 auto-fixer.** It mirrored a policy's `USING` into `WITH CHECK`,
+  but SEC006 only fires where there is nothing useful to mirror — `INSERT`
+  (which carries no `USING`), or an `UPDATE`/`ALL` whose `USING` is absent or
+  constant-`true`. Rule and fixer were **provably disjoint**: across all six
+  write-policy shapes, every shape the rule flagged the fixer skipped, and
+  every shape the fixer rewrote the rule had not flagged. So it could never
+  remediate a real finding, and instead rewrote *clean* policies — making
+  `pgrls fix --check` exit 1 on a schema with zero findings, and emitting a
+  semantic no-op `ALTER POLICY` (Postgres already reuses `USING` as the
+  implicit `WITH CHECK` on `UPDATE`/`ALL`).
+
+  The fixer predated the R3/R5 narrowing that stopped SEC006 false-positiving
+  on the closed `FOR UPDATE USING (…)` shape, and was never retired with it.
+  Auto-fixable rules: **20 → 19**. SEC006 keeps firing exactly as before; its
+  remediation needs the intended predicate, which is human intent. The
+  `USING`→`WITH CHECK` mirroring capability is unaffected for SEC020, where
+  the finding does supply a real `USING` to mirror.
+- `docs/RULES.md`'s SEC006 section had drifted the same way — it described the
+  pre-narrowing behaviour, claimed a `WITH CHECK`-less policy "admits every
+  write" (the premise R3 refuted), and used the *non-firing* shape as its
+  worked example. Rewritten to document the `_write_is_open` gate.
 
 ## [0.52.0] - 2026-07-25
 
