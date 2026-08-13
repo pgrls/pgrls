@@ -1,6 +1,8 @@
 """Unit tests for AST helpers. Pure Python, no database."""
 from __future__ import annotations
 
+import pytest
+
 from pgrls.ast_utils import (
     extract_column_refs,
     extract_range_vars,
@@ -569,3 +571,37 @@ def test_is_literal_false_rejects_non_literal_and_none() -> None:
     assert is_literal_false(parse_expr("1 = 0")) is False
     assert is_literal_false(parse_expr("id")) is False
     assert is_literal_false(None) is False
+
+
+# --- BEGIN ATOMIC function bodies (MF8) ------------------------------------
+
+
+def test_function_body_sql_unwraps_begin_atomic() -> None:
+    # A SQL-standard `BEGIN ATOMIC … END` body (PG14+) lives PARSED in
+    # `pg_proc.prosqlbody`; `prosrc` is empty and `pg_get_function_sqlbody`
+    # deparses it back WITH the wrapper. pglast cannot parse that wrapper —
+    # `BEGIN` is a transaction command in bare SQL — so every body-reading
+    # caller caught the ParseError and analyzed nothing.
+    import pglast
+
+    from pgrls.ast_utils import function_body_sql
+
+    body = "BEGIN ATOMIC\n SELECT id FROM docs LIMIT 5;\nEND"
+    with pytest.raises(pglast.parser.ParseError):
+        pglast.parse_sql(body)
+    parsed = pglast.parse_sql(function_body_sql(body))
+    assert [type(s.stmt).__name__ for s in parsed] == ["SelectStmt"]
+
+
+def test_function_body_sql_leaves_other_bodies_alone() -> None:
+    from pgrls.ast_utils import function_body_sql
+
+    # A classic `AS $$ … $$` body has no wrapper.
+    assert function_body_sql(" SELECT 1 ") == " SELECT 1 "
+    # Only the TRAILING `END` is stripped, so an `END` closing a CASE survives.
+    assert "CASE" in function_body_sql(
+        "BEGIN ATOMIC SELECT CASE WHEN a THEN 1 ELSE 2 END; END"
+    )
+    # A plpgsql `BEGIN … END` block (no ATOMIC) is NOT a SQL-standard body and
+    # must not be unwrapped — it is opaque to the parser either way.
+    assert function_body_sql("BEGIN RETURN 1; END").startswith("BEGIN")

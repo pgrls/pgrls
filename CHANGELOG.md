@@ -24,6 +24,24 @@ breaking changes — they will be called out in this file.
     keeps only the LAST row per role. Both it and `_diff_column_grants` now
     UNION per key, so a Schema that still carries duplicate rows (an older
     snapshot, a hand-built one) cannot silently lose privileges either.
+- **A `BEGIN ATOMIC` function body was analyzed as if it were empty**, so
+  `pgrls vector` silently skipped SQL-standard retrieval functions and the
+  SECDEF body rules saw nothing to check. Two layers were wrong:
+  - Introspection selected `p.prosrc`, which for a SQL-standard body (PG14+) is
+    **empty** — not NULL, so a plain `COALESCE` would not have helped. The body
+    lives parsed in `pg_proc.prosqlbody`; the queries now fall back to
+    `pg_get_function_sqlbody(p.oid)`.
+  - That deparses back to `BEGIN ATOMIC … END`, which pglast **cannot parse**
+    (`BEGIN` is a transaction command in bare SQL → `syntax error at or near
+    "ATOMIC"`), so every caller caught the ParseError and analyzed nothing. A
+    new `ast_utils.function_body_sql` strips the wrapper; the four body-parsing
+    sites (VIEW004, SEC046, and both in `verify`) share it.
+
+  Verified live on PG16 + pgvector: two functionally identical SECDEF retrieval
+  functions over one embeddings table — one classic, one `BEGIN ATOMIC` —
+  yielded **one** retrieval path before and **two** after. Only the leading
+  `BEGIN ATOMIC` and trailing `END` are stripped, so an `END` closing a `CASE`
+  survives, and a plpgsql `BEGIN … END` block (no `ATOMIC`) is left untouched.
 
 ### Fixed
 - **`verify --strict --probe` no longer relaxes the gate it is meant to

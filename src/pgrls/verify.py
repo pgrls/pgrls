@@ -825,8 +825,10 @@ def _sql_body_parses(secdef_fn: Any) -> bool:
         return False
     import pglast  # noqa: PLC0415 — lazy; pglast is a heavy optional path
 
+    from pgrls.ast_utils import function_body_sql  # noqa: PLC0415
+
     try:
-        pglast.parse_sql(secdef_fn.body)
+        pglast.parse_sql(function_body_sql(secdef_fn.body))
     except pglast.parser.ParseError:
         return False
     return True
@@ -1077,6 +1079,7 @@ def _escalation_secdef_findings(
         auth_functions if auth_functions is not None else DEFAULT_AUTH_FUNCTIONS
     )
     import pglast  # noqa: PLC0415 — heavy optional parser path
+    from pgrls.ast_utils import function_body_sql  # noqa: PLC0415
     from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415 — body parser reuse
 
     by_qname: dict[str, list[Any]] = {}
@@ -1101,7 +1104,7 @@ def _escalation_secdef_findings(
                 any_opaque = True
                 continue
             reads |= _secdef_fn_leaks(f, qname, rls_tables, bare_to_qual)
-            parsed = pglast.parse_sql(f.body)
+            parsed = pglast.parse_sql(function_body_sql(f.body))
             if _secdef_body_unresolved(
                 parsed, base_quals, base_bares, resolved_auth
             ):
