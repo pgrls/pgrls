@@ -903,6 +903,7 @@ def run_probe(
     mode: Mode,
     auth_functions: set[str] | None = None,
     probe_role: str = "pgrls_probe_runner",
+    anon_roles: set[str] | None = None,
 ) -> Probe:
     """Probe each verified table live and diff it against the static verdict.
 
@@ -928,7 +929,10 @@ def run_probe(
         )
     tables = {t.qualified_name: t for t in schema.tables}
     try:
-        gate_error = _setup_probe_role(conn, schema, verification, probe_role)
+        gate_error = _setup_probe_role(
+            conn, schema, verification, probe_role, mode=mode,
+            anon_roles=anon_roles,
+        )
         if gate_error is not None:
             return _abstain_all(verification, mode, gate_error)
 
@@ -971,6 +975,9 @@ def _setup_probe_role(
     schema: Schema,
     verification: Verification,
     probe_role: str,
+    *,
+    mode: Mode = "anon",
+    anon_roles: set[str] | None = None,
 ) -> str | None:
     """Create the unprivileged probe role and grant it read/seed access.
 
@@ -1032,6 +1039,21 @@ def _setup_probe_role(
             for role in policy.roles
             if role not in _NON_GRANTABLE_ROLES
         }
+        # ...but only the roles the MODELLED session actually holds. An
+        # anonymous caller is not a member of `authenticated`, so granting the
+        # probe every policy role made its "anon" session authenticated: on a
+        # `FOR SELECT TO authenticated USING (true)` table the static PROVEN
+        # ("no anonymous read") is correct, yet the over-privileged probe read
+        # the row and reported MISMATCH — accusing a sound proof of
+        # contradicting reality, at error severity, exit 1. Under `anon` the
+        # probe may hold only the configured anon roles (default `anon`;
+        # PUBLIC applies to everyone and is not grantable), mirroring the
+        # role-gating the anon prover itself applies. The authenticated modes
+        # (cross-tenant / write) DO model a logged-in tenant, so they keep the
+        # full set — that is what makes a `TO authenticated` policy apply.
+        if mode == "anon":
+            allowed = anon_roles if anon_roles is not None else {"anon", "PUBLIC"}
+            policy_roles &= {r for r in allowed if r not in _NON_GRANTABLE_ROLES}
         for role in sorted(policy_roles):
             rsp = f"probe_role_{secrets.token_hex(4)}"
             cur.execute(f"SAVEPOINT {rsp}")

@@ -4393,6 +4393,7 @@ def verify(
                 conn, schema, verification,
                 mode=mode,  # type: ignore[arg-type]
                 auth_functions=auth, probe_role=probe_role,
+                anon_roles=probe_anon_roles,
             )
         # Text shows the static proof and the live probe section stacked; JSON is
         # the self-contained probe document (it carries each table's
