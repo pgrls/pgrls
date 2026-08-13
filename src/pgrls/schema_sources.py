@@ -525,7 +525,7 @@ class _TableBuilder:
             policies=tuple(self.policies),
             columns=tuple(c.name for c in self.columns),
             column_details=tuple(self.columns),
-            grants=tuple(self.grants),
+            grants=_merge_grants(self.grants),
             column_grants=_merge_column_grants(self.column_grants),
             partition_of=self.partition_of,
             inherits=tuple(self.inherits),
@@ -592,6 +592,31 @@ def _apply_rename(
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder
+
+
+def _merge_grants(grants: list[Grant]) -> tuple[Grant, ...]:
+    """Merge table grants sharing a ``role`` into one with unioned privileges,
+    preserving first-seen order.
+
+    The table-level twin of `_merge_column_grants`, and it exists for the same
+    reason: introspection groups a table's ACL per role, so
+    ``GRANT SELECT ON t TO r;`` followed by ``GRANT INSERT ON t TO r;`` appears
+    live as ONE `Grant` with both privileges. Without this the offline `sql=`
+    path emitted two `Grant` rows for one role and every consumer that keys on
+    role kept only the last — `diff` compared a base `{INSERT}` against a head
+    `{INSERT}` and reported no change, silently passing a migration that had
+    just granted `SELECT` on the table to `PUBLIC`.
+    """
+    merged: dict[str, set[str]] = {}
+    order: list[str] = []
+    for g in grants:
+        if g.role not in merged:
+            merged[g.role] = set()
+            order.append(g.role)
+        merged[g.role].update(g.privileges)
+    return tuple(
+        Grant(role=r, privileges=tuple(sorted(merged[r]))) for r in order
+    )
 
 
 def _merge_column_grants(

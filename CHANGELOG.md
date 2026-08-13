@@ -11,6 +11,21 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`pgrls diff` reported no change when a migration granted a new privilege to
+  a role that already held another one** — so a PR that added
+  `GRANT SELECT ON t TO PUBLIC` alongside an existing `INSERT` grant passed the
+  gate silently. Two defects, one line apart:
+  - The offline `sql=` model appended one `Grant` per `GRANT` statement instead
+    of merging per role, so the model held `PUBLIC → {SELECT}` *and*
+    `PUBLIC → {INSERT}`. Live introspection groups a table's ACL per role, and
+    `_merge_column_grants` already mirrored that for COLUMN grants — the
+    table-level twin was simply missing. Added `_merge_grants`.
+  - `_diff_grants` keyed with `{g.role: set(g.privileges) for g in ...}`, which
+    keeps only the LAST row per role. Both it and `_diff_column_grants` now
+    UNION per key, so a Schema that still carries duplicate rows (an older
+    snapshot, a hand-built one) cannot silently lose privileges either.
+
+### Fixed
 - **`verify --strict --probe` no longer relaxes the gate it is meant to
   reinforce.** `--strict` fails on any table the verifier could not decide, but
   adding `--probe` silently dropped that: the probe path checked only its own
