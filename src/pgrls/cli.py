@@ -4152,11 +4152,18 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
       ERRORs on the very same inverted-auth shape).
     * ``escalation`` proves the SEC042 anon-callable-SECDEF case — honors
       ``[lint.rules.SEC042].anon_roles``.
+    * ``reachability`` asks which roles can ``SELECT`` the bypassing view, and
+      joins the answer against the table's ``anon`` verdict — so it must use
+      the same *anonymous* set that mode does (SEC004's). Deliberately NOT
+      SEC052's ``grantees``, whose default includes ``authenticated``: that set
+      answers "reachable over the API", a broader question. Treating an
+      authenticated role as anonymous is precisely the bug that made the probe
+      grant itself ``authenticated`` and then contradict a correct proof.
 
     Other modes (``cross-tenant`` / ``write``) don't role-gate → ``None``.
     """
     try:
-        if mode == "anon":
+        if mode in ("anon", "reachability"):
             from pgrls.rules.sec004 import _parse_anon_roles
 
             return _parse_anon_roles(rule_options.get("SEC004", {}))
@@ -4174,7 +4181,9 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
 @click.option(
     "--mode",
     "mode",
-    type=click.Choice(["anon", "cross-tenant", "write", "escalation"]),
+    type=click.Choice(
+        ["anon", "cross-tenant", "write", "escalation", "reachability"]
+    ),
     default="anon",
     show_default=True,
     help=(
@@ -4189,7 +4198,12 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "role that reaches a table's owner (not superuser/BYPASSRLS) bypasses "
         "the RLS on that owner's enabled-but-not-FORCE'd tables; LEAK when the "
         "table's RLS provably isolates tenants (so the bypass defeats real "
-        "isolation), ISOLATED when it does not."
+        "isolation), ISOLATED when it does not. 'reachability': prove no "
+        "anon-selectable VIEW hands back the rows a table's own policies "
+        "withhold — a `security_invoker = false` view executes as its owner, "
+        "so one owned by an RLS-exempt role (it owns the table and the table "
+        "is not FORCE'd, or it holds BYPASSRLS) returns every row to anon "
+        "while 'anon' mode correctly reports the table itself isolated."
     ),
 )
 @click.option(

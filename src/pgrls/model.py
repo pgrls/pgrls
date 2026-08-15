@@ -52,7 +52,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 24  # v24: foreign tables (Schema.foreign_tables) — SEC053
+SNAPSHOT_VERSION = 25  # v25: View.owner + owner_bypasses_rls — verify reachability
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -330,6 +330,22 @@ class View:
     `PUBLIC` pseudo-role rendered as `role="PUBLIC"`). SEC052 reads it to
     confirm a low-trust role can actually reach the view over the API; a
     pre-v23 snapshot round-trips with `grants=()`.
+
+    `owner` and `owner_bypasses_rls` (v25+) decide whether a
+    `security_invoker = false` view actually *bypasses* the RLS of the tables
+    it reads. Such a view executes as its owner, so the base table's RLS is
+    evaluated against the OWNER, not the caller — but only an owner that is
+    itself exempt sees every row. Validated live on PG16: a view owned by the
+    table's owner reads all rows when the table is not `FORCE`'d and **zero**
+    once it is; a view owned by an unrelated role with a plain `SELECT` grant
+    reads zero, and the same view reads everything once its owner is granted
+    `BYPASSRLS`. `verify --mode reachability` needs both fields to tell those
+    apart — without `owner` the exempt and non-exempt cases are
+    indistinguishable and every invoker=false view would look like a leak.
+    `owner_bypasses_rls` is the owner's `rolsuper OR rolbypassrls`, mirroring
+    `SecdefFunction`. A pre-v25 snapshot round-trips with `owner=""` /
+    `owner_bypasses_rls=False`, which claims **no** bypass — fail-closed
+    against inventing a leak we cannot substantiate.
     """
 
     schema: str
@@ -341,6 +357,8 @@ class View:
     references: tuple[tuple[str, str], ...]
     security_definer_calls: tuple[str, ...]
     grants: tuple[Grant, ...] = ()
+    owner: str = ""
+    owner_bypasses_rls: bool = False
 
     @property
     def qualified_name(self) -> str:
@@ -1282,6 +1300,12 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         # v23+; a pre-v23 snapshot has no "grants" key → () (SEC052 then
         # finds nothing on that view, the fail-closed direction).
         grants=tuple(_grant_from_dict(g) for g in v.get("grants", [])),
+        # v25+; a pre-v25 snapshot has neither key. "" / False means "we do not
+        # know this view's owner", and the reachability prover treats an
+        # unknown owner as NOT exempt — so an old snapshot yields no leak claim
+        # rather than a leak we cannot substantiate.
+        owner=v.get("owner", ""),
+        owner_bypasses_rls=bool(v.get("owner_bypasses_rls", False)),
     )
 
 
@@ -1833,6 +1857,8 @@ class Schema:
                         {"role": g.role, "privileges": list(g.privileges)}
                         for g in v.grants
                     ],
+                    "owner": v.owner,
+                    "owner_bypasses_rls": v.owner_bypasses_rls,
                 }
                 for v in self.views
             ],
@@ -2066,12 +2092,13 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24,
+            21, 22, 23, 24, 25,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24. "
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, "
+                "25. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
