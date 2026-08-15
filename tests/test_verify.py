@@ -3098,3 +3098,30 @@ def test_verify_anon_role_gate_matches_live_anon_session(
             f"{name}: pgrls proved {verdict} but a live anon session saw "
             f"{observed} — the role gate is unsound"
         )
+
+
+def test_every_mode_is_covered_by_the_sarif_lookups() -> None:
+    """Adding a `--mode` must not crash `--format sarif`.
+
+    `render_sarif` indexes `_SARIF_RULE_ID` / `_SARIF_RULE_TITLE` by mode with
+    `[]`, so a mode missing from either raises KeyError at render time rather
+    than degrading. That is exactly what happened when `reachability` was
+    added: text and json rendered fine and sarif died. Assert coverage off the
+    `Mode` literal itself, so the next mode is caught by this test instead of
+    by a user's CI.
+    """
+    from typing import get_args
+
+    from pgrls.verify import _SARIF_RULE_ID, _SARIF_RULE_TITLE, Mode
+
+    modes = set(get_args(Mode))
+    assert modes <= set(_SARIF_RULE_ID), (
+        f"modes missing a SARIF ruleId: {modes - set(_SARIF_RULE_ID)}"
+    )
+    assert modes <= set(_SARIF_RULE_TITLE), (
+        f"modes missing a SARIF title: {modes - set(_SARIF_RULE_TITLE)}"
+    )
+    # Distinct ruleIds — GitHub Code Scanning groups by ruleId, so two modes
+    # sharing one would merge unrelated findings in the UI.
+    ids = [_SARIF_RULE_ID[m] for m in modes]
+    assert len(ids) == len(set(ids)), f"duplicate SARIF ruleIds: {ids}"

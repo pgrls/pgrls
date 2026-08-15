@@ -8,6 +8,56 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
+## [Unreleased]
+
+### Added
+- **`pgrls verify --mode reachability` — prove no view hands back the rows a
+  table's policies withhold.** Every existing mode reasons about a table's own
+  policies. None of them looked at views, so `--mode anon` would report a table
+  `isolated` — correctly — while an anonymous caller read every row of it
+  through a view, including other tenants'. A `security_invoker = false` view
+  executes as its **owner**, so the base table's RLS is evaluated against the
+  owner rather than the caller.
+
+  The firing gate is narrow, and every clause of it was measured on live PG16
+  rather than reasoned about: the view must be `SELECT`-grantable to an anon
+  role, `security_invoker` must be off, and the view's owner must actually be
+  exempt from the base table's RLS — either it owns the table and the table is
+  not `FORCE`'d, or it holds `BYPASSRLS`. A view owned by an ordinary third
+  role with a plain `SELECT` grant returns **zero** rows and is not flagged;
+  `FORCE` on the base table cuts the owning-view case from every row to zero;
+  and `BYPASSRLS` still bypasses under `FORCE` (measured, not taken from the
+  docs). Three of the six live cases correctly produce no finding.
+
+  The verdict is the base table's `anon` verdict joined with that reachability,
+  mirroring how `escalation` joins `cross-tenant` with owner reachability: a
+  table that already leaks every row to anon cedes to `--mode anon` rather than
+  double-reporting, and an `unverified` table abstains rather than claiming the
+  view defeated a proof that was never made.
+
+  Regular views only. A materialized view stores rows captured at refresh time,
+  so `security_invoker` does not govern reads of it — a different mechanism,
+  covered by SEC053 / SEC054 / VIEW003.
+
+- **Snapshot v25 — `View.owner` and `View.owner_bypasses_rls`.** Additive, and
+  fail-closed: a pre-v25 snapshot decodes with an unknown owner, which claims
+  **no** bypass. Without the owner the exempt and non-exempt cases are
+  indistinguishable and every `security_invoker = false` view would look like a
+  leak.
+
+- **An adjudicated verdict corpus** (`corpus/verdicts.py`). `corpus/cases.py`
+  measures which lint *rules* fire; nothing measured what the prover
+  *concludes* — which is why two exploitable false clears reached 0.52.0 and
+  were caught only by hand. 15 cases across all five modes, each checked
+  against real Postgres behaviour rather than pinned from whatever the prover
+  printed, including regression guards for both shipped false clears. The gate
+  requires every mode to be represented and both directions pinned.
+
+### Fixed
+- `verify`'s module docstring described two modes when four existed, and the
+  SECDEF-escalation docstring still said view grants were "not captured by the
+  model" — stale since SEC052 added `View.grants` in snapshot v23.
+
 ## [0.53.0] - 2026-08-13
 
 ### Fixed

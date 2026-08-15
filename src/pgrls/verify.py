@@ -2,7 +2,7 @@
 
 Where `pgrls lint` *flags* a suspicious policy (SEC004 / SEC038) and `pgrls
 matrix` *summarizes* who-can-read-what, `pgrls verify` **proves** — with Z3 —
-a concrete safety property and hands back a counterexample when it fails. Two
+a concrete safety property and hands back a counterexample when it fails. Five
 complementary threat models (`--mode`):
 
 * ``anon`` (default) — for every RLS-protected table, can an *anonymous*
@@ -20,6 +20,16 @@ complementary threat models (`--mode`):
   the most CVE-adjacent footgun (CVE-2025-48757): a policy that scopes reads but
   not writes lets a tenant stamp data for another tenant. The write-side lint
   rules SEC006 / SEC020 / SEC028 / SEC040 are its heuristic fallback.
+* ``escalation`` — can a low-trust role that reaches a table's *owner* (via the
+  `pg_auth_members` closure) ``SET ROLE`` to it and read past RLS the owner is
+  exempt from? Composes the ``cross-tenant`` verdict with that reachability.
+* ``reachability`` — the modes above all prove things about a table's own
+  policies. This one asks whether a **view** hands the rows back anyway: a
+  ``security_invoker = false`` view executes as its owner, so an anon-selectable
+  one owned by an RLS-exempt role returns every row while ``anon`` correctly
+  reports the table isolated. Composes the ``anon`` verdict with view
+  reachability, the way ``escalation`` composes ``cross-tenant`` with owner
+  reachability.
 
 They are complementary: the inverted ``auth.uid() IS NULL OR …`` policy leaks
 to anon yet correctly scopes authenticated tenants — a ``leak`` in ``anon``,
@@ -274,12 +284,14 @@ _SARIF_RULE_ID: dict[Mode, str] = {
     "cross-tenant": "pgrls-cross-tenant-isolation",
     "write": "pgrls-write-isolation",
     "escalation": "pgrls-escalation-isolation",
+    "reachability": "pgrls-view-reachability-isolation",
 }
 _SARIF_RULE_TITLE: dict[Mode, str] = {
     "anon": "Anonymous read-isolation proof",
     "cross-tenant": "Cross-tenant read-isolation proof",
     "write": "Cross-tenant write-isolation proof",
     "escalation": "Reachable RLS-bypass escalation proof",
+    "reachability": "View-mediated anonymous-read isolation proof",
 }
 
 
@@ -523,12 +535,17 @@ def build_verification(
     defaults before calling this, which is why the *flag* extends rather than
     replaces.) Tables are sorted by qualified name for deterministic output.
 
-    ``escalation`` is a different shape — it composes the cross-tenant result
-    with the role-reachability graph rather than walking policies directly — so
-    it is dispatched to `build_escalation`.
+    ``escalation`` and ``reachability`` are different shapes — they compose an
+    existing verdict (cross-tenant / anon respectively) with a reachability
+    graph rather than walking policies directly — so they are dispatched to
+    `build_escalation` / `build_reachability`.
     """
     if mode == "escalation":
         return build_escalation(
+            schema, auth_functions=auth_functions, anon_roles=anon_roles
+        )
+    if mode == "reachability":
+        return build_reachability(
             schema, auth_functions=auth_functions, anon_roles=anon_roles
         )
     prove = _PROVERS[mode]
@@ -928,10 +945,13 @@ def build_reachability(
             if view.owner_bypasses_rls
             else f"owner {view.owner} owns the table and RLS is not FORCE'd"
         )
+        # The renderer already prefixes the witness phrase ("every row is
+        # anonymously readable"), so this names the PATH and why it is open —
+        # it does not restate the leak.
         path = (
-            f"{view.qualified_name} (security_invoker off, {why}) is "
-            f"SELECT-able by "
-            f"{', '.join(sorted(resolved_anon_roles))}"
+            f"reachable through {view.qualified_name}, SELECT-able by "
+            f"{', '.join(sorted(resolved_anon_roles))} "
+            f"(security_invoker off; {why})"
         )
         anv = an_by_table.get(table.qualified_name)
         # Every candidate is RLS-enabled so it has an anon verdict; treat a
@@ -944,7 +964,7 @@ def build_reachability(
                 TableVerdict(
                     table.qualified_name,
                     "leak",
-                    f"anon reads every row via {path}",
+                    path,
                     (proof,),
                 )
             )
@@ -970,8 +990,8 @@ def build_reachability(
                     TableVerdict(
                         table.qualified_name,
                         "leak",
-                        f"anon reads every row via {path} — including the rows "
-                        "the direct anon leak withholds",
+                        f"{path}; also exposes the rows the direct anon "
+                        "leak withholds",
                         (proof,),
                     )
                 )
@@ -1235,9 +1255,12 @@ def _escalation_secdef_findings(
     a known *non-RLS* base table is cleared (not a finding). ``anon_roles`` is
     the SEC042 exposure set (default ``{anon, PUBLIC}``).
 
-    The VIEW004 view-mediated *caller* case (a view selecting a SECDEF call)
-    needs the view's grants to know whether the view is anon-selectable, which
-    the model does not capture, so it is out of this scope.
+    The VIEW004 view-mediated *caller* case — a view selecting a SECDEF call —
+    is still out of scope here, but no longer for the reason this comment used
+    to give: `View.grants` HAS been captured since snapshot v23 (SEC052), so
+    "the model does not capture it" is stale. What is missing is the join
+    itself; ``--mode reachability`` covers the view-over-*table* bypass, and a
+    view whose body calls a SECDEF function is the remaining case.
     """
     secdef_fns = schema.security_definer_functions
     rls_tables = {(t.schema, t.name) for t in schema.tables if t.rls_enabled}
