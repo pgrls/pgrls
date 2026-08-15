@@ -339,9 +339,19 @@ SELECT
         FALSE
     ) AS security_barrier,
     pg_get_viewdef(c.oid, true) AS definition,
+    -- A `security_invoker = false` view executes as its OWNER, so the RLS of
+    -- the tables it reads is evaluated against the owner rather than the
+    -- caller. Whether that is a *bypass* depends on the owner being exempt —
+    -- either it owns the table and the table is not FORCE'd, or it is
+    -- superuser / BYPASSRLS. `verify --mode reachability` needs both to tell
+    -- an exempt owner from an ordinary one; same shape as the SECDEF-function
+    -- query above.
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
+    (vo.rolsuper OR vo.rolbypassrls) AS owner_bypasses_rls,
     c.oid AS view_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_roles vo ON vo.oid = c.relowner
 WHERE c.relkind IN ('v', 'm')
   AND n.nspname = ANY(%s)
 ORDER BY n.nspname, c.relname
@@ -1544,6 +1554,8 @@ def _build_views(
                 (row["schema_name"], row["view_name"]), ()
             ),
             grants=view_grants_by_oid.get(row["view_oid"], ()),
+            owner=row["owner_name"] or "",
+            owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
         )
         for row in view_rows
     )

@@ -84,7 +84,7 @@ Verdict = Literal["isolated", "leak", "unverified"]
 # complementary — the inverted `auth.uid() IS NULL OR …` policy leaks to anon
 # but correctly scopes authenticated tenants, so it is a leak in `anon` mode
 # and isolated in `cross-tenant` mode.
-Mode = Literal["anon", "cross-tenant", "write", "escalation"]
+Mode = Literal["anon", "cross-tenant", "write", "escalation", "reachability"]
 
 # `write` reuses the cross-tenant prover verbatim — write-isolation is the same
 # satisfiability question (`is_true ∧ column != session_tenant` SAT?), just
@@ -815,6 +815,186 @@ def build_escalation(
     )
     tables.sort(key=lambda t: t.qualified_name)
     return Verification(tuple(tables), "escalation")
+
+
+def _view_owner_is_rls_exempt(view: Any, table: Any) -> bool:
+    """Is `view`'s owner exempt from `table`'s RLS?
+
+    A ``security_invoker = false`` view executes as its OWNER, so the base
+    table's RLS is evaluated against the owner rather than the caller. That is
+    a *bypass* only when the owner is itself exempt. Validated live on PG16
+    (see `build_reachability`): owning the table is enough **until** the table
+    is ``FORCE``'d, at which point even the owner is filtered; and any
+    superuser / ``BYPASSRLS`` owner is exempt regardless of who owns what.
+
+    An unknown owner (``""`` — a pre-v25 snapshot, which carried no view owner)
+    returns False: no bypass claimed, so an old snapshot degrades to silence
+    rather than to a leak we cannot substantiate.
+    """
+    if view.owner_bypasses_rls:
+        return True
+    if not view.owner:
+        return False
+    return view.owner == table.owner and not table.force_rls
+
+
+def _view_is_anon_selectable(view: Any, anon_roles: set[str]) -> bool:
+    """Can a role in `anon_roles` `SELECT` from `view`? (SEC052's gate.)"""
+    return any(
+        g.role in anon_roles and "SELECT" in g.privileges for g in view.grants
+    )
+
+
+def build_reachability(
+    schema: Schema,
+    *,
+    auth_functions: set[str] | None = None,
+    anon_roles: set[str] | None = None,
+) -> Verification:
+    """Prove/refute anon reachability of RLS rows *through a view*.
+
+    ``verify --mode anon`` proves a table's own policies deny an anonymous
+    read. It says nothing about a **view** over that table — and a
+    ``security_invoker = false`` view runs as its owner, so an anon-selectable
+    one owned by an RLS-exempt role hands back every row the table's policies
+    were written to withhold. The table is genuinely isolated; the view is a
+    second door. This mode proves whether that door is open.
+
+    The firing gate, every clause validated live on PG16 against a table whose
+    policy scopes rows to ``current_setting('app.tenant')`` (anon sets no such
+    GUC, so the direct read yields nothing):
+
+    * the view is ``SELECT``-grantable to an anon role (SEC052's gate) — the
+      caller must be able to reach it at all; **and**
+    * ``security_invoker`` is false — an invoker view re-applies the *caller's*
+      RLS, and the live anon read was denied outright; **and**
+    * the view's owner is exempt from the base table's RLS
+      (`_view_owner_is_rls_exempt`) — a view owned by an ordinary third role
+      with a plain ``SELECT`` grant returned **zero** rows, and ``FORCE`` on
+      the base table cut the owning-view case from every row to zero.
+
+    The verdict is then the base table's ``anon`` verdict joined with that
+    reachability, exactly as `build_escalation` joins the cross-tenant verdict
+    with owner reachability:
+
+    * anon **isolated** → the view defeats real isolation → **leak**, witness
+      ``{}`` (the view is unconditional — it returns every row).
+    * anon **leak**, *total* (``{}`` witness — the table already hands anon
+      every row) → the view exposes nothing new → **isolated**, ceded to
+      ``verify --mode anon``.
+    * anon **leak**, *partial* (a characterizing-row witness) → the view still
+      reads the rows the partial leak withholds → **leak**.
+    * anon **unverified** → no claim that the table was isolating → abstain.
+
+    Scope: regular views only. A materialized view stores rows captured when it
+    was refreshed, so ``security_invoker`` does not apply to reads of it at all
+    — a different mechanism, and SEC053 / SEC054 / VIEW003 cover the exposed
+    matview. Base tables are resolved through ``View.references``, which
+    introspection already resolves transitively, so a ``view → view → table``
+    chain names the base table here rather than the intermediate view.
+    """
+    resolved_anon_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
+    views = [
+        v
+        for v in schema.views
+        if not v.is_materialized
+        and not v.security_invoker
+        and _view_is_anon_selectable(v, resolved_anon_roles)
+    ]
+    tables_by_key = {(t.schema, t.name): t for t in schema.tables}
+    # Only RLS-enabled base tables can be *defeated* — an RLS-off table is
+    # SEC001's finding, not a proof about a bypass.
+    candidates = [
+        (v, tables_by_key[ref])
+        for v in views
+        for ref in v.references
+        if ref in tables_by_key
+        and tables_by_key[ref].rls_enabled
+        and _view_owner_is_rls_exempt(v, tables_by_key[ref])
+    ]
+    if not candidates:
+        return Verification((), "reachability")
+
+    an = build_verification(
+        schema, auth_functions=auth_functions, mode="anon",
+        anon_roles=anon_roles,
+    )
+    an_by_table = {t.qualified_name: t for t in an.tables}
+
+    tables: list[TableVerdict] = []
+    for view, table in candidates:
+        why = (
+            f"BYPASSRLS/superuser owner {view.owner}"
+            if view.owner_bypasses_rls
+            else f"owner {view.owner} owns the table and RLS is not FORCE'd"
+        )
+        path = (
+            f"{view.qualified_name} (security_invoker off, {why}) is "
+            f"SELECT-able by "
+            f"{', '.join(sorted(resolved_anon_roles))}"
+        )
+        anv = an_by_table.get(table.qualified_name)
+        # Every candidate is RLS-enabled so it has an anon verdict; treat a
+        # defensive miss as `isolated` — the leak-direction assumption.
+        an_verdict = anv.verdict if anv is not None else "isolated"
+
+        if an_verdict == "isolated":
+            proof = PolicyProof(view.qualified_name, "leak", {}, None)
+            tables.append(
+                TableVerdict(
+                    table.qualified_name,
+                    "leak",
+                    f"anon reads every row via {path}",
+                    (proof,),
+                )
+            )
+        elif an_verdict == "leak":
+            an_leak = next(
+                (p for p in (anv.proofs if anv else ()) if p.verdict == "leak"),
+                None,
+            )
+            if an_leak is not None and an_leak.witness == {}:
+                proof = PolicyProof(view.qualified_name, "isolated", None, None)
+                tables.append(
+                    TableVerdict(
+                        table.qualified_name,
+                        "isolated",
+                        "the table already leaks every row to anon (see "
+                        "verify --mode anon) — the view exposes nothing new",
+                        (proof,),
+                    )
+                )
+            else:
+                proof = PolicyProof(view.qualified_name, "leak", {}, None)
+                tables.append(
+                    TableVerdict(
+                        table.qualified_name,
+                        "leak",
+                        f"anon reads every row via {path} — including the rows "
+                        "the direct anon leak withholds",
+                        (proof,),
+                    )
+                )
+        else:  # unverified
+            reason = next(
+                (
+                    p.reason
+                    for p in (anv.proofs if anv else ())
+                    if p.verdict == "unverified" and p.reason
+                ),
+                "anon isolation unproven",
+            )
+            proof = PolicyProof(view.qualified_name, "unverified", None, reason)
+            tables.append(
+                TableVerdict(
+                    table.qualified_name,
+                    "unverified",
+                    f"cannot prove the table denies anon reads ({reason}); {path}",
+                    (proof,),
+                )
+            )
+    tables.sort(key=lambda t: (t.qualified_name, t.proofs[0].policy))
+    return Verification(tuple(tables), "reachability")
 
 
 def _sql_body_parses(secdef_fn: Any) -> bool:
