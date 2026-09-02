@@ -1,10 +1,10 @@
 {
-  "pgrls_version": "0.16.0",
+  "pgrls_version": "0.54.0",
   "totals": {
-    "cases": 20,
-    "positive": 11,
-    "negative": 9,
-    "tp": 12,
+    "cases": 23,
+    "positive": 12,
+    "negative": 11,
+    "tp": 14,
     "fp": 0,
     "fn": 0,
     "precision": 1.0,
@@ -53,6 +53,22 @@
     },
     {
       "name": "sec004-is-not-null-safe",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "postgrest-grant-but-rls-scoped",
+      "kind": "negative",
+      "expect": [],
+      "fired": [],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "postgrest-column-grant-rls-scoped",
       "kind": "negative",
       "expect": [],
       "fired": [],
@@ -213,6 +229,20 @@
       ],
       "fired": [
         "SEC005"
+      ],
+      "false_positives": [],
+      "false_negatives": []
+    },
+    {
+      "name": "postgrest-exposed-rls-off",
+      "kind": "positive",
+      "expect": [
+        "SEC001",
+        "SEC049"
+      ],
+      "fired": [
+        "SEC001",
+        "SEC049"
       ],
       "false_positives": [],
       "false_negatives": []
