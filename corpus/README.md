@@ -5,6 +5,19 @@ pgrls's per-rule precision and — the point — its **false-positive**
 behavior, over the real introspection + lint path. The published run is
 [`docs/PRECISION.md`](../docs/PRECISION.md).
 
+Two corpora live here, asking different questions of the same kind of
+fixture:
+
+- the **lint** corpus (`cases.py`) — *which rules fire?*
+- the **verdict** corpus (`verdicts.py`) — *what does `pgrls verify`
+  conclude?*
+
+They are separate because a verdict regression is invisible to the lint
+corpus. Two exploitable false clears reached 0.52.0 with every lint case
+green: `--mode write` proved isolation on a schema one tenant could wipe,
+and `--mode anon` reported a LEAK on the canonical tenant policy. Both were
+caught by hand. The verdict corpus exists so the next one is caught here.
+
 ## Layout
 
 | file | role |
@@ -13,13 +26,16 @@ behavior, over the real introspection + lint path. The published run is
 | `harness.py` | applies each case to a fresh `public` schema on a throwaway Postgres, introspects, runs the full built-in rule set at **default options**, tabulates TP/FP/FN |
 | `measure.py` | `python -m corpus.measure` → regenerates `docs/PRECISION.md` + `results.json` |
 | `test_corpus.py` | the CI gate — fails on any *undocumented* false positive or false negative |
+| `verdicts.py` | the labeled **verdict** cases — each `VerdictCase` is a schema, a `--mode`, and the COMPLETE set of per-table verdicts expected |
+| `test_verdicts.py` | the verdict CI gate — fails on any verdict that no longer matches its adjudication |
 
 ## Run it
 
 ```bash
 python -m corpus.measure          # spin a throwaway PG, write the report
 python -m corpus.measure --print  # console only, don't write files
-pytest corpus/                    # the regression gate
+python -m corpus.verdicts         # verdict corpus, pass/fail per case
+pytest corpus/                    # both regression gates
 ```
 
 Needs Docker (testcontainers) unless `PGRLS_TEST_DATABASE_URL` /
@@ -41,6 +57,29 @@ on.
    its label. If a near-miss surfaces a *real* false positive, fix the rule
    — or record it in `known_fp` with a note. Don't paper over it by adding
    the wrongly-fired rule to `expect`.
+
+## Adding a verdict case
+
+1. Write the smallest schema that isolates the behaviour, and pick the
+   `--mode` whose claim you are pinning.
+2. **Establish the truth on a real database first.** Apply the schema, then
+   `SET ROLE` to the threat actor and run the query — count the rows it
+   actually returns. That measurement is the adjudication.
+3. Set `expect` to the COMPLETE set of `(qualified_name, verdict)` pairs,
+   so an extra finding fails as loudly as a missing one. Use `expect_paths`
+   where *which* view or owner the finding came through is the point.
+4. Put the measurement in `note`. A case whose note does not say why the
+   verdict is correct cannot be re-checked by the next reader, and
+   `test_verdicts.py` requires one.
+
+The bar: the expected verdict must be checkable against what Postgres
+does, **not** against what the prover currently prints. Pinning today's
+output is how a wrong verdict becomes a permanent fixture.
+
+Roles are cluster-wide, so anything a case creates it must also remove —
+`verdicts.py` tears its roles down in a `finally`. Leaving a `BYPASSRLS`
+role behind makes SEC016 fire on every case of the *lint* corpus that runs
+afterwards in the same database.
 
 ## What the numbers mean
 
