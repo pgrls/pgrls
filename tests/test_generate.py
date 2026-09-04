@@ -530,3 +530,110 @@ def test_cli_output_writes_file_and_force_guard(tmp_path) -> None:
     # With --force it overwrites.
     res3 = _run(schema, ["--output", str(out), "--force"])
     assert res3.exit_code == 0, res3.output
+
+
+# --- --strict-binding -------------------------------------------------
+
+
+def test_strict_binding_predicate_calls_the_raising_helper() -> None:
+    """The whole point: compare against something that RAISES when nothing is
+    bound, instead of a `current_setting(…, true)` that yields NULL and makes
+    an unbound query look like an empty result."""
+    from pgrls.generate import GenerateOptions, session_predicate
+
+    opts = GenerateOptions(strict_binding=True, tenant_column="operator_id")
+    pred = session_predicate("operator_id", "text", opts)
+    assert "pgrls_require_tenant('app.operator_id')" in pred
+    assert "current_setting" not in pred
+
+
+def test_strict_binding_keeps_the_select_wrapper() -> None:
+    """Measured on PG16: a 10,000-row scan calls the helper 10,001 times
+    unwrapped and once wrapped. The unwrapped form raises even on an empty
+    table, but a 10,000x per-query cost is not a trade worth making — and
+    PERF001 would flag it. Pin the wrapper so a later 'make it stricter'
+    change has to confront the cost."""
+    from pgrls.generate import GenerateOptions, session_predicate
+
+    pred = session_predicate(
+        "tenant_id", "text", GenerateOptions(strict_binding=True)
+    )
+    assert pred.startswith("tenant_id = (SELECT ")
+    assert pred.endswith(")")
+
+
+def test_strict_binding_preserves_the_column_cast() -> None:
+    from pgrls.generate import GenerateOptions, session_predicate
+
+    pred = session_predicate(
+        "tenant_id", "uuid", GenerateOptions(strict_binding=True)
+    )
+    assert pred.endswith("::uuid)")
+
+
+def test_default_is_unchanged_by_the_flag_existing() -> None:
+    """Existing users must see no difference — the silent form stays the
+    default."""
+    from pgrls.generate import GenerateOptions, session_predicate
+
+    pred = session_predicate("tenant_id", "text", GenerateOptions())
+    assert "current_setting('app.tenant_id', true)" in pred
+    assert "require" not in pred
+
+
+def test_binding_function_sql_is_valid_plpgsql_shape() -> None:
+    """`%` is plpgsql's RAISE placeholder — `%%` emits a literal percent and
+    leaves the argument unconsumed, which Postgres rejects. An early cut had
+    exactly that bug."""
+    from pgrls.generate import GenerateOptions, binding_function_sql
+
+    sql = binding_function_sql(GenerateOptions(strict_binding=True))
+    assert "%%" not in sql
+    assert "RAISE EXCEPTION" in sql
+    assert "insufficient_privilege" in sql
+    # Empty string counts as unbound: a helper that stringifies a null id
+    # produces `SET app.x = ''`, which fails the same silent way.
+    assert "v = ''" in sql
+
+
+def test_binding_function_is_emitted_once_and_first() -> None:
+    """Every generated policy references it, so it must be created before
+    them — and one helper serves the whole run."""
+    from pgrls.generate import GenerateOptions, plan_generation
+    from pgrls.model import Column, Schema, Table
+
+    # `column_details` is required: without a captured type, generate skips
+    # the table rather than emit an uncast predicate.
+    details = (
+        Column(name="id", data_type="integer", is_nullable=False),
+        Column(name="tenant_id", data_type="text", is_nullable=False),
+    )
+    tables = tuple(
+        Table(
+            schema="public",
+            name=f"t{i}",
+            rls_enabled=False,
+            force_rls=False,
+            columns=("id", "tenant_id"),
+            policies=(),
+            column_details=details,
+        )
+        for i in range(3)
+    )
+    result = plan_generation(
+        Schema(tables=tables), GenerateOptions(strict_binding=True)
+    )
+    fn_stmts = [s for s in result.statements if "CREATE OR REPLACE FUNCTION" in s.sql]
+    assert len(fn_stmts) == 1
+    assert result.statements[0] is fn_stmts[0]
+
+
+def test_no_binding_function_when_nothing_is_generated() -> None:
+    """A run that produces no policies should not leave a stray helper."""
+    from pgrls.generate import GenerateOptions, plan_generation
+    from pgrls.model import Schema
+
+    result = plan_generation(
+        Schema(tables=()), GenerateOptions(strict_binding=True)
+    )
+    assert result.statements == ()

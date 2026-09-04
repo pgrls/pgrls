@@ -3819,6 +3819,90 @@ reported as skipped rather than silently passing.
 
 <a id="rule-perf001"></a>
 
+## SEC055 — Tenant policy uses the silent binding form after the schema adopted the raising one
+
+**Severity:** warning
+
+A tenant policy normally compares the discriminator against a session setting
+read with `missing_ok`:
+
+```sql
+CREATE POLICY p ON leads TO app
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)));
+```
+
+That is the safe default for *access* — an unbound connection reads nothing —
+but it is silent. `current_setting(name, true)` returns NULL when the setting
+was never set, `tenant_id = NULL` evaluates to NULL, the row is filtered, and
+the query returns **zero rows**. Nothing distinguishes that from "there is no
+such row", so an application that forgets to bind a tenant does not fail: it
+reports 404s, on every affected path, at once.
+
+Two things make this hard to catch without help. A test suite that connects as
+the table owner cannot see it at all — RLS is not enforced for that role, so a
+query that binds a tenant and a query that does not are identical to every test
+in the suite. And the failure only appears when the application role stops
+being the owner, which is usually a deployment change rather than a code one.
+
+`pgrls generate --strict-binding` scaffolds the alternative: a helper that
+RAISES `insufficient_privilege` when nothing is bound, so the unbound query
+becomes a stack trace pointing at the call site that forgot.
+
+```sql
+CREATE POLICY p ON leads TO app
+    USING (tenant_id = (SELECT pgrls_require_tenant('app.tenant_id')));
+```
+
+**SEC055 is the drift guard.** Adopting the raising helper only protects you if
+*every* tenant policy uses it; one policy left on the silent form is one code
+path that still 404s instead of failing, and it is exactly the path nobody
+remembered to convert. The rule fires when this schema already uses a
+`…require_…`-shaped binding helper somewhere **and** another policy still
+carries the two-argument `current_setting(…, true)` form.
+
+### Why the trigger is the schema, not the config
+
+The obvious gate would be "`[generate].strict_binding` is set in `pgrls.toml`".
+This rule keys on the schema instead, for two reasons.
+
+A config-gated rule is silent when the config is absent — which is precisely
+the case when CI lints a database without the repo's `pgrls.toml` beside it,
+the environment most likely to catch the drift. Keying on the schema makes the
+finding self-describing: the evidence that strict binding was adopted lives in
+the object being linted, so the check travels with the database.
+
+It also cannot flood. A project that never adopted the helper has no policy
+referencing one, so the rule never fires; the population is exactly "schemas
+that opted in and half-converted".
+
+The name is matched on shape (`require_` anywhere in the function name) rather
+than pgrls's exact `pgrls_require_<label>`, so a hand-rolled `require_tenant()`
+— the pattern predates the flag — gets the drift check too.
+
+### What it does not flag
+
+- The **one-argument** `current_setting(name)` form. That already raises on an
+  unset GUC, which is loud; it is SEC019's subject, for a different reason.
+- A policy that already uses the raising helper, even if it also reads a
+  setting silently elsewhere in the same clause — the binding is guarded.
+- Anything at all in a schema that never adopted the raising form.
+
+### Remediation
+
+Point the policy at the same helper the rest of the schema uses. If the policy
+is *deliberately* readable without a bound tenant — a platform table such as
+`users`, `memberships`, or `operators` that is read before a tenant is chosen —
+allowlist it:
+
+```toml
+[lint.rules.SEC055]
+allowlist = ["public.users.p", "public.memberships.p"]
+```
+
+There is no auto-fix. Converting a policy changes which queries error, and
+which tables are legitimately readable before a tenant is bound is human
+intent — the same reason SEC006 has no fixer.
+
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK
 
 **Severity:** warning.
