@@ -8,6 +8,45 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
+## [Unreleased]
+
+### Added
+- **`pgrls generate --strict-binding`** — scaffold tenant policies that compare
+  against a helper which **RAISES** when nothing is bound, instead of a
+  `current_setting(<name>, true)` that quietly returns NULL. The silent form is
+  the safe default for *access* but makes an unbound query **indistinguishable
+  from an empty result**: an application that forgets to bind a tenant reports
+  404s rather than failing, on every affected path at once, and a test suite
+  connected as the table owner cannot tell the two apart because RLS is not
+  enforced for that role. Also settable as `[generate].strict_binding`; the
+  flag wins when both are given, and the default is unchanged.
+
+  The `(SELECT …)` wrapper is kept, which is the whole design decision.
+  Measured on PG16: a 10,000-row scan calls the helper **10,001 times**
+  unwrapped and **once** wrapped. The unwrapped form does raise even on an
+  empty table, but a 10,000x per-query cost is not a trade worth making — and
+  PERF001 would flag it besides. Wrapped, the raise fires when the scan
+  produces a candidate row, i.e. **exactly when a row would have been returned
+  and was about to be wrongly hidden**; when nothing matched anyway the silence
+  is the truthful answer, so a legitimate 404 is never turned into an error.
+
+  The generated output keeps both standing guarantees: it lints with zero
+  findings (PERF001 included) and verifies `PROVEN`.
+- **SEC055** (warning) — a tenant policy still using the silent
+  `current_setting(…, true)` form in a schema whose other policies already use
+  a raising binding helper. Adopting the helper only protects you if *every*
+  tenant policy uses it; one left behind is one code path that still 404s
+  instead of failing, and it is exactly the path nobody remembered to convert.
+
+  The trigger is the **schema**, not `pgrls.toml`: a config-gated rule is
+  silent precisely when CI lints a database without the repo's config beside
+  it. Keying on the schema also means it cannot flood — a project that never
+  adopted the helper has no policy referencing one, so the population is
+  exactly "opted in and half-converted". Matched on name shape (`require_`), so
+  a hand-rolled `require_tenant()` gets the check too. No auto-fix: which
+  tables are legitimately readable before a tenant is bound is human intent.
+  Catalog: **68 rules**.
+
 ## [0.54.0] - 2026-08-15
 
 ### Added

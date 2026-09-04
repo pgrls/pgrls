@@ -1112,6 +1112,45 @@ CREATE POLICY owner_any_bucket ON storage.objects FOR SELECT TO anon
 CREATE TABLE public.allbad_sec051_realtime (id int PRIMARY KEY, body text);
 CREATE PUBLICATION supabase_realtime FOR TABLE public.allbad_sec051_realtime;
 
+-- SEC055: this schema adopts a RAISING-shaped binding helper on one table and
+-- leaves another on the silent `current_setting(..., true)` form -- the
+-- half-converted state SEC055 exists to catch. The silent form returns NULL
+-- when nothing is bound, so an unbound query is filtered to zero rows and
+-- cannot be told apart from "no such row" -- the application 404s instead of
+-- failing. SEC055 fires (warning) on the UNCONVERTED policy.
+--
+-- The helper here does NOT actually raise. SEC055 keys on the SHAPE of the
+-- name in the policy predicate (`require_`), and CREATE POLICY only needs the
+-- function to exist -- so a trivial body keeps this fixture loadable. The
+-- raising behaviour is covered where it matters, against live Postgres, in
+-- the generate tests.
+--
+-- No statement separators anywhere in this block, comments included --
+-- conftest applies the fixture by splitting the file on that character, so
+-- one inside a comment truncates a statement mid-way.
+--
+-- NOTE: adoption is schema-wide by design -- once any policy here uses a
+-- `require_`-shaped helper, EVERY remaining silent-form policy in this
+-- fixture is reported unconverted. That is the intended semantics, and it is
+-- why this block sits at the end: it changes the SEC055 verdict for the whole
+-- schema, nothing else.
+CREATE FUNCTION public.allbad_require_tenant(setting_name text) RETURNS text
+    LANGUAGE sql STABLE AS 'SELECT current_setting($1, true)';
+
+CREATE TABLE public.allbad_sec055_converted (id int PRIMARY KEY, tenant_id text NOT NULL);
+ALTER TABLE public.allbad_sec055_converted ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec055_converted FORCE ROW LEVEL SECURITY;
+CREATE POLICY allbad_sec055_converted_p ON public.allbad_sec055_converted
+    TO anon
+    USING (tenant_id = (SELECT public.allbad_require_tenant('app.tenant_id')));
+
+CREATE TABLE public.allbad_sec055 (id int PRIMARY KEY, tenant_id text NOT NULL);
+ALTER TABLE public.allbad_sec055 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.allbad_sec055 FORCE ROW LEVEL SECURITY;
+CREATE POLICY allbad_sec055_p ON public.allbad_sec055
+    TO anon
+    USING (tenant_id = (SELECT current_setting('app.tenant_id', true)));
+
 -- SEC044: default privileges in schema public auto-grant SELECT on every
 -- future table to PUBLIC, so any table created later without RLS is silently
 -- exposed to every role (incl. anon). SEC044 fires on the pg_default_acl

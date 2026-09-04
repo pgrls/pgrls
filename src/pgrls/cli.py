@@ -2020,6 +2020,17 @@ def _parse_generate_tables(
     help="Overwrite the --output file if it already exists.",
 )
 @click.option(
+    "--strict-binding",
+    is_flag=True,
+    default=None,
+    help=(
+        "Compare against a helper that RAISES when no tenant is bound, "
+        "instead of a current_setting(..., true) that silently yields NULL. "
+        "An unbound query then errors instead of looking like an empty "
+        "result. Also settable as strict_binding in pgrls.toml."
+    ),
+)
+@click.option(
     "--apply",
     is_flag=True,
     default=False,
@@ -2027,6 +2038,7 @@ def _parse_generate_tables(
 )
 def generate(
     ctx: click.Context,
+    strict_binding: bool | None,
     database_url: str | None,
     config_path: str | None,
     schemas: str | None,
@@ -2081,6 +2093,20 @@ def generate(
     # Column default depends on the model when not given explicitly.
     resolved_column = column or ("user_id" if model_norm == "owner" else "tenant_id")
 
+    # `--strict-binding` defaults to None (not False) so an explicit flag is
+    # distinguishable from an absent one: the flag wins when given, otherwise
+    # `[generate].strict_binding` decides. A False default would make the
+    # config unreachable.
+    try:
+        _gen_cfg = load_config(config_path)
+    except ConfigError:
+        _gen_cfg = None  # re-raised with a clear message just below
+    resolved_strict_binding = (
+        strict_binding
+        if strict_binding is not None
+        else bool(_gen_cfg.generate_strict_binding) if _gen_cfg else False
+    )
+
     # Validate --config unconditionally so a broken config file surfaces on
     # both offline and live generate paths (mirrors fix()'s up-front parse).
     try:
@@ -2114,6 +2140,7 @@ def generate(
         role=role,
         restrictive=restrictive,
         tables=_parse_generate_tables(tables),
+        strict_binding=resolved_strict_binding,
     )
 
     offline = _resolve_offline_schema(

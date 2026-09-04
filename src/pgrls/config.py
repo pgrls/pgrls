@@ -84,6 +84,12 @@ class Config:
     # rename+edit as drop+add), "relaxed" (also collapse a rename+edit
     # into one POLICY_RENAMED graded by predicate direction).
     diff_rename_detection: str = "strict"
+    # `[generate].strict_binding` — scaffold policies that compare against a
+    # RAISING binding helper rather than a silent `current_setting(…, true)`,
+    # so a query that never bound a tenant errors instead of looking like an
+    # empty result. Also the signal SEC055 uses to flag a tenant policy that
+    # still carries the silent form, so the two cannot drift once chosen.
+    generate_strict_binding: bool = False
     # `[diff].rename_classification` — Classification for a name-only
     # rename. User writes the hyphenated form in TOML ("safe" |
     # "requires-review"); stored internally as the underscore form
@@ -441,6 +447,16 @@ def _build_config(raw: dict[str, Any]) -> Config:
                 ) from exc
         rule_options[normalized_id] = opts_remaining
 
+    generate = raw.get("generate", {})
+    if not isinstance(generate, dict):
+        raise ConfigError("[generate] must be a table")
+    generate_strict_binding = generate.get("strict_binding", False)
+    if not isinstance(generate_strict_binding, bool):
+        raise ConfigError(
+            "[generate].strict_binding must be a boolean, got "
+            f"{type(generate_strict_binding).__name__}"
+        )
+
     diff = raw.get("diff", {})
     if not isinstance(diff, dict):
         raise ConfigError("[diff] must be a table")
@@ -499,6 +515,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
         diff_fail_on=diff_fail_on,
         diff_rename_detection=diff_rename_detection,
         diff_rename_classification=diff_rename_classification,
+        generate_strict_binding=generate_strict_binding,
         extra_rules=extra_rules,
         database_url_error=database_url_error,
     )
