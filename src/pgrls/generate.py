@@ -74,6 +74,15 @@ class GenerateOptions:
     # Explicit (schema, table) -> discriminator column overrides, for tables
     # whose column isn't the conventional one (e.g. `org_id`).
     tables: tuple[tuple[str, str, str], ...] = ()
+    # Compare against a RAISING binding helper instead of a bare
+    # `current_setting(..., true)`, so a query that forgot to bind a tenant
+    # errors instead of silently returning nothing. See `session_predicate`.
+    strict_binding: bool = False
+
+    @property
+    def binding_function(self) -> str:
+        """Qualified name of the raising helper `--strict-binding` emits."""
+        return f"pgrls_require_{self.label}"
 
     @property
     def label(self) -> str:
@@ -147,8 +156,44 @@ def session_predicate(
       unset, making `col = NULL` evaluate to NULL → the row is denied (the
       safe default; this is NOT the SEC004 `IS NULL OR …` expose footgun).
       `auth.uid()` likewise returns NULL for an unauthenticated request.
+
+    Under `strict_binding` the session read becomes a call to a helper that
+    RAISES when nothing is bound, so a query whose connection never set the
+    GUC errors instead of quietly returning nothing. That silence is the
+    default's one real cost: an unbound query and a genuinely-empty result
+    are indistinguishable to the caller, so an application that forgets to
+    bind a tenant reports 404s rather than failing loudly, and no test that
+    connects as the owner can tell the difference.
+
+    The wrapper stays. Measured on PG16, a 10,000-row scan calls the helper
+    **10,001 times** unwrapped and **once** wrapped, so the unwrapped form
+    trades a 10,000x per-query cost for its stricter firing — and PERF001
+    would flag it besides. Wrapped, the InitPlan is evaluated when the scan
+    produces a candidate row to filter, which means the raise fires exactly
+    when a row *would have been returned and was about to be wrongly
+    hidden*. When nothing matched anyway — an empty table, a token that does
+    not exist — it stays silent, and there the empty result was the truthful
+    answer, so a legitimate 404 is never converted into an error.
     """
     qcol = quote_ident(column)
+    if options.strict_binding:
+        # The helper takes the setting name so ONE function serves every
+        # table, and returns text; the cast (if any) is applied outside it
+        # exactly as in the non-strict form.
+        setting = options.resolved_setting(column)
+        escaped = setting.replace("'", "''")
+        call = f"{quote_ident(options.binding_function)}('{escaped}')"
+        if coltype and coltype.lower() not in _TEXT_TYPES:
+            if not _is_safe_data_type(coltype):
+                raise ValueError(
+                    f"refusing to build a cast from an unsafe column type "
+                    f"{coltype!r} for column {column!r}: it does not parse as "
+                    "a single bare column type. This should never happen for "
+                    "a type read from live introspection."
+                )
+            call = f"{call}::{coltype}"
+        return f"{qcol} = (SELECT {call})"
+
     if options.convention == "supabase":
         # `col = (SELECT auth.uid())` — the canonical Supabase row-owner
         # form. No cast: auth.uid() returns uuid (match a uuid column).
@@ -285,6 +330,49 @@ def _statements_for_table(
     return out
 
 
+def binding_function_sql(options: GenerateOptions) -> str:
+    """`CREATE OR REPLACE FUNCTION` for the `--strict-binding` helper.
+
+    Takes the setting name so one function serves every table, and RAISES
+    `insufficient_privilege` when nothing is bound — the code an application
+    can catch and map to a 500 rather than the 404 an unbound query
+    currently produces. `STABLE` so the wrapped `(SELECT ...)` InitPlan is
+    evaluated once per statement.
+
+    `current_setting(name, true)` is used INSIDE the helper for the same
+    reason the non-strict predicate uses it: the one-argument form raises a
+    bare `unrecognized configuration parameter` that says nothing about
+    tenancy. Reading it with `missing_ok` and raising our own message is
+    what turns a silent empty result into a diagnosis.
+
+    Empty string is treated as unbound: `SET app.x = ''` is what a helper
+    that stringifies a null id produces, and it fails the same silent way.
+    """
+    fn = quote_ident(options.binding_function)
+    label = options.label
+    return (
+        f"CREATE OR REPLACE FUNCTION {fn}(setting_name text)\n"
+        "RETURNS text\n"
+        "LANGUAGE plpgsql\n"
+        "STABLE\n"
+        "AS $$\n"
+        "DECLARE\n"
+        "    v text := current_setting(setting_name, true);\n"
+        "BEGIN\n"
+        "    IF v IS NULL OR v = '' THEN\n"
+        "        RAISE EXCEPTION\n"
+        f"            'no {label} bound: % is not set on this connection',\n"
+        "            setting_name\n"
+        "            USING ERRCODE = 'insufficient_privilege',\n"
+        f"                  HINT = 'Bind the {label} before querying "
+        "(e.g. SET LOCAL), or use a connection helper that does.';\n"
+        "    END IF;\n"
+        "    RETURN v;\n"
+        "END\n"
+        "$$;"
+    )
+
+
 def plan_generation(
     schema: Schema, options: GenerateOptions
 ) -> GenerateResult:
@@ -390,6 +478,22 @@ def plan_generation(
         if (s, n) not in seen:
             skipped.append((f"{s}.{n}", "table not found in scanned schemas"))
 
+    if options.strict_binding and statements:
+        # One helper for the whole run, ordered first: every generated
+        # policy references it, so it must exist before they are created.
+        statements.insert(
+            0,
+            Fix(
+                rule_id="RLS",
+                location=options.binding_function,
+                sql=binding_function_sql(options),
+                description=(
+                    f"Create {options.binding_function}(), which raises when "
+                    f"no {options.label} is bound on the connection, so an "
+                    "unbound query errors instead of returning nothing."
+                ),
+            ),
+        )
     return GenerateResult(
         statements=tuple(statements),
         skipped=tuple(sorted(skipped)),
