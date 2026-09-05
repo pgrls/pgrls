@@ -3769,3 +3769,43 @@ def test_summary_counts_one_table_behind_several_doors_once() -> None:
     v = build_reachability(Schema(tables=(t,), views=views, role_memberships=()))
     assert len(v.tables) == 3  # three doors
     assert v.summary == {"tables": 1, "isolated": 0, "leak": 1, "unverified": 0}
+
+
+def test_reachability_does_not_cede_when_only_one_anon_session_reads_everything() -> None:
+    """A `{}` witness means "every row in the FIRST session that leaked", not
+    "in every session". `USING (auth.role() = 'anon')` is total for the
+    Supabase anon-key caller and admits nothing to a JWT-less one — measured:
+    a JWT-less anon read 0 rows directly and every row through a definer view
+    owned by a superuser, while the cede reported PROVEN."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Grant, Policy, Schema, Table
+
+    anon_key_only = Policy(
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
+        using_sql="auth.role() = 'anon'", with_check_sql=None,
+        using_ast=parse_expr("auth.role() = 'anon'"), with_check_ast=None,
+    )
+    t = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        columns=("id",), owner="tbl_owner", policies=(anon_key_only,),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+    v = _rv_view("v", "root", (("public", "t"),), superuser=True)
+    assert _rv(Schema(tables=(t,), views=(v,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "leak"
+
+    # A predicate that IS total in every session still cedes.
+    always = Policy(
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
+        using_sql="true", with_check_sql=None,
+        using_ast=parse_expr("true"), with_check_ast=None,
+    )
+    wide = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        columns=("id",), owner="tbl_owner", policies=(always,),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+    assert _rv(Schema(tables=(wide,), views=(v,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "isolated"

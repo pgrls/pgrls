@@ -51,7 +51,7 @@ from pgrls.diff._z3_compare import (
     cross_tenant_session_identity,
 )
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import MAYBE_SET, Column, Policy, Schema, Table
+from pgrls.model import Column, Policy, Schema, Table, is_maybe_set
 from pgrls.repro import (
     _identity_value_type,
     _row_columns,
@@ -642,7 +642,22 @@ def _observe_anon_sessions(
         cur.execute(f"SELECT current_setting({_sql_str(n)}, true) AS v")
         got = cur.fetchone()
         inherited[n] = (got[0] if got and got[0] is not None else "")
-    for state in guc_states or ({},):
+    # A custom GUC written once cannot be un-set within the session (measured:
+    # neither RESET, set_config(..., NULL), nor a savepoint rollback restores
+    # NULL). So visit the states that set the FEWEST names first, and if a
+    # later state omits a name an earlier one already wrote, abstain rather
+    # than observe a session we cannot actually build — reporting `no rows`
+    # there produced a MISMATCH against a correct proof.
+    written: set[str] = set()
+    for state in sorted(guc_states or ({},), key=lambda st: (len(st), sorted(st))):
+        stale = written - set(state)
+        if stale:
+            raise _ProbeAbstain(
+                "cannot reconstruct this anonymous session: "
+                f"{', '.join(sorted(stale))} was set for an earlier login path "
+                "and a custom GUC cannot be unset within a session"
+            )
+        written |= set(state)
         for n in names:
             if n not in state:
                 # Not set on this login path. Leave it alone rather than
@@ -651,7 +666,7 @@ def _observe_anon_sessions(
                 # destroy an `IS NULL` leak the prover legitimately found.
                 continue
             raw = state[n]
-            value = inherited[n] if raw in (None, MAYBE_SET) else str(raw)
+            value = inherited[n] if raw is None or is_maybe_set(raw) else str(raw)
             cur.execute(f"SELECT set_config({_sql_str(n)}, {_sql_str(value)}, true)")
         for guc, _val in _ANON_KEY_SESSION_GUCS:
             cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")

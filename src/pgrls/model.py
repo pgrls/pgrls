@@ -59,17 +59,31 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-# A `Schema.set_gucs` value meaning "this session can read the GUC, but we
-# cannot attribute it to the SERVER rather than to the introspecting role".
-# A GUC value can never contain a NUL byte, so this cannot collide with a real
-# one. The distinction is load-bearing: recording such a name as definitely
+# A `Schema.set_gucs` value PREFIX meaning "this session can read the GUC, but
+# we cannot attribute it to the SERVER rather than to the introspecting role".
+# The value the session observed follows the prefix, so `--emit-repro` can
+# offer it as a one-line edit. A unit-separator lead-in keeps it clear of any
+# realistic GUC value while staying storable in a `jsonb` column — a literal
+# NUL is not (Postgres rejects `\u0000` in jsonb), and snapshots do land
+# there. The distinction is load-bearing: recording such a name as definitely
 # set is STRONGER than leaving it unknown, and would prove
 # `current_setting('x', true) IS NULL` false — the SEC004 inverted-gate shape
 # — from a value an anonymous caller may not have at all (measured:
 # `PGOPTIONS='-c app.gate=whatever' pgrls verify` flipped a real LEAK to
 # PROVEN). Under this value the prover keeps both the value AND the null-flag
 # free, so it can decline but never conclude.
-MAYBE_SET = "\x00pgrls:maybe-set"
+MAYBE_SET = "\x1fpgrls:maybe-set:"
+
+
+def is_maybe_set(value: str | None) -> bool:
+    """Is this `set_gucs` value the "cannot attribute to the server" state?"""
+    return isinstance(value, str) and value.startswith(MAYBE_SET)
+
+
+def maybe_set_value(value: str) -> str:
+    """The value the introspecting session actually observed, for a
+    `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
+    return value[len(MAYBE_SET):]
 
 SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit); v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that

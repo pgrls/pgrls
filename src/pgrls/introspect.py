@@ -1358,7 +1358,7 @@ def _fetch_set_gucs(
         cur.execute("SELECT current_setting(%s, true) AS v", (name,))
         got = cur.fetchone()
         if got is not None and got["v"] not in (None, ""):
-            db_level[name] = MAYBE_SET
+            db_level[name] = MAYBE_SET + str(got["v"])
     return tuple(sorted(db_level.items())), tuple(sorted(role_level))
 
 

@@ -1081,6 +1081,36 @@ def _anon_session_exempt(schema: Schema, table: Any, anon_roles: set[str]) -> bo
     return closure is not None and table.owner in closure
 
 
+def _anon_reads_every_row(
+    schema: Schema,
+    table: Any,
+    auth_functions: set[str] | None,
+    anon_roles: set[str],
+    guc_states: tuple[GucState, ...],
+) -> bool:
+    """Does the DIRECT anonymous read already return every row of `table`?
+
+    The question a cede asks before deciding a second door adds nothing. It
+    needs "every row in EVERY modelled anonymous session", which a `{}`
+    witness does not give — that witness comes from the first session that
+    leaked (see `_z3_compare.anon_leak_is_total`). Answered here by asking
+    whether some policy anon can actually invoke admits every row in every
+    session.
+    """
+    from pgrls.diff._z3_compare import anon_leak_is_total  # noqa: PLC0415
+
+    auth = auth_functions if auth_functions is not None else None
+    for policy in table.policies:
+        if policy.command not in _MODE_COMMANDS["anon"] or not policy.permissive:
+            continue
+        if _anon_policy_reachability(schema, policy, anon_roles) != "reachable":
+            continue
+        ast = checked_ast(policy, "anon")
+        if ast is not None and anon_leak_is_total(ast, auth, set_gucs=guc_states):
+            return True
+    return False
+
+
 def _relation_is_anon_selectable(
     schema: Schema, rel: Any, anon_roles: set[str]
 ) -> bool:
@@ -1311,7 +1341,10 @@ def build_reachability(
             # (measured: `permission denied` on the direct read).
             if (
                 an_leak is not None
-                and an_leak.witness == {}
+                and _anon_reads_every_row(
+                    schema, table, auth_functions, resolved_anon_roles,
+                    caller_set_gucs,
+                )
                 and _anon_holds_select(
                     schema, table, resolved_anon_roles, table_level_only=True
                 )
@@ -1326,8 +1359,11 @@ def build_reachability(
                         (proof,),
                     )
                 )
-            elif not total and _anon_holds_select(
-                schema, table, resolved_anon_roles, table_level_only=True
+            elif (
+                not total
+                and _anon_holds_select(
+                    schema, table, resolved_anon_roles, table_level_only=True
+                )
             ):
                 # The table already leaks some rows to anon directly and the
                 # view admits its owner some rows — possibly the very same
@@ -1677,22 +1713,31 @@ def _sql_body_parses(secdef_fn: Any) -> bool:
 
 
 def _escalation_anon_rollup(
-    reads: set[str], an_by_table: dict[str, TableVerdict]
+    reads: set[str],
+    an_by_table: dict[str, TableVerdict],
+    total_read: Callable[[str], bool] | None = None,
 ) -> tuple[Verdict, dict[str, object] | None, str]:
     """Roll up the escalation verdict for a SECDEF body that reads `reads`
-    (RLS-table qnames), from each read table's ``anon`` verdict. Same witness
+    (RLS-table qnames), from each read table's ``anon`` verdict. Same
     discrimination as the owner-bypass case: an anon-isolated table → leak (the
-    function exposes rows anon couldn't read); a *total* anon leak (witness ``{}``)
-    → the function exposes nothing new; a *partial* anon leak → leak; an
-    unprovable predicate → unverified."""
+    function exposes rows anon couldn't read); a table the direct anon read
+    already returns ENTIRELY → the function exposes nothing new; a partial anon
+    leak → leak; an unprovable predicate → unverified.
+
+    "Entirely" must hold in EVERY modelled anonymous session, which is what
+    `total_read` answers. A `{}` witness only says the first leaking session
+    read everything — measured: `USING (auth.role() = 'anon')` gave the
+    anon-key caller every row and a JWT-less one none, so an anon-callable
+    SECDEF function over it was cleared while a JWT-less anon read every row
+    through it."""
     verdicts: list[Verdict] = []
     for tq in sorted(reads):
         tv = an_by_table.get(tq)
         if tv is None or tv.verdict == "isolated":
             verdicts.append("leak")
         elif tv.verdict == "leak":
-            leak = next((p for p in tv.proofs if p.verdict == "leak"), None)
-            verdicts.append("isolated" if leak and leak.witness == {} else "leak")
+            already = total_read(tq) if total_read is not None else False
+            verdicts.append("isolated" if already else "leak")
         else:
             verdicts.append("unverified")
     if "leak" in verdicts:
@@ -1912,6 +1957,18 @@ def _escalation_secdef_findings(
         schema, auth_functions=auth_functions, mode="anon", anon_roles=anon_roles
     )
     an_by_table = {t.qualified_name: t for t in an.tables}
+    # "the direct anon read already returns this table entirely" must hold in
+    # EVERY modelled anonymous session, not just the first one that leaked.
+    _tables_by_q = {t.qualified_name: t for t in schema.tables}
+    _esc_gucs = _anon_set_gucs(schema, anon_roles)
+    _esc_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
+
+    def total_read(qname: str) -> bool:
+        table = _tables_by_q.get(qname)
+        return table is not None and _anon_reads_every_row(
+            schema, table, auth_functions, _esc_roles, _esc_gucs
+        )
+
     bare_to_qual: dict[str, list[tuple[str, str]]] = {}
     for s, n in sorted(rls_tables):
         bare_to_qual.setdefault(n, []).append((s, n))
@@ -1963,7 +2020,9 @@ def _escalation_secdef_findings(
             "RLS-exempt role"
         )
         if reads:
-            verdict, witness, tail = _escalation_anon_rollup(reads, an_by_table)
+            verdict, witness, tail = _escalation_anon_rollup(
+                reads, an_by_table, total_read
+            )
             if inconclusive and verdict == "isolated":
                 # The reads we *can* see prove "nothing new", but the function
                 # also has an opaque overload or reads via a view/function we

@@ -40,7 +40,7 @@ from pglast.ast import A_Const, A_Expr, ColumnRef, FuncCall, Node, String, TypeC
 from pgrls.ast_utils import func_name_parts
 from pgrls.diff._z3_compare import cross_tenant_session_identity
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import MAYBE_SET, Column, Policy, Schema, Table
+from pgrls.model import Column, Policy, Schema, Table, is_maybe_set, maybe_set_value
 from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, Verification
 
 # auth.* stubs so a Supabase-style policy is creatable in a throwaway database;
@@ -560,7 +560,7 @@ def _build_statements(
         )
         setup.append("-- needs them, and a throwaway database has none.")
         for name, value in sorted(gucs.items()):
-            if value is MAYBE_SET or value == MAYBE_SET:
+            if is_maybe_set(value):
                 # The prover could not attribute this GUC to the server, so it
                 # modelled the anonymous session with BOTH the value and the
                 # null-flag free. Writing any value here would pin it non-NULL
@@ -580,8 +580,10 @@ def _build_statements(
                 setup.append(
                     "-- an anonymous caller may well see; if your callers do"
                 )
+                observed = maybe_set_value(str(value))
                 setup.append(
-                    f"-- have it, add: SELECT set_config({_sql_str(name)}, '<value>', true);"
+                    "-- have it, uncomment: SELECT set_config("
+                    f"{_sql_str(name)}, {_sql_str(observed)}, true);"
                 )
                 continue
             if value is None:

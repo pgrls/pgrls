@@ -141,3 +141,35 @@ def test_a_guc_we_cannot_attribute_to_the_server_stays_undecided() -> None:
     scoped = parse_expr("tenant = current_setting('app.t')")
     assert prove_anon_isolation(scoped)[0] == "isolated"
     assert prove_anon_isolation(scoped, set_gucs={"app.t": MAYBE_SET})[0] == "leak"
+
+
+def test_anon_leak_is_total_asks_the_all_sessions_question() -> None:
+    """`prove_anon_isolation` is the EXISTS question and returns the first
+    leaking session's witness, so a `{}` witness cannot be read as "every
+    session reads everything". `anon_leak_is_total` is the FORALL question the
+    reachability and escalation cedes need."""
+    from pgrls.diff._z3_compare import anon_leak_is_total, prove_anon_isolation
+
+    # Total for the anon-key caller, admits nothing to a JWT-less one.
+    anon_key = parse_expr("auth.role() = 'anon'")
+    assert prove_anon_isolation(anon_key) == ("leak", {})
+    assert anon_leak_is_total(anon_key) is False
+
+    # Total in both sessions.
+    assert anon_leak_is_total(parse_expr("true")) is True
+
+    # Not a leak at all.
+    assert anon_leak_is_total(parse_expr("tenant_id = auth.uid()")) is False
+
+
+def test_maybe_set_carries_the_observed_value_and_avoids_nul() -> None:
+    """The sentinel is a prefix so `--emit-repro` can offer the value the
+    introspecting session saw, and it must stay storable in a `jsonb` column —
+    Postgres rejects a literal NUL there, and snapshots do land in one."""
+    from pgrls.model import MAYBE_SET, is_maybe_set, maybe_set_value
+
+    assert "\x00" not in MAYBE_SET
+    assert is_maybe_set(MAYBE_SET + "fromconn")
+    assert maybe_set_value(MAYBE_SET + "fromconn") == "fromconn"
+    assert not is_maybe_set("fromconn")
+    assert not is_maybe_set(None)

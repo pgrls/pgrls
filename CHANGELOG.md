@@ -31,6 +31,32 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **An empty leak witness was read as "every anonymous session reads
+  everything", when it only means the FIRST session that leaked did — so both
+  `--mode reachability` and `--mode escalation` cleared open doors.** The anon
+  prover asks the ∃ question (a leak in any modelled session is a leak) and
+  returns that session's witness. `USING (auth.role() = 'anon')` is total for
+  the Supabase anon-key caller and admits *nothing* to a JWT-less one, so a
+  definer view over it — and an anon-callable `SECURITY DEFINER` function over
+  it, the SEC042 threat exactly — handed a JWT-less anonymous caller every row
+  while the direct read gave none, and both modes reported PROVEN and exited
+  0. Worse, `--against` credited the regression as a fix. Both cedes now ask
+  the ∀ question (`anon_leak_is_total`): the direct read must already return
+  every row in *every* modelled session.
+- **`--probe` left a GUC from one login path standing for the next, then
+  reported `no rows`.** A custom GUC written once cannot be unset within the
+  session (measured: not by `RESET`, `set_config(..., NULL, ...)`, a savepoint
+  rollback, or a full rollback), so a login role sorting before `anon` poisoned
+  `anon`'s state — the probe missed a live read and exited 0, and on the
+  decidable variant contradicted a correct proof with a MISMATCH. States are
+  now visited fewest-settings-first, and a state that cannot be reconstructed
+  abstains instead of being observed wrongly.
+- The unattributable-GUC sentinel now carries the value the introspecting
+  session observed, so `--emit-repro` offers it as a one-line uncomment rather
+  than a `<value>` placeholder, and it no longer embeds a literal NUL — which
+  `jsonb` rejects, making a snapshot from such a cluster unstorable in a
+  `jsonb` column. `--emit-repro` also says which reason left the directory
+  empty instead of attributing every case to an anonymous-role RLS exemption.
 - **Two rules stated Postgres semantics backwards, in text `pgrls explain`
   prints to users.** SEC013 said a trigger fires as the table owner regardless
   of `prosecdef` — measured, an invoker-side trigger function runs as the

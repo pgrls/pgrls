@@ -1066,6 +1066,30 @@ GRANT SELECT ON docs_v TO anon;
             "every row the door returns is one the direct read withholds."
         ),
     ),
+
+    VerdictCase(
+        name="reach_anon_key_only_leak_is_still_an_open_door",
+        mode="reachability",
+        sql="""
+CREATE TABLE docs (id int primary key, body text);
+INSERT INTO docs VALUES (1, 'alpha'), (2, 'beta');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC USING (auth.role() = 'anon');
+GRANT SELECT ON docs TO anon;
+CREATE VIEW docs_v AS SELECT * FROM docs;
+GRANT SELECT ON docs_v TO anon;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "The policy is TOTAL for the Supabase anon-key caller and admits "
+            "NOTHING to a JWT-less one (measured: 0 rows direct, every row "
+            "through the view). Reading the `{}` witness as 'the table "
+            "already leaks everything to anon' cleared the door — that "
+            "witness names the first session that leaked, not all of them."
+        ),
+    ),
 ]
 
 

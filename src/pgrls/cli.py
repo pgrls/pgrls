@@ -4666,17 +4666,26 @@ def verify(
             err=True,
         )
         if not artifacts and verification.has_leak:
-            # A leak whose proof names a role rather than a policy (the
-            # anonymous session is exempt from the table's RLS outright) has
-            # no policy to reproduce — say so instead of leaving an empty
-            # directory unexplained.
-            click.echo(
-                "pgrls: no reproduction is possible for these leaks — the "
-                "anonymous session is exempt from the table's RLS, so there "
-                "is no policy to reproduce; see verify --mode escalation "
-                "and SEC048.",
-                err=True,
+            # Say WHICH reason applies rather than assuming one: an
+            # anon-exemption proof names a role, not a policy, and a write
+            # leak on a FOR UPDATE / FOR DELETE policy has no INSERT to
+            # reproduce it with.
+            exemption = any(
+                p.policy.startswith("role:")
+                for t in verification.tables
+                for p in t.proofs
+                if p.verdict == "leak"
             )
+            reason = (
+                "the anonymous session is exempt from the table's RLS, so "
+                "there is no policy to reproduce; see verify --mode "
+                "escalation and SEC048"
+                if exemption
+                else "these leaks have no INSERT-representable reproduction "
+                "(a FOR UPDATE / FOR DELETE write policy, or no single "
+                "tenant-scoping axis to pivot on)"
+            )
+            click.echo(f"pgrls: no reproduction was written — {reason}.", err=True)
 
     if verification.has_leak:
         sys.exit(1)

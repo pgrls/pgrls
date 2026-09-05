@@ -149,7 +149,7 @@ except ImportError:  # pragma: no cover — exercised by the no-z3 install path
     Z3_AVAILABLE = False
     z3 = None  # noqa: F811  # rebind to None when import failed
 
-from pgrls.model import MAYBE_SET
+from pgrls.model import is_maybe_set
 
 from pglast.ast import (
     A_ArrayExpr,
@@ -1495,7 +1495,7 @@ def _anon_3vl(
         and ctx.set_gucs
         and isinstance(node, FuncCall)
         and _is_builtin_current_setting_call(node)
-        and ctx.set_gucs.get((_first_string_arg(node) or "").lower()) == MAYBE_SET
+        and is_maybe_set(ctx.set_gucs.get((_first_string_arg(node) or "").lower()))
     ):
         # Readable by the introspecting session, but not attributable to the
         # SERVER — it may be that connection's own option (`PGOPTIONS`), which
@@ -2283,6 +2283,43 @@ def prove_anon_isolation(
     if any(v == "unverified" for v, _ in verdicts):
         return ("unverified", None)
     return ("isolated", None)
+
+
+def anon_leak_is_total(
+    using_node: Any,
+    auth_functions: set[str] | None = None,
+    *,
+    set_gucs: Mapping[str, str | None] | Sequence[Mapping[str, str | None]] = (),
+) -> bool:
+    """Does EVERY modelled anonymous session read EVERY row?
+
+    `prove_anon_isolation` answers the ∃ question — a leak in any session is a
+    leak — and returns the FIRST leaking session's witness. That makes a `{}`
+    witness mean "some session reads everything", which is not what a caller
+    asking "does the direct read already expose everything a second door
+    would" needs. Measured: `USING (auth.role() = 'anon')` is total for the
+    Supabase anon-key caller and admits NOTHING to a JWT-less one, so a
+    definer view over it handed a JWT-less anon every row while the direct
+    read gave none — and the ∃ reading cleared it.
+    """
+    if not Z3_AVAILABLE:
+        return False
+    auth = (
+        auth_functions
+        if auth_functions is not None
+        else set(_DEFAULT_AUTH_FUNCTIONS)
+    )
+    states: tuple[Mapping[str, str | None], ...] = (
+        (set_gucs,) if isinstance(set_gucs, Mapping) else tuple(set_gucs) or ({},)
+    )
+    for state in states:
+        for anon_jwt in (False, True):
+            verdict, witness = _prove_anon_session(
+                using_node, auth, anon_jwt=anon_jwt, set_gucs=state
+            )
+            if verdict != "leak" or witness != {}:
+                return False
+    return True
 
 
 def _prove_anon_session(
