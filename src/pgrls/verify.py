@@ -460,6 +460,17 @@ def _floor_applies(permissive: Policy, restrictive: Policy, mode: Mode) -> bool:
     return True
 
 
+def _anon_set_gucs(schema: Schema, anon_roles: set[str] | None) -> frozenset[str]:
+    """Dotted GUC names an anonymous session finds already set: database /
+    server level, plus role-level settings for a role in the anon closure
+    (`ALTER ROLE unrelated SET app.x` is not what anon inherits)."""
+    seed = anon_roles if anon_roles else {"anon", "PUBLIC"}
+    reachable, _ = _anon_reachable_roles(schema, seed)
+    names = {n.lower() for n in schema.set_gucs}
+    names |= {n.lower() for role, n in schema.role_set_gucs if role in reachable}
+    return frozenset(names)
+
+
 def _anon_reachable_roles(
     schema: Schema, anon_roles: set[str]
 ) -> tuple[frozenset[str], bool]:
@@ -562,9 +573,10 @@ def build_verification(
     prove = _PROVERS[mode]
     if mode == "anon":
         # Dotted GUCs the anonymous session inherits already set (database /
-        # role / server level): a read of one is a real value, not the raise
-        # the unset-GUC assumption relies on.
-        prove = functools.partial(prove, set_gucs=frozenset(schema.set_gucs))
+        # server level, plus role-level settings for roles in the anon
+        # closure): a read of one is a real value, not the raise the
+        # unset-GUC assumption relies on.
+        prove = functools.partial(prove, set_gucs=_anon_set_gucs(schema, anon_roles))
     else:
         # The cross-tenant axis must be an identity/discriminator column, or
         # the proof is vacuous (`status != session.status` says nothing about
@@ -855,10 +867,21 @@ def build_escalation(
     return Verification(tuple(tables), "escalation")
 
 
-def _view_is_anon_selectable(view: Any, anon_roles: set[str]) -> bool:
-    """Can a role in `anon_roles` `SELECT` from `view`? (SEC052's gate.)"""
+def _view_is_anon_selectable(schema: Schema, view: Any, anon_roles: set[str]) -> bool:
+    """Can the anonymous session `SELECT` from `view`?
+
+    A grant to any role in the anon closure (`_anon_reachable_roles` — the
+    same closure policy reachability uses, plus PUBLIC), at TABLE level or
+    on ANY column: a column-level `GRANT SELECT (id, body) ON v TO anon` is a
+    door too (measured: anon read the row). When the graph is not captured
+    only a literal anon/PUBLIC grant counts.
+    """
+    reachable, _ = _anon_reachable_roles(schema, anon_roles)
+    if any(g.role in reachable and "SELECT" in g.privileges for g in view.grants):
+        return True
     return any(
-        g.role in anon_roles and "SELECT" in g.privileges for g in view.grants
+        cg.role in reachable and "SELECT" in cg.privileges
+        for cg in getattr(view, "column_grants", ())
     )
 
 
@@ -929,9 +952,26 @@ def build_reachability(
         v
         for v in schema.views
         if not v.is_materialized
-        and _view_is_anon_selectable(v, resolved_anon_roles)
+        and _view_is_anon_selectable(schema, v, resolved_anon_roles)
     ]
-    paths = _reachability_paths(schema, outers, tables_by_key, views_by_key)
+    # A definer view whose owner is NOT RLS-exempt can still launder rows: if
+    # the table's own permissive policies grant that owner every row (`TO
+    # app_role USING (true)`), the view hands them to anon. Ask the anon prover
+    # the same question with the OWNER as the session role — the predicates
+    # are evaluated with the anonymous caller's auth context (auth.* NULL /
+    # anon-key), exactly as Postgres does inside the view body.
+    owner_cache: dict[str, dict[str, TableVerdict]] = {}
+
+    def owner_verdict(owner: str, table: Any) -> TableVerdict | None:
+        if owner not in owner_cache:
+            v = build_verification(
+                schema, auth_functions=auth_functions, mode="anon",
+                anon_roles={owner},
+            )
+            owner_cache[owner] = {t.qualified_name: t for t in v.tables}
+        return owner_cache[owner].get(table.qualified_name)
+
+    paths = _reachability_paths(schema, outers, tables_by_key, views_by_key, owner_verdict)
     if not paths:
         return Verification((), "reachability")
 
@@ -951,10 +991,7 @@ def build_reachability(
         )
         selectable = f"is SELECT-able by {', '.join(sorted(resolved_anon_roles))}"
         if rp.exempt is None:
-            reason = (
-                f"role-membership graph not captured; cannot decide whether "
-                f"{eff.owner} holds table owner {table.owner}'s privileges"
-            )
+            reason = rp.unknown_reason or "cannot decide the effective user's access"
             proof = PolicyProof(outer.qualified_name, "unverified", None, reason)
             tables.append(
                 TableVerdict(
@@ -966,14 +1003,20 @@ def build_reachability(
                 )
             )
             continue
-        if eff.owner_bypasses_rls:
+        if rp.via_policy:
+            why = (
+                f"owner {eff.owner} is not RLS-exempt, but the table's own "
+                "policies grant it every row under the anonymous auth context "
+                "— the definer view launders them"
+            )
+        elif eff.owner_bypasses_rls:
             why = f"BYPASSRLS/superuser owner {eff.owner}"
         elif eff.owner == table.owner:
             why = f"owner {eff.owner} owns the table and RLS is not FORCE'd"
         else:
             why = (
-                f"owner {eff.owner} is a member of table owner {table.owner} "
-                "(owner-equivalent) and RLS is not FORCE'd"
+                f"owner {eff.owner} is an INHERIT member of table owner "
+                f"{table.owner} (owner-equivalent) and RLS is not FORCE'd"
             )
         path = f"{door}: {why}; {selectable}"
         anv = an_by_table.get(table.qualified_name)
@@ -1048,8 +1091,9 @@ class _ReachPath:
     names beneath it; `effective` the view whose owner Postgres evaluates the
     table's RLS as (the nearest enclosing `security_invoker = false` view on
     the path); `exempt` whether that owner escapes the table's RLS — `None`
-    when the role-membership graph is not captured and the answer turns on
-    membership.
+    when the answer is undecidable here (`unknown_reason` says why); and
+    `via_policy` when the owner is not exempt but the table's own policies
+    grant it every row (a laundering definer view).
     """
 
     outer: Any
@@ -1057,19 +1101,16 @@ class _ReachPath:
     hops: tuple[str, ...]
     effective: Any
     exempt: bool | None
+    via_policy: bool = False
+    unknown_reason: str | None = None
 
 
-def _inherits_privs_of(schema: Schema, role: str, target: str) -> bool | None:
-    """Does `role` hold `target`'s privileges (the upward INHERIT closure)?
-
-    Postgres's owner check is `has_privs_of_role`, so a member of the table
-    owner is owner-equivalent — validated live: a view owned by an INHERIT
-    member of the table owner read every row. `None` when the graph was not
-    captured (a snapshot / hand-built Schema): the caller must abstain, not
-    guess.
+def _inherit_closure(schema: Schema, role: str) -> frozenset[str] | None:
+    """The roles whose privileges `role` holds — Postgres's `has_privs_of_role`:
+    the upward closure over INHERIT memberships only (a NOINHERIT edge grants
+    `SET ROLE`, not the privileges — measured: a NOINHERIT member's view got
+    `permission denied`). `None` when the graph was not captured.
     """
-    if role == target:
-        return True
     if schema.role_memberships is None:
         return None
     reach = {role}
@@ -1077,10 +1118,18 @@ def _inherits_privs_of(schema: Schema, role: str, target: str) -> bool | None:
     while changed:  # transitive closure; role graphs are tiny
         changed = False
         for edge in schema.role_memberships:
-            if edge.member in reach and edge.role not in reach:
+            if edge.inherit and edge.member in reach and edge.role not in reach:
                 reach.add(edge.role)
                 changed = True
-    return target in reach
+    return frozenset(reach)
+
+
+def _inherits_privs_of(schema: Schema, role: str, target: str) -> bool | None:
+    """Does `role` hold `target`'s privileges? `None` = graph not captured."""
+    if role == target:
+        return True
+    closure = _inherit_closure(schema, role)
+    return None if closure is None else target in closure
 
 
 def _effective_user_exempt(schema: Schema, eff: Any, table: Any) -> bool | None:
@@ -1088,7 +1137,7 @@ def _effective_user_exempt(schema: Schema, eff: Any, table: Any) -> bool | None:
     `table`'s RLS? Every clause below was measured on PG16 (see
     `build_reachability`): BYPASSRLS/superuser is exempt even under FORCE;
     FORCE strips ownership-based exemption; otherwise owning the table — or
-    being owner-equivalent through role membership — is exempt.
+    being owner-equivalent through an INHERIT membership — is exempt.
     """
     if eff is None:
         return False  # the anon caller itself: never exempt
@@ -1101,26 +1150,60 @@ def _effective_user_exempt(schema: Schema, eff: Any, table: Any) -> bool | None:
     return _inherits_privs_of(schema, eff.owner, table.owner)
 
 
+def _role_reads_view(schema: Schema, eff: Any, child: Any) -> bool | None:
+    """Can the effective user (owner of view `eff`) SELECT from view `child`?
+
+    A broken intermediate grant is a dead path (measured: anon got
+    `permission denied for view inner`, no leak). Owning the child, or a
+    SELECT grant — table- or column-level — to a role in the effective
+    user's INHERIT closure (or PUBLIC), is a read. `owner_bypasses_rls`
+    conflates superuser (reads anything) with plain BYPASSRLS (still needs
+    the grant); it is treated as a read — the over-report direction. `None`
+    when the graph is not captured and no direct grant decides it.
+    """
+    if eff is None or eff.owner_bypasses_rls or child.owner == eff.owner:
+        return True
+    grantees = {
+        g.role for g in child.grants if "SELECT" in g.privileges
+    } | {
+        cg.role for cg in getattr(child, "column_grants", ()) if "SELECT" in cg.privileges
+    }
+    if "PUBLIC" in grantees or eff.owner in grantees:
+        return True
+    closure = _inherit_closure(schema, eff.owner)
+    if closure is None:
+        return None if grantees else False
+    return bool(grantees & closure)
+
+
 def _reachability_paths(
     schema: Schema,
     outers: list[Any],
     tables_by_key: dict[tuple[str, str], Any],
     views_by_key: dict[tuple[str, str], Any],
+    owner_verdict: Any,
 ) -> list[_ReachPath]:
     """Walk each anon-openable view down to the RLS tables it reaches.
 
     At each hop the effective RLS user becomes the view's owner if the view
     is `security_invoker = false`, else it is inherited from the enclosing
-    hop (the caller — never exempt — at the top). A materialized-view hop is
-    skipped: its rows were captured at refresh, a different mechanism that
-    SEC054 / VIEW003 cover. A pre-v26 view (no `direct_references`) falls
-    back to its collapsed `references`, i.e. the single-hop reading.
+    hop (the caller — never exempt — at the top). Descending into a child
+    view requires the effective user to be able to SELECT it. A
+    materialized-view hop is skipped (SEC054 / VIEW003). A pre-v26 view (no
+    `direct_references`) falls back to its collapsed `references`.
 
-    One path per (outer, table): a decided exemption wins over an undecided
-    one, and only exempt (or undecided) paths are returned — a hop whose
-    effective user is provably subject to the table's RLS is not a door.
+    A table is a door when the effective user is RLS-exempt, OR when the
+    table's own policies grant that user every row (`owner_verdict` — the
+    laundering case). One path per (outer, table): a decided door wins over
+    an undecided one.
     """
     best: dict[tuple[str, str], _ReachPath] = {}
+
+    def record(p: _ReachPath) -> None:
+        key = (p.outer.qualified_name, p.table.qualified_name)
+        prior = best.get(key)
+        if prior is None or (prior.exempt is None and p.exempt is True):
+            best[key] = p
 
     def walk(view: Any, eff: Any, hops: tuple[str, ...], outer: Any, seen: frozenset[tuple[str, str]]) -> None:
         if not view.security_invoker:
@@ -1131,18 +1214,36 @@ def _reachability_paths(
             if child is not None:
                 if child.is_materialized or ref in seen:
                     continue
+                if eff is not None:
+                    readable = _role_reads_view(schema, eff, child)
+                    if readable is False:
+                        continue  # broken intermediate grant: dead path
+                    if readable is None:
+                        # Undecidable hop: report it rather than guess either way.
+                        for tref in (child.direct_references or child.references):
+                            t = tables_by_key.get(tref)
+                            if t is not None and t.rls_enabled:
+                                record(_ReachPath(outer, t, hops + (child.qualified_name,), eff, None, unknown_reason=(
+                                    f"role-membership graph not captured; cannot decide whether {eff.owner} can read {child.qualified_name}")))
+                        continue
                 walk(child, eff, hops + (child.qualified_name,), outer, seen | {ref})
                 continue
             table = tables_by_key.get(ref)
-            if table is None or not table.rls_enabled:
+            if table is None or not table.rls_enabled or eff is None:
                 continue
             exempt = _effective_user_exempt(schema, eff, table)
-            if exempt is False or eff is None:
-                continue
-            key = (outer.qualified_name, table.qualified_name)
-            prior = best.get(key)
-            if prior is None or (prior.exempt is None and exempt is True):
-                best[key] = _ReachPath(outer, table, hops, eff, exempt)
+            if exempt is True:
+                record(_ReachPath(outer, table, hops, eff, True))
+            elif exempt is None:
+                record(_ReachPath(outer, table, hops, eff, None, unknown_reason=(
+                    f"role-membership graph not captured; cannot decide whether {eff.owner} holds table owner {table.owner}'s privileges")))
+            else:
+                ov = owner_verdict(eff.owner, table)
+                if ov is not None and ov.verdict == "leak":
+                    record(_ReachPath(outer, table, hops, eff, True, via_policy=True))
+                elif ov is not None and ov.verdict == "unverified":
+                    record(_ReachPath(outer, table, hops, eff, None, unknown_reason=(
+                        f"cannot decide whether the table's policies admit rows to {eff.owner} under the anonymous auth context")))
 
     for outer in outers:
         walk(outer, None, (), outer, frozenset({(outer.schema, outer.name)}))

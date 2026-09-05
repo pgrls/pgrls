@@ -1306,15 +1306,21 @@ shared pool role).
 
 ## SEC019 — Policy calls current_setting() without the missing_ok argument
 
-**Severity:** info. **Auto-fix:** yes — `pgrls fix` rewrites one-argument
-`current_setting(name)` calls in `USING` / `WITH CHECK` to `current_setting(name,
-true)` and emits one `ALTER POLICY` re-stating only the clause(s) it changed —
-except a call sitting under `IS [NOT] NULL`, `COALESCE`, `NULLIF`, `IS [NOT]
-DISTINCT FROM`, `CASE` or `NOT`, where a returned NULL could admit a row
-(`current_setting('app.t') IS NULL OR …` would go from an error to a TRUE
-disjunct — measured: an anonymous session read every row). Those are left
-alone and the finding stays open for review; sibling calls in safe positions
-are still fixed.
+**Severity:** info. **Auto-fix:** yes, in one shape only — `pgrls fix`
+rewrites a one-argument `current_setting(name)` to `current_setting(name,
+true)` when the call is a direct operand of a comparison (`=`, `<>`, `<`, …,
+through casts or the PERF001 `(SELECT …)` wrap) and every connective above
+that comparison is `AND`: there a returned NULL can only *hide* the row. It
+emits one `ALTER POLICY` re-stating only the clause(s) it changed. Everywhere
+else the call is left alone and the finding stays open for review, because
+the one-argument form fails *closed* (it raises when the GUC is unset) while
+the two-argument form returns NULL, and NULL can admit rows under `IS [NOT]
+NULL` / `IS NOT FALSE`, `COALESCE` / `GREATEST` / `NULLIF`, `IS [NOT] DISTINCT
+FROM`, `CASE`, `NOT`, and under `OR` / `IN (…)` / `= ANY (ARRAY[…])` where a
+sibling branch admits rows the error withheld — each measured live to read
+more rows after the naive rewrite. A fixer may never broaden, and a denylist
+of unsafe constructs kept growing under review, so the fixer allowlists the
+one safe shape instead.
 The rewrite deliberately picks the quiet-empty-result side; allowlist the
 policy if raise-on-unset is intended. Only the *builtin* `current_setting`
 (bare or `pg_catalog.`-qualified) is inspected; a user-defined

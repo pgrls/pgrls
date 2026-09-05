@@ -14,7 +14,9 @@ breaking changes — they will be called out in this file.
 - **Snapshot v26** — adds `views[].direct_references` (the un-collapsed
   table/view edges a view body reads directly), top-level `set_gucs` (dotted
   GUC names set at database / role / server level), and top-level
-  `role_memberships` (present only when captured from a live database).
+  `role_memberships` (present only when captured from a live database, now
+  with a per-edge `inherit` flag), `views[].column_grants`, and top-level
+  `role_set_gucs`.
   Additive and fail-closed: v3–v25 files still load; a missing
   `direct_references` falls back to the collapsed `references`, a missing
   `role_memberships` keeps the anon prover abstaining on non-anon roles. Re-
@@ -45,7 +47,15 @@ breaking changes — they will be called out in this file.
   view alone qualified. Snapshot **v26** adds `View.direct_references`; the
   walk now follows each hop, an invoker-ON outer over an invoker-OFF inner
   still leaks, and when the membership graph is not captured the verdict is
-  `unverified` rather than silence.
+  `unverified` rather than silence. Three more doors from the second review
+  round, each measured: a view granted to a role *anon is a member of*, a
+  view opened by a **column-level** `SELECT` grant (`View.column_grants`,
+  v26), and a definer view whose owner is not exempt but is granted every row
+  by the table's own policies (the owner **launders** them — decided by asking
+  the anon prover with the owner as the session role). And two false
+  positives removed: a `NOINHERIT` member of the table owner is not
+  owner-equivalent (`RoleMembership.inherit`, v26), and a hop the effective
+  owner cannot `SELECT` is a dead path.
 - **`verify --against <snapshot>` classified a role widening as
   "pre-existing".** The role-membership graph was live-only, so a snapshot
   base with `TO authenticated USING (true)` was `unverified` (reachability
@@ -58,8 +68,11 @@ breaking changes — they will be called out in this file.
   but under `IS NULL`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM`, `CASE`
   or `NOT` it can admit a row: `current_setting('app.t') IS NULL OR …` went
   from an error to a TRUE disjunct, and an anonymous session read every row
-  (measured). The fixer now leaves calls in those positions alone (the
-  finding stays open) while still fixing siblings in safe positions. It also
+  (measured); the second review round found `IS NOT FALSE`, `GREATEST` and
+  `= ANY (ARRAY[…])` within hours, so the fixer no longer denylists unsafe
+  constructs — it rewrites only the one provably row-hiding shape (a direct
+  comparison operand under an AND-only chain) and leaves everything else for
+  review. It also
   no longer rewrites a user-defined `myschema.current_setting(...)` the rule
   does not flag.
 - **A database- or role-level custom GUC defeated the anon prover's
@@ -67,15 +80,21 @@ breaking changes — they will be called out in this file.
   makes `current_setting('app.tenant_id')` readable for a fresh anonymous
   session (measured: 1 row), yet the canonical tenant policy stayed PROVEN
   and `--probe` cleared the GUC to `''` before looking. Snapshot v26 captures
-  `set_gucs` (dotted names set at database / role / server level); the
-  prover treats a read of one as a real value, and the probe no longer
-  clears it.
+  `set_gucs` (dotted names set at database / server level) and
+  `role_set_gucs` (role-level, counted only for roles in the anon closure —
+  `ALTER ROLE unrelated SET app.x` is not what anon inherits); names are
+  casefolded (GUC names are case-insensitive, `setconfig` is not). The
+  prover treats a read of one as a real value in every spelling — one-arg,
+  `(name, false)` and the canonical `(name, true)` a first cut missed — and
+  the probe no longer clears it.
 - **`verify --mode cross-tenant` / `write` accepted any `column = <session
   value>` as the tenant axis.** `status = current_setting('app.status',
   true)` proved "no cross-tenant read" — `status != session.status` is UNSAT,
   which says nothing about tenants. The axis must now be an identity /
   discriminator column (SEC021's default name set — `tenant_id`, `user_id`,
-  `org_id`, `owner_id`, …; `[lint.rules.SEC021].identity_columns` is honoured
+  `org_id`, `owner_id`, `client_id`, `workspace`, `project`, … — widened so
+  the bare and `_id` spellings pair up consistently;
+  `[lint.rules.SEC021].identity_columns` is honoured
   when a `--config` is given, and the `build_verification(identity_columns=…)`
   Python kwarg overrides it); otherwise the honest verdict is `unverified`.
 - **The offline DDL model dropped `ALTER POLICY … RENAME TO`.** A later
@@ -104,7 +123,9 @@ breaking changes — they will be called out in this file.
   rejected with a clear message.
 - The anon prover now translates a hand-written `x IN (a, b)` (the
   `--sql-file` spelling) exactly like the `= ANY (ARRAY[…])` the catalog
-  renders it to, instead of abstaining.
+  renders it to, instead of abstaining; and the anon-key session recognises
+  the JSON spelling of the role claim (`auth.jwt() ->> 'role'`,
+  `current_setting('request.jwt.claims', true)::jsonb ->> 'role'`).
 - Test hygiene: a live matrix test left a cluster-wide `BYPASSRLS` role
   behind (order-dependent SEC016 assertions elsewhere); three tests
   hardcoded `/tmp/x` paths.

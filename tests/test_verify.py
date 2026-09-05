@@ -3166,9 +3166,13 @@ def _rv_view(
     bypass: bool = False,
     anon_grant: bool = True,
     direct: tuple[tuple[str, str], ...] | None = None,
+    grants=None,
+    column_grants=(),
 ):
     from pgrls.model import Grant, View
 
+    if grants is None:
+        grants = (Grant(role="anon", privileges=("SELECT",)),) if anon_grant else ()
     return View(
         schema="public",
         name=name,
@@ -3178,10 +3182,11 @@ def _rv_view(
         definition="",
         references=refs,
         security_definer_calls=(),
-        grants=(Grant(role="anon", privileges=("SELECT",)),) if anon_grant else (),
+        grants=grants,
         owner=owner,
         owner_bypasses_rls=bypass,
         direct_references=refs if direct is None else direct,
+        column_grants=column_grants,
     )
 
 
@@ -3245,8 +3250,13 @@ def test_reachability_chain_effective_user_is_nearest_definer_owner() -> None:
     walk over `direct_references` names the chain."""
     from pgrls.model import Schema
 
+    from pgrls.model import Grant
+
     outer = _rv_view("v_outer", "app_owner", (("public", "t"),), direct=(("public", "v_inner"),))
-    inner = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True, anon_grant=False)
+    # The live repro GRANTed the inner view to the outer owner; without that
+    # the hop is a dead path (permission denied), which its own test pins.
+    inner = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True,
+                     grants=(Grant(role="app_owner", privileges=("SELECT",)),))
     schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
     r = _rv(schema)
     assert r[("public.t", "public.v_outer")][0] == "leak"
@@ -3272,8 +3282,11 @@ def test_reachability_invoker_on_inner_inherits_outer_definer_owner() -> None:
     leaks even though the view touching T is invoker-on."""
     from pgrls.model import Schema
 
+    from pgrls.model import Grant
+
     outer = _rv_view("v_outer", "tbl_owner", (("public", "t"),), direct=(("public", "v_inner"),))
-    inner = _rv_view("v_inner", "plain", (("public", "t"),), invoker=True, anon_grant=False)
+    inner = _rv_view("v_inner", "plain", (("public", "t"),), invoker=True,
+                     grants=(Grant(role="tbl_owner", privileges=("SELECT",)),))
     schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
     assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
 
@@ -3329,3 +3342,69 @@ def test_against_snapshot_baseline_decides_reachability_so_role_widening_is_new(
     )
     assert [t.qualified_name for t in delta.new_leaks] == ["public.tag"]
     assert delta.preexisting_leaks == ()
+
+
+def test_reachability_noinherit_member_is_not_owner_equivalent() -> None:
+    """has_privs_of_role honours INHERIT: a NOINHERIT member of the table owner
+    does not wield its privileges (measured: permission denied). Reporting a
+    leak here was a false positive."""
+    from pgrls.model import RoleMembership, Schema
+
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner"),),
+        views=(_rv_view("v", "tbl_admin", (("public", "t"),)),),
+        role_memberships=(RoleMembership(member="tbl_admin", role="tbl_owner", inherit=False),),
+    )
+    assert _rv(schema) == {}
+
+
+def test_reachability_broken_intermediate_grant_is_a_dead_path() -> None:
+    """outer(app_owner) → inner(superuser) → t, but app_owner holds no SELECT
+    on inner: Postgres says `permission denied for view inner` — no leak."""
+    from pgrls.model import Schema
+
+    outer = _rv_view("v_outer", "app_owner", (("public", "t"),), direct=(("public", "v_inner"),))
+    inner = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True, anon_grant=False)
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
+    assert _rv(schema) == {}
+    # …and with the grant in place it is a door again.
+    from pgrls.model import Grant
+
+    inner_granted = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True,
+                             grants=(Grant(role="app_owner", privileges=("SELECT",)),))
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner_granted), role_memberships=())
+    assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
+
+
+def test_reachability_view_granted_to_a_role_anon_inherits_is_a_door() -> None:
+    from pgrls.model import Grant, RoleMembership, Schema
+
+    v = _rv_view("v", "tbl_owner", (("public", "t"),), grants=(Grant(role="readers", privileges=("SELECT",)),))
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(v,),
+                    role_memberships=(RoleMembership(member="anon", role="readers"),))
+    assert _rv(schema)[("public.t", "public.v")][0] == "leak"
+
+
+def test_reachability_column_level_grant_is_a_door() -> None:
+    from pgrls.model import ColumnGrant, Schema
+
+    v = _rv_view("v", "tbl_owner", (("public", "t"),), anon_grant=False,
+                 column_grants=(ColumnGrant(role="anon", column="id", privileges=("SELECT",)),))
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(v,), role_memberships=())
+    assert _rv(schema)[("public.t", "public.v")][0] == "leak"
+
+
+def test_reachability_definer_view_launders_a_policy_granted_to_its_owner() -> None:
+    """Owner `app_role` is not RLS-exempt, but `TO app_role USING (true)`
+    grants it every row; the definer view hands them to anon (measured)."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Policy, Schema, Table
+
+    open_to_owner = Policy(name="svc", command="SELECT", permissive=True, roles=("app_role",),
+                           using_sql="true", with_check_sql=None, using_ast=parse_expr("true"), with_check_ast=None)
+    t = Table(schema="public", name="t", rls_enabled=True, force_rls=True, columns=("id",), owner="tbl_owner",
+              policies=(open_to_owner,))
+    v = _rv_view("v", "app_role", (("public", "t"),))
+    r = _rv(Schema(tables=(t,), views=(v,), role_memberships=()))
+    assert r[("public.t", "public.v")][0] == "leak"
+    assert "launders" in r[("public.t", "public.v")][1]

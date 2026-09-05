@@ -1243,6 +1243,33 @@ def _first_string_arg(node: Any) -> str | None:
     return val.sval if isinstance(val, String) else None
 
 
+def _is_builtin_current_setting_call(node: Any) -> bool:
+    qualified, bare = func_name_parts(node)
+    return bare == "current_setting" and qualified in (
+        "current_setting",
+        "pg_catalog.current_setting",
+    )
+
+
+def _is_jwt_role_extraction(node: Any) -> bool:
+    """`<jwt blob> ->> 'role'` where the blob is `auth.jwt()` or the claims GUC
+    (through any casts) — the anon-key caller's role claim, i.e. 'anon'."""
+    if not isinstance(node, A_Expr) or node.kind != A_Expr_Kind.AEXPR_OP:
+        return False
+    names = list(node.name or ())
+    if len(names) != 1 or not isinstance(names[0], String) or names[0].sval != "->>":
+        return False
+    key = node.rexpr
+    while isinstance(key, TypeCast):
+        key = key.arg
+    if not (isinstance(key, A_Const) and isinstance(getattr(key, "val", None), String) and key.val.sval == "role"):
+        return False
+    blob = node.lexpr
+    while isinstance(blob, TypeCast):
+        blob = blob.arg
+    return _anon_jwt_claim(blob) == "jwt"
+
+
 def _anon_jwt_claim(node: Any) -> str | None:
     """Which anon-key JWT claim `node` reads, under the anon-JWT session.
 
@@ -1434,6 +1461,10 @@ def _anon_3vl(
     #     authenticated attacker, not an anonymous one) caught by the anon
     #     path; here we ask only whether one tenant can read another's row.
     if ctx.anon_jwt and not ctx.session_mode:
+        # `auth.jwt() ->> 'role'` / `current_setting('request.jwt.claims',
+        # true)::jsonb ->> 'role'` — the JSON spelling of the role claim.
+        if _is_jwt_role_extraction(node):
+            return _Val(value=z3.StringVal("anon"), is_null=z3.BoolVal(False))
         claim = _anon_jwt_claim(node)
         if claim == "role":
             # The anon-key caller's role claim is the literal string 'anon'.
@@ -1443,6 +1474,22 @@ def _anon_3vl(
                 value=ctx.opaque(_canon(node), z3.StringSort()),
                 is_null=z3.BoolVal(False),
             )
+    if (
+        not ctx.session_mode
+        and ctx.set_gucs
+        and isinstance(node, FuncCall)
+        and _is_builtin_current_setting_call(node)
+        and (_first_string_arg(node) or "").lower() in ctx.set_gucs
+    ):
+        # A dotted GUC the anonymous session inherits already SET (database /
+        # role / server level) is a real value in EVERY spelling — one-arg,
+        # `(name, false)` AND the canonical `(name, true)` that `pgrls
+        # generate` emits. Gating only the raising forms left the generated
+        # policy PROVEN while a fresh anon session read the shared row.
+        return _Val(
+            value=ctx.opaque(_canon(node), z3.StringSort()),
+            is_null=z3.BoolVal(False),
+        )
     if _is_anon_null_leaf(node, auth_funcs):
         if ctx.session_mode:
             # `session_var` never returns None for a fresh StringSort key.
@@ -1507,7 +1554,7 @@ def _anon_3vl(
                     is_null=z3.BoolVal(False),
                 )
             if _reads_unset_guc_under_anon(node) and (
-                _first_string_arg(node) not in ctx.set_gucs
+                (_first_string_arg(node) or "").lower() not in ctx.set_gucs
             ):
                 # Anon: the GUC is unset, so this RAISES — the statement
                 # errors and the caller gets NO rows. Keep `is_null` False

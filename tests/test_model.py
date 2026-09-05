@@ -117,6 +117,7 @@ def test_schema_to_snapshot_shape() -> None:
         "owner_reachable_members": [],
         "foreign_tables": [],
         "set_gucs": [],
+        "role_set_gucs": [],
     }
 
 
@@ -1092,6 +1093,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         # role / server level — the anon prover's unset-GUC assumption boundary)
         # and, when captured, `role_memberships` (absent on a hand-built Schema).
         "set_gucs",
+        "role_set_gucs",
     }
     assert snap["version"] == 26
 
@@ -1754,7 +1756,9 @@ def test_snapshot_v26_round_trips_role_memberships_and_distinguishes_absent() ->
     edges = (RoleMembership(member="editor", role="authenticated"),)
     snap = Schema(tables=(), role_memberships=edges).to_snapshot()
     assert snap["version"] == 26
-    assert snap["role_memberships"] == [{"member": "editor", "role": "authenticated"}]
+    assert snap["role_memberships"] == [
+        {"member": "editor", "role": "authenticated", "inherit": True}
+    ]
     assert Schema.from_snapshot(snap).role_memberships == edges
     empty = Schema(tables=(), role_memberships=()).to_snapshot()
     assert empty["role_memberships"] == []

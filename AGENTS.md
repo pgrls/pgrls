@@ -379,9 +379,9 @@ Currently fixable:
 * **SEC019** — emits `ALTER POLICY <name> ON <schema>.<table>
   USING (…)` (and / or `WITH CHECK (…)`) adding `, true` as the
   second argument to one-argument `current_setting()` calls —
-  except under `IS [NOT] NULL` / `COALESCE` / `NULLIF` / `IS [NOT]
-  DISTINCT FROM` / `CASE` / `NOT`, where a returned NULL could
-  admit a row; those calls are left alone (never-broaden).
+  only where the call is a direct comparison operand under an
+  AND-only chain (a returned NULL can only hide the row there);
+  every other position is left alone (never-broaden).
   The two-argument overload returns NULL on an unset GUC
   instead of erroring; the rewrite picks the quiet-NULL side
   matching the overload most policy sets converge on. Both

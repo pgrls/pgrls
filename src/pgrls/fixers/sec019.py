@@ -45,10 +45,20 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import A_Const, A_Expr, BoolExpr, Boolean, CaseExpr, CoalesceExpr, NullTest
-from pglast.enums import A_Expr_Kind, BoolExprType
+from pglast.ast import (
+    A_Const,
+    A_Expr,
+    BoolExpr,
+    Boolean,
+    ResTarget,
+    SelectStmt,
+    String,
+    SubLink,
+    TypeCast,
+)
+from pglast.enums import A_Expr_Kind, BoolExprType, SubLinkType
 
-from pgrls.ast_utils import is_builtin_current_setting, transform_tree
+from pgrls.ast_utils import is_builtin_current_setting
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
@@ -74,73 +84,86 @@ def _is_one_arg_current_setting(node: Any) -> bool:
     return len(args) == 1
 
 
-def _is_null_tolerant(node: Any) -> bool:
-    """Is `node` a construct under which a NULL can admit a row?
+_COMPARISON_OPS = frozenset({"=", "<>", "!=", "<", ">", "<=", ">="})
 
-    `IS [NOT] NULL`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM`, `CASE`
-    and `NOT` all give a NULL operand a truth-affecting role — the exact
-    positions where turning a raising call into a NULL-returning one widens
-    the policy. A plain comparison (`=`, `<`, `IN`) does not: NULL there is
-    UNKNOWN and hides the row, so it is left to the normal rewrite.
-    """
-    if isinstance(node, (NullTest, CoalesceExpr, CaseExpr)):
-        return True
-    if isinstance(node, A_Expr) and node.kind in (
-        A_Expr_Kind.AEXPR_DISTINCT,
-        A_Expr_Kind.AEXPR_NOT_DISTINCT,
-        A_Expr_Kind.AEXPR_NULLIF,
-    ):
-        return True
-    return isinstance(node, BoolExpr) and node.boolop == BoolExprType.NOT_EXPR
+
+def _comparison_op(node: Any) -> bool:
+    if not isinstance(node, A_Expr) or node.kind != A_Expr_Kind.AEXPR_OP:
+        return False
+    names = list(node.name or ())
+    return (
+        len(names) == 1
+        and isinstance(names[0], String)
+        and names[0].sval in _COMPARISON_OPS
+    )
+
+
+def _unwrap_operand(node: Any) -> Any:
+    """Strip casts and the PERF001 `(SELECT …)` InitPlan wrapper (a FROM-less,
+    single-target scalar sub-select) from a comparison operand."""
+    while True:
+        if isinstance(node, TypeCast):
+            node = node.arg
+            continue
+        if (
+            isinstance(node, SubLink)
+            and node.subLinkType == SubLinkType.EXPR_SUBLINK
+            and isinstance(node.subselect, SelectStmt)
+            and not node.subselect.fromClause
+            and not node.subselect.whereClause
+            and len(node.subselect.targetList or ()) == 1
+            and isinstance(node.subselect.targetList[0], ResTarget)
+        ):
+            node = node.subselect.targetList[0].val
+            continue
+        return node
 
 
 def _add_missing_ok(node: Any) -> tuple[Any, bool]:
-    """Walk the tree; append `true` to every one-arg
-    `current_setting` call's `args`. Returns `(node, changed)`.
+    """Rewrite one-arg `current_setting` calls that sit in a PROVABLY
+    row-hiding position; leave every other occurrence alone.
 
-    The boolean `true` is constructed as `A_Const(val=Boolean
-    (boolval=True))` — the same shape `ast_utils.is_literal_true`
-    matches, so any later check reading the rewritten AST sees a
-    literal true exactly as it would have from a hand-written
-    two-argument call.
+    A fixer may never broaden. The one-argument form RAISES when the GUC is
+    unset — the statement errors and the caller gets no rows — while the
+    two-argument form returns NULL. NULL hides a row only when the whole
+    predicate then fails to be TRUE, and that holds in exactly one shape: the
+    call is a direct operand of a comparison (`=`, `<>`, `<`, …, through
+    casts or the PERF001 `(SELECT …)` wrap) and every connective above that
+    comparison is `AND`. Anywhere else a returned NULL can admit a row —
+    `IS NULL` / `IS NOT FALSE` make it TRUE, `COALESCE` / `GREATEST` / `NULLIF`
+    substitute a value, `IS NOT DISTINCT FROM` matches NULL columns, and under
+    `OR` / `IN (…)` / `= ANY(ARRAY[…])` a sibling branch admits rows the
+    raising form withheld. Iteration 1 denylisted the constructs it knew; the
+    review found three more (BooleanTest, GREATEST/LEAST, `= ANY`) within
+    hours — a denylist recurs by construction, so this is an ALLOWLIST: only
+    the row-hiding shape is rewritten, and the finding stays open everywhere
+    else for human review.
 
-    The recursion is `ast_utils.transform_tree`; the leaf function
-    below carries the only SEC019-specific behaviour: a one-arg
-    `current_setting` call is mutated in place to append the
-    missing_ok arg (a terminal `(node, True)`); every other node
-    returns `None` to recurse. Unlike PERF001 there is no
-    don't-descend guard for *most* of the tree — but a call sitting in a
-    NULL-tolerant position is left alone (see `_is_null_tolerant`).
-
-    Why: the one-argument form RAISES on an unset GUC, which fails
-    closed (0 rows). The two-argument form returns NULL. In an ordinary
-    `col = current_setting(...)` comparison NULL still hides the row, so
-    the rewrite is behaviour-preserving. But under a NULL-*tolerant*
-    construct the rewrite can WIDEN access — `current_setting('app.t') IS
-    NULL OR …` goes from an error to a TRUE disjunct, `COALESCE(
-    current_setting('app.t'), 'x')` to a fallback match, `col IS NOT
-    DISTINCT FROM current_setting('app.t')` to a match on NULL columns.
-    Verified live on PG16: rewriting the IS NULL shape let an anonymous
-    session read every row the raising form had withheld. A fixer may
-    never broaden, so those subtrees are skipped: the finding stays open
-    there for human review while sibling calls in safe positions are
-    still fixed.
+    The tree is mutated in place (the FuncCall gains its `true` arg); returns
+    `(node, changed)`.
     """
+    changed = False
 
-    def leaf(n: Any) -> tuple[Any, bool] | None:
-        if _is_null_tolerant(n):
-            # Terminal, unchanged: do not descend into a subtree where a
-            # returned NULL could admit a row.
-            return n, False
-        if _is_one_arg_current_setting(n):
-            # Mutate the FuncCall in place — append the missing_ok
-            # arg as a literal `true`.
-            new_args = (*n.args, A_Const(val=Boolean(boolval=True)))
-            n.args = new_args
-            return n, True
-        return None
+    def rewrite_operand(operand: Any) -> None:
+        nonlocal changed
+        target = _unwrap_operand(operand)
+        if _is_one_arg_current_setting(target):
+            target.args = (*target.args, A_Const(val=Boolean(boolval=True)))
+            changed = True
 
-    return transform_tree(node, leaf)
+    def walk(n: Any) -> None:
+        if isinstance(n, BoolExpr) and n.boolop == BoolExprType.AND_EXPR:
+            for arg in n.args or ():
+                walk(arg)
+            return
+        if _comparison_op(n):
+            rewrite_operand(n.lexpr)
+            rewrite_operand(n.rexpr)
+            return
+        # OR / NOT / any other construct: not provably row-hiding — abstain.
+
+    walk(node)
+    return node, changed
 
 
 class SEC019Fixer:

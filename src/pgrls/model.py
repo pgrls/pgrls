@@ -369,6 +369,12 @@ class View:
     # `references` cannot express. Empty on a pre-v26 snapshot, where the walk
     # falls back to `references` (the pre-v26 single-hop behaviour).
     direct_references: tuple[tuple[str, str], ...] = ()
+    # v26+: column-level grants on the view (`GRANT SELECT (id, body) ON v TO
+    # anon`) from `pg_attribute.attacl`. A column grant is a door for
+    # reachability (measured: anon read the row through it) even though the
+    # table-level `grants` say nothing. SEC052's API-reachability gate stays
+    # table-level by design.
+    column_grants: tuple[ColumnGrant, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -798,6 +804,14 @@ class RoleMembership:
 
     member: str  # the role that inherits privileges (the "member")
     role: str  # the role whose privileges are inherited (the "group")
+    # v26+: whether the membership carries INHERIT (PG16 `pg_auth_members.
+    # inherit_option`, else the member's `rolinherit`). Postgres's owner check
+    # is `has_privs_of_role`, which honours it: a NOINHERIT member of the
+    # table owner is NOT owner-equivalent (measured: permission denied), so
+    # the reachability exemption follows only inheriting edges. Policy
+    # reachability keeps the over-approximating full closure (the sound
+    # direction there). Defaults True for a pre-v26 payload.
+    inherit: bool = True
 
 
 @dataclass(frozen=True)
@@ -1319,6 +1333,9 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         # v26+; absent on older snapshots → () and the reachability walk uses
         # the collapsed `references` instead.
         direct_references=tuple(tuple(r) for r in v.get("direct_references", [])),
+        column_grants=tuple(
+            _column_grant_from_dict(cg) for cg in v.get("column_grants", [])
+        ),
     )
 
 
@@ -1600,6 +1617,10 @@ class Schema:
     # PROVEN when `ALTER DATABASE … SET app.x` makes it readable. Empty on a
     # pre-v26 snapshot or an offline Schema (the unset assumption stands).
     set_gucs: tuple[str, ...] = ()
+    # v26+: dotted GUCs set at ROLE level, as `(role, name)`. Only those whose
+    # role the anonymous session actually holds (the anon closure) count as
+    # set for it — `ALTER ROLE unrelated SET app.x` is not what anon inherits.
+    role_set_gucs: tuple[tuple[str, str], ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1880,6 +1901,10 @@ class Schema:
                     "owner": v.owner,
                     "owner_bypasses_rls": v.owner_bypasses_rls,
                     "direct_references": [list(r) for r in v.direct_references],
+                    "column_grants": [
+                        {"role": cg.role, "column": cg.column, "privileges": list(cg.privileges)}
+                        for cg in v.column_grants
+                    ],
                 }
                 for v in self.views
             ],
@@ -1998,6 +2023,7 @@ class Schema:
                 for m in self.owner_reachable_members
             ],
             "set_gucs": list(self.set_gucs),
+            "role_set_gucs": [list(p) for p in self.role_set_gucs],
             # v26+: the role-membership graph, so a `--against` baseline can
             # decide anon reachability of a `TO <role>` policy. Emitted only
             # when captured — `None` (an offline / hand-built Schema) stays
@@ -2007,7 +2033,7 @@ class Schema:
             **(
                 {
                     "role_memberships": [
-                        {"member": m.member, "role": m.role}
+                        {"member": m.member, "role": m.role, "inherit": m.inherit}
                         for m in self.role_memberships
                     ]
                 }
@@ -2222,6 +2248,9 @@ class Schema:
             owner_reachable_members=owner_reachable_members,
             foreign_tables=foreign_tables,
             set_gucs=tuple(payload.get("set_gucs", [])),
+            role_set_gucs=tuple(
+                (p[0], p[1]) for p in payload.get("role_set_gucs", [])
+            ),
             # v26+: absent key → None ("graph not captured", the prover
             # abstains on non-anon roles); present → the captured edges, even
             # when empty (anon is a member of nothing extra).
@@ -2229,7 +2258,11 @@ class Schema:
                 None
                 if payload.get("role_memberships") is None
                 else tuple(
-                    RoleMembership(member=m["member"], role=m["role"])
+                    RoleMembership(
+                        member=m["member"],
+                        role=m["role"],
+                        inherit=bool(m.get("inherit", True)),
+                    )
                     for m in payload["role_memberships"]
                 )
             ),

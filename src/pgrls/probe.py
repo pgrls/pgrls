@@ -70,6 +70,7 @@ from pgrls.verify import (
     Verification,
     build_verification,
     checked_ast,
+    _anon_set_gucs,
 )
 from pgrls._render_common import pluralize, render_text_table
 from pgrls.formatters._common import safe_location
@@ -981,7 +982,7 @@ def run_probe(
             results.append(
                 _probe_one(
                     conn, table, tv, mode, auth_functions, probe_role, n,
-                    set_gucs=frozenset(schema.set_gucs),
+                    set_gucs=_anon_set_gucs(schema, anon_roles),
                 )
             )
         return Probe(tuple(results), mode)

@@ -1040,36 +1040,40 @@ def test_sec019_fix_silent_when_already_two_arg() -> None:
     assert SEC019Fixer().fix(schema, {}) == []
 
 
-def test_sec019_fix_leaves_is_null_position_alone_but_fixes_sibling() -> None:
+def test_sec019_fix_rewrites_only_and_chained_comparison_operands() -> None:
+    """The allowlist: a call that is a direct operand of a comparison, with
+    only AND above it (casts and the PERF001 `(SELECT …)` wrap allowed)."""
+    for pred, expect in (
+        ("user_id = current_setting('app.user')", "current_setting('app.user', TRUE)"),
+        ("user_id = current_setting('app.user')::text AND is_active", "current_setting('app.user', TRUE)"),
+        ("user_id = (SELECT current_setting('app.user'))", "current_setting('app.user', TRUE)"),
+        ("current_setting('app.user') <> 'x' AND tenant_id = current_setting('app.t')", "current_setting('app.t', TRUE)"),
+    ):
+        fixes = SEC019Fixer().fix(_wrap_policy(_policy(pred)), {})
+        assert len(fixes) == 1 and expect in fixes[0].sql, pred
+
+
+def test_sec019_fix_abstains_wherever_a_null_could_admit_a_row() -> None:
     """A fixer may never broaden. One-arg `current_setting` RAISES when the
-    GUC is unset (fails closed); under `IS NULL` the two-arg form would turn
-    that into a TRUE disjunct — verified live: the rewrite let anon read every
-    row. The sibling `=` call is still safe to fix (NULL hides the row)."""
-    schema = _wrap_policy(
-        _policy(
-            "current_setting('app.t') IS NULL OR "
-            "tenant_id = current_setting('app.t')"
-        )
-    )
-    fixes = SEC019Fixer().fix(schema, {})
-    assert len(fixes) == 1
-    sql = fixes[0].sql
-    assert "current_setting('app.t') IS NULL" in sql  # untouched
-    assert "tenant_id = current_setting('app.t', TRUE)" in sql  # fixed
-
-
-def test_sec019_fix_abstains_under_coalesce_nullif_distinct_and_not() -> None:
-    """Every NULL-tolerant position: the fixer leaves the call alone, and with
-    nothing else to rewrite emits no fix at all (the finding stays open)."""
+    GUC is unset (fails closed); the two-arg form returns NULL. Every shape
+    here was measured live to read MORE rows after the naive rewrite —
+    iteration 1 denylisted six constructs and review found three more within
+    hours, which is why the walk is an allowlist. The finding stays open."""
     for pred in (
+        "current_setting('app.t') IS NULL OR tenant_id = current_setting('app.t')",
         "tenant_id = COALESCE(current_setting('app.t'), 'fallback')",
         "tenant_id = NULLIF(current_setting('app.t'), '')",
         "tenant_id IS NOT DISTINCT FROM current_setting('app.t')",
         "NOT (tenant_id <> current_setting('app.t'))",
         "tenant_id = CASE WHEN current_setting('app.t') = 'x' THEN 'x' END",
+        "(current_setting('app.flag')::bool) IS NOT FALSE",
+        "tenant = ANY(ARRAY[current_setting('app.t'), 'x'])",
+        "tenant = GREATEST(current_setting('app.t'), 'z')",
+        "is_public OR tenant_id = current_setting('app.t')",
+        "tenant_id IN (current_setting('app.t'), 'y')",
+        "tenant_id = lower(current_setting('app.t'))",
     ):
-        schema = _wrap_policy(_policy(pred))
-        assert SEC019Fixer().fix(schema, {}) == [], pred
+        assert SEC019Fixer().fix(_wrap_policy(_policy(pred)), {}) == [], pred
 
 
 def test_sec019_fix_silent_when_no_current_setting() -> None:

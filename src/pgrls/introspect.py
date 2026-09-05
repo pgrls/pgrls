@@ -364,6 +364,33 @@ ORDER BY n.nspname, c.relname
 # exposure. Same shape and hardening as `_GRANTS_SQL`: SELECT DISTINCT drops
 # aclexplode's per-grantor multiplicity, grantee 0 renders as PUBLIC, and the
 # owner's own self-grant is excluded (it always holds the privilege).
+# Column-level grants on views / matviews (`pg_attribute.attacl`), the twin
+# of `_COLUMN_GRANTS_SQL` for relkind v/m. A `GRANT SELECT (id, body) ON v TO
+# anon` opens the view to anon just as a table-level grant does (measured),
+# while `relacl` stays NULL — so `verify --mode reachability` must see it.
+_VIEW_COLUMN_GRANTS_SQL = """
+SELECT DISTINCT
+    c.oid AS view_oid,
+    a.attname AS column_name,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+LEFT JOIN LATERAL aclexplode(a.attacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+WHERE c.relkind IN ('v', 'm')
+  AND n.nspname = ANY(%s)
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND a.attacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> c.relowner
+ORDER BY c.oid, column_name, role_name, ax.privilege_type
+"""
+
 _VIEW_GRANTS_SQL = """
 SELECT DISTINCT
     c.oid AS view_oid,
@@ -1156,7 +1183,12 @@ def _fetch_bypassrls_escalation_roles(
 # `roleid` is the group; `member` inherits its privileges. Readable by every
 # connected role.
 _ROLE_MEMBERSHIPS_SQL = """
-    SELECT g.rolname AS role, m.rolname AS member
+    SELECT g.rolname AS role, m.rolname AS member,
+           -- PG16+ carries a per-edge INHERIT option; older servers use the
+           -- member role's rolinherit. `to_jsonb` keeps one query valid on
+           -- both: the key is simply absent (NULL) before PG16.
+           COALESCE((to_jsonb(am) ->> 'inherit_option')::boolean, m.rolinherit)
+               AS inherit
     FROM pg_catalog.pg_auth_members am
     JOIN pg_catalog.pg_roles g ON g.oid = am.roleid
     JOIN pg_catalog.pg_roles m ON m.oid = am.member
@@ -1175,9 +1207,12 @@ _ROLE_MEMBERSHIPS_SQL = """
 # claiming PROVEN there. Session-/client-set values are excluded — those are
 # this connection's own state, not what an anonymous caller inherits.
 _SET_GUCS_SQL = """
-SELECT DISTINCT split_part(cfg, '=', 1) AS name
+SELECT DISTINCT
+    lower(split_part(cfg, '=', 1)) AS name,
+    CASE WHEN s.setrole = 0 THEN NULL ELSE r.rolname END AS role
 FROM pg_catalog.pg_db_role_setting s
 CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
+LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
 WHERE (
     s.setdatabase = 0
     OR s.setdatabase = (
@@ -1187,18 +1222,30 @@ WHERE (
 )
 AND split_part(cfg, '=', 1) LIKE '%.%'
 UNION
-SELECT name
+SELECT lower(name) AS name, NULL AS role
 FROM pg_catalog.pg_settings
 WHERE name LIKE '%.%'
   AND source NOT IN ('default', 'session', 'client')
-ORDER BY 1
+ORDER BY 1, 2
 """
 
 
-def _fetch_set_gucs(cur: Any) -> tuple[str, ...]:
-    """Dotted GUC names an anonymous session would find already set."""
+def _fetch_set_gucs(cur: Any) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Dotted GUC names already set — `(database/server level, [(role, name)])`.
+
+    Names are casefolded: GUC names are case-insensitive but
+    `pg_db_role_setting.setconfig` preserves the ALTER's spelling, and a
+    case-sensitive match missed `"App.Tenant"` vs `current_setting(
+    'app.tenant')`. Role-level settings are returned with their role so the
+    prover can count only those the anonymous session actually inherits —
+    `ALTER ROLE unrelated SET app.x` is not what anon sees.
+    """
     cur.execute(_SET_GUCS_SQL)
-    return tuple(row["name"] for row in cur.fetchall())
+    rows = cur.fetchall()
+    return (
+        tuple(sorted({r["name"] for r in rows if r["role"] is None})),
+        tuple(sorted({(r["role"], r["name"]) for r in rows if r["role"] is not None})),
+    )
 
 
 def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
@@ -1212,7 +1259,9 @@ def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
     """
     cur.execute(_ROLE_MEMBERSHIPS_SQL)
     return tuple(
-        RoleMembership(member=row["member"], role=row["role"])
+        RoleMembership(
+            member=row["member"], role=row["role"], inherit=bool(row["inherit"])
+        )
         for row in cur.fetchall()
     )
 
@@ -1565,6 +1614,21 @@ def _build_views(
         view_grants_acc[row["view_oid"]][row["role_name"]].append(
             row["privilege_type"]
         )
+    cur.execute(_VIEW_COLUMN_GRANTS_SQL, [list(schemas)])
+    view_col_acc: dict[int, dict[tuple[str, str], list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in cur.fetchall():
+        view_col_acc[row["view_oid"]][(row["role_name"], row["column_name"])].append(
+            row["privilege_type"]
+        )
+    view_col_grants_by_oid: dict[int, tuple[ColumnGrant, ...]] = {
+        oid: tuple(
+            ColumnGrant(role=role, column=col, privileges=tuple(privs))
+            for (role, col), privs in sorted(rolecol.items())
+        )
+        for oid, rolecol in view_col_acc.items()
+    }
     view_grants_by_oid: dict[int, tuple[Grant, ...]] = {
         oid: tuple(
             Grant(role=role, privileges=tuple(privs))
@@ -1591,6 +1655,7 @@ def _build_views(
                 (row["schema_name"], row["view_name"]), ()
             ),
             grants=view_grants_by_oid.get(row["view_oid"], ()),
+            column_grants=view_col_grants_by_oid.get(row["view_oid"], ()),
             owner=row["owner_name"] or "",
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
             # The un-collapsed edges (tables AND views) — the hops the
@@ -1686,7 +1751,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # `verify --mode anon` can role-gate the anon prover soundly (a `None`
         # graph on an offline/snapshot Schema makes verify abstain instead).
         role_memberships = _fetch_role_memberships(cur)
-        set_gucs = _fetch_set_gucs(cur)
+        set_gucs, role_set_gucs = _fetch_set_gucs(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1707,6 +1772,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 foreign_tables=foreign_tables,
                 role_memberships=role_memberships,
                 set_gucs=set_gucs,
+                role_set_gucs=role_set_gucs,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1937,4 +2003,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         foreign_tables=foreign_tables,
         role_memberships=role_memberships,
         set_gucs=set_gucs,
+        role_set_gucs=role_set_gucs,
     )
