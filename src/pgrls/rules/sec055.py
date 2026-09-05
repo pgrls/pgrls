@@ -55,6 +55,7 @@ from pgrls.ast_utils import (
     find_func_calls,
     func_name_parts,
     is_builtin_current_setting,
+    is_literal_true,
 )
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
@@ -124,7 +125,10 @@ def _has_silent_call(node: Any) -> bool:
     for call in find_func_calls(node, {"current_setting"}):
         if not is_builtin_current_setting(call):
             continue
-        if len(getattr(call, "args", None) or ()) >= 2:
+        args: tuple[Any, ...] = tuple(getattr(call, "args", None) or ())
+        # Only `missing_ok = true` returns NULL; `(name, false)` raises on an
+        # unset GUC exactly like the one-argument form — loud, not silent.
+        if len(args) >= 2 and is_literal_true(args[1]):
             return True
     return False
 

@@ -45,9 +45,10 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import A_Const, Boolean
+from pglast.ast import A_Const, A_Expr, BoolExpr, Boolean, CaseExpr, CoalesceExpr, NullTest
+from pglast.enums import A_Expr_Kind, BoolExprType
 
-from pgrls.ast_utils import func_name_parts, transform_tree
+from pgrls.ast_utils import is_builtin_current_setting, transform_tree
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
@@ -63,13 +64,34 @@ def _is_one_arg_current_setting(node: Any) -> bool:
     qualified form — the same shape SEC019's `find_func_calls`
     detection accepts.
     """
-    qualified, bare = func_name_parts(node)
-    if qualified is None:
-        return False
-    if bare != _CURRENT_SETTING and qualified != f"pg_catalog.{_CURRENT_SETTING}":
+    # Exactly the rule's gate (`is_builtin_current_setting`): a user-defined
+    # `myschema.current_setting(...)` is not the builtin, is not flagged by
+    # SEC019, and must not be rewritten — under `--apply` a UDF without a
+    # two-argument overload would fail the whole batch.
+    if not is_builtin_current_setting(node):
         return False
     args = node.args or ()
     return len(args) == 1
+
+
+def _is_null_tolerant(node: Any) -> bool:
+    """Is `node` a construct under which a NULL can admit a row?
+
+    `IS [NOT] NULL`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM`, `CASE`
+    and `NOT` all give a NULL operand a truth-affecting role — the exact
+    positions where turning a raising call into a NULL-returning one widens
+    the policy. A plain comparison (`=`, `<`, `IN`) does not: NULL there is
+    UNKNOWN and hides the row, so it is left to the normal rewrite.
+    """
+    if isinstance(node, (NullTest, CoalesceExpr, CaseExpr)):
+        return True
+    if isinstance(node, A_Expr) and node.kind in (
+        A_Expr_Kind.AEXPR_DISTINCT,
+        A_Expr_Kind.AEXPR_NOT_DISTINCT,
+        A_Expr_Kind.AEXPR_NULLIF,
+    ):
+        return True
+    return isinstance(node, BoolExpr) and node.boolop == BoolExprType.NOT_EXPR
 
 
 def _add_missing_ok(node: Any) -> tuple[Any, bool]:
@@ -87,11 +109,29 @@ def _add_missing_ok(node: Any) -> tuple[Any, bool]:
     `current_setting` call is mutated in place to append the
     missing_ok arg (a terminal `(node, True)`); every other node
     returns `None` to recurse. Unlike PERF001 there is no
-    don't-descend guard — SEC019 rewrites matching calls anywhere in
-    the tree.
+    don't-descend guard for *most* of the tree — but a call sitting in a
+    NULL-tolerant position is left alone (see `_is_null_tolerant`).
+
+    Why: the one-argument form RAISES on an unset GUC, which fails
+    closed (0 rows). The two-argument form returns NULL. In an ordinary
+    `col = current_setting(...)` comparison NULL still hides the row, so
+    the rewrite is behaviour-preserving. But under a NULL-*tolerant*
+    construct the rewrite can WIDEN access — `current_setting('app.t') IS
+    NULL OR …` goes from an error to a TRUE disjunct, `COALESCE(
+    current_setting('app.t'), 'x')` to a fallback match, `col IS NOT
+    DISTINCT FROM current_setting('app.t')` to a match on NULL columns.
+    Verified live on PG16: rewriting the IS NULL shape let an anonymous
+    session read every row the raising form had withheld. A fixer may
+    never broaden, so those subtrees are skipped: the finding stays open
+    there for human review while sibling calls in safe positions are
+    still fixed.
     """
 
     def leaf(n: Any) -> tuple[Any, bool] | None:
+        if _is_null_tolerant(n):
+            # Terminal, unchanged: do not descend into a subtree where a
+            # returned NULL could admit a row.
+            return n, False
         if _is_one_arg_current_setting(n):
             # Mutate the FuncCall in place — append the missing_ok
             # arg as a literal `true`.

@@ -8,6 +8,93 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
+## [Unreleased]
+
+### Fixed
+- **`verify --mode anon` proved "no anonymous read" on a policy that grants
+  anon by role name.** The anon model was "every auth function is NULL" — a
+  JWT-less session. A Supabase **anon-key** caller is different: PostgREST sets
+  `request.jwt.claims = {"role":"anon"}`, so `auth.role()` is the string
+  `'anon'`, never NULL, and `USING (auth.role() = 'anon')` — encoded as
+  `NULL = 'anon'` → UNKNOWN → UNSAT — was **PROVEN** while reading every row
+  for a real anon-key caller (measured on PG16 with Supabase's own
+  `auth.role()`). No lint rule catches the shape either (SEC003 needs PUBLIC,
+  SEC037 flags only unknown names). The prover now models BOTH sessions and a
+  leak under either is a leak; `= 'authenticated'` stays isolated, so nothing
+  floods. `--probe` tries the anon-key session too, so it confirms the leak
+  instead of contradicting a correct verdict. Pinned in the verdict corpus.
+- **`verify --mode reachability` was silent on two live-verified view
+  bypasses.** (1) A view owned by an INHERIT *member* of the table owner is
+  owner-equivalent (Postgres's `has_privs_of_role`) and reads every row; the
+  gate compared owner names only. (2) `outer(invoker off, owner A, anon
+  SELECT) → inner(invoker off, superuser owner, no anon grant) → T`: T's RLS is
+  evaluated as the owner of the nearest enclosing definer view — the
+  superuser — but the collapsed `View.references` lost the hop, and neither
+  view alone qualified. Snapshot **v26** adds `View.direct_references`; the
+  walk now follows each hop, an invoker-ON outer over an invoker-OFF inner
+  still leaks, and when the membership graph is not captured the verdict is
+  `unverified` rather than silence.
+- **`verify --against <snapshot>` classified a role widening as
+  "pre-existing".** The role-membership graph was live-only, so a snapshot
+  base with `TO authenticated USING (true)` was `unverified` (reachability
+  undecidable) and a head that widened to `TO PUBLIC` could never be a *new*
+  leak. Snapshot v26 serializes `role_memberships` (absent → still "not
+  captured"), so the base proves isolated and the widening fails the gate.
+- **The SEC019 auto-fixer could broaden access.** Rewriting one-argument
+  `current_setting(name)` (raises when unset — fails closed) to the
+  two-argument NULL-returning form is behaviour-preserving in a comparison,
+  but under `IS NULL`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM`, `CASE`
+  or `NOT` it can admit a row: `current_setting('app.t') IS NULL OR …` went
+  from an error to a TRUE disjunct, and an anonymous session read every row
+  (measured). The fixer now leaves calls in those positions alone (the
+  finding stays open) while still fixing siblings in safe positions. It also
+  no longer rewrites a user-defined `myschema.current_setting(...)` the rule
+  does not flag.
+- **A database- or role-level custom GUC defeated the anon prover's
+  unset-GUC assumption.** `ALTER DATABASE … SET app.tenant_id = 'shared'`
+  makes `current_setting('app.tenant_id')` readable for a fresh anonymous
+  session (measured: 1 row), yet the canonical tenant policy stayed PROVEN
+  and `--probe` cleared the GUC to `''` before looking. Snapshot v26 captures
+  `set_gucs` (dotted names set at database / role / server level); the
+  prover treats a read of one as a real value, and the probe no longer
+  clears it.
+- **`verify --mode cross-tenant` / `write` accepted any `column = <session
+  value>` as the tenant axis.** `status = current_setting('app.status',
+  true)` proved "no cross-tenant read" — `status != session.status` is UNSAT,
+  which says nothing about tenants. The axis must now be an identity /
+  discriminator column (SEC021's default name set, `identity_columns`
+  overridable); otherwise the honest verdict is `unverified`.
+- **The offline DDL model dropped `ALTER POLICY … RENAME TO`.** A later
+  `ALTER POLICY <new> ON t USING (true)` then targeted a name the model did
+  not know and the loosening was silently discarded — `pgrls pr` and
+  `lint --sql-file` kept seeing the pre-rename predicate.
+- **`pgrls diff` rated `TO authenticated → TO PUBLIC` as `requires_review`**
+  (disjoint role sets), which passes the default `--fail-on dangerous` gate.
+  Gaining PUBLIC covers every role, anon included: it is now
+  `ROLES_WIDENED` / `dangerous`.
+- **SEC050 abstained silently offline.** On a Supabase migration set — which
+  carries `CREATE POLICY … ON storage.objects` but never the
+  extension-managed `CREATE TABLE` — the rule had no column list, said
+  nothing, and did not appear in `skipped_rules` either: a false clean on
+  the exact input it exists for. It now emits one `info` note per table
+  explaining how to get a verdict (a stub `CREATE TABLE storage.objects`,
+  or a live / snapshot run).
+- **SEC055 flagged `current_setting(name, false)`**, which raises like the
+  one-argument form and is loud, not silent. Only the literal `missing_ok =
+  true` form is the silent one.
+- `pgrls fix` emitted `ENABLE ROW LEVEL SECURITY` twice for a dormant-policy
+  table (SEC001's fixer did not mirror the rule's cede to SEC032), which
+  also double-counted under `--check`.
+- `--emit-repro --mode reachability` silently wrote zero files (the leak is
+  a view path, not a policy); it and `--probe --mode reachability` are now
+  rejected with a clear message.
+- The anon prover now translates a hand-written `x IN (a, b)` (the
+  `--sql-file` spelling) exactly like the `= ANY (ARRAY[…])` the catalog
+  renders it to, instead of abstaining.
+- Test hygiene: a live matrix test left a cluster-wide `BYPASSRLS` role
+  behind (order-dependent SEC016 assertions elsewhere); three tests
+  hardcoded `/tmp/x` paths.
+
 ## [0.55.0] - 2026-08-16
 
 ### Added

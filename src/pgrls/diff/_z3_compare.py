@@ -302,6 +302,21 @@ class _Context:
         # `<column> = <session symbol>` scoping equality the encoder binds,
         # so the prover can constrain the column != the session's tenant.
         self.session_mode: bool = False
+        # Anon prover only. False models a session with NO JWT (every auth
+        # function NULL — a raw connection as the anon DB role). True models
+        # the Supabase ANON-KEY session: PostgREST sets
+        # `request.jwt.claims = {"role":"anon"}`, so `auth.role()` is the
+        # string 'anon' (never NULL), `auth.jwt()` is a non-null blob, and
+        # `auth.uid()` (the `sub` claim) is still NULL. `prove_anon_isolation`
+        # runs BOTH and a leak under either is a leak: `USING (auth.role() =
+        # 'anon')` is UNSAT under the no-JWT model (NULL = 'anon' is UNKNOWN)
+        # yet reads every row for a real anon-key caller — a false PROVEN
+        # until the second session was modelled.
+        self.anon_jwt: bool = False
+        # Anon prover only: dotted GUC names the anonymous session inherits
+        # already SET (database / role / server level — `Schema.set_gucs`).
+        # A read of one of these is a real value, not the unset-GUC raise.
+        self.set_gucs: frozenset[str] = frozenset()
         self._session_vars: dict[str, Any] = {}
         self.tenant_pairs: list[tuple[Any, Any]] = []
 
@@ -1209,6 +1224,54 @@ def _is_anon_null_leaf(node: Any, auth_funcs: set[str]) -> bool:
     return False
 
 
+def _first_string_arg(node: Any) -> str | None:
+    """The first argument of a FuncCall when it is a string literal.
+
+    `pg_get_expr` renders literals with casts (`'x'::text`), so the argument
+    is usually a `TypeCast` around the `A_Const`; unwrap it — matching only a
+    bare `A_Const` is a silent no-op on every catalog-read policy.
+    """
+    args = getattr(node, "args", None) or ()
+    if not args:
+        return None
+    arg = args[0]
+    while isinstance(arg, TypeCast):
+        arg = arg.arg
+    if not isinstance(arg, A_Const):
+        return None
+    val = getattr(arg, "val", None)
+    return val.sval if isinstance(val, String) else None
+
+
+def _anon_jwt_claim(node: Any) -> str | None:
+    """Which anon-key JWT claim `node` reads, under the anon-JWT session.
+
+    ``"role"`` for `auth.role()` and `current_setting('request.jwt.claim.role'
+    [, …])` — the claim PostgREST sets to ``'anon'`` for an anon-key caller;
+    ``"jwt"`` for `auth.jwt()` and `current_setting('request.jwt.claims'[, …])`
+    — the claims blob, non-null for that caller; ``None`` otherwise (`auth.uid()`
+    / the `sub` claim stay NULL: an anon key carries no subject).
+    """
+    if not isinstance(node, FuncCall):
+        return None
+    qualified, bare = func_name_parts(node)
+    if qualified is None:
+        return None
+    if qualified == "auth.role":
+        return "role"
+    if qualified == "auth.jwt":
+        return "jwt"
+    if bare == "current_setting" and (
+        qualified == "current_setting" or qualified == "pg_catalog.current_setting"
+    ):
+        name = _first_string_arg(node)
+        if name == "request.jwt.claim.role":
+            return "role"
+        if name == "request.jwt.claims":
+            return "jwt"
+    return None
+
+
 def _reads_unset_guc_under_anon(node: Any) -> bool:
     """True iff ``node`` reads a *custom* GUC an anonymous session cannot
     have set — so evaluating it RAISES rather than yielding a value.
@@ -1370,6 +1433,16 @@ def _anon_3vl(
     #     `... IS NULL OR ...` anon leak is a DIFFERENT threat (an
     #     authenticated attacker, not an anonymous one) caught by the anon
     #     path; here we ask only whether one tenant can read another's row.
+    if ctx.anon_jwt and not ctx.session_mode:
+        claim = _anon_jwt_claim(node)
+        if claim == "role":
+            # The anon-key caller's role claim is the literal string 'anon'.
+            return _Val(value=z3.StringVal("anon"), is_null=z3.BoolVal(False))
+        if claim == "jwt":
+            return _Val(
+                value=ctx.opaque(_canon(node), z3.StringSort()),
+                is_null=z3.BoolVal(False),
+            )
     if _is_anon_null_leaf(node, auth_funcs):
         if ctx.session_mode:
             # `session_var` never returns None for a fresh StringSort key.
@@ -1433,7 +1506,9 @@ def _anon_3vl(
                     value=ctx.session_var(key, z3.StringSort()),
                     is_null=z3.BoolVal(False),
                 )
-            if _reads_unset_guc_under_anon(node):
+            if _reads_unset_guc_under_anon(node) and (
+                _first_string_arg(node) not in ctx.set_gucs
+            ):
                 # Anon: the GUC is unset, so this RAISES — the statement
                 # errors and the caller gets NO rows. Keep `is_null` False
                 # (it never *returns* NULL, so the `... IS NULL OR …` dead
@@ -1464,9 +1539,10 @@ def _anon_3vl(
     if isinstance(node, A_Expr):
         if node.kind == A_Expr_Kind.AEXPR_OP:
             return _anon_binop(node, ctx, auth_funcs, assertions)
-        if node.kind == A_Expr_Kind.AEXPR_OP_ANY:
-            # `col = ANY(ARRAY[lit, ...])` membership (and every `IN (...)`,
-            # which normalizes to this form). Gated to literal arrays + `=`.
+        if node.kind in (A_Expr_Kind.AEXPR_OP_ANY, A_Expr_Kind.AEXPR_IN):
+            # `col = ANY(ARRAY[lit, ...])` membership — every introspected
+            # `IN (...)` normalizes to this form — plus the hand-written
+            # `IN (...)` list itself. Gated to `=` + literal elements.
             return _anon_any_array(node, ctx, auth_funcs, assertions)
         # IN / BETWEEN / ALL / others: soundness abort (SEC004 still guards
         # the literal IS NULL shape syntactically).
@@ -1647,9 +1723,15 @@ def _anon_any_array(
     if op_names[0].sval != "=":
         return None
     arr = node.rexpr
-    if not isinstance(arr, A_ArrayExpr):
+    if isinstance(arr, A_ArrayExpr):
+        elements = list(arr.elements or ())
+    elif node.kind == A_Expr_Kind.AEXPR_IN and isinstance(arr, (list, tuple)):
+        # The hand-written `x IN (a, b)` spelling (offline `--sql-file`
+        # input); the catalog never emits it — `pg_get_expr` rewrites IN to
+        # `= ANY (ARRAY[...])` — but it is the same membership test.
+        elements = list(arr)
+    else:
         return None
-    elements = list(arr.elements or ())
     if not elements:
         return None
     acc: _TV | None = None
@@ -1956,7 +2038,10 @@ def _anon_witness_is_sufficient(
 
 
 def prove_anon_isolation(
-    using_node: Any, auth_functions: set[str] | None = None
+    using_node: Any,
+    auth_functions: set[str] | None = None,
+    *,
+    set_gucs: frozenset[str] = frozenset(),
 ) -> tuple[str, dict[str, object] | None]:
     """Prove whether an anonymous session can read any row under ``using_node``.
 
@@ -1993,7 +2078,35 @@ def prove_anon_isolation(
         if auth_functions is not None
         else set(_DEFAULT_AUTH_FUNCTIONS)
     )
+    # Two anonymous sessions, and a leak under EITHER is a leak: the no-JWT
+    # session (every auth function NULL) and the Supabase anon-key session
+    # (`auth.role()` = 'anon', `auth.jwt()` non-null, `auth.uid()` NULL). The
+    # verdict is `isolated` only when both are UNSAT, `unverified` when either
+    # cannot be decided, and the witness comes from whichever session leaked
+    # (the no-JWT one first, so existing witnesses are unchanged).
+    verdicts = [
+        _prove_anon_session(using_node, auth, anon_jwt=False, set_gucs=set_gucs),
+        _prove_anon_session(using_node, auth, anon_jwt=True, set_gucs=set_gucs),
+    ]
+    for verdict, witness in verdicts:
+        if verdict == "leak":
+            return (verdict, witness)
+    if any(v == "unverified" for v, _ in verdicts):
+        return ("unverified", None)
+    return ("isolated", None)
+
+
+def _prove_anon_session(
+    using_node: Any,
+    auth: set[str],
+    *,
+    anon_jwt: bool,
+    set_gucs: frozenset[str] = frozenset(),
+) -> tuple[str, dict[str, object] | None]:
+    """`prove_anon_isolation` for ONE session model (see `_Context.anon_jwt`)."""
     ctx = _Context()
+    ctx.anon_jwt = anon_jwt
+    ctx.set_gucs = set_gucs
     assertions: list[Any] = []
     tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
     if tv is None:
@@ -2201,7 +2314,10 @@ def _cross_tenant_witness(
 
 
 def prove_cross_tenant_isolation(
-    using_node: Any, auth_functions: set[str] | None = None
+    using_node: Any,
+    auth_functions: set[str] | None = None,
+    *,
+    identity_columns: frozenset[str] | None = None,
 ) -> tuple[str, dict[str, object] | None]:
     """Prove whether one tenant's session can read another tenant's row.
 
@@ -2263,6 +2379,22 @@ def prove_cross_tenant_isolation(
         # No single tenant axis ⇒ nothing sound to prove against.
         return ("unverified", None)
     column, session_tenant = pairs[0]
+    # The axis must be a tenant/identity DISCRIMINATOR. Any `<column> =
+    # <session value>` equality records a pair, but `status =
+    # current_setting('app.status', true)` or `region = current_setting(
+    # 'app.region', true)` carries no tenant scoping at all — proving
+    # `status != session.status` UNSAT is vacuous and read as "no
+    # cross-tenant read" was a false PROVEN. Same name set SEC021 / SEC030
+    # use (`tenant_id`, `user_id`, `org_id`, `owner_id`, …), overridable.
+    if identity_columns is None:
+        from pgrls.rules.sec021 import (  # noqa: PLC0415 — avoids a rules↔diff import cycle
+            _DEFAULT_IDENTITY_COLUMNS,
+        )
+
+        identity_columns = frozenset(_DEFAULT_IDENTITY_COLUMNS)
+    axis = column.decl().name().rsplit(".", 1)[-1].lower()
+    if axis not in identity_columns:
+        return ("unverified", None)
 
     solver = z3.Solver()
     solver.set("timeout", 1000)

@@ -66,7 +66,9 @@ scope (that is SEC001's job, not an isolation proof).
 """
 from __future__ import annotations
 
+import functools
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -100,7 +102,7 @@ Mode = Literal["anon", "cross-tenant", "write", "escalation", "reachability"]
 # `write` reuses the cross-tenant prover verbatim — write-isolation is the same
 # satisfiability question (`is_true ∧ column != session_tenant` SAT?), just
 # applied to the policy's effective WRITE-check instead of its USING.
-_PROVERS = {
+_PROVERS: dict[str, Callable[..., tuple[str, dict[str, object] | None]]] = {
     "anon": prove_anon_isolation,
     "cross-tenant": prove_cross_tenant_isolation,
     "write": prove_cross_tenant_isolation,
@@ -515,6 +517,7 @@ def build_verification(
     auth_functions: set[str] | None = None,
     mode: Mode = "anon",
     anon_roles: set[str] | None = None,
+    identity_columns: frozenset[str] | None = None,
 ) -> Verification:
     """Prove tenant isolation for every RLS-enabled table in `schema`.
 
@@ -550,6 +553,16 @@ def build_verification(
             schema, auth_functions=auth_functions, anon_roles=anon_roles
         )
     prove = _PROVERS[mode]
+    if mode == "anon":
+        # Dotted GUCs the anonymous session inherits already set (database /
+        # role / server level): a read of one is a real value, not the raise
+        # the unset-GUC assumption relies on.
+        prove = functools.partial(prove, set_gucs=frozenset(schema.set_gucs))
+    else:
+        # The cross-tenant axis must be an identity/discriminator column, or
+        # the proof is vacuous (`status != session.status` says nothing about
+        # tenants). None → the SEC021 default name set.
+        prove = functools.partial(prove, identity_columns=identity_columns)
     commands = _MODE_COMMANDS[mode]
     floor_kind = "write" if mode == "write" else "read"
     # An *empty* anon set is degenerate — there is always at least the PUBLIC
@@ -835,27 +848,6 @@ def build_escalation(
     return Verification(tuple(tables), "escalation")
 
 
-def _view_owner_is_rls_exempt(view: Any, table: Any) -> bool:
-    """Is `view`'s owner exempt from `table`'s RLS?
-
-    A ``security_invoker = false`` view executes as its OWNER, so the base
-    table's RLS is evaluated against the owner rather than the caller. That is
-    a *bypass* only when the owner is itself exempt. Validated live on PG16
-    (see `build_reachability`): owning the table is enough **until** the table
-    is ``FORCE``'d, at which point even the owner is filtered; and any
-    superuser / ``BYPASSRLS`` owner is exempt regardless of who owns what.
-
-    An unknown owner (``""`` — a pre-v25 snapshot, which carried no view owner)
-    returns False: no bypass claimed, so an old snapshot degrades to silence
-    rather than to a leak we cannot substantiate.
-    """
-    if view.owner_bypasses_rls:
-        return True
-    if not view.owner:
-        return False
-    return view.owner == table.owner and not table.force_rls
-
-
 def _view_is_anon_selectable(view: Any, anon_roles: set[str]) -> bool:
     """Can a role in `anon_roles` `SELECT` from `view`? (SEC052's gate.)"""
     return any(
@@ -886,8 +878,8 @@ def build_reachability(
       caller must be able to reach it at all; **and**
     * ``security_invoker`` is false — an invoker view re-applies the *caller's*
       RLS, and the live anon read was denied outright; **and**
-    * the view's owner is exempt from the base table's RLS
-      (`_view_owner_is_rls_exempt`) — a view owned by an ordinary third role
+    * the effective RLS user's owner is exempt from the base table's RLS
+      (`_effective_user_exempt`) — a view owned by an ordinary third role
       with a plain ``SELECT`` grant returned **zero** rows, and ``FORCE`` on
       the base table cut the owning-view case from every row to zero.
 
@@ -907,30 +899,31 @@ def build_reachability(
     Scope: regular views only. A materialized view stores rows captured when it
     was refreshed, so ``security_invoker`` does not apply to reads of it at all
     — a different mechanism, and SEC053 / SEC054 / VIEW003 cover the exposed
-    matview. Base tables are resolved through ``View.references``, which
-    introspection already resolves transitively, so a ``view → view → table``
-    chain names the base table here rather than the intermediate view.
+    matview. Paths are walked hop by hop over ``View.direct_references``: the
+    effective RLS user for a table is the owner of the nearest enclosing
+    ``security_invoker = false`` view on the path (measured: ``outer(off,
+    owner A) → inner(off, owner superuser) → T`` bypasses T as the superuser
+    even though A is not exempt and inner is not anon-selectable), and an
+    owner that is a *member* of the table owner is owner-equivalent
+    (Postgres's ``has_privs_of_role``). When the role-membership graph is not
+    captured and the answer turns on membership, the verdict is
+    ``unverified`` rather than silence.
     """
     resolved_anon_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
-    views = [
+    tables_by_key = {(t.schema, t.name): t for t in schema.tables}
+    views_by_key = {(v.schema, v.name): v for v in schema.views}
+    # Anon can open any regular view it holds SELECT on. Whether that read
+    # bypasses a table's RLS depends on the hops BENEATH it, not on this view's
+    # own invoker flag: an invoker-on outer view over an invoker-off definer
+    # view still runs the inner body as the inner owner.
+    outers = [
         v
         for v in schema.views
         if not v.is_materialized
-        and not v.security_invoker
         and _view_is_anon_selectable(v, resolved_anon_roles)
     ]
-    tables_by_key = {(t.schema, t.name): t for t in schema.tables}
-    # Only RLS-enabled base tables can be *defeated* — an RLS-off table is
-    # SEC001's finding, not a proof about a bypass.
-    candidates = [
-        (v, tables_by_key[ref])
-        for v in views
-        for ref in v.references
-        if ref in tables_by_key
-        and tables_by_key[ref].rls_enabled
-        and _view_owner_is_rls_exempt(v, tables_by_key[ref])
-    ]
-    if not candidates:
+    paths = _reachability_paths(schema, outers, tables_by_key, views_by_key)
+    if not paths:
         return Verification((), "reachability")
 
     an = build_verification(
@@ -940,32 +933,52 @@ def build_reachability(
     an_by_table = {t.qualified_name: t for t in an.tables}
 
     tables: list[TableVerdict] = []
-    for view, table in candidates:
-        why = (
-            f"BYPASSRLS/superuser owner {view.owner}"
-            if view.owner_bypasses_rls
-            else f"owner {view.owner} owns the table and RLS is not FORCE'd"
+    for rp in paths:
+        outer, table, eff = rp.outer, rp.table, rp.effective
+        door = (
+            f"{outer.qualified_name}"
+            + (f" → {' → '.join(rp.hops)}" if rp.hops else "")
+            + f" (runs as {eff.owner})"
         )
-        # The renderer already prefixes the witness phrase ("every row is
-        # anonymously readable"), so this names the PATH and why it is open —
-        # it does not restate the leak.
-        path = (
-            f"reachable through {view.qualified_name}, SELECT-able by "
-            f"{', '.join(sorted(resolved_anon_roles))} "
-            f"(security_invoker off; {why})"
-        )
+        selectable = f"is SELECT-able by {', '.join(sorted(resolved_anon_roles))}"
+        if rp.exempt is None:
+            reason = (
+                f"role-membership graph not captured; cannot decide whether "
+                f"{eff.owner} holds table owner {table.owner}'s privileges"
+            )
+            proof = PolicyProof(outer.qualified_name, "unverified", None, reason)
+            tables.append(
+                TableVerdict(
+                    table.qualified_name,
+                    "unverified",
+                    f"cannot decide whether the view bypasses RLS ({reason}); "
+                    f"{door} {selectable}",
+                    (proof,),
+                )
+            )
+            continue
+        if eff.owner_bypasses_rls:
+            why = f"BYPASSRLS/superuser owner {eff.owner}"
+        elif eff.owner == table.owner:
+            why = f"owner {eff.owner} owns the table and RLS is not FORCE'd"
+        else:
+            why = (
+                f"owner {eff.owner} is a member of table owner {table.owner} "
+                "(owner-equivalent) and RLS is not FORCE'd"
+            )
+        path = f"{door}: {why}; {selectable}"
         anv = an_by_table.get(table.qualified_name)
         # Every candidate is RLS-enabled so it has an anon verdict; treat a
         # defensive miss as `isolated` — the leak-direction assumption.
         an_verdict = anv.verdict if anv is not None else "isolated"
 
         if an_verdict == "isolated":
-            proof = PolicyProof(view.qualified_name, "leak", {}, None)
+            proof = PolicyProof(outer.qualified_name, "leak", {}, None)
             tables.append(
                 TableVerdict(
                     table.qualified_name,
                     "leak",
-                    path,
+                    f"anon reads every row via {path}",
                     (proof,),
                 )
             )
@@ -975,7 +988,7 @@ def build_reachability(
                 None,
             )
             if an_leak is not None and an_leak.witness == {}:
-                proof = PolicyProof(view.qualified_name, "isolated", None, None)
+                proof = PolicyProof(outer.qualified_name, "isolated", None, None)
                 tables.append(
                     TableVerdict(
                         table.qualified_name,
@@ -986,13 +999,13 @@ def build_reachability(
                     )
                 )
             else:
-                proof = PolicyProof(view.qualified_name, "leak", {}, None)
+                proof = PolicyProof(outer.qualified_name, "leak", {}, None)
                 tables.append(
                     TableVerdict(
                         table.qualified_name,
                         "leak",
-                        f"{path}; also exposes the rows the direct anon "
-                        "leak withholds",
+                        f"anon reads every row via {path} — including the rows "
+                        "the direct anon leak withholds",
                         (proof,),
                     )
                 )
@@ -1005,7 +1018,7 @@ def build_reachability(
                 ),
                 "anon isolation unproven",
             )
-            proof = PolicyProof(view.qualified_name, "unverified", None, reason)
+            proof = PolicyProof(outer.qualified_name, "unverified", None, reason)
             tables.append(
                 TableVerdict(
                     table.qualified_name,
@@ -1016,6 +1029,115 @@ def build_reachability(
             )
     tables.sort(key=lambda t: (t.qualified_name, t.proofs[0].policy))
     return Verification(tuple(tables), "reachability")
+
+
+@dataclass(frozen=True)
+class _ReachPath:
+    """One anon-openable door onto an RLS table.
+
+    `outer` is the view anon can SELECT from; `hops` the intermediate view
+    names beneath it; `effective` the view whose owner Postgres evaluates the
+    table's RLS as (the nearest enclosing `security_invoker = false` view on
+    the path); `exempt` whether that owner escapes the table's RLS — `None`
+    when the role-membership graph is not captured and the answer turns on
+    membership.
+    """
+
+    outer: Any
+    table: Any
+    hops: tuple[str, ...]
+    effective: Any
+    exempt: bool | None
+
+
+def _inherits_privs_of(schema: Schema, role: str, target: str) -> bool | None:
+    """Does `role` hold `target`'s privileges (the upward INHERIT closure)?
+
+    Postgres's owner check is `has_privs_of_role`, so a member of the table
+    owner is owner-equivalent — validated live: a view owned by an INHERIT
+    member of the table owner read every row. `None` when the graph was not
+    captured (a snapshot / hand-built Schema): the caller must abstain, not
+    guess.
+    """
+    if role == target:
+        return True
+    if schema.role_memberships is None:
+        return None
+    reach = {role}
+    changed = True
+    while changed:  # transitive closure; role graphs are tiny
+        changed = False
+        for edge in schema.role_memberships:
+            if edge.member in reach and edge.role not in reach:
+                reach.add(edge.role)
+                changed = True
+    return target in reach
+
+
+def _effective_user_exempt(schema: Schema, eff: Any, table: Any) -> bool | None:
+    """Is the effective RLS user (the owner of view `eff`) exempt from
+    `table`'s RLS? Every clause below was measured on PG16 (see
+    `build_reachability`): BYPASSRLS/superuser is exempt even under FORCE;
+    FORCE strips ownership-based exemption; otherwise owning the table — or
+    being owner-equivalent through role membership — is exempt.
+    """
+    if eff is None:
+        return False  # the anon caller itself: never exempt
+    if eff.owner_bypasses_rls:
+        return True
+    if not eff.owner:
+        return False  # pre-v25 snapshot: fail-closed, claim no bypass
+    if table.force_rls:
+        return False
+    return _inherits_privs_of(schema, eff.owner, table.owner)
+
+
+def _reachability_paths(
+    schema: Schema,
+    outers: list[Any],
+    tables_by_key: dict[tuple[str, str], Any],
+    views_by_key: dict[tuple[str, str], Any],
+) -> list[_ReachPath]:
+    """Walk each anon-openable view down to the RLS tables it reaches.
+
+    At each hop the effective RLS user becomes the view's owner if the view
+    is `security_invoker = false`, else it is inherited from the enclosing
+    hop (the caller — never exempt — at the top). A materialized-view hop is
+    skipped: its rows were captured at refresh, a different mechanism that
+    SEC054 / VIEW003 cover. A pre-v26 view (no `direct_references`) falls
+    back to its collapsed `references`, i.e. the single-hop reading.
+
+    One path per (outer, table): a decided exemption wins over an undecided
+    one, and only exempt (or undecided) paths are returned — a hop whose
+    effective user is provably subject to the table's RLS is not a door.
+    """
+    best: dict[tuple[str, str], _ReachPath] = {}
+
+    def walk(view: Any, eff: Any, hops: tuple[str, ...], outer: Any, seen: frozenset[tuple[str, str]]) -> None:
+        if not view.security_invoker:
+            eff = view
+        refs = view.direct_references or view.references
+        for ref in refs:
+            child = views_by_key.get(ref)
+            if child is not None:
+                if child.is_materialized or ref in seen:
+                    continue
+                walk(child, eff, hops + (child.qualified_name,), outer, seen | {ref})
+                continue
+            table = tables_by_key.get(ref)
+            if table is None or not table.rls_enabled:
+                continue
+            exempt = _effective_user_exempt(schema, eff, table)
+            if exempt is False or eff is None:
+                continue
+            key = (outer.qualified_name, table.qualified_name)
+            prior = best.get(key)
+            if prior is None or (prior.exempt is None and exempt is True):
+                best[key] = _ReachPath(outer, table, hops, eff, exempt)
+
+    for outer in outers:
+        walk(outer, None, (), outer, frozenset({(outer.schema, outer.name)}))
+    return sorted(best.values(), key=lambda p: (p.table.qualified_name, p.outer.qualified_name))
 
 
 def _sql_body_parses(secdef_fn: Any) -> bool:

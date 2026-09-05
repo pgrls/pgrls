@@ -800,9 +800,16 @@ def test_anon_clean_on_untranslatable_exists_subquery() -> None:
     ) is None
 
 
-def test_anon_clean_on_in_list() -> None:
-    # AEXPR_IN is an untranslatable shape in v1 → abort → None.
-    assert _anon("owner_id IN ('a', 'b') OR (SELECT auth.uid()) IS NULL") is None
+def test_anon_in_list_is_translated_as_membership() -> None:
+    # The deliberate flip this pin asked for: a hand-written `x IN (a, b)`
+    # (AEXPR_IN) is the same membership test as the `= ANY (ARRAY[...])` the
+    # catalog renders it to, and is now desugared onto the same `_anon_binop`
+    # machinery. This predicate is a real unconditional anon leak — the
+    # `auth.uid() IS NULL` disjunct is TRUE for a JWT-less session — so SEC038
+    # reports it (`{}` = every row) instead of abstaining.
+    assert _anon("owner_id IN ('a', 'b') OR (SELECT auth.uid()) IS NULL") == {}
+    # Membership alone, with no anon-TRUE disjunct, is not a leak.
+    assert _anon("owner_id IN ('a', 'b')") is None
 
 
 def test_anon_clean_on_case_expr_aborts() -> None:

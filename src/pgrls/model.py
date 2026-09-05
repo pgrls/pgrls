@@ -52,7 +52,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 25  # v25: View.owner + owner_bypasses_rls — verify reachability
+SNAPSHOT_VERSION = 26  # v26: View.direct_references + serialized role_memberships
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -359,6 +359,16 @@ class View:
     grants: tuple[Grant, ...] = ()
     owner: str = ""
     owner_bypasses_rls: bool = False
+    # v26+: the relations this view's body reads DIRECTLY — tables AND views —
+    # as opposed to `references`, which chases view→view edges down to base
+    # tables. `verify --mode reachability` needs the hops: Postgres evaluates a
+    # table's RLS as the owner of the *nearest enclosing* `security_invoker =
+    # false` view on the path, so `outer(invoker off, owner A) → inner(invoker
+    # off, owner superuser) → T` bypasses T's RLS as the superuser even though
+    # A is not exempt and inner is not anon-selectable — a chain the collapsed
+    # `references` cannot express. Empty on a pre-v26 snapshot, where the walk
+    # falls back to `references` (the pre-v26 single-hop behaviour).
+    direct_references: tuple[tuple[str, str], ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -1306,6 +1316,9 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         # rather than a leak we cannot substantiate.
         owner=v.get("owner", ""),
         owner_bypasses_rls=bool(v.get("owner_bypasses_rls", False)),
+        # v26+; absent on older snapshots → () and the reachability walk uses
+        # the collapsed `references` instead.
+        direct_references=tuple(tuple(r) for r in v.get("direct_references", [])),
     )
 
 
@@ -1580,6 +1593,13 @@ class Schema:
     # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
     # and every snapshot decoding without it (all versions) fail-closed.
     role_memberships: tuple[RoleMembership, ...] | None = None
+    # v26+: custom (dotted) GUC names set at database / role / server level —
+    # what an anonymous session inherits without running `SET`. The anon prover
+    # treats a read of one of these as a real (opaque, non-null) value instead
+    # of the unset-GUC raise, so `col = current_setting('app.x')` is no longer
+    # PROVEN when `ALTER DATABASE … SET app.x` makes it readable. Empty on a
+    # pre-v26 snapshot or an offline Schema (the unset assumption stands).
+    set_gucs: tuple[str, ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1859,6 +1879,7 @@ class Schema:
                     ],
                     "owner": v.owner,
                     "owner_bypasses_rls": v.owner_bypasses_rls,
+                    "direct_references": [list(r) for r in v.direct_references],
                 }
                 for v in self.views
             ],
@@ -1976,6 +1997,23 @@ class Schema:
                 }
                 for m in self.owner_reachable_members
             ],
+            "set_gucs": list(self.set_gucs),
+            # v26+: the role-membership graph, so a `--against` baseline can
+            # decide anon reachability of a `TO <role>` policy. Emitted only
+            # when captured — `None` (an offline / hand-built Schema) stays
+            # absent, and `from_snapshot` maps absence back to None so the
+            # prover keeps abstaining rather than treating "not captured" as
+            # "no memberships" (a false isolated).
+            **(
+                {
+                    "role_memberships": [
+                        {"member": m.member, "role": m.role}
+                        for m in self.role_memberships
+                    ]
+                }
+                if self.role_memberships is not None
+                else {}
+            ),
             "foreign_tables": [
                 {
                     "schema": ft.schema,
@@ -2092,13 +2130,13 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24, 25,
+            21, 22, 23, 24, 25, 26,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
                 "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, "
-                "25. "
+                "25, 26. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
@@ -2183,6 +2221,18 @@ class Schema:
             immutable_functions=immutable_functions,
             owner_reachable_members=owner_reachable_members,
             foreign_tables=foreign_tables,
+            set_gucs=tuple(payload.get("set_gucs", [])),
+            # v26+: absent key → None ("graph not captured", the prover
+            # abstains on non-anon roles); present → the captured edges, even
+            # when empty (anon is a member of nothing extra).
+            role_memberships=(
+                None
+                if payload.get("role_memberships") is None
+                else tuple(
+                    RoleMembership(member=m["member"], role=m["role"])
+                    for m in payload["role_memberships"]
+                )
+            ),
         )
 
     def to_sql(self) -> str:

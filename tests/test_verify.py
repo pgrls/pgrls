@@ -3125,3 +3125,207 @@ def test_every_mode_is_covered_by_the_sarif_lookups() -> None:
     # sharing one would merge unrelated findings in the UI.
     ids = [_SARIF_RULE_ID[m] for m in modes]
     assert len(ids) == len(set(ids)), f"duplicate SARIF ruleIds: {ids}"
+
+
+# --- reachability: chains, owner-equivalence, undecidable membership --------
+
+
+def _rv_table(name: str, owner: str, *, force: bool = False):
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Policy, Table
+
+    pred = "tenant_id = (SELECT current_setting('app.tenant', true))"
+    return Table(
+        schema="public",
+        name=name,
+        rls_enabled=True,
+        force_rls=force,
+        columns=("id", "tenant_id"),
+        owner=owner,
+        policies=(
+            Policy(
+                name="p",
+                command="SELECT",
+                permissive=True,
+                roles=("PUBLIC",),
+                using_sql=pred,
+                with_check_sql=None,
+                using_ast=parse_expr(pred),
+                with_check_ast=None,
+            ),
+        ),
+    )
+
+
+def _rv_view(
+    name: str,
+    owner: str,
+    refs: tuple[tuple[str, str], ...],
+    *,
+    invoker: bool = False,
+    bypass: bool = False,
+    anon_grant: bool = True,
+    direct: tuple[tuple[str, str], ...] | None = None,
+):
+    from pgrls.model import Grant, View
+
+    return View(
+        schema="public",
+        name=name,
+        is_materialized=False,
+        security_invoker=invoker,
+        security_barrier=False,
+        definition="",
+        references=refs,
+        security_definer_calls=(),
+        grants=(Grant(role="anon", privileges=("SELECT",)),) if anon_grant else (),
+        owner=owner,
+        owner_bypasses_rls=bypass,
+        direct_references=refs if direct is None else direct,
+    )
+
+
+def _rv(schema):
+    from pgrls.verify import build_reachability
+
+    return {
+        (t.qualified_name, t.proofs[0].policy): (t.verdict, t.note or "")
+        for t in build_reachability(schema).tables
+    }
+
+
+def test_reachability_owner_member_of_table_owner_is_leak() -> None:
+    """Postgres's owner check is has_privs_of_role: a view owned by an
+    INHERIT member of the table owner is owner-equivalent. Measured live:
+    anon read every row through it. Requires the membership graph."""
+    from pgrls.model import RoleMembership, Schema
+
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner"),),
+        views=(_rv_view("v", "tbl_admin", (("public", "t"),)),),
+        role_memberships=(RoleMembership(member="tbl_admin", role="tbl_owner"),),
+    )
+    r = _rv(schema)
+    assert r[("public.t", "public.v")][0] == "leak"
+    assert "member of table owner tbl_owner" in r[("public.t", "public.v")][1]
+
+
+def test_reachability_member_view_without_graph_is_unverified_not_silent() -> None:
+    """Same shape, graph not captured (snapshot / hand-built): the answer
+    turns on membership, so abstain loudly rather than stay silent."""
+    from pgrls.model import Schema
+
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner"),),
+        views=(_rv_view("v", "tbl_admin", (("public", "t"),)),),
+        role_memberships=None,
+    )
+    r = _rv(schema)
+    assert r[("public.t", "public.v")][0] == "unverified"
+    assert "membership graph not captured" in r[("public.t", "public.v")][1]
+
+
+def test_reachability_unrelated_owner_with_graph_is_silent() -> None:
+    """A plain third role that is NOT a member: RLS applies to it (measured: 0
+    rows). With the graph captured this is decidable and must stay silent."""
+    from pgrls.model import Schema
+
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner"),),
+        views=(_rv_view("v", "plain", (("public", "t"),)),),
+        role_memberships=(),
+    )
+    assert _rv(schema) == {}
+
+
+def test_reachability_chain_effective_user_is_nearest_definer_owner() -> None:
+    """outer(off, owner A, anon SELECT) → inner(off, owner superuser, no anon
+    grant) → T. Measured live: anon reads every row — T's RLS is evaluated as
+    inner's owner. The collapsed `references` could not express this; the
+    walk over `direct_references` names the chain."""
+    from pgrls.model import Schema
+
+    outer = _rv_view("v_outer", "app_owner", (("public", "t"),), direct=(("public", "v_inner"),))
+    inner = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True, anon_grant=False)
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
+    r = _rv(schema)
+    assert r[("public.t", "public.v_outer")][0] == "leak"
+    note = r[("public.t", "public.v_outer")][1]
+    assert "public.v_outer → public.v_inner (runs as postgres)" in note
+    assert ("public.t", "public.v_inner") not in r  # inner is not anon-openable
+
+
+def test_reachability_invoker_on_outer_over_definer_inner_still_leaks() -> None:
+    """An invoker-ON outer view runs as the caller, but the invoker-OFF inner
+    view beneath it still runs as ITS owner — the outer flag is not a shield."""
+    from pgrls.model import Schema
+
+    outer = _rv_view("v_outer", "whoever", (("public", "t"),), invoker=True, direct=(("public", "v_inner"),))
+    inner = _rv_view("v_inner", "tbl_owner", (("public", "t"),), anon_grant=False)
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
+    assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
+
+
+def test_reachability_invoker_on_inner_inherits_outer_definer_owner() -> None:
+    """outer(off, owner = table owner) → inner(ON) → T: the inner runs as its
+    invoker, which is the OUTER's execution user (the exempt owner), so this
+    leaks even though the view touching T is invoker-on."""
+    from pgrls.model import Schema
+
+    outer = _rv_view("v_outer", "tbl_owner", (("public", "t"),), direct=(("public", "v_inner"),))
+    inner = _rv_view("v_inner", "plain", (("public", "t"),), invoker=True, anon_grant=False)
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
+    assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
+
+
+def test_reachability_all_invoker_on_chain_is_silent() -> None:
+    from pgrls.model import Schema
+
+    outer = _rv_view("v_outer", "tbl_owner", (("public", "t"),), invoker=True, direct=(("public", "v_inner"),))
+    inner = _rv_view("v_inner", "tbl_owner", (("public", "t"),), invoker=True, anon_grant=False)
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
+    assert _rv(schema) == {}
+
+
+def test_reachability_pre_v26_view_falls_back_to_collapsed_references() -> None:
+    """A pre-v26 snapshot has no direct_references; the walk uses the collapsed
+    `references` — the single-hop behaviour — rather than finding nothing."""
+    from pgrls.model import Schema
+
+    v = _rv_view("v", "tbl_owner", (("public", "t"),), direct=())
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(v,), role_memberships=())
+    assert _rv(schema)[("public.t", "public.v")][0] == "leak"
+
+
+def test_against_snapshot_baseline_decides_reachability_so_role_widening_is_new() -> None:
+    """The reported gap: base `TO authenticated USING (true)` (isolated only if
+    reachability is decidable) → head `TO PUBLIC`. With the graph serialized,
+    the snapshot base proves isolated and the widening is a NEW leak, not
+    'pre-existing'."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Policy, Schema, Table
+    from pgrls.verify import build_verification, diff_verifications
+
+    def tbl(roles):
+        return Table(
+            schema="public", name="tag", rls_enabled=True, force_rls=True,
+            columns=("id",), policies=(Policy(
+                name="p", command="SELECT", permissive=True, roles=roles,
+                using_sql="true", with_check_sql=None,
+                using_ast=parse_expr("true"), with_check_ast=None,
+            ),),
+        )
+
+    from pgrls.schema_sources import reparse_policy_asts
+
+    base_live = Schema(tables=(tbl(("authenticated",)),), role_memberships=())
+    # The --against side: a snapshot carries policy SQL, not ASTs; the CLI
+    # re-parses them exactly like this before verifying.
+    base = reparse_policy_asts(Schema.from_snapshot(base_live.to_snapshot()))
+    assert base.role_memberships == ()
+    head = Schema(tables=(tbl(("PUBLIC",)),), role_memberships=())
+    delta = diff_verifications(
+        build_verification(base, mode="anon"), build_verification(head, mode="anon")
+    )
+    assert [t.qualified_name for t in delta.new_leaks] == ["public.tag"]
+    assert delta.preexisting_leaks == ()

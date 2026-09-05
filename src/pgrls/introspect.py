@@ -1164,6 +1164,43 @@ _ROLE_MEMBERSHIPS_SQL = """
 """
 
 
+# Custom (dotted) GUCs a session inherits WITHOUT running `SET` — set at the
+# database / role level (`ALTER DATABASE … SET app.x`, `ALTER ROLE … SET`) or
+# in the server configuration. `verify --mode anon` assumes a custom GUC is
+# UNSET for an anonymous session (the read raises → no rows). A standing
+# `ALTER DATABASE postgres SET app.tenant_id = 'shared'` breaks that
+# assumption: a fresh anon session reads the shared value and the canonical
+# `tenant_id = current_setting('app.tenant_id')` policy admits every row
+# stamped with it (measured live). Capturing the names lets the prover stop
+# claiming PROVEN there. Session-/client-set values are excluded — those are
+# this connection's own state, not what an anonymous caller inherits.
+_SET_GUCS_SQL = """
+SELECT DISTINCT split_part(cfg, '=', 1) AS name
+FROM pg_catalog.pg_db_role_setting s
+CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
+WHERE (
+    s.setdatabase = 0
+    OR s.setdatabase = (
+        SELECT d.oid FROM pg_catalog.pg_database d
+        WHERE d.datname = current_database()
+    )
+)
+AND split_part(cfg, '=', 1) LIKE '%.%'
+UNION
+SELECT name
+FROM pg_catalog.pg_settings
+WHERE name LIKE '%.%'
+  AND source NOT IN ('default', 'session', 'client')
+ORDER BY 1
+"""
+
+
+def _fetch_set_gucs(cur: Any) -> tuple[str, ...]:
+    """Dotted GUC names an anonymous session would find already set."""
+    cur.execute(_SET_GUCS_SQL)
+    return tuple(row["name"] for row in cur.fetchall())
+
+
 def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
     """Fetch every `pg_auth_members` edge as a (member, role) pair.
 
@@ -1556,6 +1593,11 @@ def _build_views(
             grants=view_grants_by_oid.get(row["view_oid"], ()),
             owner=row["owner_name"] or "",
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
+            # The un-collapsed edges (tables AND views) — the hops the
+            # reachability walk needs; `references` above is the collapsed set.
+            direct_references=tuple(
+                sorted(deps_index.get((row["schema_name"], row["view_name"]), set()))
+            ),
         )
         for row in view_rows
     )
@@ -1644,6 +1686,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # `verify --mode anon` can role-gate the anon prover soundly (a `None`
         # graph on an offline/snapshot Schema makes verify abstain instead).
         role_memberships = _fetch_role_memberships(cur)
+        set_gucs = _fetch_set_gucs(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1663,6 +1706,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 owner_reachable_members=owner_reachable,
                 foreign_tables=foreign_tables,
                 role_memberships=role_memberships,
+                set_gucs=set_gucs,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1892,4 +1936,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         owner_reachable_members=owner_reachable,
         foreign_tables=foreign_tables,
         role_memberships=role_memberships,
+        set_gucs=set_gucs,
     )

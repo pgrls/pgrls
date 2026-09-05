@@ -1040,6 +1040,38 @@ def test_sec019_fix_silent_when_already_two_arg() -> None:
     assert SEC019Fixer().fix(schema, {}) == []
 
 
+def test_sec019_fix_leaves_is_null_position_alone_but_fixes_sibling() -> None:
+    """A fixer may never broaden. One-arg `current_setting` RAISES when the
+    GUC is unset (fails closed); under `IS NULL` the two-arg form would turn
+    that into a TRUE disjunct — verified live: the rewrite let anon read every
+    row. The sibling `=` call is still safe to fix (NULL hides the row)."""
+    schema = _wrap_policy(
+        _policy(
+            "current_setting('app.t') IS NULL OR "
+            "tenant_id = current_setting('app.t')"
+        )
+    )
+    fixes = SEC019Fixer().fix(schema, {})
+    assert len(fixes) == 1
+    sql = fixes[0].sql
+    assert "current_setting('app.t') IS NULL" in sql  # untouched
+    assert "tenant_id = current_setting('app.t', TRUE)" in sql  # fixed
+
+
+def test_sec019_fix_abstains_under_coalesce_nullif_distinct_and_not() -> None:
+    """Every NULL-tolerant position: the fixer leaves the call alone, and with
+    nothing else to rewrite emits no fix at all (the finding stays open)."""
+    for pred in (
+        "tenant_id = COALESCE(current_setting('app.t'), 'fallback')",
+        "tenant_id = NULLIF(current_setting('app.t'), '')",
+        "tenant_id IS NOT DISTINCT FROM current_setting('app.t')",
+        "NOT (tenant_id <> current_setting('app.t'))",
+        "tenant_id = CASE WHEN current_setting('app.t') = 'x' THEN 'x' END",
+    ):
+        schema = _wrap_policy(_policy(pred))
+        assert SEC019Fixer().fix(schema, {}) == [], pred
+
+
 def test_sec019_fix_silent_when_no_current_setting() -> None:
     schema = _wrap_policy(_policy("user_id = 1"))
     assert SEC019Fixer().fix(schema, {}) == []

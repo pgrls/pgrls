@@ -4418,6 +4418,19 @@ def verify(
             "(the SET ROLE chain has no static reproduction template — use "
             "--probe, which live-confirms the escalation bypass)."
         )
+    if mode == "reachability" and emit_repro_dir is not None:
+        # A reachability leak is a VIEW path, and its proof names the view,
+        # not a policy — the emitter would silently write zero files.
+        raise click.UsageError(
+            "--emit-repro is not supported with --mode reachability (the leak "
+            "is a view path, not a policy predicate; the DETAIL column names "
+            "the view to query)."
+        )
+    if mode == "reachability" and probe:
+        raise click.UsageError(
+            "--probe is not supported with --mode reachability yet; the mode "
+            "reports the static verdict only."
+        )
     if against is not None and probe:
         raise click.UsageError(
             "--against and --probe cannot be combined: --against compares two "

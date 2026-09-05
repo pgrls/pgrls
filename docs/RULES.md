@@ -4012,7 +4012,9 @@ CREATE POLICY p ON leads TO app
 path that still 404s instead of failing, and it is exactly the path nobody
 remembered to convert. The rule fires when this schema already uses a
 `…require_…`-shaped binding helper somewhere **and** another policy still
-carries the two-argument `current_setting(…, true)` form.
+carries the two-argument `current_setting(…, true)` form (`missing_ok =
+true` — the only form that returns NULL; `(name, false)` raises like the
+one-argument form and is not flagged).
 
 ### Why the trigger is the schema, not the config
 

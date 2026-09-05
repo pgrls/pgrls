@@ -458,8 +458,12 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
         base_roles = set(base_pol.roles)
         head_roles = set(head_pol.roles)
         if base_roles != head_roles:
-            if head_roles > base_roles:
-                # strict superset: more roles covered (dangerous)
+            gained_public = "PUBLIC" in head_roles and "PUBLIC" not in base_roles
+            if head_roles > base_roles or gained_public:
+                # strict superset: more roles covered (dangerous). Gaining
+                # PUBLIC is a superset of EVERY role set whatever else changed
+                # — `TO authenticated` → `TO PUBLIC` covers anon too — so it
+                # is a widening, not a disjoint replacement to review.
                 changes.append(
                     Change(
                         kind=ChangeKind.ROLES_WIDENED,
@@ -467,7 +471,8 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
                         location=location,
                         message=(
                             f"Policy {location} roles widened"
-                            f" from {sorted(base_roles)} to {sorted(head_roles)}."
+                            f" from {sorted(base_roles)} to {sorted(head_roles)}"
+                            + (" (PUBLIC covers every role)." if gained_public else ".")
                         ),
                         before_sql=None,
                         after_sql=None,

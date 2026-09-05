@@ -1557,3 +1557,25 @@ def test_offline_model_does_not_treat_a_matview_as_a_table() -> None:
         "CREATE MATERIALIZED VIEW public.mv AS SELECT * FROM public.s;"
     )
     assert [t.qualified_name for t in schema.tables] == ["public.s"]
+
+
+def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
+    """`ALTER POLICY p … RENAME TO q; ALTER POLICY q … USING (true)`: before
+    the model followed policy renames the loosening targeted a name it did
+    not know and was silently discarded — the offline lint kept seeing the
+    scoped predicate under the old name."""
+    from click.testing import CliRunner
+
+    from pgrls.cli import main
+
+    sql = tmp_path / "s.sql"
+    sql.write_text(
+        "CREATE TABLE t (id int primary key, tenant_id text NOT NULL);\n"
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON t FOR SELECT TO PUBLIC "
+        "USING (tenant_id = current_setting('app.t', true));\n"
+        "ALTER POLICY p ON t RENAME TO q;\n"
+        "ALTER POLICY q ON t USING (true);\n"
+    )
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
+    assert "SEC008" in res.output and "public.t.q" in res.output, res.output

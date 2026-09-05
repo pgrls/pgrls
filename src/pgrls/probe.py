@@ -96,6 +96,15 @@ _ANON_BASELINE_GUCS = (
     "request.jwt.claims",
 )
 
+# The anon-KEY session (see `_z3_compare._Context.anon_jwt`): what PostgREST
+# sets for a caller presenting the public anon key — a role claim of 'anon'
+# and a claims blob carrying it, but no subject. Applied as a second attempt
+# after the JWT-less baseline reads nothing.
+_ANON_KEY_SESSION_GUCS = (
+    ("request.jwt.claim.role", "anon"),
+    ("request.jwt.claims", '{"role":"anon"}'),
+)
+
 
 @dataclass(frozen=True)
 class ProbeResult:
@@ -383,6 +392,7 @@ def _probe_one(
     auth_functions: set[str] | None,
     probe_role: str,
     n: int,
+    set_gucs: frozenset[str] = frozenset(),
 ) -> ProbeResult:
     """Probe one table, inside its own savepoint (rolled back by the caller).
 
@@ -469,7 +479,7 @@ def _probe_one(
                 cur, table, policy_ast, mode, row,
                 disc_col=disc_col, auth_sql=auth_sql, a_val=a_val,
                 probe_role=probe_role,
-            )
+             set_gucs=set_gucs)
             agreement, detail = _classify(tv.verdict, observed, mode)
             return ProbeResult(
                 tv.qualified_name, policy.name, mode, tv.verdict,
@@ -518,6 +528,7 @@ def _run_probe_steps(
     auth_sql: str | None,
     a_val: str | None,
     probe_role: str,
+    set_gucs: frozenset[str] = frozenset(),
 ) -> Observed:
     """Seed → become the threat session → observe. Returns the live outcome.
 
@@ -552,6 +563,12 @@ def _run_probe_steps(
         else:  # anon
             cur.execute(_insert_sql(table, row))  # seed as the privileged role
             for guc in _anon_gucs(policy_ast):
+                if guc in set_gucs:
+                    # Set at database / role / server level: a real anonymous
+                    # session inherits this value, so clearing it would probe a
+                    # session that does not exist — and hide the leak the
+                    # static prover now reports.
+                    continue
                 cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
     except psycopg.Error as exc:
@@ -599,6 +616,19 @@ def _run_probe_steps(
             query = f"SELECT * FROM {qtbl}"
         try:
             seen = _row_count(cur.connection, query)
+            if seen == 0 and mode == "anon":
+                # Second anonymous session: the Supabase ANON-KEY caller.
+                # PostgREST sets the role claim to 'anon', so `auth.role()` is a
+                # non-null string there — a policy that grants anon BY ROLE
+                # NAME (`USING (auth.role() = 'anon')`) reads rows for that
+                # caller while reading nothing for a JWT-less one. The static
+                # prover models both sessions; so must the probe, or it would
+                # contradict a correct LEAK with a MISMATCH.
+                for guc, val in _ANON_KEY_SESSION_GUCS:
+                    cur.execute(
+                        f"SELECT set_config({_sql_str(guc)}, {_sql_str(val)}, true)"
+                    )
+                seen = _row_count(cur.connection, query)
         except psycopg.Error as exc:
             raise _ProbeAbstain(f"probe query failed: {_short(exc)}") from exc
         return "rows_visible" if seen > 0 else "no_rows"
@@ -949,7 +979,10 @@ def run_probe(
                 )
                 continue
             results.append(
-                _probe_one(conn, table, tv, mode, auth_functions, probe_role, n)
+                _probe_one(
+                    conn, table, tv, mode, auth_functions, probe_role, n,
+                    set_gucs=frozenset(schema.set_gucs),
+                )
             )
         return Probe(tuple(results), mode)
     finally:

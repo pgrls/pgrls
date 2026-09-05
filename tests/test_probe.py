@@ -824,10 +824,10 @@ def test_probe_render_sarif_projects_actionable_results() -> None:
     assert noted == {"public.d", "public.e"}
 
 
-def test_probe_cli_emit_repro_is_usage_error() -> None:
+def test_probe_cli_emit_repro_is_usage_error(tmp_path) -> None:
     result = CliRunner().invoke(
         main,
-        ["verify", "--probe", "--emit-repro", "/tmp/x", "--database-url",
+        ["verify", "--probe", "--emit-repro", str(tmp_path / "x"), "--database-url",
          "postgresql://x/y"],
     )
     assert result.exit_code == 2

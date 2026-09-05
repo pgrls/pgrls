@@ -51,6 +51,15 @@ DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='corpus_plain')
     THEN CREATE ROLE corpus_plain NOLOGIN; END IF;
 END $$;
+-- Supabase-style auth helpers, as PostgREST would see them: auth.role() reads
+-- the JWT role claim (an anon-KEY caller carries role='anon'; a JWT-less
+-- session carries nothing).
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE OR REPLACE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS $$
+  SELECT coalesce(nullif(current_setting('request.jwt.claim.role', true), ''),
+                  (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role')) $$;
+CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$
+  SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
 -- Self-contained on purpose: the policies below are `TO authenticated`, and
 -- Postgres rejects a policy naming a role that does not exist. `cases.py`
 -- happens to create this too, but relying on that would make this corpus fail
@@ -230,6 +239,85 @@ RESET ROLE;
         note=(
             "An exempt-owner invoker-off view anon cannot SELECT from is not "
             "a path anon can take. No grant, no finding."
+        ),
+    ),
+
+    VerdictCase(
+        name="anon_grant_by_role_name_leaks",
+        mode="anon",
+        sql="""
+CREATE TABLE docs (id int primary key, body text);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO anon, authenticated USING (auth.role() = 'anon');
+""",
+        expect=(("public.docs", "leak"),),
+        note=(
+            "Grants anon BY ROLE NAME. Measured on PG16 with Supabase's auth.role(): "
+            "an anon-key session (request.jwt.claims = {role:anon}) reads every "
+            "row. Under the JWT-less model alone auth.role() is NULL, NULL = "
+            "'anon' is UNKNOWN, and this was PROVEN — a false clear until the "
+            "prover modelled the anon-key session too. No lint rule catches the "
+            "shape (SEC003 needs PUBLIC; SEC037 flags only unknown names)."
+        ),
+    ),
+    VerdictCase(
+        name="anon_authenticated_role_name_stays_isolated",
+        mode="anon",
+        sql="""
+CREATE TABLE docs (id int primary key, body text);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO anon, authenticated USING (auth.role() = 'authenticated');
+""",
+        expect=(("public.docs", "isolated"),),
+        note=(
+            "No flood: under the anon-key session the role claim is 'anon', so "
+            "= 'authenticated' is FALSE; under the JWT-less session it is UNKNOWN. "
+            "Neither admits a row."
+        ),
+    ),
+    VerdictCase(
+        name="reach_owner_member_view_leaks",
+        mode="reachability",
+        sql=_SCOPED_TABLE + """
+RESET ROLE;
+GRANT corpus_owner TO corpus_plain;
+SET ROLE corpus_plain;
+CREATE VIEW docs_v AS SELECT * FROM docs;
+GRANT SELECT ON docs_v TO anon;
+RESET ROLE;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "The view owner is an INHERIT member of the table owner. Postgres's "
+            "owner check is has_privs_of_role, so it is owner-equivalent. "
+            "Measured: anon reads every row. Was silent before the walk consulted "
+            "the membership graph."
+        ),
+    ),
+    VerdictCase(
+        name="reach_chain_definer_inner_leaks",
+        mode="reachability",
+        sql=_SCOPED_TABLE + """
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+RESET ROLE;
+CREATE VIEW docs_inner AS SELECT * FROM docs;   -- owned by the superuser, no anon grant
+GRANT SELECT ON docs_inner TO corpus_plain;
+SET ROLE corpus_plain;
+CREATE VIEW docs_outer AS SELECT * FROM docs_inner;  -- plain owner, anon-selectable
+GRANT SELECT ON docs_outer TO anon;
+RESET ROLE;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_outer",),
+        note=(
+            "outer(invoker off, plain owner, anon SELECT) -> inner(invoker off, "
+            "superuser owner, no anon grant) -> FORCE'd table. RLS on the table "
+            "is evaluated as the INNER owner (the nearest definer view), which "
+            "is BYPASSRLS. Measured: anon reads every row; the outer owner alone "
+            "would have been subject to RLS. Was silent before the chain walk."
         ),
     ),
 
