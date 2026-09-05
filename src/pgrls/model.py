@@ -375,6 +375,12 @@ class View:
     # table-level `grants` say nothing. SEC052's API-reachability gate stays
     # table-level by design.
     column_grants: tuple[ColumnGrant, ...] = ()
+    # v26+: `owner_bypasses_rls` conflates superuser with plain BYPASSRLS. Both
+    # escape RLS, but only a superuser also escapes privilege checks: a
+    # BYPASSRLS non-superuser owner still needs SELECT on what its view reads
+    # (measured: permission denied without the grant). The reachability walk
+    # uses this to require the grant.
+    owner_is_superuser: bool = False
 
     @property
     def qualified_name(self) -> str:
@@ -1336,6 +1342,7 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         column_grants=tuple(
             _column_grant_from_dict(cg) for cg in v.get("column_grants", [])
         ),
+        owner_is_superuser=bool(v.get("owner_is_superuser", False)),
     )
 
 
@@ -1610,18 +1617,27 @@ class Schema:
     # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
     # and every snapshot decoding without it (all versions) fail-closed.
     role_memberships: tuple[RoleMembership, ...] | None = None
-    # v26+: custom (dotted) GUC names set at database / server level — what
-    # every session, an anonymous one included, inherits without running
-    # `SET` (role-level ones live in `role_set_gucs`). The anon prover
-    # treats a read of one of these as a real (opaque, non-null) value instead
-    # of the unset-GUC raise, so `col = current_setting('app.x')` is no longer
-    # PROVEN when `ALTER DATABASE … SET app.x` makes it readable. Empty on a
-    # pre-v26 snapshot or an offline Schema (the unset assumption stands).
-    set_gucs: tuple[str, ...] = ()
-    # v26+: dotted GUCs set at ROLE level, as `(role, name)`. Only those whose
-    # role the anonymous session actually holds (the anon closure) count as
-    # set for it — `ALTER ROLE unrelated SET app.x` is not what anon inherits.
-    role_set_gucs: tuple[tuple[str, str], ...] = ()
+    # v26+: custom (dotted) GUCs set at database / server level, as
+    # `(name, value)` — what every session, an anonymous one included,
+    # inherits without running `SET` (role-level ones live in
+    # `role_set_gucs`). The anon prover reads one of these as its configured
+    # value instead of the unset-GUC raise, so `col = current_setting(
+    # 'app.x')` is no longer PROVEN when `ALTER DATABASE … SET app.x` makes
+    # it readable — and `current_setting('app.flag') = 'on'` with the setting
+    # at 'off' stays PROVEN (measured: 0 rows). A `None` value means "set,
+    # but the value was not captured" (see `introspect._fetch_set_gucs`): the
+    # prover falls back to an opaque non-null value there, which can decline
+    # to prove isolation but never claims it falsely. Empty on a pre-v26
+    # snapshot or an offline Schema (the unset assumption stands).
+    set_gucs: tuple[tuple[str, str | None], ...] = ()
+    # v26+: dotted GUCs set at ROLE level, as `(role, name, value)`. Role
+    # settings bind to the LOGIN role: the anonymous session sees those of
+    # `anon` itself and of any role that logs in and then `SET ROLE anon`
+    # (PostgREST's `authenticator`, a *member* of anon — the downward
+    # closure). Membership does not propagate settings, so `ALTER ROLE
+    # readers SET app.x` with anon a member of readers is NOT seen. The value
+    # is kept so `--probe` can replay it into its own session.
+    role_set_gucs: tuple[tuple[str, str, str], ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1906,6 +1922,7 @@ class Schema:
                         {"role": cg.role, "column": cg.column, "privileges": list(cg.privileges)}
                         for cg in v.column_grants
                     ],
+                    "owner_is_superuser": v.owner_is_superuser,
                 }
                 for v in self.views
             ],
@@ -2023,7 +2040,7 @@ class Schema:
                 }
                 for m in self.owner_reachable_members
             ],
-            "set_gucs": list(self.set_gucs),
+            "set_gucs": [list(p) for p in self.set_gucs],
             "role_set_gucs": [list(p) for p in self.role_set_gucs],
             # v26+: the role-membership graph, so a `--against` baseline can
             # decide anon reachability of a `TO <role>` policy. Emitted only
@@ -2248,9 +2265,10 @@ class Schema:
             immutable_functions=immutable_functions,
             owner_reachable_members=owner_reachable_members,
             foreign_tables=foreign_tables,
-            set_gucs=tuple(payload.get("set_gucs", [])),
+            set_gucs=tuple((p[0], p[1]) for p in payload.get("set_gucs", [])),
             role_set_gucs=tuple(
-                (p[0], p[1]) for p in payload.get("role_set_gucs", [])
+                (p[0], p[1], p[2] if len(p) > 2 else "")
+                for p in payload.get("role_set_gucs", [])
             ),
             # v26+: absent key → None ("graph not captured", the prover
             # abstains on non-anon roles); present → the captured edges, even

@@ -348,6 +348,7 @@ SELECT
     -- query above.
     pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
     (vo.rolsuper OR vo.rolbypassrls) AS owner_bypasses_rls,
+    vo.rolsuper AS owner_is_superuser,
     c.oid AS view_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1209,7 +1210,8 @@ _ROLE_MEMBERSHIPS_SQL = """
 _SET_GUCS_SQL = """
 SELECT DISTINCT
     lower(split_part(cfg, '=', 1)) AS name,
-    CASE WHEN s.setrole = 0 THEN NULL ELSE r.rolname END AS role
+    CASE WHEN s.setrole = 0 THEN NULL ELSE r.rolname END AS role,
+    substr(cfg, strpos(cfg, '=') + 1) AS value
 FROM pg_catalog.pg_db_role_setting s
 CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
 LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
@@ -1221,31 +1223,98 @@ WHERE (
     )
 )
 AND split_part(cfg, '=', 1) LIKE '%.%'
-UNION
-SELECT lower(name) AS name, NULL AS role
-FROM pg_catalog.pg_settings
-WHERE name LIKE '%.%'
-  AND source NOT IN ('default', 'session', 'client')
 ORDER BY 1, 2
 """
 
+# Server-configuration custom GUCs. These are NOT in `pg_settings` —
+# Postgres registers custom placeholders GUC_NO_SHOW_ALL (measured on PG16: a
+# `postgresql.conf` line `app.sys = 'sysval'` is readable by every session,
+# `current_setting` included, yet `pg_settings` has zero rows for it), so a
+# first cut that read `pg_settings` captured nothing at all. `pg_file_settings`
+# lists the applied file entries — and it is the only server-level source that
+# matters, because `ALTER SYSTEM` refuses a custom name the server has never
+# seen ("unrecognized configuration parameter").
+_FILE_SET_GUCS_SQL = """
+SELECT DISTINCT lower(name) AS name, setting
+FROM pg_catalog.pg_file_settings
+WHERE applied AND name LIKE '%.%'
+ORDER BY 1
+"""
 
-def _fetch_set_gucs(cur: Any) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """Dotted GUC names already set — `(database/server level, [(role, name)])`.
+# `pg_file_settings` needs superuser / pg_read_all_settings. Without it, fall
+# back to asking THIS session for every dotted GUC a policy reads: a
+# server-level setting applies to every session, so a non-empty answer means
+# the GUC is set — but the value could be this role's own, so it is recorded
+# as "set, value not captured" (a `None` value in `Schema.set_gucs`) and the
+# prover keeps it opaque rather than trusting a possibly wrong string.
+_POLICY_GUC_NAMES_SQL = r"""
+SELECT DISTINCT lower(m[1]) AS name
+FROM pg_catalog.pg_policy p
+CROSS JOIN LATERAL regexp_matches(
+    pg_catalog.pg_get_expr(p.polqual, p.polrelid)
+        || ' ' || COALESCE(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), ''),
+    $re$current_setting\(\s*'([^']+\.[^']+)'$re$, 'gi') AS m
+"""
+
+
+def _fetch_set_gucs(
+    cur: Any,
+) -> tuple[tuple[tuple[str, str | None], ...], tuple[tuple[str, str, str], ...]]:
+    """Dotted GUCs already set, with their values — `([(name, value)] at
+    database / server level, [(role, name, value)] at role level)`.
 
     Names are casefolded: GUC names are case-insensitive but
     `pg_db_role_setting.setconfig` preserves the ALTER's spelling, and a
     case-sensitive match missed `"App.Tenant"` vs `current_setting(
-    'app.tenant')`. Role-level settings are returned with their role so the
-    prover can count only those the anonymous session actually inherits —
-    `ALTER ROLE unrelated SET app.x` is not what anon sees.
+    'app.tenant')`. Values are captured too, so the prover can decide
+    `current_setting('app.flag') = 'on'` against the configured value
+    (measured: at 'off' the anonymous read returns 0 rows) instead of
+    declining, and so `--probe` / `--emit-repro` can replay the session a
+    real anonymous caller gets. A database-level setting overrides the
+    server configuration, so it wins here.
+
+    Role-level settings bind to the LOGIN role — see `verify._anon_login_roles`
+    — so they are returned per role rather than merged.
+
+    A `None` value means "set, but the value was not captured": the
+    `pg_file_settings` fallback below cannot attribute a live
+    `current_setting` to the server rather than to the introspecting role, so
+    it reports only the fact, and the prover keeps such a GUC opaque.
     """
     cur.execute(_SET_GUCS_SQL)
     rows = cur.fetchall()
-    return (
-        tuple(sorted({r["name"] for r in rows if r["role"] is None})),
-        tuple(sorted({(r["role"], r["name"]) for r in rows if r["role"] is not None})),
+    db_level: dict[str, str | None] = {
+        r["name"]: r["value"] for r in rows if r["role"] is None
+    }
+    role_level = {
+        (r["role"], r["name"], r["value"]) for r in rows if r["role"] is not None
+    }
+    # Ask before reading rather than catching the failure: `introspect` runs on
+    # autocommit connections too (the verdict corpus uses one), where a
+    # SAVEPOINT is itself an error and could not be rolled back.
+    cur.execute(
+        "SELECT pg_catalog.has_table_privilege("
+        "'pg_catalog.pg_file_settings', 'SELECT') AS ok"
     )
+    row = cur.fetchone()
+    if row is not None and row["ok"]:
+        cur.execute(_FILE_SET_GUCS_SQL)
+        for r in cur.fetchall():
+            db_level.setdefault(r["name"], r["setting"])
+    else:
+        # Not privileged to read pg_file_settings: ask the session instead.
+        cur.execute("SELECT session_user AS me")
+        me = cur.fetchone()["me"]
+        own = {name for role, name, _v in role_level if role == me}
+        cur.execute(_POLICY_GUC_NAMES_SQL)
+        for name in [r["name"] for r in cur.fetchall()]:
+            if name in db_level or name in own:
+                continue
+            cur.execute("SELECT current_setting(%s, true) AS v", (name,))
+            got = cur.fetchone()
+            if got is not None and got["v"] not in (None, ""):
+                db_level[name] = None  # set — value not attributable
+    return tuple(sorted(db_level.items())), tuple(sorted(role_level))
 
 
 def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
@@ -1658,6 +1727,7 @@ def _build_views(
             column_grants=view_col_grants_by_oid.get(row["view_oid"], ()),
             owner=row["owner_name"] or "",
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
+            owner_is_superuser=bool(row["owner_is_superuser"]),
             # The un-collapsed edges (tables AND views) — the hops the
             # reachability walk needs; `references` above is the collapsed set.
             direct_references=tuple(

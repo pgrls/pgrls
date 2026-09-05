@@ -4230,10 +4230,12 @@ def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | N
         cfg = load_config(config_path)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
-    cols = cfg.rule_options.get("SEC021", {}).get("identity_columns")
-    if not cols:
+    from pgrls.rules.sec021 import _parse_identity_columns  # noqa: PLC0415
+
+    opts = cfg.rule_options.get("SEC021", {})
+    if "identity_columns" not in opts:
         return None
-    return frozenset(str(c).lower() for c in cols)
+    return frozenset(_parse_identity_columns(opts))
 
 
 
@@ -4606,7 +4608,10 @@ def verify(
         from pgrls.repro import emit_repros
 
         out_dir = Path(emit_repro_dir)
-        artifacts = emit_repros(schema, verification, auth_functions=auth, mode=mode)
+        artifacts = emit_repros(
+            schema, verification, auth_functions=auth, mode=mode,
+            anon_roles=anon_roles,
+        )
         if not force:
             # Refuse to clobber a hand-edited reproduction (the artifacts tell
             # the developer to edit the INSERT for conditional/cross-table

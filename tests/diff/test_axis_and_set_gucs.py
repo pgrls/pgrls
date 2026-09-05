@@ -57,7 +57,44 @@ def test_anon_db_level_guc_defeats_the_unset_assumption() -> None:
     in `set_gucs` the prover must not claim PROVEN."""
     sql = "tenant_id = current_setting('app.tenant_id')"
     assert prove_anon_isolation(parse_expr(sql))[0] == "isolated"
+    verdict, witness = prove_anon_isolation(
+        parse_expr(sql), set_gucs={"app.tenant_id": "shared"}
+    )
+    assert verdict == "leak"
+    # The configured value is carried through, so the counterexample is a real
+    # row rather than "a conditional leak" — that is what --emit-repro seeds
+    # and what --probe replays.
+    assert witness == {"tenant_id": "shared"}
+
+
+def test_anon_guc_value_that_cannot_satisfy_the_policy_stays_isolated() -> None:
+    """A set GUC is not automatically a leak: `ALTER DATABASE … SET app.flag =
+    'off'` against `current_setting('app.flag') = 'on'` admits nothing
+    (measured live: 0 rows). Treating any set GUC as an opaque non-null value
+    reported a LEAK here."""
+    sql = "current_setting('app.flag', true) = 'on'"
+    assert prove_anon_isolation(parse_expr(sql), set_gucs={"app.flag": "off"})[0] == "isolated"
+    assert prove_anon_isolation(parse_expr(sql), set_gucs={"app.flag": "on"})[0] == "leak"
+
+
+def test_anon_guc_set_with_an_uncaptured_value_stays_opaque() -> None:
+    """A `None` value means "set, but the value was not captured" (a
+    non-superuser introspection cannot read pg_file_settings). The prover must
+    not prove isolation from a value it does not have — it declines instead."""
+    sql = "tenant_id = current_setting('app.tenant_id')"
+    verdict, witness = prove_anon_isolation(parse_expr(sql), set_gucs={"app.tenant_id": None})
+    assert verdict == "leak"
+    assert witness is None  # no value to pin the row with
+
+
+def test_anon_guc_states_are_checked_per_login_path() -> None:
+    """Role-level settings bind to the LOGIN role, so an anonymous session has
+    one GUC state per login path (a direct `anon` login, or `authenticator`
+    then `SET ROLE anon`). A leak in ANY state is a leak — both paths are real
+    sessions."""
+    sql = "tenant_id = current_setting('app.tenant_id')"
+    assert prove_anon_isolation(parse_expr(sql), set_gucs=[{}, {}])[0] == "isolated"
     assert (
-        prove_anon_isolation(parse_expr(sql), set_gucs=frozenset({"app.tenant_id"}))[0]
-        != "isolated"
+        prove_anon_isolation(parse_expr(sql), set_gucs=[{}, {"app.tenant_id": "shared"}])[0]
+        == "leak"
     )

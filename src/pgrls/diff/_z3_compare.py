@@ -134,6 +134,8 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -313,10 +315,12 @@ class _Context:
         # yet reads every row for a real anon-key caller — a false PROVEN
         # until the second session was modelled.
         self.anon_jwt: bool = False
-        # Anon prover only: dotted GUC names the anonymous session inherits
-        # already SET (database / role / server level — `Schema.set_gucs`).
-        # A read of one of these is a real value, not the unset-GUC raise.
-        self.set_gucs: frozenset[str] = frozenset()
+        # Anon prover only: the dotted GUCs the anonymous session inherits
+        # already SET (database / role / server level — `Schema.set_gucs`,
+        # `Schema.role_set_gucs`), name → configured value. A read of one is
+        # that value, not the unset-GUC raise; a `None` value means the GUC
+        # is set but its value was not captured, so it stays opaque.
+        self.set_gucs: dict[str, str | None] = {}
         self._session_vars: dict[str, Any] = {}
         self.tenant_pairs: list[tuple[Any, Any]] = []
 
@@ -1486,8 +1490,17 @@ def _anon_3vl(
         # `(name, false)` AND the canonical `(name, true)` that `pgrls
         # generate` emits. Gating only the raising forms left the generated
         # policy PROVEN while a fresh anon session read the shared row.
+        # The CONFIGURED value when it was captured, so `current_setting(
+        # 'app.flag') = 'on'` at 'off' stays PROVEN (measured: 0 rows); an
+        # uncaptured value (`None`) falls back to an opaque non-null one,
+        # which can only decline to prove isolation, never claim it.
+        configured = ctx.set_gucs[(_first_string_arg(node) or "").lower()]
         return _Val(
-            value=ctx.opaque(_canon(node), z3.StringSort()),
+            value=(
+                z3.StringVal(configured)
+                if configured is not None
+                else ctx.opaque(_canon(node), z3.StringSort())
+            ),
             is_null=z3.BoolVal(False),
         )
     if _is_anon_null_leaf(node, auth_funcs):
@@ -2068,6 +2081,20 @@ def _anon_witness_is_sufficient(
     ``(assertions) ∧ (pins) ∧ ¬is_true`` UNSAT: only then does every row
     matching ``row`` lie inside the anon-visible set, so it is an honest,
     self-sufficient counterexample. Mirrors ``_row_is_sufficient_witness``.
+
+    Each pin fixes the column's VALUE **and** its 3VL null-flag: a real row
+    holding ``tenant = 'shared'`` has a non-null ``tenant``, by construction.
+    Pinning only the value left the flag free, so ``¬is_true`` stayed
+    satisfiable via "the column is NULL" and the single most common policy
+    shape of all — ``<column> = <constant>``, the shape an inherited
+    ``current_setting`` reduces to — was downgraded to "a conditional leak,
+    no single row characterizes it". That cost the honest witness twice
+    over: ``--emit-repro`` seeded a placeholder row the policy does not
+    admit (the generated pytest then failed against a leak that is real),
+    and ``--probe`` abstained instead of confirming it. Unpinned columns
+    keep BOTH their value and their flag free, so the check still demands
+    the leak for every completion — the ``is_public OR deleted_at IS NULL``
+    projection is rejected exactly as before.
     """
     pins = []
     for key, val in row.items():
@@ -2075,6 +2102,7 @@ def _anon_witness_is_sufficient(
         if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
             return False
         pins.append(var == val)
+        pins.append(z3.Not(ctx.null_flag(key)))
     solver = z3.Solver()
     solver.set("timeout", 1000)
     for a in assertions:
@@ -2088,7 +2116,7 @@ def prove_anon_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
     *,
-    set_gucs: frozenset[str] = frozenset(),
+    set_gucs: Mapping[str, str | None] | Sequence[Mapping[str, str | None]] = (),
 ) -> tuple[str, dict[str, object] | None]:
     """Prove whether an anonymous session can read any row under ``using_node``.
 
@@ -2102,10 +2130,15 @@ def prove_anon_isolation(
     to an unauthenticated client iff the policy's USING is TRUE for it under
     anon.
 
-    ``set_gucs`` names dotted GUCs the anonymous session inherits already set
-    (database / server level, or role level for a role in the anon closure);
-    a read of one is a real, non-null value rather than the unset-GUC raise —
-    in every spelling, including the ``(name, true)`` form.
+    ``set_gucs`` maps the dotted GUCs the anonymous session inherits already
+    set (database / server level, or role level for its login role) to their
+    configured values; a read of one is that value rather than the unset-GUC
+    raise — in every spelling, including the ``(name, true)`` form. Pass a
+    SEQUENCE of such mappings to check one state per login path (a direct
+    ``anon`` login and ``authenticator`` then ``SET ROLE anon`` inherit
+    different role-level settings): every state is proven and a leak in any
+    is the verdict, since every path is a session a real caller can arrive
+    in.
 
     Returns ``(verdict, witness)``:
 
@@ -2138,9 +2171,13 @@ def prove_anon_isolation(
     # verdict is `isolated` only when both are UNSAT, `unverified` when either
     # cannot be decided, and the witness comes from whichever session leaked
     # (the no-JWT one first, so existing witnesses are unchanged).
+    states: tuple[Mapping[str, str | None], ...] = (
+        (set_gucs,) if isinstance(set_gucs, Mapping) else tuple(set_gucs) or ({},)
+    )
     verdicts = [
-        _prove_anon_session(using_node, auth, anon_jwt=False, set_gucs=set_gucs),
-        _prove_anon_session(using_node, auth, anon_jwt=True, set_gucs=set_gucs),
+        _prove_anon_session(using_node, auth, anon_jwt=anon_jwt, set_gucs=state)
+        for state in states
+        for anon_jwt in (False, True)
     ]
     for verdict, witness in verdicts:
         if verdict == "leak":
@@ -2155,12 +2192,13 @@ def _prove_anon_session(
     auth: set[str],
     *,
     anon_jwt: bool,
-    set_gucs: frozenset[str] = frozenset(),
+    set_gucs: Mapping[str, str | None] | None = None,
 ) -> tuple[str, dict[str, object] | None]:
-    """`prove_anon_isolation` for ONE session model (see `_Context.anon_jwt`)."""
+    """`prove_anon_isolation` for ONE session model (see `_Context.anon_jwt`)
+    in ONE inherited-GUC state (see `_Context.set_gucs`)."""
     ctx = _Context()
     ctx.anon_jwt = anon_jwt
-    ctx.set_gucs = set_gucs
+    ctx.set_gucs = dict(set_gucs or {})
     assertions: list[Any] = []
     tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
     if tv is None:
@@ -2442,10 +2480,10 @@ def prove_cross_tenant_isolation(
     # use (`tenant_id`, `user_id`, `org_id`, `owner_id`, …), overridable.
     if identity_columns is None:
         from pgrls.rules.sec021 import (  # noqa: PLC0415 — avoids a rules↔diff import cycle
-            _DEFAULT_IDENTITY_COLUMNS,
+            AXIS_IDENTITY_COLUMNS,
         )
 
-        identity_columns = frozenset(_DEFAULT_IDENTITY_COLUMNS)
+        identity_columns = frozenset(AXIS_IDENTITY_COLUMNS)
     axis = column.decl().name().rsplit(".", 1)[-1].lower()
     if axis not in identity_columns:
         return ("unverified", None)

@@ -13,10 +13,13 @@ breaking changes — they will be called out in this file.
 ### Changed
 - **Snapshot v26** — adds `views[].direct_references` (the un-collapsed
   table/view edges a view body reads directly), `views[].column_grants`
-  (column-level grants on views), top-level `set_gucs` (dotted GUC names set
-  at database / server level), top-level `role_set_gucs` (role-level ones,
-  as `(role, name)`), and top-level `role_memberships` (present only when
-  captured from a live database; each edge carries an `inherit` flag).
+  (column-level grants on views), `views[].owner_is_superuser` (a plain
+  `BYPASSRLS` owner escapes RLS but still needs `SELECT`; a superuser does
+  not), top-level `set_gucs` (dotted GUCs set at database / server level, as
+  `(name, value)` — a `null` value means "set, value not captured"),
+  top-level `role_set_gucs` (role-level ones, as `(role, name, value)`), and
+  top-level `role_memberships` (present only when captured from a live
+  database; each edge carries an `inherit` flag).
   Additive and fail-closed: v3–v25 files still load; a missing
   `direct_references` falls back to the collapsed `references`, a missing
   `role_memberships` keeps the anon prover abstaining on non-anon roles. Re-
@@ -24,6 +27,74 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **`verify --mode anon` read role-level GUC settings off the wrong end of the
+  role graph.** `ALTER ROLE … SET app.x` binds to the role that **logs in**,
+  and membership does not propagate it. The first cut walked the closure
+  upward from `anon`, which got both directions wrong: it counted `ALTER ROLE
+  readers SET app.tenant` with `GRANT readers TO anon` (a fresh `anon` session
+  reads nothing — measured 0 rows) and missed PostgREST's own shape, `ALTER
+  ROLE authenticator SET app.tenant` with `GRANT anon TO authenticator`, where
+  the login role's setting is still in force after `SET ROLE anon` (measured: 1
+  row through the canonical `tenant = current_setting('app.tenant')` policy,
+  reported `PROVEN`). The prover now checks one GUC state per **login path** —
+  `anon` itself and every role that can `SET ROLE` to it — and a leak in any
+  state is a leak.
+- **A custom GUC set in `postgresql.conf` was invisible.** Postgres registers
+  custom placeholders `GUC_NO_SHOW_ALL`, so `pg_settings` has *zero* rows for
+  a conf-level `app.x` that every session can nonetheless read — the first cut
+  queried exactly that view and captured nothing. Server-level values now come
+  from `pg_file_settings`; where the connection may not read it, every dotted
+  GUC the policies reference is probed in the introspection session and
+  recorded as set-with-unknown-value, which can withhold a proof but never
+  manufacture one.
+- **A set GUC was treated as "some non-null value", so a configuration that
+  cannot satisfy the policy still reported a LEAK.** Values are captured now:
+  `ALTER DATABASE … SET app.flag = 'off'` against `USING (current_setting(
+  'app.flag') = 'on')` is `PROVEN` (measured: 0 rows) instead of a false leak,
+  and a leak that *is* real carries the configured value in its witness row.
+- **`verify --mode reachability` was silent on an inherited-ownership hop and
+  wrong about `BYPASSRLS`.** A view whose owner holds the *inner* view's
+  owner's privileges reads it with no grant at all, but the hop check looked
+  only for an explicit grant and treated the path as dead (measured: every row
+  came through). Separately, `owner_bypasses_rls` conflated superuser with
+  plain `BYPASSRLS`: only the former escapes the privilege check, so a
+  `BYPASSRLS` non-superuser view owner without `SELECT` on the base table is
+  `permission denied` (measured) and is no longer reported. The base table's
+  readability is now checked at the end of every path, and an undecidable hop
+  reports `UNVERIFIED` instead of guessing.
+- **A definer view over a materialized view was passed in silence.** A matview
+  holds rows captured at REFRESH time under the refreshing role's RLS context,
+  which the prover does not model — and a definer view over a
+  superuser-refreshed one handed anon every row (measured). That path is now
+  `UNVERIFIED` rather than skipped.
+- **A laundering door was reported as wide as the view, not as wide as the
+  grant.** A definer view whose owner is admitted only *some* rows by the
+  table's own policies, over a table that already leaks *some* rows to anon
+  directly, was a second `LEAK`; measured, both reads returned the same single
+  row. It is `UNVERIFIED` now — the view may expose nothing new — and a
+  laundering leak carries the owner-session witness rather than claiming every
+  row.
+- **The laundering check evaluated GUCs as the view's owner, not the caller.**
+  Inside a definer view body `current_setting()` still reads the *caller's*
+  session, so the anonymous session's inherited settings decide it.
+- **`--emit-repro` emitted a reproduction that did not reproduce, and
+  `--probe` abstained, on the commonest policy shape of all.** A witness
+  pinned a column's value but not its 3VL null-flag, so `<column> =
+  <constant>` — the shape an inherited `current_setting` reduces to — was
+  downgraded to "a conditional leak, no single row characterizes it". The
+  emitted script then seeded a placeholder row the policy does not admit (the
+  generated pytest *failed* against a real leak) and the probe had no row to
+  pivot on. A pinned value implies a non-null column, so both are pinned now:
+  the verdict reads `a row with tenant='shared' is anonymously readable`, the
+  generated pytest passes, and `--probe` reports `LEAK CONFIRMED`.
+  Reproductions also re-establish the inherited-GUC session they need, and the
+  probe replays configured values instead of clearing them.
+- **`SEC021` (and `SEC030`/`SEC040`, which share its column set) fired on
+  ambiguous bare names.** Widening the set to serve the cross-tenant prover's
+  tenant-axis gate also widened three lint rules, so `project = 'default'`
+  beside a real `user_id = auth.uid()` scope became an `info` finding. The two
+  uses are now separate sets: the rules keep the unambiguous spellings (20
+  names), the prover keeps the wider axis set (28).
 - **`verify --mode anon` proved "no anonymous read" on a policy that grants
   anon by role name.** The anon model was "every auth function is NULL" — a
   JWT-less session. A Supabase **anon-key** caller is different: PostgREST sets

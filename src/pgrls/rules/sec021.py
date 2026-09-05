@@ -74,32 +74,35 @@ from pgrls.violations import Severity, Violation
 _DEFAULT_IDENTITY_COLUMNS: frozenset[str] = frozenset({
     "account",
     "account_id",
-    "client",
     "client_id",
-    "company",
     "company_id",
-    "customer",
     "customer_id",
     "group_id",
     "member_id",
     "org",
     "org_id",
-    "organisation",
     "organisation_id",
-    "organization",
     "organization_id",
     "owner",
     "owner_id",
-    "project",
     "project_id",
     "site_id",
-    "team",
     "team_id",
     "tenant",
     "tenant_id",
     "user_id",
-    "workspace",
     "workspace_id",
+})
+
+# The tenant-axis set the cross-tenant / write provers accept (see
+# `_z3_compare.prove_cross_tenant_isolation`). A superset of SEC021's flagging
+# set: the bare spellings (`client`, `project`, `team`, …) are real tenant keys
+# in `col = <session value>` policies, but as SEC021 *sentinels* (`project =
+# 'default'` beside a real `user_id = auth.uid()` scope) they fired info noise
+# on realistic schemas, so SEC021 keeps only the unambiguous forms.
+AXIS_IDENTITY_COLUMNS: frozenset[str] = _DEFAULT_IDENTITY_COLUMNS | frozenset({
+    "client", "customer", "company", "workspace", "team", "project",
+    "organization", "organisation",
 })
 
 

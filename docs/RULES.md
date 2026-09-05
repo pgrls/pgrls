@@ -1455,15 +1455,24 @@ session lookup.
 
 Detection is a **name heuristic**. SEC021 walks the parsed policy
 AST for a plain `=` comparison where one operand is a column whose
-name is in a configurable identity-column set — by default the bare and
-`_id` spellings of `tenant`, `org`, `organization`, `organisation`, `account`,
-`company`, `customer`, `client`, `workspace`, `team`, `project` and `owner`,
-plus `user_id`, `group_id`, `member_id` and `site_id` (28 names) — and the other
+name is in a configurable identity-column set — by default `tenant`, `org`,
+`account` and `owner` in both their bare and `_id` spellings, plus the `_id`
+spelling alone of `organization`, `organisation`, `company`, `customer`,
+`client`, `workspace`, `team`, `project`, `user`, `group`, `member` and `site`
+(20 names) — and the other
 operand is a literal (`A_Const`, optionally cast: `'…'::uuid`). The
 literal is the signal; the identity-ish column *name* separates the
 anti-pattern from a legitimate `column = literal` policy such as
 `USING (is_public = true)` or `USING (status = 'published')`, which
 compare an *attribute* column to a constant on purpose.
+
+The bare spellings of the ambiguous names (`client`, `customer`, `company`,
+`workspace`, `team`, `project`, `organization`, `organisation`) are
+deliberately **not** in this set: as SEC021 sentinels they fire on realistic
+schemas where `project = 'default'` sits beside a real `user_id = auth.uid()`
+scope. `verify --mode cross-tenant` accepts them as a tenant *axis* (a wider
+set of its own) because there they are one half of `column = <session value>`,
+which is not ambiguous at all.
 
 Because the discriminator is a name heuristic, SEC021 is **info**
 severity — a review nudge, not a hard finding. Override the column

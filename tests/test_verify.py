@@ -566,13 +566,15 @@ def test_floor_for_a_different_write_command_is_not_composed() -> None:
 @requires_z3
 def test_satisfiable_nullable_tautology_is_conditional() -> None:
     # `flag OR NOT flag` is NOT a 3VL tautology — a NULL `flag` row evaluates to
-    # NULL (hidden) — so it's a conditional leak (witness None), not "all rows".
+    # NULL (hidden) — so it must not be reported as "all rows" (`{}`). It IS
+    # characterized by a row, though: any non-NULL `flag` is visible, and
+    # pinning a column's value pins its null-flag too, so the witness names one.
     schema = Schema(tables=(_table("t", policies=(_policy("flag OR NOT flag"),)),))
     v = build_verification(schema)
     [t] = v.tables
     [p] = t.proofs
     assert t.verdict == "leak"
-    assert p.witness is None
+    assert p.witness == {"flag": False}
 
 
 def test_rls_on_no_permissive_policy_is_isolated() -> None:
@@ -3164,6 +3166,7 @@ def _rv_view(
     *,
     invoker: bool = False,
     bypass: bool = False,
+    superuser: bool = False,
     anon_grant: bool = True,
     direct: tuple[tuple[str, str], ...] | None = None,
     grants=None,
@@ -3184,7 +3187,8 @@ def _rv_view(
         security_definer_calls=(),
         grants=grants,
         owner=owner,
-        owner_bypasses_rls=bypass,
+        owner_bypasses_rls=bypass or superuser,
+        owner_is_superuser=superuser,
         direct_references=refs if direct is None else direct,
         column_grants=column_grants,
     )
@@ -3255,7 +3259,10 @@ def test_reachability_chain_effective_user_is_nearest_definer_owner() -> None:
     outer = _rv_view("v_outer", "app_owner", (("public", "t"),), direct=(("public", "v_inner"),))
     # The live repro GRANTed the inner view to the outer owner; without that
     # the hop is a dead path (permission denied), which its own test pins.
-    inner = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True,
+    # `postgres` is a real superuser here, as in the live repro: a superuser
+    # reads the base table with no grant, where a plain BYPASSRLS owner would
+    # still need one (measured: `permission denied for table t`).
+    inner = _rv_view("v_inner", "postgres", (("public", "t"),), superuser=True,
                      grants=(Grant(role="app_owner", privileges=("SELECT",)),))
     schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
     r = _rv(schema)
@@ -3267,13 +3274,23 @@ def test_reachability_chain_effective_user_is_nearest_definer_owner() -> None:
 
 def test_reachability_invoker_on_outer_over_definer_inner_still_leaks() -> None:
     """An invoker-ON outer view runs as the caller, but the invoker-OFF inner
-    view beneath it still runs as ITS owner — the outer flag is not a shield."""
+    view beneath it still runs as ITS owner — the outer flag is not a shield.
+
+    The caller's own grant on the inner view is load-bearing precisely because
+    the outer view is invoker-ON: measured on PG16, anon without `SELECT` on
+    `v_inner` gets `permission denied for view v_inner`, and with it reads
+    every row. Asserting the leak on the un-granted shape was a false
+    positive."""
     from pgrls.model import Schema
 
     outer = _rv_view("v_outer", "whoever", (("public", "t"),), invoker=True, direct=(("public", "v_inner"),))
-    inner = _rv_view("v_inner", "tbl_owner", (("public", "t"),), anon_grant=False)
+    inner = _rv_view("v_inner", "tbl_owner", (("public", "t"),))
     schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
     assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
+
+    denied = _rv_view("v_inner", "tbl_owner", (("public", "t"),), anon_grant=False)
+    blocked = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, denied), role_memberships=())
+    assert ("public.t", "public.v_outer") not in _rv(blocked)
 
 
 def test_reachability_invoker_on_inner_inherits_outer_definer_owner() -> None:
@@ -3370,7 +3387,7 @@ def test_reachability_broken_intermediate_grant_is_a_dead_path() -> None:
     # …and with the grant in place it is a door again.
     from pgrls.model import Grant
 
-    inner_granted = _rv_view("v_inner", "postgres", (("public", "t"),), bypass=True,
+    inner_granted = _rv_view("v_inner", "postgres", (("public", "t"),), superuser=True,
                              grants=(Grant(role="app_owner", privileges=("SELECT",)),))
     schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner_granted), role_memberships=())
     assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
@@ -3396,15 +3413,109 @@ def test_reachability_column_level_grant_is_a_door() -> None:
 
 def test_reachability_definer_view_launders_a_policy_granted_to_its_owner() -> None:
     """Owner `app_role` is not RLS-exempt, but `TO app_role USING (true)`
-    grants it every row; the definer view hands them to anon (measured)."""
+    grants it every row; the definer view hands them to anon (measured).
+
+    A policy naming a role is not a privilege: measured on PG16 the same view
+    returns every row while `app_role` holds `SELECT` on the table, and
+    `permission denied for table t` the moment that grant is revoked."""
     from pgrls.ast_utils import parse_expr
-    from pgrls.model import Policy, Schema, Table
+    from pgrls.model import Grant, Policy, Schema, Table
 
     open_to_owner = Policy(name="svc", command="SELECT", permissive=True, roles=("app_role",),
                            using_sql="true", with_check_sql=None, using_ast=parse_expr("true"), with_check_ast=None)
     t = Table(schema="public", name="t", rls_enabled=True, force_rls=True, columns=("id",), owner="tbl_owner",
-              policies=(open_to_owner,))
+              policies=(open_to_owner,), grants=(Grant(role="app_role", privileges=("SELECT",)),))
     v = _rv_view("v", "app_role", (("public", "t"),))
     r = _rv(Schema(tables=(t,), views=(v,), role_memberships=()))
     assert r[("public.t", "public.v")][0] == "leak"
     assert "launders" in r[("public.t", "public.v")][1]
+
+    ungranted = Table(schema="public", name="t", rls_enabled=True, force_rls=True, columns=("id",),
+                      owner="tbl_owner", policies=(open_to_owner,))
+    assert _rv(Schema(tables=(ungranted,), views=(v,), role_memberships=())) == {}
+
+
+def test_reachability_inherited_ownership_hop_is_a_door() -> None:
+    """A view whose owner HOLDS the inner view's owner's privileges reads it
+    with no grant at all (measured: every row reached anon). Requiring an
+    explicit grant on the hop called this a dead path and stayed silent on a
+    real bypass."""
+    import dataclasses
+
+    from pgrls.model import RoleMembership, Schema
+
+    del dataclasses
+    outer = _rv_view("v_outer", "mid", (("public", "t"),), direct=(("public", "v_inner"),))
+    inner = _rv_view("v_inner", "tbl_owner", (("public", "t"),), anon_grant=False)
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner"),),
+        views=(outer, inner),
+        role_memberships=(RoleMembership(member="mid", role="tbl_owner"),),
+    )
+    assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
+
+
+def test_reachability_bypassrls_owner_still_needs_select_on_the_table() -> None:
+    """BYPASSRLS escapes the POLICIES, not the privilege check: measured, a
+    non-superuser BYPASSRLS view owner without SELECT on the base table gets
+    `permission denied for table t`. A superuser owner needs no grant."""
+    import dataclasses
+
+    from pgrls.model import Grant, Schema
+
+    t = _rv_table("t", "tbl_owner")
+    v = _rv_view("v", "byp", (("public", "t"),), bypass=True)
+    assert _rv(Schema(tables=(t,), views=(v,), role_memberships=())) == {}
+
+    granted = dataclasses.replace(t, grants=(Grant(role="byp", privileges=("SELECT",)),))
+    assert _rv(Schema(tables=(granted,), views=(v,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "leak"
+
+    su = _rv_view("v", "root", (("public", "t"),), superuser=True)
+    assert _rv(Schema(tables=(t,), views=(su,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "leak"
+
+
+def test_reachability_view_over_a_matview_is_unverified_not_silent() -> None:
+    """A matview holds rows captured at REFRESH time under the refreshing
+    role's RLS context, which is not modeled — and a definer view over a
+    superuser-refreshed one handed anon every row (measured). Abstain loudly
+    instead of skipping the hop."""
+    import dataclasses
+
+    from pgrls.model import Schema
+
+    outer = _rv_view("v", "root", (("public", "m"),), superuser=True)
+    m = dataclasses.replace(
+        _rv_view("m", "tbl_owner", (("public", "t"),), anon_grant=False),
+        is_materialized=True,
+    )
+    schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, m), role_memberships=())
+    verdict, note = _rv(schema)[("public.t", "public.v")]
+    assert verdict == "unverified"
+    assert "materialized view" in note
+
+
+def test_reachability_partial_launder_over_a_partial_anon_leak_is_unverified() -> None:
+    """The policies admit the view's owner only the rows anon already reads
+    directly (measured: one row each way), so a second LEAK over-reports — the
+    door is only as wide as the owner's grant."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Grant, Policy, Schema, Table
+
+    public_rows = Policy(
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
+        using_sql="is_public", with_check_sql=None,
+        using_ast=parse_expr("is_public"), with_check_ast=None,
+    )
+    t = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        columns=("id", "is_public"), owner="tbl_owner", policies=(public_rows,),
+        grants=(Grant(role="PUBLIC", privileges=("SELECT",)),),
+    )
+    v = _rv_view("v", "plain", (("public", "t"),))
+    assert _rv(Schema(tables=(t,), views=(v,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "unverified"

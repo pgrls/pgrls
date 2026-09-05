@@ -393,7 +393,7 @@ def _probe_one(
     auth_functions: set[str] | None,
     probe_role: str,
     n: int,
-    set_gucs: frozenset[str] = frozenset(),
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
 ) -> ProbeResult:
     """Probe one table, inside its own savepoint (rolled back by the caller).
 
@@ -479,8 +479,8 @@ def _probe_one(
             observed = _run_probe_steps(
                 cur, table, policy_ast, mode, row,
                 disc_col=disc_col, auth_sql=auth_sql, a_val=a_val,
-                probe_role=probe_role,
-             set_gucs=set_gucs)
+                probe_role=probe_role, guc_states=guc_states,
+            )
             agreement, detail = _classify(tv.verdict, observed, mode)
             return ProbeResult(
                 tv.qualified_name, policy.name, mode, tv.verdict,
@@ -529,7 +529,7 @@ def _run_probe_steps(
     auth_sql: str | None,
     a_val: str | None,
     probe_role: str,
-    set_gucs: frozenset[str] = frozenset(),
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
 ) -> Observed:
     """Seed → become the threat session → observe. Returns the live outcome.
 
@@ -564,12 +564,6 @@ def _run_probe_steps(
         else:  # anon
             cur.execute(_insert_sql(table, row))  # seed as the privileged role
             for guc in _anon_gucs(policy_ast):
-                if guc in set_gucs:
-                    # Set at database / role / server level: a real anonymous
-                    # session inherits this value, so clearing it would probe a
-                    # session that does not exist — and hide the leak the
-                    # static prover now reports.
-                    continue
                 cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
     except psycopg.Error as exc:
@@ -616,19 +610,9 @@ def _run_probe_steps(
         else:
             query = f"SELECT * FROM {qtbl}"
         try:
-            seen = _row_count(cur.connection, query)
-            if seen == 0 and mode == "anon":
-                # Second anonymous session: the Supabase ANON-KEY caller.
-                # PostgREST sets the role claim to 'anon', so `auth.role()` is a
-                # non-null string there — a policy that grants anon BY ROLE
-                # NAME (`USING (auth.role() = 'anon')`) reads rows for that
-                # caller while reading nothing for a JWT-less one. The static
-                # prover models both sessions; so must the probe, or it would
-                # contradict a correct LEAK with a MISMATCH.
-                for guc, val in _ANON_KEY_SESSION_GUCS:
-                    cur.execute(
-                        f"SELECT set_config({_sql_str(guc)}, {_sql_str(val)}, true)"
-                    )
+            if mode == "anon":
+                seen = _observe_anon_sessions(cur, query, guc_states)
+            else:
                 seen = _row_count(cur.connection, query)
         except psycopg.Error as exc:
             raise _ProbeAbstain(f"probe query failed: {_short(exc)}") from exc
@@ -642,6 +626,47 @@ def _run_probe_steps(
             cur.execute("RESET ROLE")
         except psycopg.Error:
             pass
+
+
+def _observe_anon_sessions(
+    cur: psycopg.Cursor[Any],
+    query: str,
+    guc_states: tuple[dict[str, str | None], ...],
+) -> int:
+    """Rows visible under ANY anonymous session — the static prover's
+    question, so a correct LEAK is not met with a MISMATCH.
+
+    Anonymous sessions differ two ways and every combination is tried: the
+    login path (each `guc_states` entry — the GUCs a real anonymous session
+    inherits from ``ALTER ROLE`` / ``ALTER DATABASE … SET`` or the server
+    configuration, replayed here because the probe cannot log in as
+    ``authenticator``; a custom GUC is settable by any role), and the caller
+    — JWT-less, then the Supabase ANON-KEY caller: PostgREST sets the role
+    claim to 'anon', so ``USING (auth.role() = 'anon')`` reads rows for it
+    and nothing for a JWT-less one.
+    """
+    names = sorted({n for st in guc_states for n in st})
+    for state in guc_states or ({},):
+        for n in names:
+            if n in state and state[n] is None:
+                # Set at server level with a value introspection could not
+                # capture — this very session inherits it, so leave it be.
+                continue
+            cur.execute(
+                f"SELECT set_config({_sql_str(n)}, {_sql_str(state.get(n) or '')}, true)"
+            )
+        for guc, _val in _ANON_KEY_SESSION_GUCS:
+            cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
+        seen = _row_count(cur.connection, query)
+        if seen == 0:
+            for guc, val in _ANON_KEY_SESSION_GUCS:
+                cur.execute(
+                    f"SELECT set_config({_sql_str(guc)}, {_sql_str(val)}, true)"
+                )
+            seen = _row_count(cur.connection, query)
+        if seen > 0:
+            return seen
+    return 0
 
 
 def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
@@ -968,6 +993,7 @@ def run_probe(
             return _abstain_all(verification, mode, gate_error)
 
         results: list[ProbeResult] = []
+        guc_states = _anon_set_gucs(schema, anon_roles)
         for n, tv in enumerate(verification.tables):
             table = tables.get(tv.qualified_name)
             if table is None:  # pragma: no cover - verification built from schema
@@ -982,7 +1008,7 @@ def run_probe(
             results.append(
                 _probe_one(
                     conn, table, tv, mode, auth_functions, probe_role, n,
-                    set_gucs=_anon_set_gucs(schema, anon_roles),
+                    guc_states=guc_states,
                 )
             )
         return Probe(tuple(results), mode)

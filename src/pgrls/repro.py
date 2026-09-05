@@ -489,19 +489,38 @@ def _insert_row(setup: list[str], qtbl: str, row: list[tuple[str, str]]) -> None
     setup.append(_insert_stmt(qtbl, row))
 
 
-def _leaks_under_jwtless(policy: Policy, auth_functions: set[str]) -> bool:
-    """Does the JWT-less anonymous session alone exhibit the leak?
+def _leaking_anon_session(
+    policy: Policy,
+    auth_functions: set[str],
+    guc_states: tuple[dict[str, str | None], ...],
+) -> tuple[bool, dict[str, str | None]]:
+    """Which anonymous session exhibits the leak — `(needs_anon_key, gucs)`.
 
-    False means the leak is specific to the anon-key session (or the
-    predicate is unavailable), so the reproduction must set the role claim.
+    Mirrors `prove_anon_isolation`'s order (each login path's inherited-GUC
+    state, JWT-less before anon-key) so the reproduction reconstructs the
+    session whose witness row it seeds. `needs_anon_key` False means the
+    JWT-less session alone leaks; True means the leak needs the role claim
+    PostgREST sets. `gucs` are the settings that session inherits (`ALTER
+    ROLE`/`ALTER DATABASE … SET`, the server configuration) — the script sets
+    them explicitly, since it runs against a throwaway database that has
+    none of them.
     """
     from pgrls.diff._z3_compare import _prove_anon_session  # noqa: PLC0415
 
+    states = guc_states or ({},)
     ast = policy.using_ast
-    if ast is None:
-        return True
-    verdict, _ = _prove_anon_session(ast, set(auth_functions), anon_jwt=False)
-    return verdict == "leak"
+    if ast is not None:
+        for state in states:
+            for anon_key in (False, True):
+                verdict, _ = _prove_anon_session(
+                    ast, set(auth_functions), anon_jwt=anon_key, set_gucs=state
+                )
+                if verdict == "leak":
+                    return anon_key, dict(state)
+    return False, dict(states[0])
+
+
+_UNCAPTURED_GUC = "REPLACE_ME"
 
 
 def _build_statements(
@@ -510,6 +529,7 @@ def _build_statements(
     witness: dict[str, object],
     repro_table: str,
     auth_functions: set[str],
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
 ) -> tuple[list[str], str, list[str], list[str]]:
     """Return (setup_statements, leak_query, unpinned_columns, null_columns) for
     the anonymous-read reproduction. The pytest runs setup then the query in one
@@ -530,8 +550,30 @@ def _build_statements(
     # emitted pytest would fail while the leak exists. So re-ask the prover
     # which session leaks and set that session's claims; then switch into the
     # non-superuser runner so FORCE RLS + the policy decide visibility.
+    anon_key, gucs = _leaking_anon_session(policy, auth_functions, guc_states)
+    if gucs:
+        setup.append(
+            "-- A real anonymous session INHERITS these settings (ALTER ROLE /"
+        )
+        setup.append(
+            "-- ALTER DATABASE ... SET, or the server configuration); the leak"
+        )
+        setup.append("-- needs them, and a throwaway database has none.")
+        for name, value in sorted(gucs.items()):
+            if value is None:
+                setup.append(
+                    f"-- NOTE: {name} is set on the server but its value was not"
+                )
+                setup.append(
+                    "-- captured (reading pg_file_settings needs superuser) —"
+                )
+                setup.append("-- substitute the value your server uses.")
+            setup.append(
+                f"SELECT set_config({_sql_str(name)}, "
+                f"{_sql_str(_UNCAPTURED_GUC if value is None else value)}, true);"
+            )
     setup.append("SELECT set_config('request.jwt.claim.sub', '', true);")
-    if _leaks_under_jwtless(policy, auth_functions):
+    if not anon_key:
         setup.append("SELECT set_config('request.jwt.claim.role', '', true);")
         setup.append("SELECT set_config('request.jwt.claims', '', true);")
     else:
@@ -874,6 +916,7 @@ def build_repro(
     stem: str | None = None,
     mode: str = "anon",
     session: tuple[str, str] | None = None,
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
 ) -> ReproArtifact:
     """Build the .sql + pytest reproduction for one leaking (table, policy).
 
@@ -890,7 +933,9 @@ def build_repro(
     tenant"`` (requires `session` = the ``(discriminator column, session-auth
     SQL)`` from `cross_tenant_session_identity`): the session is authenticated as
     tenant A and the inserted row belongs to a *different* tenant B, which the
-    leaking policy nonetheless returns.
+    leaking policy nonetheless returns. `guc_states` (``"anon"`` only) are the
+    inherited-GUC states an anonymous session can arrive in
+    (`verify._anon_set_gucs`); the script sets the leaking state explicitly.
 
     Requires `table.column_details` to be populated — `pgrls verify` always
     supplies it via live introspection. An empty `column_details` cannot
@@ -942,7 +987,7 @@ def build_repro(
         )
     else:
         setup, leak_query, unpinned, null_fallback = _build_statements(
-            table, policy, witness or {}, repro_table, stub_auth
+            table, policy, witness or {}, repro_table, stub_auth, guc_states
         )
 
     if is_write:
@@ -1157,6 +1202,7 @@ def emit_repros(
     verification: Verification,
     auth_functions: set[str] | None = None,
     mode: str = "anon",
+    anon_roles: set[str] | None = None,
 ) -> list[ReproArtifact]:
     """One ReproArtifact per leaking (table, permissive policy) in the run.
 
@@ -1175,6 +1221,12 @@ def emit_repros(
     tables = {t.qualified_name: t for t in schema.tables}
     artifacts: list[ReproArtifact] = []
     seen_stems: set[str] = set()
+    guc_states: tuple[dict[str, str | None], ...] = ({},)
+    if mode == "anon":
+        # Imported here, not at module scope: `verify` imports this module.
+        from pgrls.verify import _anon_set_gucs  # noqa: PLC0415
+
+        guc_states = _anon_set_gucs(schema, anon_roles)
     for tv in verification.tables:
         if tv.verdict != "leak":
             continue
@@ -1232,6 +1284,7 @@ def emit_repros(
                     stem=stem,
                     mode=mode,
                     session=session,
+                    guc_states=guc_states,
                 )
             )
     return artifacts
