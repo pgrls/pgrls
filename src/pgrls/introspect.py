@@ -482,8 +482,8 @@ ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
 # Postgres auto-creates — those are framework plumbing, not an audit
 # target. User-authored `CREATE CONSTRAINT TRIGGER` rows have
 # `tgconstraint != 0` but `tgisinternal = false`, so they pass this
-# filter and SEC013 captures them — deferred constraint triggers
-# still fire as the table owner and present the same RLS bypass
+# filter and SEC013 captures them — a deferred constraint trigger runs
+# the same function under the same rules and presents the same audit
 # surface as any other AFTER trigger.
 #
 # The event mask is decoded from `pg_trigger.tgtype` bit by bit
@@ -515,8 +515,8 @@ ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
 # simple; the snapshot still flips on a re-enable.
 #
 # The ROW vs STATEMENT axis (`tgtype` bit 0) is intentionally not
-# captured. Both fire as the table owner, so both present the same
-# RLS-bypass surface — SEC013 doesn't care which one fired. A
+# captured. Both run the same function under the same rules, so both
+# present the same audit surface — SEC013 doesn't care which fired. A
 # STATEMENT trigger that runs `SELECT count(*) FROM peer_tenant` once
 # per UPDATE is just as leaky as a ROW trigger doing the same per
 # row. Skipping the axis keeps the Trigger dataclass smaller and the

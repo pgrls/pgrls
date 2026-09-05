@@ -18,7 +18,7 @@ git clone https://github.com/pgrls/pgrls.git
 cd pgrls
 python -m venv .venv
 .venv/bin/python -m pip install -e .[dev]
-.venv/bin/python -m pytest tests/       # 1,500+ tests, ~30 seconds
+.venv/bin/python -m pytest tests/       # ~3,900 tests, several minutes (needs Docker)
 .venv/bin/ruff check src tests
 .venv/bin/mypy src
 ```

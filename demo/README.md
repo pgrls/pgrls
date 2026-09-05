@@ -260,10 +260,10 @@ report artifact. Two demo-relevant snippets:
 fail_on = "error"
 ```
 
-`fail_on = "error"` blocks on SEC001/2/3/4/6/38/39/42, VIEW001 and
-HYG001. Bump to
-`warning` to also block on SEC005/8/PERF001, or `info` to also block
-on SEC007.
+`fail_on = "error"` blocks on the ten rules that fire at that tier
+here: SEC001/2/3/4/6/38/39/42, VIEW001 and HYG001. Bump to `warning`
+to add SEC005/8/9/10/11/14/15/31/40/41/43/44/48, HYG002, PERF001/2 and
+VIEW002/3/4; bump to `info` to add SEC007/22/30 on top.
 
 **Extract specific rules from the JSON output via `jq`:**
 

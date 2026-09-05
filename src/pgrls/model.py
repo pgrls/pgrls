@@ -450,9 +450,10 @@ class Index:
 class Trigger:
     """A trigger captured by snapshot v6+.
 
-    Triggers are the focus of SEC013 — they run as the table OWNER
-    (not the invoking role), so any SELECT/INSERT/UPDATE/DELETE in
-    the trigger function body bypasses the invoker's RLS policies.
+    Triggers are the focus of SEC013 — a `SECURITY DEFINER` trigger
+    function runs as its OWNER, so any SELECT/INSERT/UPDATE/DELETE in
+    the body carries that owner's RLS exemption (an invoker-side
+    function runs as the caller; measured).
     A poorly-audited trigger function on an RLS-protected table is
     a silent privilege-escalation vector: tenant A's INSERT can fire
     a trigger that reads tenant B's rows (or worse, writes to them)

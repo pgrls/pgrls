@@ -994,8 +994,11 @@ def build_reachability(
     * anon **isolated** → the view defeats real isolation → **leak**, witness
       ``{}`` (the view is unconditional — it returns every row).
     * anon **leak**, *total* (``{}`` witness — the table already hands anon
-      every row) → the view exposes nothing new → **isolated**, ceded to
-      ``verify --mode anon``.
+      every row) AND anon actually holds ``SELECT`` on the table → the view
+      exposes nothing new → **isolated**, ceded to ``verify --mode anon``.
+      Without that grant the direct read is ``permission denied`` while the
+      view still returns every row, so the door stands and the verdict is
+      **leak**.
     * anon **leak**, *partial* (a characterizing-row witness) → the view still
       reads the rows the partial leak withholds → **leak**.
     * anon **unverified** → no claim that the table was isolating → abstain.

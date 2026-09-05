@@ -39,7 +39,7 @@ share the same `Rule` Protocol shape.
            for table in schema.tables:
                if table.schema != "tenant":
                    continue
-               if "tenant_id" not in {c for c in table.columns}:
+               if "tenant_id" not in table.columns:
                    out.append(
                        Violation(
                            rule_id=self.id,

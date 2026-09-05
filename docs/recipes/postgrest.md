@@ -79,8 +79,9 @@ pool of roles (typically just `authenticated`), so `current_user`
 collapses across users and the policy lets everyone see everyone
 else's rows.
 
-pgrls flags this as **SEC018** (severity `warning`) — "policy
-discriminator is the role identity, not the per-request auth value."
+pgrls flags this as **SEC018** (severity `warning`) — "Policy compares a
+column against current_user / session_user". The discriminator is the role
+identity, not a per-request auth value.
 The fix is to scope by `current_setting('request.jwt.claim.<id>', true)`
 (or `auth.uid()` on Supabase), which IS per-request.
 

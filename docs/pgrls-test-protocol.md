@@ -6,8 +6,8 @@ This document specifies the Postgres-side conventions any pgrls test
 client follows. The Python client (`pgrls.testing.PgrlsTestClient`)
 is the reference implementation; the TypeScript port
 ([`pgrls-test`](https://www.npmjs.com/package/pgrls-test)) implements
-this same contract, and a Go port following the same contract is
-tracked. All conformant clients interoperate against the same
+this same contract, and a Go port following the same contract ships
+(`go/`). All conformant clients interoperate against the same
 RLS-protected schemas.
 
 ## Per-test wire sequence
@@ -154,6 +154,8 @@ Package versions evolve **independently per language**:
   [`CHANGELOG.md`](../CHANGELOG.md) for the current version).
 * TS `pgrls-test` ships via npm tags `ts-v*` (see
   [`ts/CHANGELOG.md`](../ts/CHANGELOG.md)).
+* Go `pgrls-test` ships via tags `go/v*` (see
+  [`go/CHANGELOG.md`](../go/CHANGELOG.md)).
 
 What ties them together is `PROTOCOL_VERSION`. Any two clients
 that expose the same `PROTOCOL_VERSION` are guaranteed to

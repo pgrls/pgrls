@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json",
   "title": "pgrls configuration",
-  "description": "Configuration file (pgrls.toml) for pgrls, the Postgres Row-Level Security linter. Rule reference: https://github.com/pgrls/pgrls/blob/main/AGENTS.md",
+  "description": "Configuration file (pgrls.toml) for pgrls, the Postgres Row-Level Security linter. Rule reference: https://github.com/pgrls/pgrls/blob/main/docs/RULES.md",
   "type": "object",
   "additionalProperties": false,
   "properties": {

@@ -736,12 +736,20 @@ allowlist = ["public.shadow_audit"]
 **Severity:** warning.
 
 **What it catches:** every user-authored, enabled trigger on a
-table with `rls_enabled = true`. Triggers fire as the table OWNER,
-not as the role that ran the statement, so any `SELECT` / `INSERT`
-/ `UPDATE` / `DELETE` inside the trigger function body sees the
-owner's view of the database — every row, RLS bypassed — even
-when the invoking role has policies that would hide or reject
-those rows directly.
+table with `rls_enabled = true`. A trigger function runs as the
+INVOKING role — **not** as the table owner — unless it is
+`SECURITY DEFINER`, in which case it runs as the function's owner and
+inherits that owner's RLS exemption. Measured on PG16: an
+invoker-side trigger function owned by the table owner, fired by an
+ordinary caller's `INSERT`, reported `current_user = <caller>` and read
+**zero** rows of a peer RLS table; marked `SECURITY DEFINER` the same
+function reported `current_user = <owner>` and read **every** row.
+
+The bypass is therefore real but conditional. It happens when the
+trigger function is `SECURITY DEFINER` owned by a role the table's RLS
+does not bind, or when the statement firing the trigger is run by the
+owner of a table that is not `FORCE`'d (measured: 3 peer rows without
+`FORCE`, 0 with it — SEC002's mechanism, reached through a trigger).
 
 The bypass is silent: no SQLSTATE 42501, no error in the log.
 A multi-tenant table protected by `WHERE tenant_id =
@@ -754,18 +762,19 @@ leaks it into the invoking session's view.
 Common leak shapes worth auditing for:
 
 * Audit trigger writes `(NEW.id, current_setting('app.tenant_id'),
-  (SELECT count(*) FROM peer_table))` into an audit table. The
-  subquery runs as owner and counts every tenant's rows.
+  (SELECT count(*) FROM peer_table))` into an audit table. If the
+  function is `SECURITY DEFINER`, that subquery runs as its owner and
+  counts every tenant's rows.
 * Trigger that "syncs" a derived column reads from a peer table
   with no tenant filter, exposing peer-tenant values through the
   synced column.
 
 The rule cannot read the trigger function body (PL/pgSQL bodies
-aren't parseable by pglast as top-level statements, and
-`SECURITY INVOKER` does not change the trigger-fires-as-owner
-contract — `pg_proc.prosecdef` is irrelevant here), so the
-warning is intentionally a prompt-to-audit rather than a proof
-of leak.
+aren't parseable by pglast as top-level statements), so the warning
+is intentionally a prompt-to-audit rather than a proof of leak. The
+audit establishes the three things the rule cannot see: whether the
+function is `SECURITY DEFINER`, whose privileges it would then run
+with, and whether it reads peer rows without a tenant filter.
 
 Internal triggers (foreign-key check helpers, RI plumbing,
 partition-routing triggers) are filtered out at the introspection
@@ -843,9 +852,9 @@ Two existing rules cover the SECDEF risk for *indirect* paths:
 
 * **VIEW004** flags views whose body calls a SECDEF function
   that reads an RLS-protected table — view-mediated bypass.
-* **SEC013** flags triggers on RLS-protected tables, which
-  fire as the table owner regardless of the trigger function's
-  `prosecdef` flag — trigger-mediated bypass.
+* **SEC013** flags triggers on RLS-protected tables — a
+  trigger-mediated path to the same SECDEF bypass, since the rule
+  cannot read the function body to tell whether `prosecdef` is set.
 
 SEC014 closes the gap for SECDEF functions called *directly*
 from application code (`SELECT my_secdef(...)`, JDBC, ORM
@@ -1084,9 +1093,10 @@ allowlist = [
 
 Relationship to the other bypass rules: SEC002 covers the
 table-owner bypass (mechanism: ownership; remedy: `FORCE`).
-SEC013 / SEC014 / SEC015 cover code-mediated bypass: triggers
-fire as the table owner (SEC013), and `SECURITY DEFINER`
-functions run as the function owner (SEC014 / SEC015). SEC016
+SEC013 / SEC014 / SEC015 cover code-mediated bypass: `SECURITY
+DEFINER` functions run as the function owner, reached directly
+(SEC014 / SEC015) or through a trigger whose body the linter cannot
+read (SEC013). SEC016
 covers the attribute-mediated bypass — the role itself is exempt,
 no code or ownership involved. It is the bluntest of the family:
 where the others need a specific object to be misconfigured,

@@ -105,10 +105,10 @@ breaking changes — they will be called out in this file.
   custom placeholders `GUC_NO_SHOW_ALL`, so `pg_settings` has *zero* rows for
   a conf-level `app.x` that every session can nonetheless read — the first cut
   queried exactly that view and captured nothing. Server-level values now come
-  from `pg_file_settings`; where the connection may not read it, every dotted
-  GUC the policies reference is probed in the introspection session and
-  recorded as set-with-unknown-value, which can withhold a proof but never
-  manufacture one.
+  from `pg_file_settings` — see the later entry in this section, which
+  removed the "only when that view is unreadable" condition on the session
+  probe after a postmaster command-line GUC turned out to appear in no
+  catalog at all.
 - **A set GUC was treated as "some non-null value", so a configuration that
   cannot satisfy the policy still reported a LEAK.** Values are captured now:
   `ALTER DATABASE … SET app.flag = 'off'` against `USING (current_setting(

@@ -4415,14 +4415,20 @@ def verify(
     identity/discriminator column to verify (the prover's tenant-axis set:
     SEC021's default names plus the ambiguous bare spellings SEC021 itself
     excludes; `[lint.rules.SEC021].identity_columns` in `--config` replaces
-    it for both);
+    it for both — except an EMPTY list, which silences SEC021 but leaves the
+    prover on its default axis, so a gate cannot pass by having its
+    configuration emptied);
     here the verifier degrades to the linter, run `pgrls lint` — for write, the
     SEC006/SEC020/SEC028/SEC040 write-check rules).
 
     The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
     (heuristic findings) this is a soundness proof: it never reports a leak it
-    cannot exhibit, and never reports isolated unless Z3 proves it. Exits
+    cannot exhibit FROM THE POLICIES, and never reports isolated unless Z3
+    proves it. The provers reason about the policy predicate and the policy's
+    TO roles, not about table GRANTs, so a predicate admitting every row on a
+    table anon cannot SELECT is still a LEAK (an over-report in the safe
+    direction; --mode reachability is where the grant is decided). Exits
     non-zero on any leak — drop it in CI as a hard tenant-isolation gate.
     `--strict` also fails on UNVERIFIED. `--format json` emits the
     per-table/per-policy verdicts and counterexamples; `--format sarif` emits a

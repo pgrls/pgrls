@@ -1,10 +1,20 @@
 """SEC013 — Trigger on RLS-protected table can bypass policies.
 
-A trigger fires as the table's OWNER, not as the role that ran the
-statement. Any SELECT/INSERT/UPDATE/DELETE inside the trigger function
-body therefore sees the owner's view of the database — every row,
-RLS bypassed — even when the invoking role has policies that would
-hide or reject those rows directly.
+A trigger function runs as the INVOKING role, unless it is
+`SECURITY DEFINER` — then it runs as the function's owner, and that
+owner's RLS exemption comes with it. Measured on PG16: with an
+invoker-side trigger function owned by the table owner, an INSERT run
+by an ordinary caller saw `current_user = <caller>` and zero rows of a
+peer RLS table; the same function marked `SECURITY DEFINER` saw
+`current_user = <owner>` and every row.
+
+So the bypass SEC013 warns about is real but conditional. It happens
+when the trigger function is `SECURITY DEFINER` owned by a role the
+table's RLS does not bind (the table owner, or a superuser/`BYPASSRLS`
+role), or when the statement firing the trigger is itself run by the
+owner of a table that is not `FORCE`'d (measured: 3 peer rows without
+`FORCE`, 0 with it — that is SEC002's mechanism, reached through a
+trigger).
 
 The bypass is silent: no SQLSTATE 42501 surfaces, no error in the
 log. A multi-tenant table protected by `WHERE tenant_id =
@@ -17,24 +27,25 @@ session's view.
 Examples of the silent leak in practice:
 
 * Audit trigger writes `(NEW.id, current_setting('app.tenant_id'),
-  (SELECT count(*) FROM the_table))` into an audit table. The
-  subquery runs as owner and counts every tenant's rows.
+  (SELECT count(*) FROM the_table))` into an audit table. If the
+  function is `SECURITY DEFINER`, that subquery runs as its owner and
+  counts every tenant's rows.
 * Trigger that "syncs" a derived column reads from a peer table with
   no tenant filter, exposing peer-tenant values through the synced
   column.
 Detection is structural: every user-authored, enabled trigger on an
 RLS-enabled table gets a warning. The rule can't read the trigger
 function body (PL/pgSQL bodies aren't parseable by pglast as
-top-level statements, and `SECURITY INVOKER` doesn't change the
-trigger-fires-as-owner contract — `pg_proc.prosecdef` is irrelevant
-here), so the warning is intentionally a prompt-to-audit rather
-than a proof of leak. Internal triggers (foreign-key check helpers,
+top-level statements), so the warning is intentionally a
+prompt-to-audit rather than a proof of leak — the audit is what
+establishes whether the function is `SECURITY DEFINER`, whose owner it
+runs as, and whether it reads peer rows without a tenant filter. Internal triggers (foreign-key check helpers,
 partition-routing triggers, RI plumbing) are filtered at the
 introspection layer via `pg_trigger.tgisinternal = false`.
 User-authored `CREATE CONSTRAINT TRIGGER` rows (`tgconstraint != 0`
-but `tgisinternal = false`) are NOT filtered — deferred constraint
-triggers still fire as the table owner and present the same RLS
-bypass surface as any other AFTER trigger.
+but `tgisinternal = false`) are NOT filtered — a deferred constraint
+trigger runs the same function under the same rules and presents the
+same audit surface as any other AFTER trigger.
 
 Out of scope in v0.5.8: INSTEAD OF triggers on views
 (``relkind = 'v'``) and triggers on foreign tables
@@ -110,10 +121,10 @@ class SEC013:
                 f"Table {table.qualified_name} has RLS enabled but trigger "
                 f"{trigger.name!r} ({trigger.timing} {trigger.event}) "
                 f"calls function {trigger.function_qualified_name}. "
-                "Triggers fire as the table owner — any SELECT, "
-                "INSERT, UPDATE, or DELETE inside the function body "
-                "bypasses the invoker's RLS policies and sees / "
-                "modifies every tenant's data. Audit the function "
+                "A trigger function runs as the invoking role unless "
+                "it is SECURITY DEFINER, in which case it runs as the "
+                "function's owner and inherits that owner's RLS "
+                "exemption — every tenant's rows. Audit the function "
                 "body to confirm it doesn't read from peer tables "
                 "without a tenant filter, doesn't write data the "
                 "caller couldn't write directly, and doesn't echo "

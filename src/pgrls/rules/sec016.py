@@ -43,9 +43,9 @@ shape, because Postgres roles have no schema component.
 
 Relationship to the other bypass rules: SEC002 covers the
 table-owner bypass (mechanism: ownership; remedy: `FORCE`).
-SEC013/SEC014/SEC015 cover code-mediated bypass: triggers fire as
-the table owner (SEC013), and `SECURITY DEFINER` functions run as
-the function owner (SEC014/SEC015). SEC016 covers the
+SEC013/SEC014/SEC015 cover code-mediated bypass: `SECURITY DEFINER`
+functions run as the function owner, reached directly (SEC014/SEC015)
+or through a trigger whose body the linter cannot read (SEC013). SEC016 covers the
 attribute-mediated bypass — the role itself is exempt, no code or
 ownership involved. It is the bluntest of the family: where the
 others need a specific object to be misconfigured, SEC016 needs

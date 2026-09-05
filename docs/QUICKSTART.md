@@ -18,9 +18,9 @@ If you don't already have a Postgres handy, spin up a one-shot with the
 canonical "policy that ships past code review" baked in:
 
 ```bash
-docker run -d --name pgrls-demo -e POSTGRES_PASSWORD=demo -p 5432:5432 postgres:16
+docker run -d --name pgrls-demo -e POSTGRES_PASSWORD=demo -p 55432:5432 postgres:16
 sleep 3
-psql 'postgres://postgres:demo@localhost/postgres' -v ON_ERROR_STOP=1 <<'SQL'
+psql 'postgres://postgres:demo@localhost:55432/postgres' -v ON_ERROR_STOP=1 <<'SQL'
 CREATE TABLE documents (id SERIAL PRIMARY KEY, owner uuid, body text);
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_read ON documents
@@ -29,7 +29,7 @@ CREATE POLICY tenant_read ON documents
            OR owner::text = current_setting('app.uid'));
 SQL
 
-export DATABASE_URL='postgres://postgres:demo@localhost/postgres'
+export DATABASE_URL='postgres://postgres:demo@localhost:55432/postgres'
 pgrls lint --explain
 ```
 

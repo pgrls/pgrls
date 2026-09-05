@@ -50,8 +50,9 @@ nothing), `SEC009` (RLS enabled but no policies —
 silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 `SEC011` (`OR true` debug branch hidden inside a policy),
 `SEC012` (table has only RESTRICTIVE policies — silent deny-all),
-`SEC013` (trigger on RLS-protected table can bypass policies —
-triggers fire as table owner),
+`SEC013` (trigger on RLS-protected table can bypass policies — a
+`SECURITY DEFINER` trigger function runs as its owner, and the linter
+cannot read the body to tell),
 `SEC014` (SECURITY DEFINER function bypasses caller's RLS —
 audit every SECDEF function),
 `SEC015` (SECURITY DEFINER function exposed to `pg_temp`
@@ -1002,7 +1003,7 @@ These are intentional in the current release. Do not invent capabilities.
   info→notice, and a clean run emits nothing). The github format
   carries no `file=`/`line=` source ranges yet — even with
   `--sql-file` (where source text exists), range-pinned annotations are a
-  follow-on (see #227); annotations currently land in the run summary rather
+  follow-on; annotations currently land in the run summary rather
   than pinned to a diff hunk. `--format junit` emits a JUnit XML
   report (one `<testcase>` per finding under a `pgrls` suite) so
   findings show in a CI run's test-report UI; the process exit code
