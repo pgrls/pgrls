@@ -8,7 +8,7 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
-## [Unreleased]
+## [0.55.0] - 2026-08-16
 
 ### Added
 - **`pgrls generate --strict-binding`** — scaffold tenant policies that compare
