@@ -149,7 +149,7 @@ pgrls lint --schemas api,public --baseline .pgrls-baseline.json
 
 - [`docs/QUICKSTART.md`](../QUICKSTART.md) — the 5-minute first-run.
 - [`README.md`](../../README.md) — the full feature tour.
-- [`AGENTS.md`](../../AGENTS.md) — every rule with its reference
+- [`docs/RULES.md`](../RULES.md) — every rule with its reference
   paragraph and fix recipe.
 - PostgREST docs on roles & RLS:
   https://docs.postgrest.org/en/stable/references/auth.html

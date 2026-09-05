@@ -37,8 +37,9 @@ spin up an ephemeral PG container per session.
 - **Every rule needs:** a module under `src/pgrls/rules/`, a unit-test
   module under `tests/rules/`, an entry in
   `tests/fixtures/all_bad.sql` (so the combined-fixture test trips
-  it), and a `### <RULE>` section in `AGENTS.md` documenting the
-  detection shape and any allowlist / config knobs.
+  it), a `## <RULE> — …` section (with its `rule-<id>` anchor) in
+  `docs/RULES.md` documenting the detection shape and any allowlist /
+  config knobs, and the one-line catalog entry in `AGENTS.md`.
 - **Auto-fixable rules:** add a fixer module under
   `src/pgrls/fixers/`, register it in `default_fixers()`, and update
   the `## Auto-fix: pgrls fix` section of `AGENTS.md`.

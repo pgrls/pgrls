@@ -41,6 +41,9 @@ Severity: warning. Allowlist a table where a global unique is intentional
 ```toml
 [lint.rules.SEC035]
 allowlist = ["public.api_tokens"]
+# Replaces the default discriminator-detection set
+# {auth.uid, auth.role, auth.jwt, current_setting}.
+auth_functions = ["auth.uid", "current_setting", "app.tenant"]
 ```
 """
 from __future__ import annotations

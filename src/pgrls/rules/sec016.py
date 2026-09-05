@@ -60,9 +60,9 @@ Out of scope (intentional):
   role that *holds* `BYPASSRLS`, not every role that could reach it.
   `BYPASSRLS` is a role attribute, not an inheritable privilege — a
   member of a `BYPASSRLS` group role does not bypass RLS unless it
-  actually `SET ROLE`s to that role. The holder is the precise and
-  complete audit target; walking the membership graph would add
-  noise without adding a finding.
+  actually `SET ROLE`s to that role. SEC016's surface is deliberately
+  just the holder; the `SET ROLE` escalation path that reaches it is
+  covered separately by SEC029.
 * **The `row_security` session GUC.** `SET row_security = off` is a
   different mechanism, and not a silent one: a query that *would*
   return RLS-filtered rows raises an error instead of quietly

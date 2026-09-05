@@ -4,7 +4,7 @@ A worked tutorial for contributors. By the end you'll have a complete
 rule (module + tests + fixture + docs) of the same shape as every
 SEC/PERF/HYG/VIEW rule already in the catalogue.
 
-For the per-rule reference (severity, detection logic, allowlist shape, fix template), see [`AGENTS.md`](../AGENTS.md).
+For the per-rule reference (severity, detection logic, allowlist shape, fix template), see [`docs/RULES.md`](RULES.md); [`AGENTS.md`](../AGENTS.md) carries the one-line catalog summary.
 For the project-wide checklist of contribution conventions, see
 [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
@@ -107,7 +107,7 @@ Three things to internalise from SEC024:
 
 ## Step-by-step: ship a brand-new rule
 
-Walk through what changes for a hypothetical new SEC033.
+Walk through what changes for a hypothetical new SEC056.
 
 ### 1. Pick the ID
 
@@ -116,13 +116,13 @@ right family by looking at [`src/pgrls/rules/`](../src/pgrls/rules/):
 
 | Family   | Concern                                | Current highest |
 | -------- | -------------------------------------- | --------------- |
-| `SEC`    | Security / correctness                 | 032             |
-| `PERF`   | Performance / index health             | 004             |
-| `HYG`    | Hygiene / naming                       | 003             |
+| `SEC`    | Security / correctness                 | 055             |
+| `PERF`   | Performance / index health             | 005             |
+| `HYG`    | Hygiene / naming                       | 004             |
 | `VIEW`   | View-mediated RLS bypasses             | 004             |
 
 Pick the next free integer **above** the current highest in your
-family (e.g. `SEC033`, `PERF005`). The catalog is append-only — never
+family (e.g. `SEC056`, `PERF006`). The catalog is append-only — never
 reuse a deprecated rule's number, never start a new family below an
 existing one.
 
@@ -131,7 +131,7 @@ existing one.
 Create `src/pgrls/rules/sec033.py`:
 
 ```python
-"""SEC033 — <one-line statement of what fires>.
+"""SEC056 — <one-line statement of what fires>.
 
 <2-3 paragraphs: the bug, why it's invisible to eyeball review, what
 the detection actually looks at, what's intentionally out of scope.>
@@ -152,8 +152,8 @@ from pgrls.rules._allowlist import parse_policy_id_allowlist
 from pgrls.violations import Severity, Violation
 
 
-class SEC033:
-    id: str = "SEC033"
+class SEC056:
+    id: str = "SEC056"
     severity: Severity = "info"      # pick deliberately
     title: str = "<one-line title — appears in `lint` text output>"
 
@@ -162,7 +162,7 @@ class SEC033:
         schema: Schema,
         options: dict[str, Any],
     ) -> list[Violation]:
-        allowlist = parse_policy_id_allowlist("SEC033", options)
+        allowlist = parse_policy_id_allowlist("SEC056", options)
         out: list[Violation] = []
         for table in schema.tables:
             for policy in table.policies:
@@ -219,11 +219,11 @@ registers every rule lazily on the first call to `default_registry()`
 def _build_default_registry() -> RuleRegistry:
     # imports are kept inside the function so importing `pgrls.rules`
     # doesn't drag in every rule module up-front (lazy registration).
-    from pgrls.rules.sec033 import SEC033
+    from pgrls.rules.sec033 import SEC056
     # ...
     registry = RuleRegistry()
     # ...
-    registry.register(SEC033())
+    registry.register(SEC056())
     return registry
 ```
 
@@ -238,12 +238,12 @@ fires-when shapes, 5–8 silent-when shapes, plus configuration / edge
 cases.
 
 ```python
-"""Unit tests for SEC033."""
+"""Unit tests for SEC056."""
 from __future__ import annotations
 
 from pgrls.ast_utils import parse_expr
 from pgrls.model import Policy, Schema, Table
-from pgrls.rules.sec033 import SEC033
+from pgrls.rules.sec033 import SEC056
 
 
 def _wrap(policy: Policy) -> Schema:
@@ -273,13 +273,13 @@ def _policy(using: str, *, name: str = "p") -> Policy:
 
 def test_sec033_fires_on_canonical_shape() -> None:
     schema = _wrap(_policy("<your canonical bad shape>"))
-    [v] = SEC033().check(schema, options={})
-    assert v.rule_id == "SEC033"
+    [v] = SEC056().check(schema, options={})
+    assert v.rule_id == "SEC056"
 
 
 def test_sec033_silent_on_close_but_not_the_shape() -> None:
     schema = _wrap(_policy("<a shape that LOOKS similar but isn't>"))
-    assert SEC033().check(schema, options={}) == []
+    assert SEC056().check(schema, options={}) == []
 ```
 
 Patterns to cover (mine the existing `tests/rules/test_sec*.py` for
@@ -309,7 +309,7 @@ file.
 Add a SQL block to `all_bad.sql`:
 
 ```sql
--- SEC033 — <one-line description>.
+-- SEC056 — <one-line description>.
 CREATE TABLE allbad_sec033 (id INT, tenant_id INT);
 ALTER TABLE allbad_sec033 ENABLE ROW LEVEL SECURITY;
 CREATE POLICY allbad_sec033_pol ON allbad_sec033
@@ -321,20 +321,21 @@ to confirm.
 
 ### 6. Update the docs
 
-Six files to touch (the last one is informational — no edit usually
+Seven files to touch (the last one is informational — no edit usually
 needed, but worth knowing the tests exist):
 
 | File                                  | Update                                                                 |
 | ------------------------------------- | ---------------------------------------------------------------------- |
-| [`AGENTS.md`](../AGENTS.md)           | Add a per-rule section under the right family with the docstring text. |
-| [`README.md`](../README.md)           | Bump the rule count (`68 lint rules` → `68`) in the badges/intro/feature line, and add a row to the rules table. |
+| [`docs/RULES.md`](RULES.md)          | Add `<a id="rule-<id>"></a>` + a `## <ID> — <title>` section (the README table and the markdown/HTML/SARIF `helpUri` links resolve to this anchor). |
+| [`AGENTS.md`](../AGENTS.md)           | Add the one-line catalog entry in the family paragraph. |
+| [`README.md`](../README.md)           | Bump the rule count (`68 lint rules` → `69`) in the badges/intro/feature line, and add a row to the rules table. |
 | [`pyproject.toml`](../pyproject.toml) | Same: the `description` field cites the rule count.                    |
 | [`CHANGELOG.md`](../CHANGELOG.md)     | An `### Added` bullet under `[Unreleased]` with the rule + severity + one-line summary. |
 | [`pgrls.schema.json`](../pgrls.schema.json) | If your rule has its own option name (`auth_functions`, `placeholder_words`, etc.) and you want it to surface in the JSON-schema example, the example in `pgrls.schema.json` may also need a touch. |
 | [`tests/test_cli.py`](../tests/test_cli.py) | The `test_lint_fires_every_registered_rule_in_combined_fixture` test runs against `all_bad.sql`; with your new rule it'll auto-include yours — *unless* your rule is opt-in / artifact-gated (it fires only when lint is handed an artifact, like HYG004 and PERF005), in which case add its ID to that test's exemption set. The `test_explain_covers_every_registered_rule` test counts the catalog — passes automatically as rules are added. No rule-count constant to bump. |
 
 **Grep before you commit.** Repo-wide search for the previous rule
-count (`68 lint rules`, `sixty-seven rules`, etc. — the phrasing
+count (`68 lint rules`, `sixty-eight rules`, etc. — the phrasing
 that actually appears in README.md and AGENTS.md) is cheap insurance
 against missing a doc spot.
 
@@ -353,11 +354,14 @@ Bump the auto-fixable count (`19 mechanically auto-fixable`) in:
 * `README.md` — the count (in the intro / feature line, several
   spots) **and** its own `Currently fixable:` prose block (one
   `**RULE** (emits …)` entry per fixer) — add an entry there too.
-* `AGENTS.md` — enumerates the fixable rules in **two** places.
-  Search for `Auto-fix for SEC001` (the catalog summary line) and
-  `Currently fixable:` (the per-fixer prose block, one bullet per
-  fixer with an `ALTER …` example) — both need a new entry when
-  shipping a new fixer.
+* `AGENTS.md` — enumerates the fixable rules in **three** places.
+  Search for `auto-remediates SEC001` (the catalog summary), `Currently
+  fixable:` (the per-fixer prose block, one bullet per fixer with an
+  `ALTER …` example) and `Auto-fix for SEC001` — all three need a new
+  entry when shipping a new fixer.
+* `src/pgrls/cli.py` — the `fix` command's docstring is the `pgrls fix
+  --help` text and lists every fixer ("Currently fixes SEC001 (…), …");
+  add yours there too. This one drifted silently for a whole release.
 
 ### 8. Verify
 
@@ -373,7 +377,7 @@ All four green.
 ### 9. Submit
 
 Branch as `feat/rule-sec033` (matches `CONTRIBUTING.md`'s
-convention), commit with `feat(rules): SEC033 — <title>`,
+convention), commit with `feat(rules): SEC056 — <title>`,
 open a PR. Per the project's release procedure, the PR goes through
 a 3-clean review loop before merging.
 

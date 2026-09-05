@@ -12,11 +12,12 @@ complementary threat models (`--mode`):
   *different* tenant's row? For the policy's own tenant-scoping equality
   ``<column> = <session identity>``, a row is exposed iff it can be visible
   while ``column`` differs from the session's tenant.
-* ``write`` — can a session authenticated as *one* tenant **write** (INSERT or
-  UPDATE/DELETE) a row of a *different* tenant? Same satisfiability question
-  as ``cross-tenant``, but proven over each write policy's *effective
-  write-check* — its ``WITH CHECK`` when present, else (for ``FOR UPDATE`` /
-  ``FOR ALL``) the ``USING`` that Postgres reuses as the new-row check. This is
+* ``write`` — can a session authenticated as *one* tenant **write** (INSERT,
+  UPDATE or DELETE) a row of a *different* tenant? Same satisfiability question
+  as ``cross-tenant``, but proven over BOTH gates of each write policy: the
+  new-row gate (``WITH CHECK``, or the ``USING`` a ``FOR UPDATE`` / ``FOR ALL``
+  policy reuses as the new-row check) and the old-row gate (``USING``, for
+  ``UPDATE`` / ``DELETE`` / ``ALL``) — a leak through either is a leak. This is
   the most CVE-adjacent footgun (CVE-2025-48757): a policy that scopes reads but
   not writes lets a tenant stamp data for another tenant. The write-side lint
   rules SEC006 / SEC020 / SEC028 / SEC040 are its heuristic fallback.
@@ -50,7 +51,7 @@ to a linter" stance:
   single tenant-scoping equality to verify against. This is where the verifier
   *degrades to the linter* — run `pgrls lint` for the heuristic rules.
 
-Scope: both modes reason over each table's permissive ``SELECT`` / ``ALL``
+Scope: the anon, cross-tenant and write provers reason over each table's permissive ``SELECT`` / ``ALL``
 policies. When a *leaking* permissive policy shares a table with a
 ``RESTRICTIVE`` floor, the floor is AND-ed into the proof and re-verified — but
 only a floor that constrains *every* role and write-operation the permissive
@@ -1566,8 +1567,9 @@ def render_sarif(v: Verification, *, strict: bool = False) -> str:
       ``schema.table``, message = the table's unverified reason — matching the
       ``--strict`` gate, which *does* fail on UNVERIFIED.
 
-    The prover is one rule per ``--mode`` (`pgrls-anon-isolation` /
-    `pgrls-cross-tenant-isolation`); a strict UNVERIFIED note reuses the same
+    The prover is one rule per ``--mode`` — the five ids in ``_SARIF_RULE_ID``
+    (anon, cross-tenant, write, escalation, reachability); a strict UNVERIFIED
+    note reuses the same
     rule id (its `defaultConfiguration.level` stays `error` while the per-result
     `level` is `note` — per-result level always wins, exactly as in lint).
 

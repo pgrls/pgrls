@@ -6,7 +6,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/pgrls/pgrls/test.yml?branch=main&label=tests)](https://github.com/pgrls/pgrls/actions/workflows/test.yml)
 [![Downloads](https://img.shields.io/pypi/dm/pgrls.svg)](https://pypistats.org/packages/pgrls)
 
-**[▶ 23-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[Docs site](https://pgrls.github.io/pgrls-docs/)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
+**[▶ 60-second demo](https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg)** · **[Quickstart](docs/QUICKSTART.md)** · **[Rule reference](AGENTS.md)** · **[Docs site](https://pgrls.github.io/pgrls-docs/)** · **[CHANGELOG](CHANGELOG.md)** · **[PyPI](https://pypi.org/project/pgrls/)**
 
 > **Static analyzer for Postgres Row-Level Security.**
 > Catches the policy bugs eyeball-review misses — broken row scoping (across tenants *and* between users in the same tenant), inverted auth checks, write-side holes; 19 of 68 rules mechanically auto-fixable.
@@ -30,7 +30,7 @@
 
 > **Beta — actively maintained.** 68 lint rules, 19 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
-> - **Lint & fix** — `pgrls lint` checks a live database against all sixty-seven rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), JUnit XML (`--format junit`), or GitLab Code Quality (`--format gitlab`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
+> - **Lint & fix** — `pgrls lint` checks a live database against all sixty-eight rules and reports findings as text, JSON, SARIF, Markdown, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), JUnit XML (`--format junit`), or GitLab Code Quality (`--format gitlab`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tables that lack it — per-tenant (`tenant_id`) or per-user (`--model owner`, incl. the Supabase `auth.uid()` form): ENABLE + FORCE, an isolation policy, a restrictive floor, and the index, output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it. `--strict-binding` scaffolds the *loud* variant — see below.
 > - **Test** — the `pgrls.testing` pytest plugin for writing RLS tests: role switching, per-test transactions, and tenant-isolation assertions.
 > - **Snapshot & diff** — `pgrls snapshot` / `pgrls diff` is a semantic RLS-policy diff that classifies every change SAFE / BREAKING / REQUIRES_REVIEW / DANGEROUS. Z3-based predicate analysis is built in, plus migration-as-input — apply a migration to an ephemeral Postgres and diff the result (`pip install pgrls[diff-apply]`), with `CREATE EXTENSION` auto-detection and a cached-baseline Docker image for fast re-runs.
@@ -102,22 +102,22 @@ The kind of mistake that ships to prod despite policy review:
 
 ```sql
 CREATE POLICY tenant_read ON public.documents
-    FOR SELECT TO authenticated
+    FOR SELECT
     USING (auth.uid() IS NULL OR owner = auth.uid());
 ```
 
 Looks fine — and is structured the way many RLS tutorials show it. But `auth.uid()` returns `NULL` for any connection without a session JWT. For those connections the `IS NULL` branch is `true`, the `OR` short-circuits, and the policy admits *every* row of `public.documents`. It's a recurring pattern in multi-tenant Supabase / PostgREST projects — the kind of thing a public CVE write-up names by hindsight.
 
-`pgrls` flags it as **SEC004** (severity `error`) in milliseconds. With `--explain`, the rule's reference paragraph is appended underneath the finding (lines hard-wrapped here for the README; the real output is one long line per paragraph):
+`pgrls` flags it as **SEC004** (severity `error` — the policy applies to every role; restricted to `authenticated` it is a `warning`, since a token-less request cannot reach it) in milliseconds. With `--explain`, the rule's reference paragraph is appended underneath the finding (lines hard-wrapped here for the README; the real output is one long line per paragraph):
 
 ```
 $ pgrls lint --rule SEC004 --explain
   ERROR  SEC004  public.documents.tenant_read
-         Policy 'tenant_read' on public.documents contains a top-level
-         `auth_func() IS NULL` disjunct in its USING clause. For anonymous
-         connections that disjunct evaluates to true, satisfying the policy
-         and exposing every row. Remove the IS NULL disjunct or replace with
-         an explicit deny.
+         Policy 'tenant_read' on public.documents has a top-level
+         `auth_func() IS NULL` disjunct in its USING clause, and the policy
+         applies to anon / PUBLIC. For token-less connections that disjunct
+         is true, satisfying the policy and exposing every row. Remove the
+         IS NULL disjunct or replace with an explicit deny.
 
          The pattern: a policy with USING (auth_func() IS NULL OR <real check>).
          auth_func() returns NULL for anonymous connections, so the IS NULL
@@ -138,7 +138,7 @@ CREATE POLICY tenant_scope ON documents
 
 Cross-tenant reads are blocked, so this passes a tenant-isolation review. But there's an `owner_id` column and nothing keys on it, so every user *in* a tenant reads every other user's documents. If that table holds drafts, DMs, or private uploads, it's a leak. **SEC027** (info) flags the table so you decide: add a per-user predicate, or confirm it's intentionally tenant-shared and allowlist it.
 
-[Browse the full rule catalogue](docs/RULES.md) for the other 65 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
+[Browse the full rule catalogue](docs/RULES.md) for the other 66 — missing `WITH CHECK`, `BYPASSRLS` roles, per-row auth-function evaluation, search-path attacks, view-mediated RLS bypasses, and more.
 
 ## Usage
 
@@ -307,7 +307,7 @@ pgrls fix --database-url "$DATABASE_URL" --output migration.sql
 pgrls fix --database-url "$DATABASE_URL" --check
 ```
 
-Currently fixable: **SEC001** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`), **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **SEC004** (emits `ALTER POLICY … USING (…)` stripping the inverted-auth `auth_func() IS NULL` disjunct that leaks rows to anonymous clients; only removes a top-level `OR` disjunct so it can never broaden the policy, and abstains when no real check survives), **SEC010** (emits `DROP POLICY … ON …;` for a permissive policy whose clause is the literal `false` — it admits no rows, so dropping it changes no access; abstains when a drop would broaden what the policy governs), **SEC011** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` stripping an `OR true` debug bypass), **SEC015** (emits `ALTER FUNCTION …(…) SET search_path = …` per SECDEF overload, pinning `pg_temp` last; abstains on pre-v12 empty signatures and quoted-comma paths), **SEC017** (emits `ALTER FUNCTION …(…) NOT LEAKPROOF;` per overload; abstains on pre-v12 empty signatures), **SEC019** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` adding the `missing_ok = true` second argument to one-argument `current_setting()` calls), **SEC020** (emits `ALTER POLICY … WITH CHECK (…)` replacing a constant-`true` `WITH CHECK` with the policy's `USING`), **SEC031** (emits `DROP POLICY … ON …;` for a no-op restrictive `USING (true)` floor — it AND-combines to nothing, so dropping it leaves access unchanged), **SEC030** (emits `ALTER TABLE … ALTER COLUMN … SET NOT NULL;` for a nullable tenant discriminator — backfill existing `NULL`s first, or the apply fails and rolls back the batch), **SEC032** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;` for a table whose policies are dormant because RLS is off), **SEC044** (emits `ALTER DEFAULT PRIVILEGES [FOR ROLE …] [IN SCHEMA …] REVOKE …` withdrawing a default-privilege grant of future-table row access to a low-trust role — only the row-access privileges it flags, keyed on the grantor so the REVOKE actually clears the entry), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` in `USING` and/or `WITH CHECK`, emitting only the clause(s) it changes), **PERF003** (emits `CREATE INDEX ON … (…);` for a policy-predicate column with no leading-column index), **PERF004** (emits `CREATE INDEX ON … (<expression>);` matching a function-wrapped predicate like `lower(email)` that defeats the plain column index), **HYG003** (emits `DROP POLICY … ON …;` for a policy that exactly duplicates another on the same table), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
+Currently fixable: **SEC001** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`), **SEC002** (emits `ALTER TABLE … FORCE ROW LEVEL SECURITY;`), **SEC004** (emits `ALTER POLICY … USING (…)` stripping the inverted-auth `auth_func() IS NULL` disjunct that leaks rows to anonymous clients; only removes a top-level `OR` disjunct so it can never broaden the policy, and abstains when no real check survives), **SEC010** (emits `DROP POLICY … ON …;` for a permissive policy whose clause is the literal `false` — it admits no rows, so dropping it changes no access; abstains when a drop would broaden what the policy governs), **SEC011** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` stripping an `OR true` debug bypass), **SEC015** (emits `ALTER FUNCTION …(…) SET search_path = …` per SECDEF overload, pinning `pg_temp` last; abstains on pre-v12 empty signatures and quoted-comma paths), **SEC017** (emits `ALTER FUNCTION …(…) NOT LEAKPROOF;` per overload; abstains on pre-v12 empty signatures), **SEC019** (emits `ALTER POLICY … USING (…) / WITH CHECK (…)` adding the `missing_ok = true` second argument to one-argument `current_setting()` calls), **SEC020** (emits `ALTER POLICY … WITH CHECK (…)` replacing a constant-`true` `WITH CHECK` with the policy's `USING`), **SEC030** (emits `ALTER TABLE … ALTER COLUMN … SET NOT NULL;` for a nullable tenant discriminator — backfill existing `NULL`s first, or the apply fails and rolls back the batch)` floor — it AND-combines to nothing, so dropping it leaves access unchanged), **SEC031** (emits `DROP POLICY … ON …;` for a no-op restrictive `USING (true), **SEC032** (emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;` for a table whose policies are dormant because RLS is off), **SEC044** (emits `ALTER DEFAULT PRIVILEGES [FOR ROLE …] [IN SCHEMA …] REVOKE …` withdrawing a default-privilege grant of future-table row access to a low-trust role — only the row-access privileges it flags, keyed on the grantor so the REVOKE actually clears the entry), **PERF001** (rewrites unwrapped auth calls as `(SELECT auth.uid())` in `USING` and/or `WITH CHECK`, emitting only the clause(s) it changes), **PERF003** (emits `CREATE INDEX ON … (…);` for a policy-predicate column with no leading-column index), **PERF004** (emits `CREATE INDEX ON … (<expression>);` matching a function-wrapped predicate like `lower(email)` that defeats the plain column index), **HYG003** (emits `DROP POLICY … ON …;` for a policy that exactly duplicates another on the same table), **VIEW001** (emits `ALTER VIEW … SET (security_invoker = true);`), and **VIEW002** (emits `ALTER VIEW … SET (security_barrier = true);`). Other rules need human intent (which role? which column? which policy?) and are not auto-fixed.
 
 ## Scaffold RLS — `pgrls generate`
 
@@ -353,6 +353,20 @@ For a non-conventional column, name it explicitly:
 `--table public.orgs:org_id`. Tables that already have policies are
 **skipped** — `generate` never overwrites hand-written policy intent, so
 re-running it is a no-op.
+
+**`--strict-binding`** — the default predicate is *silent* when nothing is
+bound: `current_setting(…, true)` returns `NULL`, `tenant_id = NULL` is
+`NULL`, and the row is filtered — so a query on a connection that never bound
+a tenant returns **zero rows, indistinguishable from "no such row"**. An
+application that forgets to bind a tenant 404s instead of failing, and a test
+suite connected as the table owner cannot see it (RLS is not enforced for the
+owner). `--strict-binding` scaffolds a `pgrls_require_tenant(setting)` helper
+(`pgrls_require_owner` under `--model owner`) that **raises**
+`insufficient_privilege` when the setting is unset or empty, and compares
+against `(SELECT pgrls_require_tenant('app.tenant_id')::<type>)` — the
+wrapper is kept, so the cost stays one call per statement. Also settable as
+`[generate] strict_binding = true`. The output still lints clean and verifies
+`PROVEN`; **SEC055** then flags any tenant policy left on the silent form.
 
 **Per-user ownership** — `--model owner` scaffolds the other canonical
 pattern (rows owned by a user, default column `user_id`) instead of
@@ -421,12 +435,12 @@ pgrls verify --database-url "$DATABASE_URL" --format json            # per-table
 pgrls verify --database-url "$DATABASE_URL" --format sarif            # SARIF v2.1.0 for GitHub Code Scanning
 pgrls verify --database-url "$DATABASE_URL" --strict                 # also fail on UNVERIFIED
 pgrls verify --database-url "$DATABASE_URL" --auth-function auth.user_id   # add a custom auth helper
-pgrls verify --database-url "$DATABASE_URL" --emit-repro ./repro      # runnable repro per leak (anon / cross-tenant)
+pgrls verify --database-url "$DATABASE_URL" --emit-repro ./repro      # runnable repro per leak (anon / cross-tenant / write)
 pgrls verify --database-url "$DATABASE_URL" --probe                   # confirm the static proof against the live DB
 pgrls verify --database-url "$DATABASE_URL" --against main.pgrls.json  # gate: fail only on leaks THIS change introduced
 ```
 
-The two modes are complementary. The signature inverted-auth policy `auth.uid() IS NULL OR tenant_id = auth.uid()` is an anon **`LEAK`** (an unauthenticated client sees every row) yet cross-tenant **`PROVEN`** (an authenticated tenant only ever sees its own rows — the `IS NULL` branch is false once authenticated). Conversely a `tenant_id = auth.uid() OR is_public` policy is anon-`LEAK` *and* cross-tenant-`LEAK` (another tenant's public rows leak), while `USING (true)` is an anon-`LEAK` but cross-tenant-`UNVERIFIED` (no scoping equality to verify against — already caught by anon mode). Run both for full coverage.
+The `anon` and `cross-tenant` modes are complementary. The signature inverted-auth policy `auth.uid() IS NULL OR tenant_id = auth.uid()` is an anon **`LEAK`** (an unauthenticated client sees every row) yet cross-tenant **`PROVEN`** (an authenticated tenant only ever sees its own rows — the `IS NULL` branch is false once authenticated). Conversely a `tenant_id = auth.uid() OR is_public` policy is anon-`LEAK` *and* cross-tenant-`LEAK` (another tenant's public rows leak), while `USING (true)` is an anon-`LEAK` but cross-tenant-`UNVERIFIED` (no scoping equality to verify against — already caught by anon mode). Run both for full coverage.
 
 Each RLS-enabled table gets one of three **honest** verdicts (the phrasing below is `anon`-mode; `cross-tenant` frames the same verdicts as "readable by a session of a different tenant"):
 
@@ -463,7 +477,7 @@ and `--format sarif` carries just the new leaks for GitHub Code Scanning.
 
 ### Confirm the proof against the live database — `--probe`
 
-The static proof reasons over the introspected policy AST. `--probe` keeps it honest by **confirming it against the live database**: for each verified table it connects as the threat-model session (anonymous, or authenticated as one tenant — for `--mode escalation` it `SET ROLE`s through the reaching low-trust member to the table owner), seeds a throwaway row, runs the real query the proof reasons about, and diffs the **observed** behavior against the Z3 verdict — all inside a transaction that is **rolled back**, so nothing is committed and the unprivileged probe role it creates — granted the policies' `TO` roles so role-scoped policies (e.g. `TO authenticated`) actually apply, but kept `NOSUPERUSER`/`NOBYPASSRLS` so RLS still decides visibility — does not survive the rollback. Per table × `--mode` it reports one of:
+The static proof reasons over the introspected policy AST. `--probe` keeps it honest by **confirming it against the live database**: for each verified table it connects as the threat-model session (anonymous, or authenticated as one tenant — for `--mode escalation` it `SET ROLE`s through the reaching low-trust member to the table owner), seeds a throwaway row, runs the real query the proof reasons about, and diffs the **observed** behavior against the Z3 verdict — all inside a transaction that is **rolled back**, so nothing is committed and the unprivileged probe role it creates — granted the policies' `TO` roles so role-scoped policies (e.g. `TO authenticated`) actually apply — except under `--mode anon`, where it holds only the configured anon roles, since an anonymous caller is not a member of `authenticated`, but kept `NOSUPERUSER`/`NOBYPASSRLS` so RLS still decides visibility — does not survive the rollback. Per table × `--mode` it reports one of:
 
 | static verdict | observed live | result |
 |---|---|---|
@@ -472,13 +486,13 @@ The static proof reasons over the introspected policy AST. `--probe` keeps it ho
 | `LEAK` | rows visible / write admitted | **LEAK CONFIRMED** — the leak reproduced live |
 | `LEAK` | no rows / write rejected | **MISMATCH** — the witness is conditional (see `--emit-repro`) or the policy changed |
 | `UNVERIFIED` | rows visible / write admitted | **LEAK CONFIRMED** — a reproduced leak the static proof could not claim |
-| `UNVERIFIED` | no rows / write rejected | *skipped* — the verifier made no claim and the probe saw no leak (not a proof) |
+| `UNVERIFIED` | no rows / write rejected | *skipped* — the verifier made no claim and the probe saw no leak (not a proof; fails the gate under `--strict`) |
 
-The headline is the `UNVERIFIED → LEAK CONFIRMED` row: a policy whose reads are scoped but whose `INSERT … WITH CHECK (true)` is wide open is statically `UNVERIFIED`, but `--probe --mode write` authenticates as one tenant, attempts to stamp a row for another, sees it admitted, and **upgrades the honest "no claim" into a reproduced leak**. With `--probe`, `pgrls verify` **exits 1 on any MISMATCH or LEAK CONFIRMED** (and, under `--strict`, on any table the probe had to abstain on); exit 2 is reserved for tool failure.
+The headline is the `UNVERIFIED → LEAK CONFIRMED` row: a policy whose reads are scoped but whose `INSERT … WITH CHECK (true)` is wide open is statically `UNVERIFIED`, but `--probe --mode write` authenticates as one tenant, attempts to stamp a row for another, sees it admitted, and **upgrades the honest "no claim" into a reproduced leak**. With `--probe`, `pgrls verify` **exits 1 on any MISMATCH or LEAK CONFIRMED** (and, under `--strict`, on any table the verifier could not decide — whether the probe abstained or ran without seeing a leak); exit 2 is reserved for tool failure.
 
-The probe is deliberately conservative — anything it cannot reproduce live it **abstains** on cleanly (per table, with a one-line reason, never a crash): the connection cannot create its probe role (it needs CREATEROLE or superuser), it has no INSERT path to seed, there is no `<column> = <session identity>` axis to pivot a cross-tenant/write probe on, the leak witness is conditional (no single characterizing row), the policy references other tables, or a column has an exotic type the synthesis can't fill. It reuses `--emit-repro`'s GUC/identity/tenant-value synthesis verbatim, so the session it establishes is identical to the one the emitted reproduction would. `--probe` supports `--format text` (the static proof stacked above the AGREE/MISMATCH/LEAK CONFIRMED table), `--format json`, and `--format sarif` — a SARIF v2.1.0 document where each MISMATCH and LEAK CONFIRMED is an `error`-level result for GitHub Code Scanning (one rule per `--mode`: `pgrls-probe-anon` / `pgrls-probe-cross-tenant` / `pgrls-probe-write` / `pgrls-probe-escalation`, kept distinct from the static `verify` SARIF rules; under `--strict` an abstain becomes a `note`). `--probe --emit-repro` is rejected — run those separately. For `--mode escalation`, `--probe` confirms the SEC048 owner-bypass (the anon-callable-SECDEF SEC042 case is not yet probed — it surfaces as the static verdict only).
+The probe is deliberately conservative — anything it cannot reproduce live it **abstains** on cleanly (per table, with a one-line reason, never a crash): the connection cannot create its probe role (it needs CREATEROLE or superuser), it has no INSERT path to seed, there is no `<column> = <session identity>` axis to pivot a cross-tenant/write probe on, the leak witness is conditional (no single characterizing row), the policy references other tables, or a column has an exotic type the synthesis can't fill. It reuses `--emit-repro`'s GUC/identity/tenant-value synthesis verbatim, so the session it establishes is identical to the one the emitted reproduction would. `--probe` supports `--format text` (the static proof stacked above the AGREE/MISMATCH/LEAK CONFIRMED table), `--format json`, and `--format sarif` — a SARIF v2.1.0 document where each MISMATCH and LEAK CONFIRMED is an `error`-level result for GitHub Code Scanning (one rule per `--mode`: `pgrls-probe-anon` / `pgrls-probe-cross-tenant` / `pgrls-probe-write` / `pgrls-probe-escalation`, kept distinct from the static `verify` SARIF rules; under `--strict` an abstain becomes a `note`). `--probe --emit-repro` is rejected — run those separately. For `--mode escalation`, `--probe` confirms the SEC048 owner-bypass (the anon-callable-SECDEF SEC042 case is not yet probed — it surfaces as the static verdict only). `--mode reachability` is likewise not probed: it reports the static verdict only.
 
-It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope:** both modes reason over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` floor is **composed with that floor** and re-proven — a row is visible only if it satisfies *some* permissive **and** *all* restrictive policies, so the prover checks `permissive ∧ floor`: if the floor provably blocks the leaking row the table is `ISOLATED`, otherwise the `LEAK` stands (a floor predicate outside the decidable fragment — or a `cross-tenant`/`write` floor the prover can't reduce to a scoping equality — stays `UNVERIFIED`). RLS-disabled tables are out of scope (that is SEC001's job). `cross-tenant` mode verifies the single `<column> = <session identity>` scoping equality `pgrls generate` emits — including when that identity is cast to the tenant column's type (`current_setting(...)::uuid`, `::bigint`/`::int`, …); a policy with no such equality (or two competing ones) is `UNVERIFIED` there. `--emit-repro` works in both modes. Needs the `z3-solver` dependency (bundled).
+It is a *soundness* proof, not a heuristic: it never reports a leak it cannot exhibit, and never reports `PROVEN` unless Z3 proves it. `pgrls verify` exits non-zero on any leak — drop it in CI as a hard tenant-isolation gate, alongside `pgrls lint`. **Scope:** the `anon`, `cross-tenant` and `write` provers reason over each table's permissive `SELECT`/`ALL` policies; a *leaking* permissive policy on a table that also carries a `RESTRICTIVE` floor is **composed with that floor** and re-proven — a row is visible only if it satisfies *some* permissive **and** *all* restrictive policies, so the prover checks `permissive ∧ floor`: if the floor provably blocks the leaking row the table is `ISOLATED`, otherwise the `LEAK` stands (a floor predicate outside the decidable fragment — or a `cross-tenant`/`write` floor the prover can't reduce to a scoping equality — stays `UNVERIFIED`). RLS-disabled tables are out of scope (that is SEC001's job). `cross-tenant` mode verifies the single `<column> = <session identity>` scoping equality `pgrls generate` emits — including when that identity is cast to the tenant column's type (`current_setting(...)::uuid`, `::bigint`/`::int`, …); a policy with no such equality (or two competing ones) is `UNVERIFIED` there. `--emit-repro` works in the `anon`, `cross-tenant` and `write` modes (not `escalation` or `reachability`). Needs the `z3-solver` dependency (bundled).
 
 ## RAG retrieval path — `pgrls vector`
 
@@ -674,7 +688,7 @@ The plugin assumes the standard PostgREST conventions (`SET LOCAL ROLE` + `reque
 
 Setting none of the three causes `pgrls_db` to raise `PgrlsTestConfigError`.
 
-The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). The **TypeScript port** ships as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm — same Layer 1 protocol, same wire-level behaviour, idiomatic JS/TS surface (camelCase API, `pg` and `postgres.js` adapters). Source under [`ts/`](ts/) in this repo. The **Go port** is shipping in stages at [`go/`](go/) (module `github.com/pgrls/pgrls/go`, versioned independently as `go/v0.7.x`); step 1 (scaffold + `ProtocolVersion` constant + error types) shipped in `go/v0.7.0`, with steps 2–7 (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite, release tag) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+The cross-language contract is documented at [`docs/pgrls-test-protocol.md`](docs/pgrls-test-protocol.md). The **TypeScript port** ships as [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) on npm — same Layer 1 protocol, same wire-level behaviour, idiomatic JS/TS surface (camelCase API, `pg` and `postgres.js` adapters). Source under [`ts/`](ts/) in this repo. The **Go port** ships at [`go/`](go/) (module `github.com/pgrls/pgrls/go`, versioned independently as `go/v0.7.x`): scaffold, Driver interface, pgx + lib/pq adapters, Client API, assertion helpers and conformance suite are all released through `go/v0.7.6` — see [`go/CHANGELOG.md`](go/CHANGELOG.md).
 
 ### Coverage — which policies are actually tested
 
@@ -755,8 +769,7 @@ output. The row is only emitted when its column values are a sound,
 self-sufficient witness; when the leak depends on a NULL test or an
 opaque value (a function call, a `current_setting(...)` GUC, `COALESCE`,
 or `CASE`), pgrls prints the label-only DANGEROUS verdict rather than a
-row that would not actually leak. Without the extra, the verdict is
-unchanged and no row is printed.
+row that would not actually leak.
 
 See [AGENTS.md](AGENTS.md) for the full classification table and AST
 pattern documentation.
@@ -770,7 +783,7 @@ pattern documentation.
 | [SEC001](docs/RULES.md#rule-sec001) | error | Tables in scanned schemas with RLS disabled and no policies (a table with policies but RLS off is SEC032) |
 | [SEC002](docs/RULES.md#rule-sec002) | error | Tables with RLS enabled but FORCE ROW LEVEL SECURITY off |
 | [SEC003](docs/RULES.md#rule-sec003) | error | Permissive policies granted to PUBLIC |
-| [SEC004](docs/RULES.md#rule-sec004) | error | Inverted auth check (Lovable CVE pattern) in USING |
+| [SEC004](docs/RULES.md#rule-sec004) | error | Inverted auth check (Lovable CVE pattern) in USING or WITH CHECK |
 | [SEC005](docs/RULES.md#rule-sec005) | warning | Policy expression has no own-column reference |
 | [SEC006](docs/RULES.md#rule-sec006) | error | INSERT/UPDATE/ALL policies with no WITH CHECK |
 | [SEC007](docs/RULES.md#rule-sec007) | info | All policies on a table are permissive (no RESTRICTIVE floor) |
@@ -848,8 +861,8 @@ metadata (id, severity, title, a `fixable` flag, and — for a single rule —
 the full reference body) for IDE / tooling integrations. All forms read only
 pgrls's built-in rule catalog, so they need no database connection.
 
-For canonical SQL fixes per rule, see [AGENTS.md](AGENTS.md). For per-rule
-configuration options (allowlists, etc.), see `pgrls.example.toml`.
+For canonical SQL fixes per rule, see [docs/RULES.md](docs/RULES.md). For per-rule
+configuration options (allowlists, etc.), see each rule's section in [docs/RULES.md](docs/RULES.md); `pgrls.example.toml` shows the common knobs.
 
 ### Precision & false positives
 
@@ -884,7 +897,7 @@ Two [pre-commit](https://pre-commit.com) hooks are published from this repo. `pg
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.48.1
+    rev: v0.55.0
     hooks:
       # Offline — lints raw DDL, no database. Repeat --sql-file for several
       # files (declare tables before the policies that reference them), or
@@ -961,8 +974,8 @@ dashboard, or keep the report as a build artifact.
 ## Roadmap
 
 - **More lint rules.** Continued expansion of the SEC / PERF / HYG / VIEW catalog. Polished error messages.
-- ~~**TypeScript port of `pgrls.testing`**~~ — shipped as the [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm package, versioned independently of the Python package (tagged `ts-v0.6.0`). Source: [`ts/`](ts/).
-- **Go port** of `pgrls.testing` following the same Layer 1 protocol — versioned independently of the Python package as the `go/v0.7.x` sequence (Go module tag prefix `go/`, distinct from the Python package's tags). Step 1 (scaffold + protocol-version constant + error types) landed in `go/v0.7.0`; subsequent steps (Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite) tracked in [`go/CHANGELOG.md`](go/CHANGELOG.md).
+- ~~**TypeScript port of `pgrls.testing`**~~ — shipped as the [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm package, versioned independently of the Python package (tagged `ts-v0.6.3`). Source: [`ts/`](ts/).
+- **Go port** of `pgrls.testing` following the same Layer 1 protocol — versioned independently of the Python package as the `go/v0.7.x` sequence (Go module tag prefix `go/`, distinct from the Python package's tags). All seven steps (scaffold, Driver interface, pgx + lib/pq adapters, Client API, assertion helpers, conformance suite, CI + release) shipped through `go/v0.7.6`; see [`go/CHANGELOG.md`](go/CHANGELOG.md).
 - ~~**SAT-based predicate implication checking.**~~ Z3-driven semantic predicate analysis landed in v0.4.x.
 - ~~**Migration-as-input.**~~ `pgrls diff --apply migration.sql` shipped in v0.5.0; baseline cache + extension auto-detect in v0.5.1–v0.5.2.
 

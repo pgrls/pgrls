@@ -38,7 +38,7 @@ bypass surface as any other AFTER trigger.
 
 Out of scope in v0.5.8: INSTEAD OF triggers on views
 (``relkind = 'v'``) and triggers on foreign tables
-(``relkind = 'f'``). See AGENTS.md SEC013 section for the full
+(``relkind = 'f'``). See docs/RULES.md#rule-sec013 for the full
 rationale; operators in those situations should audit the
 relevant triggers manually until follow-up rules land.
 

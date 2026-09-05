@@ -35,7 +35,15 @@ a table with RLS simply never turned on. The closely related case
 where a table *does* carry policies but RLS is off (the policies are
 dormant and the table is wide open) is ceded to **SEC032**, which
 gives that higher-confidence footgun its own pointed message; SEC001
-and SEC032 are disjoint, so a given RLS-off table trips exactly one.
+and SEC032 are disjoint, so a given RLS-off table trips at most one (an
+allowlisted or RLS-ancestor-covered table trips neither).
+
+**Auto-fixable.** `pgrls fix` emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`
+for every flagged standalone table and partition root; partition *children*
+are left for human review (enable RLS on the in-scope parent, or widen
+`--schemas`). It adds neither a policy nor `FORCE` — SEC009 and SEC002 fire
+next, and SEC002's fixer will not add `FORCE` in the same run (it reads the
+pre-fix schema), so run `pgrls fix` twice or add `FORCE` by hand.
 
 **Standard fix.** For a tenant-scoped table:
 
@@ -125,6 +133,10 @@ application connection finally sees the data.
 ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
 ```
 
+**Auto-fixable.** `pgrls fix` emits exactly that statement per flagged table.
+`[lint.rules.SEC002].allowlist` accepts a bare `table` or `schema.table` and
+is honoured by the fixer.
+
 If a specific role legitimately needs to bypass (e.g. a maintenance role
 that runs vacuum-style work), grant `BYPASSRLS` on that role rather than
 turning `FORCE` off table-wide. SEC016 then flags that role; allowlist it
@@ -154,8 +166,11 @@ CREATE POLICY tenant_read ON public.invoices
 ```
 
 If the table is genuinely public-readable (reference data), use a
-`RESTRICTIVE` policy instead of a `PERMISSIVE` one — restrictive policies
-narrow rather than expand access.
+`RESTRICTIVE` policy instead of a `PERMISSIVE` one — **no**: a table whose
+only policies are restrictive admits *no* rows at all (SEC012), so that swap
+turns a public table into a deny-all one. Keep the permissive policy and
+allowlist it (below). A restrictive floor belongs *alongside* role-scoped
+permissive policies (see SEC007), not in place of them.
 
 **Allowlisting individual policies.** Use `[lint.rules.SEC003].allowlist`
 with qualified policy IDs of the form `schema.table.policy_name` —
@@ -164,7 +179,7 @@ e.g. `["public.feature_flags.public_read"]`. Prefer this over
 
 <a id="rule-sec004"></a>
 
-## SEC004 — Inverted auth check (Lovable CVE pattern)
+## SEC004 — Inverted auth check (permits anonymous access)
 
 **Severity:** error. **The marquee rule** — this is the pattern that
 caused real CVEs across hundreds of AI-generated apps.
@@ -172,7 +187,10 @@ caused real CVEs across hundreds of AI-generated apps.
 **What it catches:** policies whose `USING` **or `WITH CHECK`** clause
 contains a top-level
 `OR` disjunct shaped as `auth_func() IS NULL` for one of: `auth.uid`,
-`auth.role`, `auth.jwt`, or `current_setting`. The intent was usually
+`auth.role`, `auth.jwt`, or `current_setting(name, true)` — the `missing_ok`
+form; the one-argument form and `current_setting(name, false)` raise on an
+unset GUC instead of returning NULL, so an `IS NULL` test on them is dead
+code, not a leak, and is not flagged. The intent was usually
 "let unauthenticated requests through to a downstream check"; the bug is
 that the disjunct evaluates to `true` for anonymous connections,
 satisfying the `OR` and exposing every row. (`current_user` /
@@ -235,12 +253,14 @@ abstains when no real check would survive.
 keeping it here means the SEC004 fix doesn't itself trigger PERF001.)
 
 **Auto-fixable.** `pgrls fix` performs the standard fix mechanically — it
-strips the `auth_func() IS NULL` disjunct from `USING`, leaving the real
-check (`a OR (auth.uid() IS NULL OR b)` → `a OR b`). It removes only a
+strips the `auth_func() IS NULL` disjunct from `USING` and/or `WITH CHECK` —
+each clause independently, emitting only the clause(s) it changed — leaving
+the real check (`a OR (auth.uid() IS NULL OR b)` → `a OR b`). It removes only a
 top-level `OR` disjunct, so the rewrite can only *narrow* the policy, never
 broaden it. It abstains — leaving the finding for human review — when no
-real check would survive the strip (the `IS NULL` was the whole clause, or
-only a literal `true` remains). The semantically-disguised variants
+real check would survive the strip (the `IS NULL` was the whole clause, or a
+literal `true` survives as *any* top-level `OR` disjunct — that rewrite is
+SEC011's). The semantically-disguised variants
 (`NOT … IS NOT NULL`, a `COALESCE` wrapper) are SEC038's domain and are not
 auto-fixed.
 
@@ -275,7 +295,8 @@ request — Postgres default-denies — so the disjunct is a *latent* defect rat
 than a drive-by leak: it still fires for an `authenticated` token whose `sub` is
 NULL, and becomes a full leak if the role restriction is loosened, so it is
 reported as a **warning**. Configure the anonymous-role set (default `["anon",
-"PUBLIC"]`, same convention as SEC039 / SEC042) when your project's anonymous
+"PUBLIC"]`, the same `anon_roles` key as SEC039 / SEC042 — SEC039's own
+default is `["anon"]` only) when your project's anonymous
 role has a different name:
 
 ```toml
@@ -288,7 +309,7 @@ anon_roles = ["web_anon", "PUBLIC"]
 
 <a id="rule-sec005"></a>
 
-## SEC005 — Policy expression has no own-column reference
+## SEC005 — Policy expression does not reference any column of the table
 
 **Severity:** warning.
 
@@ -445,6 +466,8 @@ permissive policy *is* the intentional surface. Allowlist by table:
 
 ```toml
 [lint.rules.SEC007]
+# `schema.table` only — unlike SEC001/002/009/012, a bare table name is a
+# config error here.
 allowlist = ["public.countries", "public.feature_flags"]
 ```
 
@@ -596,7 +619,10 @@ allowlist = ["public.invoices.block_all"]
 **Severity:** warning.
 
 **What it catches:** policies whose `USING` (or `WITH CHECK`)
-contains an `OR true` branch anywhere in the expression tree. The
+contains an `OR true` branch anywhere in the policy's own expression —
+including under `AND` / `NOT` — but not inside a subquery body: an `OR true`
+in `EXISTS (SELECT … WHERE flag OR true)` widens the subquery, not the
+policy, and is deliberately not flagged. The
 literal `true` ORed with anything else is still `true`, but a
 casual reading misses the disjunction — the predicate evaluates
 to true for every row regardless of the other branches.
@@ -631,6 +657,13 @@ inside an `OR` BoolExpr counts. Semantic-equivalent tautologies
 framing instead. A real tautology checker is significant
 infrastructure for marginal real-world value.
 
+**Auto-fixable.** `pgrls fix` emits `ALTER POLICY … USING (…)` /
+`WITH CHECK (…)` (only the changed clause) with the literal-`true` disjunct
+removed. It strips only in monotone positions — OR nodes reachable through
+AND/OR chains — never past `NOT`, a comparison, a function call or a
+subquery, and abstains on a degenerate `true OR true`; so `NOT (… OR true)`
+is flagged but left for human review.
+
 <a id="rule-sec012"></a>
 
 ## SEC012 — Table has only RESTRICTIVE policies (silent deny-all)
@@ -656,8 +689,9 @@ just achieved through a different mechanism. SEC009 catches the
 explicit "no policies at all" case; SEC010 catches the explicit
 `false` literal; SEC012 catches the silent "only RESTRICTIVE"
 case where the user intended access but composed the policies
-wrong. The three rules are disjoint by construction — a table
-can't trigger more than one.
+wrong. SEC009 is disjoint from both (it needs zero policies); SEC010 is per-policy
+and *does* co-fire with SEC012 when a table's only policies are restrictive
+constant-`false` ones — same fix.
 
 **Standard fix.** Add a PERMISSIVE policy that describes who
 CAN see rows. The existing RESTRICTIVE policies will narrow
@@ -672,7 +706,7 @@ CREATE POLICY tenant_lock ON public.invoices
 
 -- After: PERMISSIVE grants access; RESTRICTIVE narrows it.
 CREATE POLICY tenant_read ON public.invoices
-    FOR ALL TO authenticated
+    FOR SELECT TO authenticated
     USING (true);
 CREATE POLICY tenant_lock ON public.invoices
     AS RESTRICTIVE FOR ALL
@@ -737,7 +771,11 @@ layer via `pg_trigger.tgisinternal = false`. Disabled triggers
 (`tgenabled = 'D'`) are captured in the snapshot but skipped by
 the rule — they can't fire under any `session_replication_role`.
 
-**Out of scope in v0.5.8**: INSTEAD OF triggers on views. The
+Trigger rows include user-authored `CREATE CONSTRAINT TRIGGER`s; a trigger
+declared on a partitioned parent is reported once, on the parent, not per
+child clone.
+
+**Out of scope (currently)**: INSTEAD OF triggers on views. The
 introspection layer only captures triggers whose `tgrelid` points
 to a regular or partitioned table (`relkind IN ('r','p')`).
 INSTEAD OF view-triggers are a real bypass surface — a write
@@ -748,7 +786,7 @@ relying on view-triggers for security-sensitive writes should
 audit them manually.
 
 **Snapshot tampering**: `pgrls diff` does not yet emit
-`DIFF_TRIGGER_*` change kinds — an edit to a checked-in v6
+`DIFF_TRIGGER_*` change kinds — an edit to a checked-in
 snapshot file that deletes a `triggers` entry or flips
 `enabled: true → false` will not show up as a diff finding.
 Treat snapshot files like any other security-relevant artifact:
@@ -786,7 +824,9 @@ table, and a name-only allowlist would silence both.
 
 ## SEC014 — SECURITY DEFINER function bypasses caller's RLS
 
-**Severity:** warning. **Auto-fix:** no (architectural choice
+**Severity:** warning. The sharper co-firing sibling is [SEC042](#rule-sec042) (`error`): a
+SECURITY DEFINER function that is *anon-executable* **and** owned by an
+RLS-exempt role. **Auto-fix:** no (architectural choice
 needs human intent).
 
 A `SECURITY DEFINER` function runs with the privileges of the
@@ -855,7 +895,9 @@ Out of scope (intentional):
 * **Argument signatures** are not part of the allowlist shape.
   A function with two overloads (e.g. `do_thing(int)` vs
   `do_thing(text)`) is flagged once and allowlisted once —
-  introspection captures `proname` only. Operators who need
+  introspection captures each overload individually (with its
+  signature, snapshot v12+), and SEC014 reports and allowlists per
+  qualified name. Operators who need
   per-overload granularity should `ALTER FUNCTION` one of
   them to a different name.
 * **Function-body reachability of RLS tables** is not gated
@@ -924,13 +966,15 @@ all, the fixer emits the minimal-but-safe default
 the caller's path, so a function whose body needs unqualified
 names from another schema needs the operator to insert that
 schema before `pg_temp` in the generated SQL (the Fix description
-prompts this). The fixer **abstains** in two cases: a pre-v12
+prompts this). The fixer **abstains** in three cases: a pre-v12
 snapshot whose captured `signature` is empty (a bare
 `ALTER FUNCTION name()` would target the wrong overload — re-snapshot
-against v12+ to populate signatures), and a `search_path` whose raw
-GUC string contains both a quote and a comma (a possible quoted
-schema name with an internal comma that the naive comma-split
-tokenizer can't safely rewrite). Either way you can run the
+against v12+ to populate signatures); a pre-v14 snapshot that lacks the
+separate schema/function-name fields needed to target a dotted schema
+name (re-snapshot); and a `search_path` the naive comma-split tokenizer
+can't safely rewrite — one whose raw GUC string contains both a quote
+and a comma, or any token that isn't a plain identifier, `$user`, or a
+well-formed quoted identifier (only possible in a hand-edited snapshot). Either way you can run the
 `ALTER FUNCTION` by hand, or allowlist the function after confirming
 its body fully-qualifies every object reference (in which case
 `search_path` is moot).
@@ -972,7 +1016,7 @@ Out of scope (intentional):
 
 <a id="rule-sec016"></a>
 
-## SEC016 — Role with the BYPASSRLS attribute bypasses all RLS
+## SEC016 — Role with BYPASSRLS attribute bypasses all RLS
 
 **Severity:** warning. **Auto-fix:** no (`pgrls` cannot tell a
 misconfigured application role from a backup / logical-replication
@@ -1066,7 +1110,7 @@ Out of scope (intentional):
 
 <a id="rule-sec017"></a>
 
-## SEC017 — Function with the LEAKPROOF attribute bypasses the RLS barrier
+## SEC017 — Function with LEAKPROOF attribute bypasses the RLS barrier
 
 **Severity:** warning. **Auto-fix:** yes (`pgrls fix` emits
 `ALTER FUNCTION <schema>.<name>(<signature>) NOT LEAKPROOF` per
@@ -1111,7 +1155,9 @@ timing channel can expose an argument, or remove the marking.
 <schema>.<name>(<signature>) NOT LEAKPROOF` for **each** flagged
 overload (one statement per overload, since a single `ALTER
 FUNCTION` reaches only one). It **abstains** on a pre-v12 snapshot
-whose captured `signature` is empty: a bare `ALTER FUNCTION name()
+whose captured `signature` is empty, and on a pre-v14 snapshot that lacks
+the separate schema/function-name fields needed to target a dotted schema
+name: a bare `ALTER FUNCTION name()
 NOT LEAKPROOF` would target the zero-argument overload, wrong for
 every function that has arguments — re-snapshot against a live
 v12+ database to populate signatures, then re-run. pgrls does not
@@ -1125,7 +1171,8 @@ The allowlist key is `schema.function` (two parts). Bare
 `function_name` is rejected for the same reason as SEC014/SEC015.
 Overloads collapse: `public.f(int)` and `public.f(text)` both
 marked `LEAKPROOF` are one finding and one allowlist entry —
-introspection's `SELECT DISTINCT` on the qualified name does this,
+introspection captures each overload as its own row (so the fixer can
+target each signature) and SEC017 dedupes by qualified name when reporting,
 matching the signature-free allowlist shape.
 
 ```toml
@@ -1190,13 +1237,16 @@ other pgrls check, but the discriminator is a constant.
 same trap, and worse: it stays pinned to the pool's login role even
 when the application does `SET ROLE` per request.
 
-Detection is structural — the rule walks the parsed policy AST for
-an `A_Expr` (operator) node with a role-identity `SQLValueFunction`
-on one operand and a reference to a column of the policy's own
-table on the other (the same own-column scoping SEC005 uses),
-anywhere in the tree. (`A_Expr` is pglast's generic operator node;
-in practice the operator pairing a role identity with a column is
-`=` or another comparison.)
+Detection is structural — the rule walks the parsed policy AST
+(sub-selects included) for a comparison operator — `=`, `<>`, `!=`, `<`,
+`>`, `<=`, `>=`, including the `= ANY(...)` / `= ALL(...)` forms — whose
+one operand *is* a role-identity `SQLValueFunction` (optionally cast:
+`current_user::text` still fires) and whose other operand contains a
+column of the policy's own table (the same own-column scoping SEC005
+uses). A role identity merely combined into a larger value
+(`audit_key = owner || current_user`, `owner_role = lower(current_user)`)
+or paired via `IS DISTINCT FROM` / `LIKE` / `BETWEEN` is not flagged
+(`LIKE` against an auth value is SEC026's).
 
 **What SEC018 deliberately does not flag.** A `current_user`
 reference is only an isolation problem when it is the *row-matching
@@ -1256,7 +1306,13 @@ shared pool role).
 
 ## SEC019 — Policy calls current_setting() without the missing_ok argument
 
-**Severity:** info.
+**Severity:** info. **Auto-fix:** yes — `pgrls fix` rewrites every one-argument
+`current_setting(name)` in `USING` / `WITH CHECK` to `current_setting(name,
+true)` and emits one `ALTER POLICY` re-stating only the clause(s) it changed.
+The rewrite deliberately picks the quiet-empty-result side; allowlist the
+policy if raise-on-unset is intended. Only the *builtin* `current_setting`
+(bare or `pg_catalog.`-qualified) is inspected; a user-defined
+`myschema.current_setting(...)` is never examined.
 
 `current_setting(name)` — the one-argument form — raises
 `ERROR: unrecognized configuration parameter "name"` when `name` is
@@ -1307,9 +1363,13 @@ independently.
 
 <a id="rule-sec020"></a>
 
-## SEC020 — Policy WITH CHECK clause is constant true but USING is not
+## SEC020 — Policy WITH CHECK is constant true but USING is not
 
-**Severity:** warning.
+**Severity:** warning. **Auto-fix:** yes — `pgrls fix` emits `ALTER POLICY <name> ON
+<schema>.<table> WITH CHECK (<the USING predicate>)`, mirroring `USING` into
+`WITH CHECK`; an `OR true` disjunct in `USING` is stripped first and the
+fixer abstains if nothing non-trivial survives. Restrictive policies are
+fixed the same way.
 
 A policy that governs writes — a `FOR ALL` or `FOR UPDATE` policy —
 carries two predicates. `USING` filters the rows the caller may
@@ -1346,8 +1406,12 @@ design.
 Scope: detection matches the literal `true` only, exactly as SEC008
 ("USING clause is constant true") does — `1 = 1` and other semantic
 tautologies are out of scope. A policy with no `WITH CHECK` at all
-is SEC006's concern (write-side policy missing WITH CHECK), not
-SEC020's; a `USING` that is itself constant-true is SEC008's.
+is not SEC020's — and it is SEC006's only when nothing closes the write
+(`FOR INSERT`, or `FOR UPDATE`/`FOR ALL` whose `USING` is absent or
+constant-true). An `UPDATE`/`ALL` policy with a real `USING` and no
+`WITH CHECK` is closed (Postgres reuses `USING`) and neither rule flags
+it — which is exactly the shape SEC020's "drop the `WITH CHECK`" remedy
+produces. A `USING` that is itself constant-true is SEC008's.
 SEC020 does not attempt to prove a non-trivial `WITH CHECK` is
 weaker than `USING` — only the unambiguous constant-true case.
 
@@ -1379,8 +1443,10 @@ session lookup.
 
 Detection is a **name heuristic**. SEC021 walks the parsed policy
 AST for a plain `=` comparison where one operand is a column whose
-name is in a configurable identity-column set — `tenant_id`,
-`org_id`, `account_id`, `user_id`, `owner`, … — and the other
+name is in a configurable identity-column set — by default `tenant_id`,
+`tenant`, `org_id`, `org`, `organization_id`, `organisation_id`,
+`account_id`, `account`, `company_id`, `customer_id`, `workspace_id`,
+`team_id`, `project_id`, `user_id`, `owner_id`, `owner` — and the other
 operand is a literal (`A_Const`, optionally cast: `'…'::uuid`). The
 literal is the signal; the identity-ish column *name* separates the
 anti-pattern from a legitimate `column = literal` policy such as
@@ -1510,7 +1576,9 @@ SEC023 on every policy that names it.
 
 ## SEC024 — Policy calls current_setting() with an unqualified parameter name
 
-**Severity:** info. **Auto-fix:** no (the correct qualified
+**Severity:** info. Only the *builtin* `current_setting` (bare or `pg_catalog.`-qualified)
+is inspected; a user-defined `myschema.current_setting(...)` is never
+examined. **Auto-fix:** no (the correct qualified
 name — typically `app.<something>` — is application context
 pgrls cannot know).
 
@@ -1640,6 +1708,16 @@ What SEC025 flags — and what it deliberately does not:
   to include the dependent schema for SEC025 to see it. System
   catalogs (`pg_catalog.*`) are similarly skipped: they are
   never introspected.
+* **Not flagged — unqualified references to another schema.** A bare
+  `FROM team_members` is resolved only against the policy's *own*
+  schema; pgrls does not model `search_path`. If the table lives in a
+  different schema — even one already in `--schemas` — the reference is
+  silently skipped. Schema-qualify cross-schema references
+  (`public.team_members`) for SEC025 to see them.
+* **Not flagged — a `WITH` CTE that shadows a table name.** Inside the
+  clause that defines it, a CTE named like an RLS-off table shadows that
+  table, so the reference resolves to the CTE and is silent. Benign, but
+  worth knowing when a finding you expected does not appear.
 
 Out of scope (intentional):
 
@@ -1660,7 +1738,7 @@ Out of scope (intentional):
 
 <a id="rule-sec026"></a>
 
-## SEC026 — Policy uses LIKE / regex pattern matching against an auth context
+## SEC026 — Policy uses LIKE/regex pattern matching against an auth context
 
 **Severity:** warning.
 
@@ -1715,8 +1793,12 @@ drives the predicate.
 **SubLink-wrapped auth values still fire.** `col LIKE (SELECT
 current_setting('app.email', true))` is semantically identical to
 the un-wrapped form — Postgres evaluates the scalar SubLink to a
-value and feeds it to `LIKE` — so SEC026 inspects operand subtrees
-including SubLink contents. The same outer walk reaches A_Expr
+value and feeds it to `LIKE` — so SEC026 treats a FROM-less scalar
+sub-select as the pattern operand. A sub-select *with* a `FROM` clause is a
+lookup, not the pattern: an auth call in its `WHERE`/`JOIN` does not make the
+outer `LIKE` fire (`user_email LIKE (SELECT pattern FROM patterns WHERE owner
+= current_user)` is silent by design), though a pattern operator *inside*
+that sub-select is still inspected on its own. The same outer walk reaches A_Expr
 nodes inside a sub-select on its own (e.g. `EXISTS (SELECT 1 FROM
 members WHERE m.email LIKE current_setting(...))` fires on the
 inner LIKE); each policy is reported once, no double-firing.
@@ -1748,6 +1830,15 @@ a design choice, not a mechanical rewrite.
 * **Auth context with non-pattern operator.**
   `tenant_id = current_setting('app.tenant_id')::uuid` is a plain
   `=`; the auth value is interpreted as a UUID, not a pattern.
+* **Auth value matched against a fixed literal pattern.**
+  `current_user LIKE 'admin%'`, `current_setting('app.role') ~ '^tenant_'`
+  — the auth value is the *subject* and every wildcard is author-written,
+  so nothing is attacker-injectable (the admin-escape allowance, like
+  SEC018's `current_user = 'postgres'`). Not flagged.
+* **Non-text `~`.** When either operand of `~` / `!~` is cast to or built
+  as a geometric or `ltree`/`lquery` type (`path::ltree ~
+  current_setting('app.q')::lquery`) it is containment / label matching,
+  not a regex; SEC026 stays silent.
 
 <a id="rule-sec027"></a>
 
@@ -1843,7 +1934,8 @@ CREATE POLICY ins ON documents
 
 This is the open-write gap the other write-side rules miss:
 
-* **SEC006** fires when `WITH CHECK` is *absent*; here it's present
+* **SEC006** fires when `WITH CHECK` is *absent* and nothing closes the write
+  (INSERT, or UPDATE/ALL with no / constant-true `USING`); here it's present
   and wide open.
 * **SEC008** flags a constant-true `USING`; a `FOR INSERT` policy
   has no `USING`, and SEC008 never inspects the write side.
@@ -1953,9 +2045,14 @@ CREATE POLICY tenant_scope ON documents
    NULL` discriminator makes that whole failure mode unreachable.
 
 SEC030 fires when a table has RLS enabled, a policy, captured column
-nullability, and a **nullable** column that some policy compares with
-a plain `=` against an auth-context value (`current_setting`,
-`auth.uid`, `auth.role`, `auth.jwt` by default). The remedy is
+nullability, and a **nullable identity/discriminator column** — one named
+in the identity set (`tenant_id`, `user_id`, `org_id`, `owner_id`, … —
+SEC021's default list, overridable with `[lint.rules.SEC030]
+identity_columns`, which replaces the list) — that some policy compares
+with a plain `=` against an auth-context value (`current_setting`,
+`auth.uid`, `auth.role`, `auth.jwt` by default). A nullable column that
+is not identity-named (`region_code`, `status`) is not flagged unless you
+add it to `identity_columns`. The remedy is
 usually `ALTER TABLE … ALTER COLUMN … SET NOT NULL` (after
 backfilling any existing `NULL`s), plus a `DEFAULT` or trigger so the
 column is always populated.
@@ -2130,7 +2227,7 @@ intended — needs human intent and is not auto-emitted.
 
 <a id="rule-sec033"></a>
 
-## SEC033 — Policy scopes by user-modifiable JWT claim (`user_metadata`)
+## SEC033 — Policy scopes by user-modifiable JWT claim (user_metadata)
 
 **Severity:** error.
 
@@ -2164,9 +2261,10 @@ CREATE POLICY admins_only ON public.documents
 ```
 
 The same shape with any JSON operator (`->`, `->>`, `#>`, `#>>`)
-trips the rule, and so does a direct column reference to
-`raw_user_meta_data` (typically via a `SELECT ... FROM auth.users`
-sub-link).
+trips the rule, and so does `raw_user_meta_data` used as the *source* of a
+JSON extraction (`raw_user_meta_data ->> 'role'`, typically via a
+`SELECT ... FROM auth.users` sub-link); a bare reference to the column
+(`raw_user_meta_data IS NOT NULL`) is not flagged.
 
 **Standard fix.** Move the role gate into the admin-only claim:
 
@@ -2186,13 +2284,24 @@ end user can't write it through the client SDK.
 [lint.rules.SEC033]
 string_keys = ["user_metadata"]
 column_names = ["raw_user_meta_data"]
+jwt_functions = ["auth.jwt"]
 ```
 
 `string_keys` replaces the default JSON-key match list (case-
 sensitive — Postgres jsonb keys are case-sensitive). `column_names`
 replaces the default column-name match list (case-insensitive —
-Postgres lowercases unquoted identifiers). Both are list-replace, not
-list-merge: include all the names you want flagged.
+Postgres lowercases unquoted identifiers). `jwt_functions` replaces the
+functions whose result counts as a JWT source. All three are list-replace,
+not list-merge: include all the names you want flagged.
+
+The string-key vector fires only when the JSON-extraction chain is
+**rooted** in a JWT source — a configured `jwt_functions` call, a
+`current_setting('request.jwt…')` GUC, or a `column_names` column. A
+`user_metadata` key pulled from an unrelated jsonb column (`settings ->
+'user_metadata' ->> 'role'`) or from a helper not in `jwt_functions`
+(`app.jwt()`) is not flagged; add the helper to `jwt_functions`. A
+`user_metadata` key nested *under* `app_metadata` is exempt — that path is
+server-controlled.
 
 **Allowlist by `schema.table.policy`** when a policy intentionally
 reads `user_metadata` for a non-authorization side-effect (logging,
@@ -2210,7 +2319,7 @@ pgrls can't make safely.
 
 <a id="rule-sec034"></a>
 
-## SEC034 — Policy gates on `auth.email()` (silent denial / lockout)
+## SEC034 — Policy gates on auth.email() (mutable per user; case-sensitive)
 
 **Severity:** warning.
 
@@ -2262,11 +2371,11 @@ USING (owner_email = (
 ))
 ```
 
-(The latter form trips SEC036's `EXISTS`-against-`auth.users`
-detection's adjacent class, but with `id = auth.uid()` binding
-the sub-select it stays silent — and the lockout-on-email-change
-hazard is now resolved in the application's email-update handler
-rather than every downstream policy.)
+(SEC036 inspects only `EXISTS (SELECT … FROM auth.users …)` sub-links, so
+this scalar lookup is outside its scope either way; the `id = auth.uid()`
+binding is what makes it *correct* — and the lockout-on-email-change
+hazard is now resolved in the application's email-update handler rather
+than every downstream policy.)
 
 **Detection.** Walks policy USING / WITH CHECK ASTs for FuncCall
 nodes whose qualified name matches any of the configured email-
@@ -2337,6 +2446,9 @@ deliberately global identifier):
 ```toml
 [lint.rules.SEC035]
 allowlist = ["public.api_tokens"]
+# Replaces the default discriminator-detection set
+# {auth.uid, auth.role, auth.jwt, current_setting}.
+auth_functions = ["auth.uid", "current_setting", "app.tenant"]
 ```
 
 No auto-fix — converting `UNIQUE (email)` to `UNIQUE (tenant_id,
@@ -2345,7 +2457,7 @@ duplicate, so the remedy needs a data audit pgrls can't perform.
 
 <a id="rule-sec036"></a>
 
-## SEC036 — Policy `EXISTS (SELECT FROM auth.users WHERE …)` clause has no caller binding
+## SEC036 — Policy EXISTS sub-select against auth.users has no caller binding
 
 **Severity:** error.
 
@@ -2386,9 +2498,13 @@ authenticated user.
 CHECK ASTs whose `subLinkType` is `EXISTS_SUBLINK`. For each, the
 sub-select's `fromClause` is inspected for `RangeVar`s matching
 the configured target tables (default: `auth.users`). When a
-target matches, the sub-select's `whereClause` is searched for any
-FuncCall whose name is in the configured binding-functions set —
-absent any such reference, the rule fires. **One finding per
+target matches, the sub-select's `WHERE`, `HAVING`, `JOIN … ON` and
+derived-table quals are searched for a call to a configured
+binding function — absent any such reference, the rule fires. A call
+buried inside a *nested* `EXISTS`/`ANY`/`ALL` body does not count
+(unless it is the sole target of `IN (SELECT auth.uid())` /
+`= ANY (SELECT auth.uid())`), and a target reached only through a
+`WITH` CTE is not examined at all — inline the table reference. **One finding per
 policy**, even when the policy has multiple offending sub-links.
 
 **Standard fix.** Add the caller-binding clause to the sub-select's
@@ -2445,7 +2561,7 @@ rule; SEC036 stays silent on it.
 
 <a id="rule-sec037"></a>
 
-## SEC037 — Policy compares `auth.role()` to an unknown role name
+## SEC037 — Policy compares auth.role() to an unknown role name (silent deny)
 
 **Severity:** warning.
 
@@ -2486,7 +2602,9 @@ of values), extend the known-roles list in config rather than
 relying on default Supabase semantics.
 
 **Detection.** Walks policy USING / WITH CHECK ASTs for `=`
-comparisons where one side is `auth.role()` (or any configured
+comparisons — and the `IN (…)` / `= ANY (ARRAY[…])` membership forms
+`pg_get_expr` renders, one finding per unknown name — where one side is
+`auth.role()` (or any configured
 role-context function) and the other side is a string literal not
 in the configured known-role set. Handles the
 `'admin'::text` form that Postgres normalizes literals to when
@@ -2522,16 +2640,23 @@ operator what to do; the choice isn't mechanical.
 
 <a id="rule-sec038"></a>
 
-## SEC038 — Semantic anonymous-read leak (Z3-backed)
+## SEC038 — Anonymous read leak (USING is unconditionally true for an unauthenticated session)
 
 **Severity:** error.
+
+**Role gating.** SEC038 does *not* consult the policy's `TO` list: a
+`TO authenticated` policy whose predicate is anon-TRUE is still reported as
+an anonymous leak at `error`, because the role restriction is one `GRANT`
+away from being loosened and the predicate itself is the defect. (SEC004
+downgrades that same shape to `warning` when the policy cannot reach
+`anon`/`PUBLIC`.)
 
 **The hazard.** A read-capable policy (FOR ALL or FOR SELECT)
 leaks every row to anonymous if its USING predicate is provably,
 unconditionally TRUE for an unauthenticated session — one where
 every auth-context function (`auth.uid()` / `auth.role()` /
-`auth.jwt()`, `current_user`, `session_user`, `current_setting()`)
-returns NULL. Under SQL three-valued (Kleene) logic a row is
+`auth.jwt()`, `current_setting()`) returns NULL — `current_user` and
+`session_user` are never NULL and are SEC018's subject instead. Under SQL three-valued (Kleene) logic a row is
 visible iff USING evaluates to exactly TRUE; NULL and FALSE both
 hide the row.
 
@@ -2543,7 +2668,7 @@ inverted-auth variants that shape misses:
 ```sql
 USING (NOT (auth.uid() IS NOT NULL) OR owner_id = auth.uid())  -- NOT-wrapped
 USING ((auth.uid() IS NULL)::bool   OR owner_id = auth.uid())  -- cast-wrapped
-USING ((SELECT current_setting('app.user'))::uuid IS NULL OR …) -- coerced GUC
+USING ((SELECT current_setting('app.user', true))::uuid IS NULL OR …) -- coerced missing_ok GUC
 ```
 
 In each case, under an anonymous session the inverting disjunct is
@@ -2597,7 +2722,8 @@ imported the rule NO-OPs — it returns no findings rather than guessing.
 [lint.rules.SEC038]
 # Function names treated as anonymous-NULL under an unauthenticated
 # session. Replaces the default ["auth.uid", "auth.role",
-# "auth.jwt", "current_user", "session_user", "current_setting"].
+# "auth.jwt", "current_setting"] (current_user / session_user are
+# never NULL — SEC018 covers them).
 # Mirrors SEC004's option so the two rules stay consistent.
 auth_functions = ["auth.uid", "current_setting"]
 
@@ -2611,7 +2737,7 @@ public data) allowlist the policy. The choice isn't mechanical.
 
 <a id="rule-sec039"></a>
 
-## SEC039 — Permissive write policy grants the anonymous role write access
+## SEC039 — Permissive write policy grants access to the anonymous role
 
 **Severity:** error.
 
@@ -2732,7 +2858,8 @@ unwrap (e.g. `COALESCE(tenant_id, 0) = <session>`) is not recognized; allowlist
 such a policy.
 
 **Why it's separate from the other write-side rules.**
-[SEC006](#rule-sec006) fires when `WITH CHECK` is *absent* — there Postgres
+[SEC006](#rule-sec006) fires when `WITH CHECK` is *absent* on an open shape
+(INSERT, or UPDATE/ALL with no real `USING`) — there Postgres
 reuses `USING` as the implicit check, preserving the scope, so an explicit
 clause is required for SEC040. [SEC028](#rule-sec028) and
 [SEC020](#rule-sec020) fire when `WITH CHECK` is constant `true`; SEC040 cedes
@@ -3118,7 +3245,9 @@ Only **column** grants are inspected, only **content** privileges count
 content), and the default low-trust grantee set is `{PUBLIC, anon}` (a column
 grant to `anon` is *not* a standard Supabase pattern — Supabase scopes via table
 grants + RLS, never column grants). The PII match is a curated, case-insensitive
-substring set.
+set matched on **token boundaries** — the column name is split on
+non-alphanumerics, so `phone` hits `phone_number` but not `headphone`, and
+`email` hits `email_verified` (allowlist that column) but not `emailaddress`.
 
 **Remediation:** confirm the column is meant to be public, or
 `REVOKE <priv> (<column>) ON <table> FROM <role>`. No auto-fix — whether a
@@ -3135,7 +3264,7 @@ allowlist = ["public.profiles.email"]             # a deliberate public-email co
 
 <a id="rule-sec046"></a>
 
-## SEC046 — Policy calls an IMMUTABLE function that reads session state
+## SEC046 — Policy calls an IMMUTABLE function that reads session state (constant-folded, cross-user leak)
 
 **Severity:** error
 
@@ -3205,7 +3334,7 @@ allowlist = ["app.cur_tenant"]   # a function proven safe to constant-fold (sche
 
 <a id="rule-sec047"></a>
 
-## SEC047 — Foreign key to an RLS parent is a cross-tenant existence oracle
+## SEC047 — Foreign key to an RLS-protected parent is a cross-tenant existence oracle
 
 **Severity:** warning
 
@@ -3256,7 +3385,8 @@ ubiquitous, so SEC047 fires only when **all** hold:
 2. the **child** is writable by a configured low-trust role (default `anon` /
    `PUBLIC`): it has a *table-level* `INSERT` / `UPDATE` / `ALL` grant to that
    role **and** either has RLS off **or** a permissive `INSERT` / `UPDATE` /
-   `ALL` policy whose roles literally include that low-trust role (the SEC003
+   `ALL` policy whose roles include that low-trust role — literally, or via
+   `TO PUBLIC` / no `TO` clause, which covers every role (the SEC003
    literal-role idiom — no group expansion), **and**
 3. the FK is not allowlisted.
 
@@ -3457,7 +3587,7 @@ schemas = ["public", "api"]
 # The low-trust role set. Default ["anon", "authenticated", "PUBLIC"];
 # "public" is normalised to the PUBLIC pseudo-role.
 grantees = ["anon", "authenticated", "PUBLIC"]
-# Table ids (schema.table) that are intentionally public, exempted.
+# Table ids (`schema.table`, or a bare `table` name) that are intentionally public, exempted.
 allowlist = ["public.countries"]
 ```
 
@@ -3517,6 +3647,16 @@ row-reach clause (the recommended Supabase pattern pairs it with a
 `storage.foldername(name)` path check). There is no auto-fix — pgrls cannot know
 which bucket the policy is meant to confine. Pure rule logic over already-
 captured policy data; no introspection or snapshot change.
+
+**Offline (`--sql-file`) caveat.** The rule needs `storage.objects` and its
+`bucket_id` column to be *declared in the SQL it is given*. In a Supabase
+project that table is extension-managed and usually absent from migrations
+(which carry only the `CREATE POLICY … ON storage.objects` statements), so an
+offline run sees no column list, and SEC050 abstains **without appearing in
+`skipped_rules`**. Live and snapshot runs always carry the column list. To
+lint Storage policies offline, add a stub
+`CREATE TABLE storage.objects (id uuid, bucket_id text, name text, owner uuid);`
+to the input.
 
 **Configuration** (`[lint.rules.SEC050]`):
 
@@ -3586,7 +3726,7 @@ depends on whether the broadcast is intended.
 [lint.rules.SEC051]
 # Publication names treated as Realtime broadcast channels.
 publications = ["supabase_realtime"]
-# Table ids (schema.table) deliberately broadcast without RLS.
+# Table ids (`schema.table`, or a bare `table` name) deliberately broadcast without RLS.
 allowlist = ["public.presence"]
 ```
 
@@ -3628,7 +3768,11 @@ SEC052 fires when, for a view (or materialized view) in an exposed schema:
   read with the reader's grant, so `security_invoker` is moot);
 * its body **directly** reads a sensitive table (default `auth.users`) as a
   FROM-clause source — top-level, through a JOIN, or in a derived table, so its
-  columns can reach the output; **and**
+  columns can reach the output;
+* a low-trust role (`grantees`, default `anon` / `authenticated` / `PUBLIC`)
+  holds table-level `SELECT` on the view — the API-reachability signal; a
+  view `REVOKE`d from those roles, or granted only to `service_role`, is not
+  flagged; **and**
 * that read is **not** scoped to the calling user.
 
 The caller-binding analysis is shared verbatim with [SEC036](#rule-sec036) (via
@@ -3647,6 +3791,15 @@ Conservative by design (soundness over recall, no false positives):
 * `auth.users` used only to *filter* (a `WHERE owner_id IN (SELECT id FROM
   auth.users …)` membership test), not as a FROM source whose columns reach the
   output, is not a PII exposure and is not flagged.
+* A read through a **CTE** (`WITH u AS (SELECT * FROM auth.users) SELECT *
+  FROM u`) is not seen — inline the table reference.
+* A view exposed **only by a column-level grant** is not seen (the gate is
+  table-level `SELECT`).
+* In a set operation (`UNION` / `INTERSECT` / `EXCEPT`), an arm that binds the
+  caller masks an arm that does not.
+* A caller-bound **materialized** view (`WHERE id = auth.uid()`) is a miss,
+  not a safe view: the rows were captured at refresh time as the refresher,
+  so the binding did not scope them (SEC054 / VIEW003 cover the matview).
 
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
 set `WITH (security_invoker = on)` and re-grant, drop the sensitive columns,
@@ -3662,15 +3815,16 @@ schemas = ["public"]
 grantees = ["anon", "authenticated", "PUBLIC"]
 # Sensitive schema.table sources (add e.g. "auth.identities").
 tables = ["auth.users"]
-# Caller-binding signals (shared default with SEC036).
-binding_functions = ["auth.uid", "current_setting"]
+# Caller-binding signals (shared default with SEC036). The list REPLACES the
+# default — copy every signal you still want, then add project helpers.
+binding_functions = ["auth.uid", "auth.role", "auth.jwt", "current_user", "session_user", "current_setting"]
 # Qualified view names that intentionally expose the table.
 allowlist = ["public.public_profiles"]
 ```
 
 SEC052 reads the view's grants (`relacl`), captured in snapshot **v23+**. On an
-older snapshot the grants are absent (`grants=()`), so the rule finds nothing on
-that view — the fail-closed direction.
+older snapshot the grants are absent (`grants=()`), the rule is reported as *skipped* (catalog-dependent, v23+), exactly as
+SEC053 / SEC054 are on their older snapshots — not as a silent clean — the fail-closed direction.
 
 <a id="rule-sec053"></a>
 
@@ -3817,7 +3971,7 @@ in snapshot **v23+**. On an older snapshot the grants are absent (`grants=()`),
 so the rule finds nothing on that matview — the fail-closed direction — and is
 reported as skipped rather than silently passing.
 
-<a id="rule-perf001"></a>
+<a id="rule-sec055"></a>
 
 ## SEC055 — Tenant policy uses the silent binding form after the schema adopted the raising one
 
@@ -3902,6 +4056,8 @@ allowlist = ["public.users.p", "public.memberships.p"]
 There is no auto-fix. Converting a policy changes which queries error, and
 which tables are legitimately readable before a tenant is bound is human
 intent — the same reason SEC006 has no fixer.
+
+<a id="rule-perf001"></a>
 
 ## PERF001 — Auth function called per-row in policy USING/WITH CHECK
 
@@ -4000,9 +4156,9 @@ always safe.
 
 **What it catches:** policy expressions that call a VOLATILE
 function. Default set: `random`, `clock_timestamp`, `nextval`,
-`gen_random_uuid`, `pg_backend_pid`. STABLE functions like `now()`
-and `current_setting` are NOT in the set — those have separate
-treatment via PERF001's wrap-in-subquery mechanic.
+`gen_random_uuid`, `pg_backend_pid`. `current_setting` is NOT in the set — it has separate treatment via
+PERF001's wrap-in-subquery mechanic (`now()` is STABLE and cheap; no rule
+covers it).
 
 VOLATILE functions are bad in policies on two counts:
 
@@ -4083,12 +4239,11 @@ add a second index on `owner` if the policy needs both columns
 indexed, or live with the false-positive `owner` finding and
 allowlist it.
 
-**Known limitations in v0.5.10:**
+**Known limitations:**
 
 * **Expression indexes** (`CREATE INDEX ON tbl (lower(email))`)
   are not matched. The expression list lives in
-  `pg_index.indexprs` which v0.5.10's introspection doesn't
-  decode. PERF003 will flag the column as un-indexed even when a
+  `pg_index.indexprs`, which introspection doesn't decode. PERF003 will flag the column as un-indexed even when a
   matching expression index exists — allowlist the policy ID when
   this surfaces a false positive.
 * **Composite-key policies** fire per referenced column; see the
@@ -4102,6 +4257,12 @@ Allowlist by qualified policy ID (`schema.table.policy_name`):
 [lint.rules.PERF003]
 allowlist = ["public.invoices.tenant_read"]
 ```
+
+**Auto-fixable.** `pgrls fix` emits `CREATE INDEX IF NOT EXISTS
+pgrls_idx_<hash> ON <schema>.<table> (<column>);` once per (table, column).
+It is a plain `CREATE INDEX`, not `CONCURRENTLY` — on a busy table it blocks
+writes for the build, so on production run the emitted statement by hand
+with `CONCURRENTLY` instead of `--apply`.
 
 **Note on the demo**: pgrls's own demo (`demo/`) disables PERF003
 globally in `demo/pgrls.toml` because the 50+ demo fixtures don't
@@ -4173,9 +4334,18 @@ policy ID:
 allowlist = ["public.users.by_email"]
 ```
 
+**Auto-fixable, with abstention.** `pgrls fix` emits `CREATE INDEX IF NOT
+EXISTS pgrls_idx_<hash> ON <schema>.<table> (<expression>);` for the
+outermost wrapping call — but only when the whole expression is built from a
+curated set of always-`IMMUTABLE` builtins (`lower`, `upper`, `trim`, casts,
+…). A wrapper outside that set (`date_trunc('day', created_at)`, any
+user-defined function) is still *reported* but gets no fix: an expression
+index on a non-immutable expression is rejected by Postgres, and pgrls will
+not guess. Add that index by hand after confirming immutability.
+
 <a id="rule-perf005"></a>
 
-## PERF005 — RLS-protected table observed to sequentially scan in production
+## PERF005 — RLS table observed to sequentially scan in production
 
 **Severity:** info. **Opt-in** — fires only when lint is given a
 runtime-stats artifact.
@@ -4226,7 +4396,7 @@ needs human judgment about the query shape.
 
 <a id="rule-hyg001"></a>
 
-## HYG001 — Policy references a column that doesn't exist
+## HYG001 — Policy references a column that doesn't exist on the table
 
 **Severity:** error.
 
@@ -4291,7 +4461,10 @@ allowlist = ["public.tickets.todo_replace_me_later"]
 
 ## HYG003 — Policy duplicates another policy on the same table
 
-**Severity:** info.
+**Severity:** info. **Auto-fix:** yes — `pgrls fix` emits `DROP POLICY <duplicate> ON
+<schema>.<table>;` for every non-first duplicate (the name-sorted-first
+policy of each group is kept as the original). Dry-run by default; review
+the chosen survivor before `--apply`.
 
 Two policies on one table that are identical in everything but
 their name — same command, same role list, same permissive /
@@ -4368,7 +4541,7 @@ per-policy report.
 
 <a id="rule-view001"></a>
 
-## VIEW001 — View bypasses RLS without `security_invoker`
+## VIEW001 — View bypasses RLS without security_invoker
 
 **Severity:** error.
 
@@ -4424,7 +4597,7 @@ schemas can't both be silenced by a single typo'd entry.
 
 <a id="rule-view002"></a>
 
-## VIEW002 — View is not a `security_barrier`
+## VIEW002 — View is not a security barrier
 
 **Severity:** warning.
 
@@ -4528,7 +4701,7 @@ Same `schema.view` shape as VIEW001 / VIEW002.
 
 <a id="rule-view004"></a>
 
-## VIEW004 — View calls SECURITY DEFINER function reading RLS-protected table
+## VIEW004 — View calls SECURITY DEFINER function that reads RLS-protected table
 
 **Severity:** warning.
 

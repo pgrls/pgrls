@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **sixty-seven rules across four
+In the current release it ships **sixty-eight rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -26,8 +26,8 @@ authenticated user passes once any matching row exists), `SEC038`
 proves the USING predicate is unconditionally TRUE for an
 unauthenticated session under Kleene 3VL, catching the NOT-wrapped
 and cast-wrapped inverted-auth variants SEC004's syntactic match
-misses; requires the optional `pgrls[diff-z3]` extra and NO-OPs
-without it), `SEC039` (permissive write policy — INSERT/UPDATE/
+misses; Z3 is a core dependency since 0.16.0, so this runs on a plain
+`pip install pgrls`), `SEC039` (permissive write policy — INSERT/UPDATE/
 DELETE/ALL — grants the unauthenticated `anon` role, so anonymous
 PostgREST/Supabase clients can modify rows), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
@@ -143,15 +143,18 @@ row the reader cannot select), `SEC048` (low-trust role can reach an
 RLS table's owner that is not `FORCE`'d, so `SET ROLE` bypasses every
 policy), `SEC049` (PostgREST-exposed table readable by a low-trust
 role), `SEC050` (Storage policy not scoped to a bucket — cross-bucket
-access), and `SEC051` (Realtime-published table has RLS disabled, so
-the WAL broadcast is unfiltered); and info `PERF005` (RLS table
+access), `SEC051` (Realtime-published table has RLS disabled, so the WAL
+broadcast is unfiltered), and `SEC055` (tenant policy still uses the
+silent `current_setting(…, true)` binding form after the schema adopted
+a raising `require_*` helper — a half-finished conversion that 404s
+where the converted policies fail loudly); and info `PERF005` (RLS table
 observed to sequentially scan in production — opt-in, inert without a
 `pgrls perf --snapshot` artifact) and `HYG004` (policy has no
 behavioral test — inert without a coverage artifact).
 
 A `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC004, SEC006, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002;
+SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -195,8 +198,9 @@ export DATABASE_URL="postgres://user:pass@host:5432/db"
 pgrls lint
 ```
 
-`pgrls lint` exits `0` when nothing exceeds the `fail_on` threshold (default
-`warning`) and `1` otherwise. It prints findings to stdout in the form:
+`pgrls lint` exits `0` when nothing meets or exceeds the `fail_on` threshold
+(default `warning`), `1` when something does, and `2` on a tool error (bad
+config, unreachable database, unsupported snapshot). It prints findings to stdout in the form:
 
 ```
   ERROR  SEC001  public.users
@@ -261,7 +265,7 @@ Notes:
 The per-rule reference — severity, detection logic, fix guidance,
 configuration — lives in **[`docs/RULES.md`](docs/RULES.md)** so
 this file stays focused on project orientation rather than
-duplicating ~2,900 lines of rule documentation.
+duplicating ~4,600 lines of rule documentation.
 
 `pgrls explain <RULE>` (e.g. `pgrls explain SEC033`,
 case-insensitive) prints the same per-rule reference from the
@@ -289,7 +293,7 @@ between each pair of consecutive snapshots (findings keyed by
 `(rule_id, location)`, so a schema-wide finding with `location=None`
 is stable identity rather than NEW+FIXED on every comparison).
 Pair with a daily cron writing `snapshots/$(date -u +%FT%H%M%SZ).json`
-to track posture drift over time. text / JSON / Markdown output —
+to track posture drift over time. text / JSON / Markdown / HTML output —
 the markdown form drops cleanly into a weekly engineering update.
 
 ## Auto-fix: `pgrls fix`
@@ -426,8 +430,9 @@ Currently fixable:
 * **SEC031** — emits `DROP POLICY <name> ON <schema>.<table>;` for a
   restrictive policy whose `USING` is constant `true`. The
   constant-true clause AND-combines to the identity, so dropping the
-  policy leaves access unchanged — the second `pgrls fix` statement
-  that DROPs an object, safe for the same reason as HYG003's. The
+  policy leaves access unchanged — one of three `pgrls fix` statements
+  that DROP an object (with SEC010's and HYG003's), safe for the same
+  reason as HYG003's. The
   fixer abstains when the policy carries a real `WITH CHECK` (a
   load-bearing write floor whose drop WOULD change write access), so
   it only drops genuinely inert policies. SEC031's other remedy (a
@@ -475,8 +480,8 @@ Currently fixable:
   another on the same table. The fixer groups a table's policies
   by the same signature HYG003 reports on, keeps the
   name-sorted-first policy of each duplicate group as the
-  original, and drops the rest. This is the only `pgrls fix`
-  statement that DROPs an object — safe, since the dropped
+  original, and drops the rest. This is one of three `pgrls fix`
+  statements that DROP an object (with SEC010's and SEC031's) — safe, since the dropped
   policy has an exact twin that remains, but dry-run by default
   like every fixer.
 * **VIEW001** — emits `ALTER VIEW <schema>.<view> SET
@@ -893,9 +898,10 @@ Any predicate change not matching one of the four real patterns above
 (AND-tighten, AND-loosen-drop, OR-loosen, OR-tighten-drop) falls through
 to REQUIRES_REVIEW — a human or SAT solver is needed to decide whether
 the new predicate is more or less permissive than the old one. The
-SAT-style implication path shipped in v0.4 as the optional
-`pip install pgrls[diff-z3]` extra (Z3-backed); without it, REQUIRES_REVIEW
-is the terminal classification.
+SAT-style implication path is Z3-backed and, since 0.16.0, a core
+dependency (`pgrls[diff-z3]` remains only as a no-op alias) — it runs on a
+plain `pip install pgrls`, and REQUIRES_REVIEW is reserved for predicates
+outside the decidable fragment.
 
 ## CI integration
 
@@ -955,9 +961,9 @@ These are intentional in the current release. Do not invent capabilities.
   can only *under*-report: catalog-only rules abstain and are explicitly
   skipped and listed (in `--format json` as `skipped_rules`, gateable with
   `--require-full-coverage`), so an absence of findings offline is not a proof
-  of safety. `pgrls verify` stays live/ephemeral only (its proof is framed
+  of safety. `pgrls verify` stays live only (its proof is framed
   against a complete schema).
-- **Sixty-seven rules across four categories.** SEC001–SEC054,
+- **Sixty-eight rules across four categories.** SEC001–SEC055,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
@@ -1007,16 +1013,17 @@ These are intentional in the current release. Do not invent capabilities.
   supported. The CI matrix runs against PG15, PG16, and PG17.
   `security_invoker` (the VIEW001 fix target) is a PG15+ reloption,
   which is the proximate reason for the floor bump.
-- **SAT-style predicate implication is opt-in.** v0.2's diff
+- **SAT-style predicate implication is built in.** v0.2's diff
   classifier recognizes common-case AST patterns (literal-equal,
   AND-tighten / drop, OR-loosen / drop) and flags anything else
   as `REQUIRES_REVIEW`. Z3-driven implication analysis shipped in
-  v0.4 as the optional `pip install pgrls[diff-z3]` extra; without
-  it, the diff classifier falls back to syntactic patterns only.
+  v0.4 as an optional extra and became a core dependency in 0.16.0,
+  so it runs on a plain `pip install pgrls` (`pgrls[diff-z3]` is kept
+  only as a no-op alias).
 - **Go port shipping in stages.** The TypeScript port of
   `pgrls.testing` shipped as the
   [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm
-  package (tagged `ts-v0.6.0`, versioned independently of the
+  package (tagged `ts-v0.6.3`, versioned independently of the
   Python package), following the Layer 1 protocol. The Go port lives in
   [`go/`](go/) at module path `github.com/pgrls/pgrls/go`, versioned
   independently of the Python package as the `go/v0.7.x` sequence

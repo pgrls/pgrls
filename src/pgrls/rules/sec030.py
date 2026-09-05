@@ -109,9 +109,11 @@ policy exists):
 allowlist = ["public.staging_events"]
 ```
 
-Severity: info. No auto-fix — `SET NOT NULL` fails on a column that
-already holds `NULL`s, so the remedy needs a backfill and a
-population strategy pgrls can't author.
+Severity: info. Auto-fixable — `pgrls fix` emits `ALTER TABLE
+<schema>.<table> ALTER COLUMN <column> SET NOT NULL` per flagged column.
+Backfill existing `NULL`s first: the ALTER fails on a NULL and, under
+`--apply`, rolls back the whole batch (the Fix description carries the
+backfill recipe).
 """
 from __future__ import annotations
 

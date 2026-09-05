@@ -82,7 +82,8 @@ Out of scope (intentional):
   the role-membership graph to flag a policy targeting a role whose
   members can `SET ROLE` to a bypassing role — `BYPASSRLS` is a
   role attribute, not an inheritable privilege, so the named role
-  is the precise audit target. Mirrors SEC016's stance.
+  is the precise audit target. Mirrors SEC016's stance — the `SET ROLE`
+  escalation path that reaches it is SEC029's.
 * **Plain superusers.** A role that bypasses RLS purely through
   `rolsuper`, with no explicit `BYPASSRLS` attribute, is not in the
   schema's reported `BYPASSRLS` set and so is not matched. A policy

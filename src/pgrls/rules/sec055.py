@@ -31,8 +31,8 @@ The obvious gate is "`[generate].strict_binding` is set". This rule uses a
 stronger signal: it fires only when **this schema already uses the raising
 helper somewhere** — at least one policy compares against a
 `…require_<label>(…)`-shaped call — and some other tenant policy still
-carries the silent `current_setting(…, true)` form for the same
-discriminator column.
+carries the silent `current_setting(…, true)` form (any table — the
+check is schema-wide, not per column).
 
 That is deliberate. A config-gated rule is silent when the config is
 absent, which is exactly the case when CI lints a database without the

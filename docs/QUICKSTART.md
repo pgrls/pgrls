@@ -2,7 +2,7 @@
 
 5 minutes from `pip install` to finding (and fixing) a real Row-Level
 Security bug in CI. For the comprehensive feature tour see
-[README.md](../README.md); for the full rule catalogue see [AGENTS.md](../AGENTS.md).
+[README.md](../README.md); for the full rule catalogue see [docs/RULES.md](RULES.md).
 
 ## 1. Install
 
@@ -64,8 +64,9 @@ Mechanical findings are rewritten for you — SEC004 above included: the
 fixer strips the `auth_func() IS NULL` disjunct, restoring the real check
 it was masking (and abstains when no real check would survive, rather
 than guess). Findings that need a predicate pgrls can't author for you
-still need human judgement; `pgrls fix --check` lists what would and
-wouldn't be fixed without writing anything.
+still need human judgement; `pgrls fix --check` lists exactly the
+(rule, location) pairs it *would* fix, without writing anything — it does
+not enumerate what it would leave alone.
 
 ## 5. Wire it into CI
 
@@ -110,10 +111,10 @@ re-baseline after a clean-up pass.
 
 - **[README.md](../README.md)** — the full feature tour: every output
   format (text / JSON / SARIF / Markdown / GitHub-PR-comment / GitHub
-  annotations / JUnit), `pgrls diff` for semantic CI gating, the
+  annotations / JUnit / GitLab Code Quality / HTML), `pgrls diff` for semantic CI gating, the
   `pgrls.testing` pytest plugin for RLS isolation tests, the JSON
   Schema for `pgrls.toml`.
-- **[AGENTS.md](../AGENTS.md)** — every rule with its full rationale,
+- **[docs/RULES.md](RULES.md)** — every rule with its full rationale,
   worked examples (bad / good), and remediation recipe.
 - **`pgrls explain <RULE>`** — print a rule's reference paragraph from
   the CLI (e.g. `pgrls explain SEC004`); add `--format json` for tooling

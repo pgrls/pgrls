@@ -22,4 +22,4 @@ Don't see your stack? The general pattern is the same: configure pgrls
 with `DATABASE_URL` pointing at your migration-applied database, and
 the rules apply regardless of which framework wrote the SQL. See the
 [README](../../README.md) for the full configuration surface and the
-[rule catalogue](../../AGENTS.md) for every check.
+[rule catalogue](../RULES.md) for every check.

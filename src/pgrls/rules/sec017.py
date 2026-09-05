@@ -49,9 +49,12 @@ v10). Allowlist entries are qualified function names
 identically-named functions in different schemas would otherwise
 both be silenced.
 
-Severity: warning. No auto-fix — whether the `LEAKPROOF` claim holds
-is a judgement about the function's behaviour that needs human
-review; pgrls will not blindly emit `ALTER FUNCTION … NOT LEAKPROOF`.
+Severity: warning. Auto-fix: `pgrls fix` emits `ALTER FUNCTION
+<schema>.<name>(<signature>) NOT LEAKPROOF` per flagged overload
+(abstaining on a pre-v12 snapshot with an empty signature, or a pre-v14
+snapshot without the separate schema/function-name fields). The other
+remedy — establishing that the function genuinely is leakproof and
+keeping the marking — is human judgement; allowlist it to take that path.
 
 Relationship to the other attribute/audit rules: SEC014 and SEC015
 flag `SECURITY DEFINER` functions (which run as their owner); SEC016
@@ -73,8 +76,9 @@ Out of scope (intentional):
 * **Argument signatures.** The allowlist key is `schema.function`
   with no signature. Overloaded functions (`public.f(int)` vs
   `public.f(text)`) are collapsed to one finding and one allowlist
-  entry — introspection's `SELECT DISTINCT` on the qualified name
-  already does this. Audit every `LEAKPROOF` overload of a flagged
+  entry — introspection captures each overload as its own row (so the
+  fixer can target each signature) and SEC017 dedupes by qualified name
+  when reporting. Audit every `LEAKPROOF` overload of a flagged
   name; operators needing per-overload granularity should
   `ALTER FUNCTION` one to a different name.
 * **Cross-scope functions.** A `LEAKPROOF` function defined in a

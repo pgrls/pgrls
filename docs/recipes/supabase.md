@@ -29,11 +29,12 @@ role binding narrows *who* the policy applies to, not *what the
 policy means*.)
 
 pgrls flags this as **SEC004** (severity `error`) — its default
-auth-function set is `auth.uid`, `auth.role`, `auth.jwt`,
-`current_setting`, `current_user`, and `session_user`, so the same
-shape with any of them trips the rule. (If you override `auth_functions`
-in `[lint.rules.SEC004]` the value *replaces* the default — include
-all six plus any project-specific helper.)
+auth-function set is `auth.uid`, `auth.role`, `auth.jwt`, and
+`current_setting`, so the same shape with any of them trips the rule.
+(`current_user` / `session_user` are never NULL, so they are deliberately
+excluded — SEC018 covers them.) If you override `auth_functions` in
+`[lint.rules.SEC004]` the value *replaces* the default — include all four
+plus any project-specific helper.
 
 ## Within-tenant leaks (the second-biggest Supabase pattern)
 
@@ -171,7 +172,7 @@ to refresh.`)
 ## Beyond SEC004 / SEC027 / SEC030
 
 Other Supabase-relevant rules to know about (see
-[AGENTS.md](../../AGENTS.md) for the full reference paragraph on each):
+[docs/RULES.md](../RULES.md) for the full reference paragraph on each):
 
 - **SEC001** — RLS not enabled on a table in scope (a table that's
   never had `ALTER TABLE … ENABLE ROW LEVEL SECURITY`, with no
@@ -205,5 +206,5 @@ Other Supabase-relevant rules to know about (see
 
 - [`docs/QUICKSTART.md`](../QUICKSTART.md) — the 5-minute first-run.
 - [`README.md`](../../README.md) — the full feature tour.
-- [`AGENTS.md`](../../AGENTS.md) — every rule with its reference
+- [`docs/RULES.md`](../RULES.md) — every rule with its reference
   paragraph and fix recipe.

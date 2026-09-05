@@ -1733,8 +1733,12 @@ def fix(
 
     Currently fixes SEC001 (`ALTER TABLE … ENABLE ROW LEVEL
     SECURITY`), SEC002 (`ALTER TABLE … FORCE ROW LEVEL
-    SECURITY`), SEC006 (`ALTER POLICY … WITH CHECK` mirroring
-    USING), SEC011 (`ALTER POLICY … USING/WITH CHECK` stripping
+    SECURITY`), SEC004 (`ALTER POLICY … USING (…)` stripping the
+    top-level `auth_func() IS NULL` disjunct that leaks rows to anonymous
+    clients; abstains when no real check survives), SEC010 (`DROP POLICY`
+    for a permissive policy whose clause is the literal `false` — it admits
+    no rows, so dropping it changes no access), SEC011 (`ALTER POLICY …
+    USING/WITH CHECK` stripping
     an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
     `, true` to one-arg `current_setting()` calls), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
@@ -1747,7 +1751,10 @@ def fix(
     the Fix description warns and supplies the backfill recipe),
     SEC031 (`DROP POLICY` for a no-op
     restrictive `USING (true)` floor), SEC032 (`ALTER TABLE …
-    ENABLE ROW LEVEL SECURITY` for a dormant-policies table),
+    ENABLE ROW LEVEL SECURITY` for a dormant-policies table), SEC044
+    (`ALTER DEFAULT PRIVILEGES FOR ROLE <grantor> [IN SCHEMA …] REVOKE …
+    ON TABLES FROM <role>` — keyed on the grantor so the REVOKE actually
+    clears the pg_default_acl entry),
     PERF001 (wrap unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), PERF003 (`CREATE
     INDEX` for an unindexed policy-predicate column), PERF004
@@ -2027,7 +2034,7 @@ def _parse_generate_tables(
         "Compare against a helper that RAISES when no tenant is bound, "
         "instead of a current_setting(..., true) that silently yields NULL. "
         "An unbound query then errors instead of looking like an empty "
-        "result. Also settable as strict_binding in pgrls.toml."
+        "result. Also settable as `[generate].strict_binding` in pgrls.toml."
     ),
 )
 @click.option(
@@ -2382,7 +2389,7 @@ def snapshot(
 _INIT_HEAD = """\
 #:schema https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json
 # pgrls configuration. Rule reference:
-# https://github.com/pgrls/pgrls/blob/main/AGENTS.md
+# https://github.com/pgrls/pgrls/blob/main/docs/RULES.md
 # Every key is optional; this file documents the common knobs.
 
 [database]
@@ -2421,6 +2428,12 @@ fail_on = "warning"
 # Threshold that makes `pgrls diff` exit non-zero:
 # safe | breaking | requires-review | dangerous. Default: "dangerous".
 fail_on = "dangerous"
+
+[generate]
+# `pgrls generate --strict-binding` as a standing default: generated tenant
+# policies compare against a helper that RAISES when no tenant is bound,
+# instead of a current_setting(..., true) that silently returns NULL.
+strict_binding = false
 """
 
 # Per-preset RLS conventions block. Each names the stack's tenancy model and
@@ -4218,14 +4231,15 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "unauthenticated session. 'cross-tenant': no row of one tenant is "
         "readable by a session authenticated as a different tenant (verifies "
         "the `<column> = <session identity>` scoping equality). 'write': no "
-        "such session can WRITE (INSERT/UPDATE) a row stamped for another "
-        "tenant — proven over each write policy's effective WITH CHECK (or the "
-        "USING that FOR UPDATE/ALL reuses); SEC006/SEC020/SEC028/SEC040 are the "
+        "such session can WRITE (INSERT/UPDATE/DELETE) a row of another tenant "
+        "— proven over BOTH gates of each write policy: the new-row gate (WITH "
+        "CHECK, or the USING that FOR UPDATE/ALL reuses) and the old-row gate "
+        "(USING, for UPDATE/DELETE/ALL); SEC006/SEC020/SEC028/SEC040 are the "
         "linter fallback. 'escalation': prove the SEC048 finding — a low-trust "
         "role that reaches a table's owner (not superuser/BYPASSRLS) bypasses "
         "the RLS on that owner's enabled-but-not-FORCE'd tables; LEAK when the "
         "table's RLS provably isolates tenants (so the bypass defeats real "
-        "isolation), ISOLATED when it does not. 'reachability': prove no "
+        "isolation), PROVEN when it does not. 'reachability': prove no "
         "anon-selectable VIEW hands back the rows a table's own policies "
         "withhold — a `security_invoker = false` view executes as its owner, "
         "so one owned by an RLS-exempt role (it owns the table and the table "
@@ -4258,7 +4272,7 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
     default=None,
     help=(
         "Compare against a baseline schema (a snapshot JSON or a DB URL) and "
-        "report only the leaks this change *introduced*: a table proven ISOLATED "
+        "report only the leaks this change *introduced*: a table PROVEN "
         "in BASE (or absent from it) that the live schema now proves LEAK. Exits "
         "non-zero only on a NEW leak — pre-existing leaks don't fail the gate — "
         "so it's the 'no new provable leak' PR check (pair a committed `pgrls "
@@ -4305,7 +4319,7 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "leaks live to a reproduced leak. Exits non-zero on any mismatch or "
         "live-confirmed leak. Requires a live --database-url and a connection "
         "that can create a role (CREATEROLE / superuser); abstains cleanly "
-        "otherwise. Not supported with --format sarif or --emit-repro yet."
+        "otherwise. Not supported with --emit-repro (run them separately); --mode reachability reports the static verdict only."
     ),
 )
 @click.option(
@@ -4347,9 +4361,10 @@ def verify(
     read any row? `--mode cross-tenant`: can a session authenticated as one
     tenant read a **different** tenant's row (against the policy's
     `<column> = <session identity>` scoping equality)? `--mode write`: can such
-    a session **write** (INSERT/UPDATE) a row stamped for another tenant —
-    proven over each write policy's effective `WITH CHECK` (or the `USING` that
-    `FOR UPDATE`/`FOR ALL` reuses as the new-row check)? Three honest verdicts:
+    a session **write** (INSERT/UPDATE/DELETE) a row of another tenant — proven
+    over BOTH gates of each write policy: the new-row gate (`WITH CHECK`, or the
+    `USING` that `FOR UPDATE`/`FOR ALL` reuses) and the old-row gate (`USING`,
+    for `UPDATE`/`DELETE`/`ALL`)? Three honest verdicts:
     `PROVEN` (the property is unsatisfiable under the threat model), `LEAK` (it
     *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
@@ -4357,7 +4372,7 @@ def verify(
     here the verifier degrades to the linter, run `pgrls lint` — for write, the
     SEC006/SEC020/SEC028/SEC040 write-check rules).
 
-    The two modes are complementary: the inverted `auth.uid() IS NULL OR …`
+    The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
     (heuristic findings) this is a soundness proof: it never reports a leak it
     cannot exhibit, and never reports isolated unless Z3 proves it. Exits

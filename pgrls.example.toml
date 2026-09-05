@@ -87,8 +87,9 @@ allowlist = []
 
 [lint.rules.SEC004]
 # Functions whose `IS NULL` in a top-level OR disjunct triggers SEC004.
-# Defaults: auth.uid, auth.role, auth.jwt, current_user, session_user,
-# current_setting. Override with a list to add or replace.
+# Defaults: auth.uid, auth.role, auth.jwt, current_setting. (current_user /
+# session_user are never NULL — SEC018 covers them.) Override with a list to
+# add or replace.
 # auth_functions = ["auth.uid", "current_setting", "my.custom_auth"]
 
 [lint.rules.SEC005]
@@ -394,3 +395,11 @@ allowlist = []
 # are fully-qualified policy IDs of the form
 # "schema.table.policy_name".
 allowlist = []
+
+[generate]
+# `pgrls generate --strict-binding` as a standing default. The generated
+# tenant policies then compare against a helper that RAISES when no tenant
+# is bound on the connection, instead of a `current_setting(..., true)` that
+# silently returns NULL and makes an unbound query look like an empty result.
+# SEC055 flags any tenant policy left on the silent form once adopted.
+strict_binding = false

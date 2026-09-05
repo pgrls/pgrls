@@ -27,13 +27,14 @@ privilege escalation:
 
 The hazard class is different from SEC033 / SEC036 (which are
 CVE-class privilege escalation): SEC034 is silent denial-of-
-service-to-self. Severity is `warning` — surfaced for review,
-doesn't fail CI by default the way SEC033 / SEC036 do.
+service-to-self. Severity is `warning` — it still fails CI under the default
+`fail_on = "warning"` threshold; run with `--fail-on error` to let it pass
+while you review.
 
 The canonical fix is to scope by `auth.uid()` (immutable per
 user, normalized, case-insensitive) and treat email as a display
 field. If the policy needs an email lookup, do it via
-`(SELECT id FROM auth.users WHERE id = auth.uid())` and key
+`(SELECT email FROM auth.users WHERE id = auth.uid())` and key
 downstream tables off the resolved `uid`.
 
 Detection: walks policy USING / WITH CHECK ASTs for FuncCall
