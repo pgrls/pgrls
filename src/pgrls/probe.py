@@ -49,7 +49,7 @@ from pgrls.diff._z3_compare import (
     cross_tenant_session_identity,
 )
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import Column, Policy, Schema, Table
+from pgrls.model import MAYBE_SET, Column, Policy, Schema, Table
 from pgrls.repro import (
     _AUTH_IDENTITY_GUC,
     _current_setting_guc,
@@ -417,10 +417,19 @@ def _probe_one(
         tv.proofs[0],
     )
     policy = next((p for p in table.policies if p.name == proof.policy), None)
-    if policy is None:  # pragma: no cover - proof always names a real policy
+    if policy is None:
+        # `anon` mode emits a `role:<name>` proof when the anonymous session is
+        # exempt from the table's RLS outright — there is no policy to pivot
+        # on, because the policies are never consulted.
+        reason = (
+            "the anonymous session is exempt from this table's RLS — no policy "
+            "to probe; see verify --mode escalation"
+            if proof.policy.startswith("role:")
+            else "internal: proof references an unknown policy"
+        )
         return ProbeResult(
             tv.qualified_name, proof.policy, mode, tv.verdict, "abstained",
-            "abstained", "internal: proof references an unknown policy", None,
+            "abstained", reason, None,
         )
 
     policy_ast = checked_ast(policy, mode)
@@ -656,7 +665,7 @@ def _observe_anon_sessions(
         inherited[n] = (got[0] if got and got[0] is not None else "")
     for state in guc_states or ({},):
         for n in names:
-            if n in state and state[n] is None:
+            if n in state and state[n] in (None, MAYBE_SET):
                 # Set at server level with a value introspection could not
                 # capture: restore what this session actually inherits.
                 value = inherited[n]

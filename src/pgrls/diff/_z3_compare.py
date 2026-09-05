@@ -134,6 +134,8 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+import math
+
 from collections.abc import Mapping, Sequence
 
 from dataclasses import dataclass
@@ -146,6 +148,8 @@ try:
 except ImportError:  # pragma: no cover — exercised by the no-z3 install path
     Z3_AVAILABLE = False
     z3 = None  # noqa: F811  # rebind to None when import failed
+
+from pgrls.model import MAYBE_SET
 
 from pglast.ast import (
     A_ArrayExpr,
@@ -695,6 +699,14 @@ def _type_cast_to_z3(node: TypeCast, ctx: _Context) -> Any:
     # opaque under the target sort so identical casts on both sides
     # collapse to the same Z3 variable.
     return _opaque_expression(node, ctx, sort=target_sort)
+
+
+def _typename_last_segment(typename: Any) -> str | None:
+    """The bare type name of a pglast ``TypeName`` (`int4`, `numeric`), or
+    None — used to range-check an integer fold against the RIGHT width."""
+    segments = getattr(typename, "names", None) or ()
+    last = segments[-1] if segments else None
+    return last.sval.lower() if isinstance(last, String) else None
 
 
 def _typename_segments_to_sort(typename: Any) -> Any:
@@ -1483,6 +1495,27 @@ def _anon_3vl(
         and ctx.set_gucs
         and isinstance(node, FuncCall)
         and _is_builtin_current_setting_call(node)
+        and ctx.set_gucs.get((_first_string_arg(node) or "").lower()) == MAYBE_SET
+    ):
+        # Readable by the introspecting session, but not attributable to the
+        # SERVER — it may be that connection's own option (`PGOPTIONS`), which
+        # an anonymous caller would not have. Keep BOTH the value and the
+        # null-flag free: `col = current_setting('x')` stays a leak (safe),
+        # while `current_setting('x', true) IS NULL` stays undecided instead
+        # of being proven dead from evidence we do not have.
+        return _Val(
+            value=ctx.opaque(_canon(node), z3.StringSort()),
+            is_null=(
+                z3.BoolVal(False)
+                if is_never_null_current_setting(node)
+                else ctx.null_flag(_canon(node))
+            ),
+        )
+    if (
+        not ctx.session_mode
+        and ctx.set_gucs
+        and isinstance(node, FuncCall)
+        and _is_builtin_current_setting_call(node)
         and (_first_string_arg(node) or "").lower() in ctx.set_gucs
     ):
         # A dotted GUC the anonymous session inherits already SET (database /
@@ -1940,31 +1973,53 @@ _PG_TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
 _PG_FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
 
 
-def _fold_literal_cast(value: Any, target_sort: Any) -> Any:
+# The value range each integer type accepts, so a fold never invents a row
+# Postgres could not hold. `'99999999999999999999'::int` RAISES — Python's
+# unbounded `int()` happily produced it, and the witness named a row the
+# INSERT in the emitted reproduction then rejected with "integer out of
+# range": a leak the tool could not exhibit.
+_INT_RANGES: dict[str, tuple[int, int]] = {
+    "int2": (-(2**15), 2**15 - 1),
+    "smallint": (-(2**15), 2**15 - 1),
+    "int": (-(2**31), 2**31 - 1),
+    "int4": (-(2**31), 2**31 - 1),
+    "integer": (-(2**31), 2**31 - 1),
+    "int8": (-(2**63), 2**63 - 1),
+    "bigint": (-(2**63), 2**63 - 1),
+    "oid": (0, 2**32 - 1),
+}
+
+
+def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> Any:
     """`'<literal>'::<type>` as a Z3 constant of `target_sort`, else None.
 
     Only folds a String constant the encoder already knows exactly — a
-    captured GUC value or a policy literal. A text that Postgres could not
-    cast (`'abc'::int` raises, so the statement errors and the caller gets no
-    rows) returns None and stays opaque: declining to decide is the safe
-    direction, and modelling the raise as "isolated" is not this function's
-    job.
+    captured GUC value or a policy literal — and only when Postgres would
+    accept it: in range for the integer type, and finite for a float
+    (`'Infinity'` and `'NaN'` are valid PG values that `z3.RealVal` cannot
+    parse, and the resulting `Z3Exception` crashed the whole command).
+    Anything else returns None and stays opaque: declining to decide is the
+    safe direction, and modelling the raise as "isolated" is not this
+    function's job.
     """
     if not z3.is_string_value(value):
         return None
     text = value.as_string()
     try:
         if target_sort == z3.IntSort():
-            return z3.IntVal(int(text))
+            number = int(text)
+            low, high = _INT_RANGES.get(type_name or "", _INT_RANGES["int8"])
+            return z3.IntVal(number) if low <= number <= high else None
         if target_sort == z3.RealSort():
-            return z3.RealVal(float(text))
-    except ValueError:
+            real = float(text)
+            return z3.RealVal(real) if math.isfinite(real) else None
+    except (ValueError, OverflowError, z3.Z3Exception):
         return None
     if target_sort == z3.BoolSort():
-        low = text.strip().lower()
-        if low in _PG_TRUE:
+        low_text = text.strip().lower()
+        if low_text in _PG_TRUE:
             return z3.BoolVal(True)
-        if low in _PG_FALSE:
+        if low_text in _PG_FALSE:
             return z3.BoolVal(False)
     return None
 
@@ -2023,7 +2078,9 @@ def _anon_typecast(
             value=ctx.session_var(_canon(node), target_sort),
             is_null=inner.is_null,
         )
-    folded = _fold_literal_cast(inner.value, target_sort)
+    folded = _fold_literal_cast(
+        inner.value, target_sort, _typename_last_segment(node.typeName)
+    )
     if folded is not None:
         # A captured GUC value cast to the column's type is exactly that
         # constant — `col = current_setting('app.n')::int` with `app.n` set to

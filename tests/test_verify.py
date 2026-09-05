@@ -3597,3 +3597,93 @@ def test_reachability_matview_hop_walks_nested_views() -> None:
     verdict, note = _rv(schema)[("public.t", "public.v")]
     assert verdict == "unverified"
     assert "materialized view" in note
+
+
+def test_anon_owner_equivalent_session_is_a_leak_regardless_of_the_predicate() -> None:
+    """If the anon role holds the table owner's privileges and the table is not
+    FORCE'd, Postgres never consults the policies — measured: a live anon login
+    read every row while this mode reported PROVEN. FORCE and a NOINHERIT
+    membership are the two controls that must stay isolated."""
+    import dataclasses
+
+    from pgrls.model import RoleMembership, Schema
+
+    t = _rv_table("t", "tbl_owner")
+    member = (RoleMembership(member="anon", role="tbl_owner"),)
+    leaky = Schema(tables=(t,), role_memberships=member)
+    assert _verdict(build_verification(leaky, mode="anon"), "public.t") == "leak"
+
+    forced = Schema(
+        tables=(dataclasses.replace(t, force_rls=True),), role_memberships=member
+    )
+    assert _verdict(build_verification(forced, mode="anon"), "public.t") == "isolated"
+
+    noinherit = Schema(
+        tables=(t,),
+        role_memberships=(RoleMembership(member="anon", role="tbl_owner", inherit=False),),
+    )
+    assert _verdict(build_verification(noinherit, mode="anon"), "public.t") == "isolated"
+
+
+def test_anon_exemption_applies_to_a_table_with_no_policies_at_all() -> None:
+    """RLS on with no policies is default-deny for everyone EXCEPT an exempt
+    role, which still reads the whole table — so the check runs ahead of the
+    no-permissive-policy shortcut."""
+    from pgrls.model import RoleMembership, Schema, Table
+
+    t = Table(schema="public", name="t", rls_enabled=True, force_rls=False,
+              columns=("id",), owner="tbl_owner", policies=())
+    schema = Schema(
+        tables=(t,), role_memberships=(RoleMembership(member="anon", role="tbl_owner"),)
+    )
+    assert _verdict(build_verification(schema, mode="anon"), "public.t") == "leak"
+
+
+def test_reachability_column_only_grant_does_not_cede_to_anon_mode() -> None:
+    """A column-level grant opens a view but does not make the direct read
+    equivalent: measured, the secret column is `permission denied` directly
+    while the definer view hands it over. Ceding on it cleared the only door."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import ColumnGrant, Grant, Policy, Schema, Table
+
+    wide_open = Policy(
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
+        using_sql="true", with_check_sql=None,
+        using_ast=parse_expr("true"), with_check_ast=None,
+    )
+    t = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        columns=("id", "secret"), owner="tbl_owner", policies=(wide_open,),
+        column_grants=(ColumnGrant(role="anon", column="id", privileges=("SELECT",)),),
+    )
+    v = _rv_view("v", "byp", (("public", "t"),), bypass=True,
+                 grants=(Grant(role="anon", privileges=("SELECT",)),))
+    import dataclasses
+
+    t_readable = dataclasses.replace(
+        t, grants=(Grant(role="byp", privileges=("SELECT",)),)
+    )
+    assert _rv(Schema(tables=(t_readable,), views=(v,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "leak"
+
+
+def test_reachability_anon_pg_read_all_data_opens_an_ungranted_view() -> None:
+    """A view with no grants at all is still open to an anon role holding
+    `pg_read_all_data` (measured: 2 rows through a view whose relacl is NULL),
+    so anon-selectability cannot be decided from grants alone."""
+    import dataclasses
+
+    from pgrls.model import Grant, RoleMembership, Schema
+
+    t = dataclasses.replace(
+        _rv_table("t", "tbl_owner", force=True),
+        grants=(Grant(role="byp", privileges=("SELECT",)),),
+    )
+    v = _rv_view("v", "byp", (("public", "t"),), bypass=True, anon_grant=False)
+    assert _rv(Schema(tables=(t,), views=(v,), role_memberships=())) == {}
+    reader = Schema(
+        tables=(t,), views=(v,),
+        role_memberships=(RoleMembership(member="anon", role="pg_read_all_data"),),
+    )
+    assert _rv(reader)[("public.t", "public.v")][0] == "leak"

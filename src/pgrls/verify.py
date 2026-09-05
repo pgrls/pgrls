@@ -351,7 +351,10 @@ class Verification:
         counts = {"isolated": 0, "leak": 0, "unverified": 0}
         for t in self.tables:
             counts[t.verdict] += 1
-        return {"tables": len(self.tables), **counts}
+        # `reachability` appends one verdict per (view, table) DOOR, so one
+        # table behind three views is three entries — counting them as tables
+        # printed "3 RLS tables" for a schema with one.
+        return {"tables": len({t.qualified_name for t in self.tables}), **counts}
 
 
 @dataclass(frozen=True)
@@ -657,6 +660,32 @@ def build_verification(
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         if not table.rls_enabled:
             continue  # not an isolation claim — SEC001's domain, not verify's
+        # Before reading a single predicate: is the anonymous session exempt
+        # from this table's RLS altogether? If the anon role holds BYPASSRLS,
+        # or holds the table owner's privileges on a table that is not
+        # FORCE'd, Postgres never consults the policies — so no predicate,
+        # however well scoped, isolates anything. Measured on PG16: with
+        # `GRANT plainowner TO anon` a live anon login read every row while
+        # this mode reported PROVEN. Checked ahead of the no-permissive-policy
+        # branch, because a table with RLS on and NO policies is default-deny
+        # for everyone EXCEPT an exempt role, which still reads all of it.
+        if mode == "anon" and _anon_session_exempt(
+            schema, table, resolved_anon_roles
+        ):
+            exempt_by = ", ".join(sorted(resolved_anon_roles - {"PUBLIC"}))
+            tables.append(
+                TableVerdict(
+                    table.qualified_name,
+                    "leak",
+                    "the anonymous session is exempt from this table's RLS "
+                    f"({exempt_by} holds BYPASSRLS, or the privileges of owner "
+                    f"{table.owner} on a table without FORCE ROW LEVEL "
+                    "SECURITY) — the policies are never consulted; see "
+                    "verify --mode escalation and SEC048",
+                    (PolicyProof(f"role:{exempt_by}", "leak", {}, None),),
+                )
+            )
+            continue
         relevant = [p for p in table.policies if p.command in commands]
         permissive = [p for p in relevant if p.permissive]
         restrictives = [p for p in relevant if not p.permissive]
@@ -931,6 +960,78 @@ def build_escalation(
     return Verification(tuple(tables), "escalation")
 
 
+def _anon_priv_closure(schema: Schema, anon_roles: set[str]) -> frozenset[str] | None:
+    """The roles whose PRIVILEGES an anonymous session holds.
+
+    Distinct from `_anon_reachable_roles`, which is the upward closure over
+    every membership edge and answers "which policies apply". Privileges flow
+    only along INHERIT edges (`has_privs_of_role`), so a `NOINHERIT` member
+    holds none of the granted role's rights — measured: `GRANT readers TO anon
+    WITH INHERIT FALSE` left a direct read `permission denied` while the
+    upward closure said anon could read. `None` when the graph is not captured.
+    """
+    if schema.role_memberships is None:
+        return None
+    closure: set[str] = set()
+    for role in anon_roles:
+        if role.upper() == "PUBLIC":
+            continue
+        one = _inherit_closure(schema, role)
+        if one is None:  # pragma: no cover - guarded above
+            return None
+        closure |= one
+    return frozenset(closure)
+
+
+def _anon_holds_select(
+    schema: Schema, rel: Any, anon_roles: set[str], *, table_level_only: bool = False
+) -> bool:
+    """Can the anonymous session `SELECT` from `rel` on its own privileges?
+
+    Ownership, `pg_read_all_data` and an INHERIT-inherited grant all confer
+    read with no direct grant of their own. `table_level_only` asks the
+    stronger question the reachability cede needs — whether the WHOLE row is
+    readable — since a column-level `GRANT SELECT (id)` opens a view without
+    exposing the secret column a definer view hands over.
+    """
+    grantees = {g.role for g in rel.grants if "SELECT" in g.privileges}
+    if not table_level_only:
+        grantees |= {
+            cg.role
+            for cg in getattr(rel, "column_grants", ())
+            if "SELECT" in cg.privileges
+        }
+    if "PUBLIC" in grantees or grantees & anon_roles:
+        return True
+    closure = _anon_priv_closure(schema, anon_roles)
+    if closure is None:
+        return bool(grantees & anon_roles)
+    if getattr(rel, "owner", None) and rel.owner in closure:
+        return True
+    if "pg_read_all_data" in closure:
+        return True
+    return bool(grantees & closure)
+
+
+def _anon_session_exempt(schema: Schema, table: Any, anon_roles: set[str]) -> bool:
+    """Is the anonymous session itself exempt from `table`'s RLS?
+
+    The predicate is not the whole story: if the anon role holds BYPASSRLS, or
+    holds the table owner's privileges on a table that is not `FORCE`'d,
+    Postgres skips the policies entirely. Measured on PG16: with `GRANT
+    plainowner TO anon` the policies were never consulted and a live anon login
+    read every row while the prover reported PROVEN; `FORCE` cut it to zero,
+    and `WITH INHERIT FALSE` made it `permission denied`.
+    """
+    bypass = {r.name for r in schema.bypassrls_roles}
+    if bypass & anon_roles:
+        return True
+    if table.force_rls or not table.owner:
+        return False
+    closure = _anon_priv_closure(schema, anon_roles)
+    return closure is not None and table.owner in closure
+
+
 def _relation_is_anon_selectable(
     schema: Schema, rel: Any, anon_roles: set[str]
 ) -> bool:
@@ -945,10 +1046,16 @@ def _relation_is_anon_selectable(
     reachable, _ = _anon_reachable_roles(schema, anon_roles)
     if any(g.role in reachable and "SELECT" in g.privileges for g in rel.grants):
         return True
-    return any(
+    if any(
         cg.role in reachable and "SELECT" in cg.privileges
         for cg in getattr(rel, "column_grants", ())
-    )
+    ):
+        return True
+    # Grants are not the only way in: owning the relation, holding its owner's
+    # privileges, or `pg_read_all_data` all open it with no ACL at all
+    # (measured: a view with a NULL `relacl` read every row for an anon role
+    # holding `pg_read_all_data`, while every verify mode reported clean).
+    return _anon_holds_select(schema, rel, anon_roles)
 
 
 def build_reachability(
@@ -1137,15 +1244,22 @@ def build_reachability(
                 (p for p in (anv.proofs if anv else ()) if p.verdict == "leak"),
                 None,
             )
-            # …but only if anon can actually open the table. `--mode anon`
-            # proves the PREDICATE admits rows; it never checks the grant. A
-            # table with `USING (true)` and no grant to anon is `permission
-            # denied` directly (measured) while the definer view over it
-            # returns every row — so ceding here cleared the only real door.
+            # …but only if anon can actually read the WHOLE table. `--mode
+            # anon` proves the PREDICATE admits rows; it never checks
+            # privileges. A `USING (true)` table with no grant to anon is
+            # `permission denied` directly (measured) while the definer view
+            # over it returns every row — so ceding here cleared the only real
+            # door. A column-level `GRANT SELECT (id)` is not enough either:
+            # the direct read of the secret column is still denied while the
+            # view hands it over. And the privilege closure must follow
+            # INHERIT edges only — a `NOINHERIT` member holds nothing
+            # (measured: `permission denied` on the direct read).
             if (
                 an_leak is not None
                 and an_leak.witness == {}
-                and _relation_is_anon_selectable(schema, table, resolved_anon_roles)
+                and _anon_holds_select(
+                    schema, table, resolved_anon_roles, table_level_only=True
+                )
             ):
                 proof = PolicyProof(outer.qualified_name, "isolated", None, None)
                 tables.append(
@@ -1174,12 +1288,20 @@ def build_reachability(
                 )
             else:
                 proof = PolicyProof(outer.qualified_name, "leak", {}, None)
+                # Two different reasons land here, and saying "including the
+                # rows the direct anon leak withholds" is false for the
+                # second: either the direct leak is partial, or it is total
+                # but anon cannot actually read the table.
+                direct = (
+                    "including the rows the direct anon leak withholds"
+                    if an_leak is None or an_leak.witness != {}
+                    else "while a direct read of the table is denied to anon"
+                )
                 tables.append(
                     TableVerdict(
                         table.qualified_name,
                         "leak",
-                        f"anon reads every row via {path} — including the rows "
-                        "the direct anon leak withholds",
+                        f"anon reads every row via {path} — {direct}",
                         (proof,),
                     )
                 )
@@ -1414,13 +1536,13 @@ def _reachability_paths(
                             "context, which is not modeled"))
                     continue
                 if readable is None:
-                    # Undecidable hop: report it rather than guess either way.
-                    for tref in (child.direct_references or child.references):
-                        t = tables_by_key.get(tref)
-                        if t is not None and t.rls_enabled:
-                            unverified(outer, t, child_hops, eff, (
-                                f"role-membership graph not captured; cannot decide whether "
-                                f"{eff.owner} can read {child.qualified_name}"))
+                    # Undecidable hop: report it rather than guess either way,
+                    # walking nested views for the same reason the matview
+                    # branch above does.
+                    for t in _rls_tables_beneath(child, tables_by_key, views_by_key):
+                        unverified(outer, t, child_hops, eff, (
+                            f"role-membership graph not captured; cannot decide whether "
+                            f"{eff.owner} can read {child.qualified_name}"))
                     continue
                 walk(child, eff, child_hops, outer, seen | {ref})
                 continue

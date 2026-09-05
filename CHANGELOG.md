@@ -27,6 +27,49 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **`verify --mode anon` proved isolation while a live anonymous login read
+  every row, because the anon role's own RLS exemption was never modelled.**
+  The prover reasoned only about the predicate. If the anonymous role holds
+  `BYPASSRLS`, or holds the table owner's privileges on a table that is not
+  `FORCE`'d, Postgres never consults the policies at all — measured on PG16:
+  with `GRANT plainowner TO anon` a real anon session read both tenants' rows
+  while the flagship default mode printed `PROVEN` and exited 0. The check now
+  runs ahead of the predicate work, including on tables with no policies at
+  all (RLS-on-with-no-policy is default-deny for everyone *except* an exempt
+  role). `FORCE` and a `NOINHERIT` membership both correctly stay proven
+  (measured: 0 rows and `permission denied`).
+- **A view an anonymous role can open through `pg_read_all_data`, ownership or
+  an inherited grant was invisible, so every mode reported clean.** Anon
+  selectability was decided from explicit grants alone; measured, a view whose
+  `relacl` is `NULL` returned every row to an anon role holding
+  `pg_read_all_data` while `anon`, `reachability` and `escalation` all exited
+  0. It now asks the same privilege question the view-owner check asks.
+- **The reachability cede accepted a column-only grant and a `NOINHERIT`
+  membership as "anon can already read the table".** Both are false: a
+  `GRANT SELECT (id)` leaves the secret column `permission denied` on a direct
+  read while the definer view hands it over, and a `NOINHERIT` member holds
+  none of the granted role's privileges (measured, both). The cede now
+  requires a table-level `SELECT` reachable through INHERIT edges only.
+- **A GUC the introspecting connection set for itself was recorded as
+  server-level, which could prove an `IS NULL` gate dead.** Recording a name as
+  definitely-set is stronger than the evidence when the value may have come
+  from `PGOPTIONS`; measured, `PGOPTIONS='-c app.gate=whatever' pgrls verify`
+  turned a real `LEAK` into `PROVEN` on the SEC004 inverted-gate shape. Such
+  names now carry a third state — readable, but not attributable to the server
+  — under which the prover keeps both the value and the null-flag free, so it
+  can decline but never conclude.
+- **`verify` crashed with an uncaught Z3 parser error on `Infinity` / `NaN`,
+  and folded out-of-range integers into a leak it could not exhibit.**
+  `'Infinity'::float8` is a valid Postgres value that `z3.RealVal` cannot
+  parse, and Python's unbounded `int()` accepted `'99999999999999999999'` for
+  an `int4` column — the witness then named a row whose `INSERT` the emitted
+  reproduction rejected with "integer out of range". Folds are now range-
+  checked against the actual integer width and rejected for non-finite floats.
+- `--mode reachability` counted one table behind three views as three tables in
+  its summary; an undecidable hop enumerated only direct table references, so a
+  nested view beneath it produced no verdict; and a door reported over a table
+  anon cannot read said "including the rows the direct anon leak withholds",
+  which contradicts the anon verdict it composes with.
 - **A custom GUC set on the postmaster command line was invisible, so the
   prover claimed PROVEN.** `postgres -c app.x=v` — the docker-compose
   `command:` / Kubernetes `args:` idiom — appears in neither `pg_settings` nor

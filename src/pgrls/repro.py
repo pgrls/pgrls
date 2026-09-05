@@ -40,7 +40,7 @@ from pglast.ast import A_Const, A_Expr, ColumnRef, FuncCall, Node, String, TypeC
 from pgrls.ast_utils import func_name_parts
 from pgrls.diff._z3_compare import cross_tenant_session_identity
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import Column, Policy, Schema, Table
+from pgrls.model import MAYBE_SET, Column, Policy, Schema, Table
 from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, Verification
 
 # auth.* stubs so a Supabase-style policy is creatable in a throwaway database;
@@ -560,7 +560,7 @@ def _build_statements(
         )
         setup.append("-- needs them, and a throwaway database has none.")
         for name, value in sorted(gucs.items()):
-            if value is None:
+            if value in (None, MAYBE_SET):
                 setup.append(
                     f"-- NOTE: {name} is set on the server but its value was not"
                 )
@@ -570,7 +570,7 @@ def _build_statements(
                 setup.append("-- substitute the value your server uses.")
             setup.append(
                 f"SELECT set_config({_sql_str(name)}, "
-                f"{_sql_str(_UNCAPTURED_GUC if value is None else value)}, true);"
+                f"{_sql_str(_UNCAPTURED_GUC if value in (None, MAYBE_SET) else str(value))}, true);"
             )
     setup.append("SELECT set_config('request.jwt.claim.sub', '', true);")
     if not anon_key:

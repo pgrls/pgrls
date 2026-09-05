@@ -98,3 +98,46 @@ def test_anon_guc_states_are_checked_per_login_path() -> None:
         prove_anon_isolation(parse_expr(sql), set_gucs=[{}, {"app.tenant_id": "shared"}])[0]
         == "leak"
     )
+
+
+def test_cast_fold_refuses_values_postgres_would_reject() -> None:
+    """The fold must not invent a row Postgres cannot hold. `'999…'::int`
+    RAISES, so a witness naming it is a leak the tool cannot exhibit — and the
+    emitted reproduction's INSERT failed with "integer out of range".
+    `Infinity` / `NaN` are valid PG floats that z3.RealVal cannot parse; the
+    resulting Z3Exception crashed the whole command."""
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
+    in_range = prove_anon_isolation(
+        parse_expr("id = current_setting('app.n')::int"), set_gucs={"app.n": "1"}
+    )
+    assert in_range == ("leak", {"id": 1})
+    for value, sql in [
+        ("99999999999999999999", "id = current_setting('app.n')::int"),
+        ("40000", "id = current_setting('app.n')::smallint"),
+    ]:
+        verdict, witness = prove_anon_isolation(parse_expr(sql), set_gucs={"app.n": value})
+        assert (verdict, witness) == ("leak", None), (sql, value)
+    # No crash, and no fabricated constant.
+    assert prove_anon_isolation(parse_expr("score < 'Infinity'::float8"))[0] == "leak"
+    assert prove_anon_isolation(
+        parse_expr("score > current_setting('app.t')::numeric"), set_gucs={"app.t": "NaN"}
+    )[0] == "leak"
+
+
+def test_a_guc_we_cannot_attribute_to_the_server_stays_undecided() -> None:
+    """A GUC the introspecting session can read may be its own connection's
+    option (`PGOPTIONS`), which an anonymous caller would not have. Recording
+    it as definitely set proved `current_setting(x, true) IS NULL` dead — the
+    SEC004 inverted-gate shape — and flipped a real LEAK to PROVEN."""
+    from pgrls.diff._z3_compare import prove_anon_isolation
+    from pgrls.model import MAYBE_SET
+
+    gate = parse_expr("current_setting('app.gate', true) IS NULL")
+    assert prove_anon_isolation(gate)[0] == "leak"                       # unset
+    assert prove_anon_isolation(gate, set_gucs={"app.gate": "v"})[0] == "isolated"
+    assert prove_anon_isolation(gate, set_gucs={"app.gate": MAYBE_SET})[0] == "leak"
+    # The safe direction is preserved for the scoping shape too.
+    scoped = parse_expr("tenant = current_setting('app.t')")
+    assert prove_anon_isolation(scoped)[0] == "isolated"
+    assert prove_anon_isolation(scoped, set_gucs={"app.t": MAYBE_SET})[0] == "leak"

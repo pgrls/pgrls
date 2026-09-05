@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 
 from pgrls.ast_utils import find_func_calls, parse_expr
 from pgrls.model import (
+    MAYBE_SET,
     BypassRlsEscalation,
     BypassRlsRole,
     Column,
@@ -1334,10 +1335,11 @@ def _fetch_set_gucs(
             db_level.setdefault(r["name"], r["setting"])
     # Then ask the session itself, ALWAYS — not only when the view was
     # unreadable: a GUC given on the postmaster command line is in no catalog
-    # at all (measured on PG16). Only names no catalog explained are added,
-    # and only as "set, value not captured", since this session's value may
-    # be its own role's and is not attributable to an anonymous caller. That
-    # can withhold a proof; it can never manufacture one.
+    # at all (measured on PG16). Names no catalog explained are recorded
+    # `MAYBE_SET`: this session can read them, but the value could equally
+    # come from its own connection options (`PGOPTIONS`), so an anonymous
+    # caller may not have them at all. Recording them as definitely-set would
+    # be stronger than the evidence and could prove an `IS NULL` gate dead.
     cur.execute("SELECT session_user AS me")
     me = cur.fetchone()["me"]
     own = {name for role, name, _v in role_level if role == me}
@@ -1348,7 +1350,7 @@ def _fetch_set_gucs(
         cur.execute("SELECT current_setting(%s, true) AS v", (name,))
         got = cur.fetchone()
         if got is not None and got["v"] not in (None, ""):
-            db_level[name] = None
+            db_level[name] = MAYBE_SET
     return tuple(sorted(db_level.items())), tuple(sorted(role_level))
 
 

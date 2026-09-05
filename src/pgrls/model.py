@@ -52,6 +52,18 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
+# A `Schema.set_gucs` value meaning "this session can read the GUC, but we
+# cannot attribute it to the SERVER rather than to the introspecting role".
+# A GUC value can never contain a NUL byte, so this cannot collide with a real
+# one. The distinction is load-bearing: recording such a name as definitely
+# set is STRONGER than leaving it unknown, and would prove
+# `current_setting('x', true) IS NULL` false — the SEC004 inverted-gate shape
+# — from a value an anonymous caller may not have at all (measured:
+# `PGOPTIONS='-c app.gate=whatever' pgrls verify` flipped a real LEAK to
+# PROVEN). Under this value the prover keeps both the value AND the null-flag
+# free, so it can decline but never conclude.
+MAYBE_SET = "\x00pgrls:maybe-set"
+
 SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit); v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT

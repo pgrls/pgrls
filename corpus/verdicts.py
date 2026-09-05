@@ -925,6 +925,118 @@ GRANT SELECT ON docs_v TO anon;
             "Inheriting the outer owner reported a leak we cannot exhibit."
         ),
     ),
+
+    # ---- review pass 5: the anon session's OWN privileges
+    VerdictCase(
+        name="anon_owner_equivalent_means_policies_never_run",
+        mode="anon",
+        sql="""
+GRANT corpus_owner TO anon;
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, tenant text NOT NULL);
+INSERT INTO docs VALUES (1, 'a'), (2, 'b');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC
+    USING (tenant = current_setting('app.tenant', true));
+RESET ROLE;
+""",
+        expect=(("public.docs", "leak"),),
+        note=(
+            "anon holds the table owner's privileges and the table is not "
+            "FORCE'd, so Postgres never consults the policies — measured: a "
+            "live anon login read every row while the prover reported PROVEN. "
+            "The predicate is irrelevant here."
+        ),
+    ),
+    VerdictCase(
+        name="anon_owner_equivalent_under_force_is_isolated",
+        mode="anon",
+        sql="""
+GRANT corpus_owner TO anon;
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, tenant text NOT NULL);
+INSERT INTO docs VALUES (1, 'a'), (2, 'b');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC
+    USING (tenant = current_setting('app.tenant', true));
+RESET ROLE;
+""",
+        expect=(("public.docs", "isolated"),),
+        note=(
+            "The control for the case above: FORCE binds the owner too, so the "
+            "policy runs and a live anon login reads 0 rows (measured). The "
+            "exemption check must not fire here."
+        ),
+    ),
+    VerdictCase(
+        name="anon_noinherit_membership_is_not_owner_equivalent",
+        mode="anon",
+        sql="""
+GRANT corpus_owner TO anon WITH INHERIT FALSE;
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, tenant text NOT NULL);
+INSERT INTO docs VALUES (1, 'a'), (2, 'b');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC
+    USING (tenant = current_setting('app.tenant', true));
+RESET ROLE;
+""",
+        expect=(("public.docs", "isolated"),),
+        note=(
+            "Privileges flow only along INHERIT edges: a NOINHERIT member "
+            "holds none of the granted role's rights, and the live read is "
+            "`permission denied` (measured). Using the upward closure here "
+            "would have reported a leak that cannot happen."
+        ),
+    ),
+    VerdictCase(
+        name="reach_anon_pg_read_all_data_opens_an_ungranted_view",
+        mode="reachability",
+        sql=_SCOPED_TABLE + """
+RESET ROLE;
+GRANT pg_read_all_data TO anon;
+GRANT SELECT ON docs TO corpus_bypass;
+SET ROLE corpus_bypass;
+CREATE VIEW docs_v AS SELECT * FROM docs;
+RESET ROLE;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "The view carries NO grants at all (relacl NULL), but anon holds "
+            "`pg_read_all_data` and opens it anyway — measured: 2 rows. "
+            "Deciding anon-selectability from grants alone made every verify "
+            "mode report clean on a live bypass."
+        ),
+    ),
+    VerdictCase(
+        name="reach_column_only_grant_does_not_cede_to_anon_mode",
+        mode="reachability",
+        sql="""
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, secret text);
+INSERT INTO docs VALUES (1, 'nuclear-codes'), (2, 'launch-key');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC USING (true);
+GRANT SELECT (id) ON docs TO anon;
+RESET ROLE;
+GRANT SELECT ON docs TO corpus_bypass;
+SET ROLE corpus_bypass;
+CREATE VIEW docs_v AS SELECT * FROM docs;
+RESET ROLE;
+GRANT SELECT ON docs_v TO anon;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "A column-level grant opens a VIEW but does not make the direct "
+            "read equivalent: measured, `SELECT secret FROM docs` is "
+            "`permission denied` for anon while the view hands both rows over. "
+            "Ceding to `--mode anon` on a column grant cleared the only door."
+        ),
+    ),
 ]
 
 
