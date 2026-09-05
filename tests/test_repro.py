@@ -955,3 +955,29 @@ def test_write_repro_is_sound_live(pg_url: str) -> None:
     assert _run_write_insert(pg_url, fixed) is False, (
         "fixed write policy admitted the tenant-B INSERT — the repro is unsound"
     )
+
+
+def test_anon_repro_sets_the_anon_key_claims_when_only_that_session_leaks() -> None:
+    """`USING (auth.role() = 'anon')` leaks only for a Supabase anon-key caller.
+    A JWT-less script (role claim cleared) reads zero rows there and the
+    emitted pytest would FAIL while the leak exists — so the emitter re-asks
+    the prover which session leaks and sets that session's claims."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Policy, Table
+    from pgrls.repro import _build_statements
+
+    auth = {"auth.uid", "auth.role", "auth.jwt", "current_setting"}
+    table = Table(schema="public", name="docs", rls_enabled=True, force_rls=True, columns=("id",), policies=())
+
+    def stmts(sql: str) -> list[str]:
+        pol = Policy(name="p", command="SELECT", permissive=True, roles=("anon",),
+                     using_sql=sql, with_check_sql=None, using_ast=parse_expr(sql), with_check_ast=None)
+        return _build_statements(table, pol, {}, "repro_docs", auth)[0]
+
+    key_session = stmts("auth.role() = 'anon'")
+    assert any("set_config('request.jwt.claim.role', 'anon', true)" in s for s in key_session)
+    assert any('"role":"anon"' in s for s in key_session)
+
+    jwtless = stmts("auth.uid() IS NULL OR owner_id = auth.uid()")
+    assert any("set_config('request.jwt.claim.role', '', true)" in s for s in jwtless)
+    assert not any("'anon', true" in s for s in jwtless)

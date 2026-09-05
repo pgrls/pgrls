@@ -4216,6 +4216,25 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
     return None
 
 
+def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | None:
+    """`[lint.rules.SEC021].identity_columns`, for the cross-tenant axis gate.
+
+    The cross-tenant / write provers only accept an identity-named column as
+    the tenant axis (a `status = <session value>` equality proves nothing
+    about tenants). SEC021's option is the one place a project already names
+    its discriminator columns, so honour it here too; None → the default set.
+    """
+    try:
+        cfg = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+    cols = cfg.rule_options.get("SEC021", {}).get("identity_columns")
+    if not cols:
+        return None
+    return frozenset(str(c).lower() for c in cols)
+
+
+
 @main.command()
 @common_db_options
 @click.option(
@@ -4228,7 +4247,9 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
     show_default=True,
     help=(
         "Threat model to prove. 'anon': no row is readable by an "
-        "unauthenticated session. 'cross-tenant': no row of one tenant is "
+        "anonymous session — JWT-less (every auth function NULL) or Supabase "
+        "anon-key (auth.role() = 'anon', auth.jwt() non-null, auth.uid() "
+        "NULL); a leak under either is a leak. 'cross-tenant': no row of one tenant is "
         "readable by a session authenticated as a different tenant (verifies "
         "the `<column> = <session identity>` scoping equality). 'write': no "
         "such session can WRITE (INSERT/UPDATE/DELETE) a row of another tenant "
@@ -4241,10 +4262,13 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "table's RLS provably isolates tenants (so the bypass defeats real "
         "isolation), PROVEN when it does not. 'reachability': prove no "
         "anon-selectable VIEW hands back the rows a table's own policies "
-        "withhold — a `security_invoker = false` view executes as its owner, "
-        "so one owned by an RLS-exempt role (it owns the table and the table "
-        "is not FORCE'd, or it holds BYPASSRLS) returns every row to anon "
-        "while 'anon' mode correctly reports the table itself isolated."
+        "withhold — a `security_invoker = false` view executes as its owner "
+        "(the nearest such view on a view→view→table path sets the effective "
+        "user), so a path whose effective owner is RLS-exempt — "
+        "superuser/BYPASSRLS, or the table owner or an INHERIT member of it "
+        "when the table is not FORCE'd — returns every row to anon while "
+        "'anon' mode correctly reports the table itself isolated; UNVERIFIED "
+        "when the role-membership graph is unavailable."
     ),
 )
 @click.option(
@@ -4292,7 +4316,9 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "demonstrating the leak per --mode: reading the counterexample row back "
         "as an anonymous (anon) or different-tenant (cross-tenant) session, or "
         "(write) INSERTing a row stamped for another tenant and observing it "
-        "admitted. Not supported with --mode escalation (use --probe)."
+        "admitted. Not supported with --mode escalation (use --probe) or "
+        "--mode reachability (the leak is a view path; the DETAIL column names "
+        "the view to query)."
     ),
 )
 @click.option(
@@ -4319,7 +4345,7 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "leaks live to a reproduced leak. Exits non-zero on any mismatch or "
         "live-confirmed leak. Requires a live --database-url and a connection "
         "that can create a role (CREATEROLE / superuser); abstains cleanly "
-        "otherwise. Not supported with --emit-repro (run them separately); --mode reachability reports the static verdict only."
+        "otherwise. Not supported with --emit-repro (run them separately) or with --mode reachability (rejected; that mode reports the static verdict only)."
     ),
 )
 @click.option(
@@ -4357,8 +4383,9 @@ def verify(
 
     For every RLS-enabled table, `pgrls verify` *proves* a read-isolation
     property. `--mode anon` (default): can an **anonymous** session (every auth
-    function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — NULL)
-    read any row? `--mode cross-tenant`: can a session authenticated as one
+    function NULL — the JWT-less connection — *or* the Supabase anon-key
+    caller: `auth.role()` = 'anon', `auth.jwt()` non-null, `auth.uid()` NULL)
+    read any row? A leak under either session is a leak. `--mode cross-tenant`: can a session authenticated as one
     tenant read a **different** tenant's row (against the policy's
     `<column> = <session identity>` scoping equality)? `--mode write`: can such
     a session **write** (INSERT/UPDATE/DELETE) a row of another tenant — proven
@@ -4389,7 +4416,8 @@ def verify(
     stamped for tenant B and observing it admitted (rejected once the WITH CHECK
     is fixed). The proof, made reproducible (re-running won't clobber a
     hand-edited reproduction unless `--force`). Not supported with `--mode
-    escalation` (use `--probe`). See the README for scope.
+    escalation` (use `--probe`) or `--mode reachability` (the leak is a view
+    path — the DETAIL names the view to query). See the README for scope.
 
     `--probe` keeps the static proof honest by confirming it against the LIVE
     database: it connects as the threat-model session, seeds a throwaway row,
@@ -4409,6 +4437,7 @@ def verify(
     """
     if probe and emit_repro_dir is not None:
         raise click.UsageError("run --probe and --emit-repro separately")
+    identity_columns = _identity_columns_from_config(config_path)
     if mode == "escalation" and emit_repro_dir is not None:
         # The escalation bypass is a SET-ROLE role-reachability chain, not a
         # single policy predicate the emitter can template; --probe live-confirms
@@ -4457,7 +4486,7 @@ def verify(
             schemas_csv=schemas,
         ) as (_cfg, conn, schema):
             probe_anon_roles = _verify_anon_roles(mode, _cfg.rule_options)
-            verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=probe_anon_roles)  # type: ignore[arg-type]
+            verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=probe_anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
             probe_result = run_probe(
                 conn, schema, verification,
                 mode=mode,  # type: ignore[arg-type]
@@ -4511,7 +4540,7 @@ def verify(
     # (`anon`→SEC004, `escalation`→SEC042; default {anon, PUBLIC}).
     anon_roles = _verify_anon_roles(mode, cfg.rule_options)
 
-    verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
+    verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
 
     if against is not None:
         # Compose the head verdicts with a baseline schema and report only the
@@ -4527,7 +4556,7 @@ def verify(
         base_schema = reparse_policy_asts(
             _resolve_diff_source(against, schemas=schema_list)
         )
-        base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
+        base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
         delta = diff_verifications(base_verification, verification)
         if output_format == "sarif":
             # The gate is "no NEW leak", so introduced leaks become SARIF error

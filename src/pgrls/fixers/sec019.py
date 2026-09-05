@@ -10,8 +10,8 @@ two-argument form `current_setting(name, missing_ok)` returns
 NULL instead when `missing_ok` is true; in the typical `column =
 current_setting(...)` predicate that NULL simply matches no rows.
 
-The fixer rewrites each one-argument call to the two-argument
-form with `true`:
+The fixer rewrites each one-argument call outside a NULL-tolerant
+position (`_is_null_tolerant`) to the two-argument form with `true`:
 
     current_setting('app.tenant')        →  current_setting('app.tenant', true)
     pg_catalog.current_setting('app.x')  →  pg_catalog.current_setting('app.x', true)

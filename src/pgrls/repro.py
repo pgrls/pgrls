@@ -489,6 +489,21 @@ def _insert_row(setup: list[str], qtbl: str, row: list[tuple[str, str]]) -> None
     setup.append(_insert_stmt(qtbl, row))
 
 
+def _leaks_under_jwtless(policy: Policy, auth_functions: set[str]) -> bool:
+    """Does the JWT-less anonymous session alone exhibit the leak?
+
+    False means the leak is specific to the anon-key session (or the
+    predicate is unavailable), so the reproduction must set the role claim.
+    """
+    from pgrls.diff._z3_compare import _prove_anon_session  # noqa: PLC0415
+
+    ast = policy.using_ast
+    if ast is None:
+        return True
+    verdict, _ = _prove_anon_session(ast, set(auth_functions), anon_jwt=False)
+    return verdict == "leak"
+
+
 def _build_statements(
     table: Table,
     policy: Policy,
@@ -507,10 +522,26 @@ def _build_statements(
     row, unpinned, null_fallback = _row_columns(table, witness)
     _insert_row(setup, qtbl, row)
 
-    # Become an anonymous session: clear the JWT claim GUC (auth.* → NULL) and
-    # switch into the non-superuser runner so FORCE RLS + the policy decide
-    # visibility (not a privileged connection role).
+    # Become the anonymous session that exhibits the leak. The prover models
+    # two: the JWT-less connection (every auth function NULL) and the Supabase
+    # anon-key caller (`request.jwt.claims = {"role":"anon"}`, so `auth.role()`
+    # is 'anon'). A leak only the anon-key session shows — `USING (auth.role()
+    # = 'anon')` — would read ZERO rows under the JWT-less script, and the
+    # emitted pytest would fail while the leak exists. So re-ask the prover
+    # which session leaks and set that session's claims; then switch into the
+    # non-superuser runner so FORCE RLS + the policy decide visibility.
     setup.append("SELECT set_config('request.jwt.claim.sub', '', true);")
+    if _leaks_under_jwtless(policy, auth_functions):
+        setup.append("SELECT set_config('request.jwt.claim.role', '', true);")
+        setup.append("SELECT set_config('request.jwt.claims', '', true);")
+    else:
+        setup.append(
+            "-- anon-KEY session: this leak needs the role claim PostgREST sets"
+        )
+        setup.append("SELECT set_config('request.jwt.claim.role', 'anon', true);")
+        setup.append(
+            "SELECT set_config('request.jwt.claims', '{\"role\":\"anon\"}', true);"
+        )
     setup.append(f"SET LOCAL ROLE {quote_ident(runner)};")
 
     leak_query = f"SELECT * FROM {qtbl};"

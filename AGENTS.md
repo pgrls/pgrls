@@ -378,7 +378,10 @@ Currently fixable:
   than emit an empty `USING ()`.
 * **SEC019** — emits `ALTER POLICY <name> ON <schema>.<table>
   USING (…)` (and / or `WITH CHECK (…)`) adding `, true` as the
-  second argument to one-argument `current_setting()` calls.
+  second argument to one-argument `current_setting()` calls —
+  except under `IS [NOT] NULL` / `COALESCE` / `NULLIF` / `IS [NOT]
+  DISTINCT FROM` / `CASE` / `NOT`, where a returned NULL could
+  admit a row; those calls are left alone (never-broaden).
   The two-argument overload returns NULL on an unset GUC
   instead of erroring; the rewrite picks the quiet-NULL side
   matching the overload most policy sets converge on. Both
@@ -787,7 +790,8 @@ the output without blocking CI.
 | Command side-graded (narrow → different narrow, e.g. SELECT → INSERT) | BREAKING |
 | Roles widened (any role added, including PUBLIC) | DANGEROUS |
 | Roles narrowed (any role removed) | SAFE |
-| Roles set replaced disjointly | REQUIRES_REVIEW |
+| Roles set replaced disjointly (new set without PUBLIC) | REQUIRES_REVIEW |
+| Roles set replaced and the new set gains PUBLIC | DANGEROUS (`ROLES_WIDENED` — PUBLIC covers every role) |
 
 #### Policies — `USING` / `WITH CHECK` predicate changes
 

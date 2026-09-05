@@ -6,7 +6,9 @@ a concrete safety property and hands back a counterexample when it fails. Five
 complementary threat models (`--mode`):
 
 * ``anon`` (default) — for every RLS-protected table, can an *anonymous*
-  session (every auth function — auth.uid()/role()/jwt(), current_setting(...)
+  session read any row? Two anonymous sessions are modelled and a leak under
+  either is a leak: the JWT-less connection (every auth function —
+  auth.uid()/role()/jwt(), current_setting(...)
   — returning NULL, the unauthenticated state) read any row?
 * ``cross-tenant`` — can a session authenticated as *one* tenant read a
   *different* tenant's row? For the policy's own tenant-scoping equality
@@ -27,10 +29,13 @@ complementary threat models (`--mode`):
 * ``reachability`` — the modes above all prove things about a table's own
   policies. This one asks whether a **view** hands the rows back anyway: a
   ``security_invoker = false`` view executes as its owner, so an anon-selectable
-  one owned by an RLS-exempt role returns every row while ``anon`` correctly
-  reports the table isolated. Composes the ``anon`` verdict with view
-  reachability, the way ``escalation`` composes ``cross-tenant`` with owner
-  reachability.
+  path whose effective owner — the nearest enclosing definer view's owner on a
+  ``view → view → table`` chain — is RLS-exempt (superuser/BYPASSRLS, or the
+  table owner or an INHERIT member of it with RLS not FORCE'd) returns every
+  row while ``anon`` correctly reports the table isolated; ``unverified`` when
+  the role-membership graph is absent and the answer turns on membership.
+  Composes the ``anon`` verdict with view reachability, the way ``escalation``
+  composes ``cross-tenant`` with owner reachability.
 
 They are complementary: the inverted ``auth.uid() IS NULL OR …`` policy leaks
 to anon yet correctly scopes authenticated tenants — a ``leak`` in ``anon``,
@@ -83,7 +88,8 @@ from pgrls.formatters._common import safe_location
 from pgrls.formatters.sarif import format_sarif
 from pgrls.violations import Violation
 
-# The functions treated as NULL under an anonymous session (single source of
+# The auth-context functions the anon prover models — NULL in the JWT-less
+# session, `auth.role`/`auth.jwt` non-null in the anon-key session (single source of
 # truth — the SEC038 / 3VL encoder's default). `pgrls verify --auth-function`
 # extends this set with a project's own auth helper.
 DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset(_DEFAULT_AUTH_FUNCTIONS)
@@ -91,7 +97,8 @@ DEFAULT_AUTH_FUNCTIONS: frozenset[str] = frozenset(_DEFAULT_AUTH_FUNCTIONS)
 Verdict = Literal["isolated", "leak", "unverified"]
 
 # The threat models `pgrls verify` can prove. `anon` (default): can an
-# *unauthenticated* session read any row? `cross-tenant`: can a session
+# anonymous session — JWT-less, or the Supabase anon-key caller whose
+# `auth.role()` is 'anon' — read any row? `cross-tenant`: can a session
 # authenticated as one tenant read a *different* tenant's row? `write`: can such
 # a session *write* (INSERT/UPDATE/DELETE) another tenant's row? They are
 # complementary — the inverted `auth.uid() IS NULL OR …` policy leaks to anon
@@ -876,8 +883,10 @@ def build_reachability(
 
     * the view is ``SELECT``-grantable to an anon role (SEC052's gate) — the
       caller must be able to reach it at all; **and**
-    * ``security_invoker`` is false — an invoker view re-applies the *caller's*
-      RLS, and the live anon read was denied outright; **and**
+    * some view on the path is ``security_invoker = false`` — the nearest such
+      view to the table sets the effective RLS user; an all-invoker chain
+      re-applies the caller's RLS, and the live anon read was denied
+      outright; **and**
     * the effective RLS user's owner is exempt from the base table's RLS
       (`_effective_user_exempt`) — a view owned by an ordinary third role
       with a plain ``SELECT`` grant returned **zero** rows, and ``FORCE`` on

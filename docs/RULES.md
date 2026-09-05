@@ -1306,9 +1306,15 @@ shared pool role).
 
 ## SEC019 — Policy calls current_setting() without the missing_ok argument
 
-**Severity:** info. **Auto-fix:** yes — `pgrls fix` rewrites every one-argument
-`current_setting(name)` in `USING` / `WITH CHECK` to `current_setting(name,
-true)` and emits one `ALTER POLICY` re-stating only the clause(s) it changed.
+**Severity:** info. **Auto-fix:** yes — `pgrls fix` rewrites one-argument
+`current_setting(name)` calls in `USING` / `WITH CHECK` to `current_setting(name,
+true)` and emits one `ALTER POLICY` re-stating only the clause(s) it changed —
+except a call sitting under `IS [NOT] NULL`, `COALESCE`, `NULLIF`, `IS [NOT]
+DISTINCT FROM`, `CASE` or `NOT`, where a returned NULL could admit a row
+(`current_setting('app.t') IS NULL OR …` would go from an error to a TRUE
+disjunct — measured: an anonymous session read every row). Those are left
+alone and the finding stays open for review; sibling calls in safe positions
+are still fixed.
 The rewrite deliberately picks the quiet-empty-result side; allowlist the
 policy if raise-on-unset is intended. Only the *builtin* `current_setting`
 (bare or `pg_catalog.`-qualified) is inspected; a user-defined
@@ -3652,8 +3658,10 @@ captured policy data; no introspection or snapshot change.
 `bucket_id` column to be *declared in the SQL it is given*. In a Supabase
 project that table is extension-managed and usually absent from migrations
 (which carry only the `CREATE POLICY … ON storage.objects` statements), so an
-offline run sees no column list, and SEC050 abstains **without appearing in
-`skipped_rules`**. Live and snapshot runs always carry the column list. To
+offline run sees no column list, so SEC050 cannot give a per-policy verdict;
+it emits one `info` note on `storage.objects` saying so (the rule does not
+appear in `skipped_rules` — the note is the signal). Live and snapshot runs
+always carry the column list. To
 lint Storage policies offline, add a stub
 `CREATE TABLE storage.objects (id uuid, bucket_id text, name text, owner uuid);`
 to the input.

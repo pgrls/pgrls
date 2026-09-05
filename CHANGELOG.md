@@ -10,6 +10,17 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Snapshot v26** — adds `views[].direct_references` (the un-collapsed
+  table/view edges a view body reads directly), top-level `set_gucs` (dotted
+  GUC names set at database / role / server level), and top-level
+  `role_memberships` (present only when captured from a live database).
+  Additive and fail-closed: v3–v25 files still load; a missing
+  `direct_references` falls back to the collapsed `references`, a missing
+  `role_memberships` keeps the anon prover abstaining on non-anon roles. Re-
+  capture `--against` baselines to benefit — re-emitting an old file stamps
+  the new version without adding the graph.
+
 ### Fixed
 - **`verify --mode anon` proved "no anonymous read" on a policy that grants
   anon by role name.** The anon model was "every auth function is NULL" — a
@@ -22,7 +33,8 @@ breaking changes — they will be called out in this file.
   SEC037 flags only unknown names). The prover now models BOTH sessions and a
   leak under either is a leak; `= 'authenticated'` stays isolated, so nothing
   floods. `--probe` tries the anon-key session too, so it confirms the leak
-  instead of contradicting a correct verdict. Pinned in the verdict corpus.
+  instead of contradicting a correct verdict, and `--emit-repro` establishes
+  whichever anonymous session exhibits the leak. Pinned in the verdict corpus.
 - **`verify --mode reachability` was silent on two live-verified view
   bypasses.** (1) A view owned by an INHERIT *member* of the table owner is
   owner-equivalent (Postgres's `has_privs_of_role`) and reads every row; the
@@ -62,8 +74,10 @@ breaking changes — they will be called out in this file.
   value>` as the tenant axis.** `status = current_setting('app.status',
   true)` proved "no cross-tenant read" — `status != session.status` is UNSAT,
   which says nothing about tenants. The axis must now be an identity /
-  discriminator column (SEC021's default name set, `identity_columns`
-  overridable); otherwise the honest verdict is `unverified`.
+  discriminator column (SEC021's default name set — `tenant_id`, `user_id`,
+  `org_id`, `owner_id`, …; `[lint.rules.SEC021].identity_columns` is honoured
+  when a `--config` is given, and the `build_verification(identity_columns=…)`
+  Python kwarg overrides it); otherwise the honest verdict is `unverified`.
 - **The offline DDL model dropped `ALTER POLICY … RENAME TO`.** A later
   `ALTER POLICY <new> ON t USING (true)` then targeted a name the model did
   not know and the loosening was silently discarded — `pgrls pr` and

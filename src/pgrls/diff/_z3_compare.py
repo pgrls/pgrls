@@ -2045,8 +2045,10 @@ def prove_anon_isolation(
 ) -> tuple[str, dict[str, object] | None]:
     """Prove whether an anonymous session can read any row under ``using_node``.
 
-    Encodes the USING predicate under an anonymous session (every auth
-    function NULL) with the same Kleene-3VL translator SEC038 uses, then asks
+    Encodes the USING predicate under TWO anonymous sessions — JWT-less
+    (every auth function NULL) and Supabase anon-key (`auth.role()` = 'anon',
+    `auth.jwt()` non-null; see `_Context.anon_jwt`) — with the same
+    Kleene-3VL translator SEC038 uses, a leak under either being a leak, and asks
     the *satisfiability* question — can ``is_true`` hold for some row? —
     rather than SEC038's validity question (does it hold for EVERY row). The
     satisfiability criterion is what tenant isolation needs: a row is exposed
