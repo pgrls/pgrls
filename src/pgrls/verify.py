@@ -59,7 +59,9 @@ to a linter" stance:
 * ``unverified`` — no claim: Z3 is unavailable, the predicate is outside the
   decidable fragment, the solver timed out, or (cross-tenant / write) the policy
   has no single tenant-scoping equality on an identity/discriminator column
-  (SEC021's name set, ``identity_columns`` overridable) to verify against. This is where the verifier
+  (the prover's tenant-axis set — SEC021's default names plus the ambiguous
+  bare spellings SEC021 itself excludes; ``identity_columns`` replaces it) to
+  verify against. This is where the verifier
   *degrades to the linter* — run `pgrls lint` for the heuristic rules.
 
 Scope: the anon, cross-tenant and write provers reason over each table's permissive ``SELECT`` / ``ALL``
@@ -613,8 +615,9 @@ def build_verification(
     `build_escalation` / `build_reachability`.
 
     `identity_columns`, when given, replaces the identity/discriminator column
-    names the cross-tenant / write provers accept as the tenant axis (SEC021's
-    default set otherwise); a policy whose only scoping equality is on some
+    names the cross-tenant / write provers accept as the tenant axis
+    (`sec021.AXIS_IDENTITY_COLUMNS` otherwise — SEC021's own flagging set plus
+    the ambiguous bare spellings that rule excludes); a policy whose only scoping equality is on some
     other column is `unverified`, not proven.
     """
     if mode == "escalation":
@@ -628,9 +631,10 @@ def build_verification(
     prove = _PROVERS[mode]
     if mode == "anon":
         # Dotted GUCs the anonymous session inherits already set (database /
-        # server level, plus role-level settings for roles in the anon
-        # closure): a read of one is a real value, not the raise the
-        # unset-GUC assumption relies on.
+        # server level, plus the role-level settings of each login path an
+        # anonymous caller can arrive on — `_anon_login_roles`, NOT the
+        # upward `_anon_reachable_roles` closure): a read of one is its
+        # configured value, not the raise the unset-GUC assumption relies on.
         prove = functools.partial(
             prove,
             set_gucs=(

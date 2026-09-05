@@ -169,7 +169,7 @@ svg-term --in docs/screencast.cast \
 #    link), not something the README depends on.
 
 # 4) Commit
-git add docs/screencast.cast docs/screencast.svg README.md
+git add docs/screencast.svg README.md
 git commit -m 'docs: record 60-second pgrls tour for README hero'
 ```
 
@@ -190,8 +190,9 @@ unset DATABASE_URL
   screencast is the demo; we want the viewer to see the commands
   hit a real database, not pgrls's internal test plumbing.
 - **Re-record cheaply.** The whole script (setup → record → upload
-  → embed) takes ~5 minutes once. Keep `docs/screencast.cast` in
-  git so future re-records can diff against the prior cut.
+  → embed) takes ~5 minutes once. The recording leaves
+  `docs/screencast.cast` on disk so a re-record can be diffed against the
+  prior cut; only the rendered `docs/screencast.svg` is committed.
 - **Keep it short.** If the cast runs longer than 90s on first
   watch, cut Scene 1 (`pip show`) — the badges already declare the
   version.

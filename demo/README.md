@@ -1,10 +1,10 @@
 # pgrls demo
 
-A self-contained walkthrough of every rule pgrls ships, plus the
+A self-contained walkthrough of pgrls's core rules and workflows, plus the
 partition-aware paths, the JSON / SARIF output contracts, the
 `pgrls fix` auto-remediation flow, the `pgrls.testing` pytest plugin,
 and the four `pgrls diff` classifications (DANGEROUS / SAFE /
-REQUIRES_REVIEW / BREAKING). 88 use cases.
+REQUIRES_REVIEW / BREAKING). 97 use cases.
 
 ## Layout
 
@@ -35,7 +35,16 @@ demo/
     ├── 85-view001-non-invoker-view/      # VIEW001
     ├── 86-view002-non-barrier-view/      # VIEW002
     ├── 87-view003-matview-over-rls/      # VIEW003
-    └── 88-view004-view-thru-secdef/      # VIEW004
+    ├── 88-view004-view-thru-secdef/      # VIEW004
+    ├── 89-anonymous-read-semantic/       # verify --mode anon
+    ├── 90-sec039-anon-write/             # SEC039
+    ├── 91-sec040-write-scope-drop/       # SEC040
+    ├── 92-sec041-partition-rls-bypass/   # SEC041
+    ├── 93-sec042-anon-secdef-rpc/        # SEC042
+    ├── 94-sec043-inheritance-rls-bypass/ # SEC043
+    ├── 95-sec044-default-privileges/     # SEC044
+    ├── 96-sec048-reachable-owner-not-forced/   # SEC048
+    └── 97-perf001-fires-on-correlated-exists/  # PERF001
 ```
 
 Each case folder is self-contained — open it to read the SQL
@@ -101,7 +110,7 @@ numeric order).
 | 50 | Read-replica style (SELECT-only policies, no PUBLIC permissive) | (none) | passes |
 | 51 | ROW comparison `(a,b) = (c,d)` | (none) | passes (extract walks RowExpr) |
 | 52 | Two PERMISSIVE PUBLIC policies on one table | SEC003 ×2 + SEC007 | each policy fires its own line |
-| 53 | `auth_func() IS NULL` buried inside a nested OR | (none) | passes — documented false negative pin |
+| 53 | `auth_func() IS NULL` buried inside a nested OR | SEC004 | fires — `flatten_or_disjuncts` closed the false negative this case used to pin |
 | 54 | `email::text = ...` (TypeCast over column) | (none) | passes (extract walks TypeCast.arg) |
 | 55 | `USING (NOT false)` | SEC005 | fires; SEC008 specifically does NOT (literal-only detection) |
 | 56 | `gone IS TRUE` (BoolTest) on dropped column | HYG001 | fires (extract walks BoolTest.arg) |
@@ -137,6 +146,15 @@ numeric order).
 | 86 | Non-`security_barrier` view over RLS table | VIEW002 | fires |
 | 87 | Materialized view over RLS table | VIEW003 | fires |
 | 88 | View calling SECDEF function reading RLS table | VIEW004 | fires |
+| 89 | Anonymous-read semantics (`verify --mode anon`) | — | prover walkthrough, not a lint case |
+| 90 | Write policy open to the anonymous role | SEC039 | fires |
+| 91 | `FOR ALL` whose `WITH CHECK` drops the tenant scope | SEC040 | fires |
+| 92 | Partition child with RLS off under an enforcing parent | SEC041 | fires |
+| 93 | anon/`PUBLIC`-EXECUTE `SECURITY DEFINER` RPC, RLS-exempt owner | SEC042 | fires |
+| 94 | Inheritance child with RLS off under an enforcing parent | SEC043 | fires |
+| 95 | `ALTER DEFAULT PRIVILEGES` granting future tables to PUBLIC | SEC044 | fires |
+| 96 | Owner-reachable role on a table without `FORCE` | SEC048 | fires |
+| 97 | Per-row auth call inside a correlated `EXISTS` | PERF001 | fires |
 
 ## Running
 
@@ -175,7 +193,7 @@ pytest demo/ -v
 
 Spins up an isolated Postgres via `testcontainers` (no port
 collisions), applies `_shared.sql` plus every case's `setup.sql`,
-and runs 94 assertions — one or more per use case plus
+and runs 119 assertions — one or more per use case plus
 configuration-driven scenarios that exercise per-test `--config`
 overrides (allowlist, disable, custom `auth_functions`,
 multi-schema, fail_on, format), the JSON / SARIF output
@@ -192,8 +210,8 @@ DATABASE_URL=postgres://demo:demo@localhost:5433/demo \
 
 ## Expected lint output
 
-Around 68 violations across all three severities (`27 errors,
-35 warnings, 6 infos.`). The fixture is intentionally noisy — most
+Around 127 violations across all three severities (`34 errors,
+52 warnings, 41 infos.`). The fixture is intentionally noisy — most
 violations come from cross-fires where one bad policy trips several
 rules at once (`USING (true)` → SEC005 + SEC008 + SEC003 if PUBLIC; a
 Supabase `auth.uid() IS NULL OR ...` → SEC004 + PERF001). Each
@@ -218,9 +236,12 @@ WARN   PERF001 app.jwt_unwrapped.jwt_unwrapped_owner  (use case 38 — auth.jwt(
 INFO   SEC007  app.tags                          (use case 09)
 ```
 
-Tables that must stay silent (clean cases 01, 02 via allowlist, 13,
-16-18, 21, 23, 25, 27-32, 34, 36, 44-51, 53, 54, 64-67) never appear
-in any violation line. The clean tests assert this directly. The
+Tables that must stay silent for their *own* rule (clean cases 01, 02 via
+allowlist, 13, 16-18, 23, 25, 27-30, 32, 36, 44-49, 51, 54, 64-67) never
+appear in any violation line. The clean tests assert this directly — each
+asserts the absence of the rule its case is about, not of every rule, so a
+few of these tables do appear under an unrelated rule (21 and 53 under
+SEC030/PERF001, 31 and 34 under SEC030, 50 under SEC022). The
 configuration-driven cases (39-43, 59-63) verify behavior under
 specific `--config` overrides — see `conftest.py::lint` for the
 helper that drives those.
@@ -239,7 +260,8 @@ report artifact. Two demo-relevant snippets:
 fail_on = "error"
 ```
 
-`fail_on = "error"` blocks on SEC001/2/3/4/6/HYG001. Bump to
+`fail_on = "error"` blocks on SEC001/2/3/4/6/38/39/42, VIEW001 and
+HYG001. Bump to
 `warning` to also block on SEC005/8/PERF001, or `info` to also block
 on SEC007.
 

@@ -4272,8 +4272,9 @@ def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | N
         "superuser/BYPASSRLS, or the table owner or an INHERIT member of it "
         "when the table is not FORCE'd — returns every row to anon while "
         "'anon' mode correctly reports the table itself isolated — or whose "
-        "effective owner, though not exempt, is granted every row by the "
-        "table's own policies (a definer view launders them). 'Anon can open "
+        "effective owner, though not exempt, is granted rows by the "
+        "table's own policies (a definer view launders them — the door is "
+        "only as wide as that grant). 'Anon can open "
         "the view' counts a table- or column-level SELECT grant to anon/PUBLIC "
         "or any role in the anon closure; a hop the effective owner cannot "
         "SELECT is a dead path; INHERIT members only. UNVERIFIED when the "
@@ -4405,8 +4406,10 @@ def verify(
     *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
     or — cross-tenant/write — there is no single scoping equality on an
-    identity/discriminator column to verify (SEC021's default name set;
-    `[lint.rules.SEC021].identity_columns` in `--config` overrides it);
+    identity/discriminator column to verify (the prover's tenant-axis set:
+    SEC021's default names plus the ambiguous bare spellings SEC021 itself
+    excludes; `[lint.rules.SEC021].identity_columns` in `--config` replaces
+    it for both);
     here the verifier degrades to the linter, run `pgrls lint` — for write, the
     SEC006/SEC020/SEC028/SEC040 write-check rules).
 

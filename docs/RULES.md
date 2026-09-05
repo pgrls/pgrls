@@ -165,12 +165,12 @@ CREATE POLICY tenant_read ON public.invoices
     USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
 
-If the table is genuinely public-readable (reference data), use a
-`RESTRICTIVE` policy instead of a `PERMISSIVE` one — **no**: a table whose
-only policies are restrictive admits *no* rows at all (SEC012), so that swap
-turns a public table into a deny-all one. Keep the permissive policy and
-allowlist it (below). A restrictive floor belongs *alongside* role-scoped
-permissive policies (see SEC007), not in place of them.
+If the table is genuinely public-readable (reference data), keep the
+permissive policy and allowlist it (below). Do **not** swap it for a
+`RESTRICTIVE` one: a table whose only policies are restrictive admits *no*
+rows at all (SEC012), so that turns a public table into a deny-all one. A
+restrictive floor belongs *alongside* role-scoped permissive policies (see
+SEC007), never in place of them.
 
 **Allowlisting individual policies.** Use `[lint.rules.SEC003].allowlist`
 with qualified policy IDs of the form `schema.table.policy_name` —
@@ -691,7 +691,9 @@ explicit "no policies at all" case; SEC010 catches the explicit
 case where the user intended access but composed the policies
 wrong. SEC009 is disjoint from both (it needs zero policies); SEC010 is per-policy
 and *does* co-fire with SEC012 when a table's only policies are restrictive
-constant-`false` ones — same fix.
+constant-`false` ones — two findings, two remedies: add a permissive policy
+(SEC012) *and* re-express the denial at the `GRANT` layer (SEC010), whose
+fixer deliberately never drops a restrictive constant-`false` policy.
 
 **Standard fix.** Add a PERMISSIVE policy that describes who
 CAN see rows. The existing RESTRICTIVE policies will narrow

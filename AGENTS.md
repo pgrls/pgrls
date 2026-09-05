@@ -29,7 +29,12 @@ and cast-wrapped inverted-auth variants SEC004's syntactic match
 misses; Z3 is a core dependency since 0.16.0, so this runs on a plain
 `pip install pgrls`), `SEC039` (permissive write policy — INSERT/UPDATE/
 DELETE/ALL — grants the unauthenticated `anon` role, so anonymous
-PostgREST/Supabase clients can modify rows), `HYG001`
+PostgREST/Supabase clients can modify rows),
+`SEC042` (a `SECURITY DEFINER` function whose owner bypasses RLS — a
+superuser or `BYPASSRLS` role — is `EXECUTE`-able by `anon`/`PUBLIC`, so an
+unauthenticated PostgREST `POST /rpc/fn` caller runs owner-privileged,
+RLS-exempt code; function `EXECUTE` defaults to `PUBLIC`, so it fires even
+with no explicit `GRANT`; the anon-exposure sharpening of SEC014), `HYG001`
 (policies referencing dropped columns), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
@@ -85,11 +90,6 @@ partitioned parent enforces it, and is granted directly to a non-owner
 role — Postgres inherits neither RLS nor grants to partitions, so a query
 naming the granted child directly bypasses the parent's policies; the
 complement of SEC001, which cedes this case),
-`SEC042` (a `SECURITY DEFINER` function whose owner bypasses RLS — a
-superuser or `BYPASSRLS` role — is `EXECUTE`-able by `anon`/`PUBLIC`, so an
-unauthenticated PostgREST `POST /rpc/fn` caller runs owner-privileged,
-RLS-exempt code; function `EXECUTE` defaults to `PUBLIC`, so it fires even
-with no explicit `GRANT`; the anon-exposure sharpening of SEC014),
 `SEC043` (classic-`INHERITS` child has RLS disabled while an inheritance
 ancestor enforces it, and is granted directly to a non-owner role — Postgres
 inherits neither RLS nor grants to children, so a query naming the granted
@@ -265,7 +265,7 @@ Notes:
 The per-rule reference — severity, detection logic, fix guidance,
 configuration — lives in **[`docs/RULES.md`](docs/RULES.md)** so
 this file stays focused on project orientation rather than
-duplicating ~4,600 lines of rule documentation.
+duplicating ~4,800 lines of rule documentation.
 
 `pgrls explain <RULE>` (e.g. `pgrls explain SEC033`,
 case-insensitive) prints the same per-rule reference from the
@@ -447,7 +447,7 @@ Currently fixable:
   immediately. Partition-child cases the rule itself cedes (a child
   whose ancestor already has RLS) are skipped by the fixer on the
   same grounds.
-* **PERF004** — emits `CREATE INDEX ON <schema>.<table>
+* **PERF004** — emits `CREATE INDEX IF NOT EXISTS pgrls_idx_<hash> ON <schema>.<table>
   (<function-expression>);` for a policy predicate that wraps an
   indexed column in a function call (`lower(email)`,
   `date_trunc(...)`, nested calls). Walks the policy AST, finds
@@ -467,7 +467,7 @@ Currently fixable:
   per written row too) but emits ONLY the clause(s) it changed —
   an unchanged clause is omitted, so it never clobbers a sibling
   fixer's rewrite of the other clause.
-* **PERF003** — emits `CREATE INDEX ON <schema>.<table>
+* **PERF003** — emits `CREATE INDEX IF NOT EXISTS pgrls_idx_<hash> ON <schema>.<table>
   (<column>);` for a policy-predicate column with no
   leading-column index. One index per offending column,
   deduplicated across policies — two policies filtering the same
@@ -965,8 +965,10 @@ These are intentional in the current release. Do not invent capabilities.
   can only *under*-report: catalog-only rules abstain and are explicitly
   skipped and listed (in `--format json` as `skipped_rules`, gateable with
   `--require-full-coverage`), so an absence of findings offline is not a proof
-  of safety. `pgrls verify` stays live only (its proof is framed
-  against a complete schema).
+  of safety. The `pgrls verify` **CLI** stays live only (its
+  proof is framed against a complete schema); the MCP `verify` tool does
+  accept the offline sources (`sql=` / `snapshot=`), with the same
+  under-reporting caveat.
 - **Sixty-eight rules across four categories.** SEC001–SEC055,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004

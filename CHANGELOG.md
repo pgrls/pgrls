@@ -151,8 +151,8 @@ breaking changes — they will be called out in this file.
   session (measured: 1 row), yet the canonical tenant policy stayed PROVEN
   and `--probe` cleared the GUC to `''` before looking. Snapshot v26 captures
   `set_gucs` (dotted names set at database / server level) and
-  `role_set_gucs` (role-level, counted only for roles in the anon closure —
-  `ALTER ROLE unrelated SET app.x` is not what anon inherits); names are
+  `role_set_gucs` (role-level; see the later entry in this section for which
+  roles' settings an anonymous session actually inherits); names are
   casefolded (GUC names are case-insensitive, `setconfig` is not). The
   prover treats a read of one as a real value in every spelling — one-arg,
   `(name, false)` and the canonical `(name, true)` a first cut missed — and
@@ -161,9 +161,9 @@ breaking changes — they will be called out in this file.
   value>` as the tenant axis.** `status = current_setting('app.status',
   true)` proved "no cross-tenant read" — `status != session.status` is UNSAT,
   which says nothing about tenants. The axis must now be an identity /
-  discriminator column (SEC021's default name set — `tenant_id`, `user_id`,
-  `org_id`, `owner_id`, `client_id`, `workspace`, `project`, … — widened so
-  the bare and `_id` spellings pair up consistently;
+  discriminator column (the prover's tenant-axis set — `tenant_id`, `user_id`,
+  `org_id`, `owner_id`, `client_id`, `workspace`, `project`, … — SEC021's
+  default names plus the ambiguous bare spellings SEC021 itself excludes;
   `[lint.rules.SEC021].identity_columns` is honoured
   when a `--config` is given, and the `build_verification(identity_columns=…)`
   Python kwarg overrides it); otherwise the honest verdict is `unverified`.

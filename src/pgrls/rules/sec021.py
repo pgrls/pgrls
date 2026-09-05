@@ -2,7 +2,7 @@
 
 A row-level security policy isolates tenants by keying row
 visibility off a *per-request* value — the tenant id, the owning
-account, the workspace — read from session context the application
+account, the organization id — read from session context the application
 sets on every connection (`current_setting('app.tenant_id')`, a JWT
 claim). The footgun SEC021 flags is a policy that instead compares
 that identity column against a **literal constant**:

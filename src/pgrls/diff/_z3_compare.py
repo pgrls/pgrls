@@ -2476,8 +2476,11 @@ def prove_cross_tenant_isolation(
     # current_setting('app.status', true)` or `region = current_setting(
     # 'app.region', true)` carries no tenant scoping at all — proving
     # `status != session.status` UNSAT is vacuous and read as "no
-    # cross-tenant read" was a false PROVEN. Same name set SEC021 / SEC030
-    # use (`tenant_id`, `user_id`, `org_id`, `owner_id`, …), overridable.
+    # cross-tenant read" was a false PROVEN. The tenant-axis set
+    # (`sec021.AXIS_IDENTITY_COLUMNS`): SEC021's own flagging names plus the
+    # ambiguous bare spellings that rule excludes, since `client = <session
+    # value>` is a real axis even where `client = 'x'` is too noisy to flag.
+    # Overridable.
     if identity_columns is None:
         from pgrls.rules.sec021 import (  # noqa: PLC0415 — avoids a rules↔diff import cycle
             AXIS_IDENTITY_COLUMNS,

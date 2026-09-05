@@ -128,7 +128,7 @@ existing one.
 
 ### 2. Write the rule module
 
-Create `src/pgrls/rules/sec033.py`:
+Create `src/pgrls/rules/sec056.py`:
 
 ```python
 """SEC056 — <one-line statement of what fires>.
@@ -219,7 +219,7 @@ registers every rule lazily on the first call to `default_registry()`
 def _build_default_registry() -> RuleRegistry:
     # imports are kept inside the function so importing `pgrls.rules`
     # doesn't drag in every rule module up-front (lazy registration).
-    from pgrls.rules.sec033 import SEC056
+    from pgrls.rules.sec056 import SEC056
     # ...
     registry = RuleRegistry()
     # ...
@@ -233,7 +233,7 @@ within each block.
 
 ### 4. Write the tests
 
-Create `tests/rules/test_sec033.py`. Aim for **10–20 cases**: 5–8
+Create `tests/rules/test_sec056.py`. Aim for **10–20 cases**: 5–8
 fires-when shapes, 5–8 silent-when shapes, plus configuration / edge
 cases.
 
@@ -243,7 +243,7 @@ from __future__ import annotations
 
 from pgrls.ast_utils import parse_expr
 from pgrls.model import Policy, Schema, Table
-from pgrls.rules.sec033 import SEC056
+from pgrls.rules.sec056 import SEC056
 
 
 def _wrap(policy: Policy) -> Schema:
@@ -271,13 +271,13 @@ def _policy(using: str, *, name: str = "p") -> Policy:
     )
 
 
-def test_sec033_fires_on_canonical_shape() -> None:
+def test_sec056_fires_on_canonical_shape() -> None:
     schema = _wrap(_policy("<your canonical bad shape>"))
     [v] = SEC056().check(schema, options={})
     assert v.rule_id == "SEC056"
 
 
-def test_sec033_silent_on_close_but_not_the_shape() -> None:
+def test_sec056_silent_on_close_but_not_the_shape() -> None:
     schema = _wrap(_policy("<a shape that LOOKS similar but isn't>"))
     assert SEC056().check(schema, options={}) == []
 ```
@@ -310,9 +310,9 @@ Add a SQL block to `all_bad.sql`:
 
 ```sql
 -- SEC056 — <one-line description>.
-CREATE TABLE allbad_sec033 (id INT, tenant_id INT);
-ALTER TABLE allbad_sec033 ENABLE ROW LEVEL SECURITY;
-CREATE POLICY allbad_sec033_pol ON allbad_sec033
+CREATE TABLE allbad_sec056 (id INT, tenant_id INT);
+ALTER TABLE allbad_sec056 ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allbad_sec056_pol ON allbad_sec056
     USING (<your canonical bad shape>);
 ```
 
@@ -376,7 +376,7 @@ All four green.
 
 ### 9. Submit
 
-Branch as `feat/rule-sec033` (matches `CONTRIBUTING.md`'s
+Branch as `feat/rule-sec056` (matches `CONTRIBUTING.md`'s
 convention), commit with `feat(rules): SEC056 — <title>`,
 open a PR. Per the project's release procedure, the PR goes through
 a 3-clean review loop before merging.
