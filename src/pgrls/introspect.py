@@ -780,12 +780,18 @@ ORDER BY qname, signature
 # directly. The existing `_POLICIES_SQL` already joins `pg_roles` for
 # the same readability reason.
 #
-# `WHERE r.rolbypassrls` filters to the audit-relevant subset
-# (mirroring `_SECDEF_FUNCS_SQL`'s `WHERE p.prosecdef = TRUE`): the
-# captured set is exactly the roles SEC016 might flag, and a default
-# cluster — where no role has been granted BYPASSRLS — captures zero
-# rows. The Postgres-predefined `pg_*` roles (`pg_read_all_data`
-# etc.) do not carry `rolbypassrls`, so they never appear here.
+# `WHERE r.rolbypassrls OR r.rolsuper` captures every role that is exempt
+# from RLS. A superuser bypasses RLS through `rolsuper` whether or not it
+# also carries the explicit attribute — measured on PG16: a `LOGIN
+# SUPERUSER` role with `rolbypassrls = false` read every row of a FORCE'd
+# table. Filtering on `rolbypassrls` alone missed exactly that role, and
+# `verify --mode anon` then reported PROVEN for an anonymous role that
+# reads everything. SEC016 and SEC023 already skip superusers explicitly
+# (a superuser finding would only restate "this role is a superuser"), so
+# widening the capture changes no rule's output — it only stops the
+# verifier from proving isolation against a role Postgres never checks.
+# The Postgres-predefined `pg_*` roles (`pg_read_all_data` etc.) carry
+# neither attribute, so they never appear here.
 #
 # Roles are cluster-global — this query takes no schema parameter and
 # is independent of the introspector's `--schemas` set.
@@ -797,7 +803,7 @@ SELECT
     r.rolsuper AS superuser,
     r.rolcanlogin AS can_login
 FROM pg_catalog.pg_roles r
-WHERE r.rolbypassrls
+WHERE r.rolbypassrls OR r.rolsuper
 ORDER BY r.rolname
 """
 
@@ -1125,7 +1131,7 @@ def _fetch_secdef_functions(
 
 
 def _fetch_bypassrls_roles(cur: Any) -> tuple[BypassRlsRole, ...]:
-    """Fetch every role carrying the BYPASSRLS attribute.
+    """Fetch every role exempt from RLS — `BYPASSRLS` or superuser.
 
     Returns a tuple of `BypassRlsRole` records sorted by role name
     (the SQL `ORDER BY r.rolname` provides the determinism). Takes no

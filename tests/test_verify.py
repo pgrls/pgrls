@@ -3687,3 +3687,28 @@ def test_reachability_anon_pg_read_all_data_opens_an_ungranted_view() -> None:
         role_memberships=(RoleMembership(member="anon", role="pg_read_all_data"),),
     )
     assert _rv(reader)[("public.t", "public.v")][0] == "leak"
+
+
+def test_anon_superuser_role_is_exempt_even_without_the_bypassrls_attribute() -> None:
+    """A superuser bypasses RLS through `rolsuper` whether or not it also
+    carries BYPASSRLS — measured on PG16: a LOGIN SUPERUSER with
+    `rolbypassrls = false` read every row of a FORCE'd table. Capturing only
+    `rolbypassrls` roles missed it, and this mode proved isolation against a
+    role Postgres never checks."""
+    from pgrls.model import BypassRlsRole, Schema
+    from pgrls.verify import build_verification
+
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner", force=True),),
+        bypassrls_roles=(
+            BypassRlsRole(name="su_anon", superuser=True, can_login=True),
+        ),
+        role_memberships=(),
+    )
+    exempt = build_verification(schema, mode="anon", anon_roles={"su_anon"})
+    assert [t.verdict for t in exempt.tables] == ["leak"]
+    assert "exempt from this table's RLS" in (exempt.tables[0].note or "")
+
+    # An ordinary anonymous role on the same schema is unaffected.
+    plain = build_verification(schema, mode="anon", anon_roles={"anon"})
+    assert [t.verdict for t in plain.tables] == ["isolated"]

@@ -562,12 +562,17 @@ def _build_statements(
         for name, value in sorted(gucs.items()):
             if value in (None, MAYBE_SET):
                 setup.append(
-                    f"-- NOTE: {name} is set on the server but its value was not"
+                    f"-- NOTE: {name} is readable where pgrls introspected, but"
                 )
                 setup.append(
-                    "-- captured (reading pg_file_settings needs superuser) —"
+                    "-- its value could not be attributed to the server (that"
                 )
-                setup.append("-- substitute the value your server uses.")
+                setup.append(
+                    "-- needs pg_file_settings, or it may be a per-connection"
+                )
+                setup.append(
+                    "-- option) — substitute the value your callers actually see."
+                )
             setup.append(
                 f"SELECT set_config({_sql_str(name)}, "
                 f"{_sql_str(_UNCAPTURED_GUC if value in (None, MAYBE_SET) else str(value))}, true);"

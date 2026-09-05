@@ -27,6 +27,15 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **A superuser role was captured only if it *also* carried `BYPASSRLS`, so
+  `verify --mode anon` proved isolation against a role Postgres never
+  checks.** A superuser bypasses RLS through `rolsuper` alone — measured on
+  PG16: a `LOGIN SUPERUSER` with `rolbypassrls = false` read every row of a
+  `FORCE`'d table, while the capture query's `WHERE rolbypassrls` filter
+  skipped it entirely. Roles exempt from RLS are now captured on either
+  attribute. SEC016 and SEC023 already skip superusers explicitly, so no
+  rule's output changes; only the verifier stops proving isolation against an
+  exempt role.
 - **`verify --mode anon` proved isolation while a live anonymous login read
   every row, because the anon role's own RLS exemption was never modelled.**
   The prover reasoned only about the predicate. If the anonymous role holds

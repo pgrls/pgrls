@@ -722,7 +722,8 @@ class BypassRlsRole:
     ``FORCE ROW LEVEL SECURITY`` is set — see SEC002), a BYPASSRLS
     role's bypass is unconditional and cluster-wide.
 
-    Introspection captures only roles whose ``pg_roles.rolbypassrls``
+    Introspection captures roles exempt from RLS — ``pg_roles.rolbypassrls``
+    or ``rolsuper``
     is true — the audit-relevant subset, mirroring how
     ``security_definer_functions`` captures only SECDEF functions.
     Every ``BypassRlsRole`` instance therefore represents a role that
