@@ -1637,7 +1637,7 @@ class Schema:
     # closure). Membership does not propagate settings, so `ALTER ROLE
     # readers SET app.x` with anon a member of readers is NOT seen. The value
     # is kept so `--probe` can replay it into its own session.
-    role_set_gucs: tuple[tuple[str, str, str], ...] = ()
+    role_set_gucs: tuple[tuple[str, str, str | None], ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -2265,9 +2265,19 @@ class Schema:
             immutable_functions=immutable_functions,
             owner_reachable_members=owner_reachable_members,
             foreign_tables=foreign_tables,
-            set_gucs=tuple((p[0], p[1]) for p in payload.get("set_gucs", [])),
+            # A pre-reshape v26 file (intra-branch only) carried bare name
+            # strings; slicing p[0]/p[1] off those took CHARACTERS and invented
+            # a GUC. Decode either shape.
+            set_gucs=tuple(
+                (p, None) if isinstance(p, str) else (p[0], p[1])
+                for p in payload.get("set_gucs", [])
+            ),
             role_set_gucs=tuple(
-                (p[0], p[1], p[2] if len(p) > 2 else "")
+                # Missing value → None ("set, not captured"), never "": an
+                # empty string is a real value that would let the prover
+                # decide `current_setting('x') = 'on'` is FALSE and claim
+                # isolation from a value it never had.
+                (p[0], p[1], p[2] if len(p) > 2 else None)
                 for p in payload.get("role_set_gucs", [])
             ),
             # v26+: absent key → None ("graph not captured", the prover

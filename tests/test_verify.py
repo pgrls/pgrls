@@ -3293,19 +3293,24 @@ def test_reachability_invoker_on_outer_over_definer_inner_still_leaks() -> None:
     assert ("public.t", "public.v_outer") not in _rv(blocked)
 
 
-def test_reachability_invoker_on_inner_inherits_outer_definer_owner() -> None:
-    """outer(off, owner = table owner) → inner(ON) → T: the inner runs as its
-    invoker, which is the OUTER's execution user (the exempt owner), so this
-    leaks even though the view touching T is invoker-on."""
-    from pgrls.model import Schema
+def test_reachability_invoker_on_inner_resets_to_the_session_user() -> None:
+    """outer(off, owner = table owner) → inner(ON) → T does NOT leak.
 
-    from pgrls.model import Grant
+    `security_invoker = true` resets the effective user to the SESSION user;
+    it does not inherit the enclosing definer view's execution user. Measured
+    on PG16 three ways: definer(owner with BYPASSRLS) → invoker → table
+    returned the policy-filtered row rather than every row; the same chain
+    with the outer owned by the TABLE owner also returned the filtered row;
+    and revoking the anonymous caller's own `SELECT` on the table made the
+    read fail with `permission denied for table t`. Inheriting the outer
+    owner here reported a leak the tool could not exhibit."""
+    from pgrls.model import Grant, Schema
 
     outer = _rv_view("v_outer", "tbl_owner", (("public", "t"),), direct=(("public", "v_inner"),))
     inner = _rv_view("v_inner", "plain", (("public", "t"),), invoker=True,
                      grants=(Grant(role="tbl_owner", privileges=("SELECT",)),))
     schema = Schema(tables=(_rv_table("t", "tbl_owner"),), views=(outer, inner), role_memberships=())
-    assert _rv(schema)[("public.t", "public.v_outer")][0] == "leak"
+    assert _rv(schema) == {}
 
 
 def test_reachability_all_invoker_on_chain_is_silent() -> None:
@@ -3519,3 +3524,76 @@ def test_reachability_partial_launder_over_a_partial_anon_leak_is_unverified() -
     assert _rv(Schema(tables=(t,), views=(v,), role_memberships=()))[
         ("public.t", "public.v")
     ][0] == "unverified"
+
+
+def test_reachability_pg_read_all_data_confers_select_on_the_base_table() -> None:
+    """The predefined role `pg_read_all_data` confers SELECT on everything with
+    no grant of its own (measured: revoking the direct grant and granting this
+    role instead read the same rows through the same view). Missing it made the
+    new base-table readability check turn a live bypass into total silence."""
+    from pgrls.model import RoleMembership, Schema
+
+    t = _rv_table("t", "tbl_owner")
+    v = _rv_view("v", "byp", (("public", "t"),), bypass=True)
+    assert _rv(Schema(tables=(t,), views=(v,), role_memberships=())) == {}
+    reader = Schema(
+        tables=(t,), views=(v,),
+        role_memberships=(RoleMembership(member="byp", role="pg_read_all_data"),),
+    )
+    assert _rv(reader)[("public.t", "public.v")][0] == "leak"
+
+
+def test_reachability_does_not_cede_when_anon_cannot_read_the_table() -> None:
+    """`--mode anon` proves the PREDICATE admits rows; it never checks whether
+    anon holds SELECT. `USING (true)` with no grant to anon is `permission
+    denied` directly (measured) while the definer view returns every row, so
+    ceding "the table already leaks everything" cleared the only real door."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Grant, Policy, Schema, Table
+
+    wide_open = Policy(
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
+        using_sql="true", with_check_sql=None,
+        using_ast=parse_expr("true"), with_check_ast=None,
+    )
+
+    def table(grants):
+        return Table(
+            schema="public", name="t", rls_enabled=True, force_rls=False,
+            columns=("id",), owner="tbl_owner", policies=(wide_open,), grants=grants,
+        )
+
+    v = _rv_view("v", "tbl_owner", (("public", "t"),))
+    ungranted = Schema(tables=(table(()),), views=(v,), role_memberships=())
+    assert _rv(ungranted)[("public.t", "public.v")][0] == "leak"
+
+    # With anon able to read the table directly, the view really does add
+    # nothing and the finding cedes to `verify --mode anon` as before.
+    granted = Schema(
+        tables=(table((Grant(role="anon", privileges=("SELECT",)),)),),
+        views=(v,), role_memberships=(),
+    )
+    assert _rv(granted)[("public.t", "public.v")][0] == "isolated"
+
+
+def test_reachability_matview_hop_walks_nested_views() -> None:
+    """A matview whose query goes through another view names no table directly;
+    enumerating only its direct table refs produced no verdict at all for the
+    table underneath it."""
+    import dataclasses
+
+    from pgrls.model import Schema
+
+    outer = _rv_view("v", "root", (("public", "m"),), superuser=True)
+    m = dataclasses.replace(
+        _rv_view("m", "tbl_owner", (("public", "mid"),), anon_grant=False),
+        is_materialized=True,
+    )
+    mid = _rv_view("mid", "tbl_owner", (("public", "t"),), anon_grant=False)
+    schema = Schema(
+        tables=(_rv_table("t", "tbl_owner"),), views=(outer, m, mid),
+        role_memberships=(),
+    )
+    verdict, note = _rv(schema)[("public.t", "public.v")]
+    assert verdict == "unverified"
+    assert "materialized view" in note

@@ -931,8 +931,10 @@ def build_escalation(
     return Verification(tuple(tables), "escalation")
 
 
-def _view_is_anon_selectable(schema: Schema, view: Any, anon_roles: set[str]) -> bool:
-    """Can the anonymous session `SELECT` from `view`?
+def _relation_is_anon_selectable(
+    schema: Schema, rel: Any, anon_roles: set[str]
+) -> bool:
+    """Can the anonymous session `SELECT` from `rel` — a view or a table?
 
     A grant to any role in the anon closure (`_anon_reachable_roles` — the
     same closure policy reachability uses, plus PUBLIC), at TABLE level or
@@ -941,11 +943,11 @@ def _view_is_anon_selectable(schema: Schema, view: Any, anon_roles: set[str]) ->
     only a literal anon/PUBLIC grant counts.
     """
     reachable, _ = _anon_reachable_roles(schema, anon_roles)
-    if any(g.role in reachable and "SELECT" in g.privileges for g in view.grants):
+    if any(g.role in reachable and "SELECT" in g.privileges for g in rel.grants):
         return True
     return any(
         cg.role in reachable and "SELECT" in cg.privileges
-        for cg in getattr(view, "column_grants", ())
+        for cg in getattr(rel, "column_grants", ())
     )
 
 
@@ -1025,7 +1027,7 @@ def build_reachability(
         v
         for v in schema.views
         if not v.is_materialized
-        and _view_is_anon_selectable(schema, v, resolved_anon_roles)
+        and _relation_is_anon_selectable(schema, v, resolved_anon_roles)
     ]
     # A definer view whose owner is NOT RLS-exempt can still launder rows: if
     # the table's own permissive policies grant that owner every row (`TO
@@ -1132,7 +1134,16 @@ def build_reachability(
                 (p for p in (anv.proofs if anv else ()) if p.verdict == "leak"),
                 None,
             )
-            if an_leak is not None and an_leak.witness == {}:
+            # …but only if anon can actually open the table. `--mode anon`
+            # proves the PREDICATE admits rows; it never checks the grant. A
+            # table with `USING (true)` and no grant to anon is `permission
+            # denied` directly (measured) while the definer view over it
+            # returns every row — so ceding here cleared the only real door.
+            if (
+                an_leak is not None
+                and an_leak.witness == {}
+                and _relation_is_anon_selectable(schema, table, resolved_anon_roles)
+            ):
                 proof = PolicyProof(outer.qualified_name, "isolated", None, None)
                 tables.append(
                     TableVerdict(
@@ -1289,7 +1300,43 @@ def _role_reads_relation(schema: Schema, eff: Any, rel: Any) -> bool | None:
         return None
     if rel.owner in closure:
         return True
+    # The predefined role `pg_read_all_data` confers SELECT on everything
+    # without any grant of its own (measured: revoking the direct grant and
+    # granting this role instead read the same rows through the same view).
+    # Missing it turned a live bypass into total silence.
+    if "pg_read_all_data" in closure:
+        return True
     return bool(grantees & closure)
+
+
+def _rls_tables_beneath(
+    rel: Any,
+    tables_by_key: dict[tuple[str, str], Any],
+    views_by_key: dict[tuple[str, str], Any],
+) -> list[Any]:
+    """Every RLS-enabled table `rel` reads, through nested views as well.
+
+    A matview whose query goes through another view names no table directly,
+    so enumerating only its direct table refs contributed no verdict at all
+    for the table underneath it.
+    """
+    found: dict[str, Any] = {}
+    seen: set[tuple[str, str]] = set()
+
+    def walk(node: Any) -> None:
+        for ref in (node.direct_references or node.references):
+            table = tables_by_key.get(ref)
+            if table is not None:
+                if table.rls_enabled:
+                    found.setdefault(table.qualified_name, table)
+                continue
+            child = views_by_key.get(ref)
+            if child is not None and ref not in seen:
+                seen.add(ref)
+                walk(child)
+
+    walk(rel)
+    return list(found.values())
 
 
 def _reachability_paths(
@@ -1336,8 +1383,12 @@ def _reachability_paths(
         record(_ReachPath(outer, t, hops, eff, None, unknown_reason=why))
 
     def walk(view: Any, eff: Any, hops: tuple[str, ...], outer: Any, seen: frozenset[tuple[str, str]]) -> None:
-        if not view.security_invoker:
-            eff = view
+        # `security_invoker = true` RESETS the effective user to the session
+        # user — it does not inherit the enclosing definer view's owner.
+        # Measured on PG16: definer(owner BYPASSRLS) → invoker → table
+        # returned the policy-filtered row, not every row, and revoking the
+        # ANON caller's own SELECT on the table denied the read outright.
+        eff = None if view.security_invoker else view
         refs = view.direct_references or view.references
         for ref in refs:
             child = views_by_key.get(ref)
@@ -1347,19 +1398,17 @@ def _reachability_paths(
                 readable = (
                     _role_reads_relation(schema, eff, child)
                     if eff is not None
-                    else _view_is_anon_selectable(schema, child, anon_roles)
+                    else _relation_is_anon_selectable(schema, child, anon_roles)
                 )
                 if readable is False:
                     continue  # broken intermediate grant: dead path
                 child_hops = hops + (child.qualified_name,)
                 if child.is_materialized:
-                    for tref in (child.direct_references or child.references):
-                        t = tables_by_key.get(tref)
-                        if t is not None and t.rls_enabled:
-                            unverified(outer, t, child_hops, child, (
-                                f"{child.qualified_name} is a materialized view: its rows were "
-                                "captured at REFRESH time under the refreshing role's RLS "
-                                "context, which is not modeled"))
+                    for t in _rls_tables_beneath(child, tables_by_key, views_by_key):
+                        unverified(outer, t, child_hops, child, (
+                            f"{child.qualified_name} is a materialized view: its rows were "
+                            "captured at REFRESH time under the refreshing role's RLS "
+                            "context, which is not modeled"))
                     continue
                 if readable is None:
                     # Undecidable hop: report it rather than guess either way.
@@ -1836,6 +1885,9 @@ def render_text(v: Verification) -> str:
     if not v.tables:
         if v.mode == "escalation":
             return "No reachable escalation paths to verify."
+        if v.mode == "reachability":
+            return "No anon-reachable view path onto an RLS table was found."
+
         return "No RLS-enabled tables to verify."
     headers = ("TABLE", "VERDICT", "DETAIL")
     rows = [

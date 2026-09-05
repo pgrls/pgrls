@@ -1936,6 +1936,39 @@ def _resolve_3vl_operands(
     return (left, right)
 
 
+_PG_TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
+_PG_FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
+
+
+def _fold_literal_cast(value: Any, target_sort: Any) -> Any:
+    """`'<literal>'::<type>` as a Z3 constant of `target_sort`, else None.
+
+    Only folds a String constant the encoder already knows exactly — a
+    captured GUC value or a policy literal. A text that Postgres could not
+    cast (`'abc'::int` raises, so the statement errors and the caller gets no
+    rows) returns None and stays opaque: declining to decide is the safe
+    direction, and modelling the raise as "isolated" is not this function's
+    job.
+    """
+    if not z3.is_string_value(value):
+        return None
+    text = value.as_string()
+    try:
+        if target_sort == z3.IntSort():
+            return z3.IntVal(int(text))
+        if target_sort == z3.RealSort():
+            return z3.RealVal(float(text))
+    except ValueError:
+        return None
+    if target_sort == z3.BoolSort():
+        low = text.strip().lower()
+        if low in _PG_TRUE:
+            return z3.BoolVal(True)
+        if low in _PG_FALSE:
+            return z3.BoolVal(False)
+    return None
+
+
 def _anon_typecast(
     node: TypeCast, ctx: _Context, auth_funcs: set[str], assertions: list[Any]
 ) -> Any:
@@ -1990,6 +2023,14 @@ def _anon_typecast(
             value=ctx.session_var(_canon(node), target_sort),
             is_null=inner.is_null,
         )
+    folded = _fold_literal_cast(inner.value, target_sort)
+    if folded is not None:
+        # A captured GUC value cast to the column's type is exactly that
+        # constant — `col = current_setting('app.n')::int` with `app.n` set to
+        # '1' admits the row with id 1. Leaving it opaque cost the witness, so
+        # `--emit-repro` seeded a placeholder row the policy does not admit
+        # and the generated pytest failed against a real leak.
+        return _Val(value=folded, is_null=inner.is_null, unset=inner.unset)
     return _Val(
         value=ctx.opaque(_canon(node), target_sort),
         is_null=inner.is_null,

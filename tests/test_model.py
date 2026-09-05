@@ -1781,3 +1781,22 @@ def test_snapshot_v26_round_trips_view_direct_references() -> None:
     assert Schema.from_snapshot(snap).views[0].direct_references == (("public", "inner"),)
     del snap["views"][0]["direct_references"]  # pre-v26 payload
     assert Schema.from_snapshot(snap).views[0].direct_references == ()
+
+
+def test_pre_reshape_v26_set_gucs_decode_without_inventing_a_guc() -> None:
+    """An intra-branch v26 file carried bare name strings for `set_gucs` and
+    two-element pairs for `role_set_gucs`. Slicing p[0]/p[1] off a string took
+    CHARACTERS, so `app.tenant` decoded to a bogus GUC named `a`; and a missing
+    role-level value defaulted to `""`, a real value the prover can decide
+    against — enough to turn a leak into a false PROVEN."""
+    from pgrls.model import SNAPSHOT_VERSION, Schema
+
+    payload = {
+        "version": SNAPSHOT_VERSION,
+        "tables": [],
+        "set_gucs": ["app.tenant"],
+        "role_set_gucs": [["anon", "app.x"]],
+    }
+    schema = Schema.from_snapshot(payload)
+    assert schema.set_gucs == (("app.tenant", None),)
+    assert schema.role_set_gucs == (("anon", "app.x", None),)

@@ -1211,7 +1211,13 @@ _SET_GUCS_SQL = """
 SELECT DISTINCT
     lower(split_part(cfg, '=', 1)) AS name,
     CASE WHEN s.setrole = 0 THEN NULL ELSE r.rolname END AS role,
-    substr(cfg, strpos(cfg, '=') + 1) AS value
+    substr(cfg, strpos(cfg, '=') + 1) AS value,
+    CASE
+        WHEN s.setrole <> 0 AND s.setdatabase <> 0 THEN 3
+        WHEN s.setrole <> 0 THEN 2
+        WHEN s.setdatabase <> 0 THEN 1
+        ELSE 0
+    END AS tier
 FROM pg_catalog.pg_db_role_setting s
 CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
 LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
@@ -1231,9 +1237,14 @@ ORDER BY 1, 2
 # `postgresql.conf` line `app.sys = 'sysval'` is readable by every session,
 # `current_setting` included, yet `pg_settings` has zero rows for it), so a
 # first cut that read `pg_settings` captured nothing at all. `pg_file_settings`
-# lists the applied file entries — and it is the only server-level source that
-# matters, because `ALTER SYSTEM` refuses a custom name the server has never
-# seen ("unrecognized configuration parameter").
+# lists the applied file entries. It is not the whole story: a GUC given on
+# the postmaster command line (`postgres -c app.x=v`, the docker-compose
+# `command:` / k8s `args:` idiom) appears in NEITHER view, yet every session
+# reads it — measured on PG16: `current_setting('app.cmdline')` returns the
+# value while `pg_settings` and `pg_file_settings` both have zero rows. That
+# is why the session probe below runs unconditionally rather than only as a
+# fallback. (`ALTER SYSTEM` refuses a custom name the server has never seen,
+# so `postgresql.auto.conf` adds nothing beyond the file entries.)
 _FILE_SET_GUCS_SQL = """
 SELECT DISTINCT lower(name) AS name, setting
 FROM pg_catalog.pg_file_settings
@@ -1274,7 +1285,8 @@ def _fetch_set_gucs(
     server configuration, so it wins here.
 
     Role-level settings bind to the LOGIN role — see `verify._anon_login_roles`
-    — so they are returned per role rather than merged.
+    — so they are returned per role rather than merged. Where one name is set
+    at several levels the most specific wins, exactly as Postgres resolves it.
 
     A `None` value means "set, but the value was not captured": the
     `pg_file_settings` fallback below cannot attribute a live
@@ -1282,38 +1294,61 @@ def _fetch_set_gucs(
     it reports only the fact, and the prover keeps such a GUC opaque.
     """
     cur.execute(_SET_GUCS_SQL)
-    rows = cur.fetchall()
+    # Most specific tier wins, per (role, name): `ALTER ROLE x IN DATABASE d
+    # SET` beats `ALTER ROLE x SET` beats `ALTER DATABASE d SET` beats `ALTER
+    # ROLE ALL SET` — measured on PG16 by stripping one tier at a time and
+    # re-reading `current_setting` as the role. Collapsing the tiers let the
+    # lexicographically-last value win, so the prover could compare against a
+    # string no session ever sees and prove isolation from it.
+    best: dict[tuple[str | None, str], tuple[int, str]] = {}
+    for r in cur.fetchall():
+        key = (r["role"], r["name"])
+        prior = best.get(key)
+        if prior is None or r["tier"] > prior[0]:
+            best[key] = (r["tier"], r["value"])
     db_level: dict[str, str | None] = {
-        r["name"]: r["value"] for r in rows if r["role"] is None
+        name: value for (role, name), (_t, value) in best.items() if role is None
     }
     role_level = {
-        (r["role"], r["name"], r["value"]) for r in rows if r["role"] is not None
+        (role, name, value)
+        for (role, name), (_t, value) in best.items()
+        if role is not None
     }
     # Ask before reading rather than catching the failure: `introspect` runs on
     # autocommit connections too (the verdict corpus uses one), where a
-    # SAVEPOINT is itself an error and could not be rolled back.
+    # SAVEPOINT is itself an error and could not be rolled back. Both the
+    # view's ACL and the underlying set-returning function's EXECUTE are
+    # checked: `GRANT SELECT ON pg_file_settings` alone still fails the read
+    # with `permission denied for function pg_show_all_file_settings`, which
+    # would abort the whole command.
     cur.execute(
         "SELECT pg_catalog.has_table_privilege("
-        "'pg_catalog.pg_file_settings', 'SELECT') AS ok"
+        "'pg_catalog.pg_file_settings', 'SELECT') "
+        "AND pg_catalog.has_function_privilege("
+        "'pg_catalog.pg_show_all_file_settings()', 'EXECUTE') AS ok"
     )
     row = cur.fetchone()
     if row is not None and row["ok"]:
         cur.execute(_FILE_SET_GUCS_SQL)
         for r in cur.fetchall():
             db_level.setdefault(r["name"], r["setting"])
-    else:
-        # Not privileged to read pg_file_settings: ask the session instead.
-        cur.execute("SELECT session_user AS me")
-        me = cur.fetchone()["me"]
-        own = {name for role, name, _v in role_level if role == me}
-        cur.execute(_POLICY_GUC_NAMES_SQL)
-        for name in [r["name"] for r in cur.fetchall()]:
-            if name in db_level or name in own:
-                continue
-            cur.execute("SELECT current_setting(%s, true) AS v", (name,))
-            got = cur.fetchone()
-            if got is not None and got["v"] not in (None, ""):
-                db_level[name] = None  # set — value not attributable
+    # Then ask the session itself, ALWAYS — not only when the view was
+    # unreadable: a GUC given on the postmaster command line is in no catalog
+    # at all (measured on PG16). Only names no catalog explained are added,
+    # and only as "set, value not captured", since this session's value may
+    # be its own role's and is not attributable to an anonymous caller. That
+    # can withhold a proof; it can never manufacture one.
+    cur.execute("SELECT session_user AS me")
+    me = cur.fetchone()["me"]
+    own = {name for role, name, _v in role_level if role == me}
+    cur.execute(_POLICY_GUC_NAMES_SQL)
+    for name in [r["name"] for r in cur.fetchall()]:
+        if name in db_level or name in own:
+            continue
+        cur.execute("SELECT current_setting(%s, true) AS v", (name,))
+        got = cur.fetchone()
+        if got is not None and got["v"] not in (None, ""):
+            db_level[name] = None
     return tuple(sorted(db_level.items())), tuple(sorted(role_level))
 
 

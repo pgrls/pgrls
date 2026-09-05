@@ -804,6 +804,127 @@ GRANT SELECT ON docs_v TO anon;
             "over-report; the door is only as wide as the owner's grant."
         ),
     ),
+
+    # ---- review pass 4: GUC precedence, and doors the walk had lost
+    VerdictCase(
+        name="anon_guc_most_specific_tier_wins",
+        mode="anon",
+        sql="""
+CREATE TABLE k (id int primary key, body text);
+INSERT INTO k VALUES (1, 'k-secret');
+ALTER TABLE k ENABLE ROW LEVEL SECURITY;
+ALTER TABLE k FORCE ROW LEVEL SECURITY;
+CREATE POLICY kp ON k FOR SELECT TO PUBLIC
+    USING (current_setting('app.k') = 'aaa_in_database');
+GRANT SELECT ON k TO anon;
+ALTER ROLE anon SET app.k = 'zzz_role_level';
+DO $$ BEGIN
+    EXECUTE format('ALTER ROLE anon IN DATABASE %I SET app.k = %L',
+                   current_database(), 'aaa_in_database');
+    EXECUTE format('ALTER DATABASE %I SET app.k = %L',
+                   current_database(), 'db_level');
+END $$;
+""",
+        expect=(("public.k", "leak"),),
+        note=(
+            "One GUC set at three levels. Postgres resolves role-in-database > "
+            "role > database (measured by stripping one tier at a time), so a "
+            "real anon session reads 1 row. Collapsing the tiers let the "
+            "lexicographically-last value ('zzz_role_level') win and the "
+            "prover proved isolation from a string no session ever sees."
+        ),
+    ),
+    VerdictCase(
+        name="anon_guc_value_through_a_cast_pins_the_row",
+        mode="anon",
+        sql="""
+CREATE TABLE ints (id int primary key, body text);
+INSERT INTO ints VALUES (1, 'int-secret'), (2, 'other');
+ALTER TABLE ints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ints FORCE ROW LEVEL SECURITY;
+CREATE POLICY ip ON ints FOR SELECT TO PUBLIC
+    USING (id = current_setting('app.n')::int);
+GRANT SELECT ON ints TO anon;
+DO $$ BEGIN
+    EXECUTE format('ALTER DATABASE %I SET app.n = %L', current_database(), '1');
+END $$;
+""",
+        expect=(("public.ints", "leak"),),
+        expect_paths=("ip",),
+        note=(
+            "Measured: anon reads exactly row 1. The cast made the configured "
+            "value opaque again, so the leak degraded to 'conditional' and "
+            "--emit-repro seeded a row the policy does not admit — the "
+            "generated pytest failed against a real leak."
+        ),
+    ),
+    VerdictCase(
+        name="reach_pg_read_all_data_owner_is_a_door",
+        mode="reachability",
+        sql=_SCOPED_TABLE + """
+RESET ROLE;
+GRANT pg_read_all_data TO corpus_bypass;
+SET ROLE corpus_bypass;
+CREATE VIEW docs_v AS SELECT * FROM docs;
+RESET ROLE;
+GRANT SELECT ON docs_v TO anon;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "The view owner holds SELECT through the predefined role "
+            "`pg_read_all_data`, with no grant of its own — measured: anon "
+            "reads every row. A base-table readability check that looked only "
+            "at explicit grants judged the path dead and went totally silent."
+        ),
+    ),
+    VerdictCase(
+        name="reach_view_is_the_only_door_when_anon_cannot_read_the_table",
+        mode="reachability",
+        sql="""
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, body text);
+INSERT INTO docs VALUES (1, 'row-one'), (2, 'row-two');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC USING (true);
+CREATE VIEW docs_v AS SELECT * FROM docs;
+RESET ROLE;
+GRANT SELECT ON docs_v TO anon;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "`USING (true)` with NO grant to anon: the direct read is "
+            "`permission denied for table docs` while the definer view returns "
+            "every row (measured). Ceding to `--mode anon` because 'the table "
+            "already leaks every row' cleared the only real door — that mode "
+            "proves the predicate admits rows, never that anon holds SELECT."
+        ),
+    ),
+    VerdictCase(
+        name="reach_invoker_inner_resets_to_the_session_user",
+        mode="reachability",
+        sql=_SCOPED_TABLE + """
+RESET ROLE;
+GRANT SELECT ON docs TO anon, corpus_plain;
+SET ROLE corpus_plain;
+CREATE VIEW docs_inner WITH (security_invoker = true) AS SELECT * FROM docs;
+RESET ROLE;
+SET ROLE corpus_owner;
+CREATE VIEW docs_v AS SELECT * FROM docs_inner;
+RESET ROLE;
+GRANT SELECT ON docs_inner TO corpus_owner;
+GRANT SELECT ON docs_v TO anon;
+""",
+        expect=(),
+        note=(
+            "`security_invoker = true` resets the effective user to the "
+            "SESSION user; it does not inherit the enclosing definer view's "
+            "owner. Measured: the read returns the policy-filtered rows, and "
+            "revoking anon's own SELECT on the table denies it outright. "
+            "Inheriting the outer owner reported a leak we cannot exhibit."
+        ),
+    ),
 ]
 
 

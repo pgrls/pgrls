@@ -4235,7 +4235,13 @@ def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | N
     opts = cfg.rule_options.get("SEC021", {})
     if "identity_columns" not in opts:
         return None
-    return frozenset(_parse_identity_columns(opts))
+    columns = frozenset(_parse_identity_columns(opts))
+    # An empty list disables SEC021, which is a legitimate way to silence a
+    # lint rule — but as a verify axis it would make every cross-tenant/write
+    # table `unverified` and, without `--strict`, exit 0. A security gate must
+    # not pass because its configuration was emptied, so fall back to the
+    # default axis set.
+    return columns or None
 
 
 

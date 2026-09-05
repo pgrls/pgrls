@@ -646,15 +646,23 @@ def _observe_anon_sessions(
     and nothing for a JWT-less one.
     """
     names = sorted({n for st in guc_states for n in st})
+    # What this session inherits, captured BEFORE any state is applied: a GUC
+    # whose value introspection could not capture is replayed from here, so a
+    # later state cannot leave the previous state's value standing.
+    inherited: dict[str, str] = {}
+    for n in names:
+        cur.execute(f"SELECT current_setting({_sql_str(n)}, true) AS v")
+        got = cur.fetchone()
+        inherited[n] = (got[0] if got and got[0] is not None else "")
     for state in guc_states or ({},):
         for n in names:
             if n in state and state[n] is None:
                 # Set at server level with a value introspection could not
-                # capture — this very session inherits it, so leave it be.
-                continue
-            cur.execute(
-                f"SELECT set_config({_sql_str(n)}, {_sql_str(state.get(n) or '')}, true)"
-            )
+                # capture: restore what this session actually inherits.
+                value = inherited[n]
+            else:
+                value = state.get(n) or ""
+            cur.execute(f"SELECT set_config({_sql_str(n)}, {_sql_str(value)}, true)")
         for guc, _val in _ANON_KEY_SESSION_GUCS:
             cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
         seen = _row_count(cur.connection, query)

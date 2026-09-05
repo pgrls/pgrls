@@ -27,6 +27,68 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **A custom GUC set on the postmaster command line was invisible, so the
+  prover claimed PROVEN.** `postgres -c app.x=v` — the docker-compose
+  `command:` / Kubernetes `args:` idiom — appears in neither `pg_settings` nor
+  `pg_file_settings`, yet every session reads it (measured on PG16: the value
+  comes back from `current_setting` while both catalogs have zero rows). The
+  introspection session is now asked about every dotted GUC the policies read,
+  always rather than only when `pg_file_settings` is unreadable. Names no
+  catalog explains are recorded as set-with-unknown-value, which can withhold
+  a proof but never manufacture one.
+- **GUC precedence tiers were collapsed, so the prover compared against a value
+  no session ever sees.** `ALTER ROLE x IN DATABASE d SET`, `ALTER ROLE x SET`,
+  `ALTER DATABASE d SET` and `ALTER ROLE ALL SET` were stored alike, letting
+  the lexicographically-last value win. With the real value at one tier and a
+  decoy at another, `verify --mode anon` returned PROVEN on a policy a live
+  anonymous session read a row through. Postgres's order was measured by
+  stripping one tier at a time; the most specific now wins, as it does in the
+  server.
+- **`verify --mode reachability` went silent when a view owner held `SELECT`
+  through `pg_read_all_data`.** That predefined role confers read on everything
+  with no grant of its own, so the new base-table readability check judged the
+  path dead and reported nothing at all — measured: swapping a direct grant for
+  the role membership left anon reading every row through the same view.
+- **`verify --mode reachability` cleared a real door by ceding to `--mode
+  anon`.** "The table already leaks every row to anon, so the view exposes
+  nothing new" rests on the anon prover, which decides whether the *predicate*
+  admits rows and never whether anon holds `SELECT`. A `USING (true)` table
+  with no grant to anon is `permission denied` on a direct read while the
+  definer view over it returns everything (measured), so the cede is now gated
+  on anon actually being able to open the table.
+- **`pgrls snapshot` and `verify` could abort with `permission denied for
+  function pg_show_all_file_settings`.** The privilege gate asked whether the
+  connection may read the `pg_file_settings` view; the view's ACL and the
+  underlying set-returning function's `EXECUTE` are separate, so a DBA who
+  granted the view directly broke the whole command. Both are checked now.
+- **`security_invoker = true` on an inner view was modelled as inheriting the
+  enclosing definer view's owner.** It resets to the SESSION user instead —
+  measured three ways: a definer view owned by a `BYPASSRLS` role over an
+  invoker view returned the policy-filtered row rather than every row, the same
+  chain owned by the table owner did too, and revoking the anonymous caller's
+  own `SELECT` on the table denied the read outright. The old model reported a
+  leak the tool could not exhibit.
+- **`--emit-repro` still wrote a non-reproducing script when the GUC read went
+  through a numeric cast.** `col = current_setting('app.n')::int` made the
+  captured value opaque again, so the leak degraded to "conditional" and the
+  emitted script seeded a placeholder row the policy does not admit — the
+  generated pytest failed against a real leak. A captured value that Postgres
+  could cast is folded to the constant, so the witness pins the row; a value
+  that would not cast stays opaque.
+- **A pre-reshape v26 snapshot decoded into a fabricated GUC.** Slicing
+  `p[0]`/`p[1]` off the old bare-string shape took *characters*, so
+  `app.tenant` became a GUC named `a`; and a missing role-level value defaulted
+  to `""`, a real value the prover can decide against — enough to turn a leak
+  into a false PROVEN. Both shapes decode correctly, with `None` for an
+  uncaptured value.
+- A matview hop enumerated only its direct table references, so a matview
+  reading through another view produced no verdict for the table beneath it;
+  `--mode reachability` with no findings no longer reports "No RLS-enabled
+  tables to verify" when there are such tables but no view path; `--probe`
+  restores each GUC's inherited value between login-path states instead of
+  leaving the previous state's; and an empty `identity_columns` list falls back
+  to the default axis set rather than silently making every cross-tenant table
+  unverified and exiting 0.
 - **`verify --mode anon` read role-level GUC settings off the wrong end of the
   role graph.** `ALTER ROLE … SET app.x` binds to the role that **logs in**,
   and membership does not propagate it. The first cut walked the closure
