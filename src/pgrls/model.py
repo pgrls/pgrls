@@ -2,7 +2,14 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 13 (v13 added ``is_primary`` to ``Index`` — from
+Currently version 26. v26 added ``View.direct_references`` /
+``column_grants`` / ``owner_is_superuser``, top-level ``set_gucs`` /
+``role_set_gucs``, and serialized ``role_memberships`` (each edge with
+its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
+for verify's reachability mode; v24 added foreign tables; v23 added the
+matview / exposed-relation fields; v21–v22 extended grants and
+publications; v14–v20 accumulated the SEC029–SEC044 catalog fields.
+Earlier: v13 added ``is_primary`` to ``Index`` — from
 ``pg_index.indisprimary`` — so SEC035 can tell a surrogate primary
 key apart from a tenant-scopable UNIQUE; v12 added ``signature`` to
 ``SecdefFunction`` and ``LeakproofFunction`` so per-overload

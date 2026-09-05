@@ -53,9 +53,6 @@ from pgrls.diff._z3_compare import (
 from pgrls.fixers._idents import quote_ident
 from pgrls.model import MAYBE_SET, Column, Policy, Schema, Table
 from pgrls.repro import (
-    _AUTH_IDENTITY_GUC,
-    _current_setting_guc,
-    _funccall_qualified,
     _identity_value_type,
     _row_columns,
     _session_a_value,
@@ -91,8 +88,10 @@ Agreement = Literal["agree", "mismatch", "leak_confirmed", "skipped", "abstained
 
 # JWT-claim GUCs the auth.* stubs read (see repro._AUTH_STUB). Clearing them
 # (set to '') makes auth.uid()/role()/jwt() return NULL — the anonymous state
-# the `anon` threat model probes under. A policy reading a different GUC via a
-# direct current_setting(...) adds its own GUC to this set per table.
+# the `anon` threat model probes under, because those stubs read them through
+# `NULLIF(..., '')`. This set is deliberately CLOSED: a policy's own
+# `current_setting('app.x')` must never be cleared, since '' is a value rather
+# than NULL there and cannot be undone within the session.
 _ANON_BASELINE_GUCS = (
     "request.jwt.claim.sub",
     "request.jwt.claim.role",
@@ -182,40 +181,6 @@ def _short(exc: Exception) -> str:
 
 def _column_map(table: Table) -> dict[str, Column]:
     return {c.name: c for c in table.column_details}
-
-
-def _anon_gucs(policy_ast: Any) -> list[str]:
-    """The GUCs to clear so every auth value in `policy_ast` reads NULL.
-
-    The baseline Supabase JWT-claim GUCs, plus any GUC a direct
-    ``current_setting('<guc>')`` in the predicate reads (so a non-Supabase
-    policy scoping on ``current_setting('app.tenant_id')`` is anonymized too).
-    Reuses repro's `_current_setting_guc` / `_AUTH_IDENTITY_GUC` so the GUC
-    mapping is the single source of truth shared with the emitted repro."""
-    from pglast.ast import FuncCall, Node
-
-    gucs = set(_ANON_BASELINE_GUCS)
-
-    def walk(n: Any) -> None:
-        if n is None:
-            return
-        if isinstance(n, (list, tuple)):
-            for item in n:
-                walk(item)
-            return
-        if isinstance(n, FuncCall):
-            guc = _current_setting_guc(n)
-            if guc is not None:
-                gucs.add(guc)
-            qualified = _funccall_qualified(n)
-            if qualified in _AUTH_IDENTITY_GUC:
-                gucs.add(_AUTH_IDENTITY_GUC[qualified])
-        if isinstance(n, Node):
-            for field_name in n:
-                walk(getattr(n, field_name, None))
-
-    walk(policy_ast)
-    return sorted(gucs)
 
 
 def _references_other_tables(policy_ast: Any) -> bool:

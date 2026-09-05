@@ -764,6 +764,11 @@ the output without blocking CI.
 | Policy dropped, RESTRICTIVE | DANGEROUS |
 | Policy dropped, PERMISSIVE | BREAKING |
 
+> Both rename keys below have per-invocation CLI overrides on `pgrls diff`:
+> `--rename-detection` and `--rename-classification`. `pgrls diff --apply`
+> also takes `--extension NAME` to pre-install an extension in the ephemeral
+> baseline container before applying.
+>
 > **Rename detection** (shipped in 0.42.0). When `[diff].rename_detection`
 > is `strict` (default), a unique 1:1 policy pair that matches on
 > (permissive, command, roles) with predicate-equal USING/WITH CHECK is
@@ -836,10 +841,14 @@ each produces its own `Change` entry, classified independently.
 
 ### Common-case AST patterns
 
-`compare_predicates` in `pgrls.diff.ast_compare` returns one of six
+`compare_predicates` in `pgrls.diff.ast_compare` returns one of nine
 results — `unchanged`, `tightened_and`, `loosened_and_drop`,
-`loosened_or`, `tightened_or_drop`, or `requires_review` — which the
-differ maps to ChangeKind + classification. `unchanged` is filtered
+`loosened_or`, `tightened_or_drop`, `semantic_equivalent`,
+`semantic_tightened`, `semantic_loosened`, or `requires_review` — which
+the differ maps to ChangeKind + classification. The three `semantic_*`
+results come from the Z3 comparison (a core dependency since 0.16.0);
+`semantic_loosened` is the one that carries the leaking-row
+counterexample. `unchanged` is filtered
 out (no Change emitted). The mapping:
 
 | `compare_predicates` result | classification    |

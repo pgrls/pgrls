@@ -1,9 +1,17 @@
 """VIEW001 — non-`security_invoker` view over RLS-protected table.
 
 A view defined without `WITH (security_invoker = true)` runs queries
-with the view owner's privileges, NOT the calling user's. RLS policies
-are evaluated against the view owner — typically a privileged migration
-or admin role — so referenced rows leak past the policy boundary.
+with the view owner's privileges, NOT the calling user's — so the base
+table's RLS is evaluated against the view OWNER rather than the caller.
+
+Whether that returns rows the caller should not see depends on the
+owner. Measured on PG16: a definer view over a `FORCE`'d table owned by
+an ordinary (non-exempt) role handed the caller exactly its own tenant's
+row — RLS applied, nothing leaked. Drop the `FORCE` and the same view
+returned every row. So the bypass is real when the owner is RLS-exempt
+(superuser / `BYPASSRLS`) or owns a table that is not `FORCE`'d;
+otherwise the caller is still handed the *owner's* row set rather than
+its own, which is a different answer than it would get directly.
 
 PG15+ defaults `security_invoker` to false, matching the historical
 "DEFINER-style" semantics. Modern views should opt in to invoker mode
@@ -61,8 +69,9 @@ class VIEW001:
                     title=self.title,
                     message=(
                         f"View {v.qualified_name} runs queries with "
-                        "the view owner's privileges, bypassing RLS "
-                        f"on {referenced_qname}. Re-create the view "
+                        "the view owner's privileges, so "
+                        f"{referenced_qname}'s RLS is evaluated as the view "
+                        "owner rather than the caller. Re-create the view "
                         "with WITH (security_invoker = true), or "
                         "apply the auto-fix."
                     ),

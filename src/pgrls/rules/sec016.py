@@ -66,8 +66,13 @@ Out of scope (intentional):
 * **The `row_security` session GUC.** `SET row_security = off` is a
   different mechanism, and not a silent one: a query that *would*
   return RLS-filtered rows raises an error instead of quietly
-  widening, unless the role already owns the table or holds
-  `BYPASSRLS`. SEC016 covers the attribute, not the GUC.
+  widening, unless the role is exempt from that table's RLS — a
+  superuser, a `BYPASSRLS` role, or the owner of a table that is not
+  `FORCE`'d. Ownership alone is not the exemption: measured on PG16,
+  the owner of a `FORCE`'d table with `row_security = off` got
+  `ERROR: query would be affected by row-level security policy`, and
+  the same query returned every row once `FORCE` was dropped. SEC016
+  covers the attribute, not the GUC.
 """
 from __future__ import annotations
 

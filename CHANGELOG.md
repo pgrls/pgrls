@@ -22,13 +22,31 @@ breaking changes — they will be called out in this file.
   top-level `role_set_gucs` (role-level ones, as `(role, name, value)`), and
   top-level `role_memberships` (present only when captured from a live
   database; each edge carries an `inherit` flag).
-  Additive and fail-closed: v3–v25 files still load; a missing
-  `direct_references` falls back to the collapsed `references`, a missing
-  `role_memberships` keeps the anon prover abstaining on non-anon roles. Re-
+  Additive: v3–v25 files still load, and a missing `direct_references` falls
+  back to the collapsed `references`. A missing `role_memberships` keeps the
+  anon prover abstaining on role-scoped policies — but the anonymous-role
+  RLS-exemption check reports "not exempt" there rather than abstaining, the
+  one place absent evidence resolves to a proof. Re-
   capture `--against` baselines to benefit — re-emitting an old file stamps
   the new version without adding the graph.
 
 ### Fixed
+- **Two rules stated Postgres semantics backwards, in text `pgrls explain`
+  prints to users.** SEC013 said a trigger fires as the table owner regardless
+  of `prosecdef` — measured, an invoker-side trigger function runs as the
+  CALLER, and `SECURITY DEFINER` is exactly what decides the bypass. SEC009
+  said RLS with no policies denies "regardless of role" — measured, the owner
+  reads every row without `FORCE`, as do `BYPASSRLS` roles and superusers,
+  which is precisely what makes the rule's own "audit log read only by
+  superusers" example work. VIEW001 claimed a definer view bypasses RLS
+  unconditionally (it does so only when the owner is exempt or the table is
+  not `FORCE`'d); VIEW002 claimed a caller predicate can be evaluated before
+  the base table's RLS qual (it cannot — those are security quals, applied
+  first; the exposure is the view's own filtering); HYG001 claimed Postgres
+  permits dropping a policy-referenced column (it refuses, and `RENAME`
+  rewrites the policy); SEC012's composition formula used OR where AND
+  belongs; and SEC016's `row_security = off` exemption named ownership when
+  `FORCE` is what decides. All rewritten around measured behaviour.
 - **`--probe` could never reproduce a leak that rides on an unset GUC, and
   reported MISMATCH against its own correct verdict.** To build an anonymous
   session it wrote `set_config(<guc>, '', true)` for every GUC the policy
@@ -66,8 +84,10 @@ breaking changes — they will be called out in this file.
   `FORCE`'d table, while the capture query's `WHERE rolbypassrls` filter
   skipped it entirely. Roles exempt from RLS are now captured on either
   attribute. SEC016 and SEC023 already skip superusers explicitly, so no
-  rule's output changes; only the verifier stops proving isolation against an
-  exempt role.
+  rule's output changes. `pgrls matrix` does widen — it lists RLS-exempt roles
+  as columns and marks their cells bypassing, so an ordinary superuser now
+  appears there — which is the correct answer for a table that claims to show
+  who can read what.
 - **`verify --mode anon` proved isolation while a live anonymous login read
   every row, because the anon role's own RLS exemption was never modelled.**
   The prover reasoned only about the predicate. If the anonymous role holds
@@ -190,7 +210,7 @@ breaking changes — they will be called out in this file.
   custom placeholders `GUC_NO_SHOW_ALL`, so `pg_settings` has *zero* rows for
   a conf-level `app.x` that every session can nonetheless read — the first cut
   queried exactly that view and captured nothing. Server-level values now come
-  from `pg_file_settings` — see the later entry in this section, which
+  from `pg_file_settings` — see the earlier entry in this section, which
   removed the "only when that view is unreadable" condition on the session
   probe after a postmaster command-line GUC turned out to appear in no
   catalog at all.
@@ -218,9 +238,10 @@ breaking changes — they will be called out in this file.
   grant.** A definer view whose owner is admitted only *some* rows by the
   table's own policies, over a table that already leaks *some* rows to anon
   directly, was a second `LEAK`; measured, both reads returned the same single
-  row. It is `UNVERIFIED` now — the view may expose nothing new — and a
-  laundering leak carries the owner-session witness rather than claiming every
-  row.
+  row. It is `UNVERIFIED` when anon can actually read the table — the view may
+  expose nothing new — and a laundering leak carries the owner-session witness
+  rather than claiming every row. (Where anon holds no table-level `SELECT` it
+  stays a `LEAK`; see the earlier entry in this section.)
 - **The laundering check evaluated GUCs as the view's owner, not the caller.**
   Inside a definer view body `current_setting()` still reads the *caller's*
   session, so the anonymous session's inherited settings decide it.
@@ -298,7 +319,7 @@ breaking changes — they will be called out in this file.
   session (measured: 1 row), yet the canonical tenant policy stayed PROVEN
   and `--probe` cleared the GUC to `''` before looking. Snapshot v26 captures
   `set_gucs` (dotted names set at database / server level) and
-  `role_set_gucs` (role-level; see the later entry in this section for which
+  `role_set_gucs` (role-level; see the earlier entry in this section for which
   roles' settings an anonymous session actually inherits); names are
   casefolded (GUC names are case-insensitive, `setconfig` is not). The
   prover treats a read of one as a real value in every spelling — one-arg,

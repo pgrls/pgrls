@@ -1,8 +1,15 @@
 """HYG001 — Policy references a column that doesn't exist on its table.
 
-Postgres allows `ALTER TABLE ... DROP COLUMN` even when a policy references
-that column; the policy text persists with a phantom reference and errors
-at evaluation time. Detect statically.
+Postgres records a dependency from the policy to the column, so a live
+database cannot reach this state by accident (measured on PG16: `DROP
+COLUMN` is REFUSED — "cannot drop column … because other objects depend
+on it"; `DROP COLUMN … CASCADE` drops the *policy* instead, leaving
+nothing dangling; and `RENAME COLUMN` rewrites the policy expression
+automatically). A phantom reference therefore comes from a source
+Postgres never validated: an offline `--sql-file` run whose DDL declares
+a policy over a column its `CREATE TABLE` lacks, a hand-edited snapshot,
+or a bare sub-select column name that collides with an own-table column.
+Detect statically.
 
 Heuristic: only unqualified ColumnRef nodes are checked, and refs inside
 SubLink (subqueries) are skipped, because both shapes commonly point at

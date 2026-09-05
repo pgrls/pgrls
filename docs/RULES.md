@@ -152,7 +152,9 @@ in `[lint.rules.SEC016]` once the need is confirmed.
 in the role list. Permissive policies stack with `OR`; granting them to
 `PUBLIC` means any role — including unauthenticated connections — gets
 the policy's `USING` clause as the gate, regardless of any role-specific
-policies that might exist on the same table.
+*permissive* policies that might exist on the same table. A `RESTRICTIVE`
+policy still narrows it — measured: `TO PUBLIC USING (true)` plus a
+restrictive tenant filter returned 1 row of 3.
 
 **Standard fix.** Restrict the policy to the role that should actually
 have it:
@@ -573,7 +575,7 @@ own-column reference).
 policy on a table it produces deny-all (the same effect as SEC009 —
 RLS enabled, no policies — just achieved through a more misleading
 mechanism: the table looks "RLS protected" because it has a policy,
-but the predicate makes it effectively disabled). As one of several
+but the predicate makes the policy inert). As one of several
 policies it's a no-op for permissive combinations and forces
 deny-all for restrictive ones.
 
@@ -634,6 +636,9 @@ Common shape: a debug branch left in by accident. The author
 adds `OR true` to "temporarily let everything through" while
 checking data, then forgets to remove it.
 
+Allowlist by qualified policy ID (`schema.table.policy_name`) in
+`[lint.rules.SEC011]` when the branch is deliberate.
+
 **Standard fix.** Remove the `OR true`:
 
 ```sql
@@ -675,7 +680,7 @@ is flagged but left for human review.
 
 **What it catches:** tables where RLS is enabled, at least one
 policy exists, and every policy is `RESTRICTIVE`. Postgres composes
-RLS as `permissive_or | (restrictive_and & ...)`: a row is visible
+RLS as `permissive_or & restrictive_and_1 & restrictive_and_2 …`: a row is visible
 iff at least one PERMISSIVE policy matches AND every RESTRICTIVE
 policy matches. With zero PERMISSIVE policies the disjunction is
 empty — no row passes, regardless of how many RESTRICTIVE policies
@@ -1122,8 +1127,14 @@ Out of scope (intentional):
 * **The `row_security` session GUC.** `SET row_security = off` is
   a different mechanism, and not a silent one: a query that
   *would* return RLS-filtered rows raises an error instead of
-  quietly widening, unless the role already owns the table or
-  holds `BYPASSRLS`. SEC016 covers the attribute, not the GUC.
+  quietly widening, unless the role is exempt from that table's
+  RLS — a superuser, a `BYPASSRLS` role, or the owner of a table
+  that is not `FORCE`'d. Ownership alone is not the exemption:
+  measured on PG16, the owner of a `FORCE`'d table with
+  `row_security = off` got `ERROR: query would be affected by
+  row-level security policy`, and the same query returned every
+  row once `FORCE` was dropped. SEC016 covers the attribute, not
+  the GUC.
 
 <a id="rule-sec017"></a>
 
@@ -4035,7 +4046,10 @@ such row", so an application that forgets to bind a tenant does not fail: it
 reports 404s, on every affected path, at once.
 
 Two things make this hard to catch without help. A test suite that connects as
-the table owner cannot see it at all — RLS is not enforced for that role, so a
+the owner of a table that is not `FORCE`'d cannot see it at all — RLS is not
+enforced for that role there (measured: 3 rows without `FORCE`, 0 with it, so
+the `FORCE`'d schema `pgrls generate` emits and SEC002 requires *would* catch
+it), so a
 query that binds a tenant and a query that does not are identical to every test
 in the suite. And the failure only appears when the application role stops
 being the owner, which is usually a deployment change rather than a code one.
@@ -4221,6 +4235,8 @@ transaction) over `clock_timestamp()` (VOLATILE).
 
 ```toml
 [lint.rules.PERF002]
+# Allowlist by qualified policy ID when the volatile call is deliberate.
+# allowlist = ["public.audit.sampled_read"]
 # Override REPLACES the default — list every function you want covered.
 # volatile_functions = ["random", "clock_timestamp", "my.volatile_helper"]
 ```
@@ -4446,16 +4462,21 @@ needs human judgment about the query shape.
 
 **What it catches:** policies whose `USING` or `WITH CHECK` clauses
 reference an unqualified column name that isn't in the table's current
-column list. This usually happens when `ALTER TABLE ... DROP COLUMN`
-runs without the operator realizing a policy still mentions the column.
-Postgres permits the drop; the policy text persists and errors at
-evaluation time.
+column list. Postgres records a dependency from the policy to the
+column, so a live database cannot drift into this by accident — measured
+on PG16, `DROP COLUMN` is **refused** ("cannot drop column … because
+other objects depend on it"), `DROP COLUMN … CASCADE` drops the *policy*
+rather than orphaning it, and `RENAME COLUMN` rewrites the policy
+expression for you. A phantom reference therefore comes from a source
+Postgres never validated: an offline `--sql-file` run whose DDL declares
+a policy over a column its `CREATE TABLE` lacks, a hand-edited snapshot,
+or a bare sub-select column name that collides with an own-table
+column.
 
 **Standard fix.** Pick one:
 
 - If the column was meant to be removed, drop the policy and add a new
   one that doesn't reference it.
-- If the column was renamed, recreate the policy with the new name.
 - If the policy is now obsolete, drop it.
 
 There is no `pgrls.toml` option for HYG001 — every fire is a real bug.
@@ -4595,8 +4616,14 @@ Postgres 15+ defaults `security_invoker` to `false`, matching the
 historical "DEFINER-style" semantics — the view runs queries with the
 view *owner's* privileges, not the calling user's. RLS policies on the
 underlying table are then evaluated against the owner (typically a
-privileged migration / admin role), so per-tenant predicates leak past
-the policy boundary every time anyone selects from the view.
+privileged migration / admin role) rather than the caller. Whether that
+returns rows the caller should not see depends on the owner: measured on
+PG16, a definer view over a `FORCE`'d table owned by an ordinary role
+handed the caller exactly its own tenant's row, while dropping `FORCE`
+made the same view return every row. The bypass is therefore real when
+the owner is RLS-exempt (superuser / `BYPASSRLS`) or owns a table
+without `FORCE` — and in every case the caller is handed the *owner's*
+row set rather than its own.
 
 **The bad pattern:**
 
@@ -4604,7 +4631,8 @@ the policy boundary every time anyone selects from the view.
 CREATE VIEW public.user_summary AS
     SELECT id, display_name FROM public.users;
 -- security_invoker defaults to false → RLS evaluated as the
--- view owner, not the caller. Every row is visible.
+-- view owner, not the caller. If that owner is RLS-exempt, or
+-- owns a table without FORCE, every row is visible.
 ```
 
 **Standard fix.** Flip the reloption — the auto-fixer emits this
@@ -4647,17 +4675,25 @@ schemas can't both be silenced by a single typo'd entry.
 
 **What it catches:** views over RLS-protected tables that lack
 `WITH (security_barrier = true)`. Without the flag, the planner is
-free to push a caller-supplied predicate (a volatile or
-side-effecting function in `WHERE`) *below* the view's RLS-derived
-filter. The classic exploit:
+free to evaluate a caller-supplied predicate (a cheap
+side-effecting function in `WHERE`) *before the view's own
+qualifications*. The classic exploit:
 
 ```sql
 SELECT * FROM v WHERE leak(secret_column);
 ```
 
-The volatile `leak(...)` evaluates BEFORE the underlying RLS
-predicates restrict the row set — leaking rows the calling user
-should never have seen, by side-effect rather than return value.
+`leak(...)` runs against rows the view body — a join, a `WHERE`, a
+projection — would have filtered out, leaking them by side-effect
+rather than return value.
+
+What it can **not** cross is the base table's RLS qual. Postgres
+marks those security quals and always applies them first; measured on
+PG16 with a `COST 0.0000001` non-leakproof function over an invoker
+view on an RLS table, the function saw only the caller's own row and
+`EXPLAIN` reports `Filter: ((owner = CURRENT_USER) AND leak(secret))`.
+The exposure is the view's own filtering, not the policy boundary —
+which is why this is a `warning` where VIEW001 is an `error`.
 
 `security_invoker` (VIEW001) and `security_barrier` (this rule) are
 *independent* defenses against *different* leak vectors. A view

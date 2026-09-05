@@ -105,7 +105,7 @@ def compare_predicates(
 
     Returns
     -------
-    One of the six classification literals described in the module docstring.
+    One of the nine classification literals described in the module docstring.
     """
     base_empty = not base_sql
     head_empty = not head_sql

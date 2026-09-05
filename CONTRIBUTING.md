@@ -25,7 +25,8 @@ python -m venv .venv
 .venv/bin/mypy src
 ```
 
-A live Postgres is **not** required for the unit tests — the rule
+The `demo/` and `corpus/` suites need Docker (they build a real database);
+a live Postgres is **not** required for the unit tests — the rule
 suite runs against in-memory `Schema` fixtures. The integration tests
 under `tests/` and the demo cases under `demo/` use
 [testcontainers](https://testcontainers-python.readthedocs.io/) to

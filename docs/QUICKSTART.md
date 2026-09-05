@@ -26,7 +26,7 @@ ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_read ON documents
     FOR SELECT
     USING (current_setting('app.uid', true) IS NULL
-           OR owner::text = current_setting('app.uid'));
+           OR owner::text = current_setting('app.uid', true));
 SQL
 
 export DATABASE_URL='postgres://postgres:demo@localhost:55432/postgres'
@@ -44,9 +44,12 @@ pass `--database-url`); `pgrls lint` is read-only.
 The policy reads like the correct English sentence — *"anyone without a
 session sees nothing, signed-in users see their own rows"* — and would
 pass code review. But `current_setting('app.uid', true)` returns `NULL`
-for any connection that hasn't set the GUC, so the `IS NULL` branch is
-true, the `OR` short-circuits, and the policy returns **every row** to
-exactly the connections you meant to keep out. (The same pattern with
+for any connection that hasn't set the GUC, so the `IS NULL` disjunct is
+true for every row and the policy returns **every row** to exactly the
+connections you meant to keep out. (Both calls use the two-argument
+`missing_ok` form on purpose: the one-argument
+`current_setting('app.uid')` *raises* on an unset GUC, which fails the
+query loudly instead of leaking — a different bug, and SEC019's.) (The same pattern with
 `auth.uid() IS NULL OR …` is the recurring Supabase / PostgREST
 foot-gun.) `pgrls lint --explain` prints the rule's reference paragraph
 inline so the *why* travels with the *where*.
@@ -104,7 +107,7 @@ pgrls lint --baseline .pgrls-baseline.json
 git add .pgrls-baseline.json && git commit -m "pgrls: record current findings"
 ```
 
-`pgrls lint --update-baseline` refreshes the file when you intentionally
+`pgrls lint --baseline .pgrls-baseline.json --update-baseline` refreshes the file when you intentionally
 re-baseline after a clean-up pass.
 
 ## Where to go next
