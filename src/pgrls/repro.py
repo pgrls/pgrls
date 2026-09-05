@@ -560,22 +560,41 @@ def _build_statements(
         )
         setup.append("-- needs them, and a throwaway database has none.")
         for name, value in sorted(gucs.items()):
-            if value in (None, MAYBE_SET):
+            if value is MAYBE_SET or value == MAYBE_SET:
+                # The prover could not attribute this GUC to the server, so it
+                # modelled the anonymous session with BOTH the value and the
+                # null-flag free. Writing any value here would pin it non-NULL
+                # and kill an `IS NULL` disjunct the leak may ride on — the
+                # emitted script then returned zero rows against a real leak.
+                # Leave it unset (which is what a throwaway database gives)
+                # and say so.
                 setup.append(
                     f"-- NOTE: {name} is readable where pgrls introspected, but"
                 )
                 setup.append(
-                    "-- its value could not be attributed to the server (that"
+                    "-- could not be attributed to the server — it may be that"
                 )
                 setup.append(
-                    "-- needs pg_file_settings, or it may be a per-connection"
+                    "-- connection's own option. Left UNSET here, which is what"
                 )
                 setup.append(
-                    "-- option) — substitute the value your callers actually see."
+                    "-- an anonymous caller may well see; if your callers do"
                 )
+                setup.append(
+                    f"-- have it, add: SELECT set_config({_sql_str(name)}, '<value>', true);"
+                )
+                continue
+            if value is None:
+                setup.append(
+                    f"-- NOTE: {name} is set at server level but its value was"
+                )
+                setup.append(
+                    "-- not captured (that needs pg_file_settings) — substitute"
+                )
+                setup.append("-- the value your server uses.")
             setup.append(
                 f"SELECT set_config({_sql_str(name)}, "
-                f"{_sql_str(_UNCAPTURED_GUC if value in (None, MAYBE_SET) else str(value))}, true);"
+                f"{_sql_str(_UNCAPTURED_GUC if value is None else str(value))}, true);"
             )
     setup.append("SELECT set_config('request.jwt.claim.sub', '', true);")
     if not anon_key:

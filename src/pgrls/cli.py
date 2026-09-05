@@ -4424,8 +4424,10 @@ def verify(
     The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
     (heuristic findings) this is a soundness proof: it never reports a leak it
-    cannot exhibit FROM THE POLICIES, and never reports isolated unless Z3
-    proves it. The provers reason about the policy predicate and the policy's
+    cannot exhibit — from the policies, or from the anonymous role's own RLS
+    exemption (BYPASSRLS/superuser, or the table owner's privileges without
+    FORCE, where Postgres never consults the policies at all) — and never
+    reports isolated unless Z3 proves it or Postgres default-denies outright. The provers reason about the policy predicate and the policy's
     TO roles, not about table GRANTs, so a predicate admitting every row on a
     table anon cannot SELECT is still a LEAK (an over-report in the safe
     direction; --mode reachability is where the grant is decided). Exits
@@ -4663,6 +4665,18 @@ def verify(
             f"pgrls: wrote {len(artifacts)} reproduction(s) to {emit_repro_dir}",
             err=True,
         )
+        if not artifacts and verification.has_leak:
+            # A leak whose proof names a role rather than a policy (the
+            # anonymous session is exempt from the table's RLS outright) has
+            # no policy to reproduce — say so instead of leaving an empty
+            # directory unexplained.
+            click.echo(
+                "pgrls: no reproduction is possible for these leaks — the "
+                "anonymous session is exempt from the table's RLS, so there "
+                "is no policy to reproduce; see verify --mode escalation "
+                "and SEC048.",
+                err=True,
+            )
 
     if verification.has_leak:
         sys.exit(1)

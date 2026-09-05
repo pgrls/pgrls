@@ -122,7 +122,7 @@ required.
 ## When to prefer the GitHub Action instead
 
 For most projects, the [`pgrls/pgrls-action`](https://github.com/marketplace/actions/pgrls-postgres-rls-linter)
-is the cleaner GitHub-native path — it composes with `actions/upload-sarif`
+is the cleaner GitHub-native path — it composes with `github/codeql-action/upload-sarif`
 for Code Scanning ingest, supports every output format, and doesn't
 need pre-commit configured at all. Pre-commit shines when your team
 already uses it for *other* linters (ruff, shellcheck, etc.) and

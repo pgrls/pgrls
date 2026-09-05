@@ -16,7 +16,9 @@ breaking changes — they will be called out in this file.
   (column-level grants on views), `views[].owner_is_superuser` (a plain
   `BYPASSRLS` owner escapes RLS but still needs `SELECT`; a superuser does
   not), top-level `set_gucs` (dotted GUCs set at database / server level, as
-  `(name, value)` — a `null` value means "set, value not captured"),
+  `(name, value)`; the value is a sentinel string when the introspecting
+  session could read the GUC but could not attribute it to the server, and a
+  legacy `null` means "set at server level, value uncaptured"),
   top-level `role_set_gucs` (role-level ones, as `(role, name, value)`), and
   top-level `role_memberships` (present only when captured from a live
   database; each edge carries an `inherit` flag).
@@ -27,6 +29,36 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **`--probe` could never reproduce a leak that rides on an unset GUC, and
+  reported MISMATCH against its own correct verdict.** To build an anonymous
+  session it wrote `set_config(<guc>, '', true)` for every GUC the policy
+  reads. For a custom dotted GUC that is an empty *string*, not NULL —
+  measured on PG16, and neither `RESET` nor `set_config(..., NULL, ...)` gets
+  NULL back within the session — so it destroyed the very condition a
+  `current_setting('app.gate', true) IS NULL` policy leaks through. It now
+  clears only the JWT-claim GUCs (read through `NULLIF(..., '')`, where empty
+  and unset are the same value) and leaves a directly-read GUC alone. The
+  same policy that reported `MISMATCH` now reports `LEAK CONFIRMED`.
+- **`--emit-repro` wrote a script that could not reproduce, for a GUC whose
+  value could not be attributed to the server.** That state is modelled with
+  both the value and the null-flag free; emitting `set_config(name,
+  'REPLACE_ME')` pinned it non-NULL and killed the `IS NULL` disjunct the leak
+  rode on, so the generated pytest failed against a real leak. The GUC is now
+  left unset, with a note saying how to set it if your callers do have it.
+- **`--mode reachability` returned `UNVERIFIED` with a false reason for a
+  laundering door over a table anon cannot read.** The verdict asserted "the
+  table already leaks some rows to anon directly", which is untrue when anon
+  holds no privilege on it — measured: the direct read is `permission denied`
+  while the view returns the policy-admitted row, so every row the door
+  returns is one the direct read withholds. That case is now a `leak`.
+- `Verification.summary` counted one table behind three views as three
+  verdicts against one table; `diff_verifications` keyed on the table name
+  alone, so reachability's per-door entries collapsed and a change that closed
+  one door while opening another could be classified pre-existing rather than
+  new; the anon-exemption finding now names the role that is actually exempt
+  rather than every configured one; the cede prefers a total leak over a
+  partial one instead of depending on policy order; and `--emit-repro` now
+  says why an anon-exemption leak produces no artifact.
 - **A superuser role was captured only if it *also* carried `BYPASSRLS`, so
   `verify --mode anon` proved isolation against a role Postgres never
   checks.** A superuser bypasses RLS through `rolsuper` alone — measured on
@@ -86,8 +118,9 @@ breaking changes — they will be called out in this file.
   comes back from `current_setting` while both catalogs have zero rows). The
   introspection session is now asked about every dotted GUC the policies read,
   always rather than only when `pg_file_settings` is unreadable. Names no
-  catalog explains are recorded as set-with-unknown-value, which can withhold
-  a proof but never manufacture one.
+  catalog explains are recorded as set-with-unknown-value — see the later
+  entry in this section, which replaced that state after it turned out to be
+  able to prove an `IS NULL` gate dead.
 - **GUC precedence tiers were collapsed, so the prover compared against a value
   no session ever sees.** `ALTER ROLE x IN DATABASE d SET`, `ALTER ROLE x SET`,
   `ALTER DATABASE d SET` and `ALTER ROLE ALL SET` were stored alike, letting

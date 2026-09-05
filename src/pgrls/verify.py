@@ -64,8 +64,11 @@ to a linter" stance:
   verify against. This is where the verifier
   *degrades to the linter* — run `pgrls lint` for the heuristic rules.
 
-Scope: the anon, cross-tenant and write provers reason over each table's permissive ``SELECT`` / ``ALL``
-policies. When a *leaking* permissive policy shares a table with a
+Scope: the anon prover first checks whether the anonymous role is exempt from
+the table's RLS at all (BYPASSRLS/superuser, or the table owner's privileges
+without FORCE — Postgres then never consults the policies); then it and the
+cross-tenant / write provers reason over each table's permissive ``SELECT`` /
+``ALL`` policies. When a *leaking* permissive policy shares a table with a
 ``RESTRICTIVE`` floor, the floor is AND-ed into the proof and re-verified — but
 only a floor that constrains *every* role and write-operation the permissive
 admits (see ``_floor_applies``): a floor scoped to a role or command the
@@ -113,8 +116,10 @@ Verdict = Literal["isolated", "leak", "unverified"]
 # but correctly scopes authenticated tenants, so it is a leak in `anon` mode
 # and isolated in `cross-tenant` mode.
 # One anonymous-session GUC state: dotted GUC name → configured value (see
-# `_anon_set_gucs`). A `None` value means the GUC is set but its value was not
-# captured (`introspect._fetch_set_gucs`) — the prover keeps it opaque.
+# `_anon_set_gucs`). A `MAYBE_SET` value means the introspecting session could
+# read the GUC but it is not attributable to the server, so the prover keeps
+# both value and null-flag free; a `None` value is the legacy "set, value
+# uncaptured" state — opaque but definitely non-null.
 GucState = dict[str, str | None]
 
 Mode = Literal["anon", "cross-tenant", "write", "escalation", "reachability"]
@@ -348,13 +353,20 @@ class Verification:
 
     @property
     def summary(self) -> dict[str, int]:
-        counts = {"isolated": 0, "leak": 0, "unverified": 0}
-        for t in self.tables:
-            counts[t.verdict] += 1
         # `reachability` appends one verdict per (view, table) DOOR, so one
-        # table behind three views is three entries — counting them as tables
-        # printed "3 RLS tables" for a schema with one.
-        return {"tables": len({t.qualified_name for t in self.tables}), **counts}
+        # table behind three views is three entries. Roll them up to one
+        # verdict per table — worst wins — or the line contradicts itself
+        # ("1 RLS table: 0 proven isolated, 3 leaking").
+        rank = {"isolated": 0, "unverified": 1, "leak": 2}
+        worst: dict[str, str] = {}
+        for t in self.tables:
+            prior = worst.get(t.qualified_name)
+            if prior is None or rank[t.verdict] > rank[prior]:
+                worst[t.qualified_name] = t.verdict
+        counts = {"isolated": 0, "leak": 0, "unverified": 0}
+        for verdict in worst.values():
+            counts[verdict] += 1
+        return {"tables": len(worst), **counts}
 
 
 @dataclass(frozen=True)
@@ -397,13 +409,22 @@ def diff_verifications(base: Verification, head: Verification) -> LeakDelta:
     it (the symmetric counterpart of never crediting an unprovable base with a
     new leak).
     """
-    base_by = {t.qualified_name: t for t in base.tables}
-    head_by = {t.qualified_name: t for t in head.tables}
+    # `reachability` emits one verdict per (view, table) DOOR, so keying on
+    # the table name alone kept only the last door — and a change that closed
+    # one door while opening another was then classified "pre-existing"
+    # instead of new, which would not fail the gate.
+    def key(v: Verification, t: TableVerdict) -> tuple[str, ...]:
+        if v.mode == "reachability" and t.proofs:
+            return (t.qualified_name, t.proofs[0].policy)
+        return (t.qualified_name,)
+
+    base_by = {key(base, t): t for t in base.tables}
+    head_by = {key(head, t): t for t in head.tables}
     new_leaks: list[TableVerdict] = []
     preexisting: list[TableVerdict] = []
     new_unverified: list[TableVerdict] = []
     for t in head.tables:
-        b = base_by.get(t.qualified_name)
+        b = base_by.get(key(head, t))
         if t.verdict == "leak":
             if b is None or b.verdict == "isolated":
                 new_leaks.append(t)
@@ -413,10 +434,12 @@ def diff_verifications(base: Verification, head: Verification) -> LeakDelta:
             new_unverified.append(t)
     fixed = tuple(
         sorted(
-            name
-            for name, b in base_by.items()
-            if b.verdict == "leak"
-            and (name not in head_by or head_by[name].verdict == "isolated")
+            {
+                k[0]
+                for k, b in base_by.items()
+                if b.verdict == "leak"
+                and (k not in head_by or head_by[k].verdict == "isolated")
+            }
         )
     )
     return LeakDelta(
@@ -672,7 +695,9 @@ def build_verification(
         if mode == "anon" and _anon_session_exempt(
             schema, table, resolved_anon_roles
         ):
-            exempt_by = ", ".join(sorted(resolved_anon_roles - {"PUBLIC"}))
+            exempt_by = ", ".join(
+                sorted(_anon_exempting_roles(schema, table, resolved_anon_roles))
+            ) or ", ".join(sorted(resolved_anon_roles - {"PUBLIC"}))
             tables.append(
                 TableVerdict(
                     table.qualified_name,
@@ -1005,12 +1030,30 @@ def _anon_holds_select(
         return True
     closure = _anon_priv_closure(schema, anon_roles)
     if closure is None:
-        return bool(grantees & anon_roles)
+        # Without the graph only a direct grant could decide it, and the
+        # check above already covered that — so there is nothing more to say.
+        return False
     if getattr(rel, "owner", None) and rel.owner in closure:
         return True
     if "pg_read_all_data" in closure:
         return True
     return bool(grantees & closure)
+
+
+def _anon_exempting_roles(
+    schema: Schema, table: Any, anon_roles: set[str]
+) -> set[str]:
+    """Which of the configured anon roles are the ones actually exempt — so
+    the finding names the role at fault rather than every role configured."""
+    bypass = {r.name for r in schema.bypassrls_roles}
+    named = {r for r in anon_roles if r.upper() != "PUBLIC"}
+    out = named & bypass
+    if not table.force_rls and table.owner:
+        for role in named:
+            closure = _anon_priv_closure(schema, {role})
+            if closure is not None and table.owner in closure:
+                out.add(role)
+    return out
 
 
 def _anon_session_exempt(schema: Schema, table: Any, anon_roles: set[str]) -> bool:
@@ -1029,6 +1072,12 @@ def _anon_session_exempt(schema: Schema, table: Any, anon_roles: set[str]) -> bo
     if table.force_rls or not table.owner:
         return False
     closure = _anon_priv_closure(schema, anon_roles)
+    # No graph (a pre-v26 baseline, an offline `--sql-file` source, a
+    # hand-built Schema) → this reports "not exempt", which is the
+    # fail-OPEN direction: ownership-based exemption cannot be ruled out.
+    # It matches `_effective_user_exempt`'s stance for a missing owner and
+    # keeps offline runs usable, but it is the one place in this module
+    # where absent evidence resolves to a proof rather than an abstention.
     return closure is not None and table.owner in closure
 
 
@@ -1240,9 +1289,15 @@ def build_reachability(
                 )
             )
         elif an_verdict == "leak":
+            # The question is "does the table ALREADY hand anon everything",
+            # so a total (`{}` witness) leak wins over a partial one; taking
+            # the first leak proof made the answer depend on policy order.
+            an_leaks = [
+                p for p in (anv.proofs if anv else ()) if p.verdict == "leak"
+            ]
             an_leak = next(
-                (p for p in (anv.proofs if anv else ()) if p.verdict == "leak"),
-                None,
+                (p for p in an_leaks if p.witness == {}),
+                an_leaks[0] if an_leaks else None,
             )
             # …but only if anon can actually read the WHOLE table. `--mode
             # anon` proves the PREDICATE admits rows; it never checks
@@ -1271,7 +1326,9 @@ def build_reachability(
                         (proof,),
                     )
                 )
-            elif not total:
+            elif not total and _anon_holds_select(
+                schema, table, resolved_anon_roles, table_level_only=True
+            ):
                 # The table already leaks some rows to anon directly and the
                 # view admits its owner some rows — possibly the very same
                 # (measured: `TO PUBLIC USING (is_public)` read one row direct
@@ -1285,6 +1342,21 @@ def build_reachability(
                 proof = PolicyProof(outer.qualified_name, "unverified", None, reason)
                 tables.append(
                     TableVerdict(table.qualified_name, "unverified", f"{reason}; {path}", (proof,))
+                )
+            elif not total:
+                # …but anon cannot read the table at all, so "the direct read
+                # already exposes these rows" is false — every row the door
+                # returns is one the direct read withholds (measured: the
+                # direct read is `permission denied` while the view returns
+                # the policy-admitted row). The door is the only way in.
+                tables.append(
+                    TableVerdict(
+                        table.qualified_name,
+                        "leak",
+                        f"anon reads {reads} via {path} — while a direct read "
+                        "of the table is denied to anon",
+                        (PolicyProof(outer.qualified_name, "leak", witness, None),),
+                    )
                 )
             else:
                 proof = PolicyProof(outer.qualified_name, "leak", {}, None)
@@ -1507,7 +1579,9 @@ def _reachability_paths(
     def unverified(outer: Any, t: Any, hops: tuple[str, ...], eff: Any, why: str) -> None:
         record(_ReachPath(outer, t, hops, eff, None, unknown_reason=why))
 
-    def walk(view: Any, eff: Any, hops: tuple[str, ...], outer: Any, seen: frozenset[tuple[str, str]]) -> None:
+    def walk(view: Any, hops: tuple[str, ...], outer: Any, seen: frozenset[tuple[str, str]]) -> None:
+        # Each hop decides its OWN effective user; nothing is inherited from
+        # the enclosing hop, which is why this takes no `eff` argument.
         # `security_invoker = true` RESETS the effective user to the session
         # user — it does not inherit the enclosing definer view's owner.
         # Measured on PG16: definer(owner BYPASSRLS) → invoker → table
@@ -1535,16 +1609,17 @@ def _reachability_paths(
                             "captured at REFRESH time under the refreshing role's RLS "
                             "context, which is not modeled"))
                     continue
-                if readable is None:
-                    # Undecidable hop: report it rather than guess either way,
-                    # walking nested views for the same reason the matview
-                    # branch above does.
+                if readable is None and eff is not None:
+                    # Undecidable hop — only `_role_reads_relation` returns
+                    # None, and that branch runs only with an effective user.
+                    # Report it rather than guess either way, walking nested
+                    # views for the same reason the matview branch above does.
                     for t in _rls_tables_beneath(child, tables_by_key, views_by_key):
                         unverified(outer, t, child_hops, eff, (
                             f"role-membership graph not captured; cannot decide whether "
                             f"{eff.owner} can read {child.qualified_name}"))
                     continue
-                walk(child, eff, child_hops, outer, seen | {ref})
+                walk(child, child_hops, outer, seen | {ref})
                 continue
             table = tables_by_key.get(ref)
             if table is None or not table.rls_enabled or eff is None:
@@ -1580,7 +1655,7 @@ def _reachability_paths(
                         f"{eff.owner} under the anonymous auth context"))
 
     for outer in outers:
-        walk(outer, None, (), outer, frozenset({(outer.schema, outer.name)}))
+        walk(outer, (), outer, frozenset({(outer.schema, outer.name)}))
     return sorted(best.values(), key=lambda p: (p.table.qualified_name, p.outer.qualified_name))
 
 

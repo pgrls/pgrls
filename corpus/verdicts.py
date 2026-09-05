@@ -1037,6 +1037,35 @@ GRANT SELECT ON docs_v TO anon;
             "Ceding to `--mode anon` on a column grant cleared the only door."
         ),
     ),
+
+    VerdictCase(
+        name="reach_partial_launder_is_a_leak_when_anon_cannot_read_the_table",
+        mode="reachability",
+        sql="""
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, is_public boolean NOT NULL, body text);
+INSERT INTO docs VALUES (1, true, 'public-row'), (2, false, 'secret-row');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC USING (is_public);
+RESET ROLE;
+GRANT SELECT ON docs TO corpus_plain;
+SET ROLE corpus_plain;
+CREATE VIEW docs_v AS SELECT * FROM docs;
+RESET ROLE;
+GRANT SELECT ON docs_v TO anon;
+""",
+        expect=(("public.docs", "leak"),),
+        expect_paths=("public.docs_v",),
+        note=(
+            "The sibling of the column-only case: anon holds NOTHING on the "
+            "table, so the direct read is `permission denied` while the "
+            "definer view returns the policy-admitted row (measured). "
+            "Reporting `unverified` on the grounds that 'the table already "
+            "leaks some rows to anon directly' asserted something false — "
+            "every row the door returns is one the direct read withholds."
+        ),
+    ),
 ]
 
 

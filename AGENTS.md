@@ -987,7 +987,7 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
-- **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, JUnit, and GitLab-Code-Quality output.**
+- **Text, JSON, SARIF, Markdown, HTML, PR-comment, GitHub-annotation, JUnit, and GitLab-Code-Quality output.**
   `--format text` (human-readable, default), `--format json`
   (machine-readable, stable CI contract), `--format sarif` (SARIF
   v2.1.0 for GitHub Code Scanning and similar aggregators),

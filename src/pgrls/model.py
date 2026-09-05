@@ -1638,10 +1638,12 @@ class Schema:
     # value instead of the unset-GUC raise, so `col = current_setting(
     # 'app.x')` is no longer PROVEN when `ALTER DATABASE … SET app.x` makes
     # it readable — and `current_setting('app.flag') = 'on'` with the setting
-    # at 'off' stays PROVEN (measured: 0 rows). A `None` value means "set,
-    # but the value was not captured" (see `introspect._fetch_set_gucs`): the
-    # prover falls back to an opaque non-null value there, which can decline
-    # to prove isolation but never claims it falsely. Empty on a pre-v26
+    # at 'off' stays PROVEN (measured: 0 rows). A `MAYBE_SET` value means the
+    # introspecting session could read the GUC but it is not attributable to
+    # the server (see the constant above); the prover keeps both the value and
+    # the null-flag free there. A `None` value is the legacy "set at server
+    # level, value uncaptured" state — opaque but definitely non-null — still
+    # decoded but no longer produced. Empty on a pre-v26
     # snapshot or an offline Schema (the unset assumption stands).
     set_gucs: tuple[tuple[str, str | None], ...] = ()
     # v26+: dotted GUCs set at ROLE level, as `(role, name, value)`. Role

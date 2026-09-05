@@ -26,7 +26,9 @@ The probe is deliberately conservative: anything it cannot model live it
 **abstains** on (per table, with a one-line reason — never a crash). It cannot
 create its probe role (no CREATEROLE / not superuser), cannot seed (no INSERT),
 finds no scoping axis to pivot a cross-tenant probe on, the leak witness is
-conditional (no single characterizing row), the policy references other tables,
+conditional (no single characterizing row), the finding is the anonymous
+role's own RLS exemption rather than a policy, the policy references other
+tables,
 or a column has an exotic type the placeholder synthesis can't fill — all of
 these yield a clean `abstained` / `skipped`, not a false signal.
 
@@ -572,7 +574,19 @@ def _run_probe_steps(
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
         else:  # anon
             cur.execute(_insert_sql(table, row))  # seed as the privileged role
-            for guc in _anon_gucs(policy_ast):
+            # Clear ONLY the JWT-claim GUCs. Those are read through
+            # `NULLIF(current_setting(...), '')`, so '' and unset are the same
+            # value to the auth stubs. A custom dotted GUC is not: measured on
+            # PG16, `set_config('app.gate', '', true)` makes
+            # `current_setting('app.gate', true)` return '' rather than NULL,
+            # and NEITHER `RESET` nor `set_config(..., NULL, ...)` gets NULL
+            # back within the session. Clearing them therefore destroyed the
+            # very condition a `current_setting('app.gate', true) IS NULL`
+            # policy leaks through, and the probe reported MISMATCH against
+            # its own correct LEAK. A fresh probe transaction already sees
+            # them unset; `_observe_anon_sessions` sets the ones a login path
+            # actually has.
+            for guc in _ANON_BASELINE_GUCS:
                 cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
     except psycopg.Error as exc:
@@ -665,12 +679,14 @@ def _observe_anon_sessions(
         inherited[n] = (got[0] if got and got[0] is not None else "")
     for state in guc_states or ({},):
         for n in names:
-            if n in state and state[n] in (None, MAYBE_SET):
-                # Set at server level with a value introspection could not
-                # capture: restore what this session actually inherits.
-                value = inherited[n]
-            else:
-                value = state.get(n) or ""
+            if n not in state:
+                # Not set on this login path. Leave it alone rather than
+                # writing '': that is a VALUE, not NULL, and it cannot be
+                # undone within the session (measured), so writing it would
+                # destroy an `IS NULL` leak the prover legitimately found.
+                continue
+            raw = state[n]
+            value = inherited[n] if raw in (None, MAYBE_SET) else str(raw)
             cur.execute(f"SELECT set_config({_sql_str(n)}, {_sql_str(value)}, true)")
         for guc, _val in _ANON_KEY_SESSION_GUCS:
             cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")

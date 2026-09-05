@@ -522,8 +522,11 @@ allowlist = ["public.countries.public_read"]
 **Severity:** warning.
 
 **What it catches:** tables with `relrowsecurity = true` and zero
-rows in `pg_policy`. Postgres treats this as deny-all — every query
-returns no rows, regardless of role. Common shape: a migration
+rows in `pg_policy`. Postgres treats this as deny-all **for every role
+RLS applies to** — every such query returns no rows. Measured on PG16
+against a 3-row table: a plain grantee reads 0, while the table owner
+reads all 3 unless `FORCE ROW LEVEL SECURITY` is set (SEC002's remit),
+and a `BYPASSRLS` role or a superuser reads all 3 regardless. Common shape: a migration
 enabled RLS planning to add policies later, then the policy work
 was deferred and forgotten. Symptom is "the table looks empty,"
 which can take an embarrassingly long time to notice in dev.
@@ -1063,9 +1066,11 @@ other ways a session can end up not subject to RLS:
 
 SEC016 fires on every non-superuser role with `BYPASSRLS`. The
 introspector reads the role's `rolbypassrls` / `rolsuper` /
-`rolcanlogin` flags from `pg_roles` (snapshot v9+); only roles
-`WHERE rolbypassrls` are captured, so a default cluster — where
-no role has been granted the attribute — produces no findings.
+`rolcanlogin` flags from `pg_roles` (snapshot v9+); roles matching
+`rolbypassrls OR rolsuper` are captured — every role Postgres exempts
+from RLS, which `pgrls verify` needs so it does not prove isolation
+against one. SEC016 reports only the non-superuser ones, so a cluster whose only
+exempt role is the bootstrap superuser produces no findings.
 The fix is one statement, `ALTER ROLE <name> NOBYPASSRLS`, but it
 is not auto-applied (see **Auto-fix** above).
 
@@ -1596,8 +1601,10 @@ is a role attribute, not an inheritable privilege, so membership
 grants no automatic bypass and SEC023's policy-level check stays
 silent; the deliberate `SET ROLE` escalation path that *does* reach
 it is covered separately by SEC029. Also out of scope: plain
-superusers (a role that bypasses RLS only through `rolsuper`, with no
-explicit `BYPASSRLS`, is not in the schema's `BYPASSRLS` set).
+superusers. Introspection *does* capture them (`rolbypassrls OR
+rolsuper`, so `pgrls verify` can see the exemption), but SEC023
+filters them out explicitly — a policy targeting a superuser would
+only restate "this role is a superuser".
 
 Relationship to SEC016: SEC016 flags the *role* ("this role
 carries `BYPASSRLS`"); SEC023 flags the *policy* ("this policy

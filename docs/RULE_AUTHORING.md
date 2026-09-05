@@ -370,9 +370,12 @@ Bump the auto-fixable count (`19 mechanically auto-fixable`) in:
 .venv/bin/mypy src/pgrls
 .venv/bin/python -m pytest tests/ -q
 .venv/bin/python -m pytest demo/ -q
+.venv/bin/python -m pytest corpus/ -q
 ```
 
-All four green.
+All five green. The corpus run is the one a new rule is most likely to
+trip: it fails on any *undocumented* false positive or false negative, so
+a rule that fires on one of its negative near-miss cases turns CI red.
 
 ### 9. Submit
 

@@ -85,8 +85,9 @@ Out of scope (intentional):
   is the precise audit target. Mirrors SEC016's stance — the `SET ROLE`
   escalation path that reaches it is SEC029's.
 * **Plain superusers.** A role that bypasses RLS purely through
-  `rolsuper`, with no explicit `BYPASSRLS` attribute, is not in the
-  schema's reported `BYPASSRLS` set and so is not matched. A policy
+  `rolsuper`, with no explicit `BYPASSRLS` attribute, IS captured
+  (introspection takes `rolbypassrls OR rolsuper` so the verifier can
+  see the exemption) but is filtered out explicitly below. A policy
   targeting a superuser is a non-finding by the same reasoning
   SEC023 skips superusers that *do* carry `BYPASSRLS`.
 """

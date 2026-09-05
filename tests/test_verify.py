@@ -3712,3 +3712,60 @@ def test_anon_superuser_role_is_exempt_even_without_the_bypassrls_attribute() ->
     # An ordinary anonymous role on the same schema is unaffected.
     plain = build_verification(schema, mode="anon", anon_roles={"anon"})
     assert [t.verdict for t in plain.tables] == ["isolated"]
+
+
+def test_reachability_partial_launder_is_a_leak_when_anon_cannot_read_the_table() -> None:
+    """The middle branch's premise — "the table already leaks some rows to
+    anon directly" — is false when anon holds no privilege on the table. Then
+    every row the door returns is one the direct read withholds. Measured on
+    PG16: the direct read is `permission denied` while the definer view
+    returns the policy-admitted row, so the view is the only way in."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Grant, Policy, Schema, Table
+
+    public_rows = Policy(
+        name="p", command="SELECT", permissive=True, roles=("PUBLIC",),
+        using_sql="is_public", with_check_sql=None,
+        using_ast=parse_expr("is_public"), with_check_ast=None,
+    )
+
+    def table(grants):
+        return Table(
+            schema="public", name="t", rls_enabled=True, force_rls=True,
+            columns=("id", "is_public"), owner="tbl_owner",
+            policies=(public_rows,), grants=grants,
+        )
+
+    v = _rv_view("v", "plain", (("public", "t"),))
+    # anon holds nothing on the table: the door is the only way in.
+    only_door = Schema(
+        tables=(table((Grant(role="plain", privileges=("SELECT",)),)),),
+        views=(v,), role_memberships=(),
+    )
+    assert _rv(only_door)[("public.t", "public.v")][0] == "leak"
+
+    # anon can read the table directly, so whether the view adds anything is
+    # genuinely undecided — that is the case the branch was written for.
+    both = Schema(
+        tables=(table((
+            Grant(role="plain", privileges=("SELECT",)),
+            Grant(role="anon", privileges=("SELECT",)),
+        )),),
+        views=(v,), role_memberships=(),
+    )
+    assert _rv(both)[("public.t", "public.v")][0] == "unverified"
+
+
+def test_summary_counts_one_table_behind_several_doors_once() -> None:
+    """`reachability` emits one verdict per (view, table) door, so counting
+    entries printed "1 RLS table: 0 proven isolated, 3 leaking"."""
+    from pgrls.model import Schema
+    from pgrls.verify import build_reachability
+
+    t = _rv_table("t", "tbl_owner")
+    views = tuple(
+        _rv_view(f"v{i}", "tbl_owner", (("public", "t"),)) for i in range(1, 4)
+    )
+    v = build_reachability(Schema(tables=(t,), views=views, role_memberships=()))
+    assert len(v.tables) == 3  # three doors
+    assert v.summary == {"tables": 1, "isolated": 0, "leak": 1, "unverified": 0}

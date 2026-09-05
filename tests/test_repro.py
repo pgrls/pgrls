@@ -981,3 +981,35 @@ def test_anon_repro_sets_the_anon_key_claims_when_only_that_session_leaks() -> N
     jwtless = stmts("auth.uid() IS NULL OR owner_id = auth.uid()")
     assert any("set_config('request.jwt.claim.role', '', true)" in s for s in jwtless)
     assert not any("'anon', true" in s for s in jwtless)
+
+
+def test_repro_leaves_an_unattributable_guc_unset() -> None:
+    """A `MAYBE_SET` GUC is one the prover modelled with BOTH the value and
+    the null-flag free. Writing any value into the reproduction pins it
+    non-NULL and kills an `IS NULL` disjunct the leak may ride on — the
+    emitted script then returned zero rows against a real leak."""
+    from pgrls.model import MAYBE_SET
+    from pgrls.repro import build_repro
+
+    pol = _policy("current_setting('app.gate', true) IS NULL")
+    art = build_repro(
+        _table(pol, columns=_COLS), pol, {}, None,
+        guc_states=({"app.gate": MAYBE_SET},),
+    )
+    executable = [
+        line for line in art.sql.splitlines()
+        if "set_config('app.gate'" in line and not line.lstrip().startswith("--")
+    ]
+    assert executable == []
+    assert "could not be attributed to the server" in art.sql
+
+    # A genuinely server-set GUC whose value was not captured still gets a
+    # placeholder to edit — that one IS definitely set.
+    art_none = build_repro(
+        _table(pol, columns=_COLS), pol, {}, None,
+        guc_states=({"app.gate": None},),
+    )
+    assert [
+        line for line in art_none.sql.splitlines()
+        if "set_config('app.gate'" in line and not line.lstrip().startswith("--")
+    ]

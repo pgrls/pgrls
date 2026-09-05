@@ -19,6 +19,8 @@ cd pgrls
 python -m venv .venv
 .venv/bin/python -m pip install -e .[dev]
 .venv/bin/python -m pytest tests/       # ~3,900 tests, several minutes (needs Docker)
+.venv/bin/python -m pytest demo/        # end-to-end use cases
+.venv/bin/python -m pytest corpus/      # the precision gate — CI runs it as its own job
 .venv/bin/ruff check src tests
 .venv/bin/mypy src
 ```

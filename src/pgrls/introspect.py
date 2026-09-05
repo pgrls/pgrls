@@ -1259,12 +1259,13 @@ WHERE applied AND name LIKE '%.%'
 ORDER BY 1
 """
 
-# `pg_file_settings` needs superuser / pg_read_all_settings. Without it, fall
-# back to asking THIS session for every dotted GUC a policy reads: a
-# server-level setting applies to every session, so a non-empty answer means
-# the GUC is set — but the value could be this role's own, so it is recorded
-# as "set, value not captured" (a `None` value in `Schema.set_gucs`) and the
-# prover keeps it opaque rather than trusting a possibly wrong string.
+# In ADDITION to `pg_file_settings` — never as a fallback to it — this session
+# is asked about every dotted GUC a policy reads, because a GUC given on the
+# postmaster command line is in no catalog at all. A non-empty answer means the
+# GUC is set for THIS session, which is weaker than "set for every session":
+# the value could have come from this connection's own options. Such a name is
+# recorded `MAYBE_SET` in `Schema.set_gucs`, under which the prover keeps both
+# the value and the null-flag free — it can decline, never conclude.
 _POLICY_GUC_NAMES_SQL = r"""
 SELECT DISTINCT lower(m[1]) AS name
 FROM pg_catalog.pg_policy p
@@ -1295,10 +1296,11 @@ def _fetch_set_gucs(
     — so they are returned per role rather than merged. Where one name is set
     at several levels the most specific wins, exactly as Postgres resolves it.
 
-    A `None` value means "set, but the value was not captured": the
-    `pg_file_settings` fallback below cannot attribute a live
-    `current_setting` to the server rather than to the introspecting role, so
-    it reports only the fact, and the prover keeps such a GUC opaque.
+    A `MAYBE_SET` value means the introspecting session can read the GUC but
+    it cannot be attributed to the SERVER — it may be that connection's own
+    `PGOPTIONS`. The prover keeps both the value and the null-flag free there.
+    A `None` value is the legacy "set at server level, value uncaptured"
+    state, still decoded for snapshots that carry it but no longer produced.
     """
     cur.execute(_SET_GUCS_SQL)
     # Most specific tier wins, per (role, name): `ALTER ROLE x IN DATABASE d
