@@ -130,8 +130,9 @@ _UNVERIFIED_PREDICATE_REASON = {
         "no provable tenant-scoping equality on an identity/discriminator column — see [lint.rules.SEC021].identity_columns — (or outside the decidable fragment)"
     ),
     "write": (
-        "no provable tenant-scoping write-check "
-        "(or outside the decidable fragment)"
+        "no provable tenant-scoping write-check on an identity/discriminator "
+        "column — see [lint.rules.SEC021].identity_columns — (or outside the "
+        "decidable fragment)"
     ),
 }
 
@@ -953,7 +954,8 @@ def build_reachability(
     ``security_invoker = false`` view on the path (measured: ``outer(off,
     owner A) → inner(off, owner superuser) → T`` bypasses T as the superuser
     even though A is not exempt and inner is not anon-selectable), and an
-    owner that is a *member* of the table owner is owner-equivalent
+    owner that is an INHERIT *member* of the table owner is owner-equivalent (a
+    NOINHERIT member is not)
     (Postgres's ``has_privs_of_role``). When the role-membership graph is not
     captured and the answer turns on membership, the verdict is
     ``unverified`` rather than silence.
