@@ -12,11 +12,11 @@ breaking changes — they will be called out in this file.
 
 ### Changed
 - **Snapshot v26** — adds `views[].direct_references` (the un-collapsed
-  table/view edges a view body reads directly), top-level `set_gucs` (dotted
-  GUC names set at database / role / server level), and top-level
-  `role_memberships` (present only when captured from a live database, now
-  with a per-edge `inherit` flag), `views[].column_grants`, and top-level
-  `role_set_gucs`.
+  table/view edges a view body reads directly), `views[].column_grants`
+  (column-level grants on views), top-level `set_gucs` (dotted GUC names set
+  at database / server level), top-level `role_set_gucs` (role-level ones,
+  as `(role, name)`), and top-level `role_memberships` (present only when
+  captured from a live database; each edge carries an `inherit` flag).
   Additive and fail-closed: v3–v25 files still load; a missing
   `direct_references` falls back to the collapsed `references`, a missing
   `role_memberships` keeps the anon prover abstaining on non-anon roles. Re-
@@ -72,8 +72,7 @@ breaking changes — they will be called out in this file.
   `= ANY (ARRAY[…])` within hours, so the fixer no longer denylists unsafe
   constructs — it rewrites only the one provably row-hiding shape (a direct
   comparison operand under an AND-only chain) and leaves everything else for
-  review. It also
-  no longer rewrites a user-defined `myschema.current_setting(...)` the rule
+  review. It also no longer rewrites a user-defined `myschema.current_setting(...)` the rule
   does not flag.
 - **A database- or role-level custom GUC defeated the anon prover's
   unset-GUC assumption.** `ALTER DATABASE … SET app.tenant_id = 'shared'`

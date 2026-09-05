@@ -8,8 +8,9 @@ complementary threat models (`--mode`):
 * ``anon`` (default) — for every RLS-protected table, can an *anonymous*
   session read any row? Two anonymous sessions are modelled and a leak under
   either is a leak: the JWT-less connection (every auth function —
-  auth.uid()/role()/jwt(), current_setting(...)
-  — returning NULL, the unauthenticated state) read any row?
+  auth.uid()/role()/jwt(), current_setting(...) — NULL) and the Supabase
+  anon-key caller (``auth.role()`` = 'anon', ``auth.jwt()`` non-null,
+  ``auth.uid()`` NULL).
 * ``cross-tenant`` — can a session authenticated as *one* tenant read a
   *different* tenant's row? For the policy's own tenant-scoping equality
   ``<column> = <session identity>``, a row is exposed iff it can be visible
@@ -31,8 +32,12 @@ complementary threat models (`--mode`):
   ``security_invoker = false`` view executes as its owner, so an anon-selectable
   path whose effective owner — the nearest enclosing definer view's owner on a
   ``view → view → table`` chain — is RLS-exempt (superuser/BYPASSRLS, or the
-  table owner or an INHERIT member of it with RLS not FORCE'd) returns every
-  row while ``anon`` correctly reports the table isolated; ``unverified`` when
+  table owner or an INHERIT member of it with RLS not FORCE'd) — or whose
+  effective owner is granted every row by the table's own policies (a
+  laundering definer view) — returns every row while ``anon`` correctly
+  reports the table isolated. Anon "can open" a view via a table- or
+  column-level SELECT grant to anon/PUBLIC or any role in the anon closure; a
+  hop the effective owner cannot SELECT is a dead path; ``unverified`` when
   the role-membership graph is absent and the answer turns on membership.
   Composes the ``anon`` verdict with view reachability, the way ``escalation``
   composes ``cross-tenant`` with owner reachability.
@@ -52,8 +57,9 @@ to a linter" stance:
   anon leak is unconditional (``USING (true)``, the ``auth.uid() IS NULL OR …``
   inversion); or, cross-tenant, "a row of another tenant".
 * ``unverified`` — no claim: Z3 is unavailable, the predicate is outside the
-  decidable fragment, the solver timed out, or (cross-tenant) the policy has no
-  single tenant-scoping equality to verify against. This is where the verifier
+  decidable fragment, the solver timed out, or (cross-tenant / write) the policy
+  has no single tenant-scoping equality on an identity/discriminator column
+  (SEC021's name set, ``identity_columns`` overridable) to verify against. This is where the verifier
   *degrades to the linter* — run `pgrls lint` for the heuristic rules.
 
 Scope: the anon, cross-tenant and write provers reason over each table's permissive ``SELECT`` / ``ALL``
@@ -121,7 +127,7 @@ _PROVERS: dict[str, Callable[..., tuple[str, dict[str, object] | None]]] = {
 _UNVERIFIED_PREDICATE_REASON = {
     "anon": "USING predicate outside the decidable fragment",
     "cross-tenant": (
-        "no provable tenant-scoping equality (or outside the decidable fragment)"
+        "no provable tenant-scoping equality on an identity/discriminator column — see [lint.rules.SEC021].identity_columns — (or outside the decidable fragment)"
     ),
     "write": (
         "no provable tenant-scoping write-check "
@@ -561,6 +567,11 @@ def build_verification(
     existing verdict (cross-tenant / anon respectively) with a reachability
     graph rather than walking policies directly — so they are dispatched to
     `build_escalation` / `build_reachability`.
+
+    `identity_columns`, when given, replaces the identity/discriminator column
+    names the cross-tenant / write provers accept as the tenant axis (SEC021's
+    default set otherwise); a policy whose only scoping equality is on some
+    other column is `unverified`, not proven.
     """
     if mode == "escalation":
         return build_escalation(
@@ -904,16 +915,22 @@ def build_reachability(
     policy scopes rows to ``current_setting('app.tenant')`` (anon sets no such
     GUC, so the direct read yields nothing):
 
-    * the view is ``SELECT``-grantable to an anon role (SEC052's gate) — the
-      caller must be able to reach it at all; **and**
+    * anon can open the view — a table- OR column-level ``SELECT`` grant to
+      anon/PUBLIC or to any role in the anon closure (measured: a column grant
+      and a grant to a role anon is a member of both read the row); **and**
     * some view on the path is ``security_invoker = false`` — the nearest such
       view to the table sets the effective RLS user; an all-invoker chain
       re-applies the caller's RLS, and the live anon read was denied
       outright; **and**
     * the effective RLS user's owner is exempt from the base table's RLS
-      (`_effective_user_exempt`) — a view owned by an ordinary third role
-      with a plain ``SELECT`` grant returned **zero** rows, and ``FORCE`` on
-      the base table cut the owning-view case from every row to zero.
+      (`_effective_user_exempt`: superuser/BYPASSRLS, or — with the table not
+      FORCE'd — the table owner or an INHERIT member of it), **or** the
+      table's own policies grant that owner every row under the anonymous
+      auth context (the laundering case, decided by the anon prover with the
+      owner as the session role). A view owned by an ordinary third role with
+      a plain ``SELECT`` grant returned **zero** rows, ``FORCE`` on the base
+      table cut the owning-view case from every row to zero, and a hop the
+      effective owner cannot ``SELECT`` is a dead path (``permission denied``).
 
     The verdict is then the base table's ``anon`` verdict joined with that
     reachability, exactly as `build_escalation` joins the cross-tenant verdict

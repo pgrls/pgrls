@@ -52,7 +52,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 26  # v26: View.direct_references + Schema.set_gucs + serialized role_memberships; v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit); v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -1610,8 +1610,9 @@ class Schema:
     # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
     # and every snapshot decoding without it (all versions) fail-closed.
     role_memberships: tuple[RoleMembership, ...] | None = None
-    # v26+: custom (dotted) GUC names set at database / role / server level —
-    # what an anonymous session inherits without running `SET`. The anon prover
+    # v26+: custom (dotted) GUC names set at database / server level — what
+    # every session, an anonymous one included, inherits without running
+    # `SET` (role-level ones live in `role_set_gucs`). The anon prover
     # treats a read of one of these as a real (opaque, non-null) value instead
     # of the unset-GUC raise, so `col = current_setting('app.x')` is no longer
     # PROVEN when `ALTER DATABASE … SET app.x` makes it readable. Empty on a

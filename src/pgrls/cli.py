@@ -1740,7 +1740,9 @@ def fix(
     no rows, so dropping it changes no access), SEC011 (`ALTER POLICY …
     USING/WITH CHECK` stripping
     an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
-    `, true` to one-arg `current_setting()` calls), SEC020
+    `, true` to one-arg `current_setting()` calls — only where the call is a
+    direct comparison operand under an AND-only chain; other positions are
+    left open for review), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
     check with USING), SEC015 (`ALTER FUNCTION ... SET search_path
     = …, pg_temp` per overload, pinning pg_temp last to block
@@ -4267,8 +4269,13 @@ def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | N
         "user), so a path whose effective owner is RLS-exempt — "
         "superuser/BYPASSRLS, or the table owner or an INHERIT member of it "
         "when the table is not FORCE'd — returns every row to anon while "
-        "'anon' mode correctly reports the table itself isolated; UNVERIFIED "
-        "when the role-membership graph is unavailable."
+        "'anon' mode correctly reports the table itself isolated — or whose "
+        "effective owner, though not exempt, is granted every row by the "
+        "table's own policies (a definer view launders them). 'Anon can open "
+        "the view' counts a table- or column-level SELECT grant to anon/PUBLIC "
+        "or any role in the anon closure; a hop the effective owner cannot "
+        "SELECT is a dead path; INHERIT members only. UNVERIFIED when the "
+        "role-membership graph is unavailable."
     ),
 )
 @click.option(
@@ -4395,7 +4402,9 @@ def verify(
     `PROVEN` (the property is unsatisfiable under the threat model), `LEAK` (it
     *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
-    or — cross-tenant/write — there is no single scoping equality to verify;
+    or — cross-tenant/write — there is no single scoping equality on an
+    identity/discriminator column to verify (SEC021's default name set;
+    `[lint.rules.SEC021].identity_columns` in `--config` overrides it);
     here the verifier degrades to the linter, run `pgrls lint` — for write, the
     SEC006/SEC020/SEC028/SEC040 write-check rules).
 

@@ -1,5 +1,4 @@
-"""SEC055 — tenant policy still uses the silent binding form after the
-schema adopted the raising one.
+"""SEC055 — tenant policy still uses the silent binding form after the schema adopted the raising one.
 
 `pgrls generate --strict-binding` scaffolds policies that compare against
 a helper which RAISES when no tenant is bound on the connection, instead

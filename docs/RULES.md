@@ -1455,10 +1455,10 @@ session lookup.
 
 Detection is a **name heuristic**. SEC021 walks the parsed policy
 AST for a plain `=` comparison where one operand is a column whose
-name is in a configurable identity-column set — by default `tenant_id`,
-`tenant`, `org_id`, `org`, `organization_id`, `organisation_id`,
-`account_id`, `account`, `company_id`, `customer_id`, `workspace_id`,
-`team_id`, `project_id`, `user_id`, `owner_id`, `owner` — and the other
+name is in a configurable identity-column set — by default the bare and
+`_id` spellings of `tenant`, `org`, `organization`, `organisation`, `account`,
+`company`, `customer`, `client`, `workspace`, `team`, `project` and `owner`,
+plus `user_id`, `group_id`, `member_id` and `site_id` (28 names) — and the other
 operand is a literal (`A_Const`, optionally cast: `'…'::uuid`). The
 literal is the signal; the identity-ish column *name* separates the
 anti-pattern from a legitimate `column = literal` policy such as

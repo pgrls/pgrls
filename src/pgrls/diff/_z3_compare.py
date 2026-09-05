@@ -2102,6 +2102,11 @@ def prove_anon_isolation(
     to an unauthenticated client iff the policy's USING is TRUE for it under
     anon.
 
+    ``set_gucs`` names dotted GUCs the anonymous session inherits already set
+    (database / server level, or role level for a role in the anon closure);
+    a read of one is a real, non-null value rather than the unset-GUC raise —
+    in every spelling, including the ``(name, true)`` form.
+
     Returns ``(verdict, witness)``:
 
     - ``("isolated", None)`` — ``is_true`` is UNSAT under anon: **proven** that
