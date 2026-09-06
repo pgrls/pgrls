@@ -31,6 +31,39 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **The "does anon already read every row" check ignored RESTRICTIVE
+  policies, so both cedes cleared a wide-open door.** Postgres ANDs every
+  applicable restrictive policy on top of the permissive one, but the check
+  looked only at permissive ones — so `USING (true)` under a restrictive
+  tenant filter was judged "anon reads everything". Measured: anon read 1 row
+  directly and 2 through a definer view over it, while `--mode reachability`
+  reported PROVEN and exited 0. A differential fuzz over 2592 schema
+  combinations counted 204 false clears, every one involving a restrictive
+  policy, and 0 after the fix. Anon-reachable floors are composed in now, and
+  a floor that cannot be modelled means the cede is declined.
+- **`--mode escalation` ceded without checking anon can read the table at
+  all.** `--mode anon` decides what the predicate admits and never checks
+  privileges, so a `USING (true)` table with no grant to anon is `permission
+  denied` on a direct read while an anon-callable `SECURITY DEFINER` function
+  over it returned every row — the SEC042 threat, reported PROVEN. The
+  reachability cede already carried this guard; escalation now does too.
+- **A `SECURITY DEFINER` function reachable only through role membership was
+  invisible.** The candidate gate intersected `EXECUTE` grantees with
+  `{anon, PUBLIC}` literally, while every other anonymous check in the module
+  expands the role graph. Measured: with `GRANT readers TO anon` and EXECUTE
+  granted only to `readers`, anon called the function and read every row while
+  `--mode escalation` reported "No reachable escalation paths".
+- **`--probe` and `--emit-repro` wrote `''` into the JWT claim GUCs,
+  destroying the `IS NULL` gate they were sent to confirm.** `''` is a value,
+  not NULL — the same fact already documented for custom GUCs — and a policy
+  can read those claim GUCs directly rather than through pgrls's own stubs.
+  Measured: a live 2-row anonymous read came back as `no rows` / MISMATCH from
+  the probe, and the emitted reproduction returned 0 rows so its generated
+  pytest failed against a real leak. The probe now clears a claim GUC only
+  where it is already non-NULL, and a JWT-less reproduction leaves them unset,
+  which is what a throwaway database gives.
+- The ∀ cede is memoized per table: asking it once per door (and per
+  function-table pair) was a 4.7x slowdown on a 50-table schema.
 - **The SEC015 auto-fix left the vulnerability open and then reported it
   resolved.** For a function with no pinned path the fixer emitted
   `SET search_path = pg_catalog, pg_temp`, described as "minimal-but-safe".

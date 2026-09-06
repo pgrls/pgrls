@@ -2429,13 +2429,21 @@ def test_escalation_text_and_sarif_surface_the_path() -> None:
 # --- escalation mode: SEC042 anon-callable SECDEF bodies -------------------
 
 
-def _anon_tbl(name: str, using: str) -> Table:
+def _anon_tbl(name: str, using: str, *, anon_grant: bool = True) -> Table:
+    # `anon_grant` defaults on: "anon already reads this table directly" is a
+    # claim about PRIVILEGES as well as predicates. Measured on PG16, a
+    # `USING (true)` table with no grant to anon is `permission denied` on a
+    # direct read while an anon-callable SECDEF function over it returns every
+    # row — so a cede without the grant clears the only real door.
+    from pgrls.model import Grant
+
     return Table(
         schema="public",
         name=name,
         rls_enabled=True,
         force_rls=False,
         policies=(_policy(using),),
+        grants=(Grant(role="anon", privileges=("SELECT",)),) if anon_grant else (),
     )
 
 
@@ -3809,3 +3817,64 @@ def test_reachability_does_not_cede_when_only_one_anon_session_reads_everything(
     assert _rv(Schema(tables=(wide,), views=(v,), role_memberships=()))[
         ("public.t", "public.v")
     ][0] == "isolated"
+
+
+def test_escalation_does_not_cede_when_anon_cannot_read_the_table() -> None:
+    """`--mode anon` decides what the PREDICATE admits; it never checks
+    privileges. Measured on PG16: `USING (true)` with no grant to anon is
+    `permission denied` on a direct read while the anon-callable SECDEF
+    function over it returned every row — the SEC042 threat exactly, and the
+    cede cleared it."""
+    schema = Schema(
+        tables=(_anon_tbl("secret", "true", anon_grant=False),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak"
+
+
+def test_escalation_secdef_execute_reaches_through_role_membership() -> None:
+    """EXECUTE reaches through the role graph like every other anon check.
+    Measured: a function granted only to `readers` with `GRANT readers TO
+    anon` was callable by anon (`has_function_privilege` = t) and read every
+    row, while a literal set intersection against {anon, PUBLIC} reported
+    "No reachable escalation paths"."""
+    from pgrls.model import RoleMembership
+
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("readers",)),
+        ),
+        role_memberships=(RoleMembership(member="anon", role="readers"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak"
+
+
+def test_reachability_cede_composes_the_restrictive_floor() -> None:
+    """Postgres ANDs every applicable RESTRICTIVE policy on top of the
+    permissive one, so `USING (true)` under a restrictive tenant filter
+    returns ONE row, not all of them. Measured: anon read 1 row directly and 2
+    through a definer view over it, while reading the permissive policy alone
+    said "already reads everything" and cleared the door."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Grant, Policy, Schema, Table
+
+    def pol(name, using, permissive):
+        return Policy(
+            name=name, command="SELECT", permissive=permissive, roles=("PUBLIC",),
+            using_sql=using, with_check_sql=None,
+            using_ast=parse_expr(using), with_check_ast=None,
+        )
+
+    t = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        columns=("id", "tenant_id"), owner="tbl_owner",
+        policies=(pol("p_all", "true", True), pol("r_tenant", "tenant_id = 't1'", False)),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+    v = _rv_view("v", "root", (("public", "t"),), superuser=True)
+    assert _rv(Schema(tables=(t,), views=(v,), role_memberships=()))[
+        ("public.t", "public.v")
+    ][0] == "leak"

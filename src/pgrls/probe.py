@@ -552,7 +552,16 @@ def _run_probe_steps(
             # them unset; `_observe_anon_sessions` sets the ones a login path
             # actually has.
             for guc in _ANON_BASELINE_GUCS:
-                cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
+                # Only where it is already non-NULL. `''` is a VALUE, not
+                # NULL, and cannot be undone in-session — writing it into an
+                # unset claim GUC destroys a `current_setting(..., true) IS
+                # NULL` gate, which is exactly the shape SEC004 is about.
+                # Measured: the probe then reported `no rows` against a live
+                # 2-row anonymous read and MISMATCHed its own correct proof.
+                cur.execute(
+                    f"SELECT set_config({_sql_str(guc)}, '', true) "
+                    f"WHERE current_setting({_sql_str(guc)}, true) IS NOT NULL"
+                )
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
     except psycopg.Error as exc:
         # A seed INSERT denied (e.g. no permissive write path under FORCE RLS for
@@ -669,7 +678,10 @@ def _observe_anon_sessions(
             value = inherited[n] if raw is None or is_maybe_set(raw) else str(raw)
             cur.execute(f"SELECT set_config({_sql_str(n)}, {_sql_str(value)}, true)")
         for guc, _val in _ANON_KEY_SESSION_GUCS:
-            cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
+            cur.execute(
+                f"SELECT set_config({_sql_str(guc)}, '', true) "
+                f"WHERE current_setting({_sql_str(guc)}, true) IS NOT NULL"
+            )
         seen = _row_count(cur.connection, query)
         if seen == 0:
             for guc, val in _ANON_KEY_SESSION_GUCS:

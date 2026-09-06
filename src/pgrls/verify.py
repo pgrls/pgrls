@@ -1087,28 +1087,68 @@ def _anon_reads_every_row(
     auth_functions: set[str] | None,
     anon_roles: set[str],
     guc_states: tuple[GucState, ...],
+    memo: dict[str, bool] | None = None,
 ) -> bool:
     """Does the DIRECT anonymous read already return every row of `table`?
 
     The question a cede asks before deciding a second door adds nothing. It
     needs "every row in EVERY modelled anonymous session", which a `{}`
     witness does not give — that witness comes from the first session that
-    leaked (see `_z3_compare.anon_leak_is_total`). Answered here by asking
-    whether some policy anon can actually invoke admits every row in every
-    session.
+    leaked (see `_z3_compare.anon_leak_is_total`).
+
+    A permissive policy is not the whole answer. Postgres ANDs every
+    applicable RESTRICTIVE policy on top, so `USING (true)` under a
+    restrictive tenant filter returns ONE row, not all of them — measured:
+    anon read 1 row directly and 2 through a definer view over it, while
+    reading the permissive policy alone said "already reads everything" and
+    cleared the door. Every anon-reachable floor is composed in; a floor we
+    cannot model means we cannot claim totality, so we decline.
+
+    (Composing floors that `_floor_applies` would reject is deliberate here.
+    Over-restricting can only SUPPRESS a cede, which is the safe direction —
+    the opposite of the PROVEN claim that gate guards.)
     """
     from pgrls.diff._z3_compare import anon_leak_is_total  # noqa: PLC0415
 
+    if memo is not None and table.qualified_name in memo:
+        return memo[table.qualified_name]
+
+    def answer(value: bool) -> bool:
+        if memo is not None:
+            memo[table.qualified_name] = value
+        return value
+
+    # An exempt anonymous session never consults the policies at all, so it
+    # reads every row by definition — and the `role:` proof that records it
+    # carries no policy for the loop below to find.
+    if _anon_session_exempt(schema, table, anon_roles):
+        return answer(True)
+
     auth = auth_functions if auth_functions is not None else None
+    restrictives = [
+        p
+        for p in table.policies
+        if p.command in _MODE_COMMANDS["anon"]
+        and not p.permissive
+        and _anon_policy_reachability(schema, p, anon_roles) != "unreachable"
+    ]
+    floor_asts = [checked_ast(r, "anon") for r in restrictives]
+    if any(fa is None for fa in floor_asts):
+        return answer(False)
+
     for policy in table.policies:
         if policy.command not in _MODE_COMMANDS["anon"] or not policy.permissive:
             continue
         if _anon_policy_reachability(schema, policy, anon_roles) != "reachable":
             continue
         ast = checked_ast(policy, "anon")
-        if ast is not None and anon_leak_is_total(ast, auth, set_gucs=guc_states):
-            return True
-    return False
+        if ast is None:
+            continue
+        if floor_asts:
+            ast = _compose_with_floor(ast, floor_asts)
+        if anon_leak_is_total(ast, auth, set_gucs=guc_states):
+            return answer(True)
+    return answer(False)
 
 
 def _relation_is_anon_selectable(
@@ -1230,6 +1270,9 @@ def build_reachability(
     # owner's (measured: `ALTER ROLE anon SET app.x` leaked through a view
     # whose owner never had it).
     caller_set_gucs = _anon_set_gucs(schema, anon_roles)
+    # The ∀ question depends only on (schema, table); the walk asks it once
+    # per DOOR, which was a 4.7x slowdown on a 50-table schema.
+    total_read_memo: dict[str, bool] = {}
 
     def owner_verdict(owner: str, table: Any) -> TableVerdict | None:
         if owner not in owner_cache:
@@ -1343,7 +1386,7 @@ def build_reachability(
                 an_leak is not None
                 and _anon_reads_every_row(
                     schema, table, auth_functions, resolved_anon_roles,
-                    caller_set_gucs,
+                    caller_set_gucs, total_read_memo,
                 )
                 and _anon_holds_select(
                     schema, table, resolved_anon_roles, table_level_only=True
@@ -1962,11 +2005,36 @@ def _escalation_secdef_findings(
     _tables_by_q = {t.qualified_name: t for t in schema.tables}
     _esc_gucs = _anon_set_gucs(schema, anon_roles)
     _esc_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
+    _esc_memo: dict[str, bool] = {}
+    # EXECUTE reaches through the role graph like every other anon check in
+    # this module: measured, a function granted only to `readers` with
+    # `GRANT readers TO anon` was callable by anon (has_function_privilege
+    # = t) and read every row, while a literal set intersection against
+    # {anon, PUBLIC} reported "No reachable escalation paths".
+    _exec_reachable = (
+        set(_esc_roles)
+        | set(_anon_priv_closure(schema, _esc_roles) or frozenset())
+        | {"PUBLIC"}
+    )
 
     def total_read(qname: str) -> bool:
+        """Does anon ALREADY read this whole table directly?
+
+        Both halves are required. `--mode anon` decides what the predicate
+        admits; it never checks privileges. Measured: `USING (true)` with no
+        grant to anon is `permission denied` on a direct read while an
+        anon-callable SECURITY DEFINER function over it returned every row —
+        the SEC042 threat exactly, and ceding cleared it.
+        """
         table = _tables_by_q.get(qname)
-        return table is not None and _anon_reads_every_row(
-            schema, table, auth_functions, _esc_roles, _esc_gucs
+        return (
+            table is not None
+            and _anon_reads_every_row(
+                schema, table, auth_functions, _esc_roles, _esc_gucs, _esc_memo
+            )
+            and _anon_holds_select(
+                schema, table, _esc_roles, table_level_only=True
+            )
         )
 
     bare_to_qual: dict[str, list[tuple[str, str]]] = {}
@@ -1994,7 +2062,7 @@ def _escalation_secdef_findings(
         candidate = [
             f
             for f in by_qname[qname]
-            if f.owner_bypasses_rls and (set(f.execute_roles) & anon_roles)
+            if f.owner_bypasses_rls and (set(f.execute_roles) & _exec_reachable)
         ]
         if not candidate:
             continue
@@ -2013,7 +2081,7 @@ def _escalation_secdef_findings(
                 any_unseen = True
         inconclusive = any_opaque or any_unseen
         roles = ", ".join(
-            sorted({r for f in candidate for r in (set(f.execute_roles) & anon_roles)})
+            sorted({r for f in candidate for r in (set(f.execute_roles) & _exec_reachable)})
         )
         head = (
             f"SECURITY DEFINER function EXECUTE-able by {roles}, owned by an "

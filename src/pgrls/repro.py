@@ -599,11 +599,7 @@ def _build_statements(
                 f"SELECT set_config({_sql_str(name)}, "
                 f"{_sql_str(_UNCAPTURED_GUC if value is None else str(value))}, true);"
             )
-    setup.append("SELECT set_config('request.jwt.claim.sub', '', true);")
-    if not anon_key:
-        setup.append("SELECT set_config('request.jwt.claim.role', '', true);")
-        setup.append("SELECT set_config('request.jwt.claims', '', true);")
-    else:
+    if anon_key:
         setup.append(
             "-- anon-KEY session: this leak needs the role claim PostgREST sets"
         )
@@ -611,6 +607,14 @@ def _build_statements(
         setup.append(
             "SELECT set_config('request.jwt.claims', '{\"role\":\"anon\"}', true);"
         )
+    else:
+        # The JWT-less session leaves the claim GUCs UNSET, which is what a
+        # throwaway database already gives. Writing `''` into them would make
+        # `current_setting('request.jwt.claim.sub', true) IS NULL` FALSE and
+        # kill the very gate the leak rides on — measured: the emitted script
+        # returned 0 rows against a live 2-row anonymous read, so the
+        # generated pytest failed against a real leak.
+        setup.append("-- JWT-less session: the claim GUCs stay UNSET (NULL).")
     setup.append(f"SET LOCAL ROLE {quote_ident(runner)};")
 
     leak_query = f"SELECT * FROM {qtbl};"
