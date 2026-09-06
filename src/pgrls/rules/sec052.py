@@ -68,7 +68,7 @@ Conservative by design (soundness over recall, no false positives):
   logic; a projection miss here, never a false positive). Bind (or drop) the
   ``auth.users`` read in its own arm to be safe.
 * For a **materialized view** the ``WHERE`` runs once at ``REFRESH`` (as the
-  refreshing role), not per caller, so a ``WHERE id = auth.uid()`` filter does
+  matview's owner), not per caller, so a ``WHERE id = auth.uid()`` filter does
   *not* actually scope to the caller — a caller-bound matview over ``auth.users``
   is a conservative miss, not a "safe" view.
 * Any caller-binding auth call (``auth.uid()`` etc.) present in the view's
@@ -290,7 +290,7 @@ class SEC052:
         kind = "materialized view" if view.is_materialized else "view"
         tables = ", ".join(leaked)
         if view.is_materialized:
-            # A matview's WHERE runs once at REFRESH (as the refreshing role),
+            # A matview's WHERE runs once at REFRESH (as the matview's owner),
             # not per caller, so neither `security_invoker` nor an `id =
             # auth.uid()` filter scopes it — and adding such a filter would only
             # SILENCE this finding while the capture still leaks. Offer only

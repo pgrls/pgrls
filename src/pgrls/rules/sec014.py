@@ -1,10 +1,16 @@
 """SEC014 — SECURITY DEFINER function audit (free-standing).
 
 A `SECURITY DEFINER` function runs with the privileges of the function
-*owner*, not the calling role. Every SELECT/INSERT/UPDATE/DELETE inside
-the function body sees the owner's view of the database — RLS bypassed,
-GRANT/REVOKE differences flattened, the entire row set readable and
-mutable. A function that the application code calls directly via
+*owner*, not the calling role: the owner's GRANTs and the owner's RLS
+policies apply inside the body instead of the caller's.
+
+That is a **bypass** only when the owner is RLS-exempt for the table —
+superuser, `BYPASSRLS`, or the table owner while `FORCE` is off
+(measured on PG16: 3 of 3 rows). For an ordinary owner it is a
+*re-scoping* that can widen or narrow what the caller reaches (measured:
+1 of 3, with and without `FORCE`). SEC042 is the sharpened rule for the
+provably-exempt owner; SEC014 flags every SECDEF function because it
+cannot see which case applies. A function that the application code calls directly via
 ``SELECT my_secdef(...)`` therefore presents a privilege-escalation
 path: any role with EXECUTE permission on the function inherits the
 owner's effective reach into RLS-protected tables.
@@ -14,9 +20,9 @@ paths:
 
 * **VIEW004** flags views whose body calls a SECDEF function that reads
   an RLS-protected table — view-mediated bypass.
-* **SEC013** flags triggers on RLS-protected tables, which fire as the
-  table owner and bypass RLS regardless of the trigger function's
-  ``prosecdef`` flag.
+* **SEC013** flags triggers on RLS-protected tables — a trigger
+  function runs as the CALLER unless it is ``SECURITY DEFINER``
+  (measured), and the linter cannot read the body to tell which.
 
 SEC014 fills the gap by flagging *every* SECDEF function in the
 introspected schemas, regardless of how it's invoked. The intent isn't

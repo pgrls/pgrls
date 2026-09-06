@@ -775,7 +775,7 @@ GRANT SELECT ON docs_v TO anon;
         expect=(("public.docs", "unverified"),),
         note=(
             "A matview holds rows captured at REFRESH time under the "
-            "refreshing role's RLS context, which the prover does not model — "
+            "matview OWNER's RLS context, which the prover does not model — "
             "measured: anon read every row through the view. Skipping the "
             "matview hop passed this in silence; it abstains loudly instead."
         ),

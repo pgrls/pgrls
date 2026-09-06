@@ -13,7 +13,8 @@ CREATE POLICY p ON leads USING (tenant_id = (SELECT current_setting('app.tenant_
 ```
 
 An application that forgets to bind a tenant does not fail — it reports
-"not found". A test suite connected as the table owner cannot see the
+"not found". A test suite connected as the owner of a table that is not
+`FORCE`'d cannot see the
 difference either, because RLS is not enforced for that role, so a query
 that binds a tenant and one that does not are identical to every test.
 The failure is silent, total, and arrives the day the application role

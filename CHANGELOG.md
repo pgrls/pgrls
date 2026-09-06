@@ -31,6 +31,42 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **The SEC015 auto-fix left the vulnerability open and then reported it
+  resolved.** For a function with no pinned path the fixer emitted
+  `SET search_path = pg_catalog, pg_temp`, described as "minimal-but-safe".
+  It is not: an unqualified name the body reads is not in `pg_catalog`, so
+  resolution falls straight through to `pg_temp` — which the attacker writes.
+  Measured on PG16 with a `SECURITY DEFINER` function reading an unqualified
+  `secrets`, a planted `pg_temp.secrets` was returned *after* applying the
+  fix. It now emits `pg_catalog, <the function's own schema>, pg_temp`
+  (measured: the real table), and the docs frame the residual third-schema
+  case as a security precondition rather than a functionality caveat.
+- **SEC040 fired on a live database for the hardened NULL-safe write check its
+  own documentation says is not flagged.** `pg_get_expr` deparses `a IS NOT
+  DISTINCT FROM b` as `NOT (a IS DISTINCT FROM b)`, which the equality matcher
+  did not recognise — so the same DDL was clean read offline and a false
+  positive read from the catalog. The deparsed form is matched now.
+- **Five more rules stated Postgres semantics backwards**, all in text
+  `pgrls explain` prints. `REFRESH MATERIALIZED VIEW` runs the body as the
+  matview's **owner**, not as whoever issues the command (measured: the same
+  superuser refresh captured a different tenant's rows after `ALTER
+  MATERIALIZED VIEW … OWNER TO`) — corrected in ten places including three
+  runtime messages, and VIEW003's "refresh as a per-tenant role" remedy
+  replaced, since a non-owner cannot issue the command at all. `SECURITY
+  DEFINER` re-scopes RLS to the function owner rather than bypassing it
+  (measured: 1 of 3 rows for an ordinary owner). A missing `WITH CHECK` does
+  NOT default to `true` — a clause-less `FOR INSERT` policy *rejects* the
+  insert and a clause-less `FOR UPDATE` reports `UPDATE 0`, so SEC006's
+  diagnosis was inverted. `IS NOT DISTINCT FROM` does not expose NULL rows to
+  every tenant (`NULL IS NOT DISTINCT FROM 1` is FALSE); the `OR IS NULL` and
+  `COALESCE` forms do. And a `(SELECT <volatile>)` wrapper *is* hoisted to an
+  InitPlan and runs once per statement — which is the real argument for
+  PERF002, not the "re-runs per row regardless" the docs claimed.
+- Remediation that would fail if copy-pasted: SEC020's "drop the WITH CHECK
+  clause" (`ALTER POLICY` has no clause-removal syntax), SEC053's
+  "`security_invoker` view" (an invoker view needs the caller to hold the very
+  grant being revoked), and `--emit-repro`'s "uncomment" hint, which was not
+  on its own line.
 - **An empty leak witness was read as "every anonymous session reads
   everything", when it only means the FIRST session that leaked did — so both
   `--mode reachability` and `--mode escalation` cleared open doors.** The anon
@@ -256,7 +292,7 @@ breaking changes — they will be called out in this file.
   readability is now checked at the end of every path, and an undecidable hop
   reports `UNVERIFIED` instead of guessing.
 - **A definer view over a materialized view was passed in silence.** A matview
-  holds rows captured at REFRESH time under the refreshing role's RLS context,
+  holds rows captured at REFRESH time under the matview owner's RLS context,
   which the prover does not model — and a definer view over a
   superuser-refreshed one handed anon every row (measured). That path is now
   `UNVERIFIED` rather than skipped.

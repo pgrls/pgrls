@@ -166,7 +166,7 @@ class SEC050:
                 if clause is None:
                     continue  # nothing to analyze
                 if is_literal_true(clause):
-                    continue  # SEC008 / SEC006 territory
+                    continue  # SEC008 / SEC028 territory
                 if _references_bucket_id(clause, table):
                     continue  # the row-reach clause scopes bucket
                 pid = f"{table.qualified_name}.{policy.name}"

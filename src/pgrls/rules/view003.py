@@ -1,8 +1,11 @@
 """VIEW003 — materialized view over RLS-protected table.
 
-A materialized view captures rows by running its body at REFRESH
-time, with the privileges of whoever issued the `REFRESH MATERIALIZED
-VIEW` (typically a privileged migration / cron / admin role). The
+A materialized view captures rows by running its body at `REFRESH
+MATERIALIZED VIEW` time as the matview's OWNER — not as whoever issues
+the command (measured on PG16: the same superuser REFRESH captured
+tenant 1's row under one owner and tenant 2's after `ALTER MATERIALIZED
+VIEW … OWNER TO` the other). RLS on the source tables is evaluated
+against that owner. The
 captured rows are written to the matview's own physical heap, and
 queries against the matview read from that heap directly — they do
 NOT re-evaluate the underlying body and therefore do NOT honor RLS
@@ -75,11 +78,10 @@ class VIEW003:
                     message=(
                         f"Materialized view {v.qualified_name} "
                         f"captures data from {referenced_qname} at "
-                        "REFRESH time per the refresher's privileges. "
-                        "RLS is NOT applied to queries against the "
-                        "matview. Verify REFRESH is run as a "
-                        "per-tenant user, or replicate the matview "
-                        "per-tenant."
+                        "REFRESH time as the matview's OWNER (not as "
+                        "whoever issues the REFRESH). RLS is NOT applied "
+                        "to queries against the matview. Give the matview "
+                        "a per-tenant owner, or replicate it per-tenant."
                     ),
                     location=v.qualified_name,
                 )

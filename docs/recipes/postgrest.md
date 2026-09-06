@@ -48,7 +48,9 @@ USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true)::uuid)
 
 (`current_setting(...)` always returns `text`; if `tenant_id` is
 `uuid` / `int` / `bigint` you need a matching cast, or Postgres
-raises `operator does not exist: <coltype> = text` at query time.)
+raises `operator does not exist: <coltype> = text` at **CREATE POLICY**
+time — the policy never enters the catalog, so there is no query-time error
+to hunt for.)
 A row whose `tenant_id` is `NULL` evaluates `NULL = <value>` to `NULL`
 (not `true`), so the row is invisible to every tenant. That's already
 a bug — the row belongs to no one. The worse failure mode is one

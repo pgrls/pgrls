@@ -22,7 +22,7 @@ If that discriminator column is **nullable**, two things go wrong:
    NULL-tolerant form of the same key — `tenant_id IS NOT DISTINCT
    FROM <setting>`, `tenant_id = <setting> OR tenant_id IS NULL`,
    `COALESCE(tenant_id, <setting>) = <setting>` — every `NULL` row
-   becomes visible to **every** tenant at once. A `NOT NULL`
+   can become visible where it should not. The `OR IS NULL` and `COALESCE` forms do exactly that (both are TRUE for a NULL row against any tenant). `IS NOT DISTINCT FROM` is different — measured, `NULL IS NOT DISTINCT FROM 1` is FALSE, so the NULL row stays hidden from every *identified* tenant and becomes visible exactly to a session whose auth value is also NULL: an unauthenticated one. A `NOT NULL`
    discriminator makes that whole failure mode unreachable.
 
 SEC030 fires when a table has RLS enabled, a policy, captured column
@@ -119,8 +119,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.ast import A_Expr, ColumnRef, Node, SelectStmt, String, SubLink, TypeCast
-from pglast.enums import A_Expr_Kind
+from pglast.ast import (
+    A_Expr,
+    BoolExpr,
+    ColumnRef,
+    Node,
+    SelectStmt,
+    String,
+    SubLink,
+    TypeCast,
+)
+from pglast.enums import A_Expr_Kind, BoolExprType
 
 from pgrls.ast_utils import find_func_calls, own_column_ref
 from pgrls.model import Schema, Table
@@ -332,6 +341,30 @@ def _scoping_columns(
             return
         if isinstance(n, SubLink):
             return
+        # `pg_get_expr` deparses `a IS NOT DISTINCT FROM b` as
+        # `NOT (a IS DISTINCT FROM b)` — a BoolExpr(NOT) over
+        # AEXPR_DISTINCT, never the AEXPR_NOT_DISTINCT the parser
+        # produces from hand-written SQL. Without this, SEC040 fired on a
+        # live database for a hardened NULL-safe WITH CHECK that the same
+        # DDL read offline was correctly silent on (measured), and the
+        # finding message named `IS NOT DISTINCT FROM` as recognised.
+        if (
+            broaden_equality
+            and isinstance(n, BoolExpr)
+            and n.boolop == BoolExprType.NOT_EXPR
+            and len(n.args or ()) == 1
+            and isinstance(n.args[0], A_Expr)
+            and n.args[0].kind == A_Expr_Kind.AEXPR_DISTINCT
+            and _expr_op(n.args[0]) == "="
+        ):
+            inner = n.args[0]
+            for auth_side, col_side in (
+                (inner.lexpr, inner.rexpr), (inner.rexpr, inner.lexpr)
+            ):
+                if _side_has_auth_call(auth_side, auth_functions):
+                    col = _direct_own_column(col_side, table)
+                    if col is not None and col.lower() in identity_columns:
+                        found.add(col)
         if (
             isinstance(n, A_Expr)
             and _expr_op(n) == "="

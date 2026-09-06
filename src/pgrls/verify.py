@@ -1589,7 +1589,7 @@ def _reachability_paths(
     be able to SELECT it (`_role_reads_relation`; the anonymous caller's own
     grants while no definer view has been entered). A materialized-view hop
     is reported `unverified`: its rows were captured at REFRESH time under
-    the refreshing role's RLS context (measured: a definer view over a
+    the MATVIEW OWNER's RLS context (measured: a definer view over a
     superuser-refreshed matview handed anon every row), which is not
     modeled. A pre-v26 view (no `direct_references`) falls back to its
     collapsed `references`.
@@ -1642,7 +1642,7 @@ def _reachability_paths(
                     for t in _rls_tables_beneath(child, tables_by_key, views_by_key):
                         unverified(outer, t, child_hops, child, (
                             f"{child.qualified_name} is a materialized view: its rows were "
-                            "captured at REFRESH time under the refreshing role's RLS "
+                            "captured at REFRESH time under the matview owner's RLS "
                             "context, which is not modeled"))
                     continue
                 if readable is None and eff is not None:

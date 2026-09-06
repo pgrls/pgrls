@@ -849,10 +849,14 @@ RLS-exempt role. **Auto-fix:** no (architectural choice
 needs human intent).
 
 A `SECURITY DEFINER` function runs with the privileges of the
-function owner, not the calling role. Every
-SELECT/INSERT/UPDATE/DELETE inside the body sees the owner's
-view of the database — RLS bypassed, GRANT/REVOKE differences
-flattened, the entire row set readable and mutable. A role
+function owner, not the calling role: the owner's GRANTs and
+the owner's RLS policies apply inside the body instead of the
+caller's. That is a **bypass** only when the owner is RLS-exempt
+for the table — superuser, `BYPASSRLS`, or the table owner while
+`FORCE` is off (measured: 3 of 3 rows). For an ordinary owner it
+is a *re-scoping* that can widen or narrow what the caller
+reaches (measured: 1 of 3, with and without `FORCE`); SEC042 is
+the sharpened rule for the provably-exempt owner. A role
 with EXECUTE permission on the function effectively inherits
 the owner's reach into RLS-protected tables.
 
@@ -980,12 +984,18 @@ rewriting the path so `pg_temp` is pinned last with exactly one
 occurrence. When the function already pins a path, the existing
 entries are preserved (case-intact) and any earlier `pg_temp`
 tokens are stripped so it ends up last; when no path is pinned at
-all, the fixer emits the minimal-but-safe default
-`SET search_path = pg_catalog, pg_temp` — strictly tighter than
-the caller's path, so a function whose body needs unqualified
-names from another schema needs the operator to insert that
-schema before `pg_temp` in the generated SQL (the Fix description
-prompts this). The fixer **abstains** in three cases: a pre-v12
+all, the fixer emits
+`SET search_path = pg_catalog, <the function's own schema>, pg_temp`.
+The own schema is there for a **security** reason, not a convenience
+one: `pg_catalog, pg_temp` looks tighter but leaves the hole open,
+because an unqualified name the body reads is not in `pg_catalog` and
+resolution falls straight through to `pg_temp` — which the attacker
+writes. Measured on PG16 with a SECDEF function reading an unqualified
+`secrets`: under `pg_catalog, pg_temp` a planted `pg_temp.secrets` was
+returned, and under `pg_catalog, <own schema>, pg_temp` the real table
+was. A body reading unqualified names from a THIRD schema still needs
+that schema inserted before `pg_temp`, or the references
+fully-qualified (the Fix description prompts this). The fixer **abstains** in three cases: a pre-v12
 snapshot whose captured `signature` is empty (a bare
 `ALTER FUNCTION name()` would target the wrong overload — re-snapshot
 against v12+ to populate signatures); a pre-v14 snapshot that lacks the
@@ -2092,7 +2102,7 @@ CREATE POLICY tenant_scope ON documents
    policy uses a NULL-tolerant form of the same key — `tenant_id IS
    NOT DISTINCT FROM <setting>`, `tenant_id = <setting> OR tenant_id
    IS NULL`, `COALESCE(tenant_id, <setting>) = <setting>` — every
-   `NULL` row becomes visible to **every** tenant at once. A `NOT
+   `NULL` row can become visible where it should not. The `OR IS NULL` and `COALESCE` forms do exactly that (both are TRUE for a NULL row against any tenant). `IS NOT DISTINCT FROM` is different — measured, `NULL IS NOT DISTINCT FROM 1` is FALSE, so the NULL row stays hidden from every *identified* tenant and becomes visible exactly to a session whose auth value is also NULL: an unauthenticated one. A `NOT
    NULL` discriminator makes that whole failure mode unreachable.
 
 SEC030 fires when a table has RLS enabled, a policy, captured column
@@ -3851,7 +3861,7 @@ Conservative by design (soundness over recall, no false positives):
 * In a set operation (`UNION` / `INTERSECT` / `EXCEPT`), an arm that binds the
   caller masks an arm that does not.
 * A caller-bound **materialized** view (`WHERE id = auth.uid()`) is a miss,
-  not a safe view: the rows were captured at refresh time as the refresher,
+  not a safe view: the rows were captured at refresh time as the matview's owner,
   so the binding did not scope them (SEC054 / VIEW003 cover the matview).
 
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
@@ -3926,7 +3936,7 @@ Conservative by design (soundness over recall, no false positives):
 
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
 `REVOKE` the low-trust grant, move the foreign table out of the exposed schema,
-or front it with a `security_invoker` view that filters rows (the view runs as
+or front it with a definer-rights view (the default — an invoker view runs as the caller, so it needs the caller to hold SELECT on the foreign table, which is exactly the grant the remedy revokes; measured: `permission denied for foreign table`) that filters rows (the view runs as
 the caller, so it can scope the read the foreign table itself cannot).
 
 **Configuration** (`[lint.rules.SEC053]`):
@@ -4225,7 +4235,12 @@ VOLATILE functions are bad in policies on two counts:
   call timing, not on the row data — almost never the intended
   semantics, often a security hazard.
 * **No caching.** The optimizer cannot fold or cache a VOLATILE
-  call; it re-runs per row regardless of `(SELECT …)` wrapping.
+  call — but `(SELECT …)` around it still hoists it to an InitPlan and
+  runs it ONCE per statement (measured: `(SELECT clock_timestamp())` gave
+  one distinct value across three rows where the bare call gave three).
+  That is why the wrapping is wrong here rather than merely useless: it
+  silently turns "a fresh draw per row" into "one draw per statement",
+  changing what the policy means.
 
 **Standard fix.** Move the volatility outside the policy or use a
 STABLE alternative. For sampling, do it at the application layer
@@ -4734,9 +4749,8 @@ Same `schema.view` shape as VIEW001.
 
 **What it catches:** materialized views whose body reads from an
 RLS-enabled table. A matview captures rows by running its body at
-`REFRESH MATERIALIZED VIEW` time, with the privileges of whoever
-issued the REFRESH (typically a privileged migration / cron / admin
-role). The captured rows are written to the matview's own physical
+`REFRESH MATERIALIZED VIEW` time, as the matview's **owner** — not as whoever issues the command (measured on PG16: the same superuser `REFRESH` captured tenant 1's row while the matview was owned by one role and tenant 2's after `ALTER MATERIALIZED VIEW … OWNER TO` the other). RLS on the source tables is
+therefore evaluated against the owner. The captured rows are written to the matview's own physical
 heap; queries against the matview read from that heap directly —
 they do NOT re-evaluate the underlying body and therefore do NOT
 honor RLS on the source tables, regardless of any flag.
@@ -4751,10 +4765,13 @@ auto-fixer for the same reason. Pick one of the two architectural
 choices:
 
 ```sql
--- Option A: refresh as a per-tenant role so the captured rows are
--- already filtered to that tenant's view.
-SET LOCAL ROLE tenant_a;
-SET LOCAL app.tenant_id = '...';
+-- Option A: give the matview a per-tenant OWNER, so the body runs
+-- as that role at REFRESH and captures only its rows. `SET ROLE`
+-- alone does NOT work: the body runs as the owner regardless, and a
+-- non-owner cannot even issue the command
+-- (ERROR: must be owner of materialized view).
+ALTER MATERIALIZED VIEW public.user_summary OWNER TO tenant_a;
+SET LOCAL app.tenant_id = '...';   -- GUCs DO come from the issuer
 REFRESH MATERIALIZED VIEW public.user_summary;
 
 -- Option B: replicate the matview per-tenant. One physical heap per

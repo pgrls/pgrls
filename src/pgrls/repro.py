@@ -581,9 +581,10 @@ def _build_statements(
                     "-- an anonymous caller may well see; if your callers do"
                 )
                 observed = maybe_set_value(str(value))
+                setup.append("-- have it, uncomment the next line:")
                 setup.append(
-                    "-- have it, uncomment: SELECT set_config("
-                    f"{_sql_str(name)}, {_sql_str(observed)}, true);"
+                    f"-- SELECT set_config({_sql_str(name)}, "
+                    f"{_sql_str(observed)}, true);"
                 )
                 continue
             if value is None:

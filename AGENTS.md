@@ -35,7 +35,9 @@ superuser or `BYPASSRLS` role — is `EXECUTE`-able by `anon`/`PUBLIC`, so an
 unauthenticated PostgREST `POST /rpc/fn` caller runs owner-privileged,
 RLS-exempt code; function `EXECUTE` defaults to `PUBLIC`, so it fires even
 with no explicit `GRANT`; the anon-exposure sharpening of SEC014), `HYG001`
-(policies referencing dropped columns), and `VIEW001`
+(policies referencing a column their table lacks — Postgres refuses to drop
+a policy-referenced column and rewrites the policy on rename, so this comes
+from an offline source or a hand-edited snapshot), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
 `SEC034` (policy gates on `auth.email()` — silent denial of
@@ -946,8 +948,10 @@ any of these shortcuts:
   the table really does not need RLS, allowlist it in `pgrls.toml` instead.
 - **Adding `disable = ["SEC001"]` project-wide.** This hides every future
   missing-RLS bug. Allowlist individual tables.
-- **Writing `USING (true)`.** A policy that always evaluates true is
-  equivalent to no policy. If the goal is "everyone in the same tenant",
+- **Writing `USING (true)`.** A policy that always evaluates true is the
+  OPPOSITE of no policy — measured: RLS on with no policy returns 0 rows to a
+  non-owner grantee, while `FOR SELECT USING (true)` returns every row.
+  Removing such a policy denies everything; adding one opens everything. If the goal is "everyone in the same tenant",
   encode the tenant predicate explicitly.
 - **Writing `USING (...)` without `WITH CHECK (...)`** on a writable policy.
   Reads will be filtered; writes will not.
@@ -969,7 +973,8 @@ ask the human user — the lint failure is signalling a real design question.
 These are intentional in the current release. Do not invent capabilities.
 
 - **Offline or live.** `pgrls lint` / `fix` / `generate` read from a running
-  Postgres, an ephemeral `--migrations` build, OR an offline source —
+  Postgres or an offline source (the ephemeral `--migrations` build is on
+  `lint` only) —
   `--sql-file` (raw DDL, repeatable, `-` for stdin) / `--snapshot` (a `pgrls
   snapshot` artifact) — with no live database and no Docker. Offline analysis
   can only *under*-report: catalog-only rules abstain and are explicitly

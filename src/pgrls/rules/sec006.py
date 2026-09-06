@@ -55,10 +55,17 @@ def _write_is_open(policy: Policy) -> bool:
     *written* row to satisfy ``tenant_id = …`` — the write side is closed,
     not open. The only genuinely open shapes are:
 
-      * INSERT — carries no USING for Postgres to reuse, so a missing
-        WITH CHECK admits every inserted row; and
-      * UPDATE/ALL whose USING is absent or constant-true — there is no
-        meaningful predicate to reuse, so writes are unconstrained.
+      * UPDATE/ALL whose USING is constant-true — the reused predicate
+        constrains nothing, so every written row is accepted.
+
+    The other shape is the opposite of open, and worth saying plainly: a
+    permissive policy with NO usable predicate grants no write AT ALL. A
+    missing WITH CHECK does not default to ``true`` — measured on PG16, a
+    clause-less ``FOR INSERT`` policy rejected the insert with "new row
+    violates row-level security policy", and a clause-less ``FOR UPDATE``
+    reported ``UPDATE 0``. The finding is still worth making (the policy
+    is dead, not protective), but the diagnosis is "grants nothing", not
+    "accepts everything".
 
     Returns True only for those open shapes; the common multi-tenant
     ``FOR UPDATE/ALL USING (tenant = …)`` shape returns False (no finding).
@@ -125,10 +132,14 @@ class SEC006:
                 f"Policy {policy.name!r} on "
                 f"{table.qualified_name} covers "
                 f"{policy.command} but has no WITH CHECK "
-                "clause. Without one, writes that violate "
-                "the policy's intent are accepted. Add "
-                "WITH CHECK matching USING (or a write-"
-                "specific predicate)."
+                "clause. If its USING is constant-true, every "
+                "written row is accepted; with no usable predicate "
+                "at all the policy grants no write whatsoever (a "
+                "missing WITH CHECK does NOT default to true — an "
+                "INSERT raises, an UPDATE reports 0 rows). Either "
+                "way it is not doing what it looks like it is "
+                "doing: add WITH CHECK matching USING (or a "
+                "write-specific predicate)."
             )
         # Restrictive: Postgres defaults missing WITH CHECK to
         # `true`, so the policy is a no-op for the write-side

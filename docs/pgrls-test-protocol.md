@@ -93,9 +93,10 @@ exits.
   automatically.
 * **`set_config(key, value, true)`** is the procedural form of
   `SET LOCAL` for GUC keys whose names contain a dot.
-  `request.jwt.claims` has a dot, so `SET LOCAL request.jwt.claims
-  = ...` is a parse error in Postgres; `set_config` is the only
-  way to set it.
+  `SET LOCAL request.jwt.claims = '...'` is itself valid SQL —
+  dotted names are exactly how Postgres spells customized options
+  (measured) — but `SET` takes no bind parameter, so a client that
+  must pass the value as a parameter has to use `set_config`.
 * **`SAVEPOINT` per scenario** prevents one role's GUC values from
   bleeding into the next scenario in the same test.
 * **PostgREST conventions** (`request.jwt.claims` GUC) are the

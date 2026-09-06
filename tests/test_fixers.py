@@ -2068,7 +2068,7 @@ def test_sec015_fix_emits_minimal_safe_path_when_search_path_unset() -> None:
     assert f.rule_id == "SEC015"
     assert f.sql == (
         "ALTER FUNCTION public.read_secret(integer) "
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, public, pg_temp;"
     )
 
 
@@ -2260,9 +2260,9 @@ def test_sec015_fix_emits_per_overload() -> None:
     fixes = SEC015Fixer().fix(schema, {})
     assert sorted(f.sql for f in fixes) == [
         "ALTER FUNCTION public.f(integer) "
-        "SET search_path = pg_catalog, pg_temp;",
+        "SET search_path = pg_catalog, public, pg_temp;",
         "ALTER FUNCTION public.f(text) "
-        "SET search_path = pg_catalog, pg_temp;",
+        "SET search_path = pg_catalog, public, pg_temp;",
     ]
 
 
@@ -2298,7 +2298,7 @@ def test_sec015_fix_quotes_mixed_case_function_name() -> None:
     [f] = SEC015Fixer().fix(schema, {})
     assert f.sql == (
         'ALTER FUNCTION public."FastEq"(integer) '
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, public, pg_temp;"
     )
 
 
@@ -4223,7 +4223,7 @@ def test_sec015_fix_targets_correct_object_when_schema_name_has_dot() -> None:
     [fix] = SEC015Fixer().fix(schema, {})
     assert fix.sql == (
         'ALTER FUNCTION "a.b".f(integer) '
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, \"a.b\", pg_temp;"
     )
     # The old buggy split would have produced this wrong target.
     assert 'a."b.f"' not in fix.sql
@@ -4245,7 +4245,7 @@ def test_sec015_fix_targets_correct_object_when_function_name_has_dot() -> None:
     [fix] = SEC015Fixer().fix(schema, {})
     assert fix.sql == (
         'ALTER FUNCTION s."a.b"(integer) '
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, s, pg_temp;"
     )
 
 
@@ -4664,3 +4664,22 @@ def test_generate_fixes_includes_sec044_revoke() -> None:
         s.startswith("ALTER DEFAULT PRIVILEGES") and "REVOKE SELECT" in s
         for s in sqls
     )
+
+
+def test_sec015_default_path_includes_the_functions_own_schema_for_security() -> None:
+    """`pg_catalog, pg_temp` looks tighter but leaves the hole open: an
+    unqualified name the body reads is not in `pg_catalog`, so resolution falls
+    through to `pg_temp` — which the ATTACKER writes.
+
+    Measured on PG16 with a SECDEF function reading an unqualified `secrets`:
+    under `pg_catalog, pg_temp` a planted `pg_temp.secrets` was returned
+    (`ATTACKER`); under `pg_catalog, <own schema>, pg_temp` the real table was
+    (`real`). pgrls reports SEC015 resolved after applying its own fix, so the
+    tighter-looking default signed off on a still-exploitable function."""
+    from pgrls.fixers.sec015 import _rewritten_path
+
+    assert _rewritten_path(None, "s15") == "pg_catalog, s15, pg_temp"
+    # A schema needing quoting still produces valid server SQL.
+    assert _rewritten_path(None, "a.b") == 'pg_catalog, "a.b", pg_temp'
+    # An existing path is preserved with pg_temp pinned last, as before.
+    assert _rewritten_path("s15, pg_temp", "s15") == "s15, pg_temp"

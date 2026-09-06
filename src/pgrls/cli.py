@@ -4270,7 +4270,10 @@ def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | N
         "role that reaches a table's owner (not superuser/BYPASSRLS) bypasses "
         "the RLS on that owner's enabled-but-not-FORCE'd tables; LEAK when the "
         "table's RLS provably isolates tenants (so the bypass defeats real "
-        "isolation), PROVEN when it does not. 'reachability': prove no "
+        "isolation) or only partially leaks; PROVEN only when the table "
+        "already leaks EVERY row cross-tenant, so the bypass adds "
+        "nothing; UNVERIFIED when the predicate is unprovable. "
+        "'reachability': prove no "
         "anon-selectable VIEW hands back the rows a table's own policies "
         "withhold — a `security_invoker = false` view executes as its owner "
         "(the nearest such view on a view→view→table path sets the effective "
@@ -4424,9 +4427,9 @@ def verify(
     The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
     (heuristic findings) this is a soundness proof: it never reports a leak it
-    cannot exhibit — from the policies, or from the anonymous role's own RLS
-    exemption (BYPASSRLS/superuser, or the table owner's privileges without
-    FORCE, where Postgres never consults the policies at all) — and never
+    the policy predicate does not admit (or, for the anonymous-role RLS
+    exemption — BYPASSRLS/superuser, or the table owner's privileges without
+    FORCE — that Postgres does not grant), and never
     reports isolated unless Z3 proves it or Postgres default-denies outright. The provers reason about the policy predicate and the policy's
     TO roles, not about table GRANTs, so a predicate admitting every row on a
     table anon cannot SELECT is still a LEAK (an over-report in the safe
