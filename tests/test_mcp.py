@@ -354,8 +354,8 @@ def test_zero_sources_is_structured_error() -> None:
     assert result["error"]["kind"] == "no_schema_source"
 
 
-def test_multiple_sources_is_structured_error() -> None:
-    result = server.lint(sql="CREATE TABLE t (id int);", snapshot="/tmp/x.json")
+def test_multiple_sources_is_structured_error(tmp_path) -> None:
+    result = server.lint(sql="CREATE TABLE t (id int);", snapshot=str(tmp_path / "x.json"))
     assert result["error"]["kind"] == "multiple_schema_sources"
 
 

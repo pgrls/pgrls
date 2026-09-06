@@ -1,6 +1,6 @@
 # Project-specific rules — `[lint].extra_rules`
 
-`pgrls` ships 67 built-in rules. You can add more — private to your
+`pgrls` ships 68 built-in rules. You can add more — private to your
 project, experimental, or domain-specific — without forking.
 
 This guide is for **consumers** writing rules used only by their own
@@ -39,7 +39,7 @@ share the same `Rule` Protocol shape.
            for table in schema.tables:
                if table.schema != "tenant":
                    continue
-               if "tenant_id" not in {c for c in table.columns}:
+               if "tenant_id" not in table.columns:
                    out.append(
                        Violation(
                            rule_id=self.id,

@@ -30,15 +30,16 @@ searched at the written position. So:
   prescribe for SECURITY DEFINER functions.
 
 SEC015 therefore fires on every SECDEF function whose effective
-search_path does not end with an explicit `pg_temp` token. The fix is
-mechanical — append `pg_temp` to the function's `SET search_path` (or
-add the clause if absent) — but it isn't auto-applied: rewriting the
-clause needs the function's full argument signature for the
-`ALTER FUNCTION name(argtypes) SET search_path = …` statement, and
-introspection captures `proname` without `proargtypes`. The operator
-runs the `ALTER FUNCTION` by hand, or allowlists the function after
-confirming its body fully-qualifies every object reference (in which
-case `search_path` is moot).
+search_path does not end with a single explicit `pg_temp` token. The fix
+is mechanical and `pgrls fix` applies it: per flagged overload it emits
+`ALTER FUNCTION <schema>.<name>(<signature>) SET search_path = <existing
+tokens minus pg_temp>, pg_temp` (or `pg_catalog, <the function's own schema>, pg_temp` when no path is
+pinned), using the per-overload signature introspection captures
+(snapshot v12+). It abstains on a pre-v12 snapshot (empty signature), a
+pre-v14 snapshot (no separate schema/function-name fields), or a
+search_path the comma tokenizer cannot safely rewrite. Alternatively,
+allowlist the function after confirming its body fully-qualifies every
+object reference (in which case `search_path` is moot).
 
 Relationship to the other SECDEF rules: SEC014 flags every SECDEF
 function as a generic audit surface; VIEW004 flags the view-mediated
@@ -61,7 +62,9 @@ Out of scope (intentional):
   allowlist the audited-safe cases. Rationale: a body-qualification
   proof is exactly the brittle AST analysis VIEW004 documents
   false-negatives for (dynamic SQL, PL/pgSQL `EXECUTE`); a
-  structural search_path check has no false negatives.
+  structural search_path check has no false negatives for a path that OMITS pg_temp;
+  a path that names it last can still resolve an unqualified body
+  reference through it (see above).
 * **Cross-scope functions.** A SECDEF function in a schema outside
   the introspector's ``--schemas`` set is invisible to SEC015 (it
   isn't in `Schema.security_definer_functions`). Expand ``--schemas``

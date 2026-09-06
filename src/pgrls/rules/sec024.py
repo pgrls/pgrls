@@ -63,7 +63,7 @@ Out of scope (intentional):
   a name assembled from a column or an expression — is not
   inspected; SEC024 only reads string-literal arguments.
 * **Empty parameter names.** `current_setting('')` is a malformed
-  call — Postgres raises `invalid configuration parameter name:
+  call — Postgres raises `unrecognized configuration parameter
   ""` at query time. SEC024's signal is an *unqualified* name (a
   real name that lacks the required prefix), not an absent one.
 * **Parameter-value analysis.** SEC024 does not check whether a
@@ -132,7 +132,7 @@ def _unqualified_setting_names(node: Any) -> set[str]:
             continue
         sval = value.sval
         # An empty name is a malformed call (Postgres raises
-        # `invalid configuration parameter name: ""` at query time)
+        # `unrecognized configuration parameter ""` at query time)
         # — a different class of bug, not SEC024's signal. SEC024
         # flags an *unqualified* name: a real name that lacks the
         # required `prefix.` namespace.

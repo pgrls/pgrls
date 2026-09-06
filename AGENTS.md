@@ -10,7 +10,7 @@ database, introspects every table and policy, and reports problems by rule ID.
 It is framework-agnostic — it does not care whether the project uses Supabase,
 PostgREST, Hasura, Prisma, SQLAlchemy, Django, or raw SQL.
 
-In the current release it ships **sixty-seven rules across four
+In the current release it ships **sixty-eight rules across four
 categories**. Error: `SEC001` (missing RLS), `SEC002` (missing
 `FORCE`), `SEC003` (permissive policies on `PUBLIC`), `SEC004`
 (inverted auth checks — the Lovable CVE pattern), `SEC006`
@@ -26,11 +26,18 @@ authenticated user passes once any matching row exists), `SEC038`
 proves the USING predicate is unconditionally TRUE for an
 unauthenticated session under Kleene 3VL, catching the NOT-wrapped
 and cast-wrapped inverted-auth variants SEC004's syntactic match
-misses; requires the optional `pgrls[diff-z3]` extra and NO-OPs
-without it), `SEC039` (permissive write policy — INSERT/UPDATE/
+misses; Z3 is a core dependency since 0.16.0, so this runs on a plain
+`pip install pgrls`), `SEC039` (permissive write policy — INSERT/UPDATE/
 DELETE/ALL — grants the unauthenticated `anon` role, so anonymous
-PostgREST/Supabase clients can modify rows), `HYG001`
-(policies referencing dropped columns), and `VIEW001`
+PostgREST/Supabase clients can modify rows),
+`SEC042` (a `SECURITY DEFINER` function whose owner bypasses RLS — a
+superuser or `BYPASSRLS` role — is `EXECUTE`-able by `anon`/`PUBLIC`, so an
+unauthenticated PostgREST `POST /rpc/fn` caller runs owner-privileged,
+RLS-exempt code; function `EXECUTE` defaults to `PUBLIC`, so it fires even
+with no explicit `GRANT`; the anon-exposure sharpening of SEC014), `HYG001`
+(policies referencing a column their table lacks — Postgres refuses to drop
+a policy-referenced column and rewrites the policy on rename, so this comes
+from an offline source or a hand-edited snapshot), and `VIEW001`
 (view bypasses RLS without `security_invoker`). Warning:
 `SEC005` (policy expression has no own-column reference),
 `SEC034` (policy gates on `auth.email()` — silent denial of
@@ -45,8 +52,9 @@ nothing), `SEC009` (RLS enabled but no policies —
 silent deny-all), `SEC010` (`USING (false)` deny-all anti-pattern),
 `SEC011` (`OR true` debug branch hidden inside a policy),
 `SEC012` (table has only RESTRICTIVE policies — silent deny-all),
-`SEC013` (trigger on RLS-protected table can bypass policies —
-triggers fire as table owner),
+`SEC013` (trigger on RLS-protected table can bypass policies — a
+`SECURITY DEFINER` trigger function runs as its owner, and the linter
+cannot read the body to tell),
 `SEC014` (SECURITY DEFINER function bypasses caller's RLS —
 audit every SECDEF function),
 `SEC015` (SECURITY DEFINER function exposed to `pg_temp`
@@ -85,11 +93,6 @@ partitioned parent enforces it, and is granted directly to a non-owner
 role — Postgres inherits neither RLS nor grants to partitions, so a query
 naming the granted child directly bypasses the parent's policies; the
 complement of SEC001, which cedes this case),
-`SEC042` (a `SECURITY DEFINER` function whose owner bypasses RLS — a
-superuser or `BYPASSRLS` role — is `EXECUTE`-able by `anon`/`PUBLIC`, so an
-unauthenticated PostgREST `POST /rpc/fn` caller runs owner-privileged,
-RLS-exempt code; function `EXECUTE` defaults to `PUBLIC`, so it fires even
-with no explicit `GRANT`; the anon-exposure sharpening of SEC014),
 `SEC043` (classic-`INHERITS` child has RLS disabled while an inheritance
 ancestor enforces it, and is granted directly to a non-owner role — Postgres
 inherits neither RLS nor grants to children, so a query naming the granted
@@ -143,15 +146,18 @@ row the reader cannot select), `SEC048` (low-trust role can reach an
 RLS table's owner that is not `FORCE`'d, so `SET ROLE` bypasses every
 policy), `SEC049` (PostgREST-exposed table readable by a low-trust
 role), `SEC050` (Storage policy not scoped to a bucket — cross-bucket
-access), and `SEC051` (Realtime-published table has RLS disabled, so
-the WAL broadcast is unfiltered); and info `PERF005` (RLS table
+access), `SEC051` (Realtime-published table has RLS disabled, so the WAL
+broadcast is unfiltered), and `SEC055` (tenant policy still uses the
+silent `current_setting(…, true)` binding form after the schema adopted
+a raising `require_*` helper — a half-finished conversion that 404s
+where the converted policies fail loudly); and info `PERF005` (RLS table
 observed to sequentially scan in production — opt-in, inert without a
 `pgrls perf --snapshot` artifact) and `HYG004` (policy has no
 behavioral test — inert without a coverage artifact).
 
 A `pgrls fix` subcommand
 auto-remediates SEC001, SEC002,
-SEC004, SEC006, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002;
+SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002;
 other rules need human intent. A
 `pgrls.testing` pytest plugin (v0.1+) and a `pgrls diff` semantic
 policy diff command (v0.2+) are also available — see the
@@ -195,8 +201,9 @@ export DATABASE_URL="postgres://user:pass@host:5432/db"
 pgrls lint
 ```
 
-`pgrls lint` exits `0` when nothing exceeds the `fail_on` threshold (default
-`warning`) and `1` otherwise. It prints findings to stdout in the form:
+`pgrls lint` exits `0` when nothing meets or exceeds the `fail_on` threshold
+(default `warning`), `1` when something does, and `2` on a tool error (bad
+config, unreachable database, unsupported snapshot). It prints findings to stdout in the form:
 
 ```
   ERROR  SEC001  public.users
@@ -261,7 +268,7 @@ Notes:
 The per-rule reference — severity, detection logic, fix guidance,
 configuration — lives in **[`docs/RULES.md`](docs/RULES.md)** so
 this file stays focused on project orientation rather than
-duplicating ~2,900 lines of rule documentation.
+duplicating ~4,800 lines of rule documentation.
 
 `pgrls explain <RULE>` (e.g. `pgrls explain SEC033`,
 case-insensitive) prints the same per-rule reference from the
@@ -289,7 +296,7 @@ between each pair of consecutive snapshots (findings keyed by
 `(rule_id, location)`, so a schema-wide finding with `location=None`
 is stable identity rather than NEW+FIXED on every comparison).
 Pair with a daily cron writing `snapshots/$(date -u +%FT%H%M%SZ).json`
-to track posture drift over time. text / JSON / Markdown output —
+to track posture drift over time. text / JSON / Markdown / HTML output —
 the markdown form drops cleanly into a weekly engineering update.
 
 ## Auto-fix: `pgrls fix`
@@ -374,7 +381,10 @@ Currently fixable:
   than emit an empty `USING ()`.
 * **SEC019** — emits `ALTER POLICY <name> ON <schema>.<table>
   USING (…)` (and / or `WITH CHECK (…)`) adding `, true` as the
-  second argument to one-argument `current_setting()` calls.
+  second argument to one-argument `current_setting()` calls —
+  only where the call is a direct comparison operand under an
+  AND-only chain (a returned NULL can only hide the row there);
+  every other position is left alone (never-broaden).
   The two-argument overload returns NULL on an unset GUC
   instead of erroring; the rewrite picks the quiet-NULL side
   matching the overload most policy sets converge on. Both
@@ -426,8 +436,9 @@ Currently fixable:
 * **SEC031** — emits `DROP POLICY <name> ON <schema>.<table>;` for a
   restrictive policy whose `USING` is constant `true`. The
   constant-true clause AND-combines to the identity, so dropping the
-  policy leaves access unchanged — the second `pgrls fix` statement
-  that DROPs an object, safe for the same reason as HYG003's. The
+  policy leaves access unchanged — one of three `pgrls fix` statements
+  that DROP an object (with SEC010's and HYG003's), safe for the same
+  reason as HYG003's. The
   fixer abstains when the policy carries a real `WITH CHECK` (a
   load-bearing write floor whose drop WOULD change write access), so
   it only drops genuinely inert policies. SEC031's other remedy (a
@@ -439,7 +450,7 @@ Currently fixable:
   immediately. Partition-child cases the rule itself cedes (a child
   whose ancestor already has RLS) are skipped by the fixer on the
   same grounds.
-* **PERF004** — emits `CREATE INDEX ON <schema>.<table>
+* **PERF004** — emits `CREATE INDEX IF NOT EXISTS pgrls_idx_<hash> ON <schema>.<table>
   (<function-expression>);` for a policy predicate that wraps an
   indexed column in a function call (`lower(email)`,
   `date_trunc(...)`, nested calls). Walks the policy AST, finds
@@ -459,7 +470,7 @@ Currently fixable:
   per written row too) but emits ONLY the clause(s) it changed —
   an unchanged clause is omitted, so it never clobbers a sibling
   fixer's rewrite of the other clause.
-* **PERF003** — emits `CREATE INDEX ON <schema>.<table>
+* **PERF003** — emits `CREATE INDEX IF NOT EXISTS pgrls_idx_<hash> ON <schema>.<table>
   (<column>);` for a policy-predicate column with no
   leading-column index. One index per offending column,
   deduplicated across policies — two policies filtering the same
@@ -475,8 +486,8 @@ Currently fixable:
   another on the same table. The fixer groups a table's policies
   by the same signature HYG003 reports on, keeps the
   name-sorted-first policy of each duplicate group as the
-  original, and drops the rest. This is the only `pgrls fix`
-  statement that DROPs an object — safe, since the dropped
+  original, and drops the rest. This is one of three `pgrls fix`
+  statements that DROP an object (with SEC010's and SEC031's) — safe, since the dropped
   policy has an exact twin that remains, but dry-run by default
   like every fixer.
 * **VIEW001** — emits `ALTER VIEW <schema>.<view> SET
@@ -755,6 +766,11 @@ the output without blocking CI.
 | Policy dropped, RESTRICTIVE | DANGEROUS |
 | Policy dropped, PERMISSIVE | BREAKING |
 
+> Both rename keys below have per-invocation CLI overrides on `pgrls diff`:
+> `--rename-detection` and `--rename-classification`. `pgrls diff --apply`
+> also takes `--extension NAME` to pre-install an extension in the ephemeral
+> baseline container before applying.
+>
 > **Rename detection** (shipped in 0.42.0). When `[diff].rename_detection`
 > is `strict` (default), a unique 1:1 policy pair that matches on
 > (permissive, command, roles) with predicate-equal USING/WITH CHECK is
@@ -782,7 +798,8 @@ the output without blocking CI.
 | Command side-graded (narrow → different narrow, e.g. SELECT → INSERT) | BREAKING |
 | Roles widened (any role added, including PUBLIC) | DANGEROUS |
 | Roles narrowed (any role removed) | SAFE |
-| Roles set replaced disjointly | REQUIRES_REVIEW |
+| Roles set replaced disjointly (new set without PUBLIC) | REQUIRES_REVIEW |
+| Roles set replaced and the new set gains PUBLIC | DANGEROUS (`ROLES_WIDENED` — PUBLIC covers every role) |
 
 #### Policies — `USING` / `WITH CHECK` predicate changes
 
@@ -826,10 +843,14 @@ each produces its own `Change` entry, classified independently.
 
 ### Common-case AST patterns
 
-`compare_predicates` in `pgrls.diff.ast_compare` returns one of six
+`compare_predicates` in `pgrls.diff.ast_compare` returns one of nine
 results — `unchanged`, `tightened_and`, `loosened_and_drop`,
-`loosened_or`, `tightened_or_drop`, or `requires_review` — which the
-differ maps to ChangeKind + classification. `unchanged` is filtered
+`loosened_or`, `tightened_or_drop`, `semantic_equivalent`,
+`semantic_tightened`, `semantic_loosened`, or `requires_review` — which
+the differ maps to ChangeKind + classification. The three `semantic_*`
+results come from the Z3 comparison (a core dependency since 0.16.0);
+`semantic_loosened` is the one that carries the leaking-row
+counterexample. `unchanged` is filtered
 out (no Change emitted). The mapping:
 
 | `compare_predicates` result | classification    |
@@ -893,9 +914,10 @@ Any predicate change not matching one of the four real patterns above
 (AND-tighten, AND-loosen-drop, OR-loosen, OR-tighten-drop) falls through
 to REQUIRES_REVIEW — a human or SAT solver is needed to decide whether
 the new predicate is more or less permissive than the old one. The
-SAT-style implication path shipped in v0.4 as the optional
-`pip install pgrls[diff-z3]` extra (Z3-backed); without it, REQUIRES_REVIEW
-is the terminal classification.
+SAT-style implication path is Z3-backed and, since 0.16.0, a core
+dependency (`pgrls[diff-z3]` remains only as a no-op alias) — it runs on a
+plain `pip install pgrls`, and REQUIRES_REVIEW is reserved for predicates
+outside the decidable fragment.
 
 ## CI integration
 
@@ -926,8 +948,10 @@ any of these shortcuts:
   the table really does not need RLS, allowlist it in `pgrls.toml` instead.
 - **Adding `disable = ["SEC001"]` project-wide.** This hides every future
   missing-RLS bug. Allowlist individual tables.
-- **Writing `USING (true)`.** A policy that always evaluates true is
-  equivalent to no policy. If the goal is "everyone in the same tenant",
+- **Writing `USING (true)`.** A policy that always evaluates true is the
+  OPPOSITE of no policy — measured: RLS on with no policy returns 0 rows to a
+  non-owner grantee, while `FOR SELECT USING (true)` returns every row.
+  Removing such a policy denies everything; adding one opens everything. If the goal is "everyone in the same tenant",
   encode the tenant predicate explicitly.
 - **Writing `USING (...)` without `WITH CHECK (...)`** on a writable policy.
   Reads will be filtered; writes will not.
@@ -949,15 +973,18 @@ ask the human user — the lint failure is signalling a real design question.
 These are intentional in the current release. Do not invent capabilities.
 
 - **Offline or live.** `pgrls lint` / `fix` / `generate` read from a running
-  Postgres, an ephemeral `--migrations` build, OR an offline source —
+  Postgres or an offline source (the ephemeral `--migrations` build is on
+  `lint` only) —
   `--sql-file` (raw DDL, repeatable, `-` for stdin) / `--snapshot` (a `pgrls
   snapshot` artifact) — with no live database and no Docker. Offline analysis
   can only *under*-report: catalog-only rules abstain and are explicitly
   skipped and listed (in `--format json` as `skipped_rules`, gateable with
   `--require-full-coverage`), so an absence of findings offline is not a proof
-  of safety. `pgrls verify` stays live/ephemeral only (its proof is framed
-  against a complete schema).
-- **Sixty-seven rules across four categories.** SEC001–SEC054,
+  of safety. The `pgrls verify` **CLI** stays live only (its
+  proof is framed against a complete schema); the MCP `verify` tool does
+  accept the offline sources (`sql=` / `snapshot=`), with the same
+  under-reporting caveat.
+- **Sixty-eight rules across four categories.** SEC001–SEC055,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
   SECURITY DEFINER coverage is four rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
@@ -974,7 +1001,7 @@ These are intentional in the current release. Do not invent capabilities.
 - **Auto-fix for SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.
-- **Text, JSON, SARIF, Markdown, PR-comment, GitHub-annotation, JUnit, and GitLab-Code-Quality output.**
+- **Text, JSON, SARIF, Markdown, HTML, PR-comment, GitHub-annotation, JUnit, and GitLab-Code-Quality output.**
   `--format text` (human-readable, default), `--format json`
   (machine-readable, stable CI contract), `--format sarif` (SARIF
   v2.1.0 for GitHub Code Scanning and similar aggregators),
@@ -990,7 +1017,7 @@ These are intentional in the current release. Do not invent capabilities.
   info→notice, and a clean run emits nothing). The github format
   carries no `file=`/`line=` source ranges yet — even with
   `--sql-file` (where source text exists), range-pinned annotations are a
-  follow-on (see #227); annotations currently land in the run summary rather
+  follow-on; annotations currently land in the run summary rather
   than pinned to a diff hunk. `--format junit` emits a JUnit XML
   report (one `<testcase>` per finding under a `pgrls` suite) so
   findings show in a CI run's test-report UI; the process exit code
@@ -1007,16 +1034,17 @@ These are intentional in the current release. Do not invent capabilities.
   supported. The CI matrix runs against PG15, PG16, and PG17.
   `security_invoker` (the VIEW001 fix target) is a PG15+ reloption,
   which is the proximate reason for the floor bump.
-- **SAT-style predicate implication is opt-in.** v0.2's diff
+- **SAT-style predicate implication is built in.** v0.2's diff
   classifier recognizes common-case AST patterns (literal-equal,
   AND-tighten / drop, OR-loosen / drop) and flags anything else
   as `REQUIRES_REVIEW`. Z3-driven implication analysis shipped in
-  v0.4 as the optional `pip install pgrls[diff-z3]` extra; without
-  it, the diff classifier falls back to syntactic patterns only.
+  v0.4 as an optional extra and became a core dependency in 0.16.0,
+  so it runs on a plain `pip install pgrls` (`pgrls[diff-z3]` is kept
+  only as a no-op alias).
 - **Go port shipping in stages.** The TypeScript port of
   `pgrls.testing` shipped as the
   [`pgrls-test`](https://www.npmjs.com/package/pgrls-test) npm
-  package (tagged `ts-v0.6.0`, versioned independently of the
+  package (tagged `ts-v0.6.3`, versioned independently of the
   Python package), following the Layer 1 protocol. The Go port lives in
   [`go/`](go/) at module path `github.com/pgrls/pgrls/go`, versioned
   independently of the Python package as the `go/v0.7.x` sequence

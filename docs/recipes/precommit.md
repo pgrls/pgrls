@@ -1,53 +1,73 @@
 # Running pgrls as a pre-commit hook
 
-`pgrls` ships a `.pre-commit-hooks.yaml` at the repo root, so any
-project using the [pre-commit](https://pre-commit.com/) framework
-can add it as a one-line entry.
+`pgrls` ships a `.pre-commit-hooks.yaml` at the repo root with **two hooks**,
+so any project using the [pre-commit](https://pre-commit.com/) framework can
+add one as a one-line entry:
 
-## Caveat — `pgrls` reads a *live database*, not source files
+| hook | reads | needs | fires |
+|---|---|---|---|
+| `pgrls-lint-sql` | your DDL (`--sql-file`, repeatable) or a `pgrls snapshot` (`--snapshot`) | nothing — no database, no Docker | when any `*.sql` file changes |
+| `pgrls-lint` | a **live database** (`$DATABASE_URL` or `[database].url`) | a reachable Postgres | every invocation (`always_run`) |
 
-The `pre-commit` framework was designed around hooks that read
-files in the commit. `pgrls` reads the catalog of a running
-Postgres database. That means:
+Both are whole-schema (`pass_filenames: false`): RLS is cross-file — a table
+may be created in one migration and its policy in another — so pgrls needs
+the complete schema, not the individual changed files.
 
-- The hook fires on **every commit**, not only when SQL files
-  changed. The schema state lives in the database, which any commit
-  can have changed via a separately-applied migration. The hook
-  config sets `always_run: true` to make this explicit.
-- The hook needs a reachable Postgres at hook time. Most teams
-  point at a local stack (`supabase start`, a `docker-compose` dev
-  database, or a CI-only service); pre-commit is most useful in
-  CI-bound hooks where the database is always up.
-- A typical `pre-commit-config.yaml` should set
-  `stages: [pre-push, manual]` rather than the default `commit`
-  if developers don't have a local DB running on every commit.
-
-## Minimal `.pre-commit-config.yaml`
+## Minimal `.pre-commit-config.yaml` — offline (the usual choice)
 
 ```yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.6.4   # pin a release
+    rev: v0.55.0   # pin a release
+    hooks:
+      - id: pgrls-lint-sql
+        args: ["--sql-file", "schema.sql", "--fail-on", "error"]
+```
+
+This runs at commit time with no infrastructure. Declare tables before the
+policies and grants that reference them (`--sql-file` is repeatable and the
+files are concatenated in order). Rules that need catalog state an offline
+file cannot carry — `BYPASSRLS` roles, `SECURITY DEFINER` functions,
+triggers, indexes, foreign keys — are reported as inert, so an absence of
+findings offline is not a proof of safety; keep a live run in CI.
+
+## Live-database variant — `pgrls-lint`
+
+`pgrls-lint` reads the catalog of a running Postgres instead of files. That
+changes how it fits pre-commit:
+
+- It fires on **every commit**, not only when SQL files changed — the schema
+  state lives in the database, which any commit can have changed via a
+  separately-applied migration. The hook sets `always_run: true` to make this
+  explicit.
+- It needs a reachable Postgres at hook time. Most teams point it at a local
+  stack (`supabase start`, a `docker-compose` dev database) and scope it to
+  `stages: [pre-push, manual]` rather than the default `commit`, so
+  developers without a local DB running are not blocked on every commit.
+
+```yaml
+repos:
+  - repo: https://github.com/pgrls/pgrls
+    rev: v0.55.0
     hooks:
       - id: pgrls-lint
         args:
           - --schemas
           - public
-        # Skip the hook on every commit; only fire when explicitly
-        # invoked (`pre-commit run pgrls-lint --all-files`) or in CI
-        # on the `pre-push` stage.
+        # Only fire when explicitly invoked
+        # (`pre-commit run pgrls-lint --all-files`) or on `pre-push`.
         stages: [pre-push, manual]
 ```
 
-## Supabase-friendly variant
+## Supabase-friendly variant (live)
 
 If you develop against a local Supabase stack (`supabase start`),
-the database URL is well-known; the hook can derive it inline.
+the database URL is well-known; the live hook can take it inline.
 
 ```yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.6.4
+    rev: v0.55.0
     hooks:
       - id: pgrls-lint
         args:
@@ -102,7 +122,7 @@ required.
 ## When to prefer the GitHub Action instead
 
 For most projects, the [`pgrls/pgrls-action`](https://github.com/marketplace/actions/pgrls-postgres-rls-linter)
-is the cleaner GitHub-native path — it composes with `actions/upload-sarif`
+is the cleaner GitHub-native path — it composes with `github/codeql-action/upload-sarif`
 for Code Scanning ingest, supports every output format, and doesn't
 need pre-commit configured at all. Pre-commit shines when your team
 already uses it for *other* linters (ruff, shellcheck, etc.) and

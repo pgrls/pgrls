@@ -244,10 +244,13 @@ def test_sec006_restrictive_open_shapes_still_dead_policy() -> None:
         assert "dead policy" in violations[0].message
 
 
-def test_sec006_permissive_message_unchanged() -> None:
-    # The permissive case is the security hole the rule was
-    # originally written for. Pin its message wording so a future
-    # message refactor doesn't accidentally regress.
+def test_sec006_permissive_message_states_the_measured_diagnosis() -> None:
+    # The permissive case is the shape the rule was written for. Its message
+    # used to say a missing WITH CHECK means "writes that violate the policy's
+    # intent are accepted" — measured on PG16, a clause-less FOR INSERT policy
+    # REJECTS the insert ("new row violates row-level security policy") and a
+    # clause-less FOR UPDATE reports UPDATE 0. The policy is dead, not open.
+    # Pin the corrected wording so a refactor cannot reintroduce the inversion.
     p = _policy(
         "p",
         command="INSERT",
@@ -257,6 +260,7 @@ def test_sec006_permissive_message_unchanged() -> None:
     schema = _wrap(p)
     msg = SEC006().check(schema, {})[0].message
     assert "Restrictive policy" not in msg
-    assert "writes that violate the policy's intent are accepted" in msg
+    assert "does NOT default to true" in msg
+    assert "grants no write whatsoever" in msg
 
 

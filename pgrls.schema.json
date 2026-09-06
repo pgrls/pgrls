@@ -2,15 +2,22 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json",
   "title": "pgrls configuration",
-  "description": "Configuration file (pgrls.toml) for pgrls, the Postgres Row-Level Security linter. Rule reference: https://github.com/pgrls/pgrls/blob/main/AGENTS.md",
+  "description": "Configuration file (pgrls.toml) for pgrls, the Postgres Row-Level Security linter. Rule reference: https://github.com/pgrls/pgrls/blob/main/docs/RULES.md",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "extends": {
       "description": "Path, or list of paths, to base pgrls.toml file(s) merged beneath this one. Later list entries and this file's own keys take precedence.",
       "oneOf": [
-        { "type": "string" },
-        { "type": "array", "items": { "type": "string" } }
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       ]
     },
     "database": {
@@ -24,9 +31,13 @@
         },
         "schemas": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Schemas to lint.",
-          "default": ["public"]
+          "default": [
+            "public"
+          ]
         }
       }
     },
@@ -42,17 +53,23 @@
         },
         "disable": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Rule IDs to disable entirely (case-insensitive), e.g. [\"SEC022\", \"PERF002\"]."
         },
         "rules": {
           "type": "object",
-          "description": "Per-rule settings, keyed by rule ID — e.g. a [lint.rules.SEC001] table.",
-          "additionalProperties": { "$ref": "#/$defs/ruleOptions" }
+          "description": "Per-rule settings, keyed by rule ID \u2014 e.g. a [lint.rules.SEC001] table.",
+          "additionalProperties": {
+            "$ref": "#/$defs/ruleOptions"
+          }
         },
         "extra_rules": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Dotted Python module paths that expose additional project-specific rules via a `RULES` attribute (loaded by pgrls.rules.load_extra_rules). Each entry is a non-empty importable module path, e.g. [\"mycompany.pgrls_rules\"]. Built-in rules always run; these run alongside them, and their IDs become usable in `disable` and [lint.rules.<ID>]."
         }
       }
@@ -64,21 +81,45 @@
       "properties": {
         "fail_on": {
           "type": "string",
-          "enum": ["safe", "breaking", "requires-review", "dangerous"],
+          "enum": [
+            "safe",
+            "breaking",
+            "requires-review",
+            "dangerous"
+          ],
           "description": "Change classification at or above which `pgrls diff` exits non-zero.",
           "default": "dangerous"
         },
         "rename_detection": {
           "type": "string",
-          "enum": ["off", "strict", "relaxed"],
+          "enum": [
+            "off",
+            "strict",
+            "relaxed"
+          ],
           "default": "strict",
           "description": "How `pgrls diff` reports a renamed policy. 'strict' collapses a name-only rename; 'relaxed' also collapses a rename+edit (graded); 'off' keeps drop+add. A detected rename is reported as a DIFF_POLICY_RENAMED change; the old and new policy names appear in the human-readable message field (no separate structured old-name field yet)."
         },
         "rename_classification": {
           "type": "string",
-          "enum": ["safe", "requires-review"],
+          "enum": [
+            "safe",
+            "requires-review"
+          ],
           "default": "safe",
           "description": "Classification for a name-only policy rename."
+        }
+      }
+    },
+    "generate": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Behavior of `pgrls generate`.",
+      "properties": {
+        "strict_binding": {
+          "type": "boolean",
+          "default": false,
+          "description": "Scaffold policies that compare against a raising binding helper (pgrls_require_<label>) instead of current_setting(..., true), so a query on a connection that never bound a tenant errors instead of returning an empty result. Same as `pgrls generate --strict-binding`."
         }
       }
     }
@@ -86,7 +127,11 @@
   "$defs": {
     "severity": {
       "type": "string",
-      "enum": ["error", "warning", "info"]
+      "enum": [
+        "error",
+        "warning",
+        "info"
+      ]
     },
     "ruleOptions": {
       "type": "object",
@@ -98,7 +143,9 @@
         },
         "allowlist": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Objects exempt from this rule. Entry shape depends on the rule: a policy ID (schema.table.policy), a table reference (table or schema.table), a role name, a qualified view/function, etc."
         }
       },

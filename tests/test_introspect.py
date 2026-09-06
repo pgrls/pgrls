@@ -1194,16 +1194,18 @@ def test_introspect_captures_bypassrls_roles(
         DROP ROLE IF EXISTS pgrls_sec016_login;
         DROP ROLE IF EXISTS pgrls_sec016_nologin;
         DROP ROLE IF EXISTS pgrls_sec016_plain;
+        DROP ROLE IF EXISTS pgrls_sec016_super;
         CREATE ROLE pgrls_sec016_login BYPASSRLS LOGIN;
         CREATE ROLE pgrls_sec016_nologin BYPASSRLS NOLOGIN;
         CREATE ROLE pgrls_sec016_plain NOBYPASSRLS;
+        CREATE ROLE pgrls_sec016_super SUPERUSER NOBYPASSRLS;
         """
     )
     try:
         schema = introspect(pg_conn, schemas=["public"])
         by_name = {r.name: r for r in schema.bypassrls_roles}
-        # Both BYPASSRLS roles are captured; the plain role —
-        # filtered out by `WHERE rolbypassrls` — is not.
+        # Both BYPASSRLS roles are captured; the plain role — carrying
+        # neither attribute — is not.
         assert "pgrls_sec016_login" in by_name
         assert "pgrls_sec016_nologin" in by_name
         assert "pgrls_sec016_plain" not in by_name
@@ -1213,12 +1215,21 @@ def test_introspect_captures_bypassrls_roles(
         nologin = by_name["pgrls_sec016_nologin"]
         assert nologin.superuser is False
         assert nologin.can_login is False
+        # A SUPERUSER without the explicit attribute is exempt too — it
+        # bypasses RLS through `rolsuper` (measured on PG16: a LOGIN
+        # SUPERUSER with rolbypassrls=false read every row of a FORCE'd
+        # table). Filtering on `rolbypassrls` alone missed it, and
+        # `verify --mode anon` then proved isolation against a role
+        # Postgres never checks.
+        assert "pgrls_sec016_super" in by_name
+        assert by_name["pgrls_sec016_super"].superuser is True
     finally:
         apply_sql(
             """
             DROP ROLE IF EXISTS pgrls_sec016_login;
             DROP ROLE IF EXISTS pgrls_sec016_nologin;
             DROP ROLE IF EXISTS pgrls_sec016_plain;
+            DROP ROLE IF EXISTS pgrls_sec016_super;
             """
         )
 

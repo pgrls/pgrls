@@ -2,7 +2,14 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 13 (v13 added ``is_primary`` to ``Index`` — from
+Currently version 26. v26 added ``View.direct_references`` /
+``column_grants`` / ``owner_is_superuser``, top-level ``set_gucs`` /
+``role_set_gucs``, and serialized ``role_memberships`` (each edge with
+its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
+for verify's reachability mode; v24 added foreign tables; v23 added the
+matview / exposed-relation fields; v21–v22 extended grants and
+publications; v14–v20 accumulated the SEC029–SEC044 catalog fields.
+Earlier: v13 added ``is_primary`` to ``Index`` — from
 ``pg_index.indisprimary`` — so SEC035 can tell a surrogate primary
 key apart from a tenant-scopable UNIQUE; v12 added ``signature`` to
 ``SecdefFunction`` and ``LeakproofFunction`` so per-overload
@@ -52,7 +59,33 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 25  # v25: View.owner + owner_bypasses_rls — verify reachability
+# A `Schema.set_gucs` value PREFIX meaning "this session can read the GUC, but
+# we cannot attribute it to the SERVER rather than to the introspecting role".
+# The value the session observed follows the prefix, so `--emit-repro` can
+# offer it as a one-line edit. A unit-separator lead-in keeps it clear of any
+# realistic GUC value while staying storable in a `jsonb` column — a literal
+# NUL is not (Postgres rejects `\u0000` in jsonb), and snapshots do land
+# there. The distinction is load-bearing: recording such a name as definitely
+# set is STRONGER than leaving it unknown, and would prove
+# `current_setting('x', true) IS NULL` false — the SEC004 inverted-gate shape
+# — from a value an anonymous caller may not have at all (measured:
+# `PGOPTIONS='-c app.gate=whatever' pgrls verify` flipped a real LEAK to
+# PROVEN). Under this value the prover keeps both the value AND the null-flag
+# free, so it can decline but never conclude.
+MAYBE_SET = "\x1fpgrls:maybe-set:"
+
+
+def is_maybe_set(value: str | None) -> bool:
+    """Is this `set_gucs` value the "cannot attribute to the server" state?"""
+    return isinstance(value, str) and value.startswith(MAYBE_SET)
+
+
+def maybe_set_value(value: str) -> str:
+    """The value the introspecting session actually observed, for a
+    `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
+    return value[len(MAYBE_SET):]
+
+SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit); v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -359,6 +392,28 @@ class View:
     grants: tuple[Grant, ...] = ()
     owner: str = ""
     owner_bypasses_rls: bool = False
+    # v26+: the relations this view's body reads DIRECTLY — tables AND views —
+    # as opposed to `references`, which chases view→view edges down to base
+    # tables. `verify --mode reachability` needs the hops: Postgres evaluates a
+    # table's RLS as the owner of the *nearest enclosing* `security_invoker =
+    # false` view on the path, so `outer(invoker off, owner A) → inner(invoker
+    # off, owner superuser) → T` bypasses T's RLS as the superuser even though
+    # A is not exempt and inner is not anon-selectable — a chain the collapsed
+    # `references` cannot express. Empty on a pre-v26 snapshot, where the walk
+    # falls back to `references` (the pre-v26 single-hop behaviour).
+    direct_references: tuple[tuple[str, str], ...] = ()
+    # v26+: column-level grants on the view (`GRANT SELECT (id, body) ON v TO
+    # anon`) from `pg_attribute.attacl`. A column grant is a door for
+    # reachability (measured: anon read the row through it) even though the
+    # table-level `grants` say nothing. SEC052's API-reachability gate stays
+    # table-level by design.
+    column_grants: tuple[ColumnGrant, ...] = ()
+    # v26+: `owner_bypasses_rls` conflates superuser with plain BYPASSRLS. Both
+    # escape RLS, but only a superuser also escapes privilege checks: a
+    # BYPASSRLS non-superuser owner still needs SELECT on what its view reads
+    # (measured: permission denied without the grant). The reachability walk
+    # uses this to require the grant.
+    owner_is_superuser: bool = False
 
     @property
     def qualified_name(self) -> str:
@@ -428,9 +483,10 @@ class Index:
 class Trigger:
     """A trigger captured by snapshot v6+.
 
-    Triggers are the focus of SEC013 — they run as the table OWNER
-    (not the invoking role), so any SELECT/INSERT/UPDATE/DELETE in
-    the trigger function body bypasses the invoker's RLS policies.
+    Triggers are the focus of SEC013 — a `SECURITY DEFINER` trigger
+    function runs as its OWNER, so any SELECT/INSERT/UPDATE/DELETE in
+    the body carries that owner's RLS exemption (an invoker-side
+    function runs as the caller; measured).
     A poorly-audited trigger function on an RLS-protected table is
     a silent privilege-escalation vector: tenant A's INSERT can fire
     a trigger that reads tenant B's rows (or worse, writes to them)
@@ -623,10 +679,14 @@ class SecdefFunction:
 
     `signature` is the function's argument-type signature as
     `pg_get_function_identity_arguments(p.oid)` returns it — the
-    exact form `ALTER FUNCTION name(<signature>)` requires. Empty
-    string for a no-argument function. Captured in snapshot v12+;
-    v4–v11 snapshots load with `signature=""` (so the data is just
-    not available for those, never silently wrong). A function with
+    exact form `ALTER FUNCTION name(<signature>)` requires. The
+    EMPTY STRING is a real value: it is what a no-argument function
+    has, and `ALTER FUNCTION name()` targets it exactly. `None`
+    means "not captured" (a v4–v11 snapshot, which has no such
+    key). Conflating the two made both fixers abstain on every
+    zero-argument function — measured, lint reported five SEC015
+    findings and `fix` emitted one — while blaming a snapshot
+    version that had nothing to do with it. A function with
     multiple overloads appears here as MULTIPLE `SecdefFunction`
     entries with the same `qualified_name` but distinct
     `signature`s — capture preserves overload identity so a fixer
@@ -644,8 +704,18 @@ class SecdefFunction:
     # `pg_get_function_identity_arguments` output. Empty for
     # zero-arg functions; non-empty like `integer, text` for
     # overloads. Snapshot v12+; older snapshots load with "".
-    signature: str = ""
+    signature: str | None = None
     # Schema and function name as SEPARATE components (snapshot v14+).
+    # v26+: the function's owner (`pg_get_userbyid(proowner)`). RLS
+    # exemption is relative to a TABLE: a SECDEF body running as the table's
+    # own owner skips the policies whenever that table is not FORCE'd, even
+    # though the owner holds neither superuser nor BYPASSRLS. Measured on
+    # PG16: anon read 0 rows directly and every row through such a function,
+    # while `verify --mode escalation` reported "No reachable escalation
+    # paths". Empty on a pre-v26 snapshot (the exemption test then falls back
+    # to `owner_bypasses_rls` alone).
+    owner: str = ""
+
     # `qualified_name` is the ambiguous `nspname || '.' || proname`
     # join, which cannot be split unambiguously once either component
     # contains a dot (a schema or function named `a.b`). Fixers that
@@ -687,7 +757,8 @@ class BypassRlsRole:
     ``FORCE ROW LEVEL SECURITY`` is set — see SEC002), a BYPASSRLS
     role's bypass is unconditional and cluster-wide.
 
-    Introspection captures only roles whose ``pg_roles.rolbypassrls``
+    Introspection captures roles exempt from RLS — ``pg_roles.rolbypassrls``
+    or ``rolsuper``
     is true — the audit-relevant subset, mirroring how
     ``security_definer_functions`` captures only SECDEF functions.
     Every ``BypassRlsRole`` instance therefore represents a role that
@@ -788,6 +859,14 @@ class RoleMembership:
 
     member: str  # the role that inherits privileges (the "member")
     role: str  # the role whose privileges are inherited (the "group")
+    # v26+: whether the membership carries INHERIT (PG16 `pg_auth_members.
+    # inherit_option`, else the member's `rolinherit`). Postgres's owner check
+    # is `has_privs_of_role`, which honours it: a NOINHERIT member of the
+    # table owner is NOT owner-equivalent (measured: permission denied), so
+    # the reachability exemption follows only inheriting edges. Policy
+    # reachability keeps the over-approximating full closure (the sound
+    # direction there). Defaults True for a pre-v26 payload.
+    inherit: bool = True
 
 
 @dataclass(frozen=True)
@@ -887,7 +966,7 @@ class LeakproofFunction:
     # `pg_get_function_identity_arguments` output. Empty for zero-
     # arg functions; non-empty for overloads. Snapshot v12+; v10–v11
     # snapshots load with "".
-    signature: str = ""
+    signature: str | None = None
     # Separate schema / function name components (snapshot v14+); see
     # SecdefFunction. The SEC017 fixer uses these to build a correct
     # `ALTER FUNCTION` even when the schema name contains a dot,
@@ -1306,6 +1385,13 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         # rather than a leak we cannot substantiate.
         owner=v.get("owner", ""),
         owner_bypasses_rls=bool(v.get("owner_bypasses_rls", False)),
+        # v26+; absent on older snapshots → () and the reachability walk uses
+        # the collapsed `references` instead.
+        direct_references=tuple(tuple(r) for r in v.get("direct_references", [])),
+        column_grants=tuple(
+            _column_grant_from_dict(cg) for cg in v.get("column_grants", [])
+        ),
+        owner_is_superuser=bool(v.get("owner_is_superuser", False)),
     )
 
 
@@ -1374,9 +1460,12 @@ def _is_safe_signature(signature: object) -> bool:
 def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
     # `search_path` is a v8 addition; v4-v7 snapshots have no key, so
     # `.get(...)` yields None ("no SET search_path clause"). `signature`
-    # is a v12 addition; v4-v11 snapshots load it as "".
-    sig = f.get("signature", "")
-    if not _is_safe_signature(sig):
+    # is a v12 addition; v4-v11 snapshots have no key either, and load as
+    # None — "not captured", which the fixers abstain on rather than
+    # interpolate, so there is nothing to validate. An EMPTY signature is
+    # a real zero-argument function and IS validated.
+    sig = f.get("signature")
+    if sig is not None and not _is_safe_signature(sig):
         raise ValueError(
             "snapshot SECURITY DEFINER function "
             f"{f.get('qualified_name')!r} has an unsafe or unparseable "
@@ -1397,6 +1486,7 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         # SEC042 abstains (fail-closed) until the snapshot is re-captured.
         execute_roles=tuple(f.get("execute_roles", [])),
         owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
+        owner=f.get("owner", ""),
     )
 
 
@@ -1410,8 +1500,8 @@ def _bypassrls_role_from_dict(r: dict[str, Any]) -> BypassRlsRole:
 
 def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
     # `signature` is a v12 addition; v10-v11 snapshots load it as "".
-    sig = f.get("signature", "")
-    if not _is_safe_signature(sig):
+    sig = f.get("signature")
+    if sig is not None and not _is_safe_signature(sig):
         raise ValueError(
             "snapshot LEAKPROOF function "
             f"{f.get('qualified_name')!r} has an unsafe or unparseable "
@@ -1580,6 +1670,29 @@ class Schema:
     # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
     # and every snapshot decoding without it (all versions) fail-closed.
     role_memberships: tuple[RoleMembership, ...] | None = None
+    # v26+: custom (dotted) GUCs set at database / server level, as
+    # `(name, value)` — what every session, an anonymous one included,
+    # inherits without running `SET` (role-level ones live in
+    # `role_set_gucs`). The anon prover reads one of these as its configured
+    # value instead of the unset-GUC raise, so `col = current_setting(
+    # 'app.x')` is no longer PROVEN when `ALTER DATABASE … SET app.x` makes
+    # it readable — and `current_setting('app.flag') = 'on'` with the setting
+    # at 'off' stays PROVEN (measured: 0 rows). A `MAYBE_SET` value means the
+    # introspecting session could read the GUC but it is not attributable to
+    # the server (see the constant above); the prover keeps both the value and
+    # the null-flag free there. A `None` value is the legacy "set at server
+    # level, value uncaptured" state — opaque but definitely non-null — still
+    # decoded but no longer produced. Empty on a pre-v26
+    # snapshot or an offline Schema (the unset assumption stands).
+    set_gucs: tuple[tuple[str, str | None], ...] = ()
+    # v26+: dotted GUCs set at ROLE level, as `(role, name, value)`. Role
+    # settings bind to the LOGIN role: the anonymous session sees those of
+    # `anon` itself and of any role that logs in and then `SET ROLE anon`
+    # (PostgREST's `authenticator`, a *member* of anon — the downward
+    # closure). Membership does not propagate settings, so `ALTER ROLE
+    # readers SET app.x` with anon a member of readers is NOT seen. The value
+    # is kept so `--probe` can replay it into its own session.
+    role_set_gucs: tuple[tuple[str, str, str | None], ...] = ()
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
@@ -1859,6 +1972,12 @@ class Schema:
                     ],
                     "owner": v.owner,
                     "owner_bypasses_rls": v.owner_bypasses_rls,
+                    "direct_references": [list(r) for r in v.direct_references],
+                    "column_grants": [
+                        {"role": cg.role, "column": cg.column, "privileges": list(cg.privileges)}
+                        for cg in v.column_grants
+                    ],
+                    "owner_is_superuser": v.owner_is_superuser,
                 }
                 for v in self.views
             ],
@@ -1880,6 +1999,7 @@ class Schema:
                     # owner RLS-exemption, for SEC042.
                     "execute_roles": list(f.execute_roles),
                     "owner_bypasses_rls": f.owner_bypasses_rls,
+                    "owner": f.owner,
                 }
                 for f in self.security_definer_functions
             ],
@@ -1976,6 +2096,24 @@ class Schema:
                 }
                 for m in self.owner_reachable_members
             ],
+            "set_gucs": [list(p) for p in self.set_gucs],
+            "role_set_gucs": [list(p) for p in self.role_set_gucs],
+            # v26+: the role-membership graph, so a `--against` baseline can
+            # decide anon reachability of a `TO <role>` policy. Emitted only
+            # when captured — `None` (an offline / hand-built Schema) stays
+            # absent, and `from_snapshot` maps absence back to None so the
+            # prover keeps abstaining rather than treating "not captured" as
+            # "no memberships" (a false isolated).
+            **(
+                {
+                    "role_memberships": [
+                        {"member": m.member, "role": m.role, "inherit": m.inherit}
+                        for m in self.role_memberships
+                    ]
+                }
+                if self.role_memberships is not None
+                else {}
+            ),
             "foreign_tables": [
                 {
                     "schema": ft.schema,
@@ -2092,13 +2230,13 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24, 25,
+            21, 22, 23, 24, 25, 26,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
                 "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, "
-                "25. "
+                "25, 26. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
@@ -2183,6 +2321,36 @@ class Schema:
             immutable_functions=immutable_functions,
             owner_reachable_members=owner_reachable_members,
             foreign_tables=foreign_tables,
+            # A pre-reshape v26 file (intra-branch only) carried bare name
+            # strings; slicing p[0]/p[1] off those took CHARACTERS and invented
+            # a GUC. Decode either shape.
+            set_gucs=tuple(
+                (p, None) if isinstance(p, str) else (p[0], p[1])
+                for p in payload.get("set_gucs", [])
+            ),
+            role_set_gucs=tuple(
+                # Missing value → None ("set, not captured"), never "": an
+                # empty string is a real value that would let the prover
+                # decide `current_setting('x') = 'on'` is FALSE and claim
+                # isolation from a value it never had.
+                (p[0], p[1], p[2] if len(p) > 2 else None)
+                for p in payload.get("role_set_gucs", [])
+            ),
+            # v26+: absent key → None ("graph not captured", the prover
+            # abstains on non-anon roles); present → the captured edges, even
+            # when empty (anon is a member of nothing extra).
+            role_memberships=(
+                None
+                if payload.get("role_memberships") is None
+                else tuple(
+                    RoleMembership(
+                        member=m["member"],
+                        role=m["role"],
+                        inherit=bool(m.get("inherit", True)),
+                    )
+                    for m in payload["role_memberships"]
+                )
+            ),
         )
 
     def to_sql(self) -> str:

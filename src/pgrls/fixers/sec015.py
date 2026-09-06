@@ -23,13 +23,15 @@ For a function with no pinned path at all, we emit a minimal safe
 default:
 
     ALTER FUNCTION <schema>.<name>(<signature>)
-        SET search_path = pg_catalog, pg_temp;
+        SET search_path = pg_catalog, <the function's own schema>, pg_temp;
 
-This narrows the search to system catalog only — strictly tighter
-than the caller's path, so the function's body references must be
-either fully-qualified (`public.t`) or relative to pg_catalog. The
-operator who needs a broader path (e.g. wanted the function to see
-its own home schema unqualified) edits the generated SQL before
+The own schema is included for a SECURITY reason: `pg_catalog,
+pg_temp` alone looks tighter but leaves the hole open, because an
+unqualified name the body reads is not in pg_catalog and resolution
+falls through to pg_temp — which the attacker writes (measured). A
+body that reads unqualified names from a THIRD schema still needs
+that schema added before pg_temp, or the references fully qualified;
+the operator who needs that edits the generated SQL before
 --apply; the description names this.
 
 **Abstains** on:
@@ -136,12 +138,21 @@ def _safe_to_rewrite(search_path: str) -> bool:
     return True
 
 
-def _rewritten_path(existing: str | None) -> str:
+def _rewritten_path(existing: str | None, own_schema: str | None = None) -> str:
     """Build the safe search_path string.
 
-    `None` → `pg_catalog, pg_temp` (minimal-but-safe default; any
-    function relying on a broader caller path needs operator review,
-    which the description prompts).
+    `None` → `pg_catalog, <the function's own schema>, pg_temp`.
+
+    The function's own schema is in there for a SECURITY reason, not a
+    convenience one. `pg_catalog, pg_temp` looks tighter but leaves the
+    hole open: an unqualified name the body reads is not in `pg_catalog`,
+    so resolution falls through to `pg_temp` — which the ATTACKER writes.
+    Measured on PG16 with a SECDEF function reading an unqualified
+    `secrets`: under `pg_catalog, pg_temp` a planted `pg_temp.secrets`
+    was read (`ATTACKER`), and under `pg_catalog, <own schema>, pg_temp`
+    the real table was (`real`). Since pgrls reports SEC015 resolved
+    after applying its own fix, the tighter-looking default would have
+    signed off on a still-exploitable function.
 
     Non-`None` → strip any pg_temp tokens from the existing path
     (preserving case for the rest), then append `, pg_temp` so it's
@@ -149,7 +160,11 @@ def _rewritten_path(existing: str | None) -> str:
     shape `_is_pg_temp_safe` requires.
     """
     if existing is None:
-        return "pg_catalog, pg_temp"
+        return (
+            f"pg_catalog, {quote_ident(own_schema)}, pg_temp"
+            if own_schema
+            else "pg_catalog, pg_temp"
+        )
     # Naive comma-split + case-preserving filter. The caller has
     # already verified `_safe_to_rewrite(existing)`, so we don't
     # need to defend against quoted commas here.
@@ -199,10 +214,11 @@ class SEC015Fixer:
             # subset of what the rule reports.
             if _is_pg_temp_safe(fn.search_path):
                 continue
-            # Abstain on pre-v12 snapshots — empty signature would
-            # produce `ALTER FUNCTION name()` targeting the wrong
-            # overload. Operator re-snapshots to populate.
-            if not fn.signature:
+            # Abstain only when the signature was NOT CAPTURED (a v4-v11
+            # snapshot). An EMPTY signature is a real value — a zero-argument
+            # function — and `ALTER FUNCTION name()` targets it exactly.
+            # Treating the two alike silently skipped every zero-arg function.
+            if fn.signature is None:
                 continue
             # Abstain on pre-v14 snapshots — schema_name/function_name
             # were not captured, and splitting the ambiguous
@@ -245,7 +261,7 @@ class SEC015Fixer:
         # component through `quote_qualified` so a name like `Order` /
         # `a.b` / a reserved keyword still produces valid server SQL.
         qident = quote_qualified(schema_name, function_name)
-        new_path = _rewritten_path(original_path)
+        new_path = _rewritten_path(original_path, schema_name)
         return Fix(
             rule_id="SEC015",
             location=f"{qualified_name}({signature})",
@@ -260,11 +276,13 @@ class SEC015Fixer:
                 "names, blocking the pg_temp shadowing escalation "
                 "path. "
                 + (
-                    "Defaults to `pg_catalog, pg_temp` — minimal and "
-                    "safe. If the function's body needs unqualified "
-                    "names from another schema (e.g. its home schema), "
-                    "edit the generated SQL to insert the schema "
-                    "BEFORE pg_temp."
+                    "Defaults to `pg_catalog, <the function's own "
+                    "schema>, pg_temp`. The own schema is there for "
+                    "SECURITY, not convenience: without it an "
+                    "unqualified name in the body falls through to "
+                    "pg_temp, which the attacker writes. If the body "
+                    "reads unqualified names from a THIRD schema, add "
+                    "it before pg_temp too — or fully-qualify them."
                     if original_path is None
                     else "Preserves the existing search_path entries "
                     "and pins pg_temp at the end (any earlier "

@@ -53,7 +53,7 @@ Configuration ``[lint.rules.SEC054]``:
   exempted from the rule.
 
 No auto-fix: ``REVOKE`` the low-trust grant, move the matview out of the exposed
-schema, refresh it as a per-tenant role, or replicate it per-tenant — the right
+schema, give it a per-tenant OWNER (the body runs as the owner at REFRESH), or replicate it per-tenant — the right
 choice depends on intent.
 """
 from __future__ import annotations
@@ -162,8 +162,9 @@ class SEC054:
                 "source tables is NOT applied — every captured row is directly "
                 f"readable at GET /rest/v1/{view.name} by an unauthenticated or "
                 "any-authenticated request. Remedy: REVOKE the low-trust grant, "
-                "move the matview out of the exposed schema, refresh it as a "
-                "per-tenant role, or replicate it per-tenant. If it is "
+                "move the matview out of the exposed schema, give it a "
+                "per-tenant OWNER (the body runs as the owner at REFRESH, "
+                "not as whoever issues it), or replicate it per-tenant. If it is "
                 f"intentionally public, allowlist {view.qualified_name!r} in "
                 "[lint.rules.SEC054]."
             ),

@@ -4075,3 +4075,17 @@ def test_snapshot_output_write_error_exits_2(tmp_path) -> None:
     assert result.exit_code == 2, result.output
     assert "Cannot write" in result.output
     assert "Traceback" not in result.output
+
+
+def test_verify_identity_columns_come_from_sec021_config(tmp_path) -> None:
+    """The cross-tenant axis gate honours `[lint.rules.SEC021].identity_columns`
+    when `--config` is given (the one place a project already names its
+    discriminator columns); absent → None → the prover's default set."""
+    from pgrls.cli import _identity_columns_from_config
+
+    assert _identity_columns_from_config(None) is None
+    toml = tmp_path / "pgrls.toml"
+    toml.write_text('[lint.rules.SEC021]\nidentity_columns = ["Site_ID", "region"]\n')
+    assert _identity_columns_from_config(str(toml)) == frozenset({"site_id", "region"})
+    toml.write_text("[lint]\n")
+    assert _identity_columns_from_config(str(toml)) is None

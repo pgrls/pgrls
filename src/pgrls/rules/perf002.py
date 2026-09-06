@@ -9,7 +9,13 @@ on every call. Inside an RLS policy this is bad on two counts:
   call timing, not on the row data — almost never the intended
   semantics, often a security hazard.
 * **No caching.** The optimizer cannot fold or cache a VOLATILE call;
-  it re-runs per row regardless of `(SELECT ...)` wrapping. Even
+  it CANNOT be constant-folded — but `(SELECT …)` around it still
+  hoists it to an InitPlan and runs it ONCE per statement (measured:
+  `(SELECT clock_timestamp())` gave one distinct value across three
+  rows where the bare call gave three; `(SELECT nextval('s'))`
+  returned 1,1,1). That is exactly why the wrapping is wrong here:
+  it silently turns "a fresh draw per row" into "one draw per
+  statement", changing what the policy means. Even
   read-only-looking volatiles like `clock_timestamp()` add per-row
   syscall cost.
 

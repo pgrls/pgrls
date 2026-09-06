@@ -43,9 +43,9 @@ shape, because Postgres roles have no schema component.
 
 Relationship to the other bypass rules: SEC002 covers the
 table-owner bypass (mechanism: ownership; remedy: `FORCE`).
-SEC013/SEC014/SEC015 cover code-mediated bypass: triggers fire as
-the table owner (SEC013), and `SECURITY DEFINER` functions run as
-the function owner (SEC014/SEC015). SEC016 covers the
+SEC013/SEC014/SEC015 cover code-mediated bypass: `SECURITY DEFINER`
+functions run as the function owner, reached directly (SEC014/SEC015)
+or through a trigger whose body the linter cannot read (SEC013). SEC016 covers the
 attribute-mediated bypass — the role itself is exempt, no code or
 ownership involved. It is the bluntest of the family: where the
 others need a specific object to be misconfigured, SEC016 needs
@@ -60,14 +60,19 @@ Out of scope (intentional):
   role that *holds* `BYPASSRLS`, not every role that could reach it.
   `BYPASSRLS` is a role attribute, not an inheritable privilege — a
   member of a `BYPASSRLS` group role does not bypass RLS unless it
-  actually `SET ROLE`s to that role. The holder is the precise and
-  complete audit target; walking the membership graph would add
-  noise without adding a finding.
+  actually `SET ROLE`s to that role. SEC016's surface is deliberately
+  just the holder; the `SET ROLE` escalation path that reaches it is
+  covered separately by SEC029.
 * **The `row_security` session GUC.** `SET row_security = off` is a
   different mechanism, and not a silent one: a query that *would*
   return RLS-filtered rows raises an error instead of quietly
-  widening, unless the role already owns the table or holds
-  `BYPASSRLS`. SEC016 covers the attribute, not the GUC.
+  widening, unless the role is exempt from that table's RLS — a
+  superuser, a `BYPASSRLS` role, or the owner of a table that is not
+  `FORCE`'d. Ownership alone is not the exemption: measured on PG16,
+  the owner of a `FORCE`'d table with `row_security = off` got
+  `ERROR: query would be affected by row-level security policy`, and
+  the same query returned every row once `FORCE` was dropped. SEC016
+  covers the attribute, not the GUC.
 """
 from __future__ import annotations
 

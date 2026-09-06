@@ -1733,10 +1733,16 @@ def fix(
 
     Currently fixes SEC001 (`ALTER TABLE … ENABLE ROW LEVEL
     SECURITY`), SEC002 (`ALTER TABLE … FORCE ROW LEVEL
-    SECURITY`), SEC006 (`ALTER POLICY … WITH CHECK` mirroring
-    USING), SEC011 (`ALTER POLICY … USING/WITH CHECK` stripping
+    SECURITY`), SEC004 (`ALTER POLICY … USING (…)` stripping the
+    top-level `auth_func() IS NULL` disjunct that leaks rows to anonymous
+    clients; abstains when no real check survives), SEC010 (`DROP POLICY`
+    for a permissive policy whose clause is the literal `false` — it admits
+    no rows, so dropping it changes no access), SEC011 (`ALTER POLICY …
+    USING/WITH CHECK` stripping
     an `OR true` debug bypass), SEC019 (`ALTER POLICY … USING/WITH CHECK` adding
-    `, true` to one-arg `current_setting()` calls), SEC020
+    `, true` to one-arg `current_setting()` calls — only where the call is a
+    direct comparison operand under an AND-only chain; other positions are
+    left open for review), SEC020
     (`ALTER POLICY … WITH CHECK` replacing a constant-true write
     check with USING), SEC015 (`ALTER FUNCTION ... SET search_path
     = …, pg_temp` per overload, pinning pg_temp last to block
@@ -1747,7 +1753,10 @@ def fix(
     the Fix description warns and supplies the backfill recipe),
     SEC031 (`DROP POLICY` for a no-op
     restrictive `USING (true)` floor), SEC032 (`ALTER TABLE …
-    ENABLE ROW LEVEL SECURITY` for a dormant-policies table),
+    ENABLE ROW LEVEL SECURITY` for a dormant-policies table), SEC044
+    (`ALTER DEFAULT PRIVILEGES FOR ROLE <grantor> [IN SCHEMA …] REVOKE …
+    ON TABLES FROM <role>` — keyed on the grantor so the REVOKE actually
+    clears the pg_default_acl entry),
     PERF001 (wrap unwrapped auth calls in
     `(SELECT …)` and emit `ALTER POLICY`), PERF003 (`CREATE
     INDEX` for an unindexed policy-predicate column), PERF004
@@ -2027,7 +2036,7 @@ def _parse_generate_tables(
         "Compare against a helper that RAISES when no tenant is bound, "
         "instead of a current_setting(..., true) that silently yields NULL. "
         "An unbound query then errors instead of looking like an empty "
-        "result. Also settable as strict_binding in pgrls.toml."
+        "result. Also settable as `[generate].strict_binding` in pgrls.toml."
     ),
 )
 @click.option(
@@ -2382,7 +2391,7 @@ def snapshot(
 _INIT_HEAD = """\
 #:schema https://raw.githubusercontent.com/pgrls/pgrls/main/pgrls.schema.json
 # pgrls configuration. Rule reference:
-# https://github.com/pgrls/pgrls/blob/main/AGENTS.md
+# https://github.com/pgrls/pgrls/blob/main/docs/RULES.md
 # Every key is optional; this file documents the common knobs.
 
 [database]
@@ -2421,6 +2430,12 @@ fail_on = "warning"
 # Threshold that makes `pgrls diff` exit non-zero:
 # safe | breaking | requires-review | dangerous. Default: "dangerous".
 fail_on = "dangerous"
+
+[generate]
+# `pgrls generate --strict-binding` as a standing default: generated tenant
+# policies compare against a helper that RAISES when no tenant is bound,
+# instead of a current_setting(..., true) that silently returns NULL.
+strict_binding = false
 """
 
 # Per-preset RLS conventions block. Each names the stack's tenancy model and
@@ -4203,6 +4218,33 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
     return None
 
 
+def _identity_columns_from_config(config_path: str | None) -> frozenset[str] | None:
+    """`[lint.rules.SEC021].identity_columns`, for the cross-tenant axis gate.
+
+    The cross-tenant / write provers only accept an identity-named column as
+    the tenant axis (a `status = <session value>` equality proves nothing
+    about tenants). SEC021's option is the one place a project already names
+    its discriminator columns, so honour it here too; None → the default set.
+    """
+    try:
+        cfg = load_config(config_path)
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+    from pgrls.rules.sec021 import _parse_identity_columns  # noqa: PLC0415
+
+    opts = cfg.rule_options.get("SEC021", {})
+    if "identity_columns" not in opts:
+        return None
+    columns = frozenset(_parse_identity_columns(opts))
+    # An empty list disables SEC021, which is a legitimate way to silence a
+    # lint rule — but as a verify axis it would make every cross-tenant/write
+    # table `unverified` and, without `--strict`, exit 0. A security gate must
+    # not pass because its configuration was emptied, so fall back to the
+    # default axis set.
+    return columns or None
+
+
+
 @main.command()
 @common_db_options
 @click.option(
@@ -4215,22 +4257,37 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
     show_default=True,
     help=(
         "Threat model to prove. 'anon': no row is readable by an "
-        "unauthenticated session. 'cross-tenant': no row of one tenant is "
+        "anonymous session — JWT-less (every auth function NULL) or Supabase "
+        "anon-key (auth.role() = 'anon', auth.jwt() non-null, auth.uid() "
+        "NULL); a leak under either is a leak. 'cross-tenant': no row of one tenant is "
         "readable by a session authenticated as a different tenant (verifies "
         "the `<column> = <session identity>` scoping equality). 'write': no "
-        "such session can WRITE (INSERT/UPDATE) a row stamped for another "
-        "tenant — proven over each write policy's effective WITH CHECK (or the "
-        "USING that FOR UPDATE/ALL reuses); SEC006/SEC020/SEC028/SEC040 are the "
+        "such session can WRITE (INSERT/UPDATE/DELETE) a row of another tenant "
+        "— proven over BOTH gates of each write policy: the new-row gate (WITH "
+        "CHECK, or the USING that FOR UPDATE/ALL reuses) and the old-row gate "
+        "(USING, for UPDATE/DELETE/ALL); SEC006/SEC020/SEC028/SEC040 are the "
         "linter fallback. 'escalation': prove the SEC048 finding — a low-trust "
         "role that reaches a table's owner (not superuser/BYPASSRLS) bypasses "
         "the RLS on that owner's enabled-but-not-FORCE'd tables; LEAK when the "
         "table's RLS provably isolates tenants (so the bypass defeats real "
-        "isolation), ISOLATED when it does not. 'reachability': prove no "
+        "isolation) or only partially leaks; PROVEN only when the table "
+        "already leaks EVERY row cross-tenant, so the bypass adds "
+        "nothing; UNVERIFIED when the predicate is unprovable. "
+        "'reachability': prove no "
         "anon-selectable VIEW hands back the rows a table's own policies "
-        "withhold — a `security_invoker = false` view executes as its owner, "
-        "so one owned by an RLS-exempt role (it owns the table and the table "
-        "is not FORCE'd, or it holds BYPASSRLS) returns every row to anon "
-        "while 'anon' mode correctly reports the table itself isolated."
+        "withhold — a `security_invoker = false` view executes as its owner "
+        "(the nearest such view on a view→view→table path sets the effective "
+        "user), so a path whose effective owner is RLS-exempt — "
+        "superuser/BYPASSRLS, or the table owner or an INHERIT member of it "
+        "when the table is not FORCE'd — returns every row to anon while "
+        "'anon' mode correctly reports the table itself isolated — or whose "
+        "effective owner, though not exempt, is granted rows by the "
+        "table's own policies (a definer view launders them — the door is "
+        "only as wide as that grant). 'Anon can open "
+        "the view' counts a table- or column-level SELECT grant to anon/PUBLIC "
+        "or any role in the anon closure; a hop the effective owner cannot "
+        "SELECT is a dead path; INHERIT members only. UNVERIFIED when the "
+        "role-membership graph is unavailable."
     ),
 )
 @click.option(
@@ -4258,7 +4315,7 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
     default=None,
     help=(
         "Compare against a baseline schema (a snapshot JSON or a DB URL) and "
-        "report only the leaks this change *introduced*: a table proven ISOLATED "
+        "report only the leaks this change *introduced*: a table PROVEN "
         "in BASE (or absent from it) that the live schema now proves LEAK. Exits "
         "non-zero only on a NEW leak — pre-existing leaks don't fail the gate — "
         "so it's the 'no new provable leak' PR check (pair a committed `pgrls "
@@ -4278,7 +4335,9 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "demonstrating the leak per --mode: reading the counterexample row back "
         "as an anonymous (anon) or different-tenant (cross-tenant) session, or "
         "(write) INSERTing a row stamped for another tenant and observing it "
-        "admitted. Not supported with --mode escalation (use --probe)."
+        "admitted. Not supported with --mode escalation (use --probe) or "
+        "--mode reachability (the leak is a view path; the DETAIL column names "
+        "the view to query)."
     ),
 )
 @click.option(
@@ -4305,7 +4364,7 @@ def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | No
         "leaks live to a reproduced leak. Exits non-zero on any mismatch or "
         "live-confirmed leak. Requires a live --database-url and a connection "
         "that can create a role (CREATEROLE / superuser); abstains cleanly "
-        "otherwise. Not supported with --format sarif or --emit-repro yet."
+        "otherwise. Not supported with --emit-repro (run them separately) or with --mode reachability (rejected; that mode reports the static verdict only)."
     ),
 )
 @click.option(
@@ -4343,24 +4402,38 @@ def verify(
 
     For every RLS-enabled table, `pgrls verify` *proves* a read-isolation
     property. `--mode anon` (default): can an **anonymous** session (every auth
-    function — `auth.uid()`/`role()`/`jwt()`, `current_setting(...)` — NULL)
-    read any row? `--mode cross-tenant`: can a session authenticated as one
+    function NULL — the JWT-less connection — *or* the Supabase anon-key
+    caller: `auth.role()` = 'anon', `auth.jwt()` non-null, `auth.uid()` NULL)
+    read any row? A leak under either session is a leak. `--mode cross-tenant`: can a session authenticated as one
     tenant read a **different** tenant's row (against the policy's
     `<column> = <session identity>` scoping equality)? `--mode write`: can such
-    a session **write** (INSERT/UPDATE) a row stamped for another tenant —
-    proven over each write policy's effective `WITH CHECK` (or the `USING` that
-    `FOR UPDATE`/`FOR ALL` reuses as the new-row check)? Three honest verdicts:
+    a session **write** (INSERT/UPDATE/DELETE) a row of another tenant — proven
+    over BOTH gates of each write policy: the new-row gate (`WITH CHECK`, or the
+    `USING` that `FOR UPDATE`/`FOR ALL` reuses) and the old-row gate (`USING`,
+    for `UPDATE`/`DELETE`/`ALL`)? Three honest verdicts:
     `PROVEN` (the property is unsatisfiable under the threat model), `LEAK` (it
     *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
-    or — cross-tenant/write — there is no single scoping equality to verify;
+    or — cross-tenant/write — there is no single scoping equality on an
+    identity/discriminator column to verify (the prover's tenant-axis set:
+    SEC021's default names plus the ambiguous bare spellings SEC021 itself
+    excludes; `[lint.rules.SEC021].identity_columns` in `--config` replaces
+    it for both — except an EMPTY list, which silences SEC021 but leaves the
+    prover on its default axis, so a gate cannot pass by having its
+    configuration emptied);
     here the verifier degrades to the linter, run `pgrls lint` — for write, the
     SEC006/SEC020/SEC028/SEC040 write-check rules).
 
-    The two modes are complementary: the inverted `auth.uid() IS NULL OR …`
+    The `anon` and `cross-tenant` modes are complementary: the inverted `auth.uid() IS NULL OR …`
     policy is an anon LEAK but cross-tenant PROVEN. Unlike `pgrls lint`
     (heuristic findings) this is a soundness proof: it never reports a leak it
-    cannot exhibit, and never reports isolated unless Z3 proves it. Exits
+    the policy predicate does not admit (or, for the anonymous-role RLS
+    exemption — BYPASSRLS/superuser, or the table owner's privileges without
+    FORCE — that Postgres does not grant), and never
+    reports isolated unless Z3 proves it or Postgres default-denies outright. The provers reason about the policy predicate and the policy's
+    TO roles, not about table GRANTs, so a predicate admitting every row on a
+    table anon cannot SELECT is still a LEAK (an over-report in the safe
+    direction; --mode reachability is where the grant is decided). Exits
     non-zero on any leak — drop it in CI as a hard tenant-isolation gate.
     `--strict` also fails on UNVERIFIED. `--format json` emits the
     per-table/per-policy verdicts and counterexamples; `--format sarif` emits a
@@ -4374,7 +4447,8 @@ def verify(
     stamped for tenant B and observing it admitted (rejected once the WITH CHECK
     is fixed). The proof, made reproducible (re-running won't clobber a
     hand-edited reproduction unless `--force`). Not supported with `--mode
-    escalation` (use `--probe`). See the README for scope.
+    escalation` (use `--probe`) or `--mode reachability` (the leak is a view
+    path — the DETAIL names the view to query). See the README for scope.
 
     `--probe` keeps the static proof honest by confirming it against the LIVE
     database: it connects as the threat-model session, seeds a throwaway row,
@@ -4394,6 +4468,7 @@ def verify(
     """
     if probe and emit_repro_dir is not None:
         raise click.UsageError("run --probe and --emit-repro separately")
+    identity_columns = _identity_columns_from_config(config_path)
     if mode == "escalation" and emit_repro_dir is not None:
         # The escalation bypass is a SET-ROLE role-reachability chain, not a
         # single policy predicate the emitter can template; --probe live-confirms
@@ -4402,6 +4477,19 @@ def verify(
             "--emit-repro is not supported with --mode escalation "
             "(the SET ROLE chain has no static reproduction template — use "
             "--probe, which live-confirms the escalation bypass)."
+        )
+    if mode == "reachability" and emit_repro_dir is not None:
+        # A reachability leak is a VIEW path, and its proof names the view,
+        # not a policy — the emitter would silently write zero files.
+        raise click.UsageError(
+            "--emit-repro is not supported with --mode reachability (the leak "
+            "is a view path, not a policy predicate; the DETAIL column names "
+            "the view to query)."
+        )
+    if mode == "reachability" and probe:
+        raise click.UsageError(
+            "--probe is not supported with --mode reachability yet; the mode "
+            "reports the static verdict only."
         )
     if against is not None and probe:
         raise click.UsageError(
@@ -4429,7 +4517,7 @@ def verify(
             schemas_csv=schemas,
         ) as (_cfg, conn, schema):
             probe_anon_roles = _verify_anon_roles(mode, _cfg.rule_options)
-            verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=probe_anon_roles)  # type: ignore[arg-type]
+            verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=probe_anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
             probe_result = run_probe(
                 conn, schema, verification,
                 mode=mode,  # type: ignore[arg-type]
@@ -4483,7 +4571,7 @@ def verify(
     # (`anon`→SEC004, `escalation`→SEC042; default {anon, PUBLIC}).
     anon_roles = _verify_anon_roles(mode, cfg.rule_options)
 
-    verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
+    verification = build_verification(schema, auth_functions=auth, mode=mode, anon_roles=anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
 
     if against is not None:
         # Compose the head verdicts with a baseline schema and report only the
@@ -4499,7 +4587,7 @@ def verify(
         base_schema = reparse_policy_asts(
             _resolve_diff_source(against, schemas=schema_list)
         )
-        base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles)  # type: ignore[arg-type]
+        base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
         delta = diff_verifications(base_verification, verification)
         if output_format == "sarif":
             # The gate is "no NEW leak", so introduced leaks become SARIF error
@@ -4540,7 +4628,10 @@ def verify(
         from pgrls.repro import emit_repros
 
         out_dir = Path(emit_repro_dir)
-        artifacts = emit_repros(schema, verification, auth_functions=auth, mode=mode)
+        artifacts = emit_repros(
+            schema, verification, auth_functions=auth, mode=mode,
+            anon_roles=anon_roles,
+        )
         if not force:
             # Refuse to clobber a hand-edited reproduction (the artifacts tell
             # the developer to edit the INSERT for conditional/cross-table
@@ -4577,6 +4668,27 @@ def verify(
             f"pgrls: wrote {len(artifacts)} reproduction(s) to {emit_repro_dir}",
             err=True,
         )
+        if not artifacts and verification.has_leak:
+            # Say WHICH reason applies rather than assuming one: an
+            # anon-exemption proof names a role, not a policy, and a write
+            # leak on a FOR UPDATE / FOR DELETE policy has no INSERT to
+            # reproduce it with.
+            exemption = any(
+                p.policy.startswith("role:")
+                for t in verification.tables
+                for p in t.proofs
+                if p.verdict == "leak"
+            )
+            reason = (
+                "the anonymous session is exempt from the table's RLS, so "
+                "there is no policy to reproduce; see verify --mode "
+                "escalation and SEC048"
+                if exemption
+                else "these leaks have no INSERT-representable reproduction "
+                "(a FOR UPDATE / FOR DELETE write policy, or no single "
+                "tenant-scoping axis to pivot on)"
+            )
+            click.echo(f"pgrls: no reproduction was written — {reason}.", err=True)
 
     if verification.has_leak:
         sys.exit(1)

@@ -18,12 +18,15 @@ git clone https://github.com/pgrls/pgrls.git
 cd pgrls
 python -m venv .venv
 .venv/bin/python -m pip install -e .[dev]
-.venv/bin/python -m pytest tests/       # 1,500+ tests, ~30 seconds
+.venv/bin/python -m pytest tests/       # ~3,900 tests, several minutes (needs Docker)
+.venv/bin/python -m pytest demo/        # end-to-end use cases
+.venv/bin/python -m pytest corpus/      # the precision gate — CI runs it as its own job
 .venv/bin/ruff check src tests
 .venv/bin/mypy src
 ```
 
-A live Postgres is **not** required for the unit tests — the rule
+The `demo/` and `corpus/` suites need Docker (they build a real database);
+a live Postgres is **not** required for the unit tests — the rule
 suite runs against in-memory `Schema` fixtures. The integration tests
 under `tests/` and the demo cases under `demo/` use
 [testcontainers](https://testcontainers-python.readthedocs.io/) to
@@ -37,8 +40,9 @@ spin up an ephemeral PG container per session.
 - **Every rule needs:** a module under `src/pgrls/rules/`, a unit-test
   module under `tests/rules/`, an entry in
   `tests/fixtures/all_bad.sql` (so the combined-fixture test trips
-  it), and a `### <RULE>` section in `AGENTS.md` documenting the
-  detection shape and any allowlist / config knobs.
+  it), a `## <RULE> — …` section (with its `rule-<id>` anchor) in
+  `docs/RULES.md` documenting the detection shape and any allowlist /
+  config knobs, and the one-line catalog entry in `AGENTS.md`.
 - **Auto-fixable rules:** add a fixer module under
   `src/pgrls/fixers/`, register it in `default_fixers()`, and update
   the `## Auto-fix: pgrls fix` section of `AGENTS.md`.

@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 
 from pgrls.ast_utils import find_func_calls, parse_expr
 from pgrls.model import (
+    MAYBE_SET,
     BypassRlsEscalation,
     BypassRlsRole,
     Column,
@@ -348,6 +349,7 @@ SELECT
     -- query above.
     pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
     (vo.rolsuper OR vo.rolbypassrls) AS owner_bypasses_rls,
+    vo.rolsuper AS owner_is_superuser,
     c.oid AS view_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -364,6 +366,33 @@ ORDER BY n.nspname, c.relname
 # exposure. Same shape and hardening as `_GRANTS_SQL`: SELECT DISTINCT drops
 # aclexplode's per-grantor multiplicity, grantee 0 renders as PUBLIC, and the
 # owner's own self-grant is excluded (it always holds the privilege).
+# Column-level grants on views / matviews (`pg_attribute.attacl`), the twin
+# of `_COLUMN_GRANTS_SQL` for relkind v/m. A `GRANT SELECT (id, body) ON v TO
+# anon` opens the view to anon just as a table-level grant does (measured),
+# while `relacl` stays NULL — so `verify --mode reachability` must see it.
+_VIEW_COLUMN_GRANTS_SQL = """
+SELECT DISTINCT
+    c.oid AS view_oid,
+    a.attname AS column_name,
+    CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
+         ELSE COALESCE(ar.rolname, 'oid:' || ax.grantee::text)
+    END AS role_name,
+    ax.privilege_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+LEFT JOIN LATERAL aclexplode(a.attacl) ax ON true
+LEFT JOIN pg_catalog.pg_roles ar ON ar.oid = ax.grantee
+WHERE c.relkind IN ('v', 'm')
+  AND n.nspname = ANY(%s)
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND a.attacl IS NOT NULL
+  AND ax.grantee IS NOT NULL
+  AND ax.grantee <> c.relowner
+ORDER BY c.oid, column_name, role_name, ax.privilege_type
+"""
+
 _VIEW_GRANTS_SQL = """
 SELECT DISTINCT
     c.oid AS view_oid,
@@ -454,8 +483,8 @@ ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
 # Postgres auto-creates — those are framework plumbing, not an audit
 # target. User-authored `CREATE CONSTRAINT TRIGGER` rows have
 # `tgconstraint != 0` but `tgisinternal = false`, so they pass this
-# filter and SEC013 captures them — deferred constraint triggers
-# still fire as the table owner and present the same RLS bypass
+# filter and SEC013 captures them — a deferred constraint trigger runs
+# the same function under the same rules and presents the same audit
 # surface as any other AFTER trigger.
 #
 # The event mask is decoded from `pg_trigger.tgtype` bit by bit
@@ -487,8 +516,8 @@ ORDER BY vn.nspname, v.relname, tn.nspname, t.relname
 # simple; the snapshot still flips on a re-enable.
 #
 # The ROW vs STATEMENT axis (`tgtype` bit 0) is intentionally not
-# captured. Both fire as the table owner, so both present the same
-# RLS-bypass surface — SEC013 doesn't care which one fired. A
+# captured. Both run the same function under the same rules, so both
+# present the same audit surface — SEC013 doesn't care which fired. A
 # STATEMENT trigger that runs `SELECT count(*) FROM peer_tenant` once
 # per UPDATE is just as leaky as a ROW trigger doing the same per
 # row. Skipping the axis keeps the Trigger dataclass smaller and the
@@ -720,6 +749,7 @@ SELECT
     p.proconfig AS config,
     pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature,
     (po.rolsuper OR po.rolbypassrls) AS owner_bypasses_rls,
+    po.rolname AS owner_name,
     COALESCE((
         SELECT array_agg(DISTINCT CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
                                        ELSE COALESCE(ar.rolname,
@@ -751,12 +781,18 @@ ORDER BY qname, signature
 # directly. The existing `_POLICIES_SQL` already joins `pg_roles` for
 # the same readability reason.
 #
-# `WHERE r.rolbypassrls` filters to the audit-relevant subset
-# (mirroring `_SECDEF_FUNCS_SQL`'s `WHERE p.prosecdef = TRUE`): the
-# captured set is exactly the roles SEC016 might flag, and a default
-# cluster — where no role has been granted BYPASSRLS — captures zero
-# rows. The Postgres-predefined `pg_*` roles (`pg_read_all_data`
-# etc.) do not carry `rolbypassrls`, so they never appear here.
+# `WHERE r.rolbypassrls OR r.rolsuper` captures every role that is exempt
+# from RLS. A superuser bypasses RLS through `rolsuper` whether or not it
+# also carries the explicit attribute — measured on PG16: a `LOGIN
+# SUPERUSER` role with `rolbypassrls = false` read every row of a FORCE'd
+# table. Filtering on `rolbypassrls` alone missed exactly that role, and
+# `verify --mode anon` then reported PROVEN for an anonymous role that
+# reads everything. SEC016 and SEC023 already skip superusers explicitly
+# (a superuser finding would only restate "this role is a superuser"), so
+# widening the capture changes no rule's output — it only stops the
+# verifier from proving isolation against a role Postgres never checks.
+# The Postgres-predefined `pg_*` roles (`pg_read_all_data` etc.) carry
+# neither attribute, so they never appear here.
 #
 # Roles are cluster-global — this query takes no schema parameter and
 # is independent of the introspector's `--schemas` set.
@@ -768,7 +804,7 @@ SELECT
     r.rolsuper AS superuser,
     r.rolcanlogin AS can_login
 FROM pg_catalog.pg_roles r
-WHERE r.rolbypassrls
+WHERE r.rolbypassrls OR r.rolsuper
 ORDER BY r.rolname
 """
 
@@ -1090,13 +1126,14 @@ def _fetch_secdef_functions(
             function_name=row["function_name"],
             execute_roles=tuple(sorted(row["execute_roles"] or ())),
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
+            owner=row["owner_name"] or "",
         )
         for row in cur.fetchall()
     )
 
 
 def _fetch_bypassrls_roles(cur: Any) -> tuple[BypassRlsRole, ...]:
-    """Fetch every role carrying the BYPASSRLS attribute.
+    """Fetch every role exempt from RLS — `BYPASSRLS` or superuser.
 
     Returns a tuple of `BypassRlsRole` records sorted by role name
     (the SQL `ORDER BY r.rolname` provides the determinism). Takes no
@@ -1156,12 +1193,175 @@ def _fetch_bypassrls_escalation_roles(
 # `roleid` is the group; `member` inherits its privileges. Readable by every
 # connected role.
 _ROLE_MEMBERSHIPS_SQL = """
-    SELECT g.rolname AS role, m.rolname AS member
+    SELECT g.rolname AS role, m.rolname AS member,
+           -- PG16+ carries a per-edge INHERIT option; older servers use the
+           -- member role's rolinherit. `to_jsonb` keeps one query valid on
+           -- both: the key is simply absent (NULL) before PG16.
+           COALESCE((to_jsonb(am) ->> 'inherit_option')::boolean, m.rolinherit)
+               AS inherit
     FROM pg_catalog.pg_auth_members am
     JOIN pg_catalog.pg_roles g ON g.oid = am.roleid
     JOIN pg_catalog.pg_roles m ON m.oid = am.member
     ORDER BY member, role
 """
+
+
+# Custom (dotted) GUCs a session inherits WITHOUT running `SET` — set at the
+# database / role level (`ALTER DATABASE … SET app.x`, `ALTER ROLE … SET`) or
+# in the server configuration. `verify --mode anon` assumes a custom GUC is
+# UNSET for an anonymous session (the read raises → no rows). A standing
+# `ALTER DATABASE postgres SET app.tenant_id = 'shared'` breaks that
+# assumption: a fresh anon session reads the shared value and the canonical
+# `tenant_id = current_setting('app.tenant_id')` policy admits every row
+# stamped with it (measured live). Capturing the names lets the prover stop
+# claiming PROVEN there. Session-/client-set values are excluded — those are
+# this connection's own state, not what an anonymous caller inherits.
+_SET_GUCS_SQL = """
+SELECT DISTINCT
+    lower(split_part(cfg, '=', 1)) AS name,
+    CASE WHEN s.setrole = 0 THEN NULL ELSE r.rolname END AS role,
+    substr(cfg, strpos(cfg, '=') + 1) AS value,
+    CASE
+        WHEN s.setrole <> 0 AND s.setdatabase <> 0 THEN 3
+        WHEN s.setrole <> 0 THEN 2
+        WHEN s.setdatabase <> 0 THEN 1
+        ELSE 0
+    END AS tier
+FROM pg_catalog.pg_db_role_setting s
+CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
+LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
+WHERE (
+    s.setdatabase = 0
+    OR s.setdatabase = (
+        SELECT d.oid FROM pg_catalog.pg_database d
+        WHERE d.datname = current_database()
+    )
+)
+AND split_part(cfg, '=', 1) LIKE '%.%'
+ORDER BY 1, 2
+"""
+
+# Server-configuration custom GUCs. These are NOT in `pg_settings` —
+# Postgres registers custom placeholders GUC_NO_SHOW_ALL (measured on PG16: a
+# `postgresql.conf` line `app.sys = 'sysval'` is readable by every session,
+# `current_setting` included, yet `pg_settings` has zero rows for it), so a
+# first cut that read `pg_settings` captured nothing at all. `pg_file_settings`
+# lists the applied file entries. It is not the whole story: a GUC given on
+# the postmaster command line (`postgres -c app.x=v`, the docker-compose
+# `command:` / k8s `args:` idiom) appears in NEITHER view, yet every session
+# reads it — measured on PG16: `current_setting('app.cmdline')` returns the
+# value while `pg_settings` and `pg_file_settings` both have zero rows. That
+# is why the session probe below runs unconditionally rather than only as a
+# fallback. (`ALTER SYSTEM` refuses a custom name the server has never seen,
+# so `postgresql.auto.conf` adds nothing beyond the file entries.)
+_FILE_SET_GUCS_SQL = """
+SELECT DISTINCT lower(name) AS name, setting
+FROM pg_catalog.pg_file_settings
+WHERE applied AND name LIKE '%.%'
+ORDER BY 1
+"""
+
+# In ADDITION to `pg_file_settings` — never as a fallback to it — this session
+# is asked about every dotted GUC a policy reads, because a GUC given on the
+# postmaster command line is in no catalog at all. A non-empty answer means the
+# GUC is set for THIS session, which is weaker than "set for every session":
+# the value could have come from this connection's own options. Such a name is
+# recorded `MAYBE_SET` in `Schema.set_gucs`, under which the prover keeps both
+# the value and the null-flag free — it can decline, never conclude.
+_POLICY_GUC_NAMES_SQL = r"""
+SELECT DISTINCT lower(m[1]) AS name
+FROM pg_catalog.pg_policy p
+CROSS JOIN LATERAL regexp_matches(
+    pg_catalog.pg_get_expr(p.polqual, p.polrelid)
+        || ' ' || COALESCE(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), ''),
+    $re$current_setting\(\s*'([^']+\.[^']+)'$re$, 'gi') AS m
+"""
+
+
+def _fetch_set_gucs(
+    cur: Any,
+) -> tuple[tuple[tuple[str, str | None], ...], tuple[tuple[str, str, str], ...]]:
+    """Dotted GUCs already set, with their values — `([(name, value)] at
+    database / server level, [(role, name, value)] at role level)`.
+
+    Names are casefolded: GUC names are case-insensitive but
+    `pg_db_role_setting.setconfig` preserves the ALTER's spelling, and a
+    case-sensitive match missed `"App.Tenant"` vs `current_setting(
+    'app.tenant')`. Values are captured too, so the prover can decide
+    `current_setting('app.flag') = 'on'` against the configured value
+    (measured: at 'off' the anonymous read returns 0 rows) instead of
+    declining, and so `--probe` / `--emit-repro` can replay the session a
+    real anonymous caller gets. A database-level setting overrides the
+    server configuration, so it wins here.
+
+    Role-level settings bind to the LOGIN role — see `verify._anon_login_roles`
+    — so they are returned per role rather than merged. Where one name is set
+    at several levels the most specific wins, exactly as Postgres resolves it.
+
+    A `MAYBE_SET` value means the introspecting session can read the GUC but
+    it cannot be attributed to the SERVER — it may be that connection's own
+    `PGOPTIONS`. The prover keeps both the value and the null-flag free there.
+    A `None` value is the legacy "set at server level, value uncaptured"
+    state, still decoded for snapshots that carry it but no longer produced.
+    """
+    cur.execute(_SET_GUCS_SQL)
+    # Most specific tier wins, per (role, name): `ALTER ROLE x IN DATABASE d
+    # SET` beats `ALTER ROLE x SET` beats `ALTER DATABASE d SET` beats `ALTER
+    # ROLE ALL SET` — measured on PG16 by stripping one tier at a time and
+    # re-reading `current_setting` as the role. Collapsing the tiers let the
+    # lexicographically-last value win, so the prover could compare against a
+    # string no session ever sees and prove isolation from it.
+    best: dict[tuple[str | None, str], tuple[int, str]] = {}
+    for r in cur.fetchall():
+        key = (r["role"], r["name"])
+        prior = best.get(key)
+        if prior is None or r["tier"] > prior[0]:
+            best[key] = (r["tier"], r["value"])
+    db_level: dict[str, str | None] = {
+        name: value for (role, name), (_t, value) in best.items() if role is None
+    }
+    role_level = {
+        (role, name, value)
+        for (role, name), (_t, value) in best.items()
+        if role is not None
+    }
+    # Ask before reading rather than catching the failure: `introspect` runs on
+    # autocommit connections too (the verdict corpus uses one), where a
+    # SAVEPOINT is itself an error and could not be rolled back. Both the
+    # view's ACL and the underlying set-returning function's EXECUTE are
+    # checked: `GRANT SELECT ON pg_file_settings` alone still fails the read
+    # with `permission denied for function pg_show_all_file_settings`, which
+    # would abort the whole command.
+    cur.execute(
+        "SELECT pg_catalog.has_table_privilege("
+        "'pg_catalog.pg_file_settings', 'SELECT') "
+        "AND pg_catalog.has_function_privilege("
+        "'pg_catalog.pg_show_all_file_settings()', 'EXECUTE') AS ok"
+    )
+    row = cur.fetchone()
+    if row is not None and row["ok"]:
+        cur.execute(_FILE_SET_GUCS_SQL)
+        for r in cur.fetchall():
+            db_level.setdefault(r["name"], r["setting"])
+    # Then ask the session itself, ALWAYS — not only when the view was
+    # unreadable: a GUC given on the postmaster command line is in no catalog
+    # at all (measured on PG16). Names no catalog explained are recorded
+    # `MAYBE_SET`: this session can read them, but the value could equally
+    # come from its own connection options (`PGOPTIONS`), so an anonymous
+    # caller may not have them at all. Recording them as definitely-set would
+    # be stronger than the evidence and could prove an `IS NULL` gate dead.
+    cur.execute("SELECT session_user AS me")
+    me = cur.fetchone()["me"]
+    own = {name for role, name, _v in role_level if role == me}
+    cur.execute(_POLICY_GUC_NAMES_SQL)
+    for name in [r["name"] for r in cur.fetchall()]:
+        if name in db_level or name in own:
+            continue
+        cur.execute("SELECT current_setting(%s, true) AS v", (name,))
+        got = cur.fetchone()
+        if got is not None and got["v"] not in (None, ""):
+            db_level[name] = MAYBE_SET + str(got["v"])
+    return tuple(sorted(db_level.items())), tuple(sorted(role_level))
 
 
 def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
@@ -1175,7 +1375,9 @@ def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
     """
     cur.execute(_ROLE_MEMBERSHIPS_SQL)
     return tuple(
-        RoleMembership(member=row["member"], role=row["role"])
+        RoleMembership(
+            member=row["member"], role=row["role"], inherit=bool(row["inherit"])
+        )
         for row in cur.fetchall()
     )
 
@@ -1528,6 +1730,21 @@ def _build_views(
         view_grants_acc[row["view_oid"]][row["role_name"]].append(
             row["privilege_type"]
         )
+    cur.execute(_VIEW_COLUMN_GRANTS_SQL, [list(schemas)])
+    view_col_acc: dict[int, dict[tuple[str, str], list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in cur.fetchall():
+        view_col_acc[row["view_oid"]][(row["role_name"], row["column_name"])].append(
+            row["privilege_type"]
+        )
+    view_col_grants_by_oid: dict[int, tuple[ColumnGrant, ...]] = {
+        oid: tuple(
+            ColumnGrant(role=role, column=col, privileges=tuple(privs))
+            for (role, col), privs in sorted(rolecol.items())
+        )
+        for oid, rolecol in view_col_acc.items()
+    }
     view_grants_by_oid: dict[int, tuple[Grant, ...]] = {
         oid: tuple(
             Grant(role=role, privileges=tuple(privs))
@@ -1554,8 +1771,15 @@ def _build_views(
                 (row["schema_name"], row["view_name"]), ()
             ),
             grants=view_grants_by_oid.get(row["view_oid"], ()),
+            column_grants=view_col_grants_by_oid.get(row["view_oid"], ()),
             owner=row["owner_name"] or "",
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
+            owner_is_superuser=bool(row["owner_is_superuser"]),
+            # The un-collapsed edges (tables AND views) — the hops the
+            # reachability walk needs; `references` above is the collapsed set.
+            direct_references=tuple(
+                sorted(deps_index.get((row["schema_name"], row["view_name"]), set()))
+            ),
         )
         for row in view_rows
     )
@@ -1644,6 +1868,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # `verify --mode anon` can role-gate the anon prover soundly (a `None`
         # graph on an offline/snapshot Schema makes verify abstain instead).
         role_memberships = _fetch_role_memberships(cur)
+        set_gucs, role_set_gucs = _fetch_set_gucs(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -1663,6 +1888,8 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 owner_reachable_members=owner_reachable,
                 foreign_tables=foreign_tables,
                 role_memberships=role_memberships,
+                set_gucs=set_gucs,
+                role_set_gucs=role_set_gucs,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -1892,4 +2119,6 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         owner_reachable_members=owner_reachable,
         foreign_tables=foreign_tables,
         role_memberships=role_memberships,
+        set_gucs=set_gucs,
+        role_set_gucs=role_set_gucs,
     )

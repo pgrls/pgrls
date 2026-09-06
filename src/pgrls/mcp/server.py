@@ -226,7 +226,8 @@ def verify(
     witness), or ``unverified`` (Z3 can't decide, or there's no single scoping
     equality). Four threat models via ``mode``:
 
-    * ``anon`` (default) — can an unauthenticated session read any row?
+    * ``anon`` (default) — can an anonymous session (JWT-less, or the Supabase
+      anon-key caller whose ``auth.role()`` is 'anon') read any row?
     * ``cross-tenant`` — can a session authenticated as one tenant read a
       different tenant's row?
     * ``write`` — can such a session WRITE a row stamped for another tenant?

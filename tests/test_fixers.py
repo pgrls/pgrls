@@ -1040,6 +1040,42 @@ def test_sec019_fix_silent_when_already_two_arg() -> None:
     assert SEC019Fixer().fix(schema, {}) == []
 
 
+def test_sec019_fix_rewrites_only_and_chained_comparison_operands() -> None:
+    """The allowlist: a call that is a direct operand of a comparison, with
+    only AND above it (casts and the PERF001 `(SELECT …)` wrap allowed)."""
+    for pred, expect in (
+        ("user_id = current_setting('app.user')", "current_setting('app.user', TRUE)"),
+        ("user_id = current_setting('app.user')::text AND is_active", "current_setting('app.user', TRUE)"),
+        ("user_id = (SELECT current_setting('app.user'))", "current_setting('app.user', TRUE)"),
+        ("current_setting('app.user') <> 'x' AND tenant_id = current_setting('app.t')", "current_setting('app.t', TRUE)"),
+    ):
+        fixes = SEC019Fixer().fix(_wrap_policy(_policy(pred)), {})
+        assert len(fixes) == 1 and expect in fixes[0].sql, pred
+
+
+def test_sec019_fix_abstains_wherever_a_null_could_admit_a_row() -> None:
+    """A fixer may never broaden. One-arg `current_setting` RAISES when the
+    GUC is unset (fails closed); the two-arg form returns NULL. Every shape
+    here was measured live to read MORE rows after the naive rewrite —
+    iteration 1 denylisted six constructs and review found three more within
+    hours, which is why the walk is an allowlist. The finding stays open."""
+    for pred in (
+        "current_setting('app.t') IS NULL OR tenant_id = current_setting('app.t')",
+        "tenant_id = COALESCE(current_setting('app.t'), 'fallback')",
+        "tenant_id = NULLIF(current_setting('app.t'), '')",
+        "tenant_id IS NOT DISTINCT FROM current_setting('app.t')",
+        "NOT (tenant_id <> current_setting('app.t'))",
+        "tenant_id = CASE WHEN current_setting('app.t') = 'x' THEN 'x' END",
+        "(current_setting('app.flag')::bool) IS NOT FALSE",
+        "tenant = ANY(ARRAY[current_setting('app.t'), 'x'])",
+        "tenant = GREATEST(current_setting('app.t'), 'z')",
+        "is_public OR tenant_id = current_setting('app.t')",
+        "tenant_id IN (current_setting('app.t'), 'y')",
+        "tenant_id = lower(current_setting('app.t'))",
+    ):
+        assert SEC019Fixer().fix(_wrap_policy(_policy(pred)), {}) == [], pred
+
+
 def test_sec019_fix_silent_when_no_current_setting() -> None:
     schema = _wrap_policy(_policy("user_id = 1"))
     assert SEC019Fixer().fix(schema, {}) == []
@@ -2032,7 +2068,7 @@ def test_sec015_fix_emits_minimal_safe_path_when_search_path_unset() -> None:
     assert f.rule_id == "SEC015"
     assert f.sql == (
         "ALTER FUNCTION public.read_secret(integer) "
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, public, pg_temp;"
     )
 
 
@@ -2087,10 +2123,10 @@ def test_sec015_fix_silent_when_path_already_safe() -> None:
     assert SEC015Fixer().fix(schema, {}) == []
 
 
-def test_sec015_fix_abstains_on_empty_signature_from_pre_v12_snapshot() -> None:
+def test_sec015_fix_abstains_when_the_signature_was_not_captured() -> None:
     schema = Schema(
         security_definer_functions=(
-            _secdef("public.legacy", signature=""),
+            _secdef("public.legacy", signature=None),
         ),
     )
     assert SEC015Fixer().fix(schema, {}) == []
@@ -2224,9 +2260,9 @@ def test_sec015_fix_emits_per_overload() -> None:
     fixes = SEC015Fixer().fix(schema, {})
     assert sorted(f.sql for f in fixes) == [
         "ALTER FUNCTION public.f(integer) "
-        "SET search_path = pg_catalog, pg_temp;",
+        "SET search_path = pg_catalog, public, pg_temp;",
         "ALTER FUNCTION public.f(text) "
-        "SET search_path = pg_catalog, pg_temp;",
+        "SET search_path = pg_catalog, public, pg_temp;",
     ]
 
 
@@ -2262,7 +2298,7 @@ def test_sec015_fix_quotes_mixed_case_function_name() -> None:
     [f] = SEC015Fixer().fix(schema, {})
     assert f.sql == (
         'ALTER FUNCTION public."FastEq"(integer) '
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, public, pg_temp;"
     )
 
 
@@ -2295,7 +2331,7 @@ def test_sec015_fix_raises_on_malformed_allowlist() -> None:
 
 def _leakproof(
     qname: str,
-    signature: str = "",
+    signature: str | None = None,
     *,
     schema_name: str | None = None,
     function_name: str | None = None,
@@ -2350,25 +2386,25 @@ def test_sec017_fix_emits_one_fix_per_overload() -> None:
     ]
 
 
-def test_sec017_fix_abstains_on_empty_signature_from_pre_v12_snapshot() -> None:
+def test_sec017_fix_abstains_when_the_signature_was_not_captured() -> None:
     # A LeakproofFunction loaded from a pre-v12 snapshot has
-    # signature="" (the older introspection didn't capture it).
+    # signature=None (the older introspection didn't capture it).
     # Emitting `ALTER FUNCTION name() NOT LEAKPROOF` would target
     # the zero-arg overload, wrong for every function with args.
     # The fixer abstains — the operator re-snapshots to populate
     # signatures, then re-runs `pgrls fix`.
     schema = Schema(
-        leakproof_functions=(_leakproof("public.fast_eq", ""),),
+        leakproof_functions=(_leakproof("public.fast_eq", None),),
     )
     assert SEC017Fixer().fix(schema, {}) == []
 
 
-def test_sec017_fix_mixed_pre_v12_and_v12_only_emits_for_v12_entries() -> None:
-    # A schema mixing pre-v12 (signature="") and v12+ (signature
+def test_sec017_fix_mixed_uncaptured_and_captured_only_emits_for_captured_entries() -> None:
+    # A schema mixing pre-v12 (signature=None) and v12+ (signature
     # populated) entries — only the v12+ entries get a Fix.
     schema = Schema(
         leakproof_functions=(
-            _leakproof("public.legacy", ""),
+            _leakproof("public.legacy", None),
             _leakproof("public.fresh", "integer"),
         ),
     )
@@ -4187,7 +4223,7 @@ def test_sec015_fix_targets_correct_object_when_schema_name_has_dot() -> None:
     [fix] = SEC015Fixer().fix(schema, {})
     assert fix.sql == (
         'ALTER FUNCTION "a.b".f(integer) '
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, \"a.b\", pg_temp;"
     )
     # The old buggy split would have produced this wrong target.
     assert 'a."b.f"' not in fix.sql
@@ -4209,7 +4245,7 @@ def test_sec015_fix_targets_correct_object_when_function_name_has_dot() -> None:
     [fix] = SEC015Fixer().fix(schema, {})
     assert fix.sql == (
         'ALTER FUNCTION s."a.b"(integer) '
-        "SET search_path = pg_catalog, pg_temp;"
+        "SET search_path = pg_catalog, s, pg_temp;"
     )
 
 
@@ -4628,3 +4664,22 @@ def test_generate_fixes_includes_sec044_revoke() -> None:
         s.startswith("ALTER DEFAULT PRIVILEGES") and "REVOKE SELECT" in s
         for s in sqls
     )
+
+
+def test_sec015_default_path_includes_the_functions_own_schema_for_security() -> None:
+    """`pg_catalog, pg_temp` looks tighter but leaves the hole open: an
+    unqualified name the body reads is not in `pg_catalog`, so resolution falls
+    through to `pg_temp` — which the ATTACKER writes.
+
+    Measured on PG16 with a SECDEF function reading an unqualified `secrets`:
+    under `pg_catalog, pg_temp` a planted `pg_temp.secrets` was returned
+    (`ATTACKER`); under `pg_catalog, <own schema>, pg_temp` the real table was
+    (`real`). pgrls reports SEC015 resolved after applying its own fix, so the
+    tighter-looking default signed off on a still-exploitable function."""
+    from pgrls.fixers.sec015 import _rewritten_path
+
+    assert _rewritten_path(None, "s15") == "pg_catalog, s15, pg_temp"
+    # A schema needing quoting still produces valid server SQL.
+    assert _rewritten_path(None, "a.b") == 'pg_catalog, "a.b", pg_temp'
+    # An existing path is preserved with pg_temp pinned last, as before.
+    assert _rewritten_path("s15, pg_temp", "s15") == "s15, pg_temp"

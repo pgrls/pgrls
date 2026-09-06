@@ -26,7 +26,9 @@ The probe is deliberately conservative: anything it cannot model live it
 **abstains** on (per table, with a one-line reason — never a crash). It cannot
 create its probe role (no CREATEROLE / not superuser), cannot seed (no INSERT),
 finds no scoping axis to pivot a cross-tenant probe on, the leak witness is
-conditional (no single characterizing row), the policy references other tables,
+conditional (no single characterizing row), the finding is the anonymous
+role's own RLS exemption rather than a policy, the policy references other
+tables,
 or a column has an exotic type the placeholder synthesis can't fill — all of
 these yield a clean `abstained` / `skipped`, not a false signal.
 
@@ -49,11 +51,9 @@ from pgrls.diff._z3_compare import (
     cross_tenant_session_identity,
 )
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import Column, Policy, Schema, Table
+from pgrls.model import Column, Policy, Schema, Table, is_maybe_set
 from pgrls.repro import (
-    _AUTH_IDENTITY_GUC,
     _current_setting_guc,
-    _funccall_qualified,
     _identity_value_type,
     _row_columns,
     _session_a_value,
@@ -70,6 +70,7 @@ from pgrls.verify import (
     Verification,
     build_verification,
     checked_ast,
+    _anon_set_gucs,
 )
 from pgrls._render_common import pluralize, render_text_table
 from pgrls.formatters._common import safe_location
@@ -88,12 +89,23 @@ Agreement = Literal["agree", "mismatch", "leak_confirmed", "skipped", "abstained
 
 # JWT-claim GUCs the auth.* stubs read (see repro._AUTH_STUB). Clearing them
 # (set to '') makes auth.uid()/role()/jwt() return NULL — the anonymous state
-# the `anon` threat model probes under. A policy reading a different GUC via a
-# direct current_setting(...) adds its own GUC to this set per table.
+# the `anon` threat model probes under, because those stubs read them through
+# `NULLIF(..., '')`. This set is deliberately CLOSED: a policy's own
+# `current_setting('app.x')` must never be cleared, since '' is a value rather
+# than NULL there and cannot be undone within the session.
 _ANON_BASELINE_GUCS = (
     "request.jwt.claim.sub",
     "request.jwt.claim.role",
     "request.jwt.claims",
+)
+
+# The anon-KEY session (see `_z3_compare._Context.anon_jwt`): what PostgREST
+# sets for a caller presenting the public anon key — a role claim of 'anon'
+# and a claims blob carrying it, but no subject. Applied as a second attempt
+# after the JWT-less baseline reads nothing.
+_ANON_KEY_SESSION_GUCS = (
+    ("request.jwt.claim.role", "anon"),
+    ("request.jwt.claims", '{"role":"anon"}'),
 )
 
 
@@ -170,40 +182,6 @@ def _short(exc: Exception) -> str:
 
 def _column_map(table: Table) -> dict[str, Column]:
     return {c.name: c for c in table.column_details}
-
-
-def _anon_gucs(policy_ast: Any) -> list[str]:
-    """The GUCs to clear so every auth value in `policy_ast` reads NULL.
-
-    The baseline Supabase JWT-claim GUCs, plus any GUC a direct
-    ``current_setting('<guc>')`` in the predicate reads (so a non-Supabase
-    policy scoping on ``current_setting('app.tenant_id')`` is anonymized too).
-    Reuses repro's `_current_setting_guc` / `_AUTH_IDENTITY_GUC` so the GUC
-    mapping is the single source of truth shared with the emitted repro."""
-    from pglast.ast import FuncCall, Node
-
-    gucs = set(_ANON_BASELINE_GUCS)
-
-    def walk(n: Any) -> None:
-        if n is None:
-            return
-        if isinstance(n, (list, tuple)):
-            for item in n:
-                walk(item)
-            return
-        if isinstance(n, FuncCall):
-            guc = _current_setting_guc(n)
-            if guc is not None:
-                gucs.add(guc)
-            qualified = _funccall_qualified(n)
-            if qualified in _AUTH_IDENTITY_GUC:
-                gucs.add(_AUTH_IDENTITY_GUC[qualified])
-        if isinstance(n, Node):
-            for field_name in n:
-                walk(getattr(n, field_name, None))
-
-    walk(policy_ast)
-    return sorted(gucs)
 
 
 def _references_other_tables(policy_ast: Any) -> bool:
@@ -383,6 +361,8 @@ def _probe_one(
     auth_functions: set[str] | None,
     probe_role: str,
     n: int,
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
+    claims_written: set[str] | None = None,
 ) -> ProbeResult:
     """Probe one table, inside its own savepoint (rolled back by the caller).
 
@@ -406,10 +386,19 @@ def _probe_one(
         tv.proofs[0],
     )
     policy = next((p for p in table.policies if p.name == proof.policy), None)
-    if policy is None:  # pragma: no cover - proof always names a real policy
+    if policy is None:
+        # `anon` mode emits a `role:<name>` proof when the anonymous session is
+        # exempt from the table's RLS outright — there is no policy to pivot
+        # on, because the policies are never consulted.
+        reason = (
+            "the anonymous session is exempt from this table's RLS — no policy "
+            "to probe; see verify --mode escalation"
+            if proof.policy.startswith("role:")
+            else "internal: proof references an unknown policy"
+        )
         return ProbeResult(
             tv.qualified_name, proof.policy, mode, tv.verdict, "abstained",
-            "abstained", "internal: proof references an unknown policy", None,
+            "abstained", reason, None,
         )
 
     policy_ast = checked_ast(policy, mode)
@@ -420,6 +409,17 @@ def _probe_one(
             if policy_ast is None:
                 raise _ProbeAbstain(
                     "no checkable predicate for this policy under this mode"
+                )
+            if (
+                mode == "anon"
+                and claims_written
+                and _reads_claim_guc_directly(policy_ast)
+            ):
+                raise _ProbeAbstain(
+                    "cannot reconstruct a JWT-less session: "
+                    f"{', '.join(sorted(claims_written))} was set for an "
+                    "earlier table's anon-key attempt and a claim GUC cannot "
+                    "be restored to NULL within a session"
                 )
             if proof.verdict == "leak" and proof.witness is None:
                 raise _ProbeAbstain(
@@ -468,7 +468,8 @@ def _probe_one(
             observed = _run_probe_steps(
                 cur, table, policy_ast, mode, row,
                 disc_col=disc_col, auth_sql=auth_sql, a_val=a_val,
-                probe_role=probe_role,
+                probe_role=probe_role, guc_states=guc_states,
+                claims_written=claims_written,
             )
             agreement, detail = _classify(tv.verdict, observed, mode)
             return ProbeResult(
@@ -518,6 +519,8 @@ def _run_probe_steps(
     auth_sql: str | None,
     a_val: str | None,
     probe_role: str,
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
+    claims_written: set[str] | None = None,
 ) -> Observed:
     """Seed → become the threat session → observe. Returns the live outcome.
 
@@ -551,8 +554,29 @@ def _run_probe_steps(
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
         else:  # anon
             cur.execute(_insert_sql(table, row))  # seed as the privileged role
-            for guc in _anon_gucs(policy_ast):
-                cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
+            # Clear ONLY the JWT-claim GUCs. Those are read through
+            # `NULLIF(current_setting(...), '')`, so '' and unset are the same
+            # value to the auth stubs. A custom dotted GUC is not: measured on
+            # PG16, `set_config('app.gate', '', true)` makes
+            # `current_setting('app.gate', true)` return '' rather than NULL,
+            # and NEITHER `RESET` nor `set_config(..., NULL, ...)` gets NULL
+            # back within the session. Clearing them therefore destroyed the
+            # very condition a `current_setting('app.gate', true) IS NULL`
+            # policy leaks through, and the probe reported MISMATCH against
+            # its own correct LEAK. A fresh probe transaction already sees
+            # them unset; `_observe_anon_sessions` sets the ones a login path
+            # actually has.
+            for guc in _ANON_BASELINE_GUCS:
+                # Only where it is already non-NULL. `''` is a VALUE, not
+                # NULL, and cannot be undone in-session — writing it into an
+                # unset claim GUC destroys a `current_setting(..., true) IS
+                # NULL` gate, which is exactly the shape SEC004 is about.
+                # Measured: the probe then reported `no rows` against a live
+                # 2-row anonymous read and MISMATCHed its own correct proof.
+                cur.execute(
+                    f"SELECT set_config({_sql_str(guc)}, '', true) "
+                    f"WHERE current_setting({_sql_str(guc)}, true) IS NOT NULL"
+                )
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
     except psycopg.Error as exc:
         # A seed INSERT denied (e.g. no permissive write path under FORCE RLS for
@@ -598,7 +622,12 @@ def _run_probe_steps(
         else:
             query = f"SELECT * FROM {qtbl}"
         try:
-            seen = _row_count(cur.connection, query)
+            if mode == "anon":
+                seen = _observe_anon_sessions(
+                    cur, query, guc_states, claims_written
+                )
+            else:
+                seen = _row_count(cur.connection, query)
         except psycopg.Error as exc:
             raise _ProbeAbstain(f"probe query failed: {_short(exc)}") from exc
         return "rows_visible" if seen > 0 else "no_rows"
@@ -611,6 +640,111 @@ def _run_probe_steps(
             cur.execute("RESET ROLE")
         except psycopg.Error:
             pass
+
+
+def _reads_claim_guc_directly(policy_ast: Any) -> bool:
+    """Does the predicate read a JWT-claim GUC through `current_setting`
+    itself, rather than through an auth stub that wraps it in
+    `NULLIF(..., '')`? Only then does the difference between UNSET and `''`
+    change what the policy admits."""
+    from pglast.ast import FuncCall, Node  # noqa: PLC0415
+
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, FuncCall) and _current_setting_guc(n) in _ANON_BASELINE_GUCS:
+            found = True
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk(policy_ast)
+    return found
+
+
+def _observe_anon_sessions(
+    cur: psycopg.Cursor[Any],
+    query: str,
+    guc_states: tuple[dict[str, str | None], ...],
+    claims_written: set[str] | None = None,
+) -> int:
+    """Rows visible under ANY anonymous session — the static prover's
+    question, so a correct LEAK is not met with a MISMATCH.
+
+    Anonymous sessions differ two ways and every combination is tried: the
+    login path (each `guc_states` entry — the GUCs a real anonymous session
+    inherits from ``ALTER ROLE`` / ``ALTER DATABASE … SET`` or the server
+    configuration, replayed here because the probe cannot log in as
+    ``authenticator``; a custom GUC is settable by any role), and the caller
+    — JWT-less, then the Supabase ANON-KEY caller: PostgREST sets the role
+    claim to 'anon', so ``USING (auth.role() = 'anon')`` reads rows for it
+    and nothing for a JWT-less one.
+    """
+    names = sorted({n for st in guc_states for n in st})
+    # What this session inherits, captured BEFORE any state is applied: a GUC
+    # whose value introspection could not capture is replayed from here, so a
+    # later state cannot leave the previous state's value standing.
+    inherited: dict[str, str] = {}
+    for n in names:
+        cur.execute(f"SELECT current_setting({_sql_str(n)}, true) AS v")
+        got = cur.fetchone()
+        inherited[n] = (got[0] if got and got[0] is not None else "")
+    # A custom GUC written once cannot be un-set within the session (measured:
+    # neither RESET, set_config(..., NULL), nor a savepoint rollback restores
+    # NULL). So visit the states that set the FEWEST names first, and if a
+    # later state omits a name an earlier one already wrote, abstain rather
+    # than observe a session we cannot actually build — reporting `no rows`
+    # there produced a MISMATCH against a correct proof.
+    written: set[str] = set()
+    for state in sorted(guc_states or ({},), key=lambda st: (len(st), sorted(st))):
+        stale = written - set(state)
+        if stale:
+            raise _ProbeAbstain(
+                "cannot reconstruct this anonymous session: "
+                f"{', '.join(sorted(stale))} was set for an earlier login path "
+                "and a custom GUC cannot be unset within a session"
+            )
+        written |= set(state)
+        for n in names:
+            if n not in state:
+                # Not set on this login path. Leave it alone rather than
+                # writing '': that is a VALUE, not NULL, and it cannot be
+                # undone within the session (measured), so writing it would
+                # destroy an `IS NULL` leak the prover legitimately found.
+                continue
+            raw = state[n]
+            value = inherited[n] if raw is None or is_maybe_set(raw) else str(raw)
+            cur.execute(f"SELECT set_config({_sql_str(n)}, {_sql_str(value)}, true)")
+        for guc, _val in _ANON_KEY_SESSION_GUCS:
+            cur.execute(
+                f"SELECT set_config({_sql_str(guc)}, '', true) "
+                f"WHERE current_setting({_sql_str(guc)}, true) IS NOT NULL"
+            )
+        seen = _row_count(cur.connection, query)
+        if seen == 0:
+            for guc, val in _ANON_KEY_SESSION_GUCS:
+                cur.execute(
+                    f"SELECT set_config({_sql_str(guc)}, {_sql_str(val)}, true)"
+                )
+                if claims_written is not None:
+                    # Poisoned for the REST OF THE RUN: `ROLLBACK TO
+                    # SAVEPOINT` restores a placeholder GUC to `''`, never to
+                    # NULL (measured), and `''` is non-NULL. A later table
+                    # whose policy reads this GUC directly can no longer be
+                    # observed in a JWT-less session.
+                    claims_written.add(guc)
+            seen = _row_count(cur.connection, query)
+        if seen > 0:
+            return seen
+    return 0
 
 
 def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
@@ -937,6 +1071,12 @@ def run_probe(
             return _abstain_all(verification, mode, gate_error)
 
         results: list[ProbeResult] = []
+        guc_states = _anon_set_gucs(schema, anon_roles)
+        # Claim GUCs written by an earlier table's anon-key attempt. A
+        # placeholder GUC never returns to NULL in-session — `ROLLBACK TO
+        # SAVEPOINT` restores it to `''` (measured) — so a later table whose
+        # policy reads one DIRECTLY can no longer be observed JWT-less.
+        claims_written: set[str] = set()
         for n, tv in enumerate(verification.tables):
             table = tables.get(tv.qualified_name)
             if table is None:  # pragma: no cover - verification built from schema
@@ -949,7 +1089,10 @@ def run_probe(
                 )
                 continue
             results.append(
-                _probe_one(conn, table, tv, mode, auth_functions, probe_role, n)
+                _probe_one(
+                    conn, table, tv, mode, auth_functions, probe_role, n,
+                    guc_states=guc_states, claims_written=claims_written,
+                )
             )
         return Probe(tuple(results), mode)
     finally:

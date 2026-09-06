@@ -3,7 +3,8 @@
 A read-capable policy (FOR ALL or FOR SELECT) leaks to anonymous if its
 USING predicate is provably, unconditionally TRUE for an unauthenticated
 session — one where every auth-context function (auth.uid / auth.role /
-auth.jwt, current_user, session_user, current_setting) returns NULL. Under
+auth.jwt, current_setting) returns NULL; `current_user` / `session_user` are
+never NULL and are SEC018's subject instead. Under
 SQL three-valued (Kleene) logic a row is visible iff USING evaluates to
 exactly TRUE; NULL and FALSE both hide the row. SEC038 proves the property
 with Z3.
@@ -14,7 +15,12 @@ SEC038 catches the inverted-auth variants that shape misses:
 
     NOT (auth.uid() IS NOT NULL) OR <real check>   -- NOT-wrapped
     (auth.uid() IS NULL)::bool   OR <real check>   -- cast-wrapped
-    (SELECT current_setting('app.user'))::uuid IS NULL OR <real check>
+    (SELECT current_setting('app.user', true))::uuid IS NULL OR <real check>
+
+(The one-argument `current_setting(name)` and the `(name, false)` form
+raise on an unset GUC rather than returning NULL, so their `IS NULL`
+disjunct is dead and does not fire — the same never-NULL treatment as
+SEC004.)
 
 In each case, under an anonymous session the inverting disjunct is TRUE for
 *every* row, so the policy reads all rows — the Lovable-CVE catastrophic
@@ -51,8 +57,9 @@ Configuration: `[lint.rules.SEC038]` accepts:
 
   - `auth_functions` (list[str]) — the function names treated as
     anonymous-NULL under an unauthenticated session. Replaces the default
-    `["auth.uid", "auth.role", "auth.jwt", "current_user", "session_user",
-    "current_setting"]`. Mirrors SEC004's option so the two rules stay
+    `["auth.uid", "auth.role", "auth.jwt", "current_setting"]`
+    (`current_user` / `session_user` are never NULL — SEC018 covers them).
+    Mirrors SEC004's option so the two rules stay
     consistent.
   - `allowlist` (list[str]) — `schema.table.policy` IDs to exempt
     (intentional public-data tables, audit fallbacks, etc.).

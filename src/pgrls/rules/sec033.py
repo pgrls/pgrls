@@ -29,7 +29,7 @@ Both patterns capture the realistic shapes:
     USING (auth.jwt() -> 'user_metadata' ->> 'role' = 'admin')
     USING ((auth.jwt() #>> '{user_metadata,role}') = 'admin')
     USING (raw_user_meta_data ->> 'role' = 'admin')
-    USING (current_setting('request.jwt.claim.user_metadata')...)
+    USING (current_setting('request.jwt.claims', true)::jsonb -> 'user_metadata' ->> 'role' = 'admin')
 
 The string-const path catches the JSON-key form regardless of which
 JSON operator was used; the column-ref path catches the direct

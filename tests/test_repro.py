@@ -955,3 +955,93 @@ def test_write_repro_is_sound_live(pg_url: str) -> None:
     assert _run_write_insert(pg_url, fixed) is False, (
         "fixed write policy admitted the tenant-B INSERT — the repro is unsound"
     )
+
+
+def test_anon_repro_sets_the_anon_key_claims_when_only_that_session_leaks() -> None:
+    """`USING (auth.role() = 'anon')` leaks only for a Supabase anon-key caller.
+    A JWT-less script (role claim cleared) reads zero rows there and the
+    emitted pytest would FAIL while the leak exists — so the emitter re-asks
+    the prover which session leaks and sets that session's claims."""
+    from pgrls.ast_utils import parse_expr
+    from pgrls.model import Policy, Table
+    from pgrls.repro import _build_statements
+
+    auth = {"auth.uid", "auth.role", "auth.jwt", "current_setting"}
+    table = Table(schema="public", name="docs", rls_enabled=True, force_rls=True, columns=("id",), policies=())
+
+    def stmts(sql: str) -> list[str]:
+        pol = Policy(name="p", command="SELECT", permissive=True, roles=("anon",),
+                     using_sql=sql, with_check_sql=None, using_ast=parse_expr(sql), with_check_ast=None)
+        return _build_statements(table, pol, {}, "repro_docs", auth)[0]
+
+    key_session = stmts("auth.role() = 'anon'")
+    assert any("set_config('request.jwt.claim.role', 'anon', true)" in s for s in key_session)
+    assert any('"role":"anon"' in s for s in key_session)
+
+    # …and the JWT-less session leaves them UNSET rather than writing `''`,
+    # which is a VALUE and would make `current_setting(..., true) IS NULL`
+    # FALSE — measured: the emitted script then returned 0 rows against a live
+    # 2-row anonymous read.
+    jwtless = stmts("auth.uid() IS NULL OR owner_id = auth.uid()")
+    assert not any(
+        "set_config('request.jwt" in s and not s.lstrip().startswith("--")
+        for s in jwtless
+    )
+    assert any("claim GUCs stay UNSET" in s for s in jwtless)
+    assert not any("'anon', true" in s for s in jwtless)
+
+
+def test_repro_leaves_an_unattributable_guc_unset() -> None:
+    """A `MAYBE_SET` GUC is one the prover modelled with BOTH the value and
+    the null-flag free. Writing any value into the reproduction pins it
+    non-NULL and kills an `IS NULL` disjunct the leak may ride on — the
+    emitted script then returned zero rows against a real leak."""
+    from pgrls.model import MAYBE_SET
+    from pgrls.repro import build_repro
+
+    pol = _policy("current_setting('app.gate', true) IS NULL")
+    art = build_repro(
+        _table(pol, columns=_COLS), pol, {}, None,
+        guc_states=({"app.gate": MAYBE_SET},),
+    )
+    executable = [
+        line for line in art.sql.splitlines()
+        if "set_config('app.gate'" in line and not line.lstrip().startswith("--")
+    ]
+    assert executable == []
+    assert "could not be attributed to the server" in art.sql
+
+    # A genuinely server-set GUC whose value was not captured still gets a
+    # placeholder to edit — that one IS definitely set.
+    art_none = build_repro(
+        _table(pol, columns=_COLS), pol, {}, None,
+        guc_states=({"app.gate": None},),
+    )
+    assert [
+        line for line in art_none.sql.splitlines()
+        if "set_config('app.gate'" in line and not line.lstrip().startswith("--")
+    ]
+
+
+def test_repro_jwt_less_session_leaves_the_claim_gucs_unset() -> None:
+    """`''` is a VALUE, not NULL. Writing it into `request.jwt.claim.sub`
+    makes `current_setting(..., true) IS NULL` FALSE and kills the very gate
+    the leak rides on — measured: the emitted script returned 0 rows against a
+    live 2-row anonymous read, so the generated pytest failed against a real
+    leak. A throwaway database already has the claim GUCs unset, which is
+    exactly what a JWT-less session looks like."""
+    from pgrls.repro import build_repro
+
+    pol = _policy("current_setting('request.jwt.claim.sub', true) IS NULL")
+    art = build_repro(_table(pol, columns=_COLS), pol, {}, None)
+    executable = [
+        line for line in art.sql.splitlines()
+        if "set_config('request.jwt" in line and not line.lstrip().startswith("--")
+    ]
+    assert executable == []
+    assert "claim GUCs stay UNSET" in art.sql
+
+    # The anon-KEY session still gets its claims set — that leak needs them.
+    anon_key = _policy("auth.role() = 'anon'")
+    art_key = build_repro(_table(anon_key, columns=_COLS), anon_key, {}, None)
+    assert "set_config('request.jwt.claim.role', 'anon', true);" in art_key.sql

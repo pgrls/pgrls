@@ -1,7 +1,7 @@
 """SEC012 — Table has only RESTRICTIVE policies (silent deny-all).
 
-Postgres composes RLS policies as `permissive_or | (restrictive_and
-& restrictive_and ...)`: a row is visible iff at least one PERMISSIVE
+Postgres composes RLS policies as `permissive_or & restrictive_and_1
+& restrictive_and_2 ...`: a row is visible iff at least one PERMISSIVE
 policy matches AND every RESTRICTIVE policy matches. With zero
 PERMISSIVE policies, the disjunction is empty — no row passes,
 regardless of how many RESTRICTIVE policies you've added or what

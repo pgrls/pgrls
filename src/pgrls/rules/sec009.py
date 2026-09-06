@@ -1,7 +1,12 @@
 """SEC009 — RLS enabled but no policies defined.
 
 A table with `relrowsecurity = true` and zero rows in `pg_policy`
-acts as deny-all: every query against it returns no rows. That is
+acts as deny-all for every role RLS applies to: such a query returns
+no rows. The table OWNER is not one of them — it still reads every
+row unless `FORCE ROW LEVEL SECURITY` is set (SEC002) — and neither
+is a `BYPASSRLS` role or a superuser (measured on PG16: 0 rows for a
+grantee, 3 for each of those three). That asymmetry is exactly why
+the "intentional" shape below works. That is
 sometimes intentional — an audit log read only by superusers, a
 soft-deleted "tombstone" table — but far more often it's a forgotten
 step. The migration enabled RLS planning to add policies, then the
@@ -54,7 +59,10 @@ class SEC009:
             message=(
                 f"Table {table.qualified_name} has RLS enabled but "
                 "no policies defined. Postgres treats this as deny-all "
-                "— every query returns zero rows, regardless of role. "
+                "for every role RLS applies to — such a query returns zero "
+                "rows. The table owner still reads every row unless FORCE "
+                "ROW LEVEL SECURITY is set, and a BYPASSRLS role or "
+                "superuser reads it regardless. "
                 "If that's intentional (e.g., a deny-by-default audit "
                 "table), allowlist it in [lint.rules.SEC009]; otherwise "
                 "add the policies the migration was meant to include."

@@ -28,7 +28,10 @@ planner folds ``app.cur_tenant()`` to *that connection's* tenant and caches the
 plan. A *different* user reusing the same pooled backend then runs the cached
 plan and is served the **first user's** rows — RLS silently scopes them to
 someone else's tenant. (Verified live: with the function marked ``IMMUTABLE`` a
-second connection sees the first connection's rows; marked ``STABLE`` it does
+a REUSED PLAN in the same backend serves the first caller's rows to the
+second (a prepared statement, a PL/pgSQL plan cache, or a pooler handing
+the session on) — measured, a genuinely separate backend re-plans and is
+unaffected; marked ``STABLE`` it does
 not.) **The fix is to declare the function ``STABLE``** — a STABLE function is
 re-evaluated per statement execution, so the per-request value is always fresh.
 

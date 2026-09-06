@@ -15,7 +15,9 @@ id, any owner, any value — the write side is wide open.
 
 This is the open-write footgun the existing rules miss:
 
-* **SEC006** fires when `WITH CHECK` is *absent* on a write policy;
+* **SEC006** fires when `WITH CHECK` is *absent* on a write policy and
+  nothing closes the write (INSERT, or UPDATE/ALL with no / constant-true
+  USING);
   here it is present (and wide open).
 * **SEC008** flags a constant-true `USING`; a `FOR INSERT` policy
   has no `USING` at all, and SEC008 says nothing about the write

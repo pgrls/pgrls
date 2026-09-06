@@ -118,9 +118,10 @@ class SEC020:
                 "every row it writes — so the caller can write rows "
                 "into another tenant's space (rows its USING clause "
                 "would never surface) even though it can only read "
-                "its own. Mirror the USING predicate in WITH CHECK, "
-                "or drop the WITH CHECK clause so Postgres reuses "
-                "USING for it. If an intentionally open write side "
+                "its own. Mirror the USING predicate in WITH CHECK "
+                "(ALTER POLICY has no clause-removal syntax, so "
+                "'dropping' the check means DROP POLICY + CREATE "
+                "POLICY). If an intentionally open write side "
                 "is the design, allowlist this policy as "
                 f"{pid!r} in [lint.rules.SEC020]."
             ),

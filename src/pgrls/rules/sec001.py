@@ -14,7 +14,7 @@ ancestor coverage rather than telling them to enable RLS on a table that
 may already be covered upstream.
 
 Direct queries against a child bypass the parent's policies — a security
-caveat documented in `AGENTS.md`. Push a policy onto every child when
+caveat documented in `docs/RULES.md#rule-sec001`. Push a policy onto every child when
 direct access is part of the application's threat model.
 """
 from __future__ import annotations

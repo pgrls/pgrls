@@ -122,9 +122,31 @@ class SEC050:
                 # unscoped. This happens offline when a ``--sql-file`` lints
                 # only ``CREATE POLICY ON storage.objects`` with no
                 # ``CREATE TABLE`` (the table is extension-managed in Supabase).
-                # Abstain rather than false-positive — fail-closed; the rule
-                # still fires against a live database or a captured snapshot,
-                # where ``storage.objects``'s columns are always populated.
+                # Abstain from the per-policy verdict rather than
+                # false-positive — but say so: a silent abstain here was a
+                # false CLEAN on exactly the Supabase-migrations input this
+                # rule exists for, and it did not appear in `skipped_rules`
+                # either. One info note per table, never a per-policy finding.
+                if table.policies:
+                    out.append(
+                        Violation(
+                            rule_id="SEC050",
+                            severity="info",
+                            title=self.title,
+                            message=(
+                                f"{table.qualified_name} has Storage policies "
+                                "but no column list here, so SEC050 cannot "
+                                "tell whether they are scoped to a bucket "
+                                "(offline input without the extension-managed "
+                                "CREATE TABLE). Declare a stub "
+                                "`CREATE TABLE storage.objects (id uuid, "
+                                "bucket_id text, name text, owner uuid);` "
+                                "in the input, or run against a live "
+                                "database / snapshot, to get a verdict."
+                            ),
+                            location=table.qualified_name,
+                        )
+                    )
                 continue
             # A restrictive bucket_id floor confines the whole table to a
             # bucket regardless of the permissive policies — not cross-bucket.
@@ -144,7 +166,7 @@ class SEC050:
                 if clause is None:
                     continue  # nothing to analyze
                 if is_literal_true(clause):
-                    continue  # SEC008 / SEC006 territory
+                    continue  # SEC008 / SEC028 territory
                 if _references_bucket_id(clause, table):
                     continue  # the row-reach clause scopes bucket
                 pid = f"{table.qualified_name}.{policy.name}"

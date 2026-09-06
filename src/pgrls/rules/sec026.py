@@ -217,7 +217,11 @@ def _is_pattern_expr(node: A_Expr) -> bool:
 
 
 # `~` and `!~` are POSIX regex match on text, but they are ALSO the
-# geometric "contains" operator and the ltree/lquery match operator.
+# ltree/lquery match operator. (The geometric `~` "contains" forms were
+# REMOVED in PG14 — measured on PG16, `box ~ box` raises "operator does
+# not exist" — so the geometric entries below are dead on every version
+# pgrls supports; they are kept only so a policy written against PG13 is
+# still parsed rather than mis-flagged.)
 # When SEC026's auth value is cast to (or constructed as) one of these
 # non-text types, the operator is a typed containment/match — not a
 # regex pattern — and the rule must not fire (false positive). The LIKE

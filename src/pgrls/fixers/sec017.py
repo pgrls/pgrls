@@ -67,10 +67,10 @@ class SEC017Fixer:
             if fn.qualified_name in allowlist:
                 continue
             # Abstain on pre-v12 snapshots — signature is "" and a
-            # bare `ALTER FUNCTION name()` would target the zero-
-            # arg overload, wrong for every function with arguments.
-            # The operator re-snapshots to populate signatures.
-            if not fn.signature:
+            # Abstain only when the signature was NOT CAPTURED (a v4-v11
+            # snapshot). An EMPTY signature is a real value — a zero-argument
+            # function — and `ALTER FUNCTION name()` targets it exactly.
+            if fn.signature is None:
                 continue
             # Abstain on pre-v14 snapshots — schema_name/function_name
             # were not captured, and splitting the ambiguous

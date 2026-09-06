@@ -8,6 +8,492 @@ While in 0.x, the public surface is the CLI, the snapshot JSON shape,
 and the `pgrls.toml` configuration schema; minor bumps may include
 breaking changes — they will be called out in this file.
 
+## [Unreleased]
+
+### Changed
+- **Snapshot v26** — adds `views[].direct_references` (the un-collapsed
+  table/view edges a view body reads directly), `views[].column_grants`
+  (column-level grants on views), `views[].owner_is_superuser` (a plain
+  `BYPASSRLS` owner escapes RLS but still needs `SELECT`; a superuser does
+  not), top-level `set_gucs` (dotted GUCs set at database / server level, as
+  `(name, value)`; the value is a sentinel string when the introspecting
+  session could read the GUC but could not attribute it to the server, and a
+  legacy `null` means "set at server level, value uncaptured"),
+  top-level `role_set_gucs` (role-level ones, as `(role, name, value)`), and
+  top-level `role_memberships` (present only when captured from a live
+  database; each edge carries an `inherit` flag).
+  Additive: v3–v25 files still load, and a missing `direct_references` falls
+  back to the collapsed `references`. A missing `role_memberships` keeps the
+  anon prover abstaining on role-scoped policies — but the anonymous-role
+  RLS-exemption check reports "not exempt" there rather than abstaining, the
+  one place absent evidence resolves to a proof. Re-
+  capture `--against` baselines to benefit — re-emitting an old file stamps
+  the new version without adding the graph.
+
+### Fixed
+- **`--mode escalation` was silent on a `SECURITY DEFINER` function owned by
+  the table's own owner — a full anonymous bypass.** RLS exemption is relative
+  to a TABLE: a definer body running as the table owner skips its policies
+  whenever the table is not `FORCE`'d, which `owner_bypasses_rls` (superuser /
+  `BYPASSRLS`) does not capture. Measured: anon read 0 rows directly and every
+  row through such a function while the mode reported "No reachable escalation
+  paths" and exited 0. Snapshot v26 now captures the function's owner, and
+  exemption is decided per read table; a function owned by an unrelated role
+  stays correctly silent.
+- **`--probe`: one table's anon-key attempt poisoned the JWT claim GUCs for
+  every table after it.** `ROLLBACK TO SAVEPOINT` restores a placeholder GUC
+  to `''`, never to NULL (measured), and `''` is non-NULL — so the previous
+  round's guard re-wrote it. A correctly-isolated table probed first turned a
+  reproduced leak on the next table into `no rows` and exit 0, and in the other
+  direction produced a MISMATCH against a correct proof. The probe now records
+  which claim GUCs it has written and abstains, with an explicit reason, for
+  any later table whose policy reads one directly.
+- **`--mode reachability`: a narrow door hid a wider one under the same outer
+  view.** Paths were kept per (outer view, table) with a two-case precedence,
+  so two laundering doors collapsed to whichever was walked first. Measured:
+  adding a narrow door turned a provable LEAK into UNVERIFIED with a
+  factually false detail, and removing it restored the LEAK. Paths are ranked
+  by width now — an exempt owner beats a total laundering door, which beats a
+  partial one.
+- **Both auto-fixers silently skipped every zero-argument function.** Live
+  introspection returns an EMPTY identity-argument list for a no-arg function,
+  which the pre-v12 "signature not captured" guard could not tell apart from a
+  missing one — so `ALTER FUNCTION name()`, the exactly-correct target, was
+  never emitted. Measured: lint reported findings for both a zero-arg and a
+  one-arg function while `fix` emitted only the one-arg statement. "Not
+  captured" is now `null` and distinct from the empty string.
+- **The "does anon already read every row" check ignored RESTRICTIVE
+  policies, so both cedes cleared a wide-open door.** Postgres ANDs every
+  applicable restrictive policy on top of the permissive one, but the check
+  looked only at permissive ones — so `USING (true)` under a restrictive
+  tenant filter was judged "anon reads everything". Measured: anon read 1 row
+  directly and 2 through a definer view over it, while `--mode reachability`
+  reported PROVEN and exited 0. A differential fuzz over 2592 schema
+  combinations counted 204 false clears, every one involving a restrictive
+  policy, and 0 after the fix. Anon-reachable floors are composed in now, and
+  a floor that cannot be modelled means the cede is declined.
+- **`--mode escalation` ceded without checking anon can read the table at
+  all.** `--mode anon` decides what the predicate admits and never checks
+  privileges, so a `USING (true)` table with no grant to anon is `permission
+  denied` on a direct read while an anon-callable `SECURITY DEFINER` function
+  over it returned every row — the SEC042 threat, reported PROVEN. The
+  reachability cede already carried this guard; escalation now does too.
+- **A `SECURITY DEFINER` function reachable only through role membership was
+  invisible.** The candidate gate intersected `EXECUTE` grantees with
+  `{anon, PUBLIC}` literally, while every other anonymous check in the module
+  expands the role graph. Measured: with `GRANT readers TO anon` and EXECUTE
+  granted only to `readers`, anon called the function and read every row while
+  `--mode escalation` reported "No reachable escalation paths".
+- **`--probe` and `--emit-repro` wrote `''` into the JWT claim GUCs,
+  destroying the `IS NULL` gate they were sent to confirm.** `''` is a value,
+  not NULL — the same fact already documented for custom GUCs — and a policy
+  can read those claim GUCs directly rather than through pgrls's own stubs.
+  Measured: a live 2-row anonymous read came back as `no rows` / MISMATCH from
+  the probe, and the emitted reproduction returned 0 rows so its generated
+  pytest failed against a real leak. The probe now clears a claim GUC only
+  where it is already non-NULL, and a JWT-less reproduction leaves them unset,
+  which is what a throwaway database gives.
+- The ∀ cede is memoized per table: asking it once per door (and per
+  function-table pair) was a 4.7x slowdown on a 50-table schema.
+- **The SEC015 auto-fix left the vulnerability open and then reported it
+  resolved.** For a function with no pinned path the fixer emitted
+  `SET search_path = pg_catalog, pg_temp`, described as "minimal-but-safe".
+  It is not: an unqualified name the body reads is not in `pg_catalog`, so
+  resolution falls straight through to `pg_temp` — which the attacker writes.
+  Measured on PG16 with a `SECURITY DEFINER` function reading an unqualified
+  `secrets`, a planted `pg_temp.secrets` was returned *after* applying the
+  fix. It now emits `pg_catalog, <the function's own schema>, pg_temp`
+  (measured: the real table), and the docs frame the residual third-schema
+  case as a security precondition rather than a functionality caveat.
+- **SEC040 fired on a live database for the hardened NULL-safe write check its
+  own documentation says is not flagged.** `pg_get_expr` deparses `a IS NOT
+  DISTINCT FROM b` as `NOT (a IS DISTINCT FROM b)`, which the equality matcher
+  did not recognise — so the same DDL was clean read offline and a false
+  positive read from the catalog. The deparsed form is matched now.
+- **Five more rules stated Postgres semantics backwards**, all in text
+  `pgrls explain` prints. `REFRESH MATERIALIZED VIEW` runs the body as the
+  matview's **owner**, not as whoever issues the command (measured: the same
+  superuser refresh captured a different tenant's rows after `ALTER
+  MATERIALIZED VIEW … OWNER TO`) — corrected in ten places including three
+  runtime messages, and VIEW003's "refresh as a per-tenant role" remedy
+  replaced, since a non-owner cannot issue the command at all. `SECURITY
+  DEFINER` re-scopes RLS to the function owner rather than bypassing it
+  (measured: 1 of 3 rows for an ordinary owner). A missing `WITH CHECK` does
+  NOT default to `true` — a clause-less `FOR INSERT` policy *rejects* the
+  insert and a clause-less `FOR UPDATE` reports `UPDATE 0`, so SEC006's
+  diagnosis was inverted. `IS NOT DISTINCT FROM` does not expose NULL rows to
+  every tenant (`NULL IS NOT DISTINCT FROM 1` is FALSE); the `OR IS NULL` and
+  `COALESCE` forms do. And a `(SELECT <volatile>)` wrapper *is* hoisted to an
+  InitPlan and runs once per statement — which is the real argument for
+  PERF002, not the "re-runs per row regardless" the docs claimed.
+- Remediation that would fail if copy-pasted: SEC020's "drop the WITH CHECK
+  clause" (`ALTER POLICY` has no clause-removal syntax), SEC053's
+  "`security_invoker` view" (an invoker view needs the caller to hold the very
+  grant being revoked), and `--emit-repro`'s "uncomment" hint, which was not
+  on its own line.
+- **An empty leak witness was read as "every anonymous session reads
+  everything", when it only means the FIRST session that leaked did — so both
+  `--mode reachability` and `--mode escalation` cleared open doors.** The anon
+  prover asks the ∃ question (a leak in any modelled session is a leak) and
+  returns that session's witness. `USING (auth.role() = 'anon')` is total for
+  the Supabase anon-key caller and admits *nothing* to a JWT-less one, so a
+  definer view over it — and an anon-callable `SECURITY DEFINER` function over
+  it, the SEC042 threat exactly — handed a JWT-less anonymous caller every row
+  while the direct read gave none, and both modes reported PROVEN and exited
+  0. Worse, `--against` credited the regression as a fix. Both cedes now ask
+  the ∀ question (`anon_leak_is_total`): the direct read must already return
+  every row in *every* modelled session.
+- **`--probe` left a GUC from one login path standing for the next, then
+  reported `no rows`.** A custom GUC written once cannot be unset within the
+  session (measured: not by `RESET`, `set_config(..., NULL, ...)`, a savepoint
+  rollback, or a full rollback), so a login role sorting before `anon` poisoned
+  `anon`'s state — the probe missed a live read and exited 0, and on the
+  decidable variant contradicted a correct proof with a MISMATCH. States are
+  now visited fewest-settings-first, and a state that cannot be reconstructed
+  abstains instead of being observed wrongly.
+- The unattributable-GUC sentinel now carries the value the introspecting
+  session observed, so `--emit-repro` offers it as a one-line uncomment rather
+  than a `<value>` placeholder, and it no longer embeds a literal NUL — which
+  `jsonb` rejects, making a snapshot from such a cluster unstorable in a
+  `jsonb` column. `--emit-repro` also says which reason left the directory
+  empty instead of attributing every case to an anonymous-role RLS exemption.
+- **Two rules stated Postgres semantics backwards, in text `pgrls explain`
+  prints to users.** SEC013 said a trigger fires as the table owner regardless
+  of `prosecdef` — measured, an invoker-side trigger function runs as the
+  CALLER, and `SECURITY DEFINER` is exactly what decides the bypass. SEC009
+  said RLS with no policies denies "regardless of role" — measured, the owner
+  reads every row without `FORCE`, as do `BYPASSRLS` roles and superusers,
+  which is precisely what makes the rule's own "audit log read only by
+  superusers" example work. VIEW001 claimed a definer view bypasses RLS
+  unconditionally (it does so only when the owner is exempt or the table is
+  not `FORCE`'d); VIEW002 claimed a caller predicate can be evaluated before
+  the base table's RLS qual (it cannot — those are security quals, applied
+  first; the exposure is the view's own filtering); HYG001 claimed Postgres
+  permits dropping a policy-referenced column (it refuses, and `RENAME`
+  rewrites the policy); SEC012's composition formula used OR where AND
+  belongs; and SEC016's `row_security = off` exemption named ownership when
+  `FORCE` is what decides. All rewritten around measured behaviour.
+- **`--probe` could never reproduce a leak that rides on an unset GUC, and
+  reported MISMATCH against its own correct verdict.** To build an anonymous
+  session it wrote `set_config(<guc>, '', true)` for every GUC the policy
+  reads. For a custom dotted GUC that is an empty *string*, not NULL —
+  measured on PG16, and neither `RESET` nor `set_config(..., NULL, ...)` gets
+  NULL back within the session — so it destroyed the very condition a
+  `current_setting('app.gate', true) IS NULL` policy leaks through. It now
+  clears only the JWT-claim GUCs (read through `NULLIF(..., '')`, where empty
+  and unset are the same value) and leaves a directly-read GUC alone. The
+  same policy that reported `MISMATCH` now reports `LEAK CONFIRMED`.
+- **`--emit-repro` wrote a script that could not reproduce, for a GUC whose
+  value could not be attributed to the server.** That state is modelled with
+  both the value and the null-flag free; emitting `set_config(name,
+  'REPLACE_ME')` pinned it non-NULL and killed the `IS NULL` disjunct the leak
+  rode on, so the generated pytest failed against a real leak. The GUC is now
+  left unset, with a note saying how to set it if your callers do have it.
+- **`--mode reachability` returned `UNVERIFIED` with a false reason for a
+  laundering door over a table anon cannot read.** The verdict asserted "the
+  table already leaks some rows to anon directly", which is untrue when anon
+  holds no privilege on it — measured: the direct read is `permission denied`
+  while the view returns the policy-admitted row, so every row the door
+  returns is one the direct read withholds. That case is now a `leak`.
+- `Verification.summary` counted one table behind three views as three
+  verdicts against one table; `diff_verifications` keyed on the table name
+  alone, so reachability's per-door entries collapsed and a change that closed
+  one door while opening another could be classified pre-existing rather than
+  new; the anon-exemption finding now names the role that is actually exempt
+  rather than every configured one; the cede prefers a total leak over a
+  partial one instead of depending on policy order; and `--emit-repro` now
+  says why an anon-exemption leak produces no artifact.
+- **A superuser role was captured only if it *also* carried `BYPASSRLS`, so
+  `verify --mode anon` proved isolation against a role Postgres never
+  checks.** A superuser bypasses RLS through `rolsuper` alone — measured on
+  PG16: a `LOGIN SUPERUSER` with `rolbypassrls = false` read every row of a
+  `FORCE`'d table, while the capture query's `WHERE rolbypassrls` filter
+  skipped it entirely. Roles exempt from RLS are now captured on either
+  attribute. SEC016 and SEC023 already skip superusers explicitly, so no
+  rule's output changes. `pgrls matrix` does widen — it lists RLS-exempt roles
+  as columns and marks their cells bypassing, so an ordinary superuser now
+  appears there — which is the correct answer for a table that claims to show
+  who can read what.
+- **`verify --mode anon` proved isolation while a live anonymous login read
+  every row, because the anon role's own RLS exemption was never modelled.**
+  The prover reasoned only about the predicate. If the anonymous role holds
+  `BYPASSRLS`, or holds the table owner's privileges on a table that is not
+  `FORCE`'d, Postgres never consults the policies at all — measured on PG16:
+  with `GRANT plainowner TO anon` a real anon session read both tenants' rows
+  while the flagship default mode printed `PROVEN` and exited 0. The check now
+  runs ahead of the predicate work, including on tables with no policies at
+  all (RLS-on-with-no-policy is default-deny for everyone *except* an exempt
+  role). `FORCE` and a `NOINHERIT` membership both correctly stay proven
+  (measured: 0 rows and `permission denied`).
+- **A view an anonymous role can open through `pg_read_all_data`, ownership or
+  an inherited grant was invisible, so every mode reported clean.** Anon
+  selectability was decided from explicit grants alone; measured, a view whose
+  `relacl` is `NULL` returned every row to an anon role holding
+  `pg_read_all_data` while `anon`, `reachability` and `escalation` all exited
+  0. It now asks the same privilege question the view-owner check asks.
+- **The reachability cede accepted a column-only grant and a `NOINHERIT`
+  membership as "anon can already read the table".** Both are false: a
+  `GRANT SELECT (id)` leaves the secret column `permission denied` on a direct
+  read while the definer view hands it over, and a `NOINHERIT` member holds
+  none of the granted role's privileges (measured, both). The cede now
+  requires a table-level `SELECT` reachable through INHERIT edges only.
+- **A GUC the introspecting connection set for itself was recorded as
+  server-level, which could prove an `IS NULL` gate dead.** Recording a name as
+  definitely-set is stronger than the evidence when the value may have come
+  from `PGOPTIONS`; measured, `PGOPTIONS='-c app.gate=whatever' pgrls verify`
+  turned a real `LEAK` into `PROVEN` on the SEC004 inverted-gate shape. Such
+  names now carry a third state — readable, but not attributable to the server
+  — under which the prover keeps both the value and the null-flag free, so it
+  can decline but never conclude.
+- **`verify` crashed with an uncaught Z3 parser error on `Infinity` / `NaN`,
+  and folded out-of-range integers into a leak it could not exhibit.**
+  `'Infinity'::float8` is a valid Postgres value that `z3.RealVal` cannot
+  parse, and Python's unbounded `int()` accepted `'99999999999999999999'` for
+  an `int4` column — the witness then named a row whose `INSERT` the emitted
+  reproduction rejected with "integer out of range". Folds are now range-
+  checked against the actual integer width and rejected for non-finite floats.
+- `--mode reachability` counted one table behind three views as three tables in
+  its summary; an undecidable hop enumerated only direct table references, so a
+  nested view beneath it produced no verdict; and a door reported over a table
+  anon cannot read said "including the rows the direct anon leak withholds",
+  which contradicts the anon verdict it composes with.
+- **A custom GUC set on the postmaster command line was invisible, so the
+  prover claimed PROVEN.** `postgres -c app.x=v` — the docker-compose
+  `command:` / Kubernetes `args:` idiom — appears in neither `pg_settings` nor
+  `pg_file_settings`, yet every session reads it (measured on PG16: the value
+  comes back from `current_setting` while both catalogs have zero rows). The
+  introspection session is now asked about every dotted GUC the policies read,
+  always rather than only when `pg_file_settings` is unreadable. Names no
+  catalog explains are recorded as set-with-unknown-value — see the later
+  entry in this section, which replaced that state after it turned out to be
+  able to prove an `IS NULL` gate dead.
+- **GUC precedence tiers were collapsed, so the prover compared against a value
+  no session ever sees.** `ALTER ROLE x IN DATABASE d SET`, `ALTER ROLE x SET`,
+  `ALTER DATABASE d SET` and `ALTER ROLE ALL SET` were stored alike, letting
+  the lexicographically-last value win. With the real value at one tier and a
+  decoy at another, `verify --mode anon` returned PROVEN on a policy a live
+  anonymous session read a row through. Postgres's order was measured by
+  stripping one tier at a time; the most specific now wins, as it does in the
+  server.
+- **`verify --mode reachability` went silent when a view owner held `SELECT`
+  through `pg_read_all_data`.** That predefined role confers read on everything
+  with no grant of its own, so the new base-table readability check judged the
+  path dead and reported nothing at all — measured: swapping a direct grant for
+  the role membership left anon reading every row through the same view.
+- **`verify --mode reachability` cleared a real door by ceding to `--mode
+  anon`.** "The table already leaks every row to anon, so the view exposes
+  nothing new" rests on the anon prover, which decides whether the *predicate*
+  admits rows and never whether anon holds `SELECT`. A `USING (true)` table
+  with no grant to anon is `permission denied` on a direct read while the
+  definer view over it returns everything (measured), so the cede is now gated
+  on anon actually being able to open the table.
+- **`pgrls snapshot` and `verify` could abort with `permission denied for
+  function pg_show_all_file_settings`.** The privilege gate asked whether the
+  connection may read the `pg_file_settings` view; the view's ACL and the
+  underlying set-returning function's `EXECUTE` are separate, so a DBA who
+  granted the view directly broke the whole command. Both are checked now.
+- **`security_invoker = true` on an inner view was modelled as inheriting the
+  enclosing definer view's owner.** It resets to the SESSION user instead —
+  measured three ways: a definer view owned by a `BYPASSRLS` role over an
+  invoker view returned the policy-filtered row rather than every row, the same
+  chain owned by the table owner did too, and revoking the anonymous caller's
+  own `SELECT` on the table denied the read outright. The old model reported a
+  leak the tool could not exhibit.
+- **`--emit-repro` still wrote a non-reproducing script when the GUC read went
+  through a numeric cast.** `col = current_setting('app.n')::int` made the
+  captured value opaque again, so the leak degraded to "conditional" and the
+  emitted script seeded a placeholder row the policy does not admit — the
+  generated pytest failed against a real leak. A captured value that Postgres
+  could cast is folded to the constant, so the witness pins the row; a value
+  that would not cast stays opaque.
+- **A pre-reshape v26 snapshot decoded into a fabricated GUC.** Slicing
+  `p[0]`/`p[1]` off the old bare-string shape took *characters*, so
+  `app.tenant` became a GUC named `a`; and a missing role-level value defaulted
+  to `""`, a real value the prover can decide against — enough to turn a leak
+  into a false PROVEN. Both shapes decode correctly, with `None` for an
+  uncaptured value.
+- A matview hop enumerated only its direct table references, so a matview
+  reading through another view produced no verdict for the table beneath it;
+  `--mode reachability` with no findings no longer reports "No RLS-enabled
+  tables to verify" when there are such tables but no view path; `--probe`
+  restores each GUC's inherited value between login-path states instead of
+  leaving the previous state's; and an empty `identity_columns` list falls back
+  to the default axis set rather than silently making every cross-tenant table
+  unverified and exiting 0.
+- **`verify --mode anon` read role-level GUC settings off the wrong end of the
+  role graph.** `ALTER ROLE … SET app.x` binds to the role that **logs in**,
+  and membership does not propagate it. The first cut walked the closure
+  upward from `anon`, which got both directions wrong: it counted `ALTER ROLE
+  readers SET app.tenant` with `GRANT readers TO anon` (a fresh `anon` session
+  reads nothing — measured 0 rows) and missed PostgREST's own shape, `ALTER
+  ROLE authenticator SET app.tenant` with `GRANT anon TO authenticator`, where
+  the login role's setting is still in force after `SET ROLE anon` (measured: 1
+  row through the canonical `tenant = current_setting('app.tenant')` policy,
+  reported `PROVEN`). The prover now checks one GUC state per **login path** —
+  `anon` itself and every role that can `SET ROLE` to it — and a leak in any
+  state is a leak.
+- **A custom GUC set in `postgresql.conf` was invisible.** Postgres registers
+  custom placeholders `GUC_NO_SHOW_ALL`, so `pg_settings` has *zero* rows for
+  a conf-level `app.x` that every session can nonetheless read — the first cut
+  queried exactly that view and captured nothing. Server-level values now come
+  from `pg_file_settings` — see the earlier entry in this section, which
+  removed the "only when that view is unreadable" condition on the session
+  probe after a postmaster command-line GUC turned out to appear in no
+  catalog at all.
+- **A set GUC was treated as "some non-null value", so a configuration that
+  cannot satisfy the policy still reported a LEAK.** Values are captured now:
+  `ALTER DATABASE … SET app.flag = 'off'` against `USING (current_setting(
+  'app.flag') = 'on')` is `PROVEN` (measured: 0 rows) instead of a false leak,
+  and a leak that *is* real carries the configured value in its witness row.
+- **`verify --mode reachability` was silent on an inherited-ownership hop and
+  wrong about `BYPASSRLS`.** A view whose owner holds the *inner* view's
+  owner's privileges reads it with no grant at all, but the hop check looked
+  only for an explicit grant and treated the path as dead (measured: every row
+  came through). Separately, `owner_bypasses_rls` conflated superuser with
+  plain `BYPASSRLS`: only the former escapes the privilege check, so a
+  `BYPASSRLS` non-superuser view owner without `SELECT` on the base table is
+  `permission denied` (measured) and is no longer reported. The base table's
+  readability is now checked at the end of every path, and an undecidable hop
+  reports `UNVERIFIED` instead of guessing.
+- **A definer view over a materialized view was passed in silence.** A matview
+  holds rows captured at REFRESH time under the matview owner's RLS context,
+  which the prover does not model — and a definer view over a
+  superuser-refreshed one handed anon every row (measured). That path is now
+  `UNVERIFIED` rather than skipped.
+- **A laundering door was reported as wide as the view, not as wide as the
+  grant.** A definer view whose owner is admitted only *some* rows by the
+  table's own policies, over a table that already leaks *some* rows to anon
+  directly, was a second `LEAK`; measured, both reads returned the same single
+  row. It is `UNVERIFIED` when anon can actually read the table — the view may
+  expose nothing new — and a laundering leak carries the owner-session witness
+  rather than claiming every row. (Where anon holds no table-level `SELECT` it
+  stays a `LEAK`; see the earlier entry in this section.)
+- **The laundering check evaluated GUCs as the view's owner, not the caller.**
+  Inside a definer view body `current_setting()` still reads the *caller's*
+  session, so the anonymous session's inherited settings decide it.
+- **`--emit-repro` emitted a reproduction that did not reproduce, and
+  `--probe` abstained, on the commonest policy shape of all.** A witness
+  pinned a column's value but not its 3VL null-flag, so `<column> =
+  <constant>` — the shape an inherited `current_setting` reduces to — was
+  downgraded to "a conditional leak, no single row characterizes it". The
+  emitted script then seeded a placeholder row the policy does not admit (the
+  generated pytest *failed* against a real leak) and the probe had no row to
+  pivot on. A pinned value implies a non-null column, so both are pinned now:
+  the verdict reads `a row with tenant='shared' is anonymously readable`, the
+  generated pytest passes, and `--probe` reports `LEAK CONFIRMED`.
+  Reproductions also re-establish the inherited-GUC session they need, and the
+  probe replays configured values instead of clearing them.
+- **`SEC021` (and `SEC030`/`SEC040`, which share its column set) fired on
+  ambiguous bare names.** Widening the set to serve the cross-tenant prover's
+  tenant-axis gate also widened three lint rules, so `project = 'default'`
+  beside a real `user_id = auth.uid()` scope became an `info` finding. The two
+  uses are now separate sets: the rules keep the unambiguous spellings (20
+  names), the prover keeps the wider axis set (28).
+- **`verify --mode anon` proved "no anonymous read" on a policy that grants
+  anon by role name.** The anon model was "every auth function is NULL" — a
+  JWT-less session. A Supabase **anon-key** caller is different: PostgREST sets
+  `request.jwt.claims = {"role":"anon"}`, so `auth.role()` is the string
+  `'anon'`, never NULL, and `USING (auth.role() = 'anon')` — encoded as
+  `NULL = 'anon'` → UNKNOWN → UNSAT — was **PROVEN** while reading every row
+  for a real anon-key caller (measured on PG16 with Supabase's own
+  `auth.role()`). No lint rule catches the shape either (SEC003 needs PUBLIC,
+  SEC037 flags only unknown names). The prover now models BOTH sessions and a
+  leak under either is a leak; `= 'authenticated'` stays isolated, so nothing
+  floods. `--probe` tries the anon-key session too, so it confirms the leak
+  instead of contradicting a correct verdict, and `--emit-repro` establishes
+  whichever anonymous session exhibits the leak. Pinned in the verdict corpus.
+- **`verify --mode reachability` was silent on two live-verified view
+  bypasses.** (1) A view owned by an INHERIT *member* of the table owner is
+  owner-equivalent (Postgres's `has_privs_of_role`) and reads every row; the
+  gate compared owner names only. (2) `outer(invoker off, owner A, anon
+  SELECT) → inner(invoker off, superuser owner, no anon grant) → T`: T's RLS is
+  evaluated as the owner of the nearest enclosing definer view — the
+  superuser — but the collapsed `View.references` lost the hop, and neither
+  view alone qualified. Snapshot **v26** adds `View.direct_references`; the
+  walk now follows each hop, an invoker-ON outer over an invoker-OFF inner
+  still leaks, and when the membership graph is not captured the verdict is
+  `unverified` rather than silence. Three more doors from the second review
+  round, each measured: a view granted to a role *anon is a member of*, a
+  view opened by a **column-level** `SELECT` grant (`View.column_grants`,
+  v26), and a definer view whose owner is not exempt but is granted every row
+  by the table's own policies (the owner **launders** them — decided by asking
+  the anon prover with the owner as the session role). And two false
+  positives removed: a `NOINHERIT` member of the table owner is not
+  owner-equivalent (`RoleMembership.inherit`, v26), and a hop the effective
+  owner cannot `SELECT` is a dead path.
+- **`verify --against <snapshot>` classified a role widening as
+  "pre-existing".** The role-membership graph was live-only, so a snapshot
+  base with `TO authenticated USING (true)` was `unverified` (reachability
+  undecidable) and a head that widened to `TO PUBLIC` could never be a *new*
+  leak. Snapshot v26 serializes `role_memberships` (absent → still "not
+  captured"), so the base proves isolated and the widening fails the gate.
+- **The SEC019 auto-fixer could broaden access.** Rewriting one-argument
+  `current_setting(name)` (raises when unset — fails closed) to the
+  two-argument NULL-returning form is behaviour-preserving in a comparison,
+  but under `IS NULL`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM`, `CASE`
+  or `NOT` it can admit a row: `current_setting('app.t') IS NULL OR …` went
+  from an error to a TRUE disjunct, and an anonymous session read every row
+  (measured); the second review round found `IS NOT FALSE`, `GREATEST` and
+  `= ANY (ARRAY[…])` within hours, so the fixer no longer denylists unsafe
+  constructs — it rewrites only the one provably row-hiding shape (a direct
+  comparison operand under an AND-only chain) and leaves everything else for
+  review. It also no longer rewrites a user-defined `myschema.current_setting(...)` the rule
+  does not flag.
+- **A database- or role-level custom GUC defeated the anon prover's
+  unset-GUC assumption.** `ALTER DATABASE … SET app.tenant_id = 'shared'`
+  makes `current_setting('app.tenant_id')` readable for a fresh anonymous
+  session (measured: 1 row), yet the canonical tenant policy stayed PROVEN
+  and `--probe` cleared the GUC to `''` before looking. Snapshot v26 captures
+  `set_gucs` (dotted names set at database / server level) and
+  `role_set_gucs` (role-level; see the earlier entry in this section for which
+  roles' settings an anonymous session actually inherits); names are
+  casefolded (GUC names are case-insensitive, `setconfig` is not). The
+  prover treats a read of one as a real value in every spelling — one-arg,
+  `(name, false)` and the canonical `(name, true)` a first cut missed — and
+  the probe no longer clears it.
+- **`verify --mode cross-tenant` / `write` accepted any `column = <session
+  value>` as the tenant axis.** `status = current_setting('app.status',
+  true)` proved "no cross-tenant read" — `status != session.status` is UNSAT,
+  which says nothing about tenants. The axis must now be an identity /
+  discriminator column (the prover's tenant-axis set — `tenant_id`, `user_id`,
+  `org_id`, `owner_id`, `client_id`, `workspace`, `project`, … — SEC021's
+  default names plus the ambiguous bare spellings SEC021 itself excludes;
+  `[lint.rules.SEC021].identity_columns` is honoured
+  when a `--config` is given, and the `build_verification(identity_columns=…)`
+  Python kwarg overrides it); otherwise the honest verdict is `unverified`.
+- **The offline DDL model dropped `ALTER POLICY … RENAME TO`.** A later
+  `ALTER POLICY <new> ON t USING (true)` then targeted a name the model did
+  not know and the loosening was silently discarded — `pgrls pr` and
+  `lint --sql-file` kept seeing the pre-rename predicate.
+- **`pgrls diff` rated `TO authenticated → TO PUBLIC` as `requires_review`**
+  (disjoint role sets), which passes the default `--fail-on dangerous` gate.
+  Gaining PUBLIC covers every role, anon included: it is now
+  `ROLES_WIDENED` / `dangerous`.
+- **SEC050 abstained silently offline.** On a Supabase migration set — which
+  carries `CREATE POLICY … ON storage.objects` but never the
+  extension-managed `CREATE TABLE` — the rule had no column list, said
+  nothing, and did not appear in `skipped_rules` either: a false clean on
+  the exact input it exists for. It now emits one `info` note per table
+  explaining how to get a verdict (a stub `CREATE TABLE storage.objects`,
+  or a live / snapshot run).
+- **SEC055 flagged `current_setting(name, false)`**, which raises like the
+  one-argument form and is loud, not silent. Only the literal `missing_ok =
+  true` form is the silent one.
+- `pgrls fix` emitted `ENABLE ROW LEVEL SECURITY` twice for a dormant-policy
+  table (SEC001's fixer did not mirror the rule's cede to SEC032), which
+  also double-counted under `--check`.
+- `--emit-repro --mode reachability` silently wrote zero files (the leak is
+  a view path, not a policy); it and `--probe --mode reachability` are now
+  rejected with a clear message.
+- The anon prover now translates a hand-written `x IN (a, b)` (the
+  `--sql-file` spelling) exactly like the `= ANY (ARRAY[…])` the catalog
+  renders it to, instead of abstaining; and the anon-key session recognises
+  the JSON spelling of the role claim (`auth.jwt() ->> 'role'`,
+  `current_setting('request.jwt.claims', true)::jsonb ->> 'role'`).
+- Test hygiene: a live matrix test left a cluster-wide `BYPASSRLS` role
+  behind (order-dependent SEC016 assertions elsewhere); three tests
+  hardcoded `/tmp/x` paths.
+
 ## [0.55.0] - 2026-08-16
 
 ### Added

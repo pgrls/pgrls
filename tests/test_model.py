@@ -78,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 25,
+        "version": 26,
         "tables": [
             {
                 "schema": "public",
@@ -116,6 +116,8 @@ def test_schema_to_snapshot_shape() -> None:
         "immutable_functions": [],
         "owner_reachable_members": [],
         "foreign_tables": [],
+        "set_gucs": [],
+        "role_set_gucs": [],
     }
 
 
@@ -252,7 +254,7 @@ def test_snapshot_version_is_twenty_one_after_owner_capture() -> None:
     # immutable_functions for SEC046; v18 added default_privileges for SEC044;
     # v17 added Table.inherits for SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 25
+    assert snap["version"] == 26
 
 
 def test_snapshot_in_publications_round_trip() -> None:
@@ -837,7 +839,7 @@ def test_v21_table_owner_and_owner_reachable_members_round_trip() -> None:
         ),
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 25
+    assert snap["version"] == 26
     assert snap["tables"][0]["owner"] == "app_owner"
     assert snap["owner_reachable_members"] == [
         {
@@ -909,7 +911,7 @@ def test_v24_foreign_tables_round_trip() -> None:
         ),
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 25
+    assert snap["version"] == 26
     assert snap["foreign_tables"] == [
         {
             "schema": "public",
@@ -1087,8 +1089,13 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "immutable_functions",
         "owner_reachable_members",
         "foreign_tables",
+        # v26 adds the top-level `set_gucs` list (dotted GUCs set at database /
+        # role / server level — the anon prover's unset-GUC assumption boundary)
+        # and, when captured, `role_memberships` (absent on a hand-built Schema).
+        "set_gucs",
+        "role_set_gucs",
     }
-    assert snap["version"] == 25
+    assert snap["version"] == 26
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1407,7 +1414,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 25
+    assert snap["version"] == SNAPSHOT_VERSION == 26
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]
@@ -1434,7 +1441,7 @@ def test_view_grants_round_trip_through_snapshot() -> None:
         grants=(Grant(role="anon", privileges=("SELECT",)),),
     )
     snap = Schema(views=(v,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 25
+    assert snap["version"] == SNAPSHOT_VERSION == 26
     assert snap["views"][0]["grants"] == [
         {"role": "anon", "privileges": ["SELECT"]}
     ]
@@ -1737,3 +1744,59 @@ def test_from_snapshot_rejects_trailing_comment_in_leakproof_signature() -> None
     ]
     with pytest.raises(ValueError, match="signature"):
         Schema.from_snapshot(snap)
+
+
+def test_snapshot_v26_round_trips_role_memberships_and_distinguishes_absent() -> None:
+    """`--against` needs the membership graph to decide anon reachability of a
+    `TO <role>` policy; before v26 it was live-only, so every snapshot baseline
+    was `unverified` there and a head leak was classified pre-existing. Absent
+    key → None (not captured) must stay distinct from an empty graph."""
+    from pgrls.model import RoleMembership, Schema
+
+    edges = (RoleMembership(member="editor", role="authenticated"),)
+    snap = Schema(tables=(), role_memberships=edges).to_snapshot()
+    assert snap["version"] == 26
+    assert snap["role_memberships"] == [
+        {"member": "editor", "role": "authenticated", "inherit": True}
+    ]
+    assert Schema.from_snapshot(snap).role_memberships == edges
+    empty = Schema(tables=(), role_memberships=()).to_snapshot()
+    assert empty["role_memberships"] == []
+    assert Schema.from_snapshot(empty).role_memberships == ()
+    absent = Schema(tables=(), role_memberships=None).to_snapshot()
+    assert "role_memberships" not in absent
+    assert Schema.from_snapshot(absent).role_memberships is None
+
+
+def test_snapshot_v26_round_trips_view_direct_references() -> None:
+    from pgrls.model import Schema, View
+
+    v = View(
+        schema="public", name="v", is_materialized=False, security_invoker=False,
+        security_barrier=False, definition="", references=(("public", "t"),),
+        security_definer_calls=(), direct_references=(("public", "inner"),),
+    )
+    snap = Schema(tables=(), views=(v,)).to_snapshot()
+    assert snap["views"][0]["direct_references"] == [["public", "inner"]]
+    assert Schema.from_snapshot(snap).views[0].direct_references == (("public", "inner"),)
+    del snap["views"][0]["direct_references"]  # pre-v26 payload
+    assert Schema.from_snapshot(snap).views[0].direct_references == ()
+
+
+def test_pre_reshape_v26_set_gucs_decode_without_inventing_a_guc() -> None:
+    """An intra-branch v26 file carried bare name strings for `set_gucs` and
+    two-element pairs for `role_set_gucs`. Slicing p[0]/p[1] off a string took
+    CHARACTERS, so `app.tenant` decoded to a bogus GUC named `a`; and a missing
+    role-level value defaulted to `""`, a real value the prover can decide
+    against — enough to turn a leak into a false PROVEN."""
+    from pgrls.model import SNAPSHOT_VERSION, Schema
+
+    payload = {
+        "version": SNAPSHOT_VERSION,
+        "tables": [],
+        "set_gucs": ["app.tenant"],
+        "role_set_gucs": [["anon", "app.x"]],
+    }
+    schema = Schema.from_snapshot(payload)
+    assert schema.set_gucs == (("app.tenant", None),)
+    assert schema.role_set_gucs == (("anon", "app.x", None),)

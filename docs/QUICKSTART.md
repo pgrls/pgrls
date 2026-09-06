@@ -2,7 +2,7 @@
 
 5 minutes from `pip install` to finding (and fixing) a real Row-Level
 Security bug in CI. For the comprehensive feature tour see
-[README.md](../README.md); for the full rule catalogue see [AGENTS.md](../AGENTS.md).
+[README.md](../README.md); for the full rule catalogue see [docs/RULES.md](RULES.md).
 
 ## 1. Install
 
@@ -18,18 +18,18 @@ If you don't already have a Postgres handy, spin up a one-shot with the
 canonical "policy that ships past code review" baked in:
 
 ```bash
-docker run -d --name pgrls-demo -e POSTGRES_PASSWORD=demo -p 5432:5432 postgres:16
+docker run -d --name pgrls-demo -e POSTGRES_PASSWORD=demo -p 55432:5432 postgres:16
 sleep 3
-psql 'postgres://postgres:demo@localhost/postgres' -v ON_ERROR_STOP=1 <<'SQL'
+psql 'postgres://postgres:demo@localhost:55432/postgres' -v ON_ERROR_STOP=1 <<'SQL'
 CREATE TABLE documents (id SERIAL PRIMARY KEY, owner uuid, body text);
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_read ON documents
     FOR SELECT
     USING (current_setting('app.uid', true) IS NULL
-           OR owner::text = current_setting('app.uid'));
+           OR owner::text = current_setting('app.uid', true));
 SQL
 
-export DATABASE_URL='postgres://postgres:demo@localhost/postgres'
+export DATABASE_URL='postgres://postgres:demo@localhost:55432/postgres'
 pgrls lint --explain
 ```
 
@@ -44,9 +44,12 @@ pass `--database-url`); `pgrls lint` is read-only.
 The policy reads like the correct English sentence — *"anyone without a
 session sees nothing, signed-in users see their own rows"* — and would
 pass code review. But `current_setting('app.uid', true)` returns `NULL`
-for any connection that hasn't set the GUC, so the `IS NULL` branch is
-true, the `OR` short-circuits, and the policy returns **every row** to
-exactly the connections you meant to keep out. (The same pattern with
+for any connection that hasn't set the GUC, so the `IS NULL` disjunct is
+true for every row and the policy returns **every row** to exactly the
+connections you meant to keep out. (Both calls use the two-argument
+`missing_ok` form on purpose: the one-argument
+`current_setting('app.uid')` *raises* on an unset GUC, which fails the
+query loudly instead of leaking — a different bug, and SEC019's.) (The same pattern with
 `auth.uid() IS NULL OR …` is the recurring Supabase / PostgREST
 foot-gun.) `pgrls lint --explain` prints the rule's reference paragraph
 inline so the *why* travels with the *where*.
@@ -64,8 +67,9 @@ Mechanical findings are rewritten for you — SEC004 above included: the
 fixer strips the `auth_func() IS NULL` disjunct, restoring the real check
 it was masking (and abstains when no real check would survive, rather
 than guess). Findings that need a predicate pgrls can't author for you
-still need human judgement; `pgrls fix --check` lists what would and
-wouldn't be fixed without writing anything.
+still need human judgement; `pgrls fix --check` lists exactly the
+(rule, location) pairs it *would* fix, without writing anything — it does
+not enumerate what it would leave alone.
 
 ## 5. Wire it into CI
 
@@ -103,17 +107,17 @@ pgrls lint --baseline .pgrls-baseline.json
 git add .pgrls-baseline.json && git commit -m "pgrls: record current findings"
 ```
 
-`pgrls lint --update-baseline` refreshes the file when you intentionally
+`pgrls lint --baseline .pgrls-baseline.json --update-baseline` refreshes the file when you intentionally
 re-baseline after a clean-up pass.
 
 ## Where to go next
 
 - **[README.md](../README.md)** — the full feature tour: every output
   format (text / JSON / SARIF / Markdown / GitHub-PR-comment / GitHub
-  annotations / JUnit), `pgrls diff` for semantic CI gating, the
+  annotations / JUnit / GitLab Code Quality / HTML), `pgrls diff` for semantic CI gating, the
   `pgrls.testing` pytest plugin for RLS isolation tests, the JSON
   Schema for `pgrls.toml`.
-- **[AGENTS.md](../AGENTS.md)** — every rule with its full rationale,
+- **[docs/RULES.md](RULES.md)** — every rule with its full rationale,
   worked examples (bad / good), and remediation recipe.
 - **`pgrls explain <RULE>`** — print a rule's reference paragraph from
   the CLI (e.g. `pgrls explain SEC004`); add `--format json` for tooling
