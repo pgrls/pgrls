@@ -57,7 +57,10 @@ a bug — the row belongs to no one. The worse failure mode is one
 edit away: the moment any policy on the table uses a NULL-tolerant
 form of the same key (`tenant_id IS NOT DISTINCT FROM …`,
 `… OR tenant_id IS NULL`, `COALESCE(tenant_id, …)`), every NULL row
-becomes visible to **every** tenant at once. A `NOT NULL`
+becomes visible where it should not: the `OR IS NULL` and `COALESCE`
+forms expose it to **every** tenant, while `IS NOT DISTINCT FROM`
+exposes it exactly to a session whose auth value is also NULL — an
+unauthenticated one. A `NOT NULL`
 discriminator makes that whole failure mode unreachable.
 
 pgrls flags this as **SEC030** (severity `info`) — *"policy scopes

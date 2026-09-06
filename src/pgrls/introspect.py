@@ -749,6 +749,7 @@ SELECT
     p.proconfig AS config,
     pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature,
     (po.rolsuper OR po.rolbypassrls) AS owner_bypasses_rls,
+    po.rolname AS owner_name,
     COALESCE((
         SELECT array_agg(DISTINCT CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
                                        ELSE COALESCE(ar.rolname,
@@ -1125,6 +1126,7 @@ def _fetch_secdef_functions(
             function_name=row["function_name"],
             execute_roles=tuple(sorted(row["execute_roles"] or ())),
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
+            owner=row["owner_name"] or "",
         )
         for row in cur.fetchall()
     )

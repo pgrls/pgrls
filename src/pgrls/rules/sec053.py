@@ -38,7 +38,7 @@ Configuration ``[lint.rules.SEC053]``:
   intentionally public, exempted from the rule.
 
 No auto-fix: ``REVOKE`` the low-trust grant, move the foreign table out of the
-exposed schema, or front it with a ``security_invoker`` view that filters rows —
+exposed schema, or front it with a definer-rights view (the default) that filters rows —
 the right choice depends on intent.
 """
 from __future__ import annotations
@@ -121,7 +121,7 @@ class SEC053:
                 f"readable at GET /rest/v1/{ft.name} by an unauthenticated or "
                 "any-authenticated request, with no row filtering possible. "
                 "Remedy: REVOKE the low-trust grant, move the foreign table out "
-                "of the exposed schema, or front it with a security_invoker "
+                "of the exposed schema, or front it with a definer-rights "
                 f"view that filters rows. If it is intentionally public, "
                 f"allowlist {ft.qualified_name!r} in [lint.rules.SEC053]."
             ),

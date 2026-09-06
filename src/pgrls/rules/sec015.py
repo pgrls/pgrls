@@ -33,7 +33,7 @@ SEC015 therefore fires on every SECDEF function whose effective
 search_path does not end with a single explicit `pg_temp` token. The fix
 is mechanical and `pgrls fix` applies it: per flagged overload it emits
 `ALTER FUNCTION <schema>.<name>(<signature>) SET search_path = <existing
-tokens minus pg_temp>, pg_temp` (or `pg_catalog, pg_temp` when no path is
+tokens minus pg_temp>, pg_temp` (or `pg_catalog, <the function's own schema>, pg_temp` when no path is
 pinned), using the per-overload signature introspection captures
 (snapshot v12+). It abstains on a pre-v12 snapshot (empty signature), a
 pre-v14 snapshot (no separate schema/function-name fields), or a
@@ -62,7 +62,9 @@ Out of scope (intentional):
   allowlist the audited-safe cases. Rationale: a body-qualification
   proof is exactly the brittle AST analysis VIEW004 documents
   false-negatives for (dynamic SQL, PL/pgSQL `EXECUTE`); a
-  structural search_path check has no false negatives.
+  structural search_path check has no false negatives for a path that OMITS pg_temp;
+  a path that names it last can still resolve an unqualified body
+  reference through it (see above).
 * **Cross-scope functions.** A SECDEF function in a schema outside
   the introspector's ``--schemas`` set is invisible to SEC015 (it
   isn't in `Schema.security_definer_functions`). Expand ``--schemas``

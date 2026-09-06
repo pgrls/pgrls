@@ -30,7 +30,10 @@ migrates one too). That protection is incidental and entirely
 client-controlled — the caller chooses whether to add `RETURNING` — so it is
 not a substitute for a tenant-scoped `WITH CHECK`. Only a `FOR ALL` (or
 `FOR INSERT`) policy carries this INSERT path; a bare `FOR UPDATE` is **not**
-flagged (its migration is blocked in practice). SEC040 targets `FOR ALL`,
+flagged. Its row-migration is blocked for any UPDATE that reads a column
+(`… WHERE id = 1`, `… RETURNING`), but NOT for the column-free form:
+measured, `UPDATE docs SET tenant_id = 99;` re-parented every row. SEC040
+targets `FOR ALL`,
 where the `USING` scope also proves the table is tenant-scoped on reads.
 
 An *asymmetric* policy that binds a **different** identity column on the

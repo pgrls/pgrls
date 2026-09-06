@@ -214,10 +214,11 @@ class SEC015Fixer:
             # subset of what the rule reports.
             if _is_pg_temp_safe(fn.search_path):
                 continue
-            # Abstain on pre-v12 snapshots — empty signature would
-            # produce `ALTER FUNCTION name()` targeting the wrong
-            # overload. Operator re-snapshots to populate.
-            if not fn.signature:
+            # Abstain only when the signature was NOT CAPTURED (a v4-v11
+            # snapshot). An EMPTY signature is a real value — a zero-argument
+            # function — and `ALTER FUNCTION name()` targets it exactly.
+            # Treating the two alike silently skipped every zero-arg function.
+            if fn.signature is None:
                 continue
             # Abstain on pre-v14 snapshots — schema_name/function_name
             # were not captured, and splitting the ambiguous

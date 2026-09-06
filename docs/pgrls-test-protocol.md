@@ -74,9 +74,12 @@ For each test, on a single Postgres connection:
        in the nested case.
     7. On exception:
        `ROLLBACK TO SAVEPOINT pgrls_actor_<rand>` only.
-       `ROLLBACK TO SAVEPOINT` automatically reverts every
-       `SET LOCAL` made inside the savepoint, so role and
-       claims state revert to whatever step 1 captured.
+       `ROLLBACK TO SAVEPOINT` reverts the role and any GUC that
+       had a prior value. A claim GUC that was UNSET comes back as
+       `''`, not NULL (measured) — true-NULL is unreachable once
+       touched, per step 6 — so a downstream
+       `current_setting(…, true) IS NULL` gate behaves differently
+       after the rollback.
 4. `ROLLBACK` — drop the test's entire transaction.
 
 Nested scenario blocks are supported by construction: every

@@ -5,7 +5,9 @@ built-in roles: ``anon`` for requests carrying no JWT and ``authenticated``
 for signed-in users. A permissive policy whose role list includes ``anon``
 for a write command (INSERT, UPDATE, DELETE, or ALL) lets an
 *unauthenticated* client modify rows — anonymous data tampering, insertion,
-or deletion, gated only by that policy's clause. ``anon`` *read* (SELECT)
+or deletion, gated by that policy's clause AND by the table grant —
+measured, without `GRANT INSERT` the write is `permission denied`, which
+is why the remedy revokes it. ``anon`` *read* (SELECT)
 policies are a deliberate public-data pattern and are NOT flagged; only the
 write side is. This is the write-side analog of SEC003 for the named
 ``anon`` role, which SEC003's PUBLIC-pseudo-role check does not catch (the

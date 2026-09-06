@@ -20,8 +20,9 @@ RLS is bypassed by construction, regardless of any flag.
 Operators have two architectural choices, neither of which pgrls
 can pick on their behalf:
 
-* Run `REFRESH MATERIALIZED VIEW` as a per-tenant role so the
-  captured rows are already filtered to that tenant's view.
+* Give the matview a per-tenant OWNER — the body runs as the OWNER at
+  REFRESH regardless of who issues the command, and a non-owner cannot
+  issue it at all (`ERROR: must be owner of materialized view`).
 
 * Replicate the matview per-tenant (separate physical heap per
   tenant) and route queries to the right one.

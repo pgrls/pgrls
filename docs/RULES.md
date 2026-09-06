@@ -453,7 +453,10 @@ applies to every command:
 CREATE POLICY tenant_floor ON public.invoices
     AS RESTRICTIVE
     FOR ALL
-    TO authenticated
+    TO PUBLIC   -- a RESTRICTIVE policy constrains only the roles in its
+                -- own TO list; TO authenticated leaves every other role
+                -- unconstrained (measured: 1 row for authenticated, 3 for
+                -- another role), which is not a floor.
     USING (tenant_id = (SELECT current_setting('app.tenant_id')::uuid))
     WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
@@ -592,9 +595,12 @@ is the right primitive:
 CREATE POLICY block_all ON public.invoices
     AS RESTRICTIVE FOR SELECT TO PUBLIC USING (false);
 
--- After: explicit revoke at the role layer.
+-- After: explicit revoke at the role layer. Name the ROLE that
+-- actually holds the grant — `FROM PUBLIC` only clears PUBLIC's own
+-- grants and is a no-op for a grant made to a named role (measured:
+-- relacl byte-identical, and the table went from 0 rows to 3).
 DROP POLICY block_all ON public.invoices;
-REVOKE ALL ON TABLE public.invoices FROM PUBLIC;
+REVOKE ALL ON TABLE public.invoices FROM authenticated;
 ```
 
 **Auto-fixable** (`pgrls fix`): for a **permissive** constant-`false` policy —
@@ -655,9 +661,10 @@ ALTER POLICY tenant_read ON public.invoices
     USING (tenant_id = (SELECT current_setting('app.tenant')::uuid));
 ```
 
-If the intent really is "admit every row" (rare in production),
-drop the policy and either disable RLS on the table or REVOKE the
-GRANT.
+If the intent really is "admit every row" (rare in production), drop
+the policy and disable RLS on the table. Do NOT "revoke the grant" for
+that purpose — revoking is the opposite of admitting: measured, the
+role then gets `permission denied for table invoices`.
 
 Detection is narrow on purpose — only the literal `true` `A_Const`
 inside an `OR` BoolExpr counts. Semantic-equivalent tautologies
@@ -970,11 +977,16 @@ does not end with an explicit `pg_temp` token:
   `SET search_path = pg_temp, public`. It's searched at the
   written position, ahead of the legitimate schemas.
 
-The only structurally-safe shape — `pg_temp` named as the
-**last** entry of a pinned `search_path` — passes. This is the
-pattern the Postgres documentation prescribes for SECURITY
-DEFINER functions: naming `pg_temp` last forces the temp schema
-to be searched last.
+`pg_temp` named as the **last** entry of a pinned `search_path`
+passes. That is the pattern the Postgres documentation prescribes,
+and it is **necessary but not sufficient**: measured, a SECDEF
+function reading an unqualified `secrets` under
+`search_path = pg_catalog, pg_temp` still returned the attacker's
+planted `pg_temp.secrets`, because the name is not in `pg_catalog`
+and resolution falls through. The schemas the body actually reads
+must precede `pg_temp` — which is why the auto-fix emits the
+function's own schema (see **Auto-fix** below). SEC015 cannot read
+the body, so it does not flag that residue.
 
 The introspector decodes the function's `search_path` from
 `pg_proc.proconfig` (snapshot v8+). The fix is mechanical, and
@@ -1038,7 +1050,9 @@ Out of scope (intentional):
   shape alone and lets the operator allowlist the audited-safe
   cases. A body-qualification proof is exactly the brittle AST
   analysis VIEW004 documents false-negatives for; the
-  structural `search_path` check has no false negatives.
+  structural `search_path` check has no false negatives for a path that OMITS pg_temp;
+  a path that names it last can still resolve an unqualified body
+  reference through it (see above).
 * **Cross-scope functions.** A SECDEF function in a schema
   outside `--schemas` is invisible to SEC015. Expand
   `--schemas` to audit it.
@@ -1563,7 +1577,11 @@ counts as write coverage and silences the rule.
 Out of scope (intentional): zero-policy tables (deny-by-default,
 not read-only coverage), RLS-disabled tables (SEC001's surface),
 and partition children (a child's writes route through the
-partitioned parent, whose policies govern them).
+partitioned parent, whose policies govern them — but only when the write
+NAMES the parent: measured, `INSERT INTO parent` was rejected by the
+parent's policy while `INSERT INTO child` with the identical row
+succeeded, since a direct child write is governed by the child's own RLS,
+which SEC041 covers).
 
 <a id="rule-sec023"></a>
 
@@ -3937,7 +3955,10 @@ Conservative by design (soundness over recall, no false positives):
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
 `REVOKE` the low-trust grant, move the foreign table out of the exposed schema,
 or front it with a definer-rights view (the default — an invoker view runs as the caller, so it needs the caller to hold SELECT on the foreign table, which is exactly the grant the remedy revokes; measured: `permission denied for foreign table`) that filters rows (the view runs as
-the caller, so it can scope the read the foreign table itself cannot).
+the caller, so it can scope the read the foreign table itself cannot) —
+no: an invoker view is exactly what does NOT work here, since it needs
+the caller to hold the grant being revoked. A definer-rights view (the
+default) is the remedy.
 
 **Configuration** (`[lint.rules.SEC053]`):
 
@@ -4107,7 +4128,9 @@ than pgrls's exact `pgrls_require_<label>`, so a hand-rolled `require_tenant()`
   unset GUC, which is loud; it is SEC019's subject, for a different reason.
 - A policy that already uses the raising helper, even if it also reads a
   setting silently elsewhere in the same clause — the binding is guarded.
-- Anything at all in a schema that never adopted the raising form.
+- Anything at all when NO table in the scan adopted the raising form. The
+  gate is scan-wide, not per-schema: a schema that never adopted it is still
+  silent as long as some other scanned schema did.
 
 ### Remediation
 
@@ -4150,7 +4173,7 @@ times, the wrapped form once). A call reached via an UNCORRELATED
 is skipped. But a call inside a CORRELATED subselect — the common
 membership pattern `EXISTS (SELECT 1 FROM members m WHERE m.org_id =
 t.org_id AND m.user_id = auth.uid())`, whose subquery references the
-outer row — re-evaluates once per outer row scanned, exactly like a
+outer row — re-evaluates per row in the general case — though for a hashable equality membership Postgres builds a hashed SubPlan over the INNER table instead (measured: 102 calls, not 10,000). The wrapped form is one call either way, exactly like a
 top-level call, so it is flagged too. One finding per policy, naming
 the clause(s) involved.
 
@@ -4771,8 +4794,10 @@ choices:
 -- non-owner cannot even issue the command
 -- (ERROR: must be owner of materialized view).
 ALTER MATERIALIZED VIEW public.user_summary OWNER TO tenant_a;
-SET LOCAL app.tenant_id = '...';   -- GUCs DO come from the issuer
-REFRESH MATERIALIZED VIEW public.user_summary;
+BEGIN;                             -- SET LOCAL needs a transaction block;
+SET LOCAL app.tenant_id = '...';   -- outside one it WARNs and captures 0 rows
+REFRESH MATERIALIZED VIEW public.user_summary;   -- GUCs DO come from the issuer
+COMMIT;
 
 -- Option B: replicate the matview per-tenant. One physical heap per
 -- tenant; queries route to the right one.

@@ -31,6 +31,37 @@ breaking changes — they will be called out in this file.
   the new version without adding the graph.
 
 ### Fixed
+- **`--mode escalation` was silent on a `SECURITY DEFINER` function owned by
+  the table's own owner — a full anonymous bypass.** RLS exemption is relative
+  to a TABLE: a definer body running as the table owner skips its policies
+  whenever the table is not `FORCE`'d, which `owner_bypasses_rls` (superuser /
+  `BYPASSRLS`) does not capture. Measured: anon read 0 rows directly and every
+  row through such a function while the mode reported "No reachable escalation
+  paths" and exited 0. Snapshot v26 now captures the function's owner, and
+  exemption is decided per read table; a function owned by an unrelated role
+  stays correctly silent.
+- **`--probe`: one table's anon-key attempt poisoned the JWT claim GUCs for
+  every table after it.** `ROLLBACK TO SAVEPOINT` restores a placeholder GUC
+  to `''`, never to NULL (measured), and `''` is non-NULL — so the previous
+  round's guard re-wrote it. A correctly-isolated table probed first turned a
+  reproduced leak on the next table into `no rows` and exit 0, and in the other
+  direction produced a MISMATCH against a correct proof. The probe now records
+  which claim GUCs it has written and abstains, with an explicit reason, for
+  any later table whose policy reads one directly.
+- **`--mode reachability`: a narrow door hid a wider one under the same outer
+  view.** Paths were kept per (outer view, table) with a two-case precedence,
+  so two laundering doors collapsed to whichever was walked first. Measured:
+  adding a narrow door turned a provable LEAK into UNVERIFIED with a
+  factually false detail, and removing it restored the LEAK. Paths are ranked
+  by width now — an exempt owner beats a total laundering door, which beats a
+  partial one.
+- **Both auto-fixers silently skipped every zero-argument function.** Live
+  introspection returns an EMPTY identity-argument list for a no-arg function,
+  which the pre-v12 "signature not captured" guard could not tell apart from a
+  missing one — so `ALTER FUNCTION name()`, the exactly-correct target, was
+  never emitted. Measured: lint reported findings for both a zero-arg and a
+  one-arg function while `fix` emitted only the one-arg statement. "Not
+  captured" is now `null` and distinct from the empty string.
 - **The "does anon already read every row" check ignored RESTRICTIVE
   policies, so both cedes cleared a wide-open door.** Postgres ANDs every
   applicable restrictive policy on top of the permissive one, but the check

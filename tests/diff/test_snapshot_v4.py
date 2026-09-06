@@ -131,11 +131,16 @@ def test_to_snapshot_emits_security_definer_functions_field() -> None:
             "body": "SELECT * FROM public.secret",
             "language": "sql",
             "search_path": None,
-            "signature": "",
+            "signature": None,
             "schema_name": "",
             "function_name": "",
             "execute_roles": [],
             "owner_bypasses_rls": False,
+            # v26: the function's OWNER. RLS exemption is relative to a table
+            # — a SECDEF body running as the table's own owner skips that
+            # table's policies whenever it is not FORCE'd, which
+            # `owner_bypasses_rls` (superuser / BYPASSRLS) does not capture.
+            "owner": "",
         }
     ]
 
@@ -494,7 +499,7 @@ def test_to_snapshot_emits_leakproof_functions_field() -> None:
     assert snap["leakproof_functions"] == [
         {
             "qualified_name": "public.fast_eq",
-            "signature": "",
+            "signature": None,
             "schema_name": "",
             "function_name": "",
         }

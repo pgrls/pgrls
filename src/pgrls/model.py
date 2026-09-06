@@ -679,10 +679,14 @@ class SecdefFunction:
 
     `signature` is the function's argument-type signature as
     `pg_get_function_identity_arguments(p.oid)` returns it — the
-    exact form `ALTER FUNCTION name(<signature>)` requires. Empty
-    string for a no-argument function. Captured in snapshot v12+;
-    v4–v11 snapshots load with `signature=""` (so the data is just
-    not available for those, never silently wrong). A function with
+    exact form `ALTER FUNCTION name(<signature>)` requires. The
+    EMPTY STRING is a real value: it is what a no-argument function
+    has, and `ALTER FUNCTION name()` targets it exactly. `None`
+    means "not captured" (a v4–v11 snapshot, which has no such
+    key). Conflating the two made both fixers abstain on every
+    zero-argument function — measured, lint reported five SEC015
+    findings and `fix` emitted one — while blaming a snapshot
+    version that had nothing to do with it. A function with
     multiple overloads appears here as MULTIPLE `SecdefFunction`
     entries with the same `qualified_name` but distinct
     `signature`s — capture preserves overload identity so a fixer
@@ -700,8 +704,18 @@ class SecdefFunction:
     # `pg_get_function_identity_arguments` output. Empty for
     # zero-arg functions; non-empty like `integer, text` for
     # overloads. Snapshot v12+; older snapshots load with "".
-    signature: str = ""
+    signature: str | None = None
     # Schema and function name as SEPARATE components (snapshot v14+).
+    # v26+: the function's owner (`pg_get_userbyid(proowner)`). RLS
+    # exemption is relative to a TABLE: a SECDEF body running as the table's
+    # own owner skips the policies whenever that table is not FORCE'd, even
+    # though the owner holds neither superuser nor BYPASSRLS. Measured on
+    # PG16: anon read 0 rows directly and every row through such a function,
+    # while `verify --mode escalation` reported "No reachable escalation
+    # paths". Empty on a pre-v26 snapshot (the exemption test then falls back
+    # to `owner_bypasses_rls` alone).
+    owner: str = ""
+
     # `qualified_name` is the ambiguous `nspname || '.' || proname`
     # join, which cannot be split unambiguously once either component
     # contains a dot (a schema or function named `a.b`). Fixers that
@@ -952,7 +966,7 @@ class LeakproofFunction:
     # `pg_get_function_identity_arguments` output. Empty for zero-
     # arg functions; non-empty for overloads. Snapshot v12+; v10–v11
     # snapshots load with "".
-    signature: str = ""
+    signature: str | None = None
     # Separate schema / function name components (snapshot v14+); see
     # SecdefFunction. The SEC017 fixer uses these to build a correct
     # `ALTER FUNCTION` even when the schema name contains a dot,
@@ -1446,9 +1460,12 @@ def _is_safe_signature(signature: object) -> bool:
 def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
     # `search_path` is a v8 addition; v4-v7 snapshots have no key, so
     # `.get(...)` yields None ("no SET search_path clause"). `signature`
-    # is a v12 addition; v4-v11 snapshots load it as "".
-    sig = f.get("signature", "")
-    if not _is_safe_signature(sig):
+    # is a v12 addition; v4-v11 snapshots have no key either, and load as
+    # None — "not captured", which the fixers abstain on rather than
+    # interpolate, so there is nothing to validate. An EMPTY signature is
+    # a real zero-argument function and IS validated.
+    sig = f.get("signature")
+    if sig is not None and not _is_safe_signature(sig):
         raise ValueError(
             "snapshot SECURITY DEFINER function "
             f"{f.get('qualified_name')!r} has an unsafe or unparseable "
@@ -1469,6 +1486,7 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         # SEC042 abstains (fail-closed) until the snapshot is re-captured.
         execute_roles=tuple(f.get("execute_roles", [])),
         owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
+        owner=f.get("owner", ""),
     )
 
 
@@ -1482,8 +1500,8 @@ def _bypassrls_role_from_dict(r: dict[str, Any]) -> BypassRlsRole:
 
 def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
     # `signature` is a v12 addition; v10-v11 snapshots load it as "".
-    sig = f.get("signature", "")
-    if not _is_safe_signature(sig):
+    sig = f.get("signature")
+    if sig is not None and not _is_safe_signature(sig):
         raise ValueError(
             "snapshot LEAKPROOF function "
             f"{f.get('qualified_name')!r} has an unsafe or unparseable "
@@ -1981,6 +1999,7 @@ class Schema:
                     # owner RLS-exemption, for SEC042.
                     "execute_roles": list(f.execute_roles),
                     "owner_bypasses_rls": f.owner_bypasses_rls,
+                    "owner": f.owner,
                 }
                 for f in self.security_definer_functions
             ],

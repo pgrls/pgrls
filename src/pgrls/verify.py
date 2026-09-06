@@ -1645,14 +1645,25 @@ def _reachability_paths(
     """
     best: dict[tuple[str, str], _ReachPath] = {}
 
+    def _width(p: _ReachPath) -> int:
+        """How wide the door is — the WIDEST one under an outer view wins.
+
+        Two laundering doors under one outer view used to collapse to
+        whichever was walked first, so adding a NARROW door made a provable
+        one disappear: measured, `outer → c1(ownera, tenant='a')` and
+        `outer → c2(ownerb, USING true)` reported UNVERIFIED together while
+        `c2` alone reported LEAK with every row.
+        """
+        if p.exempt is not True:
+            return 0                      # undecided
+        if not p.via_policy:
+            return 3                      # exempt owner: every row
+        return 2 if p.owner_witness == {} else 1   # laundering: total, then partial
+
     def record(p: _ReachPath) -> None:
         key = (p.outer.qualified_name, p.table.qualified_name)
         prior = best.get(key)
-        if (
-            prior is None
-            or (prior.exempt is None and p.exempt is True)
-            or (prior.via_policy and p.exempt is True and not p.via_policy)
-        ):
+        if prior is None or _width(p) > _width(prior):
             best[key] = p
 
     def unverified(outer: Any, t: Any, hops: tuple[str, ...], eff: Any, why: str) -> None:
@@ -2011,6 +2022,25 @@ def _escalation_secdef_findings(
     # `GRANT readers TO anon` was callable by anon (has_function_privilege
     # = t) and read every row, while a literal set intersection against
     # {anon, PUBLIC} reported "No reachable escalation paths".
+    # A SECDEF body running as the TABLE's own owner skips that table's
+    # policies whenever the table is not FORCE'd — an exemption relative to
+    # the table, which `owner_bypasses_rls` (superuser / BYPASSRLS) does not
+    # capture. Measured: anon read 0 rows directly and every row through such
+    # a function, while this mode reported "No reachable escalation paths".
+    _owner_exempt_anywhere = {
+        t.owner
+        for t in schema.tables
+        if t.rls_enabled and not t.force_rls and t.owner
+    }
+
+    def _fn_exempt_for(f: Any, table: Any) -> bool:
+        if f.owner_bypasses_rls:
+            return True
+        owner = getattr(f, "owner", "") or ""
+        if not owner or table is None or table.force_rls or not table.owner:
+            return False
+        return _inherits_privs_of(schema, owner, table.owner) is True
+
     _exec_reachable = (
         set(_esc_roles)
         | set(_anon_priv_closure(schema, _esc_roles) or frozenset())
@@ -2062,7 +2092,11 @@ def _escalation_secdef_findings(
         candidate = [
             f
             for f in by_qname[qname]
-            if f.owner_bypasses_rls and (set(f.execute_roles) & _exec_reachable)
+            if (
+                f.owner_bypasses_rls
+                or (getattr(f, "owner", "") or "") in _owner_exempt_anywhere
+            )
+            and (set(f.execute_roles) & _exec_reachable)
         ]
         if not candidate:
             continue
@@ -2087,6 +2121,16 @@ def _escalation_secdef_findings(
             f"SECURITY DEFINER function EXECUTE-able by {roles}, owned by an "
             "RLS-exempt role"
         )
+        if reads:
+            # Exemption is relative to the TABLE, so drop the reads for which
+            # no candidate overload's owner is actually exempt — otherwise a
+            # function owned by an ordinary role would be credited with a
+            # bypass it does not have.
+            reads = {
+                q
+                for q in reads
+                if any(_fn_exempt_for(f, _tables_by_q.get(q)) for f in candidate)
+            }
         if reads:
             verdict, witness, tail = _escalation_anon_rollup(
                 reads, an_by_table, total_read

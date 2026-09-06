@@ -2123,10 +2123,10 @@ def test_sec015_fix_silent_when_path_already_safe() -> None:
     assert SEC015Fixer().fix(schema, {}) == []
 
 
-def test_sec015_fix_abstains_on_empty_signature_from_pre_v12_snapshot() -> None:
+def test_sec015_fix_abstains_when_the_signature_was_not_captured() -> None:
     schema = Schema(
         security_definer_functions=(
-            _secdef("public.legacy", signature=""),
+            _secdef("public.legacy", signature=None),
         ),
     )
     assert SEC015Fixer().fix(schema, {}) == []
@@ -2331,7 +2331,7 @@ def test_sec015_fix_raises_on_malformed_allowlist() -> None:
 
 def _leakproof(
     qname: str,
-    signature: str = "",
+    signature: str | None = None,
     *,
     schema_name: str | None = None,
     function_name: str | None = None,
@@ -2386,25 +2386,25 @@ def test_sec017_fix_emits_one_fix_per_overload() -> None:
     ]
 
 
-def test_sec017_fix_abstains_on_empty_signature_from_pre_v12_snapshot() -> None:
+def test_sec017_fix_abstains_when_the_signature_was_not_captured() -> None:
     # A LeakproofFunction loaded from a pre-v12 snapshot has
-    # signature="" (the older introspection didn't capture it).
+    # signature=None (the older introspection didn't capture it).
     # Emitting `ALTER FUNCTION name() NOT LEAKPROOF` would target
     # the zero-arg overload, wrong for every function with args.
     # The fixer abstains — the operator re-snapshots to populate
     # signatures, then re-runs `pgrls fix`.
     schema = Schema(
-        leakproof_functions=(_leakproof("public.fast_eq", ""),),
+        leakproof_functions=(_leakproof("public.fast_eq", None),),
     )
     assert SEC017Fixer().fix(schema, {}) == []
 
 
-def test_sec017_fix_mixed_pre_v12_and_v12_only_emits_for_v12_entries() -> None:
-    # A schema mixing pre-v12 (signature="") and v12+ (signature
+def test_sec017_fix_mixed_uncaptured_and_captured_only_emits_for_captured_entries() -> None:
+    # A schema mixing pre-v12 (signature=None) and v12+ (signature
     # populated) entries — only the v12+ entries get a Fix.
     schema = Schema(
         leakproof_functions=(
-            _leakproof("public.legacy", ""),
+            _leakproof("public.legacy", None),
             _leakproof("public.fresh", "integer"),
         ),
     )

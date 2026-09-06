@@ -70,8 +70,10 @@ shape, any row whose `tenant_id` is `NULL` evaluates `NULL = <value>`
 to `NULL` (not `true`), so the row is invisible to every tenant. Then
 the moment any policy uses a NULL-tolerant form
 (`tenant_id IS NOT DISTINCT FROM …`, `… OR tenant_id IS NULL`,
-`COALESCE(tenant_id, …)`), every such row becomes visible to every
-tenant.
+`COALESCE(tenant_id, …)`), every such row becomes visible where it
+should not: the `OR IS NULL` and `COALESCE` forms expose it to every
+tenant, while `IS NOT DISTINCT FROM` exposes it exactly to a session
+whose auth value is also NULL — an unauthenticated one.
 
 pgrls flags this as **SEC030** (severity `info`) and recommends
 `SET NOT NULL` on the discriminator (after backfilling existing
