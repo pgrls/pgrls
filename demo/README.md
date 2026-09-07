@@ -12,7 +12,7 @@ REQUIRES_REVIEW / BREAKING). 97 use cases.
 demo/
 ├── conftest.py            # session-scoped fixtures
 ├── docker-compose.yml     # local Postgres on port 5433 (optional)
-├── pgrls.toml             # demo config (allowlists app.countries)
+├── pgrls.toml             # demo config (allowlists app.countries; disables PERF003)
 ├── README.md              # this file
 ├── run.sh                 # bring up DB + apply fixtures + run pgrls
 ├── test_summary.py        # whole-fixture sanity checks
@@ -36,7 +36,7 @@ demo/
     ├── 86-view002-non-barrier-view/      # VIEW002
     ├── 87-view003-matview-over-rls/      # VIEW003
     ├── 88-view004-view-thru-secdef/      # VIEW004
-    ├── 89-anonymous-read-semantic/       # verify --mode anon
+    ├── 89-anonymous-read-semantic/       # SEC038
     ├── 90-sec039-anon-write/             # SEC039
     ├── 91-sec040-write-scope-drop/       # SEC040
     ├── 92-sec041-partition-rls-bypass/   # SEC041
@@ -67,7 +67,7 @@ numeric order).
 | 07 | Session-state-only predicate | SEC005 + PERF001 | fires |
 | 08 | UPDATE policy missing WITH CHECK | SEC006 | fires |
 | 09 | All policies permissive (no RESTRICTIVE floor) | SEC007 | fires |
-| 10 | `USING (true)` policy | SEC008 + SEC005 | fires |
+| 10 | `USING (true)` policy — permissive vs restrictive | SEC008 + SEC031 | fires |
 | 11 | Unwrapped auth call in USING | PERF001 | fires |
 | 12 | Orphaned column reference (in USING) | HYG001 | fires |
 | 13 | Partitioned parent with RLS — clean | (none) | passes (children suppressed by ancestor walk) |
@@ -107,7 +107,7 @@ numeric order).
 | 47 | `<scalar> = ANY(array_col)` | (none) | passes (extract walks ArrayExpr) |
 | 48 | E-commerce orders + items via FK + EXISTS | (none) | passes (2-table tenant join) |
 | 49 | GDPR-style classification (ARRAY + CASE composite) | (none) | passes (rule walks both branches) |
-| 50 | Read-replica style (SELECT-only policies, no PUBLIC permissive) | (none) | passes |
+| 50 | Read-replica style (SELECT-only policies, no PUBLIC permissive) | SEC022 | fires |
 | 51 | ROW comparison `(a,b) = (c,d)` | (none) | passes (extract walks RowExpr) |
 | 52 | Two PERMISSIVE PUBLIC policies on one table | SEC003 ×2 + SEC007 | each policy fires its own line |
 | 53 | `auth_func() IS NULL` buried inside a nested OR | SEC004 | fires — `flatten_or_disjuncts` closed the false negative this case used to pin |
@@ -146,7 +146,7 @@ numeric order).
 | 86 | Non-`security_barrier` view over RLS table | VIEW002 | fires |
 | 87 | Materialized view over RLS table | VIEW003 | fires |
 | 88 | View calling SECDEF function reading RLS table | VIEW004 | fires |
-| 89 | Anonymous-read semantics (`verify --mode anon`) | — | prover walkthrough, not a lint case |
+| 89 | Semantic anonymous-read leak (NOT-wrapped inverted auth) | SEC038 | fires |
 | 90 | Write policy open to the anonymous role | SEC039 | fires |
 | 91 | `FOR ALL` whose `WITH CHECK` drops the tenant scope | SEC040 | fires |
 | 92 | Partition child with RLS off under an enforcing parent | SEC041 | fires |
@@ -165,7 +165,8 @@ cd demo
 ./run.sh
 ```
 
-Spins up Postgres on `localhost:5433`, applies `setup.sql`, runs
+Spins up Postgres on `localhost:5433`, applies `cases/_shared.sql` and
+every `cases/NN-*/setup.sql`, runs
 `pgrls lint --config pgrls.toml`, and prints the result. The DB stays
 running so you can `psql postgres://demo:demo@localhost:5433/demo` to
 poke around.

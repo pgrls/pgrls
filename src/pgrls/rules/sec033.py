@@ -22,7 +22,11 @@ expression to either:
      `auth.users.raw_user_meta_data`, or the
      `request.jwt.claim.user_metadata` GUC), OR
   2. A column reference whose last name component is
-     `raw_user_meta_data`.
+     `raw_user_meta_data` **used as the left operand of a JSON
+     extraction operator** (`->`, `->>`, `#>`, `#>>`). A bare
+     reference — `raw_user_meta_data IS NOT NULL` — reads no
+     user-writable value out of the column and is not flagged
+     (measured).
 
 Both patterns capture the realistic shapes:
 
@@ -32,9 +36,9 @@ Both patterns capture the realistic shapes:
     USING (current_setting('request.jwt.claims', true)::jsonb -> 'user_metadata' ->> 'role' = 'admin')
 
 The string-const path catches the JSON-key form regardless of which
-JSON operator was used; the column-ref path catches the direct
-`raw_user_meta_data` column reference (typically via a SELECT
-sub-link against `auth.users`).
+JSON operator was used; the column-ref path catches a
+`raw_user_meta_data` column reference that a JSON operator extracts
+from (typically via a SELECT sub-link against `auth.users`).
 
 A `user_metadata` key nested under the service-role-only `app_metadata`
 root is deliberately NOT flagged — the end user cannot write inside

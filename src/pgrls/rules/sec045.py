@@ -224,6 +224,12 @@ class SEC045:
                 if location in allowlist:
                     continue
                 priv_list = ", ".join(exposed)
+                # One column list PER privilege. Postgres attaches a trailing
+                # `(col)` to the LAST privilege only, so `REVOKE SELECT, UPDATE
+                # (email)` revokes SELECT table-wide — measured: the table grant
+                # disappeared from relacl and the role got `permission denied
+                # for table`, the opposite of the narrow revoke intended.
+                revoke_list = ", ".join(f"{p} ({cgrant.column})" for p in exposed)
                 out.append(
                     Violation(
                         rule_id="SEC045",
@@ -236,7 +242,7 @@ class SEC045:
                             f"low-trust role {cgrant.role!r}. A column-level "
                             "grant to PUBLIC/anon exposes that field to the "
                             "least-trusted role; confirm it is meant to be "
-                            f"public, or REVOKE {priv_list} ({cgrant.column}) "
+                            f"public, or REVOKE {revoke_list} "
                             f"ON {table.qualified_name} FROM {cgrant.role}. "
                             "Allowlist a deliberate public column by its "
                             "schema.table.column id."

@@ -990,7 +990,7 @@ These are intentional in the current release. Do not invent capabilities.
   under-reporting caveat.
 - **Sixty-eight rules across four categories.** SEC001–SEC055,
   PERF001–PERF005, HYG001–HYG004, and VIEW001–VIEW004 ship today.
-  SECURITY DEFINER coverage is four rules deep: VIEW004
+  SECURITY DEFINER coverage is five rules deep: VIEW004
   catches the view-mediated RLS bypass, SEC013 the
   trigger-mediated bypass, SEC014 (v0.5.12) flags every SECDEF
   function as the free-standing audit surface for
@@ -1001,7 +1001,10 @@ These are intentional in the current release. Do not invent capabilities.
   carrying the `BYPASSRLS` attribute, which skips every policy
   unconditionally and cluster-wide. SEC017 (v0.5.15) covers the
   function-attribute bypass — a function marked `LEAKPROOF`, which
-  the planner may evaluate below the RLS barrier.
+  the planner may evaluate below the RLS barrier. SEC042 is the fifth:
+  the anon-exposure sharpening of SEC014, firing only where a SECDEF
+  function is EXECUTE-able by a low-trust role AND owned by an
+  RLS-exempt one.
 - **Auto-fix for SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, and VIEW002.**
   `pgrls fix` rewrites the mechanically-fixable subset; other
   rules need human intent.

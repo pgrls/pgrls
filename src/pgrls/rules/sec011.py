@@ -109,9 +109,10 @@ class SEC011:
                             "leftover debug branch. Remove the `OR "
                             "true` or, if the intent is genuinely "
                             "'admit every row,' drop the policy and "
-                            "rely on RLS-disabled (note `REVOKE ALL` "
-                            "does the OPPOSITE — it denies access "
-                            "denial)."
+                            "rely on RLS-disabled. Do NOT revoke the "
+                            "grant for that purpose — revoking is the "
+                            "opposite of admitting: measured, the role "
+                            "then gets `permission denied for table`)."
                         ),
                         location=pid,
                     )

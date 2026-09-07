@@ -328,7 +328,7 @@ needed, but worth knowing the tests exist):
 | ------------------------------------- | ---------------------------------------------------------------------- |
 | [`docs/RULES.md`](RULES.md)          | Add `<a id="rule-<id>"></a>` + a `## <ID> — <title>` section (the README table and the markdown/HTML/SARIF `helpUri` links resolve to this anchor). |
 | [`AGENTS.md`](../AGENTS.md)           | Add the one-line catalog entry in the family paragraph. |
-| [`README.md`](../README.md)           | Bump the rule count (`68 lint rules` → `69`) in the badges/intro/feature line, and add a row to the rules table. |
+| [`README.md`](../README.md)           | Bump the rule count (`68 lint rules` → `69`) in the intro and feature lines — the badges carry no count — and add a row to the rules table. |
 | [`pyproject.toml`](../pyproject.toml) | Same: the `description` field cites the rule count.                    |
 | [`docs/EXTRA_RULES.md`](EXTRA_RULES.md) | Its opening line cites the built-in rule count too, and the grep below does not reach it. |
 | [`CHANGELOG.md`](../CHANGELOG.md)     | An `### Added` bullet under `[Unreleased]` with the rule + severity + one-line summary. |
@@ -401,10 +401,10 @@ a 3-clean review loop before merging.
   (`s.t.col`); a 4-part `db.schema.table.col` reference is left
   unresolved (rules treat it as not-own-table).
   `pgrls.rules.perf003._own_table_column` is one such resolver
-  (re-imported by PERF004); SEC005 / SEC018 / SEC030 carry their own
-  `_is_own_column_ref` (SEC005/SEC018) / `_own_column_names` (SEC030)
-  helpers (each rule's bug class needs
-  slightly different resolution semantics).
+  (re-imported by PERF004); SEC005 / SEC018 / SEC030 all use the shared
+  `pgrls.ast_utils.own_column_ref`, which replaced the per-rule
+  `_is_own_column_ref` / `_own_column_names` helpers once the three
+  resolution semantics turned out to coincide.
 - **Sub-link handling.** A column reference inside a `SubLink` body
   belongs to a different table; pass `exclude_sublinks=True` to
   `extract_column_refs` when you want only own-table refs. A

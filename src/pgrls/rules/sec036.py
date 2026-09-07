@@ -25,11 +25,19 @@ condition is met for any single user-table row.
 Detection walks policy USING / WITH CHECK ASTs for `SubLink` nodes
 whose `subLinkType` is `EXISTS_SUBLINK`. For each, it inspects the
 sub-select's `fromClause` for `RangeVar`s matching the configured
-target tables (default: `auth.users`). If any match, the
-sub-select's `whereClause` is searched for a reference to a
-caller-binding signal — by default any FuncCall whose name is
-`auth.uid`, `auth.role`, `auth.jwt`, `current_user`, `session_user`,
-or `current_setting`. Absent any such reference, the rule fires.
+target tables (default: `auth.users`). If any match, the sub-select's
+own quals — its `WHERE`, its `HAVING`, its `JOIN … ON` conditions and
+any derived-table quals — are searched for a caller-binding signal: by
+default any FuncCall whose name is `auth.uid`, `auth.role`, `auth.jwt`,
+`current_user`, `session_user`, or `current_setting`. Absent any such
+reference, the rule fires.
+
+Depth matters in both directions, and both were measured. A policy bound
+only through `JOIN auth.users u ON … AND u.id = auth.uid()` — nothing in
+the `WHERE` at all — is correctly silent. A call buried inside a *nested*
+`EXISTS` / `ANY` / `ALL` body does NOT count as binding, even though it
+sits lexically within the outer `WHERE`: it constrains that inner query,
+not the row this sub-select returns, so such a policy still fires.
 
 The target-detection and caller-binding primitives live in
 `pgrls.rules._auth_binding` (shared with SEC052, which asks the same
@@ -64,8 +72,8 @@ Configuration: `[lint.rules.SEC036]` accepts:
     Replaces the default `["auth.users"]`. Add project-specific
     user tables (e.g. `["auth.users", "public.profiles"]`).
   - `binding_functions` (list[str]) — function names whose presence
-    in the sub-select's WHERE clause counts as a caller-binding
-    signal. Replaces the default
+    in the sub-select's own quals (WHERE / HAVING / JOIN-ON /
+    derived-table) counts as a caller-binding signal. Replaces the default
     `{auth.uid, auth.role, auth.jwt, current_user, session_user,
     current_setting}`.
   - `allowlist` (list[str]) — `schema.table.policy` IDs to exempt

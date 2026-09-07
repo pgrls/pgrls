@@ -615,8 +615,12 @@ with RLS on that is the same default-deny as no policy, so the drop is
 behavior-preserving). The fixer is a strict subset of what the rule reports: it
 **never** drops a **restrictive** constant-`false` policy (a hard deny floor —
 dropping it would *broaden* access) and abstains on any permissive policy that
-still grants on another axis (e.g. `FOR ALL USING (false) WITH CHECK (true)`
-still admits inserts). Re-express the denial at the GRANT layer as above; the
+still grants on another axis — `FOR ALL` *or* `FOR UPDATE` with
+`USING (false) WITH CHECK (true)`. The write gate is the OR of every
+applicable policy's `WITH CHECK`, not each policy's own pair, so that `true`
+still admits rows a sibling policy's `USING` selected (measured:
+`UPDATE … SET tenant_id = 99` moved 2 rows with such a policy present and
+was rejected once it was dropped). Re-express the denial at the GRANT layer as above; the
 drop just removes the misleading no-op.
 
 If you really do need to express "deny" via policy form (rare but
@@ -2058,10 +2062,18 @@ This is the open-write gap the other write-side rules miss:
 SEC028 fires when a permissive policy whose command is `INSERT`,
 `UPDATE`, or `ALL` has `WITH CHECK` = literal `true` and its `USING`
 is absent or itself constant-true (the asymmetry case is ceded to
-SEC020). Restrictive policies are out of scope: a restrictive
-`WITH CHECK (true)` is a dead clause (restrictive policies
-AND-combine, so it opens nothing on its own), SEC006's restrictive
-framing rather than an open-write hole.
+SEC020). Restrictive policies are out of scope for SEC028 — but they are not
+harmless. Postgres fills an omitted restrictive `WITH CHECK` from that
+policy's `USING`, so writing the clause explicitly as `true` **cancels**
+the write floor the omission would have given. Measured on PG16 with the
+permissive side open, so the floor was the only write gate: with the
+clause omitted the cross-tenant insert raised `new row violates row-level
+security policy "floor"`; with an explicit `WITH CHECK (true)` the same
+insert succeeded. [SEC020](#rule-sec020) reports that shape — it has no
+permissive gate. SEC028 stays permissive-only because it is the
+*no-contrast* rule (`USING` absent or itself constant-true); the one
+genuinely inert and unreported shape is a restrictive `FOR INSERT`
+policy, which has no `USING` for the explicit `true` to cancel.
 
 The fix is to replace `WITH CHECK (true)` with a predicate that
 validates the written row — usually the same tenant / ownership key
@@ -2263,9 +2275,11 @@ write) territory.
 Detection mirrors SEC008: only the literal `true` matches (a real
 tautology checker — `1 = 1`, `x OR NOT x` — is out of scope; those
 surface as SEC005, no own-column reference). A restrictive policy with
-a real `USING` and a `WITH CHECK (true)` is not flagged here — a
-restrictive `WITH CHECK (true)` is a dead clause (SEC006's framing),
-not a missing read floor.
+a real `USING` and a `WITH CHECK (true)` is not flagged here: it is not a
+missing READ floor, which is SEC031's subject. It is not harmless either
+— the explicit `true` cancels the write floor Postgres would have filled
+in from `USING` (measured) — but that is [SEC020](#rule-sec020)'s
+finding.
 
 The fix is to give the restrictive policy the real predicate it was
 meant to enforce — the tenant / ownership key — or to drop it if it

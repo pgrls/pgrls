@@ -55,8 +55,8 @@ predicate (pgrls can't statically prove that compatibility).
 * Composite-key policies (``USING (tenant_id = X AND owner = Y)``)
   fire PERF003 for each referenced column independently. An
   operator who has a composite index ``(tenant_id, owner)`` gets
-  one violation for ``tenant_id`` (the leading column matches —
-  no fire) and one for ``owner`` (no leading-column match). The
+  NO violation for ``tenant_id`` (the leading column matches) and
+  one for ``owner`` (no leading-column match). The
   ``owner`` fire is a false positive in this case and allowlisting
   it is the right response — do NOT add a second index on
   ``owner``: measured, the composite already serves the whole

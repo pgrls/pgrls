@@ -79,7 +79,9 @@ share the same `Rule` Protocol shape.
    ```
 
 That's it. `pgrls lint` now runs your rule alongside the built-ins.
-`pgrls explain` lists it in the catalog. `pgrls.toml`'s
+`pgrls explain --config pgrls.toml` lists it in the catalog — unlike
+`lint`, `explain` does not fall back to `./pgrls.toml`, so without the
+flag it shows only the built-ins. `pgrls.toml`'s
 `[lint.rules.MYCO001]` table can carry per-rule options the same way
 built-ins do.
 

@@ -1,8 +1,9 @@
 -- ============================================================
 -- Use case 44: SQLValueFunction `current_user` in policy —
 -- CLEAN against PERF001
--- `current_user` is in SEC004's default auth_functions set
--- but NOT in PERF001's. Postgres evaluates SQLValueFunctions
+-- `current_user` is in NEITHER SEC004's nor PERF001's default
+-- auth_functions set (both default to auth.uid / auth.role /
+-- auth.jwt / current_setting). Postgres evaluates SQLValueFunctions
 -- like `current_user` cheaply, so wrapping buys nothing — the
 -- rule deliberately omits them. Pin the asymmetry from a real
 -- DB rather than only the unit test in test_perf001.py.

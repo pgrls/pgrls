@@ -1876,6 +1876,35 @@ def test_sec010_fix_abstains_on_all_using_false_with_check_true() -> None:
     assert SEC010Fixer().fix(schema, {}) == []
 
 
+def test_sec010_fix_abstains_on_update_using_false_with_check_true() -> None:
+    # Review pass 11. The write gate is the OR of every applicable policy's
+    # WITH CHECK — Postgres does not pair a policy's own two clauses — so
+    # `USING (false) WITH CHECK (true)` on a FOR UPDATE policy still admits new
+    # rows a sibling policy's USING selected. Measured on PG16 with a sibling
+    # `FOR UPDATE USING (tenant_id = 1) WITH CHECK (tenant_id = 1)`:
+    # `UPDATE ... SET tenant_id = 99` moved 2 rows with this policy present and
+    # raised `new row violates row-level security policy` once dropped — so the
+    # drop is NOT behaviour-preserving. Same answer as the FOR ALL case.
+    schema = _wrap_policy(
+        _policy("false", command="UPDATE", with_check="true", name="upd")
+    )
+    assert SEC010Fixer().fix(schema, {}) == []
+
+
+def test_sec010_fix_drops_update_using_false_with_check_false() -> None:
+    # Both axes denied → genuinely inert, still dropped.
+    schema = _wrap_policy(
+        _policy("false", command="UPDATE", with_check="false", name="upd")
+    )
+    assert len(SEC010Fixer().fix(schema, {})) == 1
+
+
+def test_sec010_fix_drops_update_using_false_no_with_check() -> None:
+    # An omitted WITH CHECK falls back to USING (false) → nothing admitted.
+    schema = _wrap_policy(_policy("false", command="UPDATE", name="upd"))
+    assert len(SEC010Fixer().fix(schema, {})) == 1
+
+
 def test_sec010_fix_abstains_on_using_true() -> None:
     # USING(true) is not constant-false (SEC008's territory), not SEC010.
     schema = _wrap_policy(_policy("true", command="SELECT", name="open"))

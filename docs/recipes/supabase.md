@@ -187,8 +187,9 @@ Other Supabase-relevant rules to know about (see
   attribute, which is a different mechanism (caught by SEC016) — so
   SEC002 is the rule for the *migration*-side bypass, not for
   `service_role`.
-- **SEC008** — policy with literal `USING (true)`: no scoping at all
-  (the top-level constant-true case).
+- **SEC008** — **permissive** policy with literal `USING (true)`: no
+  scoping at all (the top-level constant-true case). The restrictive
+  twin — a `USING (true)` floor that narrows nothing — is **SEC031**.
 - **SEC009** — table has RLS enabled but **no policies** defined
   (default-deny: invisible to ordinary grantees, while the owner
   still reads it unless `FORCE` is set, and a `BYPASSRLS` role or
