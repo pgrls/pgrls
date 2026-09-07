@@ -138,7 +138,7 @@ ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
 is honoured by the fixer.
 
 If a specific role legitimately needs to bypass (e.g. a maintenance role
-that runs vacuum-style work), grant `BYPASSRLS` on that role rather than
+that runs vacuum-style work), give that role the `BYPASSRLS` attribute (`ALTER ROLE <name> BYPASSRLS` — an attribute, not a grantable privilege) rather than
 turning `FORCE` off table-wide. SEC016 then flags that role; allowlist it
 in `[lint.rules.SEC016]` once the need is confirmed.
 
@@ -1827,7 +1827,7 @@ against an **auth-context function** (`current_setting`, `auth.uid`,
 `ILIKE`, `SIMILAR TO`, or a POSIX regex operator (`~`, `~*`, `!~`,
 `!~*`) — makes the predicate's tightness depend on the *shape* of
 the auth-context value rather than on its identity. A GUC set to
-`%` (the empty `LIKE` pattern) or `.*` (regex match-everything)
+`%` (the match-everything `LIKE` wildcard) or `.*` (regex match-everything)
 matches every row, defeating the per-row isolation entirely.
 
 ```sql
@@ -2431,8 +2431,9 @@ escalation): this one is silent denial. Hence `warning` instead of
 `error`, and a `--fail-on=warning` default still gates CI on it
 while letting `--fail-on=error` continue.
 
-**Standard fix.** Scope by `auth.uid()` (immutable per user, no
-case folding, no aliasing) and treat email as a display field. If
+**Standard fix.** Scope by `auth.uid()` (immutable per user, and a
+`uuid` rather than text — so its comparison is case-insensitive and
+free of the aliasing email brings) and treat email as a display field. If
 the policy needs an email lookup (for example, "the row's
 `owner_email` must match the calling user's email"), derive it
 from `auth.users` via `auth.uid()` rather than calling
@@ -2530,9 +2531,13 @@ allowlist = ["public.api_tokens"]
 auth_functions = ["auth.uid", "current_setting", "app.tenant"]
 ```
 
-No auto-fix — converting `UNIQUE (email)` to `UNIQUE (tenant_id,
-email)` can fail if the existing data already holds a cross-tenant
-duplicate, so the remedy needs a data audit pgrls can't perform.
+No auto-fix. Not because the composite index could fail to build — while
+the global `UNIQUE (email)` is in force a cross-tenant duplicate cannot
+exist (measured: the second insert is rejected), and the composite is
+strictly weaker, so it always builds. The reasons are operational:
+dropping the old constraint and building the new one takes a lock window,
+and the application may be relying on the global uniqueness the change
+removes. Both need a human decision pgrls cannot make.
 
 <a id="rule-sec036"></a>
 
@@ -4317,8 +4322,12 @@ The rule treats any access method as "indexed" — B-tree, hash,
 GIN, GiST, BRIN. The operator chose the index type and pgrls
 doesn't second-guess. A leading-column match is the relevant
 signal: a B-tree on `(tenant_id, created_at)` helps `WHERE
-tenant_id = X`, but a B-tree on `(created_at, tenant_id)` does
-not. Partial indexes also count — the operator is responsible
+tenant_id = X`, while a B-tree on `(created_at, tenant_id)` is a poor
+fit. Not a capability limit — measured on 200k rows, the planner chose
+an Index Only Scan on the second index with `Index Cond: (tenant_id =
+…)`, 185 buffers against 25,000 for a seq scan — but a cost preference
+the planner will abandon as selectivity changes, which is why the
+leading column is the signal. Partial indexes also count — the operator is responsible
 for ensuring the partial predicate is satisfied by the policy
 predicate (pgrls can't statically prove that compatibility).
 
@@ -4332,10 +4341,11 @@ CREATE INDEX invoices_tenant_idx ON public.invoices (tenant_id);
 
 For composite predicates (`USING (tenant_id = X AND owner = Y)`),
 PERF003 fires for each unindexed column independently. A composite
-index `(tenant_id, owner)` silences the rule for `tenant_id` only;
-add a second index on `owner` if the policy needs both columns
-indexed, or live with the false-positive `owner` finding and
-allowlist it.
+index `(tenant_id, owner)` silences the rule for `tenant_id` only. The
+`owner` finding is a false positive there and allowlisting it is the
+right response — do NOT add a second index on `owner`: measured, the
+composite already serves the whole predicate (`Index Cond: ((tenant_id
+= …) AND (owner = …))`) and the extra index is never chosen.
 
 **Known limitations:**
 

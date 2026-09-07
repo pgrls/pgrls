@@ -26,7 +26,9 @@ a *prioritisation* signal — "these RLS tables are doing real sequential
 work, look here first" — not proof that RLS is the cause. Attributing a
 scan to a specific statement needs ``pg_stat_statements``; ``pgrls perf
 --statements`` does exactly that (see ``collect_statements`` /
-``top_statements_for``). ``n_live_tup`` is the planner's estimate from the last
+``top_statements_for``). ``n_live_tup`` is the live-row counter the
+cumulative statistics collector maintains — not the planner's estimate,
+which is ``pg_class.reltuples`` and is refreshed only by the last
 ANALYZE/autovacuum, so run against a database whose statistics are warm
 (reset, exercise the workload, ANALYZE, then measure).
 """

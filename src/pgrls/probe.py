@@ -90,9 +90,13 @@ Agreement = Literal["agree", "mismatch", "leak_confirmed", "skipped", "abstained
 # JWT-claim GUCs the auth.* stubs read (see repro._AUTH_STUB). Clearing them
 # (set to '') makes auth.uid()/role()/jwt() return NULL — the anonymous state
 # the `anon` threat model probes under, because those stubs read them through
-# `NULLIF(..., '')`. This set is deliberately CLOSED: a policy's own
-# `current_setting('app.x')` must never be cleared, since '' is a value rather
-# than NULL there and cannot be undone within the session.
+# `NULLIF(..., '')` — for THOSE stubs '' and unset are the same value. The set
+# is deliberately CLOSED: a policy's own `current_setting('app.x')` must never
+# be cleared, since '' is a value rather than NULL and cannot be undone within
+# the session. That is equally true of these claim GUCs when a policy reads
+# them DIRECTLY rather than through a stub, which is why they are cleared only
+# where already non-NULL, and why writing one poisons every later table in the
+# run (see `_reads_claim_guc_directly`).
 _ANON_BASELINE_GUCS = (
     "request.jwt.claim.sub",
     "request.jwt.claim.role",
