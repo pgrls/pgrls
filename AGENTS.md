@@ -86,8 +86,10 @@ errors; make it `UNIQUE(tenant_id, email)`),
 tenant/owner key but whose explicit `WITH CHECK` binds no identity
 column at all — a FOR ALL insert is governed by WITH CHECK alone, so a
 caller can INSERT a row stamped with another tenant's id; bare FOR
-UPDATE is excluded as Postgres re-checks the new row, and the "read
-team, write own" asymmetry is not flagged),
+UPDATE is excluded because Postgres re-checks the new row on any update
+that reads a column — the column-free `UPDATE t SET tenant_id = 99;` does
+still re-parent every row, measured — and the "read team, write own"
+asymmetry is not flagged),
 `SEC041` (declarative partition child has RLS disabled while its
 partitioned parent enforces it, and is granted directly to a non-owner
 role — Postgres inherits neither RLS nor grants to partitions, so a query
@@ -415,12 +417,14 @@ Currently fixable:
 * **SEC015** — emits `ALTER FUNCTION <name>(<args>) SET search_path
   = …;` per SECURITY DEFINER overload, pinning `pg_temp` last so a
   search-path hijack can't reach a caller-planted temp object. One
-  ALTER per overload signature; abstains on pre-v12 snapshots (empty
-  signatures) and paths it can't tokenize safely (quoted commas).
+  ALTER per overload signature; abstains on a pre-v12 snapshot (which
+  captured no signature at all) and on paths it can't tokenize safely
+  (quoted commas). An empty signature is a real zero-argument function
+  and is fixed.
 * **SEC017** — emits `ALTER FUNCTION <name>(<args>) NOT LEAKPROOF;`
   per overload, revoking a LEAKPROOF marking that lets the function
   observe rows an RLS predicate should have filtered first. Abstains
-  on pre-v12 empty signatures.
+  on a pre-v12 snapshot, which captured no signature at all.
 * **SEC030** — emits `ALTER TABLE <schema>.<table> ALTER COLUMN
   <col> SET NOT NULL;` for a nullable tenant discriminator — a NULL
   tenant key slips past a `tenant = current_setting(…)` filter. The

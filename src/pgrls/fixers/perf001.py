@@ -9,8 +9,11 @@ IS walked — an unwrapped auth call there re-evaluates per row. An
 UNCORRELATED subselect is skipped (a call inside it already runs
 once), but a CORRELATED subselect IS descended into — an unwrapped
 auth call inside `EXISTS (SELECT … WHERE … = t.col AND … =
-auth.uid())` re-evaluates per outer row, so PERF001's rule flags it
-and the fixer must wrap it. This mirrors
+auth.uid())` re-evaluates many times (measured: 51 calls on a
+10,000-row outer against a 50-row inner, once per inner row, and
+10,002 when the planner can push an equivalent filter onto the outer
+scan), so PERF001's rule flags it and the fixer must wrap it — the
+wrap is one InitPlan call in every shape. This mirrors
 `ast_utils.find_func_calls(descend_correlated_sublinks=True)`, which
 the rule uses.
 
@@ -146,9 +149,10 @@ def _wrap_unwrapped_calls(node: Any, names: set[str]) -> tuple[Any, bool]:
         # the auth call per row, so rewrite it. The subselect is a
         # `(SELECT …)`: a call inside an UNCORRELATED one already runs
         # once and is left alone, but a CORRELATED subselect re-executes
-        # per outer row — an unwrapped auth call inside
+        # per rescan — an unwrapped auth call inside
         # `EXISTS (SELECT … WHERE … = t.col AND … = auth.uid())`
-        # re-evaluates per row and must be wrapped too. Mirrors
+        # re-evaluates many times (how many depends on the plan) and
+        # must be wrapped too. Mirrors
         # `ast_utils.find_func_calls(descend_correlated_sublinks=True)`,
         # which the rule uses. A freshly-wrapped `(SELECT auth.uid())`
         # is uncorrelated, so re-running the fixer is idempotent.

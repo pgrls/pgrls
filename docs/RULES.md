@@ -387,8 +387,12 @@ The genuinely open shapes are `INSERT` (which carries no `USING` at all)
 and an `UPDATE` / `ALL` whose `USING` is absent or constant-`true` —
 nothing meaningful to reuse. The diagnosis then branches on permissivity:
 
-* **Permissive + open** — a concrete hole: the policy admits writes that
-  violate the read-side predicate.
+* **Permissive + open** — if the `USING` is constant-`true`, every
+  written row is accepted, a concrete hole. With no usable predicate at
+  all the policy grants no write whatsoever (measured: a clause-less
+  permissive `FOR INSERT` raises `new row violates row-level security
+  policy`, a clause-less `FOR UPDATE` reports `UPDATE 0`). Either way it
+  is not doing what it looks like it is doing.
 * **Restrictive + open** — the un-reusable missing `WITH CHECK` defaults
   to `true` and AND-combines into the restrictive group, so the policy
   constrains nothing. Not a hole on its own (other restrictives still
@@ -408,10 +412,9 @@ CREATE POLICY tenant_insert ON public.invoices
     FOR INSERT
     TO authenticated;
 
--- … and its fix:
-CREATE POLICY tenant_insert ON public.invoices
-    FOR INSERT
-    TO authenticated
+-- … and its fix (ALTER, not a second CREATE — re-running CREATE POLICY
+-- raises `policy "tenant_insert" ... already exists`):
+ALTER POLICY tenant_insert ON public.invoices
     WITH CHECK (tenant_id = (SELECT current_setting('app.tenant_id')::uuid));
 ```
 
@@ -540,7 +543,9 @@ which can take an embarrassingly long time to notice in dev.
 include:
 
 ```sql
-ALTER TABLE public.invoices ENABLE ROW LEVEL SECURITY;
+-- RLS is already ENABLEd — that is this rule's precondition. FORCE is the
+-- one flag worth adding here (it subjects the table's owner to the
+-- policies too; see SEC002).
 ALTER TABLE public.invoices FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON public.invoices
@@ -635,8 +640,11 @@ including under `AND` / `NOT` — but not inside a subquery body: an `OR true`
 in `EXISTS (SELECT … WHERE flag OR true)` widens the subquery, not the
 policy, and is deliberately not flagged. The
 literal `true` ORed with anything else is still `true`, but a
-casual reading misses the disjunction — the predicate evaluates
-to true for every row regardless of the other branches.
+casual reading misses the disjunction — the predicate admits rows it was
+never meant to. How many depends on where the branch sits: measured on one
+3-row table, a top-level `OR true` returned **every** row (3), the same
+branch under `AND` widened one conjunct (1 row), and under `NOT` it inverted
+to a constant `FALSE` (0 rows).
 
 Common shape: a debug branch left in by accident. The author
 adds `OR true` to "temporarily let everything through" while
@@ -1008,9 +1016,11 @@ returned, and under `pg_catalog, <own schema>, pg_temp` the real table
 was. A body reading unqualified names from a THIRD schema still needs
 that schema inserted before `pg_temp`, or the references
 fully-qualified (the Fix description prompts this). The fixer **abstains** in three cases: a pre-v12
-snapshot whose captured `signature` is empty (a bare
+snapshot, which captured **no** signature at all (a bare
 `ALTER FUNCTION name()` would target the wrong overload — re-snapshot
-against v12+ to populate signatures); a pre-v14 snapshot that lacks the
+against v12+ to populate signatures; an *empty* signature is a real
+value, a zero-argument function, and `ALTER FUNCTION name()` targets it
+exactly); a pre-v14 snapshot that lacks the
 separate schema/function-name fields needed to target a dotted schema
 name (re-snapshot); and a `search_path` the naive comma-split tokenizer
 can't safely rewrite — one whose raw GUC string contains both a quote
@@ -1206,13 +1216,15 @@ timing channel can expose an argument, or remove the marking.
 `pgrls fix` automates the removal — it emits `ALTER FUNCTION
 <schema>.<name>(<signature>) NOT LEAKPROOF` for **each** flagged
 overload (one statement per overload, since a single `ALTER
-FUNCTION` reaches only one). It **abstains** on a pre-v12 snapshot
-whose captured `signature` is empty, and on a pre-v14 snapshot that lacks
+FUNCTION` reaches only one). It **abstains** on a pre-v12 snapshot,
+which captured **no** signature at all, and on a pre-v14 snapshot that lacks
 the separate schema/function-name fields needed to target a dotted schema
 name: a bare `ALTER FUNCTION name()
 NOT LEAKPROOF` would target the zero-argument overload, wrong for
 every function that has arguments — re-snapshot against a live
-v12+ database to populate signatures, then re-run. pgrls does not
+v12+ database to populate signatures, then re-run. An *empty* signature
+is not that case: it is a real zero-argument function, and
+`ALTER FUNCTION name()` targets it exactly. pgrls does not
 parse the body to prove leakproofness — that is the brittle analysis
 the rule deliberately avoids (the stance SEC014 takes on SECDEF
 bodies). Postgres's own built-in leakproof functions live in
@@ -1459,6 +1471,12 @@ tenant's id, or UPDATE one of its own rows to reassign it. The
 read-side isolation looks airtight while the write side is wide
 open.
 
+The fix is to mirror the `USING` predicate into `WITH CHECK` with
+`ALTER POLICY … WITH CHECK (…)`. The other route — removing the
+`WITH CHECK` so Postgres reuses `USING` for it — takes `DROP POLICY` +
+`CREATE POLICY`: `ALTER POLICY` has no clause-removal syntax (measured:
+both `WITH CHECK ()` and `DROP WITH CHECK` are syntax errors).
+
 SEC020 fires when a policy has both clauses present, its `USING`
 clause is a real predicate, and its `WITH CHECK` clause is the
 literal `true`. The fix is almost always to mirror the `USING`
@@ -1564,6 +1582,12 @@ that owns the table or carries `BYPASSRLS`. pgrls cannot tell the
 two apart, so SEC022 is **info** — a "did you mean this?" nudge.
 Allowlist the table (bare name or `schema.table`) when the
 read-only surface is intentional.
+
+SEC022 skips any table that is itself a partition, at any level: a direct
+child write is governed by the child's own RLS, and
+[SEC041](#rule-sec041) covers the RLS-*disabled* child. An RLS-enabled
+child with no write policy falls to neither rule — harmlessly, since with
+RLS on and no permissive write policy it default-denies.
 
 SEC022 fires only when the table also has a *permissive* policy.
 A table whose policies are all restrictive denies reads too — the
@@ -1828,7 +1852,11 @@ against an **auth-context function** (`current_setting`, `auth.uid`,
 `!~*`) — makes the predicate's tightness depend on the *shape* of
 the auth-context value rather than on its identity. A GUC set to
 `%` (the match-everything `LIKE` wildcard) or `.*` (regex match-everything)
-matches every row, defeating the per-row isolation entirely.
+matches every row — under a positive operator that defeats the per-row
+isolation entirely, and under a **negated** one (`NOT LIKE`, `NOT ILIKE`,
+`!~`, `!~*`, all of them flagged) it inverts: matching every row means
+*denying* every row, silently hiding all data. The rule's message branches
+on which of the two it is.
 
 ```sql
 CREATE POLICY p ON documents
@@ -1915,9 +1943,12 @@ a design choice, not a mechanical rewrite.
   so nothing is attacker-injectable (the admin-escape allowance, like
   SEC018's `current_user = 'postgres'`). Not flagged.
 * **Non-text `~`.** When either operand of `~` / `!~` is cast to or built
-  as a geometric or `ltree`/`lquery` type (`path::ltree ~
-  current_setting('app.q')::lquery`) it is containment / label matching,
-  not a regex; SEC026 stays silent.
+  as an `ltree` / `lquery` type (`path::ltree ~
+  current_setting('app.q')::lquery`) it is label matching, not a regex;
+  SEC026 stays silent. The geometric `~` ("contains") forms are recognized
+  too, but they are dead on every version pgrls supports — PG14 removed
+  them (measured on PG16: `box ~ box` raises "operator does not exist") —
+  and are kept only so a policy written against PG13 still parses.
 
 <a id="rule-sec027"></a>
 
@@ -2433,23 +2464,28 @@ while letting `--fail-on=error` continue.
 
 **Standard fix.** Scope by `auth.uid()` (immutable per user, and a
 `uuid` rather than text — so its comparison is case-insensitive and
-free of the aliasing email brings) and treat email as a display field. If
-the policy needs an email lookup (for example, "the row's
-`owner_email` must match the calling user's email"), derive it
-from `auth.users` via `auth.uid()` rather than calling
-`auth.email()` directly:
+free of the aliasing email brings) and treat email as a display field:
 
 ```sql
 USING (owner_id = auth.uid())
 ```
 
-Or, when the table genuinely needs an email-typed FK:
+When the table genuinely needs an email-typed FK, take the email from the
+**JWT**, not from a sub-select on `auth.users`:
 
 ```sql
-USING (owner_email = (
-    SELECT email FROM auth.users WHERE id = auth.uid()
-))
+USING (owner_email = (SELECT auth.jwt() ->> 'email'))
 ```
+
+A policy sub-select is evaluated with the **caller's** privileges, and
+`anon` / `authenticated` hold no `SELECT` on `auth.users` — measured, a
+policy `TO authenticated` containing
+`(SELECT email FROM auth.users WHERE id = auth.uid())` raised
+`ERROR: permission denied for table users`, and started working only
+after a `GRANT SELECT ON auth.users`, which is exactly what
+[SEC052](#rule-sec052) reports at `error` severity. If the JWT claim is
+not available, mirror the email into a `public.profiles` row the caller
+may read.
 
 (SEC036 inspects only `EXISTS (SELECT … FROM auth.users …)` sub-links, so
 this scalar lookup is outside its scope either way; the `id = auth.uid()`
@@ -2828,11 +2864,15 @@ public data) allowlist the policy. The choice isn't mechanical.
 **What it catches:** a PERMISSIVE policy for a write command — `INSERT`,
 `UPDATE`, `DELETE`, or `ALL` — whose role list includes the unauthenticated
 `anon` role. In Supabase / PostgREST the `anon` role serves requests carrying
-no JWT, so such a policy lets an anonymous client modify rows, gated only by
-that policy's clause.
+no JWT, so such a policy lets an anonymous client modify rows, gated by that
+policy's clause **and** by the table grant — the policy alone is not enough
+(measured: without a `GRANT INSERT`, the write raised
+`permission denied for table posts`), but Supabase grants the write privileges
+to `anon` by default, so the policy is the deciding gate in practice.
 
 ```sql
--- Fires: anonymous clients can INSERT.
+-- Fires: anonymous clients can INSERT (given anon's table grant, which
+-- Supabase creates by default).
 CREATE POLICY posts_insert ON public.posts
     FOR INSERT TO anon
     WITH CHECK (true);
@@ -3378,8 +3418,11 @@ Once one connection plans `SELECT … FROM docs` under that policy, the planner
 folds `app.cur_tenant()` to *that connection's* tenant and caches the plan. A
 different user reusing the same pooled backend then runs the cached plan and is
 served the **first user's** rows — RLS silently scopes them to someone else's
-tenant. (Verified live: with the function marked `IMMUTABLE` a second connection
-sees the first connection's rows; marked `STABLE` it does not.)
+tenant. (Verified live: with the function marked `IMMUTABLE` the leak takes a **reused
+plan in the same backend** — a prepared statement, a PL/pgSQL plan cache, or a
+pooler handing the session on — which served the first caller's rows after the
+GUC changed; a genuinely separate backend re-plans and is unaffected. Marked
+`STABLE`, even the reused plan is correct.)
 
 This is a *correctness* finding distinct from its neighbours: SEC024 surfaces a
 policy that reads a session GUC at all; PERF004 flags a function-wrapped
@@ -3712,7 +3755,8 @@ cross-bucket *write* footgun left to recall.
 It is deliberately narrow to stay low-FP:
 
 * A literal `USING (true)` / `WITH CHECK (true)` is ceded to
-  [SEC008](#rule-sec008) / [SEC006](#rule-sec006) — this rule targets the
+  [SEC008](#rule-sec008) / [SEC028](#rule-sec028) (SEC006 is the
+  *absent*-`WITH CHECK` rule and skips a policy that has one) — this rule targets the
   subtler case of a policy that scopes by *something*, just not by bucket.
 * If any **restrictive** policy on `storage.objects` constrains `bucket_id`,
   the table is bucket-floored regardless of the permissive policies, so SEC050
@@ -3959,11 +4003,10 @@ Conservative by design (soundness over recall, no false positives):
 
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
 `REVOKE` the low-trust grant, move the foreign table out of the exposed schema,
-or front it with a definer-rights view (the default — an invoker view runs as the caller, so it needs the caller to hold SELECT on the foreign table, which is exactly the grant the remedy revokes; measured: `permission denied for foreign table`) that filters rows (the view runs as
-the caller, so it can scope the read the foreign table itself cannot) —
-no: an invoker view is exactly what does NOT work here, since it needs
-the caller to hold the grant being revoked. A definer-rights view (the
-default) is the remedy.
+or front it with a **definer-rights** view (the default) that filters rows.
+A `security_invoker` view is *not* the remedy here: it runs as the caller, so
+it needs the caller to hold `SELECT` on the foreign table — exactly the grant
+being revoked (measured: `permission denied for foreign table`).
 
 **Configuration** (`[lint.rules.SEC053]`):
 
@@ -4009,8 +4052,9 @@ GRANT SELECT ON public.orders_summary TO anon;
 ```
 
 **Relationship to [VIEW003](#rule-view003).** VIEW003 (`warning`) flags *any*
-matview reading an RLS table — a broad architectural caution ("verify `REFRESH`
-runs as a per-tenant role, or replicate the matview per-tenant"), which may be
+matview reading an RLS table — a broad architectural caution ("give the matview
+a per-tenant owner, since the body runs as the owner at `REFRESH`, or replicate
+the matview per-tenant"), which may be
 perfectly fine for an internal, un-exposed matview. SEC054 (`error`) is the
 sharpened, **confirmed-exposure** subset: the matview is *actually reachable over
 the API* by a low-trust role, so it is leaking now — `anon` cannot be "the
@@ -4039,9 +4083,11 @@ Conservative by design (soundness over recall, no false positives):
   a `security_invoker` question ([VIEW001](#rule-view001) / SEC052).
 
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
-`REVOKE` the low-trust grant, move the matview out of the exposed schema, run
-`REFRESH` as a per-tenant role so the captured rows are already scoped, or
-replicate the matview per-tenant.
+`REVOKE` the low-trust grant, move the matview out of the exposed schema, give
+it a per-tenant **owner** so the captured rows are already scoped — the body
+runs as the matview's owner at `REFRESH`, not as whoever issues it (measured:
+a matview owned by `mvowner` and refreshed by a member role captured
+`mvowner`'s rows) — or replicate the matview per-tenant.
 
 **Configuration** (`[lint.rules.SEC054]`):
 
@@ -4133,9 +4179,12 @@ than pgrls's exact `pgrls_require_<label>`, so a hand-rolled `require_tenant()`
   unset GUC, which is loud; it is SEC019's subject, for a different reason.
 - A policy that already uses the raising helper, even if it also reads a
   setting silently elsewhere in the same clause — the binding is guarded.
-- Anything at all when NO table in the scan adopted the raising form. The
-  gate is scan-wide, not per-schema: a schema that never adopted it is still
-  silent as long as some other scanned schema did.
+- Anything at all when NO table in the scan adopted the raising form.
+
+  Note the gate is scan-wide, not per-schema, and that cuts the other way too:
+  once *any* scanned schema adopted the raising helper, a silent-form policy in
+  a schema that never adopted it **does** fire. Lint the schemas separately if
+  you want the gate per-namespace.
 
 ### Remediation
 
@@ -4178,8 +4227,15 @@ times, the wrapped form once). A call reached via an UNCORRELATED
 is skipped. But a call inside a CORRELATED subselect — the common
 membership pattern `EXISTS (SELECT 1 FROM members m WHERE m.org_id =
 t.org_id AND m.user_id = auth.uid())`, whose subquery references the
-outer row — re-evaluates per row in the general case — though for a hashable equality membership Postgres builds a hashed SubPlan over the INNER table instead (measured: 102 calls, not 10,000). The wrapped form is one call either way, exactly like a
-top-level call, so it is flagged too. One finding per policy, naming
+outer row — re-evaluates many times, so it is flagged too. How many
+depends on the plan, not on the syntax: measured on a 10,000-row outer
+against a 50-row inner, that membership shape became a hash semi join
+with the auth call filtering the INNER scan — **51** calls, not 10,000.
+Compare the call against the *correlated* column instead and the planner
+infers an equivalent filter onto the outer scan: **10,002** calls, level
+with a top-level call's 10,001. The `(SELECT …)` wrap is a single
+InitPlan call in every shape, which is why the rule does not try to
+predict the plan. One finding per policy, naming
 the clause(s) involved.
 
 **The bad pattern:**
@@ -4206,11 +4262,12 @@ just gets to cache.
 
 **Correlated subqueries.** A bare auth call inside a *correlated*
 `EXISTS` / `IN (SELECT …)` — one whose subquery references the outer
-row, the membership-join pattern — is re-executed per outer row, so
-PERF001 flags it and `pgrls fix` wraps the nested call:
+row, the membership-join pattern — is re-executed on every rescan (see
+the measured counts above), so PERF001 flags it and `pgrls fix` wraps
+the nested call:
 
 ```sql
--- flagged: auth.uid() re-runs once per `teams` row scanned
+-- flagged: auth.uid() re-runs on every rescan of the subquery
 USING (EXISTS (SELECT 1 FROM team_members tm
               WHERE tm.team_id = teams.id AND tm.user_id = auth.uid()));
 -- fixed:
@@ -4323,11 +4380,13 @@ GIN, GiST, BRIN. The operator chose the index type and pgrls
 doesn't second-guess. A leading-column match is the relevant
 signal: a B-tree on `(tenant_id, created_at)` helps `WHERE
 tenant_id = X`, while a B-tree on `(created_at, tenant_id)` is a poor
-fit. Not a capability limit — measured on 200k rows, the planner chose
-an Index Only Scan on the second index with `Index Cond: (tenant_id =
-…)`, 185 buffers against 25,000 for a seq scan — but a cost preference
-the planner will abandon as selectivity changes, which is why the
-leading column is the signal. Partial indexes also count — the operator is responsible
+fit. Not a capability limit — Postgres *can* apply the condition as a
+non-boundary qual, and measured on a 200k-row, 25,000-page table the
+planner freely chose an Index Only Scan on that second index
+(`Index Cond: (tenant_id = …)`, 1,549 buffers against 25,000 pages for a
+seq scan). But on a narrow 885-page table it preferred the seq scan — so
+it is a cost preference the planner abandons as the table's width and
+selectivity change, which is why the leading column is the signal. Partial indexes also count — the operator is responsible
 for ensuring the partial predicate is satisfied by the policy
 predicate (pgrls can't statically prove that compatibility).
 
@@ -4841,11 +4900,17 @@ Same `schema.view` shape as VIEW001 / VIEW002.
 function that, in turn, reads from an RLS-protected table. Because
 the function runs with the function owner's privileges (typically a
 privileged migration / admin role), RLS on the underlying table is
-evaluated against the function owner — NOT the calling user. This
-bypasses the per-tenant filter even when the *view* itself is
-configured with `security_invoker = true` (VIEW001's defense),
-because the bypass happens one frame deeper, inside the function
-call.
+evaluated against the function owner — NOT the calling user. That is
+one frame deeper than the *view*, so `security_invoker = true`
+(VIEW001's defense) does not stop it.
+
+How much it bypasses depends on the owner, exactly as in
+[VIEW001](#rule-view001): RLS exemption is relative to the *table*. A
+superuser / `BYPASSRLS` owner skips the policies outright, and so does an
+ordinary owner on its own tables whenever those are not `FORCE`'d.
+Otherwise the policies still run — against the owner — so the caller gets
+the *owner's* row set rather than its own: not a full bypass, but not the
+answer a direct read would give either. Hence `warning`.
 
 **The bad pattern:**
 

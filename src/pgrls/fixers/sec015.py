@@ -36,11 +36,13 @@ the operator who needs that edits the generated SQL before
 
 **Abstains** on:
 
-* **Pre-v12 snapshots** — `signature == ""` because v3-v11
-  introspection didn't capture argument types. A bare
+* **Pre-v12 snapshots** — `signature is None` because v3-v11
+  introspection didn't capture argument types at all. A bare
   `ALTER FUNCTION name()` would target only the zero-arg overload,
   wrong for every function with arguments. Operator re-snapshots
-  to populate signatures.
+  to populate signatures. An *empty* signature is not this case: it
+  is a real value — a zero-argument function — and
+  `ALTER FUNCTION name()` targets it exactly, so it is fixed.
 * **Quoted schema names containing literal commas** — the rule's
   tokenizer (and ours) is naive comma-split, which shreds tokens
   for a path like `"My, Schema", public`. The rule explicitly

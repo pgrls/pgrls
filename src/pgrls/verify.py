@@ -1983,10 +1983,13 @@ def _escalation_secdef_findings(
     schema: Schema, auth_functions: set[str] | None, anon_roles: set[str]
 ) -> list[TableVerdict]:
     """SEC042 escalation: an anon / ``PUBLIC``-EXECUTE-able SECURITY DEFINER
-    function owned by an RLS-exempt role (superuser / ``BYPASSRLS``) runs its
-    body with the owner's RLS exemption, so an anonymous caller (``POST
-    /rpc/fn``) reads whatever RLS tables the body touches — rows its own RLS
-    would deny. We prove that against each read table's ``anon`` verdict.
+    function whose owner is RLS-exempt **for the table its body reads** —
+    superuser / ``BYPASSRLS``, or simply holding that table owner's privileges
+    while the table is not ``FORCE``'d — runs its body with that exemption, so
+    an anonymous caller (``POST /rpc/fn``) reads whatever RLS tables the body
+    touches — rows its own RLS would deny. Exemption is decided per read table,
+    so this mode is strictly broader than SEC042, which gates on the owner
+    being superuser / ``BYPASSRLS`` outright. We prove that against each read table's ``anon`` verdict.
 
     Reuses VIEW004's body parser to extract the RLS tables a SQL body reads. A
     body is **unverified** when it is opaque (PL/pgSQL or dynamic SQL) *or* when
@@ -2118,8 +2121,8 @@ def _escalation_secdef_findings(
             sorted({r for f in candidate for r in (set(f.execute_roles) & _exec_reachable)})
         )
         head = (
-            f"SECURITY DEFINER function EXECUTE-able by {roles}, owned by an "
-            "RLS-exempt role"
+            f"SECURITY DEFINER function EXECUTE-able by {roles}, whose owner "
+            "is RLS-exempt for the table its body reads"
         )
         if reads:
             # Exemption is relative to the TABLE, so drop the reads for which

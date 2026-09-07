@@ -22,11 +22,12 @@ instead of redefining `auth.role()`'s contract:
     -- intended pattern for an "admin" custom role:
     USING (auth.jwt() -> 'app_metadata' ->> 'role' = 'admin')
 
-Detection: walks policy USING / WITH CHECK ASTs for binary `=`
-A_Expr comparisons where one side is a `FuncCall` to `auth.role`
-(configurable) and the other is a string literal not in the
-configured known-role set (default `{anon, authenticated,
-service_role}`). Fires once per *distinct* unknown literal in the policy. Two
+Detection: walks policy USING / WITH CHECK ASTs for comparisons where
+one side is a `FuncCall` to `auth.role` (configurable) and the other is
+a string literal not in the configured known-role set (default `{anon,
+authenticated, service_role}`). Binary `=`, membership `IN (…)` and
+`= ANY(ARRAY[…])` are all matched; a membership list contributes each
+of its unknown literals. Fires once per *distinct* unknown literal in the policy. Two
 comparisons in the same policy with the *same* unknown literal
 collapse to a single finding (same fix). Two comparisons with
 *different* unknown literals yield two findings (the fix for each

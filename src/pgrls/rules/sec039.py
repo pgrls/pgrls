@@ -83,7 +83,8 @@ class SEC039:
                             f"Permissive {policy.command} policy "
                             f"{policy.name!r} on {table.qualified_name} lets "
                             f"the unauthenticated {role!r} role {verb} rows, "
-                            "gated only by this policy's clause. Restrict it "
+                            "gated by this policy's clause AND by the table "
+                            "grant. Restrict it "
                             "TO authenticated (or a privileged role) and "
                             f"revoke {role}'s write grant on the table."
                         ),

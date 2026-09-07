@@ -19,6 +19,11 @@ schemas = ["public"]
 # typo'd id (e.g. `["SEC0001"]`) is rejected at config load with
 # the rule catalog in the error message.
 disable = []
+# Dotted Python module paths exposing project-specific rules via a
+# `RULES` attribute (see docs/EXTRA_RULES.md). Built-in rules always
+# run; these run alongside them, and their IDs become usable in
+# `disable` and in [lint.rules.<ID>].
+# extra_rules = ["mycompany.pgrls_rules"]
 # Severity that triggers a nonzero exit code: "error" | "warning" | "info".
 fail_on = "warning"
 
@@ -292,8 +297,10 @@ allowlist = []
 # USING filters which rows the caller can read; WITH CHECK (true)
 # accepts every row it writes, so the caller can write rows it
 # could never read back (an INSERT or UPDATE into another tenant's
-# space). The fix is to mirror the USING predicate in WITH CHECK,
-# or drop the WITH CHECK clause so Postgres reuses USING for it.
+# space). The fix is to mirror the USING predicate in WITH CHECK
+# (ALTER POLICY ... WITH CHECK (...)). Removing the WITH CHECK so
+# Postgres reuses USING for it takes DROP POLICY + CREATE POLICY —
+# ALTER POLICY has no clause-removal syntax.
 #
 # Allowlist a policy when an intentionally open write side is the
 # design (e.g. an append-only audit table any tenant may write but
@@ -360,7 +367,7 @@ allowlist = []
 # without an index on the filtering column the planner does a
 # sequential scan — fine for small tables, catastrophic on multi-
 # tenant tables with millions of rows. Allowlist when:
-#   * an expression index exists that pgrls's v0.5.10 introspection
+#   * an expression index exists that pgrls's introspection
 #     doesn't decode (`CREATE INDEX ON tbl (lower(email))`);
 #   * the table is intentionally small and sequential scan is fine;
 #   * the column is part of a composite predicate where the OTHER

@@ -339,6 +339,11 @@ needed, but worth knowing the tests exist):
 count (`68 lint rules`, `sixty-eight rules`, etc. — the phrasing
 that actually appears in README.md, AGENTS.md, `pyproject.toml` and
 `docs/EXTRA_RULES.md`) is cheap insurance against missing a doc spot.
+`docs/QUICKSTART.md` carries BOTH counts in one sentence ("19 of the 68
+rules are mechanically fixable"), so grep the fixable count too. Three
+surfaces live outside this repo and go stale silently: the
+`pgrls/pgrls-action` Marketplace copy, the `pgrls/pgrls-docs` site, and
+the PyPI long description.
 
 ### 7. (Optional) Write a fixer
 

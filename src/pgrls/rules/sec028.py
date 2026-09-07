@@ -35,8 +35,10 @@ asymmetry case is explicitly ceded to SEC020).
 
 **Restrictive policies are out of scope.** A restrictive
 `WITH CHECK (true)` imposes no constraint, but restrictive policies
-AND-combine, so on its own it opens nothing — it is a dead clause
-(SEC006's restrictive framing), not an open-write hole.
+AND-combine, so on its own it opens nothing — it is a dead clause, not
+an open-write hole, and no rule reports it (SEC006 covers the dead
+*restrictive* policy only when the `WITH CHECK` is ABSENT; it skips any
+policy that has one).
 
 The fix is to replace `WITH CHECK (true)` with a predicate that
 validates the written row — typically the same tenant / ownership

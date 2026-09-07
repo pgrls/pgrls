@@ -35,7 +35,8 @@ is mechanical and `pgrls fix` applies it: per flagged overload it emits
 `ALTER FUNCTION <schema>.<name>(<signature>) SET search_path = <existing
 tokens minus pg_temp>, pg_temp` (or `pg_catalog, <the function's own schema>, pg_temp` when no path is
 pinned), using the per-overload signature introspection captures
-(snapshot v12+). It abstains on a pre-v12 snapshot (empty signature), a
+(snapshot v12+). It abstains on a pre-v12 snapshot (no signature captured at all — an
+*empty* signature is a real zero-argument function and is fixed), a
 pre-v14 snapshot (no separate schema/function-name fields), or a
 search_path the comma tokenizer cannot safely rewrite. Alternatively,
 allowlist the function after confirming its body fully-qualifies every

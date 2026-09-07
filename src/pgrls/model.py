@@ -3,9 +3,9 @@
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
 Currently version 26. v26 added ``View.direct_references`` /
-``column_grants`` / ``owner_is_superuser``, top-level ``set_gucs`` /
-``role_set_gucs``, and serialized ``role_memberships`` (each edge with
-its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
+``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,
+top-level ``set_gucs`` / ``role_set_gucs``, and serialized
+``role_memberships`` (each edge with its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
 for verify's reachability mode; v24 added foreign tables; v23 added the
 matview / exposed-relation fields; v21–v22 extended grants and
 publications; v14–v20 accumulated the SEC029–SEC044 catalog fields.
@@ -85,7 +85,7 @@ def maybe_set_value(value: str) -> str:
     `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
     return value[len(MAYBE_SET):]
 
-SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit); v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -426,7 +426,7 @@ class Index:
 
     PERF003 uses ``Table.indexes`` to check whether columns
     referenced in a policy predicate have a leading-column B-tree
-    index (or any leading-column index in v0.5.10). Without one,
+    index (or any leading-column index). Without one,
     every query against the RLS-enabled table does a sequential
     scan to filter rows — fine for small tables, catastrophic for
     multi-tenant tables with millions of rows.
@@ -703,7 +703,9 @@ class SecdefFunction:
     search_path: str | None = None
     # `pg_get_function_identity_arguments` output. Empty for
     # zero-arg functions; non-empty like `integer, text` for
-    # overloads. Snapshot v12+; older snapshots load with "".
+    # overloads. Snapshot v12+; older snapshots load with None
+    # ("not captured"), which is the case the fixers abstain on —
+    # an empty signature is a real zero-arg function and is fixed.
     signature: str | None = None
     # Schema and function name as SEPARATE components (snapshot v14+).
     # v26+: the function's owner (`pg_get_userbyid(proowner)`). RLS
@@ -965,7 +967,9 @@ class LeakproofFunction:
     qualified_name: str
     # `pg_get_function_identity_arguments` output. Empty for zero-
     # arg functions; non-empty for overloads. Snapshot v12+; v10–v11
-    # snapshots load with "".
+    # snapshots load with None ("not captured"), which is the case the
+    # fixer abstains on — an empty signature is a real zero-arg
+    # function and is fixed.
     signature: str | None = None
     # Separate schema / function name components (snapshot v14+); see
     # SecdefFunction. The SEC017 fixer uses these to build a correct
@@ -1499,7 +1503,9 @@ def _bypassrls_role_from_dict(r: dict[str, Any]) -> BypassRlsRole:
 
 
 def _leakproof_from_dict(f: dict[str, Any]) -> LeakproofFunction:
-    # `signature` is a v12 addition; v10-v11 snapshots load it as "".
+    # `signature` is a v12 addition; v10-v11 snapshots have no key and
+    # load it as None ("not captured"). An EMPTY signature is a real
+    # zero-argument function and IS validated.
     sig = f.get("signature")
     if sig is not None and not _is_safe_signature(sig):
         raise ValueError(

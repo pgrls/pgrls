@@ -30,8 +30,9 @@ unscoped ``WITH CHECK`` — is a cross-bucket *write* footgun left to recall.)
 It is deliberately narrow to stay low-FP:
 
 * A literal ``USING (true)`` / ``WITH CHECK (true)`` is ceded to
-  [SEC008](#rule-sec008) / [SEC006](#rule-sec006) (the "admits everything"
-  rules) — this rule targets the subtler case of a policy that *does* scope by
+  [SEC008](#rule-sec008) / [SEC028](#rule-sec028) (the "admits everything"
+  rules — SEC006 is the *absent*-WITH CHECK rule and skips a policy that has
+  one) — this rule targets the subtler case of a policy that *does* scope by
   something, just not by bucket.
 * If any **restrictive** policy on ``storage.objects`` constrains ``bucket_id``,
   the table is bucket-floored regardless of the permissive policies, so SEC050

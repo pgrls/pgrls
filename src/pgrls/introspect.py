@@ -590,7 +590,7 @@ ORDER BY t.tgrelid, t.tgname
 # Expression positions: `pg_index.indkey` is a `int2vector` of
 # attribute numbers (attnum). Position values that are 0 are
 # expression-index positions (the expression list lives in
-# `indexprs`); pgrls doesn't decode the expressions in v0.5.10, so
+# `indexprs`); pgrls doesn't decode the expressions, so
 # expression positions become empty strings in the `columns` array.
 # PERF003 only checks the leading column by name, so expression
 # leading positions naturally don't match any policy column — the

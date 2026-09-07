@@ -6,9 +6,12 @@ branch ("temporarily let everything through to test the data
 model"), where the author never circles back to remove it.
 
 SEC008 catches the literal `USING (true)` at the top level. SEC011
-catches the same effect buried inside a larger expression: the
+catches the same shape buried inside a larger expression: the
 literal `true` ORed with anything else is still `true`, but a
-casual reading misses the disjunction.
+casual reading misses the disjunction. The *effect* depends on where
+the branch sits — measured on one 3-row table, a top-level `OR true`
+returned every row (3), the same branch under `AND` widened one
+conjunct (1 row), and under `NOT` inverted to a constant FALSE (0 rows).
 
 Detection is narrow on purpose — only the literal `true` A_Const
 inside an OR-BoolExpr counts. Semantic equivalents (`1 = 1`,

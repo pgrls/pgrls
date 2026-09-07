@@ -42,7 +42,13 @@ spin up an ephemeral PG container per session.
   `tests/fixtures/all_bad.sql` (so the combined-fixture test trips
   it), a `## <RULE> — …` section (with its `rule-<id>` anchor) in
   `docs/RULES.md` documenting the detection shape and any allowlist /
-  config knobs, and the one-line catalog entry in `AGENTS.md`.
+  config knobs, the one-line catalog entry in `AGENTS.md`, and a row in
+  the README's rule table.
+- **Rule counts appear in prose,** not just in the catalog: `README.md`,
+  `AGENTS.md`, `pyproject.toml`, `docs/EXTRA_RULES.md`, and
+  `docs/QUICKSTART.md` (which carries the rule count *and* the fixable
+  count in one sentence). `docs/RULE_AUTHORING.md` has the full
+  checklist — grep for the old numbers before you commit.
 - **Auto-fixable rules:** add a fixer module under
   `src/pgrls/fixers/`, register it in `default_fixers()`, and update
   the `## Auto-fix: pgrls fix` section of `AGENTS.md`.

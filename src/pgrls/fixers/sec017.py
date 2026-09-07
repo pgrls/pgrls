@@ -20,12 +20,13 @@ overloads of the same function both need un-marking; a single
 
 **Abstains on pre-v12 snapshots.** A `SecdefFunction` /
 `LeakproofFunction` loaded from a pre-v12 snapshot has `signature
-= ""` because the older introspection query did not capture it.
+is None` because the older introspection query did not capture it.
 Emitting `ALTER FUNCTION name() NOT LEAKPROOF` would target the
 **zero-argument** overload — wrong for every function that actually
-has arguments. The fixer detects the empty signature and skips with
-no Fix; the operator re-snapshots against a live database (v12+) to
-populate signatures, then re-runs `pgrls fix`. A skipped function
+has arguments. The fixer detects the uncaptured signature and skips
+with no Fix; the operator re-snapshots against a live database (v12+)
+to populate signatures, then re-runs `pgrls fix`. An *empty* signature
+is a real value — a zero-argument function — and is fixed normally. A skipped function
 is not silently fixed wrong; the operator sees fewer fixes than
 SEC017 violations and knows to re-snapshot.
 
@@ -66,7 +67,6 @@ class SEC017Fixer:
         for fn in schema.leakproof_functions:
             if fn.qualified_name in allowlist:
                 continue
-            # Abstain on pre-v12 snapshots — signature is "" and a
             # Abstain only when the signature was NOT CAPTURED (a v4-v11
             # snapshot). An EMPTY signature is a real value — a zero-argument
             # function — and `ALTER FUNCTION name()` targets it exactly.

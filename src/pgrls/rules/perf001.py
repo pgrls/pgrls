@@ -21,8 +21,15 @@ SQLValueFunction nodes whose name is in the configured set. A call in an
 UNCORRELATED SubLink — `user_id IN (SELECT auth.uid())` — already runs
 once and is skipped. But a call inside a CORRELATED subselect — e.g.
 `EXISTS (SELECT 1 FROM members m WHERE m.org_id = t.org_id AND m.user_id
-= auth.uid())` — re-evaluates per outer row exactly like a top-level
-call, so it is flagged too (the SubLink's `testexpr` is always walked).
+= auth.uid())` — re-evaluates many times, so it is flagged too (the
+SubLink's `testexpr` is always walked). How many depends on the plan, not
+on the syntax: measured on a 10,000-row outer against a 50-row inner, that
+membership shape became a hash semi join with the auth call filtering the
+INNER scan — 51 calls, not 10,000. Compare the call against the
+*correlated* column instead and the planner infers an equivalent filter
+onto the outer scan: 10,002 calls, matching a top-level call's 10,001. The
+`(SELECT …)` wrap collapses every shape to a single InitPlan call, which
+is why the rule does not try to predict the plan.
 One violation per policy, naming the clause(s) where an unwrapped call
 was found.
 """

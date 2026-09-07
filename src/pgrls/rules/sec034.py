@@ -33,9 +33,14 @@ while you review.
 
 The canonical fix is to scope by `auth.uid()` (immutable per
 user, normalized, case-insensitive) and treat email as a display
-field. If the policy needs an email lookup, do it via
-`(SELECT email FROM auth.users WHERE id = auth.uid())` and key
-downstream tables off the resolved `uid`.
+field, keying downstream tables off the resolved `uid`. If the policy
+genuinely needs the email, read it from the JWT —
+`(SELECT auth.jwt() ->> 'email')` — not from a sub-select on
+`auth.users`: a policy sub-select runs with the CALLER's privileges,
+and measured on PG16 a policy `TO authenticated` containing
+`(SELECT email FROM auth.users WHERE id = auth.uid())` raised
+`ERROR: permission denied for table users`. Granting that SELECT is
+what SEC052 reports at error severity.
 
 Detection: walks policy USING / WITH CHECK ASTs for FuncCall
 nodes whose qualified name matches one of the configured
@@ -136,9 +141,14 @@ class SEC034:
                             "denial-of-service to legitimate users. "
                             "Scope by `auth.uid()` instead (immutable "
                             "per user) and treat email as a display "
-                            "field. If the policy needs an email "
-                            "lookup, derive it from auth.users via "
-                            "auth.uid(). Allowlist this policy if "
+                            "field. If the policy needs the email, "
+                            "read it from the JWT — `(SELECT auth.jwt() "
+                            "->> 'email')` — not from a sub-select on "
+                            "auth.users: a policy sub-select runs with "
+                            "the CALLER's privileges and raises "
+                            "`permission denied for table users` unless "
+                            "you grant the SELECT that SEC052 flags. "
+                            "Allowlist this policy if "
                             "the read is intentional (audit log, "
                             "display-only)."
                         ),

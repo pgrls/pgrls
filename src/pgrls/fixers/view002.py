@@ -1,8 +1,12 @@
 """VIEW002 fixer — emit `ALTER VIEW … SET (security_barrier = true)`.
 
 A view defined without `WITH (security_barrier = true)` lets the
-planner push user-supplied predicates under the view's RLS filter,
-opening the "WHERE-clause function as oracle" leak vector. The fix
+planner push user-supplied predicates below the view's OWN filtering
+(its `WHERE`, its column projection), opening the "WHERE-clause
+function as oracle" leak vector. It does not cross the base table's RLS
+quals — Postgres marks those security quals and always applies them
+first (measured; see `rules/view002`) — which is why this is a
+`warning`. The fix
 is a single ALTER VIEW statement per offending view that flips the
 reloption to true; future planner runs against the view will then
 treat it as a privilege boundary and refuse the unsafe push-down.
@@ -27,8 +31,10 @@ def _description(qualified_name: str, leaked_qnames: str) -> str:
     return (
         f"Set security_barrier on {qualified_name} "
         "so the planner cannot push user-supplied "
-        "predicates below the view's RLS qualifications "
-        f"on {leaked_qnames}."
+        "predicates below the view's own filtering of "
+        f"{leaked_qnames}. (The base table's RLS quals are "
+        "security quals and always run first — this closes the "
+        "view's own WHERE / projection, not the policy boundary.)"
     )
 
 

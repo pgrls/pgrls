@@ -57,9 +57,10 @@ when **all** of:
      ``ALL`` to that role (or ``PUBLIC``), **and**
    * the child either has ``rls_enabled == False`` (no RLS gates the write at
      all) **or** has a *permissive* ``INSERT`` / ``UPDATE`` / ``ALL`` policy
-     whose ``roles`` literally include that low-trust role (the SEC003
-     literal-role idiom — no group/membership expansion, no ``WITH CHECK``
-     satisfiability proof), **and**
+     whose ``roles`` reach that low-trust role — named literally, or via
+     ``PUBLIC`` / an absent ``TO`` clause, which apply to every role (the
+     SEC003 literal-role idiom otherwise: no group/membership expansion, no
+     ``WITH CHECK`` satisfiability proof), **and**
 
 3. the FK is not allowlisted.
 

@@ -19,9 +19,11 @@ breaking changes — they will be called out in this file.
   `(name, value)`; the value is a sentinel string when the introspecting
   session could read the GUC but could not attribute it to the server, and a
   legacy `null` means "set at server level, value uncaptured"),
-  top-level `role_set_gucs` (role-level ones, as `(role, name, value)`), and
+  top-level `role_set_gucs` (role-level ones, as `(role, name, value)`),
   top-level `role_memberships` (present only when captured from a live
-  database; each edge carries an `inherit` flag).
+  database; each edge carries an `inherit` flag), and
+  `secdef_functions[].owner` (the function's owner, for the per-table
+  RLS-exemption test in `verify --mode escalation`).
   Additive: v3–v25 files still load, and a missing `direct_references` falls
   back to the collapsed `references`. A missing `role_memberships` keeps the
   anon prover abstaining on role-scoped policies — but the anonymous-role
@@ -183,6 +185,11 @@ breaking changes — they will be called out in this file.
   clears only the JWT-claim GUCs (read through `NULLIF(..., '')`, where empty
   and unset are the same value) and leaves a directly-read GUC alone. The
   same policy that reported `MISMATCH` now reports `LEAK CONFIRMED`.
+  *Superseded twice since, both under `[Unreleased]`: writing `''` into the
+  claim GUCs was itself found to destroy an `IS NULL` gate a policy reads
+  directly, and then one table's anon-key attempt was found to poison those
+  GUCs for every later table. See the two later entries for the behavior that
+  ships.*
 - **`--emit-repro` wrote a script that could not reproduce, for a GUC whose
   value could not be attributed to the server.** That state is modelled with
   both the value and the null-flag free; emitting `set_config(name,

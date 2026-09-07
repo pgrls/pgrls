@@ -26,9 +26,11 @@ isolation looks airtight while the write side is wide open.
 SEC020 fires when a policy has BOTH clauses present, its `USING`
 clause is a real predicate, and its `WITH CHECK` clause is the
 literal `true`. The fix is almost always to mirror the `USING`
-predicate into `WITH CHECK`. (`ALTER POLICY` has no clause-removal
-syntax, so "deleting" the `WITH CHECK`
-clause, which makes Postgres reuse `USING` automatically.
+predicate into `WITH CHECK` with `ALTER POLICY … WITH CHECK (…)`. The
+other route — removing the `WITH CHECK` so Postgres reuses `USING` for
+it — takes `DROP POLICY` + `CREATE POLICY`: `ALTER POLICY` has no
+clause-removal syntax (measured: both `WITH CHECK ()` and
+`DROP WITH CHECK` are syntax errors).
 
 Severity: warning. Allowlist by qualified policy ID
 (`schema.table.policy_name`) — allowlist a policy when an

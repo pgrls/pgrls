@@ -51,8 +51,9 @@ both be silenced.
 
 Severity: warning. Auto-fix: `pgrls fix` emits `ALTER FUNCTION
 <schema>.<name>(<signature>) NOT LEAKPROOF` per flagged overload
-(abstaining on a pre-v12 snapshot with an empty signature, or a pre-v14
-snapshot without the separate schema/function-name fields). The other
+(abstaining on a pre-v12 snapshot, which captured no signature at all,
+or a pre-v14 snapshot without the separate schema/function-name fields;
+an *empty* signature is a real zero-argument function and is fixed). The other
 remedy — establishing that the function genuinely is leakproof and
 keeping the marking — is human judgement; allowlist it to take that path.
 

@@ -16,8 +16,12 @@ nothing to reuse as one:
     UPDATE/ALL whose USING is absent or constant-true (nothing meaningful
     to reuse). The diagnosis then branches on `permissive`:
 
-      - Permissive + open: a concrete security hole — the policy admits
-        writes that violate the read-side predicate.
+      - Permissive + open: if the USING is constant-true, every written
+        row is accepted — a concrete hole. With no usable predicate at
+        all the policy grants no write whatsoever (measured: a clause-less
+        permissive FOR INSERT raises `new row violates row-level security
+        policy`, a clause-less FOR UPDATE reports `UPDATE 0`). Either way
+        it is not doing what it looks like it is doing.
       - Restrictive + open: the un-reusable missing WITH CHECK defaults
         to `true`, AND-combined into the restrictive group, so the policy
         imposes no constraint on new rows — a dead policy. Not a hole on

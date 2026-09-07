@@ -32,7 +32,9 @@ stronger signal: it fires only when **this schema already uses the raising
 helper somewhere** — at least one policy compares against a
 `…require_<label>(…)`-shaped call — and some other tenant policy still
 carries the silent `current_setting(…, true)` form (any table — the
-check is schema-wide, not per column).
+check is scan-wide, not per column and not per namespace: once any
+scanned schema adopted the helper, a silent-form policy in a schema
+that never did will fire too).
 
 That is deliberate. A config-gated rule is silent when the config is
 absent, which is exactly the case when CI lints a database without the
@@ -182,7 +184,7 @@ class SEC055:
                             "returns NULL when nothing is bound — so a query "
                             "on a connection that never bound a tenant is "
                             "filtered to zero rows and looks exactly like an "
-                            "empty result. Other policies in this schema "
+                            "empty result. Other policies in this scan "
                             "already use a raising binding helper, so this "
                             "one is unconverted: it still 404s where the "
                             "others fail loudly. Point it at the same helper "

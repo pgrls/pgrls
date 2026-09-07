@@ -2,8 +2,11 @@
 
 A permissive policy with PUBLIC in its role list applies to every
 connection, including unauthenticated ones. This is rarely intentional
-in multi-tenant apps; the policy's USING clause becomes the only line of
-defense and any flaw exposes data broadly.
+in multi-tenant apps: the policy's USING clause carries the whole
+boundary for every role, and any flaw exposes data broadly. A
+RESTRICTIVE policy on the table can still narrow it — restrictives
+AND-combine, for the roles in their own TO list — so PUBLIC here is not
+automatically the last line of defense, just the widest one.
 """
 from __future__ import annotations
 

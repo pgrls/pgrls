@@ -66,8 +66,14 @@ Scope / known limits (intentional):
   matching avoids unrelated-word collisions, but a benign column that shares a
   whole token with a pattern (e.g. ``email_verified`` → token ``email``) still
   matches — allowlist it. The curated default set favors precision.
-* Snapshots predating column-grant capture carry no ``column_grants``; SEC045
-  abstains on them (fail-closed) until re-captured.
+* Snapshots predating column-grant capture (pre-v8) carry no
+  ``column_grants``, so SEC045 finds nothing on them — silently, not as an
+  announced skip. It is deliberately absent from
+  ``schema_sources._CATALOG_DEPENDENT_RULES``: that registry marks a rule
+  inert on EVERY offline source, and ``schema_from_sql`` does model
+  ``GRANT SELECT (col) ON …``, so registering SEC045 would report it
+  un-run on SQL sources where it genuinely fires. Re-snapshot a pre-v8
+  file rather than reading its silence as coverage.
 """
 from __future__ import annotations
 

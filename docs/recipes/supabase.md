@@ -190,9 +190,10 @@ Other Supabase-relevant rules to know about (see
 - **SEC008** — policy with literal `USING (true)`: no scoping at all
   (the top-level constant-true case).
 - **SEC009** — table has RLS enabled but **no policies** defined
-  (default-deny; the table is invisible to non-owner roles, which
-  is sometimes intentional and often a silent deny-all that
-  surprises in production).
+  (default-deny: invisible to ordinary grantees, while the owner
+  still reads it unless `FORCE` is set, and a `BYPASSRLS` role or
+  superuser always does — sometimes intentional, often a silent
+  deny-all that surprises in production).
 - **SEC011** — same effect as SEC008, but the `OR true` branch is
   buried inside an otherwise-scoped policy (`tenant_id = X OR true`).
 - **SEC032** — table has policies but RLS is disabled — the
