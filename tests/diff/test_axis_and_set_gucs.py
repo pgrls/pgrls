@@ -207,3 +207,55 @@ def test_cross_tenant_still_proves_when_the_axis_itself_is_null_tested() -> None
         "AND current_setting('app.tenant_id', true) IS NOT NULL"
     )
     assert prove_cross_tenant_isolation(parse_expr(sql))[0] == "isolated"
+
+
+# --- review pass 11: the round-10 recorder only fired on a BARE minted session
+# symbol, so any wrapper that keeps `is_null` but replaces the value slipped past it.
+# Measured on PG16: with tenancy in `SET app.tenant_id` and no JWT, a tenant-b session
+# READ and UPDATE'd tenant a's row through
+# `... OR (current_setting('request.jwt.claims', true)::jsonb IS NULL AND ...)`,
+# while --mode anon, --mode cross-tenant and --mode write all reported PROVEN with
+# --strict clean. An encoder sweep found 402 of 576 off-axis cells falsely PROVEN.
+
+_AXIS = "tenant_id = current_setting('app.tenant_id', true)"
+
+
+@pytest.mark.parametrize(
+    "offaxis",
+    [
+        # a cast whose target has no Z3 sort -> the value went opaque, the
+        # null-flag survived, and the symbol identity was lost
+        "current_setting('request.jwt.claims', true)::jsonb IS NULL",
+        "auth.jwt()::json IS NULL",
+        "current_setting('request.jwt.claim.sub', true)::timestamptz IS NULL",
+        "auth.uid()::date IS NULL",
+        # COALESCE builds a fresh value whose null-flag is the AND of its args'
+        "coalesce(auth.role(), current_setting('request.jwt.claim.role', true)) IS NULL",
+        "coalesce(auth.uid()::text, 'x') IS NULL",
+        # and the bare form round 10 already covered, as a guard against regression
+        "auth.role() IS NULL",
+    ],
+)
+def test_cross_tenant_declines_through_a_wrapped_offaxis_null_test(
+    offaxis: str,
+) -> None:
+    assert prove_cross_tenant_isolation(parse_expr(f"{_AXIS} OR {offaxis}"))[0] == (
+        "unverified"
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # the axis identity's own non-nullness IS the mode's premise
+        _AXIS + " AND current_setting('app.tenant_id', true) IS NOT NULL",
+        # a sort-changing cast mints the axis symbol; recording the OUTERMOST
+        # minted term is what keeps this provable
+        "tenant_id = current_setting('app.tenant_id', true)::bigint "
+        "AND current_setting('app.tenant_id', true)::bigint IS NOT NULL",
+        "user_id = auth.uid() AND auth.uid() IS NOT NULL",
+        "user_id = auth.uid() OR auth.uid() IS NULL",
+    ],
+)
+def test_cross_tenant_still_proves_on_axis_null_tests(sql: str) -> None:
+    assert prove_cross_tenant_isolation(parse_expr(sql))[0] == "isolated"

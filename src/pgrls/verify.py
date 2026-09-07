@@ -1195,6 +1195,16 @@ def build_reachability(
     were written to withhold. The table is genuinely isolated; the view is a
     second door. This mode proves whether that door is open.
 
+    Scope, both measured. A **materialized view** is not a door this mode
+    walks when it is the OUTER relation: its rows were captured at REFRESH
+    under the matview owner's RLS context, which is a different mechanism —
+    an anon-granted matview over an RLS table is ``SEC054`` (error) and
+    ``VIEW003`` (warning), which do fire on it, while this mode reports
+    nothing. (A matview reached as an intermediate HOP is reported
+    ``unverified``.) And the walk only sees relations in the scanned schemas:
+    a definer view in an un-scanned schema is invisible here and needs that
+    schema added to ``--schemas``.
+
     The firing gate, every clause validated live on PG16 against a table whose
     policy scopes rows to ``current_setting('app.tenant')`` (anon sets no such
     GUC, so the direct read yields nothing):
@@ -2097,7 +2107,12 @@ def _escalation_secdef_findings(
         if reads is False:
             return False  # no SELECT: the body raises, so there is no door
         ov = _owner_anon_verdict(owner, table)
-        return ov is not None and ov.verdict == "leak"
+        if ov is None or ov.verdict == "unverified":
+            # Undecided, not "no door" — the same answer `build_reachability`
+            # gives for this exact uncertainty. Collapsing it to False made the
+            # function a non-candidate, so it was never examined at all.
+            return None
+        return ov.verdict == "leak"
 
     _exec_reachable = (
         set(_esc_roles)
@@ -2170,6 +2185,7 @@ def _escalation_secdef_findings(
         reads: set[str] = set()
         any_opaque = False
         any_unseen = False  # reads via a view / function / unknown relation
+        any_undecided = False  # cannot decide whether the owner reaches a table
         for f in candidate:
             if not _sql_body_parses(f):
                 any_opaque = True
@@ -2180,7 +2196,7 @@ def _escalation_secdef_findings(
                 parsed, base_quals, base_bares, resolved_auth
             ):
                 any_unseen = True
-        inconclusive = any_opaque or any_unseen
+        inconclusive = any_opaque or any_unseen or any_undecided
         roles = ", ".join(
             sorted({r for f in candidate for r in (set(f.execute_roles) & _exec_reachable)})
         )
@@ -2219,9 +2235,9 @@ def _escalation_secdef_findings(
                     kept.add(q)
                     saw_launder = True
                 elif any(s is None for s in exempt + launder):
-                    any_unseen = True
+                    any_undecided = True
             reads = kept
-            inconclusive = any_opaque or any_unseen
+            inconclusive = any_opaque or any_unseen or any_undecided
             if saw_exempt != saw_launder:
                 head = head_for("exempt" if saw_exempt else "launder")
         if reads:
@@ -2236,7 +2252,11 @@ def _escalation_secdef_findings(
                 verdict, witness, tail = (
                     "unverified",
                     None,
-                    " — but it also reads via an opaque body or an unseen "
+                    " — but it also reads a table whose door cannot be decided, "
+                    "an opaque body, or an unseen view/function that may read "
+                    "an RLS table"
+                    if any_undecided
+                    else " — but it also reads via an opaque body or an unseen "
                     "view/function that may read an RLS table",
                 )
             note = f"{head}, reads {', '.join(sorted(reads))}{tail}"
@@ -2244,14 +2264,22 @@ def _escalation_secdef_findings(
             proof = PolicyProof(sorted(reads)[0], verdict, witness, reason)
             findings.append(TableVerdict(qname, verdict, note, (proof,)))
         elif inconclusive:
-            why = (
-                "has an opaque body (PL/pgSQL or dynamic SQL)"
-                if any_opaque and not any_unseen
-                else "reads via a view, a function, or a relation outside the "
-                "analyzed schema"
-                if any_unseen and not any_opaque
-                else "has an opaque body and reads via an unseen view/function"
-            )
+            if any_undecided and not (any_opaque or any_unseen):
+                why = (
+                    "reads an RLS table whose policies may or may not admit "
+                    "rows to the function's owner under the anonymous auth "
+                    "context — cannot decide whether the body launders them"
+                )
+            else:
+                why = (
+                    "has an opaque body (PL/pgSQL or dynamic SQL)"
+                    if any_opaque and not any_unseen
+                    else "reads via a view, a function, or a relation outside "
+                    "the analyzed schema"
+                    if any_unseen and not any_opaque
+                    else "has an opaque body and reads via an unseen "
+                    "view/function"
+                )
             note = f"{head}, {why} — cannot prove what it reads"
             proof = PolicyProof(qname, "unverified", None, why)
             findings.append(TableVerdict(qname, "unverified", note, (proof,)))

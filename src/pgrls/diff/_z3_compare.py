@@ -157,6 +157,7 @@ from pglast.ast import (
     A_Expr,
     Boolean,
     BoolExpr,
+    Node,
     CaseExpr,
     CoalesceExpr,
     ColumnRef,
@@ -1660,11 +1661,15 @@ def _anon_3vl(
         inner = _as_val(_anon_3vl(node.arg, ctx, auth_funcs, assertions))
         if inner is None:
             return None
-        if ctx.session_mode and _is_session_term(ctx, inner.value):
-            # Record it; the caller decides, once the tenant axis is known,
-            # whether this identity is the axis (its non-nullness is the
-            # mode's premise) or a different one (unconstrained in reality).
-            ctx.session_null_tests.add(inner.value.decl().name())
+        if ctx.session_mode:
+            # Record every session identity the TESTED SUBTREE reads, not just
+            # a bare minted symbol: a cast to a sort we do not model, or a
+            # COALESCE, keeps `is_null` while replacing the value, so testing
+            # `<wrapper>(auth.role()) IS NULL` would otherwise record nothing
+            # and prove away. The caller decides, once the tenant axis is
+            # known, whether each identity is the axis (its non-nullness is
+            # the mode's premise) or a different one (unconstrained).
+            ctx.session_null_tests |= _session_terms_under(node.arg, ctx)
         if node.nulltesttype == NullTestType.IS_NULL:
             return _TV(is_true=inner.is_null, is_null=z3.BoolVal(False))
         if node.nulltesttype == NullTestType.IS_NOT_NULL:
@@ -2386,6 +2391,40 @@ def _is_real_column_term(ctx: _Context, term: Any) -> bool:
     return bool(z3.is_const(term)) and term.decl().name() in ctx._vars
 
 
+def _session_terms_under(node: Any, ctx: _Context) -> set[str]:
+    """Decl names of every session identity the subtree `node` reads.
+
+    Taken at the OUTERMOST node that minted one, which is what preserves the
+    on-axis premise: `current_setting('app.tenant_id', true)::bigint IS NULL`
+    records the symbol the sort-changing cast minted — the same one
+    `_record_tenant_pair` recorded as the axis — rather than the inner String
+    leaf, so a policy that NULL-tests its own axis still proves.
+
+    Called only after `_anon_3vl` has walked the same subtree, so every session
+    var it can mint already exists in `ctx`.
+    """
+    found: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if not isinstance(n, Node):
+            return
+        minted = ctx._session_vars.get(_canon(n))
+        if minted is not None:
+            found.add(minted.decl().name())
+            return  # outermost wins: do not descend past it
+        for field_name in n:
+            walk(getattr(n, field_name, None))
+
+    walk(node)
+    return found
+
+
 def _session_null_tests_offaxis(ctx: _Context, axis_session: Any) -> bool:
     """Did the predicate test a session identity OTHER than the tenant axis
     for NULL?
@@ -2589,6 +2628,17 @@ def prove_cross_tenant_isolation(
 
         SAT(is_true ∧ column != session_tenant)  ⇒  cross-tenant LEAK
         UNSAT                                     ⇒  ISOLATED (proven)
+
+    **The premise, and its edge.** "A session authenticated as one tenant"
+    means that tenant's identity EXISTS, so the AXIS identity is minted
+    non-NULL and ``<axis> IS NULL`` proves FALSE. That is deliberate:
+    ``user_id = auth.uid() OR auth.uid() IS NULL`` is PROVEN here. It is not a
+    claim about a session that carries tenancy in a GUC and no JWT at all —
+    such a session does not satisfy the premise, and live it reads and updates
+    other tenants' rows. ``--mode anon`` reports exactly that shape as a leak,
+    which is why the split is sound. Any auth value that is NOT the axis gets
+    no such premise: see ``_session_null_tests_offaxis``, which declines rather
+    than assume a JWT is present.
 
     A visible row must belong to the session's own tenant, so isolation is
     exactly the UNSAT case. SAT yields a concrete cross-tenant row when one

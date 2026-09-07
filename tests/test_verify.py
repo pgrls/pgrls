@@ -3968,3 +3968,63 @@ def test_escalation_secdef_launders_rows_the_table_grants_its_owner() -> None:
         tables=(plain,), security_definer_functions=(fn,), role_memberships=(),
     )
     assert build_verification(quiet, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_undecided_laundering_door_is_unverified_not_silent() -> None:
+    """Review pass 11. `_fn_launders` collapsed an UNDECIDED owner-read to "no
+    door", so the function never became a candidate and the mode printed "No
+    reachable escalation paths to verify."
+
+    `build_reachability` reports the identical uncertainty; the mirror had
+    copied its `leak` branch and dropped the `unverified` one below it.
+    Measured on PG16 with `FORCE` on (which rules out the exempt half) and a
+    policy the encoder cannot decide: anon got `permission denied` reading the
+    table directly and read 2 rows through the alice-owned SECDEF, while
+    `--mode escalation --strict` exited 0.
+    """
+    from pgrls.model import Grant
+
+    tbl = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        owner="carol",
+        # `current_user = 'alice'` is outside the decidable fragment, so the
+        # owner's own anon verdict is `unverified` rather than leak/isolated.
+        policies=(_policy("current_user = 'alice'", roles=("alice",)),),
+        grants=(Grant(role="alice", privileges=("SELECT",)),),
+    )
+    fn = SecdefFunction(
+        qualified_name="public.f", body="SELECT * FROM t", language="sql",
+        execute_roles=("PUBLIC",), owner_bypasses_rls=False, owner="alice",
+    )
+    schema = Schema(
+        tables=(tbl,), security_definer_functions=(fn,), role_memberships=(),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.f"
+    assert t.verdict == "unverified"
+    # and the reason must describe the undecided DOOR, not an unseen READ
+    assert t.note is not None and "cannot decide whether the body launders" in t.note
+
+
+@requires_z3
+def test_escalation_owner_without_select_on_the_table_stays_silent() -> None:
+    """The complement: an owner that holds no privileges on the table makes the
+    body raise `permission denied`, so there is no door and no finding. Guards
+    the undecided branch above against becoming blanket noise."""
+    from pgrls.model import Grant
+
+    tbl = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        owner="carol",
+        policies=(_policy("current_user = 'alice'", roles=("alice",)),),
+        grants=(Grant(role="alice", privileges=("SELECT",)),),
+    )
+    fn = SecdefFunction(
+        qualified_name="public.g", body="SELECT * FROM t", language="sql",
+        execute_roles=("PUBLIC",), owner_bypasses_rls=False, owner="bob",
+    )
+    schema = Schema(
+        tables=(tbl,), security_definer_functions=(fn,), role_memberships=(),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
