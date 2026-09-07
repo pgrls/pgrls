@@ -646,6 +646,62 @@ CREATE POLICY p ON docs FOR SELECT TO authenticated
         ),
     ),
 
+    # Both cases below were live FALSE CLEARS: anon read 0 rows directly and
+    # every row through the SECURITY DEFINER function, while --mode anon,
+    # --mode escalation and --mode reachability all exited 0.
+    VerdictCase(
+        name="escalation_secdef_owner_inherits_table_owner",
+        mode="escalation",
+        sql="""
+GRANT corpus_bypass TO corpus_plain;
+SET ROLE corpus_bypass;
+CREATE TABLE docs (id int primary key, tenant text NOT NULL);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC
+    USING (tenant = current_setting('app.tenant', true));
+GRANT SELECT ON docs TO anon;
+RESET ROLE;
+SET ROLE corpus_plain;
+CREATE FUNCTION leak_docs() RETURNS SETOF docs LANGUAGE sql SECURITY DEFINER
+    AS $fn$ SELECT * FROM docs $fn$;
+RESET ROLE;
+""",
+        expect=(("public.leak_docs", "leak"),),
+        note=(
+            "Ownership is has_privs_of_role, not string equality: corpus_plain "
+            "is an INHERIT member of the table's owner, so its SECDEF body runs "
+            "owner-equivalent. The candidate gate used to test literal set "
+            "membership and never examined the function at all. Measured on "
+            "PG16: anon read 0 rows directly, 2 through the function."
+        ),
+    ),
+    VerdictCase(
+        name="escalation_secdef_launders_rows_granted_to_its_owner",
+        mode="escalation",
+        sql="""
+SET ROLE corpus_owner;
+CREATE TABLE docs (id int primary key, tenant text NOT NULL);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON docs FOR SELECT TO PUBLIC
+    USING (tenant = current_setting('app.tenant', true));
+CREATE POLICY forapp ON docs FOR SELECT TO corpus_plain USING (true);
+GRANT SELECT ON docs TO anon, corpus_plain;
+RESET ROLE;
+SET ROLE corpus_plain;
+CREATE FUNCTION launder_docs() RETURNS SETOF docs LANGUAGE sql SECURITY DEFINER
+    AS $fn$ SELECT * FROM docs $fn$;
+RESET ROLE;
+""",
+        expect=(("public.launder_docs", "leak"),),
+        note=(
+            "corpus_plain is NOT RLS-exempt, but the table's own `TO "
+            "corpus_plain USING (true)` policy grants it every row — the "
+            "definer body launders them to an anonymous caller the policies "
+            "would have denied. The function analogue of the reachability "
+            "door, which reports the equivalent definer VIEW correctly."
+        ),
+    ),
+
     # ---- anon: which role's settings an anonymous session actually inherits
     VerdictCase(
         name="anon_role_level_guc_for_the_login_role_leaks",

@@ -3878,3 +3878,93 @@ def test_reachability_cede_composes_the_restrictive_floor() -> None:
     assert _rv(Schema(tables=(t,), views=(v,), role_memberships=()))[
         ("public.t", "public.v")
     ][0] == "leak"
+
+
+# --- review pass 10: escalation reached only through has_privs_of_role, and the
+# SECDEF laundering door. Both were live false clears (anon read 0 rows directly
+# and every row through the function while every mode exited 0).
+
+
+@requires_z3
+def test_escalation_secdef_owner_is_inherit_member_of_table_owner() -> None:
+    from pgrls.model import Grant
+
+    # `_fn_exempt_for` always used has_privs_of_role, but the CANDIDATE gate
+    # tested literal `f.owner in {table owners}` — so a function owned by an
+    # INHERIT member of the table's owner was never even examined. Measured on
+    # PG16 with `GRANT brlsowner TO bob2`: anon read 0 rows directly and 2
+    # through a bob2-owned SECDEF over a brlsowner table.
+    tbl = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=False,
+        owner="brlsowner",
+        policies=(_policy("tenant = current_setting('app.tenant', true)"),),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+    fn = SecdefFunction(
+        qualified_name="public.leak_t", body="SELECT * FROM t", language="sql",
+        execute_roles=("PUBLIC",), owner_bypasses_rls=False, owner="bob2",
+    )
+    schema = Schema(
+        tables=(tbl,), security_definer_functions=(fn,),
+        role_memberships=(_mem("bob2", "brlsowner"),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.leak_t"
+    assert t.verdict == "leak"
+    assert t.note is not None and "public.t" in t.note
+
+    # A NOINHERIT member is not owner-equivalent and must stay silent.
+    noinh = Schema(
+        tables=(tbl,), security_definer_functions=(fn,),
+        role_memberships=(RoleMembership(member="bob2", role="brlsowner", inherit=False),),
+    )
+    assert build_verification(noinh, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_secdef_launders_rows_the_table_grants_its_owner() -> None:
+    from pgrls.model import Grant
+
+    # The owner is NOT RLS-exempt, but the table's own policies grant it every
+    # row under the anonymous auth context — so the definer body launders them,
+    # exactly as a definer VIEW does in `--mode reachability`. Measured: anon
+    # read 0 rows from the table directly and 2 through the function, while the
+    # equivalent view was correctly reported LEAK.
+    tbl = Table(
+        schema="public", name="t2", rls_enabled=True, force_rls=False,
+        owner="carol",
+        policies=(
+            _policy("tenant = current_setting('app.tenant', true)"),
+            _policy("true", name="forapp", command="SELECT", roles=("alice",)),
+        ),
+        grants=(
+            Grant(role="anon", privileges=("SELECT",)),
+            Grant(role="alice", privileges=("SELECT",)),
+        ),
+    )
+    fn = SecdefFunction(
+        qualified_name="public.f2", body="SELECT * FROM t2", language="sql",
+        execute_roles=("PUBLIC",), owner_bypasses_rls=False, owner="alice",
+    )
+    schema = Schema(
+        tables=(tbl,), security_definer_functions=(fn,), role_memberships=(),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.f2"
+    assert t.verdict == "leak"
+    assert t.note is not None and "launders" in t.note
+
+    # Without the laundering policy the owner reaches nothing: stay silent.
+    plain = Table(
+        schema="public", name="t2", rls_enabled=True, force_rls=False,
+        owner="carol",
+        policies=(_policy("tenant = current_setting('app.tenant', true)"),),
+        grants=(
+            Grant(role="anon", privileges=("SELECT",)),
+            Grant(role="alice", privileges=("SELECT",)),
+        ),
+    )
+    quiet = Schema(
+        tables=(plain,), security_definer_functions=(fn,), role_memberships=(),
+    )
+    assert build_verification(quiet, mode="escalation").tables == ()

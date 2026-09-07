@@ -327,6 +327,16 @@ class _Context:
         self.set_gucs: dict[str, str | None] = {}
         self._session_vars: dict[str, Any] = {}
         self.tenant_pairs: list[tuple[Any, Any]] = []
+        # Session identities the predicate tests for NULL (`auth.role() IS
+        # NULL`), by session-symbol decl name. Under `session_mode` every auth
+        # leaf is minted NON-NULL — the mode's premise is a session
+        # authenticated as some tenant, so ITS OWN identity exists. That says
+        # nothing about a DIFFERENT auth call: tenancy carried by `SET
+        # app.tenant` with no JWT at all is an ordinary deployment, and there
+        # `auth.role()` is NULL for every session. Proving such a test FALSE
+        # manufactured a PROVEN for a policy that leaks — see
+        # `_session_null_tests_offaxis`.
+        self.session_null_tests: set[str] = set()
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -1650,6 +1660,11 @@ def _anon_3vl(
         inner = _as_val(_anon_3vl(node.arg, ctx, auth_funcs, assertions))
         if inner is None:
             return None
+        if ctx.session_mode and _is_session_term(ctx, inner.value):
+            # Record it; the caller decides, once the tenant axis is known,
+            # whether this identity is the axis (its non-nullness is the
+            # mode's premise) or a different one (unconstrained in reality).
+            ctx.session_null_tests.add(inner.value.decl().name())
         if node.nulltesttype == NullTestType.IS_NULL:
             return _TV(is_true=inner.is_null, is_null=z3.BoolVal(False))
         if node.nulltesttype == NullTestType.IS_NOT_NULL:
@@ -2371,6 +2386,23 @@ def _is_real_column_term(ctx: _Context, term: Any) -> bool:
     return bool(z3.is_const(term)) and term.decl().name() in ctx._vars
 
 
+def _session_null_tests_offaxis(ctx: _Context, axis_session: Any) -> bool:
+    """Did the predicate test a session identity OTHER than the tenant axis
+    for NULL?
+
+    Under ``session_mode`` every auth leaf is minted NON-NULL, so such a test
+    encodes to a definite FALSE. For the AXIS identity that is the mode's own
+    premise (a session authenticated as tenant A has an identity). For any
+    OTHER auth call it is an unfounded assumption that a JWT is present:
+    measured on PG16, with tenancy in `SET app.tenant` and no JWT, a tenant-b
+    session read tenant a's row through `... OR auth.role() IS NULL` while
+    both `--mode cross-tenant` and `--mode anon` reported PROVEN. Decline to
+    prove instead.
+    """
+    axis_name = axis_session.decl().name() if z3.is_const(axis_session) else None
+    return any(name != axis_name for name in ctx.session_null_tests)
+
+
 def _is_session_term(ctx: _Context, term: Any) -> bool:
     """True iff ``term`` is exactly a minted session-tenant symbol.
 
@@ -2606,6 +2638,11 @@ def prove_cross_tenant_isolation(
         # No single tenant axis ⇒ nothing sound to prove against.
         return ("unverified", None)
     column, session_tenant = pairs[0]
+    if _session_null_tests_offaxis(ctx, session_tenant):
+        # The predicate turns on whether some auth call OTHER than the tenant
+        # axis is NULL. `session_mode` mints those non-NULL, which is only
+        # true of a JWT-bearing deployment — decline rather than prove.
+        return ("unverified", None)
     # The axis must be a tenant/identity DISCRIMINATOR. Any `<column> =
     # <session value>` equality records a pair, but `status =
     # current_setting('app.status', true)` or `region = current_setting(

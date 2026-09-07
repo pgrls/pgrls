@@ -173,3 +173,37 @@ def test_maybe_set_carries_the_observed_value_and_avoids_nul() -> None:
     assert maybe_set_value(MAYBE_SET + "fromconn") == "fromconn"
     assert not is_maybe_set("fromconn")
     assert not is_maybe_set(None)
+
+
+# --- review pass 10: the cross-tenant prover minted EVERY auth call non-NULL,
+# i.e. assumed a JWT is always present. Measured on PG16 with tenancy carried by
+# `SET app.tenant` and no JWT: a tenant-b session read tenant a's row through
+# `... OR auth.role() IS NULL`, while both --mode cross-tenant and --mode anon
+# reported PROVEN — nothing caught it.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "tenant_id = current_setting('app.tenant_id', true) OR auth.role() IS NULL",
+        "tenant_id = current_setting('app.tenant_id', true) "
+        "OR current_setting('request.jwt.claim.role', true) IS NULL",
+        "tenant_id = current_setting('app.tenant_id', true) "
+        "AND auth.role() IS NOT NULL",
+    ],
+)
+def test_cross_tenant_declines_when_an_offaxis_auth_value_is_null_tested(
+    sql: str,
+) -> None:
+    assert prove_cross_tenant_isolation(parse_expr(sql))[0] == "unverified"
+
+
+def test_cross_tenant_still_proves_when_the_axis_itself_is_null_tested() -> None:
+    """The AXIS being non-NULL is the mode's own premise — a session
+    authenticated as tenant A has an identity. Only a DIFFERENT auth call is an
+    unfounded assumption."""
+    sql = (
+        "tenant_id = current_setting('app.tenant_id', true) "
+        "AND current_setting('app.tenant_id', true) IS NOT NULL"
+    )
+    assert prove_cross_tenant_isolation(parse_expr(sql))[0] == "isolated"

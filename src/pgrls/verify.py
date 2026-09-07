@@ -133,17 +133,20 @@ _PROVERS: dict[str, Callable[..., tuple[str, dict[str, object] | None]]] = {
     "write": prove_cross_tenant_isolation,
 }
 
-# Why a policy got no claim, per mode. `cross-tenant`/`write` add the "no single
-# tenant-scoping equality" boundary (the prover declines unless the checked
-# predicate declares exactly one `<column> = <session identity>` axis).
+# Why a policy got no claim, per mode. `cross-tenant`/`write` add two
+# boundaries: the prover declines unless the checked predicate declares exactly
+# one `<column> = <session identity>` axis, and it declines when the predicate
+# turns on whether some auth call OTHER than that axis is NULL (those are minted
+# non-NULL, which only holds for a JWT-bearing deployment).
 _UNVERIFIED_PREDICATE_REASON = {
     "anon": "USING predicate outside the decidable fragment",
     "cross-tenant": (
-        "no provable tenant-scoping equality on an identity/discriminator column — see [lint.rules.SEC021].identity_columns — (or outside the decidable fragment)"
+        "no provable tenant-scoping equality on an identity/discriminator column — see [lint.rules.SEC021].identity_columns — (or the predicate turns on a non-axis auth value being NULL, or is outside the decidable fragment)"
     ),
     "write": (
         "no provable tenant-scoping write-check on an identity/discriminator "
-        "column — see [lint.rules.SEC021].identity_columns — (or outside the "
+        "column — see [lint.rules.SEC021].identity_columns — (or the write-check "
+        "turns on a non-axis auth value being NULL, or is outside the "
         "decidable fragment)"
     ),
 }
@@ -2030,19 +2033,71 @@ def _escalation_secdef_findings(
     # the table, which `owner_bypasses_rls` (superuser / BYPASSRLS) does not
     # capture. Measured: anon read 0 rows directly and every row through such
     # a function, while this mode reported "No reachable escalation paths".
-    _owner_exempt_anywhere = {
-        t.owner
-        for t in schema.tables
-        if t.rls_enabled and not t.force_rls and t.owner
-    }
+    #
+    # Ownership is `has_privs_of_role`, not string equality: an INHERIT member
+    # of the table's owner IS the owner for this check. The candidate gate must
+    # therefore use the same predicate as the per-table decision below — a
+    # literal `f.owner in {table owners}` set never made such a function a
+    # candidate, so it was never examined at all. Measured on PG16 with
+    # `GRANT brlsowner TO bob2` and a bob2-owned SECDEF over a brlsowner table:
+    # anon read 0 rows directly, 2 through the function, and every mode exited
+    # 0. (When the table owner is superuser/BYPASSRLS the owner-reachability
+    # half is silent too — `_OWNER_REACHABLE_MEMBERS_SQL` filters those out —
+    # so nothing else caught it.)
 
-    def _fn_exempt_for(f: Any, table: Any) -> bool:
+    def _fn_exempt_for(f: Any, table: Any) -> bool | None:
+        """Is this function's owner RLS-exempt FOR THIS TABLE?
+
+        ``None`` = the role-membership graph was not captured and the answer
+        turns on it. Reported as undecided rather than collapsed to "no
+        bypass", which is the posture `_reachability_paths` already takes for
+        the identical uncertainty.
+        """
         if f.owner_bypasses_rls:
             return True
         owner = getattr(f, "owner", "") or ""
         if not owner or table is None or table.force_rls or not table.owner:
             return False
-        return _inherits_privs_of(schema, owner, table.owner) is True
+        return _inherits_privs_of(schema, owner, table.owner)
+
+    _owner_anon_cache: dict[str, dict[str, TableVerdict]] = {}
+
+    def _owner_anon_verdict(owner: str, table: Any) -> TableVerdict | None:
+        """The ``anon`` verdict for `table` with `owner` as the session role —
+        the same question `build_reachability`'s `owner_verdict` asks of a
+        definer view's owner."""
+        if owner not in _owner_anon_cache:
+            v = build_verification(
+                schema, auth_functions=auth_functions, mode="anon",
+                anon_roles={owner}, set_gucs=_esc_gucs,
+            )
+            _owner_anon_cache[owner] = {t.qualified_name: t for t in v.tables}
+        return _owner_anon_cache[owner].get(table.qualified_name)
+
+    def _fn_launders(f: Any, table: Any) -> bool | None:
+        """Not exempt, but the table's OWN policies grant this function's owner
+        rows under the anonymous auth context — so the definer body hands them
+        to a caller the policies would have denied.
+
+        The function analogue of `build_reachability`'s `via_policy` door.
+        Measured on PG16: with a `TO alice USING (true)` policy on carol's
+        table, anon read 0 rows directly and 2 through an alice-owned SECDEF,
+        while every mode exited 0 — and the equivalent definer VIEW over the
+        same table was correctly reported LEAK, which is the asymmetry this
+        closes. ``None`` = undecided (the graph does not settle whether the
+        owner even holds SELECT, so the body may or may not raise
+        `permission denied`).
+        """
+        owner = getattr(f, "owner", "") or ""
+        if not owner:
+            return False
+        reads = _role_reads_relation(schema, f, table)
+        if reads is None:
+            return None
+        if reads is False:
+            return False  # no SELECT: the body raises, so there is no door
+        ov = _owner_anon_verdict(owner, table)
+        return ov is not None and ov.verdict == "leak"
 
     _exec_reachable = (
         set(_esc_roles)
@@ -2097,7 +2152,16 @@ def _escalation_secdef_findings(
             for f in by_qname[qname]
             if (
                 f.owner_bypasses_rls
-                or (getattr(f, "owner", "") or "") in _owner_exempt_anywhere
+                or any(
+                    _fn_exempt_for(f, t) is not False
+                    for t in schema.tables
+                    if t.rls_enabled
+                )
+                or any(
+                    _fn_launders(f, t) is not False
+                    for t in schema.tables
+                    if t.rls_enabled
+                )
             )
             and (set(f.execute_roles) & _exec_reachable)
         ]
@@ -2120,20 +2184,46 @@ def _escalation_secdef_findings(
         roles = ", ".join(
             sorted({r for f in candidate for r in (set(f.execute_roles) & _exec_reachable)})
         )
-        head = (
-            f"SECURITY DEFINER function EXECUTE-able by {roles}, whose owner "
-            "is RLS-exempt for the table its body reads"
-        )
+        def head_for(mech: str) -> str:
+            base = f"SECURITY DEFINER function EXECUTE-able by {roles}"
+            if mech == "exempt":
+                return f"{base}, whose owner is RLS-exempt for the table its body reads"
+            if mech == "launder":
+                return (
+                    f"{base}, whose owner is not RLS-exempt but is granted the "
+                    "table's rows by its own policies under the anonymous auth "
+                    "context — the definer body launders them"
+                )
+            return (
+                f"{base}, whose owner reaches the table its body reads — "
+                "RLS-exempt for it, or granted its rows by the table's own policies"
+            )
+
+        head = head_for("either")
         if reads:
-            # Exemption is relative to the TABLE, so drop the reads for which
-            # no candidate overload's owner is actually exempt — otherwise a
-            # function owned by an ordinary role would be credited with a
-            # bypass it does not have.
-            reads = {
-                q
-                for q in reads
-                if any(_fn_exempt_for(f, _tables_by_q.get(q)) for f in candidate)
-            }
+            # Exemption is relative to the TABLE, so a read whose owner is not
+            # exempt is not a bypass on its own — otherwise a function owned by
+            # an ordinary role would be credited with one it does not have. But
+            # it can still be a LAUNDERING door (`_fn_launders`), and a table
+            # neither settles is UNDECIDED, not cleared.
+            kept: set[str] = set()
+            saw_exempt = saw_launder = False
+            for q in reads:
+                t = _tables_by_q.get(q)
+                exempt = [_fn_exempt_for(f, t) for f in candidate]
+                launder = [_fn_launders(f, t) for f in candidate]
+                if any(s is True for s in exempt):
+                    kept.add(q)
+                    saw_exempt = True
+                elif any(s is True for s in launder):
+                    kept.add(q)
+                    saw_launder = True
+                elif any(s is None for s in exempt + launder):
+                    any_unseen = True
+            reads = kept
+            inconclusive = any_opaque or any_unseen
+            if saw_exempt != saw_launder:
+                head = head_for("exempt" if saw_exempt else "launder")
         if reads:
             verdict, witness, tail = _escalation_anon_rollup(
                 reads, an_by_table, total_read
@@ -2231,8 +2321,15 @@ def _witness_scope(
 
 def _summary_line(v: Verification) -> str:
     s = v.summary
+    # See `headers` in `render_text`: an escalation row's subject may be a
+    # function rather than a table, so do not call the count "RLS tables".
+    noun = (
+        f"escalation {pluralize(s['tables'], 'subject')}"
+        if v.mode == "escalation"
+        else f"RLS {pluralize(s['tables'], 'table')}"
+    )
     return (
-        f"{s['tables']} RLS {pluralize(s['tables'], 'table')}: "
+        f"{s['tables']} {noun}: "
         f"{s['isolated']} proven isolated, {s['leak']} leaking, "
         f"{s['unverified']} unverified."
     )
@@ -2263,7 +2360,13 @@ def render_text(v: Verification) -> str:
             return "No anon-reachable view path onto an RLS table was found."
 
         return "No RLS-enabled tables to verify."
-    headers = ("TABLE", "VERDICT", "DETAIL")
+    # escalation rows are a mix: the owner-bypass half keys on a TABLE, the
+    # SECDEF half on the FUNCTION that reaches one. "TABLE" mislabels the latter.
+    headers = (
+        "SUBJECT" if v.mode == "escalation" else "TABLE",
+        "VERDICT",
+        "DETAIL",
+    )
     rows = [
         (
             safe_location(t.qualified_name),

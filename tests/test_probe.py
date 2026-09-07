@@ -1074,3 +1074,50 @@ def test_escalation_partial_cross_tenant_leak_table_is_skipped(
     finally:
         _drop_role(pg_conn, "esc_member")
         _drop_role(pg_conn, "esc_owner")
+
+
+@requires_docker
+@requires_z3
+def test_anon_key_attempt_on_one_table_does_not_poison_the_next(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    """The anon-key caller writes claim GUCs that cannot be unset for the rest
+    of the connection (`ROLLBACK TO SAVEPOINT` restores a placeholder GUC to
+    `''`, never NULL). Running it inline corrupted the JWT-less observation of
+    every table probed afterwards.
+
+    `a_first` reads nothing JWT-less, so it forces the anon-key attempt.
+    `b_second` is a live JWT-less leak through an auth stub that does NOT wrap
+    the GUC in `NULLIF`, so `''` and unset differ for it — it used to come back
+    `no rows` / MISMATCH against its own correct LEAK.
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "CREATE SCHEMA IF NOT EXISTS auth;"
+            # deliberately no NULLIF: '' is not NULL to this stub
+            "CREATE OR REPLACE FUNCTION auth.role() RETURNS text LANGUAGE sql "
+            "  STABLE AS $$ SELECT current_setting('request.jwt.claim.role', true) $$;"
+            "CREATE TABLE public.a_first (id bigserial PRIMARY KEY, tenant text);"
+            "ALTER TABLE public.a_first ENABLE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.a_first FOR SELECT TO public "
+            "  USING (current_setting('request.jwt.claim.role', true) = 'anon');"
+            "GRANT SELECT, INSERT ON public.a_first TO public;"
+            "CREATE TABLE public.b_second (id bigserial PRIMARY KEY, tenant text);"
+            "ALTER TABLE public.b_second ENABLE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.b_second FOR SELECT TO public "
+            "  USING (auth.role() IS NULL OR tenant = auth.role());"
+            "GRANT SELECT, INSERT ON public.b_second TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="anon")
+
+    first = _result(probe, "public.a_first")
+    assert first.observed == "rows_visible"  # the anon-key caller sees it
+    assert first.agreement == "leak_confirmed"
+
+    second = _result(probe, "public.b_second")
+    assert second.static_verdict == "leak"
+    assert second.observed == "rows_visible", (
+        "b_second is a live JWT-less leak; a poisoned claim GUC made it `no rows`"
+    )
+    assert second.agreement == "leak_confirmed"
