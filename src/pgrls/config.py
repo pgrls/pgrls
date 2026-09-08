@@ -294,7 +294,7 @@ def _build_config(raw: dict[str, Any]) -> Config:
     # (`SEC0001`, `sec01`) surfaces as a config error instead of
     # silently leaving the rule enabled. Same UX motivation as the
     # `--rule` validation in `pgrls fix`. Lazy import — keeps
-    # `load_config()` from pulling in all 15 rule modules for
+    # `load_config()` from pulling in all rule modules for
     # callers that only want to read e.g. `Config.database_url`.
     from pgrls.rules import all_rules
 

@@ -334,7 +334,8 @@ command silently treats bad config as "nothing exempt".
 Currently fixable:
 
 * **SEC001** — emits `ALTER TABLE <schema>.<table> ENABLE ROW
-  LEVEL SECURITY;` for every table with RLS off (not allowlisted).
+  LEVEL SECURITY;` for every table with RLS off that has no policies
+  (a policy-bearing one is SEC032's) and is not allowlisted.
   Partition children are skipped — there is no single mechanical
   fix for them (enable RLS on an in-scope parent, or widen
   `--schemas` / design a child policy when the parent is in an
@@ -411,12 +412,17 @@ Currently fixable:
   explicit `WITH CHECK (true)` to replace,
   so mirroring USING is a meaningful tightening whether the
   policy is permissive (the open write side becomes scoped) or
-  restrictive (its no-op `… AND true` write check becomes real).
+  restrictive (where the explicit `true` had CANCELLED the write floor
+  Postgres would otherwise have filled in from that policy's own
+  `USING` — measured, so it is not a no-op).
   SEC006 and SEC020 never fire on the same policy — one needs
   `WITH CHECK` absent, the other needs it present.
 * **SEC015** — emits `ALTER FUNCTION <name>(<args>) SET search_path
-  = …;` per SECURITY DEFINER overload, pinning `pg_temp` last so a
-  search-path hijack can't reach a caller-planted temp object. One
+  = …;` per SECURITY DEFINER overload, pinning `pg_temp` last AFTER
+  the function's own schema. Naming `pg_temp` last is necessary but
+  not sufficient: measured, under `pg_catalog, pg_temp` an unqualified
+  body reference still resolved to a planted `pg_temp` object, because
+  nothing else on the path could resolve it. One
   ALTER per overload signature; abstains on a pre-v12 snapshot (which
   captured no signature at all) and on paths it can't tokenize safely
   (quoted commas). An empty signature is a real zero-argument function

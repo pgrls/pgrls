@@ -284,9 +284,27 @@ def checked_ast(policy: Policy, mode: Mode) -> Any:
     For ``write`` that is BOTH write gates OR-ed together — the new-row check
     and the old-row gate (see `old_row_write_gate`) — so a leak through either
     is proven. For the read modes it is the policy's ``USING``.
+
+    ``None`` means "cannot check", which the caller turns into ``unverified``.
+    A clause that EXISTS but did not parse must land there too: `parse_expr`
+    returns None for both, and treating an unparseable clause as an absent one
+    silently substituted the wrong predicate. Measured on PG17 (pglast cannot
+    parse several SQL/JSON forms `pg_get_expr` emits): an unparseable
+    ``WITH CHECK`` on ``FOR UPDATE`` fell back to the SCOPED ``USING`` and the
+    mode reported PROVEN while a tenant-b session re-stamped a row for tenant
+    a. The SQL text distinguishes the two states — a clause absent in
+    ``pg_policy`` has ``*_sql`` None — so gate on that.
     """
     if mode != "write":
         return policy.using_ast
+    if policy.with_check_sql is not None and policy.with_check_ast is None:
+        return None  # present but unparseable — never fall back to USING
+    if (
+        policy.command in ("UPDATE", "DELETE", "ALL")
+        and policy.using_sql is not None
+        and policy.using_ast is None
+    ):
+        return None  # the old-row gate exists but did not parse
     return _or_gates([effective_write_check(policy), old_row_write_gate(policy)])
 
 
@@ -617,6 +635,7 @@ def build_verification(
     anon_roles: set[str] | None = None,
     identity_columns: frozenset[str] | None = None,
     set_gucs: tuple[GucState, ...] | None = None,
+    _skip_owner_reach_gate: bool = False,
 ) -> Verification:
     """Prove tenant isolation for every RLS-enabled table in `schema`.
 
@@ -682,6 +701,14 @@ def build_verification(
     # rather than let it collapse the seed to `{PUBLIC}` and false-clear a
     # `TO anon` leak. (Truthiness, not `is not None`.)
     resolved_anon_roles = anon_roles if anon_roles else {"anon", "PUBLIC"}
+    # owner role name -> low-trust members that hold its privileges. Same map
+    # `build_escalation` builds; empty when nothing reaches an owner, so this
+    # costs nothing on a schema whose tables are superuser-owned.
+    xt_reachers_by_owner: dict[str, set[str]] = {}
+    if mode in ("cross-tenant", "write") and not _skip_owner_reach_gate:
+        for _m in schema.owner_reachable_members:
+            for _owner in _m.via_owners:
+                xt_reachers_by_owner.setdefault(_owner, set()).add(_m.member)
     tables: list[TableVerdict] = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         if not table.rls_enabled:
@@ -714,6 +741,38 @@ def build_verification(
                 )
             )
             continue
+        # The same question for a TENANT session. `anon` refuses to reason
+        # about a predicate the session never reaches; cross-tenant / write
+        # must too. We cannot know which role the caller runs as, so this is
+        # `unverified`, not `leak` — the proof is real, it just does not cover
+        # an owner-equivalent session. Measured on PG16: with
+        # `GRANT appowner TO tb` on a non-FORCE'd table, tenant-b read and
+        # overwrote tenant a's row while both modes reported PROVEN and
+        # `--probe` said AGREE.
+        if mode in ("cross-tenant", "write") and not table.force_rls:
+            reaching = xt_reachers_by_owner.get(table.owner or "")
+            if reaching:
+                who = ", ".join(sorted(reaching))
+                why = (
+                    f"{who} hold the privileges of owner {table.owner} and RLS "
+                    "is not FORCE'd, so such a session never consults these "
+                    "policies — the proof would hold only for a caller that is "
+                    "not owner-equivalent; see verify --mode escalation and "
+                    "SEC048"
+                )
+                tables.append(
+                    TableVerdict(
+                        table.qualified_name,
+                        "unverified",
+                        why,
+                        (
+                            PolicyProof(
+                                f"role:{table.owner}", "unverified", None, why
+                            ),
+                        ),
+                    )
+                )
+                continue
         relevant = [p for p in table.policies if p.command in commands]
         permissive = [p for p in relevant if p.permissive]
         restrictives = [p for p in relevant if not p.permissive]
@@ -738,7 +797,16 @@ def build_verification(
                 # A bare FOR INSERT (no WITH CHECK) grants no write path —
                 # Postgres default-denies it, so it contributes no proof. Any
                 # other missing AST is a genuine "can't check" → unverified.
-                if mode == "write" and policy.command == "INSERT":
+                # `with_check_sql is None` is what "bare" means: an INSERT
+                # policy whose clause EXISTS but did not parse must NOT be
+                # skipped — measured on PG17, skipping it left the table
+                # PROVEN with zero proofs while anon inserted a foreign-tenant
+                # row through the very clause that had been dropped.
+                if (
+                    mode == "write"
+                    and policy.command == "INSERT"
+                    and policy.with_check_sql is None
+                ):
                     continue
                 proofs.append(
                     PolicyProof(
@@ -890,7 +958,13 @@ def build_escalation(
     population); a table no low-trust role can reach its owner of is simply not a
     candidate. SECDEF-body escalation (SEC042 / VIEW004) is out of this v1 scope.
     """
-    xt = build_verification(schema, auth_functions=auth_functions, mode="cross-tenant")
+    # Ungated: this mode's whole job is the owner-reachability bypass, so it
+    # must see what the policies prove for a NON-owner-equivalent caller and
+    # compose that itself. Gating here would degrade a real LEAK to UNVERIFIED.
+    xt = build_verification(
+        schema, auth_functions=auth_functions, mode="cross-tenant",
+        _skip_owner_reach_gate=True,
+    )
     xt_by_table = {t.qualified_name: t for t in xt.tables}
 
     # owner role name -> sorted distinct low-trust members that reach it.

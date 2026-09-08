@@ -25,8 +25,9 @@ conjunction, for the one *view-family* relation whose rows can never be
 RLS-filtered.
 
 **Relationship to VIEW003.** VIEW003 (``warning``) flags *any* matview reading
-an RLS table — a broad architectural caution ("verify ``REFRESH`` runs
-per-tenant, or replicate the matview per-tenant"), which may be perfectly fine
+an RLS table — a broad architectural caution ("give the matview a per-tenant
+OWNER, since the body runs as the owner at ``REFRESH`` regardless of who issues
+it, or replicate the matview per-tenant"), which may be perfectly fine
 for an internal, un-exposed matview. SEC054 (``error``) is the sharpened,
 confirmed-exposure subset: the matview is *actually reachable over the API* by a
 low-trust role, so it is leaking now — ``anon`` cannot be "the per-tenant

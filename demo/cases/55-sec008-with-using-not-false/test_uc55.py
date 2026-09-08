@@ -1,4 +1,4 @@
-"""Use case 55: SEC008 with `USING (NOT false)` — CLEAN."""
+"""Use case 55: SEC008 with `USING (NOT false)` — clean for SEC008, fires SEC005."""
 from __future__ import annotations
 
 

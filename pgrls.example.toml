@@ -153,7 +153,10 @@ allowlist = []
 [lint.rules.SEC013]
 # Triggers allowed on RLS-protected tables. A SECURITY DEFINER trigger
 # function runs as its OWNER, so any SELECT / INSERT / UPDATE / DELETE
-# inside the body carries that owner's RLS exemption. The rule
+# inside the body is checked against THAT role's grants and policies —
+# a full bypass only when the owner is RLS-exempt for the table
+# (superuser, BYPASSRLS, or the table's owner while FORCE is off), and
+# otherwise a re-scoping. The rule
 # warns on every user-authored, enabled trigger on an RLS-enabled
 # table; allowlist after auditing the function body for cross-
 # tenant reads, writes the caller couldn't issue directly, and
@@ -293,11 +296,12 @@ allowlist = []
 allowlist = []
 
 [lint.rules.SEC020]
-# Policies that pair a restrictive USING with WITH CHECK (true).
+# Policies that pair a SCOPED USING with WITH CHECK (true) —
+# permissive or AS RESTRICTIVE, the rule has no permissive gate.
 # USING filters which rows the caller can read; WITH CHECK (true)
-# accepts every row it writes, so the caller can write rows it
-# could never read back (an INSERT or UPDATE into another tenant's
-# space). The fix is to mirror the USING predicate in WITH CHECK
+# constrains nothing about what it writes, so unless another policy
+# closes the write side the caller can write rows it could never read
+# back (an INSERT or UPDATE into another tenant's space). The fix is to mirror the USING predicate in WITH CHECK
 # (ALTER POLICY ... WITH CHECK (...)). Removing the WITH CHECK so
 # Postgres reuses USING for it takes DROP POLICY + CREATE POLICY —
 # ALTER POLICY has no clause-removal syntax.

@@ -48,7 +48,9 @@ demo/
 ```
 
 Each case folder is self-contained — open it to read the SQL
-fixture and the test assertions side by side. `pytest demo/`
+fixture and the test assertions side by side. Two exceptions carry no
+fixture of their own and say so in their `setup.sql`: case 16 exercises
+tables created under case 15, and case 65 re-uses case 03's. `pytest demo/`
 discovers every `cases/NN-*/test_uc<NN>.py` and shares one
 session-scoped Postgres testcontainer across them all (the conftest
 applies `_shared.sql` first, then every case's `setup.sql` in
@@ -118,7 +120,7 @@ numeric order).
 | 58 | `COALESCE(auth.uid(), default)` | PERF001 | fires (find_func_calls walks function args) |
 | 59 | `fail_on = "warning"` | gates (config) | exit code 1 on PERF001 |
 | 60 | `fail_on = "info"` | gates (config) | exit code 1 on SEC007 |
-| 61 | `--format json` machine-readable output | (config) | parses to a dict with `violations[]` + `summary{}`; sarif still rejects cleanly |
+| 61 | `--format json` machine-readable output | (config) | parses to a dict with `violations[]` + `summary{}`; an unknown format rejects cleanly, listing the nine supported ones |
 | 62 | `[lint].disable = ["SEC005", "SEC008"]` | disabled (config) | both rules skipped |
 | 63 | `allowlist = "..."` (string, not list) | error (config) | clean ClickException, no traceback |
 | 64 | `app."MixedCase Table"` quoted identifier | (none) | passes (round-trips through pg_class as plain string) |
@@ -238,11 +240,14 @@ INFO   SEC007  app.tags                          (use case 09)
 ```
 
 Tables that must stay silent for their *own* rule (clean cases 01, 02 via
-allowlist, 13, 16-18, 23, 25, 27-30, 32, 36, 44-49, 51, 54, 64-67) never
-appear in any violation line. The clean tests assert this directly — each
-asserts the absence of the rule its case is about, not of every rule, so a
-few of these tables do appear under an unrelated rule (21 and 53 under
-SEC030/PERF001, 31 and 34 under SEC030, 50 under SEC022). The
+allowlist, 13, 16-18, 23, 25, 27-30, 32, 36, 44-49, 51, 54, 64, 66-67)
+never appear in any violation line. Most clean tests assert that the hard
+way — 21 of them loop over `all_rule_ids` and assert the table appears
+under *no* rule at all, not merely under the one its case is about. Case
+65 is not in that list because it ships no fixture of its own: it re-uses
+uc03's `app.legacy_orders`, which is the demo's flagship SEC001
+violation, and only checks that an unqualified allowlist entry silences
+SEC001 for it. The
 configuration-driven cases (39-43, 59-63) verify behavior under
 specific `--config` overrides — see `conftest.py::lint` for the
 helper that drives those.

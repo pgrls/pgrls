@@ -1554,6 +1554,27 @@ def _anon_3vl(
                 value=ctx.session_var(_canon(node), z3.StringSort()),
                 is_null=z3.BoolVal(False),
             )
+        if isinstance(node, FuncCall) and _is_builtin_current_setting_call(node):
+            if not _reads_unset_guc_under_anon(node):
+                # A BUILT-IN (non-dotted) GUC — `role`, `search_path`,
+                # `TimeZone`. Always set, so `current_setting(name, true)`
+                # never returns NULL, and mostly USERSET, so the value is the
+                # caller's to choose. Modelling it NULL proved away a disjunct
+                # that is live: measured, `... OR current_setting('role', true)
+                # <> 'anon'` let a real anon session read every row (the value
+                # is 'none' in a fresh session) while this mode said PROVEN.
+                # The same reasoning `_DEFAULT_AUTH_FUNCTIONS` gives for
+                # excluding `current_user` — only genuinely-nullable functions
+                # may be pinned NULL.
+                return _Val(
+                    value=ctx.opaque(_canon(node), z3.StringSort()),
+                    is_null=(
+                        z3.BoolVal(False)
+                        if _first_string_arg(node) is not None
+                        # a computed name could be either: stay undecided
+                        else ctx.null_flag(_canon(node))
+                    ),
+                )
         return _Val(
             value=ctx.opaque(_canon(node), z3.StringSort()),
             is_null=z3.BoolVal(True),

@@ -1,5 +1,5 @@
 -- ============================================================
--- Use case 55: SEC008 with `USING (NOT false)` — CLEAN
+-- Use case 55: SEC008 with `USING (NOT false)` — CLEAN for SEC008, fires SEC005
 -- Logically equivalent to `USING (true)` but the AST is a
 -- BoolExpr (NOT) over an A_Const, NOT a literal Boolean.
 -- SEC008's detector keys on the literal True A_Const, so this

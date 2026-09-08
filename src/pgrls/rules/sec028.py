@@ -43,9 +43,11 @@ security policy "floor"`; with an explicit `WITH CHECK (true)` the same
 insert succeeded. That is a real hole, and [SEC020](#rule-sec020) reports
 it — it has no permissive gate, so it fires whenever the policy's `USING`
 is a real predicate. SEC028 stays permissive-only because it is the
-*no-contrast* rule (`USING` absent or itself constant-true); the one
-genuinely inert and unreported shape is a restrictive `FOR INSERT`
-policy, which has no `USING` for the explicit `true` to cancel.
+*no-contrast* rule (`USING` absent or itself constant-true); the genuinely
+inert and unreported shapes are the ones with no `USING` at all for the
+explicit `true` to cancel: a restrictive `FOR INSERT` policy, or a
+restrictive `FOR UPDATE` / `FOR ALL` written without a `USING` clause
+(all three creatable and measured inert).
 
 The fix is to replace `WITH CHECK (true)` with a predicate that
 validates the written row — typically the same tenant / ownership

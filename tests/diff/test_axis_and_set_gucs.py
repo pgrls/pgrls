@@ -259,3 +259,40 @@ def test_cross_tenant_declines_through_a_wrapped_offaxis_null_test(
 )
 def test_cross_tenant_still_proves_on_axis_null_tests(sql: str) -> None:
     assert prove_cross_tenant_isolation(parse_expr(sql))[0] == "isolated"
+
+
+# --- review pass 12: `_is_anon_null_leaf` pinned is_null=TRUE for ANY
+# `current_setting(<name>, true)`. That is true only of a CUSTOM (dotted) placeholder
+# GUC, which a stock server ships unset. A non-dotted name is a BUILT-IN GUC: always
+# set, and mostly USERSET. Measured on PG16 with RLS active and FORCE on, a policy
+# `... OR current_setting('role', true) <> 'anon'` let a live anon session read every
+# row (the value is 'none' in a fresh session) while --mode anon --strict said PROVEN.
+
+
+@pytest.mark.parametrize(
+    "builtin", ["role", "search_path", "application_name", "TimeZone"]
+)
+def test_anon_does_not_assume_a_builtin_guc_is_null(builtin: str) -> None:
+    sql = (
+        "tenant_id = current_setting('app.tenant_id', true) "
+        f"OR current_setting('{builtin}', true) <> 'anon'"
+    )
+    assert prove_anon_isolation(parse_expr(sql))[0] == "leak"
+
+
+def test_anon_builtin_guc_is_null_disjunct_is_dead() -> None:
+    """The mirror: a built-in is never NULL, so the disjunct cannot fire and the
+    predicate really is isolated. The old model proved the opposite of both."""
+    sql = (
+        "tenant_id = current_setting('app.tenant_id', true) "
+        "OR current_setting('role', true) IS NULL"
+    )
+    assert prove_anon_isolation(parse_expr(sql))[0] == "isolated"
+
+
+def test_anon_still_treats_a_custom_guc_as_unset() -> None:
+    sql = (
+        "tenant_id = current_setting('app.tenant_id', true) "
+        "OR current_setting('app.gate', true) IS NULL"
+    )
+    assert prove_anon_isolation(parse_expr(sql))[0] == "leak"

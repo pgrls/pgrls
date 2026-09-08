@@ -37,7 +37,11 @@ only through `JOIN auth.users u ON … AND u.id = auth.uid()` — nothing in
 the `WHERE` at all — is correctly silent. A call buried inside a *nested*
 `EXISTS` / `ANY` / `ALL` body does NOT count as binding, even though it
 sits lexically within the outer `WHERE`: it constrains that inner query,
-not the row this sub-select returns, so such a policy still fires.
+not the row this sub-select returns, so such a policy still fires. One
+exception, which the code implements and this rule relies on: a sub-select
+that is *nothing but* the auth call — `id IN (SELECT auth.uid())` or
+`id = ANY (SELECT auth.uid())` — does bind the caller, because its whole
+result IS the caller's identity.
 
 The target-detection and caller-binding primitives live in
 `pgrls.rules._auth_binding` (shared with SEC052, which asks the same

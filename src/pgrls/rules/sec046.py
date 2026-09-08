@@ -52,8 +52,9 @@ re-evaluated per statement execution, so the per-request value is always fresh.
   ``provolatile='i'`` reaches this rule (introspection captures only IMMUTABLE
   functions).
 
-**Relationship to other rules.** SEC024 surfaces a policy that reads a session
-GUC at all; PERF004 flags a *function-wrapped* discriminator that defeats an
+**Relationship to other rules.** SEC024 surfaces a policy whose
+``current_setting()`` names an *unqualified* parameter (it records a name only
+when it has no dot, so the ordinary ``app.tenant`` spelling does not trip it); PERF004 flags a *function-wrapped* discriminator that defeats an
 index. SEC046 is the orthogonal *correctness* finding: the wrapper is not just a
 perf footgun, its ``IMMUTABLE`` marking makes the row filter return the *wrong
 user's* rows under plan reuse. It is an ``error``: a cross-tenant data leak.
@@ -74,8 +75,10 @@ Scope / known limits (intentional, fail-closed):
   ``plpgsql`` body (which is not a parseable top-level statement), an empty
   body, or any body pglast cannot parse is **not flagged** (fail-closed) — the
   rule never guesses. A genuinely-dangerous PL/pgSQL ``IMMUTABLE`` wrapper is a
-  false negative here, surfaced instead by SEC024 (policy reads a GUC) /
-  SEC014.
+  false negative here and **no other rule picks it up**: SEC024 fires only on an
+  unqualified GUC name and only inside a policy clause, never in a function
+  body, and SEC014 iterates ``security_definer_functions`` — an ``IMMUTABLE``
+  SECURITY *INVOKER* wrapper is never captured at all.
 * **Literal call resolution.** A policy's function call is resolved to a
   captured IMMUTABLE function by its qualified (``schema.fn``) or bare (``fn``)
   name, mirroring the SECDEF-call resolution; a call reached only through

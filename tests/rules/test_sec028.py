@@ -126,7 +126,10 @@ def test_sec028_silent_on_select_only_policy() -> None:
 
 
 def test_sec028_silent_on_restrictive_policy() -> None:
-    # A restrictive WITH CHECK (true) is a dead clause (restrictive
+    # A restrictive WITH CHECK (true) on a FOR INSERT policy is inert — there is
+    # no USING for the explicit `true` to cancel (a restrictive WITH CHECK (true)
+    # alongside a real USING is NOT a dead clause: it cancels the write floor,
+    # and SEC020 reports it) (restrictive
     # policies AND-combine; it opens nothing on its own), not an
     # open-write hole.
     schema = Schema(

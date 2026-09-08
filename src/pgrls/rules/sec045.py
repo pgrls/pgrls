@@ -30,7 +30,8 @@ currently blocks every row (policies change; the grant outlives them). It is a
 ``warning`` (defense-in-depth), not an ``error``.
 
 **False-positive controls.** Only **column** grants are inspected (table grants
-are SEC003/SEC001's domain), and column grants are rare and intentional, so the
+are SEC049/SEC001's domain — SEC003 flags a *policy* naming ``PUBLIC`` and
+never inspects a ``GRANT``), and column grants are rare and intentional, so the
 finding is high-signal. Only **content** privileges count — ``SELECT`` /
 ``INSERT`` / ``UPDATE`` (a column-level ``REFERENCES`` exposes no content). The
 default low-trust grantee set is ``{PUBLIC, anon}`` (a column grant to ``anon``
@@ -52,12 +53,17 @@ allowlist = ["public.profiles.email"]             # a deliberate public-email co
 
 Severity: warning. No auto-fix — whether to ``REVOKE`` the column or keep it
 (an intentional public field) is a product decision pgrls cannot make safely;
-the remediation is ``REVOKE <priv> (<column>) ON <table> FROM <role>``.
+the remediation repeats the column per privilege —
+``REVOKE <priv> (<column>)[, <priv> (<column>) …] ON <table> FROM <role>``.
+A trailing column list binds to the LAST privilege only, so
+``REVOKE SELECT, UPDATE (email)`` revokes SELECT table-wide (measured).
 
 Scope / known limits (intentional):
 
 * **Column grants only.** A PII column exposed via a *table* grant to PUBLIC on
-  a no-RLS table is SEC003/SEC001's case; SEC045 does not duplicate it.
+  a no-RLS table is SEC049/SEC001's case (measured: that shape fires exactly
+  those two — SEC003 iterates policies, not grants); SEC045 does not
+  duplicate it.
 * **Literal grantee match.** The grantee is matched literally against the
   low-trust set (mirrors SEC003/SEC039/SEC042/SEC044): a column granted to a
   *group* role a low-trust role merely belongs to is not expanded.

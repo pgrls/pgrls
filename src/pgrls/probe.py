@@ -978,7 +978,13 @@ def _run_escalation_probe(
     # The owner-bypass witness is clean only on a table that provably isolates
     # tenants; a table that itself leaks cross-tenant contaminates the seeded
     # row, so gate on its cross-tenant verdict.
-    xt = build_verification(schema, auth_functions=auth_functions, mode="cross-tenant")
+    # Ungated, exactly as `build_escalation` does: the gate exists to stop
+    # cross-tenant claiming a proof for an owner-equivalent caller, but this
+    # mode's whole subject IS that caller, and it composes the verdict itself.
+    xt = build_verification(
+        schema, auth_functions=auth_functions, mode="cross-tenant",
+        _skip_owner_reach_gate=True,
+    )
     xt_verdicts = {t.qualified_name: t.verdict for t in xt.tables}
     try:
         results = [

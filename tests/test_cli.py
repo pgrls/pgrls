@@ -655,7 +655,7 @@ def test_explain_format_html_catalog_renders_every_rule_row() -> None:
     result = runner.invoke(main, ["explain", "--format", "html"])
     assert result.exit_code == 0, result.output
     assert "<title>pgrls rule catalog</title>" in result.output
-    # 67 rules ship today (catalog header should say so).
+    # 68 rules ship today (catalog header should say so).
     assert "<strong>68</strong> rules" in result.output
     # Header carries the auto-fixable count (18 as of v0.32.0; SEC004 fixer).
     # Use the actual value via the python API to avoid hard-coding.

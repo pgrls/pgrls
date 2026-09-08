@@ -1460,7 +1460,7 @@ row an INSERT produces, or the post-image of an UPDATE. When
 sides stay in lock-step by default.
 
 The footgun is an explicit `WITH CHECK (true)` paired with a
-restrictive `USING`:
+**scoped** `USING`:
 
 ```sql
 CREATE POLICY p ON documents
@@ -1469,11 +1469,22 @@ CREATE POLICY p ON documents
     WITH CHECK (true);
 ```
 
-The caller can only *read* its own tenant's rows, but it may
-*write* any row at all — it can INSERT a row stamped with another
-tenant's id, or UPDATE one of its own rows to reassign it. The
-read-side isolation looks airtight while the write side is wide
-open.
+The caller can only *read* its own tenant's rows, while this policy
+imposes no constraint at all on what it writes. Unless another policy
+closes the write side, it can INSERT a row stamped with another
+tenant's id or UPDATE one of its own rows to reassign it — the
+read-side isolation looks airtight while the write side is wide open.
+Measured: add `AS RESTRICTIVE … USING (tenant_id = 1)` to the same
+table and both of those raise `new row violates row-level security
+policy`. The finding still stands — the policy is not doing what it
+looks like it is doing — but the consequence is about this policy, not
+about the table.
+
+**SEC020 has no permissive gate.** It also fires on an `AS RESTRICTIVE`
+policy whose explicit `WITH CHECK (true)` cancels the write floor
+Postgres would otherwise have filled in from that policy's own `USING`
+— the population [SEC028](#rule-sec028) and [SEC031](#rule-sec031) cede
+here. The auto-fix handles those too.
 
 The fix is to mirror the `USING` predicate into `WITH CHECK` with
 `ALTER POLICY … WITH CHECK (…)`. The other route — removing the
@@ -2071,9 +2082,11 @@ clause omitted the cross-tenant insert raised `new row violates row-level
 security policy "floor"`; with an explicit `WITH CHECK (true)` the same
 insert succeeded. [SEC020](#rule-sec020) reports that shape — it has no
 permissive gate. SEC028 stays permissive-only because it is the
-*no-contrast* rule (`USING` absent or itself constant-true); the one
-genuinely inert and unreported shape is a restrictive `FOR INSERT`
-policy, which has no `USING` for the explicit `true` to cancel.
+*no-contrast* rule (`USING` absent or itself constant-true); the
+genuinely inert and unreported shapes are the ones with no `USING` at
+all for the explicit `true` to cancel: a restrictive `FOR INSERT`
+policy, or a restrictive `FOR UPDATE` / `FOR ALL` written without a
+`USING` clause (all three creatable and measured inert).
 
 The fix is to replace `WITH CHECK (true)` with a predicate that
 validates the written row — usually the same tenant / ownership key
@@ -3388,7 +3401,10 @@ non-alphanumerics, so `phone` hits `phone_number` but not `headphone`, and
 `email` hits `email_verified` (allowlist that column) but not `emailaddress`.
 
 **Remediation:** confirm the column is meant to be public, or
-`REVOKE <priv> (<column>) ON <table> FROM <role>`. No auto-fix — whether a
+`REVOKE <priv> (<column>)[, <priv> (<column>) …] ON <table> FROM <role>` —
+the column list must be repeated per privilege, because a trailing one binds
+to the LAST privilege only and `REVOKE SELECT, UPDATE (email)` therefore
+revokes `SELECT` table-wide (measured). No auto-fix — whether a
 sensitively-named column is a deliberate public field is a product decision.
 
 **Configuration** (`[lint.rules.SEC045]`):
@@ -3943,7 +3959,10 @@ Conservative by design (soundness over recall, no false positives):
   caller masks an arm that does not.
 * A caller-bound **materialized** view (`WHERE id = auth.uid()`) is a miss,
   not a safe view: the rows were captured at refresh time as the matview's owner,
-  so the binding did not scope them (SEC054 / VIEW003 cover the matview).
+  so the binding did not scope them. Nothing else picks this up: VIEW003 and
+SEC054 both require the body to read an **RLS-enabled** table, and `auth.users`
+has no RLS — it is grant-protected. A caller-bound matview over `auth.users` is
+therefore an uncovered gap, not a cede.
 
 **Remediation.** There is no auto-fix — the right remedy depends on intent:
 set `WITH (security_invoker = on)` and re-grant, drop the sensitive columns,

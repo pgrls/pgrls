@@ -26,8 +26,13 @@ searched at the written position. So:
   it isn't named, so the default applies. **Unsafe.**
 * A SECDEF function with `SET search_path = …, pg_temp` — `pg_temp`
   named explicitly as the **last** entry — forces the temp schema to
-  be searched last. **Safe.** This is the pattern the Postgres docs
-  prescribe for SECURITY DEFINER functions.
+  be searched last. **Necessary but not sufficient.** Measured on
+  PG16: under `search_path = pg_catalog, pg_temp` a body reading an
+  unqualified `secrets` still returned the attacker's planted
+  `pg_temp.secrets`, because nothing else on the path resolves the
+  name. The path must also name the schema the body's own unqualified
+  references live in — which is why the fixer emits
+  `pg_catalog, <own schema>, pg_temp`.
 
 SEC015 therefore fires on every SECDEF function whose effective
 search_path does not end with a single explicit `pg_temp` token. The fix

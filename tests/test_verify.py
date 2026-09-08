@@ -4028,3 +4028,130 @@ def test_escalation_owner_without_select_on_the_table_stays_silent() -> None:
         tables=(tbl,), security_definer_functions=(fn,), role_memberships=(),
     )
     assert build_verification(schema, mode="escalation").tables == ()
+
+
+# --- review pass 12 ---
+
+
+def _wc_policy(name, command, using_sql, with_check_sql, *, parse_check=True):
+    """A policy whose clause SQL is present but whose AST may be None — what an
+    unparseable clause looks like after `parse_expr` returns None for it."""
+    return Policy(
+        name=name, command=command, permissive=True, roles=("app",),
+        using_sql=using_sql,
+        with_check_sql=with_check_sql,
+        using_ast=_using_ast(using_sql) if using_sql else None,
+        with_check_ast=(
+            _using_ast(with_check_sql) if (with_check_sql and parse_check) else None
+        ),
+    )
+
+
+@requires_z3
+def test_write_mode_abstains_on_an_unparseable_with_check() -> None:
+    """`parse_expr` returns None both for an ABSENT clause and for one pglast
+    cannot parse, and the write path conflated them. pglast cannot parse several
+    SQL/JSON forms PG17's `pg_get_expr` emits, and pgrls supports PG17.
+
+    Measured on PG17: an unparseable `WITH CHECK` on a `FOR UPDATE` policy fell
+    back to the SCOPED `USING`, and `--mode write --strict` reported PROVEN rc=0
+    while a tenant-b session re-stamped a row for tenant a.
+    """
+    tbl = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        policies=(
+            _wc_policy(
+                "upd", "UPDATE",
+                "tenant_id = current_setting('app.tenant_id', true)",
+                "json_value(payload, '$.x' RETURNING text) IS NOT NULL",
+                parse_check=False,
+            ),
+        ),
+    )
+    [t] = build_verification(Schema(tables=(tbl,)), mode="write").tables
+    assert t.verdict == "unverified"
+
+    # An ABSENT with_check still falls back to USING, as Postgres does.
+    ok = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        policies=(
+            _wc_policy(
+                "upd", "UPDATE",
+                "tenant_id = current_setting('app.tenant_id', true)", None,
+            ),
+        ),
+    )
+    [t2] = build_verification(Schema(tables=(ok,)), mode="write").tables
+    assert t2.verdict == "isolated"
+
+
+@requires_z3
+def test_write_mode_does_not_skip_an_unparseable_insert_check() -> None:
+    """A bare FOR INSERT (no WITH CHECK) is default-denied and rightly skipped.
+    One whose clause EXISTS but did not parse must not be — measured on PG17,
+    skipping it left the table PROVEN with zero proofs while anon inserted a
+    foreign-tenant row through the dropped clause."""
+    tbl = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        policies=(
+            _wc_policy(
+                "ins", "INSERT", None,
+                "json_value(payload, '$.x' RETURNING text) IS NOT NULL",
+                parse_check=False,
+            ),
+        ),
+    )
+    [t] = build_verification(Schema(tables=(tbl,)), mode="write").tables
+    assert t.verdict == "unverified"
+
+    bare = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=True,
+        policies=(_wc_policy("ins", "INSERT", None, None),),
+    )
+    [b] = build_verification(Schema(tables=(bare,)), mode="write").tables
+    assert b.verdict == "isolated" and b.proofs == ()
+
+
+@requires_z3
+def test_cross_tenant_declines_when_a_member_holds_the_owner_privileges() -> None:
+    """`anon` refuses to reason about a predicate the session never reaches;
+    cross-tenant and write must too. Measured on PG16 with `GRANT appowner TO tb`
+    on a non-FORCE'd table: tenant-b read and overwrote tenant a's row while both
+    modes reported PROVEN rc=0 and `--probe` said AGREE."""
+    from pgrls.model import OwnerReachableMember
+
+    tbl = Table(
+        schema="public", name="docs", rls_enabled=True, force_rls=False,
+        owner="appowner",
+        policies=(
+            _policy(
+                "tenant_id = current_setting('app.tenant_id', true)",
+                roles=("tb",),
+            ),
+        ),
+    )
+    schema = Schema(
+        tables=(tbl,),
+        owner_reachable_members=(
+            OwnerReachableMember(
+                member="tb", via_owners=("appowner",), member_can_login=True,
+            ),
+        ),
+    )
+    for mode in ("cross-tenant", "write"):
+        [t] = build_verification(schema, mode=mode).tables
+        assert t.verdict == "unverified", mode
+        assert "owner appowner" in (t.note or "")
+
+    # FORCE'd → the owner is itself RLS-scoped → no bypass, so still provable.
+    forced = Schema(
+        tables=(
+            Table(
+                schema="public", name="docs", rls_enabled=True, force_rls=True,
+                owner="appowner", policies=tbl.policies,
+            ),
+        ),
+        owner_reachable_members=schema.owner_reachable_members,
+    )
+    [f] = build_verification(forced, mode="cross-tenant").tables
+    assert f.verdict == "isolated"

@@ -10,7 +10,7 @@ A row-level security policy that governs writes — a `FOR ALL` or
 
 When `WITH CHECK` is omitted Postgres reuses `USING` for it, so the
 two sides stay in lock-step by default. The footgun appears when a
-policy sets an explicit `WITH CHECK (true)` alongside a restrictive
+policy sets an explicit `WITH CHECK (true)` alongside a **scoped**
 `USING`:
 
     CREATE POLICY p ON documents
@@ -18,10 +18,20 @@ policy sets an explicit `WITH CHECK (true)` alongside a restrictive
         USING (tenant_id = current_setting('app.tenant_id')::int)
         WITH CHECK (true);
 
-The caller can only *read* its own tenant's rows, but it may *write*
-any row at all — it can INSERT a row stamped with another tenant's
-id, or UPDATE one of its own rows to reassign it. The read-side
-isolation looks airtight while the write side is wide open.
+The caller can only *read* its own tenant's rows, while THIS policy
+imposes no constraint at all on what it writes. Unless another policy
+closes the write side, it can INSERT a row stamped with another
+tenant's id or UPDATE one of its own rows to reassign it — the
+read-side isolation looks airtight while the write side is wide open.
+(Measured: add `AS RESTRICTIVE … USING (tenant_id = 1)` and both of
+those raise `new row violates row-level security policy`. The finding
+still stands — the policy is not doing what it looks like it is doing —
+but the consequence is about this policy, not about the table.)
+
+SEC020 has **no permissive gate**: it also fires on an `AS RESTRICTIVE`
+policy whose explicit `WITH CHECK (true)` cancels the write floor
+Postgres would otherwise have filled in from its own `USING`, which is
+the population SEC028 and SEC031 cede here.
 
 SEC020 fires when a policy has BOTH clauses present, its `USING`
 clause is a real predicate, and its `WITH CHECK` clause is the
