@@ -32,7 +32,81 @@ breaking changes — they will be called out in this file.
   capture `--against` baselines to benefit — re-emitting an old file stamps
   the new version without adding the graph.
 
+- **Remediation advice corrected in eight rules — each premise re-measured on
+  PG16.** `SEC034`'s "standard fix" raised `permission denied for table users`
+  for the very role it gates (a policy sub-select runs with the CALLER's
+  privileges, and granting that SELECT is what SEC052 reports at error
+  severity) → now `auth.jwt() ->> 'email'`. `SEC054`'s "run `REFRESH` as a
+  per-tenant role" is impossible — the body runs as the matview's OWNER → now
+  "give it a per-tenant owner". `SEC053`'s `security_invoker` view needs the
+  very grant the remedy revokes → now definer-rights. `SEC020` recommended a
+  clause removal `ALTER POLICY` has no syntax for (`WITH CHECK ()` and `DROP
+  WITH CHECK` are both syntax errors) → now `DROP POLICY` + `CREATE POLICY`.
+  `SEC006`'s "and its fix" re-ran `CREATE POLICY` and raised `already exists` →
+  now `ALTER POLICY`. `PERF003` told operators to add a second index the
+  planner never chooses → now says not to. `SEC028`/`SEC031`/`SEC040` called a
+  restrictive `WITH CHECK (true)` a dead clause: it is not — Postgres fills an
+  omitted restrictive `WITH CHECK` from that policy's `USING`, so writing it
+  explicitly as `true` CANCELS the write floor (measured: the cross-tenant
+  insert raised with the clause omitted and succeeded with it present), and
+  `SEC020` reports that shape.
+
 ### Fixed
+- **`--mode cross-tenant` / `--mode write` proved isolation for a policy a
+  JWT-less tenant session reads *and* overwrites across tenants.** Every auth
+  call was minted NON-NULL under the authenticated-session model — i.e. the
+  prover assumed a JWT is always present — so an `... OR <auth> IS NULL`
+  disjunct proved away. With tenancy carried by `SET app.tenant_id` and no JWT
+  at all (an ordinary non-PostgREST deployment), a tenant-b session read
+  tenant a's row and `UPDATE`d it, while `anon`, `cross-tenant` and `write` all
+  reported PROVEN with `--strict` clean; only `--probe` caught it. A NULL test
+  on the tenant AXIS is still the mode's own premise (a session authenticated
+  as one tenant has an identity); on any OTHER auth value the prover now
+  declines. The first fix recorded only a bare minted symbol, which a cast to
+  an unmodelled sort (`::jsonb`, `::json`, `::timestamptz`, …) or a `COALESCE`
+  walked straight past — an encoder sweep found 402 of 576 off-axis cells still
+  falsely PROVEN. The recorder now walks the tested subtree and records at the
+  OUTERMOST node that minted a session symbol, which is what keeps a policy
+  NULL-testing its own cast axis provable.
+- **`--mode escalation` never examined a function whose owner reaches the
+  table's owner through membership.** The per-table decision used
+  `has_privs_of_role`, but the candidate gate beside it tested literal set
+  membership, so such a function was filtered out before the decision ran —
+  and when the table owner is superuser/`BYPASSRLS` the owner-reachability half
+  is filtered out too, so nothing caught it. Measured with `GRANT brlsowner TO
+  bob2` and a bob2-owned SECDEF over a brlsowner table: anon read 0 rows
+  directly, 2 through the function, and `anon`, `escalation` and `reachability`
+  all exited 0.
+- **`verify` was silent on the SECDEF *laundering* door it already reports for
+  definer views.** Where the owner is not RLS-exempt but the table's own
+  policies grant it rows under the anonymous auth context, a definer VIEW is
+  reported `LEAK` and the identical SECDEF function was not. Measured: anon read
+  0 rows from the table and 2 through the function. `escalation` now asks the
+  anon prover with the function's owner as the session role, exactly as
+  `--mode reachability` does, and the witness names which of the two mechanisms
+  it found. An *undecided* owner-read is reported `UNVERIFIED` rather than
+  collapsed to "no door" — measured, that collapse hid a live 2-row door behind
+  "No reachable escalation paths to verify" and exit 0.
+- **`--probe` MISMATCHed a correct proof whenever an earlier table's anon-key
+  attempt had poisoned a claim GUC.** Fixed by ordering rather than by widening
+  the previous guard: the run now takes a JWT-less pass over every table and
+  only then revisits the ones that saw nothing, so no JWT-less observation is
+  ever read off a poisoned session.
+- **The SEC010 fixer dropped a `FOR UPDATE` policy that was not inert.**
+  Permissive policies OR-combine their `USING` quals and, separately, their
+  `WITH CHECK` quals — Postgres does not pair a policy's own two clauses — so
+  `USING (false) WITH CHECK (true)` still admits new rows a sibling policy's
+  `USING` selected. Measured: `UPDATE … SET tenant_id = 99` moved 2 rows with
+  the policy present and raised `new row violates row-level security policy`
+  after the drop the fixer emitted. The identical `FOR ALL` shape already
+  abstained; `UPDATE` now matches it. The drop only ever narrows, so this was
+  never a security regression — but it was not behaviour-preserving, which is
+  the fixer's contract.
+- **SEC045's printed `REVOKE` revoked the whole table.** `REVOKE SELECT, UPDATE
+  (email)` attaches the column list to the LAST privilege only, so `SELECT`
+  went table-wide and cascaded to every column grant — measured, the table
+  grant vanished from `relacl` and the role then got `permission denied for
+  table`. The message now repeats the column per privilege.
 - **`--mode escalation` was silent on a `SECURITY DEFINER` function owned by
   the table's own owner — a full anonymous bypass.** RLS exemption is relative
   to a TABLE: a definer body running as the table owner skips its policies
@@ -47,9 +121,13 @@ breaking changes — they will be called out in this file.
   to `''`, never to NULL (measured), and `''` is non-NULL — so the previous
   round's guard re-wrote it. A correctly-isolated table probed first turned a
   reproduced leak on the next table into `no rows` and exit 0, and in the other
-  direction produced a MISMATCH against a correct proof. The probe now records
-  which claim GUCs it has written and abstains, with an explicit reason, for
-  any later table whose policy reads one directly.
+  direction produced a MISMATCH against a correct proof. The probe recorded
+  which claim GUCs it had written and abstained for any later table whose
+  policy read one directly.
+  *Superseded below: that guard read only the pivot policy's AST and only a
+  literal `current_setting` call, so it missed both an auth stub without
+  `NULLIF` and a read inside a RESTRICTIVE floor. The run is now ORDERED so
+  the poisoning cannot happen, and the guard is gone.*
 - **`--mode reachability`: a narrow door hid a wider one under the same outer
   view.** Paths were kept per (outer view, table) with a two-case precedence,
   so two laundering doors collapsed to whichever was walked first. Measured:
