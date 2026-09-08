@@ -45,7 +45,9 @@ whatsoever.
 
 This is the asymmetry the existing write-side rules miss:
 
-* **SEC006** fires when `WITH CHECK` is *absent*. There it is present —
+* **SEC006** fires when `WITH CHECK` is *absent* AND nothing closes the
+  write (INSERT, or UPDATE/ALL with no real `USING` to reuse). There it is
+  present —
   and an explicit clause turns OFF the USING-reuse that SEC006 relies on
   to call the omitted shape "closed", so the scope is genuinely dropped.
 * **SEC028** fires when `WITH CHECK` is constant `true` (open write, no

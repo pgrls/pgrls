@@ -59,6 +59,9 @@ trips both — and a policy can carry one without the other.
 
 Out of scope (intentional):
 
+* **A user-defined `current_setting`.** Only the BUILT-IN is inspected
+  (bare, or `pg_catalog.current_setting`); a same-named function of
+  your own is skipped, as it is for SEC019.
 * **Dynamic parameter names.** `current_setting(<non-literal>)` —
   a name assembled from a column or an expression — is not
   inspected; SEC024 only reads string-literal arguments.

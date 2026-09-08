@@ -1130,7 +1130,7 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
 #
 # The property: a read-capable policy (FOR ALL / FOR SELECT) leaks to
 # anonymous iff its USING predicate, evaluated under a session where every
-# auth-context function (auth.uid/role/jwt, current_user, session_user,
+# auth-context function in the configured set (auth.uid/role/jwt,
 # current_setting) returns NULL, is VALID — i.e. evaluates to *exactly
 # TRUE* (Kleene) for EVERY row assignment. Under SQL 3VL a row is visible
 # iff the predicate is exactly TRUE (NULL and FALSE both hide the row), so

@@ -473,7 +473,9 @@ Currently fixable:
   for the same `pgrls fix --apply` transaction-safety reason
   PERF003 documents; the description points at `pgrls fix --output`
   + `CREATE INDEX CONCURRENTLY` for large tables.
-* **PERF001** — wraps each unwrapped auth call in `(SELECT …)`
+* **PERF001** — wraps each unwrapped auth FUNCTION CALL in `(SELECT …)`
+  (a `SQLValueFunction` — `current_user`, `session_user` — is matched by
+  the rule but deliberately not rewritten, so such a finding gets no fix)
   and emits `ALTER POLICY <name> ON <schema>.<table>` with the
   rewritten `USING` and/or `WITH CHECK` clause. It covers both
   clauses (an unwrapped auth call in `WITH CHECK` re-evaluates

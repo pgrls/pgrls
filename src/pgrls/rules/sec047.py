@@ -91,10 +91,12 @@ Configuration
 # Roles whose child-write access makes the FK an oracle. Default
 # ["anon", "PUBLIC"]; "public" (any case) normalizes to the PUBLIC pseudo-role.
 low_trust_roles = ["anon", "PUBLIC"]
-# Allowlist a deliberate FK by the child table (`schema.table`) — silences all
-# its FKs — or by a specific FK constraint name. (FK constraint names are unique
-# per table, not globally, so a bare name silences that name on EVERY child;
-# prefer the `schema.table` form when a name is shared across tables.)
+# Allowlist a deliberate FK by the child table — `schema.table` or the BARE
+# table name, either of which silences all its FKs — or by a specific FK
+# constraint name. Both bare forms are global: a bare table name silences that
+# name in every schema, and an FK constraint name (unique per table, not
+# globally) silences that name on EVERY child. Prefer `schema.table` whenever a
+# name is shared.
 allowlist = ["public.events", "events_account_id_fkey"]
 ```
 

@@ -325,7 +325,7 @@ def fix(
     """Emit auto-fix SQL for the mechanically-fixable RLS findings.
 
     The remediation counterpart of ``lint``: for every finding pgrls can fix
-    mechanically (20 of the rules — SEC001/SEC002/SEC004/SEC006/SEC010/SEC011/
+    mechanically (19 of the rules — SEC001/SEC002/SEC004/SEC010/SEC011/
     SEC015/SEC017/SEC019/SEC020/SEC030/SEC031/SEC032/SEC044/PERF001/PERF003/
     PERF004/HYG003/VIEW001/VIEW002), returns the exact SQL that closes it.
 

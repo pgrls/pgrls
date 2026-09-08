@@ -186,8 +186,10 @@ class SEC015:
         else:
             state = (
                 f"sets search_path to {fn.search_path!r}, which does "
-                "not end with an explicit pg_temp token — so pg_temp "
-                "is still searched ahead of the listed schemas for "
+                "not end with a SINGLE explicit pg_temp token (naming "
+                "it more than once puts an earlier occurrence ahead of "
+                "the listed schemas) — so pg_temp is still searched "
+                "ahead of them for "
                 "relation and type names"
             )
         return Violation(

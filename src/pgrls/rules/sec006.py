@@ -57,7 +57,8 @@ def _write_is_open(policy: Policy) -> bool:
     is omitted on an UPDATE/ALL policy, regardless of permissivity. So a
     ``FOR UPDATE USING (tenant_id = …)`` with no WITH CHECK still forces the
     *written* row to satisfy ``tenant_id = …`` — the write side is closed,
-    not open. The only genuinely open shapes are:
+    not open. The genuinely open shapes are `FOR INSERT` (no USING to
+    reuse), and UPDATE/ALL whose USING is absent or constant-true:
 
       * UPDATE/ALL whose USING is constant-true — the reused predicate
         constrains nothing, so every written row is accepted.

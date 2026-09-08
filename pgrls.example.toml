@@ -346,8 +346,12 @@ allowlist = []
 [lint.rules.PERF001]
 # Policies allowed to call an auth function unwrapped in USING/WITH CHECK. Reach
 # for this sparingly — the rewrite to `(SELECT auth.uid())` is
-# mechanical and always safe (and `pgrls fix --rule PERF001` does
-# it for you). Entries are fully-qualified policy IDs.
+# mechanical and never broadens, and `pgrls fix --rule PERF001` does it
+# for you for ordinary function calls. It does NOT rewrite a
+# SQLValueFunction (`current_user`, `session_user`, `user`,
+# `current_role`): the rule matches those if you add them to
+# `auth_functions`, but the fixer leaves them alone, so you see the
+# finding with no fix. Entries are fully-qualified policy IDs.
 allowlist = []
 # Functions whose unwrapped call in USING/WITH CHECK triggers PERF001. Defaults:
 # auth.uid, auth.role, auth.jwt, current_setting. Override REPLACES

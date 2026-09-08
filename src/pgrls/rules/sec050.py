@@ -20,7 +20,13 @@ CREATE POLICY user_files ON storage.objects FOR SELECT TO authenticated
            AND (storage.foldername(name))[1] = auth.uid()::text);
 ```
 
-SEC050 fires (warning) once per permissive ``storage.objects`` policy whose
+SEC050 has two emissions. The second is a per-TABLE ``info`` note, emitted
+only on an offline input that carries Storage policies but no column list
+(the table is extension-managed in Supabase, so a migrations-only
+``--sql-file`` has no ``CREATE TABLE`` for it): the rule cannot tell whether
+those policies are bucket-scoped, and a silent abstain there was a false
+CLEAN. The main emission fires (``warning``) once per permissive
+``storage.objects`` policy whose
 **row-reach clause** — the ``USING`` of a SELECT/UPDATE/DELETE/ALL policy, the
 ``WITH CHECK`` of an INSERT policy — has a non-trivial predicate that does not
 reference ``bucket_id``. (Checking the row-reach clause specifically catches an

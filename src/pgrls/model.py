@@ -2173,11 +2173,11 @@ class Schema:
         load with ``()`` / ``False`` so SEC042 abstains (fail-closed). v14/v15
         added ``schema_name``/``function_name`` and per-table ``column_grants``.
 
-        v13 (current): adds ``is_primary`` to each ``Index`` for
-        SEC035. v3-v12 snapshots have no key; they load with
-        ``is_primary=False`` — SEC035 then can't distinguish a
-        surrogate primary key from a tenant-scopable UNIQUE and
-        stays conservative until the snapshot is re-captured.
+        v13: adds ``is_primary`` to each ``Index`` for SEC035. v3-v12
+        snapshots have no key; they load with ``is_primary=False``, and
+        SEC035 skips an index only when ``is_unique and not is_primary``
+        — so a surrogate primary key is NOT skipped there and the rule
+        OVER-reports until the snapshot is re-captured.
         v11: adds top-level ``bypassrls_escalation_roles``
         for SEC029. v3-v10 snapshots have no key; they load with
         ``bypassrls_escalation_roles=()`` — SEC029 finds nothing to

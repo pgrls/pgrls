@@ -53,7 +53,8 @@ predicate (pgrls can't statically prove that compatibility).
   index exists. Allowlist the policy ID when this surfaces a
   false positive.
 * Composite-key policies (``USING (tenant_id = X AND owner = Y)``)
-  fire PERF003 for each referenced column independently. An
+  fire PERF003 once per policy, with every unindexed column named in
+  the one message. An
   operator who has a composite index ``(tenant_id, owner)`` gets
   NO violation for ``tenant_id`` (the leading column matches) and
   one for ``owner`` (no leading-column match). The

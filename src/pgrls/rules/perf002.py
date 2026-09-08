@@ -19,9 +19,11 @@ on every call. Inside an RLS policy this is bad on two counts:
   read-only-looking volatiles like `clock_timestamp()` add per-row
   syscall cost.
 
-STABLE functions (`now()`, `current_setting`, `auth.uid` and the
-other Supabase auth helpers) are NOT in this rule's set — they have
-their own treatment via PERF001 for the per-row evaluation cost.
+STABLE functions are NOT in this rule's set. `current_setting`,
+`auth.uid` and the other Supabase auth helpers have their own
+treatment via PERF001 for the per-row evaluation cost. `now()` is in
+NO rule's set — it is STABLE and cheap, so nothing covers it, which is
+deliberate.
 
 **SubLink scope.** Unlike SEC011 (which deliberately stops at
 `SubLink.subselect` to avoid false-firing on subqueries' own WHERE

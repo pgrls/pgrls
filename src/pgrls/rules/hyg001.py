@@ -35,6 +35,14 @@ class HYG001:
         out: list[Violation] = []
         for table in schema.tables:
             existing = set(table.columns)
+            if not existing:
+                # No column list captured for this table — an offline
+                # `--sql-file` whose CREATE TABLE lives in another migration,
+                # or an extension-managed table. EVERY referenced column would
+                # read as phantom, at `error` severity and with no allowlist
+                # entry that could be written for a column that does exist.
+                # PERF003 guards the same way (`if live_columns and ...`).
+                continue
             for policy in table.policies:
                 refs: set[tuple[str, ...]] = set()
                 if policy.using_ast is not None:

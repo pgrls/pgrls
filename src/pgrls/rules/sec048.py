@@ -29,7 +29,11 @@ SEC048 fires once per reachable member role ``M`` such that ALL hold:
    FORCE off;
 2. ``M`` is in the transitive ``pg_auth_members`` closure of
    ``owner(T)`` (any membership edge — ``INHERIT`` or not, since
-   ``NOINHERIT`` still permits ``SET ROLE``, matching SEC029's stance);
+   ``NOINHERIT`` still permits ``SET ROLE``, matching SEC029's stance).
+   Deliberately over-approximating on PG16+, where a membership granted
+   ``WITH SET FALSE`` confers no ``SET ROLE`` at all: the introspection
+   query does not filter on ``admin_option``/``set_option``, so such an
+   edge is still counted;
 3. ``owner(T)`` is NOT superuser and NOT BYPASSRLS (those are
    SEC016/SEC029 territory — excluding them keeps SEC048 disjoint from
    SEC029); and

@@ -132,7 +132,7 @@ def test_sec015_fires_on_pinned_but_pg_temp_absent() -> None:
     # Message names the actual configured value so the operator
     # sees what they have vs. what they need.
     assert "'pg_catalog, public'" in v.message
-    assert "does not end with an explicit pg_temp" in v.message
+    assert "does not end with a SINGLE explicit pg_temp" in v.message
 
 
 def test_sec015_fires_on_pg_temp_not_last() -> None:

@@ -383,8 +383,11 @@ class SEC037:
                                 message=(
                                     f"Policy {policy.name!r} on "
                                     f"{table.qualified_name} compares "
-                                    f"auth.role() to the unknown "
-                                    f"value {unknown!r}. The known set "
+                                    "a role function (auth.role() by "
+                                    "default; see "
+                                    "[lint.rules.SEC037].role_functions) "
+                                    f"to the unknown value {unknown!r}. "
+                                    "The known set "
                                     "is {anon, authenticated, "
                                     "service_role} (configurable via "
                                     "[lint.rules.SEC037].known_roles). "

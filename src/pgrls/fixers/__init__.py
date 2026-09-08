@@ -124,8 +124,8 @@ def generate_fixes(
 
     Most fixers emit independent statements (`ALTER TABLE`, `ALTER
     VIEW`, `ALTER POLICY`) whose relative order does not affect the
-    final state. The one exception is HYG003, the only fixer that
-    `DROP`s an object: a `DROP POLICY p` and an `ALTER POLICY p`
+    final state. The exceptions are the DROP fixers — HYG003, SEC010
+    and SEC031 (`_DROP_FIXER_IDS` below): a `DROP POLICY p` and an `ALTER POLICY p`
     (from PERF001 / SEC011 / SEC019 / SEC020 firing on the same
     duplicate policy's shared predicate) are NOT order-independent —
     run the DROP first and the ALTER fails on a policy that no longer

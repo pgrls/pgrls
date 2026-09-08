@@ -48,8 +48,10 @@ class SEC003:
                         message=(
                             f"Permissive policy {policy.name!r} on "
                             f"{table.qualified_name} grants access to "
-                            "PUBLIC. Anonymous connections will be "
-                            "subject to this policy's USING clause. "
+                            "PUBLIC, so anonymous connections are "
+                            "governed by this policy's own clause — its "
+                            "USING for reads, its WITH CHECK for writes "
+                            "(a FOR INSERT policy has no USING at all). "
                             "Restrict to a specific role (e.g. "
                             "TO authenticated)."
                         ),

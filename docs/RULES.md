@@ -977,7 +977,9 @@ with the owner's privileges. This is the CVE-2018-1058
 search-path privilege-escalation class.
 
 SEC015 fires when a SECDEF function's effective `search_path`
-does not end with an explicit `pg_temp` token:
+does not end with a *single* explicit `pg_temp` token — naming it more than
+once (`pg_temp, public, pg_temp`) leaves an earlier occurrence ahead of the
+listed schemas, so that fires too:
 
 * **No `SET search_path` clause** — the function inherits the
   *caller's* search_path. The caller is the attacker; `pg_temp`
@@ -2035,8 +2037,9 @@ pgrls can't make.
 
 Relationship to other rules: SEC005 ("no own-column reference")
 fires when a policy references *no* column of its table at all;
-SEC027 fires when the policy references *some* columns but not the
-principal one. A tenant-only table with no owner/user column never
+SEC027 fires whenever a principal column goes unreferenced — including
+when the policy references no column at all, so the two deliberately
+co-fire on that shape rather than partitioning it. A tenant-only table with no owner/user column never
 trips SEC027 (there's nothing to under-scope).
 
 <a id="rule-sec028"></a>
