@@ -57,9 +57,10 @@ when **all** of:
      ``ALL`` to that role (or ``PUBLIC``), **and**
    * the child either has ``rls_enabled == False`` (no RLS gates the write at
      all) **or** has a *permissive* ``INSERT`` / ``UPDATE`` / ``ALL`` policy
-     whose ``roles`` literally include that low-trust role (the SEC003
-     literal-role idiom — no group/membership expansion, no ``WITH CHECK``
-     satisfiability proof), **and**
+     whose ``roles`` reach that low-trust role — named literally, or via
+     ``PUBLIC`` / an absent ``TO`` clause, which apply to every role (the
+     SEC003 literal-role idiom otherwise: no group/membership expansion, no
+     ``WITH CHECK`` satisfiability proof), **and**
 
 3. the FK is not allowlisted.
 
@@ -90,10 +91,12 @@ Configuration
 # Roles whose child-write access makes the FK an oracle. Default
 # ["anon", "PUBLIC"]; "public" (any case) normalizes to the PUBLIC pseudo-role.
 low_trust_roles = ["anon", "PUBLIC"]
-# Allowlist a deliberate FK by the child table (`schema.table`) — silences all
-# its FKs — or by a specific FK constraint name. (FK constraint names are unique
-# per table, not globally, so a bare name silences that name on EVERY child;
-# prefer the `schema.table` form when a name is shared across tables.)
+# Allowlist a deliberate FK by the child table — `schema.table` or the BARE
+# table name, either of which silences all its FKs — or by a specific FK
+# constraint name. Both bare forms are global: a bare table name silences that
+# name in every schema, and an FK constraint name (unique per table, not
+# globally) silences that name on EVERY child. Prefer `schema.table` whenever a
+# name is shared.
 allowlist = ["public.events", "events_account_id_fkey"]
 ```
 

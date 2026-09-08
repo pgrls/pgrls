@@ -70,6 +70,20 @@ def test_message_names_column_role_and_revoke() -> None:
     assert "credit_card" in msg and "anon" in msg and "REVOKE" in msg
 
 
+def test_revoke_repeats_the_column_list_per_privilege() -> None:
+    """Review pass 11: `REVOKE SELECT, UPDATE (email)` attaches the column list
+    to the LAST privilege only, so SELECT is revoked TABLE-wide and cascades to
+    every column grant. Measured on PG16: the table grant vanished from relacl
+    and the role then got `permission denied for table`. The narrow form
+    repeats the column per privilege."""
+    out = _check(
+        _cg(role="anon", column="email", privileges=("SELECT", "UPDATE"))
+    )
+    msg = out[0].message
+    assert "REVOKE SELECT (email), UPDATE (email) ON" in msg
+    assert "REVOKE SELECT, UPDATE (email)" not in msg
+
+
 def test_multiple_pii_columns_each_fire() -> None:
     out = _check(
         _cg(role="anon", column="email"),

@@ -4,9 +4,16 @@ A view's body may call a SECURITY DEFINER function that, in turn, reads
 from an RLS-protected table. Because the function runs with the function
 owner's privileges (typically a privileged migration/admin role), RLS on
 the underlying table is evaluated against the function owner — NOT the
-calling user. This bypasses the per-tenant filter even when the *view*
-itself is configured with `security_invoker = true` (VIEW001's defense),
-because the bypass happens one frame deeper, inside the function call.
+calling user. That happens one frame deeper than the *view*, so
+`security_invoker = true` (VIEW001's defense) does not stop it.
+
+Whether it is a full bypass depends on the owner, exactly as in VIEW001:
+RLS exemption is relative to the TABLE. An owner that is superuser or
+`BYPASSRLS` skips the policies outright; an ordinary owner does too for
+its own tables whenever those are not `FORCE`'d. Otherwise the policies
+still run — but against the owner, so the caller is handed the *owner's*
+row set rather than its own, which is still a different answer than a
+direct read. Severity is `warning` for that reason.
 
 The two architectural fixes are mutually exclusive — pgrls can't pick:
 
@@ -288,8 +295,12 @@ class VIEW004:
                         f"View {view.qualified_name} calls SECURITY "
                         f"DEFINER function {fn_qnames_csv}, which "
                         f"reads RLS-protected {referenced_qnames_csv}. "
-                        "The function bypasses RLS via the function "
-                        "owner's privileges. Either re-write the "
+                        "The body runs as the function's owner, so the "
+                        "table's RLS is evaluated against that role, not "
+                        "the caller — a full bypass when the owner is "
+                        "superuser / BYPASSRLS or owns a table that is "
+                        "not FORCE'd, and otherwise the owner's row set "
+                        "rather than the caller's. Either re-write the "
                         "function as INVOKER, or document why the "
                         "bypass is intentional."
                     ),

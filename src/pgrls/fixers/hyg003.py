@@ -15,8 +15,9 @@ each of the rest:
 
     DROP POLICY <redundant> ON <schema>.<table>;
 
-This is the only `pgrls fix` statement that DROPs an object rather
-than adding or altering one. It is safe — the dropped policy has
+This is one of three `pgrls fix` statements that DROP an object rather
+than adding or altering one (with SEC010's and SEC031's — see
+``_DROP_FIXER_IDS``). It is safe — the dropped policy has
 an exact twin that remains — but, like every fixer, it is dry-run
 by default; review the SQL before `--apply`.
 """

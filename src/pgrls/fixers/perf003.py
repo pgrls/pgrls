@@ -5,7 +5,8 @@ filters on an own-table column with no leading-column index — the
 planner sequential-scans the table on every policy-filtered query.
 The mechanical fix is one B-tree index per offending column:
 
-    CREATE INDEX ON <schema>.<table> (<column>);
+    CREATE INDEX IF NOT EXISTS pgrls_idx_<hash>
+        ON <schema>.<table> (<column>);
 
 The fixer reuses PERF003's own detection (`PERF003._unindexed_columns`)
 so it indexes exactly the columns the rule flags. One index can

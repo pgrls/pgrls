@@ -26,7 +26,9 @@ The probe is deliberately conservative: anything it cannot model live it
 **abstains** on (per table, with a one-line reason — never a crash). It cannot
 create its probe role (no CREATEROLE / not superuser), cannot seed (no INSERT),
 finds no scoping axis to pivot a cross-tenant probe on, the leak witness is
-conditional (no single characterizing row), the policy references other tables,
+conditional (no single characterizing row), the finding is the anonymous
+role's own RLS exemption rather than a policy, the policy references other
+tables,
 or a column has an exotic type the placeholder synthesis can't fill — all of
 these yield a clean `abstained` / `skipped`, not a false signal.
 
@@ -49,11 +51,8 @@ from pgrls.diff._z3_compare import (
     cross_tenant_session_identity,
 )
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import Column, Policy, Schema, Table
+from pgrls.model import Column, Policy, Schema, Table, is_maybe_set
 from pgrls.repro import (
-    _AUTH_IDENTITY_GUC,
-    _current_setting_guc,
-    _funccall_qualified,
     _identity_value_type,
     _row_columns,
     _session_a_value,
@@ -70,6 +69,7 @@ from pgrls.verify import (
     Verification,
     build_verification,
     checked_ast,
+    _anon_set_gucs,
 )
 from pgrls._render_common import pluralize, render_text_table
 from pgrls.formatters._common import safe_location
@@ -88,12 +88,27 @@ Agreement = Literal["agree", "mismatch", "leak_confirmed", "skipped", "abstained
 
 # JWT-claim GUCs the auth.* stubs read (see repro._AUTH_STUB). Clearing them
 # (set to '') makes auth.uid()/role()/jwt() return NULL — the anonymous state
-# the `anon` threat model probes under. A policy reading a different GUC via a
-# direct current_setting(...) adds its own GUC to this set per table.
+# the `anon` threat model probes under, because those stubs read them through
+# `NULLIF(..., '')` — for THOSE stubs '' and unset are the same value. The set
+# is deliberately CLOSED: a policy's own `current_setting('app.x')` must never
+# be cleared, since '' is a value rather than NULL and cannot be undone within
+# the session. That is equally true of these claim GUCs when a policy reads
+# them DIRECTLY rather than through a stub, which is why they are cleared only
+# where already non-NULL, and why the anon-KEY caller — the one session that
+# WRITES them — is deferred to a second pass over the tables (see `_run_probe`).
 _ANON_BASELINE_GUCS = (
     "request.jwt.claim.sub",
     "request.jwt.claim.role",
     "request.jwt.claims",
+)
+
+# The anon-KEY session (see `_z3_compare._Context.anon_jwt`): what PostgREST
+# sets for a caller presenting the public anon key — a role claim of 'anon'
+# and a claims blob carrying it, but no subject. Applied as a second attempt
+# after the JWT-less baseline reads nothing.
+_ANON_KEY_SESSION_GUCS = (
+    ("request.jwt.claim.role", "anon"),
+    ("request.jwt.claims", '{"role":"anon"}'),
 )
 
 
@@ -170,40 +185,6 @@ def _short(exc: Exception) -> str:
 
 def _column_map(table: Table) -> dict[str, Column]:
     return {c.name: c for c in table.column_details}
-
-
-def _anon_gucs(policy_ast: Any) -> list[str]:
-    """The GUCs to clear so every auth value in `policy_ast` reads NULL.
-
-    The baseline Supabase JWT-claim GUCs, plus any GUC a direct
-    ``current_setting('<guc>')`` in the predicate reads (so a non-Supabase
-    policy scoping on ``current_setting('app.tenant_id')`` is anonymized too).
-    Reuses repro's `_current_setting_guc` / `_AUTH_IDENTITY_GUC` so the GUC
-    mapping is the single source of truth shared with the emitted repro."""
-    from pglast.ast import FuncCall, Node
-
-    gucs = set(_ANON_BASELINE_GUCS)
-
-    def walk(n: Any) -> None:
-        if n is None:
-            return
-        if isinstance(n, (list, tuple)):
-            for item in n:
-                walk(item)
-            return
-        if isinstance(n, FuncCall):
-            guc = _current_setting_guc(n)
-            if guc is not None:
-                gucs.add(guc)
-            qualified = _funccall_qualified(n)
-            if qualified in _AUTH_IDENTITY_GUC:
-                gucs.add(_AUTH_IDENTITY_GUC[qualified])
-        if isinstance(n, Node):
-            for field_name in n:
-                walk(getattr(n, field_name, None))
-
-    walk(policy_ast)
-    return sorted(gucs)
 
 
 def _references_other_tables(policy_ast: Any) -> bool:
@@ -383,6 +364,8 @@ def _probe_one(
     auth_functions: set[str] | None,
     probe_role: str,
     n: int,
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
+    allow_anon_key: bool = True,
 ) -> ProbeResult:
     """Probe one table, inside its own savepoint (rolled back by the caller).
 
@@ -406,10 +389,19 @@ def _probe_one(
         tv.proofs[0],
     )
     policy = next((p for p in table.policies if p.name == proof.policy), None)
-    if policy is None:  # pragma: no cover - proof always names a real policy
+    if policy is None:
+        # `anon` mode emits a `role:<name>` proof when the anonymous session is
+        # exempt from the table's RLS outright — there is no policy to pivot
+        # on, because the policies are never consulted.
+        reason = (
+            "the anonymous session is exempt from this table's RLS — no policy "
+            "to probe; see verify --mode escalation"
+            if proof.policy.startswith("role:")
+            else "internal: proof references an unknown policy"
+        )
         return ProbeResult(
             tv.qualified_name, proof.policy, mode, tv.verdict, "abstained",
-            "abstained", "internal: proof references an unknown policy", None,
+            "abstained", reason, None,
         )
 
     policy_ast = checked_ast(policy, mode)
@@ -468,7 +460,8 @@ def _probe_one(
             observed = _run_probe_steps(
                 cur, table, policy_ast, mode, row,
                 disc_col=disc_col, auth_sql=auth_sql, a_val=a_val,
-                probe_role=probe_role,
+                probe_role=probe_role, guc_states=guc_states,
+                allow_anon_key=allow_anon_key,
             )
             agreement, detail = _classify(tv.verdict, observed, mode)
             return ProbeResult(
@@ -518,6 +511,8 @@ def _run_probe_steps(
     auth_sql: str | None,
     a_val: str | None,
     probe_role: str,
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
+    allow_anon_key: bool = True,
 ) -> Observed:
     """Seed → become the threat session → observe. Returns the live outcome.
 
@@ -551,8 +546,29 @@ def _run_probe_steps(
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
         else:  # anon
             cur.execute(_insert_sql(table, row))  # seed as the privileged role
-            for guc in _anon_gucs(policy_ast):
-                cur.execute(f"SELECT set_config({_sql_str(guc)}, '', true)")
+            # Clear ONLY the JWT-claim GUCs. Those are read through
+            # `NULLIF(current_setting(...), '')`, so '' and unset are the same
+            # value to the auth stubs. A custom dotted GUC is not: measured on
+            # PG16, `set_config('app.gate', '', true)` makes
+            # `current_setting('app.gate', true)` return '' rather than NULL,
+            # and NEITHER `RESET` nor `set_config(..., NULL, ...)` gets NULL
+            # back within the session. Clearing them therefore destroyed the
+            # very condition a `current_setting('app.gate', true) IS NULL`
+            # policy leaks through, and the probe reported MISMATCH against
+            # its own correct LEAK. A fresh probe transaction already sees
+            # them unset; `_observe_anon_sessions` sets the ones a login path
+            # actually has.
+            for guc in _ANON_BASELINE_GUCS:
+                # Only where it is already non-NULL. `''` is a VALUE, not
+                # NULL, and cannot be undone in-session — writing it into an
+                # unset claim GUC destroys a `current_setting(..., true) IS
+                # NULL` gate, which is exactly the shape SEC004 is about.
+                # Measured: the probe then reported `no rows` against a live
+                # 2-row anonymous read and MISMATCHed its own correct proof.
+                cur.execute(
+                    f"SELECT set_config({_sql_str(guc)}, '', true) "
+                    f"WHERE current_setting({_sql_str(guc)}, true) IS NOT NULL"
+                )
             cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
     except psycopg.Error as exc:
         # A seed INSERT denied (e.g. no permissive write path under FORCE RLS for
@@ -577,7 +593,10 @@ def _run_probe_steps(
                 "cannot measure a policy leak here"
             )
         if mode == "write":
-            return _observe_write(cur, table, row)
+            return _observe_write(
+                cur, table, row,
+                disc_col=disc_col, a_val=a_val, probe_role=probe_role,
+            )
         # Observe ONLY the row the probe planted, never the whole table. A
         # cross-tenant probe counts rows stamped for tenant B (the seeded
         # discriminator value) so a correctly-scoped table that merely holds a
@@ -598,7 +617,12 @@ def _run_probe_steps(
         else:
             query = f"SELECT * FROM {qtbl}"
         try:
-            seen = _row_count(cur.connection, query)
+            if mode == "anon":
+                seen = _observe_anon_sessions(
+                    cur, query, guc_states, allow_anon_key
+                )
+            else:
+                seen = _row_count(cur.connection, query)
         except psycopg.Error as exc:
             raise _ProbeAbstain(f"probe query failed: {_short(exc)}") from exc
         return "rows_visible" if seen > 0 else "no_rows"
@@ -611,6 +635,83 @@ def _run_probe_steps(
             cur.execute("RESET ROLE")
         except psycopg.Error:
             pass
+
+
+def _observe_anon_sessions(
+    cur: psycopg.Cursor[Any],
+    query: str,
+    guc_states: tuple[dict[str, str | None], ...],
+    allow_anon_key: bool = True,
+) -> int:
+    """Rows visible under ANY anonymous session — the static prover's
+    question, so a correct LEAK is not met with a MISMATCH.
+
+    Anonymous sessions differ two ways and every combination is tried: the
+    login path (each `guc_states` entry — the GUCs a real anonymous session
+    inherits from ``ALTER ROLE`` / ``ALTER DATABASE … SET`` or the server
+    configuration, replayed here because the probe cannot log in as
+    ``authenticator``; a custom GUC is settable by any role), and the caller
+    — JWT-less, then the Supabase ANON-KEY caller: PostgREST sets the role
+    claim to 'anon', so ``USING (auth.role() = 'anon')`` reads rows for it
+    and nothing for a JWT-less one.
+
+    ``allow_anon_key=False`` stops before that second caller. Writing the anon
+    key's claim GUCs is IRREVERSIBLE for the connection — `ROLLBACK TO
+    SAVEPOINT` restores a placeholder GUC to `''`, never to NULL (measured) —
+    so it would corrupt the JWT-less observation of every table probed after
+    it. `_run_probe` therefore runs a JWT-less pass over ALL tables first and
+    only then revisits the ones that saw nothing; see its two-pass loop.
+    """
+    names = sorted({n for st in guc_states for n in st})
+    # What this session inherits, captured BEFORE any state is applied: a GUC
+    # whose value introspection could not capture is replayed from here, so a
+    # later state cannot leave the previous state's value standing.
+    inherited: dict[str, str] = {}
+    for n in names:
+        cur.execute(f"SELECT current_setting({_sql_str(n)}, true) AS v")
+        got = cur.fetchone()
+        inherited[n] = (got[0] if got and got[0] is not None else "")
+    # A custom GUC written once cannot be un-set within the session (measured:
+    # neither RESET, set_config(..., NULL), nor a savepoint rollback restores
+    # NULL). So visit the states that set the FEWEST names first, and if a
+    # later state omits a name an earlier one already wrote, abstain rather
+    # than observe a session we cannot actually build — reporting `no rows`
+    # there produced a MISMATCH against a correct proof.
+    written: set[str] = set()
+    for state in sorted(guc_states or ({},), key=lambda st: (len(st), sorted(st))):
+        stale = written - set(state)
+        if stale:
+            raise _ProbeAbstain(
+                "cannot reconstruct this anonymous session: "
+                f"{', '.join(sorted(stale))} was set for an earlier login path "
+                "and a custom GUC cannot be unset within a session"
+            )
+        written |= set(state)
+        for n in names:
+            if n not in state:
+                # Not set on this login path. Leave it alone rather than
+                # writing '': that is a VALUE, not NULL, and it cannot be
+                # undone within the session (measured), so writing it would
+                # destroy an `IS NULL` leak the prover legitimately found.
+                continue
+            raw = state[n]
+            value = inherited[n] if raw is None or is_maybe_set(raw) else str(raw)
+            cur.execute(f"SELECT set_config({_sql_str(n)}, {_sql_str(value)}, true)")
+        for guc, _val in _ANON_KEY_SESSION_GUCS:
+            cur.execute(
+                f"SELECT set_config({_sql_str(guc)}, '', true) "
+                f"WHERE current_setting({_sql_str(guc)}, true) IS NOT NULL"
+            )
+        seen = _row_count(cur.connection, query)
+        if seen == 0 and allow_anon_key:
+            for guc, val in _ANON_KEY_SESSION_GUCS:
+                cur.execute(
+                    f"SELECT set_config({_sql_str(guc)}, {_sql_str(val)}, true)"
+                )
+            seen = _row_count(cur.connection, query)
+        if seen > 0:
+            return seen
+    return 0
 
 
 def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
@@ -631,9 +732,15 @@ def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
 
 
 def _observe_write(
-    cur: psycopg.Cursor[Any], table: Table, row: list[tuple[str, str]]
+    cur: psycopg.Cursor[Any],
+    table: Table,
+    row: list[tuple[str, str]],
+    *,
+    disc_col: str | None = None,
+    a_val: str | None = None,
+    probe_role: str | None = None,
 ) -> Observed:
-    """Try the cross-tenant INSERT as the threat session, savepoint-guarded.
+    """Try all three write gates as the threat session, savepoint-guarded.
 
     ``write_rejected`` only on ``InsufficientPrivilege`` (SQLSTATE 42501, "new
     row violates row-level security policy" — the RLS ``WITH CHECK`` denial we
@@ -643,22 +750,138 @@ def _observe_write(
     the row before the constraint fired — so we ABSTAIN rather than miscredit it
     as a rejection (which would mask a real write-leak) or let the aborted
     transaction cascade into a crash. The savepoint rollback recovers the
-    transaction on every path."""
+    transaction on every path.
+
+    The INSERT alone only exercises the NEW-row gate. `verify --mode write`
+    also reasons about the OLD-row gate — the `USING` an UPDATE or a DELETE
+    consults to decide which existing rows the caller may take over or
+    destroy — and those are real escapes, which is why `old_row_write_gate`
+    exists. So after the INSERT this also attempts the two column-free forms
+    (no `WHERE`, no `RETURNING`, so nothing re-triggers the SELECT-applicable
+    check): re-stamping every row for the caller's own tenant, and deleting
+    every row. Whether tenant B's seeded row survived is read back as the
+    PRIVILEGED connection role, so the answer never depends on what the threat
+    session may SELECT. Measured on PG16 before this: with
+    `FOR DELETE USING (true)`, `DELETE FROM t` removed tenant a's row while the
+    probe reported `write rejected` and exited 0.
+    """
     w = f"w_{secrets.token_hex(4)}"
     cur.execute(f"SAVEPOINT {w}")
     try:
         cur.execute(_insert_sql(table, row))
     except psycopg.errors.InsufficientPrivilege:
         cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
-        return "write_rejected"
+        admitted = False
     except psycopg.Error as exc:
         cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
         raise _ProbeAbstain(
             "cross-tenant write hit a non-RLS constraint, so the RLS outcome "
             f"is inconclusive: {_short(exc)}"
         ) from exc
-    cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
-    return "write_admitted"
+    else:
+        cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
+        admitted = True
+    if admitted:
+        return "write_admitted"
+    # Only a permissive UPDATE/DELETE/ALL policy has an old-row gate at all;
+    # for a pure FOR INSERT policy the new-row rejection is the whole answer.
+    governs_old_rows = any(
+        p.command in ("UPDATE", "DELETE", "ALL")
+        for p in table.policies
+        if p.permissive
+    )
+    if disc_col is None or probe_role is None:
+        if governs_old_rows:
+            # There is an old-row gate and no axis to synthesize the other
+            # tenant's row with, so it was never exercised. Saying "write
+            # rejected" here asserts a denial we did not observe — measured,
+            # that is what let `FOR DELETE USING (true)` (which empties the
+            # table) come back as `write rejected`, exit 0.
+            raise _ProbeAbstain(
+                "the new-row check denied the write, but this table also has "
+                "an UPDATE/DELETE policy whose old-row gate could not be "
+                "exercised: no `<column> = <session identity>` axis to "
+                "synthesize another tenant's row with"
+            )
+        return "write_rejected"
+    b_val = _row_disc_text(row, disc_col)
+    qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    qdisc = quote_ident(disc_col)
+    # The old-row gates need a row belonging to the OTHER tenant to act on.
+    # `write` mode seeds none (only `cross-tenant` does), and the INSERT above
+    # was rolled back either way — so plant one as the privileged role.
+    seed = f"s_{secrets.token_hex(4)}"
+    cur.execute(f"SAVEPOINT {seed}")
+    cur.execute("RESET ROLE")
+    try:
+        cur.execute(_insert_sql(table, row))
+    except psycopg.Error:
+        # cannot plant the other tenant's row (a constraint, a missing
+        # default) — the old-row gates are simply not measurable here
+        cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+        cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+        if governs_old_rows:
+            raise _ProbeAbstain(
+                "the new-row check denied the write, but the other tenant's "
+                "row could not be planted, so the old-row gate was never "
+                "exercised"
+            )
+        return "write_rejected"
+    cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+
+    def _b_rows() -> int:
+        """Tenant B's surviving rows, counted as the privileged role."""
+        cur.execute("RESET ROLE")
+        try:
+            cur.execute(
+                f"SELECT count(*) FROM {qtbl} WHERE {qdisc}::text = %s",
+                (b_val,),
+            )
+            got = cur.fetchone()
+            return int(got[0]) if got else 0
+        finally:
+            cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+
+    for stmt in (
+        # take-over: re-stamp every row the old-row gate admits for tenant A
+        f"UPDATE {qtbl} SET {qdisc} = "
+        f"{_sql_str(a_val or '')}::{_disc_type(table, disc_col)}",
+        # destroy: remove every row the old-row gate admits
+        f"DELETE FROM {qtbl}",
+    ):
+        before = _b_rows()
+        if before == 0:
+            break  # nothing of tenant B's left to take over or destroy
+        g = f"g_{secrets.token_hex(4)}"
+        cur.execute(f"SAVEPOINT {g}")
+        try:
+            cur.execute(stmt)
+        except psycopg.Error as exc:
+            # RLS filters an old-row gate, it does not raise — a denied
+            # UPDATE/DELETE simply affects 0 rows. So an error here is a
+            # missing GRANT (or a constraint), meaning the gate was never
+            # exercised. Do not read that as a rejection.
+            cur.execute(f"ROLLBACK TO SAVEPOINT {g}")
+            cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+            raise _ProbeAbstain(
+                "the new-row check denied the write, but the old-row gate "
+                f"could not be exercised: {_short(exc)}"
+            ) from exc
+        after = _b_rows()
+        cur.execute(f"ROLLBACK TO SAVEPOINT {g}")
+        if after < before:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+            return "write_admitted"
+    cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+    return "write_rejected"
+
+
+def _disc_type(table: Table, disc_col: str) -> str:
+    """The discriminator column's SQL type, for the take-over UPDATE's cast."""
+    for c in table.column_details:
+        if c.name == disc_col:
+            return c.data_type
+    return "text"
 
 
 def _abstain_all(
@@ -880,7 +1103,13 @@ def _run_escalation_probe(
     # The owner-bypass witness is clean only on a table that provably isolates
     # tenants; a table that itself leaks cross-tenant contaminates the seeded
     # row, so gate on its cross-tenant verdict.
-    xt = build_verification(schema, auth_functions=auth_functions, mode="cross-tenant")
+    # Ungated, exactly as `build_escalation` does: the gate exists to stop
+    # cross-tenant claiming a proof for an owner-equivalent caller, but this
+    # mode's whole subject IS that caller, and it composes the verdict itself.
+    xt = build_verification(
+        schema, auth_functions=auth_functions, mode="cross-tenant",
+        _skip_owner_reach_gate=True,
+    )
     xt_verdicts = {t.qualified_name: t.verdict for t in xt.tables}
     try:
         results = [
@@ -937,6 +1166,14 @@ def run_probe(
             return _abstain_all(verification, mode, gate_error)
 
         results: list[ProbeResult] = []
+        guc_states = _anon_set_gucs(schema, anon_roles)
+        # PASS 1 — every table JWT-less. The anon-key attempt writes claim GUCs
+        # that CANNOT be unset for the rest of the connection (`ROLLBACK TO
+        # SAVEPOINT` restores a placeholder GUC to `''`, never NULL — measured),
+        # so doing it inline corrupted the JWT-less observation of every table
+        # probed afterwards: a live 2-row anonymous leak came back `no rows` /
+        # MISMATCH against its own correct proof. Deferring it to pass 2 means
+        # no table's JWT-less reading is ever taken on a poisoned session.
         for n, tv in enumerate(verification.tables):
             table = tables.get(tv.qualified_name)
             if table is None:  # pragma: no cover - verification built from schema
@@ -949,8 +1186,31 @@ def run_probe(
                 )
                 continue
             results.append(
-                _probe_one(conn, table, tv, mode, auth_functions, probe_role, n)
+                _probe_one(
+                    conn, table, tv, mode, auth_functions, probe_role, n,
+                    guc_states=guc_states,
+                    allow_anon_key=(mode != "anon"),
+                )
             )
+        # PASS 2 — the Supabase anon-KEY caller, for the tables pass 1 saw
+        # nothing in. Its writes are the same claim values every time, so the
+        # pass is self-consistent; and a poisoned JWT-less baseline here can
+        # only under-count, never manufacture a leak (pass 1 already holds the
+        # clean JWT-less answer for each of these tables).
+        if mode == "anon":
+            offset = len(verification.tables)
+            for n, tv in enumerate(verification.tables):
+                if results[n].observed != "no_rows":
+                    continue
+                table = tables.get(tv.qualified_name)
+                if table is None:  # pragma: no cover
+                    continue
+                retry = _probe_one(
+                    conn, table, tv, mode, auth_functions, probe_role,
+                    offset + n, guc_states=guc_states, allow_anon_key=True,
+                )
+                if retry.observed == "rows_visible":
+                    results[n] = retry
         return Probe(tuple(results), mode)
     finally:
         # Non-destructiveness invariant: revert the probe role, every grant, and
@@ -1021,7 +1281,13 @@ def _setup_probe_role(
             cur.execute(f"GRANT USAGE ON SCHEMA {quote_ident(s)} TO {qrole}")
         for t in tables:
             qtbl = f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
-            cur.execute(f"GRANT SELECT, INSERT ON {qtbl} TO {qrole}")
+            # UPDATE/DELETE are needed to exercise the OLD-row write gates
+            # (`old_row_write_gate`): RLS filters those rather than raising, so
+            # without the grant the statement fails on privilege and the gate
+            # goes unmeasured. Nothing escapes — the probe rolls back.
+            cur.execute(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON {qtbl} TO {qrole}"
+            )
         # Make each policy's named `TO` role apply to the probe role: an RLS
         # policy `TO authenticated` only applies to a session that is (a member
         # of) `authenticated`, so without this a `TO <role>` policy would

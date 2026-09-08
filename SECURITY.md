@@ -27,7 +27,7 @@ the CHANGELOG, then the public disclosure.
   overwrites intended state, or that opens a new vulnerability).
 - The `pgrls diff` classification (any change incorrectly classified
   SAFE or downgraded).
-- The JSON / SARIF / Markdown / GitHub-annotation / JUnit formatters
+- The JSON / SARIF / Markdown / PR-comment / GitHub-annotation / JUnit / GitLab / HTML formatters
   (any output that breaks downstream parsers in ways that could mask
   a finding — including escaping bugs that let a crafted policy name
   or message forge or terminate a GitHub Actions workflow command).

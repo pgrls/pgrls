@@ -1,5 +1,4 @@
-"""SEC055 — tenant policy still uses the silent binding form after the
-schema adopted the raising one.
+"""SEC055 — tenant policy still uses the silent binding form after the schema adopted the raising one.
 
 `pgrls generate --strict-binding` scaffolds policies that compare against
 a helper which RAISES when no tenant is bound on the connection, instead
@@ -14,7 +13,8 @@ CREATE POLICY p ON leads USING (tenant_id = (SELECT current_setting('app.tenant_
 ```
 
 An application that forgets to bind a tenant does not fail — it reports
-"not found". A test suite connected as the table owner cannot see the
+"not found". A test suite connected as the owner of a table that is not
+`FORCE`'d cannot see the
 difference either, because RLS is not enforced for that role, so a query
 that binds a tenant and one that does not are identical to every test.
 The failure is silent, total, and arrives the day the application role
@@ -31,8 +31,10 @@ The obvious gate is "`[generate].strict_binding` is set". This rule uses a
 stronger signal: it fires only when **this schema already uses the raising
 helper somewhere** — at least one policy compares against a
 `…require_<label>(…)`-shaped call — and some other tenant policy still
-carries the silent `current_setting(…, true)` form for the same
-discriminator column.
+carries the silent `current_setting(…, true)` form (any table — the
+check is scan-wide, not per column and not per namespace: once any
+scanned schema adopted the helper, a silent-form policy in a schema
+that never did will fire too).
 
 That is deliberate. A config-gated rule is silent when the config is
 absent, which is exactly the case when CI lints a database without the
@@ -55,6 +57,7 @@ from pgrls.ast_utils import (
     find_func_calls,
     func_name_parts,
     is_builtin_current_setting,
+    is_literal_true,
 )
 from pgrls.model import Schema, policy_id
 from pgrls.rules._allowlist import parse_policy_id_allowlist
@@ -124,7 +127,10 @@ def _has_silent_call(node: Any) -> bool:
     for call in find_func_calls(node, {"current_setting"}):
         if not is_builtin_current_setting(call):
             continue
-        if len(getattr(call, "args", None) or ()) >= 2:
+        args: tuple[Any, ...] = tuple(getattr(call, "args", None) or ())
+        # Only `missing_ok = true` returns NULL; `(name, false)` raises on an
+        # unset GUC exactly like the one-argument form — loud, not silent.
+        if len(args) >= 2 and is_literal_true(args[1]):
             return True
     return False
 
@@ -178,7 +184,7 @@ class SEC055:
                             "returns NULL when nothing is bound — so a query "
                             "on a connection that never bound a tenant is "
                             "filtered to zero rows and looks exactly like an "
-                            "empty result. Other policies in this schema "
+                            "empty result. Other policies in this scan "
                             "already use a raising binding helper, so this "
                             "one is unconverted: it still 404s where the "
                             "others fail loudly. Point it at the same helper "

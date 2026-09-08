@@ -25,8 +25,9 @@ conjunction, for the one *view-family* relation whose rows can never be
 RLS-filtered.
 
 **Relationship to VIEW003.** VIEW003 (``warning``) flags *any* matview reading
-an RLS table — a broad architectural caution ("verify ``REFRESH`` runs
-per-tenant, or replicate the matview per-tenant"), which may be perfectly fine
+an RLS table — a broad architectural caution ("give the matview a per-tenant
+OWNER, since the body runs as the owner at ``REFRESH`` regardless of who issues
+it, or replicate the matview per-tenant"), which may be perfectly fine
 for an internal, un-exposed matview. SEC054 (``error``) is the sharpened,
 confirmed-exposure subset: the matview is *actually reachable over the API* by a
 low-trust role, so it is leaking now — ``anon`` cannot be "the per-tenant
@@ -53,7 +54,7 @@ Configuration ``[lint.rules.SEC054]``:
   exempted from the rule.
 
 No auto-fix: ``REVOKE`` the low-trust grant, move the matview out of the exposed
-schema, refresh it as a per-tenant role, or replicate it per-tenant — the right
+schema, give it a per-tenant OWNER (the body runs as the owner at REFRESH), or replicate it per-tenant — the right
 choice depends on intent.
 """
 from __future__ import annotations
@@ -162,8 +163,9 @@ class SEC054:
                 "source tables is NOT applied — every captured row is directly "
                 f"readable at GET /rest/v1/{view.name} by an unauthenticated or "
                 "any-authenticated request. Remedy: REVOKE the low-trust grant, "
-                "move the matview out of the exposed schema, refresh it as a "
-                "per-tenant role, or replicate it per-tenant. If it is "
+                "move the matview out of the exposed schema, give it a "
+                "per-tenant OWNER (the body runs as the owner at REFRESH, "
+                "not as whoever issues it), or replicate it per-tenant. If it is "
                 f"intentionally public, allowlist {view.qualified_name!r} in "
                 "[lint.rules.SEC054]."
             ),

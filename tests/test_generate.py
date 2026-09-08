@@ -463,8 +463,8 @@ def test_cli_dry_run_prints_sql_and_skips() -> None:
     assert "dry-run" in res.output
 
 
-def test_cli_output_and_apply_rejected() -> None:
-    res = _run(Schema(tables=()), ["--output", "/tmp/x.sql", "--apply"])
+def test_cli_output_and_apply_rejected(tmp_path) -> None:
+    res = _run(Schema(tables=()), ["--output", str(tmp_path / "x.sql"), "--apply"])
     assert res.exit_code == 2
     assert "cannot be combined" in res.output
 

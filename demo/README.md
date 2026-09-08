@@ -1,10 +1,10 @@
 # pgrls demo
 
-A self-contained walkthrough of every rule pgrls ships, plus the
+A self-contained walkthrough of pgrls's core rules and workflows, plus the
 partition-aware paths, the JSON / SARIF output contracts, the
 `pgrls fix` auto-remediation flow, the `pgrls.testing` pytest plugin,
 and the four `pgrls diff` classifications (DANGEROUS / SAFE /
-REQUIRES_REVIEW / BREAKING). 88 use cases.
+REQUIRES_REVIEW / BREAKING). 97 use cases.
 
 ## Layout
 
@@ -12,7 +12,7 @@ REQUIRES_REVIEW / BREAKING). 88 use cases.
 demo/
 ├── conftest.py            # session-scoped fixtures
 ├── docker-compose.yml     # local Postgres on port 5433 (optional)
-├── pgrls.toml             # demo config (allowlists app.countries)
+├── pgrls.toml             # demo config (allowlists app.countries; disables PERF003)
 ├── README.md              # this file
 ├── run.sh                 # bring up DB + apply fixtures + run pgrls
 ├── test_summary.py        # whole-fixture sanity checks
@@ -35,11 +35,22 @@ demo/
     ├── 85-view001-non-invoker-view/      # VIEW001
     ├── 86-view002-non-barrier-view/      # VIEW002
     ├── 87-view003-matview-over-rls/      # VIEW003
-    └── 88-view004-view-thru-secdef/      # VIEW004
+    ├── 88-view004-view-thru-secdef/      # VIEW004
+    ├── 89-anonymous-read-semantic/       # SEC038
+    ├── 90-sec039-anon-write/             # SEC039
+    ├── 91-sec040-write-scope-drop/       # SEC040
+    ├── 92-sec041-partition-rls-bypass/   # SEC041
+    ├── 93-sec042-anon-secdef-rpc/        # SEC042
+    ├── 94-sec043-inheritance-rls-bypass/ # SEC043
+    ├── 95-sec044-default-privileges/     # SEC044
+    ├── 96-sec048-reachable-owner-not-forced/   # SEC048
+    └── 97-perf001-fires-on-correlated-exists/  # PERF001
 ```
 
 Each case folder is self-contained — open it to read the SQL
-fixture and the test assertions side by side. `pytest demo/`
+fixture and the test assertions side by side. Two exceptions carry no
+fixture of their own and say so in their `setup.sql`: case 16 exercises
+tables created under case 15, and case 65 re-uses case 03's. `pytest demo/`
 discovers every `cases/NN-*/test_uc<NN>.py` and shares one
 session-scoped Postgres testcontainer across them all (the conftest
 applies `_shared.sql` first, then every case's `setup.sql` in
@@ -58,7 +69,7 @@ numeric order).
 | 07 | Session-state-only predicate | SEC005 + PERF001 | fires |
 | 08 | UPDATE policy missing WITH CHECK | SEC006 | fires |
 | 09 | All policies permissive (no RESTRICTIVE floor) | SEC007 | fires |
-| 10 | `USING (true)` policy | SEC008 + SEC005 | fires |
+| 10 | `USING (true)` policy — permissive vs restrictive | SEC008 + SEC031 | fires |
 | 11 | Unwrapped auth call in USING | PERF001 | fires |
 | 12 | Orphaned column reference (in USING) | HYG001 | fires |
 | 13 | Partitioned parent with RLS — clean | (none) | passes (children suppressed by ancestor walk) |
@@ -98,10 +109,10 @@ numeric order).
 | 47 | `<scalar> = ANY(array_col)` | (none) | passes (extract walks ArrayExpr) |
 | 48 | E-commerce orders + items via FK + EXISTS | (none) | passes (2-table tenant join) |
 | 49 | GDPR-style classification (ARRAY + CASE composite) | (none) | passes (rule walks both branches) |
-| 50 | Read-replica style (SELECT-only policies, no PUBLIC permissive) | (none) | passes |
+| 50 | Read-replica style (SELECT-only policies, no PUBLIC permissive) | SEC022 | fires |
 | 51 | ROW comparison `(a,b) = (c,d)` | (none) | passes (extract walks RowExpr) |
 | 52 | Two PERMISSIVE PUBLIC policies on one table | SEC003 ×2 + SEC007 | each policy fires its own line |
-| 53 | `auth_func() IS NULL` buried inside a nested OR | (none) | passes — documented false negative pin |
+| 53 | `auth_func() IS NULL` buried inside a nested OR | SEC004 | fires — `flatten_or_disjuncts` closed the false negative this case used to pin |
 | 54 | `email::text = ...` (TypeCast over column) | (none) | passes (extract walks TypeCast.arg) |
 | 55 | `USING (NOT false)` | SEC005 | fires; SEC008 specifically does NOT (literal-only detection) |
 | 56 | `gone IS TRUE` (BoolTest) on dropped column | HYG001 | fires (extract walks BoolTest.arg) |
@@ -109,7 +120,7 @@ numeric order).
 | 58 | `COALESCE(auth.uid(), default)` | PERF001 | fires (find_func_calls walks function args) |
 | 59 | `fail_on = "warning"` | gates (config) | exit code 1 on PERF001 |
 | 60 | `fail_on = "info"` | gates (config) | exit code 1 on SEC007 |
-| 61 | `--format json` machine-readable output | (config) | parses to a dict with `violations[]` + `summary{}`; sarif still rejects cleanly |
+| 61 | `--format json` machine-readable output | (config) | parses to a dict with `violations[]` + `summary{}`; an unknown format rejects cleanly, listing the nine supported ones |
 | 62 | `[lint].disable = ["SEC005", "SEC008"]` | disabled (config) | both rules skipped |
 | 63 | `allowlist = "..."` (string, not list) | error (config) | clean ClickException, no traceback |
 | 64 | `app."MixedCase Table"` quoted identifier | (none) | passes (round-trips through pg_class as plain string) |
@@ -137,6 +148,15 @@ numeric order).
 | 86 | Non-`security_barrier` view over RLS table | VIEW002 | fires |
 | 87 | Materialized view over RLS table | VIEW003 | fires |
 | 88 | View calling SECDEF function reading RLS table | VIEW004 | fires |
+| 89 | Semantic anonymous-read leak (NOT-wrapped inverted auth) | SEC038 | fires |
+| 90 | Write policy open to the anonymous role | SEC039 | fires |
+| 91 | `FOR ALL` whose `WITH CHECK` drops the tenant scope | SEC040 | fires |
+| 92 | Partition child with RLS off under an enforcing parent | SEC041 | fires |
+| 93 | anon/`PUBLIC`-EXECUTE `SECURITY DEFINER` RPC, RLS-exempt owner | SEC042 | fires |
+| 94 | Inheritance child with RLS off under an enforcing parent | SEC043 | fires |
+| 95 | `ALTER DEFAULT PRIVILEGES` granting future tables to PUBLIC | SEC044 | fires |
+| 96 | Owner-reachable role on a table without `FORCE` | SEC048 | fires |
+| 97 | Per-row auth call inside a correlated `EXISTS` | PERF001 | fires |
 
 ## Running
 
@@ -147,7 +167,8 @@ cd demo
 ./run.sh
 ```
 
-Spins up Postgres on `localhost:5433`, applies `setup.sql`, runs
+Spins up Postgres on `localhost:5433`, applies `cases/_shared.sql` and
+every `cases/NN-*/setup.sql`, runs
 `pgrls lint --config pgrls.toml`, and prints the result. The DB stays
 running so you can `psql postgres://demo:demo@localhost:5433/demo` to
 poke around.
@@ -175,7 +196,7 @@ pytest demo/ -v
 
 Spins up an isolated Postgres via `testcontainers` (no port
 collisions), applies `_shared.sql` plus every case's `setup.sql`,
-and runs 94 assertions — one or more per use case plus
+and runs 119 assertions — one or more per use case plus
 configuration-driven scenarios that exercise per-test `--config`
 overrides (allowlist, disable, custom `auth_functions`,
 multi-schema, fail_on, format), the JSON / SARIF output
@@ -192,8 +213,8 @@ DATABASE_URL=postgres://demo:demo@localhost:5433/demo \
 
 ## Expected lint output
 
-Around 68 violations across all three severities (`27 errors,
-35 warnings, 6 infos.`). The fixture is intentionally noisy — most
+Around 127 violations across all three severities (`34 errors,
+52 warnings, 41 infos.`). The fixture is intentionally noisy — most
 violations come from cross-fires where one bad policy trips several
 rules at once (`USING (true)` → SEC005 + SEC008 + SEC003 if PUBLIC; a
 Supabase `auth.uid() IS NULL OR ...` → SEC004 + PERF001). Each
@@ -218,9 +239,15 @@ WARN   PERF001 app.jwt_unwrapped.jwt_unwrapped_owner  (use case 38 — auth.jwt(
 INFO   SEC007  app.tags                          (use case 09)
 ```
 
-Tables that must stay silent (clean cases 01, 02 via allowlist, 13,
-16-18, 21, 23, 25, 27-32, 34, 36, 44-51, 53, 54, 64-67) never appear
-in any violation line. The clean tests assert this directly. The
+Tables that must stay silent for their *own* rule (clean cases 01, 02 via
+allowlist, 13, 16-18, 23, 25, 27-30, 32, 36, 44-49, 51, 54, 64, 66-67)
+never appear in any violation line. Most clean tests assert that the hard
+way — 21 of them loop over `all_rule_ids` and assert the table appears
+under *no* rule at all, not merely under the one its case is about. Case
+65 is not in that list because it ships no fixture of its own: it re-uses
+uc03's `app.legacy_orders`, which is the demo's flagship SEC001
+violation, and only checks that an unqualified allowlist entry silences
+SEC001 for it. The
 configuration-driven cases (39-43, 59-63) verify behavior under
 specific `--config` overrides — see `conftest.py::lint` for the
 helper that drives those.
@@ -239,9 +266,10 @@ report artifact. Two demo-relevant snippets:
 fail_on = "error"
 ```
 
-`fail_on = "error"` blocks on SEC001/2/3/4/6/HYG001. Bump to
-`warning` to also block on SEC005/8/PERF001, or `info` to also block
-on SEC007.
+`fail_on = "error"` blocks on the ten rules that fire at that tier
+here: SEC001/2/3/4/6/38/39/42, VIEW001 and HYG001. Bump to `warning`
+to add SEC005/8/9/10/11/14/15/31/40/41/43/44/48, HYG002, PERF001/2 and
+VIEW002/3/4; bump to `info` to add SEC007/22/30 on top.
 
 **Extract specific rules from the JSON output via `jq`:**
 

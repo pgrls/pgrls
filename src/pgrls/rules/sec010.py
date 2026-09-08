@@ -15,7 +15,7 @@ just blocked.
 
 Either way, it's the wrong primitive: the right way to deny access
 is at the GRANT layer. Writing the denial as a policy makes the
-table look "RLS protected" when it's actually just disabled.
+table look "RLS protected" when it's actually denying every row.
 
 Detection mirrors SEC008's `USING (true)`: only literal `false`
 matches. Semantic equivalents like `NOT true` or `1 = 0` are out of
@@ -109,5 +109,5 @@ class SEC010:
             f"{clause} (false), which {denial}. Express denial at "
             f"the GRANT layer instead — {grant_hint} is clearer "
             "than a deny-all policy that makes the table look "
-            "RLS-protected when it's actually just disabled."
+            "RLS-protected when it's actually denying every row."
         )

@@ -20,7 +20,13 @@ CREATE POLICY user_files ON storage.objects FOR SELECT TO authenticated
            AND (storage.foldername(name))[1] = auth.uid()::text);
 ```
 
-SEC050 fires (warning) once per permissive ``storage.objects`` policy whose
+SEC050 has two emissions. The second is a per-TABLE ``info`` note, emitted
+only on an offline input that carries Storage policies but no column list
+(the table is extension-managed in Supabase, so a migrations-only
+``--sql-file`` has no ``CREATE TABLE`` for it): the rule cannot tell whether
+those policies are bucket-scoped, and a silent abstain there was a false
+CLEAN. The main emission fires (``warning``) once per permissive
+``storage.objects`` policy whose
 **row-reach clause** — the ``USING`` of a SELECT/UPDATE/DELETE/ALL policy, the
 ``WITH CHECK`` of an INSERT policy — has a non-trivial predicate that does not
 reference ``bucket_id``. (Checking the row-reach clause specifically catches an
@@ -30,8 +36,9 @@ unscoped ``WITH CHECK`` — is a cross-bucket *write* footgun left to recall.)
 It is deliberately narrow to stay low-FP:
 
 * A literal ``USING (true)`` / ``WITH CHECK (true)`` is ceded to
-  [SEC008](#rule-sec008) / [SEC006](#rule-sec006) (the "admits everything"
-  rules) — this rule targets the subtler case of a policy that *does* scope by
+  [SEC008](#rule-sec008) / [SEC028](#rule-sec028) (the "admits everything"
+  rules — SEC006 is the *absent*-WITH CHECK rule and skips a policy that has
+  one) — this rule targets the subtler case of a policy that *does* scope by
   something, just not by bucket.
 * If any **restrictive** policy on ``storage.objects`` constrains ``bucket_id``,
   the table is bucket-floored regardless of the permissive policies, so SEC050
@@ -122,9 +129,31 @@ class SEC050:
                 # unscoped. This happens offline when a ``--sql-file`` lints
                 # only ``CREATE POLICY ON storage.objects`` with no
                 # ``CREATE TABLE`` (the table is extension-managed in Supabase).
-                # Abstain rather than false-positive — fail-closed; the rule
-                # still fires against a live database or a captured snapshot,
-                # where ``storage.objects``'s columns are always populated.
+                # Abstain from the per-policy verdict rather than
+                # false-positive — but say so: a silent abstain here was a
+                # false CLEAN on exactly the Supabase-migrations input this
+                # rule exists for, and it did not appear in `skipped_rules`
+                # either. One info note per table, never a per-policy finding.
+                if table.policies:
+                    out.append(
+                        Violation(
+                            rule_id="SEC050",
+                            severity="info",
+                            title=self.title,
+                            message=(
+                                f"{table.qualified_name} has Storage policies "
+                                "but no column list here, so SEC050 cannot "
+                                "tell whether they are scoped to a bucket "
+                                "(offline input without the extension-managed "
+                                "CREATE TABLE). Declare a stub "
+                                "`CREATE TABLE storage.objects (id uuid, "
+                                "bucket_id text, name text, owner uuid);` "
+                                "in the input, or run against a live "
+                                "database / snapshot, to get a verdict."
+                            ),
+                            location=table.qualified_name,
+                        )
+                    )
                 continue
             # A restrictive bucket_id floor confines the whole table to a
             # bucket regardless of the permissive policies — not cross-bucket.
@@ -144,7 +173,7 @@ class SEC050:
                 if clause is None:
                     continue  # nothing to analyze
                 if is_literal_true(clause):
-                    continue  # SEC008 / SEC006 territory
+                    continue  # SEC008 / SEC028 territory
                 if _references_bucket_id(clause, table):
                     continue  # the row-reach clause scopes bucket
                 pid = f"{table.qualified_name}.{policy.name}"

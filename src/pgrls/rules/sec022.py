@@ -53,9 +53,13 @@ Out of scope (intentional):
 * **Partition members.** Any table that is itself a partition —
   at any level of a multi-level partition hierarchy — is skipped.
   A partition's writes normally route through the partition root,
-  whose policies govern them; flagging a partition for missing
-  write policies it is not expected to carry would be a false
-  positive. Only tables that are not themselves partitions
+  whose policies govern them — but only for a write that NAMES the
+  parent; a direct child write is governed by the child's own RLS
+  (measured). SEC041 covers the RLS-*disabled* child there; an
+  RLS-enabled child with no write policy is covered by neither rule,
+  harmlessly — with RLS on and no permissive write policy it
+  default-denies. Flagging a partition for missing write policies it
+  is not expected to carry would be a false positive. Only tables that are not themselves partitions
   (standalone tables and partition roots) are evaluated.
 """
 from __future__ import annotations

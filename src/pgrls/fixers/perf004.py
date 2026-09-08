@@ -6,7 +6,8 @@ wraps an indexed own-table column in a function call (`lower(email)`,
 leading-column B-tree index. The mechanical fix is an *expression*
 index that matches the predicate exactly:
 
-    CREATE INDEX ON <schema>.<table> (<function-expression>);
+    CREATE INDEX IF NOT EXISTS pgrls_idx_<hash>
+        ON <schema>.<table> (<function-expression>);
 
 The fixer walks the policy AST, finds each top-level `FuncCall` that
 wraps a column the rule flags, and renders the call back to SQL

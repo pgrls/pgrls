@@ -9,18 +9,26 @@ on every call. Inside an RLS policy this is bad on two counts:
   call timing, not on the row data — almost never the intended
   semantics, often a security hazard.
 * **No caching.** The optimizer cannot fold or cache a VOLATILE call;
-  it re-runs per row regardless of `(SELECT ...)` wrapping. Even
+  it CANNOT be constant-folded — but `(SELECT …)` around it still
+  hoists it to an InitPlan and runs it ONCE per statement (measured:
+  `(SELECT clock_timestamp())` gave one distinct value across three
+  rows where the bare call gave three; `(SELECT nextval('s'))`
+  returned 1,1,1). That is exactly why the wrapping is wrong here:
+  it silently turns "a fresh draw per row" into "one draw per
+  statement", changing what the policy means. Even
   read-only-looking volatiles like `clock_timestamp()` add per-row
   syscall cost.
 
-STABLE functions (`now()`, `current_setting`, `auth.uid` and the
-other Supabase auth helpers) are NOT in this rule's set — they have
-their own treatment via PERF001 for the per-row evaluation cost.
+STABLE functions are NOT in this rule's set. `current_setting`,
+`auth.uid` and the other Supabase auth helpers have their own
+treatment via PERF001 for the per-row evaluation cost. `now()` is in
+NO rule's set — it is STABLE and cheap, so nothing covers it, which is
+deliberate.
 
 **SubLink scope.** Unlike SEC011 (which deliberately stops at
 `SubLink.subselect` to avoid false-firing on subqueries' own WHERE
 clauses), PERF002 *does* walk subselects. Reason: a VOLATILE call
-inside a correlated subquery still re-runs per outer row, and even
+inside a correlated subquery still re-runs on every rescan, and even
 in an uncorrelated subquery the non-determinism leaks ("rows
 admitted depend on the random() draw at scan time"). Both shapes
 are real footguns, so PERF002 errs on the side of catching them.

@@ -35,8 +35,9 @@ already has the ingredients separately — SEC001 flags RLS being off, SEC003 a
 grant. SEC049 is the *conjunction*: it fires once, naming the actual
 HTTP-reachable consequence ("readable at ``GET /rest/v1/<table>``"), where those
 rules each report a precondition in isolation. It deliberately co-fires with
-those error-level findings (it is a ``warning`` — the connecting consequence,
-not a new precondition).
+those precondition findings — which are not uniformly ``error``: SEC008 and
+SEC044 are ``warning``. SEC049 is a ``warning`` too, the connecting
+consequence rather than a new precondition.
 
 Severity: warning. Configurable via ``[lint.rules.SEC049]``:
 

@@ -35,9 +35,15 @@ SEC019 fires when a policy's `USING` or `WITH CHECK` expression
 contains a `current_setting` call with exactly one argument —
 anywhere in the tree, including inside a `(SELECT current_setting
 (...))` wrapper. Detection is structural (`find_func_calls` over
-the parsed policy AST); it does not inspect the GUC name.
+the parsed policy AST); it does not inspect the GUC *name*, but it
+does require the call to be the BUILT-IN `current_setting` (bare, or
+`pg_catalog.current_setting`) — a user-defined function that happens
+to share the name is not flagged.
 
-Severity: info. Allowlist by qualified policy ID
+Severity: info. Auto-fix: `pgrls fix` adds the `missing_ok = true`
+second argument, but only where the call is a direct comparison
+operand under an AND-only chain; other positions are left open for
+review. Allowlist by qualified policy ID
 (`schema.table.policy_name`) — allowlist a policy when the
 raise-on-unset behaviour is the intended, documented choice.
 

@@ -50,7 +50,11 @@ What SEC026 catches:
 * **Both operand directions.** `column LIKE current_setting(...)`
   and `current_setting(...) LIKE column` both fire; the
   vulnerability is symmetric — whichever side carries the auth
-  value, that side's *shape* now drives the predicate.
+  value, that side's *shape* now drives the predicate. Two shapes
+  are deliberately excluded and are listed under "does not catch"
+  below: an auth value on the LEFT compared to a *literal* pattern
+  (`current_user LIKE 'admin%'` — the author wrote the wildcard), and
+  a non-text `~` operand (`ltree` / `lquery` containment).
 * **SubLink-wrapped auth values.**
   `user_email LIKE (SELECT current_setting('app.email', true))` is
   semantically identical to the un-wrapped form — Postgres evaluates
@@ -63,8 +67,12 @@ What SEC026 catches:
   on it (see `_side_has_auth_call`). The same outer walk still reaches
   A_Expr nodes inside a sub-select on its own (e.g. `EXISTS (SELECT 1
   FROM members WHERE m.email LIKE current_setting(...))` fires on the
-  inner LIKE), but each policy is reported once — `check`
-  short-circuits on the first match.
+  inner LIKE), but each policy is reported once. `check` does NOT
+  short-circuit: it unions the matched operators across both clauses
+  first, so the message can say whether the wildcard would EXPOSE
+  every row (a positive operator) or, when every matched operator is
+  negated (`NOT LIKE` / `!~`), DENY every row and silently hide all
+  data.
 
 What SEC026 deliberately does not catch:
 
@@ -217,7 +225,11 @@ def _is_pattern_expr(node: A_Expr) -> bool:
 
 
 # `~` and `!~` are POSIX regex match on text, but they are ALSO the
-# geometric "contains" operator and the ltree/lquery match operator.
+# ltree/lquery match operator. (The geometric `~` "contains" forms were
+# REMOVED in PG14 — measured on PG16, `box ~ box` raises "operator does
+# not exist" — so the geometric entries below are dead on every version
+# pgrls supports; they are kept only so a policy written against PG13 is
+# still parsed rather than mis-flagged.)
 # When SEC026's auth value is cast to (or constructed as) one of these
 # non-text types, the operator is a typed containment/match — not a
 # regex pattern — and the rule must not fire (false positive). The LIKE

@@ -1,7 +1,11 @@
 """VIEW001 fixer — emit `ALTER VIEW … SET (security_invoker = true)`.
 
 A view defined without `WITH (security_invoker = true)` runs queries
-with the view owner's privileges, bypassing RLS on referenced tables.
+with the view owner's privileges, so RLS on the referenced tables is
+evaluated against the OWNER rather than the caller — a full bypass when
+that owner is RLS-exempt (superuser / `BYPASSRLS`) or owns a table that
+is not `FORCE`'d, and otherwise the owner's row set rather than the
+caller's.
 The fix is a single ALTER VIEW statement per offending view that flips
 the reloption to true; future queries against the view will then
 evaluate RLS against the calling user's identity instead of the

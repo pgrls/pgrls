@@ -33,21 +33,26 @@ def test_uc61_format_json_emits_machine_readable_output(
     rule_locs = {(v["rule_id"], v["location"]) for v in parsed["violations"]}
     assert ("SEC001", "app.legacy_orders") in rule_locs
 
-    # Unsupported format still rejects cleanly with a list of
-    # supported formats. `markdown` is on the roadmap but not yet
-    # shipping; use it so this test keeps exercising the
-    # unknown-format error path even as more formats land.
+    # An unsupported format rejects cleanly, listing the supported ones.
+    # Use a name that can never ship: an earlier version of this test used
+    # `markdown` as the stand-in, and once markdown landed the assertion
+    # below passed only because the demo's `fail_on` gate exits 1 on real
+    # findings — the error path itself stopped being exercised.
     bad = runner.invoke(
         main,
         [
             "lint",
             "--database-url", demo_db,
             "--config", str(pgrls_toml),
-            "--format", "markdown",
+            "--format", "bogusfmt",
         ],
         env={"DATABASE_URL": demo_db},
     )
     assert bad.exit_code != 0
     assert "Traceback" not in bad.output
+    assert "is not one of" in bad.output
+    # every format the CLI advertises is named in the error
+    for fmt in ("text", "json", "sarif", "markdown"):
+        assert f"'{fmt}'" in bad.output
 
 

@@ -347,10 +347,13 @@ def _from_scope_relations(from_clause: Any, with_clause: Any) -> set[str]:
 def subselect_is_correlated(select_stmt: Any) -> bool:
     """True iff a SubLink subselect references an enclosing query level.
 
-    A correlated subselect is re-executed once per outer row (a
-    SubPlan), so a STABLE call like `auth.uid()` inside it is evaluated
-    per row — wrapping it in `(SELECT …)` collapses that to one InitPlan
-    call, exactly as for a top-level call. An UNCORRELATED subselect runs
+    A correlated subselect is re-executed on every rescan (a SubPlan), so
+    a STABLE call like `auth.uid()` inside it is evaluated many times —
+    how many depends on the plan the planner picks (measured on a
+    10,000-row outer against a 50-row inner: 51 calls for a hash semi
+    join filtering the inner scan, 10,002 when an equivalent filter lands
+    on the outer scan). Wrapping it in `(SELECT …)` collapses every shape
+    to one InitPlan call, exactly as for a top-level call. An UNCORRELATED subselect runs
     once (its own InitPlan); a call inside it already evaluates once, so
     wrapping buys nothing and PERF001 must stay quiet (e.g.
     `user_id IN (SELECT auth.uid())`).
@@ -447,7 +450,7 @@ def find_func_calls(
     `exclude_sublinks=True`) additionally descends into a SubLink's
     subselect when it is CORRELATED (`subselect_is_correlated`): a bare
     auth call inside a correlated `EXISTS (SELECT … WHERE … = t.col)` is
-    re-evaluated per outer row, so PERF001 must flag it. An uncorrelated
+    re-evaluated on every rescan, so PERF001 must flag it. An uncorrelated
     subselect runs once and stays skipped.
     """
     matches: list[Any] = []

@@ -40,7 +40,7 @@ from pglast.ast import A_Const, A_Expr, ColumnRef, FuncCall, Node, String, TypeC
 from pgrls.ast_utils import func_name_parts
 from pgrls.diff._z3_compare import cross_tenant_session_identity
 from pgrls.fixers._idents import quote_ident
-from pgrls.model import Column, Policy, Schema, Table
+from pgrls.model import Column, Policy, Schema, Table, is_maybe_set, maybe_set_value
 from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, Verification
 
 # auth.* stubs so a Supabase-style policy is creatable in a throwaway database;
@@ -489,12 +489,47 @@ def _insert_row(setup: list[str], qtbl: str, row: list[tuple[str, str]]) -> None
     setup.append(_insert_stmt(qtbl, row))
 
 
+def _leaking_anon_session(
+    policy: Policy,
+    auth_functions: set[str],
+    guc_states: tuple[dict[str, str | None], ...],
+) -> tuple[bool, dict[str, str | None]]:
+    """Which anonymous session exhibits the leak — `(needs_anon_key, gucs)`.
+
+    Mirrors `prove_anon_isolation`'s order (each login path's inherited-GUC
+    state, JWT-less before anon-key) so the reproduction reconstructs the
+    session whose witness row it seeds. `needs_anon_key` False means the
+    JWT-less session alone leaks; True means the leak needs the role claim
+    PostgREST sets. `gucs` are the settings that session inherits (`ALTER
+    ROLE`/`ALTER DATABASE … SET`, the server configuration) — the script sets
+    them explicitly, since it runs against a throwaway database that has
+    none of them.
+    """
+    from pgrls.diff._z3_compare import _prove_anon_session  # noqa: PLC0415
+
+    states = guc_states or ({},)
+    ast = policy.using_ast
+    if ast is not None:
+        for state in states:
+            for anon_key in (False, True):
+                verdict, _ = _prove_anon_session(
+                    ast, set(auth_functions), anon_jwt=anon_key, set_gucs=state
+                )
+                if verdict == "leak":
+                    return anon_key, dict(state)
+    return False, dict(states[0])
+
+
+_UNCAPTURED_GUC = "REPLACE_ME"
+
+
 def _build_statements(
     table: Table,
     policy: Policy,
     witness: dict[str, object],
     repro_table: str,
     auth_functions: set[str],
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
 ) -> tuple[list[str], str, list[str], list[str]]:
     """Return (setup_statements, leak_query, unpinned_columns, null_columns) for
     the anonymous-read reproduction. The pytest runs setup then the query in one
@@ -507,10 +542,79 @@ def _build_statements(
     row, unpinned, null_fallback = _row_columns(table, witness)
     _insert_row(setup, qtbl, row)
 
-    # Become an anonymous session: clear the JWT claim GUC (auth.* → NULL) and
-    # switch into the non-superuser runner so FORCE RLS + the policy decide
-    # visibility (not a privileged connection role).
-    setup.append("SELECT set_config('request.jwt.claim.sub', '', true);")
+    # Become the anonymous session that exhibits the leak. The prover models
+    # two: the JWT-less connection (every auth function NULL) and the Supabase
+    # anon-key caller (`request.jwt.claims = {"role":"anon"}`, so `auth.role()`
+    # is 'anon'). A leak only the anon-key session shows — `USING (auth.role()
+    # = 'anon')` — would read ZERO rows under the JWT-less script, and the
+    # emitted pytest would fail while the leak exists. So re-ask the prover
+    # which session leaks and set that session's claims; then switch into the
+    # non-superuser runner so FORCE RLS + the policy decide visibility.
+    anon_key, gucs = _leaking_anon_session(policy, auth_functions, guc_states)
+    if gucs:
+        setup.append(
+            "-- A real anonymous session INHERITS these settings (ALTER ROLE /"
+        )
+        setup.append(
+            "-- ALTER DATABASE ... SET, or the server configuration); the leak"
+        )
+        setup.append("-- needs them, and a throwaway database has none.")
+        for name, value in sorted(gucs.items()):
+            if is_maybe_set(value):
+                # The prover could not attribute this GUC to the server, so it
+                # modelled the anonymous session with BOTH the value and the
+                # null-flag free. Writing any value here would pin it non-NULL
+                # and kill an `IS NULL` disjunct the leak may ride on — the
+                # emitted script then returned zero rows against a real leak.
+                # Leave it unset (which is what a throwaway database gives)
+                # and say so.
+                setup.append(
+                    f"-- NOTE: {name} is readable where pgrls introspected, but"
+                )
+                setup.append(
+                    "-- could not be attributed to the server — it may be that"
+                )
+                setup.append(
+                    "-- connection's own option. Left UNSET here, which is what"
+                )
+                setup.append(
+                    "-- an anonymous caller may well see; if your callers do"
+                )
+                observed = maybe_set_value(str(value))
+                setup.append("-- have it, uncomment the next line:")
+                setup.append(
+                    f"-- SELECT set_config({_sql_str(name)}, "
+                    f"{_sql_str(observed)}, true);"
+                )
+                continue
+            if value is None:
+                setup.append(
+                    f"-- NOTE: {name} is set at server level but its value was"
+                )
+                setup.append(
+                    "-- not captured (that needs pg_file_settings) — substitute"
+                )
+                setup.append("-- the value your server uses.")
+            setup.append(
+                f"SELECT set_config({_sql_str(name)}, "
+                f"{_sql_str(_UNCAPTURED_GUC if value is None else str(value))}, true);"
+            )
+    if anon_key:
+        setup.append(
+            "-- anon-KEY session: this leak needs the role claim PostgREST sets"
+        )
+        setup.append("SELECT set_config('request.jwt.claim.role', 'anon', true);")
+        setup.append(
+            "SELECT set_config('request.jwt.claims', '{\"role\":\"anon\"}', true);"
+        )
+    else:
+        # The JWT-less session leaves the claim GUCs UNSET, which is what a
+        # throwaway database already gives. Writing `''` into them would make
+        # `current_setting('request.jwt.claim.sub', true) IS NULL` FALSE and
+        # kill the very gate the leak rides on — measured: the emitted script
+        # returned 0 rows against a live 2-row anonymous read, so the
+        # generated pytest failed against a real leak.
+        setup.append("-- JWT-less session: the claim GUCs stay UNSET (NULL).")
     setup.append(f"SET LOCAL ROLE {quote_ident(runner)};")
 
     leak_query = f"SELECT * FROM {qtbl};"
@@ -843,6 +947,7 @@ def build_repro(
     stem: str | None = None,
     mode: str = "anon",
     session: tuple[str, str] | None = None,
+    guc_states: tuple[dict[str, str | None], ...] = ({},),
 ) -> ReproArtifact:
     """Build the .sql + pytest reproduction for one leaking (table, policy).
 
@@ -859,7 +964,9 @@ def build_repro(
     tenant"`` (requires `session` = the ``(discriminator column, session-auth
     SQL)`` from `cross_tenant_session_identity`): the session is authenticated as
     tenant A and the inserted row belongs to a *different* tenant B, which the
-    leaking policy nonetheless returns.
+    leaking policy nonetheless returns. `guc_states` (``"anon"`` only) are the
+    inherited-GUC states an anonymous session can arrive in
+    (`verify._anon_set_gucs`); the script sets the leaking state explicitly.
 
     Requires `table.column_details` to be populated — `pgrls verify` always
     supplies it via live introspection. An empty `column_details` cannot
@@ -911,7 +1018,7 @@ def build_repro(
         )
     else:
         setup, leak_query, unpinned, null_fallback = _build_statements(
-            table, policy, witness or {}, repro_table, stub_auth
+            table, policy, witness or {}, repro_table, stub_auth, guc_states
         )
 
     if is_write:
@@ -1126,6 +1233,7 @@ def emit_repros(
     verification: Verification,
     auth_functions: set[str] | None = None,
     mode: str = "anon",
+    anon_roles: set[str] | None = None,
 ) -> list[ReproArtifact]:
     """One ReproArtifact per leaking (table, permissive policy) in the run.
 
@@ -1144,6 +1252,12 @@ def emit_repros(
     tables = {t.qualified_name: t for t in schema.tables}
     artifacts: list[ReproArtifact] = []
     seen_stems: set[str] = set()
+    guc_states: tuple[dict[str, str | None], ...] = ({},)
+    if mode == "anon":
+        # Imported here, not at module scope: `verify` imports this module.
+        from pgrls.verify import _anon_set_gucs  # noqa: PLC0415
+
+        guc_states = _anon_set_gucs(schema, anon_roles)
     for tv in verification.tables:
         if tv.verdict != "leak":
             continue
@@ -1201,6 +1315,7 @@ def emit_repros(
                     stem=stem,
                     mode=mode,
                     session=session,
+                    guc_states=guc_states,
                 )
             )
     return artifacts

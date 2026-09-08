@@ -10,8 +10,9 @@ two-argument form `current_setting(name, missing_ok)` returns
 NULL instead when `missing_ok` is true; in the typical `column =
 current_setting(...)` predicate that NULL simply matches no rows.
 
-The fixer rewrites each one-argument call to the two-argument
-form with `true`:
+The fixer rewrites a one-argument call to the two-argument form with
+`true` only where it is a direct comparison operand under an AND-only
+chain (`_add_missing_ok`); every other position is left for review:
 
     current_setting('app.tenant')        →  current_setting('app.tenant', true)
     pg_catalog.current_setting('app.x')  →  pg_catalog.current_setting('app.x', true)
@@ -45,9 +46,20 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from pglast.ast import A_Const, Boolean
+from pglast.ast import (
+    A_Const,
+    A_Expr,
+    BoolExpr,
+    Boolean,
+    ResTarget,
+    SelectStmt,
+    String,
+    SubLink,
+    TypeCast,
+)
+from pglast.enums import A_Expr_Kind, BoolExprType, SubLinkType
 
-from pgrls.ast_utils import func_name_parts, transform_tree
+from pgrls.ast_utils import is_builtin_current_setting
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import alter_policy
 from pgrls.model import Schema, policy_id
@@ -63,44 +75,96 @@ def _is_one_arg_current_setting(node: Any) -> bool:
     qualified form — the same shape SEC019's `find_func_calls`
     detection accepts.
     """
-    qualified, bare = func_name_parts(node)
-    if qualified is None:
-        return False
-    if bare != _CURRENT_SETTING and qualified != f"pg_catalog.{_CURRENT_SETTING}":
+    # Exactly the rule's gate (`is_builtin_current_setting`): a user-defined
+    # `myschema.current_setting(...)` is not the builtin, is not flagged by
+    # SEC019, and must not be rewritten — under `--apply` a UDF without a
+    # two-argument overload would fail the whole batch.
+    if not is_builtin_current_setting(node):
         return False
     args = node.args or ()
     return len(args) == 1
 
 
+_COMPARISON_OPS = frozenset({"=", "<>", "!=", "<", ">", "<=", ">="})
+
+
+def _comparison_op(node: Any) -> bool:
+    if not isinstance(node, A_Expr) or node.kind != A_Expr_Kind.AEXPR_OP:
+        return False
+    names = list(node.name or ())
+    return (
+        len(names) == 1
+        and isinstance(names[0], String)
+        and names[0].sval in _COMPARISON_OPS
+    )
+
+
+def _unwrap_operand(node: Any) -> Any:
+    """Strip casts and the PERF001 `(SELECT …)` InitPlan wrapper (a FROM-less,
+    single-target scalar sub-select) from a comparison operand."""
+    while True:
+        if isinstance(node, TypeCast):
+            node = node.arg
+            continue
+        if (
+            isinstance(node, SubLink)
+            and node.subLinkType == SubLinkType.EXPR_SUBLINK
+            and isinstance(node.subselect, SelectStmt)
+            and not node.subselect.fromClause
+            and not node.subselect.whereClause
+            and len(node.subselect.targetList or ()) == 1
+            and isinstance(node.subselect.targetList[0], ResTarget)
+        ):
+            node = node.subselect.targetList[0].val
+            continue
+        return node
+
+
 def _add_missing_ok(node: Any) -> tuple[Any, bool]:
-    """Walk the tree; append `true` to every one-arg
-    `current_setting` call's `args`. Returns `(node, changed)`.
+    """Rewrite one-arg `current_setting` calls that sit in a PROVABLY
+    row-hiding position; leave every other occurrence alone.
 
-    The boolean `true` is constructed as `A_Const(val=Boolean
-    (boolval=True))` — the same shape `ast_utils.is_literal_true`
-    matches, so any later check reading the rewritten AST sees a
-    literal true exactly as it would have from a hand-written
-    two-argument call.
+    A fixer may never broaden. The one-argument form RAISES when the GUC is
+    unset — the statement errors and the caller gets no rows — while the
+    two-argument form returns NULL. NULL hides a row only when the whole
+    predicate then fails to be TRUE, and that holds in exactly one shape: the
+    call is a direct operand of a comparison (`=`, `<>`, `<`, …, through
+    casts or the PERF001 `(SELECT …)` wrap) and every connective above that
+    comparison is `AND`. Anywhere else a returned NULL can admit a row —
+    `IS NULL` / `IS NOT FALSE` make it TRUE, `COALESCE` / `GREATEST` / `NULLIF`
+    substitute a value, `IS NOT DISTINCT FROM` matches NULL columns, and under
+    `OR` / `IN (…)` / `= ANY(ARRAY[…])` a sibling branch admits rows the
+    raising form withheld. Iteration 1 denylisted the constructs it knew; the
+    review found three more (BooleanTest, GREATEST/LEAST, `= ANY`) within
+    hours — a denylist recurs by construction, so this is an ALLOWLIST: only
+    the row-hiding shape is rewritten, and the finding stays open everywhere
+    else for human review.
 
-    The recursion is `ast_utils.transform_tree`; the leaf function
-    below carries the only SEC019-specific behaviour: a one-arg
-    `current_setting` call is mutated in place to append the
-    missing_ok arg (a terminal `(node, True)`); every other node
-    returns `None` to recurse. Unlike PERF001 there is no
-    don't-descend guard — SEC019 rewrites matching calls anywhere in
-    the tree.
+    The tree is mutated in place (the FuncCall gains its `true` arg); returns
+    `(node, changed)`.
     """
+    changed = False
 
-    def leaf(n: Any) -> tuple[Any, bool] | None:
-        if _is_one_arg_current_setting(n):
-            # Mutate the FuncCall in place — append the missing_ok
-            # arg as a literal `true`.
-            new_args = (*n.args, A_Const(val=Boolean(boolval=True)))
-            n.args = new_args
-            return n, True
-        return None
+    def rewrite_operand(operand: Any) -> None:
+        nonlocal changed
+        target = _unwrap_operand(operand)
+        if _is_one_arg_current_setting(target):
+            target.args = (*target.args, A_Const(val=Boolean(boolval=True)))
+            changed = True
 
-    return transform_tree(node, leaf)
+    def walk(n: Any) -> None:
+        if isinstance(n, BoolExpr) and n.boolop == BoolExprType.AND_EXPR:
+            for arg in n.args or ():
+                walk(arg)
+            return
+        if _comparison_op(n):
+            rewrite_operand(n.lexpr)
+            rewrite_operand(n.rexpr)
+            return
+        # OR / NOT / any other construct: not provably row-hiding — abstain.
+
+    walk(node)
+    return node, changed
 
 
 class SEC019Fixer:

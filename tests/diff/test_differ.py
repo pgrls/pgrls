@@ -383,6 +383,24 @@ def test_roles_disjoint_replaced_requires_review() -> None:
     )
 
 
+def test_roles_gaining_public_is_a_widening_not_a_review() -> None:
+    """`TO authenticated` → `TO PUBLIC` is disjoint as SETS, but PUBLIC is a
+    superset of every role set (it covers anon too) — a widening, dangerous,
+    and it must fail the default `--fail-on dangerous` gate rather than pass
+    as requires_review."""
+    base = Schema(
+        tables=(_t(rls=True, policies=(_p("p", roles=("authenticated",)),)),)
+    )
+    head = Schema(
+        tables=(_t(rls=True, policies=(_p("p", roles=("PUBLIC",)),)),)
+    )
+    changes = diff_schemas(base, head)
+    assert len(changes) == 1
+    assert changes[0].kind == ChangeKind.ROLES_WIDENED
+    assert changes[0].classification == "dangerous"
+    assert "PUBLIC covers every role" in changes[0].message
+
+
 def test_roles_mixed_overlap_requires_review() -> None:
     # Same ChangeKind as fully-disjoint but a distinct shape: head and
     # base share at least one role yet each carries a unique member.

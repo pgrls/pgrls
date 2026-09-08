@@ -824,10 +824,10 @@ def test_probe_render_sarif_projects_actionable_results() -> None:
     assert noted == {"public.d", "public.e"}
 
 
-def test_probe_cli_emit_repro_is_usage_error() -> None:
+def test_probe_cli_emit_repro_is_usage_error(tmp_path) -> None:
     result = CliRunner().invoke(
         main,
-        ["verify", "--probe", "--emit-repro", "/tmp/x", "--database-url",
+        ["verify", "--probe", "--emit-repro", str(tmp_path / "x"), "--database-url",
          "postgresql://x/y"],
     )
     assert result.exit_code == 2
@@ -1074,3 +1074,85 @@ def test_escalation_partial_cross_tenant_leak_table_is_skipped(
     finally:
         _drop_role(pg_conn, "esc_member")
         _drop_role(pg_conn, "esc_owner")
+
+
+@requires_docker
+@requires_z3
+def test_anon_key_attempt_on_one_table_does_not_poison_the_next(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    """The anon-key caller writes claim GUCs that cannot be unset for the rest
+    of the connection (`ROLLBACK TO SAVEPOINT` restores a placeholder GUC to
+    `''`, never NULL). Running it inline corrupted the JWT-less observation of
+    every table probed afterwards.
+
+    `a_first` reads nothing JWT-less, so it forces the anon-key attempt.
+    `b_second` is a live JWT-less leak through an auth stub that does NOT wrap
+    the GUC in `NULLIF`, so `''` and unset differ for it — it used to come back
+    `no rows` / MISMATCH against its own correct LEAK.
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "CREATE SCHEMA IF NOT EXISTS auth;"
+            # deliberately no NULLIF: '' is not NULL to this stub
+            "CREATE OR REPLACE FUNCTION auth.role() RETURNS text LANGUAGE sql "
+            "  STABLE AS $$ SELECT current_setting('request.jwt.claim.role', true) $$;"
+            "CREATE TABLE public.a_first (id bigserial PRIMARY KEY, tenant text);"
+            "ALTER TABLE public.a_first ENABLE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.a_first FOR SELECT TO public "
+            "  USING (current_setting('request.jwt.claim.role', true) = 'anon');"
+            "GRANT SELECT, INSERT ON public.a_first TO public;"
+            "CREATE TABLE public.b_second (id bigserial PRIMARY KEY, tenant text);"
+            "ALTER TABLE public.b_second ENABLE ROW LEVEL SECURITY;"
+            "CREATE POLICY p ON public.b_second FOR SELECT TO public "
+            "  USING (auth.role() IS NULL OR tenant = auth.role());"
+            "GRANT SELECT, INSERT ON public.b_second TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="anon")
+
+    first = _result(probe, "public.a_first")
+    assert first.observed == "rows_visible"  # the anon-key caller sees it
+    assert first.agreement == "leak_confirmed"
+
+    second = _result(probe, "public.b_second")
+    assert second.static_verdict == "leak"
+    assert second.observed == "rows_visible", (
+        "b_second is a live JWT-less leak; a poisoned claim GUC made it `no rows`"
+    )
+    assert second.agreement == "leak_confirmed"
+
+
+@requires_docker
+@requires_z3
+def test_write_probe_exercises_the_old_row_delete_gate(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    """`_observe_write` used to attempt the cross-tenant INSERT and nothing else,
+    while `--mode write` reasons about three gates — the new-row `WITH CHECK`
+    and the old-row `USING` for UPDATE and for DELETE. Those two exist in the
+    prover because they are real escapes.
+
+    Measured on PG16 before this: with `FOR DELETE USING (true)`, a tenant-b
+    session's `DELETE FROM t` removed tenant a's row too, while the probe
+    reported `write rejected` and exited 0.
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid NOT NULL);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY sel ON public.docs FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid());"
+            # the escape: any caller may delete ANY row
+            "CREATE POLICY del ON public.docs FOR DELETE TO public USING (true);"
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON public.docs TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="write")
+    r = _result(probe, "public.docs")
+    assert r.observed == "write_admitted", (
+        "the old-row DELETE gate admits every row; the probe must reproduce it"
+    )
+    assert probe.has_confirmed_leak

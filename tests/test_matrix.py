@@ -690,33 +690,43 @@ CREATE POLICY p_sel ON public.docs FOR SELECT TO mtx_auth
 
 @requires_docker
 def test_matrix_live_against_real_introspection(pg_conn: psycopg.Connection) -> None:
-    with pg_conn.cursor() as cur:
-        cur.execute(_LIVE_DDL)
-    schema = introspect(pg_conn, schemas=["public"])
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(_LIVE_DDL)
+        schema = introspect(pg_conn, schemas=["public"])
 
-    m = build_matrix(schema, roles=("PUBLIC", "mtx_auth", "mtx_admin"))
+        m = build_matrix(schema, roles=("PUBLIC", "mtx_auth", "mtx_admin"))
 
-    # PUBLIC: holds a real SELECT grant (proving introspect emits role
-    # "PUBLIC"), but RLS is on and no policy targets it → default-deny.
-    pub = _cell(m, "public.docs", "SELECT", "PUBLIC")
-    assert pub.verdict == "denied", pub
-    assert pub.note == "no permissive policy"
+        # PUBLIC: holds a real SELECT grant (proving introspect emits role
+        # "PUBLIC"), but RLS is on and no policy targets it → default-deny.
+        pub = _cell(m, "public.docs", "SELECT", "PUBLIC")
+        assert pub.verdict == "denied", pub
+        assert pub.note == "no permissive policy"
 
-    # mtx_auth: granted SELECT, RLS on, a tenant-scoped SELECT policy → COND
-    # (the predicate round-trips through pg_get_expr, so just assert it's set).
-    auth_sel = _cell(m, "public.docs", "SELECT", "mtx_auth")
-    assert auth_sel.verdict == "conditional"
-    assert auth_sel.predicate and "tenant_id" in auth_sel.predicate
+        # mtx_auth: granted SELECT, RLS on, a tenant-scoped SELECT policy → COND
+        # (the predicate round-trips through pg_get_expr, so just assert it's set).
+        auth_sel = _cell(m, "public.docs", "SELECT", "mtx_auth")
+        assert auth_sel.verdict == "conditional"
+        assert auth_sel.predicate and "tenant_id" in auth_sel.predicate
 
-    # mtx_auth INSERT: granted, RLS on, but the only policy is SELECT-only →
-    # no permissive policy applies to INSERT → denied.
-    assert _cell(m, "public.docs", "INSERT", "mtx_auth").verdict == "denied"
+        # mtx_auth INSERT: granted, RLS on, but the only policy is SELECT-only →
+        # no permissive policy applies to INSERT → denied.
+        assert _cell(m, "public.docs", "INSERT", "mtx_auth").verdict == "denied"
 
-    # mtx_admin: BYPASSRLS role + full grants → open (proves bypassrls_roles
-    # introspection feeds the bypass note).
-    admin = _cell(m, "public.docs", "SELECT", "mtx_admin")
-    assert admin.verdict == "open"
-    assert admin.note == "bypasses RLS"
+        # mtx_admin: BYPASSRLS role + full grants → open (proves bypassrls_roles
+        # introspection feeds the bypass note).
+        admin = _cell(m, "public.docs", "SELECT", "mtx_admin")
+        assert admin.verdict == "open"
+        assert admin.note == "bypasses RLS"
+    finally:
+        # `mtx_admin` holds BYPASSRLS and roles are CLUSTER-wide: left behind,
+        # SEC016 fires on every later test that asserts an exact SEC016 set in
+        # the shared session database (order-dependent). Anything this test
+        # creates, it removes.
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public")
+            cur.execute("DROP OWNED BY mtx_auth, mtx_admin")
+            cur.execute("DROP ROLE IF EXISTS mtx_auth, mtx_admin")
 
 
 @requires_docker
