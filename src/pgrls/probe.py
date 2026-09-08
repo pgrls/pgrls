@@ -593,7 +593,10 @@ def _run_probe_steps(
                 "cannot measure a policy leak here"
             )
         if mode == "write":
-            return _observe_write(cur, table, row)
+            return _observe_write(
+                cur, table, row,
+                disc_col=disc_col, a_val=a_val, probe_role=probe_role,
+            )
         # Observe ONLY the row the probe planted, never the whole table. A
         # cross-tenant probe counts rows stamped for tenant B (the seeded
         # discriminator value) so a correctly-scoped table that merely holds a
@@ -729,9 +732,15 @@ def _row_disc_text(row: list[tuple[str, str]], disc_col: str | None) -> str:
 
 
 def _observe_write(
-    cur: psycopg.Cursor[Any], table: Table, row: list[tuple[str, str]]
+    cur: psycopg.Cursor[Any],
+    table: Table,
+    row: list[tuple[str, str]],
+    *,
+    disc_col: str | None = None,
+    a_val: str | None = None,
+    probe_role: str | None = None,
 ) -> Observed:
-    """Try the cross-tenant INSERT as the threat session, savepoint-guarded.
+    """Try all three write gates as the threat session, savepoint-guarded.
 
     ``write_rejected`` only on ``InsufficientPrivilege`` (SQLSTATE 42501, "new
     row violates row-level security policy" — the RLS ``WITH CHECK`` denial we
@@ -741,22 +750,138 @@ def _observe_write(
     the row before the constraint fired — so we ABSTAIN rather than miscredit it
     as a rejection (which would mask a real write-leak) or let the aborted
     transaction cascade into a crash. The savepoint rollback recovers the
-    transaction on every path."""
+    transaction on every path.
+
+    The INSERT alone only exercises the NEW-row gate. `verify --mode write`
+    also reasons about the OLD-row gate — the `USING` an UPDATE or a DELETE
+    consults to decide which existing rows the caller may take over or
+    destroy — and those are real escapes, which is why `old_row_write_gate`
+    exists. So after the INSERT this also attempts the two column-free forms
+    (no `WHERE`, no `RETURNING`, so nothing re-triggers the SELECT-applicable
+    check): re-stamping every row for the caller's own tenant, and deleting
+    every row. Whether tenant B's seeded row survived is read back as the
+    PRIVILEGED connection role, so the answer never depends on what the threat
+    session may SELECT. Measured on PG16 before this: with
+    `FOR DELETE USING (true)`, `DELETE FROM t` removed tenant a's row while the
+    probe reported `write rejected` and exited 0.
+    """
     w = f"w_{secrets.token_hex(4)}"
     cur.execute(f"SAVEPOINT {w}")
     try:
         cur.execute(_insert_sql(table, row))
     except psycopg.errors.InsufficientPrivilege:
         cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
-        return "write_rejected"
+        admitted = False
     except psycopg.Error as exc:
         cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
         raise _ProbeAbstain(
             "cross-tenant write hit a non-RLS constraint, so the RLS outcome "
             f"is inconclusive: {_short(exc)}"
         ) from exc
-    cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
-    return "write_admitted"
+    else:
+        cur.execute(f"ROLLBACK TO SAVEPOINT {w}")
+        admitted = True
+    if admitted:
+        return "write_admitted"
+    # Only a permissive UPDATE/DELETE/ALL policy has an old-row gate at all;
+    # for a pure FOR INSERT policy the new-row rejection is the whole answer.
+    governs_old_rows = any(
+        p.command in ("UPDATE", "DELETE", "ALL")
+        for p in table.policies
+        if p.permissive
+    )
+    if disc_col is None or probe_role is None:
+        if governs_old_rows:
+            # There is an old-row gate and no axis to synthesize the other
+            # tenant's row with, so it was never exercised. Saying "write
+            # rejected" here asserts a denial we did not observe — measured,
+            # that is what let `FOR DELETE USING (true)` (which empties the
+            # table) come back as `write rejected`, exit 0.
+            raise _ProbeAbstain(
+                "the new-row check denied the write, but this table also has "
+                "an UPDATE/DELETE policy whose old-row gate could not be "
+                "exercised: no `<column> = <session identity>` axis to "
+                "synthesize another tenant's row with"
+            )
+        return "write_rejected"
+    b_val = _row_disc_text(row, disc_col)
+    qtbl = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    qdisc = quote_ident(disc_col)
+    # The old-row gates need a row belonging to the OTHER tenant to act on.
+    # `write` mode seeds none (only `cross-tenant` does), and the INSERT above
+    # was rolled back either way — so plant one as the privileged role.
+    seed = f"s_{secrets.token_hex(4)}"
+    cur.execute(f"SAVEPOINT {seed}")
+    cur.execute("RESET ROLE")
+    try:
+        cur.execute(_insert_sql(table, row))
+    except psycopg.Error:
+        # cannot plant the other tenant's row (a constraint, a missing
+        # default) — the old-row gates are simply not measurable here
+        cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+        cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+        if governs_old_rows:
+            raise _ProbeAbstain(
+                "the new-row check denied the write, but the other tenant's "
+                "row could not be planted, so the old-row gate was never "
+                "exercised"
+            )
+        return "write_rejected"
+    cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+
+    def _b_rows() -> int:
+        """Tenant B's surviving rows, counted as the privileged role."""
+        cur.execute("RESET ROLE")
+        try:
+            cur.execute(
+                f"SELECT count(*) FROM {qtbl} WHERE {qdisc}::text = %s",
+                (b_val,),
+            )
+            got = cur.fetchone()
+            return int(got[0]) if got else 0
+        finally:
+            cur.execute(f"SET LOCAL ROLE {quote_ident(probe_role)}")
+
+    for stmt in (
+        # take-over: re-stamp every row the old-row gate admits for tenant A
+        f"UPDATE {qtbl} SET {qdisc} = "
+        f"{_sql_str(a_val or '')}::{_disc_type(table, disc_col)}",
+        # destroy: remove every row the old-row gate admits
+        f"DELETE FROM {qtbl}",
+    ):
+        before = _b_rows()
+        if before == 0:
+            break  # nothing of tenant B's left to take over or destroy
+        g = f"g_{secrets.token_hex(4)}"
+        cur.execute(f"SAVEPOINT {g}")
+        try:
+            cur.execute(stmt)
+        except psycopg.Error as exc:
+            # RLS filters an old-row gate, it does not raise — a denied
+            # UPDATE/DELETE simply affects 0 rows. So an error here is a
+            # missing GRANT (or a constraint), meaning the gate was never
+            # exercised. Do not read that as a rejection.
+            cur.execute(f"ROLLBACK TO SAVEPOINT {g}")
+            cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+            raise _ProbeAbstain(
+                "the new-row check denied the write, but the old-row gate "
+                f"could not be exercised: {_short(exc)}"
+            ) from exc
+        after = _b_rows()
+        cur.execute(f"ROLLBACK TO SAVEPOINT {g}")
+        if after < before:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+            return "write_admitted"
+    cur.execute(f"ROLLBACK TO SAVEPOINT {seed}")
+    return "write_rejected"
+
+
+def _disc_type(table: Table, disc_col: str) -> str:
+    """The discriminator column's SQL type, for the take-over UPDATE's cast."""
+    for c in table.column_details:
+        if c.name == disc_col:
+            return c.data_type
+    return "text"
 
 
 def _abstain_all(
@@ -1156,7 +1281,13 @@ def _setup_probe_role(
             cur.execute(f"GRANT USAGE ON SCHEMA {quote_ident(s)} TO {qrole}")
         for t in tables:
             qtbl = f"{quote_ident(t.schema)}.{quote_ident(t.name)}"
-            cur.execute(f"GRANT SELECT, INSERT ON {qtbl} TO {qrole}")
+            # UPDATE/DELETE are needed to exercise the OLD-row write gates
+            # (`old_row_write_gate`): RLS filters those rather than raising, so
+            # without the grant the statement fails on privilege and the gate
+            # goes unmeasured. Nothing escapes — the probe rolls back.
+            cur.execute(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON {qtbl} TO {qrole}"
+            )
         # Make each policy's named `TO` role apply to the probe role: an RLS
         # policy `TO authenticated` only applies to a session that is (a member
         # of) `authenticated`, so without this a `TO <role>` policy would

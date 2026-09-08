@@ -1121,3 +1121,38 @@ def test_anon_key_attempt_on_one_table_does_not_poison_the_next(
         "b_second is a live JWT-less leak; a poisoned claim GUC made it `no rows`"
     )
     assert second.agreement == "leak_confirmed"
+
+
+@requires_docker
+@requires_z3
+def test_write_probe_exercises_the_old_row_delete_gate(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    """`_observe_write` used to attempt the cross-tenant INSERT and nothing else,
+    while `--mode write` reasons about three gates — the new-row `WITH CHECK`
+    and the old-row `USING` for UPDATE and for DELETE. Those two exist in the
+    prover because they are real escapes.
+
+    Measured on PG16 before this: with `FOR DELETE USING (true)`, a tenant-b
+    session's `DELETE FROM t` removed tenant a's row too, while the probe
+    reported `write rejected` and exited 0.
+    """
+    with pg_conn.cursor() as cur:
+        cur.execute(_AUTH_STUB)
+        cur.execute(
+            "CREATE TABLE public.docs (id bigserial PRIMARY KEY, tenant_id uuid NOT NULL);"
+            "ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;"
+            "ALTER TABLE public.docs FORCE ROW LEVEL SECURITY;"
+            "CREATE POLICY sel ON public.docs FOR SELECT TO public "
+            "  USING (tenant_id = auth.uid());"
+            # the escape: any caller may delete ANY row
+            "CREATE POLICY del ON public.docs FOR DELETE TO public USING (true);"
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON public.docs TO public;"
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    probe = _probe(pg_url, schema, mode="write")
+    r = _result(probe, "public.docs")
+    assert r.observed == "write_admitted", (
+        "the old-row DELETE gate admits every row; the probe must reproduce it"
+    )
+    assert probe.has_confirmed_leak
