@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-09-16
+
 ### Changed
 - **Snapshot v26** — adds `views[].direct_references` (the un-collapsed
   table/view edges a view body reads directly), `views[].column_grants`

@@ -906,7 +906,7 @@ Two [pre-commit](https://pre-commit.com) hooks are published from this repo. `pg
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.55.0
+    rev: v0.56.0
     hooks:
       # Offline — lints raw DDL, no database. Repeat --sql-file for several
       # files (declare tables before the policies that reference them), or

@@ -18,7 +18,7 @@ the complete schema, not the individual changed files.
 ```yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.55.0   # pin a release
+    rev: v0.56.0   # pin a release
     hooks:
       - id: pgrls-lint-sql
         args: ["--sql-file", "schema.sql", "--fail-on", "error"]
@@ -48,7 +48,7 @@ changes how it fits pre-commit:
 ```yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.55.0
+    rev: v0.56.0
     hooks:
       - id: pgrls-lint
         args:
@@ -67,7 +67,7 @@ the database URL is well-known; the live hook can take it inline.
 ```yaml
 repos:
   - repo: https://github.com/pgrls/pgrls
-    rev: v0.55.0
+    rev: v0.56.0
     hooks:
       - id: pgrls-lint
         args:
