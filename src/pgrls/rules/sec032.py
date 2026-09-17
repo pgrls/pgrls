@@ -25,8 +25,10 @@ RLS-managed in code review while enforcing nothing.
 SEC032 fires for a table with `rls_enabled = false` that has at least
 one policy. It is the policy-bearing complement of **SEC001** (RLS off
 with no policies): SEC001 now cedes any table that has policies to
-SEC032, so the two are disjoint and a table trips exactly one, each
-with the message that fits. Like SEC001 it skips a partition child
+SEC032, so the two are disjoint and a table trips at most one, each
+with the message that fits. *At most*, not exactly: the ancestor skip
+just below means an RLS-off, dormant-policy partition child under an
+RLS-enabled ancestor trips neither. Like SEC001 it skips a partition child
 whose ancestor chain already has RLS enabled (the child is covered for
 parent-routed queries upstream, so its own dormant policies are dead
 weight, not a security hole).

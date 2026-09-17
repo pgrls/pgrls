@@ -27,6 +27,8 @@ that absence-of-finding is NOT proof.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import json
 from dataclasses import replace
 from typing import Any, Literal
@@ -603,7 +605,27 @@ def _apply_rename(
     `pgrls pr` annotation naming a phantom table. Renames of anything other
     than a table (columns, policies, constraints) are left alone.
     """
-    if getattr(stmt, "renameType", None) != ObjectType.OBJECT_TABLE:
+    rename_type = getattr(stmt, "renameType", None)
+    if rename_type == ObjectType.OBJECT_POLICY:
+        # `ALTER POLICY <old> ON <table> RENAME TO <new>`. Without this the
+        # model kept the OLD name, so a later `ALTER POLICY <new> ON <table>
+        # USING (true)` found no policy to loosen and the loosening was
+        # silently discarded — an offline `pgrls pr` / `--sql-file verify`
+        # kept proving the pre-rename predicate.
+        key = _relation_key(stmt.relation, default_schema)
+        old_name = getattr(stmt, "subname", None)
+        newname = getattr(stmt, "newname", None)
+        if key is None or not old_name or not newname:
+            return
+        builder = tables.get(key)
+        if builder is None:
+            return
+        builder.policies = [
+            dataclasses.replace(p, name=newname) if p.name == old_name else p
+            for p in builder.policies
+        ]
+        return
+    if rename_type != ObjectType.OBJECT_TABLE:
         return
     old = _relation_key(stmt.relation, default_schema)
     newname = getattr(stmt, "newname", None)

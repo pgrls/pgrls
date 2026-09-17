@@ -15,7 +15,9 @@ id, any owner, any value — the write side is wide open.
 
 This is the open-write footgun the existing rules miss:
 
-* **SEC006** fires when `WITH CHECK` is *absent* on a write policy;
+* **SEC006** fires when `WITH CHECK` is *absent* on a write policy and
+  nothing closes the write (INSERT, or UPDATE/ALL with no / constant-true
+  USING);
   here it is present (and wide open).
 * **SEC008** flags a constant-true `USING`; a `FOR INSERT` policy
   has no `USING` at all, and SEC008 says nothing about the write
@@ -31,10 +33,21 @@ SEC028 fires when a permissive policy whose command is `INSERT`,
 **and** its `USING` is absent or itself constant-true (so SEC020's
 asymmetry case is explicitly ceded to SEC020).
 
-**Restrictive policies are out of scope.** A restrictive
-`WITH CHECK (true)` imposes no constraint, but restrictive policies
-AND-combine, so on its own it opens nothing — it is a dead clause
-(SEC006's restrictive framing), not an open-write hole.
+**Restrictive policies are out of scope — but they are not harmless.**
+A restrictive policy's omitted `WITH CHECK` is filled in by Postgres from
+its `USING`, so writing the clause explicitly as `true` *cancels* the
+write floor that omission would have given. Measured on PG16 with the
+permissive side open, so the floor was the only write gate: with the
+clause omitted the cross-tenant insert raised `new row violates row-level
+security policy "floor"`; with an explicit `WITH CHECK (true)` the same
+insert succeeded. That is a real hole, and [SEC020](#rule-sec020) reports
+it — it has no permissive gate, so it fires whenever the policy's `USING`
+is a real predicate. SEC028 stays permissive-only because it is the
+*no-contrast* rule (`USING` absent or itself constant-true); the genuinely
+inert and unreported shapes are the ones with no `USING` at all for the
+explicit `true` to cancel: a restrictive `FOR INSERT` policy, or a
+restrictive `FOR UPDATE` / `FOR ALL` written without a `USING` clause
+(all three creatable and measured inert).
 
 The fix is to replace `WITH CHECK (true)` with a predicate that
 validates the written row — typically the same tenant / ownership
@@ -49,8 +62,9 @@ Scope (intentional):
 * **Literal `true` only.** Detection matches the literal boolean
   `true`, exactly as SEC008 / SEC020 do — `1 = 1` and other
   semantic tautologies are out of scope.
-* **Permissive only.** See above; restrictive WITH-CHECK-true is a
-  dead clause, not an exposure.
+* **Permissive only.** See above — the restrictive shape is a real
+  hole, but it is SEC020's (it cancels the floor the omitted clause
+  would have supplied), not SEC028's.
 
 Severity: warning. No auto-fix — the correct write predicate is the
 application's tenant / ownership key, which pgrls cannot infer.
@@ -119,8 +133,10 @@ class SEC028:
                             f"{table.qualified_name} covers "
                             f"{policy.command} with WITH CHECK (true), so "
                             "it accepts every write the command allows — "
-                            "any caller the policy applies to can write a "
-                            "row with any tenant id, owner, or value. The "
+                            "this policy constrains nothing about the row "
+                            "written, so unless another policy closes the "
+                            "write side a caller it applies to can stamp any "
+                            "tenant id, owner, or value. The "
                             "TO clause limits who may write, not what. "
                             "Replace WITH CHECK (true) with a predicate "
                             "that validates the written row (e.g. the "

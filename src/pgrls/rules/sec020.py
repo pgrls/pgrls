@@ -10,7 +10,7 @@ A row-level security policy that governs writes — a `FOR ALL` or
 
 When `WITH CHECK` is omitted Postgres reuses `USING` for it, so the
 two sides stay in lock-step by default. The footgun appears when a
-policy sets an explicit `WITH CHECK (true)` alongside a restrictive
+policy sets an explicit `WITH CHECK (true)` alongside a **scoped**
 `USING`:
 
     CREATE POLICY p ON documents
@@ -18,16 +18,29 @@ policy sets an explicit `WITH CHECK (true)` alongside a restrictive
         USING (tenant_id = current_setting('app.tenant_id')::int)
         WITH CHECK (true);
 
-The caller can only *read* its own tenant's rows, but it may *write*
-any row at all — it can INSERT a row stamped with another tenant's
-id, or UPDATE one of its own rows to reassign it. The read-side
-isolation looks airtight while the write side is wide open.
+The caller can only *read* its own tenant's rows, while THIS policy
+imposes no constraint at all on what it writes. Unless another policy
+closes the write side, it can INSERT a row stamped with another
+tenant's id or UPDATE one of its own rows to reassign it — the
+read-side isolation looks airtight while the write side is wide open.
+(Measured: add `AS RESTRICTIVE … USING (tenant_id = 1)` and both of
+those raise `new row violates row-level security policy`. The finding
+still stands — the policy is not doing what it looks like it is doing —
+but the consequence is about this policy, not about the table.)
+
+SEC020 has **no permissive gate**: it also fires on an `AS RESTRICTIVE`
+policy whose explicit `WITH CHECK (true)` cancels the write floor
+Postgres would otherwise have filled in from its own `USING`, which is
+the population SEC028 and SEC031 cede here.
 
 SEC020 fires when a policy has BOTH clauses present, its `USING`
 clause is a real predicate, and its `WITH CHECK` clause is the
 literal `true`. The fix is almost always to mirror the `USING`
-predicate into `WITH CHECK` — or simply delete the `WITH CHECK`
-clause, which makes Postgres reuse `USING` automatically.
+predicate into `WITH CHECK` with `ALTER POLICY … WITH CHECK (…)`. The
+other route — removing the `WITH CHECK` so Postgres reuses `USING` for
+it — takes `DROP POLICY` + `CREATE POLICY`: `ALTER POLICY` has no
+clause-removal syntax (measured: both `WITH CHECK ()` and
+`DROP WITH CHECK` are syntax errors).
 
 Severity: warning. Allowlist by qualified policy ID
 (`schema.table.policy_name`) — allowlist a policy when an
@@ -112,15 +125,18 @@ class SEC020:
             title=self.title,
             message=(
                 f"Policy {policy.name!r} on {table.qualified_name} "
-                "pairs a restrictive USING clause with WITH CHECK "
+                "pairs a scoped USING clause with WITH CHECK "
                 "(true). The USING clause limits which rows the "
                 "caller can read, but WITH CHECK (true) accepts "
-                "every row it writes — so the caller can write rows "
-                "into another tenant's space (rows its USING clause "
-                "would never surface) even though it can only read "
-                "its own. Mirror the USING predicate in WITH CHECK, "
-                "or drop the WITH CHECK clause so Postgres reuses "
-                "USING for it. If an intentionally open write side "
+                "every row this policy governs — so THIS policy "
+                "imposes no constraint on what the caller writes, "
+                "and unless another policy closes the write side a "
+                "row can be stamped for any tenant (rows its USING "
+                "clause would never surface). Mirror the USING "
+                "predicate in WITH CHECK "
+                "(ALTER POLICY has no clause-removal syntax, so "
+                "'dropping' the check means DROP POLICY + CREATE "
+                "POLICY). If an intentionally open write side "
                 "is the design, allowlist this policy as "
                 f"{pid!r} in [lint.rules.SEC020]."
             ),

@@ -6,9 +6,12 @@ branch ("temporarily let everything through to test the data
 model"), where the author never circles back to remove it.
 
 SEC008 catches the literal `USING (true)` at the top level. SEC011
-catches the same effect buried inside a larger expression: the
+catches the same shape buried inside a larger expression: the
 literal `true` ORed with anything else is still `true`, but a
-casual reading misses the disjunction.
+casual reading misses the disjunction. The *effect* depends on where
+the branch sits — measured on one 3-row table, a top-level `OR true`
+returned every row (3), the same branch under `AND` widened one
+conjunct (1 row), and under `NOT` inverted to a constant FALSE (0 rows).
 
 Detection is narrow on purpose — only the literal `true` A_Const
 inside an OR-BoolExpr counts. Semantic equivalents (`1 = 1`,
@@ -97,14 +100,19 @@ class SEC011:
                         message=(
                             f"Policy {policy.name!r} on "
                             f"{table.qualified_name} has an `OR true` "
-                            "branch — the predicate evaluates to true "
-                            "for every row regardless of the other "
-                            "branches. Almost always a leftover debug "
-                            "branch. Remove the `OR true` or, if the "
-                            "intent is genuinely 'admit every row,' "
-                            "drop the policy and rely on RLS-disabled "
-                            "(or `REVOKE ALL` on the table for full "
-                            "denial)."
+                            "branch — the predicate admits rows it "
+                            "was never meant to. At the top level that "
+                            "is EVERY row; under `AND` it widens one "
+                            "conjunct, and under `NOT` it inverts to a "
+                            "constant FALSE (measured on one table: 3 "
+                            "rows, 1 row and 0 rows). Almost always a "
+                            "leftover debug branch. Remove the `OR "
+                            "true` or, if the intent is genuinely "
+                            "'admit every row,' drop the policy and "
+                            "rely on RLS-disabled. Do NOT revoke the "
+                            "grant for that purpose — revoking is the "
+                            "opposite of admitting: measured, the role "
+                            "then gets `permission denied for table`)."
                         ),
                         location=pid,
                     )

@@ -1,4 +1,4 @@
-"""Use case 26: Blog with admin-role override — CLEAN."""
+"""Use case 26: Blog with admin-role override — fires SEC003 (uc31 demos the fix)."""
 from __future__ import annotations
 
 

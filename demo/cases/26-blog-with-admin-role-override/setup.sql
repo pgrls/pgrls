@@ -1,5 +1,5 @@
 -- ============================================================
--- Use case 26: Blog with admin-role override — CLEAN
+-- Use case 26: Blog with admin-role override — FIRES SEC003
 -- A real-world multi-policy shape. One RESTRICTIVE policy
 -- enforces tenant isolation; one PERMISSIVE policy grants
 -- read access to admins via auth.role(). Both clauses are

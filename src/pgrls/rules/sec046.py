@@ -27,9 +27,12 @@ Once one connection plans ``SELECT ... FROM docs`` under that policy, the
 planner folds ``app.cur_tenant()`` to *that connection's* tenant and caches the
 plan. A *different* user reusing the same pooled backend then runs the cached
 plan and is served the **first user's** rows — RLS silently scopes them to
-someone else's tenant. (Verified live: with the function marked ``IMMUTABLE`` a
-second connection sees the first connection's rows; marked ``STABLE`` it does
-not.) **The fix is to declare the function ``STABLE``** — a STABLE function is
+someone else's tenant. (Verified live: with the function marked ``IMMUTABLE``
+the leak takes a REUSED PLAN in the same backend — a prepared statement, a
+PL/pgSQL plan cache, or a pooler handing the session on — which served the
+first caller's rows after the GUC changed; a genuinely separate backend
+re-plans and is unaffected. Marked ``STABLE``, even the reused plan is
+correct.) **The fix is to declare the function ``STABLE``** — a STABLE function is
 re-evaluated per statement execution, so the per-request value is always fresh.
 
 **Why not a false positive on the obvious-looking cases (all live-validated).**
@@ -49,8 +52,9 @@ re-evaluated per statement execution, so the per-request value is always fresh.
   ``provolatile='i'`` reaches this rule (introspection captures only IMMUTABLE
   functions).
 
-**Relationship to other rules.** SEC024 surfaces a policy that reads a session
-GUC at all; PERF004 flags a *function-wrapped* discriminator that defeats an
+**Relationship to other rules.** SEC024 surfaces a policy whose
+``current_setting()`` names an *unqualified* parameter (it records a name only
+when it has no dot, so the ordinary ``app.tenant`` spelling does not trip it); PERF004 flags a *function-wrapped* discriminator that defeats an
 index. SEC046 is the orthogonal *correctness* finding: the wrapper is not just a
 perf footgun, its ``IMMUTABLE`` marking makes the row filter return the *wrong
 user's* rows under plan reuse. It is an ``error``: a cross-tenant data leak.
@@ -71,8 +75,10 @@ Scope / known limits (intentional, fail-closed):
   ``plpgsql`` body (which is not a parseable top-level statement), an empty
   body, or any body pglast cannot parse is **not flagged** (fail-closed) — the
   rule never guesses. A genuinely-dangerous PL/pgSQL ``IMMUTABLE`` wrapper is a
-  false negative here, surfaced instead by SEC024 (policy reads a GUC) /
-  SEC014.
+  false negative here and **no other rule picks it up**: SEC024 fires only on an
+  unqualified GUC name and only inside a policy clause, never in a function
+  body, and SEC014 iterates ``security_definer_functions`` — an ``IMMUTABLE``
+  SECURITY *INVOKER* wrapper is never captured at all.
 * **Literal call resolution.** A policy's function call is resolved to a
   captured IMMUTABLE function by its qualified (``schema.fn``) or bare (``fn``)
   name, mirroring the SECDEF-call resolution; a call reached only through

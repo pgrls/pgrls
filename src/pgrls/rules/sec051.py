@@ -23,8 +23,9 @@ not just explicit ``ADD TABLE`` members.
 
 It is the Realtime-channel analog of [SEC001](#rule-sec001) (RLS disabled),
 sharpened to name the broadcast consequence — much as [SEC049](#rule-sec049)
-sharpens the PostgREST-read case. It deliberately co-fires with SEC001 (which
-reports the bare RLS-off precondition); SEC051 is the ``warning`` that the
+sharpens the PostgREST-read case. It deliberately co-fires with the rule that reports the bare RLS-off
+precondition — SEC001 for a policy-free table, or SEC032 when the table has
+dormant policies (SEC001 cedes those); SEC051 is the ``warning`` that the
 table's rows are *actively streamed* to subscribers.
 
 Severity: warning. Scope / design (deliberately narrow, low-FP):

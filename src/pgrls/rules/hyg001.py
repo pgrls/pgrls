@@ -1,8 +1,15 @@
 """HYG001 — Policy references a column that doesn't exist on its table.
 
-Postgres allows `ALTER TABLE ... DROP COLUMN` even when a policy references
-that column; the policy text persists with a phantom reference and errors
-at evaluation time. Detect statically.
+Postgres records a dependency from the policy to the column, so a live
+database cannot reach this state by accident (measured on PG16: `DROP
+COLUMN` is REFUSED — "cannot drop column … because other objects depend
+on it"; `DROP COLUMN … CASCADE` drops the *policy* instead, leaving
+nothing dangling; and `RENAME COLUMN` rewrites the policy expression
+automatically). A phantom reference therefore comes from a source
+Postgres never validated: an offline `--sql-file` run whose DDL declares
+a policy over a column its `CREATE TABLE` lacks, a hand-edited snapshot,
+or a bare sub-select column name that collides with an own-table column.
+Detect statically.
 
 Heuristic: only unqualified ColumnRef nodes are checked, and refs inside
 SubLink (subqueries) are skipped, because both shapes commonly point at
@@ -28,6 +35,14 @@ class HYG001:
         out: list[Violation] = []
         for table in schema.tables:
             existing = set(table.columns)
+            if not existing:
+                # No column list captured for this table — an offline
+                # `--sql-file` whose CREATE TABLE lives in another migration,
+                # or an extension-managed table. EVERY referenced column would
+                # read as phantom, at `error` severity and with no allowlist
+                # entry that could be written for a column that does exist.
+                # PERF003 guards the same way (`if live_columns and ...`).
+                continue
             for policy in table.policies:
                 refs: set[tuple[str, ...]] = set()
                 if policy.using_ast is not None:

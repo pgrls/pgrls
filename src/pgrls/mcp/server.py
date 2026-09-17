@@ -226,7 +226,8 @@ def verify(
     witness), or ``unverified`` (Z3 can't decide, or there's no single scoping
     equality). Four threat models via ``mode``:
 
-    * ``anon`` (default) — can an unauthenticated session read any row?
+    * ``anon`` (default) — can an anonymous session (JWT-less, or the Supabase
+      anon-key caller whose ``auth.role()`` is 'anon') read any row?
     * ``cross-tenant`` — can a session authenticated as one tenant read a
       different tenant's row?
     * ``write`` — can such a session WRITE a row stamped for another tenant?
@@ -324,7 +325,7 @@ def fix(
     """Emit auto-fix SQL for the mechanically-fixable RLS findings.
 
     The remediation counterpart of ``lint``: for every finding pgrls can fix
-    mechanically (20 of the rules — SEC001/SEC002/SEC004/SEC006/SEC010/SEC011/
+    mechanically (19 of the rules — SEC001/SEC002/SEC004/SEC010/SEC011/
     SEC015/SEC017/SEC019/SEC020/SEC030/SEC031/SEC032/SEC044/PERF001/PERF003/
     PERF004/HYG003/VIEW001/VIEW002), returns the exact SQL that closes it.
 

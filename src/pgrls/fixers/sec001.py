@@ -23,6 +23,12 @@ class SEC001Fixer:
             # Mirror SEC001's detection: RLS off, not allowlisted.
             if table.rls_enabled:
                 continue
+            if table.policies:
+                # The rule cedes a dormant-policy table (RLS off, policies
+                # present) to SEC032, whose fixer emits this same ENABLE.
+                # Mirror the cede, or `pgrls fix` emits the statement twice
+                # and `--check` double-counts it.
+                continue
             if table_in_allowlist(table, allowlist):
                 continue
             # Skip partition children. SEC001 flags a child only

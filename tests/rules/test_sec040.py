@@ -324,22 +324,22 @@ def test_allowlist_exempts_policy_by_qualified_id() -> None:
 
 
 def test_identity_columns_override_recognises_custom_key() -> None:
-    # 'workspace' isn't a default identity name; with it configured, a
-    # dropped workspace scope fires.
-    pol = _policy(using=f"workspace = {_AUTH}", with_check="status = 'x'")
+    # 'zone' isn't a default identity name; with it configured, a
+    # dropped zone scope fires.
+    pol = _policy(using=f"zone = {_AUTH}", with_check="status = 'x'")
     t = Table(
         schema="public",
         name="documents",
         rls_enabled=True,
         force_rls=True,
         policies=(pol,),
-        columns=("id", "workspace", "status"),
+        columns=("id", "zone", "status"),
         column_details=(),
     )
     schema = Schema(tables=(t,))
-    assert SEC040().check(schema, options={}) == []  # default set: workspace not recognised
-    [v] = SEC040().check(schema, options={"identity_columns": ["workspace"]})
-    assert "'workspace'" in v.message
+    assert SEC040().check(schema, options={}) == []  # default set: zone not recognised (the widened default now includes workspace, so use a truly custom key)
+    [v] = SEC040().check(schema, options={"identity_columns": ["zone"]})
+    assert "'zone'" in v.message
 
 
 def test_auth_functions_override_replaces_default_set() -> None:

@@ -43,8 +43,9 @@ function (severity ``warning``) so each gets an audit decision, regardless of
 who can call it or whether the owner is RLS-exempt. SEC042 is the sharp,
 high-severity subset: the function is provably an *unauthenticated RLS-bypass
 endpoint* (RLS-exempt owner × low-trust EXECUTE). The two are complementary —
-SEC042 escalates the cases that are exploitable as-is, exactly as SEC039
-(anon write policy) sharpens SEC003 (PUBLIC grant). VIEW004 covers the
+SEC042 escalates the cases that are exploitable as-is — a true subset of
+SEC014, unlike SEC039, which COMPLEMENTS SEC003 rather than sharpening it
+(SEC003's ``PUBLIC`` check never sees the named ``anon`` role). VIEW004 covers the
 view-mediated SECDEF path and SEC013 the trigger-mediated path.
 
 Configure the low-trust role set with ``[lint.rules.SEC042].anon_roles``
@@ -77,7 +78,9 @@ Scope / known limits (intentional, fail-closed):
   SEC039, which check ``PUBLIC`` / ``anon`` literally against the policy's
   role list. Grant EXECUTE to the low-trust role directly (or revoke the
   group grant) to surface it; the membership closure exists (SEC029 computes
-  it) if a future opt-in wants it.
+  it). `verify --mode escalation` DOES expand it — measured, it flags a
+  function EXECUTE-able only through `GRANT readers TO anon`, which this
+  rule's literal check misses.
 * Snapshots predating v16 carry no ``execute_roles`` / ``owner_bypasses_rls``;
   SEC042 abstains on them (fail-closed) until re-captured.
 """

@@ -30,7 +30,10 @@ migrates one too). That protection is incidental and entirely
 client-controlled — the caller chooses whether to add `RETURNING` — so it is
 not a substitute for a tenant-scoped `WITH CHECK`. Only a `FOR ALL` (or
 `FOR INSERT`) policy carries this INSERT path; a bare `FOR UPDATE` is **not**
-flagged (its migration is blocked in practice). SEC040 targets `FOR ALL`,
+flagged. Its row-migration is blocked for any UPDATE that reads a column
+(`… WHERE id = 1`, `… RETURNING`), but NOT for the column-free form:
+measured, `UPDATE docs SET tenant_id = 99;` re-parented every row. SEC040
+targets `FOR ALL`,
 where the `USING` scope also proves the table is tenant-scoped on reads.
 
 An *asymmetric* policy that binds a **different** identity column on the
@@ -42,7 +45,9 @@ whatsoever.
 
 This is the asymmetry the existing write-side rules miss:
 
-* **SEC006** fires when `WITH CHECK` is *absent*. There it is present —
+* **SEC006** fires when `WITH CHECK` is *absent* AND nothing closes the
+  write (INSERT, or UPDATE/ALL with no real `USING` to reuse). There it is
+  present —
   and an explicit clause turns OFF the USING-reuse that SEC006 relies on
   to call the omitted shape "closed", so the scope is genuinely dropped.
 * **SEC028** fires when `WITH CHECK` is constant `true` (open write, no
@@ -64,14 +69,19 @@ Scope (intentional, kept tight to stay low-noise):
 
 * **Permissive FOR ALL only.** `FOR ALL` is the command that carries both
   a `USING` (proving the table is tenant-scoped on the read side) and an
-  INSERT path governed by `WITH CHECK` alone — the reliable escape. Bare
-  `FOR UPDATE` is excluded (its new-row gets re-checked against the
-  SELECT-applicable `USING` on any column-reading update, so migration is
-  blocked in practice). `INSERT` carries no `USING`, so there is no
-  read-scope asymmetry to key on (an open INSERT WITH CHECK is SEC028's).
+  INSERT path governed by `WITH CHECK` alone — the reliable escape.
+  Bare `FOR UPDATE` is excluded: its new row is re-checked against the
+  SELECT-applicable `USING` on any update that reads a column, though the
+  column-free form still escapes (measured: `UPDATE docs SET tenant_id =
+  99;` re-parented every row). SEC040 keys on the `FOR ALL` INSERT path,
+  which is the shape whose `USING` also proves the table is read-scoped.
+  `INSERT` carries no `USING`, so there is no read-scope asymmetry to key
+  on (an open INSERT WITH CHECK is SEC028's).
   A `SELECT`/`DELETE` policy has no `WITH CHECK`. Restrictive policies
-  AND-combine and are SEC006/SEC028's restrictive framing, not an escape
-  on their own — out of scope, as in those rules.
+  AND-combine, so one cannot ADMIT a row on its own — out of scope here.
+  (A restrictive `WITH CHECK (true)` is still a real hole: it cancels the
+  floor Postgres would have filled in from `USING`. That is SEC020's
+  finding, not an escape SEC040 keys on.)
 * **Explicit, non-constant WITH CHECK.** An *omitted* WITH CHECK reuses
   `USING` (scope preserved — SEC006's domain for the genuinely-open
   shapes). A constant-`true` WITH CHECK is SEC028/SEC020; a constant-

@@ -37,6 +37,10 @@ What SEC025 flags — and what it deliberately does not:
 * **Flagged:** a policy whose `USING` / `WITH CHECK` references —
   in a sub-select, a JOIN, anywhere `RangeVar` reaches — a table
   whose `rls_enabled` is false within the introspected schema set.
+  A reference resolves only when it is schema-qualified or names a
+  table in the policy's OWN schema: an unqualified name belonging to
+  a different schema is silently skipped even when that schema is in
+  `--schemas` (see "Not flagged" below).
 * **Not flagged — self-references.** A policy on `t` that
   references `t` itself inherits the same RLS gate (its own
   policies apply transitively), so self-references are skipped.

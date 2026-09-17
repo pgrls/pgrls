@@ -3,7 +3,11 @@
 Permissive policies combine with OR; restrictive policies combine with
 AND. Tables that need a hard tenant boundary plus a per-tenant rule
 typically benefit from one restrictive policy as the floor — without
-one, a subtle OR branch can open access the author didn't intend.
+one, a subtle OR branch can open access the author didn't intend. The
+floor is only as wide as its own ``TO`` list: a restrictive policy
+constrains just the roles named there, so ``TO PUBLIC`` is what makes
+it a floor (measured — a restrictive ``TO authenticated`` left
+``authenticated`` at 1 row and another role at 3).
 Info-severity advisory: many simple tables are correct without
 restrictives.
 """
@@ -49,8 +53,11 @@ class SEC007:
                         f"Every policy on {table.qualified_name} is "
                         "permissive. Permissive policies combine with "
                         "OR — adding one RESTRICTIVE policy gives a "
-                        "hard floor (e.g. tenant scoping) that no OR "
-                        "branch can bypass."
+                        "floor (e.g. tenant scoping) that no OR branch "
+                        "can bypass, for the roles in its own TO list. "
+                        "Use TO PUBLIC to bind every role: measured, a "
+                        "restrictive TO authenticated left authenticated "
+                        "at 1 row and another role at 3."
                     ),
                     location=table_id,
                 )

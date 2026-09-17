@@ -101,3 +101,34 @@ def test_hyg001_skips_policy_without_ast() -> None:
         ),
     )
     assert HYG001().check(schema, {}) == []
+
+
+def test_no_captured_columns_does_not_report_every_column_as_phantom() -> None:
+    """Review pass 12. An offline `--sql-file` whose CREATE TABLE lives in
+    another migration (or whose table is extension-managed) synthesizes a table
+    with an EMPTY column list, and HYG001 then read every policy column as a
+    phantom — at `error` severity, with no allowlist entry an operator could
+    write for a column that does exist. PERF003 guards this the same way.
+
+    Reproduced through the real CLI: a file containing only
+    `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` reported
+    `ERROR HYG001 public.docs.p`.
+    """
+    policy = Policy(
+        name="p", command="SELECT", permissive=True, roles=("anon",),
+        using_sql="tenant_id = current_setting('app.t', true)",
+        with_check_sql=None,
+        using_ast=parse_expr("tenant_id = current_setting('app.t', true)"),
+    )
+    bare = Table(
+        schema="public", name="docs", rls_enabled=True, force_rls=False,
+        policies=(policy,), columns=(),
+    )
+    assert HYG001().check(Schema(tables=(bare,)), {}) == []
+
+    # With the column list captured, a genuine phantom still fires.
+    known = Table(
+        schema="public", name="docs", rls_enabled=True, force_rls=False,
+        policies=(policy,), columns=("id", "body"),
+    )
+    assert len(HYG001().check(Schema(tables=(known,)), {})) == 1

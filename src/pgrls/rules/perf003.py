@@ -32,26 +32,37 @@ The rule treats *any* access method as "indexed" — btree, hash,
 gin, gist, brin. The operator chose the index type and pgrls
 doesn't second-guess the choice. A leading-column match is the
 relevant signal: a B-tree on ``(tenant_id, created_at)`` helps
-``WHERE tenant_id = X``, but a B-tree on ``(created_at, tenant_id)``
-does not. Partial indexes also count — the operator is responsible
+``WHERE tenant_id = X``, while a B-tree on ``(created_at, tenant_id)``
+is a poor fit. Not a capability limit — Postgres *can* apply the
+condition as a non-boundary qual, and measured on a 200k-row,
+25,000-page table the planner freely chose an Index Only Scan on that
+second index (``Index Cond: (tenant_id = …)``, 1,549 buffers against
+25,000 pages for a seq scan). But on a narrow 885-page table it
+preferred the seq scan, so it is a cost preference the planner
+abandons as the table's width and selectivity change — which is why
+the leading column is the signal. Partial indexes also count — the operator is responsible
 for ensuring the partial predicate is satisfied by the policy
 predicate (pgrls can't statically prove that compatibility).
 
-**Known limitations** (intentional in v0.5.10):
+**Known limitations** (intentional):
 
 * Expression indexes (``CREATE INDEX ON tbl (lower(email))``) are
   not matched. The expression list lives in ``pg_index.indexprs``
-  which v0.5.10's introspection doesn't decode. PERF003 will
+  which introspection doesn't decode. PERF003 will
   flag the column as un-indexed even when a matching expression
   index exists. Allowlist the policy ID when this surfaces a
   false positive.
 * Composite-key policies (``USING (tenant_id = X AND owner = Y)``)
-  fire PERF003 for each referenced column independently. An
+  fire PERF003 once per policy, with every unindexed column named in
+  the one message. An
   operator who has a composite index ``(tenant_id, owner)`` gets
-  one violation for ``tenant_id`` (the leading column matches —
-  no fire) and one for ``owner`` (no leading-column match). The
-  ``owner`` fire is a false positive in this case; allowlist or
-  add a second index ``(owner)`` if the lookup direction matters.
+  NO violation for ``tenant_id`` (the leading column matches) and
+  one for ``owner`` (no leading-column match). The
+  ``owner`` fire is a false positive in this case and allowlisting
+  it is the right response — do NOT add a second index on
+  ``owner``: measured, the composite already serves the whole
+  predicate (``Index Cond: ((tenant_id = …) AND (owner = …))``) and
+  the extra index is never chosen.
 * Tables without RLS are skipped entirely. PERF003's concern is
   policy-driven filtering performance; tables without policies
   don't filter via RLS.
@@ -242,8 +253,8 @@ class PERF003:
                 "(tenant_id)` for a tenant_id-filtered policy), or "
                 f"allowlist this policy as {pid!r} in "
                 "[lint.rules.PERF003] if a matching expression "
-                "index exists (expression indexes aren't matched in "
-                "v0.5.10) or if sequential scan is acceptable for "
+                "index exists (expression indexes aren't matched) "
+                "or if sequential scan is acceptable for "
                 "the table's size."
             ),
             location=pid,

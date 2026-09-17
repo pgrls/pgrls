@@ -1,7 +1,8 @@
 # pgrls 60-second tour — screencast recording script
 
-The README's hero links to an asciinema cast. This file is the recipe
-to record it. Target length: **60–75 seconds**. Five scenes, each
+The README's hero links to `docs/screencast.svg`, an inline SVG rendered
+from a terminal recording (termtosvg or asciinema + svg-term both work).
+This file is the recipe to record it. Target length: **60–75 seconds**. Five scenes, each
 self-explanatory in 5–15 seconds.
 
 ## Prereqs
@@ -161,12 +162,14 @@ svg-term --in docs/screencast.cast \
          --out docs/screencast.svg \
          --window --width 96 --height 24
 
-# 3) Update the README hero link
-sed -i '' "s|REPLACE_AFTER_UPLOAD|abc123|" README.md   # macOS
-# Linux: sed -i "s|REPLACE_AFTER_UPLOAD|abc123|" README.md
+# 3) The README hero links the raw SVG directly
+#    (https://raw.githubusercontent.com/pgrls/pgrls/main/docs/screencast.svg),
+#    so there is no placeholder to substitute — committing the new SVG is the
+#    whole update. The asciinema upload in step 1 is optional (a shareable
+#    link), not something the README depends on.
 
 # 4) Commit
-git add docs/screencast.cast docs/screencast.svg README.md
+git add docs/screencast.svg README.md
 git commit -m 'docs: record 60-second pgrls tour for README hero'
 ```
 
@@ -187,8 +190,9 @@ unset DATABASE_URL
   screencast is the demo; we want the viewer to see the commands
   hit a real database, not pgrls's internal test plumbing.
 - **Re-record cheaply.** The whole script (setup → record → upload
-  → embed) takes ~5 minutes once. Keep `docs/screencast.cast` in
-  git so future re-records can diff against the prior cut.
+  → embed) takes ~5 minutes once. The recording leaves
+  `docs/screencast.cast` on disk so a re-record can be diffed against the
+  prior cut; only the rendered `docs/screencast.svg` is committed.
 - **Keep it short.** If the cast runs longer than 90s on first
   watch, cut Scene 1 (`pip show`) — the badges already declare the
   version.

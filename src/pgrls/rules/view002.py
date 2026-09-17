@@ -1,16 +1,23 @@
 """VIEW002 — non-`security_barrier` view over RLS-protected table.
 
 A view defined without `WITH (security_barrier = true)` lets the
-planner push user-supplied predicates *under* the view's RLS-derived
-filter. The classic exploit: the user runs
+planner evaluate a user-supplied predicate *before the view's own
+qualifications*. The classic exploit: the user runs
 
     SELECT * FROM v WHERE leak(secret_column);
 
-against a view `v` that exposes a join over an RLS-protected table.
-If `v` is not a security barrier, the planner is free to evaluate the
-volatile / side-effecting `leak(...)` BEFORE the underlying RLS
-predicates restrict the row set — leaking rows the calling user
-should never have seen.
+against a view `v` whose body narrows an RLS-protected table — a join,
+a `WHERE`, a column projection. Without the barrier the planner may run
+the cheap side-effecting `leak(...)` first, so it sees rows the view
+body would have filtered out.
+
+What it can NOT cross is the base table's RLS qual. Postgres marks
+those as security quals and always applies them first (measured on
+PG16: with a `COST 0.0000001` non-leakproof function over an invoker
+view on an RLS table, the function saw only the caller's own row, and
+`EXPLAIN` shows `Filter: ((owner = CURRENT_USER) AND leak(secret))`).
+So the exposure is the view's own filtering, not the policy boundary —
+which is exactly why this is a `warning` and VIEW001 is not.
 
 `security_barrier = true` tells the planner the view is a privilege
 boundary: predicates the user adds in the outer query MUST NOT be
@@ -73,9 +80,10 @@ class VIEW002:
                     title=self.title,
                     message=(
                         f"View {v.qualified_name} is not a security "
-                        "barrier; a function call in WHERE could leak "
-                        f"rows from {referenced_qname} before RLS "
-                        "predicates apply. Apply the auto-fix or "
+                        "barrier; a cheap function call in WHERE can be "
+                        "evaluated before this view's own filtering, so it "
+                        f"sees rows of {referenced_qname} the view body "
+                        "would have excluded. Apply the auto-fix or "
                         "re-create with WITH (security_barrier = true)."
                     ),
                     location=v.qualified_name,

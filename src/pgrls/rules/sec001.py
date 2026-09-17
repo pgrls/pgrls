@@ -1,7 +1,8 @@
 """SEC001 — RLS not enabled on a table in a configured schema.
 
 Detection: `pg_class.relrowsecurity = false` in the configured schemas,
-minus the per-rule `allowlist`. Allowlist entries can be unqualified
+minus tables that have policies (those are *dormant* — ceded to SEC032, a
+more specific finding) and minus the per-rule `allowlist`. Allowlist entries can be unqualified
 (`countries`) or schema-qualified (`tenant.things`).
 
 Declarative partitioning: Postgres does not propagate `relrowsecurity` from
@@ -14,7 +15,7 @@ ancestor coverage rather than telling them to enable RLS on a table that
 may already be covered upstream.
 
 Direct queries against a child bypass the parent's policies — a security
-caveat documented in `AGENTS.md`. Push a policy onto every child when
+caveat documented in `docs/RULES.md#rule-sec001`. Push a policy onto every child when
 direct access is part of the application's threat model.
 """
 from __future__ import annotations

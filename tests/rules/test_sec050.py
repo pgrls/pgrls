@@ -193,11 +193,14 @@ def test_silent_select_policy_with_unparsed_using() -> None:
     assert _check(_objects(_policy(None))) == []
 
 
-def test_silent_when_columns_unavailable_offline() -> None:
+def test_offline_without_columns_abstains_loudly() -> None:
     # An offline `--sql-file` that lints only `CREATE POLICY ON storage.objects`
     # (no CREATE TABLE — the table is extension-managed) leaves `columns` empty.
-    # bucket_id then can't be resolved to an own column, so the rule abstains
-    # rather than false-positive on a correctly bucket-scoped policy.
+    # bucket_id then can't be resolved to an own column, so no per-policy
+    # verdict is possible — a correctly scoped policy must not be flagged.
+    # But a SILENT abstain here was a false clean on exactly the Supabase
+    # migration input this rule exists for (and it never showed up in
+    # `skipped_rules`), so the rule now says so: one info note per table.
     table = Table(
         schema="storage",
         name="objects",
@@ -206,7 +209,12 @@ def test_silent_when_columns_unavailable_offline() -> None:
         policies=(_policy("bucket_id = 'avatars' AND owner_id = auth.uid()"),),
         columns=(),
     )
-    assert SEC050().check(Schema(tables=(table,)), {}) == []
+    vs = SEC050().check(Schema(tables=(table,)), {})
+    assert [(v.severity, v.location) for v in vs] == [("info", "storage.objects")]
+    assert "CREATE TABLE storage.objects" in vs[0].message
+    # With no policies at all there is nothing to abstain on — stay silent.
+    empty = Table(schema="storage", name="objects", rls_enabled=True, force_rls=False, policies=(), columns=())
+    assert SEC050().check(Schema(tables=(empty,)), {}) == []
 
 
 # --- multiple policies + options + metadata ------------------------------

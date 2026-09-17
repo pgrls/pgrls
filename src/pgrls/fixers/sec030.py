@@ -2,10 +2,10 @@
 
 SEC030 flags a row-scoping policy keyed off a NULLABLE discriminator
 column. Two failure modes (rule docstring): under plain `=`, a NULL
-row is silently invisible to every tenant; the moment any policy on
-the table adopts a NULL-tolerant form (``IS NOT DISTINCT FROM``,
-``OR col IS NULL``, ``COALESCE``), every NULL row becomes visible to
-every tenant. Adding `NOT NULL` to the discriminator forecloses both.
+row is silently invisible to every tenant; and a NULL-tolerant form
+opens it up — ``OR col IS NULL`` / ``COALESCE`` make every NULL row
+visible to **every** tenant, while ``IS NOT DISTINCT FROM`` exposes it
+only to a session whose own auth value is also NULL. Adding `NOT NULL` to the discriminator forecloses both.
 
 The mechanical fix is one statement per flagged column:
 
@@ -113,8 +113,10 @@ class SEC030Fixer:
             description=(
                 f"Set {column} NOT NULL on {table.schema}.{table.name} "
                 "so a NULL discriminator can't make rows invisible to "
-                "every tenant under `=`, or visible to every tenant "
-                "the moment any policy adopts a NULL-tolerant form. "
+                "every tenant under `=`, or exposed by a NULL-tolerant "
+                "form — `OR col IS NULL` / `COALESCE` show them to every "
+                "tenant, `IS NOT DISTINCT FROM` to any session whose own "
+                "auth value is also NULL. "
                 "**BACKFILL ANY EXISTING NULLs FIRST.** Postgres "
                 "scans the column at ALTER time and rejects this "
                 "statement with `ERROR: column contains null values` "

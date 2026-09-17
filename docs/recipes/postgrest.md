@@ -48,14 +48,19 @@ USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true)::uuid)
 
 (`current_setting(...)` always returns `text`; if `tenant_id` is
 `uuid` / `int` / `bigint` you need a matching cast, or Postgres
-raises `operator does not exist: <coltype> = text` at query time.)
+raises `operator does not exist: <coltype> = text` at **CREATE POLICY**
+time — the policy never enters the catalog, so there is no query-time error
+to hunt for.)
 A row whose `tenant_id` is `NULL` evaluates `NULL = <value>` to `NULL`
 (not `true`), so the row is invisible to every tenant. That's already
 a bug — the row belongs to no one. The worse failure mode is one
 edit away: the moment any policy on the table uses a NULL-tolerant
 form of the same key (`tenant_id IS NOT DISTINCT FROM …`,
 `… OR tenant_id IS NULL`, `COALESCE(tenant_id, …)`), every NULL row
-becomes visible to **every** tenant at once. A `NOT NULL`
+becomes visible where it should not: the `OR IS NULL` and `COALESCE`
+forms expose it to **every** tenant, while `IS NOT DISTINCT FROM`
+exposes it exactly to a session whose auth value is also NULL — an
+unauthenticated one. A `NOT NULL`
 discriminator makes that whole failure mode unreachable.
 
 pgrls flags this as **SEC030** (severity `info`) — *"policy scopes
@@ -79,8 +84,9 @@ pool of roles (typically just `authenticated`), so `current_user`
 collapses across users and the policy lets everyone see everyone
 else's rows.
 
-pgrls flags this as **SEC018** (severity `warning`) — "policy
-discriminator is the role identity, not the per-request auth value."
+pgrls flags this as **SEC018** (severity `warning`) — "Policy compares a
+column against current_user / session_user". The discriminator is the role
+identity, not a per-request auth value.
 The fix is to scope by `current_setting('request.jwt.claim.<id>', true)`
 (or `auth.uid()` on Supabase), which IS per-request.
 
@@ -149,7 +155,7 @@ pgrls lint --schemas api,public --baseline .pgrls-baseline.json
 
 - [`docs/QUICKSTART.md`](../QUICKSTART.md) — the 5-minute first-run.
 - [`README.md`](../../README.md) — the full feature tour.
-- [`AGENTS.md`](../../AGENTS.md) — every rule with its reference
+- [`docs/RULES.md`](../RULES.md) — every rule with its reference
   paragraph and fix recipe.
 - PostgREST docs on roles & RLS:
   https://docs.postgrest.org/en/stable/references/auth.html

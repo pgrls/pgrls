@@ -26,19 +26,26 @@ searched at the written position. So:
   it isn't named, so the default applies. **Unsafe.**
 * A SECDEF function with `SET search_path = …, pg_temp` — `pg_temp`
   named explicitly as the **last** entry — forces the temp schema to
-  be searched last. **Safe.** This is the pattern the Postgres docs
-  prescribe for SECURITY DEFINER functions.
+  be searched last. **Necessary but not sufficient.** Measured on
+  PG16: under `search_path = pg_catalog, pg_temp` a body reading an
+  unqualified `secrets` still returned the attacker's planted
+  `pg_temp.secrets`, because nothing else on the path resolves the
+  name. The path must also name the schema the body's own unqualified
+  references live in — which is why the fixer emits
+  `pg_catalog, <own schema>, pg_temp`.
 
 SEC015 therefore fires on every SECDEF function whose effective
-search_path does not end with an explicit `pg_temp` token. The fix is
-mechanical — append `pg_temp` to the function's `SET search_path` (or
-add the clause if absent) — but it isn't auto-applied: rewriting the
-clause needs the function's full argument signature for the
-`ALTER FUNCTION name(argtypes) SET search_path = …` statement, and
-introspection captures `proname` without `proargtypes`. The operator
-runs the `ALTER FUNCTION` by hand, or allowlists the function after
-confirming its body fully-qualifies every object reference (in which
-case `search_path` is moot).
+search_path does not end with a single explicit `pg_temp` token. The fix
+is mechanical and `pgrls fix` applies it: per flagged overload it emits
+`ALTER FUNCTION <schema>.<name>(<signature>) SET search_path = <existing
+tokens minus pg_temp>, pg_temp` (or `pg_catalog, <the function's own schema>, pg_temp` when no path is
+pinned), using the per-overload signature introspection captures
+(snapshot v12+). It abstains on a pre-v12 snapshot (no signature captured at all — an
+*empty* signature is a real zero-argument function and is fixed), a
+pre-v14 snapshot (no separate schema/function-name fields), or a
+search_path the comma tokenizer cannot safely rewrite. Alternatively,
+allowlist the function after confirming its body fully-qualifies every
+object reference (in which case `search_path` is moot).
 
 Relationship to the other SECDEF rules: SEC014 flags every SECDEF
 function as a generic audit surface; VIEW004 flags the view-mediated
@@ -61,7 +68,9 @@ Out of scope (intentional):
   allowlist the audited-safe cases. Rationale: a body-qualification
   proof is exactly the brittle AST analysis VIEW004 documents
   false-negatives for (dynamic SQL, PL/pgSQL `EXECUTE`); a
-  structural search_path check has no false negatives.
+  structural search_path check has no false negatives for a path that OMITS pg_temp;
+  a path that names it last can still resolve an unqualified body
+  reference through it (see above).
 * **Cross-scope functions.** A SECDEF function in a schema outside
   the introspector's ``--schemas`` set is invisible to SEC015 (it
   isn't in `Schema.security_definer_functions`). Expand ``--schemas``
@@ -177,8 +186,10 @@ class SEC015:
         else:
             state = (
                 f"sets search_path to {fn.search_path!r}, which does "
-                "not end with an explicit pg_temp token — so pg_temp "
-                "is still searched ahead of the listed schemas for "
+                "not end with a SINGLE explicit pg_temp token (naming "
+                "it more than once puts an earlier occurrence ahead of "
+                "the listed schemas) — so pg_temp is still searched "
+                "ahead of them for "
                 "relation and type names"
             )
         return Violation(

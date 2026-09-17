@@ -32,9 +32,11 @@ SEC020's (asymmetric write) and SEC028's (open write) territory.
 Detection mirrors SEC008: only the literal `true` matches (a real
 tautology checker — `1 = 1`, `x OR NOT x` — is out of scope; those
 surface as SEC005, no own-column reference). A restrictive policy
-with a `WITH CHECK (true)` but a real `USING` is not flagged here —
-a restrictive `WITH CHECK (true)` is a dead clause that restricts no
-write (SEC006's framing), not a missing read floor.
+with a `WITH CHECK (true)` but a real `USING` is not flagged here: it is
+not a missing READ floor, which is SEC031's subject. It is not harmless
+either — the explicit `true` cancels the write floor Postgres would have
+filled in from `USING` (measured) — but that is
+[SEC020](#rule-sec020)'s finding.
 
 Severity: warning. The fix is to give the restrictive policy a real
 predicate (the tenant / ownership key it was meant to enforce) or to

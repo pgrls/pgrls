@@ -2,7 +2,7 @@
 
 A row-level security policy isolates tenants by keying row
 visibility off a *per-request* value — the tenant id, the owning
-account, the workspace — read from session context the application
+account, the organization id — read from session context the application
 sets on every connection (`current_setting('app.tenant_id')`, a JWT
 claim). The footgun SEC021 flags is a policy that instead compares
 that identity column against a **literal constant**:
@@ -72,22 +72,37 @@ from pgrls.violations import Severity, Violation
 # per project with `[lint.rules.SEC021].identity_columns` (the
 # configured list replaces this set).
 _DEFAULT_IDENTITY_COLUMNS: frozenset[str] = frozenset({
-    "tenant_id",
-    "tenant",
-    "org_id",
-    "org",
-    "organization_id",
-    "organisation_id",
-    "account_id",
     "account",
+    "account_id",
+    "client_id",
     "company_id",
     "customer_id",
-    "workspace_id",
-    "team_id",
-    "project_id",
-    "user_id",
-    "owner_id",
+    "group_id",
+    "member_id",
+    "org",
+    "org_id",
+    "organisation_id",
+    "organization_id",
     "owner",
+    "owner_id",
+    "project_id",
+    "site_id",
+    "team_id",
+    "tenant",
+    "tenant_id",
+    "user_id",
+    "workspace_id",
+})
+
+# The tenant-axis set the cross-tenant / write provers accept (see
+# `_z3_compare.prove_cross_tenant_isolation`). A superset of SEC021's flagging
+# set: the bare spellings (`client`, `project`, `team`, …) are real tenant keys
+# in `col = <session value>` policies, but as SEC021 *sentinels* (`project =
+# 'default'` beside a real `user_id = auth.uid()` scope) they fired info noise
+# on realistic schemas, so SEC021 keeps only the unambiguous forms.
+AXIS_IDENTITY_COLUMNS: frozenset[str] = _DEFAULT_IDENTITY_COLUMNS | frozenset({
+    "client", "customer", "company", "workspace", "team", "project",
+    "organization", "organisation",
 })
 
 

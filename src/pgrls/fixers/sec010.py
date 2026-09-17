@@ -29,8 +29,15 @@ policy governs** (a strict subset of what SEC010 reports):
     write side).
   - ``FOR INSERT``: inert iff ``WITH CHECK`` is ``false`` (no ``USING`` side;
     an absent ``WITH CHECK`` is not constant-false → not dropped).
-  - ``FOR UPDATE``: inert iff ``USING`` is ``false`` — no existing row is
-    selectable to update, so no update happens regardless of ``WITH CHECK``.
+  - ``FOR UPDATE``: inert iff ``USING`` is ``false`` **and** ``WITH CHECK``
+    is absent or ``false`` — same shape, same reason as ``FOR ALL`` below.
+    ``USING`` selects only the rows THIS policy offers up, while the write
+    gate is the OR of every applicable policy's ``WITH CHECK``; Postgres
+    does not pair a policy's own two clauses. Measured on PG16 with a
+    sibling ``FOR UPDATE USING (tenant_id = 1) WITH CHECK (tenant_id = 1)``:
+    ``UPDATE … SET tenant_id = 99`` moved 2 rows with a ``USING (false)
+    WITH CHECK (true)`` policy present, and raised ``new row violates
+    row-level security policy`` once it was dropped.
   - ``FOR ALL``: inert iff ``USING`` is ``false`` (blocks read/update/delete)
     **and** ``WITH CHECK`` is absent or ``false`` (the INSERT path is gated by
     ``WITH CHECK``, falling back to ``USING`` when absent; a non-``false``
@@ -86,9 +93,18 @@ def _is_inert_permissive(policy: Policy) -> bool:
         # constant-false, so it is not inert.
         return with_check_false
     if command == "UPDATE":
-        # USING selects the rows to update; USING false → no row qualifies → no
-        # update regardless of WITH CHECK.
-        return using_false
+        # USING selects the rows THIS policy offers up, but the write gate is
+        # the OR of every applicable policy's WITH CHECK — Postgres does not
+        # pair a policy's own two clauses. So `USING (false) WITH CHECK (true)`
+        # is NOT inert: its `true` still admits the new row for any row a
+        # sibling policy's USING selected. Measured on PG16 with a sibling
+        # `FOR UPDATE USING (tenant_id = 1) WITH CHECK (tenant_id = 1)`:
+        # `UPDATE … SET tenant_id = 99` moved 2 rows with this policy present
+        # and raised `new row violates row-level security policy` once it was
+        # dropped. Same shape, same answer as ALL below.
+        if not using_false:
+            return False
+        return policy.with_check_ast is None or with_check_false
     if command == "ALL":
         # Reads/updates/deletes blocked by USING (false); the INSERT path is
         # gated by WITH CHECK, falling back to USING when absent. Inert only
