@@ -1103,3 +1103,243 @@ def test_a_grant_that_yields_no_rows_is_not_an_exposure() -> None:
     )
     s = Schema(tables=(users,), role_memberships=(), roles=(Role("anon", True, False, False),))
     assert build_matrix(s, roles=("anon",)).exposures == ()
+
+
+# --- live differential: every cell against a real SET ROLE session ------------
+#
+# Each matrix claim is checked against Postgres itself. The command runs under
+# SET LOCAL ROLE in a rolled-back transaction: a SELECT count, two INSERTs (one
+# row a tenant predicate admits, one it rejects), and UPDATE / DELETE row
+# counts. SELECT takes the widest of the direct read and every door — two
+# definer views, an invoker view, two SECURITY DEFINER functions. This is the
+# test that caught policies being applied through NOINHERIT edges. NOINHERIT
+# comes from the role attribute so the test runs on PG15, which has no
+# per-grant INHERIT option.
+
+_MXD_ROLES = (
+    "mxd_pub", "mxd_grp", "mxd_mid", "mxd_inh", "mxd_noinh", "mxd_nested",
+    "mxd_owner", "mxd_owner_m", "mxd_owner_m_noinh", "mxd_su", "mxd_byp",
+    "mxd_byp_nogrant", "mxd_rad", "mxd_wad", "mxd_colr", "mxd_colw",
+    "mxd_door_owner", "mxd_vowner", "mxd_vuser", "mxd_invuser", "mxd_fnuser",
+)
+
+_MXD_DDL = """
+CREATE ROLE mxd_pub NOLOGIN;
+CREATE ROLE mxd_grp NOLOGIN;
+CREATE ROLE mxd_mid NOLOGIN;
+CREATE ROLE mxd_inh NOLOGIN;
+CREATE ROLE mxd_noinh NOLOGIN NOINHERIT;
+CREATE ROLE mxd_nested NOLOGIN;
+CREATE ROLE mxd_owner NOLOGIN;
+CREATE ROLE mxd_owner_m NOLOGIN;
+CREATE ROLE mxd_owner_m_noinh NOLOGIN NOINHERIT;
+CREATE ROLE mxd_su NOLOGIN SUPERUSER;
+CREATE ROLE mxd_byp NOLOGIN BYPASSRLS;
+CREATE ROLE mxd_byp_nogrant NOLOGIN BYPASSRLS;
+CREATE ROLE mxd_rad NOLOGIN;
+CREATE ROLE mxd_wad NOLOGIN;
+CREATE ROLE mxd_colr NOLOGIN;
+CREATE ROLE mxd_colw NOLOGIN;
+CREATE ROLE mxd_door_owner NOLOGIN;
+CREATE ROLE mxd_vowner NOLOGIN;
+CREATE ROLE mxd_vuser NOLOGIN;
+CREATE ROLE mxd_invuser NOLOGIN;
+CREATE ROLE mxd_fnuser NOLOGIN;
+GRANT mxd_grp TO mxd_inh, mxd_noinh, mxd_mid;
+GRANT mxd_mid TO mxd_nested;
+GRANT mxd_owner TO mxd_owner_m, mxd_owner_m_noinh;
+GRANT pg_read_all_data TO mxd_rad;
+GRANT pg_write_all_data TO mxd_wad;
+
+CREATE FUNCTION pg_temp.mk(t text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format('CREATE TABLE public.%I (id int, tenant_id text, owner_name text,'
+                 ' note text, email text, ssn text)', t);
+  EXECUTE format($q$INSERT INTO public.%I VALUES
+    (1, 'a', 'x', 'n1', 'a1@x', '111'), (2, 'a', 'x', 'n2', 'a2@x', '222'),
+    (3, 'b', 'x', 'n3', 'b1@x', '333'), (4, 'b', 'x', 'n4', 'b2@x', '444')$q$, t);
+END $$;
+
+SELECT pg_temp.mk('t_open');
+GRANT SELECT ON t_open TO mxd_grp;
+
+SELECT pg_temp.mk('t_grp_policy');
+ALTER TABLE t_grp_policy ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, UPDATE, DELETE ON t_grp_policy TO mxd_grp, mxd_noinh;
+CREATE POLICY p_grp ON t_grp_policy FOR ALL TO mxd_grp USING (true);
+
+SELECT pg_temp.mk('t_grp_floor');
+ALTER TABLE t_grp_floor ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, UPDATE, DELETE ON t_grp_floor TO mxd_grp, mxd_noinh;
+CREATE POLICY p_all ON t_grp_floor FOR ALL TO PUBLIC USING (true);
+CREATE POLICY r_grp ON t_grp_floor AS RESTRICTIVE FOR ALL TO mxd_grp
+  USING (tenant_id = current_setting('app.tenant', true));
+
+SELECT pg_temp.mk('t_owned');
+ALTER TABLE t_owned OWNER TO mxd_owner;
+ALTER TABLE t_owned ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON t_owned TO mxd_owner_m_noinh;
+
+SELECT pg_temp.mk('t_forced');
+ALTER TABLE t_forced OWNER TO mxd_owner;
+ALTER TABLE t_forced ENABLE ROW LEVEL SECURITY;
+ALTER TABLE t_forced FORCE ROW LEVEL SECURITY;
+CREATE POLICY p_t ON t_forced FOR ALL TO PUBLIC
+  USING (tenant_id = current_setting('app.tenant', true));
+
+SELECT pg_temp.mk('t_cols');
+GRANT SELECT (id, email) ON t_cols TO mxd_colr;
+GRANT UPDATE (note) ON t_cols TO mxd_colw;
+GRANT INSERT (id, tenant_id, owner_name) ON t_cols TO mxd_colw;
+
+SELECT pg_temp.mk('t_all_data');
+ALTER TABLE t_all_data ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_ad ON t_all_data FOR ALL TO PUBLIC
+  USING (tenant_id = current_setting('app.tenant', true));
+
+SELECT pg_temp.mk('t_bypass');
+ALTER TABLE t_bypass ENABLE ROW LEVEL SECURITY;
+ALTER TABLE t_bypass FORCE ROW LEVEL SECURITY;
+GRANT SELECT ON t_bypass TO mxd_byp;
+
+SELECT pg_temp.mk('t_door');
+ALTER TABLE t_door OWNER TO mxd_door_owner;
+ALTER TABLE t_door ENABLE ROW LEVEL SECURITY;
+CREATE VIEW v_def AS SELECT * FROM public.t_door;
+ALTER VIEW v_def OWNER TO mxd_door_owner;
+GRANT SELECT ON v_def TO mxd_vuser;
+CREATE VIEW v_inv WITH (security_invoker = true) AS SELECT * FROM public.t_door;
+ALTER VIEW v_inv OWNER TO mxd_door_owner;
+GRANT SELECT ON v_inv TO mxd_invuser;
+CREATE FUNCTION f_door() RETURNS SETOF public.t_door LANGUAGE sql SECURITY DEFINER
+  AS 'SELECT * FROM public.t_door';
+ALTER FUNCTION f_door() OWNER TO mxd_door_owner;
+REVOKE EXECUTE ON FUNCTION f_door() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION f_door() TO mxd_fnuser;
+
+SELECT pg_temp.mk('t_door_filtered');
+ALTER TABLE t_door_filtered ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_v ON t_door_filtered FOR SELECT TO mxd_vowner
+  USING (tenant_id = current_setting('app.tenant', true));
+GRANT SELECT ON t_door_filtered TO mxd_vowner;
+CREATE VIEW v_def2 AS SELECT * FROM public.t_door_filtered;
+ALTER VIEW v_def2 OWNER TO mxd_vowner;
+GRANT SELECT ON v_def2 TO mxd_vuser;
+
+SELECT pg_temp.mk('t_fn_pub');
+ALTER TABLE t_fn_pub OWNER TO mxd_door_owner;
+ALTER TABLE t_fn_pub ENABLE ROW LEVEL SECURITY;
+CREATE FUNCTION f_pub() RETURNS SETOF public.t_fn_pub LANGUAGE sql SECURITY DEFINER
+  AS 'SELECT * FROM public.t_fn_pub';
+ALTER FUNCTION f_pub() OWNER TO mxd_door_owner;
+
+SELECT pg_temp.mk('t_nested');
+GRANT SELECT ON t_nested TO mxd_mid;
+"""
+
+# Each door, and the base table whose rows it returns.
+_MXD_DOORS = {
+    "v_def": "public.t_door",
+    "v_inv": "public.t_door",
+    "f_door()": "public.t_door",
+    "v_def2": "public.t_door_filtered",
+    "f_pub()": "public.t_fn_pub",
+}
+_MXD_RANK = {"all": 3, "some": 1, "none": 0}
+_MXD_VERDICT_RANK = {"open": 3, "undecided": 2, "conditional": 1, "denied": 0}
+
+
+def _mxd_run(conn: psycopg.Connection, role: str, stmt: str) -> tuple[bool, int]:
+    """Run `stmt` as `role` with app.tenant = 'a', roll back, and return
+    (succeeded, row count — the count(*) value for a SELECT)."""
+    with conn.cursor() as cur:
+        cur.execute("BEGIN")
+        try:
+            cur.execute("SET LOCAL app.tenant = 'a'")
+            cur.execute(f'SET LOCAL ROLE "{role}"')
+            cur.execute(stmt)
+            n = cur.fetchone()[0] if cur.description else cur.rowcount
+            return True, n
+        except psycopg.Error:
+            return False, 0
+        finally:
+            cur.execute("ROLLBACK")
+
+
+@requires_docker
+def test_every_cell_matches_a_live_set_role_session(pg_conn: psycopg.Connection) -> None:
+    roles = ("PUBLIC",) + _MXD_ROLES[1:]
+    as_db = {"PUBLIC": "mxd_pub"}  # a role with no memberships stands in for PUBLIC
+
+    def reach(ok: bool, n: int, total: int) -> str:
+        return "none" if not ok or n == 0 else ("all" if n == total else "some")
+
+    with pg_conn.cursor() as cur:
+        cur.execute("DROP ROLE IF EXISTS " + ", ".join(_MXD_ROLES))
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(_MXD_DDL)
+        schema = introspect(pg_conn, schemas=["public"])
+        m = build_matrix(schema, roles=roles)
+        totals = {}
+        with pg_conn.cursor() as cur:
+            for t in {r.qualified_name for r in m.rows}:
+                cur.execute(f"SELECT count(*) FROM {t}")
+                totals[t] = cur.fetchone()[0]
+
+        door_reach: dict[tuple[str, str], str] = {}
+        for role in roles:
+            for door, base in _MXD_DOORS.items():
+                got = reach(*_mxd_run(pg_conn, as_db.get(role, role),
+                                      f"SELECT count(*) FROM {door}"), totals[base])
+                if _MXD_RANK[got] > _MXD_RANK[door_reach.get((role, base), "none")]:
+                    door_reach[(role, base)] = got
+
+        wrong = []
+        for row in m.rows:
+            total = totals[row.qualified_name]
+            for role, cell in zip(m.roles, row.cells):
+                db = as_db.get(role, role)
+                t = row.qualified_name
+                if row.command == "SELECT":
+                    truth = reach(*_mxd_run(pg_conn, db, f"SELECT count(*) FROM {t}"), total)
+                    door = door_reach.get((role, t), "none")
+                    truth = max(truth, door, key=_MXD_RANK.__getitem__)
+                elif row.command == "INSERT":
+                    ins = f"INSERT INTO {t} (id, tenant_id, owner_name) VALUES "
+                    good = _mxd_run(pg_conn, db, ins + "(100, 'a', current_user)")[0]
+                    bad = _mxd_run(pg_conn, db, ins + "(101, 'zzz', 'nobody')")[0]
+                    truth = "all" if good and bad else ("some" if good or bad else "none")
+                else:
+                    stmt = (f"UPDATE {t} SET note = 'x'" if row.command == "UPDATE"
+                            else f"DELETE FROM {t}")
+                    truth = reach(*_mxd_run(pg_conn, db, stmt), total)
+                if _MXD_VERDICT_RANK[cell.verdict] != _MXD_RANK[truth]:
+                    wrong.append((t, row.command, role, cell.verdict, truth))
+        assert wrong == [], wrong
+        # Not vacuous: every verdict a live schema can produce shows up.
+        seen = {c.verdict for r in m.rows for c in r.cells}
+        assert seen == {"open", "conditional", "denied"}, seen
+
+        # The sensitive-columns section lists exactly what each role can read.
+        readable = set()
+        for role in roles:
+            for relation, base in [(t, t) for t in totals] + list(_MXD_DOORS.items()):
+                for col in ("email", "ssn"):
+                    ok, n = _mxd_run(pg_conn, as_db.get(role, role),
+                                     f"SELECT count({col}) FROM {relation}")
+                    if ok and n:
+                        readable.add((role, base, col))
+        assert {(e.role, e.table, e.column) for e in m.exposures} == readable
+    finally:
+        # Roles are cluster-wide (two carry SUPERUSER / BYPASSRLS, which later
+        # tests would see): drop every one that exists. DROP OWNED has no
+        # IF EXISTS, and a failed DDL batch rolls back as one transaction.
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public")
+            cur.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)",
+                        (list(_MXD_ROLES),))
+            existing = [r[0] for r in cur.fetchall()]
+            if existing:
+                cur.execute("DROP OWNED BY " + ", ".join(existing))
+                cur.execute("DROP ROLE " + ", ".join(existing))
