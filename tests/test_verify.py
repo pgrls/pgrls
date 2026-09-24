@@ -4254,18 +4254,22 @@ def test_escalation_noinherit_policy_does_not_cede_the_function(
 def test_policy_applicability_noinherit_matches_live_anon_session(
     pg_url: str, pg_conn: psycopg.Connection
 ) -> None:
-    """Every verdict grounded in what a live anonymous session reads. anon is a
-    NOINHERIT member of `noinh_grp`, whose `USING (true)` policy therefore
-    never applies to it: the direct read is empty, while a definer view and a
-    SECURITY DEFINER function over the table both return every row."""
+    """Every verdict grounded in what a live anonymous session reads. The anon
+    role is a NOINHERIT member of `noinh_grp` — through the role attribute, so
+    the test runs on PG15 too, which has no per-grant INHERIT option — and so
+    the `USING (true)` policy on `noinh_grp` never applies to it: the direct
+    read is empty, while a definer view and a SECURITY DEFINER function over
+    the table both return every row. Roles are cluster-wide; every one this
+    test creates, it drops."""
+    anon = {"noinh_anon"}
     with pg_conn.cursor() as cur:
-        for role in ("anon", "noinh_grp", "noinh_owner"):
-            cur.execute(
-                f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE "
-                f"rolname='{role}') THEN CREATE ROLE {role} NOLOGIN NOSUPERUSER "
-                f"NOBYPASSRLS; END IF; END $$;"
-            )
-        cur.execute("GRANT noinh_grp TO anon WITH INHERIT FALSE;")
+        cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
+        cur.execute(
+            "CREATE ROLE noinh_anon NOLOGIN NOINHERIT;"
+            "CREATE ROLE noinh_grp NOLOGIN;"
+            "CREATE ROLE noinh_owner NOLOGIN;"
+            "GRANT noinh_grp TO noinh_anon;"
+        )
     try:
         with pg_conn.cursor() as cur:
             cur.execute(
@@ -4274,10 +4278,10 @@ def test_policy_applicability_noinherit_matches_live_anon_session(
                 "ALTER TABLE t OWNER TO noinh_owner;"
                 "ALTER TABLE t ENABLE ROW LEVEL SECURITY;"
                 "CREATE POLICY p ON t FOR SELECT TO noinh_grp USING (true);"
-                "GRANT SELECT ON t TO anon;"
+                "GRANT SELECT ON t TO noinh_anon;"
                 "CREATE VIEW v AS SELECT * FROM t;"
                 "ALTER VIEW v OWNER TO noinh_owner;"
-                "GRANT SELECT ON v TO anon;"
+                "GRANT SELECT ON v TO noinh_anon;"
                 "CREATE FUNCTION f() RETURNS SETOF t LANGUAGE sql SECURITY DEFINER "
                 "  SET search_path = pg_catalog, pg_temp AS 'SELECT * FROM public.t';"
                 "ALTER FUNCTION f() OWNER TO noinh_owner;"
@@ -4289,7 +4293,7 @@ def test_policy_applicability_noinherit_matches_live_anon_session(
             ("function", "SELECT count(*) FROM f()"),
         ):
             with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
-                cur.execute("SET LOCAL ROLE anon;")
+                cur.execute("SET LOCAL ROLE noinh_anon;")
                 cur.execute(query)
                 observed[label] = cur.fetchone()[0]
                 conn.rollback()
@@ -4297,13 +4301,13 @@ def test_policy_applicability_noinherit_matches_live_anon_session(
         assert observed == {"direct": 0, "view": 2, "function": 2}, observed
 
         schema = introspect(pg_conn, schemas=["public"])
-        assert _verdict(build_verification(schema, mode="anon"), "public.t") == "isolated"
-        assert [t.verdict for t in build_verification(schema, mode="reachability").tables] == [
-            "leak"
-        ]
-        [esc] = build_verification(schema, mode="escalation").tables
+        v_anon = build_verification(schema, mode="anon", anon_roles=anon)
+        assert _verdict(v_anon, "public.t") == "isolated"
+        reach = build_verification(schema, mode="reachability", anon_roles=anon)
+        assert [t.verdict for t in reach.tables] == ["leak"]
+        [esc] = build_verification(schema, mode="escalation", anon_roles=anon).tables
         assert (esc.qualified_name, esc.verdict) == ("public.f", "leak")
     finally:
         with pg_conn.cursor() as cur:
             cur.execute("DROP FUNCTION IF EXISTS f(); DROP VIEW IF EXISTS v; DROP TABLE IF EXISTS t;")
-            cur.execute("REVOKE noinh_grp FROM anon;")
+            cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
