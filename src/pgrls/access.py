@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from pgrls.ast_utils import flatten_or_disjuncts, is_literal_true, parse_expr
@@ -313,10 +314,12 @@ def _policy_applies(
     return None if not complete else False
 
 
+@lru_cache(maxsize=4096)
 def _clause_is_open(clause: str) -> bool:
     """Whether a present clause imposes no restriction: a literal ``true``
     among its top-level OR disjuncts. Lexical — ``1 = 1`` is not recognised
-    and stays a predicate."""
+    and stays a predicate. Cached: the same clause is judged for every role,
+    command and door owner, and parsing dominates a large matrix."""
     node = parse_expr(clause)
     if node is None:
         return False
