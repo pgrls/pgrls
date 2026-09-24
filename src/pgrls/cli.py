@@ -4126,8 +4126,8 @@ def report(
     default=None,
     help=(
         "Comma-separated roles to show as columns (overrides auto-discovery). "
-        "Default: every role that reaches at least one table, plus PUBLIC and, "
-        "when they exist, anon and authenticated."
+        "Default: PUBLIC, anon and authenticated when they exist, and every "
+        "role whose reach differs from PUBLIC's."
     ),
 )
 @click.option(

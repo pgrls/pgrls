@@ -35,9 +35,23 @@ breaking changes — they will be called out in this file.
   `pg_catalog.`-qualified, but `query_to_xml('SELECT * FROM public.secrets', …)`
   and `table_to_xml` run SQL, or read a relation, named by an argument —
   measured, each handed every row of a `FORCE`d table to its caller. Those
-  built-ins (the `*_to_xml` family, `cursor_to_xml`, `ts_stat`) and
-  `set_config` of `search_path` or the role now make a body opaque
-  (UNVERIFIED). A `set_config` of any other setting no longer does.
+  built-ins (the `*_to_xml` family, `cursor_to_xml`, `ts_stat`, and
+  `ts_rewrite`, whose second argument is a query) now make a body opaque
+  (UNVERIFIED), and so does an operator Postgres does not ship, or one
+  schema-qualified outside `pg_catalog` (measured: `1 OPERATOR(public.===) 2`
+  in a SECURITY DEFINER body ran the function behind the operator as the
+  function's owner).
+- **`verify --mode escalation`: a SECURITY DEFINER function that sets a
+  parameter is no longer judged under the caller's settings.** A `SET` /
+  `SET LOCAL` or `set_config` in the body, or a `SET` clause on the function
+  itself, picks the tenant id or JWT claims the owner's policies then filter
+  by (measured: setting `request.jwt.claims` before a read returned another
+  user's row). A `SET` statement in the body was skipped, a
+  `pg_catalog.`-qualified `set_config` was trusted, and a function whose owner
+  is neither RLS-exempt nor granted rows under the anonymous context was not
+  considered at all ("no reachable escalation paths"). Such a function is now
+  a candidate and UNVERIFIED, and so is a body with any statement that is not
+  a query or DML — a `DO`, a `CALL`.
 - **SQL-standard function bodies are deparsed schema-qualified, and a `RETURN`
   body parses.** A `BEGIN ATOMIC` or `RETURN` body is stored parsed and was
   deparsed relative to the introspecting session's `search_path`, so
@@ -73,15 +87,23 @@ breaking changes — they will be called out in this file.
     view).
   - A SECURITY DEFINER function runs as its owner, statement by statement:
     each `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` in its body opens
-    that command, and PL/pgSQL bodies are traced as well as SQL ones.
+    that command (a `TRUNCATE … CASCADE` also on the tables that reference
+    the truncated one), and PL/pgSQL bodies are traced as well as SQL ones.
   - A SECURITY DEFINER trigger runs as its owner for anyone who can fire it —
-    by writing its table, with no `EXECUTE` check (measured: a role holding
-    only `INSERT` on one table emptied another through an `AFTER INSERT`
-    trigger). A trigger function cannot be called, so `EXECUTE` on one opens
-    nothing.
-  - A rewrite rule runs its actions as the relation's owner for anyone who
-    writes the relation (measured: `ON INSERT … DO ALSO DELETE FROM archive`
-    emptied a table the inserting role could not touch).
+    by writing its table, directly or through another door, with no `EXECUTE`
+    check (measured: a role holding only `INSERT` on one table emptied another
+    through an `AFTER INSERT` trigger). A statement trigger fires on the
+    privilege alone, even when no row gets through. A `BEFORE INSERT` row
+    trigger runs before the `WITH CHECK`, and one that returns NULL skips the
+    check while its own writes stand (measured). Other row triggers need a
+    row the policies admit. A partition fires its ancestors' row triggers,
+    which Postgres clones to it, but not their statement triggers. A trigger
+    function cannot be called, so `EXECUTE` on one opens nothing.
+  - A rewrite rule runs its actions with the relation owner's privileges and
+    policies for anyone who writes the relation, directly or through a door
+    (measured: `ON INSERT … DO ALSO DELETE FROM archive` emptied a table the
+    inserting role could not touch, both ways). Inside the action,
+    `current_user` is still the writer.
   - A partitioned or inheritance parent applies its own policies to its
     children's rows (measured: a partition with no grant and `FORCE`d RLS was
     read, updated, deleted and truncated through its parent).
@@ -91,10 +113,15 @@ breaking changes — they will be called out in this file.
     so those cells are `UNDECIDED`.
 
   Doors, and the other end of a door, are found in every schema; the grid
-  rows are the tables in `--schemas`. A door can only widen a cell.
+  rows are the tables in `--schemas`. A door can only widen a cell. A door
+  whose body sets a parameter (a `SET`, a `set_config`, or a `SET` clause on
+  the function) runs its filters on values it chose, so its filtered cells
+  are `UNDECIDED`.
 - **Untraced doors are listed.** A function, trigger or rule whose SQL cannot
   be traced — dynamic SQL, another language, a call into a function pgrls
-  cannot see, a `DO` / `CALL` / `SET search_path` — is listed in its own
+  cannot see, a built-in that runs SQL named by an argument (`query_to_xml`,
+  `ts_rewrite`), an operator backed by a user function, a `DO` / `CALL` /
+  `SET search_path` — is listed in its own
   section with who can open it (a function's `EXECUTE` holders, or the write
   that fires a trigger or rule), rather than attributed to a table: a `DENIED`
   cell does not rule it out. JSON always carries `untraced_doors`, empty when
@@ -109,9 +136,11 @@ breaking changes — they will be called out in this file.
   the grid; JSON always carries `sensitive_exposures`, empty when there is
   nothing to report.
 - **An `UNDECIDED` verdict** for rows that cannot be bounded: a materialized
-  view over the table, a foreign-key action, two different filtered paths whose
-  union is unknown, or — for a schema built without a role-membership graph —
-  memberships that were not captured. It replaces a `DENIED` or a `COND` that
+  view over the table, a foreign-key action, a door whose body sets a
+  parameter, two different filtered paths whose union is unknown (including
+  the same filter run as two different users, when it reads `current_user` or
+  checks a privilege), or — for a schema built without a role-membership
+  graph — memberships that were not captured. It replaces a `DENIED` or a `COND` that
   would have been a guess in the unsafe direction. The JSON `summary` gains an
   `undecided` count.
 - `pgrls matrix` honours the predefined data roles: `pg_read_all_data` confers
@@ -121,8 +150,8 @@ breaking changes — they will be called out in this file.
 ### Changed
 - **`pgrls matrix`'s default columns** are `PUBLIC`, `anon` and
   `authenticated` when they exist, and every role whose reach differs from
-  `PUBLIC`'s — a cell with another verdict or predicate, or an untraced door
-  `PUBLIC` cannot open. Previously a role appeared only when a grant or policy
+  `PUBLIC`'s — a cell with another verdict or predicate, a sensitive column
+  `PUBLIC` cannot read, or an untraced door `PUBLIC` cannot open. Previously a role appeared only when a grant or policy
   named it or it was exempt from RLS, so owners, members of a granted group,
   data-role members and door users had no column, and `anon` /
   `authenticated` appeared on clusters that have no such roles.
@@ -136,7 +165,8 @@ breaking changes — they will be called out in this file.
   `can_login`, `superuser`, `bypassrls` — so a snapshot of a live database
   now lists every role in the cluster) and `rules` (INSERT / UPDATE / DELETE
   rewrite rules); `views[].updatable`; `security_definer_functions[].definition`
-  (PL/pgSQL) and `.trigger`; `triggers[].row`; and
+  (PL/pgSQL), `.trigger` and `.config_gucs` (the parameters its `SET` clauses
+  change); `triggers[].row`; and
   `foreign_keys[].on_delete` / `.on_update`. Additive: v3–v26 files still
   load, and a missing key decodes as "not captured", never as "no roles
   exist" or "not writable".

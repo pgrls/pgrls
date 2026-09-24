@@ -1137,6 +1137,17 @@ def _extract_search_path(config: list[str] | None) -> str | None:
     return None
 
 
+def _extract_config_gucs(config: list[str] | None) -> tuple[str, ...]:
+    """The parameters a function's `SET` clauses change, other than
+    search_path, lowercased and sorted."""
+    names = {
+        name.strip().lower()
+        for name, sep, _ in (entry.partition("=") for entry in config or ())
+        if sep and name.strip().lower() != "search_path"
+    }
+    return tuple(sorted(names))
+
+
 def _fetch_secdef_functions(
     cur: Any, schemas: list[str]
 ) -> tuple[SecdefFunction, ...]:
@@ -1185,6 +1196,7 @@ def _fetch_secdef_functions(
             owner=row["owner_name"] or "",
             definition=row["definition"],
             trigger=bool(row["is_trigger"]),
+            config_gucs=_extract_config_gucs(row["config"]),
         )
         for row in rows
     )
@@ -1197,10 +1209,16 @@ def _empty_search_path(cur: Any) -> Iterator[None]:
     cur.execute("SELECT pg_catalog.current_setting('search_path') AS sp")
     saved = cur.fetchone()["sp"]
     cur.execute("SELECT pg_catalog.set_config('search_path', '', false)")
+    ok = False
     try:
         yield
+        ok = True
     finally:
-        cur.execute("SELECT pg_catalog.set_config('search_path', %s, false)", (saved,))
+        # After a failure the transaction is aborted: a restore would raise
+        # "current transaction is aborted" and hide the real error, and the
+        # path change rolls back with the transaction anyway.
+        if ok or cur.connection.info.transaction_status != psycopg.pq.TransactionStatus.INERROR:
+            cur.execute("SELECT pg_catalog.set_config('search_path', %s, false)", (saved,))
 
 
 _RULES_SQL = """

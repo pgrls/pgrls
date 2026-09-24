@@ -115,9 +115,9 @@ class Exposure:
     reach that column (a column grant elsewhere), the column's own reach may be
     narrower. `via` names how, crediting only the paths that reach this
     column: a grant, ownership, a data role, a definer view, a SECURITY DEFINER
-    function, or a parent. A door is credited with every column of the table —
-    column lineage through a view or a function is not traced — which is an
-    over-report, the safe direction for an audit.
+    function or trigger, a rewrite rule, or a parent. A door is credited with
+    every column of the table — column lineage through a view or a function
+    is not traced — which is an over-report, the safe direction for an audit.
     """
 
     role: str
@@ -213,12 +213,15 @@ def build_matrix(
     function's, trigger's or rule's target. `roles` fixes the columns.
     Otherwise every candidate is analysed and the columns are PUBLIC; anon and
     authenticated when they exist; and every other role whose reach DIFFERS
-    from PUBLIC's in the grid — a cell with another verdict or predicate, or an
-    untraced door PUBLIC cannot open. A role that can do exactly what everyone
+    from PUBLIC's in the grid — a cell with another verdict or predicate, a
+    sensitive column PUBLIC cannot read, or an untraced door PUBLIC cannot
+    open. A role that can do exactly what everyone
     can adds nothing (measured: one PUBLIC-executable helper function made
     every role in a Supabase cluster a column). `pg_*` roles are left out
     unless `include_system`. Rows are sorted by (table, command).
-    `sensitive_patterns` extends SEC045's defaults, as its config does.
+    `sensitive_patterns` replaces SEC045's default patterns; `pgrls matrix`
+    passes the defaults plus `[lint.rules.SEC045].patterns`, as SEC045 reads
+    its own config.
 
     Role attributes come from `schema.roles` (live introspection) or, without
     it, from `bypassrls_roles`. A schema from an offline source carries
@@ -242,6 +245,10 @@ def build_matrix(
         reaches[name] = role_reach(schema, role, closure, attrs, cache)
     public = reaches["PUBLIC"]
     public_untraced = {(u.door, u.reason) for u in public.untraced}
+    patterns = sensitive_patterns or _DEFAULT_PATTERNS
+    exposed: dict[str, set[tuple[str, str, str]]] = {}
+    for e in _exposures(shown, tuple(reaches), reaches, patterns):
+        exposed.setdefault(e.role, set()).add((e.table, e.column, e.verdict))
 
     def differs(name: str) -> bool:
         mine = reaches[name]
@@ -251,6 +258,10 @@ def build_matrix(
                 b = public.cells[(t.qualified_name, command)]
                 if (a.verdict, a.predicate) != (b.verdict, b.predicate):
                     return True
+        # A column grant can leave every cell as PUBLIC's while the role reads
+        # a sensitive column PUBLIC cannot (measured: `ssn`).
+        if exposed.get(name, set()) != exposed.get("PUBLIC", set()):
+            return True
         return bool({(u.door, u.reason) for u in mine.untraced} - public_untraced)
 
     role_list = tuple(n for n in candidates if n in always or differs(n))
@@ -266,8 +277,8 @@ def build_matrix(
     return Matrix(
         roles=role_list,
         rows=tuple(rows),
-        exposures=_exposures(shown, role_list, reaches,
-                             sensitive_patterns or _DEFAULT_PATTERNS),
+        exposures=tuple(e for e in _exposures(shown, tuple(reaches), reaches, patterns)
+                        if e.role in role_list),
         untraced=_untraced(candidates, reaches),
     )
 

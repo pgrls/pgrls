@@ -1860,6 +1860,223 @@ def test_updatable_bits_decode_to_commands() -> None:
     assert _updatable_commands(None) == ()
 
 
+# --- review iteration 3: what fires a trigger or rule, run-time settings -------
+
+
+def _btrg(fn: str, event: str, *, timing: str = "AFTER", row: bool | None = True,
+          name: str = "tr", enabled: bool = True) -> Trigger:
+    schema, _, fname = fn.partition(".")
+    return Trigger(name=name, function_schema=schema, function_name=fname, event=event,
+                   timing=timing, enabled=enabled, row=row)
+
+
+@pytest.mark.parametrize(("timing", "fires"), [("BEFORE", True), ("AFTER", False)])
+def test_a_before_row_insert_trigger_fires_even_when_rls_refuses_the_row(
+    timing: str, fires: bool
+) -> None:
+    """Measured: a BEFORE INSERT row trigger ran — and, returning NULL, its
+    writes stood — although RLS refused the INSERT itself. An AFTER trigger
+    never sees a refused row."""
+    secrets = _t("secrets")
+    inbox = _with(_t("inbox", force=True, grants=(_grant("app", ("INSERT",)),),
+                     policies=(_policy(command="SELECT", roles=("PUBLIC",), using="true"),)),
+                  triggers=(_btrg("public.trgfn", "INSERT", timing=timing),))
+    m = build_matrix(_s([secrets, inbox], fns=[_tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert (_cell(m, "public.secrets", "DELETE", "app").verdict == "open") is fires
+
+
+def test_a_statement_trigger_fires_through_a_door_that_reaches_no_row() -> None:
+    """A SECURITY DEFINER function's DELETE on a table whose RLS admits its
+    owner no row still fires that table's statement trigger."""
+    secrets = _t("secrets")
+    queue = _with(_t("queue", owner="fo", force=True),
+                  triggers=(_btrg("public.trgfn", "DELETE", row=False),))
+    f = _f("DELETE FROM public.queue", owner="fo")
+    m = build_matrix(_s([secrets, queue], fns=[f, _tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("fo"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+def test_a_row_moving_update_fires_the_destinations_insert_trigger() -> None:
+    secrets = _t("secrets")
+    parent = _t("p", rls=False, grants=(_grant("app", ("UPDATE",)),))
+    dest = _with(_t("p_b", rls=False, partition_of=("public", "p")),
+                 triggers=(_btrg("public.trgfn", "INSERT"),))
+    m = build_matrix(_s([secrets, parent, dest], fns=[_tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_a_disabled_trigger_is_no_door(enabled: bool) -> None:
+    secrets = _t("secrets")
+    inbox = _with(_t("inbox", rls=False, grants=(_grant("app", ("INSERT",)),)),
+                  triggers=(_btrg("public.trgfn", "INSERT", enabled=enabled),))
+    m = build_matrix(_s([secrets, inbox], fns=[_tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert (_cell(m, "public.secrets", "DELETE", "app").verdict == "open") is enabled
+
+
+def test_a_trigger_of_unknown_level_fires_on_the_privilege() -> None:
+    """Pre-v27 snapshots carry no level; the wider reading is the safe one."""
+    secrets = _t("secrets")
+    inbox = _with(_t("inbox", force=True, grants=(_grant("app", ("DELETE",)),)),
+                  triggers=(_btrg("public.trgfn", "DELETE", row=None),))
+    m = build_matrix(_s([secrets, inbox], fns=[_tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+def test_a_rule_fires_for_a_door_that_writes_its_relation() -> None:
+    """Measured: a SECURITY DEFINER function inserting into `requests` emptied
+    `archive` through the rule, for a caller with no privilege on either. The
+    rule's actions run as `requests`' owner, who owns `archive` too."""
+    archive = _t("archive")
+    requests = _t("requests", rls=False, grants=(_grant("fo", ("INSERT",)),))
+    f = _f("INSERT INTO public.requests (id) VALUES (1)", owner="fo")
+    s = Schema(tables=(archive, requests), security_definer_functions=(f,),
+               roles=(_r("app"), _r("fo"), _r("own")), role_memberships=(),
+               rules=(_rule("requests", "INSERT", "DELETE FROM public.archive"),))
+    c = _cell(build_matrix(s, roles=("app",)), "public.archive", "DELETE", "app")
+    assert c.verdict == "open" and "rule r_requests on public.requests" in (c.note or "")
+
+
+def test_a_long_trigger_chain_reaches_its_end() -> None:
+    """Measured: a chain one step longer than the table count stopped short.
+    The loop runs until nothing changes."""
+    a, b, secrets = _t("a", rls=False, grants=(_grant("app", ("INSERT",)),)), _t("b"), _t("secrets")
+    a = _with(a, triggers=(_btrg("public.f1", "INSERT", name="t1"),
+                           _btrg("public.f3", "UPDATE", name="t3"),
+                           _btrg("public.f5", "DELETE", name="t5")))
+    b = _with(b, triggers=(_btrg("public.f2", "INSERT", name="t2"),
+                           _btrg("public.f4", "UPDATE", name="t4"),
+                           _btrg("public.f6", "DELETE", name="t6")))
+    fns = [
+        _tf("INSERT INTO public.b (id) VALUES (1)", name="public.f1"),
+        _tf("UPDATE public.a SET note = 'x'", name="public.f2"),
+        _tf("UPDATE public.b SET note = 'x'", name="public.f3"),
+        _tf("DELETE FROM public.a", name="public.f4"),
+        _tf("DELETE FROM public.b", name="public.f5"),
+        _tf("DELETE FROM public.secrets", name="public.f6"),
+    ]
+    m = build_matrix(_s([a, b, secrets], fns=fns, roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+def test_truncate_cascade_in_a_body_empties_what_references_the_table() -> None:
+    parent = _t("parent")
+    child = _with(_t("child"), foreign_keys=(ForeignKey(
+        "fk", ("pid",), "public", "parent", ("id",), "NO ACTION", "NO ACTION"),))
+    f = _f("TRUNCATE public.parent CASCADE", owner="own")
+    m = build_matrix(_s([parent, child], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.child", "TRUNCATE", "app").verdict == "open"
+
+
+def test_a_role_that_differs_only_in_a_sensitive_column_is_shown() -> None:
+    """Measured: a column grant on `ssn` left every cell equal to PUBLIC's,
+    and the role — and its exposure — were hidden."""
+    t = Table(schema="public", name="people", rls_enabled=False, force_rls=False,
+              policies=(), owner="own", columns=("id", "ssn"),
+              grants=(_grant("PUBLIC", ("SELECT",)),),
+              column_grants=(ColumnGrant(role="hr", column="ssn", privileges=("SELECT",)),))
+    t = _with(t, grants=(), column_grants=(
+        ColumnGrant(role="PUBLIC", column="id", privileges=("SELECT",)),
+        ColumnGrant(role="hr", column="ssn", privileges=("SELECT",)),
+    ))
+    m = build_matrix(_s([t], roles=[_r("hr"), _r("own")]))
+    assert "hr" in m.roles
+    assert ("hr", "ssn") in {(e.role, e.column) for e in m.exposures}
+
+
+@pytest.mark.parametrize("setter", [
+    "SELECT set_config('app.tenant', 'b', true);",
+    "SELECT pg_catalog.set_config('app.tenant', 'b', true);",
+    "SET LOCAL app.tenant = 'b';",
+])
+def test_a_body_that_sets_a_parameter_has_unbounded_rows(setter: str) -> None:
+    """Measured: setting the parameter a policy reads, then reading, returned
+    another tenant's row. The owner's filter no longer bounds what it gets."""
+    t = _t(policies=(_policy(roles=("PUBLIC",), using="tenant_id = current_setting('app.tenant', true)"),),
+           grants=(_grant("fo", ("SELECT",)),), force=True)
+    f = _f(f"{setter} SELECT * FROM public.t", owner="fo")
+    m = build_matrix(_s([t], fns=[f], roles=[_r("app"), _r("fo"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.t", "SELECT", "app")
+    assert c.verdict == "undecided" and "sets configuration parameters" in (c.note or "")
+    assert m.untraced == ()
+
+
+def test_a_function_set_clause_has_unbounded_rows() -> None:
+    t = _t(policies=(_policy(roles=("PUBLIC",), using="tenant_id = current_setting('app.tenant', true)"),),
+           grants=(_grant("fo", ("SELECT",)),), force=True)
+    f = SecdefFunction(qualified_name="public.f", body="SELECT * FROM public.t", language="sql",
+                       owner="fo", execute_roles=("PUBLIC",), config_gucs=("app.tenant",))
+    m = build_matrix(_s([t], fns=[f], roles=[_r("app"), _r("fo"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "undecided"
+
+
+@pytest.mark.parametrize("setter", [
+    "SET search_path = b;", "SET ROLE other;", "SET SESSION AUTHORIZATION other;",
+    "SELECT set_config('search_path', 'b', true);", "SELECT set_config('role', 'x', true);",
+])
+def test_changing_name_resolution_or_the_role_is_untraced(setter: str) -> None:
+    f = _f(f"{setter} SELECT * FROM public.t", owner="own")
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert any("search_path or the role" in u.reason for u in m.untraced), m.untraced
+
+
+@pytest.mark.parametrize("call", [
+    "pg_catalog.ts_rewrite('a'::tsquery, 'SELECT 1')",
+    "pg_catalog.ts_stat('SELECT 1')",
+])
+def test_every_sql_running_builtin_is_untraced(call: str) -> None:
+    f = _f(f"SELECT {call}", owner="own")
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert any("does not see into" in u.reason for u in m.untraced), m.untraced
+
+
+@pytest.mark.parametrize(("expr", "untraced"), [
+    ("1 OPERATOR(public.===) 2", True),
+    ("1 === 2", True),
+    ("1 OPERATOR(pg_catalog.=) 1", False),
+    ("'x' ->> 'y' = 'z'", False),
+])
+def test_a_user_operator_is_untraced(expr: str, untraced: bool) -> None:
+    """Measured: an operator whose function deletes from a table emptied it
+    from inside a SECURITY DEFINER body the tracer called clean."""
+    f = _f(f"SELECT {expr}", owner="own")
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert bool(m.untraced) is untraced
+
+
+def test_the_same_session_free_filter_through_a_function_stays_conditional() -> None:
+    """A filter that does not read who is running it admits the same rows in
+    the function's session as in the caller's."""
+    pred = "tenant_id = current_setting('app.tenant', true)"
+    t = _t(grants=(_grant("app", ("SELECT",)), _grant("fo", ("SELECT",))), force=True,
+           policies=(_policy(roles=("PUBLIC",), using=pred),))
+    f = _f("SELECT * FROM public.t", owner="fo")
+    m = build_matrix(_s([t], fns=[f], roles=[_r("app"), _r("fo"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.t", "SELECT", "app")
+    assert c.verdict == "conditional" and c.predicate == pred
+
+
+@pytest.mark.parametrize(("predicate", "dependent"), [
+    ("owner_name = current_user", True),
+    ("owner_name = session_user", True),
+    ("pg_has_role('admin', 'MEMBER')", True),
+    ("has_table_privilege('t', 'SELECT')", True),
+    ("public.is_admin()", True),
+    ("tenant_id = current_setting('app.tenant', true)", False),
+    ("tenant_id = auth.uid()", False),
+    ("((((", True),
+])
+def test_which_filters_depend_on_the_session(predicate: str, dependent: bool) -> None:
+    from pgrls.access import _session_dependent  # noqa: PLC0415
+
+    assert _session_dependent(predicate) is dependent
+
+
 # --- live differential: every cell against a real SET ROLE session ------------
 #
 # Each matrix claim is checked against Postgres itself: the command runs as the

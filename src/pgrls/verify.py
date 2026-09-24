@@ -1977,9 +1977,6 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "array_upper",
     # type / misc (read no user data)
     "pg_typeof", "format_type", "gen_random_uuid",
-    # GUCs: `set_config` of search_path / role is caught before this list
-    # (`_set_config_changes_resolution`); any other setting reads no data.
-    "set_config",
 })
 
 
@@ -1987,47 +1984,84 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
 # range-var walk sees what they read, so a `pg_catalog.` qualification does
 # not make them safe. Measured: `pg_catalog.query_to_xml('SELECT * FROM
 # public.secrets', …)` in a SECURITY DEFINER function handed every row of a
-# FORCE'd table to its caller, and so did `table_to_xml`.
+# FORCE'd table to its caller, and so did `table_to_xml` and the two-argument
+# `ts_rewrite`, whose second argument is a query.
 _SQL_RUNNING_BUILTINS: frozenset[str] = frozenset({
     "query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema",
     "table_to_xml", "table_to_xmlschema", "table_to_xml_and_xmlschema",
     "cursor_to_xml", "cursor_to_xmlschema",
     "schema_to_xml", "schema_to_xmlschema", "schema_to_xml_and_xmlschema",
     "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema",
-    "ts_stat",
+    "ts_stat", "ts_rewrite",
+    # Setting ANY parameter changes what the policies a later statement runs
+    # under admit (a tenant id, the JWT claims), so a body that does it cannot
+    # be judged under the caller's context.
+    "set_config",
 })
-# GUCs that change which relation a later name resolves to, or who runs it.
-_RESOLUTION_GUCS = frozenset({"search_path", "role", "session_authorization"})
+
+# Operator symbols Postgres ships. An operator outside this set, or one
+# qualified with a schema other than pg_catalog, may be backed by a user
+# function (measured: `1 OPERATOR(public.===) 2` in a SECURITY DEFINER body
+# ran the DELETE behind it). A user operator that reuses a built-in symbol on
+# its own type is not caught.
+_BUILTIN_OPERATORS: frozenset[str] = frozenset({
+    "=", "<>", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/", "%", "^", "|/",
+    "||/", "!", "!!", "@", "&", "|", "#", "~", "<<", ">>", "||", "&&", "@>",
+    "<@", "~~", "~~*", "!~~", "!~~*", "~*", "!~", "!~*", "->", "->>", "#>",
+    "#>>", "#-", "?", "?|", "?&", "@@", "@@@", "@?", "<->", "<#>", "<=>",
+    "&<", "&>", "<<|", "|>>", "&<|", "|&>", "?#", "?-", "?-|", "?||", "~=",
+    "<^", ">^", "<<=", ">>=", "-|-", "@-@", "##", "*=", "*<>", "*<", "*>",
+    "*<=", "*>=",
+})
 
 
-def _set_config_changes_resolution(call: Any) -> bool:
-    """Whether a `set_config(name, …)` call may change name resolution or
-    the current role: its name is one of those GUCs, or is not a literal."""
-    from pglast.ast import A_Const, String  # noqa: PLC0415
+def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
+    """Whether one ``FuncCall`` is to something we cannot see through: a
+    built-in that runs SQL or sets a parameter, or a function that is neither
+    a known auth/session function nor a recognized built-in."""
+    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
 
-    args = getattr(call, "args", None) or ()
-    first = args[0] if args else None
-    val = getattr(first, "val", None) if isinstance(first, A_Const) else None
-    if not isinstance(val, String):
+    qualified, bare = func_name_parts(call)
+    if bare in _SQL_RUNNING_BUILTINS:
         return True
-    return str(val.sval).lower() in _RESOLUTION_GUCS
+    fn_schema = qualified.rsplit(".", 1)[0] if qualified and "." in qualified else None
+    return not (
+        qualified in auth_functions
+        or bare in auth_functions
+        or fn_schema in ("pg_catalog", "information_schema")
+        or (fn_schema is None and bare in _SAFE_BUILTIN_FUNCS)
+    )
+
+
+def _opaque_operator(expr: Any) -> bool:
+    """Whether an operator expression may run a user function: its operator
+    is schema-qualified outside pg_catalog, or is not a symbol Postgres ships."""
+    kind = getattr(getattr(expr, "kind", None), "name", "")
+    if kind not in ("AEXPR_OP", "AEXPR_OP_ANY", "AEXPR_OP_ALL"):
+        return False
+    parts = [getattr(p, "sval", None) for p in (getattr(expr, "name", None) or ())]
+    if not parts or any(not isinstance(p, str) for p in parts):
+        return True
+    if len(parts) > 1:
+        return parts[0] != "pg_catalog"
+    return parts[0] not in _BUILTIN_OPERATORS
 
 
 def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     """Whether `stmt` contains a *scalar* function call (a ``FuncCall``, not a
     ``FROM``-clause ``RangeFunction``) to a function we cannot see through — one
-    that is neither a known auth/session function nor a recognized built-in.
-    Such a call may transitively read an RLS table (through the SECDEF owner's
-    bypass) that the range-var walk never surfaces — e.g. ``SELECT get_secret()``
-    or ``SELECT 1 WHERE leaks()`` — so a body containing one is opaque
-    (UNVERIFIED), the same treatment a set-returning function in ``FROM`` already
-    gets. Auth/session calls (``auth.uid()``), ``pg_catalog`` /
-    ``information_schema``-qualified calls, and bare calls to a known built-in
-    (``count``, ``lower`` — see ``_SAFE_BUILTIN_FUNCS``) do not read user tables
-    and so do not, by themselves, force abstention."""
-    from pglast.ast import FuncCall, Node  # noqa: PLC0415
-
-    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
+    that is neither a known auth/session function nor a recognized built-in —
+    or an operator that may be backed by one. Such a call may transitively read
+    an RLS table (through the SECDEF owner's bypass) that the range-var walk
+    never surfaces — e.g. ``SELECT get_secret()`` or ``SELECT 1 WHERE
+    leaks()`` — so a body containing one is opaque (UNVERIFIED), the same
+    treatment a set-returning function in ``FROM`` already gets. Auth/session
+    calls (``auth.uid()``), ``pg_catalog`` / ``information_schema``-qualified
+    calls, and bare calls to a known built-in (``count``, ``lower`` — see
+    ``_SAFE_BUILTIN_FUNCS``) do not read user tables and so do not, by
+    themselves, force abstention — except the built-ins that run SQL or set a
+    parameter (``_SQL_RUNNING_BUILTINS``)."""
+    from pglast.ast import A_Expr, FuncCall, Node  # noqa: PLC0415
 
     found = False
 
@@ -2039,33 +2073,58 @@ def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -
             for item in n:
                 walk(item)
             return
-        if isinstance(n, FuncCall):
-            qualified, bare = func_name_parts(n)
-            if bare in _SQL_RUNNING_BUILTINS or (
-                bare == "set_config" and _set_config_changes_resolution(n)
-            ):
-                found = True
-                return
-            fn_schema = (
-                qualified.rsplit(".", 1)[0]
-                if qualified and "." in qualified
-                else None
-            )
-            if not (
-                qualified in auth_functions
-                or bare in auth_functions
-                or fn_schema in ("pg_catalog", "information_schema")
-                or (fn_schema is None and bare in _SAFE_BUILTIN_FUNCS)
-            ):
-                found = True
-                return
-            # A recognized-safe outer call may still wrap an opaque call in its
-            # arguments (``coalesce(get_secret(), 0)``) — keep walking children.
+        if isinstance(n, FuncCall) and _opaque_call(n, auth_functions):
+            found = True
+            return
+        if isinstance(n, A_Expr) and _opaque_operator(n):
+            found = True
+            return
+        # A recognized-safe outer call may still wrap an opaque call in its
+        # arguments (``coalesce(get_secret(), 0)``) — keep walking children.
         if isinstance(n, Node):
             for field_name in n:
                 walk(getattr(n, field_name, None))
 
     walk(stmt)
+    return found
+
+
+def _secdef_sets_parameters(f: Any) -> bool:
+    """Whether `f` runs under settings it chooses: a `SET` clause of its own
+    (`config_gucs`), or a `SET` / `set_config` in its SQL body. Then the
+    owner's policies are evaluated on values the function picked — measured:
+    setting the JWT claims before a read returned another user's row — so
+    what they grant under the anonymous context settles nothing. A PL/pgSQL
+    body is not read here."""
+    if getattr(f, "config_gucs", ()):
+        return True
+    if not _sql_body_parses(f):
+        return False
+    import pglast  # noqa: PLC0415
+    from pglast.ast import FuncCall, Node, VariableSetStmt  # noqa: PLC0415
+
+    from pgrls.ast_utils import func_name_parts, function_body_sql  # noqa: PLC0415
+
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, VariableSetStmt) or (
+            isinstance(n, FuncCall) and func_name_parts(n)[1] == "set_config"
+        ):
+            found = True
+            return
+        if isinstance(n, Node):
+            for field_name in n:
+                walk(getattr(n, field_name, None))
+
+    walk([raw.stmt for raw in pglast.parse_sql(function_body_sql(f.body))])
     return found
 
 
@@ -2089,11 +2148,27 @@ def _secdef_body_unresolved(
     *collides with a base table* shadows it: the body parser then treats a bare
     ref to that name as the CTE, hiding any read of the real table inside the
     CTE definition — a blind spot we cannot reason about, so we abstain."""
+    from pglast.ast import (  # noqa: PLC0415
+        DeleteStmt,
+        InsertStmt,
+        MergeStmt,
+        SelectStmt,
+        TruncateStmt,
+        UpdateStmt,
+    )
+
     from pgrls.ast_utils import extract_range_vars  # noqa: PLC0415
     from pgrls.rules.view004 import _cte_names  # noqa: PLC0415
 
     for raw in parsed:
         stmt = getattr(raw, "stmt", raw)
+        # Only a query or DML can be read. A `SET` / `SET LOCAL` changes
+        # what the policies of a later statement admit (measured: setting
+        # the JWT claims before a read returned another user's row), and a
+        # `DO` or `CALL` runs code we never see.
+        if not isinstance(stmt, (SelectStmt, InsertStmt, UpdateStmt, DeleteStmt,
+                                 MergeStmt, TruncateStmt)):
+            return True
         cte_names = _cte_names(stmt)
         if cte_names & base_bares:
             return True
@@ -2297,6 +2372,7 @@ def _escalation_secdef_findings(
                     for t in schema.tables
                     if t.rls_enabled
                 )
+                or _secdef_sets_parameters(f)
             )
             and (set(f.execute_roles) & _exec_reachable)
         ]
@@ -2354,7 +2430,9 @@ def _escalation_secdef_findings(
                 elif any(s is True for s in launder):
                     kept.add(q)
                     saw_launder = True
-                elif any(s is None for s in exempt + launder):
+                elif any(s is None for s in exempt + launder) or any(
+                    _secdef_sets_parameters(f) for f in candidate
+                ):
                     any_undecided = True
             reads = kept
             inconclusive = any_opaque or any_unseen or any_undecided
@@ -2386,7 +2464,11 @@ def _escalation_secdef_findings(
         elif inconclusive:
             if any_undecided and not (any_opaque or any_unseen):
                 why = (
-                    "reads an RLS table whose policies may or may not admit "
+                    "sets configuration parameters before it reads an RLS "
+                    "table, so the owner's policies run on values the function "
+                    "chose — cannot decide whether the body launders rows"
+                    if any(_secdef_sets_parameters(f) for f in candidate)
+                    else "reads an RLS table whose policies may or may not admit "
                     "rows to the function's owner under the anonymous auth "
                     "context — cannot decide whether the body launders them"
                 )
@@ -2395,10 +2477,11 @@ def _escalation_secdef_findings(
                     "has an opaque body (PL/pgSQL or dynamic SQL)"
                     if any_opaque and not any_unseen
                     else "reads via a view, a function, or a relation outside "
-                    "the analyzed schema"
+                    "the analyzed schema, or runs a statement it cannot judge "
+                    "(SET, DO, CALL)"
                     if any_unseen and not any_opaque
                     else "has an opaque body and reads via an unseen "
-                    "view/function"
+                    "view/function or runs a statement it cannot judge"
                 )
             note = f"{head}, {why} — cannot prove what it reads"
             proof = PolicyProof(qname, "unverified", None, why)

@@ -4,9 +4,12 @@ Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
 Currently version 27. v27 added top-level ``roles`` — the ``pg_roles``
 catalogue, the principal axis of ``pgrls matrix`` (absent → ``None``, "not
-captured", never "no roles exist") — plus ``View.updatable`` (the writes a
-view accepts on its own) and ``SecdefFunction.definition`` (a PL/pgSQL
-function's full CREATE FUNCTION), both absent → ``None``. v26 added ``View.direct_references`` /
+captured", never "no roles exist") — and ``rules`` (INSERT / UPDATE /
+DELETE rewrite rules), plus ``View.updatable`` (the writes a view accepts on
+its own), ``SecdefFunction.definition`` (a PL/pgSQL function's full CREATE
+FUNCTION), ``.trigger`` and ``.config_gucs``, ``Trigger.row``, and
+``ForeignKey.on_delete`` / ``on_update``; an absent optional key decodes as
+``None`` ("not captured"). v26 added ``View.direct_references`` /
 ``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,
 top-level ``set_gucs`` / ``role_set_gucs``, and serialized
 ``role_memberships`` (each edge with its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
@@ -91,7 +94,7 @@ def maybe_set_value(value: str) -> str:
     `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
     return value[len(MAYBE_SET):]
 
-SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls matrix`), View.updatable, SecdefFunction.definition (PL/pgSQL); v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls matrix`) / rules, View.updatable, SecdefFunction.definition (PL/pgSQL) / trigger / config_gucs, Trigger.row, ForeignKey.on_delete / on_update; v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -424,7 +427,11 @@ class View:
     # `pg_relation_is_updatable(oid, false)`: auto-updatable, OR handled by an
     # unconditional INSTEAD rule (measured: a rule-only view reports INSERT);
     # INSTEAD OF triggers are left out. `pgrls matrix` sets rule-handled
-    # commands aside and follows the rule (`Schema.rules`). A write through a
+    # commands aside and follows the rule (`Schema.rules`). A command whose
+    # only INSTEAD rules are conditional is still listed, yet Postgres refuses
+    # every such write ("Views with conditional DO INSTEAD rules are not
+    # automatically updatable"; measured: nothing written either side of the
+    # condition) — so following the rule over-reports it. A write through a
     # `security_invoker = false` view reaches the base table with the view
     # OWNER's privileges and RLS (measured: 0 rows directly, every row through
     # the view). `None` = not captured (an older snapshot, a hand-built view):
@@ -776,6 +783,12 @@ class SecdefFunction:
     # called — `trigger functions can only be called as triggers` — so it is
     # a door only through the triggers that run it, never through EXECUTE.
     trigger: bool = False
+    # v27+: parameters the function's own `SET` clauses change, other than
+    # search_path (`pg_proc.proconfig`). A body that runs under a setting it
+    # chose — a tenant id, the JWT claims — is not filtered the way the
+    # caller's session would be. Emitted only when non-empty, so a pre-v27
+    # snapshot, which never captured it, reads as "no SET clause".
+    config_gucs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -917,9 +930,11 @@ class RewriteRule:
 
 @dataclass(frozen=True)
 class RoleMembership:
-    """A single ``pg_auth_members`` edge: ``member`` is a member of ``role``
-    (``GRANT role TO member``). It holds ``role``'s privileges — and is bound
-    by its policies — only when ``inherit`` is set.
+    """A single membership edge: ``member`` is a member of ``role``
+    (``GRANT role TO member``) — a ``pg_auth_members`` row, or the database
+    owner's implicit membership in ``pg_database_owner``, which has none. It
+    holds ``role``'s privileges — and is bound by its policies — only when
+    ``inherit`` is set.
 
     Postgres applies a policy ``TO R`` to a session iff the session's role
     holds ``R``'s privileges — ``R`` itself or a transitive member through
@@ -1589,6 +1604,7 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         owner=f.get("owner", ""),
         definition=f.get("definition"),  # v27+, PL/pgSQL only
         trigger=bool(f.get("trigger", False)),  # v27+
+        config_gucs=tuple(f.get("config_gucs", [])),  # v27+
     )
 
 
@@ -2133,6 +2149,7 @@ class Schema:
                         else {}
                     ),
                     **({"trigger": True} if f.trigger else {}),
+                    **({"config_gucs": list(f.config_gucs)} if f.config_gucs else {}),
                 }
                 for f in self.security_definer_functions
             ],

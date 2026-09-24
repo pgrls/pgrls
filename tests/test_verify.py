@@ -4311,3 +4311,72 @@ def test_policy_applicability_noinherit_matches_live_anon_session(
         with pg_conn.cursor() as cur:
             cur.execute("DROP FUNCTION IF EXISTS f(); DROP VIEW IF EXISTS v; DROP TABLE IF EXISTS t;")
             cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
+
+
+# --- escalation: bodies whose effect a trace cannot bound ----------------------
+
+
+@requires_z3
+@pytest.mark.parametrize("body", [
+    # Setting the claims or a tenant id changes what the policies of the read
+    # that follows admit (measured: another user's row came back).
+    "SET LOCAL request.jwt.claims = '{}'; SELECT * FROM secret",
+    "SELECT set_config('request.jwt.claims', '{}', true); SELECT * FROM secret",
+    "SELECT pg_catalog.set_config('app.tenant', 'b', true); SELECT * FROM secret",
+    # Built-ins and operators that run code named elsewhere.
+    "SELECT pg_catalog.ts_rewrite('a'::pg_catalog.tsquery, 'SELECT 1') FROM secret",
+    "SELECT 1 OPERATOR(public.===) 2 FROM secret",
+    # Statements that are not a query or DML.
+    "DO $x$ BEGIN PERFORM 1; END $x$; SELECT * FROM secret",
+])
+def test_escalation_body_it_cannot_judge_is_not_ceded(body: str) -> None:
+    """The read table already leaks every row to anon, so a traceable body
+    exposes nothing new and is ceded (ISOLATED) — but not one whose effect
+    the trace cannot bound."""
+    ceded = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    assert [t.verdict for t in build_verification(ceded, mode="escalation").tables] == [
+        "isolated"
+    ]
+    schema = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        security_definer_functions=(_secdef(body),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", (body, t)
+
+
+@requires_z3
+@pytest.mark.parametrize("body", [
+    "SELECT set_config('request.jwt.claims', '{}', true); SELECT * FROM secret",
+    "SET LOCAL app.tenant = 'b'; SELECT * FROM secret",
+])
+def test_escalation_considers_an_ordinary_owner_that_sets_a_parameter(body: str) -> None:
+    """An owner that is neither RLS-exempt nor granted rows under the anonymous
+    context used to be no candidate at all — "no reachable escalation paths"
+    — while the body, choosing the claims, read another user's rows."""
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef(body, bypass=False),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", t
+
+
+@requires_z3
+def test_escalation_names_a_function_set_clause_as_the_reason() -> None:
+    """`ALTER FUNCTION … SET app.tenant = 'b'` makes the body run under a value
+    it chose, though the body itself is a plain traced read."""
+    from dataclasses import replace
+
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            replace(_secdef("SELECT * FROM secret", bypass=False), config_gucs=("app.tenant",)),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", t
+    assert "sets configuration parameters" in t.note, t.note
