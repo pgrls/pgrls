@@ -14,15 +14,20 @@ breaking changes — they will be called out in this file.
 - **`verify`: a policy `TO grp` no longer counts as applying to a
   `NOINHERIT` member of `grp`.** Postgres applies a policy to a session that
   holds the role's privileges (`has_privs_of_role`), which follows `INHERIT`
-  memberships only; `verify` walked every membership edge. Measured on PG16
-  with `GRANT grp TO anon WITH INHERIT FALSE` and a `TO grp USING (true)`
-  policy: anon read 0 rows directly and every row through a definer view and
-  through a SECURITY DEFINER function, while `--mode reachability` and
-  `--mode escalation` both reported PROVEN, "anon already reads those rows
-  directly". Both now report the door as a LEAK. `--mode anon` stops
-  reporting that table as leaking, and a restrictive floor `TO grp` no
-  longer counts as narrowing a `NOINHERIT` member's read. A grant to `grp`
-  no longer makes a view open to a `NOINHERIT` member either, which matches
+  memberships only; `verify` walked every membership edge. Measured on PG16,
+  and the same on PG15 and PG17, with `GRANT grp TO anon WITH INHERIT FALSE`
+  and a `TO grp USING (true)` policy: anon read 0 rows directly and every row
+  through a definer view and through a SECURITY DEFINER function.
+  `--mode reachability` reported the view PROVEN ("the table already leaks
+  every row to anon … the view exposes nothing new"), and `--mode escalation`
+  reported the function PROVEN ("anon already reads those rows directly; the
+  function exposes nothing new"). Both now report a LEAK, and `--mode anon` no
+  longer reports the table itself as leaking. The same rule works the other
+  way for a restrictive floor `TO grp`: it no longer counts as narrowing a
+  `NOINHERIT` member's direct read. So a view over a table anon already reads
+  in full is now ceded to `--mode anon` (PROVEN), instead of being reported as
+  a second LEAK whose message said the direct read was denied. A grant to
+  `grp` no longer makes a view open to a `NOINHERIT` member either, matching
   the `permission denied` Postgres returns.
 
 ## [0.56.0] - 2026-09-16
