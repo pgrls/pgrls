@@ -43,9 +43,15 @@ from pgrls._render_common import (
 )
 from pgrls.ast_utils import is_literal_true
 from pgrls.formatters._common import safe_location
-from pgrls.model import Role, Schema, Table
+from typing import Any
+
+from pgrls.model import Role, Schema, Table, View
 from pgrls.rules.sec045 import _DEFAULT_PATTERNS, _is_pii
-from pgrls.verify import _anon_reachable_roles, _inherit_closure
+from pgrls.verify import (
+    _anon_reachable_roles,
+    _inherit_closure,
+    _role_reads_relation,
+)
 
 PathKind = Literal[
     "superuser",
@@ -55,6 +61,7 @@ PathKind = Literal[
     "grant",
     "public_grant",
     "column_grant",
+    "view",
 ]
 
 RowReach = Literal["all", "filtered", "none", "undecided"]
@@ -76,6 +83,9 @@ class AccessPath:
     kind: PathKind
     via: str | None = None
     columns: tuple[str, ...] | None = None
+    # For a `view` path: every relation walked from the view the principal
+    # opened down to the base table, in order.
+    hops: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,6 +258,180 @@ def _row_reach(
     return "filtered", names, None
 
 
+# One reach result for a (principal, table), before merging: the paths that
+# produce it, the columns they reach (None = every column), and the row reach.
+_Reach = tuple[list[AccessPath], "tuple[str, ...] | None", RowReach, tuple[str, ...], "str | None"]
+
+
+def _owner_as_role(view: View, attrs: dict[str, Role]) -> Role:
+    """The view's owner as a principal. The catalogue is authoritative; without
+    it, fall back to the view's own flags (`owner_bypasses_rls` is set for a
+    superuser OR a BYPASSRLS owner, so split it on `owner_is_superuser`)."""
+    if view.owner in attrs:
+        return attrs[view.owner]
+    return Role(
+        name=view.owner,
+        can_login=False,
+        superuser=view.owner_is_superuser,
+        bypassrls=view.owner_bypasses_rls and not view.owner_is_superuser,
+    )
+
+
+def _view_doors(
+    schema: Schema,
+    role: Role,
+    closure: frozenset[str] | None,
+    attrs: dict[str, Role],
+) -> dict[str, list[_Reach]]:
+    """Base tables `role` reaches THROUGH a definer view, keyed by table.
+
+    Each hop picks its own effective user, exactly as `verify`'s reachability
+    walk (every rule below was measured on PG16 there):
+
+    * a `security_invoker = false` view runs as its OWNER;
+    * a `security_invoker = true` view RESETS the effective user to the session
+      user — the principal — rather than inheriting an enclosing definer;
+    * every hop must be readable by the effective user, or the path is dead
+      (measured: `permission denied for view inner`, no leak);
+    * a materialized-view hop is `undecided`: its rows were captured at REFRESH
+      under the matview owner's RLS context, which is not modeled.
+
+    An invoker chain that reaches a base table adds nothing — that read uses
+    the principal's own privileges, already reported as direct reach. Only a
+    definer hop opens a new door, and its rows are the OWNER's row reach.
+    """
+    views_by_key = {(v.schema, v.name): v for v in schema.views}
+    tables_by_key = {(t.schema, t.name): t for t in schema.tables}
+    found: dict[str, list[_Reach]] = {}
+
+    def record(table: Table, path: AccessPath, rows: RowReach,
+               pols: tuple[str, ...], reason: str | None) -> None:
+        found.setdefault(table.qualified_name, []).append(
+            ([path], None, rows, pols, reason)
+        )
+
+    def caller_reads(rel: Any) -> bool | None:
+        paths, complete = _privilege_paths(schema, role, rel, closure)
+        if paths:
+            return True
+        return None if not complete else False
+
+    def tables_beneath(v: View, seen: frozenset[tuple[str, str]]) -> list[Table]:
+        out: list[Table] = []
+        for ref in v.direct_references or v.references:
+            if ref in seen:
+                continue
+            if ref in tables_by_key:
+                out.append(tables_by_key[ref])
+            elif ref in views_by_key:
+                out.extend(tables_beneath(views_by_key[ref], seen | {ref}))
+        return out
+
+    def undecided(v: View, entry: View, hops: tuple[str, ...], why: str,
+                  seen: frozenset[tuple[str, str]]) -> None:
+        for t in tables_beneath(v, seen):
+            record(
+                t,
+                AccessPath("view", via=entry.qualified_name,
+                           hops=hops + (t.qualified_name,)),
+                "undecided", (), why,
+            )
+
+    def walk(view: View, hops: tuple[str, ...], entry: View,
+             seen: frozenset[tuple[str, str]]) -> None:
+        eff = None if view.security_invoker else view
+        for ref in view.direct_references or view.references:
+            child = views_by_key.get(ref)
+            if child is not None:
+                if ref in seen:
+                    continue
+                readable = (
+                    _role_reads_relation(schema, eff, child)
+                    if eff is not None
+                    else caller_reads(child)
+                )
+                if readable is False:
+                    continue  # broken intermediate hop: dead path
+                child_hops = hops + (child.qualified_name,)
+                if child.is_materialized:
+                    undecided(child, entry, child_hops, (
+                        f"{child.qualified_name} is a materialized view: its rows "
+                        "were captured at REFRESH under its owner's RLS context"
+                    ), seen | {ref})
+                    continue
+                if readable is None:
+                    undecided(child, entry, child_hops, (
+                        "role-membership graph not captured; cannot decide "
+                        f"whether the path can read {child.qualified_name}"
+                    ), seen | {ref})
+                    continue
+                walk(child, child_hops, entry, seen | {ref})
+                continue
+            table = tables_by_key.get(ref)
+            if table is None or eff is None:
+                continue  # unknown relation, or the principal's own direct read
+            path = AccessPath("view", via=entry.qualified_name,
+                              hops=hops + (table.qualified_name,))
+            reads = _role_reads_relation(schema, eff, table)
+            if reads is False:
+                continue  # the owner cannot read it: permission denied
+            if reads is None:
+                record(table, path, "undecided", (), (
+                    f"role-membership graph not captured; cannot decide whether "
+                    f"{eff.owner} can read {table.qualified_name}"
+                ))
+                continue
+            owner = _owner_as_role(eff, attrs)
+            owner_paths, _ = _privilege_paths(
+                schema, owner, table, _inherit_closure(schema, owner.name)
+            )
+            rows, pols, why = _row_reach(schema, owner, table, owner_paths)
+            record(table, path, rows, pols, (
+                f"through definer view {eff.qualified_name}, as its owner "
+                f"{eff.owner}" + (f" — {why}" if why else "")
+            ))
+
+    for v in sorted(schema.views, key=lambda v: v.qualified_name):
+        opens = caller_reads(v)
+        if opens is False:
+            continue
+        start = frozenset({(v.schema, v.name)})
+        if v.is_materialized:
+            undecided(v, v, (v.qualified_name,), (
+                f"{v.qualified_name} is a materialized view: its rows were "
+                "captured at REFRESH under its owner's RLS context"
+            ), start)
+            continue
+        if opens is None:
+            undecided(v, v, (v.qualified_name,), (
+                "role-membership graph not captured; cannot decide whether "
+                f"{role.name} can open {v.qualified_name}"
+            ), start)
+            continue
+        walk(v, (v.qualified_name,), v, start)
+    return found
+
+
+# Widest-first. `undecided` outranks `filtered`: a path we cannot bound might
+# admit every row, and a security report must not let a known partial read
+# mask an unbounded one.
+_ROW_RANK: dict[str, int] = {"all": 3, "undecided": 2, "filtered": 1, "none": 0}
+
+
+def _merge(reaches: list[_Reach]) -> _Reach:
+    paths: list[AccessPath] = []
+    for r in reaches:
+        paths.extend(r[0])
+    cols: tuple[str, ...] | None
+    if any(r[1] is None for r in reaches):
+        cols = None
+    else:
+        cols = tuple(sorted({c for r in reaches for c in (r[1] or ())}))
+    widest = max(reaches, key=lambda r: _ROW_RANK[r[2]])
+    pols = tuple(sorted({p for r in reaches for p in r[3]}))
+    return paths, cols, widest[2], pols, widest[4]
+
+
 def _sensitive(table: Table, columns: tuple[str, ...] | None) -> tuple[str, ...]:
     """The reachable columns whose name matches SEC045's PII patterns."""
     reachable = table.columns if columns is None else columns
@@ -275,35 +459,39 @@ def build_access_map(
         if (principals is None or r.name in principals)
         and (include_nologin or r.can_login or (principals is not None))
     ]
+    attrs = {r.name: r for r in catalogue}
+    tables_by_q = {t.qualified_name: t for t in schema.tables}
     accesses: list[Access] = []
     for role in sorted(chosen, key=lambda r: r.name):
         closure = _inherit_closure(schema, role.name)
-        for table in sorted(schema.tables, key=lambda t: t.qualified_name):
+        per_table: dict[str, list[_Reach]] = {}
+        for table in schema.tables:
             paths, complete = _privilege_paths(schema, role, table, closure)
-            if not paths:
-                if not complete:
-                    accesses.append(
-                        Access(
-                            role.name, table.qualified_name, None, (), "undecided",
-                            reason=(
-                                "role-membership graph not captured; a grant to a "
-                                "role this one inherits cannot be ruled out"
-                            ),
-                        )
-                    )
-                continue
-            rows, policies, reason = _row_reach(schema, role, table, paths)
-            cols = _reachable_columns(paths)
+            if paths:
+                rows, policies, reason = _row_reach(schema, role, table, paths)
+                per_table.setdefault(table.qualified_name, []).append(
+                    (paths, _reachable_columns(paths), rows, policies, reason)
+                )
+            elif not complete:
+                per_table.setdefault(table.qualified_name, []).append((
+                    [], None, "undecided", (),
+                    "role-membership graph not captured; a grant to a role "
+                    "this one inherits cannot be ruled out",
+                ))
+        for qname, reaches in _view_doors(schema, role, closure, attrs).items():
+            per_table.setdefault(qname, []).extend(reaches)
+        for qname in sorted(per_table):
+            paths, cols, rows, policies, reason = _merge(per_table[qname])
             accesses.append(
                 Access(
                     role.name,
-                    table.qualified_name,
+                    qname,
                     cols,
                     tuple(paths),
                     rows,
                     policies,
                     reason,
-                    _sensitive(table, cols),
+                    _sensitive(tables_by_q[qname], cols),
                 )
             )
     return AccessMap(
@@ -330,6 +518,8 @@ def _path_label(p: AccessPath, principal: str) -> str:
         return "PUBLIC grant"
     if p.kind == "column_grant":
         return "column grant" if p.via == principal else f"column grant via {p.via}"
+    if p.kind == "view":
+        return "view " + " → ".join(p.hops) if p.hops else f"view {p.via}"
     return "grant" if p.via == principal else f"grant via {p.via}"
 
 

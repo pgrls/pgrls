@@ -341,3 +341,137 @@ def test_cli_markdown_pluralizes_accesses(tmp_path) -> None:
 def test_cli_role_filter(tmp_path) -> None:
     r = _run(tmp_path, "--role", "app", "--format", "json")
     assert _json.loads(r.stdout)["principals"] == ["app"]
+
+
+# --- reach through views -----------------------------------------------------
+#
+# Every case mirrors a hop rule `verify`'s reachability walk measured on PG16.
+
+from pgrls.model import View  # noqa: E402
+
+
+def _view(
+    name: str,
+    refs: tuple[tuple[str, str], ...],
+    *,
+    owner: str,
+    invoker: bool = False,
+    grants: tuple[Grant, ...] = (),
+    super_: bool = False,
+    brls: bool = False,
+    mat: bool = False,
+) -> View:
+    return View(
+        schema="public", name=name, is_materialized=mat, security_invoker=invoker,
+        security_barrier=False, definition="", references=refs,
+        security_definer_calls=(), grants=grants, owner=owner,
+        owner_bypasses_rls=super_ or brls, direct_references=refs,
+        owner_is_superuser=super_,
+    )
+
+
+_T = (("public", "t"),)
+_ANON_OPENS = (Grant(role="anon", privileges=_SELECT),)
+
+
+def _vschema(tables, views, roles, memberships=()) -> Schema:
+    return Schema(
+        tables=tuple(tables), views=tuple(views), roles=tuple(roles),
+        role_memberships=tuple(memberships),
+    )
+
+
+def test_definer_view_owned_by_a_superuser_hands_over_every_row() -> None:
+    t = _table(policies=(_policy("tenant", "tenant_id = current_setting('app.t', true)"),))
+    v = _view("v", _T, owner="root", super_=True, grants=_ANON_OPENS)
+    a = _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])), "anon")
+    assert a is not None and a.rows == "all"
+    assert a.paths[0].kind == "view" and a.paths[0].hops == ("public.v", "public.t")
+    assert "root" in (a.reason or "")
+
+
+def test_definer_view_runs_under_the_owners_policies() -> None:
+    """An ordinary owner is not exempt: the policies run — against the owner."""
+    t = _table(
+        grants=(Grant(role="svc", privileges=_SELECT),),
+        policies=(_policy("svc_rows", "tenant_id = '1'", roles=("svc",)),),
+    )
+    v = _view("v", _T, owner="svc", grants=_ANON_OPENS)
+    a = _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("svc")])), "anon")
+    assert a is not None and a.rows == "filtered" and a.policies == ("svc_rows",)
+
+
+def test_invoker_view_opens_no_new_door() -> None:
+    t = _table(policies=(_policy("tenant", "tenant_id = '1'"),))
+    v = _view("v", _T, owner="root", super_=True, invoker=True, grants=_ANON_OPENS)
+    assert _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])),
+                 "anon") is None
+
+
+def test_invoker_hop_resets_to_the_session_user_not_the_enclosing_definer() -> None:
+    """Measured: definer(BYPASSRLS owner) → invoker → table returned the
+    policy-filtered row, not every row — the invoker hop does not inherit the
+    definer's owner.
+
+    The definer's owner must be able to READ the table for this to test
+    anything: BYPASSRLS is not a privilege, so without the grant the inherited
+    path would be dead either way and the rule would go unexercised (an earlier
+    version of this test passed with the rule inverted)."""
+    t = _table(
+        grants=(Grant(role="brls", privileges=_SELECT),),
+        policies=(_policy("tenant", "tenant_id = '1'"),),
+    )
+    inner = _view("inner", _T, owner="brls", invoker=True)
+    outer = _view("outer", (("public", "inner"),), owner="brls", brls=True, grants=_ANON_OPENS)
+    amap = build_access_map(
+        _vschema([t], [inner, outer], [_role("anon"), _role("brls", brls=True)])
+    )
+    assert _only(amap, "anon") is None  # the read is anon's own, and anon holds no grant
+
+
+def test_a_hop_the_owner_cannot_read_is_a_dead_path() -> None:
+    """Measured: `permission denied for view inner`, no leak."""
+    t = _table()  # owner "owner"; nobody else granted
+    v = _view("v", _T, owner="nobody", grants=_ANON_OPENS)
+    assert _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("nobody")])),
+                 "anon") is None
+
+
+def test_matview_is_undecided() -> None:
+    t = _table()
+    mv = _view("mv", _T, owner="root", super_=True, mat=True, grants=_ANON_OPENS)
+    a = _only(build_access_map(_vschema([t], [mv], [_role("anon"), _role("root", su=True)])),
+              "anon")
+    assert a is not None and a.rows == "undecided" and "materialized" in (a.reason or "")
+
+
+def test_direct_and_view_reach_merge_widest_first() -> None:
+    t = _table(
+        grants=(Grant(role="anon", privileges=_SELECT),),
+        policies=(_policy("tenant", "tenant_id = current_setting('app.t', true)"),),
+    )
+    v = _view("v", _T, owner="root", super_=True, grants=_ANON_OPENS)
+    a = _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])), "anon")
+    assert a is not None
+    assert a.rows == "all"  # the view's superuser door dominates the filtered direct read
+    assert {p.kind for p in a.paths} == {"grant", "view"}
+
+
+def test_view_door_reports_the_base_tables_sensitive_columns() -> None:
+    """Column lineage through a view is not traced, so a view door reports the
+    base table's sensitive columns as reachable — over-reporting sensitivity is
+    the safe direction; under-reporting it is the failure this command exists
+    to prevent."""
+    t = _table()
+    v = _view("v", _T, owner="root", super_=True, grants=_ANON_OPENS)
+    a = _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])), "anon")
+    assert a is not None and a.columns is None and "email" in a.sensitive
+
+
+def test_view_path_renders_as_a_view_not_a_grant() -> None:
+    from pgrls.access import render_text
+    t = _table()
+    v = _view("v", _T, owner="root", super_=True, grants=_ANON_OPENS)
+    out = render_text(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])))
+    assert "view public.v → public.t" in out
+    assert "grant via public.v" not in out
