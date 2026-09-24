@@ -14,10 +14,11 @@ breaking changes — they will be called out in this file.
 - **`verify`: a policy `TO grp` no longer counts as applying to a
   `NOINHERIT` member of `grp`.** Postgres applies a policy to a session that
   holds the role's privileges (`has_privs_of_role`), which follows `INHERIT`
-  memberships only; `verify` walked every membership edge. Measured on PG16,
-  and the same on PG15 and PG17, with `GRANT grp TO anon WITH INHERIT FALSE`
-  and a `TO grp USING (true)` policy: anon read 0 rows directly and every row
-  through a definer view and through a SECURITY DEFINER function.
+  memberships only; `verify` walked every membership edge. Measured on PG16
+  with `GRANT grp TO anon WITH INHERIT FALSE` and a `TO grp USING (true)`
+  policy (and the same on PG17, and on PG15 with a `NOINHERIT` role, since
+  PG15 has no per-grant INHERIT option): anon read 0 rows directly and every
+  row through a definer view and through a SECURITY DEFINER function.
   `--mode reachability` reported the view PROVEN ("the table already leaks
   every row to anon … the view exposes nothing new"), and `--mode escalation`
   reported the function PROVEN ("anon already reads those rows directly; the
