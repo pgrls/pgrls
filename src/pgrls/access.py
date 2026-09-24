@@ -45,7 +45,7 @@ from pgrls.ast_utils import is_literal_true
 from pgrls.formatters._common import safe_location
 from typing import Any
 
-from pgrls.model import Role, Schema, Table, View
+from pgrls.model import Role, Schema, SecdefFunction, Table, View
 from pgrls.rules.sec045 import _DEFAULT_PATTERNS, _is_pii
 from pgrls.verify import (
     _anon_reachable_roles,
@@ -62,6 +62,7 @@ PathKind = Literal[
     "public_grant",
     "column_grant",
     "view",
+    "function",
 ]
 
 RowReach = Literal["all", "filtered", "none", "undecided"]
@@ -110,6 +111,23 @@ class Access:
 
 
 @dataclass(frozen=True)
+class UnresolvedDoor:
+    """A SECURITY DEFINER function a principal can EXECUTE whose reads cannot
+    be determined — an opaque (PL/pgSQL / dynamic-SQL) body, or one that reads
+    through a view, a function call, or a relation outside the scanned schemas.
+
+    It is a door to UNKNOWN tables, so it is not attributed to any one of
+    them: attributing it to every table would bury the matrix, and dropping it
+    would hide a real door. It is listed on its own instead.
+    """
+
+    principal: str
+    function: str
+    owner: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class AccessMap:
     principals: tuple[str, ...]
     accesses: tuple[Access, ...]
@@ -119,6 +137,7 @@ class AccessMap:
     # False when `schema.role_memberships` was not captured: inherited
     # privileges and policy applicability through membership are unknown.
     graph_complete: bool
+    unresolved: tuple[UnresolvedDoor, ...] = ()
 
 
 def _derived_roles(schema: Schema) -> tuple[Role, ...]:
@@ -412,6 +431,118 @@ def _view_doors(
     return found
 
 
+def _function_doors(
+    schema: Schema,
+    role: Role,
+    closure: frozenset[str] | None,
+    attrs: dict[str, Role],
+) -> tuple[dict[str, list[_Reach]], list[UnresolvedDoor]]:
+    """Tables `role` reaches by EXECUTEing a SECURITY DEFINER function.
+
+    The body runs as the function's OWNER, so the caller reaches whatever the
+    body reads with the owner's privileges and RLS context. Reuses the
+    escalation mode's hardened primitives — the SQL-body parser and the
+    "reads through something we cannot see" check — rather than re-deriving
+    them. Unlike escalation, every base table counts, not only RLS ones: a
+    definer function reading a non-RLS table is still a door for a caller that
+    holds no grant on it.
+
+    EXECUTE is a privilege, so it follows the INHERIT closure; ``PUBLIC`` holds
+    it by default (introspection expands ``acldefault``).
+    """
+    import pglast  # noqa: PLC0415 — heavy parser, only on this path
+
+    from pgrls.ast_utils import function_body_sql  # noqa: PLC0415
+    from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415
+    from pgrls.verify import (  # noqa: PLC0415
+        DEFAULT_AUTH_FUNCTIONS,
+        _secdef_body_unresolved,
+        _sql_body_parses,
+    )
+
+    found: dict[str, list[_Reach]] = {}
+    unresolved: list[UnresolvedDoor] = []
+    tables_by_key = {(t.schema, t.name): t for t in schema.tables}
+    base_quals = set(tables_by_key)
+    base_bares = {t.name for t in schema.tables}
+    bare_to_qual: dict[str, list[tuple[str, str]]] = {}
+    for s, n in sorted(base_quals):
+        bare_to_qual.setdefault(n, []).append((s, n))
+    held = (closure if closure is not None else frozenset({role.name})) | {"PUBLIC"}
+
+    for fn in sorted(schema.security_definer_functions, key=lambda f: f.qualified_name):
+        executors = set(fn.execute_roles)
+        if not (executors & held):
+            if closure is None and executors - {"PUBLIC"}:
+                unresolved.append(UnresolvedDoor(
+                    role.name, fn.qualified_name, fn.owner,
+                    "role-membership graph not captured; cannot decide whether "
+                    f"{role.name} inherits EXECUTE from {', '.join(sorted(executors))}",
+                ))
+            continue
+        owner = _function_owner(fn, attrs)
+        if not _sql_body_parses(fn):
+            unresolved.append(UnresolvedDoor(
+                role.name, fn.qualified_name, fn.owner,
+                f"opaque {fn.language} body — cannot tell which tables it reads",
+            ))
+            continue
+        reads = _secdef_fn_leaks(fn, fn.qualified_name, base_quals, bare_to_qual)
+        parsed = pglast.parse_sql(function_body_sql(fn.body))
+        if _secdef_body_unresolved(parsed, base_quals, base_bares, DEFAULT_AUTH_FUNCTIONS):
+            unresolved.append(UnresolvedDoor(
+                role.name, fn.qualified_name, fn.owner,
+                "reads through a view, a function call, or a relation outside "
+                "the scanned schemas — it may reach more than is listed",
+            ))
+        owner_closure = _inherit_closure(schema, owner.name)
+        shim = _OwnerShim(owner.name, owner.superuser)
+        for qname in sorted(reads):
+            s, _, n = qname.partition(".")
+            table = tables_by_key.get((s, n))
+            if table is None:
+                continue
+            path = AccessPath("function", via=fn.qualified_name)
+            can = _role_reads_relation(schema, shim, table)
+            if can is False:
+                continue  # the body raises `permission denied`: no door
+            if can is None:
+                found.setdefault(qname, []).append(([path], None, "undecided", (), (
+                    f"role-membership graph not captured; cannot decide whether "
+                    f"{owner.name} can read {qname}"
+                )))
+                continue
+            owner_paths, _ = _privilege_paths(schema, owner, table, owner_closure)
+            rows, pols, why = _row_reach(schema, owner, table, owner_paths)
+            found.setdefault(qname, []).append(([path], None, rows, pols, (
+                f"through SECURITY DEFINER {fn.qualified_name}, as its owner "
+                f"{owner.name}" + (f" — {why}" if why else "")
+            )))
+    return found, unresolved
+
+
+@dataclass(frozen=True)
+class _OwnerShim:
+    """What `verify._role_reads_relation` needs of an effective user."""
+
+    owner: str
+    owner_is_superuser: bool
+
+
+def _function_owner(fn: SecdefFunction, attrs: dict[str, Role]) -> Role:
+    if fn.owner in attrs:
+        return attrs[fn.owner]
+    # `owner_bypasses_rls` is superuser OR BYPASSRLS and cannot be split
+    # without the catalogue — so treat it as BYPASSRLS, not superuser: that
+    # still exempts the owner from the policies, but does NOT grant it the
+    # privilege to read everything (which only a superuser has). Claiming
+    # superuser here would invent doors.
+    return Role(
+        name=fn.owner, can_login=False, superuser=False,
+        bypassrls=fn.owner_bypasses_rls,
+    )
+
+
 # Widest-first. `undecided` outranks `filtered`: a path we cannot bound might
 # admit every row, and a security report must not let a known partial read
 # mask an unbounded one.
@@ -462,6 +593,7 @@ def build_access_map(
     attrs = {r.name: r for r in catalogue}
     tables_by_q = {t.qualified_name: t for t in schema.tables}
     accesses: list[Access] = []
+    unresolved: list[UnresolvedDoor] = []
     for role in sorted(chosen, key=lambda r: r.name):
         closure = _inherit_closure(schema, role.name)
         per_table: dict[str, list[_Reach]] = {}
@@ -480,6 +612,10 @@ def build_access_map(
                 ))
         for qname, reaches in _view_doors(schema, role, closure, attrs).items():
             per_table.setdefault(qname, []).extend(reaches)
+        fn_reach, fn_unresolved = _function_doors(schema, role, closure, attrs)
+        for qname, reaches in fn_reach.items():
+            per_table.setdefault(qname, []).extend(reaches)
+        unresolved.extend(fn_unresolved)
         for qname in sorted(per_table):
             paths, cols, rows, policies, reason = _merge(per_table[qname])
             accesses.append(
@@ -499,6 +635,7 @@ def build_access_map(
         accesses=tuple(accesses),
         roles_derived=derived,
         graph_complete=graph_complete,
+        unresolved=tuple(unresolved),
     )
 
 
@@ -520,6 +657,8 @@ def _path_label(p: AccessPath, principal: str) -> str:
         return "column grant" if p.via == principal else f"column grant via {p.via}"
     if p.kind == "view":
         return "view " + " → ".join(p.hops) if p.hops else f"view {p.via}"
+    if p.kind == "function":
+        return f"SECURITY DEFINER {p.via}"
     return "grant" if p.via == principal else f"grant via {p.via}"
 
 
@@ -608,6 +747,16 @@ def render_text(amap: AccessMap) -> str:
         ))
     else:
         lines.append("No principal can read any relation in the scanned schemas.")
+    if amap.unresolved:
+        lines.extend(["", "Functions these principals can execute whose reads cannot be determined:"])
+        lines.extend("  " + ln for ln in render_text_table(
+            ("PRINCIPAL", "FUNCTION", "RUNS AS", "WHY"),
+            [
+                [safe_location(u.principal), safe_location(u.function),
+                 safe_location(u.owner), u.reason]
+                for u in amap.unresolved
+            ],
+        ))
     for c in _caveats(amap):
         lines.extend(["", f"note: {c}"])
     return "\n".join(lines) + "\n"
@@ -640,6 +789,11 @@ def render_json(amap: AccessMap) -> str:
             "roles_derived": amap.roles_derived,
             "graph_complete": amap.graph_complete,
             "accesses": [_access_json(a) for a in amap.accesses],
+            "unresolved_functions": [
+                {"principal": u.principal, "function": u.function,
+                 "owner": u.owner, "reason": u.reason}
+                for u in amap.unresolved
+            ],
         },
         indent=2,
     ) + "\n"
@@ -657,6 +811,12 @@ def render_markdown(amap: AccessMap) -> str:
         f"{pluralize(len(amap.accesses), 'access', 'accesses')}; {len(exposures)} sensitive "
         f"{pluralize(len(exposures), 'column exposure')}."
     )
+    if amap.unresolved:
+        summary += (
+            f"\n\n> **{len(amap.unresolved)} SECURITY DEFINER "
+            f"{pluralize(len(amap.unresolved), 'function')}** can be executed "
+            "but their reads cannot be determined — see `--format json`."
+        )
     for c in _caveats(amap):
         summary += f"\n\n> **Note:** {c}"
     body = [

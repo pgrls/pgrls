@@ -309,7 +309,10 @@ def test_cli_json_contract(tmp_path) -> None:
     r = _run(tmp_path, "--format", "json")
     assert r.exit_code == 0, r.output
     d = _json.loads(r.stdout)
-    assert set(d) == {"principals", "roles_derived", "graph_complete", "accesses"}
+    assert set(d) == {
+        "principals", "roles_derived", "graph_complete", "accesses",
+        "unresolved_functions",
+    }
     # offline SQL carries neither the catalogue nor the membership graph
     assert d["roles_derived"] is True and d["graph_complete"] is False
     anon = next(a for a in d["accesses"] if a["principal"] == "anon"
@@ -475,3 +478,113 @@ def test_view_path_renders_as_a_view_not_a_grant() -> None:
     out = render_text(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])))
     assert "view public.v → public.t" in out
     assert "grant via public.v" not in out
+
+
+# --- reach through SECURITY DEFINER functions --------------------------------
+
+from pgrls.model import SecdefFunction  # noqa: E402
+
+
+def _fn(
+    body: str,
+    *,
+    owner: str,
+    execute: tuple[str, ...] = ("PUBLIC",),
+    lang: str = "sql",
+    name: str = "public.f",
+) -> SecdefFunction:
+    return SecdefFunction(
+        qualified_name=name, body=body, language=lang, owner=owner,
+        execute_roles=execute, owner_bypasses_rls=False,
+    )
+
+
+def _fschema(tables, fns, roles, memberships=()) -> Schema:
+    return Schema(
+        tables=tuple(tables), security_definer_functions=tuple(fns),
+        roles=tuple(roles), role_memberships=tuple(memberships),
+    )
+
+
+def test_secdef_function_owned_by_a_superuser_hands_over_every_row() -> None:
+    t = _table(policies=(_policy("tenant", "tenant_id = current_setting('app.t', true)"),))
+    f = _fn("SELECT * FROM t", owner="root")
+    a = _only(build_access_map(_fschema([t], [f], [_role("anon"), _role("root", su=True)])), "anon")
+    assert a is not None and a.rows == "all"
+    assert a.paths[0].kind == "function" and a.paths[0].via == "public.f"
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("ref", ["t", "public.t"])
+def test_function_door_reaches_a_non_rls_table_too(ref: str) -> None:
+    """Escalation only counts RLS tables; an access map must count every table
+    — a definer function reading a non-RLS table is still a door for a caller
+    holding no grant on it.
+
+    Both reference forms: the body parser resolves a QUALIFIED ref through one
+    table set and a BARE ref through a separate name map, and escalation builds
+    both from RLS tables only. An earlier version of this test used only a bare
+    ref, so restricting the qualified-ref set went unnoticed."""
+    t = _table(rls=False)
+    f = _fn(f"SELECT * FROM {ref}", owner="root")
+    a = _only(build_access_map(_fschema([t], [f], [_role("anon"), _role("root", su=True)])), "anon")
+    assert a is not None and a.rows == "all"
+
+
+def test_no_execute_means_no_function_door() -> None:
+    t = _table()
+    f = _fn("SELECT * FROM t", owner="root", execute=("service_role",))
+    assert _only(build_access_map(
+        _fschema([t], [f], [_role("anon"), _role("root", su=True)])), "anon") is None
+
+
+def test_execute_inherited_through_a_group() -> None:
+    t = _table()
+    f = _fn("SELECT * FROM t", owner="root", execute=("readers",))
+    amap = build_access_map(_fschema(
+        [t], [f], [_role("anon"), _role("readers", login=False), _role("root", su=True)],
+        [RoleMembership(member="anon", role="readers", inherit=True)],
+    ))
+    assert _only(amap, "anon") is not None
+
+
+def test_owner_that_cannot_read_the_table_is_no_door() -> None:
+    """The body raises `permission denied` as its owner — no rows reach the caller."""
+    t = _table()  # owned by "owner"; nobody else granted
+    f = _fn("SELECT * FROM t", owner="nobody")
+    assert _only(build_access_map(
+        _fschema([t], [f], [_role("anon"), _role("nobody")])), "anon") is None
+
+
+def test_bypassrls_owner_without_a_grant_is_no_door() -> None:
+    """BYPASSRLS escapes the policies, not the privilege check — the same rule
+    as for direct reach."""
+    t = _table()
+    f = _fn("SELECT * FROM t", owner="brls")
+    assert _only(build_access_map(
+        _fschema([t], [f], [_role("anon"), _role("brls", brls=True)])), "anon") is None
+
+
+def test_opaque_body_is_an_unresolved_door_not_a_table_claim() -> None:
+    t = _table()
+    f = _fn("BEGIN RETURN QUERY SELECT * FROM t; END", owner="root", lang="plpgsql")
+    amap = build_access_map(_fschema([t], [f], [_role("anon"), _role("root", su=True)]))
+    assert _only(amap, "anon") is None  # not attributed to any table
+    [u] = [u for u in amap.unresolved if u.principal == "anon"]
+    assert u.function == "public.f" and "opaque" in u.reason
+
+
+def test_function_owner_flag_alone_is_not_treated_as_superuser() -> None:
+    """Without the catalogue, `owner_bypasses_rls` means superuser OR BYPASSRLS
+    and cannot be split. Assuming superuser would invent a door the owner has
+    no privilege to open; assuming BYPASSRLS does not."""
+    t = _table()
+    f = SecdefFunction(
+        qualified_name="public.f", body="SELECT * FROM t", language="sql",
+        owner="ambiguous", execute_roles=("PUBLIC",), owner_bypasses_rls=True,
+    )
+    s = Schema(tables=(t,), security_definer_functions=(f,),
+               roles=(_role("anon"),), role_memberships=())
+    assert _only(build_access_map(s), "anon") is None
