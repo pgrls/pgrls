@@ -74,7 +74,7 @@ from pgrls.history import (
 from pgrls.history import render as render_history
 from pgrls.introspect import introspect
 from pgrls.model import Schema
-from pgrls.matrix import MATRIX_FORMATS, build_matrix
+from pgrls.matrix import MATRIX_FORMATS, build_matrix, with_doors_from_every_schema
 from pgrls.matrix import render as render_matrix
 from pgrls.verify import (
     DEFAULT_AUTH_FUNCTIONS,
@@ -4126,8 +4126,8 @@ def report(
     default=None,
     help=(
         "Comma-separated roles to show as columns (overrides auto-discovery). "
-        "Default: PUBLIC, anon, authenticated plus every non-system role named "
-        "by a grant or policy, or carrying BYPASSRLS."
+        "Default: every role that reaches at least one table, plus PUBLIC and, "
+        "when they exist, anon and authenticated."
     ),
 )
 @click.option(
@@ -4135,7 +4135,7 @@ def report(
     "include_system",
     is_flag=True,
     default=False,
-    help="Also show pg_* system roles (hidden by default).",
+    help="Also consider pg_* system roles (left out by default).",
 )
 @output_format_options(
     list(MATRIX_FORMATS),
@@ -4152,23 +4152,28 @@ def matrix(
 ) -> None:
     """Show who can access what — a role x table x command access matrix.
 
-    The audit companion to `pgrls report`: instead of each table's posture,
-    it collapses table GRANTs, the RLS enabled/forced flags, and the
-    permissive(OR) / restrictive(AND) policy set into one verdict per cell —
-    `OPEN` (every row reachable), `DENIED` (no privilege, or RLS on with no
-    applicable permissive policy), or `COND` (gated by a row predicate, shown
-    in `--format json`/`html`). Per command it uses the clause Postgres
-    applies: `WITH CHECK` for INSERT, `USING` for SELECT/UPDATE/DELETE.
-    Reads a live database and runs NO lint rules. `--roles a,b` overrides the
-    columns; `--include-system-roles` adds `pg_*`.
+    The audit companion to `pgrls report`: for SELECT, INSERT, UPDATE, DELETE
+    and TRUNCATE, one verdict per role and table — `OPEN` (every row), `COND`
+    (some rows; the predicate is in `--format json`/`html`), `DENIED` (none),
+    or `UNDECIDED` (cannot be bounded: a materialized view over the table, or
+    two different filtered paths — treat it as possibly reachable). Reads a
+    live database and runs NO lint rules. `--roles a,b` fixes the columns.
 
-    Privileges and policies follow role membership, and a role that owns a
-    table (or inherits its owner) reads every row unless the table is
-    `FORCE`d; superusers read everything. The SELECT column also counts reach
-    through a definer view or a SECURITY DEFINER function, which run as their
-    owner. Columns whose names look sensitive are listed in their own section.
-    `UNDECIDED` means the answer turns on role memberships that were not
-    captured — never reported as `DENIED`, which would be a guess.
+    Grants and policies reach a role through its INHERIT memberships; an
+    owner (or a role inheriting it) reads every row unless the table is
+    `FORCE`d; superusers and BYPASSRLS roles skip RLS; TRUNCATE ignores it.
+    Doors count for every command they run: a definer view (writes only when
+    it is auto-updatable), a SECURITY DEFINER function (per statement of its
+    body), and a partitioned or inheritance parent. Doors are found in every
+    schema; rows are the `--schemas` tables. A function whose body cannot be
+    traced is listed separately — a `DENIED` cell does not rule it out.
+    Sensitive-looking columns are listed in their own section.
+
+    Each column is a session running as that role: `SET ROLE` is not
+    modelled, so a NOINHERIT member that can switch to its group reads what
+    the group's column shows. UPDATE shows the rows `USING` lets it touch,
+    not its `WITH CHECK`; a door is credited with its owner's reach, not
+    with the view's own WHERE or what a function returns (an over-report).
     """
     # Validate --roles before connecting so a malformed flag fails fast
     # (no database round-trip needed to reject it).
@@ -4180,11 +4185,20 @@ def matrix(
         if not roles:
             raise ToolError("--roles listed no role names.")
 
-    _, schema = _connect_and_introspect(
+    effective = _load_effective_config(
         config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
     )
+    assert effective.database_url is not None  # guaranteed above
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema = introspect(conn, schemas=effective.schemas)
+            schema = with_doors_from_every_schema(conn, schema, effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
 
     built = build_matrix(schema, roles=roles, include_system=include_system)
     rendered = render_matrix(built, output_format)

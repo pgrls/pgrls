@@ -585,11 +585,12 @@ def _anon_reachable_roles(
     a view or function as "anon already reads those rows directly" while the
     direct read was empty and the door returned every row.
 
-    When `schema.role_memberships is None` (an offline / `--against` /
-    hand-built Schema) the graph is unavailable — the returned set is just the
-    seed and the bool is False, so `_anon_policy_reachability` reports
-    ``"unknown"`` (→ abstain) for a leaking policy outside the seed rather than
-    guess ``unreachable`` (a false ``isolated``).
+    When `schema.role_memberships is None` (an offline `--sql-file` source, a
+    pre-v26 snapshot, a hand-built Schema) the graph is unavailable — the
+    returned set is just the seed and the bool is False, so
+    `_anon_policy_reachability` reports ``"unknown"`` (→ abstain) for a
+    leaking policy outside the seed rather than guess ``unreachable`` (a
+    false ``isolated``).
     """
     seed = set(anon_roles) | {"PUBLIC"}
     if schema.role_memberships is None:

@@ -7,7 +7,7 @@ inverting it makes its test fail.
 """
 from __future__ import annotations
 
-from pgrls.access import build_access_map
+from pgrls.access import AccessPath, build_access_map
 from pgrls.ast_utils import parse_expr
 from pgrls.model import (
     ColumnGrant,
@@ -102,7 +102,7 @@ def test_bypassrls_escapes_policies_but_not_the_privilege_check() -> None:
     assert _only(amap, "brls") is None
     granted = _table(grants=(Grant(role="brls", privileges=_SELECT),))
     a = _only(build_access_map(_schema([granted], [_role("brls", brls=True)])), "brls")
-    assert a is not None and a.rows == "all" and "BYPASSRLS" in (a.reason or "")
+    assert a is not None and a.rows == "all" and a.reason == "bypasses RLS"
 
 
 def test_public_grant_reaches_every_role() -> None:
@@ -155,7 +155,7 @@ def test_pg_read_all_data_confers_select_with_no_grant() -> None:
                 [RoleMembership(member="analyst", role="pg_read_all_data", inherit=True)])
     )
     a = _only(amap, "analyst")
-    assert a is not None and a.paths[0].kind == "pg_read_all_data"
+    assert a is not None and a.paths[0] == AccessPath("data_role", via="pg_read_all_data")
 
 
 # --- rows --------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_pg_read_all_data_confers_select_with_no_grant() -> None:
 def test_rls_off_means_every_row() -> None:
     t = _table(rls=False, grants=(Grant(role="app", privileges=_SELECT),))
     a = _only(build_access_map(_schema([t], [_role("app")])), "app")
-    assert a is not None and a.rows == "all" and a.reason == "RLS is off"
+    assert a is not None and a.rows == "all" and a.reason == "RLS off"
 
 
 def test_rls_on_with_no_applicable_policy_is_default_deny() -> None:
@@ -191,7 +191,7 @@ def test_using_true_with_no_restrictive_floor_is_every_row() -> None:
         policies=(_policy("open", "true"),),
     )
     a = _only(build_access_map(_schema([t], [_role("app")])), "app")
-    assert a is not None and a.rows == "all" and "USING (true)" in (a.reason or "")
+    assert a is not None and a.rows == "all" and a.policies == ("open",)
 
 
 def test_a_restrictive_floor_keeps_using_true_filtered() -> None:
@@ -353,7 +353,10 @@ def test_definer_view_runs_under_the_owners_policies() -> None:
     )
     v = _view("v", _T, owner="svc", grants=_ANON_OPENS)
     a = _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("svc")])), "anon")
-    assert a is not None and a.rows == "filtered" and a.policies == ("svc_rows",)
+    # anon has no direct read, so no policy of its own applies — the rows are
+    # the owner's, and the reason names the door and the owner.
+    assert a is not None and a.rows == "filtered" and a.policies == ()
+    assert "definer view public.v, as its owner svc" in (a.reason or "")
 
 
 def test_invoker_view_opens_no_new_door() -> None:
@@ -510,13 +513,15 @@ def test_bypassrls_owner_without_a_grant_is_no_door() -> None:
         _fschema([t], [f], [_role("anon"), _role("brls", brls=True)])), "anon") is None
 
 
-def test_opaque_body_is_an_unresolved_door_not_a_table_claim() -> None:
+def test_uncaptured_plpgsql_body_is_an_untraced_door_not_a_table_claim() -> None:
+    """A PL/pgSQL body is traced from its full definition; without one (an
+    older snapshot) it cannot be read, and is listed rather than attributed."""
     t = _table()
     f = _fn("BEGIN RETURN QUERY SELECT * FROM t; END", owner="root", lang="plpgsql")
     amap = build_access_map(_fschema([t], [f], [_role("anon"), _role("root", su=True)]))
     assert _only(amap, "anon") is None  # not attributed to any table
-    [u] = [u for u in amap.unresolved if u.principal == "anon"]
-    assert u.function == "public.f" and "opaque" in u.reason
+    [u] = [u for u in amap.untraced if u.principal == "anon"]
+    assert u.function == "public.f" and "not captured" in u.reason
 
 
 def test_function_owner_flag_alone_is_not_treated_as_superuser() -> None:

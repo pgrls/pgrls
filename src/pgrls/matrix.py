@@ -1,77 +1,71 @@
 """Effective access matrix for `pgrls matrix`.
 
 `pgrls report` answers "what's each table's RLS posture?"; `pgrls matrix`
-answers the audit question **"who can actually access what?"** — a grid of
-role x table x command collapsing table GRANTs, the RLS enabled/forced flags,
-and the permissive(OR) / restrictive(AND) policy combination into one verdict
-per cell:
+answers the audit question **"who can reach which rows?"** — a grid of role x
+table x command (SELECT, INSERT, UPDATE, DELETE, TRUNCATE), one verdict per
+cell, from the engine in `pgrls.access`:
 
-* ``open``        — the role can access every row (it holds the privilege, and
-  either RLS is off, the role is exempt — superuser, BYPASSRLS, or holding the
-  table owner's privileges on a table that is not ``FORCE``d — or an applicable
-  permissive policy is unconditionally true with nothing restrictive narrowing
-  it).
-* ``denied``      — no privilege for that command, or RLS is on with no
-  applicable *permissive* policy (Postgres default-denies).
-* ``conditional`` — granted and gated by a row predicate (shown): the OR of
-  applicable permissive policy clauses, AND-ed with any restrictive ones.
-* ``undecided``   — the role-membership graph was not captured and the answer
-  turns on it (a grant the role may inherit, a policy it may fall under).
-  Reported instead of ``denied``, which would be a guess in the unsafe
-  direction. Live introspection always captures the graph.
+* ``open``        — every row: the role holds the privilege and RLS lets every
+  row through (RLS off; superuser; BYPASSRLS; the owner's privileges on a table
+  that is not ``FORCE``d; TRUNCATE, which RLS never applies to; an applicable
+  permissive policy that is unconditionally true with no restrictive policy
+  narrowing it) — directly or through a door.
+* ``conditional`` — some rows: the predicate is the OR of the applicable
+  permissive clauses AND-ed with the restrictive ones. A cell reached through
+  a door names the door in its note and carries the door owner's predicate.
+* ``denied``      — no privilege on any path, or RLS on with no applicable
+  permissive policy (Postgres default-denies).
+* ``undecided``   — the rows cannot be bounded: a materialized view over the
+  table (its rows were captured at REFRESH), two different filtered paths whose
+  union is unknown, or — for a schema built without a role-membership graph —
+  memberships that were not captured. Treat it as possibly reachable.
 
-Privileges, exemption and policy applicability come from `pgrls.access`, the
-engine `verify` uses. So a grant held through an INHERIT membership, ownership
-or owner-equivalence, ``pg_read_all_data`` (SELECT) / ``pg_write_all_data``
-(writes), and a policy targeting a group the role belongs to all count. The
-SELECT column is also widened by doors: a definer view or a SECURITY DEFINER
-function the role can open, whose body then runs as its owner. A separate
-section lists sensitive columns (SEC045's name patterns) each role can read.
+Doors widen a cell for the command they run: a ``security_invoker = false``
+view (a write only when the view accepts it on its own), a SECURITY DEFINER
+function (per statement of its SQL or PL/pgSQL body), and a partitioned or
+inheritance parent. A function whose body cannot be traced is listed on its
+own instead of being attributed to a table. Each role is a session running as
+that role: ``SET ROLE`` is not modelled. Per command the clause is the one
+Postgres applies — ``WITH CHECK`` for INSERT, ``USING`` for SELECT / UPDATE /
+DELETE; an UPDATE's write-side ``WITH CHECK`` is not shown.
 
-Per command the relevant clause is the one Postgres applies: ``WITH CHECK`` for
-INSERT, ``USING`` for SELECT / UPDATE / DELETE. (UPDATE additionally has a
-write-side ``WITH CHECK``; v1 shows the read-side ``USING`` — the "who can see
-which rows" question.)
-
-Before this engine, cells matched role names literally, and reported DENIED
-for a role that read every row in three measured ways: a grant held through a
-group, a table it owns without FORCE, a policy TO a group it belongs to.
-
-"Unconditionally true" is detected lexically (a literal ``true``
-disjunct), matching the rest of the rule set — ``1=1``-style tautologies that
-are not the literal ``true`` show as ``conditional`` (the safe direction: it
-under-claims openness, never falsely reports ``open``).
+"Unconditionally true" is lexical — a literal ``true`` disjunct. A tautology
+such as ``1 = 1`` shows as ``conditional`` with that predicate even though
+every row is reachable.
 """
 from __future__ import annotations
 
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Literal
+from typing import Any
 
 from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
 from pgrls._render_common import make_dispatcher, pluralize, render_text_table
-from pgrls.ast_utils import flatten_or_disjuncts, is_literal_true, parse_expr
-from pgrls.formatters._common import safe_location
 from pgrls.access import (
-    _applicability,
+    COMMANDS,
+    AccessPath,
+    Cell,
+    RoleReach,
+    Verdict,
     _derived_roles,
-    _function_doors,
-    _merge,
-    _privilege_paths,
-    _view_doors,
-    role_accesses,
+    _reachable_columns,
+    _sensitive,
+    principal_of,
+    role_reach,
 )
-from pgrls.model import Policy, Role, Schema, Table
-from pgrls.verify import _inherit_closure
+from pgrls.formatters._common import safe_location
+from pgrls.model import Schema
 
-Verdict = Literal["open", "denied", "conditional", "undecided"]
+__all__ = [
+    "COMMANDS", "Cell", "Exposure", "MATRIX_FORMATS", "Matrix", "MatrixRow",
+    "UntracedFunction", "Verdict", "build_matrix", "render", "render_html",
+    "render_json", "render_markdown", "render_text", "with_doors_from_every_schema",
+]
 
-COMMANDS: tuple[str, ...] = ("SELECT", "INSERT", "UPDATE", "DELETE")
-
-# Roles always shown even with no grant/policy referencing them — the
-# Supabase / PostgREST audit baseline.
+# Roles shown even when they reach nothing — the Supabase / PostgREST audit
+# baseline. With the role catalogue, anon and authenticated only if they exist.
 _DEFAULT_ROLES = ("PUBLIC", "anon", "authenticated")
 
 _VERDICT_LABEL = {
@@ -105,15 +99,6 @@ _MATRIX_CSS = """    tr:nth-child(even) td { background: #0d1117; }
 
 
 @dataclass(frozen=True)
-class Cell:
-    """One role x table x command verdict."""
-
-    verdict: Verdict
-    predicate: str | None = None  # shown for "conditional"
-    note: str | None = None  # e.g. "RLS off", "bypasses RLS"
-
-
-@dataclass(frozen=True)
 class MatrixRow:
     qualified_name: str
     command: str
@@ -124,15 +109,14 @@ class MatrixRow:
 class Exposure:
     """A sensitive column (by name, SEC045's patterns) a role can read.
 
-    `verdict` is the widest row reach the role has to the TABLE — never
-    ``denied``. It can over-state one column: if the widest path does not
+    `verdict` is the role's merged SELECT verdict for the TABLE — never
+    ``denied``. It can over-state one column: when the widest path does not
     reach that column (a column grant elsewhere), the column's own reach may be
-    narrower. That only ever over-reports, the safe direction for an audit.
-    `via` names how, crediting only the paths that reach this column: a grant,
-    ownership, a definer view or a SECURITY DEFINER function. A
-    column reached through a view is *possibly* reachable: column lineage
-    through the view body is not traced, so the base table's sensitive columns
-    are reported — over-reporting sensitivity is the safe direction.
+    narrower. `via` names how, crediting only the paths that reach this
+    column: a grant, ownership, a data role, a definer view, a SECURITY DEFINER
+    function, or a parent. A door is credited with every column of the table —
+    column lineage through a view or a function is not traced — which is an
+    over-report, the safe direction for an audit.
     """
 
     role: str
@@ -143,10 +127,23 @@ class Exposure:
 
 
 @dataclass(frozen=True)
+class UntracedFunction:
+    """A SECURITY DEFINER function some shown role can EXECUTE whose body could
+    not be fully traced (dynamic SQL, another language, a call into a function
+    it does not see into). It may reach tables no cell credits it with."""
+
+    function: str
+    owner: str
+    reason: str
+    roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Matrix:
     roles: tuple[str, ...]
     rows: tuple[MatrixRow, ...]
     exposures: tuple[Exposure, ...] = ()
+    untraced: tuple[UntracedFunction, ...] = ()
 
     @property
     def summary(self) -> dict[str, int]:
@@ -171,233 +168,31 @@ def _is_system_role(role: str) -> bool:
     return role.startswith("pg_") or role.startswith("oid:")
 
 
-def _collect_roles(schema: Schema, *, include_system: bool) -> tuple[str, ...]:
-    roles: set[str] = set(_DEFAULT_ROLES)
-    for table in schema.tables:
-        for grant in table.grants:
-            roles.add(grant.role)
-        for cgrant in table.column_grants:
-            roles.add(cgrant.role)
-        for policy in table.policies:
-            roles.update(policy.roles)
-    for brole in schema.bypassrls_roles:
-        roles.add(brole.name)
+def _order(role: str) -> tuple[int, str]:
+    return ({"PUBLIC": 0, "anon": 1, "authenticated": 2}.get(role, 3), role)
+
+
+def _candidate_roles(
+    schema: Schema, *, include_system: bool
+) -> tuple[tuple[str, ...], frozenset[str]]:
+    """The roles to analyse, and the ones shown whatever they reach.
+
+    With the role catalogue (live introspection, snapshot v27+) that is every
+    role in it — so a role that reaches data only through membership,
+    ownership, a data role or a door still gets a column. Without it, every
+    name the schema mentions. PUBLIC is always shown, and anon / authenticated
+    when they exist (always, without a catalogue to say otherwise).
+    """
+    if schema.roles is not None:
+        names = {r.name for r in schema.roles}
+        always = {"PUBLIC"} | (names & {"anon", "authenticated"})
+    else:
+        names = {r.name for r in _derived_roles(schema)}
+        always = set(_DEFAULT_ROLES)
+    names |= always
     if not include_system:
-        roles = {r for r in roles if not _is_system_role(r)} | set(_DEFAULT_ROLES)
-
-    def key(role: str) -> tuple[int, str]:
-        order = {"PUBLIC": 0, "anon": 1, "authenticated": 2}
-        return (order.get(role, 3), role)
-
-    return tuple(sorted(roles, key=key))
-
-
-def _resolve_role(
-    schema: Schema, name: str
-) -> tuple[Role, frozenset[str] | None, frozenset[str], bool]:
-    """A role name as ``(Role, privilege closure, policy-applicability set,
-    whether that set is complete)``.
-
-    Attributes come from the role catalogue when one was captured, else from
-    the names the schema mentions (``_derived_roles``). ``PUBLIC`` is the
-    pseudo-role every session is in: it has no memberships of its own, so both
-    of its closures are ``{PUBLIC}`` and always complete — even with no
-    captured graph.
-    """
-    if name == "PUBLIC":
-        public = frozenset({"PUBLIC"})
-        return Role("PUBLIC", False, False, False), public, public, True
-    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
-    attrs = {r.name: r for r in catalogue}
-    role = attrs.get(name, Role(name, False, False, False))
-    applies_to, complete = _applicability(schema, name)
-    return role, _inherit_closure(schema, name), applies_to, complete
-
-
-def _effective_clause(policy: Policy, command: str) -> str | None:
-    """The clause Postgres actually applies for `command` on this policy.
-
-    SELECT/UPDATE/DELETE are gated by USING; INSERT by WITH CHECK. A ``FOR ALL``
-    policy with no explicit WITH CHECK reuses its USING expression as the
-    implicit WITH CHECK (Postgres semantics), so INSERT falls back to USING for
-    an ALL policy. Returns None when the policy imposes no clause for this
-    command — for an applicable *permissive* policy that means a missing
-    required clause and therefore default-deny, so callers treat None as
-    non-granting, never as "open" (e.g. a ``FOR SELECT`` policy with no USING
-    denies, and a non-ALL ``FOR INSERT`` policy with no WITH CHECK denies).
-    """
-    if command == "INSERT":
-        if policy.with_check_sql is not None:
-            return policy.with_check_sql
-        return policy.using_sql if policy.command == "ALL" else None
-    return policy.using_sql
-
-
-def _policy_applies(
-    policy: Policy, command: str, applies_to: frozenset[str], complete: bool
-) -> bool | None:
-    """Whether `policy` applies to a session whose role reaches `applies_to`.
-
-    Postgres applies a policy ``TO R`` to a session that holds ``R``'s
-    privileges — ``R`` itself or an INHERIT member, the same rule as a grant
-    (``has_privs_of_role``). Matching the role name literally missed that:
-    measured, a ``TO grp`` policy reported an INHERIT member as DENIED while it
-    read every row. A NOINHERIT member is bound by neither a permissive nor a
-    restrictive ``TO grp`` policy (measured on PG15-17).
-    ``None`` = undecidable (the membership graph was not captured and the
-    policy names a role outside what we can see).
-    """
-    if policy.command not in ("ALL", command):
-        return False
-    # A policy with no explicit TO defaults to PUBLIC (applies to everyone).
-    roles = set(policy.roles) or {"PUBLIC"}
-    if roles & applies_to:
-        return True
-    return None if not complete else False
-
-
-def _clause_is_open(clause: str) -> bool:
-    """Whether a present, non-empty clause imposes no restriction — a literal
-    ``true`` somewhere in its top-level OR. Callers pass only non-empty clauses;
-    an absent clause is handled upstream as default-deny, not as openness."""
-    node = parse_expr(clause)
-    if node is None:
-        return False
-    return any(is_literal_true(d) for d in flatten_or_disjuncts(node))
-
-
-def _narrowing_restrictive(restrictive: list[Policy], command: str) -> list[str]:
-    """Restrictive clauses that actually narrow rows.
-
-    A restrictive policy whose clause is unconditionally true (``USING(true)``)
-    is a no-op floor — it imposes no condition (pgrls flags it as SEC031). Such
-    clauses are dropped so an all-true floor collapses to OPEN rather than a
-    misleading ``conditional`` with a ``true`` predicate, and a mixed floor
-    (``true`` AND a real predicate) shows only the predicate that matters.
-    """
-    return [
-        c
-        for p in restrictive
-        if (c := _effective_clause(p, command)) and not _clause_is_open(c)
-    ]
-
-
-def _cell(
-    schema: Schema,
-    table: Table,
-    role: Role,
-    command: str,
-    closure: frozenset[str] | None,
-    applies_to: frozenset[str],
-    complete: bool,
-) -> Cell:
-    """One role x table x command verdict.
-
-    Privilege, exemption and policy applicability come from the same engine
-    `verify` uses (via `pgrls.access`), rather than a literal role-name match.
-    Measured on PG16, the literal match reported DENIED for a role that read
-    every row in three ways: a grant held through an INHERIT membership, a
-    table the role owns without FORCE, and a policy TO a group it belongs to.
-    """
-    paths, known = _privilege_paths(schema, role, table, closure, command)
-    if not paths:
-        if not known:
-            return Cell(
-                "undecided",
-                note="role-membership graph not captured; a grant to a role "
-                "this one inherits cannot be ruled out",
-            )
-        return Cell("denied")
-    if role.superuser:
-        return Cell("open", note="superuser")
-    if role.bypassrls:
-        return Cell("open", note="bypasses RLS")
-    if not table.rls_enabled:
-        return Cell("open", note="RLS off")
-    if (
-        any(p.kind in ("owner", "owner_member") for p in paths)
-        and not table.force_rls
-    ):
-        return Cell("open", note="owner; RLS not FORCE'd")
-
-    verdicts = {p.name: _policy_applies(p, command, applies_to, complete)
-                for p in table.policies}
-    applicable = [p for p in table.policies if verdicts[p.name] is True]
-    # An undecidable PERMISSIVE policy might grant rows, so it can only widen;
-    # an undecidable RESTRICTIVE one might narrow, so it is left out rather
-    # than let it turn a true OPEN into COND. Both lean toward over-reporting
-    # access, which is the safe direction for an audit.
-    unknown_permissive = [
-        p for p in table.policies if verdicts[p.name] is None and p.permissive
-    ]
-    permissive = [p for p in applicable if p.permissive]
-    restrictive = [p for p in applicable if not p.permissive]
-    if not permissive:
-        if unknown_permissive:
-            return Cell(
-                "undecided",
-                note="role-membership graph not captured; cannot tell whether "
-                + ", ".join(sorted(p.name for p in unknown_permissive))
-                + " apply",
-            )
-        return Cell("denied", note="no permissive policy")
-
-    # A permissive policy admits rows only through the clause Postgres applies
-    # for this command; a missing required clause is default-deny, so it does
-    # not contribute openness.
-    perm = [c for p in permissive if (c := _effective_clause(p, command))]
-    if not perm:
-        return Cell("denied", note="no applicable permissive clause")
-
-    restr = _narrowing_restrictive(restrictive, command)
-    # A permissive clause that is unconditionally true admits every row.
-    if any(_clause_is_open(c) for c in perm):
-        # Open unless a restrictive floor actually narrows rows.
-        return Cell("conditional", predicate=" AND ".join(restr)) if restr else Cell("open")
-    if unknown_permissive:
-        # A known conditional read, plus policies that might widen it.
-        return Cell(
-            "undecided",
-            note="role-membership graph not captured; "
-            + ", ".join(sorted(p.name for p in unknown_permissive))
-            + " may also apply",
-        )
-
-    # Permissive is conditional: effective predicate is (OR permissive) AND restr.
-    parts = [f"({' OR '.join(perm)})" if len(perm) > 1 else perm[0]]
-    parts.extend(restr)
-    return Cell("conditional", predicate=" AND ".join(parts))
-
-
-# Widest-first, as in `pgrls.access`: `undecided` outranks `conditional` so a
-# known partial read never masks a door that cannot be bounded.
-_RANK: dict[str, int] = {"open": 3, "undecided": 2, "conditional": 1, "denied": 0}
-_ROWS_TO_VERDICT: dict[str, Verdict] = {
-    "all": "open", "filtered": "conditional", "none": "denied", "undecided": "undecided",
-}
-
-
-def _door_cells(
-    schema: Schema, role: Role, closure: frozenset[str] | None
-) -> dict[str, Cell]:
-    """SELECT verdicts reached through a definer view or a SECURITY DEFINER
-    function, keyed by table. A door runs as its OWNER, so the rows are the
-    owner's row reach — the predicate shown on a direct cell would describe the
-    wrong role here, so a door cell carries a note instead."""
-    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
-    attrs = {r.name: r for r in catalogue}
-    reaches = _view_doors(schema, role, closure, attrs)
-    fn_reach, _ = _function_doors(schema, role, closure, attrs)
-    for qname, rs in fn_reach.items():
-        reaches.setdefault(qname, []).extend(rs)
-    out: dict[str, Cell] = {}
-    for qname, rs in reaches.items():
-        _, _, rows, pols, reason = _merge(rs)
-        note = reason or "through a door"
-        if rows == "filtered" and pols:
-            note += f" — filtered by {', '.join(pols)}"
-        out[qname] = Cell(_ROWS_TO_VERDICT[rows], note=note)
-    return out
+        names = {n for n in names if not _is_system_role(n)} | always
+    return tuple(sorted(names, key=_order)), frozenset(always)
 
 
 def build_matrix(
@@ -408,95 +203,132 @@ def build_matrix(
 ) -> Matrix:
     """Build the effective access matrix from an introspected `schema`.
 
-    `roles` overrides role discovery (else: the defaults plus every role
-    referenced by a grant/policy, minus `pg_*` system roles unless
-    `include_system`). Rows are sorted by (table, command) for determinism.
+    `roles` fixes the columns. Otherwise every candidate role is analysed and
+    the columns are those that reach something — at least one cell that is not
+    DENIED — plus PUBLIC and, when they exist, anon and authenticated; `pg_*`
+    roles are left out unless `include_system`. Rows are sorted by (table,
+    command).
+
+    Role attributes come from `schema.roles` (live introspection) or, without
+    it, from `bypassrls_roles`. A schema from an offline source carries
+    neither reliably, so an exempt role there shows as an ordinary one;
+    `pgrls matrix` itself reads only a live database.
     """
-    role_list = roles if roles is not None else _collect_roles(
-        schema, include_system=include_system
+    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
+    attrs = {r.name: r for r in catalogue}
+    if roles is not None:
+        candidates, always = tuple(roles), frozenset(roles)
+    else:
+        candidates, always = _candidate_roles(schema, include_system=include_system)
+    cache: dict[Any, Any] = {}  # function bodies, parsed once per build
+    reaches: dict[str, RoleReach] = {}
+    for name in candidates:
+        role, closure = principal_of(schema, name, attrs)
+        reaches[name] = role_reach(schema, role, closure, attrs, cache)
+    role_list = tuple(
+        n for n in candidates
+        if n in always or any(c.verdict != "denied" for c in reaches[n].cells.values())
     )
-    resolved = {name: _resolve_role(schema, name) for name in role_list}
-    doors = {
-        name: _door_cells(schema, resolved[name][0], resolved[name][1])
-        for name in role_list
-    }
-    rows: list[MatrixRow] = []
-    for table in sorted(schema.tables, key=lambda t: t.qualified_name):
-        for command in COMMANDS:
-            cells_list = []
-            for name in role_list:
-                cell = _cell(schema, table, resolved[name][0], command, *resolved[name][1:])
-                # Doors are read paths: they can widen a SELECT cell, never
-                # narrow it, and never touch a write command.
-                door = doors[name].get(table.qualified_name) if command == "SELECT" else None
-                if door is not None and _RANK[door.verdict] > _RANK[cell.verdict]:
-                    cell = door
-                cells_list.append(cell)
-            cells = tuple(cells_list)
-            rows.append(
-                MatrixRow(
-                    qualified_name=table.qualified_name,
-                    command=command,
-                    cells=cells,
-                )
-            )
+    rows = [
+        MatrixRow(
+            qualified_name=table.qualified_name,
+            command=command,
+            cells=tuple(reaches[n].cells[(table.qualified_name, command)] for n in role_list),
+        )
+        for table in sorted(schema.tables, key=lambda t: t.qualified_name)
+        for command in COMMANDS
+    ]
     return Matrix(
-        roles=tuple(role_list),
+        roles=role_list,
         rows=tuple(rows),
-        exposures=_exposures(schema, role_list, resolved),
+        exposures=_exposures(schema, role_list, reaches),
+        untraced=_untraced(role_list, reaches),
     )
 
 
-def _via(paths: tuple[object, ...], principal: str, column: str) -> str:
+def with_doors_from_every_schema(conn: Any, schema: Schema, scanned: list[str]) -> Schema:
+    """`schema` with the views and SECURITY DEFINER functions of EVERY user
+    schema, not only the scanned ones. A door reads a scanned table wherever it
+    lives (measured: a definer view in `api` over `public.t` handed anon every
+    row while a `--schemas public` matrix said DENIED). The rows are still the
+    scanned tables."""
+    from psycopg.rows import dict_row  # noqa: PLC0415
+
+    from pgrls.introspect import _list_user_schemas, introspect  # noqa: PLC0415
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        everywhere = _list_user_schemas(cur)
+    if set(everywhere) <= set(scanned):
+        return schema
+    wide = introspect(conn, schemas=everywhere)
+    return replace(
+        schema, views=wide.views, security_definer_functions=wide.security_definer_functions
+    )
+
+
+def _via(paths: tuple[AccessPath, ...], principal: str, column: str) -> str:
     """The paths that reach `column` specifically. A column grant covers only
     its own columns, so crediting it for every sensitive column on the table
     misstated how a column was reached — measured: `ssn`, reachable only
     through a definer view, was listed as reached via a column grant on
-    `email`. A path with no column list (a table grant, a view, a function)
-    reaches every column."""
+    `email`. A path with no column list (a table grant, a door) reaches every
+    column."""
     labels = []
     for p in paths:
-        cols = getattr(p, "columns", None)
-        if cols is not None and column not in cols:
+        if p.columns is not None and column not in p.columns:
             continue
-        kind, via = getattr(p, "kind", ""), getattr(p, "via", None)
-        if kind == "view":
-            labels.append(f"view {via}")
-        elif kind == "function":
-            labels.append(f"SECURITY DEFINER {via}")
-        elif kind in ("grant", "column_grant", "owner_member", "pg_read_all_data") and via:
-            label = kind.replace("_", " ")
-            labels.append(label if via == principal else f"{label} via {via}")
+        if p.kind == "view":
+            labels.append(f"view {p.via}")
+        elif p.kind == "function":
+            labels.append(f"SECURITY DEFINER {p.via}")
+        elif p.kind == "parent":
+            labels.append(f"parent {p.via}")
+        elif p.kind == "data_role":
+            labels.append(p.via or "data role")
+        elif p.kind in ("grant", "column_grant", "owner_member") and p.via:
+            label = p.kind.replace("_", " ")
+            labels.append(label if p.via == principal else f"{label} via {p.via}")
         else:
-            labels.append(kind.replace("_", " "))
+            labels.append(p.kind.replace("_", " "))
     return "; ".join(dict.fromkeys(labels)) or "-"
 
 
 def _exposures(
-    schema: Schema,
-    role_list: tuple[str, ...],
-    resolved: dict[str, tuple[Role, frozenset[str] | None, frozenset[str], bool]],
+    schema: Schema, role_list: tuple[str, ...], reaches: dict[str, RoleReach]
 ) -> tuple[Exposure, ...]:
     """Every sensitive column each shown role can read with at least some
-    rows, from the same engine that decides the cells."""
-    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
-    attrs = {r.name: r for r in catalogue}
+    rows, from the same merged verdicts as the cells. A direct path whose RLS
+    admits no row is not a way in, so it is not credited."""
     out: list[Exposure] = []
     for name in role_list:
-        role, closure = resolved[name][0], resolved[name][1]
-        accesses, _ = role_accesses(schema, role, closure, attrs)
-        for a in accesses:
-            if a.rows == "none":
+        reach = reaches[name]
+        for table in schema.tables:
+            q = table.qualified_name
+            cell = reach.cells[(q, "SELECT")]
+            if cell.verdict == "denied":
                 continue
-            for col in a.sensitive:
+            direct_cell, direct_paths = reach.direct_select[q]
+            paths = (direct_paths if direct_cell.verdict != "denied" else ()) + reach.door_paths[q]
+            cols = _reachable_columns(paths) if paths else None
+            for col in _sensitive(table, cols):
                 out.append(Exposure(
-                    role=name,
-                    table=a.relation,
-                    column=col,
-                    verdict=_ROWS_TO_VERDICT[a.rows],
-                    via=_via(a.paths, name, col),
+                    role=name, table=q, column=col, verdict=cell.verdict,
+                    via=_via(paths, name, col),
                 ))
     return tuple(sorted(out, key=lambda e: (e.table, e.column, e.role)))
+
+
+def _untraced(
+    role_list: tuple[str, ...], reaches: dict[str, RoleReach]
+) -> tuple[UntracedFunction, ...]:
+    by_fn: dict[tuple[str, str, str], list[str]] = {}
+    for name in role_list:
+        for u in reaches[name].untraced:
+            by_fn.setdefault((u.function, u.owner, u.reason), []).append(name)
+    return tuple(
+        UntracedFunction(function=f, owner=o, reason=r, roles=tuple(rs))
+        for (f, o, r), rs in sorted(by_fn.items())
+    )
 
 
 def _summary_line(matrix: Matrix) -> str:
@@ -522,16 +354,27 @@ def _exposure_rows(matrix: Matrix) -> list[list[str]]:
     ]
 
 
+_UNTRACED_TITLE = (
+    "SECURITY DEFINER functions not traced — each may reach tables no cell "
+    "credits it with"
+)
+
+
+def _untraced_rows(matrix: Matrix) -> list[list[str]]:
+    return [
+        [
+            safe_location(u.function),
+            safe_location(u.owner),
+            safe_location(", ".join(u.roles)),
+            safe_location(u.reason),
+        ]
+        for u in matrix.untraced
+    ]
+
+
 def render_text(matrix: Matrix) -> str:
     if not matrix.rows:
         return "No tables found in the scanned schemas."
-    head: list[str] = []
-    if matrix.exposures:
-        head = ["Sensitive columns reachable:"]
-        head.extend("  " + ln for ln in render_text_table(
-            ("COLUMN", "ROLE", "ROWS", "VIA"), _exposure_rows(matrix)
-        ))
-        head.append("")
     headers = ("TABLE", "CMD", *(safe_location(r) for r in matrix.roles))
     rows = [
         (
@@ -541,7 +384,17 @@ def render_text(matrix: Matrix) -> str:
         )
         for row in matrix.rows
     ]
-    out = head + render_text_table(headers, rows)
+    out = render_text_table(headers, rows)
+    if matrix.exposures:
+        out += ["", "Sensitive columns reachable:"]
+        out += ["  " + ln for ln in render_text_table(
+            ("COLUMN", "ROLE", "ROWS", "VIA"), _exposure_rows(matrix)
+        )]
+    if matrix.untraced:
+        out += ["", _UNTRACED_TITLE + ":"]
+        out += ["  " + ln for ln in render_text_table(
+            ("FUNCTION", "OWNER", "EXECUTABLE BY", "WHY"), _untraced_rows(matrix)
+        )]
     out.append("")
     out.append(_summary_line(matrix))
     return "\n".join(out)
@@ -578,6 +431,15 @@ def render_json(matrix: Matrix) -> str:
             }
             for e in matrix.exposures
         ],
+        "untraced_functions": [
+            {
+                "function": u.function,
+                "owner": u.owner,
+                "reason": u.reason,
+                "roles": list(u.roles),
+            }
+            for u in matrix.untraced
+        ],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -607,6 +469,13 @@ def render_markdown(matrix: Matrix) -> str:
         tail.extend(
             "| " + " | ".join(c.replace("|", "\\|") for c in r) + " |"
             for r in _exposure_rows(matrix)
+        )
+    if matrix.untraced:
+        tail += ["", f"## {_UNTRACED_TITLE}", "",
+                 "| Function | Owner | Executable by | Why |", "|---|---|---|---|"]
+        tail.extend(
+            "| " + " | ".join(c.replace("|", "\\|") for c in r) + " |"
+            for r in _untraced_rows(matrix)
         )
     return "\n".join(
         ["# Access matrix", "", _summary_line(matrix), "", header, sep, *body, *tail]
@@ -672,6 +541,21 @@ def render_html(matrix: Matrix, *, generated_at: datetime | None = None) -> str:
     </thead>
     <tbody>
 {exp_rows}
+    </tbody>
+  </table>"""
+    if matrix.untraced:
+        unt_rows = "\n".join(
+            "      <tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in r) + "</tr>"
+            for r in _untraced_rows(matrix)
+        )
+        body += f"""
+  <h2>{html.escape(_UNTRACED_TITLE)}</h2>
+  <table>
+    <thead>
+      <tr><th>Function</th><th>Owner</th><th>Executable by</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+{unt_rows}
     </tbody>
   </table>"""
 

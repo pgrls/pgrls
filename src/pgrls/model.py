@@ -4,7 +4,9 @@ Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
 Currently version 27. v27 added top-level ``roles`` — the ``pg_roles``
 catalogue, the principal axis of ``pgrls matrix`` (absent → ``None``, "not
-captured", never "no roles exist"). v26 added ``View.direct_references`` /
+captured", never "no roles exist") — plus ``View.updatable`` (the writes a
+view accepts on its own) and ``SecdefFunction.definition`` (a PL/pgSQL
+function's full CREATE FUNCTION), both absent → ``None``. v26 added ``View.direct_references`` /
 ``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,
 top-level ``set_gucs`` / ``role_set_gucs``, and serialized
 ``role_memberships`` (each edge with its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
@@ -87,7 +89,7 @@ def maybe_set_value(value: str) -> str:
     `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
     return value[len(MAYBE_SET):]
 
-SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls matrix`); v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls matrix`), View.updatable, SecdefFunction.definition (PL/pgSQL); v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -416,6 +418,14 @@ class View:
     # (measured: permission denied without the grant). The reachability walk
     # uses this to require the grant.
     owner_is_superuser: bool = False
+    # v27+: the write commands the view accepts on its own —
+    # `pg_relation_is_updatable(oid, false)`, so an auto-updatable view, not
+    # one made writable by INSTEAD OF triggers or rules. A write through a
+    # `security_invoker = false` view reaches the base table with the view
+    # OWNER's privileges and RLS (measured: 0 rows directly, every row through
+    # the view). `None` = not captured (an older snapshot, a hand-built view):
+    # whether it is writable is unknown, never assumed to be "no".
+    updatable: tuple[str, ...] | None = None
 
     @property
     def qualified_name(self) -> str:
@@ -748,6 +758,12 @@ class SecdefFunction:
     # function as an RLS bypass. v4-v15 snapshots load with ``False`` →
     # SEC042 abstains (fail-closed).
     owner_bypasses_rls: bool = False
+    # v27+: `pg_get_functiondef` for a PL/pgSQL function — the complete
+    # CREATE FUNCTION, which `pglast.parse_plpgsql` needs (argument names and
+    # the return type decide how the body parses). `pgrls matrix` reads the
+    # static SQL out of it to see which tables the function touches. `None`
+    # for other languages and on older snapshots.
+    definition: str | None = None
 
 
 @dataclass(frozen=True)
@@ -863,8 +879,9 @@ class Role:
 
 @dataclass(frozen=True)
 class RoleMembership:
-    """A single ``pg_auth_members`` edge: ``member`` has the privileges of
-    ``role`` (i.e. ``GRANT role TO member``).
+    """A single ``pg_auth_members`` edge: ``member`` is a member of ``role``
+    (``GRANT role TO member``). It holds ``role``'s privileges — and is bound
+    by its policies — only when ``inherit`` is set.
 
     Postgres applies a policy ``TO R`` to a session iff the session's role
     holds ``R``'s privileges — ``R`` itself or a transitive member through
@@ -1423,6 +1440,10 @@ def _view_from_dict(v: dict[str, Any]) -> View:
             _column_grant_from_dict(cg) for cg in v.get("column_grants", [])
         ),
         owner_is_superuser=bool(v.get("owner_is_superuser", False)),
+        # v27+; absent → None ("not captured"), never "not writable".
+        updatable=(
+            tuple(v["updatable"]) if v.get("updatable") is not None else None
+        ),
     )
 
 
@@ -1518,6 +1539,7 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         execute_roles=tuple(f.get("execute_roles", [])),
         owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
         owner=f.get("owner", ""),
+        definition=f.get("definition"),  # v27+, PL/pgSQL only
     )
 
 
@@ -1692,11 +1714,12 @@ class Schema:
     # v3-v23 baselines round-tripping with `foreign_tables=()` (fail-closed —
     # SEC053 finds nothing until re-captured against a live database).
     foreign_tables: tuple[ForeignTable, ...] = ()
-    # `pg_auth_members` edges (member → group), captured by LIVE introspection
-    # only — NOT serialized. `verify --mode anon` walks the upward closure of
-    # the configured anon role(s) over these to decide policy reachability. The
-    # tri-state `| None` is load-bearing: `None` = "role graph not captured"
-    # (offline snapshot / `--against` / hand-built Schema) → verify abstains
+    # `pg_auth_members` edges (member → group), captured by live introspection
+    # and serialized since snapshot v26. `verify --mode anon` walks the upward
+    # INHERIT closure of the configured anon role(s) over these to decide policy
+    # reachability. The tri-state `| None` is load-bearing: `None` = "role graph
+    # not captured" (an offline `--sql-file` source, a pre-v26 snapshot, a
+    # hand-built Schema) → verify abstains
     # (UNVERIFIED) on a policy whose roles are outside `{anon, PUBLIC}` rather
     # than risk a false `isolated`; `()` = "captured, anon is a member of
     # nothing extra" → a `TO authenticated` policy is provably not anon-reachable
@@ -2018,6 +2041,12 @@ class Schema:
                         for cg in v.column_grants
                     ],
                     "owner_is_superuser": v.owner_is_superuser,
+                    # v27 — only when captured; absent = unknown.
+                    **(
+                        {"updatable": list(v.updatable)}
+                        if v.updatable is not None
+                        else {}
+                    ),
                 }
                 for v in self.views
             ],
@@ -2040,6 +2069,12 @@ class Schema:
                     "execute_roles": list(f.execute_roles),
                     "owner_bypasses_rls": f.owner_bypasses_rls,
                     "owner": f.owner,
+                    # v27 — PL/pgSQL only; absent for other languages.
+                    **(
+                        {"definition": f.definition}
+                        if f.definition is not None
+                        else {}
+                    ),
                 }
                 for f in self.security_definer_functions
             ],

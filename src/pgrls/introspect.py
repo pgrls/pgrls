@@ -351,6 +351,10 @@ SELECT
     pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
     (vo.rolsuper OR vo.rolbypassrls) AS owner_bypasses_rls,
     vo.rolsuper AS owner_is_superuser,
+    -- The writes the view accepts ON ITS OWN (auto-updatable; `false` leaves
+    -- out INSTEAD OF triggers and rules). A bitmask of 1 << CmdType:
+    -- UPDATE = 4, INSERT = 8, DELETE = 16; a matview is always 0.
+    pg_catalog.pg_relation_is_updatable(c.oid, false) AS updatable_bits,
     c.oid AS view_oid
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -751,6 +755,10 @@ SELECT
     pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature,
     (po.rolsuper OR po.rolbypassrls) AS owner_bypasses_rls,
     po.rolname AS owner_name,
+    -- The complete CREATE FUNCTION for PL/pgSQL, which the PL/pgSQL parser
+    -- needs (argument names and the return type decide how a body parses).
+    CASE WHEN l.lanname = 'plpgsql'
+         THEN pg_catalog.pg_get_functiondef(p.oid) END AS definition,
     COALESCE((
         SELECT array_agg(DISTINCT CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
                                        ELSE COALESCE(ar.rolname,
@@ -1144,6 +1152,7 @@ def _fetch_secdef_functions(
             execute_roles=tuple(sorted(row["execute_roles"] or ())),
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
             owner=row["owner_name"] or "",
+            definition=row["definition"],
         )
         for row in cur.fetchall()
     )
@@ -1215,24 +1224,35 @@ def _fetch_bypassrls_escalation_roles(
     )
 
 
-# The raw `pg_auth_members` edge list (member → group). `verify --mode anon`
-# walks the transitive closure of the configured anon role(s) over these to
-# decide which policies an anonymous session can invoke — a `TO authenticated`
-# policy is anon-reachable only if `anon` is a (transitive) member of
-# `authenticated`, which the flat `{anon, PUBLIC}` name-match can't see. Roles
-# and their memberships are cluster-global, so this is unfiltered by schema.
-# `roleid` is the group; `member` inherits its privileges. Readable by every
-# connected role.
+# The raw `pg_auth_members` edge list (member → group), each with its INHERIT
+# flag, plus the database owner's implicit `pg_database_owner` membership.
+# `verify --mode anon` walks the upward INHERIT closure of the configured anon
+# role(s) over these to decide which policies an anonymous session can invoke
+# — a `TO authenticated` policy applies to anon only if anon inherits
+# `authenticated`, which the flat `{anon, PUBLIC}` name-match can't see; and
+# `pgrls matrix` walks the same closure for every role. Roles and their
+# memberships are cluster-global, so this is unfiltered by schema. Readable
+# by every connected role.
 _ROLE_MEMBERSHIPS_SQL = """
-    SELECT g.rolname AS role, m.rolname AS member,
-           -- PG16+ carries a per-edge INHERIT option; older servers use the
-           -- member role's rolinherit. `to_jsonb` keeps one query valid on
-           -- both: the key is simply absent (NULL) before PG16.
-           COALESCE((to_jsonb(am) ->> 'inherit_option')::boolean, m.rolinherit)
-               AS inherit
-    FROM pg_catalog.pg_auth_members am
-    JOIN pg_catalog.pg_roles g ON g.oid = am.roleid
-    JOIN pg_catalog.pg_roles m ON m.oid = am.member
+    SELECT role, member, inherit FROM (
+        SELECT g.rolname AS role, m.rolname AS member,
+               -- PG16+ carries a per-edge INHERIT option; older servers use
+               -- the member role's rolinherit. `to_jsonb` keeps one query
+               -- valid on both: the key is simply absent (NULL) before PG16.
+               COALESCE((to_jsonb(am) ->> 'inherit_option')::boolean,
+                        m.rolinherit) AS inherit
+        FROM pg_catalog.pg_auth_members am
+        JOIN pg_catalog.pg_roles g ON g.oid = am.roleid
+        JOIN pg_catalog.pg_roles m ON m.oid = am.member
+        UNION ALL
+        -- The database owner is IMPLICITLY a member of `pg_database_owner`,
+        -- with no pg_auth_members row (measured: it read a table granted
+        -- only to pg_database_owner while the catalog held no edge).
+        SELECT 'pg_database_owner', o.rolname, TRUE
+        FROM pg_catalog.pg_database d
+        JOIN pg_catalog.pg_roles o ON o.oid = d.datdba
+        WHERE d.datname = pg_catalog.current_database()
+    ) edges
     ORDER BY member, role
 """
 
@@ -1396,7 +1416,9 @@ def _fetch_set_gucs(
 
 
 def _fetch_role_memberships(cur: Any) -> tuple[RoleMembership, ...]:
-    """Fetch every `pg_auth_members` edge as a (member, role) pair.
+    """Fetch every `pg_auth_members` edge as a (member, role) pair, plus the
+    database owner's implicit membership in `pg_database_owner`, which has no
+    catalog row.
 
     Returns possibly `()` (a cluster with no non-default role grants) — which,
     unlike a `None` `Schema.role_memberships`, means "captured, and there are no
@@ -1811,9 +1833,19 @@ def _build_views(
             direct_references=tuple(
                 sorted(deps_index.get((row["schema_name"], row["view_name"]), set()))
             ),
+            updatable=_updatable_commands(row["updatable_bits"]),
         )
         for row in view_rows
     )
+
+
+# `pg_relation_is_updatable` sets bit (1 << CmdType): CMD_UPDATE = 2,
+# CMD_INSERT = 3, CMD_DELETE = 4 (measured: a simple view reports 28).
+_UPDATABLE_BITS = (("INSERT", 8), ("UPDATE", 4), ("DELETE", 16))
+
+
+def _updatable_commands(bits: int | None) -> tuple[str, ...]:
+    return tuple(cmd for cmd, bit in _UPDATABLE_BITS if (bits or 0) & bit)
 
 
 def _fetch_foreign_tables(

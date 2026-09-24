@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from pgrls.cli import main
 from pgrls.introspect import introspect
 from pgrls.matrix import (
+    COMMANDS,
     Matrix,
     build_matrix,
     render_html,
@@ -273,7 +274,10 @@ def test_bypassrls_role_still_needs_grant() -> None:
         bypassrls_roles=(BypassRlsRole(name="admin", superuser=False, can_login=True),),
         role_memberships=(),
     )
-    assert _cell(build_matrix(schema), "public.t", "SELECT", "admin").verdict == "denied"
+    m = build_matrix(schema, roles=("admin",))
+    assert _cell(m, "public.t", "SELECT", "admin").verdict == "denied"
+    # …and by default it gets no column at all: it reaches nothing.
+    assert "admin" not in build_matrix(schema).roles
 
 
 # --- command → clause mapping ---------------------------------------------
@@ -487,13 +491,13 @@ def test_role_ordering_is_stable() -> None:
 def test_summary_counts_reconcile() -> None:
     schema = Schema(
         tables=(
-            _table("a", rls=False, grants=(_grant(),)),  # 4 open (one per command)
-            _table("b", rls=True),  # 4 denied (no grant) x 3 roles
+            _table("a", rls=False, grants=(_grant(),)),  # open for every command
+            _table("b", rls=True),  # denied (no grant) x 3 roles
         )
     )
     s = build_matrix(schema).summary
     assert s["open"] + s["denied"] + s["conditional"] + s["undecided"] == s["cells"]
-    assert s["cells"] == s["tables"] * len(("S", "I", "U", "D")) * s["roles"]
+    assert s["cells"] == s["tables"] * len(COMMANDS) * s["roles"]
 
 
 # --- renderers -------------------------------------------------------------
@@ -570,8 +574,8 @@ def test_render_markdown_newline_in_role_name_does_not_split_header() -> None:
     schema = Schema(tables=(_table("t", rls=False, grants=(_grant("ok", ("SELECT",)),)),))
     out = render_markdown(build_matrix(schema, roles=("ok", "ev\nil")))
     pipe_rows = [ln for ln in out.splitlines() if ln.startswith("|")]
-    # header + separator + (1 table x 4 commands) = 6 rows, all the same width.
-    assert len(pipe_rows) == 6
+    # header + separator + (1 table x 5 commands) = 7 rows, all the same width.
+    assert len(pipe_rows) == 7
     assert len({ln.count("|") for ln in pipe_rows}) == 1, pipe_rows  # aligned
     assert not any(ln.startswith("il") for ln in out.splitlines())  # no orphan
 
@@ -766,7 +770,9 @@ def test_matrix_live_rls_off_table_is_open(pg_conn: psycopg.Connection) -> None:
             "GRANT SELECT ON public.flat TO PUBLIC;"
         )
     schema = introspect(pg_conn, schemas=["public"])
-    cell = _cell(build_matrix(schema), "public.flat", "SELECT", "anon")
+    # Named explicitly: by default `anon` gets a column only when the role
+    # exists, and this test does not create it.
+    cell = _cell(build_matrix(schema, roles=("anon",)), "public.flat", "SELECT", "anon")
     # anon inherits the PUBLIC grant; RLS off → open with the RLS-off note.
     assert cell.verdict == "open"
     assert cell.note == "RLS off"
@@ -913,7 +919,7 @@ def test_summary_line_mentions_undecided_only_when_present() -> None:
     assert "undecided" not in _summary_line(decided)
     undecided = build_matrix(Schema(tables=(_table("t", rls=False),), role_memberships=None),
                              roles=("app",))
-    assert "4 undecided" in _summary_line(undecided)
+    assert "5 undecided" in _summary_line(undecided)  # one per command
 
 
 def test_granted_role_with_an_undecidable_policy_is_undecided_not_denied() -> None:
@@ -1105,22 +1111,427 @@ def test_a_grant_that_yields_no_rows_is_not_an_exposure() -> None:
     assert build_matrix(s, roles=("anon",)).exposures == ()
 
 
+# --- doors for every command, traced bodies, parents -------------------------
+#
+# Review iteration 1 found each of these reporting less access than Postgres
+# allows; every expectation below was measured live (see the docstrings).
+
+from pgrls.matrix import UntracedFunction  # noqa: E402
+
+_ALL5 = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
+
+
+def _t(
+    name: str = "t",
+    *,
+    schema: str = "public",
+    owner: str = "own",
+    rls: bool = True,
+    force: bool = False,
+    policies: tuple[Policy, ...] = (),
+    grants: tuple[Grant, ...] = (),
+    column_grants: tuple[ColumnGrant, ...] = (),
+    partition_of: tuple[str, str] | None = None,
+    inherits: tuple[tuple[str, str], ...] = (),
+) -> Table:
+    return Table(
+        schema=schema, name=name, rls_enabled=rls, force_rls=force, policies=policies,
+        grants=grants, column_grants=column_grants, owner=owner,
+        columns=("id", "tenant_id", "email"), partition_of=partition_of, inherits=inherits,
+    )
+
+
+def _v(
+    name: str,
+    refs: tuple[tuple[str, str], ...],
+    *,
+    owner: str,
+    invoker: bool = False,
+    grants: tuple[Grant, ...] = (),
+    updatable: tuple[str, ...] | None = ("INSERT", "UPDATE", "DELETE"),
+    mat: bool = False,
+    direct: tuple[tuple[str, str], ...] | None = None,
+) -> View:
+    return View(
+        schema="public", name=name, is_materialized=mat, security_invoker=invoker,
+        security_barrier=False, definition="", references=refs, security_definer_calls=(),
+        grants=grants, owner=owner, direct_references=refs if direct is None else direct,
+        updatable=() if mat else updatable,
+    )
+
+
+def _f(
+    body: str,
+    *,
+    owner: str,
+    execute: tuple[str, ...] = ("PUBLIC",),
+    lang: str = "sql",
+    definition: str | None = None,
+    search_path: str | None = None,
+) -> SecdefFunction:
+    return SecdefFunction(
+        qualified_name="public.f", body=body, language=lang, owner=owner,
+        execute_roles=execute, definition=definition, search_path=search_path,
+    )
+
+
+def _s(tables=(), views=(), fns=(), roles=(), memberships=()) -> Schema:
+    return Schema(
+        tables=tuple(tables), views=tuple(views), security_definer_functions=tuple(fns),
+        roles=tuple(roles), role_memberships=tuple(memberships),
+    )
+
+
+def _r(name: str, *, su: bool = False, brls: bool = False) -> Role:
+    return Role(name, True, su, brls)
+
+
+_OWN_T = (("public", "t"),)
+_TENANT_A = _policy(roles=("PUBLIC",), using="tenant_id = 'a'", name="tenant_a")
+
+
+def test_write_through_an_updatable_definer_view_runs_as_its_owner() -> None:
+    """Measured: UPDATE / DELETE on the table touched 0 rows, and through a
+    definer view owned by the (non-FORCE'd) table owner every row."""
+    t = _t(policies=(_policy(roles=("PUBLIC",), using="owner_name = current_user"),),
+           grants=(_grant("app", ("SELECT", "UPDATE", "DELETE")),))
+    v = _v("v", _OWN_T, owner="own", grants=(_grant("app", ("UPDATE", "DELETE")),))
+    m = build_matrix(_s([t], [v], roles=[_r("app"), _r("own")]), roles=("app",))
+    for cmd in ("UPDATE", "DELETE"):
+        c = _cell(m, "public.t", cmd, "app")
+        assert c.verdict == "open" and "definer view public.v" in (c.note or ""), cmd
+    # No INSERT on the view, and none on the table: nothing opens it.
+    assert _cell(m, "public.t", "INSERT", "app").verdict == "denied"
+
+
+def test_a_view_that_accepts_no_writes_is_no_write_door() -> None:
+    t = _t()
+    v = _v("v", _OWN_T, owner="own", grants=(_grant("app", ("SELECT", "UPDATE")),),
+           updatable=())
+    m = build_matrix(_s([t], [v], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "UPDATE", "app").verdict == "denied"
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"  # reads still pass
+
+
+def test_uncaptured_updatability_is_undecided_not_denied() -> None:
+    t = _t()
+    v = _v("v", _OWN_T, owner="own", grants=(_grant("app", ("UPDATE",)),), updatable=None)
+    m = build_matrix(_s([t], [v], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "UPDATE", "app").verdict == "undecided"
+
+
+def test_an_invoker_view_inside_a_definer_view_resets_writes_to_the_caller() -> None:
+    """Measured: UPDATE through outer(definer, owned by the table owner) over
+    inner(invoker) updated 0 rows — the inner view ran as the caller."""
+    t = _t(policies=(_policy(roles=("PUBLIC",), using="owner_name = current_user"),),
+           grants=(_grant("app", ("UPDATE",)),))
+    inner = _v("inner", _OWN_T, owner="own", invoker=True)
+    outer = _v("outer", _OWN_T, owner="own", grants=(_grant("app", ("UPDATE",)),),
+               direct=(("public", "inner"),))
+    m = build_matrix(_s([t], [inner, outer], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "UPDATE", "app").verdict == "conditional"
+
+
+@pytest.mark.parametrize(("body", "opens"), [
+    ("DELETE FROM public.t", {"DELETE"}),
+    ("DELETE FROM public.t RETURNING *", {"DELETE", "SELECT"}),
+    ("INSERT INTO public.t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = excluded.id",
+     {"INSERT", "UPDATE"}),
+    ("TRUNCATE public.t", {"TRUNCATE"}),
+    ("WITH d AS (DELETE FROM public.t RETURNING *) SELECT count(*) FROM d", {"DELETE", "SELECT"}),
+    ("SELECT * FROM public.t", {"SELECT"}),
+])
+def test_a_function_opens_exactly_the_commands_its_body_runs(body: str, opens: set[str]) -> None:
+    """A SECURITY DEFINER body runs each statement as its owner. Measured: a
+    body `DELETE FROM t` deleted every row for a caller with no privilege — and
+    it reads nothing back, so it is no SELECT door."""
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    got = {cmd for cmd in _ALL5 if _cell(m, "public.t", cmd, "app").verdict == "open"}
+    assert got == opens
+
+
+_PLPGSQL = """CREATE FUNCTION public.f(p integer) RETURNS SETOF public.t
+ LANGUAGE plpgsql SECURITY DEFINER AS $x$
+DECLARE n int;
+BEGIN
+  n := (SELECT count(*) FROM public.a);
+  IF EXISTS (SELECT 1 FROM public.b) THEN
+    UPDATE public.c SET id = p;
+  END IF;
+  RETURN QUERY SELECT * FROM public.t;
+END $x$"""
+
+
+def test_a_plpgsql_body_is_traced_statement_by_statement() -> None:
+    """Measured: a PL/pgSQL SECURITY DEFINER function returned every row to a
+    caller whose direct read was `permission denied`. Assignments and IF
+    conditions hold subqueries too."""
+    tables = [_t(n) for n in ("a", "b", "c", "t")]
+    f = _f("<body>", owner="own", lang="plpgsql", definition=_PLPGSQL)
+    m = build_matrix(_s(tables, fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    for name in ("a", "b", "t"):
+        assert _cell(m, f"public.{name}", "SELECT", "app").verdict == "open", name
+    assert _cell(m, "public.c", "UPDATE", "app").verdict == "open"
+    assert _cell(m, "public.c", "SELECT", "app").verdict == "denied"
+    assert m.untraced == ()
+
+
+def test_dynamic_sql_is_listed_but_the_static_part_still_counts() -> None:
+    body = """CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $x$
+BEGIN
+  PERFORM 1 FROM public.t;
+  EXECUTE format('DELETE FROM %I', 'other');
+END $x$"""
+    f = _f("<body>", owner="own", lang="plpgsql", definition=body)
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
+    [u] = m.untraced
+    assert u.function == "public.f" and "dynamic SQL" in u.reason and u.roles == ("app",)
+
+
+def test_a_role_inheriting_the_function_owner_can_execute_it() -> None:
+    """Measured: EXECUTE revoked from PUBLIC, `GRANT svc TO app`, svc BYPASSRLS:
+    app read 2 of 4 rows directly and 4 of 4 through the function. The owner's
+    own EXECUTE is implicit, so it is not in the function's ACL."""
+    t = _t(policies=(_TENANT_A,), grants=(_grant("svc", ("SELECT",)),))
+    f = _f("SELECT * FROM public.t", owner="svc", execute=())
+    m = build_matrix(
+        _s([t], fns=[f], roles=[_r("app"), _r("svc", brls=True), _r("own")],
+           memberships=[RoleMembership("app", "svc", True)]),
+        roles=("app",),
+    )
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
+
+
+def test_a_function_reading_through_an_invoker_view_reads_as_its_owner() -> None:
+    """Inside a SECURITY DEFINER body `current_user` is the owner, so an
+    invoker view read there runs as the owner — a door, not the caller's own
+    access."""
+    v = _v("v", _OWN_T, owner="own", invoker=True)
+    f = _f("SELECT * FROM public.v", owner="own")
+    m = build_matrix(_s([_t()], [v], [f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
+
+
+@pytest.mark.parametrize(("search_path", "reached"), [
+    ("b, pg_temp", {"b.t"}),
+    (None, {"a.t", "b.t"}),  # the caller's search_path decides: either could win
+])
+def test_a_bare_name_resolves_through_the_functions_search_path(
+    search_path: str | None, reached: set[str]
+) -> None:
+    tables = [_t(schema="a"), _t(schema="b")]
+    f = _f("SELECT * FROM t", owner="own", search_path=search_path)
+    m = build_matrix(_s(tables, fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    got = {q for q in ("a.t", "b.t") if _cell(m, q, "SELECT", "app").verdict == "open"}
+    assert got == reached
+
+
+def test_a_partition_is_reached_through_its_parent() -> None:
+    """Measured: a partition with RLS FORCE'd, no policy and no grant was read,
+    updated, deleted and truncated through its parent, and an INSERT into the
+    parent was routed into it."""
+    parent = _t("p", rls=False, grants=(_grant("app", _ALL5),))
+    child = _t("p_a", force=True, partition_of=("public", "p"))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",))
+    for cmd in _ALL5:
+        c = _cell(m, "public.p_a", cmd, "app")
+        assert c.verdict == "open" and "through parent public.p" in (c.note or ""), cmd
+
+
+def test_an_inheritance_child_is_reached_through_its_parent_except_insert() -> None:
+    """An INSERT into a classic-inheritance parent stays in the parent."""
+    parent = _t("ip", rls=False, grants=(_grant("app", _ALL5),))
+    child = _t("ic", force=True, inherits=(("public", "ip"),))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert {c for c in _ALL5 if _cell(m, "public.ic", c, "app").verdict == "open"} == \
+        {"SELECT", "UPDATE", "DELETE", "TRUNCATE"}
+
+
+def test_a_parents_policies_filter_the_childs_rows() -> None:
+    """Measured: through the parent, the child's rows were filtered by the
+    PARENT's policy; the child's own deny-all did not apply."""
+    parent = _t("ip", policies=(_TENANT_A,), grants=(_grant("app", ("SELECT",)),))
+    child = _t("ic", force=True, inherits=(("public", "ip"),))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.ic", "SELECT", "app")
+    assert c.verdict == "conditional" and c.predicate == "tenant_id = 'a'"
+
+
+def test_two_different_filtered_paths_are_undecided() -> None:
+    """Measured: anon read id 1 directly and id 2 through a definer view. The
+    cell said COND `(id = 1)`; the union of two filters can be every row."""
+    t = _t(grants=(_grant("anon", ("SELECT",)), _grant("svc", ("SELECT",))),
+           policies=(_policy(roles=("anon",), using="id = 1", name="p_anon"),
+                     _policy(roles=("svc",), using="id = 2", name="p_svc")))
+    v = _v("v", _OWN_T, owner="svc", grants=(_grant("anon", ("SELECT",)),))
+    m = build_matrix(_s([t], [v], roles=[_r("anon"), _r("svc"), _r("own")]), roles=("anon",))
+    c = _cell(m, "public.t", "SELECT", "anon")
+    assert c.verdict == "undecided" and "definer view public.v" in (c.note or "")
+
+
+def test_the_same_filter_on_two_paths_stays_conditional() -> None:
+    parent = _t("p", policies=(_TENANT_A,), grants=(_grant("app", ("SELECT",)),))
+    child = _t("p_a", policies=(_TENANT_A,), grants=(_grant("app", ("SELECT",)),),
+               partition_of=("public", "p"))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.p_a", "SELECT", "app").verdict == "conditional"
+
+
+@pytest.mark.parametrize("policies", [
+    (_policy(roles=("svc",), using="id = 1 OR true"),),
+    (_policy(roles=("svc",), using="true", name="perm"),
+     _policy(roles=("svc",), using="true", name="floor", permissive=False)),
+])
+def test_a_door_is_judged_by_the_same_rules_as_a_cell(policies: tuple[Policy, ...]) -> None:
+    """Measured: a view owner under `USING (id = 1 OR true)`, or a permissive
+    `true` with a no-op `true` floor, read every row; the door said COND."""
+    t = _t(policies=policies, grants=(_grant("svc", ("SELECT",)),))
+    v = _v("v", _OWN_T, owner="svc", grants=(_grant("anon", ("SELECT",)),))
+    m = build_matrix(_s([t], [v], roles=[_r("anon"), _r("svc"), _r("own")]), roles=("anon",))
+    assert _cell(m, "public.t", "SELECT", "anon").verdict == "open"
+
+
+def test_truncate_ignores_rls() -> None:
+    """Measured: TRUNCATE emptied a FORCE'd table whose DELETE admitted no row."""
+    t = _t(force=True, grants=(_grant("app", ("DELETE", "TRUNCATE")),))
+    m = build_matrix(_s([t], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "DELETE", "app").verdict == "denied"
+    c = _cell(m, "public.t", "TRUNCATE", "app")
+    assert c.verdict == "open" and c.note == "TRUNCATE is not subject to RLS"
+
+
+def test_pg_write_all_data_does_not_confer_truncate() -> None:
+    m = build_matrix(
+        _s([_t(rls=False)], roles=[_r("etl"), _r("own")],
+           memberships=[RoleMembership("etl", "pg_write_all_data", True)]),
+        roles=("etl",),
+    )
+    assert _cell(m, "public.t", "DELETE", "etl").verdict == "open"
+    assert _cell(m, "public.t", "TRUNCATE", "etl").verdict == "denied"
+
+
+def test_the_data_role_itself_holds_its_privilege() -> None:
+    m = build_matrix(_s([_t(rls=False)], roles=[_r("own")]), roles=("pg_read_all_data",))
+    assert _cell(m, "public.t", "SELECT", "pg_read_all_data").verdict == "open"
+
+
+def test_default_columns_are_the_roles_that_reach_something() -> None:
+    """With the role catalogue, a role that reaches data only through a group
+    still gets a column, one that reaches nothing does not, and anon /
+    authenticated appear only when they exist."""
+    t = _t(rls=False, grants=(_grant("grp", ("SELECT",)),))
+    m = build_matrix(_s(
+        [t], roles=[_r("app"), Role("grp", False, False, False), _r("stranger"), _r("own")],
+        memberships=[RoleMembership("app", "grp", True)],
+    ))
+    assert m.roles == ("PUBLIC", "app", "grp", "own")
+
+
+def test_an_unbounded_door_outranks_a_known_filter() -> None:
+    """A materialized view's rows cannot be bounded; a known COND must not mask it."""
+    t = _t(grants=(_grant("anon", ("SELECT",)),),
+           policies=(_policy(roles=("anon",), using="id = 1"),))
+    mv = _v("mv", _OWN_T, owner="own", mat=True, grants=(_grant("anon", ("SELECT",)),))
+    m = build_matrix(_s([t], [mv], roles=[_r("anon"), _r("own")]), roles=("anon",))
+    c = _cell(m, "public.t", "SELECT", "anon")
+    assert c.verdict == "undecided" and "materialized view" in (c.note or "")
+
+
+def test_a_hop_the_owner_cannot_use_is_a_dead_path() -> None:
+    """Measured: `permission denied for view inner` — no rows."""
+    inner = _v("inner", _OWN_T, owner="root")
+    outer = _v("outer", _OWN_T, owner="app_owner", grants=(_grant("anon", ("SELECT",)),),
+               direct=(("public", "inner"),))
+    m = build_matrix(_s([_t()], [inner, outer],
+                        roles=[_r("anon"), _r("app_owner"), _r("root", su=True), _r("own")]),
+                     roles=("anon",))
+    assert _cell(m, "public.t", "SELECT", "anon").verdict == "denied"
+
+
+def test_a_materialized_view_hop_is_undecided() -> None:
+    mv = _v("mv", _OWN_T, owner="own", mat=True)
+    outer = _v("outer", _OWN_T, owner="own", grants=(_grant("anon", ("SELECT",)),),
+               direct=(("public", "mv"),))
+    m = build_matrix(_s([_t()], [mv, outer], roles=[_r("anon"), _r("own")]), roles=("anon",))
+    assert _cell(m, "public.t", "SELECT", "anon").verdict == "undecided"
+
+
+def test_a_hop_undecidable_without_the_graph_is_undecided() -> None:
+    inner = _v("inner", _OWN_T, owner="root", grants=(_grant("grp", ("SELECT",)),))
+    outer = _v("outer", _OWN_T, owner="x", grants=(_grant("PUBLIC", ("SELECT",)),),
+               direct=(("public", "inner"),))
+    s = Schema(tables=(_t(),), views=(inner, outer), roles=(_r("root", su=True), _r("x")),
+               role_memberships=None)
+    m = build_matrix(s, roles=("PUBLIC",))
+    assert _cell(m, "public.t", "SELECT", "PUBLIC").verdict == "undecided"
+
+
+def test_column_grants_confer_update_but_never_delete() -> None:
+    """Postgres has no column-level DELETE, so a column grant listing it can
+    only come from a hand-edited snapshot — and must still not confer it."""
+    t = _t(rls=False, column_grants=(ColumnGrant(role="app", column="id",
+                                                 privileges=("UPDATE", "INSERT", "DELETE")),))
+    m = build_matrix(_s([t], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.t", "UPDATE", "app").verdict == "open"
+    assert _cell(m, "public.t", "INSERT", "app").verdict == "open"
+    assert _cell(m, "public.t", "DELETE", "app").verdict == "denied"
+
+
+def test_untraced_functions_are_listed_in_every_format() -> None:
+    f = _f("BEGIN RETURN; END", owner="svc", lang="plpgsql")  # no definition captured
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("svc"), _r("own")]), roles=("PUBLIC",))
+    assert m.untraced == (UntracedFunction(
+        "public.f", "svc", "the PL/pgSQL definition was not captured", ("PUBLIC",)),)
+    assert "not traced" in render_text(m)
+    assert json.loads(render_json(m))["untraced_functions"] == [{
+        "function": "public.f", "owner": "svc",
+        "reason": "the PL/pgSQL definition was not captured", "roles": ["PUBLIC"],
+    }]
+    assert "## SECURITY DEFINER functions not traced" in render_markdown(m)
+    assert "public.f" in render_html(m, generated_at=_FIXED_AT)
+    quiet = build_matrix(_s([_t()], roles=[_r("own")]), roles=("PUBLIC",))
+    assert json.loads(render_json(quiet))["untraced_functions"] == []
+    assert "not traced" not in render_text(quiet)
+
+
+def test_text_output_puts_the_grid_first() -> None:
+    t = _t(rls=False, grants=(_grant("app", ("SELECT",)),))
+    out = render_text(build_matrix(_s([t], roles=[_r("app"), _r("own")]), roles=("app",)))
+    assert out.startswith("TABLE")
+    assert out.index("Sensitive columns reachable") > out.index("public.t")
+
+
+def test_a_data_role_is_named_plainly_in_exposures() -> None:
+    m = build_matrix(
+        _s([_t(rls=False)], roles=[_r("analyst"), _r("own")],
+           memberships=[RoleMembership("analyst", "pg_read_all_data", True)]),
+        roles=("analyst",),
+    )
+    assert {e.via for e in m.exposures} == {"pg_read_all_data"}
+
+
 # --- live differential: every cell against a real SET ROLE session ------------
 #
-# Each matrix claim is checked against Postgres itself. The command runs under
-# SET LOCAL ROLE in a rolled-back transaction: a SELECT count, two INSERTs (one
-# row a tenant predicate admits, one it rejects), and UPDATE / DELETE row
-# counts. SELECT takes the widest of the direct read and every door — two
-# definer views, an invoker view, two SECURITY DEFINER functions. This is the
-# test that caught policies being applied through NOINHERIT edges. NOINHERIT
-# comes from the role attribute so the test runs on PG15, which has no
-# per-grant INHERIT option.
+# Each matrix claim is checked against Postgres itself: the command runs as the
+# role (SET LOCAL ROLE) in a transaction that is rolled back, and its EFFECT on
+# the table is measured as superuser before the rollback — rows returned, rows
+# updated, rows left after DELETE / TRUNCATE, which of two INSERTs landed (one
+# row a tenant predicate admits, one it rejects). Every door is measured the
+# same way and the widest reach wins: definer and invoker views (reads and
+# writes), SQL and PL/pgSQL SECURITY DEFINER functions (reads, a delete, one
+# reached through the owner's membership), a view in another schema, and
+# partition / inheritance parents. This is the test that caught policies
+# applied through NOINHERIT edges and the doors review iteration 1 found
+# missing. NOINHERIT comes from the role attribute so it runs on PG15 too.
 
 _MXD_ROLES = (
     "mxd_pub", "mxd_grp", "mxd_mid", "mxd_inh", "mxd_noinh", "mxd_nested",
     "mxd_owner", "mxd_owner_m", "mxd_owner_m_noinh", "mxd_su", "mxd_byp",
     "mxd_byp_nogrant", "mxd_rad", "mxd_wad", "mxd_colr", "mxd_colw",
     "mxd_door_owner", "mxd_vowner", "mxd_vuser", "mxd_invuser", "mxd_fnuser",
+    "mxd_svc", "mxd_svc_m", "mxd_or_owner", "mxd_vwuser", "mxd_partuser", "mxd_apiuser",
 )
 
 _MXD_DDL = """
@@ -1145,9 +1556,16 @@ CREATE ROLE mxd_vowner NOLOGIN;
 CREATE ROLE mxd_vuser NOLOGIN;
 CREATE ROLE mxd_invuser NOLOGIN;
 CREATE ROLE mxd_fnuser NOLOGIN;
+CREATE ROLE mxd_svc NOLOGIN BYPASSRLS;
+CREATE ROLE mxd_svc_m NOLOGIN;
+CREATE ROLE mxd_or_owner NOLOGIN;
+CREATE ROLE mxd_vwuser NOLOGIN;
+CREATE ROLE mxd_partuser NOLOGIN;
+CREATE ROLE mxd_apiuser NOLOGIN;
 GRANT mxd_grp TO mxd_inh, mxd_noinh, mxd_mid;
 GRANT mxd_mid TO mxd_nested;
 GRANT mxd_owner TO mxd_owner_m, mxd_owner_m_noinh;
+GRANT mxd_svc TO mxd_svc_m;
 GRANT pg_read_all_data TO mxd_rad;
 GRANT pg_write_all_data TO mxd_wad;
 
@@ -1161,7 +1579,7 @@ BEGIN
 END $$;
 
 SELECT pg_temp.mk('t_open');
-GRANT SELECT ON t_open TO mxd_grp;
+GRANT SELECT, TRUNCATE ON t_open TO mxd_grp;
 
 SELECT pg_temp.mk('t_grp_policy');
 ALTER TABLE t_grp_policy ENABLE ROW LEVEL SECURITY;
@@ -1200,7 +1618,7 @@ CREATE POLICY p_ad ON t_all_data FOR ALL TO PUBLIC
 SELECT pg_temp.mk('t_bypass');
 ALTER TABLE t_bypass ENABLE ROW LEVEL SECURITY;
 ALTER TABLE t_bypass FORCE ROW LEVEL SECURITY;
-GRANT SELECT ON t_bypass TO mxd_byp;
+GRANT SELECT, TRUNCATE ON t_bypass TO mxd_byp;
 
 SELECT pg_temp.mk('t_door');
 ALTER TABLE t_door OWNER TO mxd_door_owner;
@@ -1233,109 +1651,285 @@ CREATE FUNCTION f_pub() RETURNS SETOF public.t_fn_pub LANGUAGE sql SECURITY DEFI
   AS 'SELECT * FROM public.t_fn_pub';
 ALTER FUNCTION f_pub() OWNER TO mxd_door_owner;
 
+SELECT pg_temp.mk('t_plpg');
+ALTER TABLE t_plpg OWNER TO mxd_door_owner;
+ALTER TABLE t_plpg ENABLE ROW LEVEL SECURITY;
+CREATE FUNCTION f_plpg() RETURNS SETOF public.t_plpg LANGUAGE plpgsql SECURITY DEFINER
+  AS 'BEGIN RETURN QUERY SELECT * FROM public.t_plpg; END';
+ALTER FUNCTION f_plpg() OWNER TO mxd_door_owner;
+
+SELECT pg_temp.mk('t_wipe');
+ALTER TABLE t_wipe OWNER TO mxd_door_owner;
+ALTER TABLE t_wipe ENABLE ROW LEVEL SECURITY;
+CREATE FUNCTION f_wipe() RETURNS void LANGUAGE sql SECURITY DEFINER
+  AS 'DELETE FROM public.t_wipe';
+ALTER FUNCTION f_wipe() OWNER TO mxd_door_owner;
+REVOKE EXECUTE ON FUNCTION f_wipe() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION f_wipe() TO mxd_fnuser;
+
+SELECT pg_temp.mk('t_svc');
+ALTER TABLE t_svc ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_svc ON t_svc FOR ALL TO PUBLIC
+  USING (tenant_id = current_setting('app.tenant', true));
+GRANT SELECT ON t_svc TO mxd_svc;
+CREATE FUNCTION f_svc() RETURNS SETOF public.t_svc LANGUAGE sql SECURITY DEFINER
+  AS 'SELECT * FROM public.t_svc';
+ALTER FUNCTION f_svc() OWNER TO mxd_svc;
+REVOKE EXECUTE ON FUNCTION f_svc() FROM PUBLIC;
+
+SELECT pg_temp.mk('t_ortrue');
+ALTER TABLE t_ortrue ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_or ON t_ortrue FOR SELECT TO mxd_or_owner USING (id = 1 OR true);
+GRANT SELECT ON t_ortrue TO mxd_or_owner;
+CREATE VIEW v_or AS SELECT * FROM public.t_ortrue;
+ALTER VIEW v_or OWNER TO mxd_or_owner;
+GRANT SELECT ON v_or TO mxd_vuser;
+
+SELECT pg_temp.mk('t_vw');
+ALTER TABLE t_vw OWNER TO mxd_door_owner;
+ALTER TABLE t_vw ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_vw ON t_vw FOR ALL TO PUBLIC
+  USING (tenant_id = current_setting('app.tenant', true));
+GRANT SELECT, UPDATE, DELETE ON t_vw TO mxd_vwuser;
+CREATE VIEW v_w AS SELECT * FROM public.t_vw;
+ALTER VIEW v_w OWNER TO mxd_door_owner;
+GRANT INSERT, UPDATE, DELETE ON v_w TO mxd_vwuser;
+
+SELECT pg_temp.mk('t_mv');
+ALTER TABLE t_mv OWNER TO mxd_door_owner;
+ALTER TABLE t_mv ENABLE ROW LEVEL SECURITY;
+CREATE MATERIALIZED VIEW mv_all AS SELECT * FROM public.t_mv;
+ALTER MATERIALIZED VIEW mv_all OWNER TO mxd_door_owner;
+GRANT SELECT ON mv_all TO mxd_vuser;
+
+SELECT pg_temp.mk('t_x');
+ALTER TABLE t_x OWNER TO mxd_door_owner;
+ALTER TABLE t_x ENABLE ROW LEVEL SECURITY;
+CREATE SCHEMA mxd_api;
+GRANT USAGE ON SCHEMA mxd_api TO mxd_apiuser;
+CREATE VIEW mxd_api.v_x AS SELECT * FROM public.t_x;
+ALTER VIEW mxd_api.v_x OWNER TO mxd_door_owner;
+GRANT SELECT ON mxd_api.v_x TO mxd_apiuser;
+
+CREATE TABLE t_part (id int, tenant_id text, owner_name text, note text, email text, ssn text)
+  PARTITION BY LIST (tenant_id);
+CREATE TABLE t_part_a PARTITION OF t_part FOR VALUES IN ('a');
+CREATE TABLE t_part_b PARTITION OF t_part FOR VALUES IN ('b', 'zzz');
+INSERT INTO t_part VALUES (1, 'a', 'x', 'n1', 'a1@x', '111'), (2, 'a', 'x', 'n2', 'a2@x', '222'),
+  (3, 'b', 'x', 'n3', 'b1@x', '333'), (4, 'b', 'x', 'n4', 'b2@x', '444');
+ALTER TABLE t_part_a ENABLE ROW LEVEL SECURITY;
+ALTER TABLE t_part_a FORCE ROW LEVEL SECURITY;
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON t_part TO mxd_partuser;
+
+CREATE TABLE t_inh (id int, tenant_id text, owner_name text, note text, email text, ssn text);
+CREATE TABLE t_inh_c () INHERITS (t_inh);
+INSERT INTO t_inh_c VALUES (1, 'a', 'x', 'n1', 'a1@x', '111'), (2, 'a', 'x', 'n2', 'a2@x', '222'),
+  (3, 'b', 'x', 'n3', 'b1@x', '333'), (4, 'b', 'x', 'n4', 'b2@x', '444');
+ALTER TABLE t_inh ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_inh ON t_inh FOR ALL TO PUBLIC
+  USING (tenant_id = current_setting('app.tenant', true));
+ALTER TABLE t_inh_c ENABLE ROW LEVEL SECURITY;
+ALTER TABLE t_inh_c FORCE ROW LEVEL SECURITY;
+GRANT SELECT, UPDATE, DELETE, TRUNCATE ON t_inh TO mxd_partuser;
+
 SELECT pg_temp.mk('t_nested');
 GRANT SELECT ON t_nested TO mxd_mid;
 """
 
-# Each door, and the base table whose rows it returns.
-_MXD_DOORS = {
-    "v_def": "public.t_door",
-    "v_inv": "public.t_door",
-    "f_door()": "public.t_door",
-    "v_def2": "public.t_door_filtered",
-    "f_pub()": "public.t_fn_pub",
+# Function calls that reach a table, keyed by (table, command) — their call
+# forms vary, so they are listed; view and parent doors are derived from the
+# schema (`_mxd_doors`). A SELECT door is a template over `{expr}`.
+_MXD_FUNCTION_DOORS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("public.t_door", "SELECT"): ("SELECT {expr} FROM f_door()",),
+    ("public.t_fn_pub", "SELECT"): ("SELECT {expr} FROM f_pub()",),
+    ("public.t_plpg", "SELECT"): ("SELECT {expr} FROM f_plpg()",),
+    ("public.t_svc", "SELECT"): ("SELECT {expr} FROM f_svc()",),
+    ("public.t_wipe", "DELETE"): ("SELECT f_wipe()",),
 }
+# A partition only accepts its own key: probe it with rows it can hold.
+_MXD_PROBES = {
+    "public.t_part_a": ("(100, 'a', current_user)", "(101, 'a', 'nobody')"),
+    "public.t_part_b": ("(100, 'b', current_user)", "(101, 'zzz', 'nobody')"),
+}
+_MXD_DEFAULT_PROBES = ("(100, 'a', current_user)", "(101, 'zzz', 'nobody')")
+
+
+_MXD_VIEWS_SQL = """
+SELECT DISTINCT vn.nspname || '.' || v.relname AS view, v.relkind = 'm' AS mat,
+       tn.nspname || '.' || t.relname AS base
+FROM pg_class v
+JOIN pg_namespace vn ON vn.oid = v.relnamespace
+JOIN pg_rewrite r ON r.ev_class = v.oid
+JOIN pg_depend d ON d.objid = r.oid AND d.classid = 'pg_rewrite'::regclass
+                AND d.refclassid = 'pg_class'::regclass
+JOIN pg_class t ON t.oid = d.refobjid AND t.relkind IN ('r', 'p')
+JOIN pg_namespace tn ON tn.oid = t.relnamespace
+WHERE v.relkind IN ('v', 'm') AND vn.nspname NOT IN ('pg_catalog', 'information_schema')
+"""
+_MXD_PARENTS_SQL = """
+SELECT cn.nspname || '.' || c.relname AS child, pn.nspname || '.' || p.relname AS parent,
+       p.relkind = 'p' AS declarative
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_namespace cn ON cn.oid = c.relnamespace
+JOIN pg_class p ON p.oid = i.inhparent JOIN pg_namespace pn ON pn.oid = p.relnamespace
+"""
+
+
+def _mxd_doors(conn: psycopg.Connection) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Every statement that reaches a table other than by naming it, read from
+    the Postgres catalog rather than from pgrls' introspection — a door the
+    introspection missed must not be missed here too. Each view over the table
+    (read, and write for a regular view), each ancestor (read, write, TRUNCATE,
+    and INSERT for a partitioned one), and the function calls."""
+    doors: dict[tuple[str, str], list[str]] = {k: list(v) for k, v in _MXD_FUNCTION_DOORS.items()}
+
+    def add(table: str, command: str, stmt: str) -> None:
+        doors.setdefault((table, command), []).append(stmt)
+
+    with conn.cursor() as cur:
+        cur.execute(_MXD_VIEWS_SQL)
+        views = cur.fetchall()
+        cur.execute(_MXD_PARENTS_SQL)
+        edges = cur.fetchall()
+    for view, mat, table in views:
+        add(table, "SELECT", f"SELECT {{expr}} FROM {view}")
+        if not mat:
+            add(table, "INSERT", f"INSERT INTO {view} (id, tenant_id, owner_name) VALUES {{row}}")
+            add(table, "UPDATE", f"UPDATE {view} SET note = 'x'")
+            add(table, "DELETE", f"DELETE FROM {view}")
+    parents = {child: (parent, declarative) for child, parent, declarative in edges}
+    for child in parents:
+        ancestor = child
+        while ancestor in parents:  # every ancestor, not only the parent
+            ancestor, declarative = parents[ancestor]
+            add(child, "SELECT", f"SELECT {{expr}} FROM {ancestor} "
+                f"WHERE tableoid = '{child}'::regclass")
+            add(child, "UPDATE", f"UPDATE {ancestor} SET note = 'x'")
+            add(child, "DELETE", f"DELETE FROM {ancestor}")
+            add(child, "TRUNCATE", f"TRUNCATE {ancestor}")
+            if declarative:
+                add(child, "INSERT", f"INSERT INTO {ancestor} "
+                    "(id, tenant_id, owner_name) VALUES {row}")
+    return {k: tuple(v) for k, v in doors.items()}
+
+
 _MXD_RANK = {"all": 3, "some": 1, "none": 0}
 _MXD_VERDICT_RANK = {"open": 3, "undecided": 2, "conditional": 1, "denied": 0}
 
 
-def _mxd_run(conn: psycopg.Connection, role: str, stmt: str) -> tuple[bool, int]:
-    """Run `stmt` as `role` with app.tenant = 'a', roll back, and return
-    (succeeded, row count — the count(*) value for a SELECT)."""
+def _mxd_effect(conn: psycopg.Connection, role: str, stmt: str, measure: str | None) -> int | None:
+    """Run `stmt` as `role` (app.tenant = 'a'), then — back as superuser, in
+    the same transaction — run `measure`; roll back either way. The first
+    column of the last result, or None when `stmt` was refused."""
     with conn.cursor() as cur:
         cur.execute("BEGIN")
         try:
             cur.execute("SET LOCAL app.tenant = 'a'")
             cur.execute(f'SET LOCAL ROLE "{role}"')
             cur.execute(stmt)
-            n = cur.fetchone()[0] if cur.description else cur.rowcount
-            return True, n
+            got = cur.fetchone()[0] if cur.description else 0
+            cur.execute("RESET ROLE")
+            if measure is not None:
+                cur.execute(measure)
+                got = cur.fetchone()[0]
+            return int(got or 0)
         except psycopg.Error:
-            return False, 0
+            return None
         finally:
             cur.execute("ROLLBACK")
 
 
+def _mxd_truth(conn: psycopg.Connection, role: str, table: str, command: str,
+               stmts: tuple[str, ...], total: int) -> str:
+    """The widest reach any of `stmts` gives `role` on `table` for `command`."""
+    def reach(n: int | None) -> str:
+        return "none" if not n else ("all" if n >= total else "some")
+
+    best = "none"
+    for stmt in stmts:
+        if command == "SELECT":
+            got = reach(_mxd_effect(conn, role, stmt.format(expr="count(*)"), None))
+        elif command == "UPDATE":
+            got = reach(_mxd_effect(conn, role, stmt,
+                                    f"SELECT count(*) FROM {table} WHERE note = 'x'"))
+        elif command in ("DELETE", "TRUNCATE"):
+            left = _mxd_effect(conn, role, stmt, f"SELECT count(*) FROM {table}")
+            got = reach(None if left is None else total - left)
+        else:
+            good, bad = _MXD_PROBES.get(table, _MXD_DEFAULT_PROBES)
+            landed = [
+                _mxd_effect(conn, role, stmt.format(row=row),
+                            f"SELECT count(*) FROM {table} WHERE id = {rid}")
+                for row, rid in ((good, 100), (bad, 101))
+            ]
+            hits = sum(1 for n in landed if n)
+            got = "all" if hits == 2 else ("some" if hits else "none")
+        best = max(best, got, key=_MXD_RANK.__getitem__)
+    return best
+
+
 @requires_docker
 def test_every_cell_matches_a_live_set_role_session(pg_conn: psycopg.Connection) -> None:
+    from pgrls.matrix import with_doors_from_every_schema  # noqa: PLC0415
+
     roles = ("PUBLIC",) + _MXD_ROLES[1:]
     as_db = {"PUBLIC": "mxd_pub"}  # a role with no memberships stands in for PUBLIC
-
-    def reach(ok: bool, n: int, total: int) -> str:
-        return "none" if not ok or n == 0 else ("all" if n == total else "some")
-
+    direct = {
+        "SELECT": "SELECT {{expr}} FROM {t}",
+        "INSERT": "INSERT INTO {t} (id, tenant_id, owner_name) VALUES {{row}}",
+        "UPDATE": "UPDATE {t} SET note = 'x'",
+        "DELETE": "DELETE FROM {t}",
+        "TRUNCATE": "TRUNCATE {t}",
+    }
     with pg_conn.cursor() as cur:
         cur.execute("DROP ROLE IF EXISTS " + ", ".join(_MXD_ROLES))
     try:
         with pg_conn.cursor() as cur:
             cur.execute(_MXD_DDL)
-        schema = introspect(pg_conn, schemas=["public"])
+        schema = with_doors_from_every_schema(
+            pg_conn, introspect(pg_conn, schemas=["public"]), ["public"]
+        )
         m = build_matrix(schema, roles=roles)
+        doors = _mxd_doors(pg_conn)
         totals = {}
         with pg_conn.cursor() as cur:
             for t in {r.qualified_name for r in m.rows}:
                 cur.execute(f"SELECT count(*) FROM {t}")
                 totals[t] = cur.fetchone()[0]
 
-        door_reach: dict[tuple[str, str], str] = {}
-        for role in roles:
-            for door, base in _MXD_DOORS.items():
-                got = reach(*_mxd_run(pg_conn, as_db.get(role, role),
-                                      f"SELECT count(*) FROM {door}"), totals[base])
-                if _MXD_RANK[got] > _MXD_RANK[door_reach.get((role, base), "none")]:
-                    door_reach[(role, base)] = got
-
         wrong = []
         for row in m.rows:
-            total = totals[row.qualified_name]
+            t, cmd = row.qualified_name, row.command
+            stmts = (direct[cmd].format(t=t),) + doors.get((t, cmd), ())
             for role, cell in zip(m.roles, row.cells):
-                db = as_db.get(role, role)
-                t = row.qualified_name
-                if row.command == "SELECT":
-                    truth = reach(*_mxd_run(pg_conn, db, f"SELECT count(*) FROM {t}"), total)
-                    door = door_reach.get((role, t), "none")
-                    truth = max(truth, door, key=_MXD_RANK.__getitem__)
-                elif row.command == "INSERT":
-                    ins = f"INSERT INTO {t} (id, tenant_id, owner_name) VALUES "
-                    good = _mxd_run(pg_conn, db, ins + "(100, 'a', current_user)")[0]
-                    bad = _mxd_run(pg_conn, db, ins + "(101, 'zzz', 'nobody')")[0]
-                    truth = "all" if good and bad else ("some" if good or bad else "none")
-                else:
-                    stmt = (f"UPDATE {t} SET note = 'x'" if row.command == "UPDATE"
-                            else f"DELETE FROM {t}")
-                    truth = reach(*_mxd_run(pg_conn, db, stmt), total)
+                if cell.verdict == "undecided":
+                    continue  # "possibly reachable" is consistent with any truth
+                truth = _mxd_truth(pg_conn, as_db.get(role, role), t, cmd, stmts, totals[t])
                 if _MXD_VERDICT_RANK[cell.verdict] != _MXD_RANK[truth]:
-                    wrong.append((t, row.command, role, cell.verdict, truth))
+                    wrong.append((t, cmd, role, cell.verdict, truth, cell.note))
         assert wrong == [], wrong
-        # Not vacuous: every verdict a live schema can produce shows up.
+        # Not vacuous: every verdict shows up, UNDECIDED from the matview.
         seen = {c.verdict for r in m.rows for c in r.cells}
-        assert seen == {"open", "conditional", "denied"}, seen
+        assert seen == {"open", "conditional", "denied", "undecided"}, seen
+        assert m.untraced == ()  # every function body here is traceable
 
         # The sensitive-columns section lists exactly what each role can read.
         readable = set()
         for role in roles:
-            for relation, base in [(t, t) for t in totals] + list(_MXD_DOORS.items()):
+            for t in totals:
+                reads = (f"SELECT {{expr}} FROM {t}",) + doors.get((t, "SELECT"), ())
                 for col in ("email", "ssn"):
-                    ok, n = _mxd_run(pg_conn, as_db.get(role, role),
-                                     f"SELECT count({col}) FROM {relation}")
-                    if ok and n:
-                        readable.add((role, base, col))
+                    if any(_mxd_effect(pg_conn, as_db.get(role, role),
+                                       stmt.format(expr=f"count({col})"), None)
+                           for stmt in reads):
+                        readable.add((role, t, col))
         assert {(e.role, e.table, e.column) for e in m.exposures} == readable
     finally:
         # Roles are cluster-wide (two carry SUPERUSER / BYPASSRLS, which later
         # tests would see): drop every one that exists. DROP OWNED has no
         # IF EXISTS, and a failed DDL batch rolls back as one transaction.
         with pg_conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS mxd_api CASCADE")
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public")
             cur.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)",
                         (list(_MXD_ROLES),))
@@ -1343,3 +1937,17 @@ def test_every_cell_matches_a_live_set_role_session(pg_conn: psycopg.Connection)
             if existing:
                 cur.execute("DROP OWNED BY " + ", ".join(existing))
                 cur.execute("DROP ROLE " + ", ".join(existing))
+
+
+@requires_docker
+def test_the_database_owner_is_a_member_of_pg_database_owner(pg_conn: psycopg.Connection) -> None:
+    """Measured: the database owner read a table granted only to
+    `pg_database_owner`, while `pg_auth_members` held no edge for it."""
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT pg_get_userbyid(datdba) FROM pg_database "
+                    "WHERE datname = current_database()")
+        dbo = cur.fetchone()[0]
+    schema = introspect(pg_conn, schemas=["public"])
+    assert RoleMembership(member=dbo, role="pg_database_owner", inherit=True) in (
+        schema.role_memberships or ()
+    )
