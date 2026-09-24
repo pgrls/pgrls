@@ -238,10 +238,12 @@ def _policy_applies(
 ) -> bool | None:
     """Whether `policy` applies to a session whose role reaches `applies_to`.
 
-    Postgres applies a policy ``TO R`` to any session that is ``R`` or a member
-    of ``R`` — through EVERY membership edge, INHERIT or not (unlike
-    privileges). Matching the role name literally missed that: measured, a
-    ``TO grp`` policy reported the member as DENIED while it read every row.
+    Postgres applies a policy ``TO R`` to a session that holds ``R``'s
+    privileges — ``R`` itself or an INHERIT member, the same rule as a grant
+    (``has_privs_of_role``). Matching the role name literally missed that:
+    measured, a ``TO grp`` policy reported an INHERIT member as DENIED while it
+    read every row. A NOINHERIT member is bound by neither a permissive nor a
+    restrictive ``TO grp`` policy (measured on PG15-17).
     ``None`` = undecidable (the membership graph was not captured and the
     policy names a role outside what we can see).
     """

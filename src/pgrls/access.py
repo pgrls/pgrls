@@ -239,7 +239,8 @@ def _reachable_columns(paths: list[AccessPath]) -> tuple[str, ...] | None:
 
 
 def _applicability(schema: Schema, name: str) -> tuple[frozenset[str], bool]:
-    """The roles whose ``TO`` list a session running as `name` satisfies, and
+    """The roles whose ``TO`` list a session running as `name` satisfies —
+    `name`, the roles it inherits (INHERIT edges only) and ``PUBLIC`` — and
     whether that set is complete. ``PUBLIC`` is a member of nothing, so its set
     is ``{PUBLIC}`` and always complete — even with no captured graph."""
     if name == "PUBLIC":
@@ -263,8 +264,9 @@ def _row_reach(
     owns = any(p.kind in ("owner", "owner_member") for p in paths)
     if owns and not table.force_rls:
         return "all", (), "holds the owner's privileges and RLS is not FORCE'd"
-    # Policy applicability follows EVERY membership edge (is_member_of_role),
-    # INHERIT or not — unlike privileges, which follow INHERIT only.
+    # Policy applicability follows INHERIT memberships only, like privileges
+    # (`has_privs_of_role`): a NOINHERIT member is bound by neither a
+    # permissive nor a restrictive policy TO the group (measured, PG15-17).
     applies_to, complete = _applicability(schema, role.name)
     permissive = [
         p for p in table.policies

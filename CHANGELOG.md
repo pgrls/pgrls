@@ -29,7 +29,7 @@ breaking changes — they will be called out in this file.
   invisible to it, each measured on PG16: a grant held through an `INHERIT`
   membership (`GRANT readers TO app` plus `GRANT SELECT … TO readers`), a table
   the role owns without `FORCE ROW LEVEL SECURITY`, and a policy `TO` a group
-  the role belongs to. A superuser with no explicit grant showed `DENIED` too.
+  the role inherits. A superuser with no explicit grant showed `DENIED` too.
   `matrix` now takes privileges, exemption and policy applicability from the
   same engine `pgrls verify` uses. **Expect your matrix output to change:**
   cells that said `DENIED` for these roles now say `OPEN` or `COND` — that is

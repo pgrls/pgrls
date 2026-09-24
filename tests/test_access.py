@@ -228,10 +228,10 @@ def test_inherit_member_of_owner_is_owner_equivalent() -> None:
     assert a is not None and a.paths[0].kind == "owner_member" and a.rows == "all"
 
 
-def test_policy_applies_through_a_noinherit_edge_even_without_privileges() -> None:
-    """Policy applicability is `is_member_of_role` — every membership edge —
-    while privileges follow INHERIT only. So a `TO grp` policy applies to a
-    NOINHERIT member even though that member inherits none of grp's grants."""
+def test_a_policy_to_a_group_does_not_bind_a_noinherit_member() -> None:
+    """Policies follow INHERIT edges, like grants (`has_privs_of_role`).
+    Measured on PG15-17: a NOINHERIT member holding its own grant read 0 rows
+    under `TO grp`, so no permissive policy applies and it reads nothing."""
     t = _table(
         grants=(Grant(role="app", privileges=_SELECT),),
         policies=(_policy("grp_rows", "tenant_id = '1'", roles=("grp",)),),
@@ -241,7 +241,26 @@ def test_policy_applies_through_a_noinherit_edge_even_without_privileges() -> No
                 [RoleMembership(member="app", role="grp", inherit=False)])
     )
     a = _only(amap, "app")
-    assert a is not None and a.rows == "filtered" and a.policies == ("grp_rows",)
+    assert a is not None and a.rows == "none"
+
+
+def test_a_restrictive_floor_to_a_group_does_not_narrow_a_noinherit_member() -> None:
+    """The unsafe direction: measured, a NOINHERIT member read every row past a
+    restrictive `TO grp` floor that cut an INHERIT member to the matching rows."""
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        policies=(
+            _policy("everyone", "true"),
+            _policy("floor", "tenant_id = '1'", roles=("grp",), permissive=False),
+        ),
+    )
+    for inherit, rows in ((True, "filtered"), (False, "all")):
+        amap = build_access_map(
+            _schema([t], [_role("app"), _role("grp", login=False)],
+                    [RoleMembership(member="app", role="grp", inherit=inherit)])
+        )
+        a = _only(amap, "app")
+        assert a is not None and a.rows == rows, (inherit, a)
 
 
 # --- fail-closed -------------------------------------------------------------

@@ -834,15 +834,34 @@ def test_policy_to_a_group_applies_to_its_members() -> None:
     assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "open"
 
 
-def test_policy_applicability_follows_a_noinherit_edge_too() -> None:
-    """Policy applicability is `is_member_of_role` — every edge — while
-    privileges follow INHERIT only. The grant is the member's own here."""
+def test_policy_to_a_group_does_not_bind_a_noinherit_member() -> None:
+    """Policies follow INHERIT edges, like grants (`has_privs_of_role`).
+    Measured on PG15-17: a NOINHERIT member holding its own grant read 0 rows
+    under `TO grp USING (true)`. The grant is the member's own here."""
     schema = Schema(
         tables=(_table("t", rls=True, grants=(_grant("app", ("SELECT",)),),
                        policies=(_policy(roles=("grp",), using="true"),)),),
         role_memberships=(RoleMembership(member="app", role="grp", inherit=False),),
     )
-    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "open"
+    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "denied"
+
+
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "conditional"), (False, "open")])
+def test_restrictive_floor_to_a_group_binds_only_inherit_members(
+    inherit: bool, expected: str
+) -> None:
+    """The unsafe direction. Measured on PG15-17: a restrictive `TO grp` floor
+    cut an INHERIT member to the matching rows while a NOINHERIT member read
+    every row past it. Applying the floor to every member reported COND for a
+    role that read the whole table."""
+    schema = Schema(
+        tables=(_table("t", rls=True, grants=(_grant("app", ("SELECT",)),),
+                       policies=(_policy(roles=("PUBLIC",), using="true"),
+                                 _policy(name="floor", permissive=False, roles=("grp",),
+                                         using="tenant_id = 1"))),),
+        role_memberships=(RoleMembership(member="app", role="grp", inherit=inherit),),
+    )
+    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == expected
 
 
 def test_superuser_needs_no_grant() -> None:
