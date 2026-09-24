@@ -14,10 +14,11 @@ breaking changes — they will be called out in this file.
 - **`verify`: a policy `TO grp` no longer counts as applying to a
   `NOINHERIT` member of `grp`.** Postgres applies a policy to a session that
   holds the role's privileges (`has_privs_of_role`), which follows `INHERIT`
-  memberships only; `verify` walked every membership edge. Measured on PG16,
-  and the same on PG15 and PG17, with `GRANT grp TO anon WITH INHERIT FALSE`
-  and a `TO grp USING (true)` policy: anon read 0 rows directly and every row
-  through a definer view and through a SECURITY DEFINER function.
+  memberships only; `verify` walked every membership edge. Measured on PG16
+  with `GRANT grp TO anon WITH INHERIT FALSE` and a `TO grp USING (true)`
+  policy (and the same on PG17, and on PG15 with a `NOINHERIT` role, since
+  PG15 has no per-grant INHERIT option): anon read 0 rows directly and every
+  row through a definer view and through a SECURITY DEFINER function.
   `--mode reachability` reported the view PROVEN ("the table already leaks
   every row to anon … the view exposes nothing new"), and `--mode escalation`
   reported the function PROVEN ("anon already reads those rows directly; the
@@ -29,6 +30,29 @@ breaking changes — they will be called out in this file.
   a second LEAK whose message said the direct read was denied. A grant to
   `grp` no longer makes a view open to a `NOINHERIT` member either, matching
   the `permission denied` Postgres returns.
+- **`verify --mode escalation`: a SECURITY DEFINER body that runs SQL through a
+  built-in is no longer treated as traced.** Calls were trusted wholesale once
+  `pg_catalog.`-qualified, but `query_to_xml('SELECT * FROM public.secrets', …)`
+  and `table_to_xml` run SQL, or read a relation, named by an argument —
+  measured, each handed every row of a `FORCE`d table to its caller. Those
+  built-ins (the `*_to_xml` family, `cursor_to_xml`, `ts_stat`) and
+  `set_config` of `search_path` or the role now make a body opaque
+  (UNVERIFIED). A `set_config` of any other setting no longer does.
+- **SQL-standard function bodies are deparsed schema-qualified, and a `RETURN`
+  body parses.** A `BEGIN ATOMIC` or `RETURN` body is stored parsed and was
+  deparsed relative to the introspecting session's `search_path`, so
+  `public.secrets` came back as a bare `secrets`. `pgrls matrix` resolves a
+  bare name through the function's own `search_path`, and a function pinning
+  `search_path = ''` resolved it to nothing (measured: `DENIED` while the
+  function emptied the table). Every relation is now qualified — which the
+  other body readers (VIEW004, `verify --mode escalation`, `pgrls vector`)
+  also see, in place of a bare name they matched to every same-named table.
+  And a `RETURN expr` body, which did not parse at all (VIEW004 skipped it;
+  escalation called it opaque), is now read as `SELECT expr`.
+- **A view's write rules no longer count as what it reads.** View dependencies
+  came from every rewrite rule on the view, so the target of an `INSERT` rule
+  was reported as a table the view reads. They now come from its `SELECT` rule
+  only.
 - **`pgrls matrix` reported less access than Postgres allows.** Cells matched
   role names literally, so ordinary Postgres behaviours were invisible to it,
   each measured on PG16: a grant held through an `INHERIT` membership
@@ -36,11 +60,11 @@ breaking changes — they will be called out in this file.
   owns without `FORCE ROW LEVEL SECURITY`, a policy `TO` a group the role
   inherits, and a superuser with no explicit grant — all shown `DENIED`, all
   reading every row. `matrix` now decides privileges, exemption and policy
-  applicability by the rules `pgrls verify` uses, and counts every way in, not
-  only the role's own session (see Added). **Expect your matrix output to
-  change:** cells that said `DENIED` now say `OPEN`, `COND` or `UNDECIDED`
-  wherever a role can in fact reach the rows — that is the fix, not a
-  regression.
+  applicability by the rules `pgrls verify` uses, and counts the doors below.
+  **Expect your matrix output to change:** cells that said `DENIED` now say
+  `OPEN`, `COND` or `UNDECIDED` wherever a role can in fact reach the rows, and
+  an `OPEN` cell can become `COND` where a restrictive policy on a group the
+  role inherits now applies — that is the fix, not a regression.
 
 ### Added
 - **`pgrls matrix` counts doors, for every command they run.**
@@ -50,52 +74,72 @@ breaking changes — they will be called out in this file.
   - A SECURITY DEFINER function runs as its owner, statement by statement:
     each `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` in its body opens
     that command, and PL/pgSQL bodies are traced as well as SQL ones.
+  - A SECURITY DEFINER trigger runs as its owner for anyone who can fire it —
+    by writing its table, with no `EXECUTE` check (measured: a role holding
+    only `INSERT` on one table emptied another through an `AFTER INSERT`
+    trigger). A trigger function cannot be called, so `EXECUTE` on one opens
+    nothing.
+  - A rewrite rule runs its actions as the relation's owner for anyone who
+    writes the relation (measured: `ON INSERT … DO ALSO DELETE FROM archive`
+    emptied a table the inserting role could not touch).
   - A partitioned or inheritance parent applies its own policies to its
     children's rows (measured: a partition with no grant and `FORCE`d RLS was
     read, updated, deleted and truncated through its parent).
+  - A foreign key's `CASCADE` / `SET NULL` / `SET DEFAULT` action rewrites the
+    referencing rows as their table's owner with RLS off (measured: a `DELETE`
+    on `accounts` emptied a `FORCE`d `ledger`); which rows depends on the data,
+    so those cells are `UNDECIDED`.
 
-  Doors are found in every schema, not only the scanned ones, and a door can
-  only widen a cell. An invoker view resets to the calling role and opens
-  nothing.
-- **Untraced functions are listed.** A SECURITY DEFINER function whose body
-  cannot be traced — dynamic SQL, another language, a call into a function
-  pgrls cannot see — is listed in its own section instead of attributed to a
-  table: a `DENIED` cell does not rule it out. JSON always carries
-  `untraced_functions`, empty when there is nothing to report.
+  Doors, and the other end of a door, are found in every schema; the grid
+  rows are the tables in `--schemas`. A door can only widen a cell.
+- **Untraced doors are listed.** A function, trigger or rule whose SQL cannot
+  be traced — dynamic SQL, another language, a call into a function pgrls
+  cannot see, a `DO` / `CALL` / `SET search_path` — is listed in its own
+  section with who can open it (a function's `EXECUTE` holders, or the write
+  that fires a trigger or rule), rather than attributed to a table: a `DENIED`
+  cell does not rule it out. JSON always carries `untraced_doors`, empty when
+  there is nothing to report.
 - **A `TRUNCATE` row.** TRUNCATE ignores RLS entirely (measured: it emptied a
   `FORCE`d table whose `DELETE` admitted no row), so a role holding the
-  privilege is `OPEN` whatever the policies say.
+  privilege is `OPEN` whatever the policies say — unless another table's
+  foreign key references the table and the role cannot truncate that one too.
 - **A sensitive-columns section in `pgrls matrix`** — per role, the columns
-  whose names match SEC045's patterns that it can read, and the paths reaching
-  each one. In every format, after the grid; JSON always carries
-  `sensitive_exposures`, empty when there is nothing to report.
+  whose names match SEC045's patterns (plus `[lint.rules.SEC045].patterns`)
+  that it can read, and the paths reaching each one. In every format, after
+  the grid; JSON always carries `sensitive_exposures`, empty when there is
+  nothing to report.
 - **An `UNDECIDED` verdict** for rows that cannot be bounded: a materialized
-  view over the table, two different filtered paths whose union is unknown, or
-  — for a schema built without a role-membership graph — memberships that were
-  not captured. It replaces a `DENIED` or a `COND` that would have been a guess
-  in the unsafe direction. The JSON `summary` gains an `undecided` count.
+  view over the table, a foreign-key action, two different filtered paths whose
+  union is unknown, or — for a schema built without a role-membership graph —
+  memberships that were not captured. It replaces a `DENIED` or a `COND` that
+  would have been a guess in the unsafe direction. The JSON `summary` gains an
+  `undecided` count.
 - `pgrls matrix` honours the predefined data roles: `pg_read_all_data` confers
   `SELECT` and `pg_write_all_data` confers `INSERT` / `UPDATE` / `DELETE`, each
   with no grant of its own. Neither implies the other or confers `TRUNCATE`.
 
 ### Changed
-- **`pgrls matrix`'s default columns are the roles that reach something** —
-  every role with at least one cell that is not `DENIED` — plus `PUBLIC` and,
-  when they exist, `anon` and `authenticated`. Previously a role appeared only
-  when a grant or policy named it, so owners, members of a granted group,
-  data-role members and door users had no column, and `anon` / `authenticated`
-  appeared on clusters that have no such roles.
+- **`pgrls matrix`'s default columns** are `PUBLIC`, `anon` and
+  `authenticated` when they exist, and every role whose reach differs from
+  `PUBLIC`'s — a cell with another verdict or predicate, or an untraced door
+  `PUBLIC` cannot open. Previously a role appeared only when a grant or policy
+  named it or it was exempt from RLS, so owners, members of a granted group,
+  data-role members and door users had no column, and `anon` /
+  `authenticated` appeared on clusters that have no such roles.
 - **The database owner's implicit membership in `pg_database_owner`** is now
   recorded with the other role memberships (measured: the owner read a table
   granted only to `pg_database_owner`, while `pg_auth_members` held no row for
-  it). `verify` and the lint rules see the edge too.
-- **Snapshot v27** — adds a top-level `roles` array (the `pg_roles` catalogue:
-  name, `can_login`, `superuser`, `bypassrls` — so a snapshot you commit now
-  lists every role in the cluster), `views[].updatable` (the writes a view
-  accepts on its own) and, for PL/pgSQL, `security_definer_functions[].definition`
-  (the full `CREATE FUNCTION`). Additive: v3–v26 files still load, and a
-  missing key decodes as "not captured", never as "no roles exist" or "not
-  writable".
+  it). It inherits on PG16+, and follows the owner's own `INHERIT` attribute
+  on PG15 (measured). `verify` and `matrix` see the edge; the lint rules keep
+  their own membership walks.
+- **Snapshot v27** — adds top-level `roles` (the `pg_roles` catalogue: name,
+  `can_login`, `superuser`, `bypassrls` — so a snapshot of a live database
+  now lists every role in the cluster) and `rules` (INSERT / UPDATE / DELETE
+  rewrite rules); `views[].updatable`; `security_definer_functions[].definition`
+  (PL/pgSQL) and `.trigger`; `triggers[].row`; and
+  `foreign_keys[].on_delete` / `.on_update`. Additive: v3–v26 files still
+  load, and a missing key decodes as "not captured", never as "no roles
+  exist" or "not writable".
 - Corrected stale docstrings on `RoleMembership` and `Schema.role_memberships`
   that said the membership graph is live-only and never serialized; snapshot
   v26 serializes it.

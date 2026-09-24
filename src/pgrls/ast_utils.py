@@ -690,6 +690,12 @@ def function_body_sql(body: str) -> str:
     (``AS $$ … $$``) body contains no wrapper and is returned unchanged.
     """
     stripped = body.strip()
+    # The other SQL-standard form, `RETURN expr`, deparses as just that —
+    # not a statement pglast parses. Its expression is what a SELECT of it
+    # reads (measured: listed as unparseable while it returned every row).
+    returns = re.match(r"(?is)^RETURN\b", stripped)
+    if returns is not None:
+        return "SELECT " + stripped[returns.end():].rstrip().rstrip(";")
     opener = re.match(r"(?is)^BEGIN\s+ATOMIC\b", stripped)
     if opener is None:
         return body

@@ -296,22 +296,30 @@ table × command (SELECT, INSERT, UPDATE, DELETE, TRUNCATE), which rows can it
 reach?** — as `OPEN` / `COND` (with the predicate) / `DENIED` / `UNDECIDED`.
 Grants and policies reach a role through its INHERIT memberships (a
 NOINHERIT member holds none of the group's grants and is bound by none of
-its policies); an owner, or a role inheriting it, reads every row unless the table
-is `FORCE`d; TRUNCATE ignores RLS. Every cell also counts doors, for the
-command they run: definer views (writes when auto-updatable), SECURITY
-DEFINER functions (per statement of an SQL or PL/pgSQL body), and
-partitioned / inheritance parents. Doors are found in every schema. A
-function body it cannot trace (dynamic SQL, another language) is listed
-separately — a `DENIED` cell does not rule it out. A separate section lists
-sensitive-looking columns (SEC045's name patterns) each role can read, and
-how. `UNDECIDED` means the rows cannot be bounded (a materialized view, or
-two different filtered paths) — treat it as "possibly reachable", never as
-denied. Suggest it when a user asks who can see or change a table or a
-column; it runs no rules. Its limits, all documented in the README: each
-column is a session running as that role (`SET ROLE` is not modelled);
-schema USAGE, a view's own WHERE and what a function returns are not traced
-(over-reports); UPDATE shows `USING`, not `WITH CHECK`; `1 = 1`-style
-tautologies show as `COND`.
+its policies); an owner, or a role inheriting it, reads every row unless the
+table is `FORCE`d; TRUNCATE ignores RLS. Every cell also counts doors, for
+the command they run: definer views (writes when auto-updatable), SECURITY
+DEFINER functions (per statement of an SQL or PL/pgSQL body), SECURITY
+DEFINER triggers (fired by writing their table — never through EXECUTE),
+rewrite rules (run as the relation's owner), partitioned / inheritance
+parents, and foreign-key CASCADE / SET NULL / SET DEFAULT actions (UNDECIDED:
+which rows depends on the data). Doors are found in every schema. A door
+whose SQL it cannot trace (dynamic SQL, another language, a call into an
+unseen function, `DO` / `CALL` / `SET search_path`) is listed separately with
+who can open it — a `DENIED` cell does not rule it out. A separate section
+lists sensitive-looking columns (SEC045's patterns, plus configured ones)
+each role can read, and how. `UNDECIDED` means the rows cannot be bounded (a
+materialized view, a foreign-key action, or two different filtered paths) —
+treat it as "possibly reachable", never as denied. Default columns: PUBLIC,
+anon / authenticated when they exist, and every role whose reach differs
+from PUBLIC's. Suggest it when a user asks who can see or change a table, or
+who can read a sensitive-looking column; it runs no rules. Its limits, all
+documented in the README: each column is a session running as that role
+(`SET ROLE` and DDL are not modelled); schema USAGE, a view's own WHERE and
+what a function returns are not traced (over-reports); an ordinary trigger
+fired by a door's write, a view's INSTEAD OF trigger, and event triggers are
+not traced (these can under-report); UPDATE shows `USING`, not `WITH CHECK`;
+`1 = 1`-style tautologies show as `COND`.
 
 `pgrls history <dir>` (v0.6.10+) reads a directory of JSON files
 written by `pgrls lint --format json` and emits a chronological

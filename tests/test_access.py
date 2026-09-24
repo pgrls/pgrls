@@ -7,7 +7,17 @@ inverting it makes its test fail.
 """
 from __future__ import annotations
 
-from pgrls.access import AccessPath, build_access_map
+from dataclasses import dataclass
+
+from pgrls.access import (
+    AccessPath,
+    UntracedDoor,
+    _derived_roles,
+    _reachable_columns,
+    _sensitive,
+    principal_of,
+    role_reach,
+)
 from pgrls.ast_utils import parse_expr
 from pgrls.model import (
     ColumnGrant,
@@ -19,6 +29,69 @@ from pgrls.model import (
     Table,
 )
 
+
+# --- the SELECT view of the engine, per principal -----------------------------
+#
+# What these tests check: for each principal, every table it holds a SELECT path
+# to — its own or a door — with the merged rows. Built on `role_reach`, the
+# engine `pgrls matrix` uses.
+
+_ROWS = {"open": "all", "conditional": "filtered", "denied": "none", "undecided": "undecided"}
+
+
+@dataclass(frozen=True)
+class _Access:
+    principal: str
+    relation: str
+    columns: tuple[str, ...] | None
+    paths: tuple[AccessPath, ...]
+    rows: str
+    policies: tuple[str, ...]
+    reason: str | None
+    sensitive: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _AccessMap:
+    principals: tuple[str, ...]
+    accesses: tuple[_Access, ...]
+    roles_derived: bool
+    graph_complete: bool
+    untraced: tuple[UntracedDoor, ...]
+
+
+def build_access_map(
+    schema: Schema, *, principals: set[str] | None = None, include_nologin: bool = False
+) -> _AccessMap:
+    derived = schema.roles is None
+    catalogue = _derived_roles(schema) if derived else schema.roles or ()
+    chosen = [
+        r for r in catalogue
+        if (principals is None or r.name in principals)
+        and (include_nologin or r.can_login or principals is not None)
+    ]
+    attrs = {r.name: r for r in catalogue}
+    accesses: list[_Access] = []
+    untraced: list[UntracedDoor] = []
+    cache: dict = {}
+    for role in sorted(chosen, key=lambda r: r.name):
+        reach = role_reach(schema, role, principal_of(schema, role.name, attrs)[1], attrs, cache)
+        untraced.extend(reach.untraced)
+        for table in sorted(schema.tables, key=lambda t: t.qualified_name):
+            q = table.qualified_name
+            cell = reach.cells[(q, "SELECT")]
+            paths = reach.direct_select[q][1] + reach.door_paths[q]
+            if not paths and cell.verdict != "undecided":
+                continue
+            cols = _reachable_columns(paths) if paths else None
+            accesses.append(_Access(
+                role.name, q, cols, paths, _ROWS[cell.verdict],
+                reach.select_policies[q], cell.note, _sensitive(table, cols),
+            ))
+    return _AccessMap(
+        tuple(sorted(r.name for r in chosen)), tuple(accesses), derived,
+        schema.role_memberships is not None, tuple(untraced),
+    )
 
 def _role(name: str, *, login: bool = True, su: bool = False, brls: bool = False) -> Role:
     return Role(name=name, can_login=login, superuser=su, bypassrls=brls)
@@ -521,7 +594,7 @@ def test_uncaptured_plpgsql_body_is_an_untraced_door_not_a_table_claim() -> None
     amap = build_access_map(_fschema([t], [f], [_role("anon"), _role("root", su=True)]))
     assert _only(amap, "anon") is None  # not attributed to any table
     [u] = [u for u in amap.untraced if u.principal == "anon"]
-    assert u.function == "public.f" and "not captured" in u.reason
+    assert u.door == "public.f" and "not captured" in u.reason
 
 
 def test_function_owner_flag_alone_is_not_treated_as_superuser() -> None:

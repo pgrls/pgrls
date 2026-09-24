@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sys
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 
 import pglast
@@ -24,6 +26,7 @@ from pgrls.model import (
     Index,
     LeakproofFunction,
     OwnerReachableMember,
+    RewriteRule,
     Role,
     RoleMembership,
     Policy,
@@ -65,8 +68,9 @@ def _list_user_schemas(cur: Any) -> list[str]:
     """Return the user-managed schemas visible to the connection.
 
     Used to enrich the "Schemas not found" error message with what
-    the user *could* have asked for. Filters reserved/system
-    schemas using the same rules as `_is_reserved_schema`.
+    the user *could* have asked for, and by `pgrls matrix` as "every
+    schema" — where doors and their far ends are looked for. Filters
+    reserved/system schemas using the same rules as `_is_reserved_schema`.
     """
     cur.execute(
         """
@@ -351,8 +355,9 @@ SELECT
     pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
     (vo.rolsuper OR vo.rolbypassrls) AS owner_bypasses_rls,
     vo.rolsuper AS owner_is_superuser,
-    -- The writes the view accepts ON ITS OWN (auto-updatable; `false` leaves
-    -- out INSTEAD OF triggers and rules). A bitmask of 1 << CmdType:
+    -- The writes the view accepts without a trigger: auto-updatable, or
+    -- handled by an unconditional INSTEAD rule (`false` leaves out only
+    -- INSTEAD OF triggers; measured). A bitmask of 1 << CmdType:
     -- UPDATE = 4, INSERT = 8, DELETE = 16; a matview is always 0.
     pg_catalog.pg_relation_is_updatable(c.oid, false) AS updatable_bits,
     c.oid AS view_oid
@@ -475,6 +480,9 @@ JOIN pg_catalog.pg_depend d
 JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
 JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
 WHERE v.relkind IN ('v', 'm')
+  -- The view's SELECT rule only: a write rule's target is not something
+  -- the view reads.
+  AND r.ev_type = '1'
   AND t.relkind IN ('r', 'p', 'v', 'm')  -- tables, partitioned tables, AND
                                          -- views/matviews so view→view
                                          -- chains can be resolved in Python
@@ -570,7 +578,8 @@ SELECT
         ),
         ' OR '
     ) AS event,
-    t.tgenabled != 'D' AS enabled
+    t.tgenabled != 'D' AS enabled,
+    t.tgtype & 1 = 1 AS for_each_row
 FROM pg_catalog.pg_trigger t
 JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
 JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
@@ -706,7 +715,9 @@ SELECT
         JOIN pg_catalog.pg_attribute fa
             ON fa.attrelid = con.confrelid
            AND fa.attnum = k.attnum
-    ) AS ref_columns
+    ) AS ref_columns,
+    con.confdeltype AS on_delete,
+    con.confupdtype AS on_update
 FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_class rcl ON rcl.oid = con.confrelid
 JOIN pg_catalog.pg_namespace rns ON rns.oid = rcl.relnamespace
@@ -759,6 +770,10 @@ SELECT
     -- needs (argument names and the return type decide how a body parses).
     CASE WHEN l.lanname = 'plpgsql'
          THEN pg_catalog.pg_get_functiondef(p.oid) END AS definition,
+    p.prorettype IN ('pg_catalog.trigger'::pg_catalog.regtype,
+                     'pg_catalog.event_trigger'::pg_catalog.regtype) AS is_trigger,
+    p.prosqlbody IS NOT NULL AS has_sqlbody,
+    p.oid AS fn_oid,
     COALESCE((
         SELECT array_agg(DISTINCT CASE WHEN ax.grantee = 0 THEN 'PUBLIC'
                                        ELSE COALESCE(ar.rolname,
@@ -1140,10 +1155,26 @@ def _fetch_secdef_functions(
     `owner_bypasses_rls` (for SEC042's anon-executable-bypass check).
     """
     cur.execute(_SECDEF_FUNCS_SQL, [list(schemas)])
+    rows = cur.fetchall()
+    # A SQL-standard body (`BEGIN ATOMIC …` / `RETURN …`) is stored parsed
+    # and deparsed relative to THIS session's search_path, so `public.t`
+    # comes back as a bare `t` — which the function's own pinned path may
+    # not resolve at all (measured: `SET search_path = ''` lost every
+    # table). Deparse those under an empty path: every relation qualified.
+    sqlbody = [row["fn_oid"] for row in rows if row["has_sqlbody"]]
+    qualified: dict[int, str] = {}
+    if sqlbody:
+        with _empty_search_path(cur):
+            cur.execute(
+                "SELECT p.oid AS fn_oid, pg_catalog.pg_get_function_sqlbody(p.oid) AS body "
+                "FROM pg_catalog.pg_proc p WHERE p.oid = ANY(%s)",
+                (sqlbody,),
+            )
+            qualified = {r["fn_oid"]: r["body"] for r in cur.fetchall()}
     return tuple(
         SecdefFunction(
             qualified_name=row["qname"],
-            body=row["body"],
+            body=qualified.get(row["fn_oid"], row["body"]),
             language=row["lang"],
             search_path=_extract_search_path(row["config"]),
             signature=row["signature"] or "",
@@ -1153,8 +1184,54 @@ def _fetch_secdef_functions(
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
             owner=row["owner_name"] or "",
             definition=row["definition"],
+            trigger=bool(row["is_trigger"]),
         )
-        for row in cur.fetchall()
+        for row in rows
+    )
+
+
+@contextmanager
+def _empty_search_path(cur: Any) -> Iterator[None]:
+    """Run a deparse with no schema on the search path, so every relation it
+    names comes back schema-qualified; restore the session's path after."""
+    cur.execute("SELECT pg_catalog.current_setting('search_path') AS sp")
+    saved = cur.fetchone()["sp"]
+    cur.execute("SELECT pg_catalog.set_config('search_path', '', false)")
+    try:
+        yield
+    finally:
+        cur.execute("SELECT pg_catalog.set_config('search_path', %s, false)", (saved,))
+
+
+_RULES_SQL = """
+SELECT n.nspname AS schema_name, c.relname AS relation, r.rulename AS name,
+       CASE r.ev_type WHEN '2' THEN 'UPDATE' WHEN '3' THEN 'INSERT'
+                      WHEN '4' THEN 'DELETE' END AS command,
+       r.is_instead AS instead,
+       pg_catalog.pg_get_ruledef(r.oid) AS definition
+FROM pg_catalog.pg_rewrite r
+JOIN pg_catalog.pg_class c ON c.oid = r.ev_class
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE r.ev_type IN ('2', '3', '4')
+  AND r.ev_enabled <> 'D'
+  AND n.nspname = ANY(%s)
+ORDER BY n.nspname, c.relname, r.rulename
+"""
+
+
+def _fetch_rules(cur: Any, schemas: list[str]) -> tuple[RewriteRule, ...]:
+    """The INSERT / UPDATE / DELETE rewrite rules on relations in `schemas`,
+    deparsed with every relation schema-qualified."""
+    with _empty_search_path(cur):
+        cur.execute(_RULES_SQL, [list(schemas)])
+        rows = cur.fetchall()
+    return tuple(
+        RewriteRule(
+            schema=row["schema_name"], relation=row["relation"], name=row["name"],
+            command=row["command"], instead=bool(row["instead"]),
+            definition=row["definition"],
+        )
+        for row in rows
     )
 
 
@@ -1248,7 +1325,11 @@ _ROLE_MEMBERSHIPS_SQL = """
         -- The database owner is IMPLICITLY a member of `pg_database_owner`,
         -- with no pg_auth_members row (measured: it read a table granted
         -- only to pg_database_owner while the catalog held no edge).
-        SELECT 'pg_database_owner', o.rolname, TRUE
+        -- PG16+ grants it with INHERIT regardless; PG15 follows the owner's
+        -- own rolinherit (measured: a NOINHERIT owner held none of it).
+        SELECT 'pg_database_owner', o.rolname,
+               pg_catalog.current_setting('server_version_num')::int >= 160000
+               OR o.rolinherit
         FROM pg_catalog.pg_database d
         JOIN pg_catalog.pg_roles o ON o.oid = d.datdba
         WHERE d.datname = pg_catalog.current_database()
@@ -1545,9 +1626,18 @@ def _fetch_foreign_keys(
                 ref_schema=row["ref_schema"],
                 ref_table=row["ref_table"],
                 ref_columns=tuple(row["ref_columns"]),
+                on_delete=_FK_ACTIONS.get(row["on_delete"]),
+                on_update=_FK_ACTIONS.get(row["on_update"]),
             )
         )
     return by_oid
+
+
+# `pg_constraint.confdeltype` / `confupdtype` codes.
+_FK_ACTIONS = {
+    "a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE",
+    "n": "SET NULL", "d": "SET DEFAULT",
+}
 
 
 def _fetch_default_privileges(
@@ -1932,6 +2022,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # graph on an offline/snapshot Schema makes verify abstain instead).
         role_memberships = _fetch_role_memberships(cur)
         roles = _fetch_roles(cur)
+        rules = _fetch_rules(cur, schemas)
         set_gucs, role_set_gucs = _fetch_set_gucs(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
@@ -1953,6 +2044,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 foreign_tables=foreign_tables,
                 role_memberships=role_memberships,
                 roles=roles,
+                rules=rules,
                 set_gucs=set_gucs,
                 role_set_gucs=role_set_gucs,
             )
@@ -2093,6 +2185,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 event=row["event"],
                 timing=row["timing"],
                 enabled=row["enabled"],
+                row=row["for_each_row"],
             )
         )
 
@@ -2185,6 +2278,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         foreign_tables=foreign_tables,
         role_memberships=role_memberships,
         roles=roles,
+        rules=rules,
         set_gucs=set_gucs,
         role_set_gucs=role_set_gucs,
     )

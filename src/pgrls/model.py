@@ -50,6 +50,8 @@ __all__ = [
     "OwnerReachableMember",
     "Policy",
     "PolicyCommand",
+    "RewriteRule",
+    "Role",
     "SNAPSHOT_VERSION",
     "policy_id",
     "Schema",
@@ -418,9 +420,11 @@ class View:
     # (measured: permission denied without the grant). The reachability walk
     # uses this to require the grant.
     owner_is_superuser: bool = False
-    # v27+: the write commands the view accepts on its own —
-    # `pg_relation_is_updatable(oid, false)`, so an auto-updatable view, not
-    # one made writable by INSTEAD OF triggers or rules. A write through a
+    # v27+: the write commands the view accepts without a trigger —
+    # `pg_relation_is_updatable(oid, false)`: auto-updatable, OR handled by an
+    # unconditional INSTEAD rule (measured: a rule-only view reports INSERT);
+    # INSTEAD OF triggers are left out. `pgrls matrix` sets rule-handled
+    # commands aside and follows the rule (`Schema.rules`). A write through a
     # `security_invoker = false` view reaches the base table with the view
     # OWNER's privileges and RLS (measured: 0 rows directly, every row through
     # the view). `None` = not captured (an older snapshot, a hand-built view):
@@ -550,6 +554,10 @@ class Trigger:
     event: str
     timing: str
     enabled: bool
+    # v27+: FOR EACH ROW (`tgtype` bit 0). A row trigger fires only for rows
+    # the statement actually touches; a statement trigger fires regardless.
+    # `None` = not captured (older snapshots).
+    row: bool | None = None
 
     @property
     def function_qualified_name(self) -> str:
@@ -764,6 +772,10 @@ class SecdefFunction:
     # static SQL out of it to see which tables the function touches. `None`
     # for other languages and on older snapshots.
     definition: str | None = None
+    # v27+: returns `trigger` or `event_trigger`. Such a function cannot be
+    # called — `trigger functions can only be called as triggers` — so it is
+    # a door only through the triggers that run it, never through EXECUTE.
+    trigger: bool = False
 
 
 @dataclass(frozen=True)
@@ -875,6 +887,32 @@ class Role:
     can_login: bool
     superuser: bool
     bypassrls: bool
+
+
+@dataclass(frozen=True)
+class RewriteRule:
+    """A rewrite rule for INSERT / UPDATE / DELETE on a table or view
+    (snapshot v27+).
+
+    A rule's actions run with the privileges of the relation's OWNER, so
+    writing the relation reaches whatever the actions touch — measured:
+    `ON INSERT TO requests DO ALSO DELETE FROM archive` emptied a FORCE'd
+    table the inserting role could not touch. `definition` is
+    `pg_get_ruledef`, deparsed with every relation schema-qualified, which
+    `pgrls matrix` parses to see what the actions touch. An INSTEAD rule
+    replaces the command, so a view's own auto-update does not run for it.
+    """
+
+    schema: str
+    relation: str
+    name: str
+    command: str  # INSERT / UPDATE / DELETE
+    instead: bool
+    definition: str
+
+    @property
+    def qualified_relation(self) -> str:
+        return f"{self.schema}.{self.relation}"
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1206,13 @@ class ForeignKey:
     ref_schema: str
     ref_table: str
     ref_columns: tuple[str, ...]
+    # v27+: the referential actions — "NO ACTION", "RESTRICT", "CASCADE",
+    # "SET NULL" or "SET DEFAULT". A CASCADE / SET NULL / SET DEFAULT action
+    # rewrites THIS table's rows as its owner with RLS off (measured: a
+    # DELETE on the parent emptied a FORCE'd child the role could not
+    # touch). `None` = not captured.
+    on_delete: str | None = None
+    on_update: str | None = None
 
 
 # --- Snapshot decoders -------------------------------------------------
@@ -1326,6 +1371,7 @@ def _trigger_from_dict(tr: dict[str, Any]) -> Trigger:
         event=tr["event"],
         timing=tr["timing"],
         enabled=tr["enabled"],
+        row=tr.get("row"),  # v27+
     )
 
 
@@ -1353,6 +1399,8 @@ def _foreign_key_from_dict(fk: dict[str, Any]) -> ForeignKey:
         ref_schema=fk["ref_schema"],
         ref_table=fk["ref_table"],
         ref_columns=tuple(fk["ref_columns"]),
+        on_delete=fk.get("on_delete"),  # v27+
+        on_update=fk.get("on_update"),
     )
 
 
@@ -1540,6 +1588,7 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
         owner=f.get("owner", ""),
         definition=f.get("definition"),  # v27+, PL/pgSQL only
+        trigger=bool(f.get("trigger", False)),  # v27+
     )
 
 
@@ -1730,9 +1779,11 @@ class Schema:
     # snapshot, an offline `--sql-file` source, a hand-built Schema) and must
     # never be read as "no roles exist" — `pgrls matrix` would then report
     # that nobody can read anything. On `None` it derives the principal set
-    # from grantees / owners / policy targets / membership endpoints instead,
-    # and says so in its report.
+    # from grantees / owners / policy targets / membership endpoints instead.
     roles: tuple[Role, ...] | None = None
+    # v27+: the INSERT / UPDATE / DELETE rewrite rules on tables and views.
+    # `None` = not captured (older snapshots, offline sources).
+    rules: tuple[RewriteRule, ...] | None = None
     # v26+: custom (dotted) GUCs set at database / server level, as
     # `(name, value)` — what every session, an anonymous one included,
     # inherits without running `SET` (role-level ones live in
@@ -1921,6 +1972,7 @@ class Schema:
                             "event": tr.event,
                             "timing": tr.timing,
                             "enabled": tr.enabled,
+                            **({"row": tr.row} if tr.row is not None else {}),
                         }
                         for tr in t.triggers
                     ],
@@ -1983,6 +2035,11 @@ class Schema:
                                     "ref_schema": fk.ref_schema,
                                     "ref_table": fk.ref_table,
                                     "ref_columns": list(fk.ref_columns),
+                                    **(
+                                        {"on_delete": fk.on_delete, "on_update": fk.on_update}
+                                        if fk.on_delete is not None
+                                        else {}
+                                    ),
                                 }
                                 for fk in t.foreign_keys
                             ]
@@ -2075,6 +2132,7 @@ class Schema:
                         if f.definition is not None
                         else {}
                     ),
+                    **({"trigger": True} if f.trigger else {}),
                 }
                 for f in self.security_definer_functions
             ],
@@ -2205,6 +2263,24 @@ class Schema:
                     ]
                 }
                 if self.roles is not None
+                else {}
+            ),
+            # v27+: rewrite rules, only when captured (absent → None).
+            **(
+                {
+                    "rules": [
+                        {
+                            "schema": r.schema,
+                            "relation": r.relation,
+                            "name": r.name,
+                            "command": r.command,
+                            "instead": r.instead,
+                            "definition": r.definition,
+                        }
+                        for r in self.rules
+                    ]
+                }
+                if self.rules is not None
                 else {}
             ),
             "foreign_tables": [
@@ -2457,6 +2533,21 @@ class Schema:
                         bypassrls=bool(r.get("bypassrls", False)),
                     )
                     for r in payload["roles"]
+                )
+            ),
+            rules=(
+                None
+                if payload.get("rules") is None
+                else tuple(
+                    RewriteRule(
+                        schema=r["schema"],
+                        relation=r["relation"],
+                        name=r["name"],
+                        command=r["command"],
+                        instead=bool(r["instead"]),
+                        definition=r["definition"],
+                    )
+                    for r in payload["rules"]
                 )
             ),
         )

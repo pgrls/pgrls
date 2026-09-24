@@ -1977,7 +1977,40 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "array_upper",
     # type / misc (read no user data)
     "pg_typeof", "format_type", "gen_random_uuid",
+    # GUCs: `set_config` of search_path / role is caught before this list
+    # (`_set_config_changes_resolution`); any other setting reads no data.
+    "set_config",
 })
+
+
+# Built-ins that run SQL, or read a relation, named by an ARGUMENT — no
+# range-var walk sees what they read, so a `pg_catalog.` qualification does
+# not make them safe. Measured: `pg_catalog.query_to_xml('SELECT * FROM
+# public.secrets', …)` in a SECURITY DEFINER function handed every row of a
+# FORCE'd table to its caller, and so did `table_to_xml`.
+_SQL_RUNNING_BUILTINS: frozenset[str] = frozenset({
+    "query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema",
+    "table_to_xml", "table_to_xmlschema", "table_to_xml_and_xmlschema",
+    "cursor_to_xml", "cursor_to_xmlschema",
+    "schema_to_xml", "schema_to_xmlschema", "schema_to_xml_and_xmlschema",
+    "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema",
+    "ts_stat",
+})
+# GUCs that change which relation a later name resolves to, or who runs it.
+_RESOLUTION_GUCS = frozenset({"search_path", "role", "session_authorization"})
+
+
+def _set_config_changes_resolution(call: Any) -> bool:
+    """Whether a `set_config(name, …)` call may change name resolution or
+    the current role: its name is one of those GUCs, or is not a literal."""
+    from pglast.ast import A_Const, String  # noqa: PLC0415
+
+    args = getattr(call, "args", None) or ()
+    first = args[0] if args else None
+    val = getattr(first, "val", None) if isinstance(first, A_Const) else None
+    if not isinstance(val, String):
+        return True
+    return str(val.sval).lower() in _RESOLUTION_GUCS
 
 
 def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -> bool:
@@ -2008,6 +2041,11 @@ def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -
             return
         if isinstance(n, FuncCall):
             qualified, bare = func_name_parts(n)
+            if bare in _SQL_RUNNING_BUILTINS or (
+                bare == "set_config" and _set_config_changes_resolution(n)
+            ):
+                found = True
+                return
             fn_schema = (
                 qualified.rsplit(".", 1)[0]
                 if qualified and "." in qualified

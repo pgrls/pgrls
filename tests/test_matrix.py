@@ -999,7 +999,9 @@ def test_a_secdef_function_opens_select_for_a_role_with_no_grant() -> None:
     assert c.verdict == "open" and "public.f" in (c.note or "")
 
 
-def test_doors_never_touch_write_commands() -> None:
+def test_a_read_only_grant_on_a_view_opens_no_write() -> None:
+    """A view is a write door only for the writes the role holds on it: a
+    SELECT grant opens reads alone (write doors are pinned elsewhere)."""
     m = build_matrix(_door_schema(views=(_definer_view(),)), roles=("anon",))
     for cmd in ("INSERT", "UPDATE", "DELETE"):
         assert _cell(m, "public.t", cmd, "anon").verdict == "denied", cmd
@@ -1116,7 +1118,7 @@ def test_a_grant_that_yields_no_rows_is_not_an_exposure() -> None:
 # Review iteration 1 found each of these reporting less access than Postgres
 # allows; every expectation below was measured live (see the docstrings).
 
-from pgrls.matrix import UntracedFunction  # noqa: E402
+from pgrls.matrix import Untraced  # noqa: E402
 
 _ALL5 = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
 
@@ -1287,7 +1289,8 @@ END $x$"""
     m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
     assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
     [u] = m.untraced
-    assert u.function == "public.f" and "dynamic SQL" in u.reason and u.roles == ("app",)
+    assert u.door == "public.f" and "dynamic SQL" in u.reason
+    assert u.reached_by == "EXECUTE: PUBLIC, owner own"
 
 
 def test_a_role_inheriting_the_function_owner_can_execute_it() -> None:
@@ -1479,20 +1482,20 @@ def test_column_grants_confer_update_but_never_delete() -> None:
     assert _cell(m, "public.t", "DELETE", "app").verdict == "denied"
 
 
-def test_untraced_functions_are_listed_in_every_format() -> None:
+def test_untraced_doors_are_listed_in_every_format() -> None:
     f = _f("BEGIN RETURN; END", owner="svc", lang="plpgsql")  # no definition captured
     m = build_matrix(_s([_t()], fns=[f], roles=[_r("svc"), _r("own")]), roles=("PUBLIC",))
-    assert m.untraced == (UntracedFunction(
-        "public.f", "svc", "the PL/pgSQL definition was not captured", ("PUBLIC",)),)
+    why = "the PL/pgSQL definition was not captured"
+    assert m.untraced == (Untraced("public.f", "svc", why, "EXECUTE: PUBLIC, owner svc"),)
     assert "not traced" in render_text(m)
-    assert json.loads(render_json(m))["untraced_functions"] == [{
-        "function": "public.f", "owner": "svc",
-        "reason": "the PL/pgSQL definition was not captured", "roles": ["PUBLIC"],
+    assert json.loads(render_json(m))["untraced_doors"] == [{
+        "door": "public.f", "owner": "svc", "reached_by": "EXECUTE: PUBLIC, owner svc",
+        "reason": why,
     }]
-    assert "## SECURITY DEFINER functions not traced" in render_markdown(m)
+    assert "## Doors not traced" in render_markdown(m)
     assert "public.f" in render_html(m, generated_at=_FIXED_AT)
     quiet = build_matrix(_s([_t()], roles=[_r("own")]), roles=("PUBLIC",))
-    assert json.loads(render_json(quiet))["untraced_functions"] == []
+    assert json.loads(render_json(quiet))["untraced_doors"] == []
     assert "not traced" not in render_text(quiet)
 
 
@@ -1510,6 +1513,351 @@ def test_a_data_role_is_named_plainly_in_exposures() -> None:
         roles=("analyst",),
     )
     assert {e.via for e in m.exposures} == {"pg_read_all_data"}
+
+
+# --- review iteration 2: triggers, rules, foreign keys, tracing limits --------
+
+from pgrls.model import ForeignKey, RewriteRule, Trigger  # noqa: E402
+
+
+def _trg(fn: str, event: str = "INSERT", *, row: bool | None = True, name: str = "tr") -> Trigger:
+    schema, _, fname = fn.partition(".")
+    return Trigger(name=name, function_schema=schema, function_name=fname, event=event,
+                   timing="AFTER", enabled=True, row=row)
+
+
+def _tf(body: str, *, owner: str = "own", name: str = "public.trgfn",
+        execute: tuple[str, ...] = ("PUBLIC",)) -> SecdefFunction:
+    return SecdefFunction(qualified_name=name, body=body, language="sql", owner=owner,
+                          execute_roles=execute, trigger=True)
+
+
+def _with(table: Table, **changes: object) -> Table:
+    from dataclasses import replace  # noqa: PLC0415
+
+    return replace(table, **changes)
+
+
+def test_a_security_definer_trigger_fires_for_whoever_writes_its_table() -> None:
+    """Measured: a role holding only INSERT on `inbox` emptied a FORCE'd
+    `secrets` through an AFTER INSERT trigger whose function it could not
+    EXECUTE."""
+    secrets = _t("secrets", force=False)
+    inbox = _t("inbox", rls=False, grants=(_grant("app", ("INSERT",)),),
+               )
+    inbox = _with(inbox, triggers=(_trg("public.trgfn"),))
+    fn = _tf("DELETE FROM public.secrets", execute=())
+    m = build_matrix(_s([secrets, inbox], fns=[fn], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    c = _cell(m, "public.secrets", "DELETE", "app")
+    assert c.verdict == "open" and "trigger tr on public.inbox" in (c.note or "")
+
+
+def test_a_trigger_function_is_not_a_door_through_execute() -> None:
+    """Measured: `trigger functions can only be called as triggers` — PUBLIC
+    EXECUTE on one opens nothing to a role that cannot write its table."""
+    secrets = _t("secrets")
+    inbox = _with(_t("inbox", rls=False), triggers=(_trg("public.trgfn"),))
+    fn = _tf("DELETE FROM public.secrets", execute=("PUBLIC",))
+    m = build_matrix(_s([secrets, inbox], fns=[fn], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "denied"
+
+
+@pytest.mark.parametrize(("row", "fires"), [(False, True), (True, False)])
+def test_a_statement_trigger_fires_even_when_rls_admits_no_row(row: bool, fires: bool) -> None:
+    secrets = _t("secrets")
+    inbox = _with(_t("inbox", force=True, grants=(_grant("app", ("DELETE",)),)),
+                  triggers=(_trg("public.trgfn", "DELETE", row=row),))
+    fn = _tf("DELETE FROM public.secrets")
+    m = build_matrix(_s([secrets, inbox], fns=[fn], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert (_cell(m, "public.secrets", "DELETE", "app").verdict == "open") is fires
+
+
+def test_a_partition_fires_its_parents_triggers() -> None:
+    """A trigger on a partitioned table is cloned to every partition."""
+    secrets = _t("secrets")
+    parent = _with(_t("p", rls=False), triggers=(_trg("public.trgfn"),))
+    child = _t("p_a", rls=False, partition_of=("public", "p"),
+               grants=(_grant("app", ("INSERT",)),))
+    fn = _tf("DELETE FROM public.secrets")
+    m = build_matrix(_s([secrets, parent, child], fns=[fn], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+def test_a_trigger_can_fire_another() -> None:
+    """A trigger's write fires the next table's trigger: a fixed point."""
+    secrets = _t("secrets")
+    mid = _with(_t("mid"), triggers=(_trg("public.second"),))
+    inbox = _with(_t("inbox", rls=False, grants=(_grant("app", ("INSERT",)),)),
+                  triggers=(_trg("public.first"),))
+    first = _tf("INSERT INTO public.mid (id) VALUES (1)", name="public.first")
+    second = _tf("DELETE FROM public.secrets", name="public.second")
+    m = build_matrix(_s([secrets, mid, inbox], fns=[first, second],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+@pytest.mark.parametrize(("on_delete", "on_update", "undecided"), [
+    ("CASCADE", "NO ACTION", {"DELETE"}),
+    ("SET NULL", "NO ACTION", {"UPDATE"}),
+    ("NO ACTION", "CASCADE", {"UPDATE"}),
+    ("NO ACTION", "NO ACTION", set()),
+])
+def test_a_foreign_key_action_rewrites_the_referencing_rows(
+    on_delete: str, on_update: str, undecided: set[str]
+) -> None:
+    """Measured: a DELETE on `accounts` emptied a FORCE'd `ledger` the role
+    could not touch; an UPDATE re-pointed its rows. Which rows depends on the
+    data, so it is UNDECIDED."""
+    accounts = _t("accounts", rls=False, grants=(_grant("app", ("DELETE", "UPDATE")),))
+    ledger = _t("ledger", force=True)
+    ledger = _with(ledger, foreign_keys=(ForeignKey(
+        "ledger_acct", ("acct",), "public", "accounts", ("id",), on_delete, on_update),))
+    m = build_matrix(_s([accounts, ledger], roles=[_r("app"), _r("own")]), roles=("app",))
+    got = {c for c in ("DELETE", "UPDATE")
+           if _cell(m, "public.ledger", c, "app").verdict == "undecided"}
+    assert got == undecided
+
+
+def test_a_cascade_needs_a_role_that_can_touch_the_parent() -> None:
+    accounts = _t("accounts", force=True)  # the role reaches no row of it
+    ledger = _with(_t("ledger", force=True), foreign_keys=(ForeignKey(
+        "fk", ("acct",), "public", "accounts", ("id",), "CASCADE", "NO ACTION"),))
+    m = build_matrix(_s([accounts, ledger], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.ledger", "DELETE", "app").verdict == "denied"
+
+
+def _rule(relation: str, command: str, action: str, *, instead: bool = False) -> RewriteRule:
+    kind = "INSTEAD" if instead else "ALSO"
+    return RewriteRule(
+        "public", relation, f"r_{relation}", command, instead,
+        f"CREATE RULE r_{relation} AS ON {command} TO public.{relation} DO {kind} {action};",
+    )
+
+
+def test_a_rule_runs_its_actions_as_the_relations_owner() -> None:
+    """Measured: `ON INSERT TO requests DO ALSO DELETE FROM archive` emptied a
+    FORCE'd `archive` the inserting role could not touch."""
+    archive = _t("archive", force=False)
+    requests = _t("requests", rls=False, grants=(_grant("app", ("INSERT",)),))
+    s = Schema(tables=(archive, requests), roles=(_r("app"), _r("own")), role_memberships=(),
+               rules=(_rule("requests", "INSERT", "DELETE FROM public.archive"),))
+    c = _cell(build_matrix(s, roles=("app",)), "public.archive", "DELETE", "app")
+    assert c.verdict == "open" and "rule r_requests on public.requests" in (c.note or "")
+
+
+def test_an_instead_rule_replaces_a_views_own_write() -> None:
+    """A view writable only through an INSTEAD rule does not auto-update its
+    base: the rule's actions are what runs."""
+    shown = _t("shown", force=False)
+    hidden = _t("hidden", force=False)
+    v = _v("v", (("public", "shown"),), owner="own", grants=(_grant("app", ("INSERT",)),))
+    s = Schema(tables=(shown, hidden), views=(v,), roles=(_r("app"), _r("own")),
+               role_memberships=(),
+               rules=(_rule("v", "INSERT", "DELETE FROM public.hidden", instead=True),))
+    m = build_matrix(s, roles=("app",))
+    assert _cell(m, "public.shown", "INSERT", "app").verdict == "denied"
+    assert _cell(m, "public.hidden", "DELETE", "app").verdict == "open"
+
+
+@pytest.mark.parametrize(("body", "why"), [
+    ("DO $x$ BEGIN DELETE FROM public.t; END $x$", "DoStmt"),
+    ("SET search_path = b", "search_path"),
+    ("CALL public.p()", "CallStmt"),
+    ("SELECT pg_catalog.query_to_xml('SELECT * FROM public.t', true, false, '')",
+     "does not see into"),
+    ("SELECT pg_catalog.table_to_xml('public.t'::regclass, true, false, '')",
+     "does not see into"),
+    ("SELECT public.helper()", "does not see into"),
+    ("WITH t AS (SELECT 1) SELECT * FROM t", "CTE shadows"),
+])
+def test_what_the_tracer_does_not_follow_is_listed(body: str, why: str) -> None:
+    """Measured: a `DO` block and `pg_catalog.query_to_xml` / `table_to_xml` in
+    a SECURITY DEFINER body each reached a FORCE'd table while the matrix said
+    DENIED and listed nothing."""
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert any(why in u.reason for u in m.untraced), m.untraced
+
+
+@pytest.mark.parametrize("call", ["set_config", "pg_catalog.set_config"])
+def test_setting_an_ordinary_guc_is_harmless(call: str) -> None:
+    body = f"SELECT {call}('app.tenant', 'a', true); SELECT * FROM public.t"
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
+    assert m.untraced == ()
+
+
+@pytest.mark.parametrize("statement", [
+    "FOR r IN EXECUTE 'SELECT 1' LOOP END LOOP;",
+    "RETURN QUERY EXECUTE 'SELECT 1';",
+    "OPEN c FOR EXECUTE 'SELECT 1';",
+])
+def test_every_form_of_dynamic_sql_is_listed(statement: str) -> None:
+    body = f"""CREATE FUNCTION public.f() RETURNS SETOF record LANGUAGE plpgsql
+ SECURITY DEFINER AS $x$ DECLARE r record; c refcursor; BEGIN {statement} END $x$"""
+    f = _f("<body>", owner="own", lang="plpgsql", definition=body)
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert any("dynamic SQL" in u.reason for u in m.untraced), m.untraced
+
+
+def test_an_unparseable_plpgsql_statement_is_listed() -> None:
+    body = """CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $x$
+BEGIN PERFORM 1 FROM public.t; x := ((; END $x$"""
+    f = _f("<body>", owner="own", lang="plpgsql", definition=body)
+    m = build_matrix(_s([_t()], fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert any("does not parse" in u.reason for u in m.untraced), m.untraced
+
+
+def test_another_language_is_listed() -> None:
+    m = build_matrix(_s([_t()], fns=[_f("x", owner="own", lang="plpython3u")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert [u.reason for u in m.untraced] == ["a plpython3u body cannot be read"]
+
+
+def test_a_body_too_deep_to_walk_is_listed_not_a_crash() -> None:
+    """Measured: a 1200-term expression crashed `pgrls matrix`."""
+    body = "SELECT " + " || ".join(["note"] * 3000) + " FROM public.t"
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert any("too deeply" in u.reason or "does not parse" in u.reason for u in m.untraced)
+
+
+def test_merge_opens_every_write_it_can_run() -> None:
+    body = ("MERGE INTO public.t USING (SELECT 1 AS id) s ON t.id = s.id "
+            "WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)")
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert {c for c in _ALL5 if _cell(m, "public.t", c, "app").verdict == "open"} == \
+        {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+
+def test_on_conflict_do_nothing_is_not_an_update() -> None:
+    body = "INSERT INTO public.t (id) VALUES (1) ON CONFLICT DO NOTHING"
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.t", "UPDATE", "app").verdict == "denied"
+
+
+def test_a_sql_standard_return_body_is_traced() -> None:
+    """Measured: listed as unparseable while it returned every row."""
+    body = "RETURN (SELECT count(*) AS count FROM public.t)"
+    m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open" and m.untraced == ()
+
+
+def test_every_schema_on_the_path_with_the_name_is_credited() -> None:
+    """Postgres skips a schema the owner lacks USAGE on, so the first match is
+    not necessarily the one that wins (measured: `b.t` was read)."""
+    tables = [_t(schema="a"), _t(schema="b")]
+    f = _f("SELECT * FROM t", owner="own", search_path="a, b")
+    m = build_matrix(_s(tables, fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert {q for q in ("a.t", "b.t") if _cell(m, q, "SELECT", "app").verdict == "open"} == \
+        {"a.t", "b.t"}
+
+
+def test_user_on_the_search_path_is_the_function_owner() -> None:
+    tables = [_t(schema="own"), _t(schema="app")]
+    f = _f("SELECT * FROM t", owner="own", search_path='"$user", public')
+    m = build_matrix(_s(tables, fns=[f], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "own.t", "SELECT", "app").verdict == "open"
+    assert _cell(m, "app.t", "SELECT", "app").verdict == "denied"
+
+
+def test_truncate_of_a_referenced_table_needs_truncate_on_the_referencing_one() -> None:
+    parent = _t("parent", rls=False, grants=(_grant("app", ("TRUNCATE",)),))
+    child = _with(_t("child", rls=False), foreign_keys=(ForeignKey(
+        "fk", ("pid",), "public", "parent", ("id",), "NO ACTION", "NO ACTION"),))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.parent", "TRUNCATE", "app")
+    assert c.verdict == "denied" and "public.child" in (c.note or "")
+    both = _with(child, grants=(_grant("app", ("TRUNCATE",)),))
+    m = build_matrix(_s([parent, both], roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.parent", "TRUNCATE", "app").verdict == "open"
+
+
+def test_a_filter_from_a_function_and_the_same_text_elsewhere_is_undecided() -> None:
+    """Measured: `owner_name = current_user` through a SECURITY DEFINER function
+    is the OWNER's rows, directly the caller's — not the same row set."""
+    t = _t(grants=(_grant("app", ("SELECT",)), _grant("fowner", ("SELECT",))),
+           policies=(_policy(roles=("PUBLIC",), using="owner_name = current_user"),))
+    f = _f("SELECT * FROM public.t", owner="fowner")
+    m = build_matrix(_s([t], fns=[f], roles=[_r("app"), _r("fowner"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "undecided"
+
+
+def test_the_same_filter_twice_keeps_both_notes() -> None:
+    parent = _t("p", policies=(_TENANT_A,), grants=(_grant("app", ("SELECT",)),))
+    child = _t("p_a", policies=(_TENANT_A,), grants=(_grant("app", ("SELECT",)),),
+               partition_of=("public", "p"))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.p_a", "SELECT", "app")
+    assert c.verdict == "conditional" and "through parent public.p" in (c.note or "")
+
+
+def test_a_nested_view_door_is_named_by_the_view_the_role_opened() -> None:
+    """The note names the view the role holds a grant on, not only the inner
+    definer view whose owner the rows are read as."""
+    inner = _v("inner", _OWN_T, owner="own", grants=(_grant("x", ("SELECT",)),))
+    outer = _v("outer", _OWN_T, owner="x", grants=(_grant("app", ("SELECT",)),),
+               direct=(("public", "inner"),))
+    m = build_matrix(_s([_t()], [inner, outer], roles=[_r("app"), _r("x"), _r("own")]),
+                     roles=("app",))
+    c = _cell(m, "public.t", "SELECT", "app")
+    assert c.verdict == "open"
+    assert "through view public.outer, then definer view public.inner" in (c.note or "")
+
+
+def test_default_columns_are_the_roles_that_differ_from_public() -> None:
+    """Measured: one PUBLIC-executable helper made every role in a Supabase
+    cluster a column. A role that can do exactly what everyone can adds
+    nothing; one with a door PUBLIC cannot open is shown."""
+    t = _t(rls=False)
+    helper = _f("SELECT * FROM public.t", owner="own")  # PUBLIC may EXECUTE
+    private = SecdefFunction(qualified_name="public.p", body="SELECT x FROM y(", language="sql",
+                             owner="own", execute_roles=("svc",))
+    s = _s([t], fns=[helper, private], roles=[_r("bystander"), _r("svc"), _r("own")])
+    m = build_matrix(s)
+    assert "bystander" not in m.roles and "svc" in m.roles
+    [u] = [u for u in m.untraced if u.door == "public.p"]
+    assert u.reached_by == "EXECUTE: svc, owner own"
+
+
+def test_a_parent_outside_the_grid_is_still_a_door() -> None:
+    """Measured: a partitioned `api.events` handed its partition's rows to a
+    role a `--schemas public` matrix said was DENIED."""
+    parent = _t("events", schema="api", rls=False, grants=(_grant("app", ("SELECT",)),))
+    child = _t("events_a", force=True, partition_of=("api", "events"))
+    m = build_matrix(_s([parent, child], roles=[_r("app"), _r("own")]), roles=("app",),
+                     grid=frozenset({"public.events_a"}))
+    assert [r.qualified_name for r in m.rows] == ["public.events_a"] * 5
+    assert _cell(m, "public.events_a", "SELECT", "app").verdict == "open"
+
+
+def test_configured_sensitive_patterns_extend_the_defaults() -> None:
+    t = Table(schema="public", name="patients", rls_enabled=False, force_rls=False,
+              policies=(), owner="own", columns=("id", "mrn"),
+              grants=(_grant("app", ("SELECT",)),))
+    s = _s([t], roles=[_r("app"), _r("own")])
+    assert build_matrix(s, roles=("app",)).exposures == ()
+    got = build_matrix(s, roles=("app",), sensitive_patterns=frozenset({"mrn"}))
+    assert [(e.table, e.column) for e in got.exposures] == [("public.patients", "mrn")]
+
+
+def test_updatable_bits_decode_to_commands() -> None:
+    from pgrls.introspect import _updatable_commands  # noqa: PLC0415
+
+    assert _updatable_commands(8) == ("INSERT",)
+    assert _updatable_commands(4) == ("UPDATE",)
+    assert _updatable_commands(16) == ("DELETE",)
+    assert _updatable_commands(28) == ("INSERT", "UPDATE", "DELETE")
+    assert _updatable_commands(None) == ()
 
 
 # --- live differential: every cell against a real SET ROLE session ------------
@@ -1532,6 +1880,7 @@ _MXD_ROLES = (
     "mxd_byp_nogrant", "mxd_rad", "mxd_wad", "mxd_colr", "mxd_colw",
     "mxd_door_owner", "mxd_vowner", "mxd_vuser", "mxd_invuser", "mxd_fnuser",
     "mxd_svc", "mxd_svc_m", "mxd_or_owner", "mxd_vwuser", "mxd_partuser", "mxd_apiuser",
+    "mxd_trguser", "mxd_fkuser", "mxd_ruleuser",
 )
 
 _MXD_DDL = """
@@ -1562,6 +1911,9 @@ CREATE ROLE mxd_or_owner NOLOGIN;
 CREATE ROLE mxd_vwuser NOLOGIN;
 CREATE ROLE mxd_partuser NOLOGIN;
 CREATE ROLE mxd_apiuser NOLOGIN;
+CREATE ROLE mxd_trguser NOLOGIN;
+CREATE ROLE mxd_fkuser NOLOGIN;
+CREATE ROLE mxd_ruleuser NOLOGIN;
 GRANT mxd_grp TO mxd_inh, mxd_noinh, mxd_mid;
 GRANT mxd_mid TO mxd_nested;
 GRANT mxd_owner TO mxd_owner_m, mxd_owner_m_noinh;
@@ -1734,17 +2086,84 @@ GRANT SELECT, UPDATE, DELETE, TRUNCATE ON t_inh TO mxd_partuser;
 
 SELECT pg_temp.mk('t_nested');
 GRANT SELECT ON t_nested TO mxd_mid;
+
+-- A SECURITY DEFINER trigger: INSERT on the source deletes the destination.
+SELECT pg_temp.mk('t_trig_src');
+ALTER TABLE t_trig_src OWNER TO mxd_door_owner;
+GRANT INSERT ON t_trig_src TO mxd_trguser;
+SELECT pg_temp.mk('t_trig_dst');
+ALTER TABLE t_trig_dst OWNER TO mxd_door_owner;
+ALTER TABLE t_trig_dst ENABLE ROW LEVEL SECURITY;
+CREATE FUNCTION trg_wipe() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+  AS 'BEGIN DELETE FROM public.t_trig_dst; RETURN NEW; END';
+ALTER FUNCTION trg_wipe() OWNER TO mxd_door_owner;
+REVOKE EXECUTE ON FUNCTION trg_wipe() FROM PUBLIC;
+CREATE TRIGGER wipe_on_insert AFTER INSERT ON t_trig_src
+  FOR EACH ROW EXECUTE FUNCTION trg_wipe();
+
+-- A rule: INSERT on the source runs a DELETE as the source's owner.
+SELECT pg_temp.mk('t_rule_src');
+ALTER TABLE t_rule_src OWNER TO mxd_door_owner;
+GRANT INSERT ON t_rule_src TO mxd_ruleuser;
+SELECT pg_temp.mk('t_rule_dst');
+ALTER TABLE t_rule_dst OWNER TO mxd_door_owner;
+ALTER TABLE t_rule_dst ENABLE ROW LEVEL SECURITY;
+CREATE RULE r_wipe AS ON INSERT TO t_rule_src DO ALSO DELETE FROM public.t_rule_dst;
+
+-- A foreign key that cascades a DELETE into a FORCE'd child with no grant.
+CREATE TABLE t_fk_parent (id int PRIMARY KEY, tenant_id text, owner_name text,
+  note text, email text, ssn text);
+INSERT INTO t_fk_parent VALUES (1, 'a', 'x', 'n1', 'a1@x', '111'),
+  (2, 'a', 'x', 'n2', 'a2@x', '222'), (3, 'b', 'x', 'n3', 'b1@x', '333'),
+  (4, 'b', 'x', 'n4', 'b2@x', '444');
+GRANT DELETE, UPDATE ON t_fk_parent TO mxd_fkuser;
+CREATE TABLE t_fk_child (id int, tenant_id text, owner_name text, note text, email text,
+  ssn text, pid int REFERENCES t_fk_parent ON DELETE CASCADE);
+INSERT INTO t_fk_child SELECT id, tenant_id, owner_name, note, email, ssn, id FROM t_fk_parent;
+ALTER TABLE t_fk_child ENABLE ROW LEVEL SECURITY;
+ALTER TABLE t_fk_child FORCE ROW LEVEL SECURITY;
+
+-- A SQL-standard body with an empty search_path: deparsed schema-qualified.
+SELECT pg_temp.mk('t_atomic');
+ALTER TABLE t_atomic OWNER TO mxd_door_owner;
+ALTER TABLE t_atomic ENABLE ROW LEVEL SECURITY;
+CREATE FUNCTION f_atomic() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = ''
+  BEGIN ATOMIC DELETE FROM public.t_atomic; END;
+ALTER FUNCTION f_atomic() OWNER TO mxd_door_owner;
+REVOKE EXECUTE ON FUNCTION f_atomic() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION f_atomic() TO mxd_fnuser;
+
+-- A partition whose parent lives outside the grid's schema.
+CREATE TABLE mxd_api.t_evt (id int, tenant_id text, owner_name text, note text,
+  email text, ssn text) PARTITION BY LIST (tenant_id);
+CREATE TABLE public.t_evt_a PARTITION OF mxd_api.t_evt FOR VALUES IN ('a', 'zzz');
+CREATE TABLE mxd_api.t_evt_b PARTITION OF mxd_api.t_evt FOR VALUES IN ('b');
+INSERT INTO mxd_api.t_evt VALUES (1, 'a', 'x', 'n1', 'a1@x', '111'),
+  (2, 'a', 'x', 'n2', 'a2@x', '222'), (3, 'b', 'x', 'n3', 'b1@x', '333'),
+  (4, 'b', 'x', 'n4', 'b2@x', '444');
+ALTER TABLE public.t_evt_a ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.t_evt_a FORCE ROW LEVEL SECURITY;
+GRANT USAGE ON SCHEMA mxd_api TO mxd_partuser;
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON mxd_api.t_evt TO mxd_partuser;
 """
 
 # Function calls that reach a table, keyed by (table, command) — their call
 # forms vary, so they are listed; view and parent doors are derived from the
 # schema (`_mxd_doors`). A SELECT door is a template over `{expr}`.
-_MXD_FUNCTION_DOORS: dict[tuple[str, str], tuple[str, ...]] = {
+_MXD_MANUAL_DOORS: dict[tuple[str, str], tuple[str, ...]] = {
     ("public.t_door", "SELECT"): ("SELECT {expr} FROM f_door()",),
     ("public.t_fn_pub", "SELECT"): ("SELECT {expr} FROM f_pub()",),
     ("public.t_plpg", "SELECT"): ("SELECT {expr} FROM f_plpg()",),
     ("public.t_svc", "SELECT"): ("SELECT {expr} FROM f_svc()",),
     ("public.t_wipe", "DELETE"): ("SELECT f_wipe()",),
+    ("public.t_atomic", "DELETE"): ("SELECT f_atomic()",),
+    # A trigger and a rule both fire on an INSERT into their source table.
+    ("public.t_trig_dst", "DELETE"): (
+        "INSERT INTO t_trig_src (id, tenant_id, owner_name) VALUES (500, 'a', 'x')",
+    ),
+    ("public.t_rule_dst", "DELETE"): (
+        "INSERT INTO t_rule_src (id, tenant_id, owner_name) VALUES (600, 'a', 'x')",
+    ),
 }
 # A partition only accepts its own key: probe it with rows it can hold.
 _MXD_PROBES = {
@@ -1781,7 +2200,7 @@ def _mxd_doors(conn: psycopg.Connection) -> dict[tuple[str, str], tuple[str, ...
     introspection missed must not be missed here too. Each view over the table
     (read, and write for a regular view), each ancestor (read, write, TRUNCATE,
     and INSERT for a partitioned one), and the function calls."""
-    doors: dict[tuple[str, str], list[str]] = {k: list(v) for k, v in _MXD_FUNCTION_DOORS.items()}
+    doors: dict[tuple[str, str], list[str]] = {k: list(v) for k, v in _MXD_MANUAL_DOORS.items()}
 
     def add(table: str, command: str, stmt: str) -> None:
         doors.setdefault((table, command), []).append(stmt)
@@ -1806,7 +2225,7 @@ def _mxd_doors(conn: psycopg.Connection) -> dict[tuple[str, str], tuple[str, ...
                 f"WHERE tableoid = '{child}'::regclass")
             add(child, "UPDATE", f"UPDATE {ancestor} SET note = 'x'")
             add(child, "DELETE", f"DELETE FROM {ancestor}")
-            add(child, "TRUNCATE", f"TRUNCATE {ancestor}")
+            add(child, "TRUNCATE", f"TRUNCATE {ancestor} CASCADE")
             if declarative:
                 add(child, "INSERT", f"INSERT INTO {ancestor} "
                     "(id, tenant_id, owner_name) VALUES {row}")
@@ -1870,7 +2289,7 @@ def _mxd_truth(conn: psycopg.Connection, role: str, table: str, command: str,
 
 @requires_docker
 def test_every_cell_matches_a_live_set_role_session(pg_conn: psycopg.Connection) -> None:
-    from pgrls.matrix import with_doors_from_every_schema  # noqa: PLC0415
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
 
     roles = ("PUBLIC",) + _MXD_ROLES[1:]
     as_db = {"PUBLIC": "mxd_pub"}  # a role with no memberships stands in for PUBLIC
@@ -1879,17 +2298,17 @@ def test_every_cell_matches_a_live_set_role_session(pg_conn: psycopg.Connection)
         "INSERT": "INSERT INTO {t} (id, tenant_id, owner_name) VALUES {{row}}",
         "UPDATE": "UPDATE {t} SET note = 'x'",
         "DELETE": "DELETE FROM {t}",
-        "TRUNCATE": "TRUNCATE {t}",
+        # CASCADE: a referenced table cannot be truncated otherwise, and the
+        # matrix answers whether the role can empty it at all.
+        "TRUNCATE": "TRUNCATE {t} CASCADE",
     }
     with pg_conn.cursor() as cur:
         cur.execute("DROP ROLE IF EXISTS " + ", ".join(_MXD_ROLES))
     try:
         with pg_conn.cursor() as cur:
             cur.execute(_MXD_DDL)
-        schema = with_doors_from_every_schema(
-            pg_conn, introspect(pg_conn, schemas=["public"]), ["public"]
-        )
-        m = build_matrix(schema, roles=roles)
+        schema, grid = introspect_for_matrix(pg_conn, ["public"])
+        m = build_matrix(schema, roles=roles, grid=grid)
         doors = _mxd_doors(pg_conn)
         totals = {}
         with pg_conn.cursor() as cur:
@@ -1912,6 +2331,12 @@ def test_every_cell_matches_a_live_set_role_session(pg_conn: psycopg.Connection)
         seen = {c.verdict for r in m.rows for c in r.cells}
         assert seen == {"open", "conditional", "denied", "undecided"}, seen
         assert m.untraced == ()  # every function body here is traceable
+        # The foreign-key door is UNDECIDED (which rows depends on the data),
+        # so the loop above skips it — check it is real here instead.
+        fk = _cell(m, "public.t_fk_child", "DELETE", "mxd_fkuser")
+        assert fk.verdict == "undecided" and "ON DELETE CASCADE" in (fk.note or "")
+        assert _mxd_effect(pg_conn, "mxd_fkuser", "DELETE FROM t_fk_parent",
+                           "SELECT count(*) FROM t_fk_child") == 0
 
         # The sensitive-columns section lists exactly what each role can read.
         readable = set()

@@ -74,7 +74,7 @@ from pgrls.history import (
 from pgrls.history import render as render_history
 from pgrls.introspect import introspect
 from pgrls.model import Schema
-from pgrls.matrix import MATRIX_FORMATS, build_matrix, with_doors_from_every_schema
+from pgrls.matrix import MATRIX_FORMATS, build_matrix, introspect_for_matrix
 from pgrls.matrix import render as render_matrix
 from pgrls.verify import (
     DEFAULT_AUTH_FUNCTIONS,
@@ -4154,26 +4154,31 @@ def matrix(
 
     The audit companion to `pgrls report`: for SELECT, INSERT, UPDATE, DELETE
     and TRUNCATE, one verdict per role and table — `OPEN` (every row), `COND`
-    (some rows; the predicate is in `--format json`/`html`), `DENIED` (none),
-    or `UNDECIDED` (cannot be bounded: a materialized view over the table, or
-    two different filtered paths — treat it as possibly reachable). Reads a
-    live database and runs NO lint rules. `--roles a,b` fixes the columns.
+    (some rows; the predicate is in `--format json`/`html`), `DENIED` (none on
+    any path modelled), or `UNDECIDED` (cannot be bounded — treat it as
+    possibly reachable). Reads a live database and runs NO lint rules.
+    `--roles a,b` fixes the columns; by default they are PUBLIC, anon /
+    authenticated when they exist, and every role whose reach differs from
+    PUBLIC's.
 
     Grants and policies reach a role through its INHERIT memberships; an
     owner (or a role inheriting it) reads every row unless the table is
     `FORCE`d; superusers and BYPASSRLS roles skip RLS; TRUNCATE ignores it.
-    Doors count for every command they run: a definer view (writes only when
-    it is auto-updatable), a SECURITY DEFINER function (per statement of its
-    body), and a partitioned or inheritance parent. Doors are found in every
-    schema; rows are the `--schemas` tables. A function whose body cannot be
-    traced is listed separately — a `DENIED` cell does not rule it out.
-    Sensitive-looking columns are listed in their own section.
+    Doors count for every command they run: definer views (writes when
+    auto-updatable), SECURITY DEFINER functions (per statement of their
+    body), SECURITY DEFINER triggers (fired by writing their table), rewrite
+    rules, partitioned or inheritance parents, and foreign-key actions
+    (UNDECIDED). Doors are found in every schema; the rows are the
+    `--schemas` tables. A door whose SQL cannot be traced is listed
+    separately with who can open it — a `DENIED` cell does not rule it out.
+    Sensitive-looking columns (SEC045's patterns) are listed in their own
+    section.
 
-    Each column is a session running as that role: `SET ROLE` is not
-    modelled, so a NOINHERIT member that can switch to its group reads what
-    the group's column shows. UPDATE shows the rows `USING` lets it touch,
-    not its `WITH CHECK`; a door is credited with its owner's reach, not
-    with the view's own WHERE or what a function returns (an over-report).
+    Each column is a session running as that role: `SET ROLE` and DDL are
+    not modelled, nor are ordinary triggers fired by a door's write. UPDATE
+    shows the rows `USING` lets it touch, not its `WITH CHECK`; a door is
+    credited with its owner's reach, not with a view's own WHERE or what a
+    function returns (an over-report).
     """
     # Validate --roles before connecting so a malformed flag fails fast
     # (no database round-trip needed to reject it).
@@ -4193,14 +4198,22 @@ def matrix(
     assert effective.database_url is not None  # guaranteed above
     try:
         with psycopg.connect(effective.database_url) as conn:
-            schema = introspect(conn, schemas=effective.schemas)
-            schema = with_doors_from_every_schema(conn, schema, effective.schemas)
+            schema, grid = introspect_for_matrix(conn, effective.schemas)
     except psycopg.Error as exc:
         raise ToolError(f"Database error: {exc}") from exc
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
+    try:
+        from pgrls.rules.sec045 import _parse_patterns  # noqa: PLC0415
 
-    built = build_matrix(schema, roles=roles, include_system=include_system)
+        patterns = _parse_patterns(effective.rule_options.get("SEC045", {}))
+    except TypeError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    built = build_matrix(
+        schema, roles=roles, include_system=include_system, grid=grid,
+        sensitive_patterns=patterns,
+    )
     rendered = render_matrix(built, output_format)
     _emit(rendered, output_path)
 

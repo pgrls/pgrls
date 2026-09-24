@@ -11,23 +11,23 @@ cell, from the engine in `pgrls.access`:
   permissive policy that is unconditionally true with no restrictive policy
   narrowing it) — directly or through a door.
 * ``conditional`` — some rows: the predicate is the OR of the applicable
-  permissive clauses AND-ed with the restrictive ones. A cell reached through
-  a door names the door in its note and carries the door owner's predicate.
-* ``denied``      — no privilege on any path, or RLS on with no applicable
-  permissive policy (Postgres default-denies).
+  permissive clauses (``WITH CHECK`` for INSERT, ``USING`` otherwise) AND-ed
+  with the restrictive ones. A cell reached through a door names the door in
+  its note and carries the door's predicate.
+* ``denied``      — no privilege on any path pgrls models, or RLS on with no
+  applicable permissive policy (Postgres default-denies).
 * ``undecided``   — the rows cannot be bounded: a materialized view over the
-  table (its rows were captured at REFRESH), two different filtered paths whose
-  union is unknown, or — for a schema built without a role-membership graph —
+  table, a foreign-key action, two different filtered paths whose union is
+  unknown, or — for a schema built without a role-membership graph —
   memberships that were not captured. Treat it as possibly reachable.
 
-Doors widen a cell for the command they run: a ``security_invoker = false``
-view (a write only when the view accepts it on its own), a SECURITY DEFINER
-function (per statement of its SQL or PL/pgSQL body), and a partitioned or
-inheritance parent. A function whose body cannot be traced is listed on its
-own instead of being attributed to a table. Each role is a session running as
-that role: ``SET ROLE`` is not modelled. Per command the clause is the one
-Postgres applies — ``WITH CHECK`` for INSERT, ``USING`` for SELECT / UPDATE /
-DELETE; an UPDATE's write-side ``WITH CHECK`` is not shown.
+Doors widen a cell for the command they run: definer views (writes when
+auto-updatable), SECURITY DEFINER functions (per statement of an SQL or
+PL/pgSQL body), SECURITY DEFINER triggers (fired by writing their table),
+rewrite rules, partition / inheritance parents, and foreign-key actions. A
+door whose SQL cannot be traced is listed on its own. Each role is a session
+running as that role: ``SET ROLE`` and DDL are not modelled; the rest of what
+is not is in `pgrls.access`'s docstring and the README.
 
 "Unconditionally true" is lexical — a literal ``true`` disjunct. A tautology
 such as ``1 = 1`` shows as ``conditional`` with that predicate even though
@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import html
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -56,12 +56,13 @@ from pgrls.access import (
     role_reach,
 )
 from pgrls.formatters._common import safe_location
-from pgrls.model import Schema
+from pgrls.model import Schema, Table
+from pgrls.rules.sec045 import _DEFAULT_PATTERNS
 
 __all__ = [
     "COMMANDS", "Cell", "Exposure", "MATRIX_FORMATS", "Matrix", "MatrixRow",
-    "UntracedFunction", "Verdict", "build_matrix", "render", "render_html",
-    "render_json", "render_markdown", "render_text", "with_doors_from_every_schema",
+    "Untraced", "Verdict", "build_matrix", "introspect_for_matrix", "render",
+    "render_html", "render_json", "render_markdown", "render_text",
 ]
 
 # Roles shown even when they reach nothing — the Supabase / PostgREST audit
@@ -127,15 +128,18 @@ class Exposure:
 
 
 @dataclass(frozen=True)
-class UntracedFunction:
-    """A SECURITY DEFINER function some shown role can EXECUTE whose body could
-    not be fully traced (dynamic SQL, another language, a call into a function
-    it does not see into). It may reach tables no cell credits it with."""
+class Untraced:
+    """A door some analysed role can open whose SQL could not be fully traced
+    — a SECURITY DEFINER function, trigger or rule running dynamic SQL,
+    another language, a call pgrls cannot see into, or a statement it does
+    not trace. It may reach tables no cell credits it with. `reached_by`
+    names who can open it — a function's EXECUTE holders, or the write that
+    fires a trigger or rule — whether or not they are shown as columns."""
 
-    function: str
+    door: str
     owner: str
     reason: str
-    roles: tuple[str, ...]
+    reached_by: str
 
 
 @dataclass(frozen=True)
@@ -143,7 +147,7 @@ class Matrix:
     roles: tuple[str, ...]
     rows: tuple[MatrixRow, ...]
     exposures: tuple[Exposure, ...] = ()
-    untraced: tuple[UntracedFunction, ...] = ()
+    untraced: tuple[Untraced, ...] = ()
 
     @property
     def summary(self) -> dict[str, int]:
@@ -178,10 +182,9 @@ def _candidate_roles(
     """The roles to analyse, and the ones shown whatever they reach.
 
     With the role catalogue (live introspection, snapshot v27+) that is every
-    role in it — so a role that reaches data only through membership,
-    ownership, a data role or a door still gets a column. Without it, every
-    name the schema mentions. PUBLIC is always shown, and anon / authenticated
-    when they exist (always, without a catalogue to say otherwise).
+    role in it; without it, every name the schema mentions. PUBLIC is always
+    shown, and anon / authenticated when they exist (always, without a
+    catalogue to say otherwise).
     """
     if schema.roles is not None:
         names = {r.name for r in schema.roles}
@@ -200,14 +203,22 @@ def build_matrix(
     *,
     roles: tuple[str, ...] | None = None,
     include_system: bool = False,
+    grid: frozenset[str] | None = None,
+    sensitive_patterns: frozenset[str] | None = None,
 ) -> Matrix:
     """Build the effective access matrix from an introspected `schema`.
 
-    `roles` fixes the columns. Otherwise every candidate role is analysed and
-    the columns are those that reach something — at least one cell that is not
-    DENIED — plus PUBLIC and, when they exist, anon and authenticated; `pg_*`
-    roles are left out unless `include_system`. Rows are sorted by (table,
-    command).
+    `grid` names the tables shown as rows (default: every table); the others
+    are analysed only as the far end of a door — a parent, a view's base, a
+    function's, trigger's or rule's target. `roles` fixes the columns.
+    Otherwise every candidate is analysed and the columns are PUBLIC; anon and
+    authenticated when they exist; and every other role whose reach DIFFERS
+    from PUBLIC's in the grid — a cell with another verdict or predicate, or an
+    untraced door PUBLIC cannot open. A role that can do exactly what everyone
+    can adds nothing (measured: one PUBLIC-executable helper function made
+    every role in a Supabase cluster a column). `pg_*` roles are left out
+    unless `include_system`. Rows are sorted by (table, command).
+    `sensitive_patterns` extends SEC045's defaults, as its config does.
 
     Role attributes come from `schema.roles` (live introspection) or, without
     it, from `bypassrls_roles`. A schema from an offline source carries
@@ -216,54 +227,67 @@ def build_matrix(
     """
     catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
     attrs = {r.name: r for r in catalogue}
+    shown = sorted(
+        (t for t in schema.tables if grid is None or t.qualified_name in grid),
+        key=lambda t: t.qualified_name,
+    )
     if roles is not None:
         candidates, always = tuple(roles), frozenset(roles)
     else:
         candidates, always = _candidate_roles(schema, include_system=include_system)
-    cache: dict[Any, Any] = {}  # function bodies, parsed once per build
+    cache: dict[Any, Any] = {}  # lookups and function bodies, once per build
     reaches: dict[str, RoleReach] = {}
-    for name in candidates:
+    for name in dict.fromkeys((*candidates, "PUBLIC")):
         role, closure = principal_of(schema, name, attrs)
         reaches[name] = role_reach(schema, role, closure, attrs, cache)
-    role_list = tuple(
-        n for n in candidates
-        if n in always or any(c.verdict != "denied" for c in reaches[n].cells.values())
-    )
+    public = reaches["PUBLIC"]
+    public_untraced = {(u.door, u.reason) for u in public.untraced}
+
+    def differs(name: str) -> bool:
+        mine = reaches[name]
+        for t in shown:
+            for command in COMMANDS:
+                a = mine.cells[(t.qualified_name, command)]
+                b = public.cells[(t.qualified_name, command)]
+                if (a.verdict, a.predicate) != (b.verdict, b.predicate):
+                    return True
+        return bool({(u.door, u.reason) for u in mine.untraced} - public_untraced)
+
+    role_list = tuple(n for n in candidates if n in always or differs(n))
     rows = [
         MatrixRow(
             qualified_name=table.qualified_name,
             command=command,
             cells=tuple(reaches[n].cells[(table.qualified_name, command)] for n in role_list),
         )
-        for table in sorted(schema.tables, key=lambda t: t.qualified_name)
+        for table in shown
         for command in COMMANDS
     ]
     return Matrix(
         roles=role_list,
         rows=tuple(rows),
-        exposures=_exposures(schema, role_list, reaches),
-        untraced=_untraced(role_list, reaches),
+        exposures=_exposures(shown, role_list, reaches,
+                             sensitive_patterns or _DEFAULT_PATTERNS),
+        untraced=_untraced(candidates, reaches),
     )
 
 
-def with_doors_from_every_schema(conn: Any, schema: Schema, scanned: list[str]) -> Schema:
-    """`schema` with the views and SECURITY DEFINER functions of EVERY user
-    schema, not only the scanned ones. A door reads a scanned table wherever it
-    lives (measured: a definer view in `api` over `public.t` handed anon every
-    row while a `--schemas public` matrix said DENIED). The rows are still the
-    scanned tables."""
+def introspect_for_matrix(conn: Any, schemas: list[str]) -> tuple[Schema, frozenset[str]]:
+    """Introspect every user schema, and name the tables of `schemas` as the
+    grid. A door can live anywhere, and so can the far end of one: measured, a
+    definer view in `api` over `public.t`, and a partitioned `api.events` over
+    `public.events_a`, each handed rows to a role that a `--schemas public`
+    matrix said was DENIED."""
     from psycopg.rows import dict_row  # noqa: PLC0415
 
     from pgrls.introspect import _list_user_schemas, introspect  # noqa: PLC0415
 
     with conn.cursor(row_factory=dict_row) as cur:
         everywhere = _list_user_schemas(cur)
-    if set(everywhere) <= set(scanned):
-        return schema
-    wide = introspect(conn, schemas=everywhere)
-    return replace(
-        schema, views=wide.views, security_definer_functions=wide.security_definer_functions
-    )
+    # `schemas` stays in the list so a misspelt one still fails loudly.
+    schema = introspect(conn, schemas=sorted(set(everywhere) | set(schemas)))
+    grid = frozenset(t.qualified_name for t in schema.tables if t.schema in schemas)
+    return schema, grid
 
 
 def _via(paths: tuple[AccessPath, ...], principal: str, column: str) -> str:
@@ -281,8 +305,12 @@ def _via(paths: tuple[AccessPath, ...], principal: str, column: str) -> str:
             labels.append(f"view {p.via}")
         elif p.kind == "function":
             labels.append(f"SECURITY DEFINER {p.via}")
+        elif p.kind in ("trigger", "rule"):
+            labels.append(p.via or p.kind)
         elif p.kind == "parent":
             labels.append(f"parent {p.via}")
+        elif p.kind == "foreign_key":
+            labels.append(f"foreign key {p.via}")
         elif p.kind == "data_role":
             labels.append(p.via or "data role")
         elif p.kind in ("grant", "column_grant", "owner_member") and p.via:
@@ -294,7 +322,10 @@ def _via(paths: tuple[AccessPath, ...], principal: str, column: str) -> str:
 
 
 def _exposures(
-    schema: Schema, role_list: tuple[str, ...], reaches: dict[str, RoleReach]
+    shown: list[Table],
+    role_list: tuple[str, ...],
+    reaches: dict[str, RoleReach],
+    patterns: frozenset[str],
 ) -> tuple[Exposure, ...]:
     """Every sensitive column each shown role can read with at least some
     rows, from the same merged verdicts as the cells. A direct path whose RLS
@@ -302,7 +333,7 @@ def _exposures(
     out: list[Exposure] = []
     for name in role_list:
         reach = reaches[name]
-        for table in schema.tables:
+        for table in shown:
             q = table.qualified_name
             cell = reach.cells[(q, "SELECT")]
             if cell.verdict == "denied":
@@ -310,7 +341,7 @@ def _exposures(
             direct_cell, direct_paths = reach.direct_select[q]
             paths = (direct_paths if direct_cell.verdict != "denied" else ()) + reach.door_paths[q]
             cols = _reachable_columns(paths) if paths else None
-            for col in _sensitive(table, cols):
+            for col in _sensitive(table, cols, patterns):
                 out.append(Exposure(
                     role=name, table=q, column=col, verdict=cell.verdict,
                     via=_via(paths, name, col),
@@ -319,16 +350,14 @@ def _exposures(
 
 
 def _untraced(
-    role_list: tuple[str, ...], reaches: dict[str, RoleReach]
-) -> tuple[UntracedFunction, ...]:
-    by_fn: dict[tuple[str, str, str], list[str]] = {}
-    for name in role_list:
-        for u in reaches[name].untraced:
-            by_fn.setdefault((u.function, u.owner, u.reason), []).append(name)
-    return tuple(
-        UntracedFunction(function=f, owner=o, reason=r, roles=tuple(rs))
-        for (f, o, r), rs in sorted(by_fn.items())
-    )
+    candidates: tuple[str, ...], reaches: dict[str, RoleReach]
+) -> tuple[Untraced, ...]:
+    seen = {
+        (u.door, u.owner, u.reason, u.reached_by)
+        for name in candidates
+        for u in reaches[name].untraced
+    }
+    return tuple(Untraced(*k) for k in sorted(seen))
 
 
 def _summary_line(matrix: Matrix) -> str:
@@ -354,18 +383,15 @@ def _exposure_rows(matrix: Matrix) -> list[list[str]]:
     ]
 
 
-_UNTRACED_TITLE = (
-    "SECURITY DEFINER functions not traced — each may reach tables no cell "
-    "credits it with"
-)
+_UNTRACED_TITLE = "Doors not traced — each may reach tables no cell credits it with"
 
 
 def _untraced_rows(matrix: Matrix) -> list[list[str]]:
     return [
         [
-            safe_location(u.function),
+            safe_location(u.door),
             safe_location(u.owner),
-            safe_location(", ".join(u.roles)),
+            safe_location(u.reached_by),
             safe_location(u.reason),
         ]
         for u in matrix.untraced
@@ -393,7 +419,7 @@ def render_text(matrix: Matrix) -> str:
     if matrix.untraced:
         out += ["", _UNTRACED_TITLE + ":"]
         out += ["  " + ln for ln in render_text_table(
-            ("FUNCTION", "OWNER", "EXECUTABLE BY", "WHY"), _untraced_rows(matrix)
+            ("DOOR", "OWNER", "REACHED BY", "WHY"), _untraced_rows(matrix)
         )]
     out.append("")
     out.append(_summary_line(matrix))
@@ -431,12 +457,12 @@ def render_json(matrix: Matrix) -> str:
             }
             for e in matrix.exposures
         ],
-        "untraced_functions": [
+        "untraced_doors": [
             {
-                "function": u.function,
+                "door": u.door,
                 "owner": u.owner,
+                "reached_by": u.reached_by,
                 "reason": u.reason,
-                "roles": list(u.roles),
             }
             for u in matrix.untraced
         ],
@@ -472,7 +498,7 @@ def render_markdown(matrix: Matrix) -> str:
         )
     if matrix.untraced:
         tail += ["", f"## {_UNTRACED_TITLE}", "",
-                 "| Function | Owner | Executable by | Why |", "|---|---|---|---|"]
+                 "| Door | Owner | Reached by | Why |", "|---|---|---|---|"]
         tail.extend(
             "| " + " | ".join(c.replace("|", "\\|") for c in r) + " |"
             for r in _untraced_rows(matrix)
@@ -552,7 +578,7 @@ def render_html(matrix: Matrix, *, generated_at: datetime | None = None) -> str:
   <h2>{html.escape(_UNTRACED_TITLE)}</h2>
   <table>
     <thead>
-      <tr><th>Function</th><th>Owner</th><th>Executable by</th><th>Why</th></tr>
+      <tr><th>Door</th><th>Owner</th><th>Reached by</th><th>Why</th></tr>
     </thead>
     <tbody>
 {unt_rows}
