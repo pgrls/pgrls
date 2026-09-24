@@ -24,6 +24,7 @@ from pgrls.model import (
     Index,
     LeakproofFunction,
     OwnerReachableMember,
+    Role,
     RoleMembership,
     Policy,
     Schema,
@@ -808,6 +809,22 @@ WHERE r.rolbypassrls OR r.rolsuper
 ORDER BY r.rolname
 """
 
+# Every role in the cluster — the principal axis of `pgrls access`. Read from
+# the world-readable `pg_roles` view, never `pg_authid`, for the same reason
+# as the query above: an unprivileged introspector cannot read `pg_authid`.
+# Predefined `pg_*` roles are kept — `pg_read_all_data` confers SELECT on every
+# table with no grant of its own, so it is a real principal. Cluster-global;
+# ORDER BY rolname for snapshot determinism.
+_ROLES_SQL = """
+SELECT
+    r.rolname AS name,
+    r.rolcanlogin AS can_login,
+    r.rolsuper AS superuser,
+    r.rolbypassrls AS bypassrls
+FROM pg_catalog.pg_roles r
+ORDER BY r.rolname
+"""
+
 # Roles that can reach a BYPASSRLS role via SET ROLE — the SEC029
 # surface. BYPASSRLS is a role *attribute*, never inherited through
 # membership, so a member of a BYPASSRLS role doesn't bypass RLS
@@ -1127,6 +1144,20 @@ def _fetch_secdef_functions(
             execute_roles=tuple(sorted(row["execute_roles"] or ())),
             owner_bypasses_rls=bool(row["owner_bypasses_rls"]),
             owner=row["owner_name"] or "",
+        )
+        for row in cur.fetchall()
+    )
+
+
+def _fetch_roles(cur: Any) -> tuple[Role, ...]:
+    """Fetch every role in the cluster (`pg_roles`), sorted by name."""
+    cur.execute(_ROLES_SQL)
+    return tuple(
+        Role(
+            name=row["name"],
+            can_login=row["can_login"],
+            superuser=row["superuser"],
+            bypassrls=row["bypassrls"],
         )
         for row in cur.fetchall()
     )
@@ -1868,6 +1899,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         # `verify --mode anon` can role-gate the anon prover soundly (a `None`
         # graph on an offline/snapshot Schema makes verify abstain instead).
         role_memberships = _fetch_role_memberships(cur)
+        roles = _fetch_roles(cur)
         set_gucs, role_set_gucs = _fetch_set_gucs(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
@@ -1888,6 +1920,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 owner_reachable_members=owner_reachable,
                 foreign_tables=foreign_tables,
                 role_memberships=role_memberships,
+                roles=roles,
                 set_gucs=set_gucs,
                 role_set_gucs=role_set_gucs,
             )
@@ -2119,6 +2152,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         owner_reachable_members=owner_reachable,
         foreign_tables=foreign_tables,
         role_memberships=role_memberships,
+        roles=roles,
         set_gucs=set_gucs,
         role_set_gucs=role_set_gucs,
     )

@@ -1,0 +1,343 @@
+"""Unit tests for `pgrls access` — the per-principal data-access map.
+
+Each case pins one privilege or RLS fact that `verify` already measured live
+on PG16; `access` reuses those rules, so a regression here means the two have
+drifted apart. The live differential test in `tests/test_access_live.py`
+checks the same claims against a real `SET ROLE` + `SELECT`.
+"""
+from __future__ import annotations
+
+from pgrls.access import build_access_map
+from pgrls.ast_utils import parse_expr
+from pgrls.model import (
+    ColumnGrant,
+    Grant,
+    Policy,
+    Role,
+    RoleMembership,
+    Schema,
+    Table,
+)
+
+
+def _role(name: str, *, login: bool = True, su: bool = False, brls: bool = False) -> Role:
+    return Role(name=name, can_login=login, superuser=su, bypassrls=brls)
+
+
+def _policy(
+    name: str,
+    using: str | None,
+    *,
+    roles: tuple[str, ...] = ("PUBLIC",),
+    permissive: bool = True,
+    command: str = "SELECT",
+) -> Policy:
+    return Policy(
+        name=name,
+        command=command,
+        permissive=permissive,
+        roles=roles,
+        using_sql=using,
+        with_check_sql=None,
+        using_ast=parse_expr(using) if using is not None else None,
+        with_check_ast=None,
+    )
+
+
+def _table(
+    name: str = "t",
+    *,
+    owner: str = "owner",
+    rls: bool = True,
+    force: bool = False,
+    grants: tuple[Grant, ...] = (),
+    column_grants: tuple[ColumnGrant, ...] = (),
+    policies: tuple[Policy, ...] = (),
+) -> Table:
+    return Table(
+        schema="public",
+        name=name,
+        rls_enabled=rls,
+        force_rls=force,
+        policies=policies,
+        owner=owner,
+        grants=grants,
+        column_grants=column_grants,
+        columns=("id", "email", "tenant_id"),
+    )
+
+
+def _schema(tables, roles, memberships=()) -> Schema:
+    return Schema(tables=tuple(tables), roles=tuple(roles), role_memberships=tuple(memberships))
+
+
+def _only(amap, principal, relation="public.t"):
+    hits = [a for a in amap.accesses if a.principal == principal and a.relation == relation]
+    assert len(hits) <= 1
+    return hits[0] if hits else None
+
+
+_SELECT = ("SELECT",)
+
+
+# --- privilege ---------------------------------------------------------------
+
+
+def test_no_grant_means_no_access() -> None:
+    amap = build_access_map(_schema([_table()], [_role("app")]))
+    assert _only(amap, "app") is None
+
+
+def test_superuser_reads_everything_with_no_grant() -> None:
+    amap = build_access_map(_schema([_table()], [_role("root", su=True)]))
+    a = _only(amap, "root")
+    assert a is not None and a.rows == "all" and a.columns is None
+    assert [p.kind for p in a.paths] == ["superuser"]
+
+
+def test_bypassrls_escapes_policies_but_not_the_privilege_check() -> None:
+    """Measured: a non-superuser BYPASSRLS role with no SELECT grant got
+    `permission denied for table`. BYPASSRLS is not a privilege."""
+    amap = build_access_map(_schema([_table()], [_role("brls", brls=True)]))
+    assert _only(amap, "brls") is None
+    granted = _table(grants=(Grant(role="brls", privileges=_SELECT),))
+    a = _only(build_access_map(_schema([granted], [_role("brls", brls=True)])), "brls")
+    assert a is not None and a.rows == "all" and "BYPASSRLS" in (a.reason or "")
+
+
+def test_public_grant_reaches_every_role() -> None:
+    t = _table(grants=(Grant(role="PUBLIC", privileges=_SELECT),))
+    amap = build_access_map(_schema([t], [_role("a"), _role("b")]))
+    for r in ("a", "b"):
+        a = _only(amap, r)
+        assert a is not None and [p.kind for p in a.paths] == ["public_grant"]
+
+
+def test_column_grant_reaches_only_those_columns() -> None:
+    t = _table(column_grants=(ColumnGrant(role="app", column="email", privileges=_SELECT),))
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.columns == ("email",)
+    assert a.paths[0].kind == "column_grant"
+
+
+def test_table_grant_wins_over_column_grant_for_column_set() -> None:
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        column_grants=(ColumnGrant(role="app", column="email", privileges=_SELECT),),
+    )
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.columns is None  # every column
+
+
+def test_grant_to_a_group_reaches_an_inherit_member() -> None:
+    t = _table(grants=(Grant(role="readers", privileges=_SELECT),))
+    amap = build_access_map(
+        _schema([t], [_role("app"), _role("readers", login=False)],
+                [RoleMembership(member="app", role="readers", inherit=True)])
+    )
+    a = _only(amap, "app")
+    assert a is not None and a.paths[0].kind == "grant" and a.paths[0].via == "readers"
+
+
+def test_noinherit_member_holds_none_of_the_groups_privileges() -> None:
+    """Measured: a NOINHERIT member's view got `permission denied`."""
+    t = _table(grants=(Grant(role="readers", privileges=_SELECT),))
+    amap = build_access_map(
+        _schema([t], [_role("app"), _role("readers", login=False)],
+                [RoleMembership(member="app", role="readers", inherit=False)])
+    )
+    assert _only(amap, "app") is None
+
+
+def test_pg_read_all_data_confers_select_with_no_grant() -> None:
+    amap = build_access_map(
+        _schema([_table()], [_role("analyst"), _role("pg_read_all_data", login=False)],
+                [RoleMembership(member="analyst", role="pg_read_all_data", inherit=True)])
+    )
+    a = _only(amap, "analyst")
+    assert a is not None and a.paths[0].kind == "pg_read_all_data"
+
+
+# --- rows --------------------------------------------------------------------
+
+
+def test_rls_off_means_every_row() -> None:
+    t = _table(rls=False, grants=(Grant(role="app", privileges=_SELECT),))
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.rows == "all" and a.reason == "RLS is off"
+
+
+def test_rls_on_with_no_applicable_policy_is_default_deny() -> None:
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        policies=(_policy("staff_only", "true", roles=("staff",)),),
+    )
+    a = _only(build_access_map(_schema([t], [_role("app"), _role("staff")])), "app")
+    assert a is not None and a.rows == "none"
+
+
+def test_applicable_policy_filters_rows() -> None:
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        policies=(_policy("tenant", "tenant_id = current_setting('app.t', true)"),),
+    )
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.rows == "filtered" and a.policies == ("tenant",)
+
+
+def test_using_true_with_no_restrictive_floor_is_every_row() -> None:
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        policies=(_policy("open", "true"),),
+    )
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.rows == "all" and "USING (true)" in (a.reason or "")
+
+
+def test_a_restrictive_floor_keeps_using_true_filtered() -> None:
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        policies=(
+            _policy("open", "true"),
+            _policy("floor", "tenant_id = current_setting('app.t', true)", permissive=False),
+        ),
+    )
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.rows == "filtered"
+
+
+def test_owner_reads_every_row_without_force() -> None:
+    t = _table(owner="app", policies=(_policy("tenant", "tenant_id = '1'"),))
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.rows == "all" and "FORCE" in (a.reason or "")
+
+
+def test_force_strips_owner_exemption() -> None:
+    t = _table(owner="app", force=True, policies=(_policy("tenant", "tenant_id = '1'"),))
+    a = _only(build_access_map(_schema([t], [_role("app")])), "app")
+    assert a is not None and a.rows == "filtered"
+
+
+def test_inherit_member_of_owner_is_owner_equivalent() -> None:
+    t = _table(owner="own", policies=(_policy("tenant", "tenant_id = '1'"),))
+    amap = build_access_map(
+        _schema([t], [_role("app"), _role("own", login=False)],
+                [RoleMembership(member="app", role="own", inherit=True)])
+    )
+    a = _only(amap, "app")
+    assert a is not None and a.paths[0].kind == "owner_member" and a.rows == "all"
+
+
+def test_policy_applies_through_a_noinherit_edge_even_without_privileges() -> None:
+    """Policy applicability is `is_member_of_role` — every membership edge —
+    while privileges follow INHERIT only. So a `TO grp` policy applies to a
+    NOINHERIT member even though that member inherits none of grp's grants."""
+    t = _table(
+        grants=(Grant(role="app", privileges=_SELECT),),
+        policies=(_policy("grp_rows", "tenant_id = '1'", roles=("grp",)),),
+    )
+    amap = build_access_map(
+        _schema([t], [_role("app"), _role("grp", login=False)],
+                [RoleMembership(member="app", role="grp", inherit=False)])
+    )
+    a = _only(amap, "app")
+    assert a is not None and a.rows == "filtered" and a.policies == ("grp_rows",)
+
+
+# --- fail-closed -------------------------------------------------------------
+
+
+def test_missing_graph_is_undecided_never_no_access() -> None:
+    """With `role_memberships is None`, a grant to some role `app` might
+    inherit cannot be ruled out — reporting "no access" would be a false
+    clear."""
+    t = _table(grants=(Grant(role="readers", privileges=_SELECT),))
+    s = Schema(tables=(t,), roles=(_role("app"),), role_memberships=None)
+    a = _only(build_access_map(s), "app")
+    assert a is not None and a.rows == "undecided"
+    assert build_access_map(s).graph_complete is False
+
+
+def test_missing_catalogue_derives_principals_and_says_so() -> None:
+    t = _table(grants=(Grant(role="app", privileges=_SELECT),))
+    s = Schema(tables=(t,), roles=None, role_memberships=())
+    amap = build_access_map(s)
+    assert amap.roles_derived is True
+    assert "app" in amap.principals and "owner" in amap.principals
+
+
+def test_nologin_roles_are_excluded_by_default() -> None:
+    t = _table(grants=(Grant(role="grp", privileges=_SELECT),))
+    s = _schema([t], [_role("grp", login=False)])
+    assert _only(build_access_map(s), "grp") is None
+    assert _only(build_access_map(s, include_nologin=True), "grp") is not None
+
+
+def test_naming_a_principal_includes_it_even_if_nologin() -> None:
+    t = _table(grants=(Grant(role="grp", privileges=_SELECT),))
+    s = _schema([t], [_role("grp", login=False)])
+    assert _only(build_access_map(s, principals={"grp"}), "grp") is not None
+
+
+# --- the CLI command, end to end (offline, no database) ----------------------
+
+import json as _json  # noqa: E402
+
+from click.testing import CliRunner  # noqa: E402
+
+from pgrls.cli import main  # noqa: E402
+
+_SQL = """
+CREATE TABLE users (id int, email text, ssn text, tenant_id text);
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_read ON users FOR SELECT TO app
+  USING (tenant_id = current_setting('app.tenant', true));
+GRANT SELECT ON users TO app;
+GRANT SELECT (email) ON users TO anon;
+CREATE TABLE audit (id int, detail text);
+GRANT SELECT ON audit TO PUBLIC;
+"""
+
+
+def _run(tmp_path, *args):
+    f = tmp_path / "s.sql"
+    f.write_text(_SQL)
+    return CliRunner().invoke(main, ["access", "--sql-file", str(f), *args])
+
+
+def test_cli_json_contract(tmp_path) -> None:
+    r = _run(tmp_path, "--format", "json")
+    assert r.exit_code == 0, r.output
+    d = _json.loads(r.stdout)
+    assert set(d) == {"principals", "roles_derived", "graph_complete", "accesses"}
+    # offline SQL carries neither the catalogue nor the membership graph
+    assert d["roles_derived"] is True and d["graph_complete"] is False
+    anon = next(a for a in d["accesses"] if a["principal"] == "anon"
+                and a["relation"] == "public.users")
+    assert anon["columns"] == ["email"]  # the column grant, not the table
+    assert anon["sensitive_columns"] == ["email"]
+    # `TO app` might apply to anon via a membership we cannot see: undecided,
+    # never `none` (that would be a guess in the unsafe direction)
+    assert anon["rows"] == "undecided"
+
+
+def test_cli_text_leads_with_sensitive_exposure(tmp_path) -> None:
+    r = _run(tmp_path)
+    assert r.exit_code == 0
+    assert r.stdout.index("Sensitive columns reachable:") < r.stdout.index("PRINCIPAL  RELATION")
+    assert "public.users.ssn" in r.stdout
+
+
+def test_cli_offline_warns_that_absence_is_not_denial(tmp_path) -> None:
+    r = _run(tmp_path)
+    assert "may reach MORE than is shown" in r.stderr
+
+
+def test_cli_markdown_pluralizes_accesses(tmp_path) -> None:
+    r = _run(tmp_path, "--format", "markdown")
+    assert "accesses;" in r.stdout and "accesss" not in r.stdout
+
+
+def test_cli_role_filter(tmp_path) -> None:
+    r = _run(tmp_path, "--role", "app", "--format", "json")
+    assert _json.loads(r.stdout)["principals"] == ["app"]

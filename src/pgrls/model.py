@@ -2,7 +2,9 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 26. v26 added ``View.direct_references`` /
+Currently version 27. v27 added top-level ``roles`` — the ``pg_roles``
+catalogue, the principal axis of ``pgrls access`` (absent → ``None``, "not
+captured", never "no roles exist"). v26 added ``View.direct_references`` /
 ``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,
 top-level ``set_gucs`` / ``role_set_gucs``, and serialized
 ``role_memberships`` (each edge with its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
@@ -85,7 +87,7 @@ def maybe_set_value(value: str) -> str:
     `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
     return value[len(MAYBE_SET):]
 
-SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls access`); v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -838,6 +840,28 @@ class BypassRlsEscalation:
 
 
 @dataclass(frozen=True)
+class Role:
+    """One row of ``pg_roles`` — a principal ``pgrls access`` reports on.
+
+    The model otherwise only knows roles that happen to appear somewhere: a
+    grantee, a table owner, a policy's ``TO`` list, a membership endpoint, or
+    a BYPASSRLS/superuser role. A plain login role with no grants and no
+    memberships was invisible — and an access map's primary axis should be
+    the authoritative role list, not one inferred from scattered names.
+
+    Read from ``pg_roles`` (world-readable), NOT ``pg_authid``: an
+    unprivileged introspector gets ``permission denied for table pg_authid``.
+    Includes the predefined ``pg_*`` roles — ``pg_read_all_data`` confers
+    SELECT on everything with no grant of its own, so it is a real principal.
+    """
+
+    name: str
+    can_login: bool
+    superuser: bool
+    bypassrls: bool
+
+
+@dataclass(frozen=True)
 class RoleMembership:
     """A single ``pg_auth_members`` edge: ``member`` has the privileges of
     ``role`` (i.e. ``GRANT role TO member``).
@@ -851,9 +875,10 @@ class RoleMembership:
     custom_role TO anon` makes a `TO custom_role` policy anon-reachable, which
     the flat `{anon, PUBLIC}` name-match would miss.
 
-    Live-only: this is captured by live introspection but NOT serialized into a
-    snapshot. `Schema.role_memberships is None` therefore means "role graph not
-    captured" (an offline `--sql-file`/`--migrations` snapshot, a `--against`
+    Captured by live introspection and, since snapshot v26, serialized into
+    the snapshot too (a pre-v26 file has no key and loads as None).
+    `Schema.role_memberships is None` therefore means "role graph not
+    captured" (an offline `--sql-file`/`--migrations` source, a pre-v26
     snapshot, or a hand-built Schema) — in which case anon reachability of a
     non-``{anon, PUBLIC}`` role can't be decided and `verify --mode anon`
     abstains (UNVERIFIED) rather than risk a false ``isolated``. An empty tuple
@@ -1676,6 +1701,13 @@ class Schema:
     # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
     # and every snapshot decoding without it (all versions) fail-closed.
     role_memberships: tuple[RoleMembership, ...] | None = None
+    # v27+: every role in `pg_roles`. `None` = "not captured" (a pre-v27
+    # snapshot, an offline `--sql-file` source, a hand-built Schema) and must
+    # never be read as "no roles exist" — `pgrls access` would then report
+    # that nobody can read anything. On `None` it derives the principal set
+    # from grantees / owners / policy targets / membership endpoints instead,
+    # and says so in its report.
+    roles: tuple[Role, ...] | None = None
     # v26+: custom (dotted) GUCs set at database / server level, as
     # `(name, value)` — what every session, an anonymous one included,
     # inherits without running `SET` (role-level ones live in
@@ -2120,6 +2152,24 @@ class Schema:
                 if self.role_memberships is not None
                 else {}
             ),
+            # v27+: the role catalogue. Emitted only when captured, for the
+            # same reason as role_memberships: `from_snapshot` maps absence
+            # back to None ("not captured"), never to "no roles exist".
+            **(
+                {
+                    "roles": [
+                        {
+                            "name": r.name,
+                            "can_login": r.can_login,
+                            "superuser": r.superuser,
+                            "bypassrls": r.bypassrls,
+                        }
+                        for r in self.roles
+                    ]
+                }
+                if self.roles is not None
+                else {}
+            ),
             "foreign_tables": [
                 {
                     "schema": ft.schema,
@@ -2236,13 +2286,13 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24, 25, 26,
+            21, 22, 23, 24, 25, 26, 27,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
                 "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, "
-                "25, 26. "
+                "25, 26, 27. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
@@ -2355,6 +2405,21 @@ class Schema:
                         inherit=bool(m.get("inherit", True)),
                     )
                     for m in payload["role_memberships"]
+                )
+            ),
+            # v27+: absent key → None ("catalogue not captured"); present →
+            # the captured roles.
+            roles=(
+                None
+                if payload.get("roles") is None
+                else tuple(
+                    Role(
+                        name=r["name"],
+                        can_login=bool(r.get("can_login", False)),
+                        superuser=bool(r.get("superuser", False)),
+                        bypassrls=bool(r.get("bypassrls", False)),
+                    )
+                    for r in payload["roles"]
                 )
             ),
         )
