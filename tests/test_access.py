@@ -1,9 +1,9 @@
-"""Unit tests for `pgrls access` — the per-principal data-access map.
+"""Unit tests for the access engine behind `pgrls matrix`.
 
 Each case pins one privilege or RLS fact that `verify` already measured live
-on PG16; `access` reuses those rules, so a regression here means the two have
-drifted apart. The live differential test in `tests/test_access_live.py`
-checks the same claims against a real `SET ROLE` + `SELECT`.
+on PG16; the engine reuses those rules, so a regression here means the two
+have drifted apart. Every load-bearing rule here was mutation-checked:
+inverting it makes its test fail.
 """
 from __future__ import annotations
 
@@ -279,73 +279,6 @@ def test_naming_a_principal_includes_it_even_if_nologin() -> None:
     assert _only(build_access_map(s, principals={"grp"}), "grp") is not None
 
 
-# --- the CLI command, end to end (offline, no database) ----------------------
-
-import json as _json  # noqa: E402
-
-from click.testing import CliRunner  # noqa: E402
-
-from pgrls.cli import main  # noqa: E402
-
-_SQL = """
-CREATE TABLE users (id int, email text, ssn text, tenant_id text);
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
-CREATE POLICY tenant_read ON users FOR SELECT TO app
-  USING (tenant_id = current_setting('app.tenant', true));
-GRANT SELECT ON users TO app;
-GRANT SELECT (email) ON users TO anon;
-CREATE TABLE audit (id int, detail text);
-GRANT SELECT ON audit TO PUBLIC;
-"""
-
-
-def _run(tmp_path, *args):
-    f = tmp_path / "s.sql"
-    f.write_text(_SQL)
-    return CliRunner().invoke(main, ["access", "--sql-file", str(f), *args])
-
-
-def test_cli_json_contract(tmp_path) -> None:
-    r = _run(tmp_path, "--format", "json")
-    assert r.exit_code == 0, r.output
-    d = _json.loads(r.stdout)
-    assert set(d) == {
-        "principals", "roles_derived", "graph_complete", "accesses",
-        "unresolved_functions",
-    }
-    # offline SQL carries neither the catalogue nor the membership graph
-    assert d["roles_derived"] is True and d["graph_complete"] is False
-    anon = next(a for a in d["accesses"] if a["principal"] == "anon"
-                and a["relation"] == "public.users")
-    assert anon["columns"] == ["email"]  # the column grant, not the table
-    assert anon["sensitive_columns"] == ["email"]
-    # `TO app` might apply to anon via a membership we cannot see: undecided,
-    # never `none` (that would be a guess in the unsafe direction)
-    assert anon["rows"] == "undecided"
-
-
-def test_cli_text_leads_with_sensitive_exposure(tmp_path) -> None:
-    r = _run(tmp_path)
-    assert r.exit_code == 0
-    assert r.stdout.index("Sensitive columns reachable:") < r.stdout.index("PRINCIPAL  RELATION")
-    assert "public.users.ssn" in r.stdout
-
-
-def test_cli_offline_warns_that_absence_is_not_denial(tmp_path) -> None:
-    r = _run(tmp_path)
-    assert "may reach MORE than is shown" in r.stderr
-
-
-def test_cli_markdown_pluralizes_accesses(tmp_path) -> None:
-    r = _run(tmp_path, "--format", "markdown")
-    assert "accesses;" in r.stdout and "accesss" not in r.stdout
-
-
-def test_cli_role_filter(tmp_path) -> None:
-    r = _run(tmp_path, "--role", "app", "--format", "json")
-    assert _json.loads(r.stdout)["principals"] == ["app"]
-
-
 # --- reach through views -----------------------------------------------------
 #
 # Every case mirrors a hop rule `verify`'s reachability walk measured on PG16.
@@ -469,15 +402,6 @@ def test_view_door_reports_the_base_tables_sensitive_columns() -> None:
     v = _view("v", _T, owner="root", super_=True, grants=_ANON_OPENS)
     a = _only(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])), "anon")
     assert a is not None and a.columns is None and "email" in a.sensitive
-
-
-def test_view_path_renders_as_a_view_not_a_grant() -> None:
-    from pgrls.access import render_text
-    t = _table()
-    v = _view("v", _T, owner="root", super_=True, grants=_ANON_OPENS)
-    out = render_text(build_access_map(_vschema([t], [v], [_role("anon"), _role("root", su=True)])))
-    assert "view public.v → public.t" in out
-    assert "grant via public.v" not in out
 
 
 # --- reach through SECURITY DEFINER functions --------------------------------

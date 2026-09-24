@@ -809,7 +809,7 @@ WHERE r.rolbypassrls OR r.rolsuper
 ORDER BY r.rolname
 """
 
-# Every role in the cluster — the principal axis of `pgrls access`. Read from
+# Every role in the cluster — the principal axis of `pgrls matrix`. Read from
 # the world-readable `pg_roles` view, never `pg_authid`, for the same reason
 # as the query above: an unprivileged introspector cannot read `pg_authid`.
 # Predefined `pg_*` roles are kept — `pg_read_all_data` confers SELECT on every

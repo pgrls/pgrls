@@ -1,9 +1,12 @@
-"""`pgrls access` — who can reach which data, and by what path.
+"""The access engine behind `pgrls matrix`: who can reach which data, and how.
 
 `pgrls verify` asks one narrow question — can an *anonymous* session read a
-table's rows? — and proves the answer. This module asks the general one, for
-every principal: which relations can each role ``SELECT``, which columns of
-them, how (the privilege path), and which rows (the RLS outcome for that role).
+table's rows? — and proves the answer. This engine answers the general one for
+any principal: which relations each role can reach, which columns, how (the
+privilege path — including through a definer view or a SECURITY DEFINER
+function), and which rows (the RLS outcome for that role). `pgrls matrix` is
+built on it; its literal role-name matching used to report DENIED for roles
+that read every row.
 
 Two levels of reach are reported separately because they fail independently:
 
@@ -31,18 +34,10 @@ privilege check; a ``NOINHERIT`` member holds none of the group's privileges;
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Literal
 
-from pgrls._render_common import (
-    make_dispatcher,
-    markdown_table,
-    pluralize,
-    render_text_table,
-)
 from pgrls.ast_utils import is_literal_true
-from pgrls.formatters._common import safe_location
 from typing import Any
 
 from pgrls.model import Role, Schema, SecdefFunction, Table, View
@@ -174,32 +169,52 @@ def _derived_roles(schema: Schema) -> tuple[Role, ...]:
     )
 
 
+# The predefined role that confers a command on every table with no grant of
+# its own. `pg_read_all_data` is SELECT only; `pg_write_all_data` is INSERT /
+# UPDATE / DELETE — and neither implies the other.
+_ALL_DATA_ROLE = {
+    "SELECT": "pg_read_all_data",
+    "INSERT": "pg_write_all_data",
+    "UPDATE": "pg_write_all_data",
+    "DELETE": "pg_write_all_data",
+}
+
+
 def _privilege_paths(
-    schema: Schema, role: Role, table: Table, closure: frozenset[str] | None
+    schema: Schema,
+    role: Role,
+    table: Any,
+    closure: frozenset[str] | None,
+    privilege: str = "SELECT",
 ) -> tuple[list[AccessPath], bool]:
-    """The privilege paths by which `role` can SELECT `table`, and whether the
-    answer is complete (False only when the membership graph is missing AND no
-    path that needs no graph decided it)."""
+    """The privilege paths by which `role` holds `privilege` on `table`, and
+    whether the answer is complete (False only when the membership graph is
+    missing AND no path that needs no graph decided it).
+
+    `table` may be a view: only `.owner`, `.grants` and `.column_grants` are
+    read. `DELETE` has no column-level form in Postgres, so a column grant
+    never confers it."""
     if role.superuser:
         return [AccessPath("superuser")], True
     held = closure if closure is not None else frozenset({role.name})
     paths: list[AccessPath] = []
-    if "pg_read_all_data" in held and role.name != "pg_read_all_data":
-        paths.append(AccessPath("pg_read_all_data", via="pg_read_all_data"))
+    all_data = _ALL_DATA_ROLE[privilege]
+    if all_data in held and role.name != all_data:
+        paths.append(AccessPath("pg_read_all_data", via=all_data))
     if table.owner and table.owner == role.name:
         paths.append(AccessPath("owner", via=role.name))
     elif table.owner and table.owner in held:
         paths.append(AccessPath("owner_member", via=table.owner))
     for g in table.grants:
-        if "SELECT" not in g.privileges:
+        if privilege not in g.privileges:
             continue
         if g.role == "PUBLIC":
             paths.append(AccessPath("public_grant", via="PUBLIC"))
         elif g.role in held:
             paths.append(AccessPath("grant", via=g.role))
     by_grantee: dict[str, list[str]] = {}
-    for cg in table.column_grants:
-        if "SELECT" in cg.privileges and (cg.role == "PUBLIC" or cg.role in held):
+    for cg in table.column_grants if privilege != "DELETE" else ():
+        if privilege in cg.privileges and (cg.role == "PUBLIC" or cg.role in held):
             by_grantee.setdefault(cg.role, []).append(cg.column)
     for grantee in sorted(by_grantee):
         paths.append(
@@ -223,6 +238,15 @@ def _reachable_columns(paths: list[AccessPath]) -> tuple[str, ...] | None:
     return tuple(sorted(cols))
 
 
+def _applicability(schema: Schema, name: str) -> tuple[frozenset[str], bool]:
+    """The roles whose ``TO`` list a session running as `name` satisfies, and
+    whether that set is complete. ``PUBLIC`` is a member of nothing, so its set
+    is ``{PUBLIC}`` and always complete — even with no captured graph."""
+    if name == "PUBLIC":
+        return frozenset({"PUBLIC"}), True
+    return _anon_reachable_roles(schema, {name})
+
+
 def _row_reach(
     schema: Schema,
     role: Role,
@@ -241,7 +265,7 @@ def _row_reach(
         return "all", (), "holds the owner's privileges and RLS is not FORCE'd"
     # Policy applicability follows EVERY membership edge (is_member_of_role),
     # INHERIT or not — unlike privileges, which follow INHERIT only.
-    applies_to, complete = _anon_reachable_roles(schema, {role.name})
+    applies_to, complete = _applicability(schema, role.name)
     permissive = [
         p for p in table.policies
         if p.permissive and p.command in _READ_COMMANDS
@@ -591,45 +615,12 @@ def build_access_map(
         and (include_nologin or r.can_login or (principals is not None))
     ]
     attrs = {r.name: r for r in catalogue}
-    tables_by_q = {t.qualified_name: t for t in schema.tables}
     accesses: list[Access] = []
     unresolved: list[UnresolvedDoor] = []
     for role in sorted(chosen, key=lambda r: r.name):
-        closure = _inherit_closure(schema, role.name)
-        per_table: dict[str, list[_Reach]] = {}
-        for table in schema.tables:
-            paths, complete = _privilege_paths(schema, role, table, closure)
-            if paths:
-                rows, policies, reason = _row_reach(schema, role, table, paths)
-                per_table.setdefault(table.qualified_name, []).append(
-                    (paths, _reachable_columns(paths), rows, policies, reason)
-                )
-            elif not complete:
-                per_table.setdefault(table.qualified_name, []).append((
-                    [], None, "undecided", (),
-                    "role-membership graph not captured; a grant to a role "
-                    "this one inherits cannot be ruled out",
-                ))
-        for qname, reaches in _view_doors(schema, role, closure, attrs).items():
-            per_table.setdefault(qname, []).extend(reaches)
-        fn_reach, fn_unresolved = _function_doors(schema, role, closure, attrs)
-        for qname, reaches in fn_reach.items():
-            per_table.setdefault(qname, []).extend(reaches)
-        unresolved.extend(fn_unresolved)
-        for qname in sorted(per_table):
-            paths, cols, rows, policies, reason = _merge(per_table[qname])
-            accesses.append(
-                Access(
-                    role.name,
-                    qname,
-                    cols,
-                    tuple(paths),
-                    rows,
-                    policies,
-                    reason,
-                    _sensitive(tables_by_q[qname], cols),
-                )
-            )
+        acc, unres = role_accesses(schema, role, _inherit_closure(schema, role.name), attrs)
+        accesses.extend(acc)
+        unresolved.extend(unres)
     return AccessMap(
         principals=tuple(sorted(r.name for r in chosen)),
         accesses=tuple(accesses),
@@ -639,202 +630,49 @@ def build_access_map(
     )
 
 
-# --- rendering ---------------------------------------------------------------
-
-
-def _path_label(p: AccessPath, principal: str) -> str:
-    if p.kind == "superuser":
-        return "superuser"
-    if p.kind == "pg_read_all_data":
-        return "pg_read_all_data"
-    if p.kind == "owner":
-        return "owner"
-    if p.kind == "owner_member":
-        return f"member of owner {p.via}"
-    if p.kind == "public_grant":
-        return "PUBLIC grant"
-    if p.kind == "column_grant":
-        return "column grant" if p.via == principal else f"column grant via {p.via}"
-    if p.kind == "view":
-        return "view " + " → ".join(p.hops) if p.hops else f"view {p.via}"
-    if p.kind == "function":
-        return f"SECURITY DEFINER {p.via}"
-    return "grant" if p.via == principal else f"grant via {p.via}"
-
-
-def _rows_label(a: Access) -> str:
-    if a.rows == "filtered":
-        return f"filtered ({', '.join(a.policies)})"
-    return a.rows
-
-
-def _via(a: Access) -> str:
-    return "; ".join(_path_label(p, a.principal) for p in a.paths) or "-"
-
-
-def _cols(a: Access) -> str:
-    return "all" if a.columns is None else ", ".join(a.columns)
-
-
-def _caveats(amap: AccessMap) -> list[str]:
-    out = []
-    if amap.roles_derived:
-        out.append(
-            "No role catalogue was captured (pre-v27 snapshot or offline SQL), so "
-            "principals were derived from grantees, owners and policy targets — "
-            "a role that appears nowhere is not listed, and login/superuser "
-            "attributes are approximate."
+def role_accesses(
+    schema: Schema,
+    role: Role,
+    closure: frozenset[str] | None,
+    attrs: dict[str, Role],
+) -> tuple[list[Access], list[UnresolvedDoor]]:
+    """Everything `role` can read — direct, through views, through SECURITY
+    DEFINER functions — merged per table, widest row reach first."""
+    tables_by_q = {t.qualified_name: t for t in schema.tables}
+    accesses: list[Access] = []
+    unresolved: list[UnresolvedDoor] = []
+    per_table: dict[str, list[_Reach]] = {}
+    for table in schema.tables:
+        paths, complete = _privilege_paths(schema, role, table, closure)
+        if paths:
+            rows, policies, reason = _row_reach(schema, role, table, paths)
+            per_table.setdefault(table.qualified_name, []).append(
+                (paths, _reachable_columns(paths), rows, policies, reason)
+            )
+        elif not complete:
+            per_table.setdefault(table.qualified_name, []).append((
+                [], None, "undecided", (),
+                "role-membership graph not captured; a grant to a role "
+                "this one inherits cannot be ruled out",
+            ))
+    for qname, reaches in _view_doors(schema, role, closure, attrs).items():
+        per_table.setdefault(qname, []).extend(reaches)
+    fn_reach, fn_unresolved = _function_doors(schema, role, closure, attrs)
+    for qname, reaches in fn_reach.items():
+        per_table.setdefault(qname, []).extend(reaches)
+    unresolved.extend(fn_unresolved)
+    for qname in sorted(per_table):
+        paths, cols, rows, policies, reason = _merge(per_table[qname])
+        accesses.append(
+            Access(
+                role.name,
+                qname,
+                cols,
+                tuple(paths),
+                rows,
+                policies,
+                reason,
+                _sensitive(tables_by_q[qname], cols),
+            )
         )
-    if not amap.graph_complete:
-        out.append(
-            "No role-membership graph was captured, so privileges inherited "
-            "through membership are unknown — those relations are `undecided`, "
-            "never reported as unreachable."
-        )
-    return out
-
-
-def _exposures(amap: AccessMap) -> list[tuple[str, str, Access]]:
-    """(relation, column, access) for every sensitive column a principal can
-    reach with at least some rows."""
-    return sorted(
-        (
-            (a.relation, col, a)
-            for a in amap.accesses
-            if a.rows != "none"
-            for col in a.sensitive
-        ),
-        key=lambda x: (x[0], x[1], x[2].principal),
-    )
-
-
-def render_text(amap: AccessMap) -> str:
-    n_p, n_rel = len(amap.principals), len({a.relation for a in amap.accesses})
-    lines = [
-        f"pgrls access — {n_p} {pluralize(n_p, 'principal')}, "
-        f"{n_rel} reachable {pluralize(n_rel, 'relation')}",
-        "",
-    ]
-    exposures = _exposures(amap)
-    if exposures:
-        lines.append("Sensitive columns reachable:")
-        rows = [
-            [
-                safe_location(f"{rel}.{col}"),
-                safe_location(a.principal),
-                _rows_label(a),
-                _via(a),
-            ]
-            for rel, col, a in exposures
-        ]
-        lines.extend("  " + ln for ln in render_text_table(
-            ("COLUMN", "PRINCIPAL", "ROWS", "VIA"), rows
-        ))
-        lines.append("")
-    if amap.accesses:
-        rows = [
-            [
-                safe_location(a.principal),
-                safe_location(a.relation),
-                _cols(a),
-                _rows_label(a),
-                _via(a),
-            ]
-            for a in amap.accesses
-        ]
-        lines.extend(render_text_table(
-            ("PRINCIPAL", "RELATION", "COLUMNS", "ROWS", "VIA"), rows
-        ))
-    else:
-        lines.append("No principal can read any relation in the scanned schemas.")
-    if amap.unresolved:
-        lines.extend(["", "Functions these principals can execute whose reads cannot be determined:"])
-        lines.extend("  " + ln for ln in render_text_table(
-            ("PRINCIPAL", "FUNCTION", "RUNS AS", "WHY"),
-            [
-                [safe_location(u.principal), safe_location(u.function),
-                 safe_location(u.owner), u.reason]
-                for u in amap.unresolved
-            ],
-        ))
-    for c in _caveats(amap):
-        lines.extend(["", f"note: {c}"])
-    return "\n".join(lines) + "\n"
-
-
-def _access_json(a: Access) -> dict[str, object]:
-    return {
-        "principal": a.principal,
-        "relation": a.relation,
-        "columns": list(a.columns) if a.columns is not None else None,
-        "rows": a.rows,
-        "policies": list(a.policies),
-        "reason": a.reason,
-        "sensitive_columns": list(a.sensitive),
-        "paths": [
-            {
-                "kind": p.kind,
-                "via": p.via,
-                "columns": list(p.columns) if p.columns is not None else None,
-            }
-            for p in a.paths
-        ],
-    }
-
-
-def render_json(amap: AccessMap) -> str:
-    return json.dumps(
-        {
-            "principals": list(amap.principals),
-            "roles_derived": amap.roles_derived,
-            "graph_complete": amap.graph_complete,
-            "accesses": [_access_json(a) for a in amap.accesses],
-            "unresolved_functions": [
-                {"principal": u.principal, "function": u.function,
-                 "owner": u.owner, "reason": u.reason}
-                for u in amap.unresolved
-            ],
-        },
-        indent=2,
-    ) + "\n"
-
-
-def _md(text: str) -> str:
-    return safe_location(text).replace("|", "\\|")
-
-
-def render_markdown(amap: AccessMap) -> str:
-    n_p = len(amap.principals)
-    exposures = _exposures(amap)
-    summary = (
-        f"{n_p} {pluralize(n_p, 'principal')}, {len(amap.accesses)} "
-        f"{pluralize(len(amap.accesses), 'access', 'accesses')}; {len(exposures)} sensitive "
-        f"{pluralize(len(exposures), 'column exposure')}."
-    )
-    if amap.unresolved:
-        summary += (
-            f"\n\n> **{len(amap.unresolved)} SECURITY DEFINER "
-            f"{pluralize(len(amap.unresolved), 'function')}** can be executed "
-            "but their reads cannot be determined — see `--format json`."
-        )
-    for c in _caveats(amap):
-        summary += f"\n\n> **Note:** {c}"
-    body = [
-        f"| `{_md(a.principal)}` | `{_md(a.relation)}` | {_md(_cols(a))} "
-        f"| {_md(_rows_label(a))} | {_md(_via(a))} |"
-        for a in amap.accesses
-    ] or ["| — | — | — | — | — |"]
-    return markdown_table(
-        heading="## pgrls access",
-        summary=summary,
-        header_row="| Principal | Relation | Columns | Rows | Via |",
-        separator_row="|---|---|---|---|---|",
-        body_rows=body,
-    )
-
-
-render, ACCESS_FORMATS = make_dispatcher({
-    "text": render_text,
-    "json": render_json,
-    "markdown": render_markdown,
-})
+    return accesses, unresolved

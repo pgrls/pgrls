@@ -90,8 +90,6 @@ from pgrls.verify import render_sarif as render_verify_sarif
 from pgrls.probe import run_probe
 from pgrls.probe import render as render_probe
 from pgrls.probe import render_sarif as render_probe_sarif
-from pgrls.access import ACCESS_FORMATS, build_access_map
-from pgrls.access import render as render_access
 from pgrls.report import REPORT_FORMATS, build_report
 from pgrls.report import render as render_report
 from pgrls.coverage import COVERAGE_FORMATS, DEFAULT_ARTIFACT_PATH, CoverageData, build_coverage
@@ -4121,79 +4119,6 @@ def report(
 
 
 @main.command()
-@click.pass_context
-@common_db_options
-@offline_source_options
-@output_format_options(
-    list(ACCESS_FORMATS),
-    output_help="Write the access map to this file instead of stdout (any --format).",
-)
-@click.option(
-    "--role",
-    "roles",
-    multiple=True,
-    help=(
-        "Report only this principal (repeatable). A named role is reported even "
-        "if it cannot log in."
-    ),
-)
-@click.option(
-    "--all-roles",
-    is_flag=True,
-    default=False,
-    help=(
-        "Report every role, including NOLOGIN groups and the predefined pg_* "
-        "roles. By default only roles that can log in are reported — the real "
-        "entry points; a group's reach already shows up in its login members."
-    ),
-)
-def access(
-    ctx: click.Context,
-    database_url: str | None,
-    config_path: str | None,
-    schemas: str | None,
-    sql_file: tuple[str, ...],
-    snapshot: str | None,
-    output_path: str | None,
-    output_format: str,
-    roles: tuple[str, ...],
-    all_roles: bool,
-) -> None:
-    """Map which roles can read which data, and by what path.
-
-    For every principal: which tables it can SELECT, which columns (a column
-    grant reaches only its columns), the privilege path (grant, column grant,
-    PUBLIC, ownership, owner-equivalence, pg_read_all_data, superuser), and
-    which rows RLS lets through for that role — `all` (RLS off, or the role is
-    exempt), `filtered` (naming the permissive policies that apply), `none`
-    (RLS on and no permissive policy applies), or `undecided`. Columns whose
-    names look sensitive (SEC045's patterns) are listed first.
-
-    Row reach names the policies that apply; it does not prove what they
-    admit — that is `pgrls verify`. A report, not a gate: it exits 0.
-    Reads a live database, or a `pgrls snapshot` (v27+ carries the role
-    catalogue and membership graph).
-    """
-    offline = _resolve_offline_schema(
-        sql_file=sql_file, snapshot=snapshot, schemas_csv=schemas,
-        command="access",
-    )
-    if offline is not None:
-        _guard_offline_exclusivity(ctx, command="access")
-        schema, _, _ = offline
-    else:
-        _, schema = _connect_and_introspect(
-            config_path=config_path,
-            database_url=database_url,
-            schemas_csv=schemas,
-        )
-    amap = build_access_map(
-        schema, principals=set(roles) or None, include_nologin=all_roles
-    )
-    _emit(render_access(amap, output_format), output_path)
-
-
-@main.command()
 @common_db_options
 @click.option(
     "--roles",
@@ -4235,9 +4160,15 @@ def matrix(
     in `--format json`/`html`). Per command it uses the clause Postgres
     applies: `WITH CHECK` for INSERT, `USING` for SELECT/UPDATE/DELETE.
     Reads a live database and runs NO lint rules. `--roles a,b` overrides the
-    columns; `--include-system-roles` adds `pg_*`. Note: a table *owner*
-    bypasses RLS unless the table is `FORCE`d, and a superuser bypasses
-    everything — neither is modeled per-cell.
+    columns; `--include-system-roles` adds `pg_*`.
+
+    Privileges and policies follow role membership, and a role that owns a
+    table (or inherits its owner) reads every row unless the table is
+    `FORCE`d; superusers read everything. The SELECT column also counts reach
+    through a definer view or a SECURITY DEFINER function, which run as their
+    owner. Columns whose names look sensitive are listed in their own section.
+    `UNDECIDED` means the answer turns on role memberships that were not
+    captured — never reported as `DENIED`, which would be a guess.
     """
     # Validate --roles before connecting so a malformed flag fails fast
     # (no database round-trip needed to reject it).

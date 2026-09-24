@@ -3,7 +3,7 @@
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
 Currently version 27. v27 added top-level ``roles`` — the ``pg_roles``
-catalogue, the principal axis of ``pgrls access`` (absent → ``None``, "not
+catalogue, the principal axis of ``pgrls matrix`` (absent → ``None``, "not
 captured", never "no roles exist"). v26 added ``View.direct_references`` /
 ``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,
 top-level ``set_gucs`` / ``role_set_gucs``, and serialized
@@ -87,7 +87,7 @@ def maybe_set_value(value: str) -> str:
     `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
     return value[len(MAYBE_SET):]
 
-SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls access`); v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls matrix`); v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -841,7 +841,7 @@ class BypassRlsEscalation:
 
 @dataclass(frozen=True)
 class Role:
-    """One row of ``pg_roles`` — a principal ``pgrls access`` reports on.
+    """One row of ``pg_roles`` — a principal ``pgrls matrix`` reports on.
 
     The model otherwise only knows roles that happen to appear somewhere: a
     grantee, a table owner, a policy's ``TO`` list, a membership endpoint, or
@@ -1703,7 +1703,7 @@ class Schema:
     role_memberships: tuple[RoleMembership, ...] | None = None
     # v27+: every role in `pg_roles`. `None` = "not captured" (a pre-v27
     # snapshot, an offline `--sql-file` source, a hand-built Schema) and must
-    # never be read as "no roles exist" — `pgrls access` would then report
+    # never be read as "no roles exist" — `pgrls matrix` would then report
     # that nobody can read anything. On `None` it derives the principal set
     # from grantees / owners / policy targets / membership endpoints instead,
     # and says so in its report.

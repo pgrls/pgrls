@@ -10,6 +10,46 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`pgrls matrix` reported `DENIED` for roles that read every row.** Cells
+  matched role names literally, so three ordinary Postgres behaviours were
+  invisible to it, each measured on PG16: a grant held through an `INHERIT`
+  membership (`GRANT readers TO app` plus `GRANT SELECT … TO readers`), a table
+  the role owns without `FORCE ROW LEVEL SECURITY`, and a policy `TO` a group
+  the role belongs to. A superuser with no explicit grant showed `DENIED` too.
+  `matrix` now takes privileges, exemption and policy applicability from the
+  same engine `pgrls verify` uses. **Expect your matrix output to change:**
+  cells that said `DENIED` for these roles now say `OPEN` or `COND` — that is
+  the fix, not a regression.
+
+### Added
+- **`pgrls matrix` counts doors.** The `SELECT` column is widened by a definer
+  view or a `SECURITY DEFINER` function a role can open, since either runs as
+  its owner. A door can only widen a cell — never narrow it, and never touch a
+  write command. An invoker view resets to the calling role and opens none; a
+  function whose body cannot be read is not attributed to any table.
+- **A sensitive-columns section in `pgrls matrix`** — per role, the columns
+  whose names match SEC045's patterns that it can read, and the paths reaching
+  each one. In every format; JSON always carries `sensitive_exposures`, empty
+  when there is nothing to report.
+- **An `UNDECIDED` verdict** for when the answer turns on role memberships that
+  were not captured. It replaces a `DENIED` that would have been a guess in
+  the unsafe direction. A live database always captures the graph.
+- `pgrls matrix` honours the predefined data roles: `pg_read_all_data` confers
+  `SELECT` and `pg_write_all_data` confers `INSERT` / `UPDATE` / `DELETE`, each
+  with no grant of its own. Neither implies the other. (The literal matching
+  above honoured neither.)
+
+### Changed
+- **Snapshot v27** — adds a top-level `roles` array (the `pg_roles` catalogue:
+  name, `can_login`, `superuser`, `bypassrls`). Previously a role existed in the
+  model only if it appeared somewhere — a grantee, an owner, a policy target —
+  so a plain login role with no grants was invisible. Additive: v3–v26 files
+  still load, and a missing key decodes as "not captured", never as "no roles
+  exist".
+- Corrected a stale docstring on `RoleMembership` that said the membership
+  graph is live-only and never serialized; snapshot v26 serializes it.
+
 ## [0.56.0] - 2026-09-16
 
 ### Changed

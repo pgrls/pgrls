@@ -291,6 +291,18 @@ as an audit artefact, printing to PDF, or emailing to a reviewer
 who doesn't run pgrls. A snapshot for audits and onboarding; it
 runs no rules and emits no findings.
 
+`pgrls matrix` answers the audit question directly — **for every role ×
+table × command, can it reach the rows?** — as `OPEN` / `COND` (with the
+predicate) / `DENIED` / `UNDECIDED`. Privileges and policies follow role
+membership the way Postgres does, an owner (or a role inheriting the
+owner) reads every row unless the table is `FORCE`d, and the `SELECT`
+column counts reach through definer views and SECURITY DEFINER
+functions. A separate section lists sensitive-looking columns (SEC045's
+name patterns) each role can read, and how. Suggest it when a user asks
+who can see a table or a column; it runs no rules. `UNDECIDED` means the
+answer turns on memberships that were not captured — treat it as
+"possibly reachable", never as denied.
+
 `pgrls history <dir>` (v0.6.10+) reads a directory of JSON files
 written by `pgrls lint --format json` and emits a chronological
 trend: per-snapshot severity totals plus the **NEW / FIXED** delta

@@ -92,7 +92,9 @@ def _cell(matrix: Matrix, table: str, command: str, role: str):
 
 
 def test_no_grant_is_denied() -> None:
-    schema = Schema(tables=(_table("t", rls=True, policies=(_policy(),)),))
+    schema = Schema(
+        tables=(_table("t", rls=True, policies=(_policy(),)),), role_memberships=()
+    )
     assert _cell(build_matrix(schema), "public.t", "SELECT", "authenticated").verdict == "denied"
 
 
@@ -269,6 +271,7 @@ def test_bypassrls_role_still_needs_grant() -> None:
     schema = Schema(
         tables=(_table("t", rls=True, policies=(_policy(using="true"),)),),
         bypassrls_roles=(BypassRlsRole(name="admin", superuser=False, can_login=True),),
+        role_memberships=(),
     )
     assert _cell(build_matrix(schema), "public.t", "SELECT", "admin").verdict == "denied"
 
@@ -410,7 +413,7 @@ def test_column_grant_confers_select_but_not_delete() -> None:
             ColumnGrant(role="reader", column="body", privileges=("SELECT",)),
         ),
     )
-    m = build_matrix(Schema(tables=(t,)), roles=("reader",))
+    m = build_matrix(Schema(tables=(t,), role_memberships=()), roles=("reader",))
     assert _cell(m, "public.t", "SELECT", "reader").verdict == "open"
     assert _cell(m, "public.t", "DELETE", "reader").verdict == "denied"
 
@@ -424,7 +427,8 @@ def test_policy_targeting_other_role_does_not_apply() -> None:
                 grants=(_grant("anon", ("SELECT",)),),
                 policies=(_policy(roles=("authenticated",), using="true"),),
             ),
-        )
+        ),
+        role_memberships=(),
     )
     # anon is granted but the only policy targets authenticated → denied.
     assert _cell(build_matrix(schema), "public.t", "SELECT", "anon").verdict == "denied"
@@ -488,7 +492,7 @@ def test_summary_counts_reconcile() -> None:
         )
     )
     s = build_matrix(schema).summary
-    assert s["open"] + s["denied"] + s["conditional"] == s["cells"]
+    assert s["open"] + s["denied"] + s["conditional"] + s["undecided"] == s["cells"]
     assert s["cells"] == s["tables"] * len(("S", "I", "U", "D")) * s["roles"]
 
 
@@ -507,7 +511,8 @@ def _sample_matrix() -> Matrix:
                     policies=(_policy(using="tenant_id = 1"),),
                 ),
                 _table("denied_t", rls=True),
-            )
+            ),
+            role_memberships=(),
         )
     )
 
@@ -527,7 +532,7 @@ def test_render_json_shape_and_predicate() -> None:
     payload = json.loads(render_json(_sample_matrix()))
     assert payload["roles"] == ["PUBLIC", "anon", "authenticated"]
     assert set(payload["summary"]) == {
-        "tables", "roles", "cells", "open", "denied", "conditional"
+        "tables", "roles", "cells", "open", "denied", "conditional", "undecided"
     }
     cond = next(
         r for r in payload["rows"] if r["table"] == "public.cond_t" and r["command"] == "SELECT"
@@ -765,3 +770,317 @@ def test_matrix_live_rls_off_table_is_open(pg_conn: psycopg.Connection) -> None:
     # anon inherits the PUBLIC grant; RLS off → open with the RLS-off note.
     assert cell.verdict == "open"
     assert cell.note == "RLS off"
+
+
+# --- the shared engine: membership, ownership, superuser ---------------------
+#
+# Before the fold, `matrix` matched role names literally. Measured on PG16, that
+# reported DENIED for a role that read every row in three ways; each is pinned
+# below, alongside its negative control.
+
+from pgrls.model import Role, RoleMembership  # noqa: E402
+
+
+def _owned(owner: str, *, force: bool, policies=(), grants=()) -> Table:
+    return Table(
+        schema="public", name="t", rls_enabled=True, force_rls=force,
+        policies=policies, grants=grants, owner=owner,
+    )
+
+
+def test_grant_held_through_an_inherit_membership_is_reachable() -> None:
+    schema = Schema(
+        tables=(_table("t", rls=False, grants=(_grant("readers", ("SELECT",)),)),),
+        role_memberships=(RoleMembership(member="app", role="readers", inherit=True),),
+    )
+    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "open"
+
+
+def test_noinherit_member_does_not_hold_the_groups_grant() -> None:
+    """Measured: a NOINHERIT member's view got `permission denied`."""
+    schema = Schema(
+        tables=(_table("t", rls=False, grants=(_grant("readers", ("SELECT",)),)),),
+        role_memberships=(RoleMembership(member="app", role="readers", inherit=False),),
+    )
+    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "denied"
+
+
+def test_owner_without_force_is_open() -> None:
+    schema = Schema(
+        tables=(_owned("app", force=False,
+                       policies=(_policy(roles=("someone",), using="tenant_id = 1"),)),),
+        role_memberships=(),
+    )
+    c = _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app")
+    assert c.verdict == "open" and "FORCE" in (c.note or "")
+
+
+def test_owner_with_force_is_bound_by_the_policies() -> None:
+    schema = Schema(
+        tables=(_owned("app", force=True,
+                       policies=(_policy(roles=("app",), using="tenant_id = 1"),)),),
+        role_memberships=(),
+    )
+    c = _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app")
+    assert c.verdict == "conditional" and c.predicate == "tenant_id = 1"
+
+
+def test_policy_to_a_group_applies_to_its_members() -> None:
+    schema = Schema(
+        tables=(_table("t", rls=True, grants=(_grant("app", ("SELECT",)),),
+                       policies=(_policy(roles=("grp",), using="true"),)),),
+        role_memberships=(RoleMembership(member="app", role="grp", inherit=True),),
+    )
+    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "open"
+
+
+def test_policy_applicability_follows_a_noinherit_edge_too() -> None:
+    """Policy applicability is `is_member_of_role` — every edge — while
+    privileges follow INHERIT only. The grant is the member's own here."""
+    schema = Schema(
+        tables=(_table("t", rls=True, grants=(_grant("app", ("SELECT",)),),
+                       policies=(_policy(roles=("grp",), using="true"),)),),
+        role_memberships=(RoleMembership(member="app", role="grp", inherit=False),),
+    )
+    assert _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app").verdict == "open"
+
+
+def test_superuser_needs_no_grant() -> None:
+    schema = Schema(
+        tables=(_table("t", rls=True, policies=(_policy(using="tenant_id = 1"),)),),
+        roles=(Role("root", True, True, False),),
+        role_memberships=(),
+    )
+    c = _cell(build_matrix(schema, roles=("root",)), "public.t", "DELETE", "root")
+    assert c.verdict == "open" and c.note == "superuser"
+
+
+def test_pg_read_all_data_confers_select_but_not_writes() -> None:
+    schema = Schema(
+        tables=(_table("t", rls=False),),
+        role_memberships=(RoleMembership("analyst", "pg_read_all_data", True),),
+    )
+    m = build_matrix(schema, roles=("analyst",))
+    assert _cell(m, "public.t", "SELECT", "analyst").verdict == "open"
+    for cmd in ("INSERT", "UPDATE", "DELETE"):
+        assert _cell(m, "public.t", cmd, "analyst").verdict == "denied", cmd
+
+
+def test_pg_write_all_data_confers_writes_but_not_select() -> None:
+    schema = Schema(
+        tables=(_table("t", rls=False),),
+        role_memberships=(RoleMembership("etl", "pg_write_all_data", True),),
+    )
+    m = build_matrix(schema, roles=("etl",))
+    assert _cell(m, "public.t", "SELECT", "etl").verdict == "denied"
+    for cmd in ("INSERT", "UPDATE", "DELETE"):
+        assert _cell(m, "public.t", cmd, "etl").verdict == "open", cmd
+
+
+def test_without_a_graph_a_named_role_is_undecided_but_public_is_not() -> None:
+    """A named role might inherit a grant (or `pg_read_all_data`) we cannot
+    see, so `denied` would be a guess in the unsafe direction. PUBLIC has no
+    memberships of its own, so it stays decided even without a graph."""
+    schema = Schema(tables=(_table("t", rls=False),), role_memberships=None)
+    m = build_matrix(schema, roles=("PUBLIC", "app"))
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "undecided"
+    assert _cell(m, "public.t", "SELECT", "PUBLIC").verdict == "denied"
+
+
+def test_summary_line_mentions_undecided_only_when_present() -> None:
+    from pgrls.matrix import _summary_line
+    decided = build_matrix(Schema(tables=(_table("t", rls=False),), role_memberships=()),
+                           roles=("app",))
+    assert "undecided" not in _summary_line(decided)
+    undecided = build_matrix(Schema(tables=(_table("t", rls=False),), role_memberships=None),
+                             roles=("app",))
+    assert "4 undecided" in _summary_line(undecided)
+
+
+def test_granted_role_with_an_undecidable_policy_is_undecided_not_denied() -> None:
+    """The role holds its own grant, so privilege is decided — but the only
+    permissive policy targets a group it may belong to through a membership we
+    cannot see. `denied` would under-report; it is `undecided`.
+
+    (A separate case from the no-grant one above, whose `undecided` comes from
+    the privilege check: an earlier test assignment let this branch go
+    completely untested.)"""
+    schema = Schema(
+        tables=(_table("t", rls=True, grants=(_grant("app", ("SELECT",)),),
+                       policies=(_policy(roles=("grp",), using="true"),)),),
+        role_memberships=None,
+    )
+    c = _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app")
+    assert c.verdict == "undecided" and "grp" not in (c.predicate or "")
+    assert "cannot tell whether" in (c.note or "")
+
+
+def test_known_conditional_plus_an_undecidable_policy_is_undecided() -> None:
+    """A known conditional read, plus a policy that MIGHT also apply and widen
+    it. Reporting the known predicate alone would under-report."""
+    schema = Schema(
+        tables=(_table("t", rls=True, grants=(_grant("app", ("SELECT",)),),
+                       policies=(
+                           _policy(name="own", roles=("app",), using="tenant_id = 1"),
+                           _policy(name="maybe", roles=("grp",), using="true"),
+                       )),),
+        role_memberships=None,
+    )
+    c = _cell(build_matrix(schema, roles=("app",)), "public.t", "SELECT", "app")
+    assert c.verdict == "undecided" and "maybe" in (c.note or "")
+
+
+# --- doors: definer views and SECURITY DEFINER functions widen SELECT ---------
+
+from pgrls.model import SecdefFunction, View  # noqa: E402
+
+_T = (("public", "t"),)
+
+
+def _definer_view(owner_super: bool = True) -> View:
+    return View(
+        schema="public", name="v", is_materialized=False, security_invoker=False,
+        security_barrier=False, definition="", references=_T,
+        security_definer_calls=(), grants=(_grant("anon", ("SELECT",)),),
+        owner="root", owner_bypasses_rls=owner_super, direct_references=_T,
+        owner_is_superuser=owner_super,
+    )
+
+
+def _door_schema(**extra) -> Schema:
+    return Schema(
+        tables=(_table("t", rls=True, policies=(_policy(roles=("app",), using="tenant_id = 1"),)),),
+        roles=(Role("anon", True, False, False), Role("root", False, True, False)),
+        role_memberships=(),
+        **extra,
+    )
+
+
+def test_a_definer_view_opens_select_for_a_role_with_no_grant() -> None:
+    """Before the fold `matrix` had no notion of doors: anon held no grant on
+    `t`, so it showed DENIED while anon read every row through `v`."""
+    m = build_matrix(_door_schema(views=(_definer_view(),)), roles=("anon",))
+    c = _cell(m, "public.t", "SELECT", "anon")
+    assert c.verdict == "open" and "public.v" in (c.note or "")
+
+
+def test_a_secdef_function_opens_select_for_a_role_with_no_grant() -> None:
+    fn = SecdefFunction(
+        qualified_name="public.f", body="SELECT * FROM t", language="sql",
+        owner="root", execute_roles=("PUBLIC",), owner_bypasses_rls=True,
+    )
+    m = build_matrix(_door_schema(security_definer_functions=(fn,)), roles=("anon",))
+    c = _cell(m, "public.t", "SELECT", "anon")
+    assert c.verdict == "open" and "public.f" in (c.note or "")
+
+
+def test_doors_never_touch_write_commands() -> None:
+    m = build_matrix(_door_schema(views=(_definer_view(),)), roles=("anon",))
+    for cmd in ("INSERT", "UPDATE", "DELETE"):
+        assert _cell(m, "public.t", cmd, "anon").verdict == "denied", cmd
+
+
+def test_a_door_never_narrows_a_cell() -> None:
+    """anon reads every row directly; a door that is merely conditional must
+    not downgrade that.
+
+    The door has to genuinely exist and be NARROWER for this to test anything:
+    `svc` holds its own grant and its own row filter, so reading through `v`
+    (as `svc`) is conditional while anon's direct read is open. An earlier
+    version gave `svc` no grant, so the door was a dead path, no door existed,
+    and the rule went unexercised."""
+    t = _table(
+        "t", rls=True,
+        grants=(_grant("anon", ("SELECT",)), _grant("svc", ("SELECT",))),
+        policies=(
+            _policy(name="anon_all", roles=("anon",), using="true"),
+            _policy(name="svc_some", roles=("svc",), using="tenant_id = 1"),
+        ),
+    )
+    ordinary = View(
+        schema="public", name="v", is_materialized=False, security_invoker=False,
+        security_barrier=False, definition="", references=_T,
+        security_definer_calls=(), grants=(_grant("anon", ("SELECT",)),),
+        owner="svc", owner_bypasses_rls=False, direct_references=_T,
+    )
+    s = Schema(tables=(t,), views=(ordinary,),
+               roles=(Role("anon", True, False, False), Role("svc", False, False, False)),
+               role_memberships=())
+    assert _cell(build_matrix(s, roles=("anon",)), "public.t", "SELECT", "anon").verdict == "open"
+
+
+# --- sensitive exposures ------------------------------------------------------
+
+from pgrls.model import ColumnGrant as _CG  # noqa: E402
+
+
+def _pii_schema(*, view: bool) -> Schema:
+    # A permissive policy for anon, so its own column grant yields rows. With
+    # RLS on and NO policy, the grant reads zero rows (default-deny) and is
+    # rightly not an exposure — an earlier version of this fixture missed that.
+    users = Table(
+        schema="public", name="users", rls_enabled=True, force_rls=True,
+        policies=(_policy(roles=("anon",), using="true"),),
+        owner="own", grants=(), columns=("id", "email", "ssn"),
+        column_grants=(_CG(role="anon", column="email", privileges=("SELECT",)),),
+    )
+    ut = (("public", "users"),)
+    views = (View(
+        schema="public", name="dir", is_materialized=False, security_invoker=False,
+        security_barrier=False, definition="", references=ut, security_definer_calls=(),
+        grants=(_grant("anon", ("SELECT",)),), owner="root", owner_bypasses_rls=True,
+        direct_references=ut, owner_is_superuser=True,
+    ),) if view else ()
+    return Schema(
+        tables=(users,), views=views, role_memberships=(),
+        roles=(Role("anon", True, False, False), Role("root", False, True, False)),
+    )
+
+
+def _exp(m, column):
+    return {e.column: e for e in m.exposures}.get(column)
+
+
+def test_a_column_grant_is_credited_only_for_its_own_columns() -> None:
+    """Measured in the rendered output: `ssn`, reachable ONLY through the
+    definer view, was listed as reached via the column grant on `email`."""
+    m = build_matrix(_pii_schema(view=True), roles=("anon",))
+    assert "column grant" in _exp(m, "email").via
+    assert _exp(m, "ssn").via == "view public.dir"
+
+
+def test_a_column_grant_alone_exposes_only_its_column() -> None:
+    m = build_matrix(_pii_schema(view=False), roles=("anon",))
+    assert _exp(m, "email") is not None
+    assert _exp(m, "ssn") is None  # never granted, and no door
+
+
+def test_a_grant_held_by_the_role_itself_is_not_labelled_via_itself() -> None:
+    m = build_matrix(_pii_schema(view=False), roles=("anon",))
+    assert _exp(m, "email").via == "column grant"
+
+
+def test_json_always_carries_the_exposures_key() -> None:
+    empty = build_matrix(Schema(tables=(_table("t", rls=False),), role_memberships=()),
+                         roles=("anon",))
+    assert json.loads(render_json(empty))["sensitive_exposures"] == []
+    full = json.loads(render_json(build_matrix(_pii_schema(view=True), roles=("anon",))))
+    assert {e["column"] for e in full["sensitive_exposures"]} == {"email", "ssn"}
+
+
+def test_no_exposures_leaves_the_text_output_unchanged() -> None:
+    m = build_matrix(Schema(tables=(_table("t", rls=False),), role_memberships=()),
+                     roles=("anon",))
+    assert not render_text(m).startswith("Sensitive columns reachable")
+
+
+def test_a_grant_that_yields_no_rows_is_not_an_exposure() -> None:
+    """RLS on with no applicable permissive policy is default-deny: holding the
+    column grant reads zero rows, so it is not an exposure."""
+    users = Table(
+        schema="public", name="users", rls_enabled=True, force_rls=True, policies=(),
+        owner="own", grants=(), columns=("id", "email"),
+        column_grants=(_CG(role="anon", column="email", privileges=("SELECT",)),),
+    )
+    s = Schema(tables=(users,), role_memberships=(), roles=(Role("anon", True, False, False),))
+    assert build_matrix(s, roles=("anon",)).exposures == ()

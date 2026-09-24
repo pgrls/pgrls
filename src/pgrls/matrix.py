@@ -6,22 +6,38 @@ role x table x command collapsing table GRANTs, the RLS enabled/forced flags,
 and the permissive(OR) / restrictive(AND) policy combination into one verdict
 per cell:
 
-* ``open``        — the role can access every row (granted, and either RLS is
-  off, the role bypasses RLS, or an applicable permissive policy is
-  unconditionally true with nothing restrictive narrowing it).
-* ``denied``      — no table privilege for that command, or RLS is on with no
+* ``open``        — the role can access every row (it holds the privilege, and
+  either RLS is off, the role is exempt — superuser, BYPASSRLS, or holding the
+  table owner's privileges on a table that is not ``FORCE``d — or an applicable
+  permissive policy is unconditionally true with nothing restrictive narrowing
+  it).
+* ``denied``      — no privilege for that command, or RLS is on with no
   applicable *permissive* policy (Postgres default-denies).
 * ``conditional`` — granted and gated by a row predicate (shown): the OR of
   applicable permissive policy clauses, AND-ed with any restrictive ones.
+* ``undecided``   — the role-membership graph was not captured and the answer
+  turns on it (a grant the role may inherit, a policy it may fall under).
+  Reported instead of ``denied``, which would be a guess in the unsafe
+  direction. Live introspection always captures the graph.
+
+Privileges, exemption and policy applicability come from `pgrls.access`, the
+engine `verify` uses. So a grant held through an INHERIT membership, ownership
+or owner-equivalence, ``pg_read_all_data`` (SELECT) / ``pg_write_all_data``
+(writes), and a policy targeting a group the role belongs to all count. The
+SELECT column is also widened by doors: a definer view or a SECURITY DEFINER
+function the role can open, whose body then runs as its owner. A separate
+section lists sensitive columns (SEC045's name patterns) each role can read.
 
 Per command the relevant clause is the one Postgres applies: ``WITH CHECK`` for
 INSERT, ``USING`` for SELECT / UPDATE / DELETE. (UPDATE additionally has a
 write-side ``WITH CHECK``; v1 shows the read-side ``USING`` — the "who can see
 which rows" question.)
 
-Caveats it does not model per-cell (noted in output/docs): a table *owner*
-bypasses RLS on a table that is not ``FORCE``d, and a superuser bypasses
-everything. "Unconditionally true" is detected lexically (a literal ``true``
+Before this engine, cells matched role names literally, and reported DENIED
+for a role that read every row in three measured ways: a grant held through a
+group, a table it owns without FORCE, a policy TO a group it belongs to.
+
+"Unconditionally true" is detected lexically (a literal ``true``
 disjunct), matching the rest of the rule set — ``1=1``-style tautologies that
 are not the literal ``true`` show as ``conditional`` (the safe direction: it
 under-claims openness, never falsely reports ``open``).
@@ -38,9 +54,19 @@ from pgrls._html_common import html_page, resolve_generated_at, to_iso_z
 from pgrls._render_common import make_dispatcher, pluralize, render_text_table
 from pgrls.ast_utils import flatten_or_disjuncts, is_literal_true, parse_expr
 from pgrls.formatters._common import safe_location
-from pgrls.model import Policy, Schema, Table
+from pgrls.access import (
+    _applicability,
+    _derived_roles,
+    _function_doors,
+    _merge,
+    _privilege_paths,
+    _view_doors,
+    role_accesses,
+)
+from pgrls.model import Policy, Role, Schema, Table
+from pgrls.verify import _inherit_closure
 
-Verdict = Literal["open", "denied", "conditional"]
+Verdict = Literal["open", "denied", "conditional", "undecided"]
 
 COMMANDS: tuple[str, ...] = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
@@ -48,7 +74,9 @@ COMMANDS: tuple[str, ...] = ("SELECT", "INSERT", "UPDATE", "DELETE")
 # Supabase / PostgREST audit baseline.
 _DEFAULT_ROLES = ("PUBLIC", "anon", "authenticated")
 
-_VERDICT_LABEL = {"open": "OPEN", "denied": "DENIED", "conditional": "COND"}
+_VERDICT_LABEL = {
+    "open": "OPEN", "denied": "DENIED", "conditional": "COND", "undecided": "UNDECIDED",
+}
 
 _MATRIX_CSS = """    tr:nth-child(even) td { background: #0d1117; }
     tr:nth-child(odd) td { background: #161b22; }
@@ -64,6 +92,7 @@ _MATRIX_CSS = """    tr:nth-child(even) td { background: #0d1117; }
   .v-open        { color: #cf222e; }
   .v-denied      { color: #1a7f37; }
   .v-conditional { color: #9a6700; }
+  .v-undecided   { color: #8250df; }
   .v-empty       { color: #57606a; }
   table { width: 100%; border-collapse: collapse; border: 1px solid #d0d7de; }
   thead th { text-align: left; padding: .5rem .75rem; background: #f6f8fa;
@@ -92,13 +121,36 @@ class MatrixRow:
 
 
 @dataclass(frozen=True)
+class Exposure:
+    """A sensitive column (by name, SEC045's patterns) a role can read.
+
+    `verdict` is the widest row reach the role has to the TABLE — never
+    ``denied``. It can over-state one column: if the widest path does not
+    reach that column (a column grant elsewhere), the column's own reach may be
+    narrower. That only ever over-reports, the safe direction for an audit.
+    `via` names how, crediting only the paths that reach this column: a grant,
+    ownership, a definer view or a SECURITY DEFINER function. A
+    column reached through a view is *possibly* reachable: column lineage
+    through the view body is not traced, so the base table's sensitive columns
+    are reported — over-reporting sensitivity is the safe direction.
+    """
+
+    role: str
+    table: str
+    column: str
+    verdict: Verdict
+    via: str
+
+
+@dataclass(frozen=True)
 class Matrix:
     roles: tuple[str, ...]
     rows: tuple[MatrixRow, ...]
+    exposures: tuple[Exposure, ...] = ()
 
     @property
     def summary(self) -> dict[str, int]:
-        counts = {"open": 0, "denied": 0, "conditional": 0}
+        counts = {"open": 0, "denied": 0, "conditional": 0, "undecided": 0}
         for row in self.rows:
             for cell in row.cells:
                 counts[cell.verdict] += 1
@@ -109,6 +161,7 @@ class Matrix:
             "open": counts["open"],
             "denied": counts["denied"],
             "conditional": counts["conditional"],
+            "undecided": counts["undecided"],
         }
 
 
@@ -139,23 +192,26 @@ def _collect_roles(schema: Schema, *, include_system: bool) -> tuple[str, ...]:
     return tuple(sorted(roles, key=key))
 
 
-def _role_has_privilege(table: Table, role: str, privilege: str) -> bool:
-    """Whether `role` (directly or via PUBLIC) holds `privilege` on `table`.
+def _resolve_role(
+    schema: Schema, name: str
+) -> tuple[Role, frozenset[str] | None, frozenset[str], bool]:
+    """A role name as ``(Role, privilege closure, policy-applicability set,
+    whether that set is complete)``.
 
-    Column-level grants count too: a `GRANT SELECT (col) ON t` lets the role
-    read rows (of that column), so for the "can this role reach rows" question
-    it confers the command. DELETE has no column-level form in Postgres, so
-    only table grants apply there — checking column grants for it would be a
-    false grant.
+    Attributes come from the role catalogue when one was captured, else from
+    the names the schema mentions (``_derived_roles``). ``PUBLIC`` is the
+    pseudo-role every session is in: it has no memberships of its own, so both
+    of its closures are ``{PUBLIC}`` and always complete — even with no
+    captured graph.
     """
-    for grant in table.grants:
-        if grant.role in (role, "PUBLIC") and privilege in grant.privileges:
-            return True
-    if privilege != "DELETE":
-        for cgrant in table.column_grants:
-            if cgrant.role in (role, "PUBLIC") and privilege in cgrant.privileges:
-                return True
-    return False
+    if name == "PUBLIC":
+        public = frozenset({"PUBLIC"})
+        return Role("PUBLIC", False, False, False), public, public, True
+    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
+    attrs = {r.name: r for r in catalogue}
+    role = attrs.get(name, Role(name, False, False, False))
+    applies_to, complete = _applicability(schema, name)
+    return role, _inherit_closure(schema, name), applies_to, complete
 
 
 def _effective_clause(policy: Policy, command: str) -> str | None:
@@ -177,13 +233,25 @@ def _effective_clause(policy: Policy, command: str) -> str | None:
     return policy.using_sql
 
 
-def _policy_applies(policy: Policy, role: str, command: str) -> bool:
+def _policy_applies(
+    policy: Policy, command: str, applies_to: frozenset[str], complete: bool
+) -> bool | None:
+    """Whether `policy` applies to a session whose role reaches `applies_to`.
+
+    Postgres applies a policy ``TO R`` to any session that is ``R`` or a member
+    of ``R`` — through EVERY membership edge, INHERIT or not (unlike
+    privileges). Matching the role name literally missed that: measured, a
+    ``TO grp`` policy reported the member as DENIED while it read every row.
+    ``None`` = undecidable (the membership graph was not captured and the
+    policy names a role outside what we can see).
+    """
     if policy.command not in ("ALL", command):
         return False
     # A policy with no explicit TO defaults to PUBLIC (applies to everyone).
-    if not policy.roles:
+    roles = set(policy.roles) or {"PUBLIC"}
+    if roles & applies_to:
         return True
-    return role in policy.roles or "PUBLIC" in policy.roles
+    return None if not complete else False
 
 
 def _clause_is_open(clause: str) -> bool:
@@ -212,18 +280,64 @@ def _narrowing_restrictive(restrictive: list[Policy], command: str) -> list[str]
     ]
 
 
-def _cell(table: Table, role: str, command: str, bypass: frozenset[str]) -> Cell:
-    if not _role_has_privilege(table, role, command):
+def _cell(
+    schema: Schema,
+    table: Table,
+    role: Role,
+    command: str,
+    closure: frozenset[str] | None,
+    applies_to: frozenset[str],
+    complete: bool,
+) -> Cell:
+    """One role x table x command verdict.
+
+    Privilege, exemption and policy applicability come from the same engine
+    `verify` uses (via `pgrls.access`), rather than a literal role-name match.
+    Measured on PG16, the literal match reported DENIED for a role that read
+    every row in three ways: a grant held through an INHERIT membership, a
+    table the role owns without FORCE, and a policy TO a group it belongs to.
+    """
+    paths, known = _privilege_paths(schema, role, table, closure, command)
+    if not paths:
+        if not known:
+            return Cell(
+                "undecided",
+                note="role-membership graph not captured; a grant to a role "
+                "this one inherits cannot be ruled out",
+            )
         return Cell("denied")
-    if role in bypass:
+    if role.superuser:
+        return Cell("open", note="superuser")
+    if role.bypassrls:
         return Cell("open", note="bypasses RLS")
     if not table.rls_enabled:
         return Cell("open", note="RLS off")
+    if (
+        any(p.kind in ("owner", "owner_member") for p in paths)
+        and not table.force_rls
+    ):
+        return Cell("open", note="owner; RLS not FORCE'd")
 
-    applicable = [p for p in table.policies if _policy_applies(p, role, command)]
+    verdicts = {p.name: _policy_applies(p, command, applies_to, complete)
+                for p in table.policies}
+    applicable = [p for p in table.policies if verdicts[p.name] is True]
+    # An undecidable PERMISSIVE policy might grant rows, so it can only widen;
+    # an undecidable RESTRICTIVE one might narrow, so it is left out rather
+    # than let it turn a true OPEN into COND. Both lean toward over-reporting
+    # access, which is the safe direction for an audit.
+    unknown_permissive = [
+        p for p in table.policies if verdicts[p.name] is None and p.permissive
+    ]
     permissive = [p for p in applicable if p.permissive]
     restrictive = [p for p in applicable if not p.permissive]
     if not permissive:
+        if unknown_permissive:
+            return Cell(
+                "undecided",
+                note="role-membership graph not captured; cannot tell whether "
+                + ", ".join(sorted(p.name for p in unknown_permissive))
+                + " apply",
+            )
         return Cell("denied", note="no permissive policy")
 
     # A permissive policy admits rows only through the clause Postgres applies
@@ -238,11 +352,50 @@ def _cell(table: Table, role: str, command: str, bypass: frozenset[str]) -> Cell
     if any(_clause_is_open(c) for c in perm):
         # Open unless a restrictive floor actually narrows rows.
         return Cell("conditional", predicate=" AND ".join(restr)) if restr else Cell("open")
+    if unknown_permissive:
+        # A known conditional read, plus policies that might widen it.
+        return Cell(
+            "undecided",
+            note="role-membership graph not captured; "
+            + ", ".join(sorted(p.name for p in unknown_permissive))
+            + " may also apply",
+        )
 
     # Permissive is conditional: effective predicate is (OR permissive) AND restr.
     parts = [f"({' OR '.join(perm)})" if len(perm) > 1 else perm[0]]
     parts.extend(restr)
     return Cell("conditional", predicate=" AND ".join(parts))
+
+
+# Widest-first, as in `pgrls.access`: `undecided` outranks `conditional` so a
+# known partial read never masks a door that cannot be bounded.
+_RANK: dict[str, int] = {"open": 3, "undecided": 2, "conditional": 1, "denied": 0}
+_ROWS_TO_VERDICT: dict[str, Verdict] = {
+    "all": "open", "filtered": "conditional", "none": "denied", "undecided": "undecided",
+}
+
+
+def _door_cells(
+    schema: Schema, role: Role, closure: frozenset[str] | None
+) -> dict[str, Cell]:
+    """SELECT verdicts reached through a definer view or a SECURITY DEFINER
+    function, keyed by table. A door runs as its OWNER, so the rows are the
+    owner's row reach — the predicate shown on a direct cell would describe the
+    wrong role here, so a door cell carries a note instead."""
+    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
+    attrs = {r.name: r for r in catalogue}
+    reaches = _view_doors(schema, role, closure, attrs)
+    fn_reach, _ = _function_doors(schema, role, closure, attrs)
+    for qname, rs in fn_reach.items():
+        reaches.setdefault(qname, []).extend(rs)
+    out: dict[str, Cell] = {}
+    for qname, rs in reaches.items():
+        _, _, rows, pols, reason = _merge(rs)
+        note = reason or "through a door"
+        if rows == "filtered" and pols:
+            note += f" — filtered by {', '.join(pols)}"
+        out[qname] = Cell(_ROWS_TO_VERDICT[rows], note=note)
+    return out
 
 
 def build_matrix(
@@ -260,13 +413,24 @@ def build_matrix(
     role_list = roles if roles is not None else _collect_roles(
         schema, include_system=include_system
     )
-    bypass = frozenset(b.name for b in schema.bypassrls_roles)
+    resolved = {name: _resolve_role(schema, name) for name in role_list}
+    doors = {
+        name: _door_cells(schema, resolved[name][0], resolved[name][1])
+        for name in role_list
+    }
     rows: list[MatrixRow] = []
     for table in sorted(schema.tables, key=lambda t: t.qualified_name):
         for command in COMMANDS:
-            cells = tuple(
-                _cell(table, role, command, bypass) for role in role_list
-            )
+            cells_list = []
+            for name in role_list:
+                cell = _cell(schema, table, resolved[name][0], command, *resolved[name][1:])
+                # Doors are read paths: they can widen a SELECT cell, never
+                # narrow it, and never touch a write command.
+                door = doors[name].get(table.qualified_name) if command == "SELECT" else None
+                if door is not None and _RANK[door.verdict] > _RANK[cell.verdict]:
+                    cell = door
+                cells_list.append(cell)
+            cells = tuple(cells_list)
             rows.append(
                 MatrixRow(
                     qualified_name=table.qualified_name,
@@ -274,7 +438,63 @@ def build_matrix(
                     cells=cells,
                 )
             )
-    return Matrix(roles=tuple(role_list), rows=tuple(rows))
+    return Matrix(
+        roles=tuple(role_list),
+        rows=tuple(rows),
+        exposures=_exposures(schema, role_list, resolved),
+    )
+
+
+def _via(paths: tuple[object, ...], principal: str, column: str) -> str:
+    """The paths that reach `column` specifically. A column grant covers only
+    its own columns, so crediting it for every sensitive column on the table
+    misstated how a column was reached — measured: `ssn`, reachable only
+    through a definer view, was listed as reached via a column grant on
+    `email`. A path with no column list (a table grant, a view, a function)
+    reaches every column."""
+    labels = []
+    for p in paths:
+        cols = getattr(p, "columns", None)
+        if cols is not None and column not in cols:
+            continue
+        kind, via = getattr(p, "kind", ""), getattr(p, "via", None)
+        if kind == "view":
+            labels.append(f"view {via}")
+        elif kind == "function":
+            labels.append(f"SECURITY DEFINER {via}")
+        elif kind in ("grant", "column_grant", "owner_member", "pg_read_all_data") and via:
+            label = kind.replace("_", " ")
+            labels.append(label if via == principal else f"{label} via {via}")
+        else:
+            labels.append(kind.replace("_", " "))
+    return "; ".join(dict.fromkeys(labels)) or "-"
+
+
+def _exposures(
+    schema: Schema,
+    role_list: tuple[str, ...],
+    resolved: dict[str, tuple[Role, frozenset[str] | None, frozenset[str], bool]],
+) -> tuple[Exposure, ...]:
+    """Every sensitive column each shown role can read with at least some
+    rows, from the same engine that decides the cells."""
+    catalogue = schema.roles if schema.roles is not None else _derived_roles(schema)
+    attrs = {r.name: r for r in catalogue}
+    out: list[Exposure] = []
+    for name in role_list:
+        role, closure = resolved[name][0], resolved[name][1]
+        accesses, _ = role_accesses(schema, role, closure, attrs)
+        for a in accesses:
+            if a.rows == "none":
+                continue
+            for col in a.sensitive:
+                out.append(Exposure(
+                    role=name,
+                    table=a.relation,
+                    column=col,
+                    verdict=_ROWS_TO_VERDICT[a.rows],
+                    via=_via(a.paths, name, col),
+                ))
+    return tuple(sorted(out, key=lambda e: (e.table, e.column, e.role)))
 
 
 def _summary_line(matrix: Matrix) -> str:
@@ -282,13 +502,34 @@ def _summary_line(matrix: Matrix) -> str:
     return (
         f"{s['tables']} {pluralize(s['tables'], 'table')} x "
         f"{s['roles']} {pluralize(s['roles'], 'role')}: "
-        f"{s['open']} open, {s['conditional']} conditional, {s['denied']} denied."
+        f"{s['open']} open, {s['conditional']} conditional, {s['denied']} denied"
+        + (f", {s['undecided']} undecided" if s["undecided"] else "")
+        + "."
     )
+
+
+def _exposure_rows(matrix: Matrix) -> list[list[str]]:
+    return [
+        [
+            safe_location(f"{e.table}.{e.column}"),
+            safe_location(e.role),
+            _VERDICT_LABEL[e.verdict],
+            safe_location(e.via),
+        ]
+        for e in matrix.exposures
+    ]
 
 
 def render_text(matrix: Matrix) -> str:
     if not matrix.rows:
         return "No tables found in the scanned schemas."
+    head: list[str] = []
+    if matrix.exposures:
+        head = ["Sensitive columns reachable:"]
+        head.extend("  " + ln for ln in render_text_table(
+            ("COLUMN", "ROLE", "ROWS", "VIA"), _exposure_rows(matrix)
+        ))
+        head.append("")
     headers = ("TABLE", "CMD", *(safe_location(r) for r in matrix.roles))
     rows = [
         (
@@ -298,7 +539,7 @@ def render_text(matrix: Matrix) -> str:
         )
         for row in matrix.rows
     ]
-    out = render_text_table(headers, rows)
+    out = head + render_text_table(headers, rows)
     out.append("")
     out.append(_summary_line(matrix))
     return "\n".join(out)
@@ -323,6 +564,18 @@ def render_json(matrix: Matrix) -> str:
             }
             for row in matrix.rows
         ],
+        # Always present (possibly empty) so the document's shape does not
+        # depend on what the schema happens to contain.
+        "sensitive_exposures": [
+            {
+                "role": e.role,
+                "table": e.table,
+                "column": e.column,
+                "verdict": e.verdict,
+                "via": e.via,
+            }
+            for e in matrix.exposures
+        ],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -345,8 +598,16 @@ def render_markdown(matrix: Matrix) -> str:
             *(_VERDICT_LABEL[c.verdict] for c in row.cells),
         ]
         body.append("| " + " | ".join(cells) + " |")
+    tail: list[str] = []
+    if matrix.exposures:
+        tail = ["", "## Sensitive columns reachable", "",
+                "| Column | Role | Rows | Via |", "|---|---|---|---|"]
+        tail.extend(
+            "| " + " | ".join(c.replace("|", "\\|") for c in r) + " |"
+            for r in _exposure_rows(matrix)
+        )
     return "\n".join(
-        ["# Access matrix", "", _summary_line(matrix), "", header, sep, *body]
+        ["# Access matrix", "", _summary_line(matrix), "", header, sep, *body, *tail]
     )
 
 
@@ -356,7 +617,9 @@ def render_html(matrix: Matrix, *, generated_at: datetime | None = None) -> str:
     s = matrix.summary
 
     chips = []
-    for verdict in ("open", "conditional", "denied"):
+    for verdict in ("open", "conditional", "denied", "undecided"):
+        if verdict == "undecided" and not s["undecided"]:
+            continue
         chips.append(
             f'<span class="pill v-{verdict}"><strong>{s[verdict]}</strong>'
             f"&nbsp;{verdict}</span>"
@@ -392,6 +655,21 @@ def render_html(matrix: Matrix, *, generated_at: datetime | None = None) -> str:
     </thead>
     <tbody>
 {rows_html}
+    </tbody>
+  </table>"""
+    if matrix.exposures:
+        exp_rows = "\n".join(
+            "      <tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in r) + "</tr>"
+            for r in _exposure_rows(matrix)
+        )
+        body += f"""
+  <h2>Sensitive columns reachable</h2>
+  <table>
+    <thead>
+      <tr><th>Column</th><th>Role</th><th>Rows</th><th>Via</th></tr>
+    </thead>
+    <tbody>
+{exp_rows}
     </tbody>
   </table>"""
 

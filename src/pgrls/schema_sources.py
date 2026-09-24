@@ -1184,7 +1184,7 @@ _CATALOG_DEPENDENT_RULES: dict[str, tuple[str, int]] = {
 # so adding a rule whose field lands in a future version can't slip through.
 assert all(v <= SNAPSHOT_VERSION for _, v in _CATALOG_DEPENDENT_RULES.values())
 
-WarnCommand = Literal["lint", "fix", "generate", "snapshot", "access"]
+WarnCommand = Literal["lint", "fix", "generate", "snapshot"]
 
 
 def inert_rule_ids(
@@ -1238,18 +1238,6 @@ def schema_source_warnings(
             "Generation reflects only the tables and policies in the provided "
             "schema — roles, grants, and policies defined elsewhere are not "
             "seen. Review the output against your full schema before applying.",
-        ]
-    if command == "access":
-        # The unsafe direction for an access map is UNDER-reporting: a grant or
-        # membership the offline source does not carry makes a role look like
-        # it reaches less than it does. Say that, rather than the rule-flavoured
-        # "absence of findings" text, which does not describe this command.
-        where = "snapshot" if source == "snapshot" else "SQL"
-        return [
-            f"Access is mapped from the provided {where} only — no live database. "
-            "Grants and role memberships not in it are not seen, so a role may "
-            "reach MORE than is shown here; treat an absent path as unknown, not "
-            "as denied. Re-run against a live database for the authoritative map.",
         ]
     inert = ", ".join(
         sorted(inert_rule_ids(source, snapshot_version=snapshot_version))
