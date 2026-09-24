@@ -447,6 +447,8 @@ A separate **sensitive columns** section lists, per role, the columns whose name
   - A `NOINHERIT` member that can switch to its group reads what the group's column shows.
   - An owner, or a role that inherits it, can `ALTER` the table or its policies (for example turning `FORCE` off) and then read every row.
   - A holder of the `TRIGGER` privilege can attach a trigger that sees other roles' writes.
+  - A role with `CREATEROLE`, or `ADMIN OPTION` on a role, can grant itself that role.
+  - A role that can create objects on a SECURITY DEFINER function's `search_path` can shadow what the body resolves (see [SEC015](docs/RULES.md#rule-sec015)).
 - **Schema `USAGE`.** It isn't checked, which can over-report.
 - **What a door actually returns.** A door is credited with its owner's reach of the table. A view's own `WHERE` or `WITH CHECK OPTION`, column lineage through a view, and what a function actually returns or writes are not traced. All of these over-report.
 - **An ordinary (invoker) trigger fired by a door's write.** It runs as the door's owner, and its body isn't captured. The same goes for writes through a view's `INSTEAD OF` trigger, and for event triggers.

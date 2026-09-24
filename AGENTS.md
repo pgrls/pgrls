@@ -315,7 +315,7 @@ anon / authenticated when they exist, and every role whose reach differs
 from PUBLIC's. Suggest it when a user asks who can see or change a table, or
 who can read a sensitive-looking column; it runs no rules. Its limits, all
 documented in the README: each column is a session running as that role
-(`SET ROLE` and DDL are not modelled); schema USAGE, a view's own WHERE and
+(`SET ROLE`, DDL, granting itself a role, and SEC015-style search-path shadowing are not modelled); schema USAGE, a view's own WHERE and
 what a function returns are not traced (over-reports); an ordinary trigger
 fired by a door's write, a view's INSTEAD OF trigger, and event triggers are
 not traced (these can under-report); UPDATE shows `USING`, not `WITH CHECK`;
