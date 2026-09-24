@@ -866,10 +866,11 @@ class RoleMembership:
     """A single ``pg_auth_members`` edge: ``member`` has the privileges of
     ``role`` (i.e. ``GRANT role TO member``).
 
-    Postgres applies a policy ``TO R`` to a session iff the session's role is
-    ``R`` or a transitive member of ``R`` — so ``verify --mode anon`` walks the
-    upward closure of the configured anon role(s) over these edges to decide
-    which policies an *anonymous* session can actually invoke. A `TO
+    Postgres applies a policy ``TO R`` to a session iff the session's role
+    holds ``R``'s privileges — ``R`` itself or a transitive member through
+    INHERIT edges (``has_privs_of_role``) — so ``verify --mode anon`` walks the
+    upward closure of the configured anon role(s) over the inheriting edges to
+    decide which policies an *anonymous* session can actually invoke. A `TO
     authenticated` policy is NOT anon-reachable in the default Supabase layout
     (anon and authenticated are siblings, not members of each other); a `GRANT
     custom_role TO anon` makes a `TO custom_role` policy anon-reachable, which
@@ -891,8 +892,9 @@ class RoleMembership:
     # is `has_privs_of_role`, which honours it: a NOINHERIT member of the
     # table owner is NOT owner-equivalent (measured: permission denied), so
     # the reachability exemption follows only inheriting edges. Policy
-    # reachability keeps the over-approximating full closure (the sound
-    # direction there). Defaults True for a pre-v26 payload.
+    # applicability follows them too (measured: a NOINHERIT member is bound
+    # by neither a permissive nor a restrictive `TO group` policy). Defaults
+    # True for a pre-v26 payload.
     inherit: bool = True
 
 

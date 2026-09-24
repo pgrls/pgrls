@@ -11,6 +11,19 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`verify`: a policy `TO grp` no longer counts as applying to a
+  `NOINHERIT` member of `grp`.** Postgres applies a policy to a session that
+  holds the role's privileges (`has_privs_of_role`), which follows `INHERIT`
+  memberships only; `verify` walked every membership edge. Measured on PG16
+  with `GRANT grp TO anon WITH INHERIT FALSE` and a `TO grp USING (true)`
+  policy: anon read 0 rows directly and every row through a definer view and
+  through a SECURITY DEFINER function, while `--mode reachability` and
+  `--mode escalation` both reported PROVEN, "anon already reads those rows
+  directly". Both now report the door as a LEAK. `--mode anon` stops
+  reporting that table as leaking, and a restrictive floor `TO grp` no
+  longer counts as narrowing a `NOINHERIT` member's read. A grant to `grp`
+  no longer makes a view open to a `NOINHERIT` member either, which matches
+  the `permission denied` Postgres returns.
 - **`pgrls matrix` reported `DENIED` for roles that read every row.** Cells
   matched role names literally, so three ordinary Postgres behaviours were
   invisible to it, each measured on PG16: a grant held through an `INHERIT`

@@ -575,11 +575,18 @@ def _anon_reachable_roles(
     """The roles an anonymous session's policies can be applied under, and
     whether that set is COMPLETE (the role-membership graph was captured).
 
-    A policy ``TO R`` applies to a session iff its role is ``R`` or a transitive
-    member of ``R`` (or ``R`` is ``PUBLIC``). So the anon-reachable set is the
-    upward `pg_auth_members` closure of the configured anon role(s), plus
-    ``PUBLIC``. When `schema.role_memberships is None` (an offline / `--against`
-    / hand-built Schema) the graph is unavailable — the returned set is just the
+    A policy ``TO R`` applies to a session iff its role holds ``R``'s
+    privileges — ``has_privs_of_role``: ``R`` itself or a transitive member
+    through INHERIT edges — or ``R`` is ``PUBLIC``. A NOINHERIT member is not
+    covered. Measured on PG16 with ``GRANT grp TO anon WITH INHERIT FALSE``:
+    anon read 0 rows under a permissive ``TO grp USING (true)`` policy and
+    every row past a restrictive ``TO grp`` floor. Walking every edge instead
+    was not a safe over-approximation: it let reachability and escalation cede
+    a view or function as "anon already reads those rows directly" while the
+    direct read was empty and the door returned every row.
+
+    When `schema.role_memberships is None` (an offline / `--against` /
+    hand-built Schema) the graph is unavailable — the returned set is just the
     seed and the bool is False, so `_anon_policy_reachability` reports
     ``"unknown"`` (→ abstain) for a leaking policy outside the seed rather than
     guess ``unreachable`` (a false ``isolated``).
@@ -592,7 +599,7 @@ def _anon_reachable_roles(
     while changed:  # transitive closure; role graphs are tiny
         changed = False
         for edge in schema.role_memberships:
-            if edge.member in reachable and edge.role not in reachable:
+            if edge.inherit and edge.member in reachable and edge.role not in reachable:
                 reachable.add(edge.role)
                 changed = True
     return frozenset(reachable), True
@@ -1065,12 +1072,12 @@ def build_escalation(
 def _anon_priv_closure(schema: Schema, anon_roles: set[str]) -> frozenset[str] | None:
     """The roles whose PRIVILEGES an anonymous session holds.
 
-    Distinct from `_anon_reachable_roles`, which is the upward closure over
-    every membership edge and answers "which policies apply". Privileges flow
-    only along INHERIT edges (`has_privs_of_role`), so a `NOINHERIT` member
-    holds none of the granted role's rights — measured: `GRANT readers TO anon
-    WITH INHERIT FALSE` left a direct read `permission denied` while the
-    upward closure said anon could read. `None` when the graph is not captured.
+    The same INHERIT-only walk as `_anon_reachable_roles` ("which policies
+    apply"), without ``PUBLIC`` and with `None` when the graph is not captured.
+    Privileges flow only along INHERIT edges (`has_privs_of_role`), so a
+    `NOINHERIT` member holds none of the granted role's rights — measured:
+    `GRANT readers TO anon WITH INHERIT FALSE` left a direct read `permission
+    denied`.
     """
     if schema.role_memberships is None:
         return None
