@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pgrls.model import (
@@ -1800,3 +1802,81 @@ def test_pre_reshape_v26_set_gucs_decode_without_inventing_a_guc() -> None:
     schema = Schema.from_snapshot(payload)
     assert schema.set_gucs == (("app.tenant", None),)
     assert schema.role_set_gucs == (("anon", "app.x", None),)
+
+
+def _v27_schema() -> Schema:
+    from pgrls.model import (
+        ForeignKey,
+        RewriteRule,
+        Role,
+        SecdefFunction,
+        Trigger,
+        View,
+    )
+
+    table = Table(
+        schema="public", name="t", rls_enabled=True, force_rls=False, policies=(),
+        triggers=(
+            Trigger("st", "public", "f", "DELETE", "AFTER", True, row=False),
+            Trigger("rt", "public", "f", "INSERT", "BEFORE", True, row=True),
+        ),
+        foreign_keys=(
+            ForeignKey("a", ("pid",), "public", "p", ("id",), "CASCADE", None),
+            ForeignKey("b", ("qid",), "public", "q", ("id",), None, "SET NULL"),
+        ),
+    )
+    view = View(schema="public", name="v", is_materialized=False, security_invoker=False,
+                security_barrier=False, definition="SELECT 1", references=(),
+                security_definer_calls=(), updatable=("INSERT", "UPDATE"))
+    return Schema(
+        tables=(table,),
+        views=(view,),
+        security_definer_functions=(
+            SecdefFunction(qualified_name="public.f", body="BEGIN RETURN NEW; END",
+                           language="plpgsql", definition="CREATE FUNCTION public.f() …",
+                           trigger=True, config_gucs=("app.tenant",)),
+            SecdefFunction(qualified_name="public.g", body="SELECT 1", language="sql",
+                           trigger=False, config_gucs=()),
+        ),
+        roles=(Role("app", True, False, False), Role("admin", True, True, True)),
+        rules=(RewriteRule("public", "t", "r", "INSERT", False,
+                           "CREATE RULE r AS ON INSERT TO public.t DO ALSO NOTIFY t;"),),
+    )
+
+
+def test_every_v27_field_survives_a_snapshot_round_trip() -> None:
+    schema = _v27_schema()
+    loaded = Schema.from_snapshot(json.loads(json.dumps(schema.to_snapshot())))
+    assert loaded.tables[0].triggers == schema.tables[0].triggers
+    assert loaded.tables[0].foreign_keys == schema.tables[0].foreign_keys
+    assert loaded.views[0].updatable == ("INSERT", "UPDATE")
+    assert loaded.security_definer_functions == schema.security_definer_functions
+    assert loaded.roles == schema.roles
+    assert loaded.rules == schema.rules
+
+
+def test_a_pre_v27_snapshot_leaves_the_v27_fields_not_captured() -> None:
+    """None means "not captured", never "no": an older snapshot must not read
+    as "not a trigger", "no SET clause" or "not writable"."""
+    snap = json.loads(json.dumps(_v27_schema().to_snapshot()))
+    snap["version"] = 26
+    for key in ("roles", "rules"):
+        snap.pop(key)
+    for t in snap["tables"]:
+        for tr in t.get("triggers", []):
+            tr.pop("row")
+        for fk in t.get("foreign_keys", []):
+            fk.pop("on_delete", None)
+            fk.pop("on_update", None)
+    for v in snap["views"]:
+        v.pop("updatable")
+    for f in snap["security_definer_functions"]:
+        for key in ("definition", "trigger", "config_gucs"):
+            f.pop(key, None)
+    loaded = Schema.from_snapshot(snap)
+    assert loaded.roles is None and loaded.rules is None
+    assert {tr.row for tr in loaded.tables[0].triggers} == {None}
+    assert {(fk.on_delete, fk.on_update) for fk in loaded.tables[0].foreign_keys} == {(None, None)}
+    assert loaded.views[0].updatable is None
+    assert {(f.definition, f.trigger, f.config_gucs)
+            for f in loaded.security_definer_functions} == {(None, None, None)}

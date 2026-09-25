@@ -782,13 +782,14 @@ class SecdefFunction:
     # v27+: returns `trigger` or `event_trigger`. Such a function cannot be
     # called — `trigger functions can only be called as triggers` — so it is
     # a door only through the triggers that run it, never through EXECUTE.
-    trigger: bool = False
+    # None = not captured (an older snapshot): it may be either.
+    trigger: bool | None = False
     # v27+: parameters the function's own `SET` clauses change, other than
     # search_path (`pg_proc.proconfig`). A body that runs under a setting it
     # chose — a tenant id, the JWT claims — is not filtered the way the
-    # caller's session would be. Emitted only when non-empty, so a pre-v27
-    # snapshot, which never captured it, reads as "no SET clause".
-    config_gucs: tuple[str, ...] = ()
+    # caller's session would be. None = not captured (an older snapshot),
+    # which `verify` and `pgrls matrix` treat as possibly setting one.
+    config_gucs: tuple[str, ...] | None = ()
 
 
 @dataclass(frozen=True)
@@ -1603,8 +1604,12 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
         owner=f.get("owner", ""),
         definition=f.get("definition"),  # v27+, PL/pgSQL only
-        trigger=bool(f.get("trigger", False)),  # v27+
-        config_gucs=tuple(f.get("config_gucs", [])),  # v27+
+        # v27+; absent → None ("not captured"), never "not a trigger" or
+        # "no SET clause".
+        trigger=f.get("trigger"),
+        config_gucs=(
+            tuple(f["config_gucs"]) if f.get("config_gucs") is not None else None
+        ),
     )
 
 
@@ -2052,8 +2057,13 @@ class Schema:
                                     "ref_table": fk.ref_table,
                                     "ref_columns": list(fk.ref_columns),
                                     **(
-                                        {"on_delete": fk.on_delete, "on_update": fk.on_update}
+                                        {"on_delete": fk.on_delete}
                                         if fk.on_delete is not None
+                                        else {}
+                                    ),
+                                    **(
+                                        {"on_update": fk.on_update}
+                                        if fk.on_update is not None
                                         else {}
                                     ),
                                 }
@@ -2148,8 +2158,14 @@ class Schema:
                         if f.definition is not None
                         else {}
                     ),
-                    **({"trigger": True} if f.trigger else {}),
-                    **({"config_gucs": list(f.config_gucs)} if f.config_gucs else {}),
+                    # v27 — always when captured, so absence means "not
+                    # captured" rather than "no".
+                    **({"trigger": f.trigger} if f.trigger is not None else {}),
+                    **(
+                        {"config_gucs": list(f.config_gucs)}
+                        if f.config_gucs is not None
+                        else {}
+                    ),
                 }
                 for f in self.security_definer_functions
             ],

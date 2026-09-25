@@ -4195,6 +4195,13 @@ def matrix(
         database_url=database_url,
         schemas_csv=schemas,
     )
+    # Validate the config before connecting, like --roles above.
+    try:
+        from pgrls.rules.sec045 import _parse_patterns  # noqa: PLC0415
+
+        patterns = _parse_patterns(effective.rule_options.get("SEC045", {}))
+    except TypeError as exc:
+        raise click.UsageError(str(exc)) from exc
     assert effective.database_url is not None  # guaranteed above
     try:
         with psycopg.connect(effective.database_url) as conn:
@@ -4203,12 +4210,12 @@ def matrix(
         raise ToolError(f"Database error: {exc}") from exc
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
-    try:
-        from pgrls.rules.sec045 import _parse_patterns  # noqa: PLC0415
-
-        patterns = _parse_patterns(effective.rule_options.get("SEC045", {}))
-    except TypeError as exc:
-        raise click.UsageError(str(exc)) from exc
+    if roles is not None and schema.roles is not None:
+        # A mistyped name would otherwise be a column of DENIED cells.
+        known = sorted(r.name for r in schema.roles)
+        missing = [r for r in roles if r != "PUBLIC" and r not in set(known)]
+        if missing:
+            raise ToolError(_missing_role_message(missing, known))
 
     built = build_matrix(
         schema, roles=roles, include_system=include_system, grid=grid,
@@ -4216,6 +4223,21 @@ def matrix(
     )
     rendered = render_matrix(built, output_format)
     _emit(rendered, output_path)
+
+
+def _missing_role_message(missing: list[str], available: list[str]) -> str:
+    """The error for `--roles` names the database does not have, with a "Did
+    you mean" for each close match (difflib cutoff 0.7, as for --schemas)."""
+    import difflib  # noqa: PLC0415
+
+    parts = [f"Roles not found in the database: {', '.join(missing)}."]
+    candidates = [*available, "PUBLIC"]
+    for name in missing:
+        suggestion = [c for c in candidates if c.lower() == name.lower()] or \
+            difflib.get_close_matches(name, candidates, n=1, cutoff=0.7)
+        if suggestion:
+            parts.append(f"Did you mean {suggestion[0]!r}?")
+    return " ".join(parts)
 
 
 def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | None:

@@ -1993,35 +1993,81 @@ _SQL_RUNNING_BUILTINS: frozenset[str] = frozenset({
     "schema_to_xml", "schema_to_xmlschema", "schema_to_xml_and_xmlschema",
     "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema",
     "ts_stat", "ts_rewrite",
-    # Setting ANY parameter changes what the policies a later statement runs
-    # under admit (a tenant id, the JWT claims), so a body that does it cannot
-    # be judged under the caller's context.
-    "set_config",
 })
 
-# Operator symbols Postgres ships. An operator outside this set, or one
-# qualified with a schema other than pg_catalog, may be backed by a user
-# function (measured: `1 OPERATOR(public.===) 2` in a SECURITY DEFINER body
-# ran the DELETE behind it). A user operator that reuses a built-in symbol on
-# its own type is not caught.
+# Operator symbols pg_catalog ships on PG15–17 (the same 74 on each, read from
+# pg_operator), plus the distance operators pgvector adds (`<#>`, `<=>`, `<+>`,
+# `<~>`, `<%>`; its `<->` is also a pg_catalog symbol), which compute a
+# distance and read no table. Any other symbol, or one schema-qualified
+# outside pg_catalog, may be backed by a user function (measured: `1
+# OPERATOR(public.===) 2` in a SECURITY DEFINER body ran the DELETE behind it).
+# A user operator that reuses one of these symbols is not caught — on its own
+# types, or on built-in ones pg_catalog has no such operator for (measured:
+# `public.+ (text, text)` ran for `'a'::text + 'b'::text`).
 _BUILTIN_OPERATORS: frozenset[str] = frozenset({
-    "=", "<>", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/", "%", "^", "|/",
-    "||/", "!", "!!", "@", "&", "|", "#", "~", "<<", ">>", "||", "&&", "@>",
-    "<@", "~~", "~~*", "!~~", "!~~*", "~*", "!~", "!~*", "->", "->>", "#>",
-    "#>>", "#-", "?", "?|", "?&", "@@", "@@@", "@?", "<->", "<#>", "<=>",
-    "&<", "&>", "<<|", "|>>", "&<|", "|&>", "?#", "?-", "?-|", "?||", "~=",
-    "<^", ">^", "<<=", ">>=", "-|-", "@-@", "##", "*=", "*<>", "*<", "*>",
-    "*<=", "*>=",
+    "!!", "!~", "!~*", "!~~", "!~~*", "#", "##", "#-", "#>", "#>>", "%", "&",
+    "&&", "&<", "&<|", "&>", "*", "*<", "*<=", "*<>", "*=", "*>", "*>=", "+",
+    "-", "->", "->>", "-|-", "/", "<", "<->", "<<", "<<=", "<<|", "<=", "<>",
+    "<@", "<^", "=", ">", ">=", ">>", ">>=", ">^", "?", "?#", "?&", "?-",
+    "?-|", "?|", "?||", "@", "@-@", "@>", "@?", "@@", "@@@", "^", "^@", "|",
+    "|&>", "|/", "|>>", "||", "||/", "~", "~*", "~<=~", "~<~", "~=", "~>=~",
+    "~>~", "~~", "~~*",
+    "<#>", "<=>", "<+>", "<~>", "<%>",
 })
+
+# Settings that bound resources, steer the planner or control logging. None
+# can change which rows a query returns, so a function that sets one still
+# reads under the caller's context.
+_INERT_SETTINGS: frozenset[str] = frozenset({
+    "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
+    "idle_session_timeout", "transaction_timeout", "work_mem",
+    "maintenance_work_mem", "hash_mem_multiplier", "temp_buffers",
+    "temp_file_limit", "jit", "plan_cache_mode", "random_page_cost",
+    "seq_page_cost", "cpu_tuple_cost", "cpu_index_tuple_cost",
+    "cpu_operator_cost", "parallel_setup_cost", "parallel_tuple_cost",
+    "effective_cache_size", "effective_io_concurrency",
+    "max_parallel_workers_per_gather", "from_collapse_limit",
+    "join_collapse_limit", "geqo", "default_statistics_target",
+    "client_min_messages",
+})
+_INERT_SETTING_PREFIXES = ("enable_", "log_", "jit_", "geqo_", "debug_")
+
+
+def _is_inert_setting(name: str) -> bool:
+    """Whether setting `name` leaves what a query returns unchanged."""
+    name = name.lower()
+    return name in _INERT_SETTINGS or name.startswith(_INERT_SETTING_PREFIXES)
+
+
+def _gucs_matter(gucs: tuple[str, ...] | None) -> bool:
+    """Whether a function's `SET` clauses may change what its queries return:
+    one sets a setting that is not inert, or they were not captured."""
+    return gucs is None or any(not _is_inert_setting(g) for g in gucs)
+
+
+def _set_config_target(call: Any) -> str | None:
+    """The parameter a `set_config(name, …)` call sets, if it is a literal."""
+    from pglast.ast import A_Const, String  # noqa: PLC0415
+
+    args = getattr(call, "args", None) or ()
+    first = args[0] if args else None
+    val = getattr(first, "val", None) if isinstance(first, A_Const) else None
+    return str(val.sval).lower() if isinstance(val, String) else None
 
 
 def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     """Whether one ``FuncCall`` is to something we cannot see through: a
-    built-in that runs SQL or sets a parameter, or a function that is neither
-    a known auth/session function nor a recognized built-in."""
+    built-in that runs SQL, a function that is neither a known auth/session
+    function nor a recognized built-in, or a `set_config` of anything but an
+    inert setting — setting a tenant id or the JWT claims changes what the
+    policies of a later statement admit, so such a body cannot be judged
+    under the caller's context."""
     from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
 
     qualified, bare = func_name_parts(call)
+    if bare == "set_config":
+        target = _set_config_target(call)
+        return target is None or not _is_inert_setting(target)
     if bare in _SQL_RUNNING_BUILTINS:
         return True
     fn_schema = qualified.rsplit(".", 1)[0] if qualified and "." in qualified else None
@@ -2033,18 +2079,33 @@ def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     )
 
 
-def _opaque_operator(expr: Any) -> bool:
-    """Whether an operator expression may run a user function: its operator
-    is schema-qualified outside pg_catalog, or is not a symbol Postgres ships."""
-    kind = getattr(getattr(expr, "kind", None), "name", "")
-    if kind not in ("AEXPR_OP", "AEXPR_OP_ANY", "AEXPR_OP_ALL"):
-        return False
-    parts = [getattr(p, "sval", None) for p in (getattr(expr, "name", None) or ())]
+def _opaque_operator_name(name: Any) -> bool:
+    """Whether an operator name may be backed by a user function: it is
+    schema-qualified outside pg_catalog, or is not a symbol Postgres ships."""
+    parts = [getattr(p, "sval", None) for p in (name or ())]
     if not parts or any(not isinstance(p, str) for p in parts):
         return True
     if len(parts) > 1:
         return parts[0] != "pg_catalog"
     return parts[0] not in _BUILTIN_OPERATORS
+
+
+def _opaque_operator(node: Any) -> bool:
+    """Whether `node` applies an operator that may run a user function: an
+    operator expression (``a OP b``, ``a OP ANY (array)``), an ``ANY`` /
+    ``ALL`` sub-select's operator (``a OPERATOR(s.op) ANY (SELECT …)``), or an
+    ``ORDER BY … USING`` operator."""
+    from pglast.ast import A_Expr, SortBy, SubLink  # noqa: PLC0415
+
+    if isinstance(node, A_Expr):
+        kind = getattr(getattr(node, "kind", None), "name", "")
+        return kind in ("AEXPR_OP", "AEXPR_OP_ANY", "AEXPR_OP_ALL") and \
+            _opaque_operator_name(node.name)
+    if isinstance(node, SubLink):
+        return bool(node.operName) and _opaque_operator_name(node.operName)
+    if isinstance(node, SortBy):
+        return bool(node.useOp) and _opaque_operator_name(node.useOp)
+    return False
 
 
 def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -> bool:
@@ -2059,9 +2120,10 @@ def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -
     calls (``auth.uid()``), ``pg_catalog`` / ``information_schema``-qualified
     calls, and bare calls to a known built-in (``count``, ``lower`` — see
     ``_SAFE_BUILTIN_FUNCS``) do not read user tables and so do not, by
-    themselves, force abstention — except the built-ins that run SQL or set a
-    parameter (``_SQL_RUNNING_BUILTINS``)."""
-    from pglast.ast import A_Expr, FuncCall, Node  # noqa: PLC0415
+    themselves, force abstention — except the built-ins that run SQL
+    (``_SQL_RUNNING_BUILTINS``) and a ``set_config`` of anything but an inert
+    setting."""
+    from pglast.ast import FuncCall, Node  # noqa: PLC0415
 
     found = False
 
@@ -2076,7 +2138,7 @@ def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -
         if isinstance(n, FuncCall) and _opaque_call(n, auth_functions):
             found = True
             return
-        if isinstance(n, A_Expr) and _opaque_operator(n):
+        if _opaque_operator(n):
             found = True
             return
         # A recognized-safe outer call may still wrap an opaque call in its
@@ -2089,17 +2151,23 @@ def _has_opaque_funccall(stmt: Any, auth_functions: frozenset[str] | set[str]) -
     return found
 
 
-def _secdef_sets_parameters(f: Any) -> bool:
-    """Whether `f` runs under settings it chooses: a `SET` clause of its own
-    (`config_gucs`), or a `SET` / `set_config` in its SQL body. Then the
-    owner's policies are evaluated on values the function picked — measured:
-    setting the JWT claims before a read returned another user's row — so
-    what they grant under the anonymous context settles nothing. A PL/pgSQL
-    body is not read here."""
-    if getattr(f, "config_gucs", ()):
-        return True
+def _secdef_parameter_reason(f: Any) -> str | None:
+    """Why `f` may run under settings it chooses, or None when it provably
+    does not: a `SET` clause of its own (`config_gucs`) — or clauses that were
+    never captured, from an older snapshot — or a `SET` / `set_config` in its
+    SQL body. Then the owner's policies are evaluated on values the function
+    picked — measured: setting the JWT claims before a read returned another
+    user's row — so what they grant under the anonymous context settles
+    nothing. An inert setting (a timeout, a planner knob) does not count. A
+    body that is not readable SQL is judged by `_secdef_body_unseen`."""
+    gucs = getattr(f, "config_gucs", ())
+    if gucs is None:
+        return "its SET clauses were not captured (an older snapshot)"
+    live = sorted(g for g in gucs if not _is_inert_setting(g))
+    if live:
+        return f"its own SET clause sets {', '.join(live)}"
     if not _sql_body_parses(f):
-        return False
+        return None
     import pglast  # noqa: PLC0415
     from pglast.ast import FuncCall, Node, VariableSetStmt  # noqa: PLC0415
 
@@ -2115,17 +2183,49 @@ def _secdef_sets_parameters(f: Any) -> bool:
             for item in n:
                 walk(item)
             return
-        if isinstance(n, VariableSetStmt) or (
-            isinstance(n, FuncCall) and func_name_parts(n)[1] == "set_config"
-        ):
-            found = True
+        if isinstance(n, VariableSetStmt):
+            found = n.name is None or not _is_inert_setting(str(n.name))
+        elif isinstance(n, FuncCall) and func_name_parts(n)[1] == "set_config":
+            target = _set_config_target(n)
+            found = target is None or not _is_inert_setting(target)
+        if found:
             return
         if isinstance(n, Node):
             for field_name in n:
                 walk(getattr(n, field_name, None))
 
     walk([raw.stmt for raw in pglast.parse_sql(function_body_sql(f.body))])
-    return found
+    return "its body sets a parameter (SET or set_config)" if found else None
+
+
+def _secdef_sets_parameters(f: Any) -> bool:
+    """Whether `f` may run under settings it chooses (`_secdef_parameter_reason`)."""
+    return _secdef_parameter_reason(f) is not None
+
+
+def _secdef_body_unseen(
+    f: Any,
+    base_quals: set[tuple[str, str]],
+    base_bares: set[str],
+    auth_functions: frozenset[str] | set[str],
+) -> bool:
+    """Whether `f` may do something the escalation analysis cannot see: set a
+    parameter, or run a body that is not readable SQL (PL/pgSQL, another
+    language, SQL pglast cannot parse) or that `_secdef_body_unresolved`
+    cannot resolve — a helper call, a view, a `CALL`. Such a body may change
+    the context the owner's policies see, or open another door, so its
+    function is analysed whoever owns it (measured: a PL/pgSQL body that set
+    the claims, a helper that did, and a `CALL` of a procedure that did were
+    each cleared as "no escalation path")."""
+    if _secdef_sets_parameters(f) or not _sql_body_parses(f):
+        return True
+    import pglast  # noqa: PLC0415
+
+    from pgrls.ast_utils import function_body_sql  # noqa: PLC0415
+
+    return _secdef_body_unresolved(
+        pglast.parse_sql(function_body_sql(f.body)), base_quals, base_bares, auth_functions,
+    )
 
 
 def _secdef_body_unresolved(
@@ -2155,6 +2255,7 @@ def _secdef_body_unresolved(
         SelectStmt,
         TruncateStmt,
         UpdateStmt,
+        VariableSetStmt,
     )
 
     from pgrls.ast_utils import extract_range_vars  # noqa: PLC0415
@@ -2164,8 +2265,11 @@ def _secdef_body_unresolved(
         stmt = getattr(raw, "stmt", raw)
         # Only a query or DML can be read. A `SET` / `SET LOCAL` changes
         # what the policies of a later statement admit (measured: setting
-        # the JWT claims before a read returned another user's row), and a
-        # `DO` or `CALL` runs code we never see.
+        # the JWT claims before a read returned another user's row) — unless
+        # the setting is inert — and a `DO` or `CALL` runs code we never see.
+        if isinstance(stmt, VariableSetStmt) and stmt.name is not None \
+                and _is_inert_setting(str(stmt.name)):
+            continue
         if not isinstance(stmt, (SelectStmt, InsertStmt, UpdateStmt, DeleteStmt,
                                  MergeStmt, TruncateStmt)):
             return True
@@ -2356,11 +2460,18 @@ def _escalation_secdef_findings(
 
     findings: list[TableVerdict] = []
     for qname in sorted(by_qname):
-        # Candidate iff some overload is owner-RLS-exempt AND anon-executable.
+        # Candidate iff some overload is anon-executable AND its owner is
+        # RLS-exempt, or is granted rows under the anonymous context, or its
+        # body does something the analysis cannot see (`_secdef_body_unseen`).
+        # A trigger function cannot be called (measured: "trigger functions
+        # can only be called as triggers"), so EXECUTE on one opens nothing; a
+        # trigger fired by an anonymous write is SEC013's and `pgrls matrix`'s.
         candidate = [
             f
             for f in by_qname[qname]
-            if (
+            if f.trigger is not True
+            and (set(f.execute_roles) & _exec_reachable)
+            and (
                 f.owner_bypasses_rls
                 or any(
                     _fn_exempt_for(f, t) is not False
@@ -2372,9 +2483,8 @@ def _escalation_secdef_findings(
                     for t in schema.tables
                     if t.rls_enabled
                 )
-                or _secdef_sets_parameters(f)
+                or _secdef_body_unseen(f, base_quals, base_bares, resolved_auth)
             )
-            and (set(f.execute_roles) & _exec_reachable)
         ]
         if not candidate:
             continue
@@ -2462,13 +2572,17 @@ def _escalation_secdef_findings(
             proof = PolicyProof(sorted(reads)[0], verdict, witness, reason)
             findings.append(TableVerdict(qname, verdict, note, (proof,)))
         elif inconclusive:
-            if any_undecided and not (any_opaque or any_unseen):
+            reason = next(
+                (r for f in candidate if (r := _secdef_parameter_reason(f)) is not None), None,
+            )
+            if reason is not None:
                 why = (
-                    "sets configuration parameters before it reads an RLS "
-                    "table, so the owner's policies run on values the function "
-                    "chose — cannot decide whether the body launders rows"
-                    if any(_secdef_sets_parameters(f) for f in candidate)
-                    else "reads an RLS table whose policies may or may not admit "
+                    f"{reason} — the owner's policies may run on values the "
+                    "function chose, so what it reads cannot be decided"
+                )
+            elif any_undecided and not (any_opaque or any_unseen):
+                why = (
+                    "reads an RLS table whose policies may or may not admit "
                     "rows to the function's owner under the anonymous auth "
                     "context — cannot decide whether the body launders them"
                 )

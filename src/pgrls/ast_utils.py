@@ -703,4 +703,29 @@ def function_body_sql(body: str) -> str:
     closer = re.search(r"(?is)\bEND\s*;?\s*$", inner)
     if closer is not None:
         inner = inner[: closer.start()]
-    return inner
+    return _returns_as_selects(inner)
+
+
+def _returns_as_selects(sql: str) -> str:
+    """`sql` with each statement-leading ``RETURN`` read as ``SELECT``: a
+    ``BEGIN ATOMIC`` body may end in ``RETURN expr;``, which pglast does not
+    parse (measured: such a body was called opaque while its reads were plain
+    SQL). Tokens, not text, so a ``RETURN`` inside a string or a comment is
+    left alone."""
+    import pglast  # noqa: PLC0415
+
+    try:
+        tokens = pglast.parser.scan(sql)
+    except pglast.parser.ParseError:
+        return sql
+    out: list[str] = []
+    last = 0
+    previous = None
+    for tok in tokens:
+        if tok.name == "RETURN" and (previous is None or previous.name == "ASCII_59"):
+            out.append(sql[last:tok.start])
+            out.append("SELECT")
+            last = tok.end + 1  # `end` is inclusive
+        previous = tok
+    out.append(sql[last:])
+    return "".join(out)

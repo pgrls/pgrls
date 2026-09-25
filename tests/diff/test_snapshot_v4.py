@@ -141,6 +141,10 @@ def test_to_snapshot_emits_security_definer_functions_field() -> None:
             # table's policies whenever it is not FORCE'd, which
             # `owner_bypasses_rls` (superuser / BYPASSRLS) does not capture.
             "owner": "",
+            # v27: written whenever captured, so that an absent key reads as
+            # "not captured" rather than "not a trigger" / "no SET clause".
+            "trigger": False,
+            "config_gucs": [],
         }
     ]
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import psycopg
@@ -665,6 +666,20 @@ def test_matrix_cli_rejects_empty_roles() -> None:
     )
     assert result.exit_code == 2
     assert "no role names" in result.output
+
+
+def test_matrix_cli_checks_the_sec045_config_before_connecting(tmp_path) -> None:
+    """A bad `[lint.rules.SEC045].patterns` is a config error whether or not
+    the database is reachable — reported first, like a bad --roles."""
+    config = tmp_path / "pgrls.toml"
+    config.write_text('[lint.rules.SEC045]\npatterns = "ssn"\n')
+    result = CliRunner().invoke(main, [
+        "matrix", "--config", str(config),
+        "--database-url", "postgresql://nobody@127.0.0.1:1/nothing",
+    ])
+    assert result.exit_code == 2
+    assert "patterns must be a list" in result.output
+    assert "Database error" not in result.output
 
 
 def test_matrix_cli_is_registered_format_list() -> None:
@@ -2061,20 +2076,165 @@ def test_the_same_session_free_filter_through_a_function_stays_conditional() -> 
     assert c.verdict == "conditional" and c.predicate == pred
 
 
-@pytest.mark.parametrize(("predicate", "dependent"), [
-    ("owner_name = current_user", True),
-    ("owner_name = session_user", True),
-    ("pg_has_role('admin', 'MEMBER')", True),
-    ("has_table_privilege('t', 'SELECT')", True),
-    ("public.is_admin()", True),
-    ("tenant_id = current_setting('app.tenant', true)", False),
-    ("tenant_id = auth.uid()", False),
-    ("((((", True),
+@pytest.mark.parametrize(("predicate", "session", "relations"), [
+    ("owner_name = current_user", True, False),
+    ("owner_name = session_user", True, False),
+    ("pg_has_role('admin', 'MEMBER')", True, False),
+    ("has_table_privilege('t', 'SELECT')", True, False),
+    ("public.is_admin()", True, True),
+    ("1 OPERATOR(public.===) 2", True, True),
+    ("tenant_id = current_setting('app.tenant', true)", False, False),
+    ("tenant_id = auth.uid()", False, False),
+    ("tenant_id = (SELECT auth.uid())", False, False),
+    ("tenant_id IN (SELECT tenant_id FROM memberships)", False, True),
+    ("EXISTS (SELECT 1 FROM m WHERE m.member = current_user)", True, True),
+    ("((((", True, True),
 ])
-def test_which_filters_depend_on_the_session(predicate: str, dependent: bool) -> None:
-    from pgrls.access import _session_dependent  # noqa: PLC0415
+def test_what_a_filter_depends_on(predicate: str, session: bool, relations: bool) -> None:
+    from pgrls.access import _dependence  # noqa: PLC0415
 
-    assert _session_dependent(predicate) is dependent
+    assert _dependence(predicate) == (session, relations)
+
+
+# --- filters that read another table; TRUNCATE and triggers through parents --
+
+_SUBSELECT = "tenant_id IN (SELECT memberships.tenant_id FROM public.memberships)"
+
+
+def _subselect_schema(door: str, predicate: str = _SUBSELECT, owner: str = "o") -> Schema:
+    t = _t(grants=(_grant("r", ("SELECT",)), _grant("o", ("SELECT",))),
+           policies=(_policy(roles=("PUBLIC",), using=predicate),))
+    members = _t("memberships", owner="o",
+                 grants=(_grant("r", ("SELECT",)),),
+                 policies=(_policy(roles=("PUBLIC",), using="member = current_user"),))
+    views = [_v("v", _OWN_T, owner=owner, grants=(_grant("r", ("SELECT",)),))] \
+        if door == "view" else []
+    fns = [_f("SELECT * FROM public.t", owner=owner, execute=("r",))] if door == "function" else []
+    return _s([t, members], views, fns, roles=[_r("r"), _r("o"), _r("own")])
+
+
+@pytest.mark.parametrize("door", ["view", "function"])
+def test_a_filter_reading_another_table_differs_through_a_door(door: str) -> None:
+    """Measured on PG15/16/17: `tenant_id IN (SELECT … FROM memberships)`
+    read 1 row directly and 2 through a SECURITY DEFINER function or a definer
+    view owned by `o` — the sub-select runs with the door owner's RLS, even
+    where `current_user` stays the caller. One COND would hide the second."""
+    m = build_matrix(_subselect_schema(door), roles=("r",))
+    c = _cell(m, "public.t", "SELECT", "r")
+    assert c.verdict == "undecided", c
+
+
+@pytest.mark.parametrize("door", ["view", "function"])
+def test_a_from_less_sub_select_is_the_same_filter_through_a_door(door: str) -> None:
+    """`(SELECT auth.uid())` reads no table: the same rows for everyone."""
+    m = build_matrix(_subselect_schema(door, "tenant_id = (SELECT auth.uid())"),
+                     roles=("r",))
+    assert _cell(m, "public.t", "SELECT", "r").verdict == "conditional"
+
+
+def test_a_role_opening_its_own_door_reads_as_itself() -> None:
+    """A function `r` owns runs as `r`: its `current_user` filter is the same
+    row set as `r`'s own session, not a second one."""
+    t = _t(grants=(_grant("r", ("SELECT",)),),
+           policies=(_policy(roles=("PUBLIC",), using="owner_name = current_user"),))
+    f = _f("SELECT * FROM public.t", owner="r", execute=("r",))
+    m = build_matrix(_s([t], fns=[f], roles=[_r("r"), _r("own")]), roles=("r",))
+    assert _cell(m, "public.t", "SELECT", "r").verdict == "conditional"
+
+
+def test_a_view_and_a_function_of_one_owner_differ_on_current_user() -> None:
+    """Through a definer view `current_user` is still the caller; inside a
+    SECURITY DEFINER function it is the owner. Same owner, same text — two
+    row sets."""
+    t = _t(grants=(_grant("o", ("SELECT",)),),
+           policies=(_policy(roles=("PUBLIC",), using="owner_name = current_user"),))
+    v = _v("v", _OWN_T, owner="o", grants=(_grant("r", ("SELECT",)),))
+    f = _f("SELECT * FROM public.t", owner="o", execute=("r",))
+    m = build_matrix(_s([t], [v], [f], roles=[_r("r"), _r("o"), _r("own")]), roles=("r",))
+    assert _cell(m, "public.t", "SELECT", "r").verdict == "undecided"
+
+
+def _fk(to: str, name: str = "fk") -> ForeignKey:
+    return ForeignKey(name, ("pid",), "public", to, ("id",), "NO ACTION", "NO ACTION")
+
+
+def test_truncating_a_parent_covers_a_foreign_key_from_its_partition() -> None:
+    """Measured: `TRUNCATE tree` emptied a self-referencing partitioned table
+    granted on the parent alone — the partitions are emptied by the same
+    statement, and their privilege is not checked."""
+    tree = _with(_t("tree", rls=False, grants=(_grant("app", ("TRUNCATE",)),)),
+                 foreign_keys=(_fk("tree"),))
+    parts = [_with(_t(f"tree_{i}", rls=False, partition_of=("public", "tree")),
+                   foreign_keys=(_fk("tree"),)) for i in (1, 2)]
+    m = build_matrix(_s([tree, *parts], roles=[_r("app"), _r("own")]), roles=("app",))
+    for table in ("public.tree", "public.tree_1", "public.tree_2"):
+        assert _cell(m, table, "TRUNCATE", "app").verdict == "open", table
+
+
+@pytest.mark.parametrize(("z_granted", "verdict"), [(True, "open"), (False, "denied")])
+def test_truncating_a_parent_must_also_empty_what_references_its_partitions(
+    z_granted: bool, verdict: str,
+) -> None:
+    """`TRUNCATE tree` empties partition `tree_1` too, so a table referencing
+    `tree_1` must be emptied by the same statement."""
+    tree = _t("tree", rls=False, grants=(_grant("app", ("TRUNCATE",)),))
+    part = _t("tree_1", rls=False, partition_of=("public", "tree"))
+    z = _with(_t("z", rls=False, grants=(_grant("app", ("TRUNCATE",)),) if z_granted else ()),
+              foreign_keys=(_fk("tree_1"),))
+    m = build_matrix(_s([tree, part, z], roles=[_r("app"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.tree", "TRUNCATE", "app")
+    assert c.verdict == verdict, c
+    if verdict == "denied":
+        assert "public.z" in (c.note or "")
+
+
+@pytest.mark.parametrize(("granted", "verdict"), [(("p", "q"), "open"), (("p",), "denied")])
+def test_a_referencing_partition_is_covered_by_truncating_its_parent(
+    granted: tuple[str, ...], verdict: str,
+) -> None:
+    """Measured: `TRUNCATE p, q` emptied `p` although the foreign key came
+    from `q`'s partition `q1`, which had no grant of its own."""
+    p = _t("p", rls=False, grants=tuple(_grant("app", ("TRUNCATE",)) for n in granted if n == "p"))
+    q = _t("q", rls=False, grants=tuple(_grant("app", ("TRUNCATE",)) for n in granted if n == "q"))
+    q1 = _with(_t("q1", rls=False, partition_of=("public", "q")), foreign_keys=(_fk("p"),))
+    m = build_matrix(_s([p, q, q1], roles=[_r("app"), _r("own")]), roles=("app",))
+    c = _cell(m, "public.p", "TRUNCATE", "app")
+    assert c.verdict == verdict, c
+    if verdict == "denied":
+        assert "public.q1" in (c.note or "")
+
+
+@pytest.mark.parametrize("declarative", [True, False])
+def test_truncating_a_parent_fires_its_childs_truncate_trigger(declarative: bool) -> None:
+    """Measured: `TRUNCATE pp` fired the TRUNCATE trigger of partition `pp1`,
+    and the same for a classic inheritance child."""
+    secrets = _t("secrets")
+    parent = _t("pp", rls=False, grants=(_grant("app", ("TRUNCATE",)),))
+    link = {"partition_of": ("public", "pp")} if declarative else {"inherits": (("public", "pp"),)}
+    child = _with(_t("pp1", rls=False, **link),
+                  triggers=(_btrg("public.trgfn", "TRUNCATE", row=False),))
+    m = build_matrix(_s([secrets, parent, child], fns=[_tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert _cell(m, "public.secrets", "DELETE", "app").verdict == "open"
+
+
+@pytest.mark.parametrize(("declarative", "fires"), [(True, True), (False, False)])
+def test_an_insert_routed_from_a_parent_fires_the_partitions_before_trigger(
+    declarative: bool, fires: bool,
+) -> None:
+    """Measured: `INSERT INTO ins` — RLS on, no policy — fired partition
+    `ins1`'s BEFORE ROW INSERT trigger; returning NULL, the INSERT added no
+    row and the trigger's DELETE stood. A classic inheritance parent keeps
+    its rows, so its child's trigger does not fire."""
+    secrets = _t("secrets")
+    parent = _t("ins", force=True, grants=(_grant("app", ("INSERT",)),))
+    link = {"partition_of": ("public", "ins")} if declarative \
+        else {"inherits": (("public", "ins"),)}
+    child = _with(_t("ins1", **link),
+                  triggers=(_btrg("public.trgfn", "INSERT", timing="BEFORE"),))
+    m = build_matrix(_s([secrets, parent, child], fns=[_tf("DELETE FROM public.secrets")],
+                        roles=[_r("app"), _r("own")]), roles=("app",))
+    assert (_cell(m, "public.secrets", "DELETE", "app").verdict == "open") is fires
 
 
 # --- live differential: every cell against a real SET ROLE session ------------
@@ -2593,3 +2753,216 @@ def test_the_database_owner_is_a_member_of_pg_database_owner(pg_conn: psycopg.Co
     assert RoleMembership(member=dbo, role="pg_database_owner", inherit=True) in (
         schema.role_memberships or ()
     )
+
+
+@requires_docker
+def test_introspection_captures_what_the_matrix_reads(pg_conn: psycopg.Connection) -> None:
+    """A function's SET clauses, each trigger's level, and a view's reads from
+    its SELECT rule alone — not the target of its INSERT rule."""
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE public.t (id int);
+            CREATE TABLE public.log (id int);
+            CREATE FUNCTION public.trg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+              SET search_path = public SET app.tenant = 'a' SET statement_timeout = '5s'
+              AS $$ BEGIN RETURN NULL; END $$;
+            CREATE TRIGGER st AFTER DELETE ON public.t
+              FOR EACH STATEMENT EXECUTE FUNCTION public.trg();
+            CREATE TRIGGER rt BEFORE INSERT ON public.t
+              FOR EACH ROW EXECUTE FUNCTION public.trg();
+            CREATE VIEW public.v AS SELECT id FROM public.t;
+            CREATE RULE log_ins AS ON INSERT TO public.v
+              DO INSTEAD INSERT INTO public.log VALUES (NEW.id);
+        """)
+    schema = introspect(pg_conn, schemas=["public"])
+    [fn] = [f for f in schema.security_definer_functions if f.qualified_name == "public.trg"]
+    assert fn.trigger is True
+    assert fn.config_gucs == ("app.tenant", "statement_timeout")
+    [t] = [t for t in schema.tables if t.name == "t"]
+    assert {tr.name: tr.row for tr in t.triggers} == {"st": False, "rt": True}
+    [v] = [v for v in schema.views if v.name == "v"]
+    assert ("public", "t") in v.references and ("public", "log") not in v.references
+    assert [(r.relation, r.command, r.instead) for r in schema.rules or ()] == [
+        ("v", "INSERT", True)
+    ]
+
+
+@requires_docker
+def test_the_database_owner_edge_follows_the_owners_inherit_on_pg15(
+    pg_url: str, pg_conn: psycopg.Connection,
+) -> None:
+    """The implicit membership inherits on PG16+ and follows the owner's own
+    INHERIT attribute on PG15 (measured on both); CI runs this on each."""
+    from psycopg.conninfo import make_conninfo  # noqa: PLC0415
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SHOW server_version_num")
+        version = int(cur.fetchone()[0])
+        cur.execute("DROP DATABASE IF EXISTS pgrls_dbo_noinh")
+        cur.execute("DROP ROLE IF EXISTS pgrls_dbo_noinh")
+        cur.execute("CREATE ROLE pgrls_dbo_noinh NOINHERIT")
+        cur.execute("CREATE DATABASE pgrls_dbo_noinh OWNER pgrls_dbo_noinh")
+    try:
+        with psycopg.connect(make_conninfo(pg_url, dbname="pgrls_dbo_noinh"),
+                             autocommit=True) as conn:
+            schema = introspect(conn, schemas=["public"])
+        edges = [m for m in schema.role_memberships or () if m.role == "pg_database_owner"]
+        assert edges == [RoleMembership(member="pgrls_dbo_noinh", role="pg_database_owner",
+                                        inherit=version >= 160000)]
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP DATABASE IF EXISTS pgrls_dbo_noinh")
+            cur.execute("DROP ROLE IF EXISTS pgrls_dbo_noinh")
+
+
+# --- live: review iteration 4's three shapes, measured and matched -----------
+
+_REV4_ROLES = ("pgrls_rev4_r", "pgrls_rev4_o")
+
+
+def _rev4_measure(conn: psycopg.Connection, role: str, stmt: str, after: str) -> int:
+    """Run `stmt` as `role` in a rolled-back transaction and return `after`'s
+    count, read as the superuser before the rollback."""
+    from psycopg import sql as _sql  # noqa: PLC0415
+
+    with conn.transaction(force_rollback=True), conn.cursor() as cur:
+        cur.execute(_sql.SQL("SET LOCAL ROLE {}").format(_sql.Identifier(role)))
+        cur.execute(stmt)
+        cur.execute("RESET ROLE")
+        cur.execute(after)
+        return int(cur.fetchone()[0])
+
+
+def _rev4_matrix(conn: psycopg.Connection) -> Matrix:
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
+
+    schema, grid = introspect_for_matrix(conn, ["public"])
+    return build_matrix(schema, roles=("pgrls_rev4_r",), grid=grid)
+
+
+def _rev4_drop_roles(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        for role in _REV4_ROLES:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            if cur.fetchone() is not None:
+                cur.execute(f"DROP OWNED BY {role} CASCADE")
+                cur.execute(f"DROP ROLE {role}")
+
+
+@pytest.fixture
+def rev4_roles(pg_conn: psycopg.Connection) -> Iterator[None]:
+    """The two roles, created fresh and dropped with what they own: roles are
+    cluster-wide, so a test must not leave them behind."""
+    _rev4_drop_roles(pg_conn)
+    with pg_conn.cursor() as cur:
+        for role in _REV4_ROLES:
+            cur.execute(f"CREATE ROLE {role}")
+    try:
+        yield
+    finally:
+        _rev4_drop_roles(pg_conn)
+
+
+@requires_docker
+@pytest.mark.usefixtures("rev4_roles")
+def test_live_a_filter_reading_another_table_differs_through_doors(
+    pg_conn: psycopg.Connection,
+) -> None:
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE public.memberships (tenant_id text, member text);
+            ALTER TABLE public.memberships OWNER TO pgrls_rev4_o;
+            ALTER TABLE public.memberships ENABLE ROW LEVEL SECURITY;
+            CREATE POLICY m_self ON public.memberships FOR SELECT USING (member = current_user);
+            GRANT SELECT ON public.memberships TO pgrls_rev4_r;
+            INSERT INTO public.memberships VALUES ('a', 'pgrls_rev4_r'), ('b', 'someone_else');
+            CREATE TABLE public.t (id int, tenant_id text);
+            ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
+            CREATE POLICY p ON public.t FOR SELECT
+              USING (tenant_id IN (SELECT tenant_id FROM public.memberships));
+            GRANT SELECT ON public.t TO pgrls_rev4_r, pgrls_rev4_o;
+            INSERT INTO public.t VALUES (1, 'a'), (2, 'b');
+            CREATE VIEW public.v AS SELECT * FROM public.t;
+            ALTER VIEW public.v OWNER TO pgrls_rev4_o;
+            GRANT SELECT ON public.v TO pgrls_rev4_r;
+        """)
+    direct = _rev4_measure(pg_conn, "pgrls_rev4_r", "CREATE TEMP TABLE n AS SELECT * FROM public.t",
+                           "SELECT count(*) FROM n")
+    through = _rev4_measure(pg_conn, "pgrls_rev4_r",
+                            "CREATE TEMP TABLE n AS SELECT * FROM public.v",
+                            "SELECT count(*) FROM n")
+    assert (direct, through) == (1, 2)
+    assert _cell(_rev4_matrix(pg_conn), "public.t", "SELECT", "pgrls_rev4_r").verdict == "undecided"
+
+
+@requires_docker
+@pytest.mark.usefixtures("rev4_roles")
+def test_live_truncate_through_a_parent_covers_its_partitions(
+    pg_conn: psycopg.Connection,
+) -> None:
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE public.tree (id int, part int, parent_id int, parent_part int,
+              PRIMARY KEY (id, part), FOREIGN KEY (parent_id, parent_part) REFERENCES public.tree)
+              PARTITION BY LIST (part);
+            CREATE TABLE public.tree_1 PARTITION OF public.tree FOR VALUES IN (1);
+            CREATE TABLE public.tree_2 PARTITION OF public.tree FOR VALUES IN (2);
+            INSERT INTO public.tree VALUES (1, 1, NULL, NULL), (2, 2, 1, 1);
+            GRANT TRUNCATE ON public.tree TO pgrls_rev4_r;
+        """)
+    left = _rev4_measure(pg_conn, "pgrls_rev4_r", "TRUNCATE public.tree",
+                         "SELECT count(*) FROM public.tree")
+    assert left == 0
+    m = _rev4_matrix(pg_conn)
+    for table in ("public.tree", "public.tree_1", "public.tree_2"):
+        assert _cell(m, table, "TRUNCATE", "pgrls_rev4_r").verdict == "open", table
+
+
+@requires_docker
+@pytest.mark.usefixtures("rev4_roles")
+@pytest.mark.parametrize(("setup", "stmt"), [
+    ("""CREATE TABLE public.pp (id int) PARTITION BY RANGE (id);
+        CREATE TABLE public.pp1 PARTITION OF public.pp FOR VALUES FROM (0) TO (100);
+        CREATE TRIGGER t AFTER TRUNCATE ON public.pp1
+          FOR EACH STATEMENT EXECUTE FUNCTION public.wipe();
+        GRANT TRUNCATE ON public.pp TO pgrls_rev4_r;""",
+     "TRUNCATE public.pp"),
+    ("""CREATE TABLE public.pp (id int) PARTITION BY RANGE (id);
+        CREATE TABLE public.pp1 PARTITION OF public.pp FOR VALUES FROM (0) TO (100);
+        ALTER TABLE public.pp ENABLE ROW LEVEL SECURITY;
+        CREATE TRIGGER b BEFORE INSERT ON public.pp1
+          FOR EACH ROW EXECUTE FUNCTION public.wipe();
+        GRANT INSERT ON public.pp TO pgrls_rev4_r;""",
+     "INSERT INTO public.pp VALUES (1)"),
+], ids=["truncate-parent", "insert-routed"])
+def test_live_a_childs_trigger_fires_through_its_parent(
+    pg_conn: psycopg.Connection, setup: str, stmt: str,
+) -> None:
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE public.secrets (id int);
+            ALTER TABLE public.secrets OWNER TO pgrls_rev4_o;
+            ALTER TABLE public.secrets ENABLE ROW LEVEL SECURITY;
+            INSERT INTO public.secrets VALUES (1), (2);
+            CREATE FUNCTION public.wipe() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+              SET search_path = public
+              AS $$ BEGIN DELETE FROM public.secrets; RETURN NULL; END $$;
+            ALTER FUNCTION public.wipe() OWNER TO pgrls_rev4_o;
+        """ + setup)
+    assert _rev4_measure(pg_conn, "pgrls_rev4_r", stmt, "SELECT count(*) FROM public.secrets") == 0
+    assert _cell(_rev4_matrix(pg_conn), "public.secrets", "DELETE",
+                 "pgrls_rev4_r").verdict != "denied"
+
+
+@requires_docker
+@pytest.mark.usefixtures("rev4_roles")
+def test_matrix_cli_rejects_a_role_the_database_does_not_have(
+    pg_url: str, pg_conn: psycopg.Connection,
+) -> None:
+    """Measured: a typo in --roles showed a full column of DENIED and exit 0."""
+    result = CliRunner().invoke(main, [
+        "matrix", "--database-url", pg_url, "--roles", "PUBLIC,pgrls_rev4_x",
+    ])
+    assert result.exit_code == 2, result.output
+    assert "Roles not found in the database: pgrls_rev4_x." in result.output
+    assert "Did you mean 'pgrls_rev4_r'?" in result.output

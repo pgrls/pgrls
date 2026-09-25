@@ -38,9 +38,11 @@ breaking changes — they will be called out in this file.
   built-ins (the `*_to_xml` family, `cursor_to_xml`, `ts_stat`, and
   `ts_rewrite`, whose second argument is a query) now make a body opaque
   (UNVERIFIED), and so does an operator Postgres does not ship, or one
-  schema-qualified outside `pg_catalog` (measured: `1 OPERATOR(public.===) 2`
-  in a SECURITY DEFINER body ran the function behind the operator as the
-  function's owner).
+  schema-qualified outside `pg_catalog` — in an expression, as an `ANY` /
+  `ALL` sub-select's operator, or in `ORDER BY … USING` (measured: `1
+  OPERATOR(public.===) 2` in a SECURITY DEFINER body ran the function behind
+  the operator as the function's owner). The symbols counted as built-in are
+  the 74 `pg_catalog` ships on PG15–17, plus pgvector's distance operators.
 - **`verify --mode escalation`: a SECURITY DEFINER function that sets a
   parameter is no longer judged under the caller's settings.** A `SET` /
   `SET LOCAL` or `set_config` in the body, or a `SET` clause on the function
@@ -49,9 +51,19 @@ breaking changes — they will be called out in this file.
   user's row). A `SET` statement in the body was skipped, a
   `pg_catalog.`-qualified `set_config` was trusted, and a function whose owner
   is neither RLS-exempt nor granted rows under the anonymous context was not
-  considered at all ("no reachable escalation paths"). Such a function is now
-  a candidate and UNVERIFIED, and so is a body with any statement that is not
-  a query or DML — a `DO`, a `CALL`.
+  considered at all ("no reachable escalation paths"). Now any function whose
+  body the mode cannot fully read is considered whoever owns it — one that
+  sets a parameter, a PL/pgSQL or other opaque body, a helper call, a view,
+  a `DO` or a `CALL` — and reported UNVERIFIED (measured: a PL/pgSQL body
+  that set the claims, a helper that did, and a `CALL` of a procedure that
+  did were each cleared before). Settings that can't change which rows a
+  query returns — timeouts, planner and logging settings — don't count.
+- **`verify --mode escalation` no longer reports trigger functions as
+  callable.** Postgres refuses to call one directly ("trigger functions can
+  only be called as triggers"), so `EXECUTE` on it opens nothing; every
+  PL/pgSQL trigger function, like Supabase's `handle_new_user`, was an
+  UNVERIFIED finding. A trigger fired by an anonymous write is SEC013's and
+  `pgrls matrix`'s.
 - **SQL-standard function bodies are deparsed schema-qualified, and a `RETURN`
   body parses.** A `BEGIN ATOMIC` or `RETURN` body is stored parsed and was
   deparsed relative to the introspecting session's `search_path`, so
@@ -62,7 +74,10 @@ breaking changes — they will be called out in this file.
   other body readers (VIEW004, `verify --mode escalation`, `pgrls vector`)
   also see, in place of a bare name they matched to every same-named table.
   And a `RETURN expr` body, which did not parse at all (VIEW004 skipped it;
-  escalation called it opaque), is now read as `SELECT expr`.
+  escalation called it opaque), is now read as `SELECT expr` — as is a
+  `RETURN` ending a `BEGIN ATOMIC` body. Rules that read bodies now see
+  these: SEC046 can newly report an IMMUTABLE `RETURN`-bodied function that
+  reads session state.
 - **A view's write rules no longer count as what it reads.** View dependencies
   came from every rewrite rule on the view, so the target of an `INSERT` rule
   was reported as a table the view reads. They now come from its `SELECT` rule
@@ -93,10 +108,12 @@ breaking changes — they will be called out in this file.
     by writing its table, directly or through another door, with no `EXECUTE`
     check (measured: a role holding only `INSERT` on one table emptied another
     through an `AFTER INSERT` trigger). A statement trigger fires on the
-    privilege alone, even when no row gets through. A `BEFORE INSERT` row
-    trigger runs before the `WITH CHECK`, and one that returns NULL skips the
-    check while its own writes stand (measured). Other row triggers need a
-    row the policies admit. A partition fires its ancestors' row triggers,
+    privilege alone, even when no row gets through, and a `TRUNCATE` of a
+    parent fires its partitions' and children's `TRUNCATE` triggers. A
+    `BEFORE INSERT` row trigger runs before the `WITH CHECK` — also for a row
+    an `INSERT` on its partitioned parent routes there — and one that
+    returns NULL skips the check while its own writes stand (measured).
+    Other row triggers need a row the policies admit. A partition fires its ancestors' row triggers,
     which Postgres clones to it, but not their statement triggers. A trigger
     function cannot be called, so `EXECUTE` on one opens nothing.
   - A rewrite rule runs its actions with the relation owner's privileges and
@@ -129,7 +146,12 @@ breaking changes — they will be called out in this file.
 - **A `TRUNCATE` row.** TRUNCATE ignores RLS entirely (measured: it emptied a
   `FORCE`d table whose `DELETE` admitted no row), so a role holding the
   privilege is `OPEN` whatever the policies say — unless another table's
-  foreign key references the table and the role cannot truncate that one too.
+  foreign key references the table and the same statement can't empty that
+  one too. Truncating a parent empties its partitions and inheritance
+  children, checking the privilege on the parent only (measured: `TRUNCATE
+  tree` emptied a self-referencing partitioned table granted on the parent
+  alone), so a referencing table is covered by the privilege on it or on a
+  table above it.
 - **A sensitive-columns section in `pgrls matrix`** — per role, the columns
   whose names match SEC045's patterns (plus `[lint.rules.SEC045].patterns`)
   that it can read, and the paths reaching each one. In every format, after
@@ -137,10 +159,13 @@ breaking changes — they will be called out in this file.
   nothing to report.
 - **An `UNDECIDED` verdict** for rows that cannot be bounded: a materialized
   view over the table, a foreign-key action, a door whose body sets a
-  parameter, two different filtered paths whose union is unknown (including
-  the same filter run as two different users, when it reads `current_user` or
-  checks a privilege), or — for a schema built without a role-membership
-  graph — memberships that were not captured. It replaces a `DENIED` or a `COND` that
+  parameter, two different filtered paths whose union is unknown, or — for a
+  schema built without a role-membership graph — memberships that were not
+  captured. The same filter on two paths counts as two when it depends on
+  who runs it: it reads `current_user` or checks a privilege and one path
+  runs as a door's owner, or a sub-select reads another table, whose RLS
+  applies to whoever evaluates it (measured: `tenant_id IN (SELECT … FROM
+  memberships)` read 1 row directly and 2 through a definer view). It replaces a `DENIED` or a `COND` that
   would have been a guess in the unsafe direction. The JSON `summary` gains an
   `undecided` count.
 - `pgrls matrix` honours the predefined data roles: `pg_read_all_data` confers
@@ -155,6 +180,9 @@ breaking changes — they will be called out in this file.
   named it or it was exempt from RLS, so owners, members of a granted group,
   data-role members and door users had no column, and `anon` /
   `authenticated` appeared on clusters that have no such roles.
+- **`pgrls matrix --roles` rejects a role the database does not have**, with
+  a "Did you mean" for a close name, instead of showing a column of `DENIED`
+  for the typo. The SEC045 pattern config is now checked before connecting.
 - **The database owner's implicit membership in `pg_database_owner`** is now
   recorded with the other role memberships (measured: the owner read a table
   granted only to `pg_database_owner`, while `pg_auth_members` held no row for
@@ -166,7 +194,8 @@ breaking changes — they will be called out in this file.
   now lists every role in the cluster) and `rules` (INSERT / UPDATE / DELETE
   rewrite rules); `views[].updatable`; `security_definer_functions[].definition`
   (PL/pgSQL), `.trigger` and `.config_gucs` (the parameters its `SET` clauses
-  change); `triggers[].row`; and
+  change — both written whenever captured, so their absence means "not
+  captured"); `triggers[].row`; and
   `foreign_keys[].on_delete` / `.on_update`. Additive: v3–v26 files still
   load, and a missing key decodes as "not captured", never as "no roles
   exist" or "not writable".

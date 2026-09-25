@@ -308,7 +308,9 @@ Doors are found in every schema. A door whose SQL it cannot trace (dynamic
 SQL, another language, a call into an unseen function or operator, a
 SQL-running built-in, `DO` / `CALL` / a change of search_path or role) is
 listed separately with who can open it — a `DENIED` cell does not rule it
-out; a body that sets another parameter makes its filtered doors UNDECIDED.
+out; a body that sets another parameter makes its filtered doors UNDECIDED
+(a timeout or planner setting excepted), and so does the same filter reached
+two ways when it reads `current_user` or another table.
 A separate section lists sensitive-looking columns (SEC045's patterns, plus
 configured ones) each role can read, and how. `UNDECIDED` means the rows
 cannot be bounded — treat it as "possibly reachable", never as denied.

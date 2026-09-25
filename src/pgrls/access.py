@@ -34,7 +34,8 @@ each for the commands it runs:
 
 A door whose body sets a parameter (``SET``, ``set_config``, a ``SET`` clause
 on the function) runs its filters on values it chose, so a filtered door is
-UNDECIDED.
+UNDECIDED — unless the setting cannot change which rows a query returns (a
+timeout, a planner or logging setting).
 
 A policy ``TO R`` binds exactly the roles that inherit ``R``'s privileges, like
 a grant: a ``NOINHERIT`` member is bound by neither a permissive nor a
@@ -68,7 +69,7 @@ from typing import Any, Literal
 from pgrls.ast_utils import flatten_or_disjuncts, is_literal_true, parse_expr
 from pgrls.model import Policy, RewriteRule, Role, Schema, SecdefFunction, Table, View
 from pgrls.rules.sec045 import _DEFAULT_PATTERNS, _is_pii
-from pgrls.verify import _anon_reachable_roles, _inherit_closure
+from pgrls.verify import _anon_reachable_roles, _gucs_matter, _inherit_closure
 
 Verdict = Literal["open", "denied", "conditional", "undecided"]
 
@@ -102,15 +103,20 @@ class Cell:
     verdict: Verdict
     predicate: str | None = None  # the row filter, for "conditional"
     note: str | None = None  # why: "RLS off", "through definer view …", …
-    # Whose session evaluates `predicate`: None for the caller's own (a view
-    # does not change `current_user`); the owner for a SECURITY DEFINER
-    # function or trigger, where `current_user` is the owner; the rule itself
-    # for a rule's action, where `current_user` stays whoever wrote the
-    # relation — the role, or a door's owner — so its filters are never taken
-    # for another path's. Two filters are the same row set only when predicate
-    # and session match, or the predicate cannot depend on the session
-    # (`_session_dependent`). Not rendered.
+    # Who `current_user` is when `predicate` runs: None for the caller (a view
+    # does not change it); the owner for a SECURITY DEFINER function or
+    # trigger; the rule itself for a rule's action, where it stays whoever
+    # wrote the relation — the role, or a door's owner — so its filters are
+    # never taken for another path's. Not rendered.
     session: str | None = None
+    # Whose privileges and policies the relations in `predicate`'s sub-selects
+    # are read with: None for the caller's own; the owner for a definer view
+    # (measured: a sub-select through one returned the view owner's rows
+    # while `current_user` stayed the caller), a SECURITY DEFINER function or
+    # trigger; the rule itself for a rule's action. Two filters are the same
+    # row set only when the predicate matches and so do whichever of these it
+    # depends on (`_dependence`). Not rendered.
+    privileges: str | None = None
 
 
 @dataclass(frozen=True)
@@ -341,6 +347,46 @@ def _narrowing_restrictive(restrictive: list[Policy], command: str) -> list[str]
     ]
 
 
+def _truncate_blocker(
+    ctx: _Context, role: Role, closure: frozenset[str] | None, table: Table,
+) -> tuple[Table | None, bool]:
+    """A table whose foreign key stops `role` from truncating `table`, and
+    whether that answer turned on a membership graph that was not captured.
+
+    TRUNCATE refuses unless every table referencing one it empties is emptied
+    by the same statement. Truncating a table also empties its partitions and
+    inheritance children, checking the privilege on the named table only
+    (measured: `TRUNCATE tree` emptied a self-referencing partitioned table
+    granted on the parent alone). So a referencing table is covered when it
+    lies beneath one being emptied, or when the role can name it — or a table
+    above it — in the same statement (measured: `TRUNCATE p, q` emptied `p`,
+    whose foreign key came from `q`'s partition, which had no grant)."""
+    def can(t: Table) -> bool | None:
+        paths, known = _privilege_paths(ctx.schema, role, t, closure, "TRUNCATE")
+        return True if paths else (None if not known else False)
+
+    emptied: set[str] = set()
+    todo: list[Table] = []
+
+    def empty(t: Table) -> None:
+        for x in (t, *ctx.descendants(t)):
+            if x.qualified_name not in emptied:
+                emptied.add(x.qualified_name)
+                todo.append(x)
+
+    empty(table)
+    while todo:
+        for ref in ctx.referencing.get(todo.pop().qualified_name, ()):
+            if ref.qualified_name in emptied:
+                continue
+            candidates = [ref, *(a for a, _ in ctx.ancestors(ref))]
+            answers = [can(c) for c in candidates]
+            if True not in answers:
+                return ref, None in answers
+            empty(candidates[answers.index(True)])
+    return None, False
+
+
 def cell_for(
     schema: Schema,
     table: Table,
@@ -363,14 +409,16 @@ def cell_for(
             ), [], ()
         return Cell("denied"), [], ()
     if command == "TRUNCATE" and ctx is not None:
-        # A table other tables reference cannot be truncated without CASCADE,
-        # which needs TRUNCATE on every one of them.
-        for child in ctx.truncate_cascade(table):
-            if not _privilege_paths(schema, role, child, closure, "TRUNCATE")[0]:
-                return Cell("denied", note=(
-                    f"referenced by a foreign key from {child.qualified_name}: "
-                    "TRUNCATE needs CASCADE, and the TRUNCATE privilege there"
+        blocker, unknown = _truncate_blocker(ctx, role, closure, table)
+        if blocker is not None:
+            why = (f"referenced by a foreign key from {blocker.qualified_name}, which "
+                   "the same TRUNCATE must empty: that needs the privilege on it or "
+                   "on a table above it")
+            if unknown:
+                return Cell("undecided", note=(
+                    f"{why}; role-membership graph not captured"
                 )), paths, ()
+            return Cell("denied", note=why), paths, ()
     if role.superuser:
         return Cell("open", note="superuser"), paths, ()
     if command == "TRUNCATE":
@@ -437,14 +485,16 @@ def cell_for(
 _Door = tuple[Cell, AccessPath]
 
 
-def _via(prefix: str, cell: Cell, session: str | None = None) -> Cell:
+def _via(prefix: str, cell: Cell, session: str | None = None,
+         privileges: str | None = None) -> Cell:
     """`cell` as reached through a door: same rows, the door named first, and
-    — for a door that runs as its owner — that owner's session."""
+    — for a door that runs as its owner — that owner's session and privileges."""
     return Cell(
         cell.verdict,
         cell.predicate,
         prefix + (f" — {cell.note}" if cell.note else ""),
         session if session is not None else cell.session,
+        privileges if privileges is not None else cell.privileges,
     )
 
 
@@ -498,6 +548,9 @@ class _Context:
     rules: dict[tuple[str, str], list[RewriteRule]] = field(default_factory=dict)
     # parent table qname -> the OTHER tables whose foreign keys reference it
     referencing: dict[str, list[Table]] = field(default_factory=dict)
+    # table qname -> its partitions and inheritance children
+    children: dict[str, list[Table]] = field(default_factory=dict)
+    ancestry: dict[str, list[tuple[Table, bool]]] = field(default_factory=dict)
     sessions: dict[str, _Session] = field(default_factory=dict)
     analysed: dict[Any, _Trace] = field(default_factory=dict)
 
@@ -514,6 +567,8 @@ class _Context:
             for fk in t.foreign_keys:
                 if (fk.ref_schema, fk.ref_table) != (t.schema, t.name):
                     self.referencing.setdefault(f"{fk.ref_schema}.{fk.ref_table}", []).append(t)
+            for parent in ((t.partition_of,) if t.partition_of else ()) + tuple(t.inherits):
+                self.children.setdefault(f"{parent[0]}.{parent[1]}", []).append(t)
 
     def session(self, role: Role) -> _Session:
         """`role`'s privilege closure and policy applicability — memoized, as
@@ -528,6 +583,25 @@ class _Context:
 
     def owner(self, name: str) -> Role:
         return self.attrs.get(name, Role(name, False, False, False))
+
+    def ancestors(self, table: Table) -> list[tuple[Table, bool]]:
+        """`_ancestors`, memoized: the trigger and parent walks ask about every
+        table on every pass of the fixed point."""
+        q = table.qualified_name
+        if q not in self.ancestry:
+            self.ancestry[q] = _ancestors(self.schema, table)
+        return self.ancestry[q]
+
+    def descendants(self, table: Table) -> list[Table]:
+        """Every partition and inheritance child beneath `table`."""
+        out: dict[str, Table] = {}
+        todo = list(self.children.get(table.qualified_name, ()))
+        while todo:
+            child = todo.pop()
+            if child.qualified_name not in out and child.qualified_name != table.qualified_name:
+                out[child.qualified_name] = child
+                todo.extend(self.children.get(child.qualified_name, ()))
+        return list(out.values())
 
     def truncate_cascade(self, table: Table) -> list[Table]:
         """Every other table a `TRUNCATE … CASCADE` of `table` also empties."""
@@ -678,9 +752,11 @@ def _view_doors(
             if definer is None:
                 if principal_direct:
                     own = reach(eff, table)
-                    record(table, path, Cell(own.verdict, own.predicate, own.note, session))
+                    record(table, path, Cell(own.verdict, own.predicate, own.note, session,
+                                             principal.role.name))
                 continue  # otherwise the principal's own direct access
-            record(table, path, _via(label(entry, definer), reach(eff, table), session))
+            record(table, path, _via(label(entry, definer), reach(eff, table), session,
+                                     definer.owner))
 
     chosen = starts if starts is not None else ctx.schema.views
     for v in sorted(chosen, key=lambda v: v.qualified_name):
@@ -807,18 +883,9 @@ def _search_schemas(fn: SecdefFunction) -> list[str] | None:
 # GUCs whose change alters which relation a later name resolves to, or who
 # runs it. Setting any OTHER parameter changes what a later statement's
 # policies admit (a tenant id, the JWT claims), so the door's rows are then
-# no longer bounded by the filter it shows.
+# no longer bounded by the filter it shows — unless the setting is inert
+# (`_is_inert_setting`: a timeout, a planner knob, logging).
 _RESOLUTION_GUCS = frozenset({"search_path", "role", "session_authorization"})
-
-
-def _set_config_target(call: Any) -> str | None:
-    """The parameter a `set_config(name, …)` call sets, if it is a literal."""
-    from pglast.ast import A_Const, String  # noqa: PLC0415
-
-    args = getattr(call, "args", None) or ()
-    first = args[0] if args else None
-    val = getattr(first, "val", None) if isinstance(first, A_Const) else None
-    return str(val.sval).lower() if isinstance(val, String) else None
 
 
 def _statement_touches(
@@ -839,10 +906,10 @@ def _statement_touches(
     DDL), a call into a function or operator pgrls cannot see, or a change to
     search_path or the role is a reason the trace is incomplete. Setting any
     other parameter (``SET``, ``set_config``) is traced but flagged: it
-    changes what the policies of a later statement admit.
+    changes what the policies of a later statement admit — unless the
+    setting is inert (`_is_inert_setting`).
     """
     from pglast.ast import (  # noqa: PLC0415
-        A_Expr,
         DeleteStmt,
         FuncCall,
         InsertStmt,
@@ -861,8 +928,10 @@ def _statement_touches(
     from pgrls.verify import (  # noqa: PLC0415
         DEFAULT_AUTH_FUNCTIONS,
         _has_range_function,
+        _is_inert_setting,
         _opaque_call,
         _opaque_operator,
+        _set_config_target,
     )
 
     reasons: list[str] = []
@@ -870,7 +939,7 @@ def _statement_touches(
     if isinstance(stmt, VariableSetStmt):
         if stmt.name is None or str(stmt.name).lower() in _RESOLUTION_GUCS:
             reasons.append("changes search_path or the role at run time")
-        else:
+        elif not _is_inert_setting(str(stmt.name)):
             context = True
     elif not isinstance(stmt, (SelectStmt, InsertStmt, UpdateStmt, DeleteStmt, MergeStmt,
                                TruncateStmt, NotifyStmt)):
@@ -893,11 +962,11 @@ def _statement_touches(
                 target = _set_config_target(n)
                 if target is None or target in _RESOLUTION_GUCS:
                     reasons.append("changes search_path or the role at run time")
-                else:
+                elif not _is_inert_setting(target):
                     context = True
             elif _opaque_call(n, DEFAULT_AUTH_FUNCTIONS):
                 opaque = True
-        if isinstance(n, A_Expr) and _opaque_operator(n):
+        if _opaque_operator(n):
             opaque = True
         if isinstance(n, (InsertStmt, UpdateStmt, DeleteStmt, MergeStmt)):
             cmds = {InsertStmt: ["INSERT"], UpdateStmt: ["UPDATE"],
@@ -989,14 +1058,16 @@ def _run_as_owner(
     via: str,
     *,
     session: str | None,
+    privileges: str | None = None,
     context: bool = False,
 ) -> tuple[dict[tuple[str, str], list[_Door]], _Issued]:
     """Doors for statements that run with `owner`'s privileges and policies:
     each touched table is reached as the owner; a view is walked as the owner.
-    `session` is whose `current_user` the filters see. When the body chose
-    its own settings (`context`), a filter no longer bounds the rows, so a COND
-    door is UNDECIDED. Also returns every relation written with the privilege,
-    for the triggers and rules that fires."""
+    `session` is whose `current_user` the filters see, and `privileges` whose
+    rights their sub-selects read with (default: the owner's). When the body
+    chose its own settings (`context`), a filter no longer bounds the rows, so
+    a COND door is UNDECIDED. Also returns every relation written with the
+    privilege, for the triggers and rules that fires."""
     found: dict[tuple[str, str], list[_Door]] = {}
     issued: _Issued = set()
     path = AccessPath(kind, via=via)
@@ -1026,7 +1097,8 @@ def _run_as_owner(
             if paths and command != "SELECT":
                 issued.add((table.qualified_name, command))
             if cell.verdict != "denied":
-                add(table.qualified_name, command, _via(label, cell, session), path)
+                add(table.qualified_name, command,
+                    _via(label, cell, session, privileges or owner.role.name), path)
             continue
         view = ctx.views.get(key)
         if view is None:
@@ -1038,7 +1110,8 @@ def _run_as_owner(
             issued=issued,
         ).items():
             for cell, vpath in doors:
-                add(qname, command, _via(f"{label}, then {vpath.via}", cell, session),
+                add(qname, command,
+                    _via(f"{label}, then {vpath.via}", cell, session, privileges),
                     AccessPath(kind, via=via, hops=vpath.hops))
     return found, issued
 
@@ -1086,7 +1159,7 @@ def _function_doors(
             ctx, owner, touches,
             f"through SECURITY DEFINER {_display(fn)}, as its owner {fn.owner}",
             "function", _display(fn), session=owner.role.name,
-            context=context or bool(fn.config_gucs),
+            context=context or _gucs_matter(fn.config_gucs),
         )
         issued |= out
         for key, ds in doors.items():
@@ -1100,22 +1173,39 @@ def _fires(ctx: _Context, table: Table, command: str, trigger: Any,
 
     A statement trigger (and one of unknown level, conservatively) fires on
     any statement the privilege allows, even one that touches no row — also
-    when a door's owner issues it. A BEFORE row trigger on INSERT fires before
-    the INSERT's WITH CHECK, and one returning NULL skips the check (measured:
-    its writes stood while the INSERT itself was refused). Other row triggers
-    fire only for rows that get through; an UPDATE that moves a row between
-    partitions fires DELETE on the source and INSERT on the destination."""
+    when a door's owner issues it. A TRUNCATE trigger also fires when an
+    ancestor is truncated, since that empties this table too. A BEFORE row
+    trigger on INSERT fires before the INSERT's WITH CHECK, and one returning
+    NULL skips the check (measured: its writes stood while the INSERT itself
+    was refused) — including for a row routed here from a partitioned
+    ancestor. Other row triggers fire only for rows that get through; an
+    UPDATE that moves a row between partitions fires DELETE on the source and
+    INSERT on the destination."""
     key = (table.qualified_name, command)
-    if command == "TRUNCATE" or trigger.row is not True:
-        return key in issuable
-    if trigger.timing == "BEFORE" and command == "INSERT" and key in issuable:
+    ancestors = ctx.ancestors(table)
+    if command == "TRUNCATE":
+        # TRUNCATE of an ancestor empties this table too and fires its
+        # TRUNCATE triggers (measured: `TRUNCATE pp` fired a partition's).
+        return key in issuable or any(
+            (a.qualified_name, "TRUNCATE") in issuable for a, _ in ancestors
+        )
+    if trigger.row is not True and key in issuable:
+        return True  # a statement trigger, or one of unknown level
+    if trigger.row is False:
+        return False
+    if trigger.timing == "BEFORE" and command == "INSERT" and (key in issuable or any(
+        declarative and (a.qualified_name, "INSERT") in issuable for a, declarative in ancestors
+    )):
+        # A row routed from a partitioned ancestor fires this partition's
+        # BEFORE ROW INSERT triggers before the ancestor's WITH CHECK
+        # (measured: one that returned NULL ran while the INSERT added no row).
         return True
     if cells[key].verdict != "denied":
         return True
     if command in ("INSERT", "DELETE"):
         return any(
             declarative and cells[(a.qualified_name, "UPDATE")].verdict != "denied"
-            for a, declarative in _ancestors(ctx.schema, table)
+            for a, declarative in ancestors
         )
     return False
 
@@ -1134,11 +1224,13 @@ def _trigger_doors(
     issued: _Issued = set()
     for table in ctx.tables.values():
         holders = [(table, True)] + [
-            (a, False) for a, declarative in _ancestors(ctx.schema, table) if declarative
+            (a, False) for a, declarative in ctx.ancestors(table) if declarative
         ]
         for holder, own in holders:
             for tr in holder.triggers:
-                fns = [f for f in ctx.functions.get(tr.function_qualified_name, ()) if f.trigger]
+                # An uncaptured flag (None, an older snapshot) may be either.
+                fns = [f for f in ctx.functions.get(tr.function_qualified_name, ())
+                       if f.trigger is not False]
                 if not tr.enabled or not fns or (not own and tr.row is False):
                     continue  # only row triggers are cloned to partitions
                 for command in tr.event.split(" OR "):
@@ -1160,7 +1252,7 @@ def _trigger_doors(
                             f"through {door} (SECURITY DEFINER {_display(fn)}, as its "
                             f"owner {fn.owner})",
                             "trigger", door, session=owner.role.name,
-                            context=context or bool(fn.config_gucs),
+                            context=context or _gucs_matter(fn.config_gucs),
                         )
                         issued |= out
                         for key, ds in doors.items():
@@ -1211,7 +1303,7 @@ def _rule_doors(
             doors, out = _run_as_owner(
                 ctx, ctx.session(ctx.owner(rel.owner)), touches,
                 f"through {door}, as its owner {rel.owner}", "rule", door,
-                session=door, context=context,
+                session=door, privileges=door, context=context,
             )
             issued |= out
             for k, ds in doors.items():
@@ -1275,7 +1367,7 @@ def _parent_doors(
 ) -> dict[tuple[str, str], list[_Door]]:
     found: dict[tuple[str, str], list[_Door]] = {}
     for table in ctx.tables.values():
-        for ancestor, declarative in _ancestors(ctx.schema, table):
+        for ancestor, declarative in ctx.ancestors(table):
             for command in COMMANDS:
                 # An INSERT into a partitioned parent is routed to a partition;
                 # one into a classic-inheritance parent stays in the parent.
@@ -1296,65 +1388,85 @@ _SESSION_FUNCTIONS = frozenset({"pg_has_role", "row_security_active"})
 
 
 @lru_cache(maxsize=4096)
-def _session_dependent(predicate: str) -> bool:
-    """Whether `predicate` can admit different rows for different current
-    users: it reads `current_user` / `session_user` / `current_role` / `user`,
-    checks a privilege, or calls a function pgrls cannot see into (which may
-    do either). Unparseable counts as dependent."""
-    from pglast.ast import FuncCall, Node, SQLValueFunction  # noqa: PLC0415
+def _dependence(predicate: str) -> tuple[bool, bool]:
+    """What `predicate`'s rows depend on besides the row itself: (who
+    `current_user` is, whose privileges and policies read the relations its
+    sub-selects name). The first holds when it reads `current_user` /
+    `session_user` / `current_role` / `user` or checks a privilege; the second
+    when a sub-select reads a relation — its RLS applies to whoever evaluates
+    it (measured: the same `tenant_id IN (SELECT … FROM memberships)` read 1
+    row directly and 2 through a definer view). A FROM-less `(SELECT
+    auth.uid())` reads none. A call or operator pgrls cannot see into may do
+    either, and so may an unparseable predicate."""
+    from pglast.ast import FuncCall, Node, RangeVar, SQLValueFunction  # noqa: PLC0415
 
     from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
-    from pgrls.verify import DEFAULT_AUTH_FUNCTIONS, _opaque_call  # noqa: PLC0415
+    from pgrls.verify import (  # noqa: PLC0415
+        DEFAULT_AUTH_FUNCTIONS,
+        _opaque_call,
+        _opaque_operator,
+    )
 
     node = parse_expr(predicate)
     if node is None:
-        return True
-    found = False
+        return True, True
+    session = relations = False
 
     def walk(n: Any) -> None:
-        nonlocal found
-        if found or n is None:
+        nonlocal session, relations
+        if session and relations or n is None:
             return
         if isinstance(n, (list, tuple)):
             for item in n:
                 walk(item)
             return
+        if not isinstance(n, Node):
+            return
         if isinstance(n, SQLValueFunction):
             op = getattr(getattr(n, "op", None), "name", "")
-            if "USER" in op or "ROLE" in op:
-                found = True
-                return
-        if isinstance(n, FuncCall):
+            session = session or "USER" in op or "ROLE" in op
+        elif isinstance(n, RangeVar):
+            relations = True
+        elif isinstance(n, FuncCall):
             bare = func_name_parts(n)[1] or ""
-            if (bare in _SESSION_FUNCTIONS
-                    or (bare.startswith("has_") and bare.endswith("_privilege"))
-                    or _opaque_call(n, DEFAULT_AUTH_FUNCTIONS)):
-                found = True
-                return
-        if isinstance(n, Node):
-            for fld in n:
-                walk(getattr(n, fld, None))
+            if bare in _SESSION_FUNCTIONS or (bare.startswith("has_")
+                                               and bare.endswith("_privilege")):
+                session = True
+            elif _opaque_call(n, DEFAULT_AUTH_FUNCTIONS):
+                session = relations = True
+        if _opaque_operator(n):
+            session = relations = True
+        for fld in n:
+            walk(getattr(n, fld, None))
 
     walk(node)
-    return found
+    return session, relations
 
 
-def _merge(cell: Cell, door: Cell, path: AccessPath) -> Cell:
+def _merge(cell: Cell, door: Cell, path: AccessPath, me: str | None = None) -> Cell:
     """Fold one door into a cell: the wider verdict wins. Two filtered row
     sets are a problem — their union could be every row — so unless both are
-    the same predicate, evaluated in the same session or not depending on it,
-    the answer becomes UNDECIDED rather than the narrower-looking COND."""
+    the same predicate, evaluated alike in whatever it depends on (who is
+    `current_user`, whose rights read its sub-selects), the answer becomes
+    UNDECIDED rather than the narrower-looking COND. `me` is the role whose
+    cell this is: its own session and a door it owns evaluate alike."""
     if door.verdict == "denied":
         return cell
     if RANK[door.verdict] > RANK[cell.verdict]:
         return door
     if cell.verdict == door.verdict == "conditional":
-        if door.predicate is not None and door.predicate == cell.predicate and (
-            door.session == cell.session or not _session_dependent(door.predicate)
-        ):
-            also = f"also {door.note}" if door.note else None
-            note = "; ".join(n for n in (cell.note, also) if n) or None
-            return Cell(cell.verdict, cell.predicate, note, cell.session)
+        if door.predicate is not None and door.predicate == cell.predicate:
+            on_session, on_relations = _dependence(door.predicate)
+
+            def norm(who: str | None) -> str | None:
+                return None if who == me else who
+
+            if (not on_session or norm(door.session) == norm(cell.session)) and (
+                not on_relations or norm(door.privileges) == norm(cell.privileges)
+            ):
+                also = f"also {door.note}" if door.note else None
+                note = "; ".join(n for n in (cell.note, also) if n) or None
+                return Cell(cell.verdict, cell.predicate, note, cell.session, cell.privileges)
         first = f"directly where {cell.predicate}" if cell.predicate and not cell.note \
             else (cell.note or cell.predicate)
         return Cell("undecided", note=(
@@ -1364,11 +1476,11 @@ def _merge(cell: Cell, door: Cell, path: AccessPath) -> Cell:
     return cell
 
 
-def _fold(cell: Cell, doors: list[_Door]) -> Cell:
+def _fold(cell: Cell, doors: list[_Door], me: str | None = None) -> Cell:
     for door, path in sorted(
         doors, key=lambda d: (-RANK[d[0].verdict], d[0].note or "", d[1].via or "")
     ):
-        cell = _merge(cell, door, path)
+        cell = _merge(cell, door, path, me)
     return cell
 
 
@@ -1417,7 +1529,7 @@ def role_reach(
     issuable |= fn_issued
     for key, ds in fn_doors.items():
         chosen.setdefault(key, []).extend(ds)
-    base = {k: _fold(direct[k], chosen.get(k, [])) for k in direct}
+    base = {k: _fold(direct[k], chosen.get(k, []), role.name) for k in direct}
 
     cells, reach = dict(base), set(issuable)
     followed: dict[tuple[str, str], list[_Door]] = {}
@@ -1433,7 +1545,7 @@ def role_reach(
                 followed.setdefault(key, []).extend(ds)
         more = issuable | fk_issued | trig_issued | rule_issued
         later = trig_untraced + rule_untraced
-        new = {k: _fold(base[k], followed.get(k, [])) for k in base}
+        new = {k: _fold(base[k], followed.get(k, []), role.name) for k in base}
         if new == cells and more == reach:
             break
         cells, reach = new, more

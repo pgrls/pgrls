@@ -4326,6 +4326,9 @@ def test_policy_applicability_noinherit_matches_live_anon_session(
     # Built-ins and operators that run code named elsewhere.
     "SELECT pg_catalog.ts_rewrite('a'::pg_catalog.tsquery, 'SELECT 1') FROM secret",
     "SELECT 1 OPERATOR(public.===) 2 FROM secret",
+    "SELECT 1 OPERATOR(public.===) ANY (SELECT 1) FROM secret",
+    "SELECT 1 OPERATOR(public.===) ALL (SELECT 1) FROM secret",
+    "SELECT id FROM secret ORDER BY id USING OPERATOR(public.<<<)",
     # Statements that are not a query or DML.
     "DO $x$ BEGIN PERFORM 1; END $x$; SELECT * FROM secret",
 ])
@@ -4379,4 +4382,94 @@ def test_escalation_names_a_function_set_clause_as_the_reason() -> None:
     )
     [t] = build_verification(schema, mode="escalation").tables
     assert t.verdict == "unverified", t
-    assert "sets configuration parameters" in t.note, t.note
+    assert "its own SET clause sets app.tenant" in t.note, t.note
+
+
+@requires_z3
+@pytest.mark.parametrize(("body", "lang"), [
+    # Measured on PG15/16/17, each owned by a plain role: all three were
+    # cleared as "no escalation path" while the body chose the claims.
+    ("BEGIN PERFORM set_config('request.jwt.claims', '{}', true); "
+     "RETURN (SELECT count(*) FROM secret); END", "plpgsql"),
+    ("SELECT public.set_uid('x'); SELECT count(*) FROM secret", "sql"),
+    ("CALL public.set_uid_proc('x'); SELECT count(*) FROM secret", "sql"),
+    ("SELECT * FROM public.some_view", "sql"),
+])
+def test_escalation_considers_a_body_it_cannot_see_whoever_owns_it(body: str, lang: str) -> None:
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef(body, bypass=False, lang=lang),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", t
+
+
+@requires_z3
+def test_escalation_still_passes_over_a_plain_body_of_an_ordinary_owner() -> None:
+    """Nothing unseen, no exemption, no rows granted to the owner: no finding."""
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret", bypass=False),),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+@pytest.mark.parametrize(("body", "gucs"), [
+    ("SELECT * FROM secret", ("statement_timeout",)),
+    ("SELECT * FROM secret", ("work_mem", "enable_seqscan")),
+    ("SET LOCAL statement_timeout = '5s'; SELECT * FROM secret", ()),
+    ("SELECT set_config('lock_timeout', '1s', true); SELECT * FROM secret", ()),
+])
+def test_escalation_ignores_settings_that_cannot_change_rows(
+    body: str, gucs: tuple[str, ...],
+) -> None:
+    """Measured: `SET statement_timeout = '5s'` on a plain-owner function made
+    it UNVERIFIED, though a timeout cannot change what a policy admits."""
+    from dataclasses import replace
+
+    fn = replace(_secdef(body, bypass=False), config_gucs=gucs)
+    schema = Schema(tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+                    security_definer_functions=(fn,))
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+@pytest.mark.parametrize(("trigger", "finding"), [(True, False), (None, True), (False, True)])
+def test_escalation_does_not_call_a_trigger_function(
+    trigger: bool | None, finding: bool,
+) -> None:
+    """Measured: calling a trigger function fails ("trigger functions can only
+    be called as triggers"), so EXECUTE on one opens nothing. An older
+    snapshot that did not capture the flag is still analysed."""
+    from dataclasses import replace
+
+    fn = replace(_secdef("BEGIN RETURN NEW; END", lang="plpgsql"), trigger=trigger)
+    schema = Schema(tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+                    security_definer_functions=(fn,))
+    assert bool(build_verification(schema, mode="escalation").tables) is finding
+
+
+@requires_z3
+def test_escalation_does_not_read_uncaptured_set_clauses_as_none() -> None:
+    from dataclasses import replace
+
+    fn = replace(_secdef("SELECT * FROM secret", bypass=False), config_gucs=None)
+    schema = Schema(tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+                    security_definer_functions=(fn,))
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+    assert "SET clauses were not captured" in t.note, t.note
+
+
+@requires_z3
+def test_escalation_reads_a_begin_atomic_body_that_ends_in_return() -> None:
+    """Measured on PG16: `BEGIN ATOMIC … RETURN (SELECT …); END` was called an
+    opaque body though every statement in it is plain SQL."""
+    body = "BEGIN ATOMIC\n SELECT 1;\n RETURN ( SELECT count(*) AS count FROM public.secret);\nEND"
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef(body),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak", t
