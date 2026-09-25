@@ -4155,3 +4155,321 @@ def test_cross_tenant_declines_when_a_member_holds_the_owner_privileges() -> Non
     )
     [f] = build_verification(forced, mode="cross-tenant").tables
     assert f.verdict == "isolated"
+
+
+# --- policy applicability follows INHERIT memberships only ------------------
+#
+# Postgres applies a policy `TO R` to a session that holds R's privileges
+# (`has_privs_of_role`: R itself, or a transitive member through INHERIT
+# edges), not to every member. Measured on PG16 with
+# `GRANT grp TO anon WITH INHERIT FALSE`: anon read 0 rows under a permissive
+# `TO grp USING (true)` policy, and every row past a restrictive `TO grp`
+# floor. Walking every edge made `verify` cede a definer view and a SECURITY
+# DEFINER function as "anon already reads those rows directly" while anon read
+# nothing directly and everything through the door.
+
+
+def _grp_tbl(*, floor: str | None = None, perm_roles: tuple[str, ...] = ("grp",)) -> Table:
+    from pgrls.model import Grant
+
+    policies = [_policy("true", command="SELECT", roles=perm_roles)]
+    if floor is not None:
+        policies.append(
+            _policy(floor, name="floor", permissive=False, command="SELECT", roles=("grp",))
+        )
+    return Table(
+        schema="public",
+        name="t",
+        rls_enabled=True,
+        force_rls=False,
+        columns=("id", "tenant_id"),
+        owner="tbl_owner",
+        policies=tuple(policies),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+
+
+def _grp_edge(inherit: bool) -> tuple[RoleMembership, ...]:
+    return (RoleMembership(member="anon", role="grp", inherit=inherit),)
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "leak"), (False, "isolated")])
+def test_anon_policy_to_a_group_applies_only_through_inherit(
+    inherit: bool, expected: str
+) -> None:
+    schema = Schema(tables=(_grp_tbl(),), role_memberships=_grp_edge(inherit))
+    assert _verdict(build_verification(schema, mode="anon"), "public.t") == expected
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "isolated"), (False, "leak")])
+def test_reachability_noinherit_policy_does_not_cede_the_view(
+    inherit: bool, expected: str
+) -> None:
+    """INHERIT: anon reads every row directly, so the view adds nothing (ceded).
+    NOINHERIT: the policy never applies to anon — the direct read is empty and
+    the view is the only door. Ceding it here was the measured false clear."""
+    schema = Schema(
+        tables=(_grp_tbl(),),
+        views=(_rv_view("v", "tbl_owner", (("public", "t"),)),),
+        role_memberships=_grp_edge(inherit),
+    )
+    assert _rv(schema)[("public.t", "public.v")][0] == expected
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "leak"), (False, "isolated")])
+def test_reachability_noinherit_floor_does_not_narrow_the_direct_read(
+    inherit: bool, expected: str
+) -> None:
+    """The floor side of the same rule. A restrictive `TO grp USING (false)`
+    binds an INHERIT member (direct read empty → the view is a door) but not a
+    NOINHERIT one, which reads every row directly under the `TO PUBLIC`
+    policy — so the view adds nothing and is ceded to `--mode anon`."""
+    schema = Schema(
+        tables=(_grp_tbl(floor="false", perm_roles=("PUBLIC",)),),
+        views=(_rv_view("v", "tbl_owner", (("public", "t"),)),),
+        role_memberships=_grp_edge(inherit),
+    )
+    assert _rv(schema)[("public.t", "public.v")][0] == expected
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "isolated"), (False, "leak")])
+def test_escalation_noinherit_policy_does_not_cede_the_function(
+    inherit: bool, expected: str
+) -> None:
+    schema = Schema(
+        tables=(_grp_tbl(),),
+        security_definer_functions=(_secdef("SELECT * FROM t"),),
+        role_memberships=_grp_edge(inherit),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == expected
+
+
+@requires_docker
+@requires_z3
+def test_policy_applicability_noinherit_matches_live_anon_session(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    """Every verdict grounded in what a live anonymous session reads. The anon
+    role is a NOINHERIT member of `noinh_grp` — through the role attribute, so
+    the test runs on PG15 too, which has no per-grant INHERIT option — and so
+    the `USING (true)` policy on `noinh_grp` never applies to it: the direct
+    read is empty, while a definer view and a SECURITY DEFINER function over
+    the table both return every row. Roles are cluster-wide; every one this
+    test creates, it drops."""
+    anon = {"noinh_anon"}
+    with pg_conn.cursor() as cur:
+        cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
+        cur.execute(
+            "CREATE ROLE noinh_anon NOLOGIN NOINHERIT;"
+            "CREATE ROLE noinh_grp NOLOGIN;"
+            "CREATE ROLE noinh_owner NOLOGIN;"
+            "GRANT noinh_grp TO noinh_anon;"
+        )
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE t (id int, tenant_id text);"
+                "INSERT INTO t VALUES (1, 'a'), (2, 'b');"
+                "ALTER TABLE t OWNER TO noinh_owner;"
+                "ALTER TABLE t ENABLE ROW LEVEL SECURITY;"
+                "CREATE POLICY p ON t FOR SELECT TO noinh_grp USING (true);"
+                "GRANT SELECT ON t TO noinh_anon;"
+                "CREATE VIEW v AS SELECT * FROM t;"
+                "ALTER VIEW v OWNER TO noinh_owner;"
+                "GRANT SELECT ON v TO noinh_anon;"
+                "CREATE FUNCTION f() RETURNS SETOF t LANGUAGE sql SECURITY DEFINER "
+                "  SET search_path = pg_catalog, pg_temp AS 'SELECT * FROM public.t';"
+                "ALTER FUNCTION f() OWNER TO noinh_owner;"
+            )
+        observed = {}
+        for label, query in (
+            ("direct", "SELECT count(*) FROM t"),
+            ("view", "SELECT count(*) FROM v"),
+            ("function", "SELECT count(*) FROM f()"),
+        ):
+            with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
+                cur.execute("SET LOCAL ROLE noinh_anon;")
+                cur.execute(query)
+                observed[label] = cur.fetchone()[0]
+                conn.rollback()
+        # The premise, measured: nothing directly, everything through each door.
+        assert observed == {"direct": 0, "view": 2, "function": 2}, observed
+
+        schema = introspect(pg_conn, schemas=["public"])
+        v_anon = build_verification(schema, mode="anon", anon_roles=anon)
+        assert _verdict(v_anon, "public.t") == "isolated"
+        reach = build_verification(schema, mode="reachability", anon_roles=anon)
+        assert [t.verdict for t in reach.tables] == ["leak"]
+        [esc] = build_verification(schema, mode="escalation", anon_roles=anon).tables
+        assert (esc.qualified_name, esc.verdict) == ("public.f", "leak")
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP FUNCTION IF EXISTS f(); DROP VIEW IF EXISTS v; DROP TABLE IF EXISTS t;")
+            cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
+
+
+# --- escalation: bodies whose effect a trace cannot bound ----------------------
+
+
+@requires_z3
+@pytest.mark.parametrize("body", [
+    # Setting the claims or a tenant id changes what the policies of the read
+    # that follows admit (measured: another user's row came back).
+    "SET LOCAL request.jwt.claims = '{}'; SELECT * FROM secret",
+    "SELECT set_config('request.jwt.claims', '{}', true); SELECT * FROM secret",
+    "SELECT pg_catalog.set_config('app.tenant', 'b', true); SELECT * FROM secret",
+    # Built-ins and operators that run code named elsewhere.
+    "SELECT pg_catalog.ts_rewrite('a'::pg_catalog.tsquery, 'SELECT 1') FROM secret",
+    "SELECT 1 OPERATOR(public.===) 2 FROM secret",
+    "SELECT 1 OPERATOR(public.===) ANY (SELECT 1) FROM secret",
+    "SELECT 1 OPERATOR(public.===) ALL (SELECT 1) FROM secret",
+    "SELECT id FROM secret ORDER BY id USING OPERATOR(public.<<<)",
+    # Statements that are not a query or DML.
+    "DO $x$ BEGIN PERFORM 1; END $x$; SELECT * FROM secret",
+])
+def test_escalation_body_it_cannot_judge_is_not_ceded(body: str) -> None:
+    """The read table already leaks every row to anon, so a traceable body
+    exposes nothing new and is ceded (ISOLATED) — but not one whose effect
+    the trace cannot bound."""
+    ceded = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    assert [t.verdict for t in build_verification(ceded, mode="escalation").tables] == [
+        "isolated"
+    ]
+    schema = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        security_definer_functions=(_secdef(body),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", (body, t)
+
+
+@requires_z3
+@pytest.mark.parametrize("body", [
+    "SELECT set_config('request.jwt.claims', '{}', true); SELECT * FROM secret",
+    "SET LOCAL app.tenant = 'b'; SELECT * FROM secret",
+])
+def test_escalation_considers_an_ordinary_owner_that_sets_a_parameter(body: str) -> None:
+    """An owner that is neither RLS-exempt nor granted rows under the anonymous
+    context used to be no candidate at all — "no reachable escalation paths"
+    — while the body, choosing the claims, read another user's rows."""
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef(body, bypass=False),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", t
+
+
+@requires_z3
+def test_escalation_names_a_function_set_clause_as_the_reason() -> None:
+    """`ALTER FUNCTION … SET app.tenant = 'b'` makes the body run under a value
+    it chose, though the body itself is a plain traced read."""
+    from dataclasses import replace
+
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(
+            replace(_secdef("SELECT * FROM secret", bypass=False), config_gucs=("app.tenant",)),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", t
+    assert "its own SET clause sets app.tenant" in t.note, t.note
+
+
+@requires_z3
+@pytest.mark.parametrize(("body", "lang"), [
+    # Measured on PG15/16/17, each owned by a plain role: all three were
+    # cleared as "no escalation path" while the body chose the claims.
+    ("BEGIN PERFORM set_config('request.jwt.claims', '{}', true); "
+     "RETURN (SELECT count(*) FROM secret); END", "plpgsql"),
+    ("SELECT public.set_uid('x'); SELECT count(*) FROM secret", "sql"),
+    ("CALL public.set_uid_proc('x'); SELECT count(*) FROM secret", "sql"),
+    ("SELECT * FROM public.some_view", "sql"),
+])
+def test_escalation_considers_a_body_it_cannot_see_whoever_owns_it(body: str, lang: str) -> None:
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef(body, bypass=False, lang=lang),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified", t
+
+
+@requires_z3
+def test_escalation_still_passes_over_a_plain_body_of_an_ordinary_owner() -> None:
+    """Nothing unseen, no exemption, no rows granted to the owner: no finding."""
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef("SELECT * FROM secret", bypass=False),),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+@pytest.mark.parametrize(("body", "gucs"), [
+    ("SELECT * FROM secret", ("statement_timeout",)),
+    ("SELECT * FROM secret", ("work_mem", "enable_seqscan")),
+    ("SET LOCAL statement_timeout = '5s'; SELECT * FROM secret", ()),
+    ("SELECT set_config('lock_timeout', '1s', true); SELECT * FROM secret", ()),
+])
+def test_escalation_ignores_settings_that_cannot_change_rows(
+    body: str, gucs: tuple[str, ...],
+) -> None:
+    """Measured: `SET statement_timeout = '5s'` on a plain-owner function made
+    it UNVERIFIED, though a timeout cannot change what a policy admits."""
+    from dataclasses import replace
+
+    fn = replace(_secdef(body, bypass=False), config_gucs=gucs)
+    schema = Schema(tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+                    security_definer_functions=(fn,))
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+@pytest.mark.parametrize(("trigger", "finding"), [(True, False), (None, True), (False, True)])
+def test_escalation_does_not_call_a_trigger_function(
+    trigger: bool | None, finding: bool,
+) -> None:
+    """Measured: calling a trigger function fails ("trigger functions can only
+    be called as triggers"), so EXECUTE on one opens nothing. An older
+    snapshot that did not capture the flag is still analysed."""
+    from dataclasses import replace
+
+    fn = replace(_secdef("BEGIN RETURN NEW; END", lang="plpgsql"), trigger=trigger)
+    schema = Schema(tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+                    security_definer_functions=(fn,))
+    assert bool(build_verification(schema, mode="escalation").tables) is finding
+
+
+@requires_z3
+def test_escalation_does_not_read_uncaptured_set_clauses_as_none() -> None:
+    from dataclasses import replace
+
+    fn = replace(_secdef("SELECT * FROM secret", bypass=False), config_gucs=None)
+    schema = Schema(tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+                    security_definer_functions=(fn,))
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "unverified"
+    assert "SET clauses were not captured" in t.note, t.note
+
+
+@requires_z3
+def test_escalation_reads_a_begin_atomic_body_that_ends_in_return() -> None:
+    """Measured on PG16: `BEGIN ATOMIC … RETURN (SELECT …); END` was called an
+    opaque body though every statement in it is plain SQL."""
+    body = "BEGIN ATOMIC\n SELECT 1;\n RETURN ( SELECT count(*) AS count FROM public.secret);\nEND"
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        security_definer_functions=(_secdef(body),),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == "leak", t

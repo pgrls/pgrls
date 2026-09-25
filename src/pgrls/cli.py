@@ -74,7 +74,7 @@ from pgrls.history import (
 from pgrls.history import render as render_history
 from pgrls.introspect import introspect
 from pgrls.model import Schema
-from pgrls.matrix import MATRIX_FORMATS, build_matrix
+from pgrls.matrix import MATRIX_FORMATS, build_matrix, introspect_for_matrix
 from pgrls.matrix import render as render_matrix
 from pgrls.verify import (
     DEFAULT_AUTH_FUNCTIONS,
@@ -4126,8 +4126,8 @@ def report(
     default=None,
     help=(
         "Comma-separated roles to show as columns (overrides auto-discovery). "
-        "Default: PUBLIC, anon, authenticated plus every non-system role named "
-        "by a grant or policy, or carrying BYPASSRLS."
+        "Default: PUBLIC, anon and authenticated when they exist, and every "
+        "role whose reach differs from PUBLIC's."
     ),
 )
 @click.option(
@@ -4135,7 +4135,7 @@ def report(
     "include_system",
     is_flag=True,
     default=False,
-    help="Also show pg_* system roles (hidden by default).",
+    help="Also consider pg_* system roles (left out by default).",
 )
 @output_format_options(
     list(MATRIX_FORMATS),
@@ -4152,17 +4152,33 @@ def matrix(
 ) -> None:
     """Show who can access what — a role x table x command access matrix.
 
-    The audit companion to `pgrls report`: instead of each table's posture,
-    it collapses table GRANTs, the RLS enabled/forced flags, and the
-    permissive(OR) / restrictive(AND) policy set into one verdict per cell —
-    `OPEN` (every row reachable), `DENIED` (no privilege, or RLS on with no
-    applicable permissive policy), or `COND` (gated by a row predicate, shown
-    in `--format json`/`html`). Per command it uses the clause Postgres
-    applies: `WITH CHECK` for INSERT, `USING` for SELECT/UPDATE/DELETE.
-    Reads a live database and runs NO lint rules. `--roles a,b` overrides the
-    columns; `--include-system-roles` adds `pg_*`. Note: a table *owner*
-    bypasses RLS unless the table is `FORCE`d, and a superuser bypasses
-    everything — neither is modeled per-cell.
+    The audit companion to `pgrls report`: for SELECT, INSERT, UPDATE, DELETE
+    and TRUNCATE, one verdict per role and table — `OPEN` (every row), `COND`
+    (some rows; the predicate is in `--format json`/`html`), `DENIED` (none on
+    any path modelled), or `UNDECIDED` (cannot be bounded — treat it as
+    possibly reachable). Reads a live database and runs NO lint rules.
+    `--roles a,b` fixes the columns; by default they are PUBLIC, anon /
+    authenticated when they exist, and every role whose reach differs from
+    PUBLIC's.
+
+    Grants and policies reach a role through its INHERIT memberships; an
+    owner (or a role inheriting it) reads every row unless the table is
+    `FORCE`d; superusers and BYPASSRLS roles skip RLS; TRUNCATE ignores it.
+    Doors count for every command they run: definer views (writes when
+    auto-updatable), SECURITY DEFINER functions (per statement of their
+    body), SECURITY DEFINER triggers (fired by writing their table), rewrite
+    rules, partitioned or inheritance parents, and foreign-key actions
+    (UNDECIDED). Doors are found in every schema; the rows are the
+    `--schemas` tables. A door whose SQL cannot be traced is listed
+    separately with who can open it — a `DENIED` cell does not rule it out.
+    Sensitive-looking columns (SEC045's patterns) are listed in their own
+    section.
+
+    Each column is a session running as that role: `SET ROLE` and DDL are
+    not modelled, nor are ordinary triggers fired by a door's write. UPDATE
+    shows the rows `USING` lets it touch, not its `WITH CHECK`; a door is
+    credited with its owner's reach, not with a view's own WHERE or what a
+    function returns (an over-report).
     """
     # Validate --roles before connecting so a malformed flag fails fast
     # (no database round-trip needed to reject it).
@@ -4174,15 +4190,54 @@ def matrix(
         if not roles:
             raise ToolError("--roles listed no role names.")
 
-    _, schema = _connect_and_introspect(
+    effective = _load_effective_config(
         config_path=config_path,
         database_url=database_url,
         schemas_csv=schemas,
     )
+    # Validate the config before connecting, like --roles above.
+    try:
+        from pgrls.rules.sec045 import _parse_patterns  # noqa: PLC0415
 
-    built = build_matrix(schema, roles=roles, include_system=include_system)
+        patterns = _parse_patterns(effective.rule_options.get("SEC045", {}))
+    except TypeError as exc:
+        raise click.UsageError(str(exc)) from exc
+    assert effective.database_url is not None  # guaranteed above
+    try:
+        with psycopg.connect(effective.database_url) as conn:
+            schema, grid = introspect_for_matrix(conn, effective.schemas)
+    except psycopg.Error as exc:
+        raise ToolError(f"Database error: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if roles is not None and schema.roles is not None:
+        # A mistyped name would otherwise be a column of DENIED cells.
+        known = sorted(r.name for r in schema.roles)
+        missing = [r for r in roles if r != "PUBLIC" and r not in set(known)]
+        if missing:
+            raise ToolError(_missing_role_message(missing, known))
+
+    built = build_matrix(
+        schema, roles=roles, include_system=include_system, grid=grid,
+        sensitive_patterns=patterns,
+    )
     rendered = render_matrix(built, output_format)
     _emit(rendered, output_path)
+
+
+def _missing_role_message(missing: list[str], available: list[str]) -> str:
+    """The error for `--roles` names the database does not have, with a "Did
+    you mean" for each close match (difflib cutoff 0.7, as for --schemas)."""
+    import difflib  # noqa: PLC0415
+
+    parts = [f"Roles not found in the database: {', '.join(missing)}."]
+    candidates = [*available, "PUBLIC"]
+    for name in missing:
+        suggestion = [c for c in candidates if c.lower() == name.lower()] or \
+            difflib.get_close_matches(name, candidates, n=1, cutoff=0.7)
+        if suggestion:
+            parts.append(f"Did you mean {suggestion[0]!r}?")
+    return " ".join(parts)
 
 
 def _verify_anon_roles(mode: str, rule_options: dict[str, Any]) -> set[str] | None:

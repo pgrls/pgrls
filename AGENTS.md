@@ -291,6 +291,43 @@ as an audit artefact, printing to PDF, or emailing to a reviewer
 who doesn't run pgrls. A snapshot for audits and onboarding; it
 runs no rules and emits no findings.
 
+`pgrls matrix` answers the audit question directly — **for every role ×
+table × command (SELECT, INSERT, UPDATE, DELETE, TRUNCATE), which rows can it
+reach?** — as `OPEN` / `COND` (with the predicate) / `DENIED` / `UNDECIDED`.
+Grants and policies reach a role through its INHERIT memberships (a
+NOINHERIT member holds none of the group's grants and is bound by none of
+its policies); an owner, or a role inheriting it, reads every row unless the
+table is `FORCE`d; TRUNCATE ignores RLS. Every cell also counts doors, for
+the command they run: definer views (writes when auto-updatable), SECURITY
+DEFINER functions (per statement of an SQL or PL/pgSQL body), SECURITY
+DEFINER triggers (fired by writing their table, directly or through a door —
+never through EXECUTE), rewrite rules (run with the relation owner's
+privileges), partitioned / inheritance parents, and foreign-key CASCADE /
+SET NULL / SET DEFAULT actions (UNDECIDED: which rows depends on the data).
+Doors are found in every schema. A door whose SQL it cannot trace (dynamic
+SQL, another language, a call into an unseen function or operator, a
+SQL-running built-in, `DO` / `CALL` / a change of search_path or role) is
+listed separately with who can open it — a `DENIED` cell does not rule it
+out; a body that sets another parameter makes its filtered doors UNDECIDED
+(a timeout or planner setting excepted), and so does the same filter reached
+two ways when it reads `current_user` or another table.
+A separate section lists sensitive-looking columns (SEC045's patterns, plus
+configured ones) each role can read, and how. `UNDECIDED` means the rows
+cannot be bounded — treat it as "possibly reachable", never as denied.
+Default columns: PUBLIC, anon / authenticated when they exist, and every
+role whose reach differs from PUBLIC's (a cell, a sensitive column, or an
+untraced door). Suggest it when a user asks who can see or change a table,
+or who can read a sensitive-looking column; it runs no rules. Its limits,
+documented in the README: each column is a session running as that role
+(`SET ROLE`, DDL, granting itself a role, and SEC015-style search-path
+shadowing are not modelled); schema USAGE, a view's own WHERE and what a
+function returns are not traced (over-reports); an ordinary trigger fired by
+a door's write, a view's INSTEAD OF trigger, event triggers, casts or
+built-in-looking operators backed by user functions, and access outside SQL
+privileges (REPLICATION, the server-file roles, foreign-table user mappings)
+are not modelled (these can under-report); UPDATE shows `USING`, not `WITH
+CHECK`; `1 = 1`-style tautologies show as `COND`.
+
 `pgrls history <dir>` (v0.6.10+) reads a directory of JSON files
 written by `pgrls lint --format json` and emits a chronological
 trend: per-snapshot severity totals plus the **NEW / FIXED** delta

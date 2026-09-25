@@ -2,7 +2,14 @@
 
 Snapshot format is versioned via a single int (`SNAPSHOT_VERSION`); bump
 on any change that adds, removes, or restructures an emitted field.
-Currently version 26. v26 added ``View.direct_references`` /
+Currently version 27. v27 added top-level ``roles`` — the ``pg_roles``
+catalogue, the principal axis of ``pgrls matrix`` (absent → ``None``, "not
+captured", never "no roles exist") — and ``rules`` (INSERT / UPDATE /
+DELETE rewrite rules), plus ``View.updatable`` (the writes a view accepts on
+its own), ``SecdefFunction.definition`` (a PL/pgSQL function's full CREATE
+FUNCTION), ``.trigger`` and ``.config_gucs``, ``Trigger.row``, and
+``ForeignKey.on_delete`` / ``on_update``; an absent optional key decodes as
+``None`` ("not captured"). v26 added ``View.direct_references`` /
 ``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,
 top-level ``set_gucs`` / ``role_set_gucs``, and serialized
 ``role_memberships`` (each edge with its ``inherit`` flag); v25 added ``View.owner`` / ``owner_bypasses_rls``
@@ -46,6 +53,8 @@ __all__ = [
     "OwnerReachableMember",
     "Policy",
     "PolicyCommand",
+    "RewriteRule",
+    "Role",
     "SNAPSHOT_VERSION",
     "policy_id",
     "Schema",
@@ -85,7 +94,7 @@ def maybe_set_value(value: str) -> str:
     `MAYBE_SET` entry — what `--emit-repro` offers as the edit to make."""
     return value[len(MAYBE_SET):]
 
-SNAPSHOT_VERSION = 26  # v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
+SNAPSHOT_VERSION = 27  # v27: Schema.roles (the pg_roles catalogue, for `pgrls matrix`) / rules, View.updatable, SecdefFunction.definition (PL/pgSQL) / trigger / config_gucs, Trigger.row, ForeignKey.on_delete / on_update; v26: View.direct_references/column_grants, Schema.set_gucs/role_set_gucs, serialized role_memberships (+inherit), SecdefFunction.owner; v25: View.owner/owner_bypasses_rls
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -414,6 +423,20 @@ class View:
     # (measured: permission denied without the grant). The reachability walk
     # uses this to require the grant.
     owner_is_superuser: bool = False
+    # v27+: the write commands the view accepts without a trigger —
+    # `pg_relation_is_updatable(oid, false)`: auto-updatable, OR handled by an
+    # unconditional INSTEAD rule (measured: a rule-only view reports INSERT);
+    # INSTEAD OF triggers are left out. `pgrls matrix` sets rule-handled
+    # commands aside and follows the rule (`Schema.rules`). A command whose
+    # only INSTEAD rules are conditional is still listed, yet Postgres refuses
+    # every such write ("Views with conditional DO INSTEAD rules are not
+    # automatically updatable"; measured: nothing written either side of the
+    # condition) — so following the rule over-reports it. A write through a
+    # `security_invoker = false` view reaches the base table with the view
+    # OWNER's privileges and RLS (measured: 0 rows directly, every row through
+    # the view). `None` = not captured (an older snapshot, a hand-built view):
+    # whether it is writable is unknown, never assumed to be "no".
+    updatable: tuple[str, ...] | None = None
 
     @property
     def qualified_name(self) -> str:
@@ -538,6 +561,10 @@ class Trigger:
     event: str
     timing: str
     enabled: bool
+    # v27+: FOR EACH ROW (`tgtype` bit 0). A row trigger fires only for rows
+    # the statement actually touches; a statement trigger fires regardless.
+    # `None` = not captured (older snapshots).
+    row: bool | None = None
 
     @property
     def function_qualified_name(self) -> str:
@@ -746,6 +773,23 @@ class SecdefFunction:
     # function as an RLS bypass. v4-v15 snapshots load with ``False`` →
     # SEC042 abstains (fail-closed).
     owner_bypasses_rls: bool = False
+    # v27+: `pg_get_functiondef` for a PL/pgSQL function — the complete
+    # CREATE FUNCTION, which `pglast.parse_plpgsql` needs (argument names and
+    # the return type decide how the body parses). `pgrls matrix` reads the
+    # static SQL out of it to see which tables the function touches. `None`
+    # for other languages and on older snapshots.
+    definition: str | None = None
+    # v27+: returns `trigger` or `event_trigger`. Such a function cannot be
+    # called — `trigger functions can only be called as triggers` — so it is
+    # a door only through the triggers that run it, never through EXECUTE.
+    # None = not captured (an older snapshot): it may be either.
+    trigger: bool | None = False
+    # v27+: parameters the function's own `SET` clauses change, other than
+    # search_path (`pg_proc.proconfig`). A body that runs under a setting it
+    # chose — a tenant id, the JWT claims — is not filtered the way the
+    # caller's session would be. None = not captured (an older snapshot),
+    # which `verify` and `pgrls matrix` treat as possibly setting one.
+    config_gucs: tuple[str, ...] | None = ()
 
 
 @dataclass(frozen=True)
@@ -838,22 +882,75 @@ class BypassRlsEscalation:
 
 
 @dataclass(frozen=True)
-class RoleMembership:
-    """A single ``pg_auth_members`` edge: ``member`` has the privileges of
-    ``role`` (i.e. ``GRANT role TO member``).
+class Role:
+    """One row of ``pg_roles`` — a principal ``pgrls matrix`` reports on.
 
-    Postgres applies a policy ``TO R`` to a session iff the session's role is
-    ``R`` or a transitive member of ``R`` — so ``verify --mode anon`` walks the
-    upward closure of the configured anon role(s) over these edges to decide
-    which policies an *anonymous* session can actually invoke. A `TO
+    The model otherwise only knows roles that happen to appear somewhere: a
+    grantee, a table owner, a policy's ``TO`` list, a membership endpoint, or
+    a BYPASSRLS/superuser role. A plain login role with no grants and no
+    memberships was invisible — and an access map's primary axis should be
+    the authoritative role list, not one inferred from scattered names.
+
+    Read from ``pg_roles`` (world-readable), NOT ``pg_authid``: an
+    unprivileged introspector gets ``permission denied for table pg_authid``.
+    Includes the predefined ``pg_*`` roles — ``pg_read_all_data`` confers
+    SELECT on everything with no grant of its own, so it is a real principal.
+    """
+
+    name: str
+    can_login: bool
+    superuser: bool
+    bypassrls: bool
+
+
+@dataclass(frozen=True)
+class RewriteRule:
+    """A rewrite rule for INSERT / UPDATE / DELETE on a table or view
+    (snapshot v27+).
+
+    A rule's actions run with the privileges of the relation's OWNER, so
+    writing the relation reaches whatever the actions touch — measured:
+    `ON INSERT TO requests DO ALSO DELETE FROM archive` emptied a FORCE'd
+    table the inserting role could not touch. `definition` is
+    `pg_get_ruledef`, deparsed with every relation schema-qualified, which
+    `pgrls matrix` parses to see what the actions touch. An INSTEAD rule
+    replaces the command, so a view's own auto-update does not run for it.
+    """
+
+    schema: str
+    relation: str
+    name: str
+    command: str  # INSERT / UPDATE / DELETE
+    instead: bool
+    definition: str
+
+    @property
+    def qualified_relation(self) -> str:
+        return f"{self.schema}.{self.relation}"
+
+
+@dataclass(frozen=True)
+class RoleMembership:
+    """A single membership edge: ``member`` is a member of ``role``
+    (``GRANT role TO member``) — a ``pg_auth_members`` row, or the database
+    owner's implicit membership in ``pg_database_owner``, which has none. It
+    holds ``role``'s privileges — and is bound by its policies — only when
+    ``inherit`` is set.
+
+    Postgres applies a policy ``TO R`` to a session iff the session's role
+    holds ``R``'s privileges — ``R`` itself or a transitive member through
+    INHERIT edges (``has_privs_of_role``) — so ``verify --mode anon`` walks the
+    upward closure of the configured anon role(s) over the inheriting edges to
+    decide which policies an *anonymous* session can actually invoke. A `TO
     authenticated` policy is NOT anon-reachable in the default Supabase layout
     (anon and authenticated are siblings, not members of each other); a `GRANT
     custom_role TO anon` makes a `TO custom_role` policy anon-reachable, which
     the flat `{anon, PUBLIC}` name-match would miss.
 
-    Live-only: this is captured by live introspection but NOT serialized into a
-    snapshot. `Schema.role_memberships is None` therefore means "role graph not
-    captured" (an offline `--sql-file`/`--migrations` snapshot, a `--against`
+    Captured by live introspection and, since snapshot v26, serialized into
+    the snapshot too (a pre-v26 file has no key and loads as None).
+    `Schema.role_memberships is None` therefore means "role graph not
+    captured" (an offline `--sql-file`/`--migrations` source, a pre-v26
     snapshot, or a hand-built Schema) — in which case anon reachability of a
     non-``{anon, PUBLIC}`` role can't be decided and `verify --mode anon`
     abstains (UNVERIFIED) rather than risk a false ``isolated``. An empty tuple
@@ -866,8 +963,9 @@ class RoleMembership:
     # is `has_privs_of_role`, which honours it: a NOINHERIT member of the
     # table owner is NOT owner-equivalent (measured: permission denied), so
     # the reachability exemption follows only inheriting edges. Policy
-    # reachability keeps the over-approximating full closure (the sound
-    # direction there). Defaults True for a pre-v26 payload.
+    # applicability follows them too (measured: a NOINHERIT member is bound
+    # by neither a permissive nor a restrictive `TO group` policy). Defaults
+    # True for a pre-v26 payload.
     inherit: bool = True
 
 
@@ -1124,6 +1222,13 @@ class ForeignKey:
     ref_schema: str
     ref_table: str
     ref_columns: tuple[str, ...]
+    # v27+: the referential actions — "NO ACTION", "RESTRICT", "CASCADE",
+    # "SET NULL" or "SET DEFAULT". A CASCADE / SET NULL / SET DEFAULT action
+    # rewrites THIS table's rows as its owner with RLS off (measured: a
+    # DELETE on the parent emptied a FORCE'd child the role could not
+    # touch). `None` = not captured.
+    on_delete: str | None = None
+    on_update: str | None = None
 
 
 # --- Snapshot decoders -------------------------------------------------
@@ -1282,6 +1387,7 @@ def _trigger_from_dict(tr: dict[str, Any]) -> Trigger:
         event=tr["event"],
         timing=tr["timing"],
         enabled=tr["enabled"],
+        row=tr.get("row"),  # v27+
     )
 
 
@@ -1309,6 +1415,8 @@ def _foreign_key_from_dict(fk: dict[str, Any]) -> ForeignKey:
         ref_schema=fk["ref_schema"],
         ref_table=fk["ref_table"],
         ref_columns=tuple(fk["ref_columns"]),
+        on_delete=fk.get("on_delete"),  # v27+
+        on_update=fk.get("on_update"),
     )
 
 
@@ -1396,6 +1504,10 @@ def _view_from_dict(v: dict[str, Any]) -> View:
             _column_grant_from_dict(cg) for cg in v.get("column_grants", [])
         ),
         owner_is_superuser=bool(v.get("owner_is_superuser", False)),
+        # v27+; absent → None ("not captured"), never "not writable".
+        updatable=(
+            tuple(v["updatable"]) if v.get("updatable") is not None else None
+        ),
     )
 
 
@@ -1491,6 +1603,13 @@ def _secdef_from_dict(f: dict[str, Any]) -> SecdefFunction:
         execute_roles=tuple(f.get("execute_roles", [])),
         owner_bypasses_rls=bool(f.get("owner_bypasses_rls", False)),
         owner=f.get("owner", ""),
+        definition=f.get("definition"),  # v27+, PL/pgSQL only
+        # v27+; absent → None ("not captured"), never "not a trigger" or
+        # "no SET clause".
+        trigger=f.get("trigger"),
+        config_gucs=(
+            tuple(f["config_gucs"]) if f.get("config_gucs") is not None else None
+        ),
     )
 
 
@@ -1665,17 +1784,27 @@ class Schema:
     # v3-v23 baselines round-tripping with `foreign_tables=()` (fail-closed —
     # SEC053 finds nothing until re-captured against a live database).
     foreign_tables: tuple[ForeignTable, ...] = ()
-    # `pg_auth_members` edges (member → group), captured by LIVE introspection
-    # only — NOT serialized. `verify --mode anon` walks the upward closure of
-    # the configured anon role(s) over these to decide policy reachability. The
-    # tri-state `| None` is load-bearing: `None` = "role graph not captured"
-    # (offline snapshot / `--against` / hand-built Schema) → verify abstains
+    # `pg_auth_members` edges (member → group), captured by live introspection
+    # and serialized since snapshot v26. `verify --mode anon` walks the upward
+    # INHERIT closure of the configured anon role(s) over these to decide policy
+    # reachability. The tri-state `| None` is load-bearing: `None` = "role graph
+    # not captured" (an offline `--sql-file` source, a pre-v26 snapshot, a
+    # hand-built Schema) → verify abstains
     # (UNVERIFIED) on a policy whose roles are outside `{anon, PUBLIC}` rather
     # than risk a false `isolated`; `()` = "captured, anon is a member of
     # nothing extra" → a `TO authenticated` policy is provably not anon-reachable
     # → `isolated`. Default `None` keeps `Schema(...)` construction (unit tests)
     # and every snapshot decoding without it (all versions) fail-closed.
     role_memberships: tuple[RoleMembership, ...] | None = None
+    # v27+: every role in `pg_roles`. `None` = "not captured" (a pre-v27
+    # snapshot, an offline `--sql-file` source, a hand-built Schema) and must
+    # never be read as "no roles exist" — `pgrls matrix` would then report
+    # that nobody can read anything. On `None` it derives the principal set
+    # from grantees / owners / policy targets / membership endpoints instead.
+    roles: tuple[Role, ...] | None = None
+    # v27+: the INSERT / UPDATE / DELETE rewrite rules on tables and views.
+    # `None` = not captured (older snapshots, offline sources).
+    rules: tuple[RewriteRule, ...] | None = None
     # v26+: custom (dotted) GUCs set at database / server level, as
     # `(name, value)` — what every session, an anonymous one included,
     # inherits without running `SET` (role-level ones live in
@@ -1864,6 +1993,7 @@ class Schema:
                             "event": tr.event,
                             "timing": tr.timing,
                             "enabled": tr.enabled,
+                            **({"row": tr.row} if tr.row is not None else {}),
                         }
                         for tr in t.triggers
                     ],
@@ -1926,6 +2056,16 @@ class Schema:
                                     "ref_schema": fk.ref_schema,
                                     "ref_table": fk.ref_table,
                                     "ref_columns": list(fk.ref_columns),
+                                    **(
+                                        {"on_delete": fk.on_delete}
+                                        if fk.on_delete is not None
+                                        else {}
+                                    ),
+                                    **(
+                                        {"on_update": fk.on_update}
+                                        if fk.on_update is not None
+                                        else {}
+                                    ),
                                 }
                                 for fk in t.foreign_keys
                             ]
@@ -1984,6 +2124,12 @@ class Schema:
                         for cg in v.column_grants
                     ],
                     "owner_is_superuser": v.owner_is_superuser,
+                    # v27 — only when captured; absent = unknown.
+                    **(
+                        {"updatable": list(v.updatable)}
+                        if v.updatable is not None
+                        else {}
+                    ),
                 }
                 for v in self.views
             ],
@@ -2006,6 +2152,20 @@ class Schema:
                     "execute_roles": list(f.execute_roles),
                     "owner_bypasses_rls": f.owner_bypasses_rls,
                     "owner": f.owner,
+                    # v27 — PL/pgSQL only; absent for other languages.
+                    **(
+                        {"definition": f.definition}
+                        if f.definition is not None
+                        else {}
+                    ),
+                    # v27 — always when captured, so absence means "not
+                    # captured" rather than "no".
+                    **({"trigger": f.trigger} if f.trigger is not None else {}),
+                    **(
+                        {"config_gucs": list(f.config_gucs)}
+                        if f.config_gucs is not None
+                        else {}
+                    ),
                 }
                 for f in self.security_definer_functions
             ],
@@ -2118,6 +2278,42 @@ class Schema:
                     ]
                 }
                 if self.role_memberships is not None
+                else {}
+            ),
+            # v27+: the role catalogue. Emitted only when captured, for the
+            # same reason as role_memberships: `from_snapshot` maps absence
+            # back to None ("not captured"), never to "no roles exist".
+            **(
+                {
+                    "roles": [
+                        {
+                            "name": r.name,
+                            "can_login": r.can_login,
+                            "superuser": r.superuser,
+                            "bypassrls": r.bypassrls,
+                        }
+                        for r in self.roles
+                    ]
+                }
+                if self.roles is not None
+                else {}
+            ),
+            # v27+: rewrite rules, only when captured (absent → None).
+            **(
+                {
+                    "rules": [
+                        {
+                            "schema": r.schema,
+                            "relation": r.relation,
+                            "name": r.name,
+                            "command": r.command,
+                            "instead": r.instead,
+                            "definition": r.definition,
+                        }
+                        for r in self.rules
+                    ]
+                }
+                if self.rules is not None
                 else {}
             ),
             "foreign_tables": [
@@ -2236,13 +2432,13 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24, 25, 26,
+            21, 22, 23, 24, 25, 26, 27,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
                 "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, "
-                "25, 26. "
+                "25, 26, 27. "
                 "v1 / v2 snapshots must be regenerated against the current "
                 "schema."
             )
@@ -2355,6 +2551,36 @@ class Schema:
                         inherit=bool(m.get("inherit", True)),
                     )
                     for m in payload["role_memberships"]
+                )
+            ),
+            # v27+: absent key → None ("catalogue not captured"); present →
+            # the captured roles.
+            roles=(
+                None
+                if payload.get("roles") is None
+                else tuple(
+                    Role(
+                        name=r["name"],
+                        can_login=bool(r.get("can_login", False)),
+                        superuser=bool(r.get("superuser", False)),
+                        bypassrls=bool(r.get("bypassrls", False)),
+                    )
+                    for r in payload["roles"]
+                )
+            ),
+            rules=(
+                None
+                if payload.get("rules") is None
+                else tuple(
+                    RewriteRule(
+                        schema=r["schema"],
+                        relation=r["relation"],
+                        name=r["name"],
+                        command=r["command"],
+                        instead=bool(r["instead"]),
+                        definition=r["definition"],
+                    )
+                    for r in payload["rules"]
                 )
             ),
         )

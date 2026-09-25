@@ -4982,7 +4982,10 @@ CREATE OR REPLACE FUNCTION public.read_users()
 -- for an aggregation/audit purpose) and allowlist the view.
 ```
 
-Tolerance: the rule parses `pg_proc.prosrc` with pglast. Three
+Tolerance: the rule parses the function body with pglast — the
+`pg_proc.prosrc` text, or for a SQL-standard body (`BEGIN ATOMIC` /
+`RETURN`) its stored parse tree, deparsed with every relation
+schema-qualified; a `RETURN expr` body is read as `SELECT expr`. Three
 documented false-negative paths, each handled silently or with a
 stderr warning:
 
