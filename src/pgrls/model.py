@@ -5,9 +5,9 @@ on any change that adds, removes, or restructures an emitted field.
 Currently version 27. v27 added top-level ``roles`` — the ``pg_roles``
 catalogue, the principal axis of ``pgrls matrix`` (absent → ``None``, "not
 captured", never "no roles exist") — and ``rules`` (INSERT / UPDATE /
-DELETE rewrite rules), plus ``View.updatable`` (the writes a view accepts on
-its own), ``SecdefFunction.definition`` (a PL/pgSQL function's full CREATE
-FUNCTION), ``.trigger`` and ``.config_gucs``, ``Trigger.row``, and
+DELETE rewrite rules), plus ``View.updatable`` (the writes a view accepts
+without a trigger), ``SecdefFunction.definition`` (a PL/pgSQL function's full
+CREATE FUNCTION), ``.trigger`` and ``.config_gucs``, ``Trigger.row``, and
 ``ForeignKey.on_delete`` / ``on_update``; an absent optional key decodes as
 ``None`` ("not captured"). v26 added ``View.direct_references`` /
 ``column_grants`` / ``owner_is_superuser``, ``SecdefFunction.owner``,

@@ -17,9 +17,10 @@ cell, from the engine in `pgrls.access`:
 * ``denied``      — no privilege on any path pgrls models, or RLS on with no
   applicable permissive policy (Postgres default-denies).
 * ``undecided``   — the rows cannot be bounded: a materialized view over the
-  table, a foreign-key action, two different filtered paths whose union is
-  unknown, or — for a schema built without a role-membership graph —
-  memberships that were not captured. Treat it as possibly reachable.
+  table, a foreign-key action, a door whose body sets a parameter, two
+  different filtered paths whose union is unknown, or — for a schema built
+  without a role-membership graph — memberships that were not captured. Treat
+  it as possibly reachable.
 
 Doors widen a cell for the command they run: definer views (writes when
 auto-updatable), SECURITY DEFINER functions (per statement of an SQL or

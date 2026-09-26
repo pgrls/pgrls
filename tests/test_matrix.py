@@ -2086,7 +2086,9 @@ def test_the_same_session_free_filter_through_a_function_stays_conditional() -> 
     ("tenant_id = current_setting('app.tenant', true)", False, False),
     ("tenant_id = auth.uid()", False, False),
     ("tenant_id = (SELECT auth.uid())", False, False),
-    ("tenant_id IN (SELECT tenant_id FROM memberships)", False, True),
+    # Reading a relation implies session dependence: the relation's own RLS
+    # may compare against current_user.
+    ("tenant_id IN (SELECT tenant_id FROM memberships)", True, True),
     ("EXISTS (SELECT 1 FROM m WHERE m.member = current_user)", True, True),
     ("((((", True, True),
 ])
@@ -2966,3 +2968,52 @@ def test_matrix_cli_rejects_a_role_the_database_does_not_have(
     assert result.exit_code == 2, result.output
     assert "Roles not found in the database: pgrls_rev4_x." in result.output
     assert "Did you mean 'pgrls_rev4_r'?" in result.output
+
+
+# --- iteration 5: relation-reading filters, cascade from partitions, depth ---
+
+
+def test_a_relation_reading_filter_differs_between_a_view_and_a_function_door() -> None:
+    """r reaches t ONLY through the doors — a definer view (`current_user` is
+    the caller) and a SECURITY DEFINER function (`current_user` is the owner).
+    The `IN (SELECT … FROM memberships)` sub-select reads a different set for
+    each, so their union is UNDECIDED, not one COND (measured in iteration 5's
+    review: the view returned the caller's row, the function the owner's)."""
+    memb = _t("memberships", owner="o",
+              policies=(_policy(roles=("PUBLIC",), using="member = current_user"),),
+              grants=(_grant("o", ("SELECT",)),))
+    t = _t(policies=(_policy(roles=("PUBLIC",),
+            using="tenant_id IN (SELECT tenant_id FROM public.memberships)"),),
+           grants=(_grant("o", ("SELECT",)),))  # NOT granted to r
+    v = _v("v", _OWN_T, owner="o", grants=(_grant("r", ("SELECT",)),))
+    f = _f("SELECT * FROM public.t", owner="o", execute=("r",))
+    m = build_matrix(_s([t, memb], [v], [f], roles=[_r("r"), _r("o"), _r("own")]),
+                     roles=("r",))
+    assert _cell(m, "public.t", "SELECT", "r").verdict == "undecided"
+
+
+def test_a_cascade_in_a_body_reaches_a_referencer_of_a_partition() -> None:
+    """`TRUNCATE p CASCADE` also empties tables referencing p's partitions
+    (measured: a foreign key to a partition cascades). The door must credit
+    that referencer, not only tables referencing p itself."""
+    p = _t("p", rls=False, grants=(_grant("o", ("TRUNCATE",)),))
+    p1 = _t("p1", rls=False, partition_of=("public", "p"))
+    x = _with(_t("x", rls=False, grants=(_grant("o", ("TRUNCATE",)),)),
+              foreign_keys=(_fk("p1"),))
+    f = _f("TRUNCATE public.p CASCADE", owner="o", execute=("r",))
+    m = build_matrix(_s([p, p1, x], fns=[f], roles=[_r("r"), _r("o"), _r("own")]),
+                     roles=("r",))
+    assert _cell(m, "public.x", "TRUNCATE", "r").verdict != "denied"
+
+
+def test_a_deeply_nested_predicate_does_not_crash() -> None:
+    """A pathologically deep policy predicate must not overflow the AST walks
+    (`_clause_is_open`, `_dependence`); it is treated as a real predicate."""
+    deep = "id = 0"
+    for i in range(1, 1200):
+        deep = f"id = {i} OR ({deep})"
+    t = _t(policies=(_policy(roles=("PUBLIC",), using=deep),),
+           grants=(_grant("r", ("SELECT",)),))
+    v = _v("v", _OWN_T, owner="o", grants=(_grant("r", ("SELECT",)),))
+    m = build_matrix(_s([t], [v], roles=[_r("r"), _r("o"), _r("own")]), roles=("r",))
+    assert _cell(m, "public.t", "SELECT", "r").verdict in ("conditional", "undecided")

@@ -309,8 +309,11 @@ SQL, another language, a call into an unseen function or operator, a
 SQL-running built-in, `DO` / `CALL` / a change of search_path or role) is
 listed separately with who can open it — a `DENIED` cell does not rule it
 out; a body that sets another parameter makes its filtered doors UNDECIDED
-(a timeout or planner setting excepted), and so does the same filter reached
-two ways when it reads `current_user` or another table.
+(a timeout, planner or logging setting excepted), and so does the same filter
+reached two ways when it depends on who runs it — it reads `current_user` /
+checks a privilege and one path is a SECURITY DEFINER function/trigger/rule,
+or it sub-selects a table whose own RLS applies to whoever evaluates it (a
+definer view included).
 A separate section lists sensitive-looking columns (SEC045's patterns, plus
 configured ones) each role can read, and how. `UNDECIDED` means the rows
 cannot be bounded — treat it as "possibly reachable", never as denied.
@@ -323,10 +326,14 @@ documented in the README: each column is a session running as that role
 shadowing are not modelled); schema USAGE, a view's own WHERE and what a
 function returns are not traced (over-reports); an ordinary trigger fired by
 a door's write, a view's INSTEAD OF trigger, event triggers, casts or
-built-in-looking operators backed by user functions, and access outside SQL
-privileges (REPLICATION, the server-file roles, foreign-table user mappings)
-are not modelled (these can under-report); UPDATE shows `USING`, not `WITH
-CHECK`; `1 = 1`-style tautologies show as `COND`.
+built-in-looking operators backed by user functions (a user operator reusing
+a `pg_catalog` symbol is not detected), a SECURITY DEFINER function called in
+a door owner's context via a DEFAULT/CHECK/policy/view-body that the role
+cannot EXECUTE itself, an `ALTER TABLE ONLY … DISABLE TRIGGER`'d partition
+clone, and access outside SQL privileges (REPLICATION, the server-file roles,
+foreign-table user mappings) are not modelled (these can under-report); a
+name containing a literal `.` is warned about and may be conflated; UPDATE
+shows `USING`, not `WITH CHECK`; `1 = 1`-style tautologies show as `COND`.
 
 `pgrls history <dir>` (v0.6.10+) reads a directory of JSON files
 written by `pgrls lint --format json` and emits a chronological

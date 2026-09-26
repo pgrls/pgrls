@@ -11,6 +11,41 @@ breaking changes — they will be called out in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`verify --mode escalation`: a user function named `set_config` or
+  `current_setting` in a schema of its own is no longer trusted as the
+  built-in.** The bare-name shortcuts (a `set_config` of an inert setting, a
+  known session function) now apply only when the call is unqualified or
+  `pg_catalog`-qualified; a `public.set_config` / `public.current_setting` is
+  a user function that may read a table, so a body calling one is opaque
+  (UNVERIFIED) rather than cleared. `pgrls matrix` treats it as an untraced
+  door for the same reason.
+- **`verify --mode escalation`: a custom (dotted) GUC is never treated as an
+  inert setting.** The inert-setting prefixes (`enable_`, `log_`, `debug_`, …)
+  matched `debug_app.tenant` and the like; no built-in setting has a dot, so a
+  name containing one is now always treated as one a policy can read.
+- **`verify --against`: a pre-v27 baseline no longer hides a new escalation
+  leak.** An older baseline never captured SECURITY DEFINER `SET` clauses,
+  which this release reads as "may set a parameter" — on the baseline that
+  made every anon-callable SQL function reading an RLS table `UNVERIFIED`, so a
+  `LEAK` this change introduces on one was graded pre-existing and passed the
+  gate. A pre-v27 escalation baseline is now read optimistically (functions
+  set no parameter) with a warning to regenerate it.
+- **`pgrls matrix`: the same filter on two paths is `UNDECIDED` when it reads
+  another table.** A predicate whose sub-select reads a relation depends on
+  who evaluates it — that relation's own RLS may compare against
+  `current_user` — so two paths sharing the predicate text (a definer view
+  and a SECURITY DEFINER function of the same owner) are no longer merged into
+  one `COND`; their row sets can differ.
+- **`pgrls matrix`: a `TRUNCATE … CASCADE` in a door's body reaches what
+  references the table's partitions**, not only what references the table
+  itself; a foreign key to a partition cascades too. A plain `TRUNCATE` of a
+  parent now also credits its partitions and inheritance children.
+- **`pgrls matrix`: a pathologically deep policy predicate no longer crashes**
+  the command with a traceback; it is reported as a clean tool error, and the
+  predicate walks treat an un-analyzably deep clause as a real predicate.
+- **`verify --mode escalation`: a function that is a candidate only because
+  its body cannot be read no longer claims its owner reaches a table** — the
+  note now says the body cannot be fully read, whoever owns it.
 - **`verify`: a policy `TO grp` no longer counts as applying to a
   `NOINHERIT` member of `grp`.** Postgres applies a policy to a session that
   holds the role's privileges (`has_privs_of_role`), which follows `INHERIT`
@@ -60,19 +95,18 @@ breaking changes — they will be called out in this file.
   query returns — timeouts, planner and logging settings — don't count.
 - **`verify --mode escalation` no longer reports trigger functions as
   callable.** Postgres refuses to call one directly ("trigger functions can
-  only be called as triggers"), so `EXECUTE` on it opens nothing; every
-  PL/pgSQL trigger function, like Supabase's `handle_new_user`, was an
-  UNVERIFIED finding. A trigger fired by an anonymous write is SEC013's and
+  only be called as triggers"), so `EXECUTE` on it opens nothing; a PL/pgSQL
+  trigger function whose owner is RLS-exempt (Supabase's `handle_new_user`,
+  owned by `postgres`) was an UNVERIFIED finding. A trigger fired by an anonymous write is SEC013's and
   `pgrls matrix`'s.
 - **SQL-standard function bodies are deparsed schema-qualified, and a `RETURN`
   body parses.** A `BEGIN ATOMIC` or `RETURN` body is stored parsed and was
   deparsed relative to the introspecting session's `search_path`, so
-  `public.secrets` came back as a bare `secrets`. `pgrls matrix` resolves a
-  bare name through the function's own `search_path`, and a function pinning
-  `search_path = ''` resolved it to nothing (measured: `DENIED` while the
-  function emptied the table). Every relation is now qualified — which the
-  other body readers (VIEW004, `verify --mode escalation`, `pgrls vector`)
-  also see, in place of a bare name they matched to every same-named table.
+  `public.secrets` came back as a bare `secrets`. Every relation is now
+  qualified, which the body readers (VIEW004, `verify --mode escalation`,
+  `pgrls vector`, and `pgrls matrix` — new in this release, which resolves a
+  bare name through the function's own `search_path`) see in place of a bare
+  name they matched to every same-named table.
   And a `RETURN expr` body, which did not parse at all (VIEW004 skipped it;
   escalation called it opaque), is now read as `SELECT expr` — as is a
   `RETURN` ending a `BEGIN ATOMIC` body. Rules that read bodies now see
@@ -182,7 +216,8 @@ breaking changes — they will be called out in this file.
   `authenticated` appeared on clusters that have no such roles.
 - **`pgrls matrix --roles` rejects a role the database does not have**, with
   a "Did you mean" for a close name, instead of showing a column of `DENIED`
-  for the typo. The SEC045 pattern config is now checked before connecting.
+  for the typo. `pgrls matrix` reads `[lint.rules.SEC045].patterns` for the
+  sensitive-columns section and rejects a malformed value before connecting.
 - **The database owner's implicit membership in `pg_database_owner`** is now
   recorded with the other role memberships (measured: the owner read a table
   granted only to `pg_database_owner`, while `pg_auth_members` held no row for

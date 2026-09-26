@@ -332,7 +332,10 @@ def _clause_is_open(clause: str) -> bool:
     node = parse_expr(clause)
     if node is None:
         return False
-    return any(is_literal_true(d) for d in flatten_or_disjuncts(node))
+    try:
+        return any(is_literal_true(d) for d in flatten_or_disjuncts(node))
+    except RecursionError:
+        return False  # too deeply nested to judge; treat as a real predicate
 
 
 def _narrowing_restrictive(restrictive: list[Policy], command: str) -> list[str]:
@@ -551,6 +554,7 @@ class _Context:
     # table qname -> its partitions and inheritance children
     children: dict[str, list[Table]] = field(default_factory=dict)
     ancestry: dict[str, list[tuple[Table, bool]]] = field(default_factory=dict)
+    descendancy: dict[str, list[Table]] = field(default_factory=dict)
     sessions: dict[str, _Session] = field(default_factory=dict)
     analysed: dict[Any, _Trace] = field(default_factory=dict)
 
@@ -593,26 +597,41 @@ class _Context:
         return self.ancestry[q]
 
     def descendants(self, table: Table) -> list[Table]:
-        """Every partition and inheritance child beneath `table`."""
+        """Every partition and inheritance child beneath `table`, memoized:
+        the TRUNCATE walks ask about the same tables repeatedly."""
+        q = table.qualified_name
+        if q in self.descendancy:
+            return self.descendancy[q]
         out: dict[str, Table] = {}
-        todo = list(self.children.get(table.qualified_name, ()))
+        todo = list(self.children.get(q, ()))
         while todo:
             child = todo.pop()
-            if child.qualified_name not in out and child.qualified_name != table.qualified_name:
+            if child.qualified_name not in out and child.qualified_name != q:
                 out[child.qualified_name] = child
                 todo.extend(self.children.get(child.qualified_name, ()))
-        return list(out.values())
+        self.descendancy[q] = list(out.values())
+        return self.descendancy[q]
 
     def truncate_cascade(self, table: Table) -> list[Table]:
-        """Every other table a `TRUNCATE … CASCADE` of `table` also empties."""
+        """Every other table a `TRUNCATE … CASCADE` of `table` also empties:
+        `table`'s partitions and inheritance children (emptied by truncating
+        it), every table whose foreign key references one of those, and the
+        same closure over each of those in turn — a table's own children are
+        emptied at every hop, so a foreign key to a partition cascades too."""
         out: dict[str, Table] = {}
-        todo = list(self.referencing.get(table.qualified_name, ()))
-        while todo:
-            child = todo.pop()
-            if child.qualified_name not in out and child.qualified_name != table.qualified_name:
-                out[child.qualified_name] = child
-                todo.extend(self.referencing.get(child.qualified_name, ()))
-        return list(out.values())
+        stack: list[Table] = []
+
+        def add(t: Table) -> None:
+            for x in (t, *self.descendants(t)):
+                if x.qualified_name not in out:
+                    out[x.qualified_name] = x
+                    stack.append(x)
+
+        add(table)
+        while stack:
+            for ref in self.referencing.get(stack.pop().qualified_name, ()):
+                add(ref)
+        return [t for q, t in out.items() if q != table.qualified_name]
 
     def cell(self, s: _Session, table: Table, command: str) -> Cell:
         return cell_for(self.schema, table, s.role, command, s.closure,
@@ -923,10 +942,10 @@ def _statement_touches(
         VariableSetStmt,
     )
 
-    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
     from pgrls.rules.view004 import _cte_names  # noqa: PLC0415
     from pgrls.verify import (  # noqa: PLC0415
         DEFAULT_AUTH_FUNCTIONS,
+        _bare_builtin_name,
         _has_range_function,
         _is_inert_setting,
         _opaque_call,
@@ -958,7 +977,7 @@ def _statement_touches(
         if not isinstance(n, Node):
             return
         if isinstance(n, FuncCall):
-            if func_name_parts(n)[1] == "set_config":
+            if _bare_builtin_name(n) == "set_config":
                 target = _set_config_target(n)
                 if target is None or target in _RESOLUTION_GUCS:
                     reasons.append("changes search_path or the role at run time")
@@ -1082,11 +1101,14 @@ def _run_as_owner(
 
     expanded: list[tuple[tuple[str, str], str]] = []
     for key, command in touches:
-        if command == "TRUNCATE CASCADE":
+        if command in ("TRUNCATE", "TRUNCATE CASCADE"):
             expanded.append((key, "TRUNCATE"))
             if key in ctx.tables:
-                expanded.extend(((c.schema, c.name), "TRUNCATE")
-                                for c in ctx.truncate_cascade(ctx.tables[key]))
+                # Truncating a table empties its partitions and inheritance
+                # children too; CASCADE also empties what references any of them.
+                more = (ctx.truncate_cascade(ctx.tables[key]) if command == "TRUNCATE CASCADE"
+                        else ctx.descendants(ctx.tables[key]))
+                expanded.extend(((c.schema, c.name), "TRUNCATE") for c in more)
         else:
             expanded.append((key, command))
     for key, command in dict.fromkeys(expanded):
@@ -1176,8 +1198,8 @@ def _fires(ctx: _Context, table: Table, command: str, trigger: Any,
     when a door's owner issues it. A TRUNCATE trigger also fires when an
     ancestor is truncated, since that empties this table too. A BEFORE row
     trigger on INSERT fires before the INSERT's WITH CHECK, and one returning
-    NULL skips the check (measured: its writes stood while the INSERT itself
-    was refused) — including for a row routed here from a partitioned
+    NULL skips the check (measured: its writes stood while the INSERT added no
+    row) — including for a row routed here from a partitioned
     ancestor. Other row triggers fire only for rows that get through; an
     UPDATE that moves a row between partitions fires DELETE on the source and
     INSERT on the destination."""
@@ -1218,7 +1240,9 @@ def _trigger_doors(
     as its OWNER, with no EXECUTE check (measured: a role with only INSERT on
     `inbox` emptied a FORCE'd `secrets` through an AFTER INSERT trigger). A
     partition fires its declarative ancestors' row triggers (they are cloned
-    to it). An ordinary trigger function runs as the writer and adds nothing."""
+    to it). An ordinary (invoker) trigger function adds nothing when the role
+    writes directly, or through a definer view or rule; fired by a door
+    owner's write it runs as that owner, which is not modelled."""
     found: dict[tuple[str, str], list[_Door]] = {}
     untraced: list[UntracedDoor] = []
     issued: _Issued = set()
@@ -1391,13 +1415,15 @@ _SESSION_FUNCTIONS = frozenset({"pg_has_role", "row_security_active"})
 def _dependence(predicate: str) -> tuple[bool, bool]:
     """What `predicate`'s rows depend on besides the row itself: (who
     `current_user` is, whose privileges and policies read the relations its
-    sub-selects name). The first holds when it reads `current_user` /
-    `session_user` / `current_role` / `user` or checks a privilege; the second
-    when a sub-select reads a relation — its RLS applies to whoever evaluates
-    it (measured: the same `tenant_id IN (SELECT … FROM memberships)` read 1
-    row directly and 2 through a definer view). A FROM-less `(SELECT
-    auth.uid())` reads none. A call or operator pgrls cannot see into may do
-    either, and so may an unparseable predicate."""
+    sub-selects name). The second holds when a sub-select reads a relation —
+    its RLS applies to whoever evaluates it (measured: the same `tenant_id IN
+    (SELECT … FROM memberships)` read 1 row directly and 2 through a definer
+    view). The first then holds too, because that relation's own policies may
+    compare against `current_user`; it also holds on its own when the
+    predicate reads `current_user` / `session_user` / `current_role` / `user`
+    or checks a privilege. A FROM-less `(SELECT auth.uid())` reads no relation.
+    A call or operator pgrls cannot see into may do either, and so may an
+    unparseable predicate."""
     from pglast.ast import FuncCall, Node, RangeVar, SQLValueFunction  # noqa: PLC0415
 
     from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
@@ -1439,8 +1465,18 @@ def _dependence(predicate: str) -> tuple[bool, bool]:
         for fld in n:
             walk(getattr(n, fld, None))
 
-    walk(node)
-    return session, relations
+    try:
+        walk(node)
+    except RecursionError:
+        return True, True  # too deeply nested to judge; assume it depends on both
+    # A predicate that reads a relation is also session-dependent: that
+    # relation's own RLS may compare against `current_user` (measured: a
+    # `tenant_id IN (SELECT … FROM memberships)` filter, where `memberships`
+    # scopes by `member = current_user`, returned the caller's rows through a
+    # definer view but the owner's through a SECURITY DEFINER function). So two
+    # such paths are the same row set only when BOTH the session and the
+    # reading privileges match.
+    return session or relations, relations
 
 
 def _merge(cell: Cell, door: Cell, path: AccessPath, me: str | None = None) -> Cell:

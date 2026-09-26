@@ -2034,8 +2034,14 @@ _INERT_SETTING_PREFIXES = ("enable_", "log_", "jit_", "geqo_", "debug_")
 
 
 def _is_inert_setting(name: str) -> bool:
-    """Whether setting `name` leaves what a query returns unchanged."""
+    """Whether setting `name` leaves what a query returns unchanged. A custom
+    (namespaced) GUC — a name with a dot, like `app.tenant` — is never inert:
+    no built-in setting has a dot, and the prefixes below (`enable_`, `log_`,
+    `debug_`, …) would otherwise swallow a custom `debug_app.tenant` a policy
+    reads."""
     name = name.lower()
+    if "." in name:
+        return False
     return name in _INERT_SETTINGS or name.startswith(_INERT_SETTING_PREFIXES)
 
 
@@ -2043,6 +2049,28 @@ def _gucs_matter(gucs: tuple[str, ...] | None) -> bool:
     """Whether a function's `SET` clauses may change what its queries return:
     one sets a setting that is not inert, or they were not captured."""
     return gucs is None or any(not _is_inert_setting(g) for g in gucs)
+
+
+def baseline_gucs_captured(schema: Schema) -> tuple[Schema, bool]:
+    """A copy of `schema` whose SECURITY DEFINER functions read an uncaptured
+    ``config_gucs`` (``None``, from a pre-v27 baseline) as "no SET clause",
+    and whether any were changed.
+
+    In escalation mode, uncaptured ``config_gucs`` is read as "may set a
+    parameter" — fail-closed for a plain ``verify``, but wrong for the
+    *baseline* of ``verify --against``: it makes every plain-owner SQL
+    function that reads an RLS table UNVERIFIED on the baseline, so a LEAK the
+    change introduces on one of them is graded pre-existing and does not fail
+    the gate. Treating the baseline optimistically restores "any new leak
+    fails the gate" (at worst it grades a genuinely pre-existing leak as new —
+    the fail-closed direction). Applied only to the ``--against`` baseline."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    fns = schema.security_definer_functions
+    if not any(f.config_gucs is None for f in fns):
+        return schema, False
+    fixed = tuple(replace(f, config_gucs=()) if f.config_gucs is None else f for f in fns)
+    return replace(schema, security_definer_functions=fixed), True
 
 
 def _set_config_target(call: Any) -> str | None:
@@ -2055,6 +2083,21 @@ def _set_config_target(call: Any) -> str | None:
     return str(val.sval).lower() if isinstance(val, String) else None
 
 
+def _bare_builtin_name(call: Any) -> str | None:
+    """The bare function name if `call` is unqualified or `pg_catalog` /
+    `information_schema`-qualified, so a bare-name built-in rule may apply;
+    `None` for a function in any other schema, which must NOT be trusted by
+    its bare name — a user's `public.set_config` or `public.current_setting`
+    is its own function, not the built-in, and may read a table."""
+    from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
+
+    qualified, bare = func_name_parts(call)
+    fn_schema = qualified.rsplit(".", 1)[0] if qualified and "." in qualified else None
+    if fn_schema is None or fn_schema in ("pg_catalog", "information_schema"):
+        return bare
+    return None
+
+
 def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     """Whether one ``FuncCall`` is to something we cannot see through: a
     built-in that runs SQL, a function that is neither a known auth/session
@@ -2064,18 +2107,22 @@ def _opaque_call(call: Any, auth_functions: frozenset[str] | set[str]) -> bool:
     under the caller's context."""
     from pgrls.ast_utils import func_name_parts  # noqa: PLC0415
 
-    qualified, bare = func_name_parts(call)
-    if bare == "set_config":
+    qualified, _ = func_name_parts(call)
+    name = _bare_builtin_name(call)
+    if name is None:
+        # A user-schema function is trusted only if its FULL name is a known
+        # auth function (`auth.uid`); otherwise it may read a table.
+        return qualified not in auth_functions
+    if name == "set_config":
         target = _set_config_target(call)
         return target is None or not _is_inert_setting(target)
-    if bare in _SQL_RUNNING_BUILTINS:
+    if name in _SQL_RUNNING_BUILTINS:
         return True
     fn_schema = qualified.rsplit(".", 1)[0] if qualified and "." in qualified else None
     return not (
-        qualified in auth_functions
-        or bare in auth_functions
+        name in auth_functions
         or fn_schema in ("pg_catalog", "information_schema")
-        or (fn_schema is None and bare in _SAFE_BUILTIN_FUNCS)
+        or name in _SAFE_BUILTIN_FUNCS
     )
 
 
@@ -2171,7 +2218,7 @@ def _secdef_parameter_reason(f: Any) -> str | None:
     import pglast  # noqa: PLC0415
     from pglast.ast import FuncCall, Node, VariableSetStmt  # noqa: PLC0415
 
-    from pgrls.ast_utils import func_name_parts, function_body_sql  # noqa: PLC0415
+    from pgrls.ast_utils import function_body_sql  # noqa: PLC0415
 
     found = False
 
@@ -2185,7 +2232,7 @@ def _secdef_parameter_reason(f: Any) -> str | None:
             return
         if isinstance(n, VariableSetStmt):
             found = n.name is None or not _is_inert_setting(str(n.name))
-        elif isinstance(n, FuncCall) and func_name_parts(n)[1] == "set_config":
+        elif isinstance(n, FuncCall) and _bare_builtin_name(n) == "set_config":
             target = _set_config_target(n)
             found = target is None or not _is_inert_setting(target)
         if found:
@@ -2304,12 +2351,17 @@ def _escalation_secdef_findings(
     being superuser / ``BYPASSRLS`` outright. We prove that against each read table's ``anon`` verdict.
 
     Reuses VIEW004's body parser to extract the RLS tables a SQL body reads. A
-    body is **unverified** when it is opaque (PL/pgSQL or dynamic SQL) *or* when
-    it reads from a source we cannot see through — a view, a function-call FROM,
-    or a relation outside the introspected base tables — since that source may
-    transitively read a protected table. Only a body whose every data source is
-    a known *non-RLS* base table is cleared (not a finding). ``anon_roles`` is
-    the SEC042 exposure set (default ``{anon, PUBLIC}``).
+    function is a candidate when it is anon-executable AND its owner is
+    RLS-exempt for a table, is granted a table's rows under the anonymous
+    context, OR its body does something the analysis cannot see
+    (``_secdef_body_unseen``: opaque PL/pgSQL or dynamic SQL, a view or
+    function-call read, a relation outside the base tables, a non-inert
+    ``SET`` / ``set_config``, a `DO` / `CALL`, an unseen call or operator).
+    Trigger functions are excluded — Postgres refuses to call one. A candidate
+    is **unverified** unless every readable data source is a known non-RLS base
+    table and its owner reaches none of them; then it is cleared (not a
+    finding). ``anon_roles`` is the SEC042 exposure set (default
+    ``{anon, PUBLIC}``).
 
     The VIEW004 view-mediated *caller* case — a view selecting a SECDEF call —
     is still out of scope here, but no longer for the reason this comment used
@@ -2516,6 +2568,12 @@ def _escalation_secdef_findings(
                     "table's rows by its own policies under the anonymous auth "
                     "context — the definer body launders them"
                 )
+            if mech == "unseen":
+                return (
+                    f"{base}, whose body pgrls cannot fully read — it may read "
+                    "an RLS table, set the session's context, or call another "
+                    "door, whoever owns it"
+                )
             return (
                 f"{base}, whose owner reaches the table its body reads — "
                 "RLS-exempt for it, or granted its rows by the table's own policies"
@@ -2548,6 +2606,11 @@ def _escalation_secdef_findings(
             inconclusive = any_opaque or any_unseen or any_undecided
             if saw_exempt != saw_launder:
                 head = head_for("exempt" if saw_exempt else "launder")
+        if not reads:
+            # No RLS table read is attributable to a reachable owner: the
+            # function is a candidate only because its body cannot be fully
+            # read. Don't claim its owner reaches a table.
+            head = head_for("unseen")
         if reads:
             verdict, witness, tail = _escalation_anon_rollup(
                 reads, an_by_table, total_read

@@ -688,6 +688,11 @@ def function_body_sql(body: str) -> str:
     the LEADING ``BEGIN ATOMIC`` and the TRAILING ``END`` are removed, so an
     ``END`` closing a ``CASE`` inside the body is untouched. A classic
     (``AS $$ … $$``) body contains no wrapper and is returned unchanged.
+
+    The other SQL-standard form, a bare ``RETURN expr``, is read as ``SELECT
+    expr``; a statement-leading ``RETURN`` inside a ``BEGIN ATOMIC`` body is
+    rewritten to ``SELECT`` the same way (scanner tokens, so a ``RETURN``
+    inside a string or comment is left alone).
     """
     stripped = body.strip()
     # The other SQL-standard form, `RETURN expr`, deparses as just that —

@@ -80,6 +80,7 @@ from pgrls.verify import (
     DEFAULT_AUTH_FUNCTIONS,
     VERIFY_FORMATS,
     Verification,
+    baseline_gucs_captured,
     build_verification,
     diff_verifications,
     render_delta_json,
@@ -4216,11 +4217,35 @@ def matrix(
         missing = [r for r in roles if r != "PUBLIC" and r not in set(known)]
         if missing:
             raise ToolError(_missing_role_message(missing, known))
-
-    built = build_matrix(
-        schema, roles=roles, include_system=include_system, grid=grid,
-        sensitive_patterns=patterns,
+    # Cells and doors are keyed on "<schema>.<name>"; a literal dot inside a
+    # schema, table or role identifier makes that key ambiguous, so warn
+    # rather than emit conflated rows silently (a deliberately quoted name).
+    names = (
+        [t.schema for t in schema.tables]
+        + [t.name for t in schema.tables]
+        + [v.schema for v in schema.views]
+        + [v.name for v in schema.views]
+        + [r.name for r in schema.roles or ()]
     )
+    if any("." in n for n in names):
+        click.echo(
+            "pgrls: a schema, table or role name contains a '.', which pgrls "
+            "matrix cannot tell apart from the schema/name separator; those "
+            "rows may be conflated.",
+            err=True,
+        )
+
+    try:
+        built = build_matrix(
+            schema, roles=roles, include_system=include_system, grid=grid,
+            sensitive_patterns=patterns,
+        )
+    except RecursionError as exc:
+        # A pathologically deep policy predicate overflows a walk. Fail like
+        # lint (a clean tool error), not a raw traceback.
+        raise ToolError(
+            "A policy predicate is nested too deeply to analyze."
+        ) from exc
     rendered = render_matrix(built, output_format)
     _emit(rendered, output_path)
 
@@ -4642,6 +4667,19 @@ def verify(
         base_schema = reparse_policy_asts(
             _resolve_diff_source(against, schemas=schema_list)
         )
+        if mode == "escalation":
+            # A pre-v27 baseline never captured SECURITY DEFINER `SET` clauses;
+            # read that as "no SET clause" so the gate reports the leaks THIS
+            # change introduces rather than grading them pre-existing.
+            base_schema, adjusted = baseline_gucs_captured(base_schema)
+            if adjusted:
+                click.echo(
+                    "pgrls: the --against baseline predates snapshot v27 and did "
+                    "not capture SECURITY DEFINER SET clauses; treating those "
+                    "functions as setting no parameter. Regenerate the baseline "
+                    "with `pgrls snapshot` for a precise escalation gate.",
+                    err=True,
+                )
         base_verification = build_verification(base_schema, auth_functions=auth, mode=mode, anon_roles=anon_roles, identity_columns=identity_columns)  # type: ignore[arg-type]
         delta = diff_verifications(base_verification, verification)
         if output_format == "sarif":
