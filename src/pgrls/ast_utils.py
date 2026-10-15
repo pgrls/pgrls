@@ -688,8 +688,19 @@ def function_body_sql(body: str) -> str:
     the LEADING ``BEGIN ATOMIC`` and the TRAILING ``END`` are removed, so an
     ``END`` closing a ``CASE`` inside the body is untouched. A classic
     (``AS $$ … $$``) body contains no wrapper and is returned unchanged.
+
+    The other SQL-standard form, a bare ``RETURN expr``, is read as ``SELECT
+    expr``; a statement-leading ``RETURN`` inside a ``BEGIN ATOMIC`` body is
+    rewritten to ``SELECT`` the same way (scanner tokens, so a ``RETURN``
+    inside a string or comment is left alone).
     """
     stripped = body.strip()
+    # The other SQL-standard form, `RETURN expr`, deparses as just that —
+    # not a statement pglast parses. Its expression is what a SELECT of it
+    # reads (measured: listed as unparseable while it returned every row).
+    returns = re.match(r"(?is)^RETURN\b", stripped)
+    if returns is not None:
+        return "SELECT " + stripped[returns.end():].rstrip().rstrip(";")
     opener = re.match(r"(?is)^BEGIN\s+ATOMIC\b", stripped)
     if opener is None:
         return body
@@ -697,4 +708,29 @@ def function_body_sql(body: str) -> str:
     closer = re.search(r"(?is)\bEND\s*;?\s*$", inner)
     if closer is not None:
         inner = inner[: closer.start()]
-    return inner
+    return _returns_as_selects(inner)
+
+
+def _returns_as_selects(sql: str) -> str:
+    """`sql` with each statement-leading ``RETURN`` read as ``SELECT``: a
+    ``BEGIN ATOMIC`` body may end in ``RETURN expr;``, which pglast does not
+    parse (measured: such a body was called opaque while its reads were plain
+    SQL). Tokens, not text, so a ``RETURN`` inside a string or a comment is
+    left alone."""
+    import pglast  # noqa: PLC0415
+
+    try:
+        tokens = pglast.parser.scan(sql)
+    except pglast.parser.ParseError:
+        return sql
+    out: list[str] = []
+    last = 0
+    previous = None
+    for tok in tokens:
+        if tok.name == "RETURN" and (previous is None or previous.name == "ASCII_59"):
+            out.append(sql[last:tok.start])
+            out.append("SELECT")
+            last = tok.end + 1  # `end` is inclusive
+        previous = tok
+    out.append(sql[last:])
+    return "".join(out)
