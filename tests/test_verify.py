@@ -4155,3 +4155,159 @@ def test_cross_tenant_declines_when_a_member_holds_the_owner_privileges() -> Non
     )
     [f] = build_verification(forced, mode="cross-tenant").tables
     assert f.verdict == "isolated"
+
+
+# --- policy applicability follows INHERIT memberships only ------------------
+#
+# Postgres applies a policy `TO R` to a session that holds R's privileges
+# (`has_privs_of_role`: R itself, or a transitive member through INHERIT
+# edges), not to every member. Measured on PG16 with
+# `GRANT grp TO anon WITH INHERIT FALSE`: anon read 0 rows under a permissive
+# `TO grp USING (true)` policy, and every row past a restrictive `TO grp`
+# floor. Walking every edge made `verify` cede a definer view and a SECURITY
+# DEFINER function as "anon already reads those rows directly" while anon read
+# nothing directly and everything through the door.
+
+
+def _grp_tbl(*, floor: str | None = None, perm_roles: tuple[str, ...] = ("grp",)) -> Table:
+    from pgrls.model import Grant
+
+    policies = [_policy("true", command="SELECT", roles=perm_roles)]
+    if floor is not None:
+        policies.append(
+            _policy(floor, name="floor", permissive=False, command="SELECT", roles=("grp",))
+        )
+    return Table(
+        schema="public",
+        name="t",
+        rls_enabled=True,
+        force_rls=False,
+        columns=("id", "tenant_id"),
+        owner="tbl_owner",
+        policies=tuple(policies),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+
+
+def _grp_edge(inherit: bool) -> tuple[RoleMembership, ...]:
+    return (RoleMembership(member="anon", role="grp", inherit=inherit),)
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "leak"), (False, "isolated")])
+def test_anon_policy_to_a_group_applies_only_through_inherit(
+    inherit: bool, expected: str
+) -> None:
+    schema = Schema(tables=(_grp_tbl(),), role_memberships=_grp_edge(inherit))
+    assert _verdict(build_verification(schema, mode="anon"), "public.t") == expected
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "isolated"), (False, "leak")])
+def test_reachability_noinherit_policy_does_not_cede_the_view(
+    inherit: bool, expected: str
+) -> None:
+    """INHERIT: anon reads every row directly, so the view adds nothing (ceded).
+    NOINHERIT: the policy never applies to anon — the direct read is empty and
+    the view is the only door. Ceding it here was the measured false clear."""
+    schema = Schema(
+        tables=(_grp_tbl(),),
+        views=(_rv_view("v", "tbl_owner", (("public", "t"),)),),
+        role_memberships=_grp_edge(inherit),
+    )
+    assert _rv(schema)[("public.t", "public.v")][0] == expected
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "leak"), (False, "isolated")])
+def test_reachability_noinherit_floor_does_not_narrow_the_direct_read(
+    inherit: bool, expected: str
+) -> None:
+    """The floor side of the same rule. A restrictive `TO grp USING (false)`
+    binds an INHERIT member (direct read empty → the view is a door) but not a
+    NOINHERIT one, which reads every row directly under the `TO PUBLIC`
+    policy — so the view adds nothing and is ceded to `--mode anon`."""
+    schema = Schema(
+        tables=(_grp_tbl(floor="false", perm_roles=("PUBLIC",)),),
+        views=(_rv_view("v", "tbl_owner", (("public", "t"),)),),
+        role_memberships=_grp_edge(inherit),
+    )
+    assert _rv(schema)[("public.t", "public.v")][0] == expected
+
+
+@requires_z3
+@pytest.mark.parametrize(("inherit", "expected"), [(True, "isolated"), (False, "leak")])
+def test_escalation_noinherit_policy_does_not_cede_the_function(
+    inherit: bool, expected: str
+) -> None:
+    schema = Schema(
+        tables=(_grp_tbl(),),
+        security_definer_functions=(_secdef("SELECT * FROM t"),),
+        role_memberships=_grp_edge(inherit),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.verdict == expected
+
+
+@requires_docker
+@requires_z3
+def test_policy_applicability_noinherit_matches_live_anon_session(
+    pg_url: str, pg_conn: psycopg.Connection
+) -> None:
+    """Every verdict grounded in what a live anonymous session reads. The anon
+    role is a NOINHERIT member of `noinh_grp` — through the role attribute, so
+    the test runs on PG15 too, which has no per-grant INHERIT option — and so
+    the `USING (true)` policy on `noinh_grp` never applies to it: the direct
+    read is empty, while a definer view and a SECURITY DEFINER function over
+    the table both return every row. Roles are cluster-wide; every one this
+    test creates, it drops."""
+    anon = {"noinh_anon"}
+    with pg_conn.cursor() as cur:
+        cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
+        cur.execute(
+            "CREATE ROLE noinh_anon NOLOGIN NOINHERIT;"
+            "CREATE ROLE noinh_grp NOLOGIN;"
+            "CREATE ROLE noinh_owner NOLOGIN;"
+            "GRANT noinh_grp TO noinh_anon;"
+        )
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE t (id int, tenant_id text);"
+                "INSERT INTO t VALUES (1, 'a'), (2, 'b');"
+                "ALTER TABLE t OWNER TO noinh_owner;"
+                "ALTER TABLE t ENABLE ROW LEVEL SECURITY;"
+                "CREATE POLICY p ON t FOR SELECT TO noinh_grp USING (true);"
+                "GRANT SELECT ON t TO noinh_anon;"
+                "CREATE VIEW v AS SELECT * FROM t;"
+                "ALTER VIEW v OWNER TO noinh_owner;"
+                "GRANT SELECT ON v TO noinh_anon;"
+                "CREATE FUNCTION f() RETURNS SETOF t LANGUAGE sql SECURITY DEFINER "
+                "  SET search_path = pg_catalog, pg_temp AS 'SELECT * FROM public.t';"
+                "ALTER FUNCTION f() OWNER TO noinh_owner;"
+            )
+        observed = {}
+        for label, query in (
+            ("direct", "SELECT count(*) FROM t"),
+            ("view", "SELECT count(*) FROM v"),
+            ("function", "SELECT count(*) FROM f()"),
+        ):
+            with psycopg.connect(pg_url) as conn, conn.cursor() as cur:
+                cur.execute("SET LOCAL ROLE noinh_anon;")
+                cur.execute(query)
+                observed[label] = cur.fetchone()[0]
+                conn.rollback()
+        # The premise, measured: nothing directly, everything through each door.
+        assert observed == {"direct": 0, "view": 2, "function": 2}, observed
+
+        schema = introspect(pg_conn, schemas=["public"])
+        v_anon = build_verification(schema, mode="anon", anon_roles=anon)
+        assert _verdict(v_anon, "public.t") == "isolated"
+        reach = build_verification(schema, mode="reachability", anon_roles=anon)
+        assert [t.verdict for t in reach.tables] == ["leak"]
+        [esc] = build_verification(schema, mode="escalation", anon_roles=anon).tables
+        assert (esc.qualified_name, esc.verdict) == ("public.f", "leak")
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP FUNCTION IF EXISTS f(); DROP VIEW IF EXISTS v; DROP TABLE IF EXISTS t;")
+            cur.execute("DROP ROLE IF EXISTS noinh_anon, noinh_grp, noinh_owner;")
