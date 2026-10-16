@@ -10,6 +10,8 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-10-15
+
 ### Fixed
 - **`verify --mode escalation`: a user function named `set_config` or
   `current_setting` in a schema of its own is no longer trusted as the
