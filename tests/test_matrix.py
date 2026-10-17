@@ -3663,6 +3663,18 @@ def test_prove_a_client_controlled_setting_is_never_an_identity(setting: str) ->
     assert p.status != "proven", p
 
 
+def test_prove_a_setting_name_in_its_stored_cast_form_is_read() -> None:
+    """Postgres stores current_setting('x'::text, true): a tenant setting is
+    still PROVEN, a request header still is not."""
+    ok = _sel("tenant_id = current_setting('app.tenant_id'::text, true)", grants=("authenticated",))
+    hdr = _with(_sel("tenant_id = current_setting('request.header.t'::text, true)",
+                     grants=("authenticated",)), name="h")
+    m = _prove([ok, hdr], cols=("authenticated",))
+    assert _proof(m, "public.t", "authenticated").status == "proven"
+    p = _proof(m, "public.h", "authenticated")
+    assert p.status == "unknown" and "request.header.t" in (p.detail or ""), p
+
+
 def test_prove_a_client_controlled_setting_in_a_helper_body_is_found() -> None:
     fns = (_fn("app.cur", body="SELECT current_setting('request.header.tenant', true)"),)
     t = _sel("tenant_id = cur()", grants=("authenticated",))
@@ -4167,4 +4179,46 @@ def test_live_a_plpgsql_identity_over_a_writable_table_is_not_proven(
         p = _proof(m, "public.idocs", "pgrls_pm_auth")
         assert p.status == "unknown" and "public.imembers" in (p.detail or ""), p
     finally:
+        drop()
+
+
+@requires_docker
+def test_live_a_request_header_policy_is_not_proven_but_a_tenant_setting_is(
+    pg_conn: psycopg.Connection,
+) -> None:
+    """Postgres stores the setting name as 'name'::text: a header read in the
+    policy itself is still caught, and an ordinary tenant setting stays
+    PROVEN."""
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
+
+    def drop() -> None:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS public.hdr_e, public.hdr_d")
+            cur.execute("DROP ROLE IF EXISTS pgrls_pm_auth")
+
+    drop()
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("""
+                REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+                CREATE ROLE pgrls_pm_auth NOLOGIN;
+                CREATE TABLE public.hdr_e (id int, tenant_id text);
+                CREATE TABLE public.hdr_d (id int, tenant_id text);
+                ALTER TABLE public.hdr_e ENABLE ROW LEVEL SECURITY;
+                ALTER TABLE public.hdr_d ENABLE ROW LEVEL SECURITY;
+                CREATE POLICY p ON public.hdr_e FOR SELECT
+                  USING (tenant_id = current_setting('request.header.tenant', true));
+                CREATE POLICY p ON public.hdr_d FOR SELECT
+                  USING (tenant_id = current_setting('app.tenant_id', true));
+                GRANT SELECT ON public.hdr_e, public.hdr_d TO pgrls_pm_auth;
+            """)
+        schema, grid = introspect_for_matrix(pg_conn, ["public"])
+        m = build_matrix(schema, roles=("pgrls_pm_auth",), grid=grid, prove=True)
+        e = _proof(m, "public.hdr_e", "pgrls_pm_auth")
+        assert e.status == "unknown" and "request.header.tenant" in (e.detail or ""), e
+        assert _proof(m, "public.hdr_d", "pgrls_pm_auth").status == "proven"
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS public.hdr_e, public.hdr_d")
+            cur.execute("DROP OWNED BY pgrls_pm_auth")
         drop()

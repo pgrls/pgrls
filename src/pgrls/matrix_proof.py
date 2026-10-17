@@ -157,18 +157,31 @@ _CLIENT_SETTING_NAMES = frozenset({"request.headers", "request.cookies"})
 def _client_setting(node: Any) -> str | None:
     """The setting name when `node` is a ``current_setting`` call reading one
     an HTTP client controls through PostgREST (a request header or cookie)."""
-    from pglast.ast import A_Const, String  # noqa: PLC0415
+    from pglast.ast import A_Const, String, TypeCast  # noqa: PLC0415
 
     if not _is_current_setting(node) or not node.args:
         return None
     arg = node.args[0]
+    while isinstance(arg, TypeCast):  # stored policies carry 'name'::text
+        arg = arg.arg
     val = getattr(arg, "val", None) if isinstance(arg, A_Const) else None
     if not isinstance(val, String):
-        return "a setting whose name is computed"
+        return "?"
     name = str(val.sval).lower()
     if name in _CLIENT_SETTING_NAMES or name.startswith(_CLIENT_SETTINGS):
-        return f"the setting {name}"
+        return name
     return None
+
+
+def _client_reason(found: str, where: str | None) -> str:
+    """The reason for a client-controlled setting `found` ("?" for a computed
+    name) read in `where` (None: the filter itself)."""
+    loc = f" (in {where}())" if where else ""
+    if found == "?":
+        return (f"the filter reads a setting whose name is computed{loc}; it may be a "
+                "request header or cookie the HTTP client chooses through PostgREST")
+    return (f"the filter reads {found}{loc}, a request header or cookie the HTTP "
+            "client sets through PostgREST — the client chooses its value")
 
 
 def _calls_current_setting(predicate: str) -> bool:
@@ -728,11 +741,7 @@ class _Prover:
         if predicate is not None:
             header = self._client_controlled(predicate)
             if header:
-                return CellProof("unknown", model, detail=(
-                    f"the filter reads {header}, which may be a request header or "
-                    "cookie the HTTP client sets through PostgREST — the client can "
-                    "choose its value"
-                ))
+                return CellProof("unknown", model, detail=header)
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
             # and put any schema it can create in on its search_path.
@@ -889,7 +898,7 @@ class _Prover:
 
         _has_node(predicate, match)
         if found:
-            return found[0]
+            return _client_reason(found[0], None)
         for fname in sorted(_called_functions(predicate)):
             why = self._client_in_body(fname)
             if why:
@@ -910,10 +919,12 @@ class _Prover:
                 continue
             stmts = _body_statements_of(fn)
             if stmts is None:
-                return f"{fn.qualified_name}(), whose body pgrls cannot read"
+                return (f"the filter reaches {fn.qualified_name}(), whose body pgrls "
+                        "cannot read; it may read a request header or cookie the HTTP "
+                        "client chooses through PostgREST")
             _has_node_in(stmts, match)
             if found:
-                return f"{found[0]} (in {fn.qualified_name}())"
+                return _client_reason(found[0], fn.qualified_name)
             for inner in sorted(_names_called(stmts)):
                 why = self._client_in_body(inner, seen | {fn.qualified_name})
                 if why:
