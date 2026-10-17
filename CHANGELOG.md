@@ -32,7 +32,8 @@ breaking changes — they will be called out in this file.
   SQL session — it has no CREATEROLE before Postgres 16, the filter reads no
   setting the session can set, and
   the session can neither redefine what the filter calls (it owns no
-  function and holds CREATE on no schema while the filter calls one) nor
+  function and holds CREATE on no schema or on the database while the
+  filter calls one) nor
   shadow a table a helper reads by bare name with its own temp table. (A
   NOLOGIN role is taken to be reached through a gateway that sets its
   identity.) `LEAK` is claimed only when the role's own session reads the

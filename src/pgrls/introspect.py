@@ -1292,6 +1292,27 @@ def _fetch_user_functions(cur: Any) -> tuple[UserFunction, ...]:
     )
 
 
+_DATABASE_CREATE_SQL = """
+SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee
+FROM pg_catalog.pg_database d
+CROSS JOIN LATERAL pg_catalog.aclexplode(
+    coalesce(d.datacl, pg_catalog.acldefault('d', d.datdba))) a
+WHERE d.datname = pg_catalog.current_database() AND a.privilege_type = 'CREATE'
+UNION
+SELECT pg_catalog.pg_get_userbyid(d.datdba)
+FROM pg_catalog.pg_database d
+WHERE d.datname = pg_catalog.current_database()
+ORDER BY 1
+"""
+
+
+def _fetch_database_create(cur: Any) -> tuple[str, ...]:
+    """Who can create a schema in the current database."""
+    cur.execute(_DATABASE_CREATE_SQL)
+    return tuple(row["grantee"] for row in cur.fetchall())
+
+
 _SELF_GRANTING_ROLES_SQL = """
 SELECT r.rolname AS name
 FROM pg_catalog.pg_roles r
@@ -2140,6 +2161,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         function_owners = tuple(sorted({(f.qualified_name, f.owner) for f in user_functions}))
         schema_create = _fetch_schema_create(cur)
         self_granting_roles = _fetch_self_granting_roles(cur)
+        database_create = _fetch_database_create(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -2168,6 +2190,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 user_functions=user_functions,
                 schema_create=schema_create,
                 self_granting_roles=self_granting_roles,
+                database_create=database_create,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -2407,4 +2430,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         user_functions=user_functions,
         schema_create=schema_create,
         self_granting_roles=self_granting_roles,
+        database_create=database_create,
     )

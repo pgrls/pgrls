@@ -38,9 +38,11 @@ the verdicts honest:
   cannot resolve counts, and a body it cannot read counts as any table); for a role that can log in — a raw SQL
   session — it has no CREATEROLE before Postgres 16 (which grants itself any
   non-superuser role), the filter reads no setting the session could set for
-  itself (directly or in a function body), the session owns no user-defined function (one may
+  itself (directly or in a function body, the catalog's view of session
+  state included), the session owns no user-defined function (one may
   sit behind a call, an operator or a cast), it cannot create objects in a
-  schema while the filter calls a user-defined function, and no
+  schema, nor a schema in the database, while the filter calls a
+  user-defined function, and no
   user-defined function the filter reaches reads a relation by bare name
   under a search_path that does not end in ``pg_temp`` (the session's own
   temp table would take its place); a filter scoped by a setting
@@ -151,7 +153,9 @@ def _is_current_setting(n: Any) -> bool:
 
 
 _CLIENT_SETTINGS = ("request.header.", "request.cookie.")
-_CLIENT_SETTING_NAMES = frozenset({"request.headers", "request.cookies"})
+_CLIENT_SETTING_NAMES = frozenset({
+    "request.headers", "request.cookies", "request.method", "request.path",
+})
 
 
 def _client_setting(node: Any) -> str | None:
@@ -182,6 +186,23 @@ def _client_reason(found: str, where: str | None) -> str:
                 "request header or cookie the HTTP client chooses through PostgREST")
     return (f"the filter reads {found}{loc}, a request header or cookie the HTTP "
             "client sets through PostgREST — the client chooses its value")
+
+
+def _reads_session_state(n: Any) -> bool:
+    """A setting read, or a system catalog relation — pg_settings and
+    pg_stat_activity show state the session sets for itself (application_name,
+    any SET) — or a catalog function that does."""
+    from pglast.ast import FuncCall, RangeVar  # noqa: PLC0415
+
+    if _is_current_setting(n):
+        return True
+    if isinstance(n, RangeVar):
+        schema = (n.schemaname or "").lower()
+        return schema == "pg_catalog" or (not schema and n.relname.lower().startswith("pg_"))
+    if isinstance(n, FuncCall):
+        name = getattr(n.funcname[-1], "sval", "").lower()
+        return name.startswith("pg_show_all_settings") or name == "pg_stat_get_activity"
+    return False
 
 
 def _calls_current_setting(predicate: str) -> bool:
@@ -455,7 +476,15 @@ class _Prover:
         role = self.attrs.get(name)
         login = name != "PUBLIC" and (role is None or role.can_login)
         base = self.base(name, table, model, states, login)
-        if base.status != "proven" or name == "PUBLIC":
+        if base.status != "proven":
+            return base
+        if name == "PUBLIC":
+            written = self._identity_reads_writable({"PUBLIC"}, table)
+            if written:
+                return CellProof("unknown", model, detail=(
+                    f"the filter's identity comes from {written[0]}(), which {written[1]} "
+                    "— the session may be able to change who it is taken to be"
+                ))
             return base
         targets = self.set_role_targets(name)
         if targets is None:
@@ -466,9 +495,11 @@ class _Prover:
         for target in sorted(targets):
             other = self.base(target, table, model, states, login)
             if other.status != "proven":
+                what = ("which bypasses RLS and reads every row (see SEC029)"
+                        if other.status == "exempt"
+                        else f"whose read is {other.status.upper()}")
                 return CellProof("unknown", model, detail=(
-                    f"the session can SET ROLE {target}, whose read is "
-                    f"{other.status.upper()}"
+                    f"the session can SET ROLE {target}, {what}"
                 ))
         written = self._identity_reads_writable({name} | targets, table)
         if written:
@@ -506,8 +537,11 @@ class _Prover:
         """
         session = {name} | targets
         owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & session)
-        creates = sorted(s for s, holders in self.creators.items()
-                         if holders & self._privilege_holders(session))
+        holders = self._privilege_holders(session)
+        creates = sorted(s for s, who in self.creators.items() if who & holders)
+        on_database = bool(set(self.schema.database_create or ()) & holders)
+        if on_database:
+            creates.insert(0, "")
         if not owned and not creates:
             return None
         for role in sorted(session):
@@ -522,10 +556,12 @@ class _Prover:
                 ))
             called = sorted(f for f in _called_functions(predicate) if f in self.functions)
             if called:
+                where = ("a schema of its own (it holds CREATE on the database)"
+                         if not creates[0] else f"schema {creates[0]}")
                 return CellProof("unknown", model, detail=(
-                    f"the session can create objects in schema {creates[0]}, and "
-                    f"the filter calls {called[0]}(), whose body can resolve names "
-                    "through the session's search_path"
+                    f"the session can create objects in {where}, and the filter "
+                    f"calls {called[0]}(), whose body can resolve names through the "
+                    "session's search_path"
                     + ("; REVOKE CREATE ON SCHEMA public FROM PUBLIC lifts this"
                        if creates[0] == "public" else "")
                 ))
@@ -659,6 +695,14 @@ class _Prover:
             return parent_leak or CellProof("possible", model, witness={}, detail=no_usage)
         if direct.verdict == "conditional":
             verdict, witness = self.prove(model, direct.predicate or "", states)
+            if verdict == "leak" and witness is None:
+                # No row characterizes it: the leak rests on a value the prover
+                # cannot see (an opaque helper), so it is not certain.
+                return CellProof("unknown", model, detail=(
+                    "the filter may admit rows, depending on a value the prover "
+                    "cannot see — if a helper it calls is your auth helper, name "
+                    "it with --auth-function"
+                ))
             if verdict == "leak":
                 if usage:
                     return CellProof("leak", model, witness=witness)
@@ -964,7 +1008,7 @@ class _Prover:
                 continue
             if fn.body is None or (fn.language != "sql" and not fn.atomic):
                 return True
-            if _has_node_in_sql(fn.body, _is_current_setting):
+            if _has_node_in_sql(fn.body, _reads_session_state):
                 return True
             if any(self._reads_settings(inner, seen | {fn.qualified_name})
                    for inner in _called_functions(fn.body, statement=True)):

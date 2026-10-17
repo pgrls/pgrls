@@ -4201,9 +4201,9 @@ def matrix(
     section. `--prove` checks every SELECT cell with the verify provers and
     marks it PROVEN, LEAK (with the leaking row), POSSIBLE, UNKNOWN or EXEMPT.
 
-    Each column is a session running as that role: `SET ROLE` (followed by
-    `--prove` only) and DDL are not modelled, nor are ordinary triggers fired
-    by a door's write. UPDATE
+    Each column is a session running as that role: `SET ROLE` and DDL are
+    not modelled in the grid (`--prove` accounts for both before claiming
+    PROVEN), nor are ordinary triggers fired by a door's write. UPDATE
     shows the rows `USING` lets it touch, not its `WITH CHECK`; a door is
     credited with its owner's reach, not with a view's own WHERE or what a
     function returns (an over-report).

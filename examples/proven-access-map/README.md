@@ -4,7 +4,7 @@
 `pgrls verify` uses, and shows the leaking row when a read isn't safe.
 
 ```bash
-./run.sh          # needs docker and `pip install pgrls`
+./run.sh          # needs docker and pgrls with --prove (0.58.0+)
 ```
 
 It starts a throwaway Postgres, loads [`schema.sql`](schema.sql) — a small
@@ -44,10 +44,10 @@ It also writes the same grid, with the leaking rows, to `access-map.html`.
 
 ## The two questions
 
-- **Anonymous columns** (`anon` and `PUBLIC`): can a session with no JWT read
-  any row?
-- **Every other column**: can a session of that role read a row belonging to
-  another tenant?
+- **Anonymous columns** (`anon` here; `PUBLIC` too when shown): can a session
+  with no JWT read any row?
+- **Every other column**: can a session of that role, carrying its tenant's
+  identity, read a row belonging to another tenant?
 
 A LEAK under the anonymous model means anonymous sessions read rows. On a
 table you meant to publish, that's intended — the leaking row tells you which

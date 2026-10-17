@@ -3090,6 +3090,25 @@ def test_prove_the_initplan_wrapper_is_not_called_a_table_read() -> None:
     assert p.status == "unknown" and "sub-select" not in (p.detail or ""), p
 
 
+def test_prove_a_leak_resting_on_an_opaque_helper_is_unknown() -> None:
+    """Without --auth-function the prover cannot see what app.uid() returns:
+    no row characterizes a leak, so it is not claimed."""
+    m = _prove([_sel("tenant_id = app.uid()")])
+    for role in ("anon", "authenticated"):
+        p = _proof(m, "public.t", role)
+        assert p.status == "unknown" and "--auth-function" in (p.detail or ""), (role, p)
+
+
+def test_prove_a_set_role_to_a_bypassing_role_says_so() -> None:
+    t = _sel("tenant_id = auth.uid()", grants=("authenticated", "svc"))
+    roles = [_api("authenticated"), Role("svc", False, False, True), _r("own")]
+    edge = RoleMembership(member="authenticated", role="svc", inherit=False)
+    m = build_matrix(_s([t], roles=roles, memberships=[edge]), roles=("authenticated",),
+                     prove=True)
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "bypasses RLS" in (p.detail or ""), p
+
+
 def test_prove_a_filter_outside_the_fragment_is_unknown() -> None:
     m = _prove([_sel("tenant_id IN (SELECT tenant_id FROM public.memberships)")])
     for role in ("anon", "authenticated"):
@@ -3678,7 +3697,7 @@ def test_prove_createrole_reached_by_set_role_is_named() -> None:
 
 
 @pytest.mark.parametrize("setting", ["request.header.tenant", "request.cookie.tenant",
-                                     "request.headers"])
+                                     "request.headers", "request.path", "request.method"])
 def test_prove_a_client_controlled_setting_is_never_an_identity(setting: str) -> None:
     t = _sel(f"tenant_id = current_setting('{setting}', true)", grants=("authenticated",))
     m = _prove([t], cols=("authenticated",))
@@ -3733,6 +3752,47 @@ def test_prove_a_client_setting_pgrls_cannot_rule_out_is_found(fns) -> None:
     m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
     p = _proof(m, "public.t", "authenticated")
     assert p.status == "unknown" and "PostgREST" in (p.detail or ""), p
+
+
+def test_prove_public_gets_the_writable_identity_check_too() -> None:
+    """Measured: any session — an anonymous one included — inserted a row
+    into the table its identity function reads and saw another user's rows."""
+    fns = (_fn("auth.uid", body="SELECT uid FROM public.sessions WHERE pid = pg_backend_pid()",
+               search_path="public, pg_temp"),)
+    t = _sel("tenant_id = auth.uid()", grants=("PUBLIC",))
+    sessions = _t("sessions", rls=False, grants=(_grant("PUBLIC", ("SELECT", "INSERT")),))
+    s = replace(_s([t, sessions], roles=[_api("anon"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("PUBLIC",), prove=True, grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "PUBLIC")
+    assert p.status == "unknown" and "public.sessions" in (p.detail or ""), p
+
+
+def test_prove_create_on_the_database_lets_a_login_session_make_its_own_schema() -> None:
+    """Measured: CREATE SCHEMA evil; a shadowing lower() on the search_path
+    changed what the helper returned."""
+    fns = (_fn("app.cur", body=_SAFE_BODY),)
+    m = _helper_matrix(*fns)
+    assert _proof(m, "public.t", "app_user").status == "proven"
+    t = _sel("tenant_id = cur()", grants=("app_user",))
+    users = _t("users", schema="app", rls=False)
+    s = replace(_s([t, users], roles=[_r("app_user"), _r("own")]), user_functions=fns,
+                schema_create=(), database_create=("app_user",))
+    m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "CREATE on the database" in (p.detail or ""), p
+
+
+@pytest.mark.parametrize("body", [
+    "SELECT application_name FROM pg_catalog.pg_stat_activity WHERE pid = pg_backend_pid()",
+    "SELECT setting FROM pg_settings WHERE name = 'application_name'",
+])
+def test_prove_a_helper_reading_session_state_from_the_catalog_is_settable(body: str) -> None:
+    """Measured: SET application_name = 't2' made the helper return another
+    tenant."""
+    m = _helper_matrix(_fn("app.cur", body=body, search_path="pg_catalog, pg_temp"))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "cur()" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
@@ -4145,6 +4205,13 @@ def test_live_createrole_self_granting_is_captured_before_pg16(pg_conn: psycopg.
     try:
         schema, _ = introspect_for_matrix(pg_conn, ["public"])
         assert ("pgrls_pm_cr" in (schema.self_granting_roles or ())) is pre16
+        # The database owner can create schemas; a role granted nothing cannot.
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT pg_get_userbyid(datdba) FROM pg_database "
+                        "WHERE datname = current_database()")
+            owner = cur.fetchone()[0]
+        assert owner in (schema.database_create or ())
+        assert "pgrls_pm_cr" not in (schema.database_create or ())
     finally:
         with pg_conn.cursor() as cur:
             cur.execute("DROP ROLE pgrls_pm_cr")

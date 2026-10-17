@@ -1872,6 +1872,10 @@ class Schema:
     # CREATEROLE lets a role grant itself any non-superuser role (16 requires
     # ADMIN OPTION, which the membership edges already carry). Live only.
     self_granting_roles: tuple[str, ...] | None = field(default=None, compare=False)
+    # Who holds CREATE on the database (PUBLIC included, the owner too): they
+    # can create a schema of their own and put it on their search_path. Live
+    # only; `None` = not captured.
+    database_create: tuple[str, ...] | None = field(default=None, compare=False)
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:

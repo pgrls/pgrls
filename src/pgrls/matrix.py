@@ -226,7 +226,7 @@ _PROOF_LEGEND = (
     ("proven", "no such read is possible"),
     ("leak", "the role's own session reads it — row shown"),
     ("possible", "through a door, which may filter it, or a direct read without schema USAGE"),
-    ("unknown", "outside what the prover can decide"),
+    ("unknown", "undecided, or something pgrls cannot see could change it — reason below"),
     ("exempt", "bypasses RLS by design"),
 )
 
