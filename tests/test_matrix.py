@@ -4040,6 +4040,24 @@ def test_prove_a_hook_copying_from_a_writable_table_taints_settings(privs, expec
     m = build_matrix(s, roles=("authenticated",), prove=True, grid=frozenset({"public.t"}))
     p = _proof(m, "public.t", "authenticated")
     assert p.status == expect, p
+    if expect == "unknown":
+        assert "public.profiles" in (p.detail or ""), p  # the real source, named
+
+
+def test_prove_every_configured_pre_request_hook_is_judged() -> None:
+    """Measured: a database-level clean hook and a role-level tainting one —
+    the role's overrides it, so it is the one that runs."""
+    clean = _fn("public.aaa_clean", body="SELECT 1")
+    pre = _fn("public.pre", body="SELECT set_config('app.tenant', current_setting("
+              "'request.header.x-tenant', true), true)")
+    t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(clean, pre),
+                set_gucs=(("pgrst.db_pre_request", "public.aaa_clean"),),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True)
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "public.pre" in (p.detail or ""), p
 
 
 def test_prove_a_hook_tainted_setting_in_the_identity_tables_policy_is_found() -> None:
