@@ -3960,6 +3960,29 @@ def test_prove_the_identity_tables_own_row_security_is_followed(using, role, exp
         assert "row security" in (p.detail or ""), p
 
 
+@pytest.mark.parametrize("via", ["sub-select", "helper"])
+@pytest.mark.parametrize("role", [_r("appf"), _api("appf")])
+def test_prove_a_writable_table_behind_the_identity_tables_policy_is_found(via, role) -> None:
+    """Measured (through an ordinary API write too): inserting into the table
+    the identity table's policy reads changed which rows the identity saw."""
+    using = ("tenant_id IN (SELECT tenant_id FROM public.unlocked)" if via == "sub-select"
+             else "app.is_unlocked(tenant_id)")
+    rt = _t("role_tenants", force=True,
+            policies=(_policy(command="SELECT", roles=("PUBLIC",), using=using),),
+            grants=(_grant("appf", ("SELECT",)),))
+    unlocked = _t("unlocked", rls=False, grants=(_grant("appf", ("SELECT", "INSERT")),))
+    fns = (_fn("app.cur", body="SELECT max(tenant_id) FROM public.role_tenants",
+               search_path="pg_catalog, pg_temp"),
+           _fn("app.is_unlocked", body="SELECT EXISTS (SELECT 1 FROM public.unlocked)",
+               search_path="pg_catalog, pg_temp"))
+    t = _sel("tenant_id = cur()", grants=("appf",))
+    s = replace(_s([t, rt, unlocked], roles=[role, _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "appf")
+    assert p.status == "unknown" and "public.unlocked" in (p.detail or ""), p
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""

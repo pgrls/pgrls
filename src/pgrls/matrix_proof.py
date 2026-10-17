@@ -948,6 +948,11 @@ class _Prover:
                 return fname, (f"reads {resolved}, which pgrls cannot resolve, so it "
                                "cannot rule out that the session writes it")
             tables, views = resolved
+            closed = self._through_policies(tables, views)
+            if isinstance(closed, str):
+                return fname, (f"reads {closed}, which pgrls cannot resolve, so it "
+                               "cannot rule out that the session writes it")
+            tables, views = closed
             rels = [(r.qualified_name, r.owner) for r in tables] + [
                 (v.qualified_name, v.owner) for v in views]
             for qname, rel_owner in rels:
@@ -957,16 +962,79 @@ class _Prover:
                 if rel_owner in door_holders:
                     door = (door_owners or {})[door_holders[rel_owner]]
                     return fname, (f"reads {qname}, owned by {rel_owner} — {door}, an "
-                                   "untraced door this role can open, runs as it and "
-                                   "can lift FORCE or replace what it returns")
+                                   "untraced door this role can open, runs with "
+                                   "its privileges and can lift FORCE or replace "
+                                   "what it returns")
             for t in tables:
                 if writable(t):
                     return fname, f"reads {t.qualified_name}, which the session can write"
                 why = self._policy_steers(t, login)
                 if why:
-                    return fname, (f"reads {t.qualified_name}, whose row security reads "
-                                   f"{why} — the session may change which rows it sees")
+                    return fname, f"reads {t.qualified_name}, whose row security reads {why}"
         return None
+
+    def _through_policies(
+        self, tables: list[Table], views: list[View],
+    ) -> tuple[list[Table], list[View]] | str:
+        """`tables` and `views`, plus everything the SELECT policies of those
+        tables read — their sub-selects and the helpers they call — and so on
+        through those relations' own policies. The policies run in the
+        session, so a writable or owned relation they read changes which rows
+        the identity sees (measured). An unresolvable name is returned."""
+        t_out = {t.qualified_name: t for t in tables}
+        v_out = {v.qualified_name: v for v in views}
+        todo = list(t_out.values())
+        while todo:
+            table = todo.pop()
+            if not table.rls_enabled:
+                continue
+            for pol in table.policies:
+                if pol.command not in ("SELECT", "ALL") or not pol.using_sql:
+                    continue
+                rels = self._predicate_relations(pol.using_sql)
+                if rels is None:
+                    return f"what policy {pol.name} on {table.qualified_name} reads"
+                resolved = self._resolve(rels)
+                if isinstance(resolved, str):
+                    return resolved
+                more_t, more_v = resolved
+                for v in more_v:
+                    v_out.setdefault(v.qualified_name, v)
+                for t in more_t:
+                    if t.qualified_name not in t_out:
+                        t_out[t.qualified_name] = t
+                        todo.append(t)
+        return list(t_out.values()), list(v_out.values())
+
+    def _predicate_relations(self, predicate: str) -> set[str] | None:
+        """The relations a policy expression reads — in its sub-selects and in
+        the bodies of the user-defined functions it calls — or None when a
+        body cannot be read."""
+        from pglast.ast import CommonTableExpr, RangeVar  # noqa: PLC0415
+
+        node = parse_expr(predicate)
+        if node is None:
+            return None
+        rels: set[str] = set()
+        ctes: set[str] = set()
+
+        def match(n: Any) -> bool:
+            if isinstance(n, RangeVar):
+                rels.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
+            if isinstance(n, CommonTableExpr):
+                ctes.add(n.ctename)
+            return False
+
+        _has_node_in(node, match)
+        out = rels - ctes
+        for fname in sorted(_called_functions(predicate)):
+            if fname not in self.functions:
+                continue  # a builtin; an opaque auth helper is judged elsewhere
+            more = self._relations_read(fname)
+            if more is None:
+                return None
+            out |= more
+        return out
 
     def _policy_steers(self, table: Table, login: bool) -> str | None:
         """What in `table`'s SELECT policies a session could steer — a value
@@ -982,14 +1050,14 @@ class _Prover:
                 continue
             client = self._client_controlled(using)
             if client:
-                return f"a value the HTTP client chooses ({pol.name})"
+                return f"a value the HTTP client chooses (policy {pol.name})"
             if login:
                 settable = self._settable_identity(using)
                 if settable:
-                    return f"{settable} ({pol.name})"
+                    return f"{settable} (policy {pol.name})"
                 for fname in sorted(_called_functions(using)):
                     if self._shadowable(fname):
-                        return f"{fname}(), which a temp table can shadow ({pol.name})"
+                        return f"{fname}(), which a temp table can shadow (policy {pol.name})"
         return None
 
     def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str] | None:
