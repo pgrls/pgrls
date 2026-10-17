@@ -4005,6 +4005,47 @@ def test_prove_a_pre_request_hook_copying_a_header_taints_settings(hook_body, ex
         assert "pre-request hook" in (p.detail or ""), p
 
 
+def test_prove_a_hook_taints_only_the_settings_it_writes() -> None:
+    """A hook that copies a header into app.tenant leaves a filter on
+    auth.uid() — which reads the JWT claim — PROVEN."""
+    hook = _fn("public.pre", body="SELECT set_config('app.tenant', current_setting("
+               "'request.header.x-tenant', true), true)")
+    uid = _fn("auth.uid", body="SELECT nullif(current_setting('request.jwt.claim.sub', true), '')")
+    t = _sel("tenant_id = auth.uid()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(hook, uid),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True)
+    assert _proof(m, "public.t", "authenticated").status == "proven"
+    # A hook writing a computed name taints every setting.
+    s = replace(s, user_functions=(_fn("public.pre", body=(
+        "SELECT set_config('app.' || current_setting('request.header.k', true), 'x', true)")),
+        uid))
+    m = build_matrix(s, roles=("authenticated",), prove=True)
+    assert _proof(m, "public.t", "authenticated").status == "unknown"
+
+
+def test_prove_a_hook_tainted_setting_in_the_identity_tables_policy_is_found() -> None:
+    """Replayed: the hook copied X-Tenant into app.tenant, which the identity
+    table's own policy read."""
+    hook = _fn("public.pre", body="SELECT set_config('app.tenant', current_setting("
+               "'request.headers', true)::json ->> 'x-tenant', true)")
+    cur = _fn("app.cur", body="SELECT max(tenant_id) FROM public.memberships",
+              search_path="pg_catalog, pg_temp")
+    mem = _t("memberships", force=True, policies=(_policy(
+        command="SELECT", roles=("PUBLIC",),
+        using="tenant_id = coalesce(current_setting('app.tenant', true), 't1')"),),
+        grants=(_grant("authenticated", ("SELECT",)),))
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    s = replace(_s([t, mem], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(hook, cur),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "row security" in (p.detail or ""), p
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""

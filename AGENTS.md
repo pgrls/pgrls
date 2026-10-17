@@ -325,7 +325,8 @@ which may filter it, or a read without schema USAGE), `UNKNOWN` (with the
 reason — including an untraced door, the table's owner, a `SET ROLE` target
 that is not proven, a filter that admits an unset setting or reads what an
 HTTP client chooses (request headers, cookies, method, path, the search_path
-behind `current_schema()`), a leak resting on an opaque helper, an auth
+behind `current_schema()`, a setting a PostgREST pre-request hook copies one
+into), a leak resting on an opaque helper, an auth
 function reading a table the role can write, and for a role that can log in
 — a raw SQL session — pre-16 CREATEROLE, a filter reading a setting it can
 set, or a session that can redefine or shadow what the filter calls) or

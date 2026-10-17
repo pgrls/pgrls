@@ -220,6 +220,18 @@ def _reads_session_state(n: Any) -> bool:
     return False
 
 
+def _setting_name(node: Any) -> str | None:
+    """The literal setting name a ``current_setting`` call reads, lowercased,
+    or None when it is computed."""
+    from pglast.ast import A_Const, String, TypeCast  # noqa: PLC0415
+
+    arg = node.args[0] if getattr(node, "args", None) else None
+    while isinstance(arg, TypeCast):
+        arg = arg.arg
+    val = getattr(arg, "val", None) if isinstance(arg, A_Const) else None
+    return str(val.sval).lower() if isinstance(val, String) else None
+
+
 def _calls_current_setting(predicate: str) -> bool:
     """Whether `predicate` reads a setting with the built-in
     ``current_setting`` (a tenant carried in a GUC, not a JWT)."""
@@ -389,7 +401,7 @@ class _Prover:
         self.states_cache: dict[str, _GucStates] = {}
         self.base_cache: dict[Any, CellProof] = {}
         self.usage: dict[str, frozenset[str]] | None = None
-        self._hook_cache: str | None = None
+        self._hook_cache: tuple[str, frozenset[str] | None] | tuple[()] | None = None
         # function name — qualified and bare — -> its owners; and by
         # qualified name alone, for naming the owned function
         self.fn_owners: dict[str, set[str]] = {}
@@ -863,11 +875,11 @@ class _Prover:
                 return CellProof("unknown", model, detail=header)
         if not login and predicate is not None:
             hook = self._tainting_hook()
-            if hook and self._settable_identity(predicate):
+            if hook and self._reads_any_setting_of(predicate, hook[1]):
+                written = ", ".join(sorted(hook[1])) if hook[1] else "settings"
                 return CellProof("unknown", model, detail=(
-                    f"the PostgREST pre-request hook {hook} sets settings from what "
-                    "the HTTP client sends (or from a body pgrls cannot read), and "
-                    "the filter reads settings"
+                    f"the PostgREST pre-request hook {hook[0]} may set {written} from "
+                    "what the HTTP client sends, and the filter reads it"
                 ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
@@ -1073,6 +1085,12 @@ class _Prover:
                 settable = self._settable_identity(using)
                 if settable:
                     return f"{settable} (policy {pol.name})"
+            else:
+                # A gateway session gets its settings from a pre-request hook
+                # that may copy client values.
+                hook = self._tainting_hook()
+                if hook and self._reads_any_setting_of(using, hook[1]):
+                    return f"a setting the pre-request hook {hook[0]} may set (policy {pol.name})"
                 for fname in sorted(_called_functions(using)):
                     if self._shadowable(fname):
                         return f"{fname}(), which a temp table can shadow (policy {pol.name})"
@@ -1287,26 +1305,128 @@ class _Prover:
                  or ("." in f and not f.lower().startswith("pg_catalog.")))
         )
 
-    def _tainting_hook(self) -> str | None:
+    def _tainting_hook(self) -> tuple[str, frozenset[str] | None] | None:
         """A PostgREST pre-request hook (``pgrst.db_pre_request``, set at
         database or role level) that may copy a client-chosen value into a
-        setting: its body, or a callee, reads one — or pgrls cannot read it
-        (measured: a hook copying a request header into app.tenant)."""
+        setting — its body, or a callee, reads one, or pgrls cannot read it
+        (measured: a hook copying a request header into app.tenant) — with the
+        setting names it writes; None for the names when any is computed or
+        the body cannot be read."""
         if self._hook_cache is not None:
             return self._hook_cache or None
-        names = [v for n, v in self.schema.set_gucs if n.lower() == "pgrst.db_pre_request"]
-        names += [v for _, n, v in self.schema.role_set_gucs
-                  if n.lower() == "pgrst.db_pre_request"]
-        found = ""
-        for value in names:
+        values = [v for n, v in self.schema.set_gucs if n.lower() == "pgrst.db_pre_request"]
+        values += [v for _, n, v in self.schema.role_set_gucs
+                   if n.lower() == "pgrst.db_pre_request"]
+        found: tuple[str, frozenset[str] | None] | tuple[()] = ()
+        for value in values:
             hook = (value or "").strip().strip('"')
             if not hook:
                 continue
-            if hook not in self.functions or self._client_in_body(hook):
-                found = hook
+            if hook not in self.functions:
+                found = (hook, None)
+                break
+            if self._client_in_body(hook):
+                found = (hook, self._settings_written(hook))
                 break
         self._hook_cache = found
         return found or None
+
+    def _settings_written(self, fname: str, seen: frozenset[str] = frozenset()) -> frozenset[str] | None:
+        """The setting names `fname` (and its callees) write with
+        ``set_config`` or ``SET`` — None when a name is computed or a body
+        cannot be read."""
+        from pglast.ast import A_Const, FuncCall, String, TypeCast, VariableSetStmt  # noqa: PLC0415
+
+        names: set[str] = set()
+        unknown = False
+
+        def match(n: Any) -> bool:
+            nonlocal unknown
+            if isinstance(n, VariableSetStmt) and n.name:
+                names.add(str(n.name).lower())
+            if isinstance(n, FuncCall) and getattr(n.funcname[-1], "sval", "") == "set_config":
+                arg = n.args[0] if n.args else None
+                while isinstance(arg, TypeCast):
+                    arg = arg.arg
+                val = getattr(arg, "val", None) if isinstance(arg, A_Const) else None
+                if isinstance(val, String):
+                    names.add(str(val.sval).lower())
+                else:
+                    unknown = True
+            return False
+
+        for fn in self.functions.get(fname, ()):
+            if fn.qualified_name in seen or fn.language in ("c", "internal"):
+                continue
+            stmts = _body_statements_of(fn)
+            if stmts is None:
+                return None
+            _has_node_in(stmts, match)
+            if unknown:
+                return None
+            for inner in sorted(_names_called(stmts)):
+                more = self._settings_written(inner, seen | {fn.qualified_name})
+                if more is None:
+                    return None
+                names |= more
+        return frozenset(names)
+
+    def _reads_any_setting_of(self, predicate: str, names: frozenset[str] | None) -> bool:
+        """Whether `predicate` — directly or in a function body it reaches —
+        reads one of the settings `names` (any setting when None); a computed
+        name or a body pgrls cannot read counts."""
+        if names is None:
+            return self._settable_identity(predicate) is not None
+        hit = False
+
+        def match(n: Any) -> bool:
+            nonlocal hit
+            if _is_current_setting(n):
+                setting = _setting_name(n)
+                if setting is None or setting in names:
+                    hit = True
+            return False
+
+        _has_node(predicate, match)
+        if hit:
+            return True
+        return any(self._body_reads_setting_of(f, names) for f in _called_functions(predicate))
+
+    def _body_reads_setting_of(self, fname: str, names: frozenset[str],
+                               seen: frozenset[str] = frozenset()) -> bool:
+        from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
+
+        fns = self.functions.get(fname)
+        if not fns:
+            if fname.rsplit(".", 1)[-1].lower() == "current_setting":
+                return False  # a setting read is matched by its name
+            auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
+            bare = {a.rsplit(".", 1)[-1] for a in auth}
+            # an auth function whose body was not captured: it may read any
+            return fname in auth or fname.rsplit(".", 1)[-1] in bare
+        hit = False
+
+        def match(n: Any) -> bool:
+            nonlocal hit
+            if _is_current_setting(n):
+                setting = _setting_name(n)
+                if setting is None or setting in names:
+                    hit = True
+            return False
+
+        for fn in fns:
+            if fn.qualified_name in seen or fn.language in ("c", "internal"):
+                continue
+            stmts = _body_statements_of(fn)
+            if stmts is None:
+                return True
+            _has_node_in(stmts, match)
+            if hit:
+                return True
+            if any(self._body_reads_setting_of(inner, names, seen | {fn.qualified_name})
+                   for inner in _names_called(stmts)):
+                return True
+        return False
 
     def _settable_identity(self, predicate: str) -> str | None:
         """What in `predicate` reads state a session can set for itself — a
