@@ -30,9 +30,10 @@ the verdicts honest:
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
-  policy in one statement); no auth function the filter calls reads, in a
-  SQL body it or its callees have, a table the role can write (it could
-  change who it is taken to be); for a role that can log in — a raw SQL
+  policy in one statement); no auth function the filter calls reads — in
+  its body or a callee's, a view standing for its tables — a table the role
+  can write (it could change who it is taken to be; a body or relation pgrls
+  cannot see counts as any table); for a role that can log in — a raw SQL
   session — it has no CREATEROLE before Postgres 16 (which grants itself any
   non-superuser role), the filter reads no setting the session could set for
   itself (directly or in a function body), the session owns no user-defined function (one may
@@ -226,6 +227,45 @@ def _unqualified_relations(body: str) -> set[str] | None:
     return names
 
 
+def _body_statements_of(fn: UserFunction) -> list[Any] | None:
+    """The statements a user-defined function's body runs, parsed — None
+    when they cannot all be known (another language, dynamic SQL, a parse
+    error). An atomic body's ``CREATE FUNCTION`` is parsed whole."""
+    from pglast import parse_sql  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    if fn.body is None:
+        return None
+    if fn.language == "sql" or fn.atomic:
+        try:
+            return [raw.stmt for raw in parse_sql(fn.body)]
+        except Exception:  # noqa: BLE001
+            return None
+    if fn.language == "plpgsql":
+        stmts, incomplete = _plpgsql_statements(
+            "CREATE FUNCTION pgrls_body() RETURNS void LANGUAGE plpgsql AS "
+            f"$pgrls_body${fn.body}$pgrls_body$"
+        )
+        return None if incomplete else stmts
+    return None
+
+
+def _names_called(stmts: Any) -> set[str]:
+    """The function names (as written) called anywhere in `stmts`."""
+    from pglast.ast import FuncCall  # noqa: PLC0415
+
+    names: set[str] = set()
+
+    def match(n: Any) -> bool:
+        if isinstance(n, FuncCall):
+            names.add(".".join(getattr(part, "sval", "") for part in n.funcname))
+        return False
+
+    _has_node_in(stmts, match)
+    return names
+
+
 def _has_subselect(predicate: str) -> bool:
     from pglast.ast import SubLink  # noqa: PLC0415
 
@@ -393,9 +433,11 @@ class _Prover:
             return base
         granting = sorted(({name} | targets) & set(self.schema.self_granting_roles or ()))
         if granting:
+            who = (f"{granting[0]} has" if granting[0] == name
+                   else f"the session can SET ROLE {granting[0]}, which has")
             return CellProof("unknown", model, detail=(
-                f"{granting[0]} has CREATEROLE on a server before Postgres 16: it "
-                "can grant itself any non-superuser role, a BYPASSRLS one included"
+                f"{who} CREATEROLE on a server before Postgres 16: it can grant "
+                "itself any non-superuser role, a BYPASSRLS one included"
             ))
         return self._redefinable(name, targets, table, model) or base
 
@@ -697,57 +739,94 @@ class _Prover:
         return proven
 
     def _identity_reads_writable(self, name: str, predicate: str) -> tuple[str, str] | None:
-        """(auth function, table) when an auth function the filter calls reads
-        — in its body, or a function that body calls — a table `name` can
-        INSERT, UPDATE or DELETE: the prover takes the function's value as the
-        session's identity, but the session can rewrite what it reads
-        (measured, through an ordinary API write too)."""
+        """(auth function, what it reads) when an auth function the filter
+        calls reads — in its body, or a function that body calls — a table
+        `name` can INSERT, UPDATE or DELETE: the prover takes the function's
+        value as the session's identity, but the session can rewrite what it
+        reads (measured, through an ordinary API write too). A view counts as
+        the tables under it. A body pgrls cannot read, or a relation it
+        cannot resolve, counts as any table — unsafe unless the role can write
+        none."""
         from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
 
         auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
         bare = {a.rsplit(".", 1)[-1] for a in auth}
         reach = self.reach_of(name)
+
+        def writable(t: Table) -> bool:
+            return any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
+                       for cmd in ("INSERT", "UPDATE", "DELETE"))
+
         for fname in sorted(_called_functions(predicate)):
             if fname not in auth and fname.rsplit(".", 1)[-1] not in bare:
                 continue
-            for rel in sorted(self._relations_read(fname)):
-                for table in self._tables_named(rel):
-                    if any(reach.cells[(table.qualified_name, cmd)].verdict != "denied"
-                           for cmd in ("INSERT", "UPDATE", "DELETE")):
-                        return fname, table.qualified_name
+            rels = self._relations_read(fname)
+            tables = None if rels is None else self._resolve(rels)
+            if tables is None:
+                anything = next((t for t in self.schema.tables if writable(t)), None)
+                if anything is not None:
+                    return fname, (f"tables pgrls cannot see (and the role can write "
+                                   f"{anything.qualified_name})")
+                continue
+            for table in tables:
+                if writable(table):
+                    return fname, table.qualified_name
         return None
 
-    def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str]:
-        """Every relation name (as written) the bodies of `fname` and the
-        user-defined functions they call read."""
-        from pglast import parse_sql  # noqa: PLC0415
+    def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str] | None:
+        """Every relation name (as written) the body of `fname` and the
+        user-defined functions it calls read; None when a body cannot be read
+        (another language, dynamic SQL, a parse error)."""
         from pglast.ast import RangeVar  # noqa: PLC0415
 
         out: set[str] = set()
+
+        def match(n: Any) -> bool:
+            if isinstance(n, RangeVar):
+                out.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
+            return False
+
         for fn in self.functions.get(fname, ()):
-            if fn.qualified_name in seen or not fn.body or fn.language != "sql":
+            if fn.qualified_name in seen or fn.language in ("c", "internal"):
                 continue
-            try:
-                stmts = parse_sql(fn.body)
-            except Exception:  # noqa: BLE001
-                continue
-
-            def match(n: Any) -> bool:
-                if isinstance(n, RangeVar):
-                    out.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
-                return False
-
+            stmts = _body_statements_of(fn)
+            if stmts is None:
+                return None
             _has_node_in(stmts, match)
-            for inner in _called_functions(fn.body, statement=True):
-                out |= self._relations_read(inner, seen | {fn.qualified_name})
+            for inner in sorted(_names_called(stmts)):
+                more = self._relations_read(inner, seen | {fn.qualified_name})
+                if more is None:
+                    return None
+                out |= more
         return out
 
-    def _tables_named(self, rel: str) -> list[Table]:
-        """The tables a relation name may be: exact when qualified, every
-        table of that name when bare."""
-        if "." in rel:
-            return [t for t in (self.tables.get(rel),) if t is not None]
-        return [t for t in self.schema.tables if t.name == rel]
+    def _resolve(self, rels: set[str]) -> list[Table] | None:
+        """The tables relation names read — a view's base tables for a view;
+        a bare name as every table or view of that name. None when a name
+        resolves to nothing pgrls captured (a system catalog excepted)."""
+        tables: dict[str, Table] = {}
+        for rel in rels:
+            schema_name, _, relname = rel.rpartition(".")
+            if schema_name in ("pg_catalog", "information_schema") or (
+                not schema_name and relname.startswith("pg_")
+            ):
+                continue
+            found = False
+            for t in self.schema.tables:
+                if t.name == relname and (not schema_name or t.schema == schema_name):
+                    tables[t.qualified_name] = t
+                    found = True
+            for v in self.schema.views:
+                if v.name == relname and (not schema_name or v.schema == schema_name):
+                    found = True
+                    for vs, vn in v.references:
+                        base = self.tables.get(f"{vs}.{vn}")
+                        if base is None:
+                            return None
+                        tables[base.qualified_name] = base
+            if not found:
+                return None
+        return list(tables.values())
 
     def _settable_identity(self, predicate: str) -> str | None:
         """What in `predicate` reads state a session can set for itself — a

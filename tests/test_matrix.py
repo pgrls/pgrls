@@ -3573,6 +3573,49 @@ def test_prove_a_writable_table_read_by_a_function_the_identity_calls_is_found()
     assert p.status == "unknown" and "public.memberships" in (p.detail or ""), p
 
 
+@pytest.mark.parametrize(("body", "language", "views"), [
+    ("BEGIN RETURN (SELECT tenant_id FROM public.memberships LIMIT 1); END", "plpgsql", ()),
+    ("SELECT tenant_id FROM public.my_memberships LIMIT 1", "sql", ("my_memberships",)),
+    ("SELECT tenant_id FROM private.profiles LIMIT 1", "sql", ()),
+    ("BEGIN RETURN 1; EXECUTE 'SELECT 1'; END", "plpgsql", ()),
+    ("SELECT tenant_id FROM", "sql", ()),
+])
+def test_prove_an_identity_pgrls_cannot_fully_see_is_not_proven(body, language, views) -> None:
+    """Measured for a view over the table and a plpgsql body: the session
+    wrote memberships and became another tenant. A body pgrls cannot read or a
+    relation it cannot resolve counts as any table the role can write."""
+    fns = (_fn("app.tenant_of", body=body, language=language, search_path="public, pg_temp"),)
+    t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
+    memberships = _t("memberships", rls=False, grants=(_grant("app_user", ("INSERT",)),))
+    vs = [_v(v, (("public", "memberships"),), owner="own", invoker=True) for v in views]
+    s = replace(_s([t, memberships], vs, roles=[_api("app_user"), _r("own")]),
+                user_functions=fns)
+    m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"app.tenant_of"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "app.tenant_of()" in (p.detail or ""), p
+
+
+def test_prove_an_unreadable_identity_is_fine_when_the_role_writes_nothing() -> None:
+    fns = (_fn("app.tenant_of", body="BEGIN RETURN 1; END", language="plpgsql"),)
+    t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
+    s = replace(_s([t], roles=[_api("app_user"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"app.tenant_of"})
+    assert _proof(m, "public.t", "app_user").status == "proven"
+
+
+def test_prove_createrole_reached_by_set_role_is_named() -> None:
+    t = _sel("tenant_id = auth.uid()", grants=())
+    roles = [_r("ops"), _api("cr"), _api("gw"), _r("own")]
+    edges = [RoleMembership(member="ops", role="cr", inherit=False)]
+    s = replace(_s([t], roles=roles, memberships=edges), self_granting_roles=("cr", "gw"))
+    m = build_matrix(s, roles=("ops", "gw"), prove=True)
+    p = _proof(m, "public.t", "ops")
+    assert p.status == "unknown" and "SET ROLE cr" in (p.detail or ""), p
+    # A NOLOGIN CREATEROLE role is reached only through a login member's column.
+    assert _proof(m, "public.t", "gw").status == "proven"
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""
@@ -3986,3 +4029,58 @@ def test_live_createrole_self_granting_is_captured_before_pg16(pg_conn: psycopg.
     finally:
         with pg_conn.cursor() as cur:
             cur.execute("DROP ROLE pgrls_pm_cr")
+
+
+@requires_docker
+def test_live_a_plpgsql_identity_over_a_writable_table_is_not_proven(
+    pg_conn: psycopg.Connection,
+) -> None:
+    """Measured: the session inserts a membership for another tenant and its
+    identity function then returns that tenant."""
+    from psycopg import sql as _sql  # noqa: PLC0415
+
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
+
+    def drop() -> None:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS public.idocs, public.imembers")
+            cur.execute("DROP FUNCTION IF EXISTS public.itenant()")
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'pgrls_pm_auth'")
+            if cur.fetchone() is not None:
+                cur.execute("DROP OWNED BY pgrls_pm_auth CASCADE")
+                cur.execute("DROP ROLE pgrls_pm_auth")
+
+    drop()
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("""
+                REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+                CREATE ROLE pgrls_pm_auth NOLOGIN;
+                CREATE TABLE public.imembers (member text, tenant_id text);
+                INSERT INTO public.imembers VALUES ('pgrls_pm_auth', 'a');
+                GRANT SELECT, INSERT ON public.imembers TO pgrls_pm_auth;
+                CREATE FUNCTION public.itenant() RETURNS text LANGUAGE plpgsql STABLE
+                  SET search_path = public, pg_temp AS $$
+                BEGIN
+                  RETURN (SELECT tenant_id FROM public.imembers
+                          WHERE member = current_user ORDER BY tenant_id DESC LIMIT 1);
+                END $$;
+                CREATE TABLE public.idocs (id int, tenant_id text);
+                INSERT INTO public.idocs VALUES (1, 'a'), (2, 'b');
+                ALTER TABLE public.idocs ENABLE ROW LEVEL SECURITY;
+                CREATE POLICY p ON public.idocs FOR SELECT USING (tenant_id = public.itenant());
+                GRANT SELECT ON public.idocs TO pgrls_pm_auth;
+            """)
+        with pg_conn.transaction(force_rollback=True), pg_conn.cursor() as cur:
+            cur.execute(_sql.SQL("SET LOCAL ROLE pgrls_pm_auth"))
+            cur.execute("INSERT INTO public.imembers VALUES ('pgrls_pm_auth', 'b')")
+            cur.execute("SELECT count(*) FROM public.idocs WHERE tenant_id <> 'a'")
+            assert cur.fetchone()[0] == 1  # it became tenant b
+
+        schema, grid = introspect_for_matrix(pg_conn, ["public"])
+        m = build_matrix(schema, roles=("pgrls_pm_auth",), grid=grid, prove=True,
+                         auth_functions={"public.itenant", "itenant"})
+        p = _proof(m, "public.idocs", "pgrls_pm_auth")
+        assert p.status == "unknown" and "public.imembers" in (p.detail or ""), p
+    finally:
+        drop()
