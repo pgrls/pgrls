@@ -394,7 +394,12 @@ class _Prover:
         self.reach_of = reach_of
         self.attrs = attrs
         self.anon_set = anon_set
-        self.auth = auth_functions
+        # Postgres stores a call to a function on the search_path without its
+        # schema (public.my_tenant() reads back as my_tenant()), so a qualified
+        # --auth-function also names its bare call — for the prover too, or a
+        # helper the user named would be opaque to it (a false LEAK).
+        self.auth = (None if auth_functions is None else
+                     set(auth_functions) | {a.rsplit(".", 1)[-1] for a in auth_functions})
         self.identity_columns = identity_columns
         self.axis = identity_columns if identity_columns is not None else AXIS_IDENTITY_COLUMNS
         self.cache: dict[Any, tuple[str, dict[str, object] | None]] = {}
@@ -864,7 +869,7 @@ class _Prover:
                 "cannot decide"
             ))
         if _dependence(predicate)[1]:
-            opaque = self._opaque_helpers(predicate)
+            opaque = self._opaque_helpers(predicate) or sorted(_called_functions(predicate))
             what = f"{opaque[0]}()" if opaque else "a function"
             return CellProof("unknown", model, detail=(
                 f"the filter calls {what}, which the prover cannot see into — if it "

@@ -3090,6 +3090,17 @@ def test_prove_the_initplan_wrapper_is_not_called_a_table_read() -> None:
     assert p.status == "unknown" and "sub-select" not in (p.detail or ""), p
 
 
+def test_prove_a_qualified_auth_function_matches_its_stored_bare_call() -> None:
+    """Postgres stores public.my_tenant() as my_tenant(): naming the qualified
+    helper must make it the identity for the prover too."""
+    m = build_matrix(_s([_sel("tenant_id = my_tenant()")],
+                        roles=[_api("anon"), _api("authenticated"), _r("own")]),
+                     roles=("anon", "authenticated"), prove=True,
+                     auth_functions={"public.my_tenant"})
+    for role in ("anon", "authenticated"):
+        assert _proof(m, "public.t", role).status == "proven", role
+
+
 def test_prove_a_leak_resting_on_an_opaque_helper_is_unknown() -> None:
     """Without --auth-function the prover cannot see what app.uid() returns:
     no row characterizes a leak, so it is not claimed."""
