@@ -3981,6 +3981,28 @@ def test_prove_a_writable_table_behind_the_identity_tables_policy_is_found(via, 
                      grid=frozenset({"public.t"}))
     p = _proof(m, "public.t", "appf")
     assert p.status == "unknown" and "public.unlocked" in (p.detail or ""), p
+    if via == "sub-select":
+        assert "through the row security of public.role_tenants" in (p.detail or ""), p
+
+
+@pytest.mark.parametrize(("hook_body", "expect"), [
+    ("SELECT set_config('app.tenant', current_setting('request.headers', true)::json"
+     " ->> 'x-tenant', true)", "unknown"),
+    ("SELECT set_config('app.tenant', current_setting('request.jwt.claims', true)::json"
+     " ->> 'tenant', true)", "proven"),
+])
+def test_prove_a_pre_request_hook_copying_a_header_taints_settings(hook_body, expect) -> None:
+    """Replayed: PostgREST's per-request sequence with a hook that copies the
+    X-Tenant header into app.tenant served another tenant's rows."""
+    t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(_fn("public.pre", body=hook_body),),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True)
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == expect, p
+    if expect == "unknown":
+        assert "pre-request hook" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:

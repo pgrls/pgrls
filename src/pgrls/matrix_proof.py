@@ -389,6 +389,7 @@ class _Prover:
         self.states_cache: dict[str, _GucStates] = {}
         self.base_cache: dict[Any, CellProof] = {}
         self.usage: dict[str, frozenset[str]] | None = None
+        self._hook_cache: str | None = None
         # function name — qualified and bare — -> its owners; and by
         # qualified name alone, for naming the owned function
         self.fn_owners: dict[str, set[str]] = {}
@@ -860,6 +861,14 @@ class _Prover:
             header = self._client_controlled(predicate)
             if header:
                 return CellProof("unknown", model, detail=header)
+        if not login and predicate is not None:
+            hook = self._tainting_hook()
+            if hook and self._settable_identity(predicate):
+                return CellProof("unknown", model, detail=(
+                    f"the PostgREST pre-request hook {hook} sets settings from what "
+                    "the HTTP client sends (or from a body pgrls cannot read), and "
+                    "the filter reads settings"
+                ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
             # and put any schema it can create in on its search_path.
@@ -952,30 +961,35 @@ class _Prover:
             if isinstance(closed, str):
                 return fname, (f"reads {closed}, which pgrls cannot resolve, so it "
                                "cannot rule out that the session writes it")
-            tables, views = closed
+            tables, views, via = closed
+
+            def named(q: str) -> str:
+                return f"{q} (through the row security of {via[q]})" if q in via else q
+
             rels = [(r.qualified_name, r.owner) for r in tables] + [
                 (v.qualified_name, v.owner) for v in views]
             for qname, rel_owner in rels:
                 if rel_owner in owners:
-                    return fname, (f"reads {qname}, which the session owns — it can "
+                    return fname, (f"reads {named(qname)}, which the session owns — it can "
                                    "lift FORCE or replace what it returns")
                 if rel_owner in door_holders:
                     door = (door_owners or {})[door_holders[rel_owner]]
-                    return fname, (f"reads {qname}, owned by {rel_owner} — {door}, an "
+                    return fname, (f"reads {named(qname)}, owned by {rel_owner} — {door}, an "
                                    "untraced door this role can open, runs with "
                                    "its privileges and can lift FORCE or replace "
                                    "what it returns")
             for t in tables:
                 if writable(t):
-                    return fname, f"reads {t.qualified_name}, which the session can write"
+                    return fname, f"reads {named(t.qualified_name)}, which the session can write"
                 why = self._policy_steers(t, login)
                 if why:
-                    return fname, f"reads {t.qualified_name}, whose row security reads {why}"
+                    return fname, (f"reads {named(t.qualified_name)}, whose row security "
+                                   f"reads {why}")
         return None
 
     def _through_policies(
         self, tables: list[Table], views: list[View],
-    ) -> tuple[list[Table], list[View]] | str:
+    ) -> tuple[list[Table], list[View], dict[str, str]] | str:
         """`tables` and `views`, plus everything the SELECT policies of those
         tables read — their sub-selects and the helpers they call — and so on
         through those relations' own policies. The policies run in the
@@ -983,6 +997,7 @@ class _Prover:
         the identity sees (measured). An unresolvable name is returned."""
         t_out = {t.qualified_name: t for t in tables}
         v_out = {v.qualified_name: v for v in views}
+        via: dict[str, str] = {}  # relation -> the table whose policy reads it
         todo = list(t_out.values())
         while todo:
             table = todo.pop()
@@ -999,12 +1014,15 @@ class _Prover:
                     return resolved
                 more_t, more_v = resolved
                 for v in more_v:
-                    v_out.setdefault(v.qualified_name, v)
+                    if v.qualified_name not in v_out:
+                        v_out[v.qualified_name] = v
+                        via[v.qualified_name] = table.qualified_name
                 for t in more_t:
                     if t.qualified_name not in t_out:
                         t_out[t.qualified_name] = t
+                        via[t.qualified_name] = table.qualified_name
                         todo.append(t)
-        return list(t_out.values()), list(v_out.values())
+        return list(t_out.values()), list(v_out.values()), via
 
     def _predicate_relations(self, predicate: str) -> set[str] | None:
         """The relations a policy expression reads — in its sub-selects and in
@@ -1268,6 +1286,27 @@ class _Prover:
             and (f in self.functions
                  or ("." in f and not f.lower().startswith("pg_catalog.")))
         )
+
+    def _tainting_hook(self) -> str | None:
+        """A PostgREST pre-request hook (``pgrst.db_pre_request``, set at
+        database or role level) that may copy a client-chosen value into a
+        setting: its body, or a callee, reads one — or pgrls cannot read it
+        (measured: a hook copying a request header into app.tenant)."""
+        if self._hook_cache is not None:
+            return self._hook_cache or None
+        names = [v for n, v in self.schema.set_gucs if n.lower() == "pgrst.db_pre_request"]
+        names += [v for _, n, v in self.schema.role_set_gucs
+                  if n.lower() == "pgrst.db_pre_request"]
+        found = ""
+        for value in names:
+            hook = (value or "").strip().strip('"')
+            if not hook:
+                continue
+            if hook not in self.functions or self._client_in_body(hook):
+                found = hook
+                break
+        self._hook_cache = found
+        return found or None
 
     def _settable_identity(self, predicate: str) -> str | None:
         """What in `predicate` reads state a session can set for itself — a

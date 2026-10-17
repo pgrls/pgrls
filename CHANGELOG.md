@@ -23,12 +23,13 @@ breaking changes — they will be called out in this file.
     no door evaluates a who-runs-it filter or opens an untraced path to the
     table; the role neither owns the table nor can `SET ROLE` to a role
     whose read is not `PROVEN`; the filter reads nothing an HTTP client
-    chooses (request headers, cookies, method, path, or the search_path
-    behind `current_schema()`), and no auth function it calls reads a table
-    the session can write or whose own row security it can steer (what those
-    policies read is followed the same way) (SQL and PL/pgSQL bodies followed, views to their
-    tables, an unresolvable relation or unreadable body counting against
-    it). A login session must also have no pre-16 CREATEROLE, read no
+    chooses (request headers, cookies, method, path, the search_path behind
+    `current_schema()`, or a setting a PostgREST pre-request hook copies one
+    into), and no auth function it calls reads a table
+    the session can write or whose own row security it can steer — following
+    SQL and PL/pgSQL bodies, views to their tables, and what those tables'
+    policies read in turn, with an unresolvable relation or unreadable body
+    counting against it. A login session must also have no pre-16 CREATEROLE, read no
     setting it can set for itself, and be unable to redefine or shadow what
     the filter calls (owned functions or relations, CREATE on a schema or the
     database, a helper reading a table by bare name without `pg_temp` last);
