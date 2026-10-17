@@ -4025,6 +4025,23 @@ def test_prove_a_hook_taints_only_the_settings_it_writes() -> None:
     assert _proof(m, "public.t", "authenticated").status == "unknown"
 
 
+@pytest.mark.parametrize(("privs", "expect"), [(("SELECT", "UPDATE"), "unknown"),
+                                              (("SELECT",), "proven")])
+def test_prove_a_hook_copying_from_a_writable_table_taints_settings(privs, expect) -> None:
+    """Replayed: an ordinary UPDATE of the user's own profile row changed the
+    "active org" the hook copied into app.tenant."""
+    hook = _fn("public.pre", body="SELECT set_config('app.tenant', "
+               "(SELECT active_org FROM public.profiles LIMIT 1), true)")
+    profiles = _t("profiles", rls=False, grants=(_grant("authenticated", privs),))
+    t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("authenticated",))
+    s = replace(_s([t, profiles], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(hook,),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True, grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == expect, p
+
+
 def test_prove_a_hook_tainted_setting_in_the_identity_tables_policy_is_found() -> None:
     """Replayed: the hook copied X-Tenant into app.tenant, which the identity
     table's own policy read."""

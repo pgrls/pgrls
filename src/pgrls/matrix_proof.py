@@ -401,7 +401,7 @@ class _Prover:
         self.states_cache: dict[str, _GucStates] = {}
         self.base_cache: dict[Any, CellProof] = {}
         self.usage: dict[str, frozenset[str]] | None = None
-        self._hook_cache: tuple[str, frozenset[str] | None] | tuple[()] | None = None
+        self._in_hook = False
         # function name — qualified and bare — -> its owners; and by
         # qualified name alone, for naming the owned function
         self.fn_owners: dict[str, set[str]] = {}
@@ -874,7 +874,7 @@ class _Prover:
             if header:
                 return CellProof("unknown", model, detail=header)
         if not login and predicate is not None:
-            hook = self._tainting_hook()
+            hook = self._hook_taint({name}, login)
             if hook and self._reads_any_setting_of(predicate, hook[1]):
                 written = ", ".join(sorted(hook[1])) if hook[1] else "settings"
                 return CellProof("unknown", model, detail=(
@@ -934,6 +934,29 @@ class _Prover:
         auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
         bare = {a.rsplit(".", 1)[-1] for a in auth}
         reaches = [self.reach_of(r) for r in sorted(session)]
+        called = set()
+        for reach in reaches:
+            predicate = reach.cells[(table.qualified_name, "SELECT")].predicate
+            if predicate:
+                called |= _called_functions(predicate)
+        for fname in sorted(called):
+            if fname not in auth and fname.rsplit(".", 1)[-1] not in bare:
+                continue
+            why = self._function_steerable(fname, session, login, door_owners)
+            if why:
+                return fname, why
+        return None
+
+    def _function_steerable(
+        self, fname: str, session: set[str], login: bool,
+        door_owners: dict[str, str] | None,
+    ) -> str | None:
+        """Why what `fname` returns is something the session can change: the
+        relations its body (and callees) read — views to their tables, tables
+        to their children and through their policies — include one it can
+        write, owns (a login session) or reaches through an untraced door's
+        owner, or whose row security it can steer; or pgrls cannot tell."""
+        reaches = [self.reach_of(r) for r in sorted(session)]
         owners = self._privilege_holders(session) - {"PUBLIC"} if login else set()
         door_holders = {h: owner for owner in (door_owners or {})
                         for h in self._privilege_holders({owner}) - {"PUBLIC"}}
@@ -947,56 +970,45 @@ class _Prover:
             return any(self._owner_writes(door.owner, t)
                        for reach in reaches for door in reach.untraced)
 
-        called = set()
-        for reach in reaches:
-            predicate = reach.cells[(table.qualified_name, "SELECT")].predicate
-            if predicate:
-                called |= _called_functions(predicate)
-        for fname in sorted(called):
-            if fname not in auth and fname.rsplit(".", 1)[-1] not in bare:
-                continue
-            read = self._relations_read(fname)
-            if read is None:
-                # Every non-system schema is introspected, so "any table it
-                # could read" is one of these.
-                anything = next((t for t in self.schema.tables if writable(t)), None)
-                if anything is not None:
-                    return fname, (f"has a body pgrls cannot read, and the session can "
-                                   f"write {anything.qualified_name}")
-                continue
-            resolved = self._resolve(read)
-            if isinstance(resolved, str):
-                return fname, (f"reads {resolved}, which pgrls cannot resolve, so it "
-                               "cannot rule out that the session writes it")
-            tables, views = resolved
-            closed = self._through_policies(tables, views)
-            if isinstance(closed, str):
-                return fname, (f"reads {closed}, which pgrls cannot resolve, so it "
-                               "cannot rule out that the session writes it")
-            tables, views, via = closed
+        read = self._relations_read(fname)
+        if read is None:
+            # Every non-system schema is introspected, so "any table it could
+            # read" is one of these.
+            anything = next((t for t in self.schema.tables if writable(t)), None)
+            if anything is not None:
+                return (f"has a body pgrls cannot read, and the session can write "
+                        f"{anything.qualified_name}")
+            return None
+        resolved = self._resolve(read)
+        if isinstance(resolved, str):
+            return (f"reads {resolved}, which pgrls cannot resolve, so it cannot rule "
+                    "out that the session writes it")
+        closed = self._through_policies(*resolved)
+        if isinstance(closed, str):
+            return (f"reads {closed}, which pgrls cannot resolve, so it cannot rule "
+                    "out that the session writes it")
+        tables, views, via = closed
 
-            def named(q: str) -> str:
-                return f"{q} (through the row security of {via[q]})" if q in via else q
+        def named(q: str) -> str:
+            return f"{q} (through the row security of {via[q]})" if q in via else q
 
-            rels = [(r.qualified_name, r.owner) for r in tables] + [
-                (v.qualified_name, v.owner) for v in views]
-            for qname, rel_owner in rels:
-                if rel_owner in owners:
-                    return fname, (f"reads {named(qname)}, which the session owns — it can "
-                                   "lift FORCE or replace what it returns")
-                if rel_owner in door_holders:
-                    door = (door_owners or {})[door_holders[rel_owner]]
-                    return fname, (f"reads {named(qname)}, owned by {rel_owner} — {door}, an "
-                                   "untraced door this role can open, runs with "
-                                   "its privileges and can lift FORCE or replace "
-                                   "what it returns")
-            for t in tables:
-                if writable(t):
-                    return fname, f"reads {named(t.qualified_name)}, which the session can write"
-                why = self._policy_steers(t, login)
-                if why:
-                    return fname, (f"reads {named(t.qualified_name)}, whose row security "
-                                   f"reads {why}")
+        rels = [(r.qualified_name, r.owner) for r in tables] + [
+            (v.qualified_name, v.owner) for v in views]
+        for qname, rel_owner in rels:
+            if rel_owner in owners:
+                return (f"reads {named(qname)}, which the session owns — it can lift "
+                        "FORCE or replace what it returns")
+            if rel_owner in door_holders:
+                door = (door_owners or {})[door_holders[rel_owner]]
+                return (f"reads {named(qname)}, owned by {rel_owner} — {door}, an "
+                        "untraced door this role can open, runs with its privileges "
+                        "and can lift FORCE or replace what it returns")
+        for t in tables:
+            if writable(t):
+                return f"reads {named(t.qualified_name)}, which the session can write"
+            why = self._policy_steers(t, login, session)
+            if why:
+                return f"reads {named(t.qualified_name)}, whose row security reads {why}"
         return None
 
     def _through_policies(
@@ -1066,7 +1078,9 @@ class _Prover:
             out |= more
         return out
 
-    def _policy_steers(self, table: Table, login: bool) -> str | None:
+    def _policy_steers(
+        self, table: Table, login: bool, session: set[str] | None = None,
+    ) -> str | None:
         """What in `table`'s SELECT policies a session could steer — a value
         the HTTP client chooses, or, for a login session, a setting it can set
         or a helper it can shadow. Those policies run in the session, so they
@@ -1087,8 +1101,8 @@ class _Prover:
                     return f"{settable} (policy {pol.name})"
             else:
                 # A gateway session gets its settings from a pre-request hook
-                # that may copy client values.
-                hook = self._tainting_hook()
+                # that may copy values it can steer.
+                hook = self._hook_taint(session or set(), login)
                 if hook and self._reads_any_setting_of(using, hook[1]):
                     return f"a setting the pre-request hook {hook[0]} may set (policy {pol.name})"
                 for fname in sorted(_called_functions(using)):
@@ -1305,31 +1319,39 @@ class _Prover:
                  or ("." in f and not f.lower().startswith("pg_catalog.")))
         )
 
-    def _tainting_hook(self) -> tuple[str, frozenset[str] | None] | None:
-        """A PostgREST pre-request hook (``pgrst.db_pre_request``, set at
-        database or role level) that may copy a client-chosen value into a
-        setting — its body, or a callee, reads one, or pgrls cannot read it
-        (measured: a hook copying a request header into app.tenant) — with the
-        setting names it writes; None for the names when any is computed or
-        the body cannot be read."""
-        if self._hook_cache is not None:
-            return self._hook_cache or None
+    def _pre_request_hook(self) -> str | None:
+        """The PostgREST pre-request hook (``pgrst.db_pre_request``) set at
+        database or role level, if any."""
         values = [v for n, v in self.schema.set_gucs if n.lower() == "pgrst.db_pre_request"]
         values += [v for _, n, v in self.schema.role_set_gucs
                    if n.lower() == "pgrst.db_pre_request"]
-        found: tuple[str, frozenset[str] | None] | tuple[()] = ()
         for value in values:
             hook = (value or "").strip().strip('"')
-            if not hook:
-                continue
-            if hook not in self.functions:
-                found = (hook, None)
-                break
-            if self._client_in_body(hook):
-                found = (hook, self._settings_written(hook))
-                break
-        self._hook_cache = found
-        return found or None
+            if hook:
+                return hook
+        return None
+
+    def _hook_taint(
+        self, session: set[str], login: bool,
+    ) -> tuple[str, frozenset[str] | None] | None:
+        """(hook, the setting names it writes — None for every one) when the
+        pre-request hook may set them from something the session can steer:
+        a value the HTTP client chooses (measured: a header copied into
+        app.tenant), or a relation the session can write, owns or steers
+        (measured: an "active org" in a profile row the user can update) —
+        or when pgrls cannot read it."""
+        hook = self._pre_request_hook()
+        if not hook or self._in_hook:
+            return None
+        if hook not in self.functions:
+            return hook, None
+        self._in_hook = True
+        try:
+            steered = self._client_in_body(hook) or self._function_steerable(
+                hook, session, login, self._door_owners(session))
+        finally:
+            self._in_hook = False
+        return (hook, self._settings_written(hook)) if steered else None
 
     def _settings_written(self, fname: str, seen: frozenset[str] = frozenset()) -> frozenset[str] | None:
         """The setting names `fname` (and its callees) write with
