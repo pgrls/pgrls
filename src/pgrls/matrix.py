@@ -193,7 +193,7 @@ _PROOF_CSS = """
 _PROOF_LEGEND = (
     ("proven", "no such read is possible"),
     ("leak", "the role's own session reads it — row shown"),
-    ("possible", "through a door, which may filter it, or without schema USAGE"),
+    ("possible", "through a door, which may filter it, or a direct read without schema USAGE"),
     ("unknown", "outside what the prover can decide"),
     ("exempt", "bypasses RLS by design"),
 )

@@ -2792,7 +2792,7 @@ def test_introspection_captures_what_the_matrix_reads(pg_conn: psycopg.Connectio
 
 @requires_docker
 def test_the_database_owner_edge_follows_the_owners_inherit_on_pg15(
-    pg_url: str, pg_conn: psycopg.Connection, tmp_path,
+    pg_url: str, pg_conn: psycopg.Connection,
 ) -> None:
     """The implicit membership inherits on PG16+ and follows the owner's own
     INHERIT attribute on PG15 (measured on both); CI runs this on each."""
@@ -2960,7 +2960,7 @@ def test_live_a_childs_trigger_fires_through_its_parent(
 @requires_docker
 @pytest.mark.usefixtures("rev4_roles")
 def test_matrix_cli_rejects_a_role_the_database_does_not_have(
-    pg_url: str, pg_conn: psycopg.Connection, tmp_path,
+    pg_url: str, pg_conn: psycopg.Connection,
 ) -> None:
     """Measured: a typo in --roles showed a full column of DENIED and exit 0."""
     result = CliRunner().invoke(main, [
@@ -3264,6 +3264,34 @@ def test_prove_a_parent_in_a_schema_without_usage_is_not_the_roles_own() -> None
     m = build_matrix(replace(s, schema_usage=None), roles=("app",), prove=True,
                      anon_roles={"app"})
     assert _proof(m, "public.c", "app").status == "leak"
+
+
+def test_prove_a_parent_leak_counts_when_the_child_schema_lacks_usage() -> None:
+    """The role cannot name cs.c, but SELECT FROM public.p is its own query
+    and returns c's rows."""
+    parent = _t("p", rls=False, grants=(_grant("app", ("SELECT",)),))
+    child = _t("c", schema="cs", rls=False, grants=(_grant("app", ("SELECT",)),),
+               partition_of=("public", "p"))
+    s = replace(_s([parent, child], roles=[_r("app"), _r("own")]),
+                schema_usage=(("public", "PUBLIC"), ("cs", "own")))
+    m = build_matrix(s, roles=("app",), prove=True, anon_roles={"app"})
+    p = _proof(m, "cs.c", "app")
+    assert (p.status, p.witness) == ("leak", {}) and "public.p" in (p.detail or ""), p
+
+
+def test_prove_a_leaking_parent_the_role_queries_wins_over_another_door() -> None:
+    """app reads p1 itself (RLS off) and p0 only through a view: c's rows
+    reach it through p1, so LEAK — the view does not soften that."""
+    p0 = _t("p0", rls=False)
+    p1 = _t("p1", rls=False, grants=(_grant("app", ("SELECT",)),),
+            partition_of=("public", "p0"))
+    c = _t("c", rls=False, partition_of=("public", "p1"))
+    v = _v("v", (("public", "p0"),), owner="own", grants=(_grant("app", ("SELECT",)),))
+    m = build_matrix(_s([p0, p1, c], [v], roles=[_r("app"), _r("own")]),
+                     roles=("app",), prove=True, anon_roles={"app"})
+    p = _proof(m, "public.c", "app")
+    assert (p.status, p.witness) == ("leak", {}) and "public.p1" in (p.detail or ""), p
+    assert _proof(m, "public.p0", "app").status == "possible"
 
 
 def test_prove_a_role_that_reaches_nothing_is_not_a_column() -> None:

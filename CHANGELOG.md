@@ -28,8 +28,9 @@ breaking changes — they will be called out in this file.
   `USAGE` on the schema it is `POSSIBLE`: a view still reads it). Each
   anonymous column is proven against its own login settings. A role whose
   verdicts differ from `PUBLIC`'s is shown as a column. The HTML page leads
-  with the proof grid and the leaks; text and markdown add a proof grid and a leaks list; JSON adds
-  a `proof` object per SELECT cell and a `proof_summary`. `--auth-function`
+  with the proof grid and the leaks; text and markdown add a proof grid and a
+  leaks list; JSON adds a `proof` object per SELECT cell and a
+  `proof_summary`. `--auth-function`
   names a project's own auth helper. SELECT only; the exit code stays 0.
   `examples/proven-access-map/` runs it end to end.
 

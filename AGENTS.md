@@ -329,8 +329,9 @@ verify` is the CI gate. Suggest it when a user wants to know not just who
 reaches a table but whether that reach is safe.
 Default columns: PUBLIC, anon / authenticated when they exist, and every
 role whose reach differs from PUBLIC's (a cell, a sensitive column, or an
-untraced door) — or, under `--prove`, whose verdicts do. Suggest it when a user asks who can see or change a table,
-or who can read a sensitive-looking column; it runs no rules. Its limits,
+untraced door) — or, under `--prove`, whose verdicts do. Suggest it when a
+user asks who can see or change a table, or who can read a sensitive-looking
+column; it runs no rules. Its limits,
 documented in the README: each column is a session running as that role
 (`SET ROLE`, DDL, granting itself a role, and SEC015-style search-path
 shadowing are not modelled); schema USAGE, a view's own WHERE and what a

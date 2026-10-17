@@ -300,8 +300,14 @@ class _Prover:
         shared = model == "cross-tenant" and not (set(table.columns) & self.axis)
         no_usage = (
             f"no USAGE on schema {table.schema}, so not by querying the table "
-            "itself; a view or a function with a pre-parsed body still can"
+            "itself; a view or a function with a pre-parsed body that reads it "
+            "still can"
         )
+
+        own_parents = tuple(
+            p for p in doors if p.kind == "parent" and self._parent_is_own(name, p.via)
+        )
+        parents_only = bool(doors) and len(own_parents) == len(doors)
 
         # The role's own read first: a leak there is certain whatever a door adds.
         if direct.verdict == "open":
@@ -309,17 +315,20 @@ class _Prover:
                 return self._shared(model)
             if usage:
                 return CellProof("leak", model, witness={}, detail=direct.note)
-            return CellProof("possible", model, witness={}, detail=no_usage)
+            return self._parent_leak(reach, own_parents, model, states, shared) or \
+                CellProof("possible", model, witness={}, detail=no_usage)
         if direct.verdict == "conditional":
             verdict, witness = self.prove(model, direct.predicate or "", states)
             if verdict == "leak":
                 if usage:
                     return CellProof("leak", model, witness=witness)
-                return CellProof("possible", model, witness=witness, detail=no_usage)
-
-        parents_only = bool(doors) and all(
-            p.kind == "parent" and self._parent_is_own(name, p.via) for p in doors
-        )
+                return self._parent_leak(reach, own_parents, model, states, shared) or \
+                    CellProof("possible", model, witness=witness, detail=no_usage)
+        # A parent the role queries itself that leaks is the role's own leak,
+        # whatever other doors add.
+        found = self._parent_leak(reach, own_parents, model, states, shared)
+        if found is not None:
+            return found
         own: ProofStatus = "leak" if parents_only else "possible"
         if cell.verdict == "open":
             if shared:
@@ -343,6 +352,24 @@ class _Prover:
         from pgrls.verify import _UNVERIFIED_PREDICATE_REASON  # noqa: PLC0415
 
         return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
+
+    def _parent_leak(
+        self, reach: RoleReach, own_parents: tuple[Any, ...], model: ThreatModel,
+        states: _GucStates, shared: bool,
+    ) -> CellProof | None:
+        """A leak through a parent the role queries itself (`_parent_is_own`),
+        judged on that parent's own cell. Every row of a table with no tenant
+        column is not a cross-tenant leak (`shared`)."""
+        for door in own_parents:
+            parent = reach.cells[(door.via, "SELECT")]
+            if parent.verdict == "open" and not shared:
+                return CellProof("leak", model, witness={}, detail=f"through parent {door.via}")
+            if parent.verdict == "conditional":
+                verdict, witness = self.prove(model, parent.predicate or "", states)
+                if verdict == "leak":
+                    return CellProof("leak", model, witness=witness,
+                                     detail=f"through parent {door.via}")
+        return None
 
     def _shared(self, model: ThreatModel) -> CellProof:
         # No tenant discriminator: shared data, or a column the project has
