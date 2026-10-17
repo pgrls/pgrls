@@ -31,9 +31,9 @@ the verdicts honest:
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
   policy in one statement); no auth function the filter calls reads — in
-  its body or a callee's, a view standing for its tables — a table the role
-  can write (it could change who it is taken to be; a body or relation pgrls
-  cannot see counts as any table); for a role that can log in — a raw SQL
+  its body or a callee's, a view standing for its tables — a table the
+  session can write (it could change who it is taken to be; a relation pgrls
+  cannot resolve counts, and a body it cannot read counts as any table); for a role that can log in — a raw SQL
   session — it has no CREATEROLE before Postgres 16 (which grants itself any
   non-superuser role), the filter reads no setting the session could set for
   itself (directly or in a function body), the session owns no user-defined function (one may
@@ -427,6 +427,12 @@ class _Prover:
                     f"the session can SET ROLE {target}, whose read is "
                     f"{other.status.upper()}"
                 ))
+        written = self._identity_reads_writable({name} | targets, table)
+        if written:
+            return CellProof("unknown", model, detail=(
+                f"the filter's identity comes from {written[0]}(), which {written[1]}: "
+                "the session could change who it is taken to be"
+            ))
         if not login:
             # Reached through a gateway that runs only the API's queries: it
             # changes no schema object (a login member's own column does).
@@ -713,14 +719,6 @@ class _Prover:
                         "that does not end in pg_temp — a session's own temp table "
                         "could take its place"
                     ))
-        if predicate is not None:
-            written = self._identity_reads_writable(name, predicate)
-            if written:
-                return CellProof("unknown", model, detail=(
-                    f"the filter's identity comes from {written[0]}(), which reads "
-                    f"{written[1]} — a table this role can write, so it can change "
-                    "who it is taken to be"
-                ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
                 return CellProof("unknown", model, detail=(
@@ -738,10 +736,11 @@ class _Prover:
             ))
         return proven
 
-    def _identity_reads_writable(self, name: str, predicate: str) -> tuple[str, str] | None:
-        """(auth function, what it reads) when an auth function the filter
-        calls reads — in its body, or a function that body calls — a table
-        `name` can INSERT, UPDATE or DELETE: the prover takes the function's
+    def _identity_reads_writable(self, session: set[str], table: Table) -> tuple[str, str] | None:
+        """(auth function, what it reads) when an auth function a filter of the
+        session's read of `table` calls reads — in its body, or a function that
+        body calls — a table some role of the session (it, or one it can SET
+        ROLE to) can INSERT, UPDATE or DELETE: the prover takes the function's
         value as the session's identity, but the session can rewrite what it
         reads (measured, through an ordinary API write too). A view counts as
         the tables under it. A body pgrls cannot read, or a relation it
@@ -751,39 +750,55 @@ class _Prover:
 
         auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
         bare = {a.rsplit(".", 1)[-1] for a in auth}
-        reach = self.reach_of(name)
+        reaches = [self.reach_of(r) for r in sorted(session)]
 
         def writable(t: Table) -> bool:
             return any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
-                       for cmd in ("INSERT", "UPDATE", "DELETE"))
+                       for reach in reaches for cmd in ("INSERT", "UPDATE", "DELETE"))
 
-        for fname in sorted(_called_functions(predicate)):
+        called = set()
+        for reach in reaches:
+            predicate = reach.cells[(table.qualified_name, "SELECT")].predicate
+            if predicate:
+                called |= _called_functions(predicate)
+        for fname in sorted(called):
             if fname not in auth and fname.rsplit(".", 1)[-1] not in bare:
                 continue
-            rels = self._relations_read(fname)
-            tables = None if rels is None else self._resolve(rels)
-            if tables is None:
+            read = self._relations_read(fname)
+            if read is None:
+                # Every non-system schema is introspected, so "any table it
+                # could read" is one of these.
                 anything = next((t for t in self.schema.tables if writable(t)), None)
                 if anything is not None:
-                    return fname, (f"tables pgrls cannot see (and the role can write "
-                                   f"{anything.qualified_name})")
+                    return fname, (f"has a body pgrls cannot read, and the session can "
+                                   f"write {anything.qualified_name}")
                 continue
-            for table in tables:
-                if writable(table):
-                    return fname, table.qualified_name
+            rels, ctes = read
+            tables = self._resolve(rels, ctes)
+            if isinstance(tables, str):
+                return fname, f"reads {tables}, which pgrls cannot resolve"
+            for t in tables:
+                if writable(t):
+                    return fname, f"reads {t.qualified_name}, which the session can write"
         return None
 
-    def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str] | None:
+    def _relations_read(
+        self, fname: str, seen: frozenset[str] = frozenset(),
+    ) -> tuple[set[str], set[str]] | None:
         """Every relation name (as written) the body of `fname` and the
-        user-defined functions it calls read; None when a body cannot be read
-        (another language, dynamic SQL, a parse error)."""
-        from pglast.ast import RangeVar  # noqa: PLC0415
+        user-defined functions it calls read, and the CTE names they define;
+        None when a body cannot be read (another language, dynamic SQL, a
+        parse error)."""
+        from pglast.ast import CommonTableExpr, RangeVar  # noqa: PLC0415
 
         out: set[str] = set()
+        ctes: set[str] = set()
 
         def match(n: Any) -> bool:
             if isinstance(n, RangeVar):
                 out.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
+            if isinstance(n, CommonTableExpr):
+                ctes.add(n.ctename)
             return False
 
         for fn in self.functions.get(fname, ()):
@@ -797,13 +812,15 @@ class _Prover:
                 more = self._relations_read(inner, seen | {fn.qualified_name})
                 if more is None:
                     return None
-                out |= more
-        return out
+                out |= more[0]
+                ctes |= more[1]
+        return out, ctes
 
-    def _resolve(self, rels: set[str]) -> list[Table] | None:
+    def _resolve(self, rels: set[str], ctes: set[str]) -> list[Table] | str:
         """The tables relation names read — a view's base tables for a view;
-        a bare name as every table or view of that name. None when a name
-        resolves to nothing pgrls captured (a system catalog excepted)."""
+        a bare name as every table or view of that name. A name that resolves
+        to nothing pgrls captured is returned instead (a system catalog, and a
+        bare name that is a CTE's, excepted)."""
         tables: dict[str, Table] = {}
         for rel in rels:
             schema_name, _, relname = rel.rpartition(".")
@@ -822,10 +839,10 @@ class _Prover:
                     for vs, vn in v.references:
                         base = self.tables.get(f"{vs}.{vn}")
                         if base is None:
-                            return None
+                            return f"{vs}.{vn}"
                         tables[base.qualified_name] = base
-            if not found:
-                return None
+            if not found and not (not schema_name and relname in ctes):
+                return rel
         return list(tables.values())
 
     def _settable_identity(self, predicate: str) -> str | None:

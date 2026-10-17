@@ -25,9 +25,9 @@ breaking changes — they will be called out in this file.
   doors), the role does not own the table, a `current_setting(…)` filter
   also isolates a session that leaves the setting unset, every role the
   session can `SET ROLE` to is proven too, no auth function the filter calls
-  reads a table the role can write (bodies followed through SQL and
-  PL/pgSQL, views to their tables; what pgrls cannot see counts as any
-  table), and — for a role that can log in, a raw
+  reads a table the session can write (bodies followed through SQL and
+  PL/pgSQL, views to their tables; an unresolvable relation counts, an
+  unreadable body as any table), and — for a role that can log in, a raw
   SQL session — it has no CREATEROLE before Postgres 16, the filter reads no
   setting the session can set, and
   the session can neither redefine what the filter calls (it owns no

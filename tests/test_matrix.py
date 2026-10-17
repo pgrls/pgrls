@@ -3420,10 +3420,12 @@ _BARE_BODY = "SELECT tenant FROM users WHERE name = current_user"
 def _helper_matrix(*fns, creators=(), memberships=()):
     roles = ("app_user", "other")
     t = _sel("tenant_id = cur()", grants=roles)
-    s = replace(_s([t], roles=[*(_r(r) for r in roles), _api("fnadm"), _r("own")],
+    users = _t("users", schema="app", rls=False)  # what the helpers read; nobody writes it
+    s = replace(_s([t, users], roles=[*(_r(r) for r in roles), _api("fnadm"), _r("own")],
                    memberships=memberships),
                 user_functions=fns, schema_create=creators)
-    return build_matrix(s, roles=roles, prove=True, auth_functions={"cur"})
+    return build_matrix(s, roles=roles, prove=True, auth_functions={"cur"},
+                        grid=frozenset({"public.t"}))
 
 
 def test_prove_a_login_role_with_an_unforgeable_helper_is_proven() -> None:
@@ -3484,7 +3486,8 @@ def test_prove_schema_changing_gates_skip_a_gateway_role() -> None:
     """A NOLOGIN role is reached through a gateway that runs only the API's
     queries; a login member's own column carries what the session can do."""
     t = _sel("tenant_id = cur()", grants=("authenticated",))
-    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]),
+    users = _t("users", schema="app", rls=False)
+    s = replace(_s([t, users], roles=[_api("authenticated"), _r("own")]),
                 user_functions=(_fn("app.cur", owner="authenticated", body=_BARE_BODY),),
                 schema_create=(("public", "PUBLIC"),))
     m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
@@ -3594,6 +3597,41 @@ def test_prove_an_identity_pgrls_cannot_fully_see_is_not_proven(body, language, 
                      grid=frozenset({"public.t"}))
     p = _proof(m, "public.t", "app_user")
     assert p.status == "unknown" and "app.tenant_of()" in (p.detail or ""), p
+
+
+def test_prove_an_identity_reading_a_relation_pgrls_cannot_resolve_is_not_proven() -> None:
+    """Even when the role writes no table pgrls sees: the relation may be one
+    it can write."""
+    fns = (_fn("app.tenant_of", body="SELECT tenant_id FROM elsewhere.profiles LIMIT 1"),)
+    t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
+    s = replace(_s([t], roles=[_api("app_user"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"app.tenant_of"})
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "elsewhere.profiles" in (p.detail or ""), p
+
+
+def test_prove_a_cte_name_in_an_identity_body_is_not_a_table() -> None:
+    body = ("WITH me AS (SELECT tenant_id FROM app.users WHERE name = current_user) "
+            "SELECT tenant_id FROM me")
+    m = _helper_matrix(_fn("app.cur", body=body, search_path="app, pg_temp"))
+    assert _proof(m, "public.t", "other").status == "proven"
+
+
+def test_prove_an_identity_table_a_set_role_target_can_write_is_found() -> None:
+    """Measured: xr could not write memberships itself, but SET ROLE writer;
+    INSERT …; RESET ROLE made it another tenant."""
+    fns = (_fn("app.tenant_of", body="SELECT tenant_id FROM public.memberships LIMIT 1",
+               search_path="public, pg_temp"),)
+    t = _sel("tenant_id = app.tenant_of()", grants=("xr",))
+    memberships = _t("memberships", rls=False, grants=(
+        _grant("xr", ("SELECT",)), _grant("writer", ("INSERT",))))
+    edges = [RoleMembership(member="xr", role="writer", inherit=False)]
+    s = replace(_s([t, memberships], roles=[_api("xr"), _api("writer"), _r("own")],
+                   memberships=edges), user_functions=fns)
+    m = build_matrix(s, roles=("xr",), prove=True, auth_functions={"app.tenant_of"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "xr")
+    assert p.status == "unknown" and "public.memberships" in (p.detail or ""), p
 
 
 def test_prove_an_unreadable_identity_is_fine_when_the_role_writes_nothing() -> None:
