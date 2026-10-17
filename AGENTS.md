@@ -321,13 +321,15 @@ cannot be bounded — treat it as "possibly reachable", never as denied.
 anonymous columns: can a session with no JWT read any row; other columns: can
 a session carrying its tenant's identity read another tenant's row — and marks
 it `PROVEN`, `LEAK` (with the leaking row), `POSSIBLE` (only through a door,
-which may filter it), `UNKNOWN` (with the reason — including an untraced door,
-a `SET ROLE` target that is not proven, or a setting-scoped filter that admits
-an unset session) or `EXEMPT` (superuser / BYPASSRLS). Suggest it when a user wants to know not
-just who reaches a table but whether that reach is safe.
+which may filter it, or a read without schema USAGE), `UNKNOWN` (with the
+reason — including an untraced door, a `SET ROLE` target that is not proven,
+or a setting-scoped filter that admits an unset session) or `EXEMPT`
+(superuser / BYPASSRLS). SELECT only, and the exit code stays 0 — `pgrls
+verify` is the CI gate. Suggest it when a user wants to know not just who
+reaches a table but whether that reach is safe.
 Default columns: PUBLIC, anon / authenticated when they exist, and every
 role whose reach differs from PUBLIC's (a cell, a sensitive column, or an
-untraced door). Suggest it when a user asks who can see or change a table,
+untraced door) — or, under `--prove`, whose verdicts do. Suggest it when a user asks who can see or change a table,
 or who can read a sensitive-looking column; it runs no rules. Its limits,
 documented in the README: each column is a session running as that role
 (`SET ROLE`, DDL, granting itself a role, and SEC015-style search-path

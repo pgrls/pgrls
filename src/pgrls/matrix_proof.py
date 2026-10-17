@@ -15,8 +15,9 @@ the verdicts honest:
 
 * **leak** only when the role's *own* session reads such a row: the role's
   direct read is proven to leak (or reads every row), or a partition /
-  inheritance parent it can query does. A role without USAGE on the table's
-  schema cannot query the table at all, so its direct read leaks nothing.
+  inheritance parent it queries itself does. A role without USAGE on the
+  table's schema cannot query the table by name, so its direct read is only
+  a possible leak — a view or a pre-parsed function body skips that check.
 * **possible** when the read exists only through a door: a door is credited
   with its owner's whole reach of the table — a view's own ``WHERE`` and what
   a function returns are not traced — so it may filter the row out.
@@ -24,7 +25,8 @@ the verdicts honest:
   the prover shows the filter isolates — and nothing pgrls cannot see could
   change that: no door evaluates a filter that depends on who runs it
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
-  an owner that reaches the table; a filter scoped by a setting
+  an owner that reaches the table, itself or through untraced doors of its
+  own; a filter scoped by a setting
   (``current_setting``) also isolates a session that leaves it unset; and
   every role the session can ``SET ROLE`` to is proven too.
 * **unknown** for everything else, with the reason.
@@ -43,7 +45,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pgrls.access import Cell, RoleReach, _dependence
+from pgrls.access import RoleReach, _dependence
 from pgrls.ast_utils import parse_expr
 from pgrls.model import Role, Schema, Table
 
@@ -51,6 +53,8 @@ ProofStatus = Literal["proven", "leak", "possible", "unknown", "exempt"]
 ThreatModel = Literal["anon", "cross-tenant"]
 
 PROOF_STATUSES: tuple[ProofStatus, ...] = ("proven", "leak", "possible", "unknown", "exempt")
+
+_ALL_DATA_ROLES = frozenset({"pg_read_all_data", "pg_write_all_data"})
 
 _GucStates = tuple[dict[str, str | None], ...]
 _StatesKey = tuple[tuple[tuple[str, str | None], ...], ...]
@@ -127,6 +131,7 @@ class _Prover:
         from pgrls.rules.sec021 import AXIS_IDENTITY_COLUMNS  # noqa: PLC0415
 
         self.schema = schema
+        self.tables = {t.qualified_name: t for t in schema.tables}
         self.reach_of = reach_of
         self.attrs = attrs
         self.anon_set = anon_set
@@ -183,7 +188,9 @@ class _Prover:
         closure = _inherit_closure(self.schema, name)
         if closure is None:
             return True
-        return bool(holders & (closure | {name}))
+        # pg_read_all_data / pg_write_all_data carry USAGE on every schema
+        # without appearing in any schema's ACL.
+        return bool((holders | _ALL_DATA_ROLES) & (closure | {name}))
 
     # --- provers ------------------------------------------------------------
 
@@ -273,25 +280,17 @@ class _Prover:
         cell = reach.cells[(q, "SELECT")]
         direct, _ = reach.direct_select[q]
         doors = reach.door_paths.get(q, ())
-        no_usage = not self.has_usage(name, table)
-        # A parent the role queries is its own session; but without USAGE the
-        # merged cell may still carry the failed direct read, so stay modest.
-        parents_only = (
-            bool(doors) and all(p.kind == "parent" for p in doors) and not no_usage
-        )
-        if no_usage:
-            # The direct read fails outright: permission denied for schema.
-            direct = Cell("denied")
-            if not doors:
-                cell = direct
+        # Without USAGE on the schema the role's own query fails ("permission
+        # denied for schema"), but a stored query — a view, a function with a
+        # pre-parsed body — does not look the name up again (measured: an
+        # invoker view returned the rows). So missing USAGE turns the role's
+        # own leak into a possible one; it never makes a cell PROVEN.
+        usage = self.has_usage(name, table)
         role = self.attrs.get(name)
 
         if cell.verdict == "denied":
-            return self.gates(name, table, model, states, None, CellProof(
-                "proven", model,
-                detail=(f"no USAGE on schema {table.schema}" if no_usage
-                        else "no row reachable"),
-            ))
+            return self.gates(name, table, model, states, None,
+                              CellProof("proven", model, detail="no row reachable"))
         if model == "cross-tenant" and role is not None and (role.superuser or role.bypassrls):
             return CellProof("exempt", model, detail=(
                 "superuser" if role.superuser else "BYPASSRLS"
@@ -299,17 +298,28 @@ class _Prover:
         if cell.verdict == "undecided":
             return CellProof("unknown", model, detail=cell.note or "rows cannot be bounded")
         shared = model == "cross-tenant" and not (set(table.columns) & self.axis)
+        no_usage = (
+            f"no USAGE on schema {table.schema}, so not by querying the table "
+            "itself; a view or a function with a pre-parsed body still can"
+        )
 
         # The role's own read first: a leak there is certain whatever a door adds.
         if direct.verdict == "open":
             if shared:
                 return self._shared(model)
-            return CellProof("leak", model, witness={}, detail=direct.note)
+            if usage:
+                return CellProof("leak", model, witness={}, detail=direct.note)
+            return CellProof("possible", model, witness={}, detail=no_usage)
         if direct.verdict == "conditional":
             verdict, witness = self.prove(model, direct.predicate or "", states)
             if verdict == "leak":
-                return CellProof("leak", model, witness=witness)
+                if usage:
+                    return CellProof("leak", model, witness=witness)
+                return CellProof("possible", model, witness=witness, detail=no_usage)
 
+        parents_only = bool(doors) and all(
+            p.kind == "parent" and self._parent_is_own(name, p.via) for p in doors
+        )
         own: ProofStatus = "leak" if parents_only else "possible"
         if cell.verdict == "open":
             if shared:
@@ -364,13 +374,32 @@ class _Prover:
             ))
         return proven
 
-    def _owner_reaches(self, owner: str, table: Table) -> bool:
+    def _parent_is_own(self, name: str, parent: str | None) -> bool:
+        """Whether rows reached through `parent` come from the role querying
+        it itself: it holds USAGE on the parent's schema, and the parent's
+        rows reach it only directly or through the parent's own parents —
+        never through a view or function, which may filter."""
+        table = self.tables.get(parent or "")
+        if table is None or not self.has_usage(name, table):
+            return False
+        return all(p.kind == "parent" for p in self.reach_of(name).door_paths.get(parent or "", ()))
+
+    def _owner_reaches(self, owner: str, table: Table, seen: frozenset[str] = frozenset()) -> bool:
+        """Whether `owner` reaches rows of `table` — itself, through its
+        traced doors, or through an untraced door it can open in turn."""
         role = self.attrs.get(owner)
         if not owner or role is None:
             return True
         if role.superuser or role.bypassrls:
             return True
-        return self.reach_of(owner).cells[(table.qualified_name, "SELECT")].verdict != "denied"
+        reach = self.reach_of(owner)
+        if reach.cells[(table.qualified_name, "SELECT")].verdict != "denied":
+            return True
+        seen = seen | {owner}
+        return any(
+            door.owner not in seen and self._owner_reaches(door.owner, table, seen)
+            for door in reach.untraced
+        )
 
 
 def prove_matrix(

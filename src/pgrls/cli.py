@@ -4229,6 +4229,7 @@ def matrix(
 
         patterns = _parse_patterns(effective.rule_options.get("SEC045", {}))
         identity_columns = _identity_columns_from_config(config_path) if prove else None
+        anon_roles = _verify_anon_roles("anon", effective.rule_options) if prove else None
     except TypeError as exc:
         raise click.UsageError(str(exc)) from exc
     assert effective.database_url is not None  # guaranteed above
@@ -4267,7 +4268,7 @@ def matrix(
         built = build_matrix(
             schema, roles=roles, include_system=include_system, grid=grid,
             sensitive_patterns=patterns, prove=prove,
-            anon_roles=_verify_anon_roles("anon", effective.rule_options) if prove else None,
+            anon_roles=anon_roles,
             auth_functions=(
                 set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
                 if auth_functions else None

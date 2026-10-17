@@ -179,12 +179,21 @@ _PROOF_CSS = """
   table.proof td.p-unknown  { background: rgba(110,119,129,.14); color: #57606a; }
   table.proof td.p-exempt   { background: rgba(84,174,255,.10); color: #57606a; }
   .pill.p-proven { color: #1a7f37; } .pill.p-leak { color: #cf222e; }
-  .pill.p-possible { color: #9a6700; } .pill.p-unknown, .pill.p-exempt { color: #57606a; }"""
+  .pill.p-possible { color: #9a6700; } .pill.p-unknown, .pill.p-exempt { color: #57606a; }
+  @media (prefers-color-scheme: dark) {
+    .lede, .legend, table.proof th small { color: #8b949e; }
+    table.proof td.p-proven   { color: #3fb950; }
+    table.proof td.p-leak     { color: #ff7b72; }
+    table.proof td.p-possible { color: #e3b341; }
+    table.proof td.p-unknown, table.proof td.p-exempt { color: #8b949e; }
+    .pill.p-proven { color: #3fb950; } .pill.p-leak { color: #ff7b72; }
+    .pill.p-possible { color: #e3b341; } .pill.p-unknown, .pill.p-exempt { color: #8b949e; }
+  }"""
 
 _PROOF_LEGEND = (
     ("proven", "no such read is possible"),
     ("leak", "the role's own session reads it — row shown"),
-    ("possible", "only through a door, which may filter it"),
+    ("possible", "through a door, which may filter it, or without schema USAGE"),
     ("unknown", "outside what the prover can decide"),
     ("exempt", "bypasses RLS by design"),
 )
@@ -388,8 +397,13 @@ def build_matrix(
                               identity_columns=identity_columns)
 
     def proves_differently(name: str) -> bool:
+        # The verdict and the leaking row; the threat model always differs
+        # (PUBLIC is anonymous) and the wording of a reason does not count.
+        def key(p: CellProof) -> tuple[str, dict[str, object] | None]:
+            return p.status, p.witness
+
         return prove and any(
-            proofs[(t.qualified_name, name)] != proofs[(t.qualified_name, "PUBLIC")]
+            key(proofs[(t.qualified_name, name)]) != key(proofs[(t.qualified_name, "PUBLIC")])
             for t in shown
         )
 
@@ -806,7 +820,10 @@ def render_html(matrix: Matrix, *, generated_at: datetime | None = None) -> str:
     )
     if matrix.proven:
         header_extra = _proof_header(matrix)
-        body = _proof_body(matrix) + "\n  <h2>Reach by command</h2>\n" + body
+        body = (
+            _proof_body(matrix) + "\n  <h2>Reach by command</h2>\n"
+            f'  <div class="pills">\n    {chips_html}\n  </div>\n' + body
+        )
 
     return html_page(
         title="pgrls proven access map" if matrix.proven else "pgrls access matrix",
@@ -856,6 +873,9 @@ def _proof_body(matrix: Matrix) -> str:
         for r in matrix.roles
     )
     lines = []
+    if not matrix.rows:
+        lines.append(f'      <tr><td colspan="{1 + len(matrix.roles)}" class="empty">'
+                     "No tables found in the scanned schemas.</td></tr>")
     for row in matrix.rows:
         if row.proofs is None:
             continue

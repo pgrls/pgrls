@@ -34,7 +34,7 @@ info via the new ``column_details`` per table; v4 added top-level
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, Literal
 
@@ -1830,11 +1830,11 @@ class Schema:
     role_set_gucs: tuple[tuple[str, str, str | None], ...] = ()
     # `(schema, grantee)` pairs holding USAGE on each introspected schema —
     # `PUBLIC` for a grant to every role; the schema owner is listed too. A
-    # role without USAGE cannot query a table in the schema at all ("permission
+    # role without USAGE cannot query a table in the schema by name ("permission
     # denied for schema"), so `pgrls matrix --prove` does not call such a read
     # a LEAK. Live introspection only — not serialized into snapshots; `None`
     # = not captured, which `--prove` treats as "USAGE held".
-    schema_usage: tuple[tuple[str, str], ...] | None = None
+    schema_usage: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
