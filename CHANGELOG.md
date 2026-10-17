@@ -15,35 +15,36 @@ breaking changes — they will be called out in this file.
   grid is checked with the Z3 provers `pgrls verify` uses: anonymous columns
   (`anon` / `[lint.rules.SEC004].anon_roles`, and `PUBLIC`) for "can a session
   with no JWT read any row?", every other column for "can a session of this
-  role read another tenant's row?". Each cell becomes `PROVEN`, `LEAK` (with the
-  leaking row when one characterizes it), `POSSIBLE` (the read exists only
-  through a door, which may filter it), `UNKNOWN` (with the reason) or `EXEMPT`
-  (a superuser / `BYPASSRLS` column, which skips RLS by design). `PROVEN` is
-  claimed only when nothing pgrls cannot see could change the answer — no door
-  evaluates a who-runs-it filter, no untraced door the role can open has an
-  owner that reaches the table (followed through that owner's own untraced
-  doors), the role does not own the table, a `current_setting(…)` filter
-  also isolates a session that leaves the setting unset, every role the
-  session can `SET ROLE` to is proven too, the filter reads no request
-  header or cookie setting (the HTTP client chooses those), no auth function
-  the filter calls reads a table the session can write (bodies followed
-  through SQL and PL/pgSQL, views to their tables; an unresolvable relation
-  counts, an unreadable body as any table), and — for a role that can log in, a raw
-  SQL session — it has no CREATEROLE before Postgres 16, the filter reads no
-  setting the session can set, and
-  the session can neither redefine what the filter calls (it owns no
-  function and holds CREATE on no schema or on the database while the
-  filter calls one) nor
-  shadow a table a helper reads by bare name with its own temp table. (A
-  NOLOGIN role is taken to be reached through a gateway that sets its
-  identity.) `LEAK` is claimed only when the role's own session reads the
-  row; a direct read without `USAGE` on the schema is `POSSIBLE`, since a
-  view still reads it. Each anonymous column is proven against its own login settings. A role
+  role, carrying its tenant's identity, read another tenant's row?". A
+  NOLOGIN role is taken to be reached through a gateway (PostgREST) that sets
+  its identity and runs only the API's queries; a role that can log in is a
+  raw SQL session. Each cell becomes:
+  - `PROVEN` — only when nothing pgrls cannot see could change the answer:
+    no door evaluates a who-runs-it filter or opens an untraced path to the
+    table; the role neither owns the table nor can `SET ROLE` to a role
+    whose read is not `PROVEN`; the filter reads nothing an HTTP client
+    chooses (request headers, cookies, method, path, or the search_path
+    behind `current_schema()`), and no auth function it calls reads a table
+    the session can write (SQL and PL/pgSQL bodies followed, views to their
+    tables, an unresolvable relation or unreadable body counting against
+    it). A login session must also have no pre-16 CREATEROLE, read no
+    setting it can set for itself, and be unable to redefine or shadow what
+    the filter calls (owned functions or relations, CREATE on a schema or the
+    database, a helper reading a table by bare name without `pg_temp` last).
+  - `LEAK` — the role's own session reads such a row, shown when one
+    characterizes it; a direct read without schema `USAGE` is `POSSIBLE`,
+    and a leak resting on a helper the prover cannot see into is `UNKNOWN`
+    with an `--auth-function` hint.
+  - `POSSIBLE` — only through a door, which may filter it.
+  - `UNKNOWN` — with the reason.
+  - `EXEMPT` — a superuser / `BYPASSRLS` column, which skips RLS by design.
+
+  Each anonymous column is proven against its own login settings. A role
   whose verdicts differ from what `PUBLIC` gets under the same question, or
-  are more alarming than the `PUBLIC` column shows, is a column. The HTML page
-  leads with the proof grid, the leaks and the undecided cells with their
-  reasons; text and markdown add the same, with the question each column
-  answers; JSON adds a `proof` object per SELECT cell and a
+  are more alarming than the `PUBLIC` column shows, is a column. The HTML
+  page leads with the proof grid, the leaks and the undecided cells with
+  their reasons; text and markdown add the same, with the question each
+  column answers; JSON adds a `proof` object per SELECT cell and a
   `proof_summary`. `--auth-function` names a project's own auth helper.
   SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
   end to end.

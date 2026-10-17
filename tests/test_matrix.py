@@ -3795,6 +3795,52 @@ def test_prove_a_helper_reading_session_state_from_the_catalog_is_settable(body:
     assert p.status == "unknown" and "cur()" in (p.detail or ""), p
 
 
+def test_prove_a_conditional_leak_on_a_builtin_stays_a_leak() -> None:
+    """now() is not a helper the prover cannot see: a row with a future
+    timestamp leaks, even if no single row is shown."""
+    m = _prove([_sel("(tenant_id = auth.uid()) OR (created > now())")], cols=("anon",))
+    assert _proof(m, "public.t", "anon").status == "leak"
+
+
+@pytest.mark.parametrize("kind", ["table", "view"])
+def test_prove_a_login_session_owning_what_its_identity_reads_is_not_proven(kind: str) -> None:
+    """Measured: the owner lifted FORCE on the identity table (or replaced the
+    view's _RETURN rule) and read another tenant's row."""
+    rt = _t("role_tenants", schema="app", owner="appf", force=True,
+            policies=(_policy(command="SELECT", roles=("PUBLIC",), using="true"),),
+            grants=(_grant("appf", ("SELECT",)),))
+    views = []
+    rel = "app.role_tenants"
+    if kind == "view":
+        rt = _with(rt, owner="own")
+        views = [_v("my_tenant_v", (("app", "role_tenants"),), owner="appf")]
+        rel = "public.my_tenant_v"
+    fns = (_fn("app.cur", body=f"SELECT tenant_id FROM {rel} LIMIT 1",
+               search_path="pg_catalog, pg_temp"),)
+    t = _sel("tenant_id = cur()", grants=("appf",))
+    for login, expect in ((True, "unknown"), (False, "proven")):
+        role = _r("appf") if login else _api("appf")
+        s = replace(_s([t, rt], views, roles=[role, _r("own")]), user_functions=fns)
+        m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"},
+                         grid=frozenset({"public.t"}))
+        p = _proof(m, "public.t", "appf")
+        assert p.status == expect, (login, p)
+        if expect == "unknown":
+            assert "owns" in (p.detail or ""), p
+
+
+@pytest.mark.parametrize("role", [_r("appf"), _api("appf")])
+def test_prove_current_schema_is_chosen_by_the_session(role) -> None:
+    """Measured for a login role: SET search_path = t2 read the other tenant.
+    PostgREST sets the search_path from the client's Accept-Profile header."""
+    fns = (_fn("app.cur", body="SELECT pg_catalog.current_schema()::text",
+               search_path=None),)
+    t = _sel("tenant_id = cur()", grants=("appf",))
+    s = replace(_s([t], roles=[role, _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"})
+    assert _proof(m, "public.t", "appf").status == "unknown"
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""

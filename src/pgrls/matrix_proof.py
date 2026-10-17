@@ -30,8 +30,9 @@ the verdicts honest:
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
-  policy in one statement); the filter reads no setting an HTTP client sets
-  through PostgREST (a request header or cookie); no auth function the
+  policy in one statement); the filter reads nothing an HTTP client chooses
+  through PostgREST (a request header, cookie, method or path setting, or the
+  search_path behind ``current_schema()``); no auth function the
   filter calls reads — in
   its body or a callee's, a view standing for its tables — a table the
   session can write (it could change who it is taken to be; a relation pgrls
@@ -72,7 +73,7 @@ from typing import Any, Literal
 
 from pgrls.access import RoleReach, _dependence
 from pgrls.ast_utils import parse_expr
-from pgrls.model import Role, Schema, Table, UserFunction
+from pgrls.model import Role, Schema, Table, UserFunction, View
 
 ProofStatus = Literal["proven", "leak", "possible", "unknown", "exempt"]
 ThreatModel = Literal["anon", "cross-tenant"]
@@ -153,6 +154,9 @@ def _is_current_setting(n: Any) -> bool:
 
 
 _CLIENT_SETTINGS = ("request.header.", "request.cookie.")
+# Follow the search_path, which a session sets — and PostgREST sets from the
+# client's Accept-Profile / Content-Profile header.
+_SEARCH_PATH_FUNCTIONS = frozenset({"current_schema", "current_schemas"})
 _CLIENT_SETTING_NAMES = frozenset({
     "request.headers", "request.cookies", "request.method", "request.path",
 })
@@ -161,8 +165,11 @@ _CLIENT_SETTING_NAMES = frozenset({
 def _client_setting(node: Any) -> str | None:
     """The setting name when `node` is a ``current_setting`` call reading one
     an HTTP client controls through PostgREST (a request header or cookie)."""
-    from pglast.ast import A_Const, String, TypeCast  # noqa: PLC0415
+    from pglast.ast import A_Const, FuncCall, String, TypeCast  # noqa: PLC0415
 
+    if isinstance(node, FuncCall) and getattr(
+        node.funcname[-1], "sval", "").lower() in _SEARCH_PATH_FUNCTIONS:
+        return "search_path"
     if not _is_current_setting(node) or not node.args:
         return None
     arg = node.args[0]
@@ -181,6 +188,10 @@ def _client_reason(found: str, where: str | None) -> str:
     """The reason for a client-controlled setting `found` ("?" for a computed
     name) read in `where` (None: the filter itself)."""
     loc = f" (in {where}())" if where else ""
+    if found == "search_path":
+        return (f"the filter reads current_schema(){loc}, which follows the "
+                "search_path — PostgREST sets it from the client's Accept-Profile "
+                "header, so the client may choose among the exposed schemas")
     if found == "?":
         return (f"the filter reads a setting whose name is computed{loc}; it may be a "
                 "request header or cookie the HTTP client chooses through PostgREST")
@@ -201,7 +212,8 @@ def _reads_session_state(n: Any) -> bool:
         return schema == "pg_catalog" or (not schema and n.relname.lower().startswith("pg_"))
     if isinstance(n, FuncCall):
         name = getattr(n.funcname[-1], "sval", "").lower()
-        return name.startswith("pg_show_all_settings") or name == "pg_stat_get_activity"
+        return (name.startswith("pg_show_all_settings") or name == "pg_stat_get_activity"
+                or name in _SEARCH_PATH_FUNCTIONS)
     return False
 
 
@@ -501,7 +513,7 @@ class _Prover:
                 return CellProof("unknown", model, detail=(
                     f"the session can SET ROLE {target}, {what}"
                 ))
-        written = self._identity_reads_writable({name} | targets, table)
+        written = self._identity_reads_writable({name} | targets, table, login)
         if written:
             return CellProof("unknown", model, detail=(
                 f"the filter's identity comes from {written[0]}(), which {written[1]} "
@@ -695,13 +707,14 @@ class _Prover:
             return parent_leak or CellProof("possible", model, witness={}, detail=no_usage)
         if direct.verdict == "conditional":
             verdict, witness = self.prove(model, direct.predicate or "", states)
-            if verdict == "leak" and witness is None:
-                # No row characterizes it: the leak rests on a value the prover
-                # cannot see (an opaque helper), so it is not certain.
-                return CellProof("unknown", model, detail=(
-                    "the filter may admit rows, depending on a value the prover "
-                    "cannot see — if a helper it calls is your auth helper, name "
-                    "it with --auth-function"
+            opaque = self._opaque_helpers(direct.predicate or "")
+            if verdict == "leak" and witness is None and opaque:
+                # No row characterizes it and it rests on a helper the prover
+                # cannot see into, so it is not certain.
+                return parent_leak or CellProof("unknown", model, detail=(
+                    f"the filter may admit rows, depending on what {opaque[0]}() "
+                    "returns — if it is your auth helper, name it with "
+                    "--auth-function"
                 ))
             if verdict == "leak":
                 if usage:
@@ -827,7 +840,9 @@ class _Prover:
             ))
         return proven
 
-    def _identity_reads_writable(self, session: set[str], table: Table) -> tuple[str, str] | None:
+    def _identity_reads_writable(
+        self, session: set[str], table: Table, login: bool = False,
+    ) -> tuple[str, str] | None:
         """(auth function, what it reads) when an auth function a filter of the
         session's read of `table` calls reads — in its body, or a function that
         body calls — a table some role of the session (it, or one it can SET
@@ -836,12 +851,14 @@ class _Prover:
         reads (measured, through an ordinary API write too). A view counts as
         the tables under it. A body pgrls cannot read, or a relation it
         cannot resolve, counts as any table — unsafe unless the role can write
-        none."""
+        none. For a login session, a relation it owns counts too — the owner
+        can lift FORCE, or replace a view's rule (measured)."""
         from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
 
         auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
         bare = {a.rsplit(".", 1)[-1] for a in auth}
         reaches = [self.reach_of(r) for r in sorted(session)]
+        owners = self._privilege_holders(session) - {"PUBLIC"} if login else set()
 
         def writable(t: Table) -> bool:
             return any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
@@ -864,10 +881,16 @@ class _Prover:
                     return fname, (f"has a body pgrls cannot read, and the session can "
                                    f"write {anything.qualified_name}")
                 continue
-            tables = self._resolve(read)
-            if isinstance(tables, str):
-                return fname, (f"reads {tables}, which pgrls cannot resolve, so it "
+            resolved = self._resolve(read)
+            if isinstance(resolved, str):
+                return fname, (f"reads {resolved}, which pgrls cannot resolve, so it "
                                "cannot rule out that the session writes it")
+            tables, views = resolved
+            owned = [r.qualified_name for r in tables if r.owner in owners] + [
+                v.qualified_name for v in views if v.owner in owners]
+            if owned:
+                return fname, (f"reads {owned[0]}, which the session owns — it can "
+                               "lift FORCE or replace what it returns")
             for t in tables:
                 if writable(t):
                     return fname, f"reads {t.qualified_name}, which the session can write"
@@ -906,12 +929,13 @@ class _Prover:
                 out |= more
         return out
 
-    def _resolve(self, rels: set[str]) -> list[Table] | str:
-        """The tables relation names read — a view's base tables for a view;
-        a bare name as every table or view of that name. A name that resolves
-        to nothing pgrls captured is returned instead (a system catalog
-        excepted)."""
+    def _resolve(self, rels: set[str]) -> tuple[list[Table], list[View]] | str:
+        """The tables relation names read — a view's base tables for a view,
+        and the views themselves; a bare name as every table or view of that
+        name. A name that resolves to nothing pgrls captured is returned
+        instead (a system catalog excepted)."""
         tables: dict[str, Table] = {}
+        views: dict[str, View] = {}
         for rel in rels:
             schema_name, _, relname = rel.rpartition(".")
             if schema_name in ("pg_catalog", "information_schema") or (
@@ -926,6 +950,7 @@ class _Prover:
             for v in self.schema.views:
                 if v.name == relname and (not schema_name or v.schema == schema_name):
                     found = True
+                    views[v.qualified_name] = v
                     for vs, vn in v.references:
                         base = self.tables.get(f"{vs}.{vn}")
                         if base is None:
@@ -933,7 +958,7 @@ class _Prover:
                         tables[base.qualified_name] = base
             if not found:
                 return rel
-        return list(tables.values())
+        return list(tables.values()), list(views.values())
 
     def _client_controlled(self, predicate: str) -> str | None:
         """A request header or cookie setting the filter reads — directly, or
@@ -981,6 +1006,24 @@ class _Prover:
                 if why:
                     return why
         return None
+
+    def _opaque_helpers(self, predicate: str) -> list[str]:
+        """The functions `predicate` calls that are user-defined (captured, or
+        named with a schema other than pg_catalog) and not auth functions —
+        values the prover cannot see into."""
+        from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
+
+        auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
+        bare = {a.rsplit(".", 1)[-1] for a in auth}
+        def is_auth(f: str) -> bool:  # a qualified call must name it exactly
+            return f in auth if "." in f else f in bare
+
+        return sorted(
+            f for f in _called_functions(predicate)
+            if not is_auth(f)
+            and (f in self.functions
+                 or ("." in f and not f.lower().startswith("pg_catalog.")))
+        )
 
     def _settable_identity(self, predicate: str) -> str | None:
         """What in `predicate` reads state a session can set for itself — a
