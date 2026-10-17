@@ -874,13 +874,9 @@ class _Prover:
             if header:
                 return CellProof("unknown", model, detail=header)
         if not login and predicate is not None:
-            hook = self._hook_taint({name}, login)
-            if hook and self._reads_any_setting_of(predicate, hook[1]):
-                written = ", ".join(sorted(hook[1])) if hook[1] else "settings"
-                return CellProof("unknown", model, detail=(
-                    f"the PostgREST pre-request hook {hook[0]} may set {written}, and "
-                    f"the filter reads it — {hook[2]}"
-                ))
+            hook = self._hook_reason({name}, login, predicate)
+            if hook:
+                return CellProof("unknown", model, detail=hook)
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
             # and put any schema it can create in on its search_path.
@@ -1102,9 +1098,9 @@ class _Prover:
             else:
                 # A gateway session gets its settings from a pre-request hook
                 # that may copy values it can steer.
-                hook = self._hook_taint(session or set(), login)
-                if hook and self._reads_any_setting_of(using, hook[1]):
-                    return f"a setting the pre-request hook {hook[0]} may set (policy {pol.name})"
+                hook = self._hook_reason(session or set(), login, using)
+                if hook:
+                    return f"a setting a pre-request hook may set (policy {pol.name}: {hook})"
                 for fname in sorted(_called_functions(using)):
                     if self._shadowable(fname):
                         return f"{fname}(), which a temp table can shadow (policy {pol.name})"
@@ -1328,19 +1324,18 @@ class _Prover:
                    if n.lower() == "pgrst.db_pre_request"]
         return sorted({h for v in values if (h := (v or "").strip().strip('"'))})
 
-    def _hook_taint(
+    def _hook_taints(
         self, session: set[str], login: bool,
-    ) -> tuple[str, frozenset[str] | None, str] | None:
+    ) -> list[tuple[str, frozenset[str] | None, str]]:
         """(hook, the setting names it writes — None for every one) when the
         pre-request hook may set them from something the session can steer:
         a value the HTTP client chooses (measured: a header copied into
         app.tenant), or a relation the session can write, owns or steers
         (measured: an "active org" in a profile row the user can update) —
-        or when pgrls cannot read it. With several hooks configured, any may
-        be the one that runs, so every tainting hook counts: their written
-        names are combined (every setting when any is None)."""
+        or when pgrls cannot read it — one entry per tainting hook. With several
+        configured, any may be the one that runs, so each counts."""
         if self._in_hook:
-            return None
+            return []
         tainting: list[tuple[str, frozenset[str] | None, str]] = []
         for hook in self._pre_request_hooks():
             if hook not in self.functions:
@@ -1358,12 +1353,17 @@ class _Prover:
                                  "the HTTP client chooses the value"))
             elif steered:
                 tainting.append((hook, self._settings_written(hook), f"the hook {steered}"))
-        if not tainting:
-            return None
-        names: frozenset[str] | None = frozenset()
-        for _, written, _ in tainting:
-            names = None if names is None or written is None else names | written
-        return ", ".join(h for h, _, _ in tainting), names, tainting[0][2]
+        return tainting
+
+    def _hook_reason(self, session: set[str], login: bool, predicate: str) -> str | None:
+        """Why a tainting pre-request hook steers what `predicate` reads —
+        only hooks whose written settings it reads, each with its own cause."""
+        for hook, names, cause in self._hook_taints(session, login):
+            if self._reads_any_setting_of(predicate, names):
+                written = ", ".join(sorted(names)) if names else "any setting"
+                return (f"the PostgREST pre-request hook {hook} may set {written}, and "
+                        f"the filter reads it — {cause}")
+        return None
 
     def _settings_written(self, fname: str, seen: frozenset[str] = frozenset()) -> frozenset[str] | None:
         """The setting names `fname` (and its callees) write with

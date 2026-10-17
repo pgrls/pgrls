@@ -4058,7 +4058,9 @@ def test_prove_two_tainting_hooks_combine_what_they_write() -> None:
                 role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
     m = build_matrix(s, roles=("authenticated",), prove=True)
     p = _proof(m, "public.t", "authenticated")
-    assert p.status == "unknown" and "public.pre" in (p.detail or ""), p
+    assert p.status == "unknown" and "public.pre " in (p.detail or ""), p
+    # Only the hook whose setting the filter reads is named.
+    assert "public.a_pre" not in (p.detail or ""), p
 
 
 def test_prove_every_configured_pre_request_hook_is_judged() -> None:
