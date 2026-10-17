@@ -22,14 +22,15 @@ breaking changes — they will be called out in this file.
   claimed only when nothing pgrls cannot see could change the answer — no door
   evaluates a who-runs-it filter, no untraced door the role can open has an
   owner that reaches the table (followed through that owner's own untraced
-  doors), the role owns neither the table nor a function the filter calls, a `current_setting(…)` filter
+  doors), the role does not own the table, the session owns no user-defined
+  function while the filter calls one, a `current_setting(…)` filter
   also isolates a session that leaves the setting unset (and, for a login
   role, one with no JWT), and every role the session can `SET ROLE` to is
   proven too — and `LEAK` only when the role's own session reads the row (a
   direct read without `USAGE` on the schema is `POSSIBLE`: a view still reads
   it). Each anonymous column is proven against its own login settings. A role
-  whose verdicts differ from what `PUBLIC` gets under the same question is
-  shown as a column. The HTML page
+  whose verdicts differ from what `PUBLIC` gets under the same question, or
+  are more alarming than the `PUBLIC` column shows, is a column. The HTML page
   leads with the proof grid, the leaks and the undecided cells with their
   reasons; text and markdown add the same, with the question each column
   answers; JSON adds a `proof` object per SELECT cell and a

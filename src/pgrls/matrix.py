@@ -135,6 +135,9 @@ def _proof_findings(
 
 
 _LEAKS_TITLE = "Leaks and possible leaks"
+# How alarming a verdict reads, for deciding whether PUBLIC's column covers a
+# role's (EXEMPT never matches PUBLIC's baseline, so its rank is moot).
+_SEVERITY = {"proven": 0, "exempt": 0, "unknown": 1, "possible": 2, "leak": 3}
 _UNDECIDED_TITLE = "Undecided"
 
 
@@ -441,14 +444,15 @@ def build_matrix(
 
         def differs_at(t: Table) -> bool:
             mine = proofs[(t.qualified_name, name)]
-            if key(mine) == key(proofs[(t.qualified_name, "PUBLIC")]):
+            shown = proofs[(t.qualified_name, "PUBLIC")]
+            if key(mine) == key(shown):
                 return False  # the PUBLIC column already shows it
-            # PUBLIC under this role's own question is not shown, so only a
-            # verdict that claims nothing (PROVEN / UNKNOWN) may hide behind it.
-            return not (
-                mine.status in ("proven", "unknown")
-                and key(mine) == key(baseline[(t.qualified_name, mine.model, login)])
-            )
+            if key(mine) != key(baseline[(t.qualified_name, mine.model, login)]):
+                return True
+            # Everyone gets the same under this role's question, but the PUBLIC
+            # column shows the anonymous answer: hide behind it only when that
+            # answer is at least as alarming, so the column never reads safer.
+            return _SEVERITY[mine.status] > _SEVERITY[shown.status]
 
         return prove and any(differs_at(t) for t in shown)
 

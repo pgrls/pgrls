@@ -3345,6 +3345,7 @@ def test_prove_a_parent_filter_admitting_every_row_leaks_the_child() -> None:
 @pytest.mark.parametrize("table", [
     _with(_t(rls=False, grants=(_grant("PUBLIC", ("SELECT",)),)), columns=("code", "name")),
     _sel("auth.uid() IS NULL OR tenant_id = auth.uid()", grants=("PUBLIC",)),
+    _sel("auth.role() = 'anon' OR tenant_id = auth.uid()", grants=("PUBLIC",)),
 ])
 def test_prove_a_role_doing_what_public_does_is_not_a_column(table: Table) -> None:
     """PUBLIC answers the anonymous question; each other role is compared
@@ -3407,8 +3408,45 @@ def test_prove_the_owner_of_a_function_the_filter_calls_is_not_proven() -> None:
                 function_owners=(("auth.uid", "authadm"),))
     m = build_matrix(s, roles=("authadm", "other"), prove=True)
     p = _proof(m, "public.t", "authadm")
-    assert p.status == "unknown" and "owns auth.uid()" in (p.detail or ""), p
+    assert p.status == "unknown" and "session owns auth.uid()" in (p.detail or ""), p
     assert _proof(m, "public.t", "other").status == "proven"
+
+
+def test_prove_a_member_of_a_function_owner_is_not_proven() -> None:
+    """Measured: ops, a member of fnadm (owner of auth.uid(), no grant on the
+    table itself), redefined the function and read another tenant's row."""
+    t = _sel("tenant_id = auth.uid()", grants=("ops",))
+    s = replace(_s([t], roles=[_r("ops"), _api("fnadm"), _r("own")],
+                   memberships=[RoleMembership(member="ops", role="fnadm", inherit=True)]),
+                function_owners=(("auth.uid", "fnadm"),))
+    p = _proof(build_matrix(s, roles=("ops",), prove=True), "public.t", "ops")
+    assert p.status == "unknown" and "auth.uid()" in (p.detail or ""), p
+
+
+def test_prove_owning_a_function_called_inside_the_filters_function_is_not_proven() -> None:
+    """The filter calls public.cur(), owned by someone else; its body calls
+    auth.uid(), which the role owns. Bodies are not traced, so owning any
+    user-defined function rules out PROVEN when the filter calls one."""
+    t = _sel("tenant_id = cur()", grants=("authadm",))
+    s = replace(_s([t], roles=[_api("authadm"), _r("own")]),
+                function_owners=(("auth.uid", "authadm"), ("public.cur", "own")))
+    m = build_matrix(s, roles=("authadm",), prove=True, auth_functions={"cur"})
+    p = _proof(m, "public.t", "authadm")
+    assert p.status == "unknown" and "cur()" in (p.detail or ""), p
+    # Owning no function at all: proven.
+    s = replace(s, function_owners=(("public.cur", "own"),))
+    m = build_matrix(s, roles=("authadm",), prove=True, auth_functions={"cur"})
+    assert _proof(m, "public.t", "authadm").status == "proven"
+
+
+def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
+    """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
+    under its own question must not hide behind that."""
+    t = _with(_sel("auth.uid() IS NOT NULL", grants=("PUBLIC",)), columns=("id", "body"))
+    s = _s([t], roles=[_api("anon"), _r("app_user"), _r("own")])
+    m = build_matrix(s, prove=True)
+    assert _proof(m, "public.t", "PUBLIC").status == "proven"
+    assert "app_user" in m.roles and _proof(m, "public.t", "app_user").status == "unknown"
 
 
 def test_prove_a_leak_every_login_role_shares_is_still_shown() -> None:

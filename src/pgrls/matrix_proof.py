@@ -29,9 +29,10 @@ the verdicts honest:
   change that: no door evaluates a filter that depends on who runs it
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
-  own; the role owns neither the table (it can lift ``FORCE`` or rewrite a
-  policy in one statement) nor a function the filter calls (it can redefine
-  it); a filter scoped by a setting
+  own; the role does not own the table (it could lift ``FORCE`` or rewrite a
+  policy in one statement), and the session owns no user-defined function
+  while the filter calls one (bodies are not traced, so the called one may
+  call the owned one, which CREATE OR REPLACE would change); a filter scoped by a setting
   (``current_setting``) also isolates a session that leaves it unset, and —
   for a role that can log in — one that connects with no JWT; and every role
   the session can ``SET ROLE`` to is proven too.
@@ -182,9 +183,12 @@ class _Prover:
         self.states_cache: dict[str, _GucStates] = {}
         self.base_cache: dict[Any, CellProof] = {}
         self.usage: dict[str, frozenset[str]] | None = None
-        # function name — qualified and bare — -> its owners
+        # function name — qualified and bare — -> its owners; and by
+        # qualified name alone, for naming the owned function
         self.fn_owners: dict[str, set[str]] = {}
+        self.fn_owners_by_name: dict[str, set[str]] = {}
         for qname, owner in schema.function_owners or ():
+            self.fn_owners_by_name.setdefault(qname, set()).add(owner)
             for key in (qname, qname.rsplit(".", 1)[-1]):
                 self.fn_owners.setdefault(key, set()).add(owner)
         if schema.schema_usage is not None:
@@ -294,7 +298,30 @@ class _Prover:
                     f"the session can SET ROLE {target}, whose read is "
                     f"{other.status.upper()}"
                 ))
-        return base
+        return self._redefinable(name, targets, table, model) or base
+
+    def _redefinable(
+        self, name: str, targets: set[str], table: Table, model: ThreatModel,
+    ) -> CellProof | None:
+        """Whether the session — the role or one it can SET ROLE to — owns a
+        user-defined function while a filter it reads the table through calls
+        one. Bodies are not traced, so a called function may call an owned
+        one: CREATE OR REPLACE FUNCTION would then change the filter
+        (measured)."""
+        session = {name} | targets
+        owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & session)
+        if not owned:
+            return None
+        for role in sorted(session):
+            predicate = self.reach_of(role).cells[(table.qualified_name, "SELECT")].predicate
+            called = sorted(f for f in _called_functions(predicate or "") if f in self.fn_owners)
+            if predicate and called:
+                return CellProof("unknown", model, detail=(
+                    f"the session owns {owned[0]}() and the filter calls the "
+                    f"user-defined {called[0]}(): redefining a function it calls, "
+                    "directly or in a body, changes the filter"
+                ))
+        return None
 
     def set_role_targets(self, name: str) -> set[str] | None:
         """Every role `name` can switch to with SET ROLE: the roles it is a
@@ -459,14 +486,6 @@ class _Prover:
                 f"the role owns the table ({table.owner}): one ALTER TABLE … NO "
                 "FORCE ROW LEVEL SECURITY or ALTER POLICY lets it read every row"
             ))
-        if predicate is not None:
-            owned = sorted(f for f in _called_functions(predicate)
-                           if name in self.fn_owners.get(f, ()))
-            if owned:
-                return CellProof("unknown", model, detail=(
-                    f"the role owns {owned[0]}(), which the filter calls: a CREATE "
-                    "OR REPLACE FUNCTION changes what it returns"
-                ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
                 return CellProof("unknown", model, detail=(
