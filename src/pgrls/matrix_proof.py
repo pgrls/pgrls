@@ -335,6 +335,16 @@ def _names_called(stmts: Any) -> set[str]:
     return names
 
 
+def _or_branches(node: Any) -> list[Any]:
+    """The top-level OR disjuncts of an expression (itself when not an OR)."""
+    from pglast.ast import BoolExpr  # noqa: PLC0415
+    from pglast.enums import BoolExprType  # noqa: PLC0415
+
+    if isinstance(node, BoolExpr) and node.boolop == BoolExprType.OR_EXPR:
+        return [b for arg in node.args for b in _or_branches(arg)]
+    return [node]
+
+
 def _has_subselect(predicate: str) -> bool:
     """Whether `predicate` has a sub-select that reads a relation anywhere in
     it (a UNION's halves included) — a FROM-less ``( SELECT auth.uid() AS
@@ -871,8 +881,13 @@ class _Prover:
         owners = self._privilege_holders(session) - {"PUBLIC"} if login else set()
 
         def writable(t: Table) -> bool:
-            return any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
-                       for reach in reaches for cmd in ("INSERT", "UPDATE", "DELETE"))
+            if any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
+                   for reach in reaches for cmd in ("INSERT", "UPDATE", "DELETE")):
+                return True
+            # A door pgrls cannot trace may write it as its owner (measured:
+            # a SECURITY DEFINER function's dynamic UPDATE).
+            return any(self._owner_writes(door.owner, t)
+                       for reach in reaches for door in reach.untraced)
 
         called = set()
         for reach in reaches:
@@ -1031,17 +1046,65 @@ class _Prover:
         return None
 
     def _other_session_value(self, predicate: str) -> str | None:
-        """A session value `predicate` reads besides one tenant identity — a
-        setting, or a second auth function — or None."""
+        """A session value `predicate` reads outside its tenant binding — a
+        setting or an auth function not compared with a tenant column — or
+        None."""
+        from pglast.ast import A_Expr, ColumnRef, FuncCall, Node  # noqa: PLC0415
+
         from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
 
-        if _calls_current_setting(predicate):
-            return "current_setting()"
+        node = parse_expr(predicate)
+        if node is None:
+            return None
         auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
         bare = {a.rsplit(".", 1)[-1] for a in auth}
-        names = sorted(f for f in _called_functions(predicate)
-                       if (f in auth if "." in f else f in bare))
-        return f"{names[1]}()" if len(names) > 1 else None
+
+        def is_axis_column(n: Any) -> bool:
+            if not isinstance(n, ColumnRef):
+                return False
+            last = getattr(n.fields[-1], "sval", "") if n.fields else ""
+            return str(last).lower() in self.axis
+
+        def session_value(n: Any) -> str | None:
+            if not isinstance(n, FuncCall):
+                return None
+            f = ".".join(getattr(part, "sval", "") for part in n.funcname)
+            if _is_current_setting(n):
+                return "current_setting()"
+            return f"{f}()" if (f in auth if "." in f else f in bare) else None
+
+        def binds_tenant(n: Any) -> bool:
+            return (isinstance(n, A_Expr) and bool(n.name)
+                    and getattr(n.name[-1], "sval", "") == "="
+                    and (is_axis_column(n.lexpr) or is_axis_column(n.rexpr)))
+
+        found: list[str] = []
+
+        def walk(n: Any) -> None:
+            if found or n is None:
+                return
+            if isinstance(n, (list, tuple)):
+                for item in n:
+                    walk(item)
+                return
+            name = session_value(n)
+            if name:
+                found.append(name)
+                return
+            if isinstance(n, Node):
+                for fld in n:
+                    walk(getattr(n, fld, None))
+
+        # A top-level OR branch that carries the tenant binding cannot leak
+        # another tenant's row on its own; a session value in any other
+        # branch is what a no-witness leak may rest on.
+        try:
+            for branch in _or_branches(node):
+                if not _has_node_in(branch, binds_tenant):
+                    walk(branch)
+        except RecursionError:
+            return "a value pgrls could not walk"
+        return found[0] if found else None
 
     def _opaque_helpers(self, predicate: str) -> list[str]:
         """The functions `predicate` calls that are user-defined (captured, or
@@ -1099,6 +1162,20 @@ class _Prover:
         member of the owner, inheriting or not, can SET ROLE to it: the SET
         ROLE gate in `cell` covers that."""
         return bool(table.owner) and name == table.owner
+
+    def _owner_writes(self, owner: str, table: Table, seen: frozenset[str] = frozenset()) -> bool:
+        """Whether `owner` can write `table` — itself, through its traced
+        doors, or through an untraced door it can open in turn."""
+        role = self.attrs.get(owner)
+        if not owner or role is None or role.superuser or role.bypassrls:
+            return True
+        reach = self.reach_of(owner)
+        if any(reach.cells[(table.qualified_name, cmd)].verdict != "denied"
+               for cmd in ("INSERT", "UPDATE", "DELETE")):
+            return True
+        seen = seen | {owner}
+        return any(door.owner not in seen and self._owner_writes(door.owner, table, seen)
+                   for door in reach.untraced)
 
     def _parent_is_own(self, name: str, parent: str | None) -> bool:
         """Whether rows reached through `parent` come from the role querying

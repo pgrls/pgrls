@@ -3872,10 +3872,34 @@ def test_prove_a_cross_tenant_leak_on_another_session_value_is_unknown(extra: st
     assert p.status == "unknown" and "besides the tenant identity" in (p.detail or ""), p
 
 
-def test_prove_a_cross_tenant_leak_on_a_builtin_stays_a_leak() -> None:
-    m = _prove([_sel("(tenant_id = auth.uid()) OR (created > now())")],
-               cols=("authenticated",))
+@pytest.mark.parametrize("filt", [
+    "(tenant_id = auth.uid()) OR (created > now())",
+    "(tenant_id = current_setting('app.tenant', true)) OR (created > now())",
+    "((tenant_id = auth.uid()) AND (auth.role() = 'authenticated')) OR (created > now())",
+])
+def test_prove_a_cross_tenant_leak_on_a_builtin_stays_a_leak(filt: str) -> None:
+    """The tenant binding — even one that reads a setting — and a claim that
+    only narrows the tenant branch are not what the leak rests on."""
+    m = _prove([_sel(filt)], cols=("authenticated",))
     assert _proof(m, "public.t", "authenticated").status == "leak"
+
+
+@pytest.mark.parametrize("role", [_r("appf"), _api("appf")])
+def test_prove_an_untraced_door_that_writes_the_identity_table_is_found(role) -> None:
+    """Measured: a SECURITY DEFINER function's dynamic UPDATE of the table the
+    identity function reads switched the caller's tenant."""
+    rt = _t("role_tenants", rls=False, grants=(_grant("appf", ("SELECT",)),
+                                               _grant("tenant_admin", ("UPDATE",))))
+    door = _f("BEGIN RETURN; END", owner="tenant_admin", lang="plpgsql", execute=("appf",))
+    fns = (_fn("app.cur", body="SELECT max(tenant_id) FROM public.role_tenants",
+               search_path="pg_catalog, pg_temp"),)
+    t = _sel("tenant_id = cur()", grants=("appf",))
+    s = replace(_s([t, rt], fns=[door], roles=[role, _r("tenant_admin"), _r("own")]),
+                user_functions=fns)
+    m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "appf")
+    assert p.status == "unknown" and "public.role_tenants" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:

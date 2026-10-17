@@ -34,7 +34,7 @@ breaking changes — they will be called out in this file.
   - `LEAK` — the role's own session reads such a row, shown when one
     characterizes it; a direct read without schema `USAGE` is `POSSIBLE`,
     and a leak resting on a helper the prover cannot see into (or, for a
-    tenant column, on a session value besides the tenant identity) is
+    tenant column, on a setting or claim outside the tenant binding) is
     `UNKNOWN`.
   - `POSSIBLE` — only through a door, which may filter it.
   - `UNKNOWN` — with the reason.
