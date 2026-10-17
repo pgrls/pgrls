@@ -4147,7 +4147,8 @@ def report(
         "(anon roles and PUBLIC) — can an unauthenticated session read any "
         "row; other columns — can a session of that role read another "
         "tenant's row. Each cell becomes PROVEN, LEAK (with the leaking row), "
-        "POSSIBLE (only through a door), UNKNOWN or EXEMPT."
+        "POSSIBLE (through a door, or a direct read without schema USAGE), "
+        "UNKNOWN (with the reason) or EXEMPT."
     ),
 )
 @click.option(
@@ -4200,8 +4201,9 @@ def matrix(
     section. `--prove` checks every SELECT cell with the verify provers and
     marks it PROVEN, LEAK (with the leaking row), POSSIBLE, UNKNOWN or EXEMPT.
 
-    Each column is a session running as that role: `SET ROLE` and DDL are
-    not modelled, nor are ordinary triggers fired by a door's write. UPDATE
+    Each column is a session running as that role: `SET ROLE` (followed by
+    `--prove` only) and DDL are not modelled, nor are ordinary triggers fired
+    by a door's write. UPDATE
     shows the rows `USING` lets it touch, not its `WITH CHECK`; a door is
     credited with its owner's reach, not with a view's own WHERE or what a
     function returns (an over-report).

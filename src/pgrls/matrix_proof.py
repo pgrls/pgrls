@@ -29,17 +29,21 @@ the verdicts honest:
   change that: no door evaluates a filter that depends on who runs it
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
-  own; a filter scoped by a setting
-  (``current_setting``) also isolates a session that leaves it unset; and
-  every role the session can ``SET ROLE`` to is proven too.
+  own; the role is not the table's owner (who can lift ``FORCE`` or rewrite
+  a policy in one statement); a filter scoped by a setting
+  (``current_setting``) also isolates a session that leaves it unset, and —
+  for a role that can log in — one that connects with no JWT; and every role
+  the session can ``SET ROLE`` to is proven too.
 * **unknown** for everything else, with the reason.
 * **exempt** for a superuser or ``BYPASSRLS`` column outside the anonymous
   set: it skips RLS by design (SEC016 is the place to question that). An
   anonymous role that bypasses RLS is the worst leak there is, so anonymous
   columns are never exempt.
 
-The cross-tenant model assumes a JWT-bearing session carries its identity
-(``auth.uid()`` is the session's user). It also assumes the role can execute
+The cross-tenant model assumes a session carries its identity
+(``auth.uid()`` is the session's user) — checked without one for a role that
+can log in, assumed for a NOLOGIN role reached through a login role that sets
+the JWT (Supabase's ``authenticated``). It also assumes the role can execute
 the functions a policy calls, as `pgrls verify` does.
 """
 from __future__ import annotations
@@ -56,6 +60,7 @@ ProofStatus = Literal["proven", "leak", "possible", "unknown", "exempt"]
 ThreatModel = Literal["anon", "cross-tenant"]
 
 PROOF_STATUSES: tuple[ProofStatus, ...] = ("proven", "leak", "possible", "unknown", "exempt")
+_MODELS: tuple[ThreatModel, ...] = ("anon", "cross-tenant")
 
 _ALL_DATA_ROLES = frozenset({"pg_read_all_data", "pg_write_all_data"})
 
@@ -232,7 +237,11 @@ class _Prover:
         roles its session can SET ROLE to."""
         model = self.model(name)
         states = self.states(name)
-        base = self.base(name, table, model, states)
+        # A login role's session can arrive with no JWT at all; a NOLOGIN one
+        # (authenticated) only through whoever logs in and switches to it.
+        role = self.attrs.get(name)
+        login = name != "PUBLIC" and (role is None or role.can_login)
+        base = self.base(name, table, model, states, login)
         if base.status != "proven" or name == "PUBLIC":
             return base
         targets = self.set_role_targets(name)
@@ -242,7 +251,7 @@ class _Prover:
                 "to a role that reads it"
             ))
         for target in sorted(targets):
-            other = self.base(target, table, model, states)
+            other = self.base(target, table, model, states, login)
             if other.status != "proven":
                 return CellProof("unknown", model, detail=(
                     f"the session can SET ROLE {target}, whose read is "
@@ -269,14 +278,18 @@ class _Prover:
 
     def base(
         self, name: str, table: Table, model: ThreatModel, states: _GucStates,
+        login: bool = False,
     ) -> CellProof:
-        key = (name, table.qualified_name, model, _states_key(states))
+        """`name`'s own read of `table`, in a session with `states` that
+        logged in as itself (`login`) or as a role that switched to it."""
+        key = (name, table.qualified_name, model, _states_key(states), login)
         if key not in self.base_cache:
-            self.base_cache[key] = self._base(name, table, model, states)
+            self.base_cache[key] = self._base(name, table, model, states, login)
         return self.base_cache[key]
 
     def _base(
         self, name: str, table: Table, model: ThreatModel, states: _GucStates,
+        login: bool,
     ) -> CellProof:
         reach = self.reach_of(name)
         q = table.qualified_name
@@ -292,7 +305,7 @@ class _Prover:
         role = self.attrs.get(name)
 
         if cell.verdict == "denied":
-            return self.gates(name, table, model, states, None,
+            return self.gates(name, table, model, states, login, None,
                               CellProof("proven", model, detail="no row reachable"))
         if model == "cross-tenant" and role is not None and (role.superuser or role.bypassrls):
             return CellProof("exempt", model, detail=(
@@ -344,7 +357,8 @@ class _Prover:
             ))
         verdict, witness = self.prove(model, predicate, states)
         if verdict == "isolated":
-            return self.gates(name, table, model, states, predicate, CellProof("proven", model))
+            return self.gates(name, table, model, states, login, predicate,
+                              CellProof("proven", model))
         if verdict == "leak":
             # Through a door — or a parent, whose filter was written for every
             # partition: the leaking row may lie outside this one's bounds.
@@ -353,6 +367,13 @@ class _Prover:
             return CellProof("unknown", model, detail="the filter does not parse")
         from pgrls.verify import _UNVERIFIED_PREDICATE_REASON  # noqa: PLC0415
 
+        if _dependence(predicate)[1]:
+            # Not a missing identity column: the filter is outside what the
+            # prover decides.
+            return CellProof("unknown", model, detail=(
+                "the filter reads another table (a sub-select) or calls a function "
+                "the prover cannot see into"
+            ))
         return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
 
     def _parent_leak(
@@ -388,9 +409,15 @@ class _Prover:
 
     def gates(
         self, name: str, table: Table, model: ThreatModel, states: _GucStates,
-        predicate: str | None, proven: CellProof,
+        login: bool, predicate: str | None, proven: CellProof,
     ) -> CellProof:
         """What must also hold before a cell is PROVEN."""
+        if self._owns(name, table):
+            return CellProof("unknown", model, detail=(
+                f"is the table's owner {table.owner}: one "
+                "ALTER TABLE … NO FORCE ROW LEVEL SECURITY or ALTER POLICY reads "
+                "every row"
+            ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
                 return CellProof("unknown", model, detail=(
@@ -399,14 +426,21 @@ class _Prover:
                 ))
         if (
             model == "cross-tenant" and predicate is not None
-            and _calls_current_setting(predicate)
+            and (login or _calls_current_setting(predicate))
             and self.prove("anon", predicate, states)[0] == "leak"
         ):
             return CellProof("unknown", model, detail=(
-                "isolated while the session sets the setting the filter reads; "
-                "a session of this role that leaves it unset reads rows"
+                "isolated for a session that carries its identity; one that "
+                "logs in with no JWT, or leaves the setting the filter reads "
+                "unset, reads rows"
             ))
         return proven
+
+    def _owns(self, name: str, table: Table) -> bool:
+        """Whether `name` is the table's owner — and so can change its RLS. A
+        member of the owner, inheriting or not, can SET ROLE to it: the SET
+        ROLE gate in `cell` covers that."""
+        return bool(table.owner) and name == table.owner
 
     def _parent_is_own(self, name: str, parent: str | None) -> bool:
         """Whether rows reached through `parent` come from the role querying
@@ -456,6 +490,32 @@ def prove_matrix(
         (table.qualified_name, name): prover.cell(name, table)
         for name in roles
         for table in tables
+    }
+
+
+def public_baseline(
+    schema: Schema,
+    tables: list[Table],
+    reach_of: Callable[[str], RoleReach],
+    attrs: dict[str, Role],
+    *,
+    anon_roles: set[str] | None = None,
+    auth_functions: set[str] | None = None,
+    identity_columns: frozenset[str] | None = None,
+) -> dict[tuple[str, ThreatModel, bool], CellProof]:
+    """PUBLIC's proof for every table under both threat models, for a session
+    that logged in itself and one that switched in — so a role is compared
+    with what everyone can do under the same question."""
+    anon_set = frozenset((anon_roles if anon_roles else {"anon"}) | {"PUBLIC"})
+    prover = _Prover(schema, reach_of, attrs, anon_set=anon_set,
+                     auth_functions=auth_functions, identity_columns=identity_columns)
+    states = prover.states("PUBLIC")
+    return {
+        (table.qualified_name, model, login):
+            prover.base("PUBLIC", table, model, states, login)
+        for table in tables
+        for model in _MODELS
+        for login in (False, True)
     }
 
 

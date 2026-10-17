@@ -57,7 +57,14 @@ from pgrls.access import (
     role_reach,
 )
 from pgrls.formatters._common import safe_location
-from pgrls.matrix_proof import PROOF_STATUSES, CellProof, proof_summary, prove_matrix
+from pgrls.matrix_proof import (
+    PROOF_STATUSES,
+    CellProof,
+    ThreatModel,
+    proof_summary,
+    prove_matrix,
+    public_baseline,
+)
 from pgrls.model import Schema, Table
 from pgrls.rules.sec045 import _DEFAULT_PATTERNS
 
@@ -100,7 +107,7 @@ def _proof_phrase(proof: CellProof) -> str:
         phrase = _witness_phrase(proof.witness, proof.model)
         if proof.status == "possible":
             phrase = f"possibly: {phrase}"
-        return f"{phrase} — {proof.detail}" if proof.detail else phrase
+        return f"{phrase} ({proof.detail})" if proof.detail else phrase
     return proof.detail or ""
 
 
@@ -115,14 +122,34 @@ def _witness_short(proof: CellProof) -> str:
     return ", ".join(f"{k} = {v!r}" for k, v in sorted(proof.witness.items()))
 
 
-def _proof_findings(matrix: Matrix) -> list[tuple[str, str, CellProof]]:
-    """Every LEAK and POSSIBLE cell, as (table, role, proof)."""
+def _proof_findings(
+    matrix: Matrix, statuses: tuple[str, ...] = ("leak", "possible"),
+) -> list[tuple[str, str, CellProof]]:
+    """Every cell whose proof is one of `statuses`, as (table, role, proof)."""
     return [
         (row.qualified_name, role, p)
         for row in matrix.rows
         for role, p in zip(matrix.roles, row.proofs or (), strict=False)
-        if p.status in ("leak", "possible")
+        if p.status in statuses
     ]
+
+
+_LEAKS_TITLE = "Leaks and possible leaks"
+_UNDECIDED_TITLE = "Undecided"
+
+
+def _proof_columns_line(matrix: Matrix) -> str:
+    """Which question each column was asked."""
+    models: dict[str, list[str]] = {"anon": [], "cross-tenant": []}
+    for role in matrix.roles:
+        for row in matrix.rows:
+            if row.proofs is not None:
+                models[row.proofs[matrix.roles.index(role)].model].append(role)
+                break
+    parts = [f"{label}: {', '.join(models[m])}"
+             for m, label in (("anon", "Anonymous"), ("cross-tenant", "Cross-tenant"))
+             if models[m]]
+    return ("; ".join(parts) + ".") if parts else ""
 
 
 def _proof_summary_line(matrix: Matrix) -> str:
@@ -160,6 +187,8 @@ _MATRIX_CSS = """    tr:nth-child(even) td { background: #0d1117; }
     thead th { background: #161b22; }
     code { background: #161b22; }
     .meta { color: #8b949e; }
+    .v-open { color: #ff7b72; } .v-denied { color: #3fb950; }
+    .v-conditional { color: #e3b341; } .v-undecided { color: #d2a8ff; }
   }"""
 
 # Proof cells: tinted so both colour schemes read them; `table.proof td.p-*`
@@ -388,6 +417,7 @@ def build_matrix(
         return bool({(u.door, u.reason) for u in mine.untraced} - public_untraced)
 
     proofs: dict[tuple[str, str], CellProof] = {}
+    baseline: dict[tuple[str, ThreatModel, bool], CellProof] = {}
     if prove:
         # A role whose cells match PUBLIC's can still prove differently — it
         # bypasses RLS, or can SET ROLE to one that does — so it is a column
@@ -395,17 +425,25 @@ def build_matrix(
         proofs = prove_matrix(schema, shown, candidates, reach_of, attrs,
                               anon_roles=anon_roles, auth_functions=auth_functions,
                               identity_columns=identity_columns)
+        baseline = public_baseline(schema, shown, reach_of, attrs, anon_roles=anon_roles,
+                                   auth_functions=auth_functions,
+                                   identity_columns=identity_columns)
 
     def proves_differently(name: str) -> bool:
-        # The verdict and the leaking row; the threat model always differs
-        # (PUBLIC is anonymous) and the wording of a reason does not count.
+        # The verdict and the leaking row, against PUBLIC's under the same
+        # question (PUBLIC is otherwise anonymous); a reason's wording does
+        # not count.
         def key(p: CellProof) -> tuple[str, dict[str, object] | None]:
             return p.status, p.witness
 
-        return prove and any(
-            key(proofs[(t.qualified_name, name)]) != key(proofs[(t.qualified_name, "PUBLIC")])
-            for t in shown
-        )
+        role = attrs.get(name)
+        login = role is None or role.can_login
+
+        def differs_at(t: Table) -> bool:
+            mine = proofs[(t.qualified_name, name)]
+            return key(mine) != key(baseline[(t.qualified_name, mine.model, login)])
+
+        return prove and any(differs_at(t) for t in shown)
 
     role_list = tuple(
         n for n in candidates if n in always or differs(n) or proves_differently(n)
@@ -592,17 +630,24 @@ def render_text(matrix: Matrix) -> str:
                 for row in matrix.rows if row.proofs is not None
             ],
         )]
-        findings = _proof_findings(matrix)
-        if findings:
-            out += ["", "Leaks:"]
-            out += ["  " + ln for ln in render_text_table(
-                ("TABLE", "ROLE", "PROOF", "WHAT"),
-                [
-                    (safe_location(t), safe_location(r), _PROOF_LABEL[p.status],
-                     safe_location(_proof_phrase(p)))
-                    for t, r, p in findings
-                ],
-            )]
+        columns = _proof_columns_line(matrix)
+        if columns:
+            out.append("  " + safe_location(columns))
+        for title, statuses, head in (
+            (_LEAKS_TITLE, ("leak", "possible"), "WHAT"),
+            (_UNDECIDED_TITLE, ("unknown",), "WHY"),
+        ):
+            findings = _proof_findings(matrix, statuses)
+            if findings:
+                out += ["", title + ":"]
+                out += ["  " + ln for ln in render_text_table(
+                    ("TABLE", "ROLE", "PROOF", head),
+                    [
+                        (safe_location(t), safe_location(r), _PROOF_LABEL[p.status],
+                         safe_location(_proof_phrase(p)))
+                        for t, r, p in findings
+                    ],
+                )]
     out.append("")
     out.append(_summary_line(matrix))
     if matrix.proven:
@@ -715,9 +760,17 @@ def render_markdown(matrix: Matrix) -> str:
             ]) + " |"
             for row in matrix.rows if row.proofs is not None
         )
-        findings = _proof_findings(matrix)
-        if findings:
-            proof_part += ["", "### Leaks", "", "| Table | Role | Proof | What |",
+        columns = _proof_columns_line(matrix)
+        if columns:
+            proof_part += ["", safe_location(columns).replace("|", "\\|")]
+        for title, statuses, head in (
+            (_LEAKS_TITLE, ("leak", "possible"), "What"),
+            (_UNDECIDED_TITLE, ("unknown",), "Why"),
+        ):
+            findings = _proof_findings(matrix, statuses)
+            if not findings:
+                continue
+            proof_part += ["", f"### {title}", "", f"| Table | Role | Proof | {head} |",
                            "|---|---|---|---|"]
             proof_part.extend(
                 "| " + " | ".join(c.replace("|", "\\|") for c in (
@@ -893,23 +946,28 @@ def _proof_body(matrix: Matrix) -> str:
         f"      <tr><th>Table</th>{ths}</tr>\n"
         "    </thead>\n    <tbody>\n" + "\n".join(lines) + "\n    </tbody>\n  </table>"
     )
-    findings = _proof_findings(matrix)
-    if not findings:
-        return grid
-    frows = "\n".join(
-        "      <tr>"
-        f"<td><code>{html.escape(t)}</code></td><td>{html.escape(r)}</td>"
-        f'<td class="v-{"open" if p.status == "leak" else "conditional"}">'
-        f"{_PROOF_LABEL[p.status]}</td>"
-        f"<td>{html.escape(_proof_phrase(p))}</td>"
-        "</tr>"
-        for t, r, p in findings
-    )
-    return grid + (
-        "\n  <h2>Leaks</h2>\n  <table>\n    <thead>\n"
-        "      <tr><th>Table</th><th>Role</th><th>Proof</th><th>What</th></tr>\n"
-        "    </thead>\n    <tbody>\n" + frows + "\n    </tbody>\n  </table>"
-    )
+    out = grid
+    for title, statuses, head in (
+        (_LEAKS_TITLE, ("leak", "possible"), "What"),
+        (_UNDECIDED_TITLE, ("unknown",), "Why"),
+    ):
+        findings = _proof_findings(matrix, statuses)
+        if not findings:
+            continue
+        frows = "\n".join(
+            "      <tr>"
+            f"<td><code>{html.escape(t)}</code></td><td>{html.escape(r)}</td>"
+            f'<td class="cell p-{p.status}">{_PROOF_LABEL[p.status]}</td>'
+            f"<td>{html.escape(_proof_phrase(p))}</td>"
+            "</tr>"
+            for t, r, p in findings
+        )
+        out += (
+            f"\n  <h2>{title}</h2>\n  <table class=\"proof\">\n    <thead>\n"
+            f"      <tr><th>Table</th><th>Role</th><th>Proof</th><th>{head}</th></tr>\n"
+            "    </thead>\n    <tbody>\n" + frows + "\n    </tbody>\n  </table>"
+        )
+    return out
 
 
 render, MATRIX_FORMATS = make_dispatcher(

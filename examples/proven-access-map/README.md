@@ -9,7 +9,8 @@
 
 It starts a throwaway Postgres, loads [`schema.sql`](schema.sql) — a small
 Supabase-style schema with `anon`, `authenticated` and `service_role` — and
-prints:
+prints this grid, followed by the leaks, the undecided cells with their
+reasons, and a summary:
 
 ```
   TABLE               anon      authenticated  service_role

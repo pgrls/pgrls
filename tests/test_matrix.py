@@ -3029,8 +3029,14 @@ def _proof(m: Matrix, table: str, role: str):
     return dict(zip(m.roles, row.proofs, strict=True))[role]
 
 
+def _api(name: str) -> Role:
+    """A Supabase-style API role: NOLOGIN, reached by SET ROLE from a login
+    role that carries the request's JWT."""
+    return Role(name, False, False, False)
+
+
 def _prove(tables, views=(), fns=(), *, roles=None, cols=("anon", "authenticated")) -> Matrix:
-    roles = roles or [_r("anon"), _r("authenticated"), _r("svc"), _r("own")]
+    roles = roles or [_api("anon"), _api("authenticated"), _r("svc"), _r("own")]
     return build_matrix(_s(tables, views, fns, roles=roles), roles=cols, prove=True)
 
 
@@ -3151,11 +3157,12 @@ def test_prove_only_select_rows_carry_proofs() -> None:
 def test_prove_renders_in_every_format() -> None:
     m = _prove([_sel("auth.uid() IS NULL OR tenant_id = auth.uid()", name="a<b>")])
     text = render_text(m)
-    assert "Isolation proof (SELECT)" in text and "Leaks:" in text
+    assert "Isolation proof (SELECT)" in text and "Leaks and possible leaks:" in text
+    assert "Anonymous: anon; Cross-tenant: authenticated." in text
     assert "every row is anonymously readable" in text
     assert "Isolation: 1 proven, 1 leak" in text
     md = render_markdown(m)
-    assert "## Isolation proof (SELECT)" in md and "### Leaks" in md
+    assert "## Isolation proof (SELECT)" in md and "### Leaks and possible leaks" in md
     assert "| public.a<b> | LEAK | PROVEN |" in md
     assert "| public.a<b> | anon | LEAK | every row is anonymously readable |" in md
     assert "Isolation: 1 proven, 1 leak." in md
@@ -3333,6 +3340,63 @@ def test_prove_a_parent_filter_admitting_every_row_leaks_the_child() -> None:
     m = _prove([parent, child], cols=("anon",))
     p = _proof(m, "public.posts_a", "anon")
     assert (p.status, p.witness) == ("leak", {}) and "public.posts" in (p.detail or ""), p
+
+
+@pytest.mark.parametrize("table", [
+    _with(_t(rls=False, grants=(_grant("PUBLIC", ("SELECT",)),)), columns=("code", "name")),
+    _sel("auth.uid() IS NULL OR tenant_id = auth.uid()", grants=("PUBLIC",)),
+])
+def test_prove_a_role_doing_what_public_does_is_not_a_column(table: Table) -> None:
+    """PUBLIC answers the anonymous question; each other role is compared
+    with PUBLIC under its own (cross-tenant) one, so identical roles stay
+    hidden even where the two questions disagree."""
+    s = _s([table], roles=[_r("anon"), _r("authenticated"), _r("app_user0"), _r("own")])
+    assert "app_user0" not in build_matrix(s, prove=True).roles
+
+
+def test_prove_unknown_cells_are_listed_with_the_reason() -> None:
+    m = _prove([_sel("tenant_id IN (SELECT tenant_id FROM public.memberships)")])
+    text, md = render_text(m), render_markdown(m)
+    assert "Undecided:" in text and "### Undecided" in md
+    assert "reads another table (a sub-select)" in text
+    assert "identity_columns" not in text.split("Undecided:")[1]
+    page = render_html(m, generated_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert "<h2>Undecided</h2>" in page
+
+
+def test_prove_the_table_owner_is_never_proven() -> None:
+    """FORCE binds the owner to the policies, but the owner can lift FORCE or
+    rewrite the policy in one statement — and so can a role that inherits
+    the owner, or can SET ROLE to it."""
+    t = _with(_sel("tenant_id = auth.uid()", grants=()), owner="app_owner", force_rls=True)
+    roles = [_api("app_owner"), _api("heir"), _api("deployer"), _api("other")]
+    edges = [RoleMembership(member="heir", role="app_owner", inherit=True),
+             RoleMembership(member="deployer", role="app_owner", inherit=False)]
+    m = build_matrix(_s([t], roles=roles, memberships=edges),
+                     roles=("app_owner", "heir", "deployer", "other"), prove=True)
+    for role in ("app_owner", "heir", "deployer"):
+        p = _proof(m, "public.t", role)
+        assert p.status == "unknown", (role, p)
+    assert "owner app_owner" in (_proof(m, "public.t", "app_owner").detail or "")
+    assert "SET ROLE app_owner" in (_proof(m, "public.t", "deployer").detail or "")
+    assert _proof(m, "public.t", "other").status == "proven"
+
+
+def test_prove_a_login_role_without_a_jwt_is_not_proven() -> None:
+    """The cross-tenant question assumes the session carries its identity. A
+    role that logs in itself can connect without one, so `auth.uid() IS NULL
+    OR …` is not PROVEN for it; a NOLOGIN API role reached through a login
+    role that carries the JWT is."""
+    t = _sel("auth.uid() IS NULL OR tenant_id = auth.uid()", grants=("app_user", "authenticated"))
+    m = build_matrix(_s([t], roles=[_r("app_user"), _api("authenticated"), _r("own")]),
+                     roles=("app_user", "authenticated"), prove=True)
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "no JWT" in (p.detail or ""), p
+    assert _proof(m, "public.t", "authenticated").status == "proven"
+    # A plainly scoped filter stays PROVEN for the login role.
+    t = _sel("tenant_id = auth.uid()", grants=("app_user",))
+    m = build_matrix(_s([t], roles=[_r("app_user"), _r("own")]), roles=("app_user",), prove=True)
+    assert _proof(m, "public.t", "app_user").status == "proven"
 
 
 def test_prove_a_role_that_reaches_nothing_is_not_a_column() -> None:
