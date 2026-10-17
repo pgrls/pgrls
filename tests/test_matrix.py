@@ -3099,6 +3099,13 @@ def test_prove_a_qualified_auth_function_matches_its_stored_bare_call() -> None:
                      auth_functions={"public.my_tenant"})
     for role in ("anon", "authenticated"):
         assert _proof(m, "public.t", role).status == "proven", role
+    # Another schema's uid() of the same name: the bare call is ambiguous.
+    s = replace(_s([_sel("tenant_id = uid()")],
+                   roles=[_api("anon"), _api("authenticated"), _r("own")]),
+                user_functions=(_fn("app.uid"), _fn("public.uid")))
+    m = build_matrix(s, roles=("anon", "authenticated"), prove=True,
+                     auth_functions={"app.uid"})
+    assert _proof(m, "public.t", "authenticated").status != "proven"
 
 
 def test_prove_a_leak_resting_on_an_opaque_helper_is_unknown() -> None:

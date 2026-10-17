@@ -398,8 +398,8 @@ class _Prover:
         # schema (public.my_tenant() reads back as my_tenant()), so a qualified
         # --auth-function also names its bare call — for the prover too, or a
         # helper the user named would be opaque to it (a false LEAK).
-        self.auth = (None if auth_functions is None else
-                     set(auth_functions) | {a.rsplit(".", 1)[-1] for a in auth_functions})
+        self.auth = None if auth_functions is None else self._with_bare_names(
+            set(auth_functions), schema)
         self.identity_columns = identity_columns
         self.axis = identity_columns if identity_columns is not None else AXIS_IDENTITY_COLUMNS
         self.cache: dict[Any, tuple[str, dict[str, object] | None]] = {}
@@ -432,6 +432,22 @@ class _Prover:
             for s, grantee in schema.schema_usage:
                 usage.setdefault(s, set()).add(grantee)
             self.usage = {s: frozenset(g) for s, g in usage.items()}
+
+    @staticmethod
+    def _with_bare_names(auth: set[str], schema: Schema) -> set[str]:
+        """`auth` plus the bare name of each qualified entry that is the only
+        user-defined function of that name — so the bare call cannot be
+        another schema's function of the same name."""
+        schemas_of: dict[str, set[str]] = {}
+        for fn in schema.user_functions or ():
+            sch, _, bare = fn.qualified_name.rpartition(".")
+            schemas_of.setdefault(bare, set()).add(sch)
+        out = set(auth)
+        for a in auth:
+            sch, _, bare = a.rpartition(".")
+            if sch and schemas_of.get(bare, {sch}) <= {sch}:
+                out.add(bare)
+        return out
 
     # --- inputs -------------------------------------------------------------
 
