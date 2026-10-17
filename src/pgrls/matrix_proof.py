@@ -878,8 +878,8 @@ class _Prover:
             if hook and self._reads_any_setting_of(predicate, hook[1]):
                 written = ", ".join(sorted(hook[1])) if hook[1] else "settings"
                 return CellProof("unknown", model, detail=(
-                    f"the PostgREST pre-request hook {hook[0]} may set {written} from "
-                    "what the HTTP client sends, and the filter reads it"
+                    f"the PostgREST pre-request hook {hook[0]} may set {written} "
+                    f"{hook[2]}, and the filter reads it"
                 ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
@@ -1319,39 +1319,42 @@ class _Prover:
                  or ("." in f and not f.lower().startswith("pg_catalog.")))
         )
 
-    def _pre_request_hook(self) -> str | None:
-        """The PostgREST pre-request hook (``pgrst.db_pre_request``) set at
-        database or role level, if any."""
+    def _pre_request_hooks(self) -> list[str]:
+        """Every PostgREST pre-request hook (``pgrst.db_pre_request``) set at
+        database or role level. Which one runs depends on the login path (a
+        role's setting overrides the database's), so all are judged."""
         values = [v for n, v in self.schema.set_gucs if n.lower() == "pgrst.db_pre_request"]
         values += [v for _, n, v in self.schema.role_set_gucs
                    if n.lower() == "pgrst.db_pre_request"]
-        for value in values:
-            hook = (value or "").strip().strip('"')
-            if hook:
-                return hook
-        return None
+        return sorted({h for v in values if (h := (v or "").strip().strip('"'))})
 
     def _hook_taint(
         self, session: set[str], login: bool,
-    ) -> tuple[str, frozenset[str] | None] | None:
+    ) -> tuple[str, frozenset[str] | None, str] | None:
         """(hook, the setting names it writes — None for every one) when the
         pre-request hook may set them from something the session can steer:
         a value the HTTP client chooses (measured: a header copied into
         app.tenant), or a relation the session can write, owns or steers
         (measured: an "active org" in a profile row the user can update) —
-        or when pgrls cannot read it."""
-        hook = self._pre_request_hook()
-        if not hook or self._in_hook:
+        or when pgrls cannot read it. With several hooks configured, the first
+        that taints (by name) — any of them may be the one that runs."""
+        if self._in_hook:
             return None
-        if hook not in self.functions:
-            return hook, None
-        self._in_hook = True
-        try:
-            steered = self._client_in_body(hook) or self._function_steerable(
-                hook, session, login, self._door_owners(session))
-        finally:
-            self._in_hook = False
-        return (hook, self._settings_written(hook)) if steered else None
+        for hook in self._pre_request_hooks():
+            if hook not in self.functions:
+                return hook, None, "pgrls cannot read it"
+            self._in_hook = True
+            try:
+                client = self._client_in_body(hook)
+                steered = None if client else self._function_steerable(
+                    hook, session, login, self._door_owners(session))
+            finally:
+                self._in_hook = False
+            if client:
+                return hook, self._settings_written(hook), "from what the HTTP client sends"
+            if steered:
+                return hook, self._settings_written(hook), f"from what it {steered}"
+        return None
 
     def _settings_written(self, fname: str, seen: frozenset[str] = frozenset()) -> frozenset[str] | None:
         """The setting names `fname` (and its callees) write with
