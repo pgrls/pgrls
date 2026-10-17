@@ -24,15 +24,15 @@ breaking changes — they will be called out in this file.
   owner that reaches the table (followed through that owner's own untraced
   doors), a `current_setting(…)` filter also isolates a session that leaves
   the setting unset, and every role the session can `SET ROLE` to is proven
-  too — and `LEAK` only when the role's own session reads the row (without
-  `USAGE` on the schema it is `POSSIBLE`: a view still reads it). Each
-  anonymous column is proven against its own login settings. A role whose
-  verdicts differ from `PUBLIC`'s is shown as a column. The HTML page leads
-  with the proof grid and the leaks; text and markdown add a proof grid and a
-  leaks list; JSON adds a `proof` object per SELECT cell and a
-  `proof_summary`. `--auth-function`
-  names a project's own auth helper. SELECT only; the exit code stays 0.
-  `examples/proven-access-map/` runs it end to end.
+  too — and `LEAK` only when the role's own session reads the row (a direct
+  read without `USAGE` on the schema is `POSSIBLE`: a view still reads it).
+  Each anonymous column is proven against its own login settings. A role
+  whose verdicts differ from `PUBLIC`'s is shown as a column. The HTML page
+  leads with the proof grid and the leaks; text and markdown add a proof grid
+  and a leaks list; JSON adds a `proof` object per SELECT cell and a
+  `proof_summary`. `--auth-function` names a project's own auth helper.
+  SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
+  end to end.
 
 ### Fixed
 - `pgrls matrix --format html` in a dark colour scheme: table headers and

@@ -3294,6 +3294,35 @@ def test_prove_a_leaking_parent_the_role_queries_wins_over_another_door() -> Non
     assert _proof(m, "public.p0", "app").status == "possible"
 
 
+def test_prove_a_grandparent_the_role_cannot_query_is_not_its_own_leak() -> None:
+    """p1 is reached only through p0 — via a view in one case, in a schema
+    without USAGE in the other — so c's rows are not the role's own read."""
+    p1 = _t("p1", rls=False, partition_of=("public", "p0"))
+    c = _t("c", rls=False, partition_of=("public", "p1"))
+    v = _v("v", (("public", "p0"),), owner="own", grants=(_grant("app", ("SELECT",)),))
+    m = build_matrix(_s([_t("p0", rls=False), p1, c], [v], roles=[_r("app"), _r("own")]),
+                     roles=("app",), prove=True, anon_roles={"app"})
+    assert _proof(m, "public.c", "app").status == "possible"
+    p0 = _t("p0", schema="s0", rls=False, grants=(_grant("app", ("SELECT",)),))
+    p1 = _t("p1", rls=False, partition_of=("s0", "p0"))
+    s = replace(_s([p0, p1, c], roles=[_r("app"), _r("own")]),
+                schema_usage=(("public", "PUBLIC"), ("s0", "own")))
+    m = build_matrix(s, roles=("app",), prove=True, anon_roles={"app"})
+    assert _proof(m, "public.c", "app").status == "possible"
+
+
+def test_prove_a_filtered_parent_leak_is_only_possible_on_a_partition() -> None:
+    """The parent's filter is written for every partition: its leaking row
+    (visibility = 'public') may not be one this partition can hold."""
+    parent = _t("posts", policies=(_policy(command="SELECT", roles=("PUBLIC",),
+                                           using="visibility = 'public'"),),
+                grants=(_grant("anon", ("SELECT",)),))
+    child = _t("posts_priv", partition_of=("public", "posts"))
+    m = _prove([parent, child], cols=("anon",))
+    assert _proof(m, "public.posts", "anon").status == "leak"
+    assert _proof(m, "public.posts_priv", "anon").status == "possible"
+
+
 def test_prove_a_role_that_reaches_nothing_is_not_a_column() -> None:
     s = _s([_sel("tenant_id = auth.uid()")],
            roles=[_r("anon"), _r("authenticated"), _r("y"), _r("own")])

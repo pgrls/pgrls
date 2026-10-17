@@ -15,7 +15,10 @@ the verdicts honest:
 
 * **leak** only when the role's *own* session reads such a row: the role's
   direct read is proven to leak (or reads every row), or a partition /
-  inheritance parent it queries itself does. A role without USAGE on the
+  inheritance parent it queries itself returns every row. A parent whose
+  filter leaks makes the child only a possible leak: the filter was written
+  for every partition, so the leaking row may not be the child's. A role
+  without USAGE on the
   table's schema cannot query the table by name, so its direct read is only
   a possible leak — a view or a pre-parsed function body skips that check.
 * **possible** when the read exists only through a door: a door is credited
@@ -304,10 +307,12 @@ class _Prover:
             "still can"
         )
 
-        own_parents = tuple(
-            p for p in doors if p.kind == "parent" and self._parent_is_own(name, p.via)
+        # Every ancestor of a partition / inheritance child is a door of its
+        # own, so each level is judged on the role's own query of it.
+        parents_only = bool(doors) and all(
+            p.kind == "parent" and self._parent_is_own(name, p.via) for p in doors
         )
-        parents_only = bool(doors) and len(own_parents) == len(doors)
+        parent_leak = None if shared else self._parent_leak(name, reach, doors, model)
 
         # The role's own read first: a leak there is certain whatever a door adds.
         if direct.verdict == "open":
@@ -315,25 +320,20 @@ class _Prover:
                 return self._shared(model)
             if usage:
                 return CellProof("leak", model, witness={}, detail=direct.note)
-            return self._parent_leak(reach, own_parents, model, states, shared) or \
-                CellProof("possible", model, witness={}, detail=no_usage)
+            return parent_leak or CellProof("possible", model, witness={}, detail=no_usage)
         if direct.verdict == "conditional":
             verdict, witness = self.prove(model, direct.predicate or "", states)
             if verdict == "leak":
                 if usage:
                     return CellProof("leak", model, witness=witness)
-                return self._parent_leak(reach, own_parents, model, states, shared) or \
-                    CellProof("possible", model, witness=witness, detail=no_usage)
-        # A parent the role queries itself that leaks is the role's own leak,
-        # whatever other doors add.
-        found = self._parent_leak(reach, own_parents, model, states, shared)
-        if found is not None:
-            return found
-        own: ProofStatus = "leak" if parents_only else "possible"
+                return parent_leak or CellProof(
+                    "possible", model, witness=witness, detail=no_usage)
+        if parent_leak is not None:
+            return parent_leak
         if cell.verdict == "open":
             if shared:
                 return self._shared(model)
-            return CellProof(own, model, witness={}, detail=cell.note)
+            return CellProof("possible", model, witness={}, detail=cell.note)
 
         # conditional: one filter, shared by every path that reaches rows
         predicate = cell.predicate or ""
@@ -346,7 +346,9 @@ class _Prover:
         if verdict == "isolated":
             return self.gates(name, table, model, states, predicate, CellProof("proven", model))
         if verdict == "leak":
-            return CellProof(own, model, witness=witness, detail=cell.note)
+            # Through a door — or a parent, whose filter was written for every
+            # partition: the leaking row may lie outside this one's bounds.
+            return CellProof("possible", model, witness=witness, detail=cell.note)
         if verdict == "unparseable":
             return CellProof("unknown", model, detail="the filter does not parse")
         from pgrls.verify import _UNVERIFIED_PREDICATE_REASON  # noqa: PLC0415
@@ -354,21 +356,20 @@ class _Prover:
         return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
 
     def _parent_leak(
-        self, reach: RoleReach, own_parents: tuple[Any, ...], model: ThreatModel,
-        states: _GucStates, shared: bool,
+        self, name: str, reach: RoleReach, doors: tuple[Any, ...], model: ThreatModel,
     ) -> CellProof | None:
-        """A leak through a parent the role queries itself (`_parent_is_own`),
-        judged on that parent's own cell. Every row of a table with no tenant
-        column is not a cross-tenant leak (`shared`)."""
-        for door in own_parents:
-            parent = reach.cells[(door.via, "SELECT")]
-            if parent.verdict == "open" and not shared:
-                return CellProof("leak", model, witness={}, detail=f"through parent {door.via}")
-            if parent.verdict == "conditional":
-                verdict, witness = self.prove(model, parent.predicate or "", states)
-                if verdict == "leak":
-                    return CellProof("leak", model, witness=witness,
-                                     detail=f"through parent {door.via}")
+        """A parent the role queries itself — USAGE on its schema, a direct read
+        of it — that returns every row returns this child's rows too. A
+        conditional one is left to the door logic: its filter was written for
+        every partition, so the leaking row may not be this child's."""
+        for door in doors:
+            parent = self.tables.get(door.via or "") if door.kind == "parent" else None
+            if parent is None or not self.has_usage(name, parent):
+                continue
+            own, _ = reach.direct_select[parent.qualified_name]
+            if own.verdict == "open":
+                return CellProof("leak", model, witness={},
+                                 detail=f"through parent {parent.qualified_name}")
         return None
 
     def _shared(self, model: ThreatModel) -> CellProof:
