@@ -3530,7 +3530,7 @@ def test_prove_schema_changing_gates_skip_a_gateway_role() -> None:
     t = _sel("tenant_id = cur()", grants=("authenticated",))
     users = _t("users", schema="app", rls=False)
     s = replace(_s([t, users], roles=[_api("authenticated"), _r("own")]),
-                user_functions=(_fn("app.cur", owner="authenticated", body=_BARE_BODY),),
+                user_functions=(_fn("app.cur", owner="authenticated", body=_SAFE_BODY),),
                 schema_create=(("public", "PUBLIC"),))
     m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
     assert _proof(m, "public.t", "authenticated").status == "proven"
@@ -3728,8 +3728,9 @@ def test_prove_a_client_controlled_setting_in_a_helper_body_is_found() -> None:
 
 def test_prove_a_cte_name_excuses_a_bare_name_only_in_its_own_body() -> None:
     fns = (_fn("app.tenant_of", body="WITH x AS (SELECT 1 AS tenant_id) "
-               "SELECT app.inner_of() FROM x"),
-           _fn("app.inner_of", body="SELECT tenant_id FROM x LIMIT 1"))
+               "SELECT app.inner_of() FROM x", search_path="app, pg_temp"),
+           _fn("app.inner_of", body="SELECT tenant_id FROM x LIMIT 1",
+               search_path="app, pg_temp"))
     t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
     s = replace(_s([t], roles=[_api("app_user"), _r("own")]), user_functions=fns)
     m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"app.tenant_of"})
@@ -4112,6 +4113,41 @@ def test_prove_a_hook_tainted_setting_in_the_identity_tables_policy_is_found() -
                      grid=frozenset({"public.t"}))
     p = _proof(m, "public.t", "authenticated")
     assert p.status == "unknown" and "row security" in (p.detail or ""), p
+
+
+@pytest.mark.parametrize(("fn", "expect"), [
+    (_fn("app.cur", body="SELECT tenant_id FROM tenant_info"), "unknown"),
+    (_fn("app.cur", body="SELECT tenant_id FROM tenant_info", search_path="t1"), "proven"),
+    (_fn("app.cur", body="SELECT tenant_id FROM t1.tenant_info"), "proven"),
+    (_fn("app.cur", body="SELECT lookup()"), "unknown"),
+])
+def test_prove_accept_profile_can_steer_a_gateway_helpers_bare_names(fn, expect) -> None:
+    """Measured: search_path = "t2", "public" — what PostgREST sets for
+    Accept-Profile: t2 — made an unpinned helper read t2's table."""
+    fns = (fn, _fn("app.lookup", body="SELECT 1", search_path="app"))
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    tables = [_t("tenant_info", schema="t1", rls=False), _t("tenant_info", schema="t2", rls=False)]
+    s = replace(_s([t, *tables], roles=[_api("authenticated"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == expect, p
+    if expect == "unknown":
+        assert "Accept-Profile" in (p.detail or ""), p
+
+
+def test_prove_a_hook_that_writes_a_table_taints_every_setting() -> None:
+    """Measured: an AFTER INSERT trigger on the table the hook logged into set
+    app.tenant from the logged header."""
+    hook = _fn("public.pre", body="INSERT INTO public.request_log VALUES "
+               "(current_setting('request.headers', true))")
+    t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(hook,),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True)
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "any setting" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:

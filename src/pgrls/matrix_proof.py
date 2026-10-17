@@ -687,6 +687,50 @@ class _Prover:
                     return why
         return None
 
+    def _profile_steerable(
+        self, fname: str, path: str | None = None, seen: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """Why a call to `fname` from a gateway session can resolve a name the
+        HTTP client chose, or None. PostgREST sets the search_path from the
+        client's Accept-Profile header (measured: a bare table name in an
+        unpinned helper read the other schema's table). So a body running
+        under no pinned path (`path` None, the session's) must name every
+        relation and user-defined function with its schema; a pinned path, or
+        a pre-parsed (BEGIN ATOMIC) body, fixes its own names, and callees are
+        judged under the path they inherit. A body pgrls cannot read counts."""
+        for fn in self.functions.get(fname, ()):
+            key = f"{fn.qualified_name}@{path}"
+            if key in seen or fn.language in ("c", "internal"):
+                continue
+            effective = fn.search_path if fn.search_path is not None else path
+            stmts = _body_statements_of(fn)
+            if stmts is None:
+                if effective is None:
+                    return f"{fn.qualified_name}() has a body pgrls cannot read"
+                continue
+            if effective is None and not fn.atomic:
+                from pglast.ast import FuncCall, RangeVar  # noqa: PLC0415
+
+                bare: list[str] = []
+
+                def match(n: Any) -> bool:
+                    if isinstance(n, RangeVar) and not n.schemaname:
+                        bare.append(n.relname)
+                    if isinstance(n, FuncCall) and len(n.funcname) == 1:
+                        name = getattr(n.funcname[0], "sval", "")
+                        if name in self.functions:
+                            bare.append(f"{name}()")
+                    return False
+
+                _has_node_in(stmts, match)
+                if bare:
+                    return f"{fn.qualified_name}() names {sorted(bare)[0]} without a schema"
+            for inner in sorted(_names_called(stmts)):
+                why = self._profile_steerable(inner, effective, seen | {key})
+                if why:
+                    return why
+        return None
+
     def set_role_targets(self, name: str) -> set[str] | None:
         """Every role `name` can switch to with SET ROLE: the roles it is a
         member of, directly or through other memberships. Whether a grant
@@ -877,6 +921,13 @@ class _Prover:
             hook = self._hook_reason({name}, login, predicate)
             if hook:
                 return CellProof("unknown", model, detail=hook)
+            for fname in sorted(_called_functions(predicate)):
+                why = self._profile_steerable(fname)
+                if why:
+                    return CellProof("unknown", model, detail=(
+                        f"the filter calls {fname}(): {why}, and PostgREST sets the "
+                        "search_path from the client's Accept-Profile header"
+                    ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
             # and put any schema it can create in on its search_path.
@@ -1101,6 +1152,11 @@ class _Prover:
                 hook = self._hook_reason(session or set(), login, using)
                 if hook:
                     return f"a setting a pre-request hook may set (policy {pol.name}: {hook})"
+                for fname in sorted(_called_functions(using)):
+                    why = self._profile_steerable(fname)
+                    if why:
+                        return (f"{fname}(), which resolves a name through the search_path "
+                                f"the client chooses (policy {pol.name}: {why})")
                 for fname in sorted(_called_functions(using)):
                     if self._shadowable(fname):
                         return f"{fname}(), which a temp table can shadow (policy {pol.name})"
@@ -1373,13 +1429,24 @@ class _Prover:
         """The setting names `fname` (and its callees) write with
         ``set_config`` or ``SET`` — None when a name is computed or a body
         cannot be read."""
-        from pglast.ast import A_Const, FuncCall, String, TypeCast, VariableSetStmt  # noqa: PLC0415
+        from pglast.ast import (  # noqa: PLC0415
+            A_Const,
+            DeleteStmt,
+            FuncCall,
+            InsertStmt,
+            String,
+            TypeCast,
+            UpdateStmt,
+            VariableSetStmt,
+        )
 
         names: set[str] = set()
         unknown = False
 
         def match(n: Any) -> bool:
             nonlocal unknown
+            if isinstance(n, (InsertStmt, UpdateStmt, DeleteStmt)):
+                unknown = True  # a trigger on the table may set settings (measured)
             if isinstance(n, VariableSetStmt) and n.name:
                 names.add(str(n.name).lower())
             if isinstance(n, FuncCall) and getattr(n.funcname[-1], "sval", "") == "set_config":

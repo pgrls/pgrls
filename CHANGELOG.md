@@ -24,7 +24,7 @@ breaking changes — they will be called out in this file.
     table; the role neither owns the table nor can `SET ROLE` to a role
     whose read is not `PROVEN`; the filter reads nothing an HTTP client
     chooses (request headers, cookies, method, path, the search_path behind
-    `current_schema()`, or a setting a PostgREST pre-request hook copies such
+    `current_schema()` and an unpinned helper's bare names, or a setting a PostgREST pre-request hook copies such
     a value, or one from a table the session can write, into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
     SQL and PL/pgSQL bodies, views to their tables, and what those tables'
