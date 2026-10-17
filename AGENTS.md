@@ -322,7 +322,8 @@ anonymous columns: can a session with no JWT read any row; other columns: can
 a session carrying its tenant's identity read another tenant's row — and marks
 it `PROVEN`, `LEAK` (with the leaking row), `POSSIBLE` (only through a door,
 which may filter it, or a read without schema USAGE), `UNKNOWN` (with the
-reason — including an untraced door, the table's owner, a `SET ROLE` target
+reason — including an untraced door, the owner of the table or of a function
+its filter calls, a `SET ROLE` target
 that is not proven, or a filter that admits an unset setting or, for a login
 role, a session with no JWT) or `EXEMPT`
 (superuser / BYPASSRLS). SELECT only, and the exit code stays 0 — `pgrls

@@ -1243,6 +1243,22 @@ def _fetch_schema_usage(cur: Any, schemas: list[str]) -> tuple[tuple[str, str], 
     return tuple((row["schema_name"], row["grantee"]) for row in cur.fetchall())
 
 
+_FUNCTION_OWNERS_SQL = """
+SELECT DISTINCT n.nspname || '.' || p.proname AS name,
+       pg_catalog.pg_get_userbyid(p.proowner) AS owner
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1, 2
+"""
+
+
+def _fetch_function_owners(cur: Any) -> tuple[tuple[str, str], ...]:
+    """Who owns each function outside the system schemas."""
+    cur.execute(_FUNCTION_OWNERS_SQL)
+    return tuple((row["name"], row["owner"]) for row in cur.fetchall())
+
+
 _RULES_SQL = """
 SELECT n.nspname AS schema_name, c.relname AS relation, r.rulename AS name,
        CASE r.ev_type WHEN '2' THEN 'UPDATE' WHEN '3' THEN 'INSERT'
@@ -2065,6 +2081,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         rules = _fetch_rules(cur, schemas)
         set_gucs, role_set_gucs = _fetch_set_gucs(cur)
         schema_usage = _fetch_schema_usage(cur, schemas)
+        function_owners = _fetch_function_owners(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -2089,6 +2106,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 set_gucs=set_gucs,
                 role_set_gucs=role_set_gucs,
                 schema_usage=schema_usage,
+                function_owners=function_owners,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -2324,4 +2342,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         set_gucs=set_gucs,
         role_set_gucs=role_set_gucs,
         schema_usage=schema_usage,
+        function_owners=function_owners,
     )

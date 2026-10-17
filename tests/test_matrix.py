@@ -3377,7 +3377,7 @@ def test_prove_the_table_owner_is_never_proven() -> None:
     for role in ("app_owner", "heir", "deployer"):
         p = _proof(m, "public.t", role)
         assert p.status == "unknown", (role, p)
-    assert "owner app_owner" in (_proof(m, "public.t", "app_owner").detail or "")
+    assert "owns the table (app_owner)" in (_proof(m, "public.t", "app_owner").detail or "")
     assert "SET ROLE app_owner" in (_proof(m, "public.t", "deployer").detail or "")
     assert _proof(m, "public.t", "other").status == "proven"
 
@@ -3397,6 +3397,30 @@ def test_prove_a_login_role_without_a_jwt_is_not_proven() -> None:
     t = _sel("tenant_id = auth.uid()", grants=("app_user",))
     m = build_matrix(_s([t], roles=[_r("app_user"), _r("own")]), roles=("app_user",), prove=True)
     assert _proof(m, "public.t", "app_user").status == "proven"
+
+
+def test_prove_the_owner_of_a_function_the_filter_calls_is_not_proven() -> None:
+    """Measured: the owner of auth.uid() redefined it and read another
+    tenant's row."""
+    t = _sel("tenant_id = auth.uid()", grants=("authadm", "other"))
+    s = replace(_s([t], roles=[_api("authadm"), _api("other"), _r("own")]),
+                function_owners=(("auth.uid", "authadm"),))
+    m = build_matrix(s, roles=("authadm", "other"), prove=True)
+    p = _proof(m, "public.t", "authadm")
+    assert p.status == "unknown" and "owns auth.uid()" in (p.detail or ""), p
+    assert _proof(m, "public.t", "other").status == "proven"
+
+
+def test_prove_a_leak_every_login_role_shares_is_still_shown() -> None:
+    """PUBLIC's column answers the anonymous question (PROVEN here); a leak
+    to every signed-in role must not hide behind PUBLIC's unshown answer to
+    the cross-tenant one."""
+    t = _sel("auth.uid() IS NOT NULL AND (tenant_id = auth.uid() OR is_public)",
+             grants=("PUBLIC",))
+    s = _s([t], roles=[_api("anon"), _r("app_user"), _r("own")])
+    m = build_matrix(s, prove=True)
+    assert _proof(m, "public.t", "PUBLIC").status == "proven"
+    assert "app_user" in m.roles and _proof(m, "public.t", "app_user").status == "leak"
 
 
 def test_prove_a_role_that_reaches_nothing_is_not_a_column() -> None:
@@ -3610,6 +3634,10 @@ def test_live_every_proof_agrees_with_a_real_session(pg_conn: psycopg.Connection
                 return int(cur.fetchone()[0]) > 0
 
         schema, grid = introspect_for_matrix(pg_conn, ["public", "pgrls_pm_priv"])
+        owners = dict(schema.function_owners or ())
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT current_user")
+            assert owners.get("auth.uid") == cur.fetchone()[0]
         m = build_matrix(schema, roles=_PM_ROLES, grid=grid, prove=True,
                          anon_roles={"pgrls_pm_anon"})
         anon = _proof(m, "pgrls_pm_priv.secrets", "pgrls_pm_anon")

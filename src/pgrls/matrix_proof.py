@@ -29,8 +29,9 @@ the verdicts honest:
   change that: no door evaluates a filter that depends on who runs it
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
-  own; the role is not the table's owner (who can lift ``FORCE`` or rewrite
-  a policy in one statement); a filter scoped by a setting
+  own; the role owns neither the table (it can lift ``FORCE`` or rewrite a
+  policy in one statement) nor a function the filter calls (it can redefine
+  it); a filter scoped by a setting
   (``current_setting``) also isolates a session that leaves it unset, and —
   for a role that can log in — one that connects with no JWT; and every role
   the session can ``SET ROLE`` to is proven too.
@@ -88,12 +89,10 @@ def _states_key(states: _GucStates) -> _StatesKey:
     return tuple(tuple(sorted(s.items())) for s in states)
 
 
-def _calls_current_setting(predicate: str) -> bool:
-    """Whether `predicate` reads a setting with the built-in
-    ``current_setting`` (a tenant carried in a GUC, not a JWT)."""
-    from pglast.ast import FuncCall, Node  # noqa: PLC0415
-
-    from pgrls.verify import _bare_builtin_name  # noqa: PLC0415
+def _has_node(predicate: str, match: Callable[[Any], bool]) -> bool:
+    """Whether any node of `predicate`'s AST satisfies `match` — `True` when it
+    does not parse or is too deep to walk."""
+    from pglast.ast import Node  # noqa: PLC0415
 
     node = parse_expr(predicate)
     if node is None:
@@ -108,7 +107,7 @@ def _calls_current_setting(predicate: str) -> bool:
             for item in n:
                 walk(item)
             return
-        if isinstance(n, FuncCall) and _bare_builtin_name(n) == "current_setting":
+        if match(n):
             found = True
             return
         if isinstance(n, Node):
@@ -120,6 +119,39 @@ def _calls_current_setting(predicate: str) -> bool:
     except RecursionError:
         return True
     return found
+
+
+def _calls_current_setting(predicate: str) -> bool:
+    """Whether `predicate` reads a setting with the built-in
+    ``current_setting`` (a tenant carried in a GUC, not a JWT)."""
+    from pglast.ast import FuncCall  # noqa: PLC0415
+
+    from pgrls.verify import _bare_builtin_name  # noqa: PLC0415
+
+    return _has_node(predicate, lambda n: isinstance(n, FuncCall)
+                     and _bare_builtin_name(n) == "current_setting")
+
+
+def _called_functions(predicate: str) -> set[str]:
+    """The names of the functions `predicate` calls, as written (qualified
+    or bare)."""
+    from pglast.ast import FuncCall  # noqa: PLC0415
+
+    names: set[str] = set()
+
+    def match(n: Any) -> bool:
+        if isinstance(n, FuncCall):
+            names.add(".".join(getattr(part, "sval", "") for part in n.funcname))
+        return False
+
+    _has_node(predicate, match)
+    return names
+
+
+def _has_subselect(predicate: str) -> bool:
+    from pglast.ast import SubLink  # noqa: PLC0415
+
+    return _has_node(predicate, lambda n: isinstance(n, SubLink))
 
 
 class _Prover:
@@ -150,6 +182,11 @@ class _Prover:
         self.states_cache: dict[str, _GucStates] = {}
         self.base_cache: dict[Any, CellProof] = {}
         self.usage: dict[str, frozenset[str]] | None = None
+        # function name — qualified and bare — -> its owners
+        self.fn_owners: dict[str, set[str]] = {}
+        for qname, owner in schema.function_owners or ():
+            for key in (qname, qname.rsplit(".", 1)[-1]):
+                self.fn_owners.setdefault(key, set()).add(owner)
         if schema.schema_usage is not None:
             usage: dict[str, set[str]] = {}
             for s, grantee in schema.schema_usage:
@@ -367,12 +404,17 @@ class _Prover:
             return CellProof("unknown", model, detail="the filter does not parse")
         from pgrls.verify import _UNVERIFIED_PREDICATE_REASON  # noqa: PLC0415
 
-        if _dependence(predicate)[1]:
-            # Not a missing identity column: the filter is outside what the
-            # prover decides.
+        # Not a missing identity column: the filter is outside what the
+        # prover decides.
+        if _has_subselect(predicate):
             return CellProof("unknown", model, detail=(
-                "the filter reads another table (a sub-select) or calls a function "
-                "the prover cannot see into"
+                "the filter reads another table (a sub-select), which the prover "
+                "cannot decide"
+            ))
+        if _dependence(predicate)[1]:
+            return CellProof("unknown", model, detail=(
+                "the filter calls a function the prover cannot see into — if it is "
+                "your auth helper, name it with --auth-function"
             ))
         return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
 
@@ -414,25 +456,34 @@ class _Prover:
         """What must also hold before a cell is PROVEN."""
         if self._owns(name, table):
             return CellProof("unknown", model, detail=(
-                f"is the table's owner {table.owner}: one "
-                "ALTER TABLE … NO FORCE ROW LEVEL SECURITY or ALTER POLICY reads "
-                "every row"
+                f"the role owns the table ({table.owner}): one ALTER TABLE … NO "
+                "FORCE ROW LEVEL SECURITY or ALTER POLICY lets it read every row"
             ))
+        if predicate is not None:
+            owned = sorted(f for f in _called_functions(predicate)
+                           if name in self.fn_owners.get(f, ()))
+            if owned:
+                return CellProof("unknown", model, detail=(
+                    f"the role owns {owned[0]}(), which the filter calls: a CREATE "
+                    "OR REPLACE FUNCTION changes what it returns"
+                ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
                 return CellProof("unknown", model, detail=(
                     f"{door.door} is an untraced door this role can open, and "
                     f"its owner {door.owner or '(unknown)'} reaches the table"
                 ))
+        setting = predicate is not None and _calls_current_setting(predicate)
         if (
-            model == "cross-tenant" and predicate is not None
-            and (login or _calls_current_setting(predicate))
+            model == "cross-tenant" and predicate is not None and (login or setting)
             and self.prove("anon", predicate, states)[0] == "leak"
         ):
+            ways = [w for w, on in (("logs in with no JWT", login),
+                                    ("leaves the setting the filter reads unset", setting))
+                    if on]
             return CellProof("unknown", model, detail=(
                 "isolated for a session that carries its identity; one that "
-                "logs in with no JWT, or leaves the setting the filter reads "
-                "unset, reads rows"
+                + " or ".join(ways) + " reads rows"
             ))
         return proven
 

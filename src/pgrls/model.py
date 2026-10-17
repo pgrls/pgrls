@@ -1835,6 +1835,11 @@ class Schema:
     # a LEAK. Live introspection only — not serialized into snapshots; `None`
     # = not captured, which `--prove` treats as "USAGE held".
     schema_usage: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    # `(schema.function, owner)` for every function outside the system
+    # schemas. Its owner can CREATE OR REPLACE it, so `pgrls matrix --prove`
+    # never proves a filter that calls it isolated for that owner. Live
+    # introspection only, like `schema_usage`; `None` = not captured.
+    function_owners: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:

@@ -441,7 +441,14 @@ def build_matrix(
 
         def differs_at(t: Table) -> bool:
             mine = proofs[(t.qualified_name, name)]
-            return key(mine) != key(baseline[(t.qualified_name, mine.model, login)])
+            if key(mine) == key(proofs[(t.qualified_name, "PUBLIC")]):
+                return False  # the PUBLIC column already shows it
+            # PUBLIC under this role's own question is not shown, so only a
+            # verdict that claims nothing (PROVEN / UNKNOWN) may hide behind it.
+            return not (
+                mine.status in ("proven", "unknown")
+                and key(mine) == key(baseline[(t.qualified_name, mine.model, login)])
+            )
 
         return prove and any(differs_at(t) for t in shown)
 
