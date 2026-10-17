@@ -1377,13 +1377,16 @@ class _Prover:
     def _helper_hint(self, fname: str) -> str:
         """What to do about a helper the prover cannot see into: name it — or,
         when it is named already but its bare call is ambiguous, say why."""
-        if "." not in fname and self.auth is not None and any(
-            a.rsplit(".", 1)[-1] == fname for a in self.auth if "." in a
-        ):
-            schemas = sorted({f.qualified_name.rpartition(".")[0]
-                              for f in self.functions.get(fname, ())})
+        named = sorted(a for a in (self.auth or ()) if "." in a
+                       and a.rsplit(".", 1)[-1] == fname) if "." not in fname else []
+        schemas = sorted({f.qualified_name.rpartition(".")[0]
+                          for f in self.functions.get(fname, ())})
+        if named and len(schemas) >= 2:
             return (f"{fname}() is defined in {', '.join(schemas)}, so pgrls cannot "
                     "tell which one the stored call names")
+        if named and schemas:
+            return (f"--auth-function {named[0]} names no function; {fname}() is in "
+                    f"{schemas[0]}")
         return "if it is your auth helper, name it with --auth-function"
 
     def _opaque_helpers(self, predicate: str) -> list[str]:

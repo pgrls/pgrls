@@ -3117,6 +3117,16 @@ def test_prove_a_qualified_auth_function_matches_its_stored_bare_call() -> None:
     assert p.status != "proven" and "defined in app, public" in (p.detail or ""), p
 
 
+def test_prove_a_mistyped_auth_function_is_called_out() -> None:
+    s = replace(_s([_sel("tenant_id = my_tenant()")],
+                   roles=[_api("anon"), _api("authenticated"), _r("own")]),
+                user_functions=(_fn("public.my_tenant"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True,
+                     auth_functions={"pub.my_tenant"})
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "names no function" in (p.detail or ""), p
+
+
 def test_prove_a_leak_resting_on_an_opaque_helper_is_unknown() -> None:
     """Without --auth-function the prover cannot see what app.uid() returns:
     no row characterizes a leak, so it is not claimed."""
