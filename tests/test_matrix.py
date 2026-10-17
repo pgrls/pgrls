@@ -3408,7 +3408,8 @@ def test_prove_the_owner_of_a_function_the_filter_calls_is_not_proven() -> None:
                 function_owners=(("auth.uid", "authadm"),))
     m = build_matrix(s, roles=("authadm", "other"), prove=True)
     p = _proof(m, "public.t", "authadm")
-    assert p.status == "unknown" and "session owns auth.uid()" in (p.detail or ""), p
+    assert p.status == "unknown" and "session owns the user-defined function auth.uid()" in (
+        p.detail or ""), p
     assert _proof(m, "public.t", "other").status == "proven"
 
 
@@ -3432,11 +3433,76 @@ def test_prove_owning_a_function_called_inside_the_filters_function_is_not_prove
                 function_owners=(("auth.uid", "authadm"), ("public.cur", "own")))
     m = build_matrix(s, roles=("authadm",), prove=True, auth_functions={"cur"})
     p = _proof(m, "public.t", "authadm")
-    assert p.status == "unknown" and "cur()" in (p.detail or ""), p
+    assert p.status == "unknown" and "auth.uid()" in (p.detail or ""), p
     # Owning no function at all: proven.
     s = replace(s, function_owners=(("public.cur", "own"),))
     m = build_matrix(s, roles=("authadm",), prove=True, auth_functions={"cur"})
     assert _proof(m, "public.t", "authadm").status == "proven"
+
+
+def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
+        language: str = "sql", search_path: str | None = None, atomic: bool = False):
+    from pgrls.model import UserFunction  # noqa: PLC0415
+
+    return UserFunction(qualified_name=qname, owner=owner, language=language,
+                        search_path=search_path, atomic=atomic, body=body)
+
+
+def test_prove_owning_any_function_rules_out_a_filter_with_no_call() -> None:
+    """Measured: an operator backed by a function the session owns — the
+    filter names no function at all."""
+    t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("opuser",))
+    s = replace(_s([t], roles=[_api("opuser"), _r("own")]),
+                user_functions=(_fn("public.txt_eq", owner="opuser"),))
+    p = _proof(build_matrix(s, roles=("opuser",), prove=True), "public.t", "opuser")
+    assert p.status == "unknown" and "operator" in (p.detail or ""), p
+
+
+def test_prove_create_on_a_schema_rules_out_a_filter_calling_a_user_function() -> None:
+    """Measured: with CREATE on a schema the session put a shadowing function
+    on its search_path, which the helper's unpinned body resolved."""
+    t = _sel("tenant_id = cur()", grants=("sp_user",))
+    fns = (_fn("app.cur", body="SELECT myuid()"),)
+    s = replace(_s([t], roles=[_api("sp_user"), _r("own")]), user_functions=fns,
+                schema_create=(("scratch", "sp_user"),))
+    m = build_matrix(s, roles=("sp_user",), prove=True, auth_functions={"cur"})
+    p = _proof(m, "public.t", "sp_user")
+    assert p.status == "unknown" and "schema scratch" in (p.detail or ""), p
+    m = build_matrix(replace(s, schema_create=(("scratch", "own"),)), roles=("sp_user",),
+                     prove=True, auth_functions={"cur"})
+    assert _proof(m, "public.t", "sp_user").status == "proven"
+
+
+@pytest.mark.parametrize(("fn", "shadowable"), [
+    (_fn("app.cur", body="SELECT tenant FROM cfg"), True),
+    (_fn("app.cur", body="SELECT tenant FROM app.cfg"), False),
+    (_fn("app.cur", body="SELECT tenant FROM cfg", search_path="app, pg_temp"), False),
+    (_fn("app.cur", body="SELECT tenant FROM cfg", search_path="pg_temp, app"), True),
+    (_fn("app.cur", body="SELECT tenant FROM cfg", atomic=True), False),
+    (_fn("app.cur", body="BEGIN RETURN 1; END", language="plpgsql"), True),
+    (_fn("app.cur", body="WITH cfg AS (SELECT 1 AS tenant) SELECT tenant FROM cfg"), False),
+])
+def test_prove_a_helper_that_reads_a_table_by_bare_name_is_not_proven(fn, shadowable) -> None:
+    """Any session can create a temp table; pg_temp is searched first for
+    relations unless the search_path puts it last, so a helper naming a table
+    without its schema can be made to read the session's own."""
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]), user_functions=(fn,))
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
+    p = _proof(m, "public.t", "authenticated")
+    assert (p.status == "unknown") is shadowable, p
+    if shadowable:
+        assert "pg_temp" in (p.detail or "")
+
+
+def test_prove_a_shadowable_helper_called_inside_another_is_found() -> None:
+    fns = (_fn("app.cur", body="SELECT app.inner_uid()"),
+           _fn("app.inner_uid", body="SELECT tenant FROM cfg"))
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "app.inner_uid()" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
@@ -3626,6 +3692,9 @@ def test_live_every_proof_agrees_with_a_real_session(pg_conn: psycopg.Connection
         with pg_conn.cursor() as cur:
             cur.execute("""
                 CREATE ROLE pgrls_pm_anon NOLOGIN; CREATE ROLE pgrls_pm_auth NOLOGIN;
+                -- The fixture grants CREATE on public to PUBLIC (the pre-PG15
+                -- default): any role could then shadow what auth.uid() resolves.
+                REVOKE CREATE ON SCHEMA public FROM PUBLIC;
                 CREATE SCHEMA auth;
                 CREATE FUNCTION auth.uid() RETURNS text LANGUAGE sql STABLE AS
                   $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '') $$;
@@ -3715,6 +3784,9 @@ def test_live_matrix_cli_prove_reports_a_leak_and_exits_0(
         with pg_conn.cursor() as cur:
             cur.execute("""
                 CREATE ROLE pgrls_pm_anon NOLOGIN; CREATE ROLE pgrls_pm_auth NOLOGIN;
+                -- The fixture grants CREATE on public to PUBLIC (the pre-PG15
+                -- default): any role could then shadow what auth.uid() resolves.
+                REVOKE CREATE ON SCHEMA public FROM PUBLIC;
                 CREATE SCHEMA auth;
                 CREATE FUNCTION auth.uid() RETURNS text LANGUAGE sql STABLE AS
                   $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '') $$;
@@ -3753,3 +3825,77 @@ def test_live_matrix_cli_prove_reports_a_leak_and_exits_0(
         assert named[("public.orders", "pgrls_pm_auth")] == "proven"
     finally:
         _pm_drop(pg_conn)
+
+
+@requires_docker
+def test_live_a_temp_table_shadows_a_helper_unless_pg_temp_is_last(
+    pg_conn: psycopg.Connection,
+) -> None:
+    """Measured, and what --prove says about it: a helper reading `cfg` by
+    bare name under a pinned search_path that does not end in pg_temp reads
+    the session's own temp table; ending the path in pg_temp stops it."""
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
+
+    def drop() -> None:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS public.shadow_a, public.shadow_b")
+            cur.execute("DROP SCHEMA IF EXISTS pgrls_pm_app CASCADE")
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'pgrls_pm_auth'")
+            if cur.fetchone() is not None:
+                cur.execute("DROP OWNED BY pgrls_pm_auth CASCADE")
+                cur.execute("DROP ROLE pgrls_pm_auth")
+
+    drop()
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("""
+                CREATE ROLE pgrls_pm_auth NOLOGIN;
+                CREATE SCHEMA pgrls_pm_app;
+                GRANT USAGE ON SCHEMA pgrls_pm_app TO pgrls_pm_auth;
+                CREATE TABLE pgrls_pm_app.cfg (tenant text);
+                INSERT INTO pgrls_pm_app.cfg VALUES ('a');
+                GRANT SELECT ON pgrls_pm_app.cfg TO pgrls_pm_auth;
+                CREATE FUNCTION pgrls_pm_app.cur_a() RETURNS text LANGUAGE sql STABLE
+                  SET search_path = pgrls_pm_app AS $$ SELECT tenant FROM cfg $$;
+                CREATE FUNCTION pgrls_pm_app.cur_b() RETURNS text LANGUAGE sql STABLE
+                  SET search_path = pgrls_pm_app, pg_temp AS $$ SELECT tenant FROM cfg $$;
+            """)
+            for t, fn in (("shadow_a", "cur_a"), ("shadow_b", "cur_b")):
+                cur.execute(f"""
+                    CREATE TABLE public.{t} (id int, tenant_id text);
+                    INSERT INTO public.{t} VALUES (1, 'a'), (2, 'b');
+                    ALTER TABLE public.{t} ENABLE ROW LEVEL SECURITY;
+                    CREATE POLICY p ON public.{t} FOR SELECT
+                      USING (tenant_id = pgrls_pm_app.{fn}());
+                    GRANT SELECT ON public.{t} TO pgrls_pm_auth;
+                """)
+
+        def other_tenant_rows(table: str) -> int:
+            with pg_conn.transaction(force_rollback=True), pg_conn.cursor() as cur:
+                cur.execute("SET LOCAL ROLE pgrls_pm_auth")
+                cur.execute("CREATE TEMP TABLE cfg (tenant text) ON COMMIT DROP")
+                cur.execute("INSERT INTO cfg VALUES ('b')")
+                cur.execute(f"SELECT count(*) FROM public.{table} WHERE tenant_id <> 'a'")
+                return int(cur.fetchone()[0])
+
+        assert other_tenant_rows("shadow_a") == 1  # the temp table took cfg's place
+        assert other_tenant_rows("shadow_b") == 0
+
+        # The fixture's public schema lets PUBLIC create objects: a session
+        # could also shadow a name the helper resolves, so nothing is PROVEN.
+        schema, grid = introspect_for_matrix(pg_conn, ["public"])
+        m = build_matrix(schema, roles=("pgrls_pm_auth",), grid=grid, prove=True,
+                         auth_functions={"pgrls_pm_app.cur_a", "pgrls_pm_app.cur_b"})
+        b = _proof(m, "public.shadow_b", "pgrls_pm_auth")
+        assert b.status == "unknown" and "schema public" in (b.detail or ""), b
+        with pg_conn.cursor() as cur:
+            cur.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+
+        schema, grid = introspect_for_matrix(pg_conn, ["public"])
+        m = build_matrix(schema, roles=("pgrls_pm_auth",), grid=grid, prove=True,
+                         auth_functions={"pgrls_pm_app.cur_a", "pgrls_pm_app.cur_b"})
+        a = _proof(m, "public.shadow_a", "pgrls_pm_auth")
+        assert a.status == "unknown" and "pg_temp" in (a.detail or ""), a
+        assert _proof(m, "public.shadow_b", "pgrls_pm_auth").status == "proven"
+    finally:
+        drop()

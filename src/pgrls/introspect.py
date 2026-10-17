@@ -34,6 +34,7 @@ from pgrls.model import (
     SecdefFunction,
     Table,
     Trigger,
+    UserFunction,
     View,
 )
 
@@ -1243,20 +1244,57 @@ def _fetch_schema_usage(cur: Any, schemas: list[str]) -> tuple[tuple[str, str], 
     return tuple((row["schema_name"], row["grantee"]) for row in cur.fetchall())
 
 
-_FUNCTION_OWNERS_SQL = """
-SELECT DISTINCT n.nspname || '.' || p.proname AS name,
-       pg_catalog.pg_get_userbyid(p.proowner) AS owner
+_USER_FUNCTIONS_SQL = """
+SELECT n.nspname || '.' || p.proname AS name,
+       pg_catalog.pg_get_userbyid(p.proowner) AS owner,
+       l.lanname AS language,
+       (SELECT substr(c, 13) FROM unnest(p.proconfig) AS c
+        WHERE starts_with(c, 'search_path=') LIMIT 1) AS search_path,
+       p.prosqlbody IS NOT NULL AS atomic,
+       p.prosrc AS body
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_catalog.pg_language l ON l.oid = p.prolang
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
 ORDER BY 1, 2
 """
 
+_SCHEMA_CREATE_SQL = """
+SELECT n.nspname AS schema_name,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee
+FROM pg_catalog.pg_namespace n
+CROSS JOIN LATERAL pg_catalog.aclexplode(
+    coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+WHERE a.privilege_type = 'CREATE'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname !~ '^pg_(toast|temp)'
+UNION
+SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner)
+FROM pg_catalog.pg_namespace n
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname !~ '^pg_(toast|temp)'
+ORDER BY 1, 2
+"""
 
-def _fetch_function_owners(cur: Any) -> tuple[tuple[str, str], ...]:
-    """Who owns each function outside the system schemas."""
-    cur.execute(_FUNCTION_OWNERS_SQL)
-    return tuple((row["name"], row["owner"]) for row in cur.fetchall())
+
+def _fetch_user_functions(cur: Any) -> tuple[UserFunction, ...]:
+    """Every function outside the system schemas, with its owner and how its
+    body resolves names."""
+    cur.execute(_USER_FUNCTIONS_SQL)
+    return tuple(
+        UserFunction(
+            qualified_name=row["name"], owner=row["owner"], language=row["language"],
+            search_path=row["search_path"], atomic=bool(row["atomic"]), body=row["body"],
+        )
+        for row in cur.fetchall()
+    )
+
+
+def _fetch_schema_create(cur: Any) -> tuple[tuple[str, str], ...]:
+    """Who can create objects in each non-system schema (owners included)."""
+    cur.execute(_SCHEMA_CREATE_SQL)
+    return tuple((row["schema_name"], row["grantee"]) for row in cur.fetchall())
 
 
 _RULES_SQL = """
@@ -2081,7 +2119,9 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         rules = _fetch_rules(cur, schemas)
         set_gucs, role_set_gucs = _fetch_set_gucs(cur)
         schema_usage = _fetch_schema_usage(cur, schemas)
-        function_owners = _fetch_function_owners(cur)
+        user_functions = _fetch_user_functions(cur)
+        function_owners = tuple(sorted({(f.qualified_name, f.owner) for f in user_functions}))
+        schema_create = _fetch_schema_create(cur)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -2107,6 +2147,8 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 role_set_gucs=role_set_gucs,
                 schema_usage=schema_usage,
                 function_owners=function_owners,
+                user_functions=user_functions,
+                schema_create=schema_create,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -2343,4 +2385,6 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         role_set_gucs=role_set_gucs,
         schema_usage=schema_usage,
         function_owners=function_owners,
+        user_functions=user_functions,
+        schema_create=schema_create,
     )

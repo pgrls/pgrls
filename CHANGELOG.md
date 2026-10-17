@@ -22,8 +22,10 @@ breaking changes — they will be called out in this file.
   claimed only when nothing pgrls cannot see could change the answer — no door
   evaluates a who-runs-it filter, no untraced door the role can open has an
   owner that reaches the table (followed through that owner's own untraced
-  doors), the role does not own the table, the session owns no user-defined
-  function while the filter calls one, a `current_setting(…)` filter
+  doors), the role does not own the table, the session can neither redefine
+  a function (it owns none, and holds CREATE on no schema while the filter
+  calls one) nor shadow a table a helper reads by bare name through its
+  own temp table, a `current_setting(…)` filter
   also isolates a session that leaves the setting unset (and, for a login
   role, one with no JWT), and every role the session can `SET ROLE` to is
   proven too — and `LEAK` only when the role's own session reads the row (a

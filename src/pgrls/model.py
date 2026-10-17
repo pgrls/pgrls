@@ -677,6 +677,26 @@ class Table:
 
 
 @dataclass(frozen=True)
+class UserFunction:
+    """A function outside the system schemas, as `pgrls matrix --prove` needs
+    it to judge whether a filter calling it can be made to compute something
+    else: who owns it, and how its body resolves names at run time.
+
+    ``search_path`` is the function's pinned ``SET search_path`` (None when
+    unpinned — it then runs with the caller's). ``atomic`` is a SQL-standard
+    ``BEGIN ATOMIC`` / ``RETURN`` body, parsed once at creation, so it
+    resolves no names at run time. ``body`` is ``prosrc``.
+    """
+
+    qualified_name: str
+    owner: str
+    language: str
+    search_path: str | None
+    atomic: bool
+    body: str | None
+
+
+@dataclass(frozen=True)
 class SecdefFunction:
     """A SECURITY DEFINER function captured by introspection.
 
@@ -1840,6 +1860,12 @@ class Schema:
     # never proves a filter that calls it isolated for that owner. Live
     # introspection only, like `schema_usage`; `None` = not captured.
     function_owners: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    # The same functions with what `--prove` needs to judge name shadowing in
+    # their bodies; and `(schema, grantee)` holding CREATE on each non-system
+    # schema (owners included) — a role that can create objects can shadow a
+    # name an unpinned body resolves. Live only; `None` = not captured.
+    user_functions: tuple[UserFunction, ...] | None = field(default=None, compare=False)
+    schema_create: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:

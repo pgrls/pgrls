@@ -30,9 +30,14 @@ the verdicts honest:
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
-  policy in one statement), and the session owns no user-defined function
-  while the filter calls one (bodies are not traced, so the called one may
-  call the owned one, which CREATE OR REPLACE would change); a filter scoped by a setting
+  policy in one statement); the session cannot change what the filter
+  computes — it owns no user-defined function (one may sit behind a call,
+  an operator or a cast, and CREATE OR REPLACE changes it), and it cannot
+  create objects in any schema while the filter calls a user-defined
+  function (whose body resolves names through the session's search_path);
+  no user-defined function the filter reaches reads a relation by bare name
+  under a search_path that does not end in ``pg_temp`` (any session's own
+  temp table would take its place); a filter scoped by a setting
   (``current_setting``) also isolates a session that leaves it unset, and —
   for a role that can log in — one that connects with no JWT; and every role
   the session can ``SET ROLE`` to is proven too.
@@ -56,7 +61,7 @@ from typing import Any, Literal
 
 from pgrls.access import RoleReach, _dependence
 from pgrls.ast_utils import parse_expr
-from pgrls.model import Role, Schema, Table
+from pgrls.model import Role, Schema, Table, UserFunction
 
 ProofStatus = Literal["proven", "leak", "possible", "unknown", "exempt"]
 ThreatModel = Literal["anon", "cross-tenant"]
@@ -93,11 +98,17 @@ def _states_key(states: _GucStates) -> _StatesKey:
 def _has_node(predicate: str, match: Callable[[Any], bool]) -> bool:
     """Whether any node of `predicate`'s AST satisfies `match` — `True` when it
     does not parse or is too deep to walk."""
-    from pglast.ast import Node  # noqa: PLC0415
-
     node = parse_expr(predicate)
     if node is None:
         return True
+    return _has_node_in(node, match)
+
+
+def _has_node_in(node: Any, match: Callable[[Any], bool]) -> bool:
+    """Whether any node under `node` satisfies `match` — `True` when it is too
+    deep to walk."""
+    from pglast.ast import Node  # noqa: PLC0415
+
     found = False
 
     def walk(n: Any) -> None:
@@ -133,9 +144,10 @@ def _calls_current_setting(predicate: str) -> bool:
                      and _bare_builtin_name(n) == "current_setting")
 
 
-def _called_functions(predicate: str) -> set[str]:
-    """The names of the functions `predicate` calls, as written (qualified
-    or bare)."""
+def _called_functions(sql: str, *, statement: bool = False) -> set[str]:
+    """The names of the functions `sql` — an expression, or with `statement`
+    a function body — calls, as written (qualified or bare)."""
+    from pglast import parse_sql  # noqa: PLC0415
     from pglast.ast import FuncCall  # noqa: PLC0415
 
     names: set[str] = set()
@@ -145,8 +157,56 @@ def _called_functions(predicate: str) -> set[str]:
             names.add(".".join(getattr(part, "sval", "") for part in n.funcname))
         return False
 
-    _has_node(predicate, match)
+    if statement:
+        try:
+            stmts = parse_sql(sql)
+        except Exception:  # noqa: BLE001
+            return names
+        _has_node_in(stmts, match)
+    else:
+        _has_node(predicate=sql, match=match)
     return names
+
+
+def _pg_temp_last(search_path: str) -> bool:
+    """Whether a pinned ``search_path`` value names pg_temp as its last entry."""
+    entries = [e.strip().strip('"').lower() for e in search_path.split(",") if e.strip()]
+    return bool(entries) and entries[-1] == "pg_temp"
+
+
+def _unqualified_relations(body: str) -> set[str] | None:
+    """The relation names a SQL body reads without a schema (CTE names
+    excluded), or None when it does not parse."""
+    from pglast import parse_sql  # noqa: PLC0415
+    from pglast.ast import CommonTableExpr, Node, RangeVar  # noqa: PLC0415
+
+    try:
+        stmts = parse_sql(body)
+    except Exception:  # noqa: BLE001 — any parse failure means "unreadable"
+        return None
+    names: set[str] = set()
+    ctes: set[str] = set()
+
+    def walk(n: Any) -> None:
+        if n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, RangeVar) and not n.schemaname:
+            names.add(n.relname)
+        if isinstance(n, CommonTableExpr):
+            ctes.add(n.ctename)
+        if isinstance(n, Node):
+            for fld in n:
+                walk(getattr(n, fld, None))
+
+    try:
+        walk(stmts)
+    except RecursionError:
+        return None
+    return names - ctes
 
 
 def _has_subselect(predicate: str) -> bool:
@@ -187,7 +247,19 @@ class _Prover:
         # qualified name alone, for naming the owned function
         self.fn_owners: dict[str, set[str]] = {}
         self.fn_owners_by_name: dict[str, set[str]] = {}
-        for qname, owner in schema.function_owners or ():
+        # name — qualified and bare — -> the user-defined functions it may be
+        self.functions: dict[str, list[UserFunction]] = {}
+        for fn in schema.user_functions or ():
+            for key in (fn.qualified_name, fn.qualified_name.rsplit(".", 1)[-1]):
+                self.functions.setdefault(key, []).append(fn)
+        # schema -> who can create objects in it (`None` captured: nobody)
+        self.creators: dict[str, set[str]] = {}
+        for sch, grantee in schema.schema_create or ():
+            self.creators.setdefault(sch, set()).add(grantee)
+        owner_pairs = schema.function_owners
+        if owner_pairs is None and schema.user_functions is not None:
+            owner_pairs = tuple((f.qualified_name, f.owner) for f in schema.user_functions)
+        for qname, owner in owner_pairs or ():
             self.fn_owners_by_name.setdefault(qname, set()).add(owner)
             for key in (qname, qname.rsplit(".", 1)[-1]):
                 self.fn_owners.setdefault(key, set()).add(owner)
@@ -303,24 +375,78 @@ class _Prover:
     def _redefinable(
         self, name: str, targets: set[str], table: Table, model: ThreatModel,
     ) -> CellProof | None:
-        """Whether the session — the role or one it can SET ROLE to — owns a
-        user-defined function while a filter it reads the table through calls
-        one. Bodies are not traced, so a called function may call an owned
-        one: CREATE OR REPLACE FUNCTION would then change the filter
-        (measured)."""
+        """Whether the session — the role or one it can SET ROLE to — can
+        change what a filter it reads the table through computes:
+
+        * it owns a user-defined function: CREATE OR REPLACE changes it, and
+          it may sit behind a call, an operator or a cast the filter uses
+          (measured: a redefined auth.uid(), and an operator's function);
+        * it can create objects in a schema while the filter calls a
+          user-defined function, whose body resolves names at run time
+          through a search_path the session can put that schema on
+          (measured).
+        """
         session = {name} | targets
         owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & session)
-        if not owned:
+        creates = sorted(s for s, holders in self.creators.items()
+                         if holders & self._privilege_holders(session))
+        if not owned and not creates:
             return None
         for role in sorted(session):
             predicate = self.reach_of(role).cells[(table.qualified_name, "SELECT")].predicate
-            called = sorted(f for f in _called_functions(predicate or "") if f in self.fn_owners)
-            if predicate and called:
+            if not predicate:
+                continue
+            if owned:
                 return CellProof("unknown", model, detail=(
-                    f"the session owns {owned[0]}() and the filter calls the "
-                    f"user-defined {called[0]}(): redefining a function it calls, "
-                    "directly or in a body, changes the filter"
+                    f"the session owns the user-defined function {owned[0]}(): "
+                    "redefining it changes any filter that reaches it — through "
+                    "a call, an operator or a cast"
                 ))
+            called = sorted(f for f in _called_functions(predicate) if f in self.functions)
+            if called:
+                return CellProof("unknown", model, detail=(
+                    f"the session can create objects in schema {creates[0]}, and "
+                    f"the filter calls {called[0]}(), whose body resolves names "
+                    "through the session's search_path"
+                ))
+        return None
+
+    def _privilege_holders(self, session: set[str]) -> set[str]:
+        """The grantees whose privileges some role of `session` holds — itself,
+        its INHERIT closure, and PUBLIC."""
+        from pgrls.verify import _inherit_closure  # noqa: PLC0415
+
+        out = {"PUBLIC"}
+        for role in session:
+            out |= _inherit_closure(self.schema, role) or {role}
+        return out
+
+    def _shadowable(self, fname: str, seen: frozenset[str] = frozenset()) -> str | None:
+        """Why a call to `fname` can be made to read a session's own temp
+        table instead of the one meant, or None. A body resolves an
+        unqualified relation name through the search_path, and pg_temp comes
+        first unless the path names it — so only a pinned search_path ending
+        in pg_temp, a pre-parsed (BEGIN ATOMIC) body, or a body naming every
+        relation with its schema is safe. A body that cannot be read is
+        assumed unsafe."""
+        for fn in self.functions.get(fname, ()):
+            if fn.qualified_name in seen:
+                continue
+            if fn.language in ("c", "internal") or fn.atomic:
+                continue
+            if fn.search_path is not None and _pg_temp_last(fn.search_path):
+                continue
+            if fn.language != "sql" or fn.body is None:
+                return f"{fn.qualified_name}() has a {fn.language} body pgrls cannot read"
+            refs = _unqualified_relations(fn.body)
+            if refs is None:
+                return f"the body of {fn.qualified_name}() does not parse"
+            if refs:
+                return f"{fn.qualified_name}() reads {sorted(refs)[0]} without a schema"
+            for inner in sorted(_called_functions(fn.body, statement=True)):
+                why = self._shadowable(inner, seen | {fn.qualified_name})
+                if why:
+                    return why
         return None
 
     def set_role_targets(self, name: str) -> set[str] | None:
@@ -486,6 +612,15 @@ class _Prover:
                 f"the role owns the table ({table.owner}): one ALTER TABLE … NO "
                 "FORCE ROW LEVEL SECURITY or ALTER POLICY lets it read every row"
             ))
+        if predicate is not None:
+            for fname in sorted(_called_functions(predicate)):
+                why = self._shadowable(fname)
+                if why:
+                    return CellProof("unknown", model, detail=(
+                        f"the filter calls {fname}(): {why}, and its search_path "
+                        "does not end in pg_temp — a session's own temp table of "
+                        "that name takes its place"
+                    ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
                 return CellProof("unknown", model, detail=(
