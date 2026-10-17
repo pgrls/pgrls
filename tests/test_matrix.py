@@ -3046,25 +3046,41 @@ def _sel(using: str, *, grants=("anon", "authenticated"), **kw) -> Table:
               grants=tuple(_grant(g, ("SELECT",)) for g in grants), **kw)
 
 
-def test_prove_the_inverted_auth_check_leaks_to_anon_but_isolates_tenants() -> None:
+# Each key shape as written and as Postgres stores it (Supabase's InitPlan
+# wrapper, deparsed with an alias and brackets).
+_UID = ["auth.uid()", "( SELECT auth.uid() AS uid)"]
+
+
+@pytest.mark.parametrize("uid", _UID)
+def test_prove_the_inverted_auth_check_leaks_to_anon_but_isolates_tenants(uid: str) -> None:
     """The Lovable-CVE shape in one row: anon reads every row, a tenant only
     its own."""
-    m = _prove([_sel("auth.uid() IS NULL OR tenant_id = auth.uid()")])
+    m = _prove([_sel(f"({uid} IS NULL) OR (tenant_id = {uid})")])
     anon, auth = _proof(m, "public.t", "anon"), _proof(m, "public.t", "authenticated")
     assert (anon.status, anon.model, anon.witness) == ("leak", "anon", {})
     assert (auth.status, auth.model) == ("proven", "cross-tenant")
 
 
-def test_prove_a_scoped_filter_is_proven_for_both_models() -> None:
-    m = _prove([_sel("tenant_id = auth.uid()")])
+@pytest.mark.parametrize("uid", _UID)
+def test_prove_a_scoped_filter_is_proven_for_both_models(uid: str) -> None:
+    m = _prove([_sel(f"(tenant_id = {uid})")])
     assert {_proof(m, "public.t", r).status for r in ("anon", "authenticated")} == {"proven"}
 
 
-def test_prove_a_public_flag_leaks_with_the_row_that_shows_it() -> None:
-    m = _prove([_sel("tenant_id = auth.uid() OR is_public")])
+@pytest.mark.parametrize("uid", _UID)
+def test_prove_a_public_flag_leaks_with_the_row_that_shows_it(uid: str) -> None:
+    m = _prove([_sel(f"((tenant_id = {uid}) OR is_public)")])
     for role in ("anon", "authenticated"):
         p = _proof(m, "public.t", role)
         assert p.status == "leak" and p.witness and p.witness.get("is_public") is True, p
+
+
+def test_prove_the_initplan_wrapper_is_not_called_a_table_read() -> None:
+    """A FROM-less ( SELECT auth.uid() AS uid) reads no table: an unscoped
+    column gets the identity_columns hint, not the sub-select reason."""
+    m = _prove([_sel("(creator = ( SELECT auth.uid() AS uid))")], cols=("authenticated",))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "sub-select" not in (p.detail or ""), p
 
 
 def test_prove_a_filter_outside_the_fragment_is_unknown() -> None:
