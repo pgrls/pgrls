@@ -3929,10 +3929,35 @@ def test_prove_an_untraced_door_acts_with_its_owners_ddl(owns: str) -> None:
     and the caller read another tenant's row."""
     p = _door_case(owns=owns)
     assert p.status == "unknown", (owns, p)
+    assert "untraced door" in (p.detail or ""), p  # the cause is the door, named
 
 
 def test_prove_an_untraced_door_owning_nothing_relevant_is_fine() -> None:
     assert _door_case(owns="nothing").status == "proven"
+
+
+@pytest.mark.parametrize(("using", "role", "expect"), [
+    ("tenant_id = coalesce(current_setting('app.allowed', true), 't1')", _r("appf"), "unknown"),
+    ("tenant_id = coalesce(current_setting('app.allowed', true), 't1')", _api("appf"), "proven"),
+    ("tenant_id = current_setting('request.header.t', true)", _api("appf"), "unknown"),
+])
+def test_prove_the_identity_tables_own_row_security_is_followed(using, role, expect) -> None:
+    """Measured for a login role: SET app.allowed = 't2' changed which rows
+    the identity function saw, and the caller read another tenant's row. A
+    gateway session cannot SET, but the HTTP client chooses its headers."""
+    rt = _t("role_tenants", force=True,
+            policies=(_policy(command="SELECT", roles=("PUBLIC",), using=using),),
+            grants=(_grant("appf", ("SELECT",)),))
+    fns = (_fn("app.cur", body="SELECT max(tenant_id) FROM public.role_tenants",
+               search_path="pg_catalog, pg_temp"),)
+    t = _sel("tenant_id = cur()", grants=("appf",))
+    s = replace(_s([t, rt], roles=[role, _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "appf")
+    assert p.status == expect, p
+    if expect == "unknown":
+        assert "row security" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:

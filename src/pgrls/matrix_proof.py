@@ -541,7 +541,7 @@ class _Prover:
             # Reached through a gateway that runs only the API's queries: it
             # changes no schema object itself (a login member's own column
             # does); a door it can open still acts as that door's owner.
-            return self._redefinable(name, readers, door_owners, table, model) or base
+            return self._redefinable(readers, set(), door_owners, table, model) or base
         granting = sorted(({name} | targets) & set(self.schema.self_granting_roles or ()))
         if granting:
             who = (f"{granting[0]} has" if granting[0] == name
@@ -550,30 +550,31 @@ class _Prover:
                 f"{who} CREATEROLE on a server before Postgres 16: it can grant "
                 "itself any non-superuser role, a BYPASSRLS one included"
             ))
-        return self._redefinable(name, readers, readers | door_owners, table, model) or base
+        return self._redefinable(readers, readers, door_owners, table, model) or base
 
-    def _door_owners(self, roles: set[str]) -> set[str]:
+    def _door_owners(self, roles: set[str]) -> dict[str, str]:
         """The owners of every untraced door `roles` can open, and of the
-        untraced doors those owners can open in turn."""
-        out: set[str] = set()
+        untraced doors those owners can open in turn — each with the door
+        that first reaches it."""
+        out: dict[str, str] = {}
         todo = sorted(roles)
         seen = set(todo)
         while todo:
             for door in self.reach_of(todo.pop()).untraced:
                 if door.owner and door.owner not in out:
-                    out.add(door.owner)
+                    out[door.owner] = door.door
                     if door.owner not in seen:
                         seen.add(door.owner)
                         todo.append(door.owner)
         return out
 
     def _redefinable(
-        self, name: str, readers: set[str], actors: set[str], table: Table,
+        self, readers: set[str], own: set[str], doors: dict[str, str], table: Table,
         model: ThreatModel,
     ) -> CellProof | None:
-        """Whether `actors` — the session's roles, and the owners of untraced
-        doors it can open — can change what a filter `readers` read the table
-        through computes:
+        """Whether the session's own roles (`own`), or the owners of untraced
+        doors it can open (`doors`: owner -> door), can change what a filter
+        `readers` read the table through computes:
 
         * it owns a user-defined function: CREATE OR REPLACE changes it, and
           it may sit behind a call, an operator or a cast the filter uses
@@ -583,37 +584,43 @@ class _Prover:
           through a search_path the session can put that schema on
           (measured).
         """
-        if not actors:
+        predicates = [p for r in sorted(readers)
+                      if (p := self.reach_of(r).cells[(table.qualified_name, "SELECT")].predicate)]
+        if not predicates:
             return None
-        owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & actors)
-        holders = self._privilege_holders(actors)
-        creates = sorted(s for s, who in self.creators.items() if who & holders)
-        on_database = bool(set(self.schema.database_create or ()) & holders)
-        if on_database:
-            creates.insert(0, "")
-        if not owned and not creates:
-            return None
-        for role in sorted(readers):
-            predicate = self.reach_of(role).cells[(table.qualified_name, "SELECT")].predicate
-            if not predicate:
-                continue
+        called = sorted({f for p in predicates for f in _called_functions(p)
+                         if f in self.functions})
+        actors: list[tuple[set[str], str]] = []
+        if own:
+            actors.append((own, "the session"))
+        for owner, door in sorted(doors.items()):
+            actors.append(({owner}, f"{door}, an untraced door this role can open, runs "
+                                    f"as {owner}, which"))
+        for who, subject in actors:
+            owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & who)
             if owned:
                 return CellProof("unknown", model, detail=(
-                    f"the session owns the user-defined function {owned[0]}(): "
-                    "redefining it changes any filter that reaches it — through "
-                    "a call, an operator or a cast"
+                    f"{subject} owns the user-defined function {owned[0]}(): redefining "
+                    "it changes any filter that reaches it — through a call, an "
+                    "operator or a cast"
                 ))
-            called = sorted(f for f in _called_functions(predicate) if f in self.functions)
-            if called:
-                where = ("a schema of its own (it holds CREATE on the database)"
-                         if not creates[0] else f"schema {creates[0]}")
-                return CellProof("unknown", model, detail=(
-                    f"the session can create objects in {where}, and the filter "
-                    f"calls {called[0]}(), whose body can resolve names through the "
-                    "session's search_path"
-                    + ("; REVOKE CREATE ON SCHEMA public FROM PUBLIC lifts this"
-                       if creates[0] == "public" else "")
-                ))
+            if not called:
+                continue
+            holders = self._privilege_holders(who)
+            creates = sorted(sch for sch, w in self.creators.items() if w & holders)
+            if set(self.schema.database_create or ()) & holders:
+                where = "a schema of its own (it holds CREATE on the database)"
+            elif creates:
+                where = f"schema {creates[0]}"
+            else:
+                continue
+            hint = ("; REVOKE CREATE ON SCHEMA public FROM PUBLIC lifts this"
+                    if where == "schema public" else "")
+            return CellProof("unknown", model, detail=(
+                f"{subject} can create objects in {where}, and the filter calls "
+                f"{called[0]}(), whose body can resolve names through the "
+                f"session's search_path{hint}"
+            ))
         return None
 
     def _privilege_holders(self, session: set[str]) -> set[str]:
@@ -889,7 +896,7 @@ class _Prover:
 
     def _identity_reads_writable(
         self, session: set[str], table: Table, login: bool = False,
-        door_owners: set[str] | None = None,
+        door_owners: dict[str, str] | None = None,
     ) -> tuple[str, str] | None:
         """(auth function, what it reads) when an auth function a filter of the
         session's read of `table` calls reads — in its body, or a function that
@@ -907,8 +914,8 @@ class _Prover:
         bare = {a.rsplit(".", 1)[-1] for a in auth}
         reaches = [self.reach_of(r) for r in sorted(session)]
         owners = self._privilege_holders(session) - {"PUBLIC"} if login else set()
-        if door_owners:
-            owners |= self._privilege_holders(door_owners) - {"PUBLIC"}
+        door_holders = {h: owner for owner in (door_owners or {})
+                        for h in self._privilege_holders({owner}) - {"PUBLIC"}}
 
         def writable(t: Table) -> bool:
             if any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
@@ -941,14 +948,48 @@ class _Prover:
                 return fname, (f"reads {resolved}, which pgrls cannot resolve, so it "
                                "cannot rule out that the session writes it")
             tables, views = resolved
-            owned = [r.qualified_name for r in tables if r.owner in owners] + [
-                v.qualified_name for v in views if v.owner in owners]
-            if owned:
-                return fname, (f"reads {owned[0]}, which the session owns — it can "
-                               "lift FORCE or replace what it returns")
+            rels = [(r.qualified_name, r.owner) for r in tables] + [
+                (v.qualified_name, v.owner) for v in views]
+            for qname, rel_owner in rels:
+                if rel_owner in owners:
+                    return fname, (f"reads {qname}, which the session owns — it can "
+                                   "lift FORCE or replace what it returns")
+                if rel_owner in door_holders:
+                    door = (door_owners or {})[door_holders[rel_owner]]
+                    return fname, (f"reads {qname}, owned by {rel_owner} — {door}, an "
+                                   "untraced door this role can open, runs as it and "
+                                   "can lift FORCE or replace what it returns")
             for t in tables:
                 if writable(t):
                     return fname, f"reads {t.qualified_name}, which the session can write"
+                why = self._policy_steers(t, login)
+                if why:
+                    return fname, (f"reads {t.qualified_name}, whose row security reads "
+                                   f"{why} — the session may change which rows it sees")
+        return None
+
+    def _policy_steers(self, table: Table, login: bool) -> str | None:
+        """What in `table`'s SELECT policies a session could steer — a value
+        the HTTP client chooses, or, for a login session, a setting it can set
+        or a helper it can shadow. Those policies run in the session, so they
+        decide which rows an identity function reading `table` sees
+        (measured)."""
+        if not table.rls_enabled:
+            return None
+        for pol in table.policies:
+            using = pol.using_sql
+            if pol.command not in ("SELECT", "ALL") or not using:
+                continue
+            client = self._client_controlled(using)
+            if client:
+                return f"a value the HTTP client chooses ({pol.name})"
+            if login:
+                settable = self._settable_identity(using)
+                if settable:
+                    return f"{settable} ({pol.name})"
+                for fname in sorted(_called_functions(using)):
+                    if self._shadowable(fname):
+                        return f"{fname}(), which a temp table can shadow ({pol.name})"
         return None
 
     def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str] | None:
