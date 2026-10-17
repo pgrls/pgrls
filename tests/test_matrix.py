@@ -4044,6 +4044,20 @@ def test_prove_a_hook_copying_from_a_writable_table_taints_settings(privs, expec
         assert "public.profiles" in (p.detail or ""), p  # the real source, named
 
 
+def test_prove_a_hook_that_writes_no_setting_taints_nothing() -> None:
+    """A header-checking hook that only raises writes no setting, so it can
+    steer none — even for a filter reaching an auth function pgrls cannot
+    read."""
+    hook = _fn("public.pre", body="SELECT CASE WHEN current_setting('request.header.k', true)"
+               " IS NULL THEN 1/0 END")
+    t = _sel("tenant_id = auth.uid()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
+                user_functions=(hook,),
+                role_set_gucs=(("authenticator", "pgrst.db_pre_request", "public.pre"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True)
+    assert _proof(m, "public.t", "authenticated").status == "proven"
+
+
 def test_prove_two_tainting_hooks_combine_what_they_write() -> None:
     """Measured: a database-level hook tainting app.x sorted first, and the
     role-level one that runs taints app.tenant."""

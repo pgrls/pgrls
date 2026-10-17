@@ -1348,11 +1348,13 @@ class _Prover:
                     hook, session, login, self._door_owners(session))
             finally:
                 self._in_hook = False
+            written = self._settings_written(hook) if (client or steered) else frozenset()
+            if written == frozenset():
+                continue  # read in full and writes no setting: it steers none
             if client:
-                tainting.append((hook, self._settings_written(hook),
-                                 "the HTTP client chooses the value"))
+                tainting.append((hook, written, "the HTTP client chooses the value"))
             elif steered:
-                tainting.append((hook, self._settings_written(hook), f"the hook {steered}"))
+                tainting.append((hook, written, f"the hook {steered}"))
         return tainting
 
     def _hook_reason(self, session: set[str], login: bool, predicate: str) -> str | None:
@@ -1362,11 +1364,8 @@ class _Prover:
             if self._reads_any_setting_of(predicate, names):
                 if names is None:
                     what = "any setting, and the filter reads one"
-                elif names:
-                    what = f"{', '.join(sorted(names))}, and the filter reads it"
                 else:
-                    what = ("settings pgrls cannot name, and the filter reads one it "
-                            "cannot name either")
+                    what = f"{', '.join(sorted(names))}, and the filter reads it"
                 return f"the PostgREST pre-request hook {hook} may set {what} — {cause}"
         return None
 
