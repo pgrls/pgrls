@@ -8,7 +8,7 @@ set -euo pipefail
 
 PORT="${PORT:-55433}"
 NAME="pgrls-access-map-demo"
-URL="postgresql://postgres:demo@localhost:${PORT}/postgres"
+URL="postgresql://postgres:demo@127.0.0.1:${PORT}/postgres"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${HERE}/access-map.html"
 ROLES="anon,authenticated,service_role"
@@ -19,12 +19,12 @@ cleanup
 
 echo "▸ starting Postgres on :${PORT} ..."
 docker run -d --name "$NAME" -e POSTGRES_PASSWORD=demo \
-  -p "${PORT}:5432" postgres:16 >/dev/null
+  -p "127.0.0.1:${PORT}:5432" postgres:16 >/dev/null
 until docker exec "$NAME" pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
 sleep 1
 
 echo "▸ loading the schema ..."
-docker exec -i "$NAME" psql -q -U postgres < "${HERE}/schema.sql"
+docker exec -i "$NAME" psql -q -v ON_ERROR_STOP=1 -U postgres < "${HERE}/schema.sql"
 
 echo
 pgrls matrix --database-url "$URL" --prove --roles "$ROLES" \

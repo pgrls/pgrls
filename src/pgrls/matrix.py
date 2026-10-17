@@ -83,7 +83,8 @@ _PROOF_LABEL = {
 _PROOF_HEADING = "Isolation proof (SELECT)"
 _PROOF_MODELS = (
     "Anonymous columns: can an unauthenticated session read any row? "
-    "Other columns: can a session of that role read another tenant's row?"
+    "Other columns: can a session of that role, carrying its tenant's "
+    "identity, read another tenant's row?"
 )
 
 
@@ -347,9 +348,15 @@ def build_matrix(
         candidates, always = _candidate_roles(schema, include_system=include_system)
     cache: dict[Any, Any] = {}  # lookups and function bodies, once per build
     reaches: dict[str, RoleReach] = {}
+
+    def reach_of(name: str) -> RoleReach:
+        if name not in reaches:
+            role, closure = principal_of(schema, name, attrs)
+            reaches[name] = role_reach(schema, role, closure, attrs, cache)
+        return reaches[name]
+
     for name in dict.fromkeys((*candidates, "PUBLIC")):
-        role, closure = principal_of(schema, name, attrs)
-        reaches[name] = role_reach(schema, role, closure, attrs, cache)
+        reach_of(name)
     public = reaches["PUBLIC"]
     public_untraced = {(u.door, u.reason) for u in public.untraced}
     patterns = sensitive_patterns or _DEFAULT_PATTERNS
@@ -371,11 +378,23 @@ def build_matrix(
             return True
         return bool({(u.door, u.reason) for u in mine.untraced} - public_untraced)
 
-    role_list = tuple(n for n in candidates if n in always or differs(n))
-    proofs = (
-        prove_matrix(schema, shown, role_list, reaches, attrs, anon_roles=anon_roles,
-                     auth_functions=auth_functions, identity_columns=identity_columns)
-        if prove else {}
+    proofs: dict[tuple[str, str], CellProof] = {}
+    if prove:
+        # A role whose cells match PUBLIC's can still prove differently — it
+        # bypasses RLS, or can SET ROLE to one that does — so it is a column
+        # when its proof row differs too.
+        proofs = prove_matrix(schema, shown, candidates, reach_of, attrs,
+                              anon_roles=anon_roles, auth_functions=auth_functions,
+                              identity_columns=identity_columns)
+
+    def proves_differently(name: str) -> bool:
+        return prove and any(
+            proofs[(t.qualified_name, name)] != proofs[(t.qualified_name, "PUBLIC")]
+            for t in shown
+        )
+
+    role_list = tuple(
+        n for n in candidates if n in always or differs(n) or proves_differently(n)
     )
     rows = [
         MatrixRow(
@@ -818,7 +837,7 @@ def _proof_header(matrix: Matrix) -> str:
         f'    <p class="summary"><strong>{s["tables"]}</strong> '
         f'{pluralize(s["tables"], "table")} x '
         f'<strong>{s["roles"]}</strong> {pluralize(s["roles"], "role")}, '
-        "every SELECT cell checked by the Z3 prover.</p>\n"
+        "an isolation verdict for every SELECT cell.</p>\n"
         f'    <p class="lede">{html.escape(_PROOF_MODELS)}</p>\n'
         '    <div class="pills">\n'
         f"      {pills}\n"

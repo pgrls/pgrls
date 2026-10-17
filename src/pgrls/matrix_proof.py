@@ -5,31 +5,41 @@ reach is *safe*, cell by cell, with the same Z3 provers `pgrls verify` uses —
 SELECT only:
 
 * an **anonymous** column (the anon roles and ``PUBLIC``) gets the anon
-  threat model: can an unauthenticated session read any row?
+  threat model: can a session with no JWT read any row?
 * every **other** column gets the cross-tenant model: can a session of that
-  role read a row belonging to another tenant?
+  role, carrying its tenant identity, read a row of another tenant?
 
 Each cell ends up ``proven``, ``leak`` (with the leaking row when one
 characterizes it), ``possible``, ``unknown`` or ``exempt``. The rules that keep
 the verdicts honest:
 
-* **proven** only when the prover proves it and no door could change the
-  answer — the predicate is the role's own, or it cannot depend on who
-  evaluates it (`pgrls.access._dependence`): a door evaluates the filter as
-  its owner, and a filter that reads ``current_user`` or another table can
-  admit different rows there.
-* **leak** only when the role's *own* session reads the row. A door is
-  credited with its owner's whole reach of the table — a view's own ``WHERE``
-  and what a function returns are not traced — so a leak that exists only
-  through a door is ``possible``: it may be filtered on the way out.
-* everything the prover cannot decide is ``unknown``, with the reason.
-* a superuser or ``BYPASSRLS`` column outside the anonymous set is
-  ``exempt``: it skips RLS by design (SEC016 is the place to question that).
-  An anonymous role that bypasses RLS is the worst leak there is, so the
-  anonymous columns are never exempt.
+* **leak** only when the role's *own* session reads such a row: the role's
+  direct read is proven to leak (or reads every row), or a partition /
+  inheritance parent it can query does. A role without USAGE on the table's
+  schema cannot query the table at all, so its direct read leaks nothing.
+* **possible** when the read exists only through a door: a door is credited
+  with its owner's whole reach of the table — a view's own ``WHERE`` and what
+  a function returns are not traced — so it may filter the row out.
+* **proven** only when no such read is possible — the role reaches no row, or
+  the prover shows the filter isolates — and nothing pgrls cannot see could
+  change that: no door evaluates a filter that depends on who runs it
+  (`pgrls.access._dependence`); no untraced door the role can open belongs to
+  an owner that reaches the table; a filter scoped by a setting
+  (``current_setting``) also isolates a session that leaves it unset; and
+  every role the session can ``SET ROLE`` to is proven too.
+* **unknown** for everything else, with the reason.
+* **exempt** for a superuser or ``BYPASSRLS`` column outside the anonymous
+  set: it skips RLS by design (SEC016 is the place to question that). An
+  anonymous role that bypasses RLS is the worst leak there is, so anonymous
+  columns are never exempt.
+
+The cross-tenant model assumes a JWT-bearing session carries its identity
+(``auth.uid()`` is the session's user). It also assumes the role can execute
+the functions a policy calls, as `pgrls verify` does.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -41,6 +51,9 @@ ProofStatus = Literal["proven", "leak", "possible", "unknown", "exempt"]
 ThreatModel = Literal["anon", "cross-tenant"]
 
 PROOF_STATUSES: tuple[ProofStatus, ...] = ("proven", "leak", "possible", "unknown", "exempt")
+
+_GucStates = tuple[dict[str, str | None], ...]
+_StatesKey = tuple[tuple[tuple[str, str | None], ...], ...]
 
 
 @dataclass(frozen=True)
@@ -59,32 +72,132 @@ class CellProof:
     detail: str | None = None
 
 
-class _Provers:
-    """The two provers, configured once and cached by predicate: most cells
-    share a handful of filters across roles."""
+def _states_key(states: _GucStates) -> _StatesKey:
+    return tuple(tuple(sorted(s.items())) for s in states)
+
+
+def _calls_current_setting(predicate: str) -> bool:
+    """Whether `predicate` reads a setting with the built-in
+    ``current_setting`` (a tenant carried in a GUC, not a JWT)."""
+    from pglast.ast import FuncCall, Node  # noqa: PLC0415
+
+    from pgrls.verify import _bare_builtin_name  # noqa: PLC0415
+
+    node = parse_expr(predicate)
+    if node is None:
+        return True
+    found = False
+
+    def walk(n: Any) -> None:
+        nonlocal found
+        if found or n is None:
+            return
+        if isinstance(n, (list, tuple)):
+            for item in n:
+                walk(item)
+            return
+        if isinstance(n, FuncCall) and _bare_builtin_name(n) == "current_setting":
+            found = True
+            return
+        if isinstance(n, Node):
+            for fld in n:
+                walk(getattr(n, fld, None))
+
+    try:
+        walk(node)
+    except RecursionError:
+        return True
+    return found
+
+
+class _Prover:
+    """Everything one `prove_matrix` call shares: the provers (cached by
+    predicate and session state), each role's reach, and the session states."""
 
     def __init__(
         self,
         schema: Schema,
+        reach_of: Callable[[str], RoleReach],
+        attrs: dict[str, Role],
         *,
-        anon_roles: set[str] | None,
+        anon_set: frozenset[str],
         auth_functions: set[str] | None,
         identity_columns: frozenset[str] | None,
     ) -> None:
-        from pgrls.verify import _anon_set_gucs  # noqa: PLC0415
+        from pgrls.rules.sec021 import AXIS_IDENTITY_COLUMNS  # noqa: PLC0415
 
+        self.schema = schema
+        self.reach_of = reach_of
+        self.attrs = attrs
+        self.anon_set = anon_set
         self.auth = auth_functions
         self.identity_columns = identity_columns
-        self.set_gucs = _anon_set_gucs(schema, anon_roles)
-        self.cache: dict[tuple[ThreatModel, str], tuple[str, dict[str, object] | None]] = {}
+        self.axis = identity_columns if identity_columns is not None else AXIS_IDENTITY_COLUMNS
+        self.cache: dict[Any, tuple[str, dict[str, object] | None]] = {}
+        self.states_cache: dict[str, _GucStates] = {}
+        self.base_cache: dict[Any, CellProof] = {}
+        self.usage: dict[str, frozenset[str]] | None = None
+        if schema.schema_usage is not None:
+            usage: dict[str, set[str]] = {}
+            for s, grantee in schema.schema_usage:
+                usage.setdefault(s, set()).add(grantee)
+            self.usage = {s: frozenset(g) for s, g in usage.items()}
 
-    def prove(self, model: ThreatModel, predicate: str) -> tuple[str, dict[str, object] | None]:
-        key = (model, predicate)
+    # --- inputs -------------------------------------------------------------
+
+    def model(self, name: str) -> ThreatModel:
+        return "anon" if name in self.anon_set else "cross-tenant"
+
+    def states(self, name: str) -> _GucStates:
+        """The setting states a session of column `name` can be in: one per
+        login path. PUBLIC is every session, so every login role's."""
+        if name not in self.states_cache:
+            from pgrls.verify import _anon_set_gucs  # noqa: PLC0415
+
+            if name == "PUBLIC":
+                if self.schema.roles is not None:
+                    logins = {r.name for r in self.schema.roles if r.can_login}
+                else:
+                    logins = {r for r, _, _ in self.schema.role_set_gucs}
+                seed = logins or {"anon"}
+            else:
+                seed = {name}
+            self.states_cache[name] = _anon_set_gucs(self.schema, seed)
+        return self.states_cache[name]
+
+    def has_usage(self, name: str, table: Table) -> bool:
+        """Whether `name` holds USAGE on the table's schema — `True` when that
+        was not captured."""
+        if self.usage is None or table.schema not in self.usage:
+            return True
+        role = self.attrs.get(name)
+        if role is not None and role.superuser:
+            return True
+        holders = self.usage[table.schema]
+        if "PUBLIC" in holders:
+            return True
+        if name == "PUBLIC":
+            return False
+        from pgrls.verify import _inherit_closure  # noqa: PLC0415
+
+        closure = _inherit_closure(self.schema, name)
+        if closure is None:
+            return True
+        return bool(holders & (closure | {name}))
+
+    # --- provers ------------------------------------------------------------
+
+    def prove(
+        self, model: ThreatModel, predicate: str, states: _GucStates,
+    ) -> tuple[str, dict[str, object] | None]:
+        key = (model, predicate, _states_key(states) if model == "anon" else None)
         if key not in self.cache:
-            self.cache[key] = self._prove(model, predicate)
+            self.cache[key] = self._prove(model, predicate, states)
         return self.cache[key]
 
-    def _prove(self, model: ThreatModel, predicate: str) -> tuple[str, dict[str, object] | None]:
+    def _prove(
+        self, model: ThreatModel, predicate: str, states: _GucStates,
+    ) -> tuple[str, dict[str, object] | None]:
         from pgrls.diff._z3_compare import (  # noqa: PLC0415
             prove_anon_isolation,
             prove_cross_tenant_isolation,
@@ -95,123 +208,192 @@ class _Provers:
             return "unparseable", None
         try:
             if model == "anon":
-                return prove_anon_isolation(node, self.auth, set_gucs=self.set_gucs)
+                return prove_anon_isolation(node, self.auth, set_gucs=states)
             return prove_cross_tenant_isolation(
                 node, self.auth, identity_columns=self.identity_columns
             )
         except RecursionError:
             return "unverified", None
 
+    # --- one cell -------------------------------------------------------------
 
-def _identity_axis(identity_columns: frozenset[str] | None) -> frozenset[str]:
-    if identity_columns is not None:
-        return identity_columns
-    from pgrls.rules.sec021 import AXIS_IDENTITY_COLUMNS  # noqa: PLC0415
-
-    return AXIS_IDENTITY_COLUMNS
-
-
-def prove_cell(
-    *,
-    model: ThreatModel,
-    role: Role | None,
-    table: Table,
-    cell: Cell,
-    direct: Cell,
-    has_doors: bool,
-    provers: _Provers,
-    axis: frozenset[str],
-) -> CellProof:
-    """The proof for one SELECT cell. `cell` is the role's merged verdict,
-    `direct` its own session's verdict before any door, `has_doors` whether
-    any door reaches the table's rows for this role."""
-    if cell.verdict == "denied":
-        return CellProof("proven", model, detail="no row reachable")
-    if model == "cross-tenant" and role is not None and (role.superuser or role.bypassrls):
-        return CellProof("exempt", model, detail=(
-            "superuser" if role.superuser else "BYPASSRLS"
-        ) + " — skips RLS by design")
-    if cell.verdict == "undecided":
-        return CellProof("unknown", model, detail=cell.note or "rows cannot be bounded")
-    if cell.verdict == "open":
-        own = direct.verdict == "open"
-        if model == "cross-tenant" and not (set(table.columns) & axis):
-            # No tenant discriminator: shared data, or a column the project
-            # has not named in [lint.rules.SEC021].identity_columns.
+    def cell(self, name: str, table: Table) -> CellProof:
+        """The proof for column `name`'s SELECT on `table`, including the
+        roles its session can SET ROLE to."""
+        model = self.model(name)
+        states = self.states(name)
+        base = self.base(name, table, model, states)
+        if base.status != "proven" or name == "PUBLIC":
+            return base
+        targets = self.set_role_targets(name)
+        if targets is None:
             return CellProof("unknown", model, detail=(
-                "reads every row, but the table has no tenant column to "
-                "isolate on (see [lint.rules.SEC021].identity_columns)"
+                "role-membership graph not captured — cannot rule out a SET ROLE "
+                "to a role that reads it"
             ))
-        return CellProof(
-            "leak" if own else "possible", model, witness={},
-            detail=cell.note if own else _door_detail(cell),
-        )
+        for target in sorted(targets):
+            other = self.base(target, table, model, states)
+            if other.status != "proven":
+                return CellProof("unknown", model, detail=(
+                    f"the session can SET ROLE {target}, whose read is "
+                    f"{other.status.upper()}"
+                ))
+        return base
 
-    # conditional: one filter, shared by every path that reaches rows
-    predicate = cell.predicate or ""
-    own = direct.verdict == "conditional" and direct.predicate == cell.predicate
-    if has_doors and _dependence(predicate) != (False, False):
+    def set_role_targets(self, name: str) -> set[str] | None:
+        """Every role `name` can switch to with SET ROLE: the roles it is a
+        member of, directly or through other memberships. Whether a grant
+        carries the SET option is not captured, so every edge counts."""
+        edges = self.schema.role_memberships
+        if edges is None:
+            return None
+        out: set[str] = set()
+        todo = [name]
+        while todo:
+            current = todo.pop()
+            for e in edges:
+                if e.member == current and e.role not in out and e.role != name:
+                    out.add(e.role)
+                    todo.append(e.role)
+        return out
+
+    def base(
+        self, name: str, table: Table, model: ThreatModel, states: _GucStates,
+    ) -> CellProof:
+        key = (name, table.qualified_name, model, _states_key(states))
+        if key not in self.base_cache:
+            self.base_cache[key] = self._base(name, table, model, states)
+        return self.base_cache[key]
+
+    def _base(
+        self, name: str, table: Table, model: ThreatModel, states: _GucStates,
+    ) -> CellProof:
+        reach = self.reach_of(name)
+        q = table.qualified_name
+        cell = reach.cells[(q, "SELECT")]
+        direct, _ = reach.direct_select[q]
+        doors = reach.door_paths.get(q, ())
+        no_usage = not self.has_usage(name, table)
+        # A parent the role queries is its own session; but without USAGE the
+        # merged cell may still carry the failed direct read, so stay modest.
+        parents_only = (
+            bool(doors) and all(p.kind == "parent" for p in doors) and not no_usage
+        )
+        if no_usage:
+            # The direct read fails outright: permission denied for schema.
+            direct = Cell("denied")
+            if not doors:
+                cell = direct
+        role = self.attrs.get(name)
+
+        if cell.verdict == "denied":
+            return self.gates(name, table, model, states, None, CellProof(
+                "proven", model,
+                detail=(f"no USAGE on schema {table.schema}" if no_usage
+                        else "no row reachable"),
+            ))
+        if model == "cross-tenant" and role is not None and (role.superuser or role.bypassrls):
+            return CellProof("exempt", model, detail=(
+                "superuser" if role.superuser else "BYPASSRLS"
+            ) + " — skips RLS by design")
+        if cell.verdict == "undecided":
+            return CellProof("unknown", model, detail=cell.note or "rows cannot be bounded")
+        shared = model == "cross-tenant" and not (set(table.columns) & self.axis)
+
+        # The role's own read first: a leak there is certain whatever a door adds.
+        if direct.verdict == "open":
+            if shared:
+                return self._shared(model)
+            return CellProof("leak", model, witness={}, detail=direct.note)
+        if direct.verdict == "conditional":
+            verdict, witness = self.prove(model, direct.predicate or "", states)
+            if verdict == "leak":
+                return CellProof("leak", model, witness=witness)
+
+        own: ProofStatus = "leak" if parents_only else "possible"
+        if cell.verdict == "open":
+            if shared:
+                return self._shared(model)
+            return CellProof(own, model, witness={}, detail=cell.note)
+
+        # conditional: one filter, shared by every path that reaches rows
+        predicate = cell.predicate or ""
+        if doors and not parents_only and _dependence(predicate) != (False, False):
+            return CellProof("unknown", model, detail=(
+                "the filter reads current_user, a privilege check or another "
+                "table, and a door evaluates it as its owner — the rows can differ"
+            ))
+        verdict, witness = self.prove(model, predicate, states)
+        if verdict == "isolated":
+            return self.gates(name, table, model, states, predicate, CellProof("proven", model))
+        if verdict == "leak":
+            return CellProof(own, model, witness=witness, detail=cell.note)
+        if verdict == "unparseable":
+            return CellProof("unknown", model, detail="the filter does not parse")
+        from pgrls.verify import _UNVERIFIED_PREDICATE_REASON  # noqa: PLC0415
+
+        return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
+
+    def _shared(self, model: ThreatModel) -> CellProof:
+        # No tenant discriminator: shared data, or a column the project has
+        # not named in [lint.rules.SEC021].identity_columns.
         return CellProof("unknown", model, detail=(
-            "the filter reads current_user, a privilege check or another "
-            "table, and a door evaluates it as its owner — the rows can differ"
+            "reads every row, but the table has no tenant column to isolate on "
+            "(see [lint.rules.SEC021].identity_columns)"
         ))
-    verdict, witness = provers.prove(model, predicate)
-    if verdict == "isolated":
-        return CellProof("proven", model)
-    if verdict == "leak":
-        return CellProof(
-            "leak" if own else "possible", model, witness=witness,
-            detail=None if own else _door_detail(cell),
-        )
-    if verdict == "unparseable":
-        return CellProof("unknown", model, detail="the filter does not parse")
-    from pgrls.verify import _UNVERIFIED_PREDICATE_REASON  # noqa: PLC0415
 
-    return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
+    def gates(
+        self, name: str, table: Table, model: ThreatModel, states: _GucStates,
+        predicate: str | None, proven: CellProof,
+    ) -> CellProof:
+        """What must also hold before a cell is PROVEN."""
+        for door in self.reach_of(name).untraced:
+            if self._owner_reaches(door.owner, table):
+                return CellProof("unknown", model, detail=(
+                    f"{door.door} is an untraced door this role can open, and "
+                    f"its owner {door.owner or '(unknown)'} reaches the table"
+                ))
+        if (
+            model == "cross-tenant" and predicate is not None
+            and _calls_current_setting(predicate)
+            and self.prove("anon", predicate, states)[0] == "leak"
+        ):
+            return CellProof("unknown", model, detail=(
+                "isolated while the session sets the setting the filter reads; "
+                "a session of this role that leaves it unset reads rows"
+            ))
+        return proven
 
-
-def _door_detail(cell: Cell) -> str:
-    """The door behind a POSSIBLE: a door is credited with its owner's whole
-    reach of the table, and what it actually returns is not traced."""
-    return cell.note or "through a door"
+    def _owner_reaches(self, owner: str, table: Table) -> bool:
+        role = self.attrs.get(owner)
+        if not owner or role is None:
+            return True
+        if role.superuser or role.bypassrls:
+            return True
+        return self.reach_of(owner).cells[(table.qualified_name, "SELECT")].verdict != "denied"
 
 
 def prove_matrix(
     schema: Schema,
     tables: list[Table],
-    roles: tuple[str, ...],
-    reaches: dict[str, RoleReach],
+    roles: Iterable[str],
+    reach_of: Callable[[str], RoleReach],
     attrs: dict[str, Role],
     *,
     anon_roles: set[str] | None = None,
     auth_functions: set[str] | None = None,
     identity_columns: frozenset[str] | None = None,
 ) -> dict[tuple[str, str], CellProof]:
-    """A proof for every (table, role) SELECT cell of the grid."""
-    anon_set = (anon_roles if anon_roles else {"anon"}) | {"PUBLIC"}
-    provers = _Provers(
-        schema, anon_roles=anon_set, auth_functions=auth_functions,
-        identity_columns=identity_columns,
-    )
-    axis = _identity_axis(identity_columns)
-    out: dict[tuple[str, str], CellProof] = {}
-    for name in roles:
-        reach = reaches[name]
-        model: ThreatModel = "anon" if name in anon_set else "cross-tenant"
-        for table in tables:
-            q = table.qualified_name
-            direct, _ = reach.direct_select[q]
-            out[(q, name)] = prove_cell(
-                model=model,
-                role=attrs.get(name),
-                table=table,
-                cell=reach.cells[(q, "SELECT")],
-                direct=direct,
-                has_doors=bool(reach.door_paths.get(q)),
-                provers=provers,
-                axis=axis,
-            )
-    return out
+    """A proof for every (table, role) SELECT cell. `reach_of` gives any
+    role's reach — the columns', and also door owners' and SET ROLE targets'."""
+    anon_set = frozenset((anon_roles if anon_roles else {"anon"}) | {"PUBLIC"})
+    prover = _Prover(schema, reach_of, attrs, anon_set=anon_set,
+                     auth_functions=auth_functions, identity_columns=identity_columns)
+    return {
+        (table.qualified_name, name): prover.cell(name, table)
+        for name in roles
+        for table in tables
+    }
 
 
 def proof_summary(proofs: Any) -> dict[str, int]:

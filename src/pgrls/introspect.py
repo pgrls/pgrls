@@ -1221,6 +1221,28 @@ def _empty_search_path(cur: Any) -> Iterator[None]:
             cur.execute("SELECT pg_catalog.set_config('search_path', %s, false)", (saved,))
 
 
+_SCHEMA_USAGE_SQL = """
+SELECT n.nspname AS schema_name,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+            ELSE pg_catalog.pg_get_userbyid(a.grantee) END AS grantee
+FROM pg_catalog.pg_namespace n
+CROSS JOIN LATERAL pg_catalog.aclexplode(
+    coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+WHERE n.nspname = ANY(%s) AND a.privilege_type = 'USAGE'
+UNION
+SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner)
+FROM pg_catalog.pg_namespace n
+WHERE n.nspname = ANY(%s)
+ORDER BY 1, 2
+"""
+
+
+def _fetch_schema_usage(cur: Any, schemas: list[str]) -> tuple[tuple[str, str], ...]:
+    """Who holds USAGE on each schema in `schemas` (the owner included)."""
+    cur.execute(_SCHEMA_USAGE_SQL, (list(schemas), list(schemas)))
+    return tuple((row["schema_name"], row["grantee"]) for row in cur.fetchall())
+
+
 _RULES_SQL = """
 SELECT n.nspname AS schema_name, c.relname AS relation, r.rulename AS name,
        CASE r.ev_type WHEN '2' THEN 'UPDATE' WHEN '3' THEN 'INSERT'
@@ -2042,6 +2064,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         roles = _fetch_roles(cur)
         rules = _fetch_rules(cur, schemas)
         set_gucs, role_set_gucs = _fetch_set_gucs(cur)
+        schema_usage = _fetch_schema_usage(cur, schemas)
 
         cur.execute(_TABLES_SQL, (schemas,))
         table_rows = cur.fetchall()
@@ -2065,6 +2088,7 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
                 rules=rules,
                 set_gucs=set_gucs,
                 role_set_gucs=role_set_gucs,
+                schema_usage=schema_usage,
             )
 
         oids = [row["table_oid"] for row in table_rows]
@@ -2299,4 +2323,5 @@ def introspect(conn: psycopg.Connection, schemas: list[str]) -> Schema:
         rules=rules,
         set_gucs=set_gucs,
         role_set_gucs=role_set_gucs,
+        schema_usage=schema_usage,
     )

@@ -1828,6 +1828,13 @@ class Schema:
     # readers SET app.x` with anon a member of readers is NOT seen. The value
     # is kept so `--probe` can replay it into its own session.
     role_set_gucs: tuple[tuple[str, str, str | None], ...] = ()
+    # `(schema, grantee)` pairs holding USAGE on each introspected schema —
+    # `PUBLIC` for a grant to every role; the schema owner is listed too. A
+    # role without USAGE cannot query a table in the schema at all ("permission
+    # denied for schema"), so `pgrls matrix --prove` does not call such a read
+    # a LEAK. Live introspection only — not serialized into snapshots; `None`
+    # = not captured, which `--prove` treats as "USAGE held".
+    schema_usage: tuple[tuple[str, str], ...] | None = None
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
