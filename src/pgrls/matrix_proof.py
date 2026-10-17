@@ -62,7 +62,10 @@ runs only the API's queries, so the cross-tenant model takes the identity as
 given and the session changes no schema object; whatever the gateway's own
 login role can do is that role's column. A role that can log in is a raw SQL
 session: it can set any setting, create temp tables and use any schema it can
-create in, which the gates above account for. The proof also assumes the role
+create in, which the gates above account for. A door pgrls cannot trace
+runs whatever its owner can, DDL included, so for every column the owners of
+untraced doors the session can open count toward the ownership and CREATE
+checks. The proof also assumes the role
 can execute the functions a policy calls, as `pgrls verify` does.
 """
 from __future__ import annotations
@@ -523,7 +526,12 @@ class _Prover:
                 return CellProof("unknown", model, detail=(
                     f"the session can SET ROLE {target}, {what}"
                 ))
-        written = self._identity_reads_writable({name} | targets, table, login)
+        readers = {name} | targets
+        # A door pgrls cannot trace runs whatever its owner can, DDL included
+        # (measured: ALTER TABLE … NO FORCE, CREATE OR REPLACE FUNCTION through
+        # a SECURITY DEFINER function's dynamic SQL) — for any session.
+        door_owners = self._door_owners(readers)
+        written = self._identity_reads_writable(readers, table, login, door_owners)
         if written:
             return CellProof("unknown", model, detail=(
                 f"the filter's identity comes from {written[0]}(), which {written[1]} "
@@ -531,8 +539,9 @@ class _Prover:
             ))
         if not login:
             # Reached through a gateway that runs only the API's queries: it
-            # changes no schema object (a login member's own column does).
-            return base
+            # changes no schema object itself (a login member's own column
+            # does); a door it can open still acts as that door's owner.
+            return self._redefinable(name, readers, door_owners, table, model) or base
         granting = sorted(({name} | targets) & set(self.schema.self_granting_roles or ()))
         if granting:
             who = (f"{granting[0]} has" if granting[0] == name
@@ -541,13 +550,30 @@ class _Prover:
                 f"{who} CREATEROLE on a server before Postgres 16: it can grant "
                 "itself any non-superuser role, a BYPASSRLS one included"
             ))
-        return self._redefinable(name, targets, table, model) or base
+        return self._redefinable(name, readers, readers | door_owners, table, model) or base
+
+    def _door_owners(self, roles: set[str]) -> set[str]:
+        """The owners of every untraced door `roles` can open, and of the
+        untraced doors those owners can open in turn."""
+        out: set[str] = set()
+        todo = sorted(roles)
+        seen = set(todo)
+        while todo:
+            for door in self.reach_of(todo.pop()).untraced:
+                if door.owner and door.owner not in out:
+                    out.add(door.owner)
+                    if door.owner not in seen:
+                        seen.add(door.owner)
+                        todo.append(door.owner)
+        return out
 
     def _redefinable(
-        self, name: str, targets: set[str], table: Table, model: ThreatModel,
+        self, name: str, readers: set[str], actors: set[str], table: Table,
+        model: ThreatModel,
     ) -> CellProof | None:
-        """Whether the session — the role or one it can SET ROLE to — can
-        change what a filter it reads the table through computes:
+        """Whether `actors` — the session's roles, and the owners of untraced
+        doors it can open — can change what a filter `readers` read the table
+        through computes:
 
         * it owns a user-defined function: CREATE OR REPLACE changes it, and
           it may sit behind a call, an operator or a cast the filter uses
@@ -557,16 +583,17 @@ class _Prover:
           through a search_path the session can put that schema on
           (measured).
         """
-        session = {name} | targets
-        owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & session)
-        holders = self._privilege_holders(session)
+        if not actors:
+            return None
+        owned = sorted(f for f, owners in self.fn_owners_by_name.items() if owners & actors)
+        holders = self._privilege_holders(actors)
         creates = sorted(s for s, who in self.creators.items() if who & holders)
         on_database = bool(set(self.schema.database_create or ()) & holders)
         if on_database:
             creates.insert(0, "")
         if not owned and not creates:
             return None
-        for role in sorted(session):
+        for role in sorted(readers):
             predicate = self.reach_of(role).cells[(table.qualified_name, "SELECT")].predicate
             if not predicate:
                 continue
@@ -862,6 +889,7 @@ class _Prover:
 
     def _identity_reads_writable(
         self, session: set[str], table: Table, login: bool = False,
+        door_owners: set[str] | None = None,
     ) -> tuple[str, str] | None:
         """(auth function, what it reads) when an auth function a filter of the
         session's read of `table` calls reads — in its body, or a function that
@@ -879,6 +907,8 @@ class _Prover:
         bare = {a.rsplit(".", 1)[-1] for a in auth}
         reaches = [self.reach_of(r) for r in sorted(session)]
         owners = self._privilege_holders(session) - {"PUBLIC"} if login else set()
+        if door_owners:
+            owners |= self._privilege_holders(door_owners) - {"PUBLIC"}
 
         def writable(t: Table) -> bool:
             if any(reach.cells[(t.qualified_name, cmd)].verdict != "denied"
@@ -1073,10 +1103,16 @@ class _Prover:
                 return "current_setting()"
             return f"{f}()" if (f in auth if "." in f else f in bare) else None
 
+        def has_session_value(n: Any) -> bool:
+            return _has_node_in(n, lambda m: session_value(m) is not None)
+
         def binds_tenant(n: Any) -> bool:
-            return (isinstance(n, A_Expr) and bool(n.name)
-                    and getattr(n.name[-1], "sval", "") == "="
-                    and (is_axis_column(n.lexpr) or is_axis_column(n.rexpr)))
+            """`tenant_col = <session value>` — not a fixed tenant like 'demo'."""
+            if not (isinstance(n, A_Expr) and n.name
+                    and getattr(n.name[-1], "sval", "") == "="):
+                return False
+            return ((is_axis_column(n.lexpr) and has_session_value(n.rexpr))
+                    or (is_axis_column(n.rexpr) and has_session_value(n.lexpr)))
 
         found: list[str] = []
 

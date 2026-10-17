@@ -30,7 +30,9 @@ breaking changes — they will be called out in this file.
     it). A login session must also have no pre-16 CREATEROLE, read no
     setting it can set for itself, and be unable to redefine or shadow what
     the filter calls (owned functions or relations, CREATE on a schema or the
-    database, a helper reading a table by bare name without `pg_temp` last).
+    database, a helper reading a table by bare name without `pg_temp` last);
+    the owner of an untraced door the session can open counts toward these
+    for every column.
   - `LEAK` — the role's own session reads such a row, shown when one
     characterizes it; a direct read without schema `USAGE` is `POSSIBLE`,
     and a leak resting on a helper the prover cannot see into (or, for a

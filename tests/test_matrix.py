@@ -3863,6 +3863,7 @@ def test_prove_a_writable_child_of_the_identity_table_is_found(child_kind, role)
 @pytest.mark.parametrize("extra", [
     "(published AND current_setting('app.preview', true) = 'on')",
     "auth.role() = 'anon'",
+    "((tenant_id = 'demo') AND (current_setting('app.preview', true) = 'on'))",
 ])
 def test_prove_a_cross_tenant_leak_on_another_session_value_is_unknown(extra: str) -> None:
     """The cross-tenant prover leaves a setting or a second claim free; a
@@ -3900,6 +3901,38 @@ def test_prove_an_untraced_door_that_writes_the_identity_table_is_found(role) ->
                      grid=frozenset({"public.t"}))
     p = _proof(m, "public.t", "appf")
     assert p.status == "unknown" and "public.role_tenants" in (p.detail or ""), p
+
+
+def _door_case(*, owns: str):
+    """A gateway role that can run an untraced SECURITY DEFINER function owned
+    by tenant_admin; `owns` says what tenant_admin owns."""
+    rt = _t("role_tenants", owner="tenant_admin" if owns == "identity_table" else "own",
+            force=True, policies=(_policy(command="SELECT", roles=("PUBLIC",), using="true"),),
+            grants=(_grant("appf", ("SELECT",)),))
+    door = _f("BEGIN RETURN; END", owner="tenant_admin", lang="plpgsql", execute=("appf",))
+    fns = (_fn("app.cur", owner="tenant_admin" if owns == "function" else "own",
+               body="SELECT max(tenant_id) FROM public.role_tenants",
+               search_path="pg_catalog, pg_temp"),)
+    t = _with(_sel("tenant_id = cur()", grants=("appf",)),
+              owner="tenant_admin" if owns == "table" else "own")
+    s = replace(_s([t, rt], fns=[door], roles=[_api("appf"), _api("tenant_admin"), _r("own")]),
+                user_functions=fns)
+    m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    return _proof(m, "public.t", "appf")
+
+
+@pytest.mark.parametrize("owns", ["identity_table", "function", "table"])
+def test_prove_an_untraced_door_acts_with_its_owners_ddl(owns: str) -> None:
+    """Measured: through a SECURITY DEFINER function's dynamic SQL, its owner
+    lifted FORCE on the identity table, or redefined the identity function,
+    and the caller read another tenant's row."""
+    p = _door_case(owns=owns)
+    assert p.status == "unknown", (owns, p)
+
+
+def test_prove_an_untraced_door_owning_nothing_relevant_is_fine() -> None:
+    assert _door_case(owns="nothing").status == "proven"
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
