@@ -1431,10 +1431,13 @@ class _Prover:
         cannot be read."""
         from pglast.ast import (  # noqa: PLC0415
             A_Const,
+            CopyStmt,
             DeleteStmt,
             FuncCall,
             InsertStmt,
+            MergeStmt,
             String,
+            TruncateStmt,
             TypeCast,
             UpdateStmt,
             VariableSetStmt,
@@ -1445,8 +1448,11 @@ class _Prover:
 
         def match(n: Any) -> bool:
             nonlocal unknown
-            if isinstance(n, (InsertStmt, UpdateStmt, DeleteStmt)):
-                unknown = True  # a trigger on the table may set settings (measured)
+            if isinstance(n, (InsertStmt, UpdateStmt, DeleteStmt, MergeStmt,
+                              TruncateStmt, CopyStmt)):
+                # Any statement that can fire a trigger: one on the table may
+                # set settings (measured for INSERT and MERGE).
+                unknown = True
             if isinstance(n, VariableSetStmt) and n.name:
                 names.add(str(n.name).lower())
             if isinstance(n, FuncCall) and getattr(n.funcname[-1], "sval", "") == "set_config":

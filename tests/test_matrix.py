@@ -4136,11 +4136,16 @@ def test_prove_accept_profile_can_steer_a_gateway_helpers_bare_names(fn, expect)
         assert "Accept-Profile" in (p.detail or ""), p
 
 
-def test_prove_a_hook_that_writes_a_table_taints_every_setting() -> None:
-    """Measured: an AFTER INSERT trigger on the table the hook logged into set
-    app.tenant from the logged header."""
-    hook = _fn("public.pre", body="INSERT INTO public.request_log VALUES "
-               "(current_setting('request.headers', true))")
+@pytest.mark.parametrize("write", [
+    "INSERT INTO public.request_log VALUES (current_setting('request.headers', true))",
+    "MERGE INTO public.request_log l USING (SELECT current_setting('request.headers', true) "
+    "AS h) s ON false WHEN NOT MATCHED THEN INSERT VALUES (s.h)",
+    "TRUNCATE public.request_log",
+])
+def test_prove_a_hook_that_writes_a_table_taints_every_setting(write: str) -> None:
+    """Measured (INSERT and MERGE): a trigger on the table the hook wrote set
+    app.tenant from the request headers."""
+    hook = _fn("public.pre", body=f"SELECT current_setting('request.headers', true); {write}")
     t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("authenticated",))
     s = replace(_s([t], roles=[_api("authenticated"), _r("authenticator"), _r("own")]),
                 user_functions=(hook,),
