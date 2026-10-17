@@ -323,9 +323,10 @@ a session carrying its tenant's identity read another tenant's row — and marks
 it `PROVEN`, `LEAK` (with the leaking row), `POSSIBLE` (only through a door,
 which may filter it, or a read without schema USAGE), `UNKNOWN` (with the
 reason — including an untraced door, the table's owner, a `SET ROLE` target
-that is not proven, a filter that admits an unset setting, and for a role
-that can log in — a raw SQL session — a filter reading a setting it can set,
-or a session that can redefine or shadow what the filter calls) or `EXEMPT`
+that is not proven, a filter that admits an unset setting, an auth function
+reading a table the role can write, and for a role that can log in — a raw
+SQL session — pre-16 CREATEROLE, a filter reading a setting it can set, or a
+session that can redefine or shadow what the filter calls) or `EXEMPT`
 (superuser / BYPASSRLS). A NOLOGIN role (`anon`, `authenticated`) is taken to
 be reached through a gateway that sets its identity. SELECT only, and the exit code stays 0 — `pgrls
 verify` is the CI gate. Suggest it when a user wants to know not just who

@@ -24,8 +24,10 @@ breaking changes — they will be called out in this file.
   owner that reaches the table (followed through that owner's own untraced
   doors), the role does not own the table, a `current_setting(…)` filter
   also isolates a session that leaves the setting unset, every role the
-  session can `SET ROLE` to is proven too, and — for a role that can log in,
-  a raw SQL session — the filter reads no setting the session can set, and
+  session can `SET ROLE` to is proven too, no auth function the filter calls
+  reads a table the role can write, and — for a role that can log in, a raw
+  SQL session — it has no CREATEROLE before Postgres 16, the filter reads no
+  setting the session can set, and
   the session can neither redefine what the filter calls (it owns no
   function and holds CREATE on no schema while the filter calls one) nor
   shadow a table a helper reads by bare name with its own temp table. (A

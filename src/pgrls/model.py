@@ -1868,6 +1868,10 @@ class Schema:
     # name an unpinned body resolves. Live only; `None` = not captured.
     user_functions: tuple[UserFunction, ...] | None = field(default=None, compare=False)
     schema_create: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    # Non-superuser CREATEROLE roles on a server before Postgres 16, where
+    # CREATEROLE lets a role grant itself any non-superuser role (16 requires
+    # ADMIN OPTION, which the membership edges already carry). Live only.
+    self_granting_roles: tuple[str, ...] | None = field(default=None, compare=False)
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:

@@ -30,9 +30,12 @@ the verdicts honest:
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
-  policy in one statement); for a role that can log in — a raw SQL session —
-  the filter reads no setting the session could set for itself (directly or
-  in a function body), the session owns no user-defined function (one may
+  policy in one statement); no auth function the filter calls reads, in a
+  SQL body it or its callees have, a table the role can write (it could
+  change who it is taken to be); for a role that can log in — a raw SQL
+  session — it has no CREATEROLE before Postgres 16 (which grants itself any
+  non-superuser role), the filter reads no setting the session could set for
+  itself (directly or in a function body), the session owns no user-defined function (one may
   sit behind a call, an operator or a cast), it cannot create objects in a
   schema while the filter calls a user-defined function, and no
   user-defined function the filter reaches reads a relation by bare name
@@ -388,6 +391,12 @@ class _Prover:
             # Reached through a gateway that runs only the API's queries: it
             # changes no schema object (a login member's own column does).
             return base
+        granting = sorted(({name} | targets) & set(self.schema.self_granting_roles or ()))
+        if granting:
+            return CellProof("unknown", model, detail=(
+                f"{granting[0]} has CREATEROLE on a server before Postgres 16: it "
+                "can grant itself any non-superuser role, a BYPASSRLS one included"
+            ))
         return self._redefinable(name, targets, table, model) or base
 
     def _redefinable(
@@ -474,7 +483,8 @@ class _Prover:
                 if refs is None:
                     return f"the body of {fn.qualified_name}() does not parse"
                 if refs:
-                    return f"{fn.qualified_name}() reads {sorted(refs)[0]} without a schema"
+                    return (f"{fn.qualified_name}() reads {sorted(refs)[0]} without a schema "
+                        "(a CTE's name counts: its scope is not modelled)")
             for inner in sorted(_called_functions(fn.body, statement=True)):
                 why = self._shadowable(inner, effective, seen | {key})
                 if why:
@@ -661,6 +671,14 @@ class _Prover:
                         "that does not end in pg_temp — a session's own temp table "
                         "could take its place"
                     ))
+        if predicate is not None:
+            written = self._identity_reads_writable(name, predicate)
+            if written:
+                return CellProof("unknown", model, detail=(
+                    f"the filter's identity comes from {written[0]}(), which reads "
+                    f"{written[1]} — a table this role can write, so it can change "
+                    "who it is taken to be"
+                ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
                 return CellProof("unknown", model, detail=(
@@ -677,6 +695,59 @@ class _Prover:
                 "leaves the setting the filter reads unset reads rows"
             ))
         return proven
+
+    def _identity_reads_writable(self, name: str, predicate: str) -> tuple[str, str] | None:
+        """(auth function, table) when an auth function the filter calls reads
+        — in its body, or a function that body calls — a table `name` can
+        INSERT, UPDATE or DELETE: the prover takes the function's value as the
+        session's identity, but the session can rewrite what it reads
+        (measured, through an ordinary API write too)."""
+        from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
+
+        auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
+        bare = {a.rsplit(".", 1)[-1] for a in auth}
+        reach = self.reach_of(name)
+        for fname in sorted(_called_functions(predicate)):
+            if fname not in auth and fname.rsplit(".", 1)[-1] not in bare:
+                continue
+            for rel in sorted(self._relations_read(fname)):
+                for table in self._tables_named(rel):
+                    if any(reach.cells[(table.qualified_name, cmd)].verdict != "denied"
+                           for cmd in ("INSERT", "UPDATE", "DELETE")):
+                        return fname, table.qualified_name
+        return None
+
+    def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str]:
+        """Every relation name (as written) the bodies of `fname` and the
+        user-defined functions they call read."""
+        from pglast import parse_sql  # noqa: PLC0415
+        from pglast.ast import RangeVar  # noqa: PLC0415
+
+        out: set[str] = set()
+        for fn in self.functions.get(fname, ()):
+            if fn.qualified_name in seen or not fn.body or fn.language != "sql":
+                continue
+            try:
+                stmts = parse_sql(fn.body)
+            except Exception:  # noqa: BLE001
+                continue
+
+            def match(n: Any) -> bool:
+                if isinstance(n, RangeVar):
+                    out.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
+                return False
+
+            _has_node_in(stmts, match)
+            for inner in _called_functions(fn.body, statement=True):
+                out |= self._relations_read(inner, seen | {fn.qualified_name})
+        return out
+
+    def _tables_named(self, rel: str) -> list[Table]:
+        """The tables a relation name may be: exact when qualified, every
+        table of that name when bare."""
+        if "." in rel:
+            return [t for t in (self.tables.get(rel),) if t is not None]
+        return [t for t in self.schema.tables if t.name == rel]
 
     def _settable_identity(self, predicate: str) -> str | None:
         """What in `predicate` reads state a session can set for itself — a

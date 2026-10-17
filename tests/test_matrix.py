@@ -14,6 +14,7 @@ from click.testing import CliRunner
 from pgrls.cli import main
 from pgrls.introspect import introspect
 from pgrls.matrix import (
+    CellProof,
     COMMANDS,
     Matrix,
     build_matrix,
@@ -3395,6 +3396,13 @@ def test_prove_a_login_role_can_set_the_identity_it_is_judged_by() -> None:
     assert _proof(m, "public.t", "authenticated").status == "proven"
 
 
+def test_prove_public_is_a_gateway_session_while_a_login_role_is_not() -> None:
+    t = _sel("tenant_id = auth.uid()", grants=("PUBLIC",))
+    m = build_matrix(_s([t], roles=[_api("anon"), _r("app_user"), _r("own")]), prove=True)
+    assert _proof(m, "public.t", "PUBLIC").status == "proven"
+    assert _proof(m, "public.t", "app_user").status == "unknown"
+
+
 def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
         language: str = "sql", search_path: str | None = None, atomic: bool = False):
     from pgrls.model import UserFunction  # noqa: PLC0415
@@ -3515,6 +3523,54 @@ def test_prove_a_shadowable_helper_called_inside_another_is_found(outer) -> None
     inner = _fn("app.inner_uid", body=_BARE_BODY, search_path="app")
     p = _proof(_helper_matrix(outer, inner), "public.t", "app_user")
     assert p.status == "unknown" and "app.inner_uid()" in (p.detail or ""), p
+
+
+def test_prove_a_pre16_createrole_login_is_never_proven() -> None:
+    """Measured on PG15: GRANT service_role TO cr; SET ROLE service_role read
+    every row of a table cr had no grant on."""
+    t = _sel("tenant_id = auth.uid()", grants=("svc",))
+    roles = [_r("cr"), _api("svc"), _r("own")]
+    s = replace(_s([t], roles=roles), self_granting_roles=("cr",))
+    p = _proof(build_matrix(s, roles=("cr",), prove=True), "public.t", "cr")
+    assert p.status == "unknown" and "CREATEROLE" in (p.detail or ""), p
+    m = build_matrix(replace(s, self_granting_roles=()), roles=("cr",), prove=True)
+    assert _proof(m, "public.t", "cr").status == "proven"
+
+
+@pytest.mark.parametrize("role", [_r("app_user"), _api("app_user")])
+def test_prove_an_identity_read_from_a_table_the_role_can_write_is_not_proven(role) -> None:
+    """Measured: the session inserted a membership row for another tenant
+    and its identity function then returned that tenant — through an ordinary
+    API write too, so a gateway role is not spared."""
+    body = ("SELECT tenant_id FROM public.memberships WHERE member = current_user "
+            "ORDER BY tenant_id DESC LIMIT 1")
+    fns = (_fn("app.tenant_of", body=body, search_path="public, pg_temp"),)
+    t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
+
+    def proof(write: bool) -> CellProof:
+        memberships = _t("memberships", rls=False, grants=(
+            _grant("app_user", ("SELECT", "INSERT") if write else ("SELECT",)),))
+        s = replace(_s([t, memberships], roles=[role, _r("own")]), user_functions=fns)
+        m = build_matrix(s, roles=("app_user",), prove=True,
+                         auth_functions={"app.tenant_of"}, grid=frozenset({"public.t"}))
+        return _proof(m, "public.t", "app_user")
+
+    p = proof(write=True)
+    assert p.status == "unknown" and "public.memberships" in (p.detail or ""), p
+    assert proof(write=False).status == "proven"
+
+
+def test_prove_a_writable_table_read_by_a_function_the_identity_calls_is_found() -> None:
+    fns = (_fn("app.tenant_of", body="SELECT app.lookup()", search_path="public, pg_temp"),
+           _fn("app.lookup", body="SELECT tenant_id FROM public.memberships LIMIT 1",
+               search_path="public, pg_temp"))
+    t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
+    memberships = _t("memberships", rls=False, grants=(_grant("app_user", ("INSERT",)),))
+    s = replace(_s([t, memberships], roles=[_api("app_user"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"app.tenant_of"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "public.memberships" in (p.detail or ""), p
 
 
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
@@ -3913,3 +3969,20 @@ def test_live_a_temp_table_shadows_a_helper_unless_pg_temp_is_last(
         assert _proof(m, "public.shadow_b", "pgrls_pm_auth").status == "proven"
     finally:
         drop()
+
+
+@requires_docker
+def test_live_createrole_self_granting_is_captured_before_pg16(pg_conn: psycopg.Connection) -> None:
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
+
+    with pg_conn.cursor() as cur:
+        cur.execute("DROP ROLE IF EXISTS pgrls_pm_cr")
+        cur.execute("CREATE ROLE pgrls_pm_cr LOGIN CREATEROLE")
+        cur.execute("SELECT current_setting('server_version_num')::int")
+        pre16 = cur.fetchone()[0] < 160000
+    try:
+        schema, _ = introspect_for_matrix(pg_conn, ["public"])
+        assert ("pgrls_pm_cr" in (schema.self_granting_roles or ())) is pre16
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute("DROP ROLE pgrls_pm_cr")
