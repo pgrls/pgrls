@@ -30,7 +30,9 @@ the verdicts honest:
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
-  policy in one statement); no auth function the filter calls reads — in
+  policy in one statement); the filter reads no setting an HTTP client sets
+  through PostgREST (a request header or cookie); no auth function the
+  filter calls reads — in
   its body or a callee's, a view standing for its tables — a table the
   session can write (it could change who it is taken to be; a relation pgrls
   cannot resolve counts, and a body it cannot read counts as any table); for a role that can log in — a raw SQL
@@ -146,6 +148,25 @@ def _is_current_setting(n: Any) -> bool:
     from pgrls.verify import _bare_builtin_name  # noqa: PLC0415
 
     return isinstance(n, FuncCall) and _bare_builtin_name(n) == "current_setting"
+
+
+_CLIENT_SETTINGS = ("request.header.", "request.cookie.")
+_CLIENT_SETTING_NAMES = frozenset({"request.headers", "request.cookies"})
+
+
+def _client_setting(node: Any) -> str | None:
+    """The setting name when `node` is a ``current_setting`` call reading one
+    an HTTP client controls through PostgREST (a request header or cookie)."""
+    from pglast.ast import A_Const, String  # noqa: PLC0415
+
+    if not _is_current_setting(node) or not node.args:
+        return None
+    arg = node.args[0]
+    val = getattr(arg, "val", None) if isinstance(arg, A_Const) else None
+    name = str(val.sval).lower() if isinstance(val, String) else None
+    if name and (name in _CLIENT_SETTING_NAMES or name.startswith(_CLIENT_SETTINGS)):
+        return name
+    return None
 
 
 def _calls_current_setting(predicate: str) -> bool:
@@ -430,8 +451,8 @@ class _Prover:
         written = self._identity_reads_writable({name} | targets, table)
         if written:
             return CellProof("unknown", model, detail=(
-                f"the filter's identity comes from {written[0]}(), which {written[1]}: "
-                "the session could change who it is taken to be"
+                f"the filter's identity comes from {written[0]}(), which {written[1]} "
+                "— the session may be able to change who it is taken to be"
             ))
         if not login:
             # Reached through a gateway that runs only the API's queries: it
@@ -702,6 +723,13 @@ class _Prover:
                 f"the role owns the table ({table.owner}): one ALTER TABLE … NO "
                 "FORCE ROW LEVEL SECURITY or ALTER POLICY lets it read every row"
             ))
+        if predicate is not None:
+            header = self._client_controlled(predicate)
+            if header:
+                return CellProof("unknown", model, detail=(
+                    f"the filter reads the setting {header}, which the HTTP client "
+                    "sets through PostgREST — it can name another tenant"
+                ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
             # and put any schema it can create in on its search_path.
@@ -773,54 +801,53 @@ class _Prover:
                     return fname, (f"has a body pgrls cannot read, and the session can "
                                    f"write {anything.qualified_name}")
                 continue
-            rels, ctes = read
-            tables = self._resolve(rels, ctes)
+            tables = self._resolve(read)
             if isinstance(tables, str):
-                return fname, f"reads {tables}, which pgrls cannot resolve"
+                return fname, (f"reads {tables}, which pgrls cannot resolve, so it "
+                               "cannot rule out that the session writes it")
             for t in tables:
                 if writable(t):
                     return fname, f"reads {t.qualified_name}, which the session can write"
         return None
 
-    def _relations_read(
-        self, fname: str, seen: frozenset[str] = frozenset(),
-    ) -> tuple[set[str], set[str]] | None:
+    def _relations_read(self, fname: str, seen: frozenset[str] = frozenset()) -> set[str] | None:
         """Every relation name (as written) the body of `fname` and the
-        user-defined functions it calls read, and the CTE names they define;
-        None when a body cannot be read (another language, dynamic SQL, a
-        parse error)."""
+        user-defined functions it calls read — a bare name a body defines as a
+        CTE left out of that body's — or None when a body cannot be read
+        (another language, dynamic SQL, a parse error)."""
         from pglast.ast import CommonTableExpr, RangeVar  # noqa: PLC0415
 
         out: set[str] = set()
-        ctes: set[str] = set()
-
-        def match(n: Any) -> bool:
-            if isinstance(n, RangeVar):
-                out.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
-            if isinstance(n, CommonTableExpr):
-                ctes.add(n.ctename)
-            return False
-
         for fn in self.functions.get(fname, ()):
             if fn.qualified_name in seen or fn.language in ("c", "internal"):
                 continue
             stmts = _body_statements_of(fn)
             if stmts is None:
                 return None
+            rels: set[str] = set()
+            ctes: set[str] = set()
+
+            def match(n: Any) -> bool:
+                if isinstance(n, RangeVar):
+                    rels.add(f"{n.schemaname}.{n.relname}" if n.schemaname else n.relname)
+                if isinstance(n, CommonTableExpr):
+                    ctes.add(n.ctename)
+                return False
+
             _has_node_in(stmts, match)
+            out |= rels - ctes
             for inner in sorted(_names_called(stmts)):
                 more = self._relations_read(inner, seen | {fn.qualified_name})
                 if more is None:
                     return None
-                out |= more[0]
-                ctes |= more[1]
-        return out, ctes
+                out |= more
+        return out
 
-    def _resolve(self, rels: set[str], ctes: set[str]) -> list[Table] | str:
+    def _resolve(self, rels: set[str]) -> list[Table] | str:
         """The tables relation names read — a view's base tables for a view;
         a bare name as every table or view of that name. A name that resolves
-        to nothing pgrls captured is returned instead (a system catalog, and a
-        bare name that is a CTE's, excepted)."""
+        to nothing pgrls captured is returned instead (a system catalog
+        excepted)."""
         tables: dict[str, Table] = {}
         for rel in rels:
             schema_name, _, relname = rel.rpartition(".")
@@ -841,9 +868,32 @@ class _Prover:
                         if base is None:
                             return f"{vs}.{vn}"
                         tables[base.qualified_name] = base
-            if not found and not (not schema_name and relname in ctes):
+            if not found:
                 return rel
         return list(tables.values())
+
+    def _client_controlled(self, predicate: str) -> str | None:
+        """A request header or cookie setting the filter reads — directly or
+        in a function body it calls — whose value the HTTP client chooses."""
+        found: list[str] = []
+
+        def match(n: Any) -> bool:
+            name = _client_setting(n)
+            if name:
+                found.append(name)
+            return False
+
+        _has_node(predicate, match)
+        if found:
+            return found[0]
+        for fname in sorted(_called_functions(predicate)):
+            for fn in self.functions.get(fname, ()):
+                stmts = _body_statements_of(fn)
+                if stmts:
+                    _has_node_in(stmts, match)
+                    if found:
+                        return found[0]
+        return None
 
     def _settable_identity(self, predicate: str) -> str | None:
         """What in `predicate` reads state a session can set for itself — a

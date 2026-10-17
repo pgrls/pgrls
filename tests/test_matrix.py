@@ -3654,6 +3654,35 @@ def test_prove_createrole_reached_by_set_role_is_named() -> None:
     assert _proof(m, "public.t", "gw").status == "proven"
 
 
+@pytest.mark.parametrize("setting", ["request.header.tenant", "request.cookie.tenant",
+                                     "request.headers"])
+def test_prove_a_client_controlled_setting_is_never_an_identity(setting: str) -> None:
+    t = _sel(f"tenant_id = current_setting('{setting}', true)", grants=("authenticated",))
+    m = _prove([t], cols=("authenticated",))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status != "proven", p
+
+
+def test_prove_a_client_controlled_setting_in_a_helper_body_is_found() -> None:
+    fns = (_fn("app.cur", body="SELECT current_setting('request.header.tenant', true)"),)
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "request.header.tenant" in (p.detail or ""), p
+
+
+def test_prove_a_cte_name_excuses_a_bare_name_only_in_its_own_body() -> None:
+    fns = (_fn("app.tenant_of", body="WITH x AS (SELECT 1 AS tenant_id) "
+               "SELECT app.inner_of() FROM x"),
+           _fn("app.inner_of", body="SELECT tenant_id FROM x LIMIT 1"))
+    t = _sel("tenant_id = app.tenant_of()", grants=("app_user",))
+    s = replace(_s([t], roles=[_api("app_user"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("app_user",), prove=True, auth_functions={"app.tenant_of"})
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "reads x" in (p.detail or ""), p
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""
