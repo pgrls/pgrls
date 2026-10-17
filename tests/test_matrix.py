@@ -3683,6 +3683,23 @@ def test_prove_a_cte_name_excuses_a_bare_name_only_in_its_own_body() -> None:
     assert p.status == "unknown" and "reads x" in (p.detail or ""), p
 
 
+@pytest.mark.parametrize("fns", [
+    (_fn("app.cur", body="SELECT app.hdr()"),
+     _fn("app.hdr", body="SELECT current_setting('request.headers', true)")),
+    (_fn("app.cur", language="plpgsql",
+         body="DECLARE r text; BEGIN EXECUTE 'SELECT 1' INTO r; RETURN r; END"),),
+    (_fn("app.cur", body="SELECT current_setting('request.' || 'headers', true)"),),
+])
+def test_prove_a_client_setting_pgrls_cannot_rule_out_is_found(fns) -> None:
+    """Measured for a nested helper and dynamic SQL: the client chose the
+    tenant through a request header."""
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "PostgREST" in (p.detail or ""), p
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""

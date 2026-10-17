@@ -163,9 +163,11 @@ def _client_setting(node: Any) -> str | None:
         return None
     arg = node.args[0]
     val = getattr(arg, "val", None) if isinstance(arg, A_Const) else None
-    name = str(val.sval).lower() if isinstance(val, String) else None
-    if name and (name in _CLIENT_SETTING_NAMES or name.startswith(_CLIENT_SETTINGS)):
-        return name
+    if not isinstance(val, String):
+        return "a setting whose name is computed"
+    name = str(val.sval).lower()
+    if name in _CLIENT_SETTING_NAMES or name.startswith(_CLIENT_SETTINGS):
+        return f"the setting {name}"
     return None
 
 
@@ -727,8 +729,9 @@ class _Prover:
             header = self._client_controlled(predicate)
             if header:
                 return CellProof("unknown", model, detail=(
-                    f"the filter reads the setting {header}, which the HTTP client "
-                    "sets through PostgREST — it can name another tenant"
+                    f"the filter reads {header}, which may be a request header or "
+                    "cookie the HTTP client sets through PostgREST — the client can "
+                    "choose its value"
                 ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
@@ -873,8 +876,9 @@ class _Prover:
         return list(tables.values())
 
     def _client_controlled(self, predicate: str) -> str | None:
-        """A request header or cookie setting the filter reads — directly or
-        in a function body it calls — whose value the HTTP client chooses."""
+        """A request header or cookie setting the filter reads — directly, or
+        in the body of a function it calls or one those call — whose value
+        the HTTP client chooses; or a body pgrls cannot read, which may."""
         found: list[str] = []
 
         def match(n: Any) -> bool:
@@ -887,12 +891,33 @@ class _Prover:
         if found:
             return found[0]
         for fname in sorted(_called_functions(predicate)):
-            for fn in self.functions.get(fname, ()):
-                stmts = _body_statements_of(fn)
-                if stmts:
-                    _has_node_in(stmts, match)
-                    if found:
-                        return found[0]
+            why = self._client_in_body(fname)
+            if why:
+                return why
+        return None
+
+    def _client_in_body(self, fname: str, seen: frozenset[str] = frozenset()) -> str | None:
+        found: list[str] = []
+
+        def match(n: Any) -> bool:
+            name = _client_setting(n)
+            if name:
+                found.append(name)
+            return False
+
+        for fn in self.functions.get(fname, ()):
+            if fn.qualified_name in seen or fn.language in ("c", "internal"):
+                continue
+            stmts = _body_statements_of(fn)
+            if stmts is None:
+                return f"{fn.qualified_name}(), whose body pgrls cannot read"
+            _has_node_in(stmts, match)
+            if found:
+                return f"{found[0]} (in {fn.qualified_name}())"
+            for inner in sorted(_names_called(stmts)):
+                why = self._client_in_body(inner, seen | {fn.qualified_name})
+                if why:
+                    return why
         return None
 
     def _settable_identity(self, predicate: str) -> str | None:
