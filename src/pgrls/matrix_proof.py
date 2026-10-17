@@ -878,8 +878,8 @@ class _Prover:
             if hook and self._reads_any_setting_of(predicate, hook[1]):
                 written = ", ".join(sorted(hook[1])) if hook[1] else "settings"
                 return CellProof("unknown", model, detail=(
-                    f"the PostgREST pre-request hook {hook[0]} may set {written} "
-                    f"{hook[2]}, and the filter reads it"
+                    f"the PostgREST pre-request hook {hook[0]} may set {written}, and "
+                    f"the filter reads it — {hook[2]}"
                 ))
         if login and predicate is not None:
             # A raw SQL session: it can SET any setting, create temp tables,
@@ -1336,13 +1336,16 @@ class _Prover:
         a value the HTTP client chooses (measured: a header copied into
         app.tenant), or a relation the session can write, owns or steers
         (measured: an "active org" in a profile row the user can update) —
-        or when pgrls cannot read it. With several hooks configured, the first
-        that taints (by name) — any of them may be the one that runs."""
+        or when pgrls cannot read it. With several hooks configured, any may
+        be the one that runs, so every tainting hook counts: their written
+        names are combined (every setting when any is None)."""
         if self._in_hook:
             return None
+        tainting: list[tuple[str, frozenset[str] | None, str]] = []
         for hook in self._pre_request_hooks():
             if hook not in self.functions:
-                return hook, None, "pgrls cannot read it"
+                tainting.append((hook, None, f"pgrls cannot find {hook}()"))
+                continue
             self._in_hook = True
             try:
                 client = self._client_in_body(hook)
@@ -1351,10 +1354,16 @@ class _Prover:
             finally:
                 self._in_hook = False
             if client:
-                return hook, self._settings_written(hook), "from what the HTTP client sends"
-            if steered:
-                return hook, self._settings_written(hook), f"from what it {steered}"
-        return None
+                tainting.append((hook, self._settings_written(hook),
+                                 "the HTTP client chooses the value"))
+            elif steered:
+                tainting.append((hook, self._settings_written(hook), f"the hook {steered}"))
+        if not tainting:
+            return None
+        names: frozenset[str] | None = frozenset()
+        for _, written, _ in tainting:
+            names = None if names is None or written is None else names | written
+        return ", ".join(h for h, _, _ in tainting), names, tainting[0][2]
 
     def _settings_written(self, fname: str, seen: frozenset[str] = frozenset()) -> frozenset[str] | None:
         """The setting names `fname` (and its callees) write with
