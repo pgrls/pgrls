@@ -407,6 +407,7 @@ pgrls matrix --database-url "$DATABASE_URL"                                 # ro
 pgrls matrix --database-url "$DATABASE_URL" --roles anon,authenticated     # only these role columns
 pgrls matrix --database-url "$DATABASE_URL" --format json                   # full predicates, machine-readable
 pgrls matrix --database-url "$DATABASE_URL" --format html -o access.html     # standalone audit page
+pgrls matrix --database-url "$DATABASE_URL" --prove --format html -o map.html # every read proven or shown leaking
 ```
 
 Each cell is one of:
@@ -457,6 +458,16 @@ A body that sets any other parameter (`SET`, `set_config`, or its own `SET` clau
 A separate **sensitive columns** section lists, per role, the columns whose names match SEC045's patterns (`email`, `ssn`, `phone`, … plus any `[lint.rules.SEC045].patterns` in your config) that the role can read, and the paths that reach each one.
 
 **Columns.** By default the grid shows `PUBLIC`; `anon` and `authenticated` when they exist; and every other role whose reach differs from `PUBLIC`'s somewhere in the grid. That means a cell with a different verdict or predicate, a sensitive column `PUBLIC` can't read, or an untraced door `PUBLIC` can't open. A role that can do exactly what everyone can adds nothing. This compares each cell's verdict and predicate text, so it can miss a role whose extra reach comes only from a relation-reading predicate over a table outside `--schemas` (a membership table in another schema): name such a role with `--roles` to see it. `--roles` fixes the columns; `--include-system-roles` also considers `pg_*` roles.
+
+**Proving each cell — `--prove`.** The grid says which rows a role *reaches*; `--prove` asks whether that is *safe*, with the same Z3 provers `pgrls verify` uses, for every SELECT cell. Anonymous columns (`anon`, or `[lint.rules.SEC004].anon_roles`, and `PUBLIC`) get the question "can a session with no JWT read any row?"; every other column gets "can a session of this role read another tenant's row?" Each cell becomes:
+
+- **`PROVEN`** — no such read is possible: the prover shows it, or the role reaches no row.
+- **`LEAK`** — the role's own session reads such a row. The leaking row is shown when one characterizes the leak (`is_public = true`), or "every row".
+- **`POSSIBLE`** — the read exists only through a door. A door is credited with its owner's whole reach of the table and a view's own `WHERE` is not traced, so the door may filter the row out; check it.
+- **`UNKNOWN`** — the prover can't decide: the filter is outside its fragment (a sub-select such as `IN (SELECT … FROM memberships)`), the cell is `UNDECIDED`, a role reads every row of a table with no tenant column (shared data), or a door evaluates a filter that reads `current_user` or another table as its owner.
+- **`EXEMPT`** — a superuser or `BYPASSRLS` column outside the anonymous ones: it skips RLS by design (SEC016 is the place to question that). An anonymous role that bypasses RLS is reported as a `LEAK`.
+
+`PROVEN` is only claimed when no door could change the answer, and `LEAK` only when the role's own session reads the row. The tenant column is one of SEC021's identity columns (`[lint.rules.SEC021].identity_columns`), and `--auth-function` names a project's own auth helper, as for `pgrls verify`. A `LEAK` under the anonymous model means anonymous sessions read rows — intended on a table you publish, and the leaking row says which. `--prove` covers SELECT only and keeps the exit code at 0: `pgrls verify` is the CI gate. [`examples/proven-access-map/`](examples/proven-access-map/) runs it end to end.
 
 **What it does not model:**
 

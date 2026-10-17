@@ -10,6 +10,27 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pgrls matrix --prove` — a proven access map.** Every SELECT cell of the
+  grid is checked with the Z3 provers `pgrls verify` uses: anonymous columns
+  (`anon` / `[lint.rules.SEC004].anon_roles`, and `PUBLIC`) for "can a session
+  with no JWT read any row?", every other column for "can a session of this
+  role read another tenant's row?". Each cell becomes `PROVEN`, `LEAK` (with the
+  leaking row when one characterizes it), `POSSIBLE` (the read exists only
+  through a door, which may filter it), `UNKNOWN` (with the reason) or `EXEMPT`
+  (a superuser / `BYPASSRLS` column, which skips RLS by design). `PROVEN` is
+  claimed only when no door could change the answer, and `LEAK` only when the
+  role's own session reads the row. The HTML page leads with the proof grid
+  and the leaks; text and markdown add a proof grid and a leaks list; JSON adds
+  a `proof` object per SELECT cell and a `proof_summary`. `--auth-function`
+  names a project's own auth helper. SELECT only; the exit code stays 0.
+  `examples/proven-access-map/` runs it end to end.
+
+### Fixed
+- `pgrls matrix --format html` in a dark colour scheme: table headers and
+  `code` cells kept their light backgrounds under light text, so table names
+  and role names were unreadable.
+
 ## [0.57.0] - 2026-10-15
 
 ### Fixed

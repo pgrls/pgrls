@@ -317,6 +317,12 @@ definer view included).
 A separate section lists sensitive-looking columns (SEC045's patterns, plus
 configured ones) each role can read, and how. `UNDECIDED` means the rows
 cannot be bounded — treat it as "possibly reachable", never as denied.
+`pgrls matrix --prove` checks every SELECT cell with the verify provers —
+anonymous columns: can a session with no JWT read any row; other columns: can
+a session read another tenant's row — and marks it `PROVEN`, `LEAK` (with the
+leaking row), `POSSIBLE` (only through a door, which may filter it), `UNKNOWN`
+or `EXEMPT` (superuser / BYPASSRLS). Suggest it when a user wants to know not
+just who reaches a table but whether that reach is safe.
 Default columns: PUBLIC, anon / authenticated when they exist, and every
 role whose reach differs from PUBLIC's (a cell, a sensitive column, or an
 untraced door). Suggest it when a user asks who can see or change a table,

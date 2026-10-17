@@ -4138,6 +4138,28 @@ def report(
     default=False,
     help="Also consider pg_* system roles (left out by default).",
 )
+@click.option(
+    "--prove",
+    is_flag=True,
+    default=False,
+    help=(
+        "Prove each SELECT cell with the verify provers: anonymous columns "
+        "(anon roles and PUBLIC) — can an unauthenticated session read any "
+        "row; other columns — can a session of that role read another "
+        "tenant's row. Each cell becomes PROVEN, LEAK (with the leaking row), "
+        "POSSIBLE (only through a door), UNKNOWN or EXEMPT."
+    ),
+)
+@click.option(
+    "--auth-function",
+    "auth_functions",
+    multiple=True,
+    help=(
+        "With --prove: treat this function as an auth-context value, in "
+        "addition to the defaults (auth.uid/role/jwt, current_setting), as "
+        "`pgrls verify --auth-function` does. Repeatable."
+    ),
+)
 @output_format_options(
     list(MATRIX_FORMATS),
     output_help="Write the matrix to this file instead of stdout (any --format).",
@@ -4148,6 +4170,8 @@ def matrix(
     schemas: str | None,
     roles_csv: str | None,
     include_system: bool,
+    prove: bool,
+    auth_functions: tuple[str, ...],
     output_path: str | None,
     output_format: str,
 ) -> None:
@@ -4173,7 +4197,8 @@ def matrix(
     `--schemas` tables. A door whose SQL cannot be traced is listed
     separately with who can open it — a `DENIED` cell does not rule it out.
     Sensitive-looking columns (SEC045's patterns) are listed in their own
-    section.
+    section. `--prove` checks every SELECT cell with the verify provers and
+    marks it PROVEN, LEAK (with the leaking row), POSSIBLE, UNKNOWN or EXEMPT.
 
     Each column is a session running as that role: `SET ROLE` and DDL are
     not modelled, nor are ordinary triggers fired by a door's write. UPDATE
@@ -4190,6 +4215,8 @@ def matrix(
         )
         if not roles:
             raise ToolError("--roles listed no role names.")
+    if auth_functions and not prove:
+        raise click.UsageError("--auth-function only applies with --prove.")
 
     effective = _load_effective_config(
         config_path=config_path,
@@ -4238,7 +4265,13 @@ def matrix(
     try:
         built = build_matrix(
             schema, roles=roles, include_system=include_system, grid=grid,
-            sensitive_patterns=patterns,
+            sensitive_patterns=patterns, prove=prove,
+            anon_roles=_verify_anon_roles("anon", effective.rule_options) if prove else None,
+            auth_functions=(
+                set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
+                if auth_functions else None
+            ),
+            identity_columns=_identity_columns_from_config(config_path) if prove else None,
         )
     except RecursionError as exc:
         # A pathologically deep policy predicate overflows a walk. Fail like

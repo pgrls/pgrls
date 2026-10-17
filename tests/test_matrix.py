@@ -3017,3 +3017,238 @@ def test_a_deeply_nested_predicate_does_not_crash() -> None:
     v = _v("v", _OWN_T, owner="o", grants=(_grant("r", ("SELECT",)),))
     m = build_matrix(_s([t], [v], roles=[_r("r"), _r("o"), _r("own")]), roles=("r",))
     assert _cell(m, "public.t", "SELECT", "r").verdict in ("conditional", "undecided")
+
+
+# --- matrix --prove: an isolation proof per SELECT cell -----------------------
+
+
+def _proof(m: Matrix, table: str, role: str):
+    row = next(r for r in m.rows if r.qualified_name == table and r.command == "SELECT")
+    assert row.proofs is not None
+    return dict(zip(m.roles, row.proofs, strict=True))[role]
+
+
+def _prove(tables, views=(), fns=(), *, roles=None, cols=("anon", "authenticated")) -> Matrix:
+    roles = roles or [_r("anon"), _r("authenticated"), _r("svc"), _r("own")]
+    return build_matrix(_s(tables, views, fns, roles=roles), roles=cols, prove=True)
+
+
+def _sel(using: str, *, grants=("anon", "authenticated"), **kw) -> Table:
+    return _t(policies=(_policy(command="SELECT", roles=("PUBLIC",), using=using),),
+              grants=tuple(_grant(g, ("SELECT",)) for g in grants), **kw)
+
+
+def test_prove_the_inverted_auth_check_leaks_to_anon_but_isolates_tenants() -> None:
+    """The Lovable-CVE shape in one row: anon reads every row, a tenant only
+    its own."""
+    m = _prove([_sel("auth.uid() IS NULL OR tenant_id = auth.uid()")])
+    anon, auth = _proof(m, "public.t", "anon"), _proof(m, "public.t", "authenticated")
+    assert (anon.status, anon.model, anon.witness) == ("leak", "anon", {})
+    assert (auth.status, auth.model) == ("proven", "cross-tenant")
+
+
+def test_prove_a_scoped_filter_is_proven_for_both_models() -> None:
+    m = _prove([_sel("tenant_id = auth.uid()")])
+    assert {_proof(m, "public.t", r).status for r in ("anon", "authenticated")} == {"proven"}
+
+
+def test_prove_a_public_flag_leaks_with_the_row_that_shows_it() -> None:
+    m = _prove([_sel("tenant_id = auth.uid() OR is_public")])
+    for role in ("anon", "authenticated"):
+        p = _proof(m, "public.t", role)
+        assert p.status == "leak" and p.witness and p.witness.get("is_public") is True, p
+
+
+def test_prove_a_filter_outside_the_fragment_is_unknown() -> None:
+    m = _prove([_sel("tenant_id IN (SELECT tenant_id FROM public.memberships)")])
+    for role in ("anon", "authenticated"):
+        p = _proof(m, "public.t", role)
+        assert p.status == "unknown" and p.detail, p
+
+
+def test_prove_no_privilege_is_proven() -> None:
+    m = _prove([_sel("true", grants=())])
+    p = _proof(m, "public.t", "anon")
+    assert (p.status, p.detail) == ("proven", "no row reachable")
+
+
+def test_prove_rls_off_reads_every_row() -> None:
+    m = _prove([_t(rls=False, grants=(_grant("anon", ("SELECT",)),
+                                       _grant("authenticated", ("SELECT",))))])
+    anon = _proof(m, "public.t", "anon")
+    assert (anon.status, anon.witness, anon.detail) == ("leak", {}, "RLS off")
+    # tenant_id is a tenant column: every row includes other tenants' rows.
+    assert _proof(m, "public.t", "authenticated").status == "leak"
+
+
+def test_prove_reading_every_row_of_a_shared_table_is_unknown_cross_tenant() -> None:
+    """No tenant column to isolate on: shared data like `countries`, not a
+    cross-tenant leak — but still an anonymous read."""
+    shared = _with(_t(rls=False, grants=(_grant("anon", ("SELECT",)),
+                                         _grant("authenticated", ("SELECT",)))),
+                   columns=("code", "name"))
+    m = _prove([shared])
+    assert _proof(m, "public.t", "anon").status == "leak"
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "no tenant column" in (p.detail or "")
+
+
+def test_prove_an_undecided_cell_is_unknown() -> None:
+    mv = _v("mv", _OWN_T, owner="own", mat=True, grants=(_grant("anon", ("SELECT",)),))
+    m = _prove([_sel("tenant_id = auth.uid()", grants=())], [mv])
+    assert _proof(m, "public.t", "anon").status == "unknown"
+
+
+@pytest.mark.parametrize("using", ["true", "tenant_id = auth.uid() OR is_public"])
+def test_prove_a_leak_only_through_a_door_is_possible(using: str) -> None:
+    """anon holds no grant on t; a definer view owned by svc hands rows over.
+    A door is credited with its owner's whole reach — the view's own WHERE is
+    not traced — so the leak is POSSIBLE, never a claimed LEAK."""
+    t = _sel(using, grants=("svc",))
+    v = _v("v", _OWN_T, owner="svc", grants=(_grant("anon", ("SELECT",)),))
+    p = _proof(_prove([t], [v]), "public.t", "anon")
+    assert p.status == "possible" and "definer view public.v" in (p.detail or ""), p
+
+
+def test_prove_a_session_dependent_filter_through_a_door_is_unknown() -> None:
+    """A door evaluates the filter as its owner; one that reads current_user
+    can admit different rows there, so PROVEN cannot be claimed."""
+    t = _sel("owner_name = current_user", grants=("svc",))
+    f = _f("SELECT * FROM public.t", owner="svc", execute=("anon",))
+    p = _proof(_prove([t], fns=[f]), "public.t", "anon")
+    assert p.status == "unknown" and "door" in (p.detail or ""), p
+
+
+def test_prove_a_bypassrls_role_is_exempt_but_an_anonymous_one_leaks() -> None:
+    t = _sel("tenant_id = auth.uid()", grants=("anon", "svc"))
+    roles = [_r("anon", brls=True), _r("svc", brls=True), _r("own")]
+    m = _prove([t], roles=roles, cols=("anon", "svc"))
+    assert _proof(m, "public.t", "svc").status == "exempt"
+    anon = _proof(m, "public.t", "anon")
+    assert (anon.status, anon.witness) == ("leak", {}), anon
+
+
+def test_prove_no_privilege_beats_exempt() -> None:
+    roles = [_r("anon"), _r("svc", brls=True), _r("own")]
+    m = _prove([_sel("true", grants=())], roles=roles, cols=("anon", "svc"))
+    assert _proof(m, "public.t", "svc").status == "proven"
+
+
+def test_without_prove_there_are_no_proofs() -> None:
+    m = build_matrix(_s([_sel("true")], roles=[_r("anon"), _r("own")]), roles=("anon",))
+    assert not m.proven and all(r.proofs is None for r in m.rows)
+    payload = json.loads(render_json(m))
+    assert "proof_summary" not in payload
+    assert all("proof" not in c for r in payload["rows"] for c in r["access"].values())
+
+
+def test_prove_only_select_rows_carry_proofs() -> None:
+    m = _prove([_sel("tenant_id = auth.uid()")])
+    assert {r.command for r in m.rows if r.proofs is not None} == {"SELECT"}
+
+
+def test_prove_renders_in_every_format() -> None:
+    m = _prove([_sel("auth.uid() IS NULL OR tenant_id = auth.uid()", name="a<b>")])
+    text = render_text(m)
+    assert "Isolation proof (SELECT)" in text and "Leaks:" in text
+    assert "every row is anonymously readable" in text
+    assert "Isolation: 1 proven, 1 leak" in text
+    md = render_markdown(m)
+    assert "## Isolation proof (SELECT)" in md and "### Leaks" in md
+    payload = json.loads(render_json(m))
+    access = payload["rows"][0]["access"]
+    assert access["anon"]["proof"]["status"] == "leak"
+    assert access["authenticated"]["proof"]["status"] == "proven"
+    assert payload["proof_summary"]["leak"] == 1
+    page = render_html(m, generated_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert "Proven access map" in page and 'class="cell p-leak"' in page
+    assert "public.a&lt;b&gt;" in page and "public.a<b>" not in page
+
+
+def test_matrix_cli_auth_function_needs_prove() -> None:
+    result = CliRunner().invoke(
+        main, ["matrix", "--database-url", "postgresql://u@/db", "--auth-function", "auth.x"],
+    )
+    assert result.exit_code == 2
+    assert "only applies with --prove" in result.output
+
+
+_PM_ROLES = ("pgrls_pm_anon", "pgrls_pm_auth")
+
+
+def _pm_drop(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        for role in _PM_ROLES:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            if cur.fetchone() is not None:
+                cur.execute(f"DROP OWNED BY {role} CASCADE")
+                cur.execute(f"DROP ROLE {role}")
+        cur.execute("DROP SCHEMA IF EXISTS auth CASCADE")
+
+
+@requires_docker
+def test_live_every_proof_agrees_with_a_real_session(pg_conn: psycopg.Connection) -> None:
+    """PROVEN means a real session reads no such row; LEAK means it does — for
+    the anonymous model (any row, no JWT claim) and the cross-tenant one (a
+    row of another tenant, with tenant a's claim)."""
+    from psycopg import sql as _sql  # noqa: PLC0415
+
+    from pgrls.matrix import introspect_for_matrix  # noqa: PLC0415
+
+    _pm_drop(pg_conn)
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("""
+                CREATE ROLE pgrls_pm_anon NOLOGIN; CREATE ROLE pgrls_pm_auth NOLOGIN;
+                CREATE SCHEMA auth;
+                CREATE FUNCTION auth.uid() RETURNS text LANGUAGE sql STABLE AS
+                  $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '') $$;
+                GRANT USAGE ON SCHEMA auth TO pgrls_pm_anon, pgrls_pm_auth;
+            """)
+            for table, using in (
+                ("notes", "auth.uid() IS NULL OR tenant_id = auth.uid()"),
+                ("orders", "tenant_id = auth.uid()"),
+                ("invoices", "tenant_id = auth.uid() OR is_public"),
+            ):
+                cur.execute(f"""
+                    CREATE TABLE public.{table} (id int, tenant_id text, is_public bool);
+                    INSERT INTO public.{table} VALUES (1, 'a', false), (2, 'b', false),
+                                                      (3, 'b', true);
+                    ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY;
+                    ALTER TABLE public.{table} FORCE ROW LEVEL SECURITY;
+                    CREATE POLICY p ON public.{table} FOR SELECT USING ({using});
+                    GRANT SELECT ON public.{table} TO pgrls_pm_anon, pgrls_pm_auth;
+                """)
+
+        def reads(role: str, table: str, claim: str | None) -> bool:
+            """Whether the session sees a row it should not: any row for the
+            anonymous model, a row of another tenant for the cross-tenant one."""
+            with pg_conn.transaction(force_rollback=True), pg_conn.cursor() as cur:
+                cur.execute(_sql.SQL("SET LOCAL ROLE {}").format(_sql.Identifier(role)))
+                if claim is not None:
+                    cur.execute("SELECT set_config('request.jwt.claim.sub', %s, true)", (claim,))
+                    cur.execute(_sql.SQL("SELECT count(*) FROM public.{} WHERE tenant_id <> %s")
+                                .format(_sql.Identifier(table)), (claim,))
+                else:
+                    cur.execute(_sql.SQL("SELECT count(*) FROM public.{}")
+                                .format(_sql.Identifier(table)))
+                return int(cur.fetchone()[0]) > 0
+
+        schema, grid = introspect_for_matrix(pg_conn, ["public"])
+        m = build_matrix(schema, roles=_PM_ROLES, grid=grid, prove=True,
+                         anon_roles={"pgrls_pm_anon"})
+        seen = {}
+        for table in ("notes", "orders", "invoices"):
+            q = f"public.{table}"
+            for role, claim in (("pgrls_pm_anon", None), ("pgrls_pm_auth", "a")):
+                p = _proof(m, q, role)
+                assert p.status in ("proven", "leak"), (q, role, p)
+                assert (p.status == "leak") is reads(role, table, claim), (q, role, p)
+                seen[(table, role)] = p.status
+        # The shapes the grid exists to show.
+        assert seen[("notes", "pgrls_pm_anon")] == "leak"
+        assert seen[("notes", "pgrls_pm_auth")] == "proven"
+        assert seen[("orders", "pgrls_pm_anon")] == "proven"
+        assert seen[("invoices", "pgrls_pm_auth")] == "leak"
+    finally:
+        _pm_drop(pg_conn)
