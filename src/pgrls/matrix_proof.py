@@ -835,8 +835,7 @@ class _Prover:
                 # cannot see into, so it is not certain.
                 return parent_leak or CellProof("unknown", model, detail=(
                     f"the filter may admit rows, depending on what {opaque[0]}() "
-                    "returns — if it is your auth helper, name it with "
-                    "--auth-function"
+                    f"returns — {self._helper_hint(opaque[0])}"
                 ))
             other = (self._other_session_value(direct.predicate or "")
                      if model == "cross-tenant" and witness is None else None)
@@ -887,9 +886,10 @@ class _Prover:
         if _dependence(predicate)[1]:
             opaque = self._opaque_helpers(predicate) or sorted(_called_functions(predicate))
             what = f"{opaque[0]}()" if opaque else "a function"
+            hint = self._helper_hint(opaque[0]) if opaque else (
+                "if it is your auth helper, name it with --auth-function")
             return CellProof("unknown", model, detail=(
-                f"the filter calls {what}, which the prover cannot see into — if it "
-                "is your auth helper, name it with --auth-function"
+                f"the filter calls {what}, which the prover cannot see into — {hint}"
             ))
         return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
 
@@ -1373,6 +1373,18 @@ class _Prover:
         except RecursionError:
             return "a value pgrls could not walk"
         return found[0] if found else None
+
+    def _helper_hint(self, fname: str) -> str:
+        """What to do about a helper the prover cannot see into: name it — or,
+        when it is named already but its bare call is ambiguous, say why."""
+        if "." not in fname and self.auth is not None and any(
+            a.rsplit(".", 1)[-1] == fname for a in self.auth if "." in a
+        ):
+            schemas = sorted({f.qualified_name.rpartition(".")[0]
+                              for f in self.functions.get(fname, ())})
+            return (f"{fname}() is defined in {', '.join(schemas)}, so pgrls cannot "
+                    "tell which one the stored call names")
+        return "if it is your auth helper, name it with --auth-function"
 
     def _opaque_helpers(self, predicate: str) -> list[str]:
         """The functions `predicate` calls that are user-defined (captured, or

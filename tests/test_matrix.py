@@ -3113,7 +3113,8 @@ def test_prove_a_qualified_auth_function_matches_its_stored_bare_call() -> None:
                 user_functions=(_fn("app.uid"), _fn("public.uid")))
     m = build_matrix(s, roles=("anon", "authenticated"), prove=True,
                      auth_functions={"app.uid"})
-    assert _proof(m, "public.t", "authenticated").status != "proven"
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status != "proven" and "defined in app, public" in (p.detail or ""), p
 
 
 def test_prove_a_leak_resting_on_an_opaque_helper_is_unknown() -> None:
