@@ -1360,9 +1360,14 @@ class _Prover:
         only hooks whose written settings it reads, each with its own cause."""
         for hook, names, cause in self._hook_taints(session, login):
             if self._reads_any_setting_of(predicate, names):
-                written = ", ".join(sorted(names)) if names else "any setting"
-                return (f"the PostgREST pre-request hook {hook} may set {written}, and "
-                        f"the filter reads it — {cause}")
+                if names is None:
+                    what = "any setting, and the filter reads one"
+                elif names:
+                    what = f"{', '.join(sorted(names))}, and the filter reads it"
+                else:
+                    what = ("settings pgrls cannot name, and the filter reads one it "
+                            "cannot name either")
+                return f"the PostgREST pre-request hook {hook} may set {what} — {cause}"
         return None
 
     def _settings_written(self, fname: str, seen: frozenset[str] = frozenset()) -> frozenset[str] | None:
