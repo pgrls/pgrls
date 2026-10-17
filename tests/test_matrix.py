@@ -3323,6 +3323,18 @@ def test_prove_a_filtered_parent_leak_is_only_possible_on_a_partition() -> None:
     assert _proof(m, "public.posts_priv", "anon").status == "possible"
 
 
+def test_prove_a_parent_filter_admitting_every_row_leaks_the_child() -> None:
+    """`auth.uid() IS NULL OR …` hands anon every row of the parent, so every
+    row of each partition too — no partition bound can rule that out."""
+    parent = _t("posts", policies=(_policy(command="SELECT", roles=("PUBLIC",),
+                                           using="auth.uid() IS NULL OR tenant_id = auth.uid()"),),
+                grants=(_grant("anon", ("SELECT",)),))
+    child = _t("posts_a", partition_of=("public", "posts"))
+    m = _prove([parent, child], cols=("anon",))
+    p = _proof(m, "public.posts_a", "anon")
+    assert (p.status, p.witness) == ("leak", {}) and "public.posts" in (p.detail or ""), p
+
+
 def test_prove_a_role_that_reaches_nothing_is_not_a_column() -> None:
     s = _s([_sel("tenant_id = auth.uid()")],
            roles=[_r("anon"), _r("authenticated"), _r("y"), _r("own")])

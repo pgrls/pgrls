@@ -312,7 +312,7 @@ class _Prover:
         parents_only = bool(doors) and all(
             p.kind == "parent" and self._parent_is_own(name, p.via) for p in doors
         )
-        parent_leak = None if shared else self._parent_leak(name, reach, doors, model)
+        parent_leak = None if shared else self._parent_leak(name, reach, doors, model, states)
 
         # The role's own read first: a leak there is certain whatever a door adds.
         if direct.verdict == "open":
@@ -357,17 +357,23 @@ class _Prover:
 
     def _parent_leak(
         self, name: str, reach: RoleReach, doors: tuple[Any, ...], model: ThreatModel,
+        states: _GucStates,
     ) -> CellProof | None:
         """A parent the role queries itself — USAGE on its schema, a direct read
-        of it — that returns every row returns this child's rows too. A
-        conditional one is left to the door logic: its filter was written for
-        every partition, so the leaking row may not be this child's."""
+        of it — that returns every row returns this child's rows too: RLS off,
+        or a filter proven to admit every row. Any other leaking filter is left
+        to the door logic: it was written for every partition, so the leaking
+        row may not be this child's."""
         for door in doors:
             parent = self.tables.get(door.via or "") if door.kind == "parent" else None
             if parent is None or not self.has_usage(name, parent):
                 continue
             own, _ = reach.direct_select[parent.qualified_name]
-            if own.verdict == "open":
+            every_row = own.verdict == "open" or (
+                own.verdict == "conditional"
+                and self.prove(model, own.predicate or "", states) == ("leak", {})
+            )
+            if every_row:
                 return CellProof("leak", model, witness={},
                                  detail=f"through parent {parent.qualified_name}")
         return None
