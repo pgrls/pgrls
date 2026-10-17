@@ -3099,6 +3099,14 @@ def test_prove_a_qualified_auth_function_matches_its_stored_bare_call() -> None:
                      auth_functions={"public.my_tenant"})
     for role in ("anon", "authenticated"):
         assert _proof(m, "public.t", role).status == "proven", role
+    # The defaults (auth.uid) come along with --auth-function; a public.uid()
+    # the policy calls bare is not auth.uid.
+    s = replace(_s([_sel("tenant_id = uid()")],
+                   roles=[_api("anon"), _api("authenticated"), _r("own")]),
+                user_functions=(_fn("auth.uid"), _fn("public.uid")))
+    m = build_matrix(s, roles=("authenticated",), prove=True,
+                     auth_functions={"auth.uid", "app.my_tenant"})
+    assert _proof(m, "public.t", "authenticated").status != "proven"
     # Another schema's uid() of the same name: the bare call is ambiguous.
     s = replace(_s([_sel("tenant_id = uid()")],
                    roles=[_api("anon"), _api("authenticated"), _r("own")]),

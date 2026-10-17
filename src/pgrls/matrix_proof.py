@@ -1380,10 +1380,12 @@ class _Prover:
         values the prover cannot see into."""
         from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
 
+        # Exactly what the prover takes as an auth function: self.auth carries
+        # a bare name only where it cannot be another schema's function.
         auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
-        bare = {a.rsplit(".", 1)[-1] for a in auth}
-        def is_auth(f: str) -> bool:  # a qualified call must name it exactly
-            return f in auth if "." in f else f in bare
+
+        def is_auth(f: str) -> bool:
+            return f in auth
 
         return sorted(
             f for f in _called_functions(predicate)
