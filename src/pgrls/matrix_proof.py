@@ -30,13 +30,13 @@ the verdicts honest:
   (`pgrls.access._dependence`); no untraced door the role can open belongs to
   an owner that reaches the table, itself or through untraced doors of its
   own; the role does not own the table (it could lift ``FORCE`` or rewrite a
-  policy in one statement); the session cannot change what the filter
-  computes — it owns no user-defined function (one may sit behind a call,
-  an operator or a cast, and CREATE OR REPLACE changes it), and it cannot
-  create objects in any schema while the filter calls a user-defined
-  function (whose body resolves names through the session's search_path);
-  no user-defined function the filter reaches reads a relation by bare name
-  under a search_path that does not end in ``pg_temp`` (any session's own
+  policy in one statement); for a role that can log in — a raw SQL session —
+  the filter reads no setting the session could set for itself (directly or
+  in a function body), the session owns no user-defined function (one may
+  sit behind a call, an operator or a cast), it cannot create objects in a
+  schema while the filter calls a user-defined function, and no
+  user-defined function the filter reaches reads a relation by bare name
+  under a search_path that does not end in ``pg_temp`` (the session's own
   temp table would take its place); a filter scoped by a setting
   (``current_setting``) also isolates a session that leaves it unset, and —
   for a role that can log in — one that connects with no JWT; and every role
@@ -47,11 +47,14 @@ the verdicts honest:
   anonymous role that bypasses RLS is the worst leak there is, so anonymous
   columns are never exempt.
 
-The cross-tenant model assumes a session carries its identity
-(``auth.uid()`` is the session's user) — checked without one for a role that
-can log in, assumed for a NOLOGIN role reached through a login role that sets
-the JWT (Supabase's ``authenticated``). It also assumes the role can execute
-the functions a policy calls, as `pgrls verify` does.
+Who the session is: a NOLOGIN role (Supabase's ``anon`` and
+``authenticated``) is reached through a gateway that sets its identity and
+runs only the API's queries, so the cross-tenant model takes the identity as
+given and the session changes no schema object; whatever the gateway's own
+login role can do is that role's column. A role that can log in is a raw SQL
+session: it can set any setting, create temp tables and use any schema it can
+create in, which the gates above account for. The proof also assumes the role
+can execute the functions a policy calls, as `pgrls verify` does.
 """
 from __future__ import annotations
 
@@ -133,15 +136,29 @@ def _has_node_in(node: Any, match: Callable[[Any], bool]) -> bool:
     return found
 
 
-def _calls_current_setting(predicate: str) -> bool:
-    """Whether `predicate` reads a setting with the built-in
-    ``current_setting`` (a tenant carried in a GUC, not a JWT)."""
+def _is_current_setting(n: Any) -> bool:
     from pglast.ast import FuncCall  # noqa: PLC0415
 
     from pgrls.verify import _bare_builtin_name  # noqa: PLC0415
 
-    return _has_node(predicate, lambda n: isinstance(n, FuncCall)
-                     and _bare_builtin_name(n) == "current_setting")
+    return isinstance(n, FuncCall) and _bare_builtin_name(n) == "current_setting"
+
+
+def _calls_current_setting(predicate: str) -> bool:
+    """Whether `predicate` reads a setting with the built-in
+    ``current_setting`` (a tenant carried in a GUC, not a JWT)."""
+    return _has_node(predicate, _is_current_setting)
+
+
+def _has_node_in_sql(body: str, match: Callable[[Any], bool]) -> bool:
+    """`_has_node` for a function body — `True` when it does not parse."""
+    from pglast import parse_sql  # noqa: PLC0415
+
+    try:
+        stmts = parse_sql(body)
+    except Exception:  # noqa: BLE001
+        return True
+    return _has_node_in(stmts, match)
 
 
 def _called_functions(sql: str, *, statement: bool = False) -> set[str]:
@@ -175,17 +192,16 @@ def _pg_temp_last(search_path: str) -> bool:
 
 
 def _unqualified_relations(body: str) -> set[str] | None:
-    """The relation names a SQL body reads without a schema (CTE names
-    excluded), or None when it does not parse."""
+    """The relation names a SQL body reads without a schema — a CTE's name
+    too, since its scope is not modelled — or None when it does not parse."""
     from pglast import parse_sql  # noqa: PLC0415
-    from pglast.ast import CommonTableExpr, Node, RangeVar  # noqa: PLC0415
+    from pglast.ast import Node, RangeVar  # noqa: PLC0415
 
     try:
         stmts = parse_sql(body)
     except Exception:  # noqa: BLE001 — any parse failure means "unreadable"
         return None
     names: set[str] = set()
-    ctes: set[str] = set()
 
     def walk(n: Any) -> None:
         if n is None:
@@ -196,8 +212,6 @@ def _unqualified_relations(body: str) -> set[str] | None:
             return
         if isinstance(n, RangeVar) and not n.schemaname:
             names.add(n.relname)
-        if isinstance(n, CommonTableExpr):
-            ctes.add(n.ctename)
         if isinstance(n, Node):
             for fld in n:
                 walk(getattr(n, fld, None))
@@ -206,7 +220,7 @@ def _unqualified_relations(body: str) -> set[str] | None:
         walk(stmts)
     except RecursionError:
         return None
-    return names - ctes
+    return names
 
 
 def _has_subselect(predicate: str) -> bool:
@@ -252,7 +266,7 @@ class _Prover:
         for fn in schema.user_functions or ():
             for key in (fn.qualified_name, fn.qualified_name.rsplit(".", 1)[-1]):
                 self.functions.setdefault(key, []).append(fn)
-        # schema -> who can create objects in it (`None` captured: nobody)
+        # schema -> who can create objects in it (none known when not captured)
         self.creators: dict[str, set[str]] = {}
         for sch, grantee in schema.schema_create or ():
             self.creators.setdefault(sch, set()).add(grantee)
@@ -370,6 +384,10 @@ class _Prover:
                     f"the session can SET ROLE {target}, whose read is "
                     f"{other.status.upper()}"
                 ))
+        if not login:
+            # Reached through a gateway that runs only the API's queries: it
+            # changes no schema object (a login member's own column does).
+            return base
         return self._redefinable(name, targets, table, model) or base
 
     def _redefinable(
@@ -406,8 +424,10 @@ class _Prover:
             if called:
                 return CellProof("unknown", model, detail=(
                     f"the session can create objects in schema {creates[0]}, and "
-                    f"the filter calls {called[0]}(), whose body resolves names "
+                    f"the filter calls {called[0]}(), whose body can resolve names "
                     "through the session's search_path"
+                    + ("; REVOKE CREATE ON SCHEMA public FROM PUBLIC lifts this"
+                       if creates[0] == "public" else "")
                 ))
         return None
 
@@ -421,30 +441,42 @@ class _Prover:
             out |= _inherit_closure(self.schema, role) or {role}
         return out
 
-    def _shadowable(self, fname: str, seen: frozenset[str] = frozenset()) -> str | None:
-        """Why a call to `fname` can be made to read a session's own temp
-        table instead of the one meant, or None. A body resolves an
-        unqualified relation name through the search_path, and pg_temp comes
-        first unless the path names it — so only a pinned search_path ending
-        in pg_temp, a pre-parsed (BEGIN ATOMIC) body, or a body naming every
-        relation with its schema is safe. A body that cannot be read is
-        assumed unsafe."""
+    def _shadowable(
+        self, fname: str, path: str | None = None, seen: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """Why a call to `fname` can be made to read a session's own temp table
+        instead of the one meant, or None. `path` is the search_path the call
+        runs under — None for the session's own, which puts pg_temp first.
+
+        A body resolves a bare relation name through its pinned search_path,
+        or else its caller's; pg_temp comes first unless the path names it. So
+        a body's own references are safe only when they are pre-parsed (BEGIN
+        ATOMIC) or the path ends in pg_temp — and every function it calls is
+        judged the same way, under the path it inherits. Any bare relation name
+        counts, a CTE's included (scoping is not modelled). A body that cannot
+        be read is assumed unsafe. Types resolve through pg_temp too, but only
+        a superuser can create the base type that would compute differently."""
         for fn in self.functions.get(fname, ()):
-            if fn.qualified_name in seen:
+            key = f"{fn.qualified_name}@{path}"
+            if key in seen or fn.language in ("c", "internal"):
                 continue
-            if fn.language in ("c", "internal") or fn.atomic:
-                continue
-            if fn.search_path is not None and _pg_temp_last(fn.search_path):
-                continue
-            if fn.language != "sql" or fn.body is None:
-                return f"{fn.qualified_name}() has a {fn.language} body pgrls cannot read"
-            refs = _unqualified_relations(fn.body)
-            if refs is None:
-                return f"the body of {fn.qualified_name}() does not parse"
-            if refs:
-                return f"{fn.qualified_name}() reads {sorted(refs)[0]} without a schema"
+            effective = fn.search_path if fn.search_path is not None else path
+            safe_path = effective is not None and _pg_temp_last(effective)
+            if fn.body is None or (fn.language != "sql" and not fn.atomic):
+                if not safe_path:
+                    return f"{fn.qualified_name}() has a {fn.language} body pgrls cannot read"
+                # A body pgrls cannot read may still call a function whose
+                # own pinned path is unsafe; it cannot tell which.
+                return (f"{fn.qualified_name}() has a {fn.language} body pgrls cannot "
+                        "follow into the functions it calls")
+            if not fn.atomic and not safe_path:
+                refs = _unqualified_relations(fn.body)
+                if refs is None:
+                    return f"the body of {fn.qualified_name}() does not parse"
+                if refs:
+                    return f"{fn.qualified_name}() reads {sorted(refs)[0]} without a schema"
             for inner in sorted(_called_functions(fn.body, statement=True)):
-                why = self._shadowable(inner, seen | {fn.qualified_name})
+                why = self._shadowable(inner, effective, seen | {key})
                 if why:
                     return why
         return None
@@ -612,14 +644,22 @@ class _Prover:
                 f"the role owns the table ({table.owner}): one ALTER TABLE … NO "
                 "FORCE ROW LEVEL SECURITY or ALTER POLICY lets it read every row"
             ))
-        if predicate is not None:
+        if login and predicate is not None:
+            # A raw SQL session: it can SET any setting, create temp tables,
+            # and put any schema it can create in on its search_path.
+            forged = self._settable_identity(predicate)
+            if forged:
+                return CellProof("unknown", model, detail=(
+                    f"a session that logs in as this role runs its own SQL and can "
+                    f"set what {forged} reads — another tenant's identity, or none"
+                ))
             for fname in sorted(_called_functions(predicate)):
                 why = self._shadowable(fname)
                 if why:
                     return CellProof("unknown", model, detail=(
-                        f"the filter calls {fname}(): {why}, and its search_path "
-                        "does not end in pg_temp — a session's own temp table of "
-                        "that name takes its place"
+                        f"the filter calls {fname}(): {why} under a search_path "
+                        "that does not end in pg_temp — a session's own temp table "
+                        "could take its place"
                     ))
         for door in self.reach_of(name).untraced:
             if self._owner_reaches(door.owner, table):
@@ -627,19 +667,49 @@ class _Prover:
                     f"{door.door} is an untraced door this role can open, and "
                     f"its owner {door.owner or '(unknown)'} reaches the table"
                 ))
-        setting = predicate is not None and _calls_current_setting(predicate)
         if (
-            model == "cross-tenant" and predicate is not None and (login or setting)
+            model == "cross-tenant" and predicate is not None
+            and _calls_current_setting(predicate)
             and self.prove("anon", predicate, states)[0] == "leak"
         ):
-            ways = [w for w, on in (("logs in with no JWT", login),
-                                    ("leaves the setting the filter reads unset", setting))
-                    if on]
             return CellProof("unknown", model, detail=(
                 "isolated for a session that carries its identity; one that "
-                + " or ".join(ways) + " reads rows"
+                "leaves the setting the filter reads unset reads rows"
             ))
         return proven
+
+    def _settable_identity(self, predicate: str) -> str | None:
+        """What in `predicate` reads state a session can set for itself — a
+        setting, directly or in the body of a function it calls — or None. A
+        default auth function whose body was not captured is taken to read
+        the request's JWT claims from settings; so is any body pgrls cannot
+        read."""
+        if _calls_current_setting(predicate):
+            return "current_setting()"
+        for fname in sorted(_called_functions(predicate)):
+            if self._reads_settings(fname):
+                return f"{fname}()"
+        return None
+
+    def _reads_settings(self, fname: str, seen: frozenset[str] = frozenset()) -> bool:
+        from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
+
+        fns = self.functions.get(fname)
+        if not fns:
+            auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
+            bare = {a.rsplit(".", 1)[-1] for a in auth}
+            return fname in auth or fname.rsplit(".", 1)[-1] in bare
+        for fn in fns:
+            if fn.qualified_name in seen or fn.language in ("c", "internal"):
+                continue
+            if fn.body is None or (fn.language != "sql" and not fn.atomic):
+                return True
+            if _has_node_in_sql(fn.body, _is_current_setting):
+                return True
+            if any(self._reads_settings(inner, seen | {fn.qualified_name})
+                   for inner in _called_functions(fn.body, statement=True)):
+                return True
+        return False
 
     def _owns(self, name: str, table: Table) -> bool:
         """Whether `name` is the table's owner — and so can change its RLS. A

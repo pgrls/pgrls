@@ -22,15 +22,17 @@ breaking changes — they will be called out in this file.
   claimed only when nothing pgrls cannot see could change the answer — no door
   evaluates a who-runs-it filter, no untraced door the role can open has an
   owner that reaches the table (followed through that owner's own untraced
-  doors), the role does not own the table, the session can neither redefine
-  a function (it owns none, and holds CREATE on no schema while the filter
-  calls one) nor shadow a table a helper reads by bare name through its
-  own temp table, a `current_setting(…)` filter
-  also isolates a session that leaves the setting unset (and, for a login
-  role, one with no JWT), and every role the session can `SET ROLE` to is
-  proven too — and `LEAK` only when the role's own session reads the row (a
-  direct read without `USAGE` on the schema is `POSSIBLE`: a view still reads
-  it). Each anonymous column is proven against its own login settings. A role
+  doors), the role does not own the table, a `current_setting(…)` filter
+  also isolates a session that leaves the setting unset, every role the
+  session can `SET ROLE` to is proven too, and — for a role that can log in,
+  a raw SQL session — the filter reads no setting the session can set, and
+  the session can neither redefine what the filter calls (it owns no
+  function and holds CREATE on no schema while the filter calls one) nor
+  shadow a table a helper reads by bare name with its own temp table. (A
+  NOLOGIN role is taken to be reached through a gateway that sets its
+  identity.) `LEAK` is claimed only when the role's own session reads the
+  row; a direct read without `USAGE` on the schema is `POSSIBLE`, since a
+  view still reads it. Each anonymous column is proven against its own login settings. A role
   whose verdicts differ from what `PUBLIC` gets under the same question, or
   are more alarming than the `PUBLIC` column shows, is a column. The HTML page
   leads with the proof grid, the leaks and the undecided cells with their

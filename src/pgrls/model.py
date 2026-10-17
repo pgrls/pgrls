@@ -685,7 +685,9 @@ class UserFunction:
     ``search_path`` is the function's pinned ``SET search_path`` (None when
     unpinned — it then runs with the caller's). ``atomic`` is a SQL-standard
     ``BEGIN ATOMIC`` / ``RETURN`` body, parsed once at creation, so it
-    resolves no names at run time. ``body`` is ``prosrc``.
+    resolves no names at run time, though the functions it calls still do.
+    ``body`` is ``prosrc`` — or, for an atomic body (whose ``prosrc`` is
+    empty), the whole ``CREATE FUNCTION`` from ``pg_get_functiondef``.
     """
 
     qualified_name: str

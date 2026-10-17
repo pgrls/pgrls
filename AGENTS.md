@@ -322,13 +322,12 @@ anonymous columns: can a session with no JWT read any row; other columns: can
 a session carrying its tenant's identity read another tenant's row — and marks
 it `PROVEN`, `LEAK` (with the leaking row), `POSSIBLE` (only through a door,
 which may filter it, or a read without schema USAGE), `UNKNOWN` (with the
-reason — including an untraced door, the table's owner, a session that can
-redefine or shadow what the filter calls (owns a function, holds CREATE on a
-schema, or a helper reads a table by bare name without `pg_temp` last on its
-search_path), a `SET ROLE` target
-that is not proven, or a filter that admits an unset setting or, for a login
-role, a session with no JWT) or `EXEMPT`
-(superuser / BYPASSRLS). SELECT only, and the exit code stays 0 — `pgrls
+reason — including an untraced door, the table's owner, a `SET ROLE` target
+that is not proven, a filter that admits an unset setting, and for a role
+that can log in — a raw SQL session — a filter reading a setting it can set,
+or a session that can redefine or shadow what the filter calls) or `EXEMPT`
+(superuser / BYPASSRLS). A NOLOGIN role (`anon`, `authenticated`) is taken to
+be reached through a gateway that sets its identity. SELECT only, and the exit code stays 0 — `pgrls
 verify` is the CI gate. Suggest it when a user wants to know not just who
 reaches a table but whether that reach is safe.
 Default columns: PUBLIC, anon / authenticated when they exist, and every

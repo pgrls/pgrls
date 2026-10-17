@@ -3238,7 +3238,7 @@ def test_prove_an_untraced_door_is_followed_through_its_owners_doors() -> None:
     g = SecdefFunction(qualified_name="public.g", body="BEGIN RETURN; END", language="plpgsql",
                        owner="svc", execute_roles=("mid",))
     t = _sel("tenant_id = auth.uid()", grants=("anon", "svc"))
-    roles = [_r("anon"), _r("mid"), _r("svc"), _r("own")]
+    roles = [_api("anon"), _api("mid"), _r("svc"), _r("own")]
     p = _proof(build_matrix(_s([t], fns=[f, g], roles=roles), roles=("anon",), prove=True),
                "public.t", "anon")
     assert p.status == "unknown" and "public.f" in (p.detail or ""), p
@@ -3383,61 +3383,16 @@ def test_prove_the_table_owner_is_never_proven() -> None:
     assert _proof(m, "public.t", "other").status == "proven"
 
 
-def test_prove_a_login_role_without_a_jwt_is_not_proven() -> None:
-    """The cross-tenant question assumes the session carries its identity. A
-    role that logs in itself can connect without one, so `auth.uid() IS NULL
-    OR …` is not PROVEN for it; a NOLOGIN API role reached through a login
-    role that carries the JWT is."""
-    t = _sel("auth.uid() IS NULL OR tenant_id = auth.uid()", grants=("app_user", "authenticated"))
+def test_prove_a_login_role_can_set_the_identity_it_is_judged_by() -> None:
+    """A role that logs in runs its own SQL: it can SET request.jwt.claim.sub
+    (or any setting) to another tenant's value, or leave it unset. A NOLOGIN
+    API role reached through a gateway that sets the JWT cannot."""
+    t = _sel("tenant_id = auth.uid()", grants=("app_user", "authenticated"))
     m = build_matrix(_s([t], roles=[_r("app_user"), _api("authenticated"), _r("own")]),
                      roles=("app_user", "authenticated"), prove=True)
     p = _proof(m, "public.t", "app_user")
-    assert p.status == "unknown" and "no JWT" in (p.detail or ""), p
+    assert p.status == "unknown" and "logs in" in (p.detail or ""), p
     assert _proof(m, "public.t", "authenticated").status == "proven"
-    # A plainly scoped filter stays PROVEN for the login role.
-    t = _sel("tenant_id = auth.uid()", grants=("app_user",))
-    m = build_matrix(_s([t], roles=[_r("app_user"), _r("own")]), roles=("app_user",), prove=True)
-    assert _proof(m, "public.t", "app_user").status == "proven"
-
-
-def test_prove_the_owner_of_a_function_the_filter_calls_is_not_proven() -> None:
-    """Measured: the owner of auth.uid() redefined it and read another
-    tenant's row."""
-    t = _sel("tenant_id = auth.uid()", grants=("authadm", "other"))
-    s = replace(_s([t], roles=[_api("authadm"), _api("other"), _r("own")]),
-                function_owners=(("auth.uid", "authadm"),))
-    m = build_matrix(s, roles=("authadm", "other"), prove=True)
-    p = _proof(m, "public.t", "authadm")
-    assert p.status == "unknown" and "session owns the user-defined function auth.uid()" in (
-        p.detail or ""), p
-    assert _proof(m, "public.t", "other").status == "proven"
-
-
-def test_prove_a_member_of_a_function_owner_is_not_proven() -> None:
-    """Measured: ops, a member of fnadm (owner of auth.uid(), no grant on the
-    table itself), redefined the function and read another tenant's row."""
-    t = _sel("tenant_id = auth.uid()", grants=("ops",))
-    s = replace(_s([t], roles=[_r("ops"), _api("fnadm"), _r("own")],
-                   memberships=[RoleMembership(member="ops", role="fnadm", inherit=True)]),
-                function_owners=(("auth.uid", "fnadm"),))
-    p = _proof(build_matrix(s, roles=("ops",), prove=True), "public.t", "ops")
-    assert p.status == "unknown" and "auth.uid()" in (p.detail or ""), p
-
-
-def test_prove_owning_a_function_called_inside_the_filters_function_is_not_proven() -> None:
-    """The filter calls public.cur(), owned by someone else; its body calls
-    auth.uid(), which the role owns. Bodies are not traced, so owning any
-    user-defined function rules out PROVEN when the filter calls one."""
-    t = _sel("tenant_id = cur()", grants=("authadm",))
-    s = replace(_s([t], roles=[_api("authadm"), _r("own")]),
-                function_owners=(("auth.uid", "authadm"), ("public.cur", "own")))
-    m = build_matrix(s, roles=("authadm",), prove=True, auth_functions={"cur"})
-    p = _proof(m, "public.t", "authadm")
-    assert p.status == "unknown" and "auth.uid()" in (p.detail or ""), p
-    # Owning no function at all: proven.
-    s = replace(s, function_owners=(("public.cur", "own"),))
-    m = build_matrix(s, roles=("authadm",), prove=True, auth_functions={"cur"})
-    assert _proof(m, "public.t", "authadm").status == "proven"
 
 
 def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
@@ -3448,60 +3403,117 @@ def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
                         search_path=search_path, atomic=atomic, body=body)
 
 
-def test_prove_owning_any_function_rules_out_a_filter_with_no_call() -> None:
+# A helper keyed on current_user, which a login session cannot forge — so the
+# schema-changing gates are what stands between it and PROVEN.
+_SAFE_BODY = "SELECT tenant FROM app.users WHERE name = current_user"
+_BARE_BODY = "SELECT tenant FROM users WHERE name = current_user"
+
+
+def _helper_matrix(*fns, creators=(), memberships=()):
+    roles = ("app_user", "other")
+    t = _sel("tenant_id = cur()", grants=roles)
+    s = replace(_s([t], roles=[*(_r(r) for r in roles), _api("fnadm"), _r("own")],
+                   memberships=memberships),
+                user_functions=fns, schema_create=creators)
+    return build_matrix(s, roles=roles, prove=True, auth_functions={"cur"})
+
+
+def test_prove_a_login_role_with_an_unforgeable_helper_is_proven() -> None:
+    m = _helper_matrix(_fn("app.cur", body=_SAFE_BODY, search_path="app, pg_temp"))
+    assert _proof(m, "public.t", "app_user").status == "proven"
+
+
+def test_prove_a_helper_that_reads_a_setting_is_forgeable() -> None:
+    m = _helper_matrix(_fn("app.cur", body="SELECT current_setting('app.tenant', true)",
+                           search_path="app, pg_temp"))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "cur()" in (p.detail or ""), p
+
+
+def test_prove_the_owner_of_a_function_the_filter_calls_is_not_proven() -> None:
+    """Measured: the owner of the helper redefined it and read another
+    tenant's row."""
+    m = _helper_matrix(_fn("app.cur", owner="app_user", body=_SAFE_BODY,
+                           search_path="app, pg_temp"))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "owns the user-defined function app.cur()" in (
+        p.detail or ""), p
+    assert _proof(m, "public.t", "other").status == "proven"
+
+
+def test_prove_a_member_of_a_function_owner_is_not_proven() -> None:
+    """Measured: a member of the helper's owner (no grant on the table
+    itself) redefined it and read another tenant's row."""
+    m = _helper_matrix(_fn("app.cur", owner="fnadm", body=_SAFE_BODY, search_path="app, pg_temp"),
+                       memberships=[RoleMembership(member="app_user", role="fnadm",
+                                                   inherit=True)])
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "app.cur()" in (p.detail or ""), p
+
+
+def test_prove_owning_any_function_rules_out_the_filter() -> None:
     """Measured: an operator backed by a function the session owns — the
-    filter names no function at all."""
-    t = _sel("tenant_id = current_setting('app.tenant', true)", grants=("opuser",))
-    s = replace(_s([t], roles=[_api("opuser"), _r("own")]),
-                user_functions=(_fn("public.txt_eq", owner="opuser"),))
-    p = _proof(build_matrix(s, roles=("opuser",), prove=True), "public.t", "opuser")
+    owned function need not be one the filter names."""
+    m = _helper_matrix(_fn("app.cur", body=_SAFE_BODY, search_path="app, pg_temp"),
+                       _fn("public.txt_eq", owner="app_user"))
+    p = _proof(m, "public.t", "app_user")
     assert p.status == "unknown" and "operator" in (p.detail or ""), p
 
 
 def test_prove_create_on_a_schema_rules_out_a_filter_calling_a_user_function() -> None:
     """Measured: with CREATE on a schema the session put a shadowing function
-    on its search_path, which the helper's unpinned body resolved."""
-    t = _sel("tenant_id = cur()", grants=("sp_user",))
-    fns = (_fn("app.cur", body="SELECT myuid()"),)
-    s = replace(_s([t], roles=[_api("sp_user"), _r("own")]), user_functions=fns,
-                schema_create=(("scratch", "sp_user"),))
-    m = build_matrix(s, roles=("sp_user",), prove=True, auth_functions={"cur"})
-    p = _proof(m, "public.t", "sp_user")
-    assert p.status == "unknown" and "schema scratch" in (p.detail or ""), p
-    m = build_matrix(replace(s, schema_create=(("scratch", "own"),)), roles=("sp_user",),
-                     prove=True, auth_functions={"cur"})
-    assert _proof(m, "public.t", "sp_user").status == "proven"
+    on its search_path, which the helper resolved."""
+    fns = (_fn("app.cur", body=_SAFE_BODY),)
+    m = _helper_matrix(*fns, creators=(("public", "PUBLIC"),))
+    p = _proof(m, "public.t", "app_user")
+    assert p.status == "unknown" and "schema public" in (p.detail or ""), p
+    assert "REVOKE CREATE ON SCHEMA public FROM PUBLIC" in (p.detail or "")
+    m = _helper_matrix(*fns, creators=(("public", "own"),))
+    assert _proof(m, "public.t", "app_user").status == "proven"
+
+
+def test_prove_schema_changing_gates_skip_a_gateway_role() -> None:
+    """A NOLOGIN role is reached through a gateway that runs only the API's
+    queries; a login member's own column carries what the session can do."""
+    t = _sel("tenant_id = cur()", grants=("authenticated",))
+    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]),
+                user_functions=(_fn("app.cur", owner="authenticated", body=_BARE_BODY),),
+                schema_create=(("public", "PUBLIC"),))
+    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
+    assert _proof(m, "public.t", "authenticated").status == "proven"
 
 
 @pytest.mark.parametrize(("fn", "shadowable"), [
-    (_fn("app.cur", body="SELECT tenant FROM cfg"), True),
-    (_fn("app.cur", body="SELECT tenant FROM app.cfg"), False),
-    (_fn("app.cur", body="SELECT tenant FROM cfg", search_path="app, pg_temp"), False),
-    (_fn("app.cur", body="SELECT tenant FROM cfg", search_path="pg_temp, app"), True),
-    (_fn("app.cur", body="SELECT tenant FROM cfg", atomic=True), False),
+    (_fn("app.cur", body=_BARE_BODY), True),
+    (_fn("app.cur", body=_SAFE_BODY), False),
+    (_fn("app.cur", body=_BARE_BODY, search_path="app, pg_temp"), False),
+    (_fn("app.cur", body=_BARE_BODY, search_path="pg_temp, app"), True),
+    (_fn("app.cur", body=_BARE_BODY, search_path=""), True),
+    (_fn("app.cur", body="SELECT 1", atomic=True), False),
     (_fn("app.cur", body="BEGIN RETURN 1; END", language="plpgsql"), True),
-    (_fn("app.cur", body="WITH cfg AS (SELECT 1 AS tenant) SELECT tenant FROM cfg"), False),
+    (_fn("app.cur", body="tenant_lookup", language="c"), False),
+    (_fn("app.cur", body="WITH users AS (SELECT 1 AS tenant) SELECT tenant FROM users"), True),
 ])
 def test_prove_a_helper_that_reads_a_table_by_bare_name_is_not_proven(fn, shadowable) -> None:
-    """Any session can create a temp table; pg_temp is searched first for
-    relations unless the search_path puts it last, so a helper naming a table
-    without its schema can be made to read the session's own."""
-    t = _sel("tenant_id = cur()", grants=("authenticated",))
-    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]), user_functions=(fn,))
-    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
-    p = _proof(m, "public.t", "authenticated")
+    """A login session can create a temp table; pg_temp is searched first
+    for relations unless the search_path ends in it, so a helper naming a
+    table without its schema can be made to read the session's own. A CTE
+    name counts too (its scope is not modelled)."""
+    p = _proof(_helper_matrix(fn), "public.t", "app_user")
     assert (p.status == "unknown") is shadowable, p
-    if shadowable:
-        assert "pg_temp" in (p.detail or "")
 
 
-def test_prove_a_shadowable_helper_called_inside_another_is_found() -> None:
-    fns = (_fn("app.cur", body="SELECT app.inner_uid()"),
-           _fn("app.inner_uid", body="SELECT tenant FROM cfg"))
-    t = _sel("tenant_id = cur()", grants=("authenticated",))
-    s = replace(_s([t], roles=[_api("authenticated"), _r("own")]), user_functions=fns)
-    m = build_matrix(s, roles=("authenticated",), prove=True, auth_functions={"cur"})
-    p = _proof(m, "public.t", "authenticated")
+@pytest.mark.parametrize("outer", [
+    _fn("app.cur", body="SELECT app.inner_uid()"),
+    _fn("app.cur", body="SELECT app.inner_uid()", search_path="app, pg_temp"),
+    _fn("app.cur", body="CREATE FUNCTION app.cur() RETURNS text BEGIN ATOMIC "
+        "SELECT app.inner_uid(); END", atomic=True),
+])
+def test_prove_a_shadowable_helper_called_inside_another_is_found(outer) -> None:
+    """A safe outer body still calls an inner one that resolves its own
+    names — by its pinned path, or the one it inherits (measured)."""
+    inner = _fn("app.inner_uid", body=_BARE_BODY, search_path="app")
+    p = _proof(_helper_matrix(outer, inner), "public.t", "app_user")
     assert p.status == "unknown" and "app.inner_uid()" in (p.detail or ""), p
 
 
@@ -3570,7 +3582,7 @@ def test_matrix_cli_rejects_bad_anon_roles_before_connecting(tmp_path) -> None:
 
 def test_prove_a_role_that_can_set_role_to_a_bypassing_one_is_unknown() -> None:
     t = _sel("tenant_id = auth.uid()", grants=("anon", "authenticated", "svc"))
-    roles = [_r("anon"), _r("authenticated"), _r("svc", brls=True), _r("own")]
+    roles = [_api("anon"), _api("authenticated"), _r("svc", brls=True), _r("own")]
     # NOINHERIT: no privileges carried over, but SET ROLE svc still works.
     edge = RoleMembership(member="authenticated", role="svc", inherit=False)
     m = build_matrix(_s([t], roles=roles, memberships=[edge]),
@@ -3600,9 +3612,10 @@ def test_prove_a_role_only_a_set_role_away_from_bypassing_is_shown() -> None:
 
 
 def test_prove_each_anonymous_column_gets_its_own_login_settings() -> None:
-    """A role-level setting binds to that login role only."""
+    """A role-level setting binds to that login role only (guest cannot log
+    in, so its own settings never apply)."""
     t = _sel("current_setting('app.open', true) = 'on'", grants=("anon", "guest", "PUBLIC"))
-    s = replace(_s([t], roles=[_r("anon"), _r("guest"), _r("own")]),
+    s = replace(_s([t], roles=[_r("anon"), _api("guest"), _r("own")]),
                 role_set_gucs=(("anon", "app.open", "on"),))
     m = build_matrix(s, roles=("anon", "guest", "PUBLIC"), prove=True,
                      anon_roles={"anon", "guest"})
@@ -3849,7 +3862,8 @@ def test_live_a_temp_table_shadows_a_helper_unless_pg_temp_is_last(
     try:
         with pg_conn.cursor() as cur:
             cur.execute("""
-                CREATE ROLE pgrls_pm_auth NOLOGIN;
+                -- LOGIN: a raw SQL session, which can create temp tables.
+                CREATE ROLE pgrls_pm_auth LOGIN;
                 CREATE SCHEMA pgrls_pm_app;
                 GRANT USAGE ON SCHEMA pgrls_pm_app TO pgrls_pm_auth;
                 CREATE TABLE pgrls_pm_app.cfg (tenant text);

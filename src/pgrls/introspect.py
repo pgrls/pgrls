@@ -1251,7 +1251,8 @@ SELECT n.nspname || '.' || p.proname AS name,
        (SELECT substr(c, 13) FROM unnest(p.proconfig) AS c
         WHERE starts_with(c, 'search_path=') LIMIT 1) AS search_path,
        p.prosqlbody IS NOT NULL AS atomic,
-       p.prosrc AS body
+       CASE WHEN p.prosqlbody IS NOT NULL THEN pg_catalog.pg_get_functiondef(p.oid)
+            ELSE p.prosrc END AS body
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_language l ON l.oid = p.prolang
