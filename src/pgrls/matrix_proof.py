@@ -716,6 +716,14 @@ class _Prover:
                     "returns — if it is your auth helper, name it with "
                     "--auth-function"
                 ))
+            other = (self._other_session_value(direct.predicate or "")
+                     if model == "cross-tenant" and witness is None else None)
+            if verdict == "leak" and other:
+                return parent_leak or CellProof("unknown", model, detail=(
+                    f"the filter may admit another tenant's rows depending on {other}, "
+                    "a session value besides the tenant identity that the prover "
+                    "leaves free — a real session may never hold it"
+                ))
             if verdict == "leak":
                 if usage:
                     return CellProof("leak", model, witness=witness)
@@ -755,9 +763,11 @@ class _Prover:
                 "cannot decide"
             ))
         if _dependence(predicate)[1]:
+            opaque = self._opaque_helpers(predicate)
+            what = f"{opaque[0]}()" if opaque else "a function"
             return CellProof("unknown", model, detail=(
-                "the filter calls a function the prover cannot see into — if it is "
-                "your auth helper, name it with --auth-function"
+                f"the filter calls {what}, which the prover cannot see into — if it "
+                "is your auth helper, name it with --auth-function"
             ))
         return CellProof("unknown", model, detail=_UNVERIFIED_PREDICATE_REASON[model])
 
@@ -958,6 +968,19 @@ class _Prover:
                         tables[base.qualified_name] = base
             if not found:
                 return rel
+        # A query on a parent returns its inheritance children's and
+        # partitions' rows too (measured: an insert into a writable child
+        # changed what the parent read). ONLY is not distinguished.
+        todo = list(tables)
+        while todo:
+            parent = todo.pop()
+            ps, _, pn = parent.partition(".")
+            for t in self.schema.tables:
+                if t.qualified_name in tables:
+                    continue
+                if t.partition_of == (ps, pn) or (ps, pn) in t.inherits:
+                    tables[t.qualified_name] = t
+                    todo.append(t.qualified_name)
         return list(tables.values()), list(views.values())
 
     def _client_controlled(self, predicate: str) -> str | None:
@@ -1006,6 +1029,19 @@ class _Prover:
                 if why:
                     return why
         return None
+
+    def _other_session_value(self, predicate: str) -> str | None:
+        """A session value `predicate` reads besides one tenant identity — a
+        setting, or a second auth function — or None."""
+        from pgrls.verify import DEFAULT_AUTH_FUNCTIONS  # noqa: PLC0415
+
+        if _calls_current_setting(predicate):
+            return "current_setting()"
+        auth = self.auth if self.auth is not None else set(DEFAULT_AUTH_FUNCTIONS)
+        bare = {a.rsplit(".", 1)[-1] for a in auth}
+        names = sorted(f for f in _called_functions(predicate)
+                       if (f in auth if "." in f else f in bare))
+        return f"{names[1]}()" if len(names) > 1 else None
 
     def _opaque_helpers(self, predicate: str) -> list[str]:
         """The functions `predicate` calls that are user-defined (captured, or

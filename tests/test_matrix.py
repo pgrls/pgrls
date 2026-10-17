@@ -3841,6 +3841,43 @@ def test_prove_current_schema_is_chosen_by_the_session(role) -> None:
     assert _proof(m, "public.t", "appf").status == "unknown"
 
 
+@pytest.mark.parametrize("child_kind", ["inherits", "partition"])
+@pytest.mark.parametrize("role", [_r("appf"), _api("appf")])
+def test_prove_a_writable_child_of_the_identity_table_is_found(child_kind, role) -> None:
+    """Measured (inheritance, through an API write too): inserting into a
+    child changed what the identity function read from the parent."""
+    parent = _t("role_tenants", rls=False, grants=(_grant("appf", ("SELECT",)),))
+    child = _t("role_tenants_extra", rls=False, grants=(_grant("appf", ("INSERT",)),),
+               **({"inherits": (("public", "role_tenants"),)} if child_kind == "inherits"
+                  else {"partition_of": ("public", "role_tenants")}))
+    fns = (_fn("app.cur", body="SELECT max(tenant_id) FROM public.role_tenants",
+               search_path="pg_catalog, pg_temp"),)
+    t = _sel("tenant_id = cur()", grants=("appf",))
+    s = replace(_s([t, parent, child], roles=[role, _r("own")]), user_functions=fns)
+    m = build_matrix(s, roles=("appf",), prove=True, auth_functions={"cur"},
+                     grid=frozenset({"public.t"}))
+    p = _proof(m, "public.t", "appf")
+    assert p.status == "unknown" and "role_tenants_extra" in (p.detail or ""), p
+
+
+@pytest.mark.parametrize("extra", [
+    "(published AND current_setting('app.preview', true) = 'on')",
+    "auth.role() = 'anon'",
+])
+def test_prove_a_cross_tenant_leak_on_another_session_value_is_unknown(extra: str) -> None:
+    """The cross-tenant prover leaves a setting or a second claim free; a
+    real authenticated session may never hold the value it needs."""
+    m = _prove([_sel(f"(tenant_id = auth.uid()) OR {extra}")], cols=("authenticated",))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "besides the tenant identity" in (p.detail or ""), p
+
+
+def test_prove_a_cross_tenant_leak_on_a_builtin_stays_a_leak() -> None:
+    m = _prove([_sel("(tenant_id = auth.uid()) OR (created > now())")],
+               cols=("authenticated",))
+    assert _proof(m, "public.t", "authenticated").status == "leak"
+
+
 def test_prove_a_column_never_reads_safer_than_the_role_is() -> None:
     """PUBLIC shows PROVEN (anonymous question); a login role's UNKNOWN
     under its own question must not hide behind that."""
