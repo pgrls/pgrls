@@ -337,9 +337,9 @@ documented in the README: each column is a session running as that role
 shadowing are not modelled); schema USAGE (checked only for `--prove`'s own
 reads), a view's own WHERE and what a function returns are not traced
 (over-reports); an ordinary trigger fired by a door's write, a view's
-INSTEAD OF trigger, event triggers, casts or
-built-in-looking operators backed by user functions (a user operator reusing
-a `pg_catalog` symbol is not detected), a SECURITY DEFINER function called in
+INSTEAD OF trigger, event triggers, casts or built-in-looking operators
+backed by user functions (a user operator reusing a `pg_catalog` symbol is
+not detected), a SECURITY DEFINER function called in
 a door owner's context via a DEFAULT/CHECK/policy/view-body that the role
 cannot EXECUTE itself, an `ALTER TABLE ONLY … DISABLE TRIGGER`'d partition
 clone, and access outside SQL privileges (REPLICATION, the server-file roles,
