@@ -303,12 +303,16 @@ def _names_called(stmts: Any) -> set[str]:
 
 
 def _has_subselect(predicate: str) -> bool:
-    """Whether `predicate` has a sub-select that reads a relation — a FROM-less
-    ``( SELECT auth.uid() AS uid)`` (Supabase's InitPlan wrapper) does not."""
-    from pglast.ast import SubLink  # noqa: PLC0415
+    """Whether `predicate` has a sub-select that reads a relation anywhere in
+    it (a UNION's halves included) — a FROM-less ``( SELECT auth.uid() AS
+    uid)`` (Supabase's InitPlan wrapper) does not."""
+    from pglast.ast import RangeVar, SubLink  # noqa: PLC0415
 
-    return _has_node(predicate, lambda n: isinstance(n, SubLink)
-                     and bool(getattr(n.subselect, "fromClause", None)))
+    def reads_relation(n: Any) -> bool:
+        return isinstance(n, SubLink) and _has_node_in(
+            n.subselect, lambda m: isinstance(m, RangeVar))
+
+    return _has_node(predicate, reads_relation)
 
 
 class _Prover:

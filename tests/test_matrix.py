@@ -3075,6 +3075,13 @@ def test_prove_a_public_flag_leaks_with_the_row_that_shows_it(uid: str) -> None:
         assert p.status == "leak" and p.witness and p.witness.get("is_public") is True, p
 
 
+def test_prove_a_union_sub_select_is_called_a_table_read() -> None:
+    m = _prove([_sel("tenant_id IN (SELECT tenant_id FROM public.a UNION "
+                     "SELECT tenant_id FROM public.b)")], cols=("authenticated",))
+    p = _proof(m, "public.t", "authenticated")
+    assert p.status == "unknown" and "sub-select" in (p.detail or ""), p
+
+
 def test_prove_the_initplan_wrapper_is_not_called_a_table_read() -> None:
     """A FROM-less ( SELECT auth.uid() AS uid) reads no table: an unscoped
     column gets the identity_columns hint, not the sub-select reason."""
