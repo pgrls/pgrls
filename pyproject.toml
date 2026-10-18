@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgrls"
-version = "0.57.0"
+version = "0.57.1"
 description = "Static analyzer for Postgres Row-Level Security — 68 lint rules for tenant and per-user row-scoping bugs, performance traps, and hygiene (19 auto-fixable); a Z3 tenant-isolation prover (pgrls verify) that proves no row leaks to an anonymous session, across tenants, or through a view, or shows the leaking row; gold-standard RLS scaffolding (pgrls generate); runtime seq-scan analysis (pgrls perf); a semantic policy-diff command for CI gating; and a pytest plugin for RLS isolation tests."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -29,7 +29,7 @@ classifiers = [
 dependencies = [
     "click>=8.2",
     "psycopg[binary]>=3.1",
-    "pglast>=6,<7",
+    "pglast>=7.20,<8",
     # z3-solver ships precompiled wheels (fast, no C++ toolchain) and
     # powers the semantic verifier path — `pgrls diff` predicate analysis
     # (the concrete leaking-row counterexample) and the SEC038
@@ -141,14 +141,16 @@ python_version = "3.11"
 strict = true
 
 # pglast (the Postgres SQL parser pgrls uses for AST-based rules
-# and the diff predicate matcher) doesn't ship `py.typed` in the
-# v6.x range we pin, so mypy --strict reports `[import-untyped]`
-# for every `from pglast import …` line. Silence at the
-# import-resolver level so real type errors elsewhere stay loud,
-# without sprinkling per-import `# type: ignore` comments.
+# and the diff predicate matcher) was untyped through v6 and is only
+# partially typed in v7 (untyped node constructors, Optional fields),
+# so mypy --strict would report every `from pglast import …` line or
+# every node access. Treat it as untyped at the import-resolver level
+# so real type errors elsewhere stay loud, without sprinkling
+# per-import `# type: ignore` comments.
 [[tool.mypy.overrides]]
 module = ["pglast", "pglast.*"]
 ignore_missing_imports = true
+follow_imports = "skip"
 
 # `z3-solver` (the Python wrapper around Z3) doesn't ship type
 # stubs as of 4.13. Suppress at the import-resolver level so the

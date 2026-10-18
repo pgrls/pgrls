@@ -10,6 +10,14 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+## [0.57.1] - 2026-10-18
+
+### Fixed
+- **Installable again: require `pglast>=7.20,<8`.** PyPI no longer serves the
+  pglast 6.x releases pgrls pinned (only a yanked 6.12 remains), so a fresh
+  `pip install pgrls` could not resolve. The test suites pass unchanged on
+  pglast 7.21; mypy treats it as untyped, as before.
+
 ## [0.57.0] - 2026-10-15
 
 ### Fixed
