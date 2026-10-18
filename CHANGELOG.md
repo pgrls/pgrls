@@ -55,6 +55,10 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **Installable again: require `pglast>=7.20,<8`.** PyPI no longer serves the
+  pglast 6.x releases pgrls pinned (only a yanked 6.12 remains), so a fresh
+  `pip install pgrls` could not resolve. The test suites pass unchanged on
+  pglast 7.21; mypy treats it as untyped, as before.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
