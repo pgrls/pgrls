@@ -24,14 +24,15 @@ breaking changes — they will be called out in this file.
     table; the role neither owns the table nor can `SET ROLE` to a role
     whose read is not `PROVEN`; the filter reads nothing an HTTP client
     chooses (request headers, cookies, method, path, the search_path behind
-    `current_schema()` and an unpinned helper's bare names, or a setting a PostgREST pre-request hook copies such
-    a value, or one from a table the session can write, into), and no auth function it calls reads a table
+    `current_schema()` and an unpinned helper's bare names, or a setting a
+    PostgREST pre-request hook copies such a value — or one from a table the
+    session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
     SQL and PL/pgSQL bodies, views to their tables, and what those tables'
     policies read in turn, with an unresolvable relation or unreadable body
-    counting against it. A login session must also have no pre-16 CREATEROLE, read no
-    setting it can set for itself, and be unable to redefine or shadow what
-    the filter calls (owned functions or relations, CREATE on a schema or the
+    counting against it. A login session must also have no pre-16
+    CREATEROLE, read no setting it can set for itself, and be unable to
+    redefine or shadow what the filter calls (owned functions or relations, CREATE on a schema or the
     database, a helper reading a table by bare name without `pg_temp` last);
     the owner of an untraced door the session can open counts toward these
     for every column.
@@ -55,13 +56,17 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- `pgrls matrix --format html` in a dark colour scheme: table headers and
+  `code` cells kept their light backgrounds under light text, so table names
+  and role names were unreadable.
+
+## [0.57.1] - 2026-10-18
+
+### Fixed
 - **Installable again: require `pglast>=7.20,<8`.** PyPI no longer serves the
   pglast 6.x releases pgrls pinned (only a yanked 6.12 remains), so a fresh
   `pip install pgrls` could not resolve. The test suites pass unchanged on
   pglast 7.21; mypy treats it as untyped, as before.
-- `pgrls matrix --format html` in a dark colour scheme: table headers and
-  `code` cells kept their light backgrounds under light text, so table names
-  and role names were unreadable.
 
 ## [0.57.0] - 2026-10-15
 
