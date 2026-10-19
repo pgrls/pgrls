@@ -317,17 +317,36 @@ definer view included).
 A separate section lists sensitive-looking columns (SEC045's patterns, plus
 configured ones) each role can read, and how. `UNDECIDED` means the rows
 cannot be bounded — treat it as "possibly reachable", never as denied.
+`pgrls matrix --prove` checks every SELECT cell with the verify provers —
+anonymous columns: can a session with no JWT read any row; other columns: can
+a session carrying its tenant's identity read another tenant's row — and marks
+it `PROVEN`, `LEAK` (with the leaking row), `POSSIBLE` (only through a door,
+which may filter it, or a read without schema USAGE), `UNKNOWN` (with the
+reason — including an untraced door, the table's owner, a `SET ROLE` target
+that is not proven, a filter that admits an unset setting or reads what an
+HTTP client chooses (request headers, cookies, method, path, the search_path
+behind `current_schema()`, a setting a PostgREST pre-request hook copies one
+into), a leak resting on an opaque helper, an auth
+function reading a table the role can write, and for a role that can log in
+— a raw SQL session — pre-16 CREATEROLE, a filter reading a setting it can
+set, or a session that can redefine or shadow what the filter calls) or
+`EXEMPT` (superuser / BYPASSRLS). A NOLOGIN role (`anon`, `authenticated`) is
+taken to be reached through a gateway that sets its identity. SELECT only,
+and the exit code stays 0 — `pgrls verify` is the CI gate. Suggest it when a user wants to know not just who
+reaches a table but whether that reach is safe.
 Default columns: PUBLIC, anon / authenticated when they exist, and every
 role whose reach differs from PUBLIC's (a cell, a sensitive column, or an
-untraced door). Suggest it when a user asks who can see or change a table,
-or who can read a sensitive-looking column; it runs no rules. Its limits,
+untraced door) — or, under `--prove`, whose verdicts do. Suggest it when a
+user asks who can see or change a table, or who can read a sensitive-looking
+column; it runs no rules. Its limits,
 documented in the README: each column is a session running as that role
 (`SET ROLE`, DDL, granting itself a role, and SEC015-style search-path
-shadowing are not modelled); schema USAGE, a view's own WHERE and what a
-function returns are not traced (over-reports); an ordinary trigger fired by
-a door's write, a view's INSTEAD OF trigger, event triggers, casts or
-built-in-looking operators backed by user functions (a user operator reusing
-a `pg_catalog` symbol is not detected), a SECURITY DEFINER function called in
+shadowing are not modelled); schema USAGE (checked only for `--prove`'s own
+reads), a view's own WHERE and what a function returns are not traced
+(over-reports); an ordinary trigger fired by a door's write, a view's
+INSTEAD OF trigger, event triggers, casts or built-in-looking operators
+backed by user functions (a user operator reusing a `pg_catalog` symbol is
+not detected), a SECURITY DEFINER function called in
 a door owner's context via a DEFAULT/CHECK/policy/view-body that the role
 cannot EXECUTE itself, an `ALTER TABLE ONLY … DISABLE TRIGGER`'d partition
 clone, and access outside SQL privileges (REPLICATION, the server-file roles,
