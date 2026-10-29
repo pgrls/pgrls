@@ -4138,6 +4138,29 @@ def report(
     default=False,
     help="Also consider pg_* system roles (left out by default).",
 )
+@click.option(
+    "--prove",
+    is_flag=True,
+    default=False,
+    help=(
+        "Prove each SELECT cell with the verify provers: anonymous columns "
+        "(anon roles and PUBLIC) — can an unauthenticated session read any "
+        "row; other columns — can a session of that role read another "
+        "tenant's row. Each cell becomes PROVEN, LEAK (with the leaking row), "
+        "POSSIBLE (through a door, or a direct read without schema USAGE), "
+        "UNKNOWN (with the reason) or EXEMPT."
+    ),
+)
+@click.option(
+    "--auth-function",
+    "auth_functions",
+    multiple=True,
+    help=(
+        "With --prove: treat this function as an auth-context value, in "
+        "addition to the defaults (auth.uid/role/jwt, current_setting), as "
+        "`pgrls verify --auth-function` does. Repeatable."
+    ),
+)
 @output_format_options(
     list(MATRIX_FORMATS),
     output_help="Write the matrix to this file instead of stdout (any --format).",
@@ -4148,6 +4171,8 @@ def matrix(
     schemas: str | None,
     roles_csv: str | None,
     include_system: bool,
+    prove: bool,
+    auth_functions: tuple[str, ...],
     output_path: str | None,
     output_format: str,
 ) -> None:
@@ -4173,10 +4198,12 @@ def matrix(
     `--schemas` tables. A door whose SQL cannot be traced is listed
     separately with who can open it — a `DENIED` cell does not rule it out.
     Sensitive-looking columns (SEC045's patterns) are listed in their own
-    section.
+    section. `--prove` checks every SELECT cell with the verify provers and
+    marks it PROVEN, LEAK (with the leaking row), POSSIBLE, UNKNOWN or EXEMPT.
 
     Each column is a session running as that role: `SET ROLE` and DDL are
-    not modelled, nor are ordinary triggers fired by a door's write. UPDATE
+    not modelled in the grid (`--prove` accounts for both before claiming
+    PROVEN), nor are ordinary triggers fired by a door's write. UPDATE
     shows the rows `USING` lets it touch, not its `WITH CHECK`; a door is
     credited with its owner's reach, not with a view's own WHERE or what a
     function returns (an over-report).
@@ -4190,6 +4217,8 @@ def matrix(
         )
         if not roles:
             raise ToolError("--roles listed no role names.")
+    if auth_functions and not prove:
+        raise click.UsageError("--auth-function only applies with --prove.")
 
     effective = _load_effective_config(
         config_path=config_path,
@@ -4201,6 +4230,8 @@ def matrix(
         from pgrls.rules.sec045 import _parse_patterns  # noqa: PLC0415
 
         patterns = _parse_patterns(effective.rule_options.get("SEC045", {}))
+        identity_columns = _identity_columns_from_config(config_path) if prove else None
+        anon_roles = _verify_anon_roles("anon", effective.rule_options) if prove else None
     except TypeError as exc:
         raise click.UsageError(str(exc)) from exc
     assert effective.database_url is not None  # guaranteed above
@@ -4238,7 +4269,13 @@ def matrix(
     try:
         built = build_matrix(
             schema, roles=roles, include_system=include_system, grid=grid,
-            sensitive_patterns=patterns,
+            sensitive_patterns=patterns, prove=prove,
+            anon_roles=anon_roles,
+            auth_functions=(
+                set(DEFAULT_AUTH_FUNCTIONS) | {a.strip() for a in auth_functions if a.strip()}
+                if auth_functions else None
+            ),
+            identity_columns=identity_columns,
         )
     except RecursionError as exc:
         # A pathologically deep policy predicate overflows a walk. Fail like

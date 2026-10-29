@@ -10,6 +10,56 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pgrls matrix --prove` — a proven access map.** Every SELECT cell of the
+  grid is checked with the Z3 provers `pgrls verify` uses: anonymous columns
+  (`anon` / `[lint.rules.SEC004].anon_roles`, and `PUBLIC`) for "can a session
+  with no JWT read any row?", every other column for "can a session of this
+  role, carrying its tenant's identity, read another tenant's row?". A
+  NOLOGIN role is taken to be reached through a gateway (PostgREST) that sets
+  its identity and runs only the API's queries; a role that can log in is a
+  raw SQL session. Each cell becomes:
+  - `PROVEN` — only when nothing pgrls cannot see could change the answer:
+    no door evaluates a who-runs-it filter or opens an untraced path to the
+    table; the role neither owns the table nor can `SET ROLE` to a role
+    whose read is not `PROVEN`; the filter reads nothing an HTTP client
+    chooses (request headers, cookies, method, path, the search_path behind
+    `current_schema()` and an unpinned helper's bare names, or a setting a
+    PostgREST pre-request hook copies such a value — or one from a table the
+    session can write — into), and no auth function it calls reads a table
+    the session can write or whose own row security it can steer — following
+    SQL and PL/pgSQL bodies, views to their tables, and what those tables'
+    policies read in turn, with an unresolvable relation or unreadable body
+    counting against it. A login session must also have no pre-16
+    CREATEROLE, read no setting it can set for itself, and be unable to
+    redefine or shadow what the filter calls (owned functions or relations, CREATE on a schema or the
+    database, a helper reading a table by bare name without `pg_temp` last);
+    the owner of an untraced door the session can open counts toward these
+    for every column.
+  - `LEAK` — the role's own session reads such a row, shown when one
+    characterizes it; a direct read without schema `USAGE` is `POSSIBLE`,
+    and a leak resting on a helper the prover cannot see into (or, for a
+    tenant column, on a setting or claim outside the tenant binding) is
+    `UNKNOWN`.
+  - `POSSIBLE` — only through a door, which may filter it.
+  - `UNKNOWN` — with the reason.
+  - `EXEMPT` — a superuser / `BYPASSRLS` column, which skips RLS by design.
+
+  Each anonymous column is proven against its own login settings. A role
+  whose verdicts differ from what `PUBLIC` gets under the same question, or
+  are more alarming than the `PUBLIC` column shows, is a column. The HTML
+  page leads with the proof grid, the leaks and the undecided cells with
+  their reasons; text and markdown add the same, with the question each
+  column answers; JSON adds a `proof` object per SELECT cell and a
+  `proof_summary`. `--auth-function` names a project's own auth helper.
+  SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
+  end to end.
+
+### Fixed
+- `pgrls matrix --format html` in a dark colour scheme: table headers and
+  `code` cells kept their light backgrounds under light text, so table names
+  and role names were unreadable.
+
 ## [0.57.1] - 2026-10-18
 
 ### Fixed

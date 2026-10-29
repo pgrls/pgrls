@@ -34,7 +34,7 @@ info via the new ``column_details`` per table; v4 added top-level
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, Literal
 
@@ -674,6 +674,28 @@ class Table:
     @property
     def qualified_name(self) -> str:
         return f"{self.schema}.{self.name}"
+
+
+@dataclass(frozen=True)
+class UserFunction:
+    """A function outside the system schemas, as `pgrls matrix --prove` needs
+    it to judge whether a filter calling it can be made to compute something
+    else: who owns it, and how its body resolves names at run time.
+
+    ``search_path`` is the function's pinned ``SET search_path`` (None when
+    unpinned — it then runs with the caller's). ``atomic`` is a SQL-standard
+    ``BEGIN ATOMIC`` / ``RETURN`` body, parsed once at creation, so it
+    resolves no names at run time, though the functions it calls still do.
+    ``body`` is ``prosrc`` — or, for an atomic body (whose ``prosrc`` is
+    empty), the whole ``CREATE FUNCTION`` from ``pg_get_functiondef``.
+    """
+
+    qualified_name: str
+    owner: str
+    language: str
+    search_path: str | None
+    atomic: bool
+    body: str | None
 
 
 @dataclass(frozen=True)
@@ -1828,6 +1850,32 @@ class Schema:
     # readers SET app.x` with anon a member of readers is NOT seen. The value
     # is kept so `--probe` can replay it into its own session.
     role_set_gucs: tuple[tuple[str, str, str | None], ...] = ()
+    # `(schema, grantee)` pairs holding USAGE on each introspected schema —
+    # `PUBLIC` for a grant to every role; the schema owner is listed too. A
+    # role without USAGE cannot query a table in the schema by name ("permission
+    # denied for schema"), so `pgrls matrix --prove` does not call such a read
+    # a LEAK. Live introspection only — not serialized into snapshots; `None`
+    # = not captured, which `--prove` treats as "USAGE held".
+    schema_usage: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    # `(schema.function, owner)` for every function outside the system
+    # schemas. Its owner can CREATE OR REPLACE it, so `pgrls matrix --prove`
+    # never proves a filter that calls it isolated for that owner. Live
+    # introspection only, like `schema_usage`; `None` = not captured.
+    function_owners: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    # The same functions with what `--prove` needs to judge name shadowing in
+    # their bodies; and `(schema, grantee)` holding CREATE on each non-system
+    # schema (owners included) — a role that can create objects can shadow a
+    # name an unpinned body resolves. Live only; `None` = not captured.
+    user_functions: tuple[UserFunction, ...] | None = field(default=None, compare=False)
+    schema_create: tuple[tuple[str, str], ...] | None = field(default=None, compare=False)
+    # Non-superuser CREATEROLE roles on a server before Postgres 16, where
+    # CREATEROLE lets a role grant itself any non-superuser role (16 requires
+    # ADMIN OPTION, which the membership edges already carry). Live only.
+    self_granting_roles: tuple[str, ...] | None = field(default=None, compare=False)
+    # Who holds CREATE on the database (PUBLIC included, the owner too): they
+    # can create a schema of their own and put it on their search_path. Live
+    # only; `None` = not captured.
+    database_create: tuple[str, ...] | None = field(default=None, compare=False)
 
     @cached_property
     def _by_qname(self) -> dict[str, Table]:
