@@ -1347,25 +1347,78 @@ def test_qualified_types_never_change_a_statement(body: str, statements: list[st
     assert [RawStream()(s) for s in stmts] == statements
 
 
-@pytest.mark.parametrize("decl", [
-    "m public.mood := (SELECT v::public.mood FROM app.secret LIMIT 1)",
-    "r record := (SELECT 1 FROM app.secret)",
-    "m mood\n    DEFAULT (SELECT v FROM app.secret LIMIT 1)",
+@pytest.mark.parametrize("decls", [
+    "m public.mood := (SELECT v::public.mood FROM app.secret LIMIT 1);",
+    "r record := (SELECT 1 FROM app.secret);",
+    "m mood\n    DEFAULT (SELECT v FROM app.secret LIMIT 1);",
+    # The name also appears, earlier on the line, in another default.
+    "a text := m; m mood := (SELECT v FROM app.secret);",
+    "a int := (SELECT begin FROM app.b); m mood := (SELECT v FROM app.secret);",
+    '"M" mood := (SELECT v FROM app.secret);',
 ])
-def test_a_record_default_is_never_dropped_silently(decl: str) -> None:
+def test_a_record_default_is_read_from_the_source(decls: str) -> None:
     # pglast leaves a record variable's default out of the parse (pglast 7
-    # for `record`, pglast 8 for any type it does not know, measured), so its
-    # SQL would go unseen: the result is incomplete.
+    # for `record`, pglast 8 for any type it does not know, measured), so it
+    # is read from the declaration instead.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
     from pgrls.access import _plpgsql_statements  # noqa: PLC0415
 
     stmts, incomplete = _plpgsql_statements(
         f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x$\n"
-        f"DECLARE\n  {decl};\nBEGIN NULL; END$x$")
-    if incomplete is None:
-        # pglast 7 models `mood` as a scalar and keeps the default.
-        assert any("secret" in str(s) for s in stmts)
-    else:
-        assert "default is not captured" in incomplete
+        f"DECLARE\n  {decls}\nBEGIN NULL; END$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+def test_a_declare_inside_sql_never_rewrites_a_statement() -> None:
+    # A column named `declare` after THEN is no DECLARE section: the rewrite
+    # must not strip `app.` from the UPDATE (pglast 8), so the body is read
+    # as written or not at all.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"{_QUALIFIED_HEAD}DECLARE update int; v int;\nBEGIN\n"
+        "  SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM public.cfg;\n"
+        "  UPDATE app.secret SET s = 'x';\nEND$x$")
+    if incomplete != _PLPGSQL_UNPARSEABLE:
+        assert "UPDATE app.secret SET s = 'x'" in [RawStream()(s) for s in stmts]
+
+
+@pytest.mark.parametrize("body", [
+    # The same name declared twice on one line: which default is whose
+    # cannot be told apart.
+    "DECLARE r record; BEGIN DECLARE r record := (SELECT 1 FROM app.secret); BEGIN NULL; END; END",
+    "DECLARE r record := (SELECT 1 FROM app.secret); BEGIN DECLARE r int; BEGIN NULL; END; END",
+    # A stray `declare` the parse does not confirm.
+    "DECLARE r record := (SELECT 1 FROM app.secret); v int; BEGIN "
+    "SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM cfg; r := r; END",
+])
+def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    _, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is not None and "default could not be read" in incomplete
+
+
+@pytest.mark.parametrize("body", [
+    "DECLARE arr int[]; BEGIN arr[(SELECT id FROM app.secret LIMIT 1)] := 7; END",
+    # A cursor loop's implicit record has no default; an ALIAS declares none.
+    "DECLARE c CURSOR FOR SELECT * FROM app.secret; BEGIN FOR r IN c LOOP NULL; END LOOP; END",
+    "DECLARE a ALIAS FOR $1; m mood := (SELECT v FROM app.secret); BEGIN NULL; END",
+])
+def test_plpgsql_sql_outside_statements_is_read(body: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f(p int) RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
 
 
 def test_a_variadic_plpgsql_function_is_traced() -> None:

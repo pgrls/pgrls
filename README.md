@@ -449,7 +449,7 @@ Doors, and the other end of a door, are found in every schema: the grid rows are
 
 A door whose SQL can't be traced is listed in its own section, with who can open it (a function's `EXECUTE` holders, or the write that fires a trigger or rule), instead of being attributed to a table. What *can* be traced is still credited, and a `DENIED` cell does not rule out an untraced door. That covers:
 
-- dynamic SQL, and a body in another language;
+- dynamic SQL, a body in another language, and a PL/pgSQL body pgrls can't fully read (one that does not parse, or a variable default it can't read back from the declaration);
 - a call into a function pgrls can't see, including built-ins that run SQL named by an argument (such as `query_to_xml` or `ts_rewrite`), and an operator whose symbol `pg_catalog` does not ship (one reusing a built-in symbol is not detected — see the limits below);
 - statements such as `DO`, `CALL`, or a change of `search_path` or the role.
 

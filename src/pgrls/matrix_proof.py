@@ -314,7 +314,8 @@ def _unqualified_relations(body: str) -> set[str] | None:
 def _body_statements_of(fn: UserFunction) -> list[Any] | None:
     """The statements a user-defined function's body runs, parsed — None
     when they cannot all be known (another language, dynamic SQL, a parse
-    error). An atomic body's ``CREATE FUNCTION`` is parsed whole."""
+    error, a variable default it cannot read). An atomic body's ``CREATE
+    FUNCTION`` is parsed whole."""
     from pglast import parse_sql  # noqa: PLC0415
 
     from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415

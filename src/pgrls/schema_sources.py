@@ -30,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 
 import json
+import re
 from dataclasses import replace
 from typing import Any, Literal
 
@@ -539,6 +540,9 @@ class _TableBuilder:
         self.inherits: list[tuple[str, str]] = []
         # Named NOT NULL constraints (PG18 can drop one by name) → column.
         self.not_null_names: dict[str, str] = {}
+        # Every name the table has had: an unnamed NOT NULL keeps the name
+        # it got from the table at the time.
+        self.former_names: list[str] = [name]
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -547,17 +551,35 @@ class _TableBuilder:
                 self.columns[i] = replace(col, is_nullable=not not_null)
                 return
 
+    def not_null_columns(self, conname: str) -> list[str]:
+        """The columns a NOT NULL constraint of this name can be for: the one
+        it was named for, or — Postgres names an unnamed one
+        `<table>_<column>_not_null`, shortening either name to fit and adding
+        a digit on a clash — any column that name could be for."""
+        if conname in self.not_null_names:
+            return [self.not_null_names[conname]]
+        m = _AUTO_NOT_NULL.fullmatch(conname)
+        if m is None:
+            return []
+        stem = m.group(1)
+        return [
+            c.name for c in self.columns
+            if any(any(t.startswith(stem[:cut]) for t in self.former_names)
+                   and stem[cut + 1:] and c.name.startswith(stem[cut + 1:])
+                   for cut, ch in enumerate(stem) if ch == "_")
+        ]
+
     def drop_constraint(self, conname: str) -> None:
-        """`DROP CONSTRAINT`: a NOT NULL one makes its column nullable again.
-        Postgres names an unnamed one `<table>_<column>_not_null`, truncated
-        to fit — so any column that name could be for counts."""
-        col = self.not_null_names.pop(conname, None)
-        if col is not None:
+        """`DROP CONSTRAINT`: a NOT NULL one makes its column nullable again."""
+        for col in self.not_null_columns(conname):
             self.set_not_null(col, not_null=False)
-        elif conname.endswith("_not_null"):
-            for c in self.columns:
-                if c.name in conname:
-                    self.set_not_null(c.name, not_null=False)
+        self.not_null_names.pop(conname, None)
+
+    def rename_constraint(self, old: str, new: str) -> None:
+        """`RENAME CONSTRAINT`: the NOT NULL keeps its column."""
+        for col in self.not_null_columns(old):
+            self.not_null_names[new] = col
+        self.not_null_names.pop(old, None)
 
     def drop_column(self, colname: str) -> None:
         self.columns = [c for c in self.columns if c.name != colname]
@@ -595,6 +617,9 @@ def _column_def_is_not_null(column_def: Any) -> bool:
         ):
             return True
     return False
+
+
+_AUTO_NOT_NULL = re.compile(r"(.+)_not_null\d*")
 
 
 def _record_not_null_names(builder: _TableBuilder, column_def: Any) -> None:
@@ -640,6 +665,14 @@ def _apply_rename(
     than a table (columns, policies, constraints) are left alone.
     """
     rename_type = getattr(stmt, "renameType", None)
+    if rename_type == ObjectType.OBJECT_TABCONSTRAINT:
+        key = _relation_key(stmt.relation, default_schema)
+        old_name = getattr(stmt, "subname", None)
+        newname = getattr(stmt, "newname", None)
+        builder = tables.get(key) if key is not None else None
+        if builder is not None and old_name and newname:
+            builder.rename_constraint(old_name, newname)
+        return
     if rename_type == ObjectType.OBJECT_POLICY:
         # `ALTER POLICY <old> ON <table> RENAME TO <new>`. Without this the
         # model kept the OLD name, so a later `ALTER POLICY <new> ON <table>
@@ -670,6 +703,7 @@ def _apply_rename(
         return
     new = (old[0], newname)
     builder.name = newname
+    builder.former_names.append(newname)
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder

@@ -56,32 +56,40 @@ breaking changes — they will be called out in this file.
   end to end.
 - **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
   17 and 18, and the dependency pin allows pglast 7 or 8
-  (`pglast>=7.20,<9`); pglast 8 parses the PG18 grammar. `pgrls matrix`
-  reads pglast 8's `ReturningClause`, so a door's `RETURNING` (on
-  `INSERT` / `UPDATE` / `DELETE`) still counts as a read, and
-  `pgrls matrix --prove` reads a PL/pgSQL auth helper's body whatever it
-  returns (`RETURN <value>`, `RETURN QUERY`, `RETURN NEXT`, a trigger's
-  `RETURN NEW`) on either pglast major. On pglast 8 a PL/pgSQL body that
-  names a type qualified with a schema other than `pg_catalog` / `public`
-  (a parameter or return type, which `pg_get_functiondef` qualifies when the
-  type is off the search_path, or a `DECLARE`) no longer reads as
-  unparseable, which listed the door as untraced in `pgrls matrix` and left
-  `--prove` UNKNOWN: pgrls drops those qualifiers before parsing — a type
-  does not change which SQL the body runs — and reads a VARIADIC parameter,
-  which pglast 8 also rejects, as a plain one. The DB-free sources
-  (`--sql-file`, `pgrls pr`) read PG18's table-level `NOT NULL c` and
-  `ADD CONSTRAINT … NOT NULL` forms (pglast 8 only; an `ALTER TABLE … NOT
-  VALID` one stays nullable, as on a live database), and on either pglast
-  major an `ALTER TABLE … ADD PRIMARY KEY` now marks its columns NOT NULL
-  and a `DROP CONSTRAINT` of a NOT NULL makes the column nullable again.
+  (`pglast>=7.20,<9`); pglast 8 parses the PG18 grammar. On pglast 8:
+  - `pgrls matrix` reads the new `ReturningClause`, so a door's
+    `RETURNING` (on `INSERT` / `UPDATE` / `DELETE`) still counts as a read;
+  - a PL/pgSQL body that names a type qualified with a schema other than
+    `pg_catalog` / `public` (a parameter or return type, which
+    `pg_get_functiondef` qualifies when the type is off the search_path,
+    or a `DECLARE`), or that has a VARIADIC parameter, is read rather than
+    listed as untraced: pgrls drops the qualifier and reads VARIADIC as a
+    plain parameter — neither changes which SQL the body runs;
+  - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
+    the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
+    `ADD CONSTRAINT … NOT NULL` (an `ALTER TABLE … NOT VALID` one stays
+    nullable, as on a live database).
+
+  On either major, `pgrls matrix --prove` reads a PL/pgSQL auth helper's
+  body whatever it returns (`RETURN <value>`, `RETURN QUERY`,
+  `RETURN NEXT`, a trigger's `RETURN NEW`).
 
 ### Fixed
-- **`pgrls matrix` no longer misses SQL in a PL/pgSQL record variable's
-  default.** pglast leaves the default of a variable it models as a record
-  out of the parse — on pglast 7 a `record`, on pglast 8 any type it does not
-  know (an enum, a domain, a composite) — so a door that read a table only
-  in `DECLARE r record := (SELECT … FROM t)` showed no reach of `t`. Such a
-  door is now listed as untraced, with the reason.
+- **`pgrls matrix` no longer misses SQL in a PL/pgSQL variable's default.**
+  pglast leaves the default of a variable it models as a record out of the
+  parse — on pglast 7 a `record`, on pglast 8 any type it does not know (an
+  enum, a domain, a composite) — so a door that read a table only in
+  `DECLARE r record := (SELECT … FROM t)` showed no reach of `t`. pgrls now
+  reads such a default from the declaration itself, once the parse confirms
+  every `DECLARE` section it found; a door whose default it cannot read is
+  listed as untraced, with the reason. The subscript of an assignment target
+  (`a[(SELECT …)] := 1`) was dropped the same way, and is now read too.
+- **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
+  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL (named, renamed, or the
+  auto-named `<table>_<column>_not_null`) makes the column nullable
+  again.**
+  `--sql-file` / `pgrls pr` ignored both, so SEC030 flagged a primary-key
+  column or missed a column whose NOT NULL was dropped.
 - **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as
   nullable.** Postgres 18 sets `attnotnull` for such a constraint while
   existing NULLs stay in the table, so pgrls read the column as not-nullable

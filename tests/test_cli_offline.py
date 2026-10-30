@@ -1456,6 +1456,29 @@ def test_offline_drop_constraint_of_a_not_null():
         " ALTER TABLE t DROP CONSTRAINT t_tenant_not_null;"
     )
     assert {c.name: c.is_nullable for c in auto.column_details}["tenant"] is True
+    # Postgres shortens the longer name to fit 63 bytes (measured on PG18).
+    long_col = "tenant_" + "x" * 56
+    long_table = "orders_" + "y" * 50
+    for table, col, conname in (
+        ("orders", long_col, f"orders_{long_col[:47]}_not_null"),
+        (long_table, "tenant_id", f"{long_table[:44]}_tenant_id_not_null"),
+    ):
+        t = _only(f"CREATE TABLE {table} (id int, {col} text NOT NULL);"
+                  f" ALTER TABLE {table} DROP CONSTRAINT {conname};")
+        assert {c.name: c.is_nullable for c in t.column_details}[col] is True, conname
+    for sql in (
+        # A clash adds a digit; a renamed constraint keeps its column; an
+        # unnamed one keeps the table name it was created under.
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t DROP CONSTRAINT t_tenant_not_null1;",
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t RENAME CONSTRAINT t_tenant_not_null TO tn;"
+        " ALTER TABLE t DROP CONSTRAINT tn;",
+        "CREATE TABLE old (id int, tenant text NOT NULL); ALTER TABLE old RENAME TO t;"
+        " ALTER TABLE t DROP CONSTRAINT old_tenant_not_null;",
+    ):
+        t = _only(sql)
+        assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql
     other = _only(
         "CREATE TABLE t (id int, tenant text NOT NULL, CONSTRAINT ck CHECK (id > 0));"
         " ALTER TABLE t DROP CONSTRAINT ck;"
