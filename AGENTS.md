@@ -308,8 +308,8 @@ Doors are found in every schema. A door whose SQL it cannot trace (dynamic
 SQL, another language, a PL/pgSQL body it cannot fully read — one that does
 not parse, or a variable default it cannot read back — a call into an unseen
 function or operator, a SQL-running built-in, `DO` / `CALL` / a change of
-search_path or role) is listed separately with who can open it — a `DENIED` cell does not rule it
-out; a body that sets another parameter makes its filtered doors UNDECIDED
+search_path or role) is listed separately with who can open it — a `DENIED`
+cell does not rule it out; a body that sets another parameter makes its filtered doors UNDECIDED
 (a timeout, planner or logging setting excepted), and so does the same filter
 reached two ways when it depends on who runs it — it reads `current_user` /
 checks a privilege and one path is a SECURITY DEFINER function/trigger/rule,

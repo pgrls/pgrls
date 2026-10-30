@@ -1483,6 +1483,10 @@ def test_offline_drop_constraint_of_a_not_null():
     ):
         t = _only(sql)
         assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql
+    # A primary key's columns stay NOT NULL when it is dropped.
+    pk = _only("CREATE TABLE t (id int, CONSTRAINT t_pk PRIMARY KEY (id));"
+               " ALTER TABLE t DROP CONSTRAINT t_pk;")
+    assert {c.name: c.is_nullable for c in pk.column_details}["id"] is False
     other = _only(
         "CREATE TABLE t (id int, tenant text NOT NULL, CONSTRAINT ck CHECK (id > 0));"
         " ALTER TABLE t DROP CONSTRAINT ck;"

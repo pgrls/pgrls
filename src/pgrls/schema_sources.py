@@ -497,7 +497,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         for elt in stmt.tableElts or ():
             for col_name in _constraint_not_null_columns(elt, creating=True):
                 builder.set_not_null(col_name)
-                if getattr(elt, "conname", None):
+                # A primary key's columns stay NOT NULL when it is dropped.
+                if elt.contype == ConstrType.CONSTR_NOTNULL and elt.conname:
                     builder.not_null_names.setdefault(elt.conname, set()).add(col_name)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
@@ -874,7 +875,9 @@ def _apply_alter_table(
             con = getattr(cmd, "def_", None)
             for col_name in _constraint_not_null_columns(con):
                 builder.set_not_null(col_name)
-                if conname := getattr(con, "conname", None):
+                # A primary key's columns stay NOT NULL when it is dropped.
+                conname = getattr(con, "conname", None)
+                if getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL and conname:
                     builder.not_null_names.setdefault(conname, set()).add(col_name)
         elif subtype == AlterTableType.AT_DropConstraint:
             name = getattr(cmd, "name", None)

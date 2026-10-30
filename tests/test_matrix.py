@@ -1357,9 +1357,9 @@ def test_qualified_types_never_change_a_statement(body: str, statements: list[st
     '"M" mood := (SELECT v FROM app.secret);',
 ])
 def test_a_record_default_is_read_from_the_source(decls: str) -> None:
-    # pglast leaves a record variable's default out of the parse (pglast 7
-    # for `record`, pglast 8 for any type it does not know, measured), so it
-    # is read from the declaration instead.
+    # pglast leaves a record variable's default out of the parse (`record`
+    # on both majors; on pglast 8 also any type it does not know, measured),
+    # so it is read from the declaration instead.
     from pglast.stream import RawStream  # noqa: PLC0415
 
     from pgrls.access import _plpgsql_statements  # noqa: PLC0415
@@ -1397,14 +1397,19 @@ def test_a_declare_inside_sql_never_rewrites_a_statement(body: str, statement: s
         assert statement in [RawStream()(s) for s in stmts]
 
 
-def test_option_dump_is_not_parsed() -> None:
+def test_option_dump_is_not_parsed_on_pglast_8() -> None:
     # pglast 8 prints the function's tree to stdout for `#option dump`.
-    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
+    import pglast  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
 
     _, incomplete = _plpgsql_statements(
         "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $x$#option dump\n"
         "BEGIN RETURN 1; END$x$")
-    assert incomplete == _PLPGSQL_UNPARSEABLE
+    if pglast.__version__.startswith("v7"):
+        assert incomplete is None
+    else:
+        assert incomplete is not None and "#option dump" in incomplete
 
 
 @pytest.mark.parametrize("body", [

@@ -55,9 +55,9 @@ runs as the writer and adds nothing); access outside SQL privileges
 another role); a cast, or an operator reusing a built-in symbol, backed by a
 user function; the write-side ``WITH CHECK`` of an UPDATE (the cell shows the
 rows ``USING`` lets it touch). A function, trigger or rule whose SQL cannot
-be traced — dynamic SQL, another language, a PL/pgSQL body it cannot fully
-read (an unparseable body, a variable default it cannot read back), a call
-into a function or operator pgrls cannot see, a built-in that runs SQL named by an argument, a
+be traced — dynamic SQL, another language, a PL/pgSQL body pgrls cannot
+fully read (an unparseable body, a variable default it cannot read back), a
+call into a function or operator pgrls cannot see, a built-in that runs SQL named by an argument, a
 utility statement — is listed as untraced instead of attributed to a table.
 """
 from __future__ import annotations
@@ -827,7 +827,8 @@ _PLPGSQL_UNPARSEABLE = "the PL/pgSQL body does not parse"
 # character in one.
 _DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z_0-9\x80-\U0010ffff]*)?\$")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
-# Where a PL/pgSQL block — and so a `DECLARE` section — can start.
+# Keywords after which a PL/pgSQL block — and so a `DECLARE` section — can
+# start (so can the body's start, a `;` and a `<<label>>`).
 _BLOCK_STARTERS = frozenset({"begin", "then", "else", "loop"})
 # pglast's PL/pgSQL parse errors that a rewrite of the parameters and types
 # can get past (pglast 8): a type qualified outside pg_catalog / public, and
@@ -1002,8 +1003,10 @@ def _confirmed_parse(definition: str, *, retype: bool) -> _Parsed | None:
     return type, any schema in a confirmed ``DECLARE`` — and VARIADIC becomes
     a plain parameter. A type does not change which SQL the body runs.
 
-    None when the definition cannot be rewritten, does not parse, or a
-    probe does not come back."""
+    None when the definition is not one ``CREATE FUNCTION`` with a body,
+    cannot be rewritten or probed (its body already uses a
+    ``pgrls_probe_<n>`` name), does not parse, or a probe does not come
+    back."""
     import pglast  # noqa: PLC0415
     from pglast import ast  # noqa: PLC0415
     from pglast.enums import FunctionParameterMode  # noqa: PLC0415
@@ -1115,9 +1118,9 @@ def _loop_variables(tree: Any) -> set[tuple[str | None, int]]:
 
 def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     """The default expressions of the variables the parse models as records,
-    read from their confirmed declarations — pglast leaves them out (pglast 7
-    for ``record``, pglast 8 for every type it does not know: an enum, a
-    domain, a composite), so their SQL would go unseen. None when one cannot
+    read from their confirmed declarations — pglast leaves them out
+    (``record`` on both majors; on pglast 8 also every type it does not know:
+    an enum, a domain, a composite), so their SQL would go unseen. None when one cannot
     be read."""
     body = parsed.body
     loops = _loop_variables(parsed.tree)
@@ -1154,8 +1157,9 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     import pglast  # noqa: PLC0415 — heavy parser, only on this path
 
     # pglast 8 prints the function's tree to stdout for `#option dump`.
-    if re.search(r"#\s*option\s+dump", definition, re.IGNORECASE):
-        return [], _PLPGSQL_UNPARSEABLE
+    if (not pglast.__version__.startswith("v7")
+            and re.search(r"#\s*option\s+dump", definition, re.IGNORECASE)):
+        return [], "the PL/pgSQL body sets #option dump (pglast 8 prints its parse tree)"
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError as exc:

@@ -65,20 +65,23 @@ breaking changes — they will be called out in this file.
     or a `DECLARE`), or that has a VARIADIC parameter, is read rather than
     listed as untraced: pgrls drops the qualifier and reads VARIADIC as a
     plain parameter — neither changes which SQL the body runs;
+  - a PL/pgSQL body with `#option dump` is listed as untraced (pglast 8
+    prints its parse tree to stdout);
   - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
     the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
     `ADD CONSTRAINT … NOT NULL` (an `ALTER TABLE … NOT VALID` one stays
     nullable, as on a live database).
 
   On either major, `pgrls matrix --prove` reads a PL/pgSQL auth helper's
-  body whatever it returns (`RETURN <value>`, `RETURN QUERY`,
-  `RETURN NEXT`, a trigger's `RETURN NEW`).
+  body whatever its `RETURN` form (`RETURN <value>`, `RETURN QUERY`,
+  `RETURN NEXT`, a trigger's `RETURN NEW`). A body that assigns to its own
+  OUT or named parameter still cannot be read, and counts against `PROVEN`.
 
 ### Fixed
 - **`pgrls matrix` no longer misses SQL in a PL/pgSQL variable's default.**
   pglast leaves the default of a variable it models as a record out of the
-  parse — on pglast 7 a `record`, on pglast 8 any type it does not know (an
-  enum, a domain, a composite) — so a door that read a table only in
+  parse — a `record` on either major, and on pglast 8 also any type it does
+  not know (an enum, a domain, a composite) — so a door that read a table only in
   `DECLARE r record := (SELECT … FROM t)` showed no reach of `t`. pgrls now
   reads such a default from the declaration itself, once the PL/pgSQL parser
   confirms where each declaration starts and ends; a door whose default it
