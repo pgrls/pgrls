@@ -58,8 +58,8 @@ rows ``USING`` lets it touch). A function, trigger or rule whose SQL cannot
 be traced — dynamic SQL, another language, a PL/pgSQL body pgrls cannot
 fully read (an unparseable body, a record variable whose declaration it
 cannot read back, ``#option dump`` on pglast 8), a call into a function or
-operator pgrls cannot see, a built-in that runs SQL named by an argument, a utility
-statement — is listed as untraced instead of attributed to a table.
+operator pgrls cannot see, a built-in that runs SQL named by an argument, a
+utility statement — is listed as untraced instead of attributed to a table.
 """
 from __future__ import annotations
 
@@ -840,6 +840,8 @@ _REWRITABLE_ERRORS = ("LookupExplicitNamespace", "VARIADIC parameter must be an 
 # plain-typed one, when the error does not name it).
 _NOT_SCALAR = re.compile(r'"(.+)" is not a scalar variable')
 _RECORD_IN_INTO = "record variable cannot be part of multiple-item INTO list"
+# …and as the first of several `FOR a, b IN` targets, a bare syntax error.
+_FOR_TARGETS = 'syntax error at or near ","'
 
 _Token = tuple[str, int, int]
 # An assignment target that runs no SQL: a variable or a field path.
@@ -1078,6 +1080,15 @@ def _confirmed_parse(
                 return None
 
         _Normalize()(stmt)
+        # A single OUT / INOUT parameter is the result type: retyped to text,
+        # the result follows.
+        outs = [p for p in stmt.parameters or ()
+                if p.mode in (FunctionParameterMode.FUNC_PARAM_OUT,
+                              FunctionParameterMode.FUNC_PARAM_INOUT)]
+        if (len(outs) == 1 and stmt.returnType is not None
+                and getattr((outs[0].argType.names or (None,))[-1], "sval", None) == "text"):
+            stmt.returnType = ast.TypeName(names=(ast.String(sval="text"),),
+                                           setof=stmt.returnType.setof)
         toks = _plpgsql_tokens(body)
         if toks is None:
             return ""
@@ -1202,18 +1213,24 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError as exc:
-        error, scalars, last = str(exc), frozenset[str](), ""
+        error, scalars = str(exc), frozenset[str]()
+        tried: set[frozenset[str]] = set()
         for _ in range(32):
             if m := _NOT_SCALAR.fullmatch(error):
-                # The name as written, or label-qualified (`o.v`); when that
-                # does not help, every plain-typed variable.
+                # The name the error gives and, when label-qualified (`o.v`),
+                # its last part.
                 name = m.group(1)
-                scalars |= {"*"} if error == last else {name, name.rsplit(".", 1)[-1]}
-            elif error == _RECORD_IN_INTO:
+                scalars |= {name, name.rsplit(".", 1)[-1]}
+            elif error == _RECORD_IN_INTO or error.startswith(_FOR_TARGETS):
                 scalars |= {"*"}
             elif not any(e in error for e in _REWRITABLE_ERRORS):
                 break
-            last = error
+            if scalars in tried:
+                # No progress: every plain-typed variable, once.
+                scalars |= {"*"}
+                if scalars in tried:
+                    break
+            tried.add(scalars)
             parsed = _confirmed_parse(definition, retype=True, scalars=scalars)
             if not isinstance(parsed, str):
                 break

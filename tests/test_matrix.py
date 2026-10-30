@@ -1462,6 +1462,25 @@ def test_an_unknown_typed_out_parameter_is_read() -> None:
     assert any("app.secret" in RawStream()(s) for s in stmts)
 
 
+@pytest.mark.parametrize("head", [
+    "public.f(OUT o app.mood) RETURNS app.mood",
+    "public.f(OUT o app.mood) RETURNS SETOF app.mood",
+    "public.f(INOUT o app.mood) RETURNS app.mood",
+])
+def test_a_retyped_single_out_parameter_keeps_its_result_type(head: str) -> None:
+    # A single OUT / INOUT parameter is the result type, so retyping it to
+    # text retypes the result too (pg_get_functiondef always prints RETURNS).
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION {head} LANGUAGE plpgsql AS $x$DECLARE w int;\n"
+        "BEGIN SELECT a, b INTO w, o FROM app.secret; END$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
 def test_a_cursor_sharing_a_retyped_name_keeps_its_query() -> None:
     # Only a plain type becomes `text`: a cursor of the same name keeps its
     # declaration, so `FOR r IN values(1)` still reads app.secret.
@@ -1533,6 +1552,9 @@ def test_type_edits(body: str, expected: str | None) -> None:
     "<<o>> DECLARE v app_role; w int; BEGIN SELECT 1, 'a' INTO w, o.v FROM app.secret; END",
     "DECLARE r record; v app_role; w int; BEGIN SELECT role, 1 INTO v, w FROM app.m; "
     "FOR r IN SELECT * FROM app.secret LOOP NULL; END LOOP; END",
+    # …and as the first of several FOR targets, a bare syntax error.
+    "DECLARE r app_role; o uuid; BEGIN FOR r, o IN SELECT m.role, m.org_id FROM app.secret m "
+    "LOOP NULL; END LOOP; END",
 ])
 def test_an_unknown_typed_variable_is_read_on_either_major(body: str) -> None:
     from pglast.stream import RawStream  # noqa: PLC0415

@@ -1527,6 +1527,22 @@ def test_offline_drop_constraint_of_a_not_null():
             schemas=("public",))
         child = next(t for t in schema.tables if t.name == "c")
         assert {c.name: c.is_nullable for c in child.column_details}["a"] is True
+    # `SET NOT NULL` validates a NOT VALID one in place, keeping its name; a
+    # parent's RENAME CONSTRAINT renames its children's copies (measured).
+    import pglast
+
+    if pglast.__version__.startswith("v8"):
+        for sql, table in (
+            ("CREATE TABLE t (id int, a int);"
+             " ALTER TABLE t ADD CONSTRAINT nn NOT NULL a NOT VALID;"
+             " ALTER TABLE t ALTER COLUMN a SET NOT NULL; ALTER TABLE t DROP CONSTRAINT nn;", "t"),
+            ("CREATE TABLE p (id int, a int NOT NULL); CREATE TABLE c () INHERITS (p);"
+             " ALTER TABLE p RENAME CONSTRAINT p_a_not_null TO keep;"
+             " ALTER TABLE c NO INHERIT p; ALTER TABLE c DROP CONSTRAINT keep;", "c"),
+        ):
+            schema = schema_from_sql(sql, schemas=("public",))
+            t = next(x for x in schema.tables if x.name == table)
+            assert {c.name: c.is_nullable for c in t.column_details}["a"] is True, sql
     # A primary key's columns stay NOT NULL when it is dropped.
     pk = _only("CREATE TABLE t (id int, CONSTRAINT t_pk PRIMARY KEY (id));"
                " ALTER TABLE t DROP CONSTRAINT t_pk;")

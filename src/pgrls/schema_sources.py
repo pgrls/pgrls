@@ -693,8 +693,8 @@ def _apply_rename(
     table pointed at a relation that does not exist after the migration — a
     `pgrls pr` annotation naming a phantom table. Also applies `ALTER POLICY …
     RENAME TO` and `ALTER TABLE … RENAME CONSTRAINT` (so a later `DROP
-    CONSTRAINT` of a NOT NULL still finds its column); column renames are
-    left alone.
+    CONSTRAINT` of a NOT NULL still finds its column); other renames
+    (columns, indexes, …) are left alone.
     """
     rename_type = getattr(stmt, "renameType", None)
     if rename_type == ObjectType.OBJECT_TABCONSTRAINT:
@@ -702,8 +702,19 @@ def _apply_rename(
         old_name = getattr(stmt, "subname", None)
         newname = getattr(stmt, "newname", None)
         builder = tables.get(key) if key is not None else None
-        if builder is not None and old_name and newname:
-            builder.rename_constraint(old_name, newname)
+        if key is not None and builder is not None and old_name and newname:
+            # The inherited copies on its children are renamed with it.
+            todo: list[tuple[str, str]] = [key]
+            seen: set[tuple[str, str]] = set()
+            while todo:
+                k = todo.pop()
+                if k in seen:
+                    continue
+                seen.add(k)
+                if (b := tables.get(k)) is not None:
+                    b.rename_constraint(old_name, newname)
+                todo.extend(ck for ck, cb in tables.items()
+                            if k in cb.inherits or cb.partition_of == k)
         return
     if rename_type == ObjectType.OBJECT_POLICY:
         # `ALTER POLICY <old> ON <table> RENAME TO <new>`. Without this the
@@ -866,9 +877,13 @@ def _apply_alter_table(
         subtype = getattr(cmd, "subtype", None)
         if subtype in (AlterTableType.AT_DropColumn, AlterTableType.AT_SetNotNull,
                        AlterTableType.AT_DropNotNull):
-            # The column's NOT VALID NOT NULL, if any, is gone or moot.
-            for cols in builder.invalid_not_null.values():
-                cols.discard(getattr(cmd, "name", None) or "")
+            # The column's NOT VALID NOT NULL, if any, is gone or moot —
+            # `SET NOT NULL` validates it in place, keeping its name.
+            target = getattr(cmd, "name", None) or ""
+            for invalid, cols in builder.invalid_not_null.items():
+                if target in cols and subtype == AlterTableType.AT_SetNotNull:
+                    builder.not_null_names.setdefault(invalid, set()).add(target)
+                cols.discard(target)
         if subtype == AlterTableType.AT_EnableRowSecurity:
             builder.rls_enabled = True
         elif subtype == AlterTableType.AT_ForceRowSecurity:

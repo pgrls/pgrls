@@ -28,10 +28,10 @@ breaking changes — they will be called out in this file.
     PostgREST pre-request hook copies such a value — or one from a table the
     session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
-    SQL and PL/pgSQL bodies (whatever they return), views to their tables,
-    and what those tables' policies read in turn, with an unresolvable
-    relation or unreadable body counting against it. A login session must also have no pre-16
-    CREATEROLE, read no setting it can set for itself, and be unable to
+    SQL and PL/pgSQL bodies (whatever their return type), views to their
+    tables, and what those tables' policies read in turn, with an
+    unresolvable relation or unreadable body counting against it. A login
+    session must also have no pre-16 CREATEROLE, read no setting it can set for itself, and be unable to
     redefine or shadow what the filter calls (owned functions or relations, CREATE on a schema or the
     database, a helper reading a table by bare name without `pg_temp` last);
     the owner of an untraced door the session can open counts toward these
@@ -63,20 +63,22 @@ breaking changes — they will be called out in this file.
     `pg_catalog` / `public` (a parameter or return type, which
     `pg_get_functiondef` qualifies when the type is off the search_path,
     or a `DECLARE`), that has a VARIADIC parameter, or that puts a variable
-    of a type pglast 8 does not know (an enum, a domain) among several
-    `INTO` targets, is read rather than listed as untraced: pgrls drops the
-    qualifier, reads VARIADIC as a plain parameter and declares such a
-    variable `text` — none of which changes which SQL the body runs;
+    or parameter of a type pglast 8 does not know (an enum, a domain) among
+    several `INTO` or `FOR` targets, is read rather than listed as untraced: pgrls
+    drops the qualifier, reads VARIADIC as a plain parameter and declares
+    such a variable `text` — none of which changes which SQL the body runs;
   - a PL/pgSQL body with `#option dump` is listed as untraced (pglast 8
     prints its parse tree to stdout);
   - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
     the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
-    `ADD CONSTRAINT … NOT NULL` (an `ALTER TABLE … NOT VALID` one stays
-    nullable until `VALIDATE CONSTRAINT`, as on a live database, and an
-    `INHERITS` child does not get a parent's `NOT NULL … NO INHERIT`).
+    `ADD CONSTRAINT … NOT NULL` (a named `ADD CONSTRAINT … NOT NULL …
+    NOT VALID` stays nullable until `VALIDATE CONSTRAINT`, as on a live
+    database — an unnamed one stays nullable — and an `INHERITS` child does
+    not get a parent's `NOT NULL … NO INHERIT`).
 
 ### Fixed
-- **`pgrls matrix` no longer misses SQL in a PL/pgSQL variable's default.**
+- **`pgrls matrix` no longer misses SQL in a PL/pgSQL variable's default or
+  an assignment target's subscript.**
   pglast leaves the default of a variable it models as a record out of the
   parse — a `record` on either major, and on pglast 8 also any type it does
   not know (an enum, a domain, a composite) — so a door that read a table
@@ -84,8 +86,7 @@ breaking changes — they will be called out in this file.
   pgrls now reads such a default from the declaration itself, once the
   PL/pgSQL parser confirms where each declaration starts and ends; a door
   whose record declarations it cannot read is listed as untraced, with the
-  reason. pgrls
-  also discarded the subscript of an assignment target
+  reason. pgrls also discarded the subscript of an assignment target
   (`a[(SELECT …)] := 1`); it is now read too.
 - **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
   NOT NULL, and `DROP CONSTRAINT` of a NOT NULL (named, renamed, or the
