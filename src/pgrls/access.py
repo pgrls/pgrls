@@ -842,6 +842,9 @@ _NOT_SCALAR = re.compile(r'"(.+)" is not a scalar variable')
 _RECORD_IN_INTO = "record variable cannot be part of multiple-item INTO list"
 # …and as the first of several `FOR a, b IN` targets, a bare syntax error.
 _FOR_TARGETS = 'syntax error at or near ","'
+# A composite variable whose field the body assigns (`r.f := …`) must keep
+# its type when every other one becomes `text`.
+_FIELD_TARGET = re.compile(r'"([^".]+)\.[^"]+" is not a known variable')
 
 _Token = tuple[str, int, int]
 # An assignment target that runs no SQL: a variable or a field path.
@@ -964,15 +967,16 @@ def _line_of(body: str, tok: _Token) -> int:
 
 
 def _type_edits(
-    body: str, toks: list[_Token], scalars: frozenset[str] = frozenset()
+    body: str, toks: list[_Token], scalars: frozenset[str] = frozenset(),
+    keep: frozenset[str] = frozenset(),
 ) -> list[tuple[int, int, str]]:
     """(start, end, replacement) edits to the type each declaration names —
     the tokens after ``name [CONSTANT]`` up to a default, ``NOT NULL``,
     ``COLLATE`` or the ``;``, never a default expression: the schema is
     dropped (``u auth.users;`` → ``u users;``), and the type of a variable in
-    `scalars` (every variable, for ``*``) becomes ``text`` — only when the
-    type is a plain name, never a cursor, ``record``, ``refcursor`` or an
-    array. ``%TYPE`` / ``%ROWTYPE`` stay as they are."""
+    `scalars` (every variable not in `keep`, for ``*``) becomes ``text`` —
+    only when the type is a plain name, never a cursor, ``record``,
+    ``refcursor`` or an array. ``%TYPE`` / ``%ROWTYPE`` stay as they are."""
     names = ("word", "qword")
     edits: list[tuple[int, int, str]] = []
     for spans, _ in _declaration_sections(body, toks):
@@ -992,7 +996,8 @@ def _type_edits(
             plain = (stop - j) % 2 == 1 and all(
                 toks[k][0] in (names if (k - j) % 2 == 0 else ("dot",))
                 for k in range(j, stop))
-            if (plain and ("*" in scalars or _ident(body, toks[i]) in scalars)
+            name = _ident(body, toks[i])
+            if (plain and (("*" in scalars and name not in keep) or name in scalars)
                     and _ident(body, toks[stop - 1]) not in ("record", "refcursor")):
                 edits.append((toks[j][1], toks[stop - 1][2], "text"))
                 continue
@@ -1017,7 +1022,8 @@ class _Parsed:
 
 
 def _confirmed_parse(
-    definition: str, *, retype: bool, scalars: frozenset[str] = frozenset()
+    definition: str, *, retype: bool, scalars: frozenset[str] = frozenset(),
+    keep: frozenset[str] = frozenset(),
 ) -> _Parsed | str:
     """Parse `definition` (a ``CREATE FUNCTION``) with every ``DECLARE``
     section the tokens suggest confirmed by the parser itself: a probe
@@ -1033,7 +1039,7 @@ def _confirmed_parse(
     dropped from each type it names — outside ``pg_catalog`` for parameters
     and the return type, any schema in a confirmed ``DECLARE`` — VARIADIC
     becomes a plain parameter, and each variable or parameter in `scalars`
-    is declared ``text``. A type does not change which SQL the body runs.
+    (every one not in `keep`, for ``*``) is declared ``text``. A type does not change which SQL the body runs.
 
     Otherwise the reason it failed: the parse error, or ``""`` when the
     definition is not one ``CREATE FUNCTION`` with a body, cannot be
@@ -1073,26 +1079,30 @@ def _confirmed_parse(
                     node.mode = FunctionParameterMode.FUNC_PARAM_IN
                 typ = node.argType
                 last = getattr((typ.names or (None,))[-1], "sval", None) if typ else None
-                if (typ is not None and ("*" in scalars or node.name in scalars)
+                if (typ is not None
+                        and (("*" in scalars and node.name not in keep)
+                             or node.name in scalars)
                         and not typ.pct_type and not typ.arrayBounds
                         and last not in ("record", "refcursor")):
                     node.argType = ast.TypeName(names=(ast.String(sval="text"),))
+                    retyped.append(node)
                 return None
 
+        retyped: list[Any] = []
         _Normalize()(stmt)
         # A single OUT / INOUT parameter is the result type: retyped to text,
         # the result follows.
         outs = [p for p in stmt.parameters or ()
                 if p.mode in (FunctionParameterMode.FUNC_PARAM_OUT,
                               FunctionParameterMode.FUNC_PARAM_INOUT)]
-        if (len(outs) == 1 and stmt.returnType is not None
-                and getattr((outs[0].argType.names or (None,))[-1], "sval", None) == "text"):
+        if (len(outs) == 1 and any(p is outs[0] for p in retyped)
+                and stmt.returnType is not None):
             stmt.returnType = ast.TypeName(names=(ast.String(sval="text"),),
                                            setof=stmt.returnType.setof)
         toks = _plpgsql_tokens(body)
         if toks is None:
             return ""
-        for start, stop, text in reversed(_type_edits(body, toks, scalars)):
+        for start, stop, text in reversed(_type_edits(body, toks, scalars, keep)):
             body = body[:start] + text + body[stop:]
 
     toks = _plpgsql_tokens(body)
@@ -1213,8 +1223,8 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError as exc:
-        error, scalars = str(exc), frozenset[str]()
-        tried: set[frozenset[str]] = set()
+        error, scalars, keep = str(exc), frozenset[str](), frozenset[str]()
+        tried: set[tuple[frozenset[str], frozenset[str]]] = set()
         for _ in range(32):
             if m := _NOT_SCALAR.fullmatch(error):
                 # The name the error gives and, when label-qualified (`o.v`),
@@ -1223,15 +1233,17 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
                 scalars |= {name, name.rsplit(".", 1)[-1]}
             elif error == _RECORD_IN_INTO or error.startswith(_FOR_TARGETS):
                 scalars |= {"*"}
+            elif "*" in scalars and (m := _FIELD_TARGET.fullmatch(error)):
+                keep |= {m.group(1)}
             elif not any(e in error for e in _REWRITABLE_ERRORS):
                 break
-            if scalars in tried:
+            if (scalars, keep) in tried:
                 # No progress: every plain-typed variable, once.
                 scalars |= {"*"}
-                if scalars in tried:
+                if (scalars, keep) in tried:
                     break
-            tried.add(scalars)
-            parsed = _confirmed_parse(definition, retype=True, scalars=scalars)
+            tried.add((scalars, keep))
+            parsed = _confirmed_parse(definition, retype=True, scalars=scalars, keep=keep)
             if not isinstance(parsed, str):
                 break
             error = parsed

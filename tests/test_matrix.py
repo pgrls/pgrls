@@ -1466,6 +1466,9 @@ def test_an_unknown_typed_out_parameter_is_read() -> None:
     "public.f(OUT o app.mood) RETURNS app.mood",
     "public.f(OUT o app.mood) RETURNS SETOF app.mood",
     "public.f(INOUT o app.mood) RETURNS app.mood",
+    # An OUT parameter left as it is keeps its result type.
+    "public.f(OUT o text[], VARIADIC xs text[]) RETURNS text[]",
+    "public.f(OUT o text[], p app.mood) RETURNS SETOF text[]",
 ])
 def test_a_retyped_single_out_parameter_keeps_its_result_type(head: str) -> None:
     # A single OUT / INOUT parameter is the result type, so retyping it to
@@ -1479,6 +1482,28 @@ def test_a_retyped_single_out_parameter_keeps_its_result_type(head: str) -> None
         "BEGIN SELECT a, b INTO w, o FROM app.secret; END$x$")
     assert incomplete is None
     assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+@pytest.mark.parametrize("head", [
+    "public.f(INOUT r app.pair)",
+    "public.f(p app.pair) RETURNS void",
+])
+def test_a_composite_with_an_assigned_field_keeps_its_type(head: str) -> None:
+    # Every plain-typed variable becomes text for a multi-target INTO (pglast
+    # 8) — except one whose field the body assigns.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    var = "r" if "INOUT" in head else "p"
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION {head} LANGUAGE plpgsql AS $x$DECLARE s app.status; t text;\n"
+        f"BEGIN SELECT x.status, x.token INTO s, t FROM app.secret x; {var}.b := t;\n"
+        "DELETE FROM app.audit WHERE msg = t; END$x$")
+    assert incomplete is None
+    rendered = [RawStream()(s) for s in stmts]
+    assert any("app.secret" in r for r in rendered)
+    assert any("app.audit" in r for r in rendered)
 
 
 def test_a_cursor_sharing_a_retyped_name_keeps_its_query() -> None:

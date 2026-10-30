@@ -703,16 +703,22 @@ def _apply_rename(
         newname = getattr(stmt, "newname", None)
         builder = tables.get(key) if key is not None else None
         if key is not None and builder is not None and old_name and newname:
-            # The inherited copies on its children are renamed with it.
-            todo: list[tuple[str, str]] = [key]
-            seen: set[tuple[str, str]] = set()
+            builder.rename_constraint(old_name, newname)
+            # The inherited copies on its children are renamed with it. A
+            # child pgrls cannot tell has left (NO INHERIT / DETACH), or whose
+            # constraint of that name is its own, keeps the old name too —
+            # erring wide only reads a column as nullable.
+            todo = [ck for ck, cb in tables.items()
+                    if key in cb.inherits or cb.partition_of == key]
+            seen: set[tuple[str, str]] = {key}
             while todo:
                 k = todo.pop()
                 if k in seen:
                     continue
                 seen.add(k)
                 if (b := tables.get(k)) is not None:
-                    b.rename_constraint(old_name, newname)
+                    b.not_null_names.setdefault(newname, set()).update(
+                        b.not_null_columns(old_name))
                 todo.extend(ck for ck, cb in tables.items()
                             if k in cb.inherits or cb.partition_of == k)
         return
@@ -747,6 +753,11 @@ def _apply_rename(
     new = (old[0], newname)
     builder.name = newname
     builder.former_names.append(newname)
+    # Its children follow it to the new name.
+    for child in tables.values():
+        child.inherits = [new if p == old else p for p in child.inherits]
+        if child.partition_of == old:
+            child.partition_of = new
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder

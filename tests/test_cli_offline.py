@@ -1539,6 +1539,18 @@ def test_offline_drop_constraint_of_a_not_null():
             ("CREATE TABLE p (id int, a int NOT NULL); CREATE TABLE c () INHERITS (p);"
              " ALTER TABLE p RENAME CONSTRAINT p_a_not_null TO keep;"
              " ALTER TABLE c NO INHERIT p; ALTER TABLE c DROP CONSTRAINT keep;", "c"),
+            # A child that left before the rename keeps the old name.
+            ("CREATE TABLE p (id int, a int CONSTRAINT req NOT NULL, k int)"
+             " PARTITION BY LIST (k); CREATE TABLE c PARTITION OF p FOR VALUES IN (1);"
+             " ALTER TABLE p DETACH PARTITION c; ALTER TABLE p RENAME CONSTRAINT req TO p_req;"
+             " ALTER TABLE c DROP CONSTRAINT req;", "c"),
+            # The parent's rename reaches children after the parent is renamed.
+            ("CREATE TABLE p (id int, a int CONSTRAINT req NOT NULL, k int)"
+             " PARTITION BY LIST (k); CREATE TABLE c PARTITION OF p FOR VALUES IN (1);"
+             " ALTER TABLE p RENAME TO events;"
+             " ALTER TABLE events RENAME CONSTRAINT req TO events_req;"
+             " ALTER TABLE events DETACH PARTITION c; ALTER TABLE c DROP CONSTRAINT events_req;",
+             "c"),
         ):
             schema = schema_from_sql(sql, schemas=("public",))
             t = next(x for x in schema.tables if x.name == table)
