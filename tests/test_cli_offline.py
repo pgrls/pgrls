@@ -1422,6 +1422,8 @@ def test_offline_primary_key_implies_not_null():
     assert {
         c.name: c.is_nullable for c in table_level.column_details
     }["id"] is False
+    altered = _only("CREATE TABLE t (id int, x text); ALTER TABLE t ADD PRIMARY KEY (id);")
+    assert {c.name: c.is_nullable for c in altered.column_details}["id"] is False
 
 
 def test_offline_pg18_not_null_constraints():
@@ -1438,12 +1440,38 @@ def test_offline_pg18_not_null_constraints():
         " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant;": False,
         "CREATE TABLE t (id int, tenant text);"
         " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;": True,
-        "CREATE TABLE t (id int, tenant text);"
-        " ALTER TABLE t ADD PRIMARY KEY (tenant);": False,
+        # In CREATE TABLE there are no rows yet: Postgres stores it validated.
+        "CREATE TABLE t (id int, tenant text, CONSTRAINT tnn NOT NULL tenant NOT VALID);": False,
     }
     for stmt, nullable in sql.items():
         t = _only(stmt)
         assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is nullable, stmt
+
+
+def test_offline_drop_constraint_of_a_not_null():
+    # PG18 stores NOT NULL as a named constraint, and DROP CONSTRAINT drops
+    # it; an unnamed one is `<table>_<column>_not_null`.
+    auto = _only(
+        "CREATE TABLE t (id int, tenant text NOT NULL);"
+        " ALTER TABLE t DROP CONSTRAINT t_tenant_not_null;"
+    )
+    assert {c.name: c.is_nullable for c in auto.column_details}["tenant"] is True
+    other = _only(
+        "CREATE TABLE t (id int, tenant text NOT NULL, CONSTRAINT ck CHECK (id > 0));"
+        " ALTER TABLE t DROP CONSTRAINT ck;"
+    )
+    assert {c.name: c.is_nullable for c in other.column_details}["tenant"] is False
+    import pglast
+
+    if not pglast.__version__.startswith("v8"):
+        return  # named NOT NULL constraints are PG18 syntax
+    for sql in (
+        "CREATE TABLE t (id int, tenant text CONSTRAINT nn NOT NULL);",
+        "CREATE TABLE t (id int, tenant text, CONSTRAINT nn NOT NULL tenant);",
+        "CREATE TABLE t (id int, tenant text); ALTER TABLE t ADD CONSTRAINT nn NOT NULL tenant;",
+    ):
+        t = _only(sql + " ALTER TABLE t DROP CONSTRAINT nn;")
+        assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql
 
 
 def test_offline_alter_column_set_and_drop_not_null():

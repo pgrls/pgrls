@@ -489,12 +489,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                         is_nullable=not _column_def_is_not_null(elt),
                     )
                 )
+                _record_not_null_names(builder, elt)
         # A table-level `PRIMARY KEY (a, b)` constraint makes its columns NOT
         # NULL just as an inline `PRIMARY KEY` does, and so does PG18's
         # table-level `NOT NULL c`.
         for elt in stmt.tableElts or ():
-            for col_name in _constraint_not_null_columns(elt):
+            for col_name in _constraint_not_null_columns(elt, creating=True):
                 builder.set_not_null(col_name)
+                if getattr(elt, "conname", None):
+                    builder.not_null_names[elt.conname] = col_name
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
@@ -534,6 +537,8 @@ class _TableBuilder:
         self.column_grants: list[ColumnGrant] = []
         self.partition_of: tuple[str, str] | None = None
         self.inherits: list[tuple[str, str]] = []
+        # Named NOT NULL constraints (PG18 can drop one by name) → column.
+        self.not_null_names: dict[str, str] = {}
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -541,6 +546,18 @@ class _TableBuilder:
             if col.name == colname:
                 self.columns[i] = replace(col, is_nullable=not not_null)
                 return
+
+    def drop_constraint(self, conname: str) -> None:
+        """`DROP CONSTRAINT`: a NOT NULL one makes its column nullable again.
+        Postgres names an unnamed one `<table>_<column>_not_null`, truncated
+        to fit — so any column that name could be for counts."""
+        col = self.not_null_names.pop(conname, None)
+        if col is not None:
+            self.set_not_null(col, not_null=False)
+        elif conname.endswith("_not_null"):
+            for c in self.columns:
+                if c.name in conname:
+                    self.set_not_null(c.name, not_null=False)
 
     def drop_column(self, colname: str) -> None:
         self.columns = [c for c in self.columns if c.name != colname]
@@ -580,16 +597,25 @@ def _column_def_is_not_null(column_def: Any) -> bool:
     return False
 
 
-def _constraint_not_null_columns(con: Any) -> list[str]:
+def _record_not_null_names(builder: _TableBuilder, column_def: Any) -> None:
+    """Remember the name of an inline `CONSTRAINT <name> NOT NULL`."""
+    for con in getattr(column_def, "constraints", None) or ():
+        if (getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL
+                and getattr(con, "conname", None)):
+            builder.not_null_names[con.conname] = column_def.colname
+
+
+def _constraint_not_null_columns(con: Any, *, creating: bool = False) -> list[str]:
     """Column names a table-level constraint makes NOT NULL: a `PRIMARY KEY
-    (...)`, or PG18's `NOT NULL c` (pglast 8). A `NOT VALID` NOT NULL leaves
-    existing NULLs in place, so its column stays nullable — as introspection
-    reads it."""
+    (...)`, or PG18's `NOT NULL c` (pglast 8). An `ALTER TABLE … NOT VALID`
+    NOT NULL leaves existing NULLs in place, so its column stays nullable — as
+    introspection reads it; in `CREATE TABLE` there are no rows, and Postgres
+    stores it validated (measured on PG18)."""
     if type(con).__name__ != "Constraint":
         return []
     contype = getattr(con, "contype", None)
     if contype == ConstrType.CONSTR_NOTNULL:
-        if getattr(con, "skip_validation", False):
+        if getattr(con, "skip_validation", False) and not creating:
             return []
     elif contype != ConstrType.CONSTR_PRIMARY:
         return []
@@ -793,6 +819,7 @@ def _apply_alter_table(
                             is_nullable=not _column_def_is_not_null(col),
                         )
                     )
+                    _record_not_null_names(builder, col)
         elif subtype == AlterTableType.AT_DropColumn:
             # Without this the model keeps a column the migration removed, so
             # column-keyed rules (SEC030's discriminator, SEC045's sensitive
@@ -809,8 +836,15 @@ def _apply_alter_table(
             if name:
                 builder.set_not_null(name, not_null=False)
         elif subtype == AlterTableType.AT_AddConstraint:
-            for col_name in _constraint_not_null_columns(getattr(cmd, "def_", None)):
+            con = getattr(cmd, "def_", None)
+            for col_name in _constraint_not_null_columns(con):
                 builder.set_not_null(col_name)
+                if conname := getattr(con, "conname", None):
+                    builder.not_null_names[conname] = col_name
+        elif subtype == AlterTableType.AT_DropConstraint:
+            name = getattr(cmd, "name", None)
+            if name:
+                builder.drop_constraint(name)
         # Other ALTER subcommands are ignored.
 
 

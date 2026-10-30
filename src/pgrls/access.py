@@ -822,16 +822,25 @@ _PARSE_ASSIGNMENTS = frozenset({3, 4, 5})
 
 _PLPGSQL_UNPARSEABLE = "the PL/pgSQL body does not parse"
 
-_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+# A dollar-quote tag is an identifier without `$`; Postgres takes any high-bit
+# character in one.
+_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z_0-9\x80-\U0010ffff]*)?\$")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+# Where a PL/pgSQL block — and so a `DECLARE` section — can start.
+_BLOCK_STARTERS = frozenset({"begin", "then", "else", "loop"})
+# pglast's PL/pgSQL parse errors that a rewrite of the types can get past
+# (pglast 8): a type qualified outside pg_catalog / public, and VARIADIC.
+_REWRITABLE_ERRORS = ("LookupExplicitNamespace", "VARIADIC parameter must be an array")
+
+_Token = tuple[str, int, int]
 
 
-def _plpgsql_tokens(text: str) -> list[tuple[str, int, int]] | None:
+def _plpgsql_tokens(text: str) -> list[_Token] | None:
     """`text` as (kind, start, end) tokens — ``word``, ``qword`` (a quoted
     identifier), ``dot``, ``semi`` or ``other`` — skipping whitespace and
     comments and keeping each string literal whole. None when a string,
     quoted identifier or comment is left open."""
-    out: list[tuple[str, int, int]] = []
+    out: list[_Token] = []
     i, n = 0, len(text)
     while i < n:
         c = text[i]
@@ -891,11 +900,23 @@ def _plpgsql_tokens(text: str) -> list[tuple[str, int, int]] | None:
     return out
 
 
-def _unqualify_declared_types(body: str) -> str | None:
+def _ident(text: str, tok: _Token) -> str | None:
+    """The identifier `tok` spells, case-folded as Postgres folds it."""
+    kind, start, end = tok
+    if kind == "word":
+        return text[start:end].lower()
+    if kind == "qword":
+        return text[start + 1:end - 1].replace('""', '"')
+    return None
+
+
+def _unqualify_declared_types(body: str) -> tuple[str, frozenset[str]] | None:
     """`body` with the schema dropped from each type a ``DECLARE`` section
-    names (``u auth.users;`` → ``u users;``) — None when there is none, or the
-    body cannot be tokenized. Only the type right after ``name [CONSTANT]`` at
-    the start of a declaration is touched, never a default expression."""
+    names (``u auth.users;`` → ``u users;``), and the variables whose type
+    changed — None when no declared type is qualified, or the body cannot be
+    tokenized. Only the type right after ``name [CONSTANT]`` at the start of
+    a declaration is touched, never a default expression; ``%TYPE`` /
+    ``%ROWTYPE`` references parse as they are."""
     toks = _plpgsql_tokens(body)
     if toks is None:
         return None
@@ -903,11 +924,19 @@ def _unqualify_declared_types(body: str) -> str | None:
     def word(k: int) -> str | None:
         return body[toks[k][1]:toks[k][2]].lower() if toks[k][0] == "word" else None
 
+    def text(k: int) -> str:
+        return body[toks[k][1]:toks[k][2]]
+
+    def block_start(k: int) -> bool:
+        return (k == 0 or toks[k - 1][0] == "semi" or word(k - 1) in _BLOCK_STARTERS
+                or (k >= 2 and text(k - 1) == ">" and text(k - 2) == ">"))
+
     names = ("word", "qword")
     cuts: list[tuple[int, int]] = []
+    declared: set[str] = set()
     i = 0
     while i < len(toks):
-        if word(i) != "declare":
+        if word(i) != "declare" or not block_start(i):
             i += 1
             continue
         i += 1
@@ -921,23 +950,27 @@ def _unqualify_declared_types(body: str) -> str | None:
                 while (k + 2 < len(toks) and toks[k][0] in names
                        and toks[k + 1][0] == "dot" and toks[k + 2][0] in names):
                     k += 2
-                if k > j:
+                if k > j and not (k + 1 < len(toks) and text(k + 1) == "%"):
                     cuts.append((toks[j][1], toks[k][1]))
+                    declared.add(_ident(body, toks[i]) or "")
             at_start = toks[i][0] == "semi"
             i += 1
     for start, end in reversed(cuts):
         body = body[:start] + body[end:]
-    return body if cuts else None
+    return (body, frozenset(declared)) if cuts else None
 
 
-def _unqualified_types(definition: str) -> str | None:
-    """`definition` (a ``CREATE FUNCTION``) with the schema dropped from every
-    type it names — parameters, the return type and ``DECLARE`` sections — or
-    None when it cannot be rewritten. pglast 8's PL/pgSQL parser resolves a
-    schema-qualified type only in ``pg_catalog`` / ``public`` and rejects the
-    rest; a type does not change which SQL the body runs."""
+def _normalized_for_plpgsql(definition: str) -> tuple[str, frozenset[str]] | None:
+    """`definition` (a ``CREATE FUNCTION``) rewritten for pglast 8's PL/pgSQL
+    parser, which resolves a schema-qualified type only in ``pg_catalog`` /
+    ``public`` and rejects every VARIADIC parameter: the schema is dropped
+    from each other type it names — parameters, the return type and
+    ``DECLARE`` sections — and VARIADIC becomes a plain parameter. Also
+    returns the variables whose declared type changed. None when it cannot be
+    rewritten. A type does not change which SQL the body runs."""
     import pglast  # noqa: PLC0415
     from pglast import ast  # noqa: PLC0415
+    from pglast.enums import FunctionParameterMode  # noqa: PLC0415
     from pglast.stream import RawStream  # noqa: PLC0415
     from pglast.visitors import Visitor  # noqa: PLC0415
 
@@ -949,23 +982,90 @@ def _unqualified_types(definition: str) -> str | None:
         return None
     stmt = raws[0].stmt
 
-    class _Unqualify(Visitor):  # type: ignore[misc]
+    class _Normalize(Visitor):  # type: ignore[misc]
         def visit_TypeName(self, parent: Any, node: Any) -> Any:  # noqa: N802
             names: tuple[Any, ...] = node.names or ()
-            if len(names) > 1 and getattr(names[0], "sval", None) != "pg_catalog":
-                node.names = names[-1:]
+            # `schema.table.column%TYPE` keeps `table.column`.
+            keep = 2 if node.pct_type else 1
+            if len(names) > keep and getattr(names[0], "sval", None) != "pg_catalog":
+                node.names = names[-keep:]
             return None
 
-    _Unqualify()(stmt)
+        def visit_FunctionParameter(self, parent: Any, node: Any) -> Any:  # noqa: N802
+            if node.mode == FunctionParameterMode.FUNC_PARAM_VARIADIC:
+                node.mode = FunctionParameterMode.FUNC_PARAM_IN
+            return None
+
+    _Normalize()(stmt)
+    declared: frozenset[str] = frozenset()
     for opt in stmt.options or ():
         if opt.defname == "as" and opt.arg and getattr(opt.arg[0], "sval", None):
-            body = _unqualify_declared_types(opt.arg[0].sval)
-            if body is not None:
+            rewritten = _unqualify_declared_types(opt.arg[0].sval)
+            if rewritten is not None:
+                body, declared = rewritten
                 opt.arg = (ast.String(sval=body), *opt.arg[1:])
     try:
-        return str(RawStream()(stmt))
+        return str(RawStream()(stmt)), declared
     except Exception:  # noqa: BLE001 — a node the deparser cannot render
         return None
+
+
+def _function_body(definition: str) -> str | None:
+    """The body (``AS`` string) of a ``CREATE FUNCTION``."""
+    import pglast  # noqa: PLC0415
+
+    try:
+        raws = pglast.parse_sql(definition)
+    except pglast.parser.ParseError:
+        return None
+    if len(raws) != 1:
+        return None
+    for opt in getattr(raws[0].stmt, "options", None) or ():
+        if opt.defname == "as" and opt.arg and getattr(opt.arg[0], "sval", None):
+            return str(opt.arg[0].sval)
+    return None
+
+
+def _datums(tree: Any) -> list[tuple[str, dict[str, Any]]]:
+    """The (kind, fields) of each variable a parsed PL/pgSQL function declares
+    in its source (``lineno`` set) — not the implicit ``found`` / ``new``."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for fn in tree if isinstance(tree, list) else ():
+        for datum in (fn.get("PLpgSQL_function") or {}).get("datums") or ():
+            for kind, fields in datum.items():
+                if isinstance(fields, dict) and fields.get("lineno"):
+                    out.append((kind, fields))
+    return out
+
+
+def _rec_default_dropped(body: str | None, tree: Any) -> bool:
+    """Whether a variable the parse models as a record was declared with a
+    default. pglast leaves a record's default expression out of the parse
+    (pglast 7 for ``record``, pglast 8 for every type it does not know —
+    an enum, a domain, a composite), so its SQL would go unseen. True when
+    that cannot be ruled out."""
+    recs = [f for kind, f in _datums(tree) if kind == "PLpgSQL_rec"]
+    if not recs:
+        return False
+    toks = None if body is None else _plpgsql_tokens(body)
+    if body is None or toks is None:
+        return True
+    line_starts = [0] + [m.end() for m in re.finditer("\n", body)]
+    for rec in recs:
+        line = int(rec["lineno"])
+        if line > len(line_starts):
+            return True
+        at = next((k for k, t in enumerate(toks)
+                   if t[1] >= line_starts[line - 1] and _ident(body, t) == rec.get("refname")),
+                  None)
+        if at is None:
+            return True
+        for t in toks[at + 1:]:
+            if t[0] == "semi":
+                break
+            if body[t[1]:t[2]] == "=" or (t[0] == "word" and body[t[1]:t[2]].lower() == "default"):
+                return True
+    return False
 
 
 def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
@@ -977,14 +1077,19 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError as exc:
-        retry = (_unqualified_types(definition)
-                 if "LookupExplicitNamespace" in str(exc) else None)
-        try:
-            tree = pglast.parse_plpgsql(retry) if retry else None
-        except pglast.parser.ParseError:
-            tree = None
-        if tree is None:
+        normalized = (_normalized_for_plpgsql(definition)
+                      if any(e in str(exc) for e in _REWRITABLE_ERRORS) else None)
+        if normalized is None:
             return [], _PLPGSQL_UNPARSEABLE
+        definition, retyped = normalized
+        try:
+            tree = pglast.parse_plpgsql(definition)
+        except pglast.parser.ParseError:
+            return [], _PLPGSQL_UNPARSEABLE
+        # Every declaration the rewrite touched must be one the parser saw.
+        if not retyped <= {f.get("refname") for _, f in _datums(tree)}:
+            return [], _PLPGSQL_UNPARSEABLE
+    rec_default = _rec_default_dropped(_function_body(definition), tree)
     exprs: list[tuple[str, int]] = []
     dynamic = False
 
@@ -1019,6 +1124,8 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
         reasons.append("runs dynamic SQL (EXECUTE)")
     if unparsed:
         reasons.append("a statement in the body does not parse")
+    if rec_default:
+        reasons.append("a record variable's default is not captured by the parser")
     return stmts, "; ".join(reasons) or None
 
 

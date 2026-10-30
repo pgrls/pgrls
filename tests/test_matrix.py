@@ -1298,8 +1298,9 @@ def test_a_plpgsql_body_is_traced_statement_by_statement() -> None:
 
 def test_a_plpgsql_body_with_schema_qualified_types_is_traced() -> None:
     # pglast 8's PL/pgSQL parser resolves a qualified type only in pg_catalog
-    # / public, and pg_get_functiondef qualifies the rest. The types are
-    # dropped before parsing; the statements the body runs are unchanged.
+    # / public; pg_get_functiondef qualifies a parameter / return type outside
+    # the search_path (a DECLARE type is as written). The types are dropped
+    # before parsing; the statements the body runs are unchanged.
     body = """CREATE OR REPLACE FUNCTION public.f(p app.status)
  RETURNS SETOF app.t LANGUAGE plpgsql SECURITY DEFINER
 AS $function$
@@ -1317,23 +1318,92 @@ END $function$"""
     assert m.untraced == ()
 
 
+_QUALIFIED_HEAD = ("CREATE FUNCTION public.f(p app.t) RETURNS void LANGUAGE plpgsql "
+                   "SECURITY DEFINER AS $x$")
+
+
+@pytest.mark.parametrize(("body", "statements"), [
+    # A `declare` that cannot start a block — a column, a table, a function,
+    # a dollar-quoted string — opens no DECLARE section: statements keep
+    # their schema.
+    ("BEGIN PERFORM 1 FROM app.secret s WHERE s.declare = 1; UPDATE app.secret SET v = 1; END",
+     ["SELECT 1 FROM app.secret AS s WHERE s.declare = 1", "UPDATE app.secret SET v = 1"]),
+    ("BEGIN PERFORM x.declare FROM app.a x; TRUNCATE app.secret; END",
+     ["SELECT x.declare FROM app.a AS x", "TRUNCATE TABLE app.secret"]),
+    ("BEGIN PERFORM app.declare(); CALL app.proc(); END",
+     ["SELECT app.declare()", "CALL app.proc()"]),
+    ("BEGIN PERFORM $é$ declare $é$; UPDATE app.secret SET v = 1; END",
+     ["SELECT ' declare '", "UPDATE app.secret SET v = 1"]),
+    ("DECLARE w app.secret.v%TYPE; BEGIN SELECT v INTO w FROM app.secret; END",
+     ["SELECT v FROM app.secret"]),
+])
+def test_qualified_types_never_change_a_statement(body: str, statements: list[str]) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(f"{_QUALIFIED_HEAD}{body}$x$")
+    assert incomplete is None
+    assert [RawStream()(s) for s in stmts] == statements
+
+
+@pytest.mark.parametrize("decl", [
+    "m public.mood := (SELECT v::public.mood FROM app.secret LIMIT 1)",
+    "r record := (SELECT 1 FROM app.secret)",
+    "m mood\n    DEFAULT (SELECT v FROM app.secret LIMIT 1)",
+])
+def test_a_record_default_is_never_dropped_silently(decl: str) -> None:
+    # pglast leaves a record variable's default out of the parse (pglast 7
+    # for `record`, pglast 8 for any type it does not know, measured), so its
+    # SQL would go unseen: the result is incomplete.
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x$\n"
+        f"DECLARE\n  {decl};\nBEGIN NULL; END$x$")
+    if incomplete is None:
+        # pglast 7 models `mood` as a scalar and keeps the default.
+        assert any("secret" in str(s) for s in stmts)
+    else:
+        assert "default is not captured" in incomplete
+
+
+def test_a_variadic_plpgsql_function_is_traced() -> None:
+    # pglast 8's PL/pgSQL parser rejects every VARIADIC parameter.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f(VARIADIC a integer[]) RETURNS void LANGUAGE plpgsql "
+        "AS $x$BEGIN PERFORM 1 FROM app.v; END$x$")
+    assert incomplete is None
+    assert [RawStream()(s) for s in stmts] == ["SELECT 1 FROM app.v"]
+
+
 @pytest.mark.parametrize(("body", "expected"), [
-    ("DECLARE u auth.users; BEGIN END", "DECLARE u users; BEGIN END"),
-    ('DECLARE u CONSTANT "auth"."users" := NULL; BEGIN END',
-     'DECLARE u CONSTANT "users" := NULL; BEGIN END'),
+    ("DECLARE u auth.users; BEGIN END", ("DECLARE u users; BEGIN END", {"u"})),
+    ('DECLARE "U" CONSTANT "auth"."users" := NULL; BEGIN END',
+     ('DECLARE "U" CONSTANT "users" := NULL; BEGIN END', {"U"})),
     # A default expression, a string and a comment are never touched.
-    ("DECLARE s app.st := 'x'::app.st; BEGIN END", "DECLARE s st := 'x'::app.st; BEGIN END"),
+    ("DECLARE s app.st := 'x'::app.st; BEGIN END",
+     ("DECLARE s st := 'x'::app.st; BEGIN END", {"s"})),
     ("DECLARE s text := E'\\'; DECLARE x app.t'; BEGIN END", None),
     ("DECLARE /* u app.t; */ n int; BEGIN END", None),
     # A nested block's DECLARE section too; statements are left alone.
     ("BEGIN PERFORM 1 FROM app.t; DECLARE d app.t; BEGIN NULL; END; END",
-     "BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END"),
+     ("BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END", {"d"})),
+    ("<<outer>> DECLARE d app.t; BEGIN NULL; END",
+     ("<<outer>> DECLARE d t; BEGIN NULL; END", {"d"})),
     ("DECLARE s text := 'open", None),
 ])
-def test_unqualify_declared_types(body: str, expected: str | None) -> None:
+def test_unqualify_declared_types(
+    body: str, expected: tuple[str, set[str]] | None
+) -> None:
     from pgrls.access import _unqualify_declared_types  # noqa: PLC0415
 
-    assert _unqualify_declared_types(body) == expected
+    got = _unqualify_declared_types(body)
+    assert (got if got is None else (got[0], set(got[1]))) == expected
 
 
 def test_dynamic_sql_is_listed_but_the_static_part_still_counts() -> None:
