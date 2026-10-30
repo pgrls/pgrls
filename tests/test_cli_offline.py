@@ -1448,6 +1448,26 @@ def test_offline_pg18_not_null_constraints():
         assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is nullable, stmt
 
 
+def test_offline_no_inherit_not_null_is_not_inherited():
+    # PG18: an INHERITS child does not get a parent's NOT NULL … NO INHERIT
+    # (measured), so the child's column is nullable.
+    import pglast
+
+    from pgrls.schema_sources import schema_from_sql
+
+    if not pglast.__version__.startswith("v8"):
+        pytest.skip("NOT NULL … NO INHERIT is PG18 syntax (pglast 8)")
+    for parent in (
+        "CREATE TABLE p (id int, tenant int NOT NULL NO INHERIT);",
+        "CREATE TABLE p (id int, tenant int, NOT NULL tenant NO INHERIT);",
+    ):
+        schema = schema_from_sql(parent + " CREATE TABLE c (x int) INHERITS (p);",
+                                 schemas=("public",))
+        nullable = {t.name: {c.name: c.is_nullable for c in t.column_details}["tenant"]
+                    for t in schema.tables}
+        assert nullable == {"p": False, "c": True}, parent
+
+
 def test_offline_drop_constraint_of_a_not_null():
     # PG18 stores NOT NULL as a named constraint, and DROP CONSTRAINT drops
     # it; an unnamed one is `<table>_<column>_not_null`.

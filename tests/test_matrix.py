@@ -1430,7 +1430,7 @@ def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
 
     _, incomplete = _plpgsql_statements(
         f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
-    assert incomplete is not None and "default could not be read" in incomplete
+    assert incomplete is not None and "declaration could not be read" in incomplete
 
 
 @pytest.mark.parametrize("body", [
@@ -1476,15 +1476,37 @@ def test_a_variadic_plpgsql_function_is_traced() -> None:
      "BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END"),
     ("<<outer>> DECLARE d app.t; BEGIN NULL; END", "<<outer>> DECLARE d t; BEGIN NULL; END"),
 ])
-def test_type_cuts(body: str, expected: str | None) -> None:
-    from pgrls.access import _plpgsql_tokens, _type_cuts  # noqa: PLC0415
+def test_type_edits(body: str, expected: str | None) -> None:
+    from pgrls.access import _plpgsql_tokens, _type_edits  # noqa: PLC0415
 
     toks = _plpgsql_tokens(body)
     assert toks is not None
-    cuts = _type_cuts(body, toks)
-    for start, stop in reversed(cuts):
-        body = body[:start] + body[stop:]
-    assert (body if cuts else None) == expected
+    edits = _type_edits(body, toks)
+    for start, stop, text in reversed(edits):
+        body = body[:start] + text + body[stop:]
+    assert (body if edits else None) == expected
+
+
+@pytest.mark.parametrize("body", [
+    # pglast 8 takes a variable of a type it does not know for a record, which
+    # cannot be one of several INTO targets (measured).
+    "DECLARE v_id uuid; v_role app_member_role; BEGIN "
+    "SELECT id, role INTO v_id, v_role FROM app.secret WHERE user_id = auth.uid(); END",
+    "DECLARE v_id uuid; v_role app.member_role := 'a'; c refcursor; BEGIN "
+    "FETCH c INTO v_id, v_role; PERFORM 1 FROM app.secret; END",
+    "DECLARE n app_dom; BEGIN UPDATE app.secret SET v = 1; GET DIAGNOSTICS n = ROW_COUNT; END",
+    # Postgres folds only ASCII letters.
+    "DECLARE \u00c4rger app_mood := (SELECT mood FROM app.secret LIMIT 1); BEGIN NULL; END",
+])
+def test_an_unknown_typed_variable_is_read_on_either_major(body: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
 
 
 def test_dynamic_sql_is_listed_but_the_static_part_still_counts() -> None:

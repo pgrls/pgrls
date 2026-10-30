@@ -476,6 +476,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 continue
             for col in parent.columns:
                 if not any(c.name == col.name for c in builder.columns):
+                    if col.name in parent.no_inherit_not_null:
+                        col = replace(col, is_nullable=True)
                     builder.columns.append(col)
         for elt in stmt.tableElts or ():
             if type(elt).__name__ != "ColumnDef":
@@ -491,15 +493,20 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                     )
                 )
                 _record_not_null_names(builder, elt)
+                if _only_no_inherit_not_null(getattr(elt, "constraints", None) or ()):
+                    builder.no_inherit_not_null.add(colname)
         # A table-level `PRIMARY KEY (a, b)` constraint makes its columns NOT
         # NULL just as an inline `PRIMARY KEY` does, and so does PG18's
         # table-level `NOT NULL c`.
         for elt in stmt.tableElts or ():
             for col_name in _constraint_not_null_columns(elt, creating=True):
                 builder.set_not_null(col_name)
-                # A primary key's columns stay NOT NULL when it is dropped.
+                # Only a NOT NULL's name is recorded: dropping a primary key leaves
+                # its columns NOT NULL.
                 if elt.contype == ConstrType.CONSTR_NOTNULL and elt.conname:
                     builder.not_null_names.setdefault(elt.conname, set()).add(col_name)
+                if _only_no_inherit_not_null([elt]):
+                    builder.no_inherit_not_null.add(col_name)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
@@ -544,6 +551,9 @@ class _TableBuilder:
         # Every name the table has had: an unnamed NOT NULL keeps the name
         # it got from the table at the time.
         self.former_names: list[str] = [name]
+        # Columns NOT NULL only through a `NO INHERIT` constraint: an
+        # `INHERITS` child does not get it.
+        self.no_inherit_not_null: set[str] = set()
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -617,6 +627,17 @@ def _column_def_is_not_null(column_def: Any) -> bool:
         ):
             return True
     return False
+
+
+def _only_no_inherit_not_null(constraints: Any) -> bool:
+    """Whether `constraints` make a column NOT NULL only through a PG18
+    `NOT NULL … NO INHERIT`, which an `INHERITS` child does not get."""
+    kinds = [(getattr(c, "contype", None), bool(getattr(c, "is_no_inherit", False)))
+             for c in constraints if type(c).__name__ == "Constraint"]
+    return ((ConstrType.CONSTR_NOTNULL, True) in kinds
+            and not any(k == ConstrType.CONSTR_PRIMARY
+                        or (k == ConstrType.CONSTR_NOTNULL and not no_inherit)
+                        for k, no_inherit in kinds))
 
 
 _AUTO_NOT_NULL = re.compile(r"(.+)_not_null\d*")
@@ -875,7 +896,8 @@ def _apply_alter_table(
             con = getattr(cmd, "def_", None)
             for col_name in _constraint_not_null_columns(con):
                 builder.set_not_null(col_name)
-                # A primary key's columns stay NOT NULL when it is dropped.
+                # Only a NOT NULL's name is recorded: dropping a primary key leaves
+                # its columns NOT NULL.
                 conname = getattr(con, "conname", None)
                 if getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL and conname:
                     builder.not_null_names.setdefault(conname, set()).add(col_name)

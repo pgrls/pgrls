@@ -56,9 +56,10 @@ another role); a cast, or an operator reusing a built-in symbol, backed by a
 user function; the write-side ``WITH CHECK`` of an UPDATE (the cell shows the
 rows ``USING`` lets it touch). A function, trigger or rule whose SQL cannot
 be traced — dynamic SQL, another language, a PL/pgSQL body pgrls cannot
-fully read (an unparseable body, a variable default it cannot read back), a
-call into a function or operator pgrls cannot see, a built-in that runs SQL named by an argument, a
-utility statement — is listed as untraced instead of attributed to a table.
+fully read (an unparseable body, a variable default it cannot read back,
+``#option dump`` on pglast 8), a call into a function or operator pgrls
+cannot see, a built-in that runs SQL named by an argument, a utility
+statement — is listed as untraced instead of attributed to a table.
 """
 from __future__ import annotations
 
@@ -834,6 +835,9 @@ _BLOCK_STARTERS = frozenset({"begin", "then", "else", "loop"})
 # can get past (pglast 8): a type qualified outside pg_catalog / public, and
 # VARIADIC.
 _REWRITABLE_ERRORS = ("LookupExplicitNamespace", "VARIADIC parameter must be an array")
+# pglast 8 takes a variable of a type it does not know for a record, which
+# cannot be one of several INTO targets: declare that variable `text`.
+_NOT_SCALAR = re.compile(r'"(.+)" is not a scalar variable')
 
 _Token = tuple[str, int, int]
 # An assignment target that runs no SQL: a variable or a field path.
@@ -843,8 +847,8 @@ _PLAIN_TARGET = re.compile(r'\s*(?:[^\W\d][\w$]*|"(?:[^"]|"")+")(?:\s*\.\s*(?:[^
 def _plpgsql_tokens(text: str) -> list[_Token] | None:
     """`text` as (kind, start, end) tokens — ``word``, ``qword`` (a quoted
     identifier), ``dot``, ``semi`` or ``other`` — skipping whitespace and
-    comments and keeping each string literal whole. None when a string,
-    quoted identifier or comment is left open."""
+    comments and keeping each string literal whole. None when a string
+    (dollar-quoted too), quoted identifier or comment is left open."""
     out: list[_Token] = []
     i, n = 0, len(text)
     while i < n:
@@ -906,10 +910,11 @@ def _plpgsql_tokens(text: str) -> list[_Token] | None:
 
 
 def _ident(text: str, tok: _Token) -> str | None:
-    """The identifier `tok` spells, case-folded as Postgres folds it."""
+    """The identifier `tok` spells, case-folded as Postgres folds it (ASCII
+    letters only)."""
     kind, start, end = tok
     if kind == "word":
-        return text[start:end].lower()
+        return "".join(c.lower() if c.isascii() else c for c in text[start:end])
     if kind == "qword":
         return text[start + 1:end - 1].replace('""', '"')
     return None
@@ -954,12 +959,16 @@ def _line_of(body: str, tok: _Token) -> int:
     return body.count("\n", 0, tok[1]) + 1
 
 
-def _type_cuts(body: str, toks: list[_Token]) -> list[tuple[int, int]]:
-    """Where to drop the schema from the type a declaration names (``u
-    auth.users;`` → ``u users;``): the type right after ``name [CONSTANT]``,
-    never a default expression; ``%TYPE`` / ``%ROWTYPE`` parse as they are."""
+def _type_edits(
+    body: str, toks: list[_Token], scalars: frozenset[str] = frozenset()
+) -> list[tuple[int, int, str]]:
+    """(start, end, replacement) edits to the type each declaration names —
+    the tokens after ``name [CONSTANT]`` up to a default, ``NOT NULL``,
+    ``COLLATE`` or the ``;``, never a default expression: the schema is
+    dropped (``u auth.users;`` → ``u users;``), and the type of a variable in
+    `scalars` becomes ``text``. ``%TYPE`` / ``%ROWTYPE`` stay as they are."""
     names = ("word", "qword")
-    cuts: list[tuple[int, int]] = []
+    edits: list[tuple[int, int, str]] = []
     for spans, _ in _declaration_sections(body, toks):
         for i, end in spans:
             if toks[i][0] not in names:
@@ -968,13 +977,22 @@ def _type_cuts(body: str, toks: list[_Token]) -> list[tuple[int, int]]:
             if (j < end and toks[j][0] == "word"
                     and body[toks[j][1]:toks[j][2]].lower() == "constant"):
                 j += 1
+            stop = next((k for k in range(j, end)
+                         if body[toks[k][1]:toks[k][2]] in (":", "=")
+                         or (toks[k][0] == "word" and body[toks[k][1]:toks[k][2]].lower()
+                             in ("default", "not", "collate"))), end)
+            if stop == j or any(body[toks[k][1]:toks[k][2]] == "%" for k in range(j, stop)):
+                continue
+            if _ident(body, toks[i]) in scalars:
+                edits.append((toks[j][1], toks[stop - 1][2], "text"))
+                continue
             k = j
-            while (k + 2 < end and toks[k][0] in names
+            while (k + 2 < stop and toks[k][0] in names
                    and toks[k + 1][0] == "dot" and toks[k + 2][0] in names):
                 k += 2
-            if k > j and not (k + 1 < end and body[toks[k + 1][1]:toks[k + 1][2]] == "%"):
-                cuts.append((toks[j][1], toks[k][1]))
-    return cuts
+            if k > j:
+                edits.append((toks[j][1], toks[k][1], ""))
+    return edits
 
 
 @dataclass(frozen=True)
@@ -988,7 +1006,9 @@ class _Parsed:
     decls: dict[tuple[str | None, int], tuple[int, int] | None]
 
 
-def _confirmed_parse(definition: str, *, retype: bool) -> _Parsed | None:
+def _confirmed_parse(
+    definition: str, *, retype: bool, scalars: frozenset[str] = frozenset()
+) -> _Parsed | str:
     """Parse `definition` (a ``CREATE FUNCTION``) with every ``DECLARE``
     section the tokens suggest confirmed by the parser itself: a probe
     declaration ``pgrls_probe_<n> int;`` goes at each declaration start and
@@ -998,15 +1018,17 @@ def _confirmed_parse(definition: str, *, retype: bool) -> _Parsed | None:
 
     With `retype`, the definition is first rewritten for pglast 8's PL/pgSQL
     parser, which resolves a schema-qualified type only in ``pg_catalog`` /
-    ``public`` and rejects every VARIADIC parameter: the schema is dropped
-    from each type it names — outside ``pg_catalog`` for parameters and the
-    return type, any schema in a confirmed ``DECLARE`` — and VARIADIC becomes
-    a plain parameter. A type does not change which SQL the body runs.
+    ``public``, rejects every VARIADIC parameter, and takes a variable of a
+    type it does not know for a record (no scalar target): the schema is
+    dropped from each type it names — outside ``pg_catalog`` for parameters
+    and the return type, any schema in a confirmed ``DECLARE`` — VARIADIC
+    becomes a plain parameter, and each variable in `scalars` is declared
+    ``text``. A type does not change which SQL the body runs.
 
-    None when the definition is not one ``CREATE FUNCTION`` with a body,
-    cannot be rewritten or probed (its body already uses a
-    ``pgrls_probe_<n>`` name), does not parse, or a probe does not come
-    back."""
+    Otherwise the reason it failed: the parse error, or ``""`` when the
+    definition is not one ``CREATE FUNCTION`` with a body, cannot be
+    rewritten or probed (its body already uses a ``pgrls_probe_<n>`` name),
+    or a probe does not come back."""
     import pglast  # noqa: PLC0415
     from pglast import ast  # noqa: PLC0415
     from pglast.enums import FunctionParameterMode  # noqa: PLC0415
@@ -1016,14 +1038,14 @@ def _confirmed_parse(definition: str, *, retype: bool) -> _Parsed | None:
     try:
         raws = pglast.parse_sql(definition)
     except pglast.parser.ParseError:
-        return None
+        return ""
     if len(raws) != 1 or type(raws[0].stmt).__name__ != "CreateFunctionStmt":
-        return None
+        return ""
     stmt = raws[0].stmt
     opt = next((o for o in stmt.options or ()
                 if o.defname == "as" and o.arg and getattr(o.arg[0], "sval", None)), None)
     if opt is None:
-        return None
+        return ""
     body = str(opt.arg[0].sval)
 
     if retype:
@@ -1044,13 +1066,13 @@ def _confirmed_parse(definition: str, *, retype: bool) -> _Parsed | None:
         _Normalize()(stmt)
         toks = _plpgsql_tokens(body)
         if toks is None:
-            return None
-        for start, stop in reversed(_type_cuts(body, toks)):
-            body = body[:start] + body[stop:]
+            return ""
+        for start, stop, text in reversed(_type_edits(body, toks, scalars)):
+            body = body[:start] + text + body[stop:]
 
     toks = _plpgsql_tokens(body)
     if toks is None:
-        return None
+        return ""
     sections = _declaration_sections(body, toks)
     taken = set(re.findall(r"pgrls_probe_\d+", body))
     at: list[int] = []
@@ -1063,17 +1085,19 @@ def _confirmed_parse(definition: str, *, retype: bool) -> _Parsed | None:
     for n, pos in sorted(enumerate(at), key=lambda x: -x[1]):
         name = f"pgrls_probe_{n}"
         if name in taken:
-            return None
+            return ""
         probes[name] = body.count("\n", 0, pos) + 1
         probed = f"{probed[:pos]}{name} int; {probed[pos:]}"
     opt.arg = (ast.String(sval=probed), *opt.arg[1:])
     try:
         tree = pglast.parse_plpgsql(str(RawStream()(stmt)))
-    except Exception:  # noqa: BLE001 — a parse error, or a node the deparser cannot render
-        return None
+    except pglast.parser.ParseError as exc:
+        return str(exc)
+    except Exception:  # noqa: BLE001 — a node the deparser cannot render
+        return ""
     declared = {(f.get("refname"), int(f["lineno"])) for _, f in _datums(tree)}
     if any((name, line) not in declared for name, line in probes.items()):
-        return None
+        return ""
     decls: dict[tuple[str | None, int], tuple[int, int] | None] = {}
     for spans, closing in sections:
         if closing is None:
@@ -1120,8 +1144,8 @@ def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     """The default expressions of the variables the parse models as records,
     read from their confirmed declarations — pglast leaves them out
     (``record`` on both majors; on pglast 8 also every type it does not know:
-    an enum, a domain, a composite), so their SQL would go unseen. None when one cannot
-    be read."""
+    an enum, a domain, a composite), so their SQL would go unseen. None when
+    one cannot be read."""
     body = parsed.body
     loops = _loop_variables(parsed.tree)
     out: list[str] = []
@@ -1160,21 +1184,28 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     if (not pglast.__version__.startswith("v7")
             and re.search(r"#\s*option\s+dump", definition, re.IGNORECASE)):
         return [], "the PL/pgSQL body sets #option dump (pglast 8 prints its parse tree)"
+    parsed: _Parsed | str | None = None
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError as exc:
-        if not any(e in str(exc) for e in _REWRITABLE_ERRORS):
-            return [], _PLPGSQL_UNPARSEABLE
-        parsed = _confirmed_parse(definition, retype=True)
-        if parsed is None:
+        error, scalars = str(exc), frozenset[str]()
+        for _ in range(8):
+            if m := _NOT_SCALAR.fullmatch(error):
+                scalars |= {m.group(1)}
+            elif not any(e in error for e in _REWRITABLE_ERRORS):
+                break
+            parsed = _confirmed_parse(definition, retype=True, scalars=scalars)
+            if not isinstance(parsed, str):
+                break
+            error = parsed
+        if not isinstance(parsed, _Parsed):
             return [], _PLPGSQL_UNPARSEABLE
         tree = parsed.tree
     else:
-        parsed = None
         if any(kind == "PLpgSQL_rec" for kind, _ in _datums(tree)):
             parsed = _confirmed_parse(definition, retype=False)
     rec_defaults = None
-    if parsed is not None:
+    if isinstance(parsed, _Parsed):
         rec_defaults = _rec_defaults(parsed)
     elif not any(kind == "PLpgSQL_rec" for kind, _ in _datums(tree)):
         rec_defaults = []
@@ -1220,8 +1251,8 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     if unparsed:
         reasons.append("a statement in the body does not parse")
     if rec_defaults is None:
-        reasons.append("a variable's default could not be read (a record, or on "
-                       "pglast 8 a type it does not know)")
+        reasons.append("a record variable's declaration could not be read (a record, "
+                       "or on pglast 8 a type it does not know)")
     return stmts, "; ".join(reasons) or None
 
 
