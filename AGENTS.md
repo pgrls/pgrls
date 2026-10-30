@@ -1109,7 +1109,7 @@ These are intentional in the current release. Do not invent capabilities.
 - **Postgres only.** No support for other databases or for
   MySQL/MariaDB emulation layers.
 - **Postgres 15+.** Older PG releases (10–14) are no longer
-  supported. The CI matrix runs against PG15, PG16, and PG17.
+  supported. The CI matrix runs against PG15, PG16, PG17, and PG18.
   `security_invoker` (the VIEW001 fix target) is a PG15+ reloption,
   which is the proximate reason for the floor bump.
 - **SAT-style predicate implication is built in.** v0.2's diff

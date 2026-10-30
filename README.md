@@ -28,7 +28,7 @@
   </a>
 </p>
 
-> **Beta — actively maintained.** 68 lint rules, 19 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
+> **Beta — actively maintained.** 68 lint rules, 19 mechanically auto-fixable, [semantic policy-diff command](#diff--pgrls-snapshot--pgrls-diff), pytest plugin for RLS isolation tests. Tested on PostgreSQL 15, 16, 17, 18. Stable JSON / SARIF schema for CI integrations. The [CHANGELOG](CHANGELOG.md) records every release; current build is shown by the PyPI badge above.
 >
 > - **Lint & fix** — `pgrls lint` checks a live database against all sixty-eight rules and reports findings as text, JSON, SARIF, Markdown, HTML, GitHub-PR-comment (`--format pr-comment`), GitHub Actions annotations (`--format github`), JUnit XML (`--format junit`), or GitLab Code Quality (`--format gitlab`) for CI. `pgrls fix` auto-remediates the mechanically-fixable rules (SEC001, SEC002, SEC004, SEC010, SEC011, SEC015, SEC017, SEC019, SEC020, SEC030, SEC031, SEC032, SEC044, PERF001, PERF003, PERF004, HYG003, VIEW001, VIEW002) — to stdout or a migration-ready `.sql` file (`--output`). `pgrls lint --baseline` records existing findings so CI fails only on *new* ones, letting a team adopt pgrls on a legacy database without clearing the whole backlog first.
 > - **Generate** — `pgrls generate` scaffolds gold-standard RLS for tables that lack it — per-tenant (`tenant_id`) or per-user (`--model owner`, incl. the Supabase `auth.uid()` form): ENABLE + FORCE, an isolation policy, a restrictive floor, and the index, output designed to lint clean. Don't trust your ORM's RLS; generate correct RLS, then lint it. `--strict-binding` scaffolds the *loud* variant — see below.
@@ -45,7 +45,7 @@ pgrls needs **Python 3.11+** (and Postgres 15+ to lint against) — check `pytho
 pip install pgrls   # requires Python 3.11+
 ```
 
-pgrls is tested in CI against PostgreSQL 15–17 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
+pgrls is tested in CI against PostgreSQL 15–18 (see [`.github/workflows/test.yml`](.github/workflows/test.yml) for the matrix).
 
 ## Lint without a live database
 

@@ -29,7 +29,7 @@ classifiers = [
 dependencies = [
     "click>=8.2",
     "psycopg[binary]>=3.1",
-    "pglast>=7.20,<8",
+    "pglast>=7.20,<9",
     # z3-solver ships precompiled wheels (fast, no C++ toolchain) and
     # powers the semantic verifier path — `pgrls diff` predicate analysis
     # (the concrete leaking-row counterexample) and the SEC038
@@ -142,15 +142,17 @@ strict = true
 
 # pglast (the Postgres SQL parser pgrls uses for AST-based rules
 # and the diff predicate matcher) was untyped through v6 and is only
-# partially typed in v7 (untyped node constructors, Optional fields),
+# partially typed in v7 and v8 (untyped node constructors, Optional fields),
 # so mypy --strict would report every `from pglast import …` line or
 # every node access. Treat it as untyped at the import-resolver level
 # so real type errors elsewhere stay loud, without sprinkling
-# per-import `# type: ignore` comments.
+# per-import `# type: ignore` comments. v8 ships `.pyi` stubs, which
+# `follow_imports` ignores unless `follow_imports_for_stubs` is set.
 [[tool.mypy.overrides]]
 module = ["pglast", "pglast.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
+follow_imports_for_stubs = true
 
 # `z3-solver` (the Python wrapper around Z3) doesn't ship type
 # stubs as of 4.13. Suppress at the import-resolver level so the

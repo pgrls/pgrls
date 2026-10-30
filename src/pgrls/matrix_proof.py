@@ -327,11 +327,17 @@ def _body_statements_of(fn: UserFunction) -> list[Any] | None:
         except Exception:  # noqa: BLE001
             return None
     if fn.language == "plpgsql":
-        stmts, incomplete = _plpgsql_statements(
-            "CREATE FUNCTION pgrls_body() RETURNS void LANGUAGE plpgsql AS "
-            f"$pgrls_body${fn.body}$pgrls_body$"
-        )
-        return None if incomplete else stmts
+        # Only the body (prosrc) is captured, not the return type, and the
+        # PL/pgSQL parser checks RETURN against it (pglast 8 rejects `RETURN
+        # 1` in a void function) — so try the shapes a body can have.
+        for returns in ("void", "text", "SETOF text", "trigger"):
+            stmts, incomplete = _plpgsql_statements(
+                f"CREATE FUNCTION pgrls_body() RETURNS {returns} LANGUAGE plpgsql AS "
+                f"$pgrls_body${fn.body}$pgrls_body$"
+            )
+            if incomplete != "the PL/pgSQL body does not parse":
+                return None if incomplete else stmts
+        return None
     return None
 
 

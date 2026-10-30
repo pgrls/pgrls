@@ -54,6 +54,13 @@ breaking changes — they will be called out in this file.
   `proof_summary`. `--auth-function` names a project's own auth helper.
   SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
   end to end.
+- **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
+  17 and 18, and the dependency pin allows pglast 7 or 8
+  (`pglast>=7.20,<9`). pglast 8 parses the PG18 grammar: `pgrls matrix`
+  now reads `RETURNING` from its new `ReturningClause` node (a door's
+  `UPDATE … RETURNING` still counts as a SELECT), and stops reading a
+  PL/pgSQL body as untraceable when the parser checks a `RETURN` value
+  against the function's return type.
 
 ### Fixed
 - `pgrls matrix --format html` in a dark colour scheme: table headers and

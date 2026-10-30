@@ -26,7 +26,7 @@ jobs:
         # Floor (15) plus every still-supported major. Keep this
         # in sync with README.md's stated PG floor and with
         # tests/test_pg_version_floor.py::_README_PG_FLOOR_NUM.
-        pg: ["15", "16", "17"]
+        pg: ["15", "16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.pg }}-alpine
@@ -57,7 +57,7 @@ jobs:
       PGRLS_TEST_PG_IMAGE: postgres:${{ matrix.pg }}-alpine
       # The `pgrls vector` probe keys on a real pgvector column, so its live
       # tests spawn a pgvector image instead of the plain postgres one. Pin it
-      # to the same major as the matrix leg so all three versions are exercised.
+      # to the same major as the matrix leg so every version is exercised.
       PGRLS_TEST_PGVECTOR_IMAGE: pgvector/pgvector:pg${{ matrix.pg }}
     steps:
       - uses: actions/checkout@v6

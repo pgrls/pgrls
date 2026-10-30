@@ -995,7 +995,9 @@ def _statement_touches(
             action = getattr(getattr(conflict, "action", None), "name", "")
             if action == "ONCONFLICT_UPDATE":
                 cmds = cmds + ["UPDATE"]  # ON CONFLICT DO UPDATE, not DO NOTHING
-            if getattr(n, "returningList", None):
+            # RETURNING reads the rows it returns (pglast 7: returningList;
+            # pglast 8 / the PG18 grammar wraps it in a ReturningClause).
+            if getattr(n, "returningList", None) or getattr(n, "returningClause", None):
                 cmds = cmds + ["SELECT"]
             if n.relation is not None:
                 targets[id(n.relation)] = cmds

@@ -2142,7 +2142,7 @@ Detection treats every membership edge as `SET ROLE`-capable. On
 PostgreSQL 16+ a grant `WITH SET FALSE` does not permit `SET ROLE`,
 so SEC029 can over-report there — a deliberate bias toward surfacing
 a potential bypass route (allowlist a false positive) over missing
-one, and it keeps the introspection query identical across PG15-17.
+one, and it keeps the introspection query identical across PG15-18.
 
 Allowlist the *member* role by name (roles are unqualified, as in
 SEC016's allowlist) when the membership is intentional and the member
