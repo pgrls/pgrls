@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   pytest:
-    name: "pytest pg${{ matrix.pg }}"
+    name: "pytest pg${{ matrix.pg }}${{ matrix.pglast == '7' && ' pglast7' || '' }}"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -27,6 +27,12 @@ jobs:
         # in sync with README.md's stated PG floor and with
         # tests/test_pg_version_floor.py::_README_PG_FLOOR_NUM.
         pg: ["15", "16", "17", "18"]
+        # A fresh resolve picks the newest pglast (8); one extra leg pins
+        # the floor of the `pglast>=7.20,<9` range so both majors stay tested.
+        pglast: ["8"]
+        include:
+          - pg: "17"
+            pglast: "7"
     services:
       postgres:
         image: postgres:${{ matrix.pg }}-alpine
@@ -71,11 +77,19 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
+      - name: Pin pglast 7 (floor leg)
+        if: matrix.pglast == '7'
+        run: |
+          uv pip install "pglast>=7.20,<8"
+          uv run --no-sync python -c "import pglast; assert pglast.__version__.startswith('v7'), pglast.__version__"
+
+      # --no-sync: a plain `uv run` re-syncs the environment, which would
+      # put the floor leg back on the newest pglast.
       - name: Run unit tests
-        run: uv run pytest tests/ -q
+        run: uv run --no-sync pytest tests/ -q
 
       - name: Run demo tests
-        run: uv run pytest demo/ -q
+        run: uv run --no-sync pytest demo/ -q
 
   lint:
     name: lint (ruff + mypy + pip-audit)

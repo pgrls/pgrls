@@ -229,6 +229,27 @@ def test_populates_table_columns(
     assert set(things.columns) == {"id", "tenant_id", "name"}
 
 
+def test_not_valid_not_null_column_is_nullable(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # PG18 sets attnotnull for a NOT VALID NOT NULL constraint while existing
+    # NULLs stay in the table (measured), so SEC030 must still see the column
+    # as nullable. A validated NOT NULL stays not-nullable on every version.
+    apply_sql("CREATE TABLE public.things (id INT NOT NULL, tenant_id UUID);")
+    if pg_conn.info.server_version >= 180000:
+        apply_sql(
+            """
+            INSERT INTO public.things VALUES (1, NULL);
+            ALTER TABLE public.things
+                ADD CONSTRAINT tenant_nn NOT NULL tenant_id NOT VALID;
+            """
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    things = next(t for t in schema.tables if t.name == "things")
+    nullable = {c.name: c.is_nullable for c in things.column_details}
+    assert nullable == {"id": False, "tenant_id": True}
+
+
 def test_columns_skips_dropped_columns(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
