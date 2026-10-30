@@ -818,6 +818,9 @@ _PARSE_STATEMENT, _PARSE_EXPRESSION = 0, 2
 _PARSE_ASSIGNMENTS = frozenset({3, 4, 5})
 
 
+_PLPGSQL_UNPARSEABLE = "the PL/pgSQL body does not parse"
+
+
 def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     """The static SQL a PL/pgSQL function runs, parsed, and why the list is
     incomplete (None when it is not). Every expression in the function is
@@ -827,7 +830,7 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError:
-        return [], "the PL/pgSQL body does not parse"
+        return [], _PLPGSQL_UNPARSEABLE
     exprs: list[tuple[str, int]] = []
     dynamic = False
 

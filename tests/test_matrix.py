@@ -3490,6 +3490,31 @@ def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
                         search_path=search_path, atomic=atomic, body=body)
 
 
+@pytest.mark.parametrize("body", [
+    "BEGIN PERFORM 1 FROM app.t; END",
+    "BEGIN RETURN (SELECT x FROM app.t LIMIT 1); END",
+    "BEGIN RETURN QUERY SELECT x FROM app.t; END",
+    "BEGIN RETURN NEXT (SELECT x FROM app.t LIMIT 1); END",
+    "BEGIN PERFORM 1 FROM app.t; RETURN NEXT; END",
+    "BEGIN NEW.tenant := (SELECT x FROM app.t LIMIT 1); RETURN NEW; END",
+])
+def test_plpgsql_body_is_read_whatever_it_returns(body: str) -> None:
+    # Only prosrc is captured, and the PL/pgSQL parser checks RETURN against
+    # the declared return type, so each shape needs a matching wrapper.
+    from pgrls.matrix_proof import _body_statements_of, _has_node_in  # noqa: PLC0415
+
+    stmts = _body_statements_of(_fn("app.helper", body=body, language="plpgsql"))
+    assert stmts is not None
+    assert any(_has_node_in(s, lambda n: getattr(n, "relname", None) == "t") for s in stmts)
+
+
+def test_plpgsql_body_that_does_not_parse_is_unknown() -> None:
+    from pgrls.matrix_proof import _body_statements_of  # noqa: PLC0415
+
+    assert _body_statements_of(_fn("app.helper", body="BEGIN SELEC 1; END",
+                                   language="plpgsql")) is None
+
+
 # A helper keyed on current_user, which a login session cannot forge — so the
 # schema-changing gates are what stands between it and PROVEN.
 _SAFE_BODY = "SELECT tenant FROM app.users WHERE name = current_user"

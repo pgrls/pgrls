@@ -317,7 +317,7 @@ def _body_statements_of(fn: UserFunction) -> list[Any] | None:
     error). An atomic body's ``CREATE FUNCTION`` is parsed whole."""
     from pglast import parse_sql  # noqa: PLC0415
 
-    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
 
     if fn.body is None:
         return None
@@ -330,12 +330,12 @@ def _body_statements_of(fn: UserFunction) -> list[Any] | None:
         # Only the body (prosrc) is captured, not the return type, and the
         # PL/pgSQL parser checks RETURN against it (pglast 8 rejects `RETURN
         # 1` in a void function) — so try the shapes a body can have.
-        for returns in ("void", "text", "SETOF text", "trigger"):
+        for returns in ("void", "text", "SETOF text", "TABLE(pgrls_out text)", "trigger"):
             stmts, incomplete = _plpgsql_statements(
                 f"CREATE FUNCTION pgrls_body() RETURNS {returns} LANGUAGE plpgsql AS "
                 f"$pgrls_body${fn.body}$pgrls_body$"
             )
-            if incomplete != "the PL/pgSQL body does not parse":
+            if incomplete != _PLPGSQL_UNPARSEABLE:
                 return None if incomplete else stmts
         return None
     return None

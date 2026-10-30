@@ -224,7 +224,8 @@ SELECT
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
     -- PG18 sets attnotnull for a NOT VALID NOT NULL constraint too, while
     -- existing NULLs stay in the table: count such a column as nullable.
-    -- PG15-17 store no NOT NULL rows in pg_constraint, so this is a no-op there.
+    -- PG15-17 store no table NOT NULL constraints in pg_constraint, so this is
+    -- a no-op there.
     NOT (a.attnotnull AND NOT EXISTS (
         SELECT 1 FROM pg_catalog.pg_constraint c
         WHERE c.conrelid = a.attrelid AND c.contype = 'n'

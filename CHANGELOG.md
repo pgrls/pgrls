@@ -58,17 +58,17 @@ breaking changes — they will be called out in this file.
   17 and 18, and the dependency pin allows pglast 7 or 8
   (`pglast>=7.20,<9`). pglast 8 parses the PG18 grammar, and pgrls handles
   its two parser changes so results match pglast 7: `pgrls matrix` still
-  counts a door's `UPDATE … RETURNING` as a read (RETURNING now arrives as a
-  `ReturningClause`), and `pgrls matrix --prove` still follows a PL/pgSQL
+  counts a door's `RETURNING` (on `INSERT` / `UPDATE` / `DELETE` / `MERGE`) as
+  a read (RETURNING now arrives as a `ReturningClause`), and `pgrls matrix --prove` still follows a PL/pgSQL
   auth helper whose body returns a value (pglast 8 checks `RETURN` against
   the declared return type, which pgrls does not capture; trying the common
   return types also lets pglast 7 read `RETURN QUERY` / `RETURN NEXT` bodies).
 
 ### Fixed
-- On PostgreSQL 18 a column with a `NOT VALID` NOT NULL constraint was read
-  as not-nullable (Postgres 18 sets `attnotnull` for it while existing NULLs
-  stay in the table), so SEC030 missed a nullable tenant column. Such a
-  column now counts as nullable.
+- **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as
+  nullable.** Postgres 18 sets `attnotnull` for such a constraint while
+  existing NULLs stay in the table, so pgrls read the column as not-nullable
+  and SEC030 (and its `pgrls fix`) missed a nullable tenant column.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

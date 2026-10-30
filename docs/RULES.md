@@ -2231,6 +2231,10 @@ Detection is structural and conservative:
   weren't captured (a hand-built fixture, or a pre-v5 snapshot) is
   skipped — nullability is unknowable, so the rule stays silent until
   the schema is re-introspected.
+* **A NOT VALID NOT NULL counts as nullable (PostgreSQL 18).**
+  `ADD CONSTRAINT … NOT NULL col NOT VALID` leaves existing NULL rows in
+  place, so SEC030 still fires. Backfill the NULLs, then
+  `ALTER TABLE … VALIDATE CONSTRAINT <name>`.
 
 Configure the auth-context function set (replaces the default) via
 `[lint.rules.SEC030].auth_functions`. Allowlist tables where a

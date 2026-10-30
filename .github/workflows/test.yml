@@ -28,7 +28,8 @@ jobs:
         # tests/test_pg_version_floor.py::_README_PG_FLOOR_NUM.
         pg: ["15", "16", "17", "18"]
         # A fresh resolve picks the newest pglast (8); one extra leg pins
-        # the floor of the `pglast>=7.20,<9` range so both majors stay tested.
+        # the floor of the `pglast>=7.20,<9` range (7.20) so both majors
+        # stay tested.
         pglast: ["8"]
         include:
           - pg: "17"
@@ -80,8 +81,8 @@ jobs:
       - name: Pin pglast 7 (floor leg)
         if: matrix.pglast == '7'
         run: |
-          uv pip install "pglast>=7.20,<8"
-          uv run --no-sync python -c "import pglast; assert pglast.__version__.startswith('v7'), pglast.__version__"
+          uv pip install "pglast==7.20.*"
+          uv run --no-sync python -c "import pglast; assert pglast.__version__.startswith('v7.20'), pglast.__version__"
 
       # --no-sync: a plain `uv run` re-syncs the environment, which would
       # put the floor leg back on the newest pglast.

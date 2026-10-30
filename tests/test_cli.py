@@ -69,7 +69,8 @@ def test_python_dash_m_pgrls_invokes_cli() -> None:
     # `if __name__ == "__main__": main()` block dispatches to the CLI.
     # Run it as the documented subprocess: in-process `runpy.run_module`
     # goes through pytest's assertion-rewriting import hook (pgrls is a
-    # pytest11 plugin), which lacks `get_code` as of pytest 9.2.
+    # pytest11 plugin), which has no `get_code` for runpy to call; this
+    # broke under pytest 9.2.
     # `--version` exits 0 after printing the version.
     import subprocess
     import sys

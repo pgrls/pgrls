@@ -146,8 +146,8 @@ strict = true
 # so mypy --strict would report every `from pglast import …` line or
 # every node access. Treat it as untyped at the import-resolver level
 # so real type errors elsewhere stay loud, without sprinkling
-# per-import `# type: ignore` comments. v8 ships a full set of `.pyi`
-# stubs (v7 only `parser.pyi`), and mypy reads stubs even under
+# per-import `# type: ignore` comments. v8 ships `.pyi` stubs for every
+# module (v7 only `parser.pyi`), and mypy reads stubs even under
 # `follow_imports = "skip"` unless `follow_imports_for_stubs` is set —
 # so it is, keeping pglast `Any` on both majors.
 [[tool.mypy.overrides]]
