@@ -80,16 +80,17 @@ breaking changes — they will be called out in this file.
   parse — on pglast 7 a `record`, on pglast 8 any type it does not know (an
   enum, a domain, a composite) — so a door that read a table only in
   `DECLARE r record := (SELECT … FROM t)` showed no reach of `t`. pgrls now
-  reads such a default from the declaration itself, once the parse confirms
-  every `DECLARE` section it found; a door whose default it cannot read is
-  listed as untraced, with the reason. The subscript of an assignment target
-  (`a[(SELECT …)] := 1`) was dropped the same way, and is now read too.
+  reads such a default from the declaration itself, once the PL/pgSQL parser
+  confirms where each declaration starts and ends; a door whose default it
+  cannot read is listed as untraced, with the reason. `--prove` likewise saw
+  no table read there by an auth helper. pgrls also discarded the subscript
+  of an assignment target (`a[(SELECT …)] := 1`); it is now read too.
 - **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
   NOT NULL, and `DROP CONSTRAINT` of a NOT NULL (named, renamed, or the
-  auto-named `<table>_<column>_not_null`) makes the column nullable
-  again.**
-  `--sql-file` / `pgrls pr` ignored both, so SEC030 flagged a primary-key
-  column or missed a column whose NOT NULL was dropped.
+  auto-named `<table>_<column>_not_null`; PostgreSQL 18 stores a NOT NULL
+  as a constraint) makes the column nullable again.** The DB-free sources
+  ignored both, so SEC030 flagged a primary-key column or missed a column
+  whose NOT NULL was dropped.
 - **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as
   nullable.** Postgres 18 sets `attnotnull` for such a constraint while
   existing NULLs stay in the table, so pgrls read the column as not-nullable

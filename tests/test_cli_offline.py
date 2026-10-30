@@ -1476,6 +1476,10 @@ def test_offline_drop_constraint_of_a_not_null():
         " ALTER TABLE t DROP CONSTRAINT tn;",
         "CREATE TABLE old (id int, tenant text NOT NULL); ALTER TABLE old RENAME TO t;"
         " ALTER TABLE t DROP CONSTRAINT old_tenant_not_null;",
+        # An auto-name several columns could have: all of them.
+        "CREATE TABLE t (tenant text NOT NULL, tenant_b int NOT NULL);"
+        " ALTER TABLE t RENAME CONSTRAINT t_tenant_not_null TO keep;"
+        " ALTER TABLE t DROP CONSTRAINT keep;",
     ):
         t = _only(sql)
         assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql

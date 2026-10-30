@@ -498,7 +498,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             for col_name in _constraint_not_null_columns(elt, creating=True):
                 builder.set_not_null(col_name)
                 if getattr(elt, "conname", None):
-                    builder.not_null_names[elt.conname] = col_name
+                    builder.not_null_names.setdefault(elt.conname, set()).add(col_name)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
@@ -538,8 +538,8 @@ class _TableBuilder:
         self.column_grants: list[ColumnGrant] = []
         self.partition_of: tuple[str, str] | None = None
         self.inherits: list[tuple[str, str]] = []
-        # Named NOT NULL constraints (PG18 can drop one by name) → column.
-        self.not_null_names: dict[str, str] = {}
+        # Named NOT NULL constraints (PG18 can drop one by name) → columns.
+        self.not_null_names: dict[str, set[str]] = {}
         # Every name the table has had: an unnamed NOT NULL keeps the name
         # it got from the table at the time.
         self.former_names: list[str] = [name]
@@ -551,23 +551,23 @@ class _TableBuilder:
                 self.columns[i] = replace(col, is_nullable=not not_null)
                 return
 
-    def not_null_columns(self, conname: str) -> list[str]:
-        """The columns a NOT NULL constraint of this name can be for: the one
-        it was named for, or — Postgres names an unnamed one
+    def not_null_columns(self, conname: str) -> set[str]:
+        """The columns a NOT NULL constraint of this name can be for: those it
+        was named for, and — Postgres names an unnamed one
         `<table>_<column>_not_null`, shortening either name to fit and adding
-        a digit on a clash — any column that name could be for."""
-        if conname in self.not_null_names:
-            return [self.not_null_names[conname]]
+        a digit on a clash — any column that name could be for. Erring wide
+        only reads a column as nullable."""
+        out = set(self.not_null_names.get(conname, ()))
         m = _AUTO_NOT_NULL.fullmatch(conname)
-        if m is None:
-            return []
-        stem = m.group(1)
-        return [
-            c.name for c in self.columns
-            if any(any(t.startswith(stem[:cut]) for t in self.former_names)
-                   and stem[cut + 1:] and c.name.startswith(stem[cut + 1:])
-                   for cut, ch in enumerate(stem) if ch == "_")
-        ]
+        if m is not None:
+            stem = m.group(1)
+            out.update(
+                c.name for c in self.columns
+                if any(any(t.startswith(stem[:cut]) for t in self.former_names)
+                       and stem[cut + 1:] and c.name.startswith(stem[cut + 1:])
+                       for cut, ch in enumerate(stem) if ch == "_")
+            )
+        return out
 
     def drop_constraint(self, conname: str) -> None:
         """`DROP CONSTRAINT`: a NOT NULL one makes its column nullable again."""
@@ -577,8 +577,7 @@ class _TableBuilder:
 
     def rename_constraint(self, old: str, new: str) -> None:
         """`RENAME CONSTRAINT`: the NOT NULL keeps its column."""
-        for col in self.not_null_columns(old):
-            self.not_null_names[new] = col
+        self.not_null_names.setdefault(new, set()).update(self.not_null_columns(old))
         self.not_null_names.pop(old, None)
 
     def drop_column(self, colname: str) -> None:
@@ -627,7 +626,7 @@ def _record_not_null_names(builder: _TableBuilder, column_def: Any) -> None:
     for con in getattr(column_def, "constraints", None) or ():
         if (getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL
                 and getattr(con, "conname", None)):
-            builder.not_null_names[con.conname] = column_def.colname
+            builder.not_null_names.setdefault(con.conname, set()).add(column_def.colname)
 
 
 def _constraint_not_null_columns(con: Any, *, creating: bool = False) -> list[str]:
@@ -661,8 +660,10 @@ def _apply_rename(
 
     Without this the model keeps the pre-rename name, so every finding on the
     table pointed at a relation that does not exist after the migration — a
-    `pgrls pr` annotation naming a phantom table. Renames of anything other
-    than a table (columns, policies, constraints) are left alone.
+    `pgrls pr` annotation naming a phantom table. Also applies `ALTER POLICY …
+    RENAME TO` and `ALTER TABLE … RENAME CONSTRAINT` (so a later `DROP
+    CONSTRAINT` of a NOT NULL still finds its column); column renames are
+    left alone.
     """
     rename_type = getattr(stmt, "renameType", None)
     if rename_type == ObjectType.OBJECT_TABCONSTRAINT:
@@ -874,7 +875,7 @@ def _apply_alter_table(
             for col_name in _constraint_not_null_columns(con):
                 builder.set_not_null(col_name)
                 if conname := getattr(con, "conname", None):
-                    builder.not_null_names[conname] = col_name
+                    builder.not_null_names.setdefault(conname, set()).add(col_name)
         elif subtype == AlterTableType.AT_DropConstraint:
             name = getattr(cmd, "name", None)
             if name:

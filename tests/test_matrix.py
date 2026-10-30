@@ -1371,20 +1371,40 @@ def test_a_record_default_is_read_from_the_source(decls: str) -> None:
     assert any("app.secret" in RawStream()(s) for s in stmts)
 
 
-def test_a_declare_inside_sql_never_rewrites_a_statement() -> None:
-    # A column named `declare` after THEN is no DECLARE section: the rewrite
-    # must not strip `app.` from the UPDATE (pglast 8), so the body is read
-    # as written or not at all.
+@pytest.mark.parametrize(("body", "statement"), [
+    # A column named `declare` after THEN, or after an identifier named
+    # `loop`, is no DECLARE section — even when a loop variable or a schema
+    # shares the name the scan takes for a declaration. The rewrite (pglast
+    # 8) must not strip the schema from a statement: the body is read as
+    # written or not at all.
+    ("DECLARE update int; v int;\nBEGIN\n"
+     "  SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM public.cfg;\n"
+     "  UPDATE app.secret SET s = 'x';\nEND",
+     "UPDATE app.secret SET s = 'x'"),
+    ('DECLARE n int;\nBEGIN\n  FOR "from" IN 1..1 LOOP SELECT loop declare FROM app.secret '
+     "INTO n; BEGIN NULL; END; END LOOP;\nEND",
+     "SELECT loop AS declare FROM app.secret"),
+    ("BEGIN PERFORM loop declare FROM alias.secret; BEGIN NULL; END; END",
+     "SELECT loop AS declare FROM alias.secret"),
+])
+def test_a_declare_inside_sql_never_rewrites_a_statement(body: str, statement: str) -> None:
     from pglast.stream import RawStream  # noqa: PLC0415
 
     from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
 
-    stmts, incomplete = _plpgsql_statements(
-        f"{_QUALIFIED_HEAD}DECLARE update int; v int;\nBEGIN\n"
-        "  SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM public.cfg;\n"
-        "  UPDATE app.secret SET s = 'x';\nEND$x$")
+    stmts, incomplete = _plpgsql_statements(f"{_QUALIFIED_HEAD}{body}$x$")
     if incomplete != _PLPGSQL_UNPARSEABLE:
-        assert "UPDATE app.secret SET s = 'x'" in [RawStream()(s) for s in stmts]
+        assert statement in [RawStream()(s) for s in stmts]
+
+
+def test_option_dump_is_not_parsed() -> None:
+    # pglast 8 prints the function's tree to stdout for `#option dump`.
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
+
+    _, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $x$#option dump\n"
+        "BEGIN RETURN 1; END$x$")
+    assert incomplete == _PLPGSQL_UNPARSEABLE
 
 
 @pytest.mark.parametrize("body", [
@@ -1395,6 +1415,10 @@ def test_a_declare_inside_sql_never_rewrites_a_statement() -> None:
     # A stray `declare` the parse does not confirm.
     "DECLARE r record := (SELECT 1 FROM app.secret); v int; BEGIN "
     "SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM cfg; r := r; END",
+    # A section the scan misses (after a compiler option), with a later loop
+    # over the same name on its line.
+    "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN FOR r IN SELECT 1 LOOP END LOOP; END",
 ])
 def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
     from pgrls.access import _plpgsql_statements  # noqa: PLC0415
@@ -1435,28 +1459,27 @@ def test_a_variadic_plpgsql_function_is_traced() -> None:
 
 
 @pytest.mark.parametrize(("body", "expected"), [
-    ("DECLARE u auth.users; BEGIN END", ("DECLARE u users; BEGIN END", {"u"})),
+    ("DECLARE u auth.users; BEGIN END", "DECLARE u users; BEGIN END"),
     ('DECLARE "U" CONSTANT "auth"."users" := NULL; BEGIN END',
-     ('DECLARE "U" CONSTANT "users" := NULL; BEGIN END', {"U"})),
+     'DECLARE "U" CONSTANT "users" := NULL; BEGIN END'),
     # A default expression, a string and a comment are never touched.
-    ("DECLARE s app.st := 'x'::app.st; BEGIN END",
-     ("DECLARE s st := 'x'::app.st; BEGIN END", {"s"})),
+    ("DECLARE s app.st := 'x'::app.st; BEGIN END", "DECLARE s st := 'x'::app.st; BEGIN END"),
     ("DECLARE s text := E'\\'; DECLARE x app.t'; BEGIN END", None),
     ("DECLARE /* u app.t; */ n int; BEGIN END", None),
     # A nested block's DECLARE section too; statements are left alone.
     ("BEGIN PERFORM 1 FROM app.t; DECLARE d app.t; BEGIN NULL; END; END",
-     ("BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END", {"d"})),
-    ("<<outer>> DECLARE d app.t; BEGIN NULL; END",
-     ("<<outer>> DECLARE d t; BEGIN NULL; END", {"d"})),
-    ("DECLARE s text := 'open", None),
+     "BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END"),
+    ("<<outer>> DECLARE d app.t; BEGIN NULL; END", "<<outer>> DECLARE d t; BEGIN NULL; END"),
 ])
-def test_unqualify_declared_types(
-    body: str, expected: tuple[str, set[str]] | None
-) -> None:
-    from pgrls.access import _unqualify_declared_types  # noqa: PLC0415
+def test_type_cuts(body: str, expected: str | None) -> None:
+    from pgrls.access import _plpgsql_tokens, _type_cuts  # noqa: PLC0415
 
-    got = _unqualify_declared_types(body)
-    assert (got if got is None else (got[0], set(got[1]))) == expected
+    toks = _plpgsql_tokens(body)
+    assert toks is not None
+    cuts = _type_cuts(body, toks)
+    for start, stop in reversed(cuts):
+        body = body[:start] + body[stop:]
+    assert (body if cuts else None) == expected
 
 
 def test_dynamic_sql_is_listed_but_the_static_part_still_counts() -> None:
