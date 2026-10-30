@@ -868,7 +868,7 @@ ORDER BY r.rolname
 # acceptable for a warning that surfaces a bypass *path* (a false
 # positive is an allowlist entry; a false negative is a missed
 # escalation route). Using the raw edge set keeps the query
-# identical across PG15-17 with no version-specific catalog columns.
+# identical across PG15-18 with no version-specific catalog columns.
 #
 # Members that already hold BYPASSRLS directly are SEC016's surface,
 # not SEC029's; superusers bypass unconditionally. Both are excluded.

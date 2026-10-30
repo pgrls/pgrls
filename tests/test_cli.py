@@ -64,23 +64,24 @@ def test_package_version_matches_pyproject() -> None:
     )
 
 
-def test_python_dash_m_pgrls_invokes_cli(monkeypatch, capsys) -> None:
+def test_python_dash_m_pgrls_invokes_cli() -> None:
     # `python -m pgrls` runs `src/pgrls/__main__.py`, whose
     # `if __name__ == "__main__": main()` block dispatches to the CLI.
-    # `runpy.run_module(run_name="__main__")` executes that block
-    # in-process (so it's the same entry the documented subprocess form
-    # uses). `--version` exits 0 after printing the version.
-    import runpy
-
-    import pytest
+    # Run it as the documented subprocess: in-process `runpy.run_module`
+    # goes through pytest's assertion-rewriting import hook (pgrls is a
+    # pytest11 plugin), which lacks `get_code` as of pytest 9.2.
+    # `--version` exits 0 after printing the version.
+    import subprocess
+    import sys
 
     from pgrls import __version__
 
-    monkeypatch.setattr("sys.argv", ["pgrls", "--version"])
-    with pytest.raises(SystemExit) as exc_info:
-        runpy.run_module("pgrls", run_name="__main__")
-    assert exc_info.value.code == 0
-    assert __version__ in capsys.readouterr().out
+    result = subprocess.run(
+        [sys.executable, "-m", "pgrls", "--version"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert __version__ in result.stdout
 
 
 def test_init_writes_parseable_default_config(tmp_path) -> None:
