@@ -56,13 +56,18 @@ breaking changes — they will be called out in this file.
   end to end.
 - **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
   17 and 18, and the dependency pin allows pglast 7 or 8
-  (`pglast>=7.20,<9`). pglast 8 parses the PG18 grammar, and pgrls handles
-  its two parser changes so results match pglast 7: `pgrls matrix` still
-  counts a door's `RETURNING` (on `INSERT` / `UPDATE` / `DELETE` / `MERGE`) as
-  a read (RETURNING now arrives as a `ReturningClause`), and `pgrls matrix --prove` still follows a PL/pgSQL
-  auth helper whose body returns a value (pglast 8 checks `RETURN` against
-  the declared return type, which pgrls does not capture; trying the common
-  return types also lets pglast 7 read `RETURN QUERY` / `RETURN NEXT` bodies).
+  (`pglast>=7.20,<9`); pglast 8 parses the PG18 grammar. `pgrls matrix`
+  reads pglast 8's `ReturningClause`, so a door's `RETURNING` (on
+  `INSERT` / `UPDATE` / `DELETE` / `MERGE`) still counts as a read, and
+  `pgrls matrix --prove` reads a PL/pgSQL auth helper's body whatever it
+  returns (`RETURN <value>`, `RETURN QUERY`, `RETURN NEXT`, a trigger's
+  `RETURN NEW`) on either pglast major. pglast 8's PL/pgSQL parser rejects
+  a type qualified with a schema other than `pg_catalog` / `public` (a
+  parameter, the return type, a `DECLARE`), and `pg_get_functiondef`
+  qualifies them, so pgrls drops those qualifiers before parsing — a type
+  does not change which SQL the body runs. The DB-free sources
+  (`--sql-file`, `pgrls pr`) read PG18's table-level and
+  `ADD CONSTRAINT … NOT NULL` forms, which pglast 8 parses.
 
 ### Fixed
 - **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as

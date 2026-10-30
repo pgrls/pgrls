@@ -1296,6 +1296,46 @@ def test_a_plpgsql_body_is_traced_statement_by_statement() -> None:
     assert m.untraced == ()
 
 
+def test_a_plpgsql_body_with_schema_qualified_types_is_traced() -> None:
+    # pglast 8's PL/pgSQL parser resolves a qualified type only in pg_catalog
+    # / public, and pg_get_functiondef qualifies the rest. The types are
+    # dropped before parsing; the statements the body runs are unchanged.
+    body = """CREATE OR REPLACE FUNCTION public.f(p app.status)
+ RETURNS SETOF app.t LANGUAGE plpgsql SECURITY DEFINER
+AS $function$
+DECLARE
+  u auth.users;
+BEGIN
+  SELECT * INTO u FROM public.a;
+  RETURN QUERY SELECT * FROM public.t;
+END $function$"""
+    f = _f("<body>", owner="own", lang="plpgsql", definition=body)
+    m = build_matrix(_s([_t("a"), _t("t")], fns=[f], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.a", "SELECT", "app").verdict == "open"
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
+    assert m.untraced == ()
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    ("DECLARE u auth.users; BEGIN END", "DECLARE u users; BEGIN END"),
+    ('DECLARE u CONSTANT "auth"."users" := NULL; BEGIN END',
+     'DECLARE u CONSTANT "users" := NULL; BEGIN END'),
+    # A default expression, a string and a comment are never touched.
+    ("DECLARE s app.st := 'x'::app.st; BEGIN END", "DECLARE s st := 'x'::app.st; BEGIN END"),
+    ("DECLARE s text := E'\\'; DECLARE x app.t'; BEGIN END", None),
+    ("DECLARE /* u app.t; */ n int; BEGIN END", None),
+    # A nested block's DECLARE section too; statements are left alone.
+    ("BEGIN PERFORM 1 FROM app.t; DECLARE d app.t; BEGIN NULL; END; END",
+     "BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END"),
+    ("DECLARE s text := 'open", None),
+])
+def test_unqualify_declared_types(body: str, expected: str | None) -> None:
+    from pgrls.access import _unqualify_declared_types  # noqa: PLC0415
+
+    assert _unqualify_declared_types(body) == expected
+
+
 def test_dynamic_sql_is_listed_but_the_static_part_still_counts() -> None:
     body = """CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $x$
 BEGIN
@@ -3497,6 +3537,7 @@ def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
     "BEGIN RETURN NEXT (SELECT x FROM app.t LIMIT 1); END",
     "BEGIN PERFORM 1 FROM app.t; RETURN NEXT; END",
     "BEGIN NEW.tenant := (SELECT x FROM app.t LIMIT 1); RETURN NEW; END",
+    "DECLARE u auth.users; BEGIN SELECT * INTO u FROM app.t; RETURN u.id; END",
 ])
 def test_plpgsql_body_is_read_whatever_it_returns(body: str) -> None:
     # Only prosrc is captured, and the PL/pgSQL parser checks RETURN against

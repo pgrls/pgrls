@@ -490,9 +490,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                     )
                 )
         # A table-level `PRIMARY KEY (a, b)` constraint makes its columns NOT
-        # NULL just as an inline `PRIMARY KEY` does.
-        for pk_col in _table_constraint_pk_columns(stmt):
-            builder.set_not_null(pk_col)
+        # NULL just as an inline `PRIMARY KEY` does, and so does PG18's
+        # table-level `NOT NULL c`.
+        for elt in stmt.tableElts or ():
+            for col_name in _constraint_not_null_columns(elt):
+                builder.set_not_null(col_name)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
@@ -578,18 +580,24 @@ def _column_def_is_not_null(column_def: Any) -> bool:
     return False
 
 
-def _table_constraint_pk_columns(stmt: Any) -> list[str]:
-    """Column names named by a table-level `PRIMARY KEY (...)` constraint."""
+def _constraint_not_null_columns(con: Any) -> list[str]:
+    """Column names a table-level constraint makes NOT NULL: a `PRIMARY KEY
+    (...)`, or PG18's `NOT NULL c` (pglast 8). A `NOT VALID` NOT NULL leaves
+    existing NULLs in place, so its column stays nullable — as introspection
+    reads it."""
+    if type(con).__name__ != "Constraint":
+        return []
+    contype = getattr(con, "contype", None)
+    if contype == ConstrType.CONSTR_NOTNULL:
+        if getattr(con, "skip_validation", False):
+            return []
+    elif contype != ConstrType.CONSTR_PRIMARY:
+        return []
     out: list[str] = []
-    for elt in getattr(stmt, "tableElts", None) or ():
-        if type(elt).__name__ != "Constraint":
-            continue
-        if getattr(elt, "contype", None) != ConstrType.CONSTR_PRIMARY:
-            continue
-        for key in getattr(elt, "keys", None) or ():
-            name = getattr(key, "sval", None) or getattr(key, "str", None)
-            if isinstance(name, str):
-                out.append(name)
+    for key in getattr(con, "keys", None) or ():
+        name = getattr(key, "sval", None) or getattr(key, "str", None)
+        if isinstance(name, str):
+            out.append(name)
     return out
 
 
@@ -800,6 +808,9 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif subtype == AlterTableType.AT_AddConstraint:
+            for col_name in _constraint_not_null_columns(getattr(cmd, "def_", None)):
+                builder.set_not_null(col_name)
         # Other ALTER subcommands are ignored.
 
 

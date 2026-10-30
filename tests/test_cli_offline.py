@@ -1424,6 +1424,28 @@ def test_offline_primary_key_implies_not_null():
     }["id"] is False
 
 
+def test_offline_pg18_not_null_constraints():
+    # pglast 8 parses PG18's table-level / named NOT NULL. A validated one
+    # makes the column NOT NULL; a NOT VALID one leaves existing NULLs, so the
+    # column stays nullable, as introspection reads it.
+    import pglast
+
+    if not pglast.__version__.startswith("v8"):
+        pytest.skip("PG18 NOT NULL constraint syntax needs pglast 8")
+    sql = {
+        "CREATE TABLE t (id int, tenant text, NOT NULL tenant);": False,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant;": False,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;": True,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD PRIMARY KEY (tenant);": False,
+    }
+    for stmt, nullable in sql.items():
+        t = _only(stmt)
+        assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is nullable, stmt
+
+
 def test_offline_alter_column_set_and_drop_not_null():
     setted = _only(
         "CREATE TABLE t (id int, tenant text);"
