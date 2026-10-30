@@ -87,8 +87,8 @@ Detection is structural and deliberately conservative:
 * **A NOT VALID NOT NULL counts as nullable (PostgreSQL 18+).**
   `ALTER TABLE … ADD CONSTRAINT <name> NOT NULL <column> NOT VALID`
   leaves existing NULL rows in place, so SEC030 still fires. Backfill
-  the NULLs, then `ALTER TABLE … VALIDATE CONSTRAINT <name>` (`pgrls
-  fix`'s `SET NOT NULL` validates it too).
+  the NULLs, then `ALTER TABLE … VALIDATE CONSTRAINT <name>`
+  (`pgrls fix`'s `SET NOT NULL` validates it too).
 
 Configure the auth-context function set (replaces the default):
 

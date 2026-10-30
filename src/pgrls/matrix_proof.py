@@ -1195,7 +1195,7 @@ class _Prover:
         """Every relation name (as written) the body of `fname` and the
         user-defined functions it calls read — a bare name a body defines as a
         CTE left out of that body's — or None when a body cannot be read
-        (another language, dynamic SQL, a parse error)."""
+        (see `_body_statements_of`)."""
         from pglast.ast import CommonTableExpr, RangeVar  # noqa: PLC0415
 
         out: set[str] = set()

@@ -1440,6 +1440,19 @@ def test_offline_pg18_not_null_constraints():
         " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant;": False,
         "CREATE TABLE t (id int, tenant text);"
         " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;": True,
+        # A name reused after the NOT VALID NOT NULL is gone is not it.
+        "CREATE TABLE t (id int, tenant int);"
+        " ALTER TABLE t ADD CONSTRAINT nn NOT NULL tenant NOT VALID;"
+        " ALTER TABLE t ALTER COLUMN tenant DROP NOT NULL;"
+        " ALTER TABLE t ADD CONSTRAINT nn CHECK (tenant > 0) NOT VALID;"
+        " ALTER TABLE t VALIDATE CONSTRAINT nn;": True,
+        # Validating it — SEC030's remedy — makes the column NOT NULL.
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;"
+        " ALTER TABLE t VALIDATE CONSTRAINT tnn;": False,
+        "CREATE TABLE t (id int, tenant text);"
+        " ALTER TABLE t ADD CONSTRAINT tnn NOT NULL tenant NOT VALID;"
+        " ALTER TABLE t RENAME CONSTRAINT tnn TO tn2; ALTER TABLE t VALIDATE CONSTRAINT tn2;": False,
         # In CREATE TABLE there are no rows yet: Postgres stores it validated.
         "CREATE TABLE t (id int, tenant text, CONSTRAINT tnn NOT NULL tenant NOT VALID);": False,
     }
@@ -1503,6 +1516,17 @@ def test_offline_drop_constraint_of_a_not_null():
     ):
         t = _only(sql)
         assert {c.name: c.is_nullable for c in t.column_details}["tenant"] is True, sql
+    # An inherited NOT NULL keeps the parent's name; a detached child can
+    # drop it by that name (measured on PG18).
+    from pgrls.schema_sources import schema_from_sql
+
+    for detach in ("ALTER TABLE c NO INHERIT p;", ""):
+        schema = schema_from_sql(
+            "CREATE TABLE p (a int NOT NULL, b int); CREATE TABLE c () INHERITS (p);"
+            f" {detach} ALTER TABLE c DROP CONSTRAINT p_a_not_null;",
+            schemas=("public",))
+        child = next(t for t in schema.tables if t.name == "c")
+        assert {c.name: c.is_nullable for c in child.column_details}["a"] is True
     # A primary key's columns stay NOT NULL when it is dropped.
     pk = _only("CREATE TABLE t (id int, CONSTRAINT t_pk PRIMARY KEY (id));"
                " ALTER TABLE t DROP CONSTRAINT t_pk;")

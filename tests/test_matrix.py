@@ -1450,6 +1450,36 @@ def test_plpgsql_sql_outside_statements_is_read(body: str) -> None:
     assert any("app.secret" in RawStream()(s) for s in stmts)
 
 
+def test_an_unknown_typed_out_parameter_is_read() -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f(OUT tok text, OUT s app.status) LANGUAGE plpgsql AS "
+        "$x$BEGIN SELECT token, status INTO tok, s FROM app.secret; END$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+def test_a_cursor_sharing_a_retyped_name_keeps_its_query() -> None:
+    # Only a plain type becomes `text`: a cursor of the same name keeps its
+    # declaration, so `FOR r IN values(1)` still reads app.secret.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x$\n"
+        "DECLARE r record; n int;\nBEGIN\n"
+        "  DECLARE values public.app_role;\n"
+        "  BEGIN SELECT org_id, role INTO n, values FROM public.members; END;\n"
+        "  DECLARE values CURSOR (k int) FOR SELECT * FROM app.secret WHERE id = k;\n"
+        "  BEGIN FOR r IN values(1) LOOP NULL; END LOOP; END;\nEND$x$")
+    if incomplete is None:
+        assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
 def test_a_variadic_plpgsql_function_is_traced() -> None:
     # pglast 8's PL/pgSQL parser rejects every VARIADIC parameter.
     from pglast.stream import RawStream  # noqa: PLC0415
@@ -1497,6 +1527,12 @@ def test_type_edits(body: str, expected: str | None) -> None:
     "DECLARE n app_dom; BEGIN UPDATE app.secret SET v = 1; GET DIAGNOSTICS n = ROW_COUNT; END",
     # Postgres folds only ASCII letters.
     "DECLARE \u00c4rger app_mood := (SELECT mood FROM app.secret LIMIT 1); BEGIN NULL; END",
+    # First of several targets: the error names no variable.
+    "DECLARE v_role app_role; v_org uuid; BEGIN "
+    "SELECT role, org_id INTO v_role, v_org FROM app.secret WHERE user_id = auth.uid(); END",
+    "<<o>> DECLARE v app_role; w int; BEGIN SELECT 1, 'a' INTO w, o.v FROM app.secret; END",
+    "DECLARE r record; v app_role; w int; BEGIN SELECT role, 1 INTO v, w FROM app.m; "
+    "FOR r IN SELECT * FROM app.secret LOOP NULL; END LOOP; END",
 ])
 def test_an_unknown_typed_variable_is_read_on_either_major(body: str) -> None:
     from pglast.stream import RawStream  # noqa: PLC0415

@@ -479,6 +479,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                     if col.name in parent.no_inherit_not_null:
                         col = replace(col, is_nullable=True)
                     builder.columns.append(col)
+            # An inherited NOT NULL keeps the parent's constraint name, which
+            # the child can drop once detached.
+            for conname, cols in parent.not_null_names.items():
+                builder.not_null_names.setdefault(conname, set()).update(cols)
+            builder.former_names.extend(parent.former_names)
         for elt in stmt.tableElts or ():
             if type(elt).__name__ != "ColumnDef":
                 continue
@@ -554,6 +559,8 @@ class _TableBuilder:
         # Columns NOT NULL only through a `NO INHERIT` constraint: an
         # `INHERITS` child does not get it.
         self.no_inherit_not_null: set[str] = set()
+        # `NOT VALID` NOT NULL constraints → columns, until validated.
+        self.invalid_not_null: dict[str, set[str]] = {}
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -590,6 +597,8 @@ class _TableBuilder:
         """`RENAME CONSTRAINT`: the NOT NULL keeps its column."""
         self.not_null_names.setdefault(new, set()).update(self.not_null_columns(old))
         self.not_null_names.pop(old, None)
+        if old in self.invalid_not_null:
+            self.invalid_not_null[new] = self.invalid_not_null.pop(old)
 
     def drop_column(self, colname: str) -> None:
         self.columns = [c for c in self.columns if c.name != colname]
@@ -855,6 +864,11 @@ def _apply_alter_table(
         tables[key] = builder
     for cmd in stmt.cmds or ():
         subtype = getattr(cmd, "subtype", None)
+        if subtype in (AlterTableType.AT_DropColumn, AlterTableType.AT_SetNotNull,
+                       AlterTableType.AT_DropNotNull):
+            # The column's NOT VALID NOT NULL, if any, is gone or moot.
+            for cols in builder.invalid_not_null.values():
+                cols.discard(getattr(cmd, "name", None) or "")
         if subtype == AlterTableType.AT_EnableRowSecurity:
             builder.rls_enabled = True
         elif subtype == AlterTableType.AT_ForceRowSecurity:
@@ -894,6 +908,14 @@ def _apply_alter_table(
                 builder.set_not_null(name, not_null=False)
         elif subtype == AlterTableType.AT_AddConstraint:
             con = getattr(cmd, "def_", None)
+            builder.invalid_not_null.pop(getattr(con, "conname", None) or "", None)
+            if (getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL
+                    and getattr(con, "skip_validation", False)
+                    and (conname := getattr(con, "conname", None))):
+                builder.invalid_not_null[conname] = {
+                    name for key in getattr(con, "keys", None) or ()
+                    if isinstance(name := getattr(key, "sval", None), str)
+                }
             for col_name in _constraint_not_null_columns(con):
                 builder.set_not_null(col_name)
                 # Only a NOT NULL's name is recorded: dropping a primary key leaves
@@ -904,7 +926,15 @@ def _apply_alter_table(
         elif subtype == AlterTableType.AT_DropConstraint:
             name = getattr(cmd, "name", None)
             if name:
+                builder.invalid_not_null.pop(name, None)
                 builder.drop_constraint(name)
+        elif subtype == AlterTableType.AT_ValidateConstraint:
+            # A validated `NOT VALID` NOT NULL makes its column NOT NULL.
+            name = getattr(cmd, "name", None)
+            if name:
+                for col in builder.invalid_not_null.pop(name, set()):
+                    builder.set_not_null(col)
+                    builder.not_null_names.setdefault(name, set()).add(col)
         # Other ALTER subcommands are ignored.
 
 

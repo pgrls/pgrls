@@ -56,9 +56,9 @@ another role); a cast, or an operator reusing a built-in symbol, backed by a
 user function; the write-side ``WITH CHECK`` of an UPDATE (the cell shows the
 rows ``USING`` lets it touch). A function, trigger or rule whose SQL cannot
 be traced — dynamic SQL, another language, a PL/pgSQL body pgrls cannot
-fully read (an unparseable body, a variable default it cannot read back,
-``#option dump`` on pglast 8), a call into a function or operator pgrls
-cannot see, a built-in that runs SQL named by an argument, a utility
+fully read (an unparseable body, a record variable whose declaration it
+cannot read back, ``#option dump`` on pglast 8), a call into a function or
+operator pgrls cannot see, a built-in that runs SQL named by an argument, a utility
 statement — is listed as untraced instead of attributed to a table.
 """
 from __future__ import annotations
@@ -836,8 +836,10 @@ _BLOCK_STARTERS = frozenset({"begin", "then", "else", "loop"})
 # VARIADIC.
 _REWRITABLE_ERRORS = ("LookupExplicitNamespace", "VARIADIC parameter must be an array")
 # pglast 8 takes a variable of a type it does not know for a record, which
-# cannot be one of several INTO targets: declare that variable `text`.
+# cannot be one of several INTO targets: declare that variable `text` (every
+# plain-typed one, when the error does not name it).
 _NOT_SCALAR = re.compile(r'"(.+)" is not a scalar variable')
+_RECORD_IN_INTO = "record variable cannot be part of multiple-item INTO list"
 
 _Token = tuple[str, int, int]
 # An assignment target that runs no SQL: a variable or a field path.
@@ -966,7 +968,9 @@ def _type_edits(
     the tokens after ``name [CONSTANT]`` up to a default, ``NOT NULL``,
     ``COLLATE`` or the ``;``, never a default expression: the schema is
     dropped (``u auth.users;`` → ``u users;``), and the type of a variable in
-    `scalars` becomes ``text``. ``%TYPE`` / ``%ROWTYPE`` stay as they are."""
+    `scalars` (every variable, for ``*``) becomes ``text`` — only when the
+    type is a plain name, never a cursor, ``record``, ``refcursor`` or an
+    array. ``%TYPE`` / ``%ROWTYPE`` stay as they are."""
     names = ("word", "qword")
     edits: list[tuple[int, int, str]] = []
     for spans, _ in _declaration_sections(body, toks):
@@ -983,7 +987,11 @@ def _type_edits(
                              in ("default", "not", "collate"))), end)
             if stop == j or any(body[toks[k][1]:toks[k][2]] == "%" for k in range(j, stop)):
                 continue
-            if _ident(body, toks[i]) in scalars:
+            plain = (stop - j) % 2 == 1 and all(
+                toks[k][0] in (names if (k - j) % 2 == 0 else ("dot",))
+                for k in range(j, stop))
+            if (plain and ("*" in scalars or _ident(body, toks[i]) in scalars)
+                    and _ident(body, toks[stop - 1]) not in ("record", "refcursor")):
                 edits.append((toks[j][1], toks[stop - 1][2], "text"))
                 continue
             k = j
@@ -1022,13 +1030,13 @@ def _confirmed_parse(
     type it does not know for a record (no scalar target): the schema is
     dropped from each type it names — outside ``pg_catalog`` for parameters
     and the return type, any schema in a confirmed ``DECLARE`` — VARIADIC
-    becomes a plain parameter, and each variable in `scalars` is declared
-    ``text``. A type does not change which SQL the body runs.
+    becomes a plain parameter, and each variable or parameter in `scalars`
+    is declared ``text``. A type does not change which SQL the body runs.
 
     Otherwise the reason it failed: the parse error, or ``""`` when the
     definition is not one ``CREATE FUNCTION`` with a body, cannot be
     rewritten or probed (its body already uses a ``pgrls_probe_<n>`` name),
-    or a probe does not come back."""
+    or rendered by the deparser, or a probe does not come back."""
     import pglast  # noqa: PLC0415
     from pglast import ast  # noqa: PLC0415
     from pglast.enums import FunctionParameterMode  # noqa: PLC0415
@@ -1061,6 +1069,12 @@ def _confirmed_parse(
             def visit_FunctionParameter(self, parent: Any, node: Any) -> Any:  # noqa: N802
                 if node.mode == FunctionParameterMode.FUNC_PARAM_VARIADIC:
                     node.mode = FunctionParameterMode.FUNC_PARAM_IN
+                typ = node.argType
+                last = getattr((typ.names or (None,))[-1], "sval", None) if typ else None
+                if (typ is not None and ("*" in scalars or node.name in scalars)
+                        and not typ.pct_type and not typ.arrayBounds
+                        and last not in ("record", "refcursor")):
+                    node.argType = ast.TypeName(names=(ast.String(sval="text"),))
                 return None
 
         _Normalize()(stmt)
@@ -1188,12 +1202,18 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     try:
         tree = pglast.parse_plpgsql(definition)
     except pglast.parser.ParseError as exc:
-        error, scalars = str(exc), frozenset[str]()
-        for _ in range(8):
+        error, scalars, last = str(exc), frozenset[str](), ""
+        for _ in range(32):
             if m := _NOT_SCALAR.fullmatch(error):
-                scalars |= {m.group(1)}
+                # The name as written, or label-qualified (`o.v`); when that
+                # does not help, every plain-typed variable.
+                name = m.group(1)
+                scalars |= {"*"} if error == last else {name, name.rsplit(".", 1)[-1]}
+            elif error == _RECORD_IN_INTO:
+                scalars |= {"*"}
             elif not any(e in error for e in _REWRITABLE_ERRORS):
                 break
+            last = error
             parsed = _confirmed_parse(definition, retype=True, scalars=scalars)
             if not isinstance(parsed, str):
                 break
