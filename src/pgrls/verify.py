@@ -1951,10 +1951,12 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "split_part", "concat", "concat_ws", "format", "reverse", "repeat",
     "position", "strpos", "overlay", "md5", "starts_with", "to_hex", "ascii",
     "chr", "quote_ident", "quote_literal", "quote_nullable",
+    "casefold",  # PostgreSQL 18
     # numeric
     "abs", "ceil", "ceiling", "floor", "round", "trunc", "sign", "mod", "power",
     "sqrt", "cbrt", "exp", "ln", "log", "log10", "div", "gcd", "lcm",
     "greatest", "least", "width_bucket",
+    "gamma", "lgamma",  # PostgreSQL 18
     # null / conditional
     "coalesce", "nullif",
     # date / time
@@ -1975,8 +1977,10 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "array_remove", "array_replace", "array_position", "array_positions",
     "array_to_string", "string_to_array", "array_ndims", "array_lower",
     "array_upper",
+    "array_sort", "array_reverse",  # PostgreSQL 18
     # type / misc (read no user data)
     "pg_typeof", "format_type", "gen_random_uuid",
+    "uuidv4", "uuidv7", "crc32", "crc32c",  # PostgreSQL 18
 })
 
 

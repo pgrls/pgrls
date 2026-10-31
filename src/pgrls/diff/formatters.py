@@ -332,9 +332,9 @@ _RATIONALE_BY_KIND_AND_CLASSIFICATION: dict[
     (ChangeKind.USING_REQUIRES_REVIEW, "requires_review"): (
         "USING predicate changed in a shape that is not a simple "
         "AND/OR shift. pgrls cannot mechanically prove whether the "
-        "new predicate is more or less permissive than the old. "
-        "Install `pgrls[diff-z3]` for SAT-assisted classification, "
-        "or review manually."
+        "new predicate is more or less permissive than the old: the "
+        "Z3 comparison either does not model a part of it or found "
+        "neither predicate implies the other. Review manually."
     ),
     (ChangeKind.WITH_CHECK_TIGHTENED, "safe"): (
         "WITH CHECK predicate added a conjunct or dropped a "
@@ -348,8 +348,9 @@ _RATIONALE_BY_KIND_AND_CLASSIFICATION: dict[
     ),
     (ChangeKind.WITH_CHECK_REQUIRES_REVIEW, "requires_review"): (
         "WITH CHECK predicate changed in a shape that is not a "
-        "simple AND/OR shift. Install `pgrls[diff-z3]` for "
-        "SAT-assisted classification, or review manually."
+        "simple AND/OR shift, and the Z3 comparison either does not "
+        "model a part of it or found neither predicate implies the "
+        "other. Review manually."
     ),
     # ---------- Columns ----------
     (ChangeKind.COLUMN_DROPPED_REFERENCED, "requires_review"): (

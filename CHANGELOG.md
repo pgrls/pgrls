@@ -56,6 +56,13 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **PostgreSQL 18's built-in functions** — `casefold`, `array_sort`,
+  `array_reverse`, `uuidv4`, `uuidv7`, `crc32`, `crc32c`, `gamma`,
+  `lgamma` — are known to read no table. A SECURITY DEFINER body calling
+  one was listed by `pgrls matrix` as a door it does not see into.
+- The `pgrls diff --explain` text for a `REQUIRES_REVIEW` predicate change
+  no longer says to install `pgrls[diff-z3]`, which has been part of a plain
+  install since 0.16.0.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

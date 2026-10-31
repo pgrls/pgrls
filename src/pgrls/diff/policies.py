@@ -548,8 +548,7 @@ def _diff_policy_shapes(base_table: Table, head_table: Table) -> list[Change]:
                 # syntax — i.e. no Change, exactly like "unchanged" (see
                 # diff/_z3_compare). It is deliberately absent from the
                 # mapping tables below, so it MUST be skipped here too,
-                # else `mapping[result]` raises KeyError on valid input
-                # whenever the diff-z3 extra is installed.
+                # else `mapping[result]` raises KeyError on valid input.
                 continue
             kind, classification = mapping[result]
             message_fragment = _PREDICATE_RESULT_MESSAGES[result]
