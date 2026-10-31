@@ -65,8 +65,9 @@ breaking changes — they will be called out in this file.
   list of built-ins that read no table. Either way a door into a function
   that read a FORCE'd table was traced as harmless and the cell PROVEN
   (measured on PG17). Such a call now makes the door one pgrls does not see
-  into; in a policy predicate, a `matrix` cell that depends on it reads
-  UNDECIDED rather than COND (the `--prove` verdict is unchanged). Taking a
+  into; in a policy predicate reached two ways (say, directly and through a
+  definer view), the `matrix` cell reads UNDECIDED rather than COND and
+  `--prove` reports UNKNOWN rather than PROVEN. Taking a
   call's schema from its name parts also trusts a three-part
   `<db>.pg_catalog.lower(…)`, which Postgres resolves only in the current
   database. A bare built-in name that resolves to a better-fitting user
