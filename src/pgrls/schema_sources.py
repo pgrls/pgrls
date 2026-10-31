@@ -1102,9 +1102,9 @@ def _deparse_or_none(node: Any, written: str | None = None) -> str | None:
     When no rendering parses back to the node — pglast's printer drops
     parentheses it needs, or (pglast 7, ``x OPERATOR(s.op) ANY (…)``) cannot
     print it at all — the clause as the statement wrote it (`written`) is
-    used instead, so the rules see the predicate the SQL wrote. Without
-    `written` (the statement's source could not be scanned) it falls back
-    to pglast's rendering, or `None` when pglast cannot print the node.
+    used instead, so the rules see the predicate the SQL wrote. Without a
+    `written` that parses back to the node it falls back to pglast's
+    rendering, or `None` when pglast cannot print the node.
     """
     if node is None:
         return None

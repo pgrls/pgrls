@@ -57,8 +57,10 @@ breaking changes — they will be called out in this file.
 
 ### Fixed
 - **`pgrls diff` no longer calls a changed predicate `unchanged` when pglast
-  prints both alike.** pglast's deparser drops parentheses an operand of
-  `BETWEEN` needs (and, on pglast 7, of `IS NULL` and the like) — `(a OR b) BETWEEN x AND y` and
+  prints both alike.** pglast's deparser drops parentheses an operand
+  needs — on pglast 7 an AND / OR / NOT operand of `BETWEEN`, `IN (…)`,
+  `= ANY (…)` or `IS [NOT] NULL`, and a comparison operand of `BETWEEN` or
+  `IN (…)`; on pglast 8 one of `BETWEEN` — so `(a OR b) BETWEEN x AND y` and
   `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
   `pgrls diff` compared those strings, so a real change was not reported.
   Predicates are now compared on their parse trees, and the Z3 translation
@@ -78,9 +80,15 @@ breaking changes — they will be called out in this file.
   uses the clause as the file wrote it for a shape pglast cannot print
   faithfully (on pglast 7, a subscripted or field-selected constant such as
   `(-1)[1]`, which pglast prints without its parentheses), which the rules
-  skipped. Re-check any
-  policy with such a nested operand that `pgrls fix` rewrote (`--apply`, or
-  a migration written with `--output`).
+  skipped. **If `pgrls fix` rewrote a policy with such an operand** in an
+  earlier release — applied with `--apply`, from a `--output` migration, or
+  by hand from the dry-run SQL — look in the `ALTER POLICY` it emitted for
+  that operand with its parentheses gone, or compare the policy's
+  `pg_get_expr(polqual, polrelid)` / `pg_get_expr(polwithcheck, polrelid)`
+  with its definition before the fix: the widened policy is valid SQL, so a
+  later `pgrls lint` does not flag it. A PERF004 index expression could lose
+  them the same way; that changes no access, but the index may not serve
+  the policy.
 - **A predicate pglast cannot print at all** — on pglast 7,
   `x OPERATOR(schema.op) ANY (…)`, the form `pg_dump` writes — no longer
   crashes `pgrls diff` or `pgrls fix`, and is no longer dropped from a
@@ -88,7 +96,9 @@ breaking changes — they will be called out in this file.
   no USING / WITH CHECK clause at all, with no warning, so the rules missed
   what it said and `pgrls pr` reported a widened clause as no change. The
   clause as the file wrote it is used instead; `pgrls diff` compares it on
-  its parse tree, and a fixer leaves the finding rather than rewrite it.
+  its parse tree, and a fixer leaves the finding rather than rewrite it. A
+  widening that merged this way does not show in later base↔head checks;
+  run `pgrls lint --sql-file` over the current migrations to see it.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
