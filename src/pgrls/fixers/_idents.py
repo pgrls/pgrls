@@ -144,8 +144,8 @@ def alter_policy(
     a clause has no SQL that parses back to its AST (the fixer then leaves
     the finding rather than apply a different predicate).
 
-    Single source of truth for the shape the PERF001 / SEC011 /
-    SEC019 / SEC020 fixers all emit:
+    Single source of truth for the shape the SEC004 / SEC011 / SEC019
+    fixers emit:
 
         ALTER POLICY <name> ON <schema>.<table>
             [USING (<using_ast>)]

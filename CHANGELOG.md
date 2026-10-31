@@ -76,8 +76,9 @@ breaking changes — they will be called out in this file.
   needs; a fixer whose rewrite has no SQL that parses back to it now leaves
   the finding instead, while the rebuilt `--sql-file` / `pgrls pr` text
   uses the clause as the file wrote it for a shape pglast cannot print
-  faithfully (on pglast 7, a constant subscripted or field-selected without
-  its parentheses, `(-1)[1]`), which the rules skipped. Re-check any
+  faithfully (on pglast 7, a subscripted or field-selected constant such as
+  `(-1)[1]`, which pglast prints without its parentheses), which the rules
+  skipped. Re-check any
   policy with such a nested operand that `pgrls fix` rewrote (`--apply`, or
   a migration written with `--output`).
 - **A predicate pglast cannot print at all** — on pglast 7,
