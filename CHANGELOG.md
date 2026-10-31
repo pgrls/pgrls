@@ -57,8 +57,7 @@ breaking changes — they will be called out in this file.
 
 ### Fixed
 - **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
-  that a SECURITY DEFINER body calls by a built-in's name** — in two forms,
-  in the body (a policy predicate is judged separately). A quoted name
+  called by a built-in's name**, in two forms. A quoted name
   holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one
   identifier, a function in the search path, but was read as that schema's
   function; and a quoted SQL keyword (`"greatest"(…)`, `"coalesce"(…)`,
@@ -66,8 +65,12 @@ breaking changes — they will be called out in this file.
   list of built-ins that read no table. Either way a door into a function
   that read a FORCE'd table was traced as harmless and the cell PROVEN
   (measured on PG17). Such a call now makes the door one pgrls does not see
-  into. A bare built-in name that resolves to a better-fitting user overload
-  (`public.lower(integer)` for `lower(1)`) is still trusted.
+  into; in a policy predicate, a `matrix` cell that depends on it reads
+  UNDECIDED rather than COND (the `--prove` verdict is unchanged). Taking a
+  call's schema from its name parts also trusts a three-part
+  `<db>.pg_catalog.lower(…)`, which Postgres resolves only in the current
+  database. A bare built-in name that resolves to a better-fitting user
+  overload (`public.lower(integer)` for `lower(1)`) is still trusted.
 - The `pgrls diff --explain` text for a `REQUIRES_REVIEW` predicate change
   no longer says to install `pgrls[diff-z3]`, which has been part of a plain
   install since 0.16.0.

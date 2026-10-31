@@ -4516,6 +4516,10 @@ def _call(sql: str):
     ('SELECT "trim"(\'a\')', True),
     # Unquoted, they never were calls by that name.
     ("SELECT trim('a')", False),
+    # A three-part name's schema is its second part (Postgres refuses any
+    # database but the current one).
+    ("SELECT postgres.pg_catalog.lower('A')", False),
+    ("SELECT postgres.public.lower('A')", True),
 ])
 def test_opaque_call_trusts_builtins_only_when_unqualified_or_pg_catalog(
     sql: str, opaque: bool
