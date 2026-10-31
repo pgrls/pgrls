@@ -953,6 +953,9 @@ def _declaration_sections(
         i += 1
         spans: list[tuple[int, int]] = []
         while i < len(toks) and word(i) != "begin":
+            if word(i) == "declare":  # a repeated DECLARE starts no declaration
+                i += 1
+                continue
             j = i
             while j < len(toks) and toks[j][0] != "semi":
                 j += 1
@@ -1037,10 +1040,10 @@ def _confirmed_parse(
     ``public``, rejects every VARIADIC parameter, and takes a variable of a
     type it does not know for a record (no scalar target): the schema is
     dropped from each type it names — outside ``pg_catalog`` for parameters
-    and the return type, any schema in a confirmed ``DECLARE`` — VARIADIC
-    becomes a plain parameter, and each variable or parameter in `scalars`
-    (every one not in `keep`, for ``*``) is declared ``text``. A type does
-    not change which SQL the body runs.
+    and the return type, any schema in a ``DECLARE`` section (which the
+    probes then confirm) — VARIADIC becomes a plain parameter, and each
+    variable or parameter in `scalars` (every one not in `keep`, for ``*``)
+    is declared ``text``. A type does not change which SQL the body runs.
 
     Otherwise the reason it failed: the parse error, or ``""`` when the
     definition is not one ``CREATE FUNCTION`` with a body, cannot be
@@ -1209,6 +1212,27 @@ def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     return out
 
 
+def _assignment_split(query: str) -> tuple[str, str] | None:
+    """`target := value` (or `target = value`) as (target, value), split at
+    the first `:=` / `=` outside brackets, strings and comments — a named
+    argument (`f(x := 1)`) or a subscript comparison stays in its part."""
+    toks = _plpgsql_tokens(query)
+    if toks is None:
+        return None
+    depth = 0
+    for k, (_, start, end) in enumerate(toks):
+        text = query[start:end]
+        if text in ("(", "["):
+            depth += 1
+        elif text in (")", "]"):
+            depth -= 1
+        elif text == "=" and depth == 0:
+            if k and query[toks[k - 1][1]:toks[k - 1][2]] == ":" and toks[k - 1][2] == start:
+                start = toks[k - 1][1]
+            return query[:start], query[end:]
+    return None
+
+
 def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     """The static SQL a PL/pgSQL function runs, parsed, and why the list is
     incomplete (None when it is not). Every expression in the function is
@@ -1282,9 +1306,11 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     unparsed = False
     for query, mode in exprs:
         if mode in _PARSE_ASSIGNMENTS:
-            head, sep, tail = query.partition(":=")
-            if not sep:
-                head, _, tail = query.partition("=")
+            split = _assignment_split(query)
+            if split is None:
+                unparsed = True
+                continue
+            head, tail = split
             # A subscript of the target runs SQL too: `a[(SELECT …)] := 1`
             # (this loop parses the entry it appends).
             if not _PLAIN_TARGET.fullmatch(head):
@@ -1302,8 +1328,8 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     if unparsed:
         reasons.append("a statement in the body does not parse")
     if rec_defaults is None:
-        reasons.append("a record variable's declaration could not be read (a record, "
-                       "or on pglast 8 a type it does not know)")
+        reasons.append("a variable's declaration could not be read (one typed "
+                       "`record`, or on pglast 8 of a type it does not know)")
     return stmts, "; ".join(reasons) or None
 
 

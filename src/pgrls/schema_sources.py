@@ -553,8 +553,8 @@ class _TableBuilder:
         self.inherits: list[tuple[str, str]] = []
         # Named NOT NULL constraints (PG18 can drop one by name) → columns.
         self.not_null_names: dict[str, set[str]] = {}
-        # Every name the table has had: an unnamed NOT NULL keeps the name
-        # it got from the table at the time.
+        # Every name the table, or a parent it inherits a NOT NULL from, has
+        # had: an unnamed NOT NULL keeps the name it got at the time.
         self.former_names: list[str] = [name]
         # Columns NOT NULL only through a `NO INHERIT` constraint: an
         # `INHERITS` child does not get it.
@@ -695,7 +695,8 @@ def _apply_rename(
     `pgrls pr` annotation naming a phantom table. Also applies `ALTER POLICY …
     RENAME TO` and `ALTER TABLE … RENAME CONSTRAINT` (so a later `DROP
     CONSTRAINT` of a NOT NULL still finds its column); other renames
-    (columns, indexes, …) are left alone.
+    (columns, indexes, …) are left alone. A renamed parent takes the
+    children created before it along.
     """
     rename_type = getattr(stmt, "renameType", None)
     if rename_type == ObjectType.OBJECT_TABCONSTRAINT:

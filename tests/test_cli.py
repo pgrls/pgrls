@@ -66,12 +66,12 @@ def test_package_version_matches_pyproject() -> None:
 
 def test_python_dash_m_pgrls_invokes_cli() -> None:
     # `python -m pgrls` runs `src/pgrls/__main__.py`, whose
-    # `if __name__ == "__main__": main()` block dispatches to the CLI.
-    # Run it as the documented subprocess: in-process `runpy.run_module`
-    # goes through pytest's assertion-rewriting import hook (pgrls is a
-    # pytest11 plugin), which has no `get_code` for runpy to call; this
-    # broke under pytest 9.2.
-    # `--version` exits 0 after printing the version.
+    # `if __name__ == "__main__": main()` block dispatches to the CLI;
+    # `--version` exits 0 after printing the version. Run it as the
+    # documented subprocess: in-process `runpy.run_module` goes through
+    # pytest's assertion-rewriting import hook (pgrls ships a pytest11
+    # plugin, so pytest marks the package for rewriting), which has no
+    # `get_code` for runpy to call; this broke under pytest 9.2.
     import subprocess
     import sys
 

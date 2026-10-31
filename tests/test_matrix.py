@@ -1435,6 +1435,11 @@ def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
 
 @pytest.mark.parametrize("body", [
     "DECLARE arr int[]; BEGIN arr[(SELECT id FROM app.secret LIMIT 1)] := 7; END",
+    # Split at the first `:=` / `=` outside brackets and strings.
+    "DECLARE v interval; BEGIN v = make_interval(days := (SELECT n FROM app.secret)); END",
+    "DECLARE a int[]; BEGIN a[(SELECT ':=' FROM app.secret)::int] := 1; END",
+    # A repeated DECLARE inside a declare section.
+    "DECLARE x int := 1;\nDECLARE y mood := (SELECT 1 FROM app.secret);\nBEGIN NULL; END",
     # A cursor loop's implicit record has no default; an ALIAS declares none.
     "DECLARE c CURSOR FOR SELECT * FROM app.secret; BEGIN FOR r IN c LOOP NULL; END LOOP; END",
     "DECLARE a ALIAS FOR $1; m mood := (SELECT v FROM app.secret); BEGIN NULL; END",

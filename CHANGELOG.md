@@ -28,8 +28,10 @@ breaking changes — they will be called out in this file.
     PostgREST pre-request hook copies such a value — or one from a table the
     session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
-    SQL and PL/pgSQL bodies (whatever their return type), views to their
-    tables, and what those tables' policies read in turn, with an
+    SQL and PL/pgSQL bodies (whatever their return type, though one that
+    assigns to an OUT parameter or a RETURNS TABLE column is still
+    unreadable — only the body is captured), views to their tables, and
+    what those tables' policies read in turn, with an
     unresolvable relation or unreadable body counting against it. A login
     session must also have no pre-16 CREATEROLE, read no setting it can set
     for itself, and be unable to redefine or shadow what the filter calls
@@ -76,9 +78,8 @@ breaking changes — they will be called out in this file.
     the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
     `ADD CONSTRAINT … NOT NULL`. A named `… NOT NULL … NOT VALID` stays
     nullable until `VALIDATE CONSTRAINT` or `SET NOT NULL`, as on a live
-    database; an
-    unnamed `ADD NOT NULL c NOT VALID` stays nullable until `SET NOT NULL`
-    (pgrls does not follow a `VALIDATE` of its generated name, so SEC030
+    database; an unnamed `ADD NOT NULL c NOT VALID` stays nullable until
+    `SET NOT NULL` (pgrls does not follow a `VALIDATE` of its generated name, so SEC030
     errs toward firing); and an `INHERITS` child does not get a parent's
     `NOT NULL … NO INHERIT`.
 
@@ -95,10 +96,10 @@ breaking changes — they will be called out in this file.
   reason. pgrls also discarded the subscript of an assignment target
   (`a[(SELECT …)] := 1`); it is now read too.
 - **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
-  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL (named — on the table or
-  inherited from a parent — renamed, or the auto-named
-  `<table>_<column>_not_null`; PostgreSQL 18 stores a NOT NULL as a
-  constraint) makes the column nullable again.** The DB-free sources
+  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL makes its column nullable
+  again** — whether the constraint was named on the table, inherited from
+  a parent, renamed, or auto-named `<table>_<column>_not_null`
+  (PostgreSQL 18 stores a NOT NULL as a constraint). The DB-free sources
   ignored both, so SEC030 flagged a primary-key column or missed a column
   whose NOT NULL was dropped.
 - **DB-free sources: a renamed parent keeps its partitions and `INHERITS`

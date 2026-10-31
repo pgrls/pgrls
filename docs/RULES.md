@@ -2235,7 +2235,7 @@ Detection is structural and conservative:
   `ALTER TABLE … ADD CONSTRAINT <name> NOT NULL <column> NOT VALID` leaves
   existing NULL rows in place, so SEC030 still fires. Backfill the NULLs,
   then `ALTER TABLE … VALIDATE CONSTRAINT <name>` (`pgrls fix`'s
-  `SET NOT NULL` validates it too). Offline (`--sql-file` / `pgrls pr`), an
+  `SET NOT NULL` validates it too). Offline (the DB-free sources), an
   unnamed `ADD NOT NULL c NOT VALID` is cleared only by `SET NOT NULL`.
 
 Configure the auth-context function set (replaces the default) via
