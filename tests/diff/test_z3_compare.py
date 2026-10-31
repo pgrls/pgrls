@@ -1023,8 +1023,48 @@ def test_a_quoted_column_named_like_a_call_has_its_own_null_flag() -> None:
 
 
 def test_a_huge_numeric_literal_does_not_crash() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
     assert _classify("n > 1e400 OR o = 1", "n > 1e400 AND o = 1") == "semantic_tightened"
     assert anon_read_counterexample(parse_expr("n > 1e400 OR o = current_setting('app.u', true)")) is None
+    assert _counterexample("c > 1e400", "c > 1e399") is None
+    for using in ("n > 1e400", "tenant_id = auth.uid() OR n > 1e400"):
+        prove_anon_isolation(parse_expr(using))
+        prove_cross_tenant_isolation(parse_expr(using))
+
+
+def test_a_value_no_double_holds_is_left_out_of_a_leaking_row() -> None:
+    import z3
+
+    from pgrls.diff._z3_compare import _Context, _decode_model
+
+    ctx = _Context()
+    n = ctx.column("n", z3.RealSort())
+    solver = z3.Solver()
+    solver.add(n == z3.RealVal(10**400))
+    assert solver.check() == z3.sat
+    assert _decode_model(solver.model(), ctx) == {}
+
+
+def test_a_decimal_no_double_holds_is_a_value_of_its_own() -> None:
+    # A `float8` column compares with the literal rounded to a double, a
+    # `numeric` one exactly: `score >= 0.10000000000000000001` admits 0.1 on
+    # float8 but not on numeric, so the diff decides nothing.
+    assert _classify("score > 0.1", "score >= 0.10000000000000000001") is None
+    assert _classify("n > 0.1", "n > 0.1 AND x = 1") == "semantic_tightened"
+    # A double holds 0.5 exactly: both column types read it alike.
+    assert _classify("n > 0.5", "n >= 0.5") == "semantic_loosened"
+    assert _counterexample("n > 0.5", "n >= 0.5") == {"n": 0.5}
+
+
+def test_a_folded_numeric_no_double_holds_is_not_proven_isolated() -> None:
+    # Through a float both bounds were -0.1, an empty range; a row holding
+    # -0.100000000000000000015 is read.
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
+    using = ("n < '-0.10000000000000000001'::numeric "
+             "AND n > '-0.10000000000000000002'::numeric")
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
 
 
 def test_a_value_keeping_cast_still_translates() -> None:

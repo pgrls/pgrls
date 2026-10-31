@@ -41,8 +41,9 @@ What the encoder translates: columns, literals, comparisons and arithmetic
 (on the diff path not where Z3 and Postgres disagree — ``/`` and ``%``,
 arithmetic on anything but integers, ordering on text, which collations
 decide; a cast that may change the value, such as ``varchar(3)`` or
-``float4``, or of a value whose type pgrls does not know, is an opaque value
-of its own),
+``float4``, or of a function's result, is an opaque value of its own; so is
+a decimal literal no double holds exactly, which a ``float8`` and a
+``numeric`` column read differently),
 AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
@@ -68,6 +69,7 @@ so this is a defensive guardrail rather than a real limitation.
 """
 from __future__ import annotations
 
+import fractions
 import math
 import re
 
@@ -400,21 +402,40 @@ def _const_to_z3(node: A_Const) -> Any:
         return z3.BoolVal(val.boolval)
     if isinstance(val, Float):
         # pglast keeps a Float as its text — an integer too big for an int4
-        # among them. Read it exactly: through a Python float, two literals
-        # past double precision became one value (and `1e400` raised).
+        # among them, which is read exactly (through a Python float, two
+        # past double precision became one value).
         text = val.fval or ""
         try:
             if re.fullmatch(r"[+-]?\d+", text):
                 return z3.IntVal(int(text))
-            return z3.RealVal(text)
+            exact = _exact_double(text)
         except (ValueError, TypeError, z3.Z3Exception):
             return None
+        # A decimal a double cannot hold reads differently against a
+        # `float8` column (rounded) and a `numeric` one (exact), and the diff
+        # does not see which: it is a value of its own, the same in both
+        # predicates.
+        return exact if exact is not None else z3.Const(
+            f"{_OPAQUE_PREFIX}literal {text}", z3.RealSort())
     # Anything else (NULL literal, BitString, etc.) — out of scope.
     # In particular, `col = NULL` is always-false in Postgres but
     # users express that with `IS NULL` instead; if we see a literal
     # NULL on either side of a comparison, return None and let the
     # caller fall through to requires_review.
     return None
+
+
+def _exact_double(text: str) -> Any:
+    """`text`'s number as a Z3 real when a finite double holds it exactly —
+    then a `float8` and a `numeric` read it alike — else None."""
+    exact = fractions.Fraction(text.strip())
+    try:
+        double = float(exact)
+    except OverflowError:
+        return None
+    if not math.isfinite(double) or fractions.Fraction(double) != exact:
+        return None
+    return z3.Q(exact.numerator, exact.denominator)
 
 
 def _z3_string(text: str) -> Any:
@@ -432,7 +453,9 @@ def _z3_value(val: object) -> Any:
 
 # Cast targets that keep the value of a column, a literal or another such
 # cast (an out-of-range integer raises rather than changing): a cast to one
-# of these, with no type modifier, leaves the value as it is. Any other —
+# of these, with no type modifier, of a value Z3 already holds in that sort
+# leaves it as it is (one that changes sort, like `1.5::int`, is opaque).
+# Any other —
 # `varchar(3)` truncates, `char` is `char(1)`, `bpchar` ignores trailing
 # spaces, `numeric(4,1)` and `float4` round, `oid` wraps a negative integer
 # — makes a value of its own (an opaque one, which the same cast in both
@@ -585,8 +608,9 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     ``_nullflag__*`` / ``_opaque__*`` / ``_session__*`` vars are dropped — and decodes
     each value by its Z3 sort, one-to-one with the constructors in
     ``_const_to_z3`` (Int → ``as_long``, String → ``as_string``,
-    Bool → ``z3.is_true``, Real → ``float(as_fraction())``). Any other
-    sort is omitted (defensive). ``model.decls()`` yields only the
+    Bool → ``z3.is_true``, Real → ``float(as_fraction())``, left out when
+    no double holds it, and a witness gate then declines the row). Any
+    other sort is omitted (defensive). ``model.decls()`` yields only the
     constants Z3 actually assigned; a don't-care column is simply
     absent and is never fabricated.
     """
@@ -606,7 +630,10 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
         elif sort == z3.BoolSort():
             row[name] = z3.is_true(value)
         elif sort == z3.RealSort():
-            row[name] = float(value.as_fraction())
+            try:
+                row[name] = float(value.as_fraction())
+            except OverflowError:
+                pass
         # any other sort: omit (defensive)
     return row
 
@@ -1783,9 +1810,8 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
             low, high = _INT_RANGES.get(type_name or "", _INT_RANGES["int8"])
             return z3.IntVal(number) if low <= number <= high else None
         if target_sort == z3.RealSort():
-            real = float(text)
-            return z3.RealVal(real) if math.isfinite(real) else None
-    except (ValueError, OverflowError, z3.Z3Exception):
+            return _exact_double(text)
+    except (ValueError, OverflowError, ZeroDivisionError, z3.Z3Exception):
         return None
     if target_sort == z3.BoolSort():
         low_text = text.strip().lower()
