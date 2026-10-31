@@ -984,30 +984,60 @@ def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
 
 
 def _check_lexer_settings(statements: Any) -> None:
-    """Refuse a `SET` that changes how Postgres reads the strings after it:
-    a client encoding whose characters can hold a quote or backslash byte, or
-    `standard_conforming_strings` off. pgrls reads the SQL as UTF-8 with
-    standard strings, so it would end strings where Postgres does not."""
+    """Refuse SQL that sets what changes how Postgres reads the strings after
+    it — a client encoding whose characters can hold a quote or backslash
+    byte, or `standard_conforming_strings` off — by `SET`, `ALTER DATABASE /
+    ROLE … SET` (which a `\\connect` brings in) or `set_config()`. pgrls
+    reads the SQL as UTF-8 with standard strings, so it would end strings
+    where Postgres does not. A setting changed by code (a `DO` block, a
+    function) is not seen."""
     for raw in statements:
-        stmt = raw.stmt
-        if not isinstance(stmt, _pgast.VariableSetStmt) or not stmt.args:
-            continue
-        val = stmt.args[0].val
-        value = str(getattr(val, "sval", None) or getattr(val, "ival", "")).lower()
-        unsafe = (
-            stmt.name == "client_encoding"
-            and re.sub(r"[^a-z0-9]", "", value) in _UNSAFE_CLIENT_ENCODINGS
-        ) or (
-            stmt.name == "standard_conforming_strings"
-            and not (value in ("on", "1") or (value and ("true".startswith(value)
-                                                         or "yes".startswith(value))))
-        )
-        if unsafe:
-            raise SchemaSourceError(
-                "bad_sql",
-                f"the SQL sets {stmt.name} to {value!r}, under which Postgres "
-                "reads strings differently from how pgrls reads them.",
+        for node in _subnodes(raw.stmt):
+            if isinstance(node, _pgast.VariableSetStmt) and node.args:
+                name, arg = node.name, node.args[0]
+            elif (isinstance(node, _pgast.FuncCall)
+                  and ast_utils.func_name_parts(node)[1] == "set_config"):
+                args = node.args or ()
+                if not args or not isinstance(args[0], _pgast.A_Const):
+                    raise SchemaSourceError(
+                        "bad_sql",
+                        "the SQL calls set_config() on a setting it does not name; "
+                        "pgrls cannot tell how Postgres reads the strings after it.",
+                    )
+                name = str(getattr(args[0].val, "sval", "")).lower()
+                arg = args[1] if len(args) > 1 else None
+            else:
+                continue
+            if name not in ("client_encoding", "standard_conforming_strings"):
+                continue
+            val = arg.val if isinstance(arg, _pgast.A_Const) else None
+            value = str(getattr(val, "sval", None) or getattr(val, "ival", "")).lower()
+            unsafe = val is None or (
+                name == "client_encoding"
+                and re.sub(r"[^a-z0-9]", "", value) in _UNSAFE_CLIENT_ENCODINGS
+            ) or (
+                name == "standard_conforming_strings"
+                and not (value in ("on", "1") or (value and ("true".startswith(value)
+                                                             or "yes".startswith(value))))
             )
+            if unsafe:
+                raise SchemaSourceError(
+                    "bad_sql",
+                    f"the SQL sets {name} to {value or 'a computed value'!r}, under "
+                    "which Postgres reads strings differently from how pgrls "
+                    "reads them.",
+                )
+
+
+def _subnodes(node: Any) -> Any:
+    """`node` and every node beneath it."""
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _subnodes(item)
+    elif isinstance(node, _pgast.Node):
+        yield node
+        for field in node:
+            yield from _subnodes(getattr(node, field, None))
 
 
 def _without_psql_meta_commands(sql: str) -> str:

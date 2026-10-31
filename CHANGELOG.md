@@ -70,8 +70,9 @@ breaking changes — they will be called out in this file.
   names one of psql's own variables (`:ROW_COUNT`), and `pg_dumpall`
   output, which connects to one database after another (dump each with
   `pg_dump`). Any SQL file that sets `client_encoding` to an encoding such
-  as SJIS or BIG5, or turns `standard_conforming_strings` off, is refused
-  too: Postgres then ends strings where pgrls does not. And every `ALTER … OWNER TO` the dump
+  as SJIS or BIG5, or turns `standard_conforming_strings` off (by `SET`,
+  `ALTER DATABASE / ROLE … SET` or `set_config()`), is refused too:
+  Postgres then ends strings where pgrls does not. And every `ALTER … OWNER TO` the dump
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
   not a table, or one that changes nothing pgrls models (`OWNER TO`) on a

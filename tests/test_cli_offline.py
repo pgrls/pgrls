@@ -1772,6 +1772,13 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("SET standard_conforming_strings = off;\n", True),
     ("SET standard_conforming_strings = 0;\n", True),
     ("SET standard_conforming_strings = fa;\n", True),
+    # A database's or role's setting applies once psql reconnects.
+    ("ALTER DATABASE d SET standard_conforming_strings = off;\n", True),
+    ("ALTER ROLE r IN DATABASE d SET client_encoding = 'SJIS';\n", True),
+    ("SELECT set_config('standard_conforming_strings', 'off', false);\n", True),
+    ("SELECT set_config('client_encoding', current_setting('x'), false);\n", True),
+    ("SELECT set_config(current_setting('x'), 'off', false);\n", "set_config"),
+    ("SELECT pg_catalog.set_config('search_path', '', false);\n", False),
     ("SET client_encoding = 'UTF8';\n", False),
     ("SET client_encoding = 'LATIN1';\n", False),
     ("SET standard_conforming_strings = on;\n", False),
@@ -1786,7 +1793,8 @@ def test_a_setting_that_changes_how_strings_read_is_refused(sql, refused):
 
     sql += "CREATE TABLE t (id int);\n"
     if refused:
-        with pytest.raises(SchemaSourceError, match="reads strings differently"):
+        why = refused if isinstance(refused, str) else "reads strings differently"
+        with pytest.raises(SchemaSourceError, match=why):
             schema_from_sql(sql)
     else:
         assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
