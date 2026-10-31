@@ -1703,11 +1703,22 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # COPY data: blanking `\\.` would read the rows as SQL.
     ("CREATE TABLE t (b text);\nCOPY t (b) FROM stdin;\n\\.\n", "COPY data"),
     # Another file, a branch not taken, generated SQL: not the SQL that runs.
-    ("\\i other.sql\nCREATE TABLE t (id int);\n", "\\i,"),
-    ("\\if :prod\nALTER TABLE t DISABLE ROW LEVEL SECURITY;\n\\endif\n", "\\if,"),
-    ("SELECT 'ALTER TABLE t DISABLE ROW LEVEL SECURITY'\n\\gexec\n", "\\gexec,"),
+    ("\\i other.sql\nCREATE TABLE t (id int);\n", "psql command"),
+    ("\\if :prod\nALTER TABLE t DISABLE ROW LEVEL SECURITY;\n\\endif\n", "psql command"),
+    ("SELECT 'ALTER TABLE t DISABLE ROW LEVEL SECURITY'\n\\gexec\n", "psql command"),
     # A connect after objects switches database.
     ("CREATE TABLE a (id int);\n\\connect other\nCREATE TABLE b (id int);\n", "connects to another"),
+    ("SELECT 1 AS id INTO t;\n\\connect other\nCREATE TABLE b (id int);\n", "connects to another"),
+    # One line, more than one command: `\\\\` ends a command and the rest runs
+    # as SQL; a second backslash starts another; a backtick runs a shell.
+    ("\\echo hi \\\\ ALTER TABLE t DISABLE ROW LEVEL SECURITY;\n", "psql command"),
+    ("\\echo hi \\i other.sql\n", "psql command"),
+    ("\\set ON_ERROR_STOP `id`\n", "psql command"),
+    ("\\;ALTER TABLE t DISABLE ROW LEVEL SECURITY;\n", "psql command"),
+    ("\\! psql -c 'select 1'\n", "psql command"),
+    # A script's own variable can be interpolated into the SQL after it.
+    ("\\set n 2\nSELECT (ARRAY[1,2,3])[1:n];\n", "psql command"),
+    ("\\set AUTOCOMMIT off\n", "psql command"),
 ])
 def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
@@ -1721,5 +1732,10 @@ def test_harmless_psql_commands_are_skipped():
 
     sql = ("\\set ON_ERROR_STOP on\n\\echo start\n"
            "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # pg_dump --create connects again after the database's own settings.
+    sql = ("CREATE DATABASE d;\n\\connect d\nALTER DATABASE d SET work_mem = '4MB';\n"
+           "ALTER ROLE app IN DATABASE d SET work_mem = '4MB';\n\\connect d\n"
+           "CREATE TABLE t (id int);\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
 
