@@ -1430,6 +1430,10 @@ def test_option_dump_is_not_parsed_on_pglast_8() -> None:
     "BEGIN NULL; END",
     "DECLARE c NO SCROLL CURSOR (a mood) FOR SELECT a; "
     "x public.cursor := (SELECT ROW(v)::cursor FROM app.secret LIMIT 1); BEGIN NULL; END",
+    # A line comment ends at a CR too, as Postgres scans it.
+    "DECLARE\n  r --\r record := (SELECT v FROM app.secret LIMIT 1); y int\n  = 1;\nBEGIN NULL; END",
+    "DECLARE\n  r --\r record NOT NULL DEFAULT (SELECT v FROM app.secret LIMIT 1); y int\n"
+    "  = 1;\nBEGIN NULL; END",
 ])
 def test_a_record_default_is_read_by_its_declaration(body: str) -> None:
     from pglast.stream import RawStream  # noqa: PLC0415

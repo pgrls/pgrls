@@ -851,6 +851,9 @@ _Token = tuple[str, int, int]
 _PLAIN_TARGET = re.compile(r'\s*(?:[^\W\d][\w$]*|"(?:[^"]|"")+")(?:\s*\.\s*(?:[^\W\d][\w$]*|"(?:[^"]|"")+"))*\s*')
 
 
+_LINE_END = re.compile(r"[\n\r]")
+
+
 def _plpgsql_tokens(text: str) -> list[_Token] | None:
     """`text` as (kind, start, end) tokens — ``word``, ``qword`` (a quoted
     identifier), ``dot``, ``semi`` or ``other`` — skipping whitespace and
@@ -860,11 +863,13 @@ def _plpgsql_tokens(text: str) -> list[_Token] | None:
     i, n = 0, len(text)
     while i < n:
         c = text[i]
-        if c.isspace():
+        # Postgres's whitespace, and its line comment, which a CR ends too;
+        # any other character past ASCII belongs to an identifier.
+        if c in " \t\n\r\f\v":
             i += 1
         elif text.startswith("--", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j + 1
+            m = _LINE_END.search(text, i)
+            i = n if m is None else m.end()
         elif text.startswith("/*", i):
             depth, j = 1, i + 2
             while j < n and depth:
@@ -901,9 +906,10 @@ def _plpgsql_tokens(text: str) -> list[_Token] | None:
                 return None
             out.append(("other", i, j + len(m.group(0))))
             i = j + len(m.group(0))
-        elif c.isalpha() or c == "_" or ord(c) > 127:
+        elif (c.isascii() and c.isalpha()) or c == "_" or ord(c) > 127:
             j = i + 1
-            while j < n and (text[j].isalnum() or text[j] in "_$" or ord(text[j]) > 127):
+            while j < n and ((text[j].isascii() and text[j].isalnum())
+                             or text[j] in "_$" or ord(text[j]) > 127):
                 j += 1
             out.append(("word", i, j))
             i = j
