@@ -892,7 +892,7 @@ def _non_table_relation(stmt: Any) -> Any:
 # (generated SQL), `\\.` (the end of COPY data) — means the SQL pgrls would
 # read is not the SQL that runs, so it is refused rather than blanked.
 # `\\set` is not here: psql interpolates its variables into the SQL that
-# follows (`:n`), and `\\encoding` changes how psql splits the lines.
+# follows (`:n`). `\\encoding` and `\\connect` are checked on their own.
 _HARMLESS_PSQL_COMMANDS = frozenset({
     "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
 })
@@ -922,7 +922,13 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
     A line is skipped only when it is ONE known command and nothing else: a
     second backslash starts another command (`\\echo x \\i f`), and `\\\\`
     ends the command so the rest of the line runs as SQL; a backtick runs a
-    shell command. Any of those is refused, as is any other command."""
+    shell command. Any of those is refused, as is any other command.
+
+    A `\\connect` is skipped only in the forms pg_dump writes — a bare
+    database name, or `-reuse-previous=on "dbname='…'"` — since a conninfo
+    string can also set `options` or `client_encoding`, which change how
+    the server reads the strings after it; an `\\encoding` only to an
+    encoding `_check_lexer_settings` would accept."""
     connects: list[tuple[int, str]] = []
     for offset, line in commands:
         m = re.match(r"\\([A-Za-z]+|\.)(?:\s+(.*))?$", line.strip(), re.DOTALL)
@@ -934,7 +940,16 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
                 "schema with pg_dump --schema-only.",
             )
         connect = name in ("c", "connect")
-        known = name in _HARMLESS_PSQL_COMMANDS or (connect and ":" not in rest)
+        target = None
+        if connect and (c := re.fullmatch(
+            r'([^\s"\'=:\-][^\s"\'=:]*)|-reuse-previous=on "dbname=\'([^\'"\\:]*)\'"',
+            rest,
+        )):
+            target = c.group(1) or c.group(2)
+        known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
+            name == "encoding" and re.fullmatch(r"[A-Za-z0-9_-]+", rest) is not None
+            and re.sub(r"[^a-z0-9]", "", rest.lower()) not in _UNSAFE_CLIENT_ENCODINGS
+        )
         if m is None or "\\" in rest or "`" in rest or not known:
             raise SchemaSourceError(
                 "bad_sql",
@@ -942,7 +957,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
                 "does not model (the SQL it reads would not be the SQL that runs).",
             )
         if connect:
-            connects.append((offset, rest))
+            connects.append((offset, target or ""))
     if len({target for _, target in connects}) > 1:
         raise SchemaSourceError(
             "bad_sql",

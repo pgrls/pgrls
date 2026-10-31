@@ -1726,6 +1726,12 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("\\echo x\nSELECT :'USER', 1 FROM (SELECT 1) s(\"USER\");\n", "psql command|its own variable|parse"),
     # psql splits lines by the client encoding.
     ("\\encoding SJIS\nCREATE TABLE t (id int);\n", "psql command"),
+    # A conninfo string can set what the server reads strings by, or reach
+    # another server: only pg_dump's own forms are skipped.
+    ("\\connect \"dbname=d options='-c standard_conforming_strings=off'\"\n", "psql command"),
+    ("\\connect -reuse-previous=on \"dbname=d client_encoding=SJIS\"\n", "psql command"),
+    ("\\connect dbname=d\n", "psql command"),
+    ("\\connect d app otherhost\n", "psql command"),
 ])
 def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
@@ -1805,6 +1811,11 @@ def test_harmless_psql_commands_are_skipped():
 
     sql = ("\\restrict k\n\\echo start\n"
            "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # pg_dump --create's form for a name that needs quoting, after an
+    # `\\encoding` of the server's.
+    sql = ('CREATE DATABASE "my-app";\n\\encoding SQL_ASCII\n'
+           '\\connect -reuse-previous=on "dbname=\'my-app\'"\nCREATE TABLE t (id int);\n')
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # pg_dump --create connects again after the database's own settings.
     sql = ("CREATE DATABASE d;\n\\connect d\nALTER DATABASE d SET work_mem = '4MB';\n"
