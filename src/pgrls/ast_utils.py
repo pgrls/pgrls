@@ -780,7 +780,10 @@ def _parenthesized(node: Any) -> str | None:
     in parentheses, which adds no node to the tree. None when pglast cannot
     print the placeholder in that place."""
     holes: list[Any] = []
-    rendered = _render(node)
+    try:
+        rendered = _render(node)
+    except Exception:  # noqa: BLE001 — pglast's own printer can fail
+        rendered = ""
     stem = "pgrls_hole"
     while stem in rendered:
         stem += "_"
@@ -825,7 +828,10 @@ def _parenthesized(node: Any) -> str | None:
     def fill(match: re.Match[str]) -> str:
         return f"({faithful_sql(holes[int(match.group(1))])})"
 
-    return re.sub(rf"\b{stem}(\d+)\b", fill, text)
+    try:
+        return re.sub(rf"\b{stem}(\d+)\b", fill, text)
+    except Exception:  # noqa: BLE001 — an operand pglast cannot render
+        return None
 
 
 def _shape(value: Any) -> Any:
@@ -875,18 +881,30 @@ def faithful_sql(node: Any) -> str:
     pglast's rendering when it does, else one with each of its operands
     parenthesized (pglast's deparser drops parentheses an operand of
     ``BETWEEN`` / ``IS NULL`` needs, so two different predicates can print
-    the same). Falls back to pglast's rendering when neither round-trips."""
-    text = _render(node)
-    if _same_tree(text, node):
+    the same). Falls back to pglast's rendering when neither round-trips;
+    raises when pglast cannot render the node at all (pglast 7's printer
+    fails on ``x OPERATOR(s.op) ANY (…)``) and no grouping renders it."""
+    try:
+        text: str | None = _render(node)
+    except Exception:  # noqa: BLE001 — pglast's own printer can fail
+        text = None
+    if text is not None and _same_tree(text, node):
         return text
     grouped = _parenthesized(node)
-    return grouped if grouped is not None and _same_tree(grouped, node) else text
+    if grouped is not None and _same_tree(grouped, node):
+        return grouped
+    if text is None:
+        raise ValueError(f"pglast cannot render this {type(node).__name__}")
+    return text
 
 
 def exact_sql(node: Any) -> str | None:
     """`faithful_sql` when it parses back to `node`, else None — for SQL that
     is applied, where pglast's lossy rendering would mean something else."""
-    text = faithful_sql(node)
+    try:
+        text = faithful_sql(node)
+    except ValueError:
+        return None
     return text if _same_tree(text, node) else None
 
 
@@ -897,8 +915,12 @@ def canonical_key(node: Any) -> str:
     when it parses back to the node — so one text cannot stand for two
     trees — else that text tagged with a digest of the tree. Same-shaped
     trees usually, but not always, share a key: ``p AND (q AND r)`` keeps
-    its parentheses."""
-    text = faithful_sql(node)
+    its parentheses. A node pglast cannot render at all is keyed by its
+    digest alone."""
+    try:
+        text = faithful_sql(node)
+    except ValueError:
+        text = type(node).__name__
     if _same_tree(text, node):
         return text
     digest = hashlib.sha256(_tree(node).encode()).hexdigest()[:16]

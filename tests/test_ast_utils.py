@@ -652,3 +652,26 @@ def test_canonical_key_ignores_source_positions() -> None:
     a = parse_expr("EXISTS (SELECT 1 FROM unnest(ARRAY[1]) u WHERE (a OR b) BETWEEN x AND y)")
     b = parse_expr("EXISTS (SELECT 1   FROM unnest( ARRAY[1] ) u WHERE (a OR b) BETWEEN x AND y)")
     assert canonical_key(a) == canonical_key(b)
+
+
+def test_a_node_pglast_cannot_print_has_a_key_but_no_exact_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pglast 7's printer raises on `x OPERATOR(s.op) ANY (…)`, which pg_dump
+    # writes: comparing such a predicate must not crash, two of them must not
+    # share a key, and a fixer must get no SQL to apply.
+    import pgrls.ast_utils
+    from pgrls.ast_utils import exact_sql
+    from pgrls.diff.ast_compare import compare_predicates
+
+    def broken(node: object) -> str:
+        raise TypeError("printer failed")
+
+    monkeypatch.setattr(pgrls.ast_utils, "_render", broken)
+    a, b = parse_expr("email = ANY (ARRAY['a'])"), parse_expr("email = ANY (ARRAY['b'])")
+    with pytest.raises(ValueError):
+        faithful_sql(a)
+    assert exact_sql(a) is None
+    assert canonical_key(a) != canonical_key(b)
+    assert canonical_key(a) == canonical_key(parse_expr("email = ANY(ARRAY['a'])"))
+    assert compare_predicates("email = ANY (ARRAY['a'])", "email = ANY (ARRAY['a'])") == "unchanged"

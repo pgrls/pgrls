@@ -81,6 +81,10 @@ breaking changes — they will be called out in this file.
   analysed as the regrouped predicate. Re-check any
   policy with such a nested operand that `pgrls fix` rewrote (`--apply`, or
   a migration written with `--output`).
+- `pgrls diff` and `pgrls fix` no longer crash on a predicate pglast cannot
+  print at all — on pglast 7, `x OPERATOR(schema.op) ANY (…)`, the form
+  `pg_dump` writes. `pgrls diff` compares it on its parse tree; a fixer
+  leaves the finding rather than rewrite it.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
