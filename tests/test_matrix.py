@@ -1423,6 +1423,13 @@ def test_option_dump_is_not_parsed_on_pglast_8() -> None:
     f"BEGIN FOR {'i' * 70} IN 1..1 LOOP END LOOP; END",
     f"DECLARE {'r' * 64} record := (SELECT v FROM app.secret LIMIT 1); "
     f"BEGIN DECLARE {'r' * 63} record; BEGIN NULL; END; END",
+    # A type named `cursor` (a record on pglast 8) is no cursor declaration.
+    "DECLARE x public.cursor := (SELECT ROW(v)::public.cursor FROM app.secret LIMIT 1); "
+    "BEGIN NULL; END",
+    "DECLARE x CONSTANT cursor := (SELECT ROW(v)::cursor FROM app.secret LIMIT 1); "
+    "BEGIN NULL; END",
+    "DECLARE c NO SCROLL CURSOR (a mood) FOR SELECT a; "
+    "x public.cursor := (SELECT ROW(v)::cursor FROM app.secret LIMIT 1); BEGIN NULL; END",
 ])
 def test_a_record_default_is_read_by_its_declaration(body: str) -> None:
     from pglast.stream import RawStream  # noqa: PLC0415

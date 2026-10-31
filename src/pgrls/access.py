@@ -1176,6 +1176,10 @@ def _loop_variables(tree: Any) -> set[int]:
     return out
 
 
+# How a cursor declaration begins after its name.
+_CURSOR_WORDS = (["cursor"], ["scroll", "cursor"], ["no", "scroll", "cursor"])
+
+
 def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     """The default expressions of the variables the parse models as records,
     read from their confirmed declarations — pglast leaves them out
@@ -1184,48 +1188,59 @@ def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     one cannot be read.
 
     Each record is matched to the declaration of the probe before it in the
-    parser's numbering: in a cursor declaration it is one of the cursor's
-    arguments, which take no default; otherwise it must be the variable
-    right after the probe, under the declaration's name. Any other record —
-    one whose declaration the scan did not find — cannot be read."""
+    parser's numbering. In a cursor declaration (``name [NO] [SCROLL]
+    CURSOR``, whose own variable follows its arguments under that name) a
+    record before the cursor's variable is one of its arguments, which take
+    no default; otherwise it must be the variable right after the probe,
+    under the declaration's name. Any other record — one whose declaration
+    the scan did not find — cannot be read."""
     body = parsed.body
     loops = _loop_variables(parsed.tree)
-    out: list[str] = []
-    probe: str | None = None
-    after = 0
+    # The datums after each probe, in the parser's order, up to the next.
+    groups: list[tuple[str | None, list[tuple[int, str, dict[str, Any]]]]] = [(None, [])]
     for fn in parsed.tree if isinstance(parsed.tree, list) else ():
         for dno, datum in enumerate((fn.get("PLpgSQL_function") or {}).get("datums") or ()):
-            for kind, rec in datum.items():
-                if not isinstance(rec, dict) or not rec.get("lineno"):
+            for kind, fields in datum.items():
+                if not isinstance(fields, dict) or not fields.get("lineno"):
                     continue
-                if re.fullmatch(r"pgrls_probe_\d+", str(rec.get("refname"))):
+                if re.fullmatch(r"pgrls_probe_\d+", str(fields.get("refname"))):
                     # Every probe, the ones before a closing BEGIN too (no
                     # declaration follows those).
-                    probe, after = str(rec.get("refname")), 0
-                    continue
-                after += 1
-                if kind != "PLpgSQL_rec" or dno in loops:
-                    continue
-                span = parsed.decls.get(probe) if probe is not None else None
-                if span is None:
-                    return None
-                text = body[span[0]:span[1]]
-                toks = _plpgsql_tokens(text)
-                if not toks:
-                    return None
-                if any(t[0] == "word" and text[t[1]:t[2]].lower() == "cursor"
-                       for t in toks[1:4]):
-                    continue  # an argument of the cursor declared there
-                if after > 1:
-                    return None
-                name = _ident(text, toks[0])
-                if name is None or name.encode()[:63].decode(errors="ignore") != rec.get("refname"):
-                    return None
-                default = _default_of(text, toks)
-                if default is None:
-                    return None
-                if default:
-                    out.append(default)
+                    groups.append((str(fields.get("refname")), []))
+                else:
+                    groups[-1][1].append((dno, kind, fields))
+    out: list[str] = []
+    for probe, items in groups:
+        recs = [k for k, (dno, kind, _) in enumerate(items)
+                if kind == "PLpgSQL_rec" and dno not in loops]
+        if not recs:
+            continue
+        span = parsed.decls.get(probe) if probe is not None else None
+        if span is None:
+            return None
+        text = body[span[0]:span[1]]
+        toks = _plpgsql_tokens(text)
+        if not toks:
+            return None
+        name = _ident(text, toks[0])
+        if name is None:
+            return None
+        name = name.encode()[:63].decode(errors="ignore")
+        words = [text[t[1]:t[2]].lower() if t[0] == "word" else "" for t in toks[1:4]]
+        cursor = next((k for k, (_, kind, fields) in enumerate(items)
+                       if kind == "PLpgSQL_var" and "cursor_explicit_expr" in fields
+                       and fields.get("refname") == name), None)
+        if cursor is not None and any(words[:len(w)] == w for w in _CURSOR_WORDS):
+            if any(k > cursor for k in recs):
+                return None
+            continue  # arguments of the cursor declared there
+        if recs != [0] or items[0][2].get("refname") != name:
+            return None
+        default = _default_of(text, toks)
+        if default is None:
+            return None
+        if default:
+            out.append(default)
     return out
 
 
