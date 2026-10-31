@@ -867,11 +867,14 @@ A DANGEROUS *semantic-loosening* verdict — the new predicate admits a
 strict superset of the old one's rows — also prints a concrete
 **leaking row**: a row the new policy admits but the old one rejected
 (e.g. `example leaking row: {tenant_id=2}`), in both text and JSON
-output. The row is only emitted when its column values are a sound,
-self-sufficient witness; when the leak depends on a NULL test or an
-opaque value (a function call, a `current_setting(...)` GUC, `COALESCE`,
-or `CASE`), pgrls prints the label-only DANGEROUS verdict rather than a
-row that would not actually leak.
+output. The row can name a NULL column (`{a=NULL}`): predicates are
+compared under SQL's three-valued logic, where a row passes only when the
+predicate is exactly TRUE. The row is only emitted when its column values
+are a sound, self-sufficient witness; when the leak depends on an opaque
+value (a function call, a `current_setting(...)` GUC, a `CASE`, or a
+`COALESCE` it cannot model exactly), or on a column being NOT NULL that the
+predicates only test for NULL, pgrls prints the label-only DANGEROUS verdict
+rather than a row that would not actually leak.
 
 See [AGENTS.md](AGENTS.md) for the full classification table and AST
 pattern documentation.

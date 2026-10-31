@@ -152,9 +152,8 @@ def test_or_mixing_comparison_and_bare_boolean_funccall_returns_none():
     # Regression: `is_admin()` translates as an opaque String marker, so
     # `z3.Or(<Int-comparison Bool>, <String opaque>)` raised an uncaught
     # `z3.Z3Exception: sort mismatch` and crashed `pgrls diff` on a
-    # realistic policy edit. `_to_z3` now catches it at the boolean-
-    # connective site and degrades to None (→ requires_review), like
-    # every other untranslatable operator.
+    # realistic policy edit. The boolean connective now degrades to None
+    # (→ requires_review), like every other untranslatable operator.
     assert _classify("tenant_id = 2", "tenant_id = 1 OR is_admin()") is None
 
 
@@ -198,15 +197,14 @@ def test_in_list_string_subset_is_semantic_tightened():
 
 
 # ---------------------------------------------------------------------------
-# NULL tests (opaque markers)
+# NULL tests (a column's null-flag)
 # ---------------------------------------------------------------------------
 
 
 def test_is_null_with_added_predicate_is_semantic_tightened():
     # `col IS NULL` ⊃ `col IS NULL AND tenant = 'a'`. The added
-    # AND-conjunct only restricts. NULL is treated as opaque so the
-    # tenant-comparison and the IS NULL marker share the same column
-    # variable per the translator's binding policy.
+    # AND-conjunct only restricts. The IS NULL test reads `col`'s null-flag,
+    # the same in both predicates.
     assert (
         _classify("col IS NULL", "col IS NULL AND tenant = 'a'")
         == "semantic_tightened"
@@ -456,24 +454,25 @@ def _row_satisfies_head_not_base(base_sql, head_sql, row) -> bool:
     pinning every reported column to its value keeps ``head ∧ ¬base``
     SAT — i.e. the row really is a member of ``head ∖ base``.
 
-    The pin var is fetched from the freshly-rebuilt context's
-    ``_vars`` so it is byte-identical to the variable already inside
-    ``h`` / ``b`` (same name + sort); no sort is guessed from the
-    Python value (which would mis-handle ``bool`` vs ``int``).
+    The pin var comes from the freshly-rebuilt context, so it is the
+    variable already inside ``h`` / ``b`` (same name + sort). A ``None``
+    pins the column NULL.
     """
-    from pgrls.diff._z3_compare import _Context, _to_z3
+    from pgrls.diff._z3_compare import _diff_truths
 
-    ctx = _Context()
-    base = parse_expr(base_sql)
-    head = parse_expr(head_sql)
-    b = _to_z3(base, ctx)
-    h = _to_z3(head, ctx)
+    truths = _diff_truths(parse_expr(base_sql), parse_expr(head_sql))
+    assert truths is not None
+    ctx, assertions, b, h = truths
     s = z3_solver.Solver()
-    s.add(z3_solver.And(h, z3_solver.Not(b)))
+    s.add(*assertions)
+    s.add(z3_solver.And(h.is_true, z3_solver.Not(b.is_true)))
     for key, val in row.items():
+        if val is None:
+            s.add(ctx.null_flag(key))
+            continue
         var = ctx.column(key, _py_value_sort(val))
         assert var is not None, f"reported column {key!r} not bindable"
-        s.add(var == val)
+        s.add(var == val, z3_solver.Not(ctx.null_flag(key)))
     return s.check() == z3_solver.sat
 
 
@@ -496,7 +495,7 @@ def test_counterexample_present_on_or_loosen():
     cx = _counterexample(base, head)
     assert cx is not None
     # Every key is a REAL column — no synthetic vars leaked.
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     # SOUNDNESS: the row genuinely satisfies head ∧ ¬base.
     assert _row_satisfies_head_not_base(base, head, cx)
 
@@ -533,7 +532,7 @@ def test_counterexample_present_on_incomparable_pair():
     assert _classify(base, head) is None
     cx = _counterexample(base, head)
     assert cx is not None
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     # SOUNDNESS: the returned row genuinely lies in head ∖ base.
     assert _row_satisfies_head_not_base(base, head, cx)
 
@@ -550,19 +549,14 @@ def test_no_counterexample_when_tightened():
     assert _counterexample("a = 1 OR a = 2", "a = 1") is None
 
 
-def test_no_counterexample_when_null_dependent_loosen():
-    # SOUNDNESS GATE (the critique's fatal case): base `active = true`,
-    # head `active = true OR deleted_at IS NULL` classifies loosened,
-    # but the leak hinges on `deleted_at IS NULL` — a synthetic NULL
-    # marker, not a column value. The real-column projection
-    # `{active: False}` does NOT leak on its own, so the emitter must
-    # return None (degrade to label-only) rather than a non-leaking row.
-    assert _classify("active = true", "active = true OR deleted_at IS NULL") == (
-        "semantic_loosened"
-    )
-    assert _counterexample(
-        "active = true", "active = true OR deleted_at IS NULL"
-    ) is None
+def test_null_dependent_loosen_names_the_null_column():
+    # The leak hinges on `deleted_at IS NULL`: `{active: False}` alone does
+    # not leak, so the row must say deleted_at is NULL too.
+    base, head = "active = true", "active = true OR deleted_at IS NULL"
+    assert _classify(base, head) == "semantic_loosened"
+    cx = _counterexample(base, head)
+    assert cx is not None and cx["deleted_at"] is None
+    assert _row_satisfies_head_not_base(base, head, cx)
 
 
 def test_no_counterexample_when_opaque_only_loosen():
@@ -585,7 +579,7 @@ def test_counterexample_for_loosen_via_public_helper():
 
     cx = counterexample_for("tenant_id = 1", "tenant_id = 1 OR tenant_id = 2")
     assert cx is not None
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     assert _row_satisfies_head_not_base(
         "tenant_id = 1", "tenant_id = 1 OR tenant_id = 2", cx
     )
@@ -593,7 +587,7 @@ def test_counterexample_for_loosen_via_public_helper():
 
 # ---------------------------------------------------------------------------
 # H2 (SEC038) — `anon_read_counterexample`: the Kleene 3VL anonymous-read
-# validity prover. Additive; the 2-valued path above is untouched.
+# validity prover — the encoder the diff path above shares.
 #
 # Contract: returns a dict (a proof artifact) iff the USING predicate is
 # anon-VALID — TRUE for every row under an anonymous session (every auth
@@ -830,14 +824,16 @@ def test_anon_clean_on_string_sorted_arithmetic_no_crash() -> None:
     # (now()/current_setting/an unknown-target cast) and for `col OP col`
     # (both default to StringSort). Before the fix this escaped the
     # operator-application catch and crashed SEC038 (and, via the cli
-    # dispatch loop, the WHOLE lint run). Each predicate must now degrade
-    # to None (untranslatable -> NO-OP), not raise. The headline case is
-    # a benign, idiomatic "recent rows" window policy.
+    # dispatch loop, the WHOLE lint run). The result is now a value of its
+    # own, so nothing raises: the benign, idiomatic "recent rows" window
+    # policy is not anon-valid.
     assert _anon("created_at > now() - interval '7 days'") is None
     assert _anon("created_at <> now() - interval '7 days'") is None
-    # `col OP col` arithmetic (both sides default to StringSort):
+    # `col OP col` arithmetic (both sides default to StringSort) beside an
+    # `auth.uid() IS NULL` disjunct, TRUE for every anonymous row: a real
+    # total leak, which the arithmetic used to hide.
     for op in ("-", "*", "/", "%"):
-        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") is None, op
+        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") == {}, op
 
 
 def test_anon_clean_on_bool_sorted_comparison_no_crash() -> None:
@@ -911,7 +907,7 @@ def test_bare_constant_predicate_degrades_instead_of_crashing() -> None:
 
 
 def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
-    # R13 #1 (2VL diff path): String-sorted arithmetic (`-`/`*`/`/`/`%`)
+    # R13 #1: String-sorted arithmetic (`-`/`*`/`/`/`%`)
     # makes the Z3 operator overload raise a plain TypeError, not
     # z3.Z3Exception. classify_via_z3 / counterexample used to let it
     # escape and crash `pgrls diff`; both must now degrade to None so the
@@ -929,64 +925,267 @@ def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
     assert counterexample(cc, cc) is None
 
 
-def test_reserved_marker_prefix_column_cannot_alias_the_null_marker() -> None:
-    # R15 #3: the synthetic NULL marker for column `x` is minted as
-    # z3.Bool("_isnull__x"); a REAL column literally named `_isnull__x`
-    # (legal via a quoted identifier) is bound as z3.Const("_isnull__x",
-    # Bool) and — since Z3 keys a constant by name+sort — would alias the
-    # marker in the `base AND NOT head` implication query, silently
-    # collapsing distinct predicates to `semantic_equivalent` (a
-    # suppressed diff Change; by symmetry a missed DANGEROUS loosening).
-    # `_column_key` now refuses to bind a reserved-prefix column, so the
-    # predicate degrades to requires_review (None) — never a false
-    # equivalence.
-    assert _classify("x IS NULL AND y = 1", '"_isnull__x" AND y = 1') is None
+def test_reserved_marker_prefix_column_cannot_alias_the_null_flag() -> None:
+    # R15 #3: the null-flag for column `x` is minted as
+    # z3.Bool("_nullflag__x"); a REAL column literally named `_nullflag__x`
+    # (legal via a quoted identifier) would be bound as
+    # z3.Const("_nullflag__x", Bool) and — since Z3 keys a constant by
+    # name+sort — alias the flag, collapsing distinct predicates to
+    # `semantic_equivalent`. `_column_key` refuses to bind a reserved-prefix
+    # column, so the predicate degrades to requires_review (None).
+    assert _classify("x IS NULL AND y = 1", '"_nullflag__x" AND y = 1') is None
     # _column_key returns "" for every reserved synthetic prefix...
     from pgrls.diff._z3_compare import _column_key
 
-    for name in ("_isnull__x", "_opaque__foo", "_nullflag__z"):
+    for name in ("_opaque__foo", "_nullflag__z", "_session__a"):
         ref = parse_expr(f'"{name}" = 1').lexpr
         assert _column_key(ref) == "", name
     # ...but a near-miss / ordinary name still binds normally.
-    assert _column_key(parse_expr('"_isnullx" = 1').lexpr) == "_isnullx"
+    assert _column_key(parse_expr('"_nullflagx" = 1').lexpr) == "_nullflagx"
     assert _column_key(parse_expr("owner_id = 1").lexpr) == "owner_id"
 
 
-def test_null_marker_disconnection_is_a_documented_safe_limitation() -> None:
-    # CHARACTERIZATION of the deliberate NullTest limitation (module
-    # docstring): the IS NULL marker is modelled DISCONNECTED from the
-    # column's value var — a 2-valued approximation of Postgres 3VL.
-    #
-    # A faithful 2-valued linkage was attempted and rejected as UNSOUND
-    # under negation (z3.Not is 2-valued; Postgres `NOT (col = x)` is
-    # 3-valued — NULL when col is NULL), so it would only trade these
-    # over-reports for a new class of `NOT (...)` false alarms. A correct
-    # fix needs a full Kleene 3VL re-encoding of the diff path.
-    #
-    # `col IS NOT NULL AND col = x` is EQUIVALENT to `col = x` in Postgres
-    # (a value comparison already excludes NULL rows), but the disconnected
-    # marker over-reports it. Pinned so a future 3VL fix flips this
-    # deliberately, not by accident.
-    assert (
-        classify_via_z3(
-            parse_expr("active IS NOT NULL AND active = true"),
-            parse_expr("active = true"),
-        )
-        == "semantic_loosened"
-    )
-    assert (
-        classify_via_z3(
-            parse_expr("active = true"),
-            parse_expr("active IS NOT NULL AND active = true"),
-        )
-        == "semantic_tightened"
-    )
+def test_a_null_test_is_tied_to_its_columns_value() -> None:
+    # `col IS NOT NULL AND col = x` is EQUIVALENT to `col = x`: a value
+    # comparison already hides the NULL row. (The 2-valued model kept the
+    # IS NULL test apart from the column's value and called it loosened.)
+    assert classify_via_z3(
+        parse_expr("active IS NOT NULL AND active = true"),
+        parse_expr("active = true"),
+    ) == "semantic_equivalent"
+    assert classify_via_z3(
+        parse_expr("tenant_id = 1"),
+        parse_expr("tenant_id IS NOT NULL AND tenant_id = 1"),
+    ) == "semantic_equivalent"
 
 
-def test_null_limitation_does_not_compromise_soundness() -> None:
-    # The limitation must never cost the verifier its safety guarantees —
-    # these are exactly the invariants a naive null-guard "fix" broke, and
-    # that any real fix must preserve.
+@pytest.mark.parametrize(("base", "head", "verdict"), [
+    # A predicate passes a row only when it is exactly TRUE; NULL hides it.
+    # `x OR NOT x`-style rewrites are not tautologies: they hide NULL rows.
+    ("(c OR false) = (d OR c)", "c OR false = d OR c", "semantic_loosened"),
+    ("a = 1 OR a <> 1", "true", "semantic_loosened"),
+    ("a = 1 OR NOT (a = 1)", "true", "semantic_loosened"),
+    ("x OR NOT x", "true", "semantic_loosened"),
+    ("true", "a > 1 OR a <= 1", "semantic_tightened"),
+    # `=` / `<>` are NULL on a NULL operand; IS [NOT] DISTINCT FROM never is.
+    ("c = d", "c IS NOT DISTINCT FROM d", "semantic_loosened"),
+    ("c IS NOT DISTINCT FROM d", "c = d", "semantic_tightened"),
+    ("c <> d", "c IS DISTINCT FROM d", "semantic_loosened"),
+    ("c IS DISTINCT FROM d", "NOT (c IS NOT DISTINCT FROM d)", "semantic_equivalent"),
+    ("a = 1", "a IS NOT DISTINCT FROM 1", "semantic_equivalent"),
+    # A boolean comparison nested in another.
+    ("(c = d) = e", "(c = d) IS NOT DISTINCT FROM e", "semantic_loosened"),
+    # BETWEEN is its AND of comparisons.
+    ("x BETWEEN 1 AND 5", "x >= 1 AND x <= 5", "semantic_equivalent"),
+    ("x NOT BETWEEN 1 AND 5", "x < 1 OR x > 5", "semantic_equivalent"),
+])
+def test_three_valued_classification(base: str, head: str, verdict: str) -> None:
+    assert _classify(base, head) == verdict
+
+
+@pytest.mark.parametrize(("base", "head"), [
+    # Z3 and Postgres disagree here, so the comparison abstains.
+    ("COALESCE(a, b) = 1", "COALESCE(a, b) = 2"),       # bare columns: no sort
+    ("COALESCE(a, b) = 1", "COALESCE(a, b) > 0"),
+    ("a % 2 = 1 OR a % 2 = 0", "a IS NOT NULL"),        # -1 % 2 is -1 in PG
+    ("a / 2 = -1", "a = -2 OR a = -1"),                 # PG truncates
+    ("a + b >= a", "a IS NOT NULL AND b IS NOT NULL"),  # Z3 + on text concatenates
+    ("'B' < 'b'", "c <> true"),                         # collation order
+    # ... also once an equality pins a column, or through a COALESCE.
+    ("(s = 'B' AND u = 'a' AND s < u) OR a = 1", "(s = 'B' AND u = 'a') OR a = 1"),
+    ("c", "NOT (NOT ((COALESCE(f(), 'a') < s AND s < COALESCE(f(), 'B') "
+     "AND f() IS NULL) OR c))"),
+    # Postgres rounds a numeric quotient.
+    ("(x = 1.0 AND (x / 3.0) * 3.0 = x) OR c", "x = 1.0 OR c"),
+    # Z3's reals have no NaN / Infinity.
+    ("n * 0.0 = 0.0", "n IS NOT NULL"),
+    # A cast that can change the value: precision, truncation, padding, wrap.
+    ("f = 0.5", "f = '0.5'::float4"),
+    ("n = 1.25", "n = '1.25'::numeric(3,1)"),
+    ("c = 'abcdef'", "c = 'abcdef'::varchar(3)"),
+    ("c = 'abc'", "c = 'abc'::char"),
+    ("a > 0", "a::oid > 0"),
+    # A policy's backslash is a backslash, not an escape.
+    ("s = 'A'", "s = '\\u{41}'"),
+    # Numeric literals past double precision are distinct.
+    ("c = 9007199254740992", "c = 9007199254740993"),
+    ("n = 0.1", "n = 0.10000000000000000001"),
+    # A cast of a value whose type is unknown can change it, even to a type
+    # of the same sort.
+    ("s::float8 = 0.3", "s::float8::numeric = 0.3"),
+    ("s::oid < 0", "s::oid::int4 < 0"),
+    ("abs(n)::text = '5'", "abs(n) = '5'"),
+])
+def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str) -> None:
+    assert _classify(base, head) is None
+
+
+def test_a_quoted_column_named_like_a_call_has_its_own_null_flag() -> None:
+    assert _classify('"f()" IS NULL', "f() IS NULL") is None
+
+
+def test_a_huge_numeric_literal_does_not_crash() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    assert _classify("n > 1e400 OR o = 1", "n > 1e400 AND o = 1") is None
+    assert anon_read_counterexample(parse_expr("n > 1e400 OR o = current_setting('app.u', true)")) is None
+    assert _counterexample("c > 1e400", "c > 1e399") is None
+    for using in ("n > 1e400", "tenant_id = auth.uid() OR n > 1e400"):
+        prove_anon_isolation(parse_expr(using))
+        prove_cross_tenant_isolation(parse_expr(using))
+
+
+def test_a_value_beyond_a_doubles_range_is_left_out_of_a_leaking_row() -> None:
+    import z3
+
+    from pgrls.diff._z3_compare import _Context, _decode_model
+
+    ctx = _Context()
+    n = ctx.column("n", z3.RealSort())
+    solver = z3.Solver()
+    solver.add(n == z3.RealVal(10**400))
+    assert solver.check() == z3.sat
+    assert _decode_model(solver.model(), ctx) == {}
+
+
+@pytest.mark.parametrize(("base", "head"), [
+    # A `float8` column compares with the literal rounded to a double, a
+    # `numeric` one exactly: the head admits 0.1 on float8 only.
+    ("score > 0.1", "score >= 0.10000000000000000001"),
+    # The same literal against a `numeric` and a `float8` column.
+    ("a = 1.00000000000000001 AND b = 1.00000000000000001 AND "
+     "((a > 1.0 AND b > 1.0) OR (a <= 1.0 AND b <= 1.0))",
+     "NOT (a <> 1.00000000000000001 OR b <> 1.00000000000000001)"),
+    # A `float4` column's `IN` list of two rounds each to a single.
+    ("c = 0.1 OR c = 7.0", "c IN (0.1, 7.0)"),
+    ("c = 16777217.0", "c IN (16777217.0, 16777217.0)"),
+])
+def test_a_decimal_column_types_read_differently_decides_nothing(base, head) -> None:
+    assert _classify(base, head) is None
+
+
+def test_a_decimal_a_single_holds_still_translates() -> None:
+    assert _classify("n > 0.5", "n >= 0.5") == "semantic_loosened"
+    assert _counterexample("n > 0.5", "n >= 0.5") == {"n": 0.5}
+    assert _classify("n > 2.25", "n > 2.25 AND x = 1") == "semantic_tightened"
+
+
+@pytest.mark.parametrize("using", [
+    # Through a float both bounds were -0.1, an empty range; a row holding
+    # -0.100000000000000000015 is read.
+    "n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric",
+    "a = 1.00000000000000001 AND 1.00000000000000001 > 1.0 AND a <= 1.0",
+    "c IN (0.1, 0.1) AND c <> 0.1",
+    # A cast that changes the value is a value of its own on every path.
+    "tenant_id = auth.uid() OR 0.5 <> 0.5::float4",
+    "tenant_id = auth.uid() OR '16777217'::float4 = 16777216.0",
+    "tenant_id = auth.uid() OR '1.25'::numeric(3,1) <> 1.25",
+])
+def test_the_provers_do_not_prove_what_a_column_type_decides(using) -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+
+
+@pytest.mark.parametrize("using", [
+    # Postgres reads `Infinity + 0.5` as `Infinity`, and rounds a float8 sum.
+    "tenant_id = auth.uid() OR f + 0.5 = f",
+    "tenant_id = auth.uid() OR (f + 0.25 = 0.5 AND f <> 0.25)",
+    # Postgres truncates: `-1 % 2` is -1.
+    "tenant_id = auth.uid() OR (a % 2) = -1",
+])
+def test_arithmetic_z3_does_not_compute_as_postgres_proves_nothing(using) -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+
+
+def test_arithmetic_beside_the_identity_keeps_the_proof() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = auth.uid() AND price * 2.5 > 10",
+                  "tenant_id = auth.uid() AND created_at > now() - interval '7 days'"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+
+
+def test_a_huge_exponent_is_refused_at_once() -> None:
+    import time
+
+    from pgrls.diff._z3_compare import _exact_real
+
+    start = time.monotonic()
+    assert _exact_real("1e999999999") is None
+    assert _classify("x < 1e999999999", "x < 2e999999999") is None
+    assert time.monotonic() - start < 5
+
+
+def test_a_uuid_or_integer_cast_of_the_identity_keeps_the_proof() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = current_setting('app.t', true)::uuid",
+                  "tenant_id = current_setting('app.t', true)::bigint"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated"
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated"
+
+
+def test_a_guc_value_postgres_would_not_read_is_not_folded() -> None:
+    # `'1/2'::float8` raises in Postgres; it is not the row {x: 0.5}.
+    from pgrls.diff._z3_compare import _exact_real
+
+    assert _exact_real("1/2") is None
+    assert _exact_real("\u0661.5") is None  # Arabic-Indic digit
+    assert _exact_real(" .5 ") is not None
+
+
+def test_a_value_keeping_cast_still_translates() -> None:
+    assert _classify("a = '5'::int", "a = 5") == "semantic_equivalent"
+    assert _classify("t = 'x'::text", "t = 'x'") == "semantic_equivalent"
+
+
+def test_a_leaking_row_keeps_a_policys_backslash() -> None:
+    assert _counterexample("s = 'B'", "s = 'B' OR s = '\\u{41}'") == {"s": "\\u{41}"}
+
+
+def test_integer_arithmetic_still_translates() -> None:
+    assert _classify("a + 1 > 3", "a > 2") == "semantic_equivalent"
+    assert _classify("a * 2 = 4", "a * 2 = 4 AND b = 1") == "semantic_tightened"
+
+
+def test_a_leaking_row_prints_a_character_outside_the_bmp() -> None:
+    assert _counterexample("s = 'a'", "s = 'a' OR s = '\U00024cc8'") == {"s": "\U00024cc8"}
+
+
+def test_the_anon_and_cross_tenant_provers_keep_their_proofs() -> None:
+    # Only the Bool / non-Bool guard applies off the diff path: a `%` or a
+    # text ordering beside the tenant equality cannot make it leak.
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = auth.uid() AND (seq % 2) = 0",
+                  "user_id = auth.uid() AND status < 'm'::text"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+
+
+def test_a_bare_column_coalesce_is_no_anonymous_leak() -> None:
+    # `COALESCE(level, tier) < 2` modelled the two as Bools coerced to 0/1,
+    # which made this policy read as TRUE for every row (a false SEC038).
+    assert anon_read_counterexample(parse_expr(
+        "COALESCE(level, tier) < 2 OR (level IS NULL AND tier IS NULL)")) is None
+
+
+def test_a_null_admitting_widening_names_the_null_row() -> None:
+    base, head = "a = 1 OR a <> 1", "true"
+    cx = _counterexample(base, head)
+    assert cx == {"a": None}
+    assert _row_satisfies_head_not_base(base, head, cx)
+
+
+def test_null_handling_keeps_the_verifiers_invariants() -> None:
+    # The invariants a naive 2-valued null-guard "fix" broke, which the
+    # three-valued encoding keeps.
     #
     # Arithmetic equivalence holds (a naive guard flipped this to
     # `tightened`):
@@ -994,15 +1193,17 @@ def test_null_limitation_does_not_compromise_soundness() -> None:
         classify_via_z3(parse_expr("col - 3 > 0"), parse_expr("col > 3"))
         == "semantic_equivalent"
     )
-    # A genuine NULL-admitting loosening is STILL flagged DANGEROUS — the
-    # coarse model never MISSES a real loosening (the safety-critical
-    # direction is intact):
+    # A genuine NULL-admitting loosening is flagged DANGEROUS, with the
+    # NULL row that leaks:
     assert (
         classify_via_z3(
             parse_expr("col = 5"), parse_expr("col = 5 OR col IS NULL")
         )
         == "semantic_loosened"
     )
+    assert counterexample(
+        parse_expr("col = 5"), parse_expr("col = 5 OR col IS NULL")
+    ) == {"col": None}
     # A genuine value loosening is flagged AND still yields the concrete
     # leaking row (col = 6 is the unique member of head \ base):
     assert (
@@ -1019,19 +1220,16 @@ def test_counterexample_empty_row_for_all_rows_leak() -> None:
     # every row, head admits all), the verifier's most important admit-case
     # is "every row leaks" — a sound EMPTY-projection witness. Pin the {}
     # return and the witness gate accepting the empty pin.
-    from pgrls.diff._z3_compare import (
-        _Context,
-        _row_is_sufficient_witness,
-        _to_z3,
-    )
+    from pgrls.diff._z3_compare import _diff_truths, _diff_witness_is_sufficient
 
     base = parse_expr("a IS NULL AND a IS NOT NULL")  # always false
     head = parse_expr("true")
     assert counterexample(base, head) == {}
-    ctx = _Context()
-    base_z3 = _to_z3(base, ctx)
-    head_z3 = _to_z3(head, ctx)
-    assert _row_is_sufficient_witness({}, base_z3, head_z3, ctx) is True
+    truths = _diff_truths(base, head)
+    assert truths is not None
+    ctx, assertions, b, h = truths
+    leaks = z3_solver.And(h.is_true, z3_solver.Not(b.is_true))
+    assert _diff_witness_is_sufficient({}, leaks, ctx, assertions) is True
 
 
 def test_counterexample_decodes_real_column_as_float() -> None:

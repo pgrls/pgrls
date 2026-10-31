@@ -56,6 +56,47 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`pgrls diff` / `pgrls pr` compare predicates under SQL's three-valued
+  logic.** The Z3 comparison treated every column as non-NULL, so it called
+  predicates equivalent that differ on a row holding a NULL: `a = 1 OR
+  a <> 1` → `true`, or `(c OR false) = (d OR c)` → `c OR false = d OR c`,
+  newly admits such rows but was reported as no change. A predicate now
+  admits a row only when it is exactly TRUE — NULL hides a row as FALSE
+  does — so these are `DANGEROUS` loosenings, and the leaking row can name a
+  NULL column (`{a=NULL}`). The same model ties an `IS NULL` test to its
+  column, so `(col IS NOT NULL AND col = 5) OR b = 1` → `col = 5 OR b = 1`
+  is no longer flagged as a loosening, and it also decides `IS [NOT]
+  DISTINCT FROM`. Where Z3 and Postgres disagree — `/` and `%` (Postgres
+  truncates), arithmetic on anything but integers (Z3's reals have no NaN
+  and never round), ordering on text (Postgres uses the collation) — the
+  diff now abstains instead of deciding wrongly, and a cast that may change
+  the value (`varchar(3)`, `float4`, `numeric(4,1)`, `oid`, or any cast of a
+  function's result) is a value of its own. An integer literal is read
+  exactly (through a float, `c = 9007199254740992` and
+  `c = 9007199254740993` were one value), a decimal only when a `float4`
+  holds it exactly (`0.5`, not `0.1`: a `numeric`, a `float8` and, in an
+  `IN` list, a `float4` column read it differently), and a literal past the
+  double range (`1e400`) no longer crashes.
+- **`pgrls verify`, `matrix --prove` and SEC038 follow the same rules where
+  Z3 and Postgres disagree.** A Bool compared with a number is no longer
+  coerced to 0 / 1, which fixes a false SEC038 on `COALESCE(level, tier) <
+  2 OR …`; a cast that may change the value (`::float4`, `::numeric(3,1)`,
+  `::varchar(3)`, `::citext`) is a value of its own (a `uuid` or integer
+  cast of the session identity still keeps it), and so is arithmetic Z3
+  does not compute as Postgres does (on reals, `/`, `%`). Proofs that relied
+  on those are no longer made: `tenant_id = auth.uid() AND COALESCE(a, b) =
+  1` goes from PROVEN to unverified (UNKNOWN in the matrix), `tenant_id =
+  auth.uid() OR f + 0.5 = f` (true for `Infinity`) from PROVEN to LEAK, and
+  `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`,
+  which the float reading made an empty range, from PROVEN to LEAK under
+  `--mode anon`. A leak found through a decimal no `float4` holds (`… OR n <
+  0.1`) is now unverified, so `verify` exits 0 on it. A time window such as
+  `created_at > now() - interval '7 days'`, unverified before, is now
+  decided, and SEC038 now fires on a policy whose arithmetic sat beside an
+  `auth.uid() IS NULL` disjunct (`a - b > c OR auth.uid() IS NULL`).
+- Leaking rows from every prover print a character outside the BMP as
+  itself, not Z3's `\u{…}`, and keep a backslash in a policy's string
+  literal (`'\u{41}'` was taken for `'A'`).
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

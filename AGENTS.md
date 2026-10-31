@@ -923,9 +923,12 @@ results — `unchanged`, `tightened_and`, `loosened_and_drop`,
 `loosened_or`, `tightened_or_drop`, `semantic_equivalent`,
 `semantic_tightened`, `semantic_loosened`, or `requires_review` — which
 the differ maps to ChangeKind + classification. The three `semantic_*`
-results come from the Z3 comparison (a core dependency since 0.16.0);
-`semantic_loosened` is the one that carries the leaking-row
-counterexample. `unchanged` is filtered
+results come from the Z3 comparison (a core dependency since 0.16.0),
+which compares the rows each predicate admits under SQL's three-valued
+logic — a row passes only when the predicate is exactly TRUE, so
+`a = 1 OR a <> 1` → `true` is a loosening (it newly admits rows where
+`a` is NULL); `semantic_loosened` is the one that carries the leaking-row
+counterexample, which can name a NULL column. `unchanged` is filtered
 out (no Change emitted). The mapping:
 
 | `compare_predicates` result | classification    |
