@@ -14,11 +14,9 @@ Recognizes a small set of structural transformations:
 
 The first 5 results are syntactic — fast structural matches that
 cover the common predicate-edit shapes without any solver. When
-none match, the comparator can optionally call into Z3 (via
-``_z3_compare.classify_via_z3``) to attempt a semantic decision.
-The Z3 path is opt-in via ``pip install pgrls[diff-z3]``; without
-the extra it returns None and the comparator falls through to
-``requires_review`` (the historical behavior).
+none match, the comparator calls into Z3 (via
+``_z3_compare.classify_via_z3``) to attempt a semantic decision; when
+that returns None the comparator falls through to ``requires_review``.
 """
 from __future__ import annotations
 
@@ -170,12 +168,10 @@ def compare_predicates(
     if head_or < base_or and len(base_or) - len(head_or) == 1:
         return "tightened_or_drop"
 
-    # Syntactic patterns exhausted. Optional fall-through to Z3
-    # implication. Returns None when Z3 isn't installed
-    # (`pgrls[diff-z3]` extra not selected) or the predicate uses
-    # an AST node Phase 1 doesn't model (function calls, casts,
-    # CASE, etc.). In either case, the comparator falls back to
-    # ``requires_review`` — the historical behavior.
+    # Syntactic patterns exhausted. Fall through to Z3 implication,
+    # which returns None when the predicate uses a node it doesn't
+    # model or neither predicate implies the other; the comparator
+    # then falls back to ``requires_review``.
     from pgrls.diff._z3_compare import classify_via_z3
 
     z3_result = classify_via_z3(base_node, head_node)

@@ -56,6 +56,25 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
+  called by a built-in's name**, in two forms. A quoted name
+  holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one
+  identifier, a function in the search path, but was read as that schema's
+  function; and a quoted SQL keyword (`"greatest"(…)`, `"coalesce"(…)`,
+  `"trim"(…)`, `"current_date"()`) has no built-in behind it, but was on the
+  list of built-ins that read no table. Either way a door into a function
+  that read a FORCE'd table was traced as harmless and the cell PROVEN
+  (measured on PG17). Such a call now makes the door one pgrls does not see
+  into; in a policy predicate reached two ways (say, directly and through a
+  definer view), the `matrix` cell reads UNDECIDED rather than COND, and
+  `--prove`, where it had proved the cell, reports UNKNOWN. Taking a
+  call's schema from its name parts also trusts a three-part
+  `<db>.pg_catalog.lower(…)`, which Postgres resolves only in the current
+  database. A bare built-in name that resolves to a better-fitting user
+  overload (`public.lower(integer)` for `lower(1)`) is still trusted.
+- The `pgrls diff --explain` text for a `REQUIRES_REVIEW` predicate change
+  no longer says to install `pgrls[diff-z3]`, which has been part of a plain
+  install since 0.16.0.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
