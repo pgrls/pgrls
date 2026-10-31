@@ -824,6 +824,17 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif subtype in (AlterTableType.AT_AttachPartition, AlterTableType.AT_DetachPartition):
+            # pg_dump writes each partition as a plain CREATE TABLE plus
+            # `ALTER TABLE ONLY <parent> ATTACH PARTITION <child>`; without
+            # this the child looked like a standalone table with RLS off.
+            child = tables.get(_relation_key(
+                getattr(getattr(cmd, "def_", None), "name", None), default_schema) or ("", ""))
+            if child is not None:
+                if subtype == AlterTableType.AT_AttachPartition:
+                    child.partition_of = key
+                elif child.partition_of == key:
+                    child.partition_of = None
         # Other ALTER subcommands are ignored.
 
 
@@ -887,7 +898,9 @@ def _without_psql_meta_commands(sql: str) -> str:
                 else:
                     i += 1
         elif c in "'\"":
-            escapes = c == "'" and i > 0 and sql[i - 1] in "eE"
+            # `E'…'` takes backslash escapes; `date'…'` does not.
+            escapes = c == "'" and i > 0 and sql[i - 1] in "eE" and not (
+                i > 1 and (sql[i - 2].isalnum() or sql[i - 2] in "_$"))
             i += 1
             while i < n:
                 if escapes and sql[i] == "\\":

@@ -65,7 +65,10 @@ breaking changes — they will be called out in this file.
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
   not a table, or one that changes nothing pgrls models (`OWNER TO`) on a
-  name it has not seen, no longer creates one.
+  name it has not seen, no longer creates one. A partition the dump
+  attaches with `ALTER TABLE … ATTACH PARTITION` is now its parent's
+  partition (`DETACH PARTITION` undoes it), not a standalone table with a
+  false SEC001.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

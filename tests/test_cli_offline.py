@@ -1655,3 +1655,29 @@ def test_alter_table_on_an_unseen_name_needs_a_modelled_change():
         "ALTER SEQUENCE d OWNER TO postgres;\n"
     ).tables]
     assert names == ["a"]
+
+
+def test_pg_dump_attaches_partitions_with_alter_table():
+    from pgrls.schema_sources import schema_from_sql
+
+    # pg_dump writes a partition as a plain CREATE TABLE plus ATTACH; the
+    # child is no standalone RLS-off table (a false SEC001).
+    schema = schema_from_sql(
+        "CREATE TABLE public.ev (id int, t int) PARTITION BY RANGE (t);\n"
+        "CREATE TABLE public.ev_2025 (id int, t int);\n"
+        "CREATE TABLE public.ev_old (id int, t int);\n"
+        "ALTER TABLE ONLY public.ev ATTACH PARTITION public.ev_2025 FOR VALUES FROM (1) TO (2);\n"
+        "ALTER TABLE public.ev ATTACH PARTITION public.ev_old FOR VALUES FROM (0) TO (1);\n"
+        "ALTER TABLE public.ev DETACH PARTITION public.ev_old;\n"
+        "ALTER TABLE public.ev ENABLE ROW LEVEL SECURITY;\n")
+    parents = {t.name: t.partition_of for t in schema.tables}
+    assert parents == {"ev": None, "ev_2025": ("public", "ev"), "ev_old": None}
+
+
+def test_a_typed_literal_is_no_escape_string():
+    from pgrls.schema_sources import _without_psql_meta_commands
+
+    # `date'x\'` ends at its second quote (only `E'…'` takes escapes), so
+    # the backslash line inside the next string is left alone.
+    sql = "COMMENT ON TABLE t IS date'x\\' || '\n\\keep me\n';"
+    assert _without_psql_meta_commands(sql) == sql
