@@ -196,9 +196,15 @@ def test_extra_outer_parens_returns_unchanged():
      "tenant_id = 1 OR (is_public BETWEEN true AND true)"),
     ("(owner = 1 AND x) IS NULL", "owner = 1 AND (x IS NULL)"),
     ("NOT ((a OR b) BETWEEN 1 AND 2)", "NOT (a OR (b BETWEEN 1 AND 2))"),
+    # The same inside a term Z3 models as one opaque value: the two must not
+    # share a variable, or the change reads as equivalent.
+    ("tenant_id = COALESCE(((a OR b) BETWEEN true AND true)::text, 'x')",
+     "tenant_id = COALESCE((a OR (b BETWEEN true AND true))::text, 'x')"),
+    ("tenant_id = current_setting(((a OR b) BETWEEN true AND true)::text)",
+     "tenant_id = current_setting((a OR (b BETWEEN true AND true))::text)"),
 ])
 def test_predicates_that_print_alike_are_not_unchanged(base: str, head: str) -> None:
-    assert compare_predicates(base, head) != "unchanged"
+    assert compare_predicates(base, head) not in ("unchanged", "semantic_equivalent")
     assert compare_predicates(base, base) == "unchanged"
 
 

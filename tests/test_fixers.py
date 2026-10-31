@@ -4774,6 +4774,32 @@ def test_a_fixer_leaves_the_finding_when_no_sql_parses_back_to_its_rewrite(
     assert fixer().fix(_wrap_policy(_policy(using)), {}) == []
 
 
+def test_sec020_mirrored_check_keeps_the_predicates_grouping() -> None:
+    import pglast
+
+    from pgrls.ast_utils import _tree
+
+    using = "(owner = 1 OR a) BETWEEN true AND true"
+    [f] = SEC020Fixer().fix(
+        _wrap_policy(_policy(using, command="ALL", with_check="true")), {})
+    assert _tree(pglast.parse_sql(f.sql)[0].stmt.with_check) == _tree(parse_expr(using))
+
+
+@pytest.mark.parametrize(("fixer", "policy"), [
+    (SEC004Fixer, _policy("auth.uid() IS NULL OR user_id = 1")),
+    (SEC020Fixer, _policy("user_id = 1", command="ALL", with_check="true")),
+])
+def test_sec004_and_sec020_leave_the_finding_when_no_sql_parses_back(
+    fixer: Any, policy: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pgrls.fixers._idents
+    import pgrls.fixers.sec020
+
+    monkeypatch.setattr(pgrls.fixers._idents, "exact_sql", lambda node: None)
+    monkeypatch.setattr(pgrls.fixers.sec020, "exact_sql", lambda node: None)
+    assert fixer().fix(_wrap_policy(policy), {}) == []
+
+
 def test_like_and_similar_to_escape_keep_their_operands_grouping() -> None:
     from pgrls.ast_utils import exact_sql
 

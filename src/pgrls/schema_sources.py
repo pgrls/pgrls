@@ -1154,11 +1154,23 @@ def _clause_source(source: str) -> dict[str, str]:
         else:
             return found
         if k > j + 1:
-            # From the first token to the last: a comment before the closing
-            # parenthesis must not outlive it.
-            found.setdefault(key, source[tokens[j + 1].start:tokens[k - 1].end + 1])
+            found.setdefault(key, _without_comments(source, tokens[j + 1:k]))
         i = k + 1
     return found
+
+
+def _without_comments(source: str, tokens: list[Any]) -> str:
+    """The text `tokens` span in `source`, each gap between two of them (a
+    comment is one) written as a newline when it holds a line break — a
+    string literal continues across one — and a space otherwise. A snapshot
+    refuses a predicate that carries a comment."""
+    parts = [source[tokens[0].start:tokens[0].end + 1]]
+    for prev, tok in zip(tokens, tokens[1:]):
+        gap = source[prev.end + 1:tok.start]
+        if gap:
+            parts.append("\n" if "\n" in gap or "\r" in gap else " ")
+        parts.append(source[tok.start:tok.end + 1])
+    return "".join(parts)
 
 
 # Catalog-dependent rules: each reads a model field that an offline schema

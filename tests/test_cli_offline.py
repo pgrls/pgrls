@@ -1619,3 +1619,15 @@ def test_offline_policy_pglast_cannot_print_keeps_the_clause_it_wrote(monkeypatc
     assert policy.using_sql == using
     assert parse_expr(policy.with_check_sql) == parse_expr(check)
     assert policy.using_ast is not None
+
+    # The other clause of each statement, and comments, which a snapshot
+    # refuses in a predicate; a string still continues across a line break.
+    schema = schema_from_sql(
+        "CREATE TABLE t (tenant_id int, s text);\n"
+        f"CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK ({check} /* x */);\n"
+        "ALTER POLICY p ON t USING (s = 'a'\n'b' -- c\nOR tenant_id = 1);",
+        schemas=("public",))
+    policy = schema.tables[0].policies[0]
+    assert "/*" not in policy.with_check_sql and "--" not in policy.using_sql
+    assert parse_expr(policy.with_check_sql) == parse_expr(check)
+    assert parse_expr(policy.using_sql) == parse_expr("s = 'ab' OR tenant_id = 1")
