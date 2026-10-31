@@ -30,8 +30,8 @@ breaking changes — they will be called out in this file.
     the session can write or whose own row security it can steer — following
     SQL and PL/pgSQL bodies (whatever their return type, though one that
     assigns to — or reads `INTO` — one of its parameters or `RETURNS
-    TABLE` columns, or declares an `ALIAS FOR $n`, is still unreadable —
-    only the body is captured), views to their tables, and what those
+    TABLE` columns is still unreadable, and one that declares an `ALIAS
+    FOR $n` can be — only the body is captured), views to their tables, and what those
     tables' policies read in turn, with an unresolvable relation or
     unreadable body counting against it. A login session must also have
     no pre-16 CREATEROLE, read no setting it can set for itself, and be
@@ -108,7 +108,8 @@ breaking changes — they will be called out in this file.
   NOT NULL, and `DROP CONSTRAINT` of a NOT NULL makes its column nullable
   again** — whether the constraint was named on the table, inherited from
   a parent, renamed, or auto-named `<table>_<column>_not_null`
-  (PostgreSQL 18 stores a NOT NULL as a constraint). The DB-free sources
+  (PostgreSQL 18 stores a NOT NULL as a constraint). A parent's drop still
+  does not reach its children offline, as before. The DB-free sources
   ignored both, so SEC030 flagged a primary-key column or missed a column
   whose NOT NULL was dropped.
 - **DB-free sources: a renamed parent keeps its partitions and `INHERITS`
