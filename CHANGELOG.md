@@ -31,8 +31,8 @@ breaking changes — they will be called out in this file.
     SQL and PL/pgSQL bodies (whatever their return type, though one that
     assigns to an OUT parameter or a RETURNS TABLE column is still
     unreadable — only the body is captured), views to their tables, and
-    what those tables' policies read in turn, with an
-    unresolvable relation or unreadable body counting against it. A login
+    what those tables' policies read in turn, with an unresolvable relation
+    or unreadable body counting against it. A login
     session must also have no pre-16 CREATEROLE, read no setting it can set
     for itself, and be unable to redefine or shadow what the filter calls
     (owned functions or relations, CREATE on a schema or the database, a
@@ -76,12 +76,15 @@ breaking changes — they will be called out in this file.
     prints its parse tree to stdout);
   - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
     the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
-    `ADD CONSTRAINT … NOT NULL`. A named `… NOT NULL … NOT VALID` stays
-    nullable until `VALIDATE CONSTRAINT` or `SET NOT NULL`, as on a live
-    database; an unnamed `ADD NOT NULL c NOT VALID` stays nullable until
-    `SET NOT NULL` (pgrls does not follow a `VALIDATE` of its generated name, so SEC030
-    errs toward firing); and an `INHERITS` child does not get a parent's
-    `NOT NULL … NO INHERIT`.
+    `ADD CONSTRAINT … NOT NULL`. A named `ADD CONSTRAINT … NOT NULL …
+    NOT VALID` stays nullable until `VALIDATE CONSTRAINT` or `SET NOT NULL`,
+    as on a live database; an unnamed `ADD NOT NULL c NOT VALID` stays
+    nullable until `SET NOT NULL` (pgrls does not follow a `VALIDATE` of
+    its generated name, so SEC030 errs toward firing); and an `INHERITS`
+    child does not get a parent's `NOT NULL … NO INHERIT`. Constraint
+    names are tracked erring toward nullable: a renamed constraint's new
+    name also reaches any other table holding the old one, since pgrls
+    does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
 - **`pgrls matrix` no longer misses SQL in a PL/pgSQL variable's default or
