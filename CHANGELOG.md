@@ -59,9 +59,12 @@ breaking changes — they will be called out in this file.
   SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
   end to end.
 - **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
-  17 and 18, and the dependency pin allows pglast 7 or 8
-  (`pglast>=7.20,<9`; CI tests both); pglast 8 parses the PG18 grammar.
-  On pglast 8:
+  17 and 18, and the dependency pin allows pglast 7 or 8.5+ (pglast 8.3 /
+  8.4 return invalid JSON for a trigger function's body; CI tests pglast 7
+  on PostgreSQL 17 and pglast 8 on every version). pglast 8 parses the
+  PG18 grammar, so reading PG18-only DDL offline (`--sql-file`,
+  `pgrls pr`) needs it: `pip install -U pgrls pglast` on an existing
+  install. On pglast 8:
   - `pgrls matrix` still counts a door's `RETURNING` (on `INSERT` /
     `UPDATE` / `DELETE`) as a read — pglast 8 moved it into a new
     `ReturningClause` node;

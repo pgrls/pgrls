@@ -28,7 +28,7 @@ jobs:
         # tests/test_pg_version_floor.py::_README_PG_FLOOR_NUM.
         pg: ["15", "16", "17", "18"]
         # A fresh resolve picks the newest pglast (8); one extra leg pins
-        # the floor of the `pglast>=7.20,<9` range (7.20) so both majors
+        # the floor of the pglast range (7.20, see pyproject.toml) so both majors
         # stay tested.
         pglast: ["8"]
         include:

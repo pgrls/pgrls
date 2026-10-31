@@ -1247,6 +1247,9 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
     parsed: _Parsed | str | None = None
     try:
         tree = pglast.parse_plpgsql(definition)
+    except ValueError:
+        # pglast 8.3 / 8.4 return invalid JSON for a trigger function.
+        return [], _PLPGSQL_UNPARSEABLE
     except pglast.parser.ParseError as exc:
         error, scalars, keep = str(exc), frozenset[str](), frozenset[str]()
         tried: set[tuple[frozenset[str], frozenset[str]]] = set()

@@ -5044,3 +5044,21 @@ def test_live_a_request_header_policy_is_not_proven_but_a_tenant_setting_is(
             cur.execute("DROP TABLE IF EXISTS public.hdr_e, public.hdr_d")
             cur.execute("DROP OWNED BY pgrls_pm_auth")
         drop()
+
+
+def test_a_parser_that_returns_invalid_json_is_unparseable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # pglast 8.3 / 8.4 return invalid JSON from parse_plpgsql for a trigger
+    # function (excluded from the pin; still never a crash).
+    import json
+
+    import pglast
+
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements
+
+    def broken(_sql: str) -> object:
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+    monkeypatch.setattr(pglast, "parse_plpgsql", broken)
+    assert _plpgsql_statements(
+        "CREATE FUNCTION public.f() RETURNS trigger LANGUAGE plpgsql "
+        "AS $x$BEGIN RETURN NEW; END$x$") == ([], _PLPGSQL_UNPARSEABLE)
