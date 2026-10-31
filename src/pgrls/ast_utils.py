@@ -9,14 +9,19 @@ stays internal until v1.0.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sys
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
 
 import pglast
-from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
+from pglast.ast import A_ArrayExpr, A_Const, A_Expr, A_Indirection, A_Star, BoolExpr, Boolean, BooleanTest, CaseExpr, CoalesceExpr, CollateClause, ColumnRef, JsonIsPredicate, MinMaxExpr, RowExpr, XmlExpr, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
 from pglast.enums import BoolExprType, NullTestType, SetOperation, SQLValueFunctionOp
+from pglast import ast as ast_nodes
+from pglast.stream import RawStream
 
 
 _LINT_AST_RULES_TAIL = (
@@ -734,3 +739,191 @@ def _returns_as_selects(sql: str) -> str:
         previous = tok
     out.append(sql[last:])
     return "".join(out)
+
+
+@lru_cache(maxsize=4096)
+def _quiet_parse(sql: str) -> Any | None:
+    """`parse_expr` without its warning: the expression node, or None (cached
+    — compare the result, never mutate it)."""
+    try:
+        parsed = pglast.parse_sql(f"SELECT ({sql}) AS _expr")
+    except pglast.parser.ParseError:
+        return None
+    stmt = parsed[0].stmt
+    if not isinstance(stmt, SelectStmt) or not stmt.targetList:
+        return None
+    return stmt.targetList[0].val
+
+
+def _render(node: Any) -> str:
+    # `str(...)`: RawStream is untyped (mypy override) → bare call is `Any`.
+    return str(RawStream()(node))
+
+
+# Expression nodes an operand can be: each is set apart in its own
+# parentheses when a node is re-rendered, so pglast's precedence cannot
+# regroup it. Leaves (columns, constants) need none.
+_GROUPABLE = (
+    A_Expr, BoolExpr, NullTest, BooleanTest, FuncCall, TypeCast, CaseExpr,
+    A_ArrayExpr, CoalesceExpr, MinMaxExpr, A_Indirection,
+    CollateClause, RowExpr, SubLink, JsonIsPredicate, XmlExpr,
+)
+
+
+def _parenthesized(node: Any) -> str | None:
+    """`node` rendered with each expression operand directly below it in its
+    own parentheses (each rendered by its own `faithful_sql`), so the
+    precedence pglast's deparser can get wrong (``(a OR b) BETWEEN x AND y``
+    printed as ``a OR b BETWEEN x AND y``) cannot regroup them. Each such
+    expression is swapped for a placeholder column, pglast renders the
+    rest, and the placeholder becomes the expression's own `faithful_sql`
+    in parentheses, which adds no node to the tree. None when pglast cannot
+    print the placeholder in that place."""
+    holes: list[Any] = []
+    try:
+        rendered = _render(node)
+    except Exception:  # noqa: BLE001 — pglast's own printer can fail
+        rendered = ""
+    stem = "pgrls_hole"
+    while stem in rendered:
+        stem += "_"
+
+    def hole(child: Any) -> Any:
+        holes.append(child)
+        return ColumnRef(fields=(String(sval=f"{stem}{len(holes) - 1}"),))
+
+    def inside(value: Any) -> Any:
+        return type(value)(**{k: rebuild(getattr(value, k)) for k in value})
+
+    def rebuild(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return type(value)(rebuild(v) for v in value)
+        if isinstance(value, RangeFunction):
+            # A FROM-clause function cannot be parenthesized
+            # (`FROM (unnest(a))` does not parse): rebuild its arguments.
+            functions = tuple(
+                type(item)(inside(f) if isinstance(f, _GROUPABLE) else rebuild(f) for f in item)
+                for item in value.functions or ())
+            return type(value)(**{k: functions if k == "functions" else rebuild(getattr(value, k))
+                                  for k in value})
+        if isinstance(value, FuncCall) and func_name_parts(value)[-1:] in (
+                ("similar_to_escape",), ("like_escape",)):
+            # The printer of `SIMILAR TO` / `LIKE … ESCAPE` needs its escape
+            # call in place: rebuild its arguments instead.
+            return inside(value)
+        if isinstance(value, _GROUPABLE):
+            return hole(value)
+        if isinstance(value, Node):
+            return inside(value)
+        return value
+
+    shell = type(node)(**{k: rebuild(getattr(node, k)) for k in node})
+    try:
+        # A printer that needs a particular child shape (SIMILAR TO's
+        # escape call) cannot print a placeholder in its place.
+        text = _render(shell)
+    except Exception:  # noqa: BLE001
+        return None
+
+    def fill(match: re.Match[str]) -> str:
+        return f"({faithful_sql(holes[int(match.group(1))])})"
+
+    try:
+        return re.sub(rf"\b{stem}(\d+)\b", fill, text)
+    except Exception:  # noqa: BLE001 — an operand pglast cannot render
+        return None
+
+
+def _shape(value: Any) -> Any:
+    """`value` (a pglast node dict) in the form trees are compared in: like
+    pglast's `==`, without source positions (pglast 8's bare `list_start` /
+    `list_end` too) or the attributes `==` ignores, but also with an unset
+    field equal to its default — a tree a fixer builds leaves ``isnull`` /
+    ``groupDistinct`` unset where the parser writes False, which `==` tells
+    apart — and same-operator AND / OR nesting flattened."""
+    if isinstance(value, dict):
+        node_type = getattr(ast_nodes, str(value.get("@", "")), None)
+        ignored = getattr(node_type, "_ATTRS_TO_IGNORE_IN_COMPARISON", ()) or ()
+        shaped = {k: _shape(v) for k, v in value.items()
+                  if k not in ignored and k != "location"
+                  and not k.endswith(("list_start", "list_end"))
+                  and v not in (None, False, 0, "", (), [])}
+        op = shaped.get("boolop")
+        if (shaped.get("@") == "BoolExpr" and isinstance(op, dict)
+                and op.get("name") in ("AND_EXPR", "OR_EXPR")):
+            # AND / OR are associative (NULLs too) and the parser flattens
+            # `(p AND q) AND r` into one AND, so a nested one — what a fixer
+            # leaves after dropping a disjunct — is the same tree.
+            args: list[Any] = []
+            for arg in shaped.get("args", ()):
+                same = (isinstance(arg, dict) and arg.get("@") == "BoolExpr"
+                        and arg.get("boolop") == op)
+                args.extend(arg.get("args", ()) if same else [arg])
+            shaped["args"] = args
+        return shaped
+    if isinstance(value, (list, tuple)):
+        return [_shape(v) for v in value]
+    return value
+
+
+def _tree(node: Any) -> str:
+    return json.dumps(_shape(node(skip_none=True)), sort_keys=True, default=str)
+
+
+def _same_tree(sql: str, node: Any) -> bool:
+    """Whether `sql` parses back to `node`."""
+    parsed = _quiet_parse(sql)
+    return parsed is not None and _tree(parsed) == _tree(node)
+
+
+def faithful_sql(node: Any) -> str:
+    """SQL text for an expression node that parses back to the same AST:
+    pglast's rendering when it does, else one with each of its operands
+    parenthesized (pglast's deparser drops parentheses some operands need —
+    of ``BETWEEN``, and on pglast 7 also of ``IN``, ``op ANY / ALL``,
+    ``IS NULL`` and others — so two different predicates can print the
+    same). Falls back to pglast's rendering when neither round-trips;
+    raises when pglast cannot render the node at all (pglast 7's printer
+    fails on ``x OPERATOR(s.op) ANY / ALL (…)``) and no grouping
+    round-trips."""
+    try:
+        text: str | None = _render(node)
+    except Exception:  # noqa: BLE001 — pglast's own printer can fail
+        text = None
+    if text is not None and _same_tree(text, node):
+        return text
+    grouped = _parenthesized(node)
+    if grouped is not None and _same_tree(grouped, node):
+        return grouped
+    if text is None:
+        raise ValueError(f"pglast cannot render this {type(node).__name__}")
+    return text
+
+
+def exact_sql(node: Any) -> str | None:
+    """`faithful_sql` when it parses back to `node`, else None — for SQL that
+    is applied, where pglast's lossy rendering would mean something else."""
+    try:
+        text = faithful_sql(node)
+    except ValueError:
+        return None
+    return text if _same_tree(text, node) else None
+
+
+def canonical_key(node: Any) -> str:
+    """A string that is equal for two expression nodes only when their trees
+    are the same (source positions, unset-vs-default fields and the nesting
+    of same-operator AND / OR aside — see `_shape`): their `faithful_sql`
+    when it parses back to the node — so one text cannot stand for two
+    trees — else that text tagged with a digest of the tree. Same-shaped
+    trees usually, but not always, share a key: ``p AND (q AND r)`` keeps
+    its parentheses. A node pglast cannot render at all is keyed by its node
+    type and digest."""
+    try:
+        text = faithful_sql(node)
+    except ValueError:
+        text = type(node).__name__
+    if _same_tree(text, node):
+        return text
+    digest = hashlib.sha256(_tree(node).encode()).hexdigest()[:16]
+    return f"{text} /* ast {digest} */"

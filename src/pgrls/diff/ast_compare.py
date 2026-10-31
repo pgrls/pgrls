@@ -2,7 +2,8 @@
 
 Recognizes a small set of structural transformations:
 
-  * unchanged             — identical after pglast canonicalization
+  * unchanged             — identical parse trees (whitespace and
+                            parentheses the parser discards aside)
   * tightened_and         — base AND new_clause (more conditions)
   * loosened_and_drop     — head AND dropped_clause (fewer conditions)
   * loosened_or           — base OR new_disjunct (more alternatives)
@@ -26,9 +27,8 @@ from typing import Any, Literal
 
 from pglast.ast import BoolExpr
 from pglast.enums import BoolExprType
-from pglast.stream import RawStream
 
-from pgrls.ast_utils import parse_expr
+from pgrls.ast_utils import canonical_key, parse_expr
 
 
 def _and_clauses(node: Any) -> list[Any]:
@@ -54,18 +54,12 @@ def _or_clauses(node: Any) -> list[Any]:
 
 
 def _canon(node: Any) -> str:
-    """Canonicalize a pglast node to a stable SQL string via RawStream."""
-    # pglast v6 (the pinned range) ships without type stubs, so
-    # mypy --strict treats `RawStream()(node)` as `Any -> Any`.
-    # The explicit `: str` annotation on the local pins the
-    # boundary — a real type error elsewhere in the file still
-    # surfaces, while the unavoidable Any-leak from pglast is
-    # absorbed locally without a per-call `# type: ignore`. If
-    # pglast ever ships `py.typed` (or this project pins to a
-    # typed v7+), the annotation simply becomes a redundant
-    # narrow and mypy stays happy.
-    rendered: str = RawStream()(node)
-    return rendered
+    """A key equal for two nodes only when their ASTs are the same (see
+    `canonical_key`) — pglast's
+    rendering alone can print two different predicates the same (it drops
+    the parentheses ``(a OR b) BETWEEN x AND y`` needs), which made a real
+    change read as ``unchanged``."""
+    return canonical_key(node)
 
 
 def compare_predicates(

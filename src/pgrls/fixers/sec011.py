@@ -212,7 +212,7 @@ class SEC011Fixer:
 
                 # Only re-emit the clause(s) that actually changed, so
                 # the migration is the minimal diff. `alter_policy`
-                # renders each provided clause through RawStream and
+                # renders each provided clause with `exact_sql` and
                 # orders USING before WITH CHECK.
                 stmt = alter_policy(
                     table,
@@ -220,6 +220,8 @@ class SEC011Fixer:
                     using_ast=new_using_ast if using_changed else None,
                     with_check_ast=new_wc_ast if wc_changed else None,
                 )
+                if stmt is None:
+                    continue
 
                 out.append(
                     Fix(

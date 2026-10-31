@@ -500,10 +500,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
             _apply_alter_table(stmt, tables, default_schema)
-        elif kind == "CreatePolicyStmt":
-            _apply_create_policy(stmt, tables, default_schema)
-        elif kind == "AlterPolicyStmt":
-            _apply_alter_policy(stmt, tables, default_schema)
+        elif kind in ("CreatePolicyStmt", "AlterPolicyStmt"):
+            start = raw.stmt_location or 0
+            source = sql[start:start + raw.stmt_len] if raw.stmt_len else sql[start:]
+            apply = _apply_create_policy if kind == "CreatePolicyStmt" else _apply_alter_policy
+            apply(stmt, tables, default_schema, source=source)
         elif kind == "DropStmt":
             _apply_drop(stmt, tables, default_schema, stmt_index=index)
         elif kind == "GrantStmt":
@@ -807,6 +808,8 @@ def _apply_create_policy(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    *,
+    source: str = "",
 ) -> None:
     key = _relation_key(getattr(stmt, "table", None), default_schema)
     if key is None:
@@ -824,8 +827,9 @@ def _apply_create_policy(
         # An unrecognized command word — skip rather than guess.
         return
 
-    using_sql = _deparse_or_none(getattr(stmt, "qual", None))
-    check_sql = _deparse_or_none(getattr(stmt, "with_check", None))
+    written = _clause_source(source)
+    using_sql = _deparse_or_none(getattr(stmt, "qual", None), written.get("USING"))
+    check_sql = _deparse_or_none(getattr(stmt, "with_check", None), written.get("WITH CHECK"))
     location = f"{key[0]}.{key[1]}.{name}"
     using_ast = (
         _parse_clause(using_sql, location=location, clause="USING")
@@ -856,6 +860,8 @@ def _apply_alter_policy(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    *,
+    source: str = "",
 ) -> None:
     """Apply ``ALTER POLICY`` — replace the named policy's USING / WITH CHECK /
     roles in place, leaving clauses the statement omits unchanged (Postgres
@@ -884,7 +890,7 @@ def _apply_alter_policy(
             updates["roles"] = _role_specs(roles)
         qual = getattr(stmt, "qual", None)
         if qual is not None:
-            using_sql = _deparse_or_none(qual)
+            using_sql = _deparse_or_none(qual, _clause_source(source).get("USING"))
             updates["using_sql"] = using_sql
             updates["using_ast"] = (
                 _parse_clause(using_sql, location=location, clause="USING")
@@ -893,7 +899,9 @@ def _apply_alter_policy(
             )
         with_check = getattr(stmt, "with_check", None)
         if with_check is not None:
-            check_sql = _deparse_or_none(with_check)
+            check_sql = _deparse_or_none(
+                with_check, _clause_source(source).get("WITH CHECK"),
+            )
             updates["with_check_sql"] = check_sql
             updates["with_check_ast"] = (
                 _parse_clause(check_sql, location=location, clause="WITH CHECK")
@@ -1086,19 +1094,83 @@ def _role_specs(roles: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _deparse_or_none(node: Any) -> str | None:
+def _deparse_or_none(node: Any, written: str | None = None) -> str | None:
     """Render a policy USING / WITH CHECK expression node back to SQL text.
 
     Returns the deparsed fragment (which `parse_expr` then re-parses into the
     canonical AST shape the rules expect), or `None` when the clause is absent.
+    When no rendering parses back to the node — pglast's printer drops
+    parentheses it needs, or (pglast 7, ``x OPERATOR(s.op) ANY / ALL (…)``) cannot
+    print it at all — the clause as the statement wrote it (`written`) is
+    used instead, so the rules see the predicate the SQL wrote. Without a
+    `written` that parses back to the node it falls back to pglast's
+    rendering, or `None` when pglast cannot print the node.
     """
     if node is None:
         return None
+    exact = ast_utils.exact_sql(node)
+    if exact is not None:
+        return exact
+    if written and ast_utils._same_tree(written, node):
+        return written
     try:
-        # `str(...)`: RawStream is untyped (mypy override) → bare call is `Any`.
-        return str(RawStream()(node))
-    except Exception:
+        return ast_utils.faithful_sql(node)
+    except ValueError:
         return None
+
+
+def _clause_source(source: str) -> dict[str, str]:
+    """The text of a `CREATE` / `ALTER POLICY` statement's ``USING (…)`` and
+    ``WITH CHECK (…)`` expressions, keyed ``"USING"`` / ``"WITH CHECK"``.
+    Before the clauses the statement holds only names and keywords, so the
+    first top-level ``USING (`` / ``WITH CHECK (`` opens each."""
+    try:
+        tokens = [t for t in pglast.parser.scan(source)
+                  if t.name not in ("SQL_COMMENT", "C_COMMENT")]
+    except pglast.parser.ParseError:
+        return {}
+    found: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        name = tokens[i].name
+        if name == "USING":
+            key, j = "USING", i + 1
+        elif name == "WITH" and i + 1 < len(tokens) and tokens[i + 1].name == "CHECK":
+            key, j = "WITH CHECK", i + 2
+        else:
+            i += 1
+            continue
+        if j >= len(tokens) or tokens[j].name != "ASCII_40":
+            i = j
+            continue
+        depth = 0
+        for k in range(j, len(tokens)):
+            if tokens[k].name == "ASCII_40":
+                depth += 1
+            elif tokens[k].name == "ASCII_41":
+                depth -= 1
+                if depth == 0:
+                    break
+        else:
+            return found
+        if k > j + 1:
+            found.setdefault(key, _without_comments(source, tokens[j + 1:k]))
+        i = k + 1
+    return found
+
+
+def _without_comments(source: str, tokens: list[Any]) -> str:
+    """The text `tokens` span in `source`, each gap between two of them (a
+    comment is one) written as a newline when it holds a line break — a
+    string literal continues across one — and a space otherwise. A snapshot
+    refuses a predicate that carries a comment."""
+    parts = [source[tokens[0].start:tokens[0].end + 1]]
+    for prev, tok in zip(tokens, tokens[1:]):
+        gap = source[prev.end + 1:tok.start]
+        if gap:
+            parts.append("\n" if "\n" in gap or "\r" in gap else " ")
+        parts.append(source[tok.start:tok.end + 1])
+    return "".join(parts)
 
 
 # Catalog-dependent rules: each reads a model field that an offline schema

@@ -369,7 +369,10 @@ the markdown form drops cleanly into a weekly engineering update.
 `pgrls fix` generates remediation SQL for the rules whose fix is
 mechanical. Default mode is dry-run — it prints the SQL but does
 not modify the database. Pass `--apply` to execute, or `--output
-<file>` to write the SQL to a file instead of stdout.
+<file>` to write the SQL to a file instead of stdout. A
+policy-rewriting fixer (SEC004 / SEC011 / SEC019 / SEC020 / PERF001)
+or PERF004 also declines when no SQL text parses back to its rewrite,
+leaving the finding.
 
 ```bash
 pgrls fix --database-url "$DATABASE_URL"               # dry-run
@@ -528,7 +531,9 @@ Currently fixable:
   indexed column in a function call (`lower(email)`,
   `date_trunc(...)`, nested calls). Walks the policy AST, finds
   the outermost `FuncCall` wrapping each flagged column, renders it
-  back to SQL via pglast's `RawStream`, and emits one CREATE INDEX
+  back to SQL (pglast's rendering, with any parentheses it drops
+  restored; an expression with no SQL that parses back to it gets no
+  index), and emits one CREATE INDEX
   per distinct expression (deduped across policies that share the
   same wrap). The existing plain index on the bare column stays in
   place; the new expression index runs in parallel for the
@@ -882,7 +887,7 @@ Driven by `pgrls.diff.ast_compare.compare_predicates`:
 
 | AST pattern (old → new) | Classification |
 |---|---|
-| Identical after pglast normalization (whitespace-only diff) | (no Change emitted) |
+| Identical parse trees (a whitespace diff, or parentheses the parser discards) | (no Change emitted) |
 | `P` → `P AND Q` (new AND clause added) | SAFE |
 | `P AND Q` → `P` (AND clause removed) | DANGEROUS |
 | `P` → `P OR Q` (new OR disjunct added) | DANGEROUS |
@@ -936,10 +941,10 @@ out (no Change emitted). The mapping:
 | `loosened_or`               | `DANGEROUS`       |
 | `requires_review`           | `REQUIRES_REVIEW` |
 
-The five recognized AST patterns (whitespace-only is the trivial
-no-op case; the four real diffs follow):
+The five recognized AST patterns (a whitespace diff, or parentheses the
+parser discards, is the trivial no-op case; the four real diffs follow):
 
-**Literal-equal (whitespace-only diff).** When both sides parse to
+**Literal-equal (whitespace, or parentheses the parser discards).** When both sides parse to
 identical pglast ASTs the predicate is unchanged. No Change emitted.
 
 ```sql

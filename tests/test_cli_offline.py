@@ -1579,3 +1579,55 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
     )
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
     assert "SEC008" in res.output and "public.t.q" in res.output, res.output
+
+
+def test_offline_policy_keeps_the_parentheses_its_predicate_needs():
+    # The DB-free source renders each predicate from its AST; pglast's
+    # deparser drops the parentheses `(a OR b) BETWEEN …` needs, which would
+    # hand the rules a different predicate than the SQL wrote.
+    from pgrls.ast_utils import parse_expr
+    from pgrls.schema_sources import schema_from_sql
+
+    source = "(tenant_id = 1 OR is_public) BETWEEN true AND true"
+    schema = schema_from_sql(
+        "CREATE TABLE t (tenant_id int, is_public bool);"
+        f" CREATE POLICY p ON t USING ({source});", schemas=("public",))
+    assert parse_expr(schema.tables[0].policies[0].using_sql) == parse_expr(source)
+
+
+def test_offline_policy_pglast_cannot_print_keeps_the_clause_it_wrote(monkeypatch):
+    # pglast 7's printer raises on `x OPERATOR(s.op) ANY (…)`, which pg_dump
+    # writes; the clause was then dropped, so the rules (and `pgrls pr`) saw
+    # a policy with no USING at all. The clause as written is used instead.
+    import pgrls.ast_utils
+    from pgrls.ast_utils import parse_expr
+    from pgrls.schema_sources import schema_from_sql
+
+    def broken(node):
+        raise TypeError("printer failed")
+
+    monkeypatch.setattr(pgrls.ast_utils, "_render", broken)
+    using = "(auth.uid() IS NULL) OR (tenant_id OPERATOR(pg_catalog.=) ANY (ARRAY[1]))"
+    check = "tenant_id = ANY (ARRAY['é'])"
+    schema = schema_from_sql(
+        "/* ü */ CREATE TABLE t (tenant_id int); -- é\n"
+        f"CREATE POLICY \"using\" ON t FOR ALL TO \"with\" USING ({using} -- c\n)"
+        " WITH CHECK (true);\n"
+        f"ALTER POLICY \"using\" ON t WITH CHECK (/* x */ {check})",
+        schemas=("public",))
+    policy = schema.tables[0].policies[0]
+    assert policy.using_sql == using
+    assert parse_expr(policy.with_check_sql) == parse_expr(check)
+    assert policy.using_ast is not None
+
+    # The other clause of each statement, and comments, which a snapshot
+    # refuses in a predicate; a string still continues across a line break.
+    schema = schema_from_sql(
+        "CREATE TABLE t (tenant_id int, s text);\n"
+        f"CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK ({check} /* x */);\n"
+        "ALTER POLICY p ON t USING (s = 'a'\n'b' -- c\nOR tenant_id = 1);",
+        schemas=("public",))
+    policy = schema.tables[0].policies[0]
+    assert "/*" not in policy.with_check_sql and "--" not in policy.using_sql
+    assert parse_expr(policy.with_check_sql) == parse_expr(check)
+    assert parse_expr(policy.using_sql) == parse_expr("s = 'ab' OR tenant_id = 1")

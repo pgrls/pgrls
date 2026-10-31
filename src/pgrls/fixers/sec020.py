@@ -28,10 +28,11 @@ every shape it fires on lacks a `USING` worth mirroring.
 
 Detection reuses the rule's own `_is_open_write_asymmetry` so the
 fixer flags exactly what SEC020 reports — a single definition of
-the finding. The `USING` predicate is round-tripped through
-`pglast.stream.RawStream` rather than echoed verbatim — symmetric
-with the PERF001 fixer, so pglast's escaping is
-applied consistently regardless of where the SQL originated.
+the finding. The `USING` predicate is rendered from its AST
+(`ast_utils.exact_sql`, which keeps every parenthesis the tree
+needs, and declines when no SQL parses back to it) rather than
+echoed verbatim — symmetric with the PERF001 fixer, so pglast's escaping is applied consistently regardless of
+where the SQL originated.
 
 Before mirroring, a constant-true disjunct (`x = 1 OR true`) is
 stripped from the predicate (via SEC011's
@@ -46,8 +47,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pglast.stream import RawStream
-
+from pgrls.ast_utils import exact_sql
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 # Reuse SEC011's constant-true stripping so a USING with an `OR true`
@@ -95,7 +95,9 @@ class SEC020Fixer:
                 )
                 if mirror_ast is None:
                     continue
-                using_sql = RawStream()(mirror_ast)
+                using_sql = exact_sql(mirror_ast)
+                if using_sql is None:
+                    continue
                 sql = (
                     f"ALTER POLICY {quote_ident(policy.name)} "
                     f"ON {quote_qualified(table.schema, table.name)}\n"
