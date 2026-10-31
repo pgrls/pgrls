@@ -309,8 +309,9 @@ SQL, another language, a PL/pgSQL body it cannot fully read (one that does
 not parse, one with a record variable whose declaration it cannot read
 back, or `#option dump` on pglast 8), a call into an unseen function or
 operator, a SQL-running built-in, `DO` / `CALL` / a change of search_path
-or role) is listed separately with who can open it — a `DENIED` cell does not rule it out; a
-body that sets another parameter makes its filtered doors UNDECIDED
+or role) is listed separately with who can open it — a `DENIED` cell does
+not rule it out; a body that sets another parameter makes its filtered
+doors UNDECIDED
 (a timeout, planner or logging setting excepted), and so does the same filter
 reached two ways when it depends on who runs it — it reads `current_user` /
 checks a privilege and one path is a SECURITY DEFINER function/trigger/rule,

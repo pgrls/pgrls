@@ -528,7 +528,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         elif kind == "GrantStmt":
             _apply_grant(stmt, tables, default_schema)
         elif kind == "RenameStmt":
-            _apply_rename(stmt, tables, default_schema)
+            _apply_rename(stmt, tables, default_schema, index)
         # Every other statement shape is skipped tolerantly.
 
     return Schema(tables=tuple(b.build() for b in tables.values()))
@@ -686,6 +686,7 @@ def _apply_rename(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    index: int = -1,
 ) -> None:
     """Apply `ALTER TABLE <old> RENAME TO <new>`.
 
@@ -704,10 +705,17 @@ def _apply_rename(
         builder = tables.get(key) if key is not None else None
         if key is not None and builder is not None and old_name and newname:
             builder.rename_constraint(old_name, newname)
-            # The inherited copies on its children are renamed with it. A
-            # child pgrls cannot tell has left (NO INHERIT / DETACH), or whose
-            # constraint of that name is its own, keeps the old name too —
-            # erring wide only reads a column as nullable.
+            # The inherited copies on its children are renamed with it, and
+            # so is a child's own constraint of that name (measured on PG18)
+            # — a child that joined through `ALTER TABLE … INHERIT`, which
+            # pgrls does not follow, included: every table holding the name
+            # gets the new one too. A child that left (NO INHERIT / DETACH)
+            # keeps the old name as well — erring wide only reads a column as
+            # nullable.
+            for other in tables.values():
+                if other is not builder and old_name in other.not_null_names:
+                    other.not_null_names.setdefault(newname, set()).update(
+                        other.not_null_names[old_name])
             todo = [ck for ck, cb in tables.items()
                     if key in cb.inherits or cb.partition_of == key]
             seen: set[tuple[str, str]] = {key}
@@ -753,8 +761,11 @@ def _apply_rename(
     new = (old[0], newname)
     builder.name = newname
     builder.former_names.append(newname)
-    # Its children follow it to the new name.
+    # Its children follow it to the new name — those created before the
+    # rename; a later one names a new table that took the old name.
     for child in tables.values():
+        if child.created_at >= index >= 0:
+            continue
         child.inherits = [new if p == old else p for p in child.inherits]
         if child.partition_of == old:
             child.partition_of = new

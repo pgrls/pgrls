@@ -844,7 +844,7 @@ _RECORD_IN_INTO = "record variable cannot be part of multiple-item INTO list"
 _FOR_TARGETS = 'syntax error at or near ","'
 # A composite variable whose field the body assigns (`r.f := …`) must keep
 # its type when every other one becomes `text`.
-_FIELD_TARGET = re.compile(r'"([^".]+)\.[^"]+" is not a known variable')
+_FIELD_TARGET = re.compile(r'"([^"]+)\.[^".]+" is not a known variable')
 
 _Token = tuple[str, int, int]
 # An assignment target that runs no SQL: a variable or a field path.
@@ -1039,7 +1039,8 @@ def _confirmed_parse(
     dropped from each type it names — outside ``pg_catalog`` for parameters
     and the return type, any schema in a confirmed ``DECLARE`` — VARIADIC
     becomes a plain parameter, and each variable or parameter in `scalars`
-    (every one not in `keep`, for ``*``) is declared ``text``. A type does not change which SQL the body runs.
+    (every one not in `keep`, for ``*``) is declared ``text``. A type does
+    not change which SQL the body runs.
 
     Otherwise the reason it failed: the parse error, or ``""`` when the
     definition is not one ``CREATE FUNCTION`` with a body, cannot be
@@ -1234,7 +1235,8 @@ def _plpgsql_statements(definition: str) -> tuple[list[Any], str | None]:
             elif error == _RECORD_IN_INTO or error.startswith(_FOR_TARGETS):
                 scalars |= {"*"}
             elif "*" in scalars and (m := _FIELD_TARGET.fullmatch(error)):
-                keep |= {m.group(1)}
+                # Every part before the field: `r.f`, or label-qualified `o.r.f`.
+                keep |= set(m.group(1).split("."))
             elif not any(e in error for e in _REWRITABLE_ERRORS):
                 break
             if (scalars, keep) in tried:

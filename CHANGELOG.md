@@ -75,7 +75,8 @@ breaking changes — they will be called out in this file.
   - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
     the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
     `ADD CONSTRAINT … NOT NULL`. A named `… NOT NULL … NOT VALID` stays
-    nullable until `VALIDATE CONSTRAINT`, as on a live database; an
+    nullable until `VALIDATE CONSTRAINT` or `SET NOT NULL`, as on a live
+    database; an
     unnamed `ADD NOT NULL c NOT VALID` stays nullable until `SET NOT NULL`
     (pgrls does not follow a `VALIDATE` of its generated name, so SEC030
     errs toward firing); and an `INHERITS` child does not get a parent's
@@ -94,11 +95,16 @@ breaking changes — they will be called out in this file.
   reason. pgrls also discarded the subscript of an assignment target
   (`a[(SELECT …)] := 1`); it is now read too.
 - **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
-  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL (named, renamed, or the
-  auto-named `<table>_<column>_not_null`; PostgreSQL 18 stores a NOT NULL
-  as a constraint) makes the column nullable again.** The DB-free sources
+  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL (named — on the table or
+  inherited from a parent — renamed, or the auto-named
+  `<table>_<column>_not_null`; PostgreSQL 18 stores a NOT NULL as a
+  constraint) makes the column nullable again.** The DB-free sources
   ignored both, so SEC030 flagged a primary-key column or missed a column
   whose NOT NULL was dropped.
+- **DB-free sources: a renamed parent keeps its partitions and `INHERITS`
+  children.** `ALTER TABLE <parent> RENAME TO …` left each child pointing
+  at the old name, so SEC001 reported a partition whose renamed parent
+  enforces RLS as having an ancestor outside the scanned schemas.
 - **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as
   nullable.** Postgres 18 sets `attnotnull` for such a constraint while
   existing NULLs stay in the table, so pgrls read the column as not-nullable

@@ -1487,6 +1487,7 @@ def test_a_retyped_single_out_parameter_keeps_its_result_type(head: str) -> None
 @pytest.mark.parametrize("head", [
     "public.f(INOUT r app.pair)",
     "public.f(p app.pair) RETURNS void",
+    "public.f() RETURNS void",
 ])
 def test_a_composite_with_an_assigned_field_keeps_its_type(head: str) -> None:
     # Every plain-typed variable becomes text for a multi-target INTO (pglast
@@ -1495,10 +1496,17 @@ def test_a_composite_with_an_assigned_field_keeps_its_type(head: str) -> None:
 
     from pgrls.access import _plpgsql_statements  # noqa: PLC0415
 
-    var = "r" if "INOUT" in head else "p"
+    import pglast  # noqa: PLC0415
+
+    # A label-qualified field (`o.c.b`) keeps its variable too — pglast 7
+    # cannot assign a declared unknown composite's field at all.
+    var, decl = (("r", "") if "INOUT" in head else ("p", "") if "app.pair" in head
+                 else ("o.c", " c app.pair;"))
+    if decl and pglast.__version__.startswith("v7"):
+        pytest.skip("pglast 7 rejects a field assignment on an unknown composite")
     stmts, incomplete = _plpgsql_statements(
-        f"CREATE FUNCTION {head} LANGUAGE plpgsql AS $x$DECLARE s app.status; t text;\n"
-        f"BEGIN SELECT x.status, x.token INTO s, t FROM app.secret x; {var}.b := t;\n"
+        f"CREATE FUNCTION {head} LANGUAGE plpgsql AS $x$<<o>> DECLARE s app.status; t text;"
+        f"{decl}\nBEGIN SELECT x.status, x.token INTO s, t FROM app.secret x; {var}.b := t;\n"
         "DELETE FROM app.audit WHERE msg = t; END$x$")
     assert incomplete is None
     rendered = [RawStream()(s) for s in stmts]

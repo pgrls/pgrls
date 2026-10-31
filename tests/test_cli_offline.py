@@ -1481,6 +1481,41 @@ def test_offline_no_inherit_not_null_is_not_inherited():
         assert nullable == {"p": False, "c": True}, parent
 
 
+def test_offline_parent_rename_redirects_only_earlier_children():
+    # A child created after the rename names the table that now has the old
+    # name, not the renamed one (measured on PG18).
+    from pgrls.schema_sources import schema_from_sql
+
+    schema = schema_from_sql(
+        "CREATE TABLE p (a int, k int) PARTITION BY LIST (k);"
+        " CREATE TABLE o (a int, k int) PARTITION BY LIST (k);"
+        " CREATE TABLE early PARTITION OF p FOR VALUES IN (0);"
+        " ALTER TABLE p RENAME TO tmp; ALTER TABLE o RENAME TO p; ALTER TABLE tmp RENAME TO o;"
+        " CREATE TABLE late PARTITION OF p FOR VALUES IN (1);",
+        schemas=("public",))
+    parent = {t.name: t.partition_of for t in schema.tables}
+    assert parent["early"] == ("public", "o") and parent["late"] == ("public", "p")
+
+
+def test_offline_parent_constraint_rename_reaches_a_same_named_child_constraint():
+    # PG18 renames a child's own constraint of the parent's name too — even
+    # one joined by ALTER TABLE … INHERIT, which offline does not follow.
+    import pglast
+
+    from pgrls.schema_sources import schema_from_sql
+
+    if not pglast.__version__.startswith("v8"):
+        pytest.skip("named NOT NULL constraints are PG18 syntax")
+    schema = schema_from_sql(
+        "CREATE TABLE p (id int CONSTRAINT k NOT NULL);"
+        " CREATE TABLE c (id int NOT NULL, tenant_id uuid CONSTRAINT k NOT NULL);"
+        " ALTER TABLE c INHERIT p; ALTER TABLE p RENAME CONSTRAINT k TO z;"
+        " ALTER TABLE c DROP CONSTRAINT z;",
+        schemas=("public",))
+    child = next(t for t in schema.tables if t.name == "c")
+    assert {c.name: c.is_nullable for c in child.column_details}["tenant_id"] is True
+
+
 def test_offline_drop_constraint_of_a_not_null():
     # PG18 stores NOT NULL as a named constraint, and DROP CONSTRAINT drops
     # it; an unnamed one is `<table>_<column>_not_null`.
