@@ -57,7 +57,8 @@ breaking changes — they will be called out in this file.
 
 ### Fixed
 - **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
-  that a SECURITY DEFINER body calls by a built-in's name.** A quoted name
+  that a SECURITY DEFINER body calls by a built-in's name** (in the body; a
+  policy predicate is judged separately). A quoted name
   holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one
   identifier, a function in the search path, but was read as that schema's
   function; and a quoted SQL keyword (`"greatest"(…)`, `"coalesce"(…)`,

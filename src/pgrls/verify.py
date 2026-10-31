@@ -1938,7 +1938,8 @@ def _has_range_function(stmt: Any) -> bool:
 # trust widening is a user function deliberately *named after* a builtin and
 # called bare — it would be cleared rather than abstained, negligible in
 # practice and in line with how bare auth-function names are already trusted.
-# That argument needs the builtin to exist on every supported server, so
+# That argument needs, at the least, the builtin to exist on every supported
+# server, so
 # PostgreSQL 18's additions (`casefold`, `uuidv7`, `array_sort`, `crc32`, …)
 # are left out: on 15–17 a bare call to one can only be a user function — a
 # polyfill under the same name — and pgrls does not know the server version.
@@ -1947,8 +1948,11 @@ def _has_range_function(stmt: Any) -> bool:
 # they are trusted, like every pg_catalog-qualified call. For the same
 # reason the list holds no SQL keyword (`greatest`, `coalesce`, `trim`,
 # `current_date`, …): unquoted, each parses as its own node (or as
-# `pg_catalog.btrim`), never as a call by that name; a quoted
-# `"greatest"(x)` is a call, to a user function — there is no such built-in.
+# `pg_catalog.btrim` / `ltrim` / `rtrim`), never as a call by that name; a
+# quoted `"greatest"(x)` is a call, to a user function — there is no such
+# built-in. Existence is not enough on its own either: a user overload that
+# fits the arguments better (`public.lower(integer)` for `lower(1)`) is the
+# one a bare call runs — not caught here.
 _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     # aggregates
     "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "json_agg",
