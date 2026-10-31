@@ -1938,6 +1938,13 @@ def _has_range_function(stmt: Any) -> bool:
 # trust widening is a user function deliberately *named after* a builtin and
 # called bare — it would be cleared rather than abstained, negligible in
 # practice and in line with how bare auth-function names are already trusted.
+# That argument needs the builtin to exist on every supported server, so
+# PostgreSQL 18's additions (`casefold`, `uuidv7`, `array_sort`, `crc32`, …)
+# are left out: on 15–17 a bare call to one can only be a user function — a
+# polyfill under the same name — and pgrls does not know the server version.
+# Measured on PG17: a door calling a user `casefold()` that read a FORCE'd
+# table was PROVEN while it held the name. Called as `pg_catalog.casefold`
+# they are trusted, like every pg_catalog-qualified call.
 _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     # aggregates
     "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "json_agg",
@@ -1951,12 +1958,10 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "split_part", "concat", "concat_ws", "format", "reverse", "repeat",
     "position", "strpos", "overlay", "md5", "starts_with", "to_hex", "ascii",
     "chr", "quote_ident", "quote_literal", "quote_nullable",
-    "casefold",  # PostgreSQL 18
     # numeric
     "abs", "ceil", "ceiling", "floor", "round", "trunc", "sign", "mod", "power",
     "sqrt", "cbrt", "exp", "ln", "log", "log10", "div", "gcd", "lcm",
     "greatest", "least", "width_bucket",
-    "gamma", "lgamma",  # PostgreSQL 18
     # null / conditional
     "coalesce", "nullif",
     # date / time
@@ -1977,10 +1982,8 @@ _SAFE_BUILTIN_FUNCS: frozenset[str] = frozenset({
     "array_remove", "array_replace", "array_position", "array_positions",
     "array_to_string", "string_to_array", "array_ndims", "array_lower",
     "array_upper",
-    "array_sort", "array_reverse",  # PostgreSQL 18
     # type / misc (read no user data)
     "pg_typeof", "format_type", "gen_random_uuid",
-    "uuidv4", "uuidv7", "crc32", "crc32c",  # PostgreSQL 18
 })
 
 

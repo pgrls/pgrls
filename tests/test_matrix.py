@@ -1700,17 +1700,19 @@ def test_what_the_tracer_does_not_follow_is_listed(body: str, why: str) -> None:
     assert any(why in u.reason for u in m.untraced), m.untraced
 
 
-@pytest.mark.parametrize("call", [
-    "casefold(s)", "array_sort(ARRAY[id])", "uuidv7()", "crc32(s::bytea)",
+@pytest.mark.parametrize(("call", "traced"), [
+    # On PostgreSQL 15–17 a bare `casefold` / `uuidv7` can only be a user
+    # function (measured on PG17: one that read a FORCE'd table); the
+    # pg_catalog-qualified call is the PG18 builtin.
+    ("casefold(s)", False), ("uuidv7()", False),
+    ("pg_catalog.casefold(s)", True), ("pg_catalog.uuidv7()", True),
 ])
-def test_a_postgres_18_builtin_is_seen_through(call: str) -> None:
-    # Measured on PG18: a door calling `casefold` was listed as one the
-    # tracer does not see into, though it reads no table.
+def test_a_postgres_18_builtin_is_seen_through_only_qualified(call: str, traced: bool) -> None:
     body = f"SELECT {call} FROM public.t"
     m = build_matrix(_s([_t()], fns=[_f(body, owner="own")], roles=[_r("app"), _r("own")]),
                      roles=("app",))
     assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
-    assert m.untraced == ()
+    assert (m.untraced == ()) is traced
 
 
 @pytest.mark.parametrize("call", ["set_config", "pg_catalog.set_config"])

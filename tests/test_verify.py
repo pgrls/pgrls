@@ -4497,12 +4497,12 @@ def _call(sql: str):
     ("SELECT pg_catalog.set_config('request.jwt.claims', '{}', true)", True),
     # A schema-qualified known auth function stays trusted by its full name.
     ("SELECT auth.uid()", False),
-    # PostgreSQL 18's built-ins read no table either.
-    ("SELECT casefold('A')", False),
-    ("SELECT array_sort(ARRAY[2, 1])", False),
-    ("SELECT array_reverse(ARRAY[1, 2])", False),
-    ("SELECT uuidv7()", False),
-    ("SELECT crc32c('a'::bytea)", False),
+    # PostgreSQL 18's additions are trusted only pg_catalog-qualified: on
+    # 15–17 a bare call to one can only be a user function.
+    ("SELECT casefold('A')", True),
+    ("SELECT uuidv7()", True),
+    ("SELECT pg_catalog.casefold('A')", False),
+    ("SELECT pg_catalog.uuidv7()", False),
     ("SELECT public.casefold('A')", True),
 ])
 def test_opaque_call_trusts_builtins_only_when_unqualified_or_pg_catalog(
