@@ -772,11 +772,13 @@ _GROUPABLE = (
 
 def _parenthesized(node: Any) -> str | None:
     """`node` rendered with each expression operand directly below it in its
-    own parentheses (each rendered by its own `faithful_sql`) — the precedence pglast's deparser can get wrong (``(a OR
-    b) BETWEEN x AND y`` printed as ``a OR b BETWEEN x AND y``) cannot
-    regroup them. Each such expression is swapped for a placeholder column,
-    pglast renders the rest, and the placeholder becomes the expression's
-    own `faithful_sql` in parentheses, which adds no node to the tree."""
+    own parentheses (each rendered by its own `faithful_sql`), so the
+    precedence pglast's deparser can get wrong (``(a OR b) BETWEEN x AND y``
+    printed as ``a OR b BETWEEN x AND y``) cannot regroup them. Each such
+    expression is swapped for a placeholder column, pglast renders the
+    rest, and the placeholder becomes the expression's own `faithful_sql`
+    in parentheses, which adds no node to the tree. None when pglast cannot
+    print the placeholder in that place."""
     holes: list[Any] = []
     rendered = _render(node)
     stem = "pgrls_hole"
@@ -787,13 +789,24 @@ def _parenthesized(node: Any) -> str | None:
         holes.append(child)
         return ColumnRef(fields=(String(sval=f"{stem}{len(holes) - 1}"),))
 
+    def inside(value: Any) -> Any:
+        return type(value)(**{k: rebuild(getattr(value, k)) for k in value})
+
     def rebuild(value: Any) -> Any:
         if isinstance(value, (list, tuple)):
             return type(value)(rebuild(v) for v in value)
+        if isinstance(value, RangeFunction):
+            # A FROM-clause function cannot be parenthesized
+            # (`FROM (unnest(a))` does not parse): rebuild its arguments.
+            functions = tuple(
+                type(item)(inside(f) if isinstance(f, FuncCall) else rebuild(f) for f in item)
+                for item in value.functions or ())
+            return type(value)(**{k: functions if k == "functions" else rebuild(getattr(value, k))
+                                  for k in value})
         if isinstance(value, _GROUPABLE):
             return hole(value)
         if isinstance(value, Node):
-            return type(value)(**{k: rebuild(getattr(value, k)) for k in value})
+            return inside(value)
         return value
 
     shell = type(node)(**{k: rebuild(getattr(node, k)) for k in node})
@@ -811,17 +824,32 @@ def _parenthesized(node: Any) -> str | None:
 
 
 def _shape(value: Any) -> Any:
-    """`value` (a pglast node dict) as `==` compares it: without source
-    positions or the attributes pglast leaves out of comparison, and with an
-    unset field the same as its default (a tree a fixer builds leaves
-    ``isnull`` / ``groupDistinct`` unset where the parser writes False)."""
+    """`value` (a pglast node dict) in the form trees are compared in: like
+    pglast's `==`, without source positions (pglast 8's bare `list_start` /
+    `list_end` too) or the attributes `==` ignores, but also with an unset
+    field equal to its default — a tree a fixer builds leaves ``isnull`` /
+    ``groupDistinct`` unset where the parser writes False, which `==` tells
+    apart."""
     if isinstance(value, dict):
         node_type = getattr(ast_nodes, str(value.get("@", "")), None)
         ignored = getattr(node_type, "_ATTRS_TO_IGNORE_IN_COMPARISON", ()) or ()
-        return {k: _shape(v) for k, v in value.items()
-                if k not in ignored and k != "location"
-                and not k.endswith(("list_start", "list_end"))
-                and v not in (None, False, 0, "", (), [])}
+        shaped = {k: _shape(v) for k, v in value.items()
+                  if k not in ignored and k != "location"
+                  and not k.endswith(("list_start", "list_end"))
+                  and v not in (None, False, 0, "", (), [])}
+        op = shaped.get("boolop")
+        if (shaped.get("@") == "BoolExpr" and isinstance(op, dict)
+                and op.get("name") in ("AND_EXPR", "OR_EXPR")):
+            # AND / OR are associative (NULLs too) and the parser flattens
+            # `(p AND q) AND r` into one AND, so a nested one — what a fixer
+            # leaves after dropping a disjunct — is the same tree.
+            args: list[Any] = []
+            for arg in shaped.get("args", ()):
+                same = (isinstance(arg, dict) and arg.get("@") == "BoolExpr"
+                        and arg.get("boolop") == op)
+                args.extend(arg.get("args", ()) if same else [arg])
+            shaped["args"] = args
+        return shaped
     if isinstance(value, (list, tuple)):
         return [_shape(v) for v in value]
     return value
@@ -852,9 +880,9 @@ def faithful_sql(node: Any) -> str:
 
 def canonical_key(node: Any) -> str:
     """A string that is equal for two expression nodes exactly when their
-    ASTs are (source positions aside): their `faithful_sql` when it parses
-    back to the node — so one text cannot stand for two trees — else that
-    text tagged with a digest of the tree."""
+    ASTs are (source positions, and unset-vs-default fields, aside): their
+    `faithful_sql` when it parses back to the node — so one text cannot
+    stand for two trees — else that text tagged with a digest of the tree."""
     text = faithful_sql(node)
     if _same_tree(text, node):
         return text

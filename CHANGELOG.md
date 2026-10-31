@@ -60,12 +60,20 @@ breaking changes — they will be called out in this file.
   prints both alike.** pglast's deparser drops parentheses an operand of
   `BETWEEN`, `IS NULL` and the like needs — `(a OR b) BETWEEN x AND y` and
   `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
-  `pgrls diff` compared those strings, so a real change emitted no Change.
+  `pgrls diff` compared those strings, so a real change was not reported.
   Predicates are now compared on their parse trees, and the Z3 comparison
   no longer gives two such expressions one variable. The same rendering
-  was used for the policy text `--sql-file` / `pgrls pr` read (which the
-  rules then re-parsed) and for the SQL `pgrls fix` emits; both now keep
-  every parenthesis the tree needs.
+  was used for the policy text pgrls rebuilds from a `--sql-file` /
+  `pgrls pr` source (which the rules then re-parsed, so they could analyse
+  a different predicate than the file wrote) and for the SQL `pgrls fix`
+  emits: the `ALTER POLICY` of the SEC004, SEC011, SEC019, SEC020 and
+  PERF001 fixers, and PERF004's index expression. A fixer could emit a
+  policy that admits more rows than the one it rewrote — PERF001 turned
+  `user_id = auth.uid() AND ((a OR b) BETWEEN false AND true)` into
+  `… AND a OR b BETWEEN FALSE AND TRUE`, which Postgres reads as
+  `(… AND a) OR (b BETWEEN …)`. Both now keep every parenthesis the tree
+  needs; re-check any policy with such a nested operand that `pgrls fix
+  --apply` rewrote.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

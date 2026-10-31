@@ -940,7 +940,7 @@ out (no Change emitted). The mapping:
 The five recognized AST patterns (whitespace-only is the trivial
 no-op case; the four real diffs follow):
 
-**Literal-equal (whitespace-only diff).** When both sides parse to
+**Literal-equal (whitespace / redundant-parenthesis-only diff).** When both sides parse to
 identical pglast ASTs the predicate is unchanged. No Change emitted.
 
 ```sql

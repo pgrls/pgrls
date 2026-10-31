@@ -4738,9 +4738,18 @@ def test_alter_policy_keeps_the_parentheses_its_predicate_needs() -> None:
      "user_id = (SELECT auth.uid()) AND ((a OR b) BETWEEN false AND true)"),
     (SEC019Fixer, "user_id = current_setting('app.t') AND ((a OR b) BETWEEN false AND true)",
      "user_id = current_setting('app.t', true) AND ((a OR b) BETWEEN false AND true)"),
+    # Dropping `OR true` leaves an AND inside an AND, which no text parses
+    # back to (the parser flattens it) — still the same predicate.
+    (SEC011Fixer, "(((a OR b) BETWEEN false AND true AND user_id = 1) OR true) AND c",
+     "((a OR b) BETWEEN false AND true) AND user_id = 1 AND c"),
+    (SEC011Fixer, "EXISTS (SELECT 1 FROM jsonb_array_elements(j) e "
+     "WHERE (a OR b) BETWEEN false AND true) OR true",
+     "EXISTS (SELECT 1 FROM jsonb_array_elements(j) e WHERE (a OR b) BETWEEN false AND true)"),
 ])
 def test_fixer_sql_keeps_the_predicates_grouping(fixer: Any, using: str, rewritten: str) -> None:
     import pglast
 
+    from pgrls.ast_utils import _tree
+
     [f] = fixer().fix(_wrap_policy(_policy(using)), {})
-    assert pglast.parse_sql(f.sql)[0].stmt.qual == parse_expr(rewritten)
+    assert _tree(pglast.parse_sql(f.sql)[0].stmt.qual) == _tree(parse_expr(rewritten))
