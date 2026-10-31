@@ -73,17 +73,22 @@ breaking changes — they will be called out in this file.
   the value (`varchar(3)`, `float4`, `numeric(4,1)`, `oid`, or any cast of a
   function's result) is a value of its own. A numeric literal is read
   exactly where it can be: through a float, `c = 9007199254740992` and
-  `c = 9007199254740993` were one value. A decimal no double holds exactly
-  (`0.1`), which a `float8` column and a `numeric` one read differently, is
-  a value of its own, and a literal past the double range (`1e400`) no
-  longer crashes. A Bool compared with a number is no longer coerced to
-  0 / 1 on any path, which also fixes a false SEC038 on `COALESCE(level,
-  tier) < 2 OR …`; in `pgrls verify` and `matrix --prove`, `tenant_id =
-  auth.uid() AND COALESCE(a, b) = 1` goes from isolated to unverified, as
-  does a `'…'::numeric` bound no double holds. A leaking row holding a
-  character outside the BMP prints it, not Z3's `\u{…}`, and a backslash
-  in a policy's string literal is a backslash, not an escape Z3 reads
-  (`'\u{41}'` was taken for `'A'`); both apply to every prover's rows.
+  `c = 9007199254740993` were one value. A decimal (`0.1`) is translated
+  only when a `float4` holds it exactly, since a `numeric`, a `float8` and
+  (in an `IN` list) a `float4` column read it differently, and a literal
+  past the double range (`1e400`) no longer crashes. A Bool compared with
+  a number is no longer coerced to 0 / 1 on any path, which also fixes a
+  false SEC038 on `COALESCE(level, tier) < 2 OR …`. In `pgrls verify` and
+  `matrix --prove`, `tenant_id = auth.uid() AND COALESCE(a, b) = 1` goes
+  from PROVEN to unverified (UNKNOWN in the matrix); and a proof that read
+  a decimal through a float, or took a value-changing cast (`::float4`,
+  `::numeric(3,1)`, `::varchar(3)`) to keep the value, is no longer made —
+  `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`
+  was a false PROVEN under `verify --mode anon` and is now a LEAK. A
+  leaking row holding a character outside the BMP prints it, not Z3's
+  `\u{…}`, and a backslash in a policy's string literal is a backslash,
+  not an escape Z3 reads (`'\u{41}'` was taken for `'A'`); both apply to
+  every prover's rows.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

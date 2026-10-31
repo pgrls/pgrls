@@ -1025,7 +1025,7 @@ def test_a_quoted_column_named_like_a_call_has_its_own_null_flag() -> None:
 def test_a_huge_numeric_literal_does_not_crash() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
-    assert _classify("n > 1e400 OR o = 1", "n > 1e400 AND o = 1") == "semantic_tightened"
+    assert _classify("n > 1e400 OR o = 1", "n > 1e400 AND o = 1") is None
     assert anon_read_counterexample(parse_expr("n > 1e400 OR o = current_setting('app.u', true)")) is None
     assert _counterexample("c > 1e400", "c > 1e399") is None
     for using in ("n > 1e400", "tenant_id = auth.uid() OR n > 1e400"):
@@ -1033,7 +1033,7 @@ def test_a_huge_numeric_literal_does_not_crash() -> None:
         prove_cross_tenant_isolation(parse_expr(using))
 
 
-def test_a_value_no_double_holds_is_left_out_of_a_leaking_row() -> None:
+def test_a_value_beyond_a_doubles_range_is_left_out_of_a_leaking_row() -> None:
     import z3
 
     from pgrls.diff._z3_compare import _Context, _decode_model
@@ -1046,25 +1046,61 @@ def test_a_value_no_double_holds_is_left_out_of_a_leaking_row() -> None:
     assert _decode_model(solver.model(), ctx) == {}
 
 
-def test_a_decimal_no_double_holds_is_a_value_of_its_own() -> None:
+@pytest.mark.parametrize(("base", "head"), [
     # A `float8` column compares with the literal rounded to a double, a
-    # `numeric` one exactly: `score >= 0.10000000000000000001` admits 0.1 on
-    # float8 but not on numeric, so the diff decides nothing.
-    assert _classify("score > 0.1", "score >= 0.10000000000000000001") is None
-    assert _classify("n > 0.1", "n > 0.1 AND x = 1") == "semantic_tightened"
-    # A double holds 0.5 exactly: both column types read it alike.
+    # `numeric` one exactly: the head admits 0.1 on float8 only.
+    ("score > 0.1", "score >= 0.10000000000000000001"),
+    # The same literal against a `numeric` and a `float8` column.
+    ("a = 1.00000000000000001 AND b = 1.00000000000000001 AND "
+     "((a > 1.0 AND b > 1.0) OR (a <= 1.0 AND b <= 1.0))",
+     "NOT (a <> 1.00000000000000001 OR b <> 1.00000000000000001)"),
+    # A `float4` column's `IN` list of two rounds each to a single.
+    ("c = 0.1 OR c = 7.0", "c IN (0.1, 7.0)"),
+    ("c = 16777217.0", "c IN (16777217.0, 16777217.0)"),
+])
+def test_a_decimal_column_types_read_differently_decides_nothing(base, head) -> None:
+    assert _classify(base, head) is None
+
+
+def test_a_decimal_a_single_holds_still_translates() -> None:
     assert _classify("n > 0.5", "n >= 0.5") == "semantic_loosened"
     assert _counterexample("n > 0.5", "n >= 0.5") == {"n": 0.5}
+    assert _classify("n > 2.25", "n > 2.25 AND x = 1") == "semantic_tightened"
 
 
-def test_a_folded_numeric_no_double_holds_is_not_proven_isolated() -> None:
+@pytest.mark.parametrize("using", [
     # Through a float both bounds were -0.1, an empty range; a row holding
     # -0.100000000000000000015 is read.
-    from pgrls.diff._z3_compare import prove_anon_isolation
+    "n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric",
+    "a = 1.00000000000000001 AND 1.00000000000000001 > 1.0 AND a <= 1.0",
+    "c IN (0.1, 0.1) AND c <> 0.1",
+    # A cast that changes the value is a value of its own on every path.
+    "tenant_id = auth.uid() OR 0.1 <> 0.1::float4",
+    "tenant_id = auth.uid() OR '16777217'::float4 = 16777216.0",
+    "tenant_id = auth.uid() OR '1.25'::numeric(3,1) <> 1.25",
+])
+def test_the_provers_do_not_prove_what_a_column_type_decides(using) -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
-    using = ("n < '-0.10000000000000000001'::numeric "
-             "AND n > '-0.10000000000000000002'::numeric")
     assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+
+
+def test_a_uuid_or_integer_cast_of_the_identity_keeps_the_proof() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = current_setting('app.t', true)::uuid",
+                  "tenant_id = current_setting('app.t', true)::bigint"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated"
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated"
+
+
+def test_a_guc_value_postgres_would_not_read_is_not_folded() -> None:
+    # `'1/2'::float8` raises in Postgres; it is not the row {x: 0.5}.
+    from pgrls.diff._z3_compare import _exact_real
+
+    assert _exact_real("1/2") is None
+    assert _exact_real(" .5 ") is not None
 
 
 def test_a_value_keeping_cast_still_translates() -> None:

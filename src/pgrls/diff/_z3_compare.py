@@ -41,9 +41,9 @@ What the encoder translates: columns, literals, comparisons and arithmetic
 (on the diff path not where Z3 and Postgres disagree — ``/`` and ``%``,
 arithmetic on anything but integers, ordering on text, which collations
 decide; a cast that may change the value, such as ``varchar(3)`` or
-``float4``, or of a function's result, is an opaque value of its own; so is
-a decimal literal no double holds exactly, which a ``float8`` and a
-``numeric`` column read differently),
+``float4``, or of a function's result, is an opaque value of its own), a
+decimal literal only when a ``float4`` holds it exactly (otherwise a
+``numeric``, ``float8`` and ``float4`` column read it differently),
 AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
@@ -56,7 +56,8 @@ falls through to ``requires_review``.
 A column's type is inferred from what it is compared with: against an
 integer literal it is an integer, so ``a >= 2`` and ``a > 1`` are
 equivalent — wrong for a ``numeric`` column, where 1.5 passes only the
-second; and against a text literal it is text, so ``c = 'true'`` and
+second, or a ``float4`` one, whose ``IN`` list rounds ``16777217`` to a
+single; and against a text literal it is text, so ``c = 'true'`` and
 ``c <> 't'`` can both hold — wrong for a ``bool`` column (or ``uuid``,
 where case does not matter). The diff compares policy text and does not see
 column types.
@@ -72,6 +73,7 @@ from __future__ import annotations
 import fractions
 import math
 import re
+import struct
 
 from collections.abc import Mapping, Sequence
 
@@ -408,15 +410,13 @@ def _const_to_z3(node: A_Const) -> Any:
         try:
             if re.fullmatch(r"[+-]?\d+", text):
                 return z3.IntVal(int(text))
-            exact = _exact_double(text)
         except (ValueError, TypeError, z3.Z3Exception):
             return None
-        # A decimal a double cannot hold reads differently against a
-        # `float8` column (rounded) and a `numeric` one (exact), and the diff
-        # does not see which: it is a value of its own, the same in both
-        # predicates.
-        return exact if exact is not None else z3.Const(
-            f"{_OPAQUE_PREFIX}literal {text}", z3.RealSort())
+        # A decimal reads differently against a `numeric` (exactly), a
+        # `float8` (rounded to a double) and, in an `IN` list, a `float4`
+        # (rounded to a single), and pgrls does not see which: it is
+        # translated only when all three agree.
+        return _exact_real(text)
     # Anything else (NULL literal, BitString, etc.) — out of scope.
     # In particular, `col = NULL` is always-false in Postgres but
     # users express that with `IS NULL` instead; if we see a literal
@@ -425,15 +425,18 @@ def _const_to_z3(node: A_Const) -> Any:
     return None
 
 
-def _exact_double(text: str) -> Any:
-    """`text`'s number as a Z3 real when a finite double holds it exactly —
-    then a `float8` and a `numeric` read it alike — else None."""
+def _exact_real(text: str) -> Any:
+    """`text`'s number as a Z3 real when it is Postgres numeric syntax and a
+    `float4` holds it exactly — so a `numeric`, a `float8` and a `float4`
+    read it alike — else None."""
+    if not re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*", text):
+        return None
     exact = fractions.Fraction(text.strip())
     try:
-        double = float(exact)
-    except OverflowError:
+        single = struct.unpack("f", struct.pack("f", float(exact)))[0]
+    except (OverflowError, struct.error):
         return None
-    if not math.isfinite(double) or fractions.Fraction(double) != exact:
+    if not math.isfinite(single) or fractions.Fraction(single) != exact:
         return None
     return z3.Q(exact.numerator, exact.denominator)
 
@@ -454,7 +457,8 @@ def _z3_value(val: object) -> Any:
 # Cast targets that keep the value of a column, a literal or another such
 # cast (an out-of-range integer raises rather than changing): a cast to one
 # of these, with no type modifier, of a value Z3 already holds in that sort
-# leaves it as it is (one that changes sort, like `1.5::int`, is opaque).
+# leaves it as it is; one that changes sort, like `1.5::int`, is opaque,
+# except a string literal Postgres reads exactly (`'5'::int`).
 # Any other —
 # `varchar(3)` truncates, `char` is `char(1)`, `bpchar` ignores trailing
 # spaces, `numeric(4,1)` and `float4` round, `oid` wraps a negative integer
@@ -470,6 +474,15 @@ def _exact_cast(typename: Any) -> bool:
     """Whether a cast to `typename` keeps the value (see `_EXACT_CAST_TARGETS`)."""
     return (
         _typename_last_segment(typename) in _EXACT_CAST_TARGETS
+        and not getattr(typename, "typmods", None)
+        and not getattr(typename, "arrayBounds", None)
+    )
+
+
+def _bare_type(typename: Any, name: str) -> bool:
+    """Whether `typename` is `name` with no type modifier or array bounds."""
+    return (
+        _typename_last_segment(typename) == name
         and not getattr(typename, "typmods", None)
         and not getattr(typename, "arrayBounds", None)
     )
@@ -609,8 +622,9 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     each value by its Z3 sort, one-to-one with the constructors in
     ``_const_to_z3`` (Int → ``as_long``, String → ``as_string``,
     Bool → ``z3.is_true``, Real → ``float(as_fraction())``, left out when
-    no double holds it, and a witness gate then declines the row). Any
-    other sort is omitted (defensive). ``model.decls()`` yields only the
+    it is beyond a double's range; a witness gate declines a row whose
+    float is not the model's value). Any other sort is omitted
+    (defensive). ``model.decls()`` yields only the
     constants Z3 actually assigned; a don't-care column is simply
     absent and is never fabricated.
     """
@@ -1794,10 +1808,11 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
 
     Only folds a String constant the encoder already knows exactly — a
     captured GUC value or a policy literal — and only when Postgres would
-    accept it: in range for the integer type, and finite for a float
-    (`'Infinity'` and `'NaN'` are valid PG values that `z3.RealVal` cannot
-    parse, and the resulting `Z3Exception` crashed the whole command).
-    Anything else returns None and stays opaque: declining to decide is the
+    accept it and read it alike whatever it is compared with: in range for
+    the integer type, and for a real one that `_exact_real` reads (not
+    `'NaN'` / `'Infinity'`, which Z3 reals do not have). The caller folds
+    only for a cast that keeps the value (`_exact_cast`). Anything else
+    returns None and stays opaque: declining to decide is the
     safe direction, and modelling the raise as "isolated" is not this
     function's job.
     """
@@ -1810,7 +1825,7 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
             low, high = _INT_RANGES.get(type_name or "", _INT_RANGES["int8"])
             return z3.IntVal(number) if low <= number <= high else None
         if target_sort == z3.RealSort():
-            return _exact_double(text)
+            return _exact_real(text)
     except (ValueError, OverflowError, ZeroDivisionError, z3.Z3Exception):
         return None
     if target_sort == z3.BoolSort():
@@ -1854,9 +1869,19 @@ def _anon_typecast(
     if inner is None:
         return None
     target_sort = _typename_segments_to_sort(node.typeName)
-    if ctx.any_session and target_sort is not None and not _exact_cast(node.typeName):
-        # The diff path compares two readings, so a cast that may change the
-        # value (`varchar(3)`, `float4`, `oid`) is a value of its own.
+    lossy = target_sort is not None and not _exact_cast(node.typeName)
+    if lossy and not ctx.any_session:
+        # Off the diff path a `uuid` cast (the session identity's) and an
+        # integer one (which raises rather than changes) keep the value as
+        # before; `oid` wraps a negative integer.
+        lossy = not (
+            _bare_type(node.typeName, "uuid")
+            or (target_sort == z3.IntSort()
+                and _typename_last_segment(node.typeName) != "oid")
+        )
+    if lossy:
+        # A cast that may change the value (`varchar(3)`, `float4`, `oid`,
+        # `numeric(3,1)`, `citext`) is a value of its own.
         return _Val(
             value=ctx.opaque(_canon(node), target_sort),
             is_null=inner.is_null,
