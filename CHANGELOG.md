@@ -29,8 +29,9 @@ breaking changes — they will be called out in this file.
     session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
     SQL and PL/pgSQL bodies (whatever their return type, though one that
-    assigns to an OUT parameter or a RETURNS TABLE column is still
-    unreadable — only the body is captured), views to their tables, and
+    assigns to one of its parameters or RETURNS TABLE columns, or declares
+    an `ALIAS FOR $n`, is still unreadable — only the body is captured),
+    views to their tables, and
     what those tables' policies read in turn, with an unresolvable relation
     or unreadable body counting against it. A login
     session must also have no pre-16 CREATEROLE, read no setting it can set

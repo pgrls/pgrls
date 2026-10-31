@@ -1040,8 +1040,8 @@ def _confirmed_parse(
     ``public``, rejects every VARIADIC parameter, and takes a variable of a
     type it does not know for a record (no scalar target): the schema is
     dropped from each type it names — outside ``pg_catalog`` for parameters
-    and the return type, any schema in a ``DECLARE`` section (which the
-    probes then confirm) — VARIADIC becomes a plain parameter, and each
+    and the return type, any schema in a ``DECLARE`` section (a ``%TYPE``
+    / ``%ROWTYPE`` one excepted; the probes then confirm it) — VARIADIC becomes a plain parameter, and each
     variable or parameter in `scalars` (every one not in `keep`, for ``*``)
     is declared ``text``. A type does not change which SQL the body runs.
 

@@ -518,7 +518,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
-            _apply_alter_table(stmt, tables, default_schema)
+            _apply_alter_table(stmt, tables, default_schema, index)
         elif kind == "CreatePolicyStmt":
             _apply_create_policy(stmt, tables, default_schema)
         elif kind == "AlterPolicyStmt":
@@ -884,6 +884,7 @@ def _apply_alter_table(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    index: int = -1,
 ) -> None:
     key = _relation_key(stmt.relation, default_schema)
     if key is None:
@@ -944,6 +945,13 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif (subtype in (AlterTableType.AT_AddConstraint,
+                          AlterTableType.AT_ValidateConstraint)
+              and 0 <= index < builder.created_at):
+            # Before the table's last CREATE (a DROP and re-CREATE): it
+            # constrained the old table, not this one — skipping it only
+            # reads a column as nullable.
+            continue
         elif subtype == AlterTableType.AT_AddConstraint:
             con = getattr(cmd, "def_", None)
             builder.invalid_not_null.pop(getattr(con, "conname", None) or "", None)

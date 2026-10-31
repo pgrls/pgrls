@@ -1767,3 +1767,14 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
     )
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
     assert "SEC008" in res.output and "public.t.q" in res.output, res.output
+
+
+def test_offline_constraint_before_a_rebuild_does_not_reach_the_new_table():
+    # An ADD PRIMARY KEY / NOT NULL constraint that ran before DROP TABLE and
+    # a re-CREATE constrained the old table only (measured on PG18).
+    t = _only(
+        "CREATE TABLE docs (id int, tenant_id uuid);"
+        " ALTER TABLE docs ADD PRIMARY KEY (id, tenant_id);"
+        " DROP TABLE docs; CREATE TABLE docs (id int, tenant_id uuid);"
+    )
+    assert {c.name: c.is_nullable for c in t.column_details}["tenant_id"] is True
