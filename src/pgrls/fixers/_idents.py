@@ -40,7 +40,7 @@ from typing import Any
 import pglast
 from pglast.ast import ColumnDef
 
-from pgrls.ast_utils import faithful_sql
+from pgrls.ast_utils import exact_sql
 
 _PLAIN_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -139,8 +139,10 @@ def alter_policy(
     *,
     using_ast: Any | None = None,
     with_check_ast: Any | None = None,
-) -> str:
-    """Assemble an `ALTER POLICY` statement with optional clauses.
+) -> str | None:
+    """Assemble an `ALTER POLICY` statement with optional clauses — None when
+    a clause has no SQL that parses back to its AST (the fixer then leaves
+    the finding rather than apply a different predicate).
 
     Single source of truth for the shape the PERF001 / SEC011 /
     SEC019 / SEC020 fixers all emit:
@@ -151,9 +153,9 @@ def alter_policy(
 
     `USING` precedes `WITH CHECK`; each clause is 4-space indented
     and only rendered when its AST is provided. Each clause AST is
-    rendered by `ast_utils.faithful_sql` — pglast's rendering, with the
-    parentheses it can drop restored, so the emitted policy means what
-    the AST does — and pglast's escaping is applied consistently
+    rendered by `ast_utils.exact_sql` — pglast's rendering, with the
+    parentheses it can drop restored, and only when that parses back to
+    the AST — and pglast's escaping is applied consistently
     regardless of where the SQL originated. The identifier and
     qualified-name quoting is the same `quote_ident` /
     `quote_qualified` this module owns.
@@ -163,10 +165,13 @@ def alter_policy(
     only call this after establishing a clause changed).
     """
     clauses: list[str] = []
-    if using_ast is not None:
-        clauses.append(f"    USING ({faithful_sql(using_ast)})")
-    if with_check_ast is not None:
-        clauses.append(f"    WITH CHECK ({faithful_sql(with_check_ast)})")
+    for keyword, ast in (("USING", using_ast), ("WITH CHECK", with_check_ast)):
+        if ast is None:
+            continue
+        sql = exact_sql(ast)
+        if sql is None:
+            return None
+        clauses.append(f"    {keyword} ({sql})")
     return (
         f"ALTER POLICY {quote_ident(policy_name)} "
         f"ON {quote_qualified(table.schema, table.name)}\n"

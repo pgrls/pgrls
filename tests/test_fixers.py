@@ -4753,3 +4753,15 @@ def test_fixer_sql_keeps_the_predicates_grouping(fixer: Any, using: str, rewritt
 
     [f] = fixer().fix(_wrap_policy(_policy(using)), {})
     assert _tree(pglast.parse_sql(f.sql)[0].stmt.qual) == _tree(parse_expr(rewritten))
+
+
+def test_a_fixer_leaves_the_finding_when_no_sql_parses_back_to_its_rewrite() -> None:
+    # pglast prints this SIMILAR TO operand without the parentheses it needs
+    # and no placeholder can stand in its place: the fixer must not emit SQL
+    # that means something else.
+    from pgrls.ast_utils import exact_sql
+
+    using = ("(((a OR b) BETWEEN false AND true)::text SIMILAR TO 'z' "
+             "AND user_id = 1) OR true")
+    assert exact_sql(parse_expr("((a OR b) BETWEEN false AND true)::text SIMILAR TO 'z'")) is None
+    assert SEC011Fixer().fix(_wrap_policy(_policy(using)), {}) == []

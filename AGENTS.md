@@ -529,7 +529,7 @@ Currently fixable:
   `date_trunc(...)`, nested calls). Walks the policy AST, finds
   the outermost `FuncCall` wrapping each flagged column, renders it
   back to SQL (pglast's rendering, with any parentheses it drops
-  restored), and emits one CREATE INDEX
+  restored — none when no SQL parses back to it), and emits one CREATE INDEX
   per distinct expression (deduped across policies that share the
   same wrap). The existing plain index on the bare column stays in
   place; the new expression index runs in parallel for the
@@ -937,8 +937,8 @@ out (no Change emitted). The mapping:
 | `loosened_or`               | `DANGEROUS`       |
 | `requires_review`           | `REQUIRES_REVIEW` |
 
-The five recognized AST patterns (whitespace-only is the trivial
-no-op case; the four real diffs follow):
+The five recognized AST patterns (whitespace / redundant-parenthesis-only
+is the trivial no-op case; the four real diffs follow):
 
 **Literal-equal (whitespace / redundant-parenthesis-only diff).** When both sides parse to
 identical pglast ASTs the predicate is unchanged. No Change emitted.

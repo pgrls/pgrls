@@ -217,6 +217,8 @@ class SEC004Fixer:
                     using_ast=new_using if using_changed else None,
                     with_check_ast=new_check if check_changed else None,
                 )
+                if stmt is None:
+                    continue
                 if using_changed and check_changed:
                     clause_disp = "USING and WITH CHECK checks"
                 elif using_changed:

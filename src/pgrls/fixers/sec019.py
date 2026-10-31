@@ -202,7 +202,7 @@ class SEC019Fixer:
 
                 # Only re-emit the clause(s) that actually changed, so
                 # the migration is the minimal diff. `alter_policy`
-                # renders each provided clause with `faithful_sql` and
+                # renders each provided clause with `exact_sql` and
                 # orders USING before WITH CHECK.
                 stmt = alter_policy(
                     table,
@@ -212,6 +212,8 @@ class SEC019Fixer:
                         new_wc_ast if with_check_changed else None
                     ),
                 )
+                if stmt is None:
+                    continue
 
                 out.append(
                     Fix(

@@ -799,7 +799,7 @@ def _parenthesized(node: Any) -> str | None:
             # A FROM-clause function cannot be parenthesized
             # (`FROM (unnest(a))` does not parse): rebuild its arguments.
             functions = tuple(
-                type(item)(inside(f) if isinstance(f, FuncCall) else rebuild(f) for f in item)
+                type(item)(inside(f) if isinstance(f, _GROUPABLE) else rebuild(f) for f in item)
                 for item in value.functions or ())
             return type(value)(**{k: functions if k == "functions" else rebuild(getattr(value, k))
                                   for k in value})
@@ -829,7 +829,7 @@ def _shape(value: Any) -> Any:
     `list_end` too) or the attributes `==` ignores, but also with an unset
     field equal to its default — a tree a fixer builds leaves ``isnull`` /
     ``groupDistinct`` unset where the parser writes False, which `==` tells
-    apart."""
+    apart — and same-operator AND / OR nesting flattened."""
     if isinstance(value, dict):
         node_type = getattr(ast_nodes, str(value.get("@", "")), None)
         ignored = getattr(node_type, "_ATTRS_TO_IGNORE_IN_COMPARISON", ()) or ()
@@ -878,11 +878,21 @@ def faithful_sql(node: Any) -> str:
     return grouped if grouped is not None and _same_tree(grouped, node) else text
 
 
+def exact_sql(node: Any) -> str | None:
+    """`faithful_sql` when it parses back to `node`, else None — for SQL that
+    is applied, where pglast's lossy rendering would mean something else."""
+    text = faithful_sql(node)
+    return text if _same_tree(text, node) else None
+
+
 def canonical_key(node: Any) -> str:
-    """A string that is equal for two expression nodes exactly when their
-    ASTs are (source positions, and unset-vs-default fields, aside): their
-    `faithful_sql` when it parses back to the node — so one text cannot
-    stand for two trees — else that text tagged with a digest of the tree."""
+    """A string that is equal for two expression nodes only when their trees
+    are the same (source positions, unset-vs-default fields and the nesting
+    of same-operator AND / OR aside — see `_shape`): their `faithful_sql`
+    when it parses back to the node — so one text cannot stand for two
+    trees — else that text tagged with a digest of the tree. Same-shaped
+    trees usually, but not always, share a key: ``p AND (q AND r)`` keeps
+    its parentheses."""
     text = faithful_sql(node)
     if _same_tree(text, node):
         return text

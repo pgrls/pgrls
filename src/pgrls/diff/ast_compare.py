@@ -54,7 +54,8 @@ def _or_clauses(node: Any) -> list[Any]:
 
 
 def _canon(node: Any) -> str:
-    """A key equal for two nodes exactly when their ASTs are — pglast's
+    """A key equal for two nodes only when their ASTs are the same (see
+    `canonical_key`) — pglast's
     rendering alone can print two different predicates the same (it drops
     the parentheses ``(a OR b) BETWEEN x AND y`` needs), which made a real
     change read as ``unchanged``."""

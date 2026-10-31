@@ -21,8 +21,9 @@ the rule uses.
 intentionally NOT wrapped: see `_funccall_matches` for the
 rationale. PERF001's *check* walks them; the fixer does not.
 
-The new SQL is rendered by `ast_utils.faithful_sql` (pglast's
-rendering, with any parentheses it drops restored). Output
+The new SQL is rendered by `ast_utils.exact_sql` (pglast's rendering,
+with any parentheses it drops restored; a rewrite with no SQL that parses
+back to it is not emitted). Output
 emits only the clause(s) actually rewritten:
 
     ALTER POLICY <name> ON <schema>.<table>
@@ -55,7 +56,7 @@ from typing import Any
 from pglast.ast import FuncCall, Node, ResTarget, SelectStmt, String, SubLink
 from pglast.enums import LimitOption, SetOperation, SubLinkType
 
-from pgrls.ast_utils import faithful_sql, subselect_is_correlated
+from pgrls.ast_utils import exact_sql, subselect_is_correlated
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema, policy_id
@@ -228,7 +229,7 @@ class PERF001Fixer:
                 # after `pgrls fix` runs (snapshot tests, programmatic
                 # API, the `pgrls fix && pgrls lint` chain). The invariant
                 # is "fixer is read-only over Schema"; honor it.
-                new_clauses: dict[str, str] = {}
+                new_clauses: dict[str, str | None] = {}
                 for key, ast in (
                     ("using", policy.using_ast),
                     ("with_check", policy.with_check_ast),
@@ -239,8 +240,9 @@ class PERF001Fixer:
                         copy.deepcopy(ast), names
                     )
                     if changed:
-                        new_clauses[key] = faithful_sql(new_ast)
-                if not new_clauses:
+                        new_clauses[key] = exact_sql(new_ast)
+                # No SQL that parses back to the rewrite: leave the finding.
+                if not new_clauses or None in new_clauses.values():
                     continue
 
                 # Emit ONLY the clause(s) actually rewritten. An
