@@ -906,7 +906,7 @@ def test_bare_constant_predicate_degrades_instead_of_crashing() -> None:
 
 
 def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
-    # R13 #1 (2VL diff path): String-sorted arithmetic (`-`/`*`/`/`/`%`)
+    # R13 #1: String-sorted arithmetic (`-`/`*`/`/`/`%`)
     # makes the Z3 operator overload raise a plain TypeError, not
     # z3.Z3Exception. classify_via_z3 / counterexample used to let it
     # escape and crash `pgrls diff`; both must now degrade to None so the
@@ -990,15 +990,36 @@ def test_three_valued_classification(base: str, head: str, verdict: str) -> None
     ("a / 2 = -1", "a = -2 OR a = -1"),                 # PG truncates
     ("a + b >= a", "a IS NOT NULL AND b IS NOT NULL"),  # Z3 + on text concatenates
     ("'B' < 'b'", "c <> true"),                         # collation order
+    # ... also once an equality pins a column, or through a COALESCE.
+    ("(s = 'B' AND u = 'a' AND s < u) OR a = 1", "(s = 'B' AND u = 'a') OR a = 1"),
+    ("c", "NOT (NOT ((COALESCE(f(), 'a') < s AND s < COALESCE(f(), 'B') "
+     "AND f() IS NULL) OR c))"),
+    # Postgres rounds a numeric quotient.
+    ("(x = 1.0 AND (x / 3.0) * 3.0 = x) OR c", "x = 1.0 OR c"),
     ('"f()" IS NULL', "f() IS NULL"),                   # a column, not the call
 ])
 def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str) -> None:
     assert _classify(base, head) is None
 
 
-def test_an_opaque_ordering_and_numeric_division_still_translate() -> None:
-    assert _classify("created_at > now()", "created_at > now() AND x = 1") == "semantic_tightened"
-    assert _classify("price / 2.0 > 1.0", "price > 2.0") == "semantic_equivalent"
+def test_integer_arithmetic_still_translates() -> None:
+    assert _classify("a + 1 > 3", "a > 2") == "semantic_equivalent"
+    assert _classify("a * 2 = 4", "a * 2 = 4 AND b = 1") == "semantic_tightened"
+
+
+def test_a_leaking_row_prints_a_character_outside_the_bmp() -> None:
+    assert _counterexample("s = 'a'", "s = 'a' OR s = '\U00024cc8'") == {"s": "\U00024cc8"}
+
+
+def test_the_anon_and_cross_tenant_provers_keep_their_proofs() -> None:
+    # Only the Bool / non-Bool guard applies off the diff path: a `%` or a
+    # text ordering beside the tenant equality cannot make it leak.
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = auth.uid() AND (seq % 2) = 0",
+                  "user_id = auth.uid() AND status < 'm'::text"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
 
 
 def test_a_bare_column_coalesce_is_no_anonymous_leak() -> None:
@@ -1015,10 +1036,9 @@ def test_a_null_admitting_widening_names_the_null_row() -> None:
     assert _row_satisfies_head_not_base(base, head, cx)
 
 
-def test_null_limitation_does_not_compromise_soundness() -> None:
-    # The limitation must never cost the verifier its safety guarantees —
-    # these are exactly the invariants a naive null-guard "fix" broke, and
-    # that any real fix must preserve.
+def test_null_handling_keeps_the_verifiers_invariants() -> None:
+    # The invariants a naive 2-valued null-guard "fix" broke, which the
+    # three-valued encoding keeps.
     #
     # Arithmetic equivalence holds (a naive guard flipped this to
     # `tightened`):

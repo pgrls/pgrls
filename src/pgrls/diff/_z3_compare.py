@@ -1,4 +1,4 @@
-"""SAT-based predicate implication via Z3 (Phases 1, 3, and 4).
+"""SAT-based predicate implication via Z3.
 
 Z3 (``z3-solver``) is a core dependency as of 0.16.0, so this path runs
 on a plain ``pip install pgrls``. The ``Z3_AVAILABLE`` guard is retained
@@ -38,20 +38,24 @@ equivalent, and with an ``IS NULL`` disconnected from the column's value
 it flags the second.
 
 What the encoder translates: columns, literals, comparisons and arithmetic
-(not where Z3 and Postgres disagree — integer ``/`` and ``%``, arithmetic on
-text, ordering against a text literal, which collations decide),
+(on the diff path not where Z3 and Postgres disagree — ``/`` and ``%``,
+arithmetic on text, ordering on text, which collations decide),
 AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
 by base and head). On the diff path a ``CASE``, or a ``COALESCE`` it cannot
-model exactly, is an opaque value too. Opaque values are text, so only a
-comparison with text translates. Anything else returns None and the caller
+model exactly, is an opaque value too. Opaque values are text: compared
+with something else they translate only through a cast. Anything else
+returns None and the caller
 falls through to ``requires_review``.
 
 A column's type is inferred from what it is compared with: against an
 integer literal it is an integer, so ``a >= 2`` and ``a > 1`` are
 equivalent — wrong for a ``numeric`` column, where 1.5 passes only the
-second. The diff compares policy text and does not see column types.
+second; and against a text literal it is text, so ``c = 'true'`` and
+``c <> 't'`` can both hold — wrong for a ``bool`` column (or ``uuid``,
+where case does not matter). The diff compares policy text and does not see
+column types.
 
 Type unification per column: the first comparison fixes the type.
 A subsequent reference with a conflicting type (e.g. ``col = 5``
@@ -62,6 +66,7 @@ so this is a defensive guardrail rather than a real limitation.
 from __future__ import annotations
 
 import math
+import re
 
 from collections.abc import Mapping, Sequence
 
@@ -541,7 +546,9 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
         if sort == z3.IntSort():
             row[name] = value.as_long()
         elif sort == z3.StringSort():
-            row[name] = value.as_string()
+            # `as_string` escapes a character outside the BMP as `\\u{…}`.
+            row[name] = re.sub(r"\\u\{([0-9a-fA-F]+)\}",
+                               lambda m: chr(int(m.group(1), 16)), value.as_string())
         elif sort == z3.BoolSort():
             row[name] = z3.is_true(value)
         elif sort == z3.RealSort():
@@ -1431,7 +1438,7 @@ def _anon_distinct(
     )
     if left is None or right is None or left.unset or right.unset:
         return None
-    if _unlike_sql("=", left.value, right.value):
+    if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session):
         return None
     try:
         differ = z3.Or(
@@ -1558,7 +1565,7 @@ def _anon_binop(
     if ctx.session_mode and op == "=":
         _record_tenant_pair(ctx, left, right)
 
-    if _unlike_sql(op, left.value, right.value):
+    if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session):
         return None
 
     if comparison_fn is not None:
@@ -1600,28 +1607,32 @@ def _anon_binop(
     return None  # unreachable (guarded above) — satisfies the type checker
 
 
-def _unlike_sql(op: str, left: Any, right: Any) -> bool:
+def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     """Whether Z3's reading of `left op right` would differ from Postgres's,
-    so the comparison must not be translated:
+    so the comparison must not be translated.
 
-    * a Bool against a non-Bool — an encoding artifact (a bare column
-      defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects;
+    On every path: a Bool against a non-Bool — an encoding artifact (a bare
+    column defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects.
+
+    On the diff path (`any_session`), where both predicates' readings must be
+    exact for an equivalence or an implication to hold, also:
+
     * arithmetic on a non-number — Z3's ``+`` on two strings concatenates;
-    * integer ``/`` and ``%`` — Postgres truncates toward zero, Z3 rounds
-      toward negative infinity (``-1 % 2`` is -1 in Postgres, 1 in Z3);
-    * ``<`` / ``>`` / ``<=`` / ``>=`` against a string literal — Postgres
-      orders text by its collation, Z3 by code point (``'B' < 'b'`` is FALSE
-      under en_US)."""
+    * ``/`` and ``%`` — Postgres truncates an integer quotient toward zero
+      (``-1 % 2`` is -1, Z3's is 1) and rounds a numeric one, Z3 is exact;
+    * ``<`` / ``>`` / ``<=`` / ``>=`` on text — Postgres orders it by
+      collation, Z3 by code point (``'B' < 'b'`` is FALSE under en_US), and
+      an equality elsewhere can pin either side to a literal."""
     sorts = (left.sort(), right.sort())
     if (sorts[0] == z3.BoolSort()) != (sorts[1] == z3.BoolSort()):
         return True
+    if not any_session:
+        return False
     if op in _ARITHMETIC_OPS:
         if not all(s in (z3.IntSort(), z3.RealSort()) for s in sorts):
             return True
-        return op in ("/", "%") and z3.IntSort() in sorts
-    return op in ("<", ">", "<=", ">=") and (
-        z3.is_string_value(left) or z3.is_string_value(right)
-    )
+        return op in ("/", "%")
+    return op in ("<", ">", "<=", ">=") and z3.StringSort() in sorts
 
 
 def _resolve_3vl_operands(

@@ -66,11 +66,13 @@ breaking changes — they will be called out in this file.
   NULL column (`{a=NULL}`). The same model ties an `IS NULL` test to its
   column, so `(col IS NOT NULL AND col = 5) OR b = 1` → `col = 5 OR b = 1`
   is no longer flagged as a loosening, and it also decides `IS [NOT]
-  DISTINCT FROM`. Where Z3 and Postgres disagree — integer `/` and `%`
-  (Postgres truncates), arithmetic on text, ordering against a text literal
-  (Postgres uses the collation), a `COALESCE` of bare columns — the
-  comparison now abstains instead of deciding wrongly, which also fixes a
-  false SEC038 on `COALESCE(level, tier) < 2 OR …`.
+  DISTINCT FROM`. Where Z3 and Postgres disagree — `/` and `%` (Postgres
+  truncates or rounds), arithmetic on text, ordering on text (Postgres uses
+  the collation), a `COALESCE` of bare columns compared with a non-text
+  value — the diff now abstains instead of deciding wrongly. A Bool
+  compared with a number is no longer coerced to 0 / 1 on any path, which
+  also fixes a false SEC038 on `COALESCE(level, tier) < 2 OR …`. A leaking
+  row holding a character outside the BMP prints it, not Z3's `\u{…}`.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

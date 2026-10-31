@@ -1330,7 +1330,7 @@ def test_diff_schemas_populates_counterexample_on_semantic_loosen() -> None:
     cx = loosened[0].counterexample
     assert cx is not None
     # Only real columns, and the row is a member of head ∖ base.
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     assert cx.get("tenant_id") in (2, 3)
 
 
