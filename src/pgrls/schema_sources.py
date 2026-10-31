@@ -375,7 +375,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
       An unqualified relation defaults to the first entry in `schemas`
       (``public`` by default), keyed on ``(schema, name)``.
     * ``ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`` → sets the table's
-      `rls_enabled` / `force_rls`.
+      `rls_enabled` / `force_rls`; ``ALTER TABLE … ATTACH / DETACH
+      PARTITION`` sets / clears the child's `partition_of` (the form
+      ``pg_dump`` writes partitions in). An ALTER on a view, sequence or other
+      non-table relation is ignored, and psql meta-command lines
+      (``\\restrict``) are skipped.
     * ``CREATE POLICY`` → a `Policy` (name, command, permissive vs
       ``AS RESTRICTIVE``, ``TO`` roles, and USING / WITH CHECK parsed into the
       ASTs `verify` and the AST rules need).
