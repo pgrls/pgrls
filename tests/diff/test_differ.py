@@ -1281,6 +1281,13 @@ def test_text_includes_leaking_row() -> None:
     assert "tenant_id=2" in out
 
 
+def test_text_prints_a_null_column_as_null() -> None:
+    from pgrls.diff.formatters import format_diff_text
+
+    c = dataclasses.replace(_loosened_change_with_cx(), counterexample={"a": None, "b": 1})
+    assert "{a=NULL, b=1}" in format_diff_text([c])
+
+
 def test_text_omits_leaking_row_when_absent() -> None:
     from pgrls.diff.formatters import format_diff_text
 

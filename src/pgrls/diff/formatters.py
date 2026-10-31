@@ -491,14 +491,15 @@ def _format_counterexample(cx: dict[str, object]) -> str:
     """Render a leaking-row counterexample as a copy-pasteable row literal.
 
     ``{v!r}`` gives ``'abc'`` for strings, ``5`` for ints, ``True`` for
-    bools, ``3.5`` for reals — unambiguous and round-trippable. An empty
+    bools, ``3.5`` for reals — unambiguous and round-trippable — and a
+    ``None`` (a column the leak needs NULL) prints ``NULL``. An empty
     dict can only be produced by the soundness gate when EVERY row leaks
     (``head ∧ ¬base`` is a tautology — e.g. an unsatisfiable base
     predicate), so "(any row)" is literally accurate there, not a guess.
     """
     if not cx:
         return "(any row — the old predicate rejected everything)"
-    parts = ", ".join(f"{k}={v!r}" for k, v in cx.items())
+    parts = ", ".join(f"{k}={'NULL' if v is None else repr(v)}" for k, v in cx.items())
     return f"{{{parts}}}"
 
 

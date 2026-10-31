@@ -456,24 +456,25 @@ def _row_satisfies_head_not_base(base_sql, head_sql, row) -> bool:
     pinning every reported column to its value keeps ``head ∧ ¬base``
     SAT — i.e. the row really is a member of ``head ∖ base``.
 
-    The pin var is fetched from the freshly-rebuilt context's
-    ``_vars`` so it is byte-identical to the variable already inside
-    ``h`` / ``b`` (same name + sort); no sort is guessed from the
-    Python value (which would mis-handle ``bool`` vs ``int``).
+    The pin var comes from the freshly-rebuilt context, so it is the
+    variable already inside ``h`` / ``b`` (same name + sort). A ``None``
+    pins the column NULL.
     """
-    from pgrls.diff._z3_compare import _Context, _to_z3
+    from pgrls.diff._z3_compare import _diff_truths
 
-    ctx = _Context()
-    base = parse_expr(base_sql)
-    head = parse_expr(head_sql)
-    b = _to_z3(base, ctx)
-    h = _to_z3(head, ctx)
+    truths = _diff_truths(parse_expr(base_sql), parse_expr(head_sql))
+    assert truths is not None
+    ctx, assertions, b, h = truths
     s = z3_solver.Solver()
-    s.add(z3_solver.And(h, z3_solver.Not(b)))
+    s.add(*assertions)
+    s.add(z3_solver.And(h.is_true, z3_solver.Not(b.is_true)))
     for key, val in row.items():
+        if val is None:
+            s.add(ctx.null_flag(key))
+            continue
         var = ctx.column(key, _py_value_sort(val))
         assert var is not None, f"reported column {key!r} not bindable"
-        s.add(var == val)
+        s.add(var == val, z3_solver.Not(ctx.null_flag(key)))
     return s.check() == z3_solver.sat
 
 
@@ -550,19 +551,14 @@ def test_no_counterexample_when_tightened():
     assert _counterexample("a = 1 OR a = 2", "a = 1") is None
 
 
-def test_no_counterexample_when_null_dependent_loosen():
-    # SOUNDNESS GATE (the critique's fatal case): base `active = true`,
-    # head `active = true OR deleted_at IS NULL` classifies loosened,
-    # but the leak hinges on `deleted_at IS NULL` — a synthetic NULL
-    # marker, not a column value. The real-column projection
-    # `{active: False}` does NOT leak on its own, so the emitter must
-    # return None (degrade to label-only) rather than a non-leaking row.
-    assert _classify("active = true", "active = true OR deleted_at IS NULL") == (
-        "semantic_loosened"
-    )
-    assert _counterexample(
-        "active = true", "active = true OR deleted_at IS NULL"
-    ) is None
+def test_null_dependent_loosen_names_the_null_column():
+    # The leak hinges on `deleted_at IS NULL`: `{active: False}` alone does
+    # not leak, so the row must say deleted_at is NULL too.
+    base, head = "active = true", "active = true OR deleted_at IS NULL"
+    assert _classify(base, head) == "semantic_loosened"
+    cx = _counterexample(base, head)
+    assert cx is not None and cx["deleted_at"] is None
+    assert _row_satisfies_head_not_base(base, head, cx)
 
 
 def test_no_counterexample_when_opaque_only_loosen():
@@ -952,35 +948,49 @@ def test_reserved_marker_prefix_column_cannot_alias_the_null_marker() -> None:
     assert _column_key(parse_expr("owner_id = 1").lexpr) == "owner_id"
 
 
-def test_null_marker_disconnection_is_a_documented_safe_limitation() -> None:
-    # CHARACTERIZATION of the deliberate NullTest limitation (module
-    # docstring): the IS NULL marker is modelled DISCONNECTED from the
-    # column's value var — a 2-valued approximation of Postgres 3VL.
-    #
-    # A faithful 2-valued linkage was attempted and rejected as UNSOUND
-    # under negation (z3.Not is 2-valued; Postgres `NOT (col = x)` is
-    # 3-valued — NULL when col is NULL), so it would only trade these
-    # over-reports for a new class of `NOT (...)` false alarms. A correct
-    # fix needs a full Kleene 3VL re-encoding of the diff path.
-    #
-    # `col IS NOT NULL AND col = x` is EQUIVALENT to `col = x` in Postgres
-    # (a value comparison already excludes NULL rows), but the disconnected
-    # marker over-reports it. Pinned so a future 3VL fix flips this
-    # deliberately, not by accident.
-    assert (
-        classify_via_z3(
-            parse_expr("active IS NOT NULL AND active = true"),
-            parse_expr("active = true"),
-        )
-        == "semantic_loosened"
-    )
-    assert (
-        classify_via_z3(
-            parse_expr("active = true"),
-            parse_expr("active IS NOT NULL AND active = true"),
-        )
-        == "semantic_tightened"
-    )
+def test_a_null_test_is_tied_to_its_columns_value() -> None:
+    # `col IS NOT NULL AND col = x` is EQUIVALENT to `col = x`: a value
+    # comparison already hides the NULL row. (The 2-valued model kept the
+    # IS NULL test apart from the column's value and called it loosened.)
+    assert classify_via_z3(
+        parse_expr("active IS NOT NULL AND active = true"),
+        parse_expr("active = true"),
+    ) == "semantic_equivalent"
+    assert classify_via_z3(
+        parse_expr("tenant_id = 1"),
+        parse_expr("tenant_id IS NOT NULL AND tenant_id = 1"),
+    ) == "semantic_equivalent"
+
+
+@pytest.mark.parametrize(("base", "head", "verdict"), [
+    # A predicate passes a row only when it is exactly TRUE; NULL hides it.
+    # `x OR NOT x`-style rewrites are not tautologies: they hide NULL rows.
+    ("(c OR false) = (d OR c)", "c OR false = d OR c", "semantic_loosened"),
+    ("a = 1 OR a <> 1", "true", "semantic_loosened"),
+    ("a = 1 OR NOT (a = 1)", "true", "semantic_loosened"),
+    ("x OR NOT x", "true", "semantic_loosened"),
+    ("true", "a > 1 OR a <= 1", "semantic_tightened"),
+    # `=` / `<>` are NULL on a NULL operand; IS [NOT] DISTINCT FROM never is.
+    ("c = d", "c IS NOT DISTINCT FROM d", "semantic_loosened"),
+    ("c IS NOT DISTINCT FROM d", "c = d", "semantic_tightened"),
+    ("c <> d", "c IS DISTINCT FROM d", "semantic_loosened"),
+    ("c IS DISTINCT FROM d", "NOT (c IS NOT DISTINCT FROM d)", "semantic_equivalent"),
+    ("a = 1", "a IS NOT DISTINCT FROM 1", "semantic_equivalent"),
+    # A boolean comparison nested in another.
+    ("(c = d) = e", "(c = d) IS NOT DISTINCT FROM e", "semantic_loosened"),
+    # BETWEEN is its AND of comparisons.
+    ("x BETWEEN 1 AND 5", "x >= 1 AND x <= 5", "semantic_equivalent"),
+    ("x NOT BETWEEN 1 AND 5", "x < 1 OR x > 5", "semantic_equivalent"),
+])
+def test_three_valued_classification(base: str, head: str, verdict: str) -> None:
+    assert _classify(base, head) == verdict
+
+
+def test_a_null_admitting_widening_names_the_null_row() -> None:
+    base, head = "a = 1 OR a <> 1", "true"
+    cx = _counterexample(base, head)
+    assert cx == {"a": None}
+    assert _row_satisfies_head_not_base(base, head, cx)
 
 
 def test_null_limitation_does_not_compromise_soundness() -> None:
@@ -994,15 +1004,17 @@ def test_null_limitation_does_not_compromise_soundness() -> None:
         classify_via_z3(parse_expr("col - 3 > 0"), parse_expr("col > 3"))
         == "semantic_equivalent"
     )
-    # A genuine NULL-admitting loosening is STILL flagged DANGEROUS — the
-    # coarse model never MISSES a real loosening (the safety-critical
-    # direction is intact):
+    # A genuine NULL-admitting loosening is flagged DANGEROUS, with the
+    # NULL row that leaks:
     assert (
         classify_via_z3(
             parse_expr("col = 5"), parse_expr("col = 5 OR col IS NULL")
         )
         == "semantic_loosened"
     )
+    assert counterexample(
+        parse_expr("col = 5"), parse_expr("col = 5 OR col IS NULL")
+    ) == {"col": None}
     # A genuine value loosening is flagged AND still yields the concrete
     # leaking row (col = 6 is the unique member of head \ base):
     assert (
@@ -1019,19 +1031,16 @@ def test_counterexample_empty_row_for_all_rows_leak() -> None:
     # every row, head admits all), the verifier's most important admit-case
     # is "every row leaks" — a sound EMPTY-projection witness. Pin the {}
     # return and the witness gate accepting the empty pin.
-    from pgrls.diff._z3_compare import (
-        _Context,
-        _row_is_sufficient_witness,
-        _to_z3,
-    )
+    from pgrls.diff._z3_compare import _diff_truths, _diff_witness_is_sufficient
 
     base = parse_expr("a IS NULL AND a IS NOT NULL")  # always false
     head = parse_expr("true")
     assert counterexample(base, head) == {}
-    ctx = _Context()
-    base_z3 = _to_z3(base, ctx)
-    head_z3 = _to_z3(head, ctx)
-    assert _row_is_sufficient_witness({}, base_z3, head_z3, ctx) is True
+    truths = _diff_truths(base, head)
+    assert truths is not None
+    ctx, assertions, b, h = truths
+    leaks = z3_solver.And(h.is_true, z3_solver.Not(b.is_true))
+    assert _diff_witness_is_sufficient({}, leaks, ctx, assertions) is True
 
 
 def test_counterexample_decodes_real_column_as_float() -> None:

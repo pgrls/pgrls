@@ -56,6 +56,16 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`pgrls diff` / `pgrls pr` compare predicates under SQL's three-valued
+  logic.** The Z3 comparison treated every column as non-NULL, so it called
+  predicates equivalent that differ on a row holding a NULL: `a = 1 OR
+  a <> 1` → `true`, or `(c OR false) = (d OR c)` → `c OR false = d OR c`,
+  newly admits such rows but was reported as no change. A predicate now
+  admits a row only when it is exactly TRUE — NULL hides a row as FALSE
+  does — so these are `DANGEROUS` loosenings, and the leaking row can name a
+  NULL column (`{a=NULL}`). The same model ties an `IS NULL` test to its
+  column, so `col IS NOT NULL AND col = x` → `col = x` is no longer flagged
+  as a loosening, and it also decides `IS [NOT] DISTINCT FROM`.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
