@@ -965,10 +965,6 @@ def _declaration_sections(
     return out
 
 
-def _line_of(body: str, tok: _Token) -> int:
-    return body.count("\n", 0, tok[1]) + 1
-
-
 def _type_edits(
     body: str, toks: list[_Token], scalars: frozenset[str] = frozenset(),
     keep: frozenset[str] = frozenset(),
@@ -1016,12 +1012,14 @@ def _type_edits(
 @dataclass(frozen=True)
 class _Parsed:
     """A PL/pgSQL parse whose ``DECLARE`` sections the parser confirmed:
-    `decls` maps (name, line) to the (start, end) of each declaration's text
-    in `body` — None for a name declared twice on one line."""
+    `decls` maps the name of the probe placed before each declaration
+    (``pgrls_probe_<n>``) to the (start, end) of that declaration's text in
+    `body` — the parser numbers variables in declaration order, so the
+    variables right after a probe are that declaration's."""
 
     tree: Any
     body: str
-    decls: dict[tuple[str | None, int], tuple[int, int] | None]
+    decls: dict[str, tuple[int, int]]
 
 
 def _confirmed_parse(
@@ -1115,8 +1113,12 @@ def _confirmed_parse(
     sections = _declaration_sections(body, toks)
     taken = set(re.findall(r"pgrls_probe_\d+", body))
     at: list[int] = []
+    starts: dict[int, tuple[int, int]] = {}
     for spans, closing in sections:
-        at.extend(toks[i][1] for i, _ in spans)
+        for i, end in spans:
+            if closing is not None:
+                starts[len(at)] = (toks[i][1], toks[end][1])
+            at.append(toks[i][1])
         if closing is not None:
             at.append(toks[closing][1])
     probes: dict[str, int] = {}
@@ -1137,14 +1139,7 @@ def _confirmed_parse(
     declared = {(f.get("refname"), int(f["lineno"])) for _, f in _datums(tree)}
     if any((name, line) not in declared for name, line in probes.items()):
         return ""
-    decls: dict[tuple[str | None, int], tuple[int, int] | None] = {}
-    for spans, closing in sections:
-        if closing is None:
-            continue
-        for i, end in spans:
-            key = (_ident(body, toks[i]), _line_of(body, toks[i]))
-            decls[key] = None if key in decls else (toks[i][1], toks[end][1])
-    return _Parsed(tree, body, decls)
+    return _Parsed(tree, body, {f"pgrls_probe_{n}": span for n, span in starts.items()})
 
 
 def _datums(tree: Any) -> list[tuple[str, dict[str, Any]]]:
@@ -1186,32 +1181,65 @@ def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     read from their confirmed declarations — pglast leaves them out
     (``record`` on both majors; on pglast 8 also every type it does not know:
     an enum, a domain, a composite), so their SQL would go unseen. None when
-    one cannot be read."""
+    one cannot be read.
+
+    Each record is matched to the declaration of the probe before it in the
+    parser's numbering: in a cursor declaration it is one of the cursor's
+    arguments, which take no default; otherwise it must be the variable
+    right after the probe, under the declaration's name. Any other record —
+    one whose declaration the scan did not find — cannot be read."""
     body = parsed.body
     loops = _loop_variables(parsed.tree)
     out: list[str] = []
-    for kind, rec in _datums(parsed.tree):
-        if kind != "PLpgSQL_rec":
-            continue
-        if rec.get("dno") is not None and int(rec["dno"]) in loops:
-            continue
-        key = (rec.get("refname"), int(rec["lineno"]))
-        span = parsed.decls.get(key)
-        if span is None:
-            return None
-        toks = _plpgsql_tokens(body[span[0]:span[1]])
-        if toks is None:
-            return None
-        text = body[span[0]:span[1]]
-        default = next((k for k, t in enumerate(toks)
-                        if text[t[1]:t[2]] == "="
-                        or (t[0] == "word" and text[t[1]:t[2]].lower() == "default")), None)
-        if default is None:
-            continue
-        if default + 1 >= len(toks):
-            return None
-        out.append(text[toks[default + 1][1]:])
+    probe: str | None = None
+    after = 0
+    for fn in parsed.tree if isinstance(parsed.tree, list) else ():
+        for dno, datum in enumerate((fn.get("PLpgSQL_function") or {}).get("datums") or ()):
+            for kind, rec in datum.items():
+                if not isinstance(rec, dict) or not rec.get("lineno"):
+                    continue
+                if re.fullmatch(r"pgrls_probe_\d+", str(rec.get("refname"))):
+                    # Every probe, the ones before a closing BEGIN too (no
+                    # declaration follows those).
+                    probe, after = str(rec.get("refname")), 0
+                    continue
+                after += 1
+                if kind != "PLpgSQL_rec" or dno in loops:
+                    continue
+                span = parsed.decls.get(probe) if probe is not None else None
+                if span is None:
+                    return None
+                text = body[span[0]:span[1]]
+                toks = _plpgsql_tokens(text)
+                if not toks:
+                    return None
+                if any(t[0] == "word" and text[t[1]:t[2]].lower() == "cursor"
+                       for t in toks[1:4]):
+                    continue  # an argument of the cursor declared there
+                if after > 1:
+                    return None
+                name = _ident(text, toks[0])
+                if name is None or name.encode()[:63].decode(errors="ignore") != rec.get("refname"):
+                    return None
+                default = _default_of(text, toks)
+                if default is None:
+                    return None
+                if default:
+                    out.append(default)
     return out
+
+
+def _default_of(text: str, toks: list[_Token]) -> str | None:
+    """The default expression of declaration `text` — ``""`` when it has
+    none, None when one is begun but empty."""
+    default = next((k for k, t in enumerate(toks)
+                    if text[t[1]:t[2]] == "="
+                    or (t[0] == "word" and text[t[1]:t[2]].lower() == "default")), None)
+    if default is None:
+        return ""
+    if default + 1 >= len(toks):
+        return None
+    return text[toks[default + 1][1]:]
 
 
 def _assignment_split(query: str) -> tuple[str, str] | None:

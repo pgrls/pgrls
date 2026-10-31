@@ -1413,10 +1413,29 @@ def test_option_dump_is_not_parsed_on_pglast_8() -> None:
 
 
 @pytest.mark.parametrize("body", [
-    # The same name declared twice on one line: which default is whose
-    # cannot be told apart.
+    # The same name declared twice on one line: each record is matched to
+    # its own declaration by the parser's numbering, not by name and line.
     "DECLARE r record; BEGIN DECLARE r record := (SELECT 1 FROM app.secret); BEGIN NULL; END; END",
     "DECLARE r record := (SELECT 1 FROM app.secret); BEGIN DECLARE r int; BEGIN NULL; END; END",
+    # A name past 63 bytes, which Postgres truncates; a loop and an inner
+    # block reuse it.
+    f"DECLARE {'i' * 70} record := (SELECT v FROM app.secret LIMIT 1); "
+    f"BEGIN FOR {'i' * 70} IN 1..1 LOOP END LOOP; END",
+    f"DECLARE {'r' * 64} record := (SELECT v FROM app.secret LIMIT 1); "
+    f"BEGIN DECLARE {'r' * 63} record; BEGIN NULL; END; END",
+])
+def test_a_record_default_is_read_by_its_declaration(body: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+@pytest.mark.parametrize("body", [
     # A stray `declare` the parse does not confirm.
     "DECLARE r record := (SELECT 1 FROM app.secret); v int; BEGIN "
     "SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM cfg; r := r; END",
@@ -1430,9 +1449,12 @@ def test_option_dump_is_not_parsed_on_pglast_8() -> None:
     "BEGIN FOR i IN 1..1 LOOP END LOOP; END",
     "#variable_conflict use_column\nDECLARE c CURSOR FOR SELECT 1; "
     "i record := (SELECT v FROM app.secret LIMIT 1); BEGIN FOR i IN c LOOP END LOOP; END",
-    # A name past 63 bytes, which Postgres truncates.
-    f"DECLARE {'i' * 70} record := (SELECT v FROM app.secret LIMIT 1); "
-    f"BEGIN FOR {'i' * 70} IN 1..1 LOOP END LOOP; END",
+    # ... or an inner block declaring the same name on its line.
+    "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN DECLARE r record; BEGIN NULL; END; END",
+    # ... or after a cursor, whose arguments are records too.
+    "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN DECLARE c CURSOR (a int) FOR SELECT a; BEGIN NULL; END; END",
 ])
 def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
     from pgrls.access import _plpgsql_statements  # noqa: PLC0415
