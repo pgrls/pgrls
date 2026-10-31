@@ -1732,6 +1732,15 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("\\connect -reuse-previous=on \"dbname=d client_encoding=SJIS\"\n", "psql command"),
     ("\\connect dbname=d\n", "psql command"),
     ("\\connect d app otherhost\n", "psql command"),
+    # psql reads a line to its LF: the rest after a CR is the command's.
+    ("CREATE TABLE t (id int);\n\\echo hi\rALTER TABLE t ENABLE ROW LEVEL SECURITY;\n",
+     "psql command"),
+    # `:USER` lexes as a keyword, and psql replaces it all the same.
+    ("\\echo x\nSELECT (ARRAY[1, 2])[1:USER];\n", "its own variable"),
+    ("\\encoding LATIN1\nCREATE TABLE t (id int);\n", "psql command"),
+    # psql rolls an open transaction back when it reconnects.
+    ("CREATE DATABASE d;\n\\connect d\nCREATE TABLE t (id int);\nBEGIN;\n"
+     "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n\\connect d\n", "open transaction"),
 ])
 def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
@@ -1760,6 +1769,29 @@ def test_a_psql_line_inside_a_string_is_not_skipped(sql):
     assert tables == ["hidden"]
 
 
+def test_a_sql_file_keeps_a_lone_cr(tmp_path):
+    # Read with universal newlines, `\\echo hi\rALTER …` became two lines
+    # and the ALTER, which psql never runs, was linted.
+    from pgrls.cli import main
+
+    sql = tmp_path / "cr.sql"
+    sql.write_bytes(b"CREATE TABLE t (id int);\n\\echo hi\rALTER TABLE t ENABLE ROW LEVEL SECURITY;\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "psql command" in res.output, res.output
+    sql.write_bytes(b"CREATE TABLE t (id int);\r\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\r\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--format", "json"])
+    assert res.exit_code in (0, 1), res.output
+
+
+def test_a_sql_file_that_is_not_utf8_is_a_tool_error(tmp_path):
+    from pgrls.cli import main
+
+    sql = tmp_path / "latin1.sql"
+    sql.write_bytes('CREATE TABLE "\u00e9" (id int);\n'.encode("latin-1"))
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "cannot read" in res.output, res.output
+
+
 def test_a_skipped_line_must_lie_between_tokens():
     # Whatever the line splitter decides, a blanked line Postgres's lexer
     # reads as inside a string is refused.
@@ -1785,6 +1817,13 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("SELECT set_config('client_encoding', current_setting('x'), false);\n", True),
     ("SELECT set_config(current_setting('x'), 'off', false);\n", "set_config"),
     ("SELECT pg_catalog.set_config('search_path', '', false);\n", False),
+    # Under any encoding but UTF-8 / SQL_ASCII a non-ASCII character is read
+    # as others (`é` as `Ã©` under LATIN1).
+    ("SET client_encoding = 'LATIN1';\nCREATE TABLE \"\u00e9\" (id int);\n", True),
+    ("SET client_encoding = 'SQL_ASCII';\nCREATE TABLE \"\u00e9\" (id int);\n", False),
+    # A rule on pg_settings sets what it names.
+    ("UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\n",
+     "pg_settings"),
     ("SET client_encoding = 'UTF8';\n", False),
     ("SET client_encoding = 'LATIN1';\n", False),
     ("SET standard_conforming_strings = on;\n", False),
@@ -1799,11 +1838,11 @@ def test_a_setting_that_changes_how_strings_read_is_refused(sql, refused):
 
     sql += "CREATE TABLE t (id int);\n"
     if refused:
-        why = refused if isinstance(refused, str) else "reads strings differently"
+        why = refused if isinstance(refused, str) else "reads its text differently"
         with pytest.raises(SchemaSourceError, match=why):
             schema_from_sql(sql)
     else:
-        assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+        assert "t" in [t.name for t in schema_from_sql(sql).tables]
 
 
 def test_harmless_psql_commands_are_skipped():

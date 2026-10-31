@@ -45,6 +45,7 @@ from pglast.enums.parsenodes import (
     GrantTargetType,
     ObjectType,
     RoleSpecType,
+    TransactionStmtKind,
 )
 from pglast.stream import RawStream
 
@@ -404,7 +405,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
     # are not SQL; each is blanked so offsets into `sql` still hold.
     sql, commands = _split_psql_meta_commands(sql)
-    connect = _check_psql_meta_commands(commands)
+    connects = _check_psql_meta_commands(commands)
+    connect = connects[0] if connects else None
     try:
         statements = pglast.parse_sql(sql)
         if commands:
@@ -414,11 +416,35 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             "bad_sql",
             f"could not parse the provided SQL: {exc}.",
         ) from exc
-    _check_lexer_settings(statements)
+    _check_lexer_settings(statements, non_ascii=not sql.isascii())
+
+    def end(raw: Any) -> int:
+        # Where the statement ends: its start can include the gap before it.
+        return (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)
+
+    # Whether a transaction is open after each statement: psql rolls one
+    # back when it reconnects.
+    in_transaction, states = False, []
+    for raw in statements:
+        if isinstance(raw.stmt, _pgast.TransactionStmt):
+            if raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
+                                 TransactionStmtKind.TRANS_STMT_START):
+                in_transaction = True
+            elif raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
+                                   TransactionStmtKind.TRANS_STMT_ROLLBACK,
+                                   TransactionStmtKind.TRANS_STMT_PREPARE):
+                in_transaction = bool(raw.stmt.chain)
+        states.append((end(raw), in_transaction))
+    for c in connects:
+        if [state for e, state in states if e < c][-1:] == [True]:
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL \\connects inside an open transaction, which psql "
+                "rolls back; pgrls cannot tell what was kept.",
+            )
 
     if connect is not None and any(
-        # Where the statement ends: its start can include the gap before it.
-        ((raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)) < connect
+        end(raw) < connect
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
              or getattr(raw.stmt, "intoClause", None) is not None)  # SELECT … INTO
         for raw in statements
@@ -904,6 +930,10 @@ _UNSAFE_CLIENT_ENCODINGS = frozenset({
     "big5", "win950", "windows950", "gbk", "win936", "windows936", "cp936",
     "gb18030", "uhc", "win949", "windows949", "cp949", "johab",
 })
+# Client encodings under which Postgres reads the UTF-8 text pgrls reads as
+# pgrls does (SQL_ASCII converts nothing). Under any other, a non-ASCII
+# character is read as other characters (`é` as `Ã©` under LATIN1).
+_UTF8_ENCODINGS = frozenset({"utf8", "unicode", "sqlascii"})
 # Statements `pg_dump --create` writes before its `\\connect`.
 _DATABASE_LEVEL_STATEMENTS = frozenset({
     "VariableSetStmt", "SelectStmt", "CreatedbStmt", "AlterDatabaseStmt",
@@ -912,10 +942,9 @@ _DATABASE_LEVEL_STATEMENTS = frozenset({
 })
 
 
-def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
+def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     """Refuse the meta-commands pgrls cannot model (raising
-    `SchemaSourceError`); the offset of the first `\\connect`, if any — every
-    one must name the same database (pg_dump --create repeats it after the
+    `SchemaSourceError`); the offset of each `\\connect` — every one must name the same database (pg_dump --create repeats it after the
     database's settings), since pg_dumpall writes one per database, whose
     schemas must not merge.
 
@@ -947,10 +976,11 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
         )):
             target = c.group(1) or c.group(2)
         known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
-            name == "encoding" and re.fullmatch(r"[A-Za-z0-9_-]+", rest) is not None
-            and re.sub(r"[^a-z0-9]", "", rest.lower()) not in _UNSAFE_CLIENT_ENCODINGS
+            name == "encoding"
+            and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
         )
-        if m is None or "\\" in rest or "`" in rest or not known:
+        # psql reads a line to its LF: a CR is part of the command's arguments.
+        if m is None or "\\" in rest or "`" in rest or "\r" in rest or not known:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "
@@ -964,7 +994,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
             "the SQL connects to more than one database (pg_dumpall output); "
             "dump each database with pg_dump and lint each file.",
         )
-    return connects[0][0] if connects else None
+    return [offset for offset, _ in connects]
 
 
 def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
@@ -987,8 +1017,8 @@ def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
             )
     for colon, name in zip(tokens, tokens[1:]):
         text = sql[name.start:name.end + 1].strip("'\"")
+        # `:USER` lexes as a keyword, not an identifier.
         if (colon.name == "ASCII_58" and name.start == colon.end + 1
-                and name.name in ("IDENT", "SCONST")
                 and re.fullmatch(r"[A-Z][A-Z0-9_]*", text)):
             raise SchemaSourceError(
                 "bad_sql",
@@ -998,16 +1028,25 @@ def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
             )
 
 
-def _check_lexer_settings(statements: Any) -> None:
+def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
     """Refuse SQL that sets what changes how Postgres reads the strings after
     it — a client encoding whose characters can hold a quote or backslash
     byte, or `standard_conforming_strings` off — by `SET`, `ALTER DATABASE /
     ROLE … SET` (which a `\\connect` brings in) or `set_config()`. pgrls
     reads the SQL as UTF-8 with standard strings, so it would end strings
-    where Postgres does not. A setting changed by code (a `DO` block, a
-    function) is not seen."""
+    where Postgres does not. With `non_ascii`, any client encoding but UTF-8
+    or SQL_ASCII is refused: Postgres reads those characters as others.
+    `UPDATE pg_settings` is refused too. A setting changed by code (a `DO`
+    block, a function) is not seen."""
     for raw in statements:
         for node in _subnodes(raw.stmt):
+            if (isinstance(node, _pgast.UpdateStmt) and node.relation is not None
+                    and node.relation.relname == "pg_settings"):
+                raise SchemaSourceError(
+                    "bad_sql",
+                    "the SQL updates pg_settings, which changes settings pgrls "
+                    "cannot follow.",
+                )
             if isinstance(node, _pgast.VariableSetStmt) and node.args:
                 name, arg = node.name, node.args[0]
             elif (isinstance(node, _pgast.FuncCall)
@@ -1027,9 +1066,11 @@ def _check_lexer_settings(statements: Any) -> None:
                 continue
             val = arg.val if isinstance(arg, _pgast.A_Const) else None
             value = str(getattr(val, "sval", None) or getattr(val, "ival", "")).lower()
+            encoding = re.sub(r"[^a-z0-9]", "", value)
             unsafe = val is None or (
                 name == "client_encoding"
-                and re.sub(r"[^a-z0-9]", "", value) in _UNSAFE_CLIENT_ENCODINGS
+                and (encoding in _UNSAFE_CLIENT_ENCODINGS
+                     or (non_ascii and encoding not in _UTF8_ENCODINGS))
             ) or (
                 name == "standard_conforming_strings"
                 and not (value in ("on", "1") or (value and ("true".startswith(value)
@@ -1039,8 +1080,8 @@ def _check_lexer_settings(statements: Any) -> None:
                 raise SchemaSourceError(
                     "bad_sql",
                     f"the SQL sets {name} to {value or 'a computed value'!r}, under "
-                    "which Postgres reads strings differently from how pgrls "
-                    "reads them.",
+                    "which Postgres reads its text differently from how pgrls "
+                    "reads it (as UTF-8 with standard strings).",
                 )
 
 

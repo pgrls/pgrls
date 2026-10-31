@@ -986,9 +986,11 @@ def _resolve_offline_schema(
                 chunk = sys.stdin.read()
             else:
                 try:
-                    with open(entry, encoding="utf-8") as fh:
+                    # newline="": psql reads a line to its LF, so a lone CR
+                    # must reach the meta-command check as it is.
+                    with open(entry, encoding="utf-8", newline="") as fh:
                         chunk = fh.read()
-                except OSError as exc:
+                except (OSError, UnicodeDecodeError) as exc:
                     raise ToolError(
                         f"cannot read --sql-file {entry!r}: {exc}"
                     ) from exc
