@@ -1296,6 +1296,357 @@ def test_a_plpgsql_body_is_traced_statement_by_statement() -> None:
     assert m.untraced == ()
 
 
+def test_a_plpgsql_body_with_schema_qualified_types_is_traced() -> None:
+    # pglast 8's PL/pgSQL parser resolves a qualified type only in pg_catalog
+    # / public; pg_get_functiondef qualifies a parameter / return type outside
+    # the search_path (a DECLARE type is as written). The types are dropped
+    # before parsing; the statements the body runs are unchanged.
+    body = """CREATE OR REPLACE FUNCTION public.f(p app.status)
+ RETURNS SETOF app.t LANGUAGE plpgsql SECURITY DEFINER
+AS $function$
+DECLARE
+  u auth.users;
+BEGIN
+  SELECT * INTO u FROM public.a;
+  RETURN QUERY SELECT * FROM public.t;
+END $function$"""
+    f = _f("<body>", owner="own", lang="plpgsql", definition=body)
+    m = build_matrix(_s([_t("a"), _t("t")], fns=[f], roles=[_r("app"), _r("own")]),
+                     roles=("app",))
+    assert _cell(m, "public.a", "SELECT", "app").verdict == "open"
+    assert _cell(m, "public.t", "SELECT", "app").verdict == "open"
+    assert m.untraced == ()
+
+
+_QUALIFIED_HEAD = ("CREATE FUNCTION public.f(p app.t) RETURNS void LANGUAGE plpgsql "
+                   "SECURITY DEFINER AS $x$")
+
+
+@pytest.mark.parametrize(("body", "statements"), [
+    # A `declare` that cannot start a block — a column, a table, a function,
+    # a dollar-quoted string — opens no DECLARE section: statements keep
+    # their schema.
+    ("BEGIN PERFORM 1 FROM app.secret s WHERE s.declare = 1; UPDATE app.secret SET v = 1; END",
+     ["SELECT 1 FROM app.secret AS s WHERE s.declare = 1", "UPDATE app.secret SET v = 1"]),
+    ("BEGIN PERFORM x.declare FROM app.a x; TRUNCATE app.secret; END",
+     ["SELECT x.declare FROM app.a AS x", "TRUNCATE TABLE app.secret"]),
+    ("BEGIN PERFORM app.declare(); CALL app.proc(); END",
+     ["SELECT app.declare()", "CALL app.proc()"]),
+    ("BEGIN PERFORM $é$ declare $é$; UPDATE app.secret SET v = 1; END",
+     ["SELECT ' declare '", "UPDATE app.secret SET v = 1"]),
+    ("DECLARE w app.secret.v%TYPE; BEGIN SELECT v INTO w FROM app.secret; END",
+     ["SELECT v FROM app.secret"]),
+])
+def test_qualified_types_never_change_a_statement(body: str, statements: list[str]) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(f"{_QUALIFIED_HEAD}{body}$x$")
+    assert incomplete is None
+    assert [RawStream()(s) for s in stmts] == statements
+
+
+@pytest.mark.parametrize("decls", [
+    "m public.mood := (SELECT v::public.mood FROM app.secret LIMIT 1);",
+    "r record := (SELECT 1 FROM app.secret);",
+    "m mood\n    DEFAULT (SELECT v FROM app.secret LIMIT 1);",
+    # The name also appears, earlier on the line, in another default.
+    "a text := m; m mood := (SELECT v FROM app.secret);",
+    "a int := (SELECT begin FROM app.b); m mood := (SELECT v FROM app.secret);",
+    '"M" mood := (SELECT v FROM app.secret);',
+])
+def test_a_record_default_is_read_from_the_source(decls: str) -> None:
+    # pglast leaves a record variable's default out of the parse (`record`
+    # on both majors; on pglast 8 also any type it does not know, measured),
+    # so it is read from the declaration instead.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x$\n"
+        f"DECLARE\n  {decls}\nBEGIN NULL; END$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+@pytest.mark.parametrize(("body", "statement"), [
+    # A column named `declare` after THEN, or after an identifier named
+    # `loop`, is no DECLARE section — even when a loop variable or a schema
+    # shares the name the scan takes for a declaration. The rewrite (pglast
+    # 8) must not strip the schema from a statement: the body is read as
+    # written or not at all.
+    ("DECLARE update int; v int;\nBEGIN\n"
+     "  SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM public.cfg;\n"
+     "  UPDATE app.secret SET s = 'x';\nEND",
+     "UPDATE app.secret SET s = 'x'"),
+    ('DECLARE n int;\nBEGIN\n  FOR "from" IN 1..1 LOOP SELECT loop declare FROM app.secret '
+     "INTO n; BEGIN NULL; END; END LOOP;\nEND",
+     "SELECT loop AS declare FROM app.secret"),
+    ("BEGIN PERFORM loop declare FROM alias.secret; BEGIN NULL; END; END",
+     "SELECT loop AS declare FROM alias.secret"),
+])
+def test_a_declare_inside_sql_never_rewrites_a_statement(body: str, statement: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(f"{_QUALIFIED_HEAD}{body}$x$")
+    if incomplete != _PLPGSQL_UNPARSEABLE:
+        assert statement in [RawStream()(s) for s in stmts]
+
+
+def test_option_dump_is_not_parsed_on_pglast_8() -> None:
+    # pglast 8 prints the function's tree to stdout for `#option dump`.
+    import pglast  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    _, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f() RETURNS int LANGUAGE plpgsql AS $x$#option dump\n"
+        "BEGIN RETURN 1; END$x$")
+    if pglast.__version__.startswith("v7"):
+        assert incomplete is None
+    else:
+        assert incomplete is not None and "#option dump" in incomplete
+
+
+@pytest.mark.parametrize("body", [
+    # The same name declared twice on one line: each record is matched to
+    # its own declaration by the parser's numbering, not by name and line.
+    "DECLARE r record; BEGIN DECLARE r record := (SELECT 1 FROM app.secret); BEGIN NULL; END; END",
+    "DECLARE r record := (SELECT 1 FROM app.secret); BEGIN DECLARE r int; BEGIN NULL; END; END",
+    # A name past 63 bytes, which Postgres truncates; a loop and an inner
+    # block reuse it.
+    f"DECLARE {'i' * 70} record := (SELECT v FROM app.secret LIMIT 1); "
+    f"BEGIN FOR {'i' * 70} IN 1..1 LOOP END LOOP; END",
+    f"DECLARE {'r' * 64} record := (SELECT v FROM app.secret LIMIT 1); "
+    f"BEGIN DECLARE {'r' * 63} record; BEGIN NULL; END; END",
+    # A type named `cursor` (a record on pglast 8) is no cursor declaration.
+    "DECLARE x public.cursor := (SELECT ROW(v)::public.cursor FROM app.secret LIMIT 1); "
+    "BEGIN NULL; END",
+    "DECLARE x CONSTANT cursor := (SELECT ROW(v)::cursor FROM app.secret LIMIT 1); "
+    "BEGIN NULL; END",
+    "DECLARE c NO SCROLL CURSOR (a mood) FOR SELECT a; "
+    "x public.cursor := (SELECT ROW(v)::cursor FROM app.secret LIMIT 1); BEGIN NULL; END",
+    # A line comment ends at a CR too, as Postgres scans it.
+    "DECLARE\n  r --\r record := (SELECT v FROM app.secret LIMIT 1); y int\n  = 1;\nBEGIN NULL; END",
+    "DECLARE\n  r --\r record NOT NULL DEFAULT (SELECT v FROM app.secret LIMIT 1); y int\n"
+    "  = 1;\nBEGIN NULL; END",
+])
+def test_a_record_default_is_read_by_its_declaration(body: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+@pytest.mark.parametrize("body", [
+    # A stray `declare` the parse does not confirm.
+    "DECLARE r record := (SELECT 1 FROM app.secret); v int; BEGIN "
+    "SELECT CASE WHEN true THEN declare ELSE 0 END INTO v FROM cfg; r := r; END",
+    # A section the scan misses (after a compiler option), with a later loop
+    # over the same name on its line.
+    "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN FOR r IN SELECT 1 LOOP END LOOP; END",
+    # The same, with an integer or a cursor loop over the same name on its
+    # line: that loop's variable is not the declared record.
+    "#variable_conflict use_column\nDECLARE i record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN FOR i IN 1..1 LOOP END LOOP; END",
+    "#variable_conflict use_column\nDECLARE c CURSOR FOR SELECT 1; "
+    "i record := (SELECT v FROM app.secret LIMIT 1); BEGIN FOR i IN c LOOP END LOOP; END",
+    # ... or an inner block declaring the same name on its line.
+    "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN DECLARE r record; BEGIN NULL; END; END",
+    # ... or after a cursor, whose arguments are records too.
+    "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN DECLARE c CURSOR (a int) FOR SELECT a; BEGIN NULL; END; END",
+])
+def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    _, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is not None and "declaration could not be read" in incomplete
+
+
+@pytest.mark.parametrize("body", [
+    "DECLARE arr int[]; BEGIN arr[(SELECT id FROM app.secret LIMIT 1)] := 7; END",
+    # Split at the first `:=` / `=` outside brackets and strings.
+    "DECLARE v interval; BEGIN v = make_interval(days := (SELECT n FROM app.secret)); END",
+    "DECLARE a int[]; BEGIN a[(SELECT ':=' FROM app.secret)::int] := 1; END",
+    # A repeated DECLARE inside a declare section.
+    "DECLARE x int := 1;\nDECLARE y mood := (SELECT 1 FROM app.secret);\nBEGIN NULL; END",
+    # A cursor loop's implicit record has no default; an ALIAS declares none.
+    "DECLARE c CURSOR FOR SELECT * FROM app.secret; BEGIN FOR r IN c LOOP NULL; END LOOP; END",
+    "DECLARE a ALIAS FOR $1; m mood := (SELECT v FROM app.secret); BEGIN NULL; END",
+])
+def test_plpgsql_sql_outside_statements_is_read(body: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f(p int) RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+def test_an_unknown_typed_out_parameter_is_read() -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f(OUT tok text, OUT s app.status) LANGUAGE plpgsql AS "
+        "$x$BEGIN SELECT token, status INTO tok, s FROM app.secret; END$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+@pytest.mark.parametrize("head", [
+    "public.f(OUT o app.mood) RETURNS app.mood",
+    "public.f(OUT o app.mood) RETURNS SETOF app.mood",
+    "public.f(INOUT o app.mood) RETURNS app.mood",
+    # An OUT parameter left as it is keeps its result type.
+    "public.f(OUT o text[], VARIADIC xs text[]) RETURNS text[]",
+    "public.f(OUT o text[], p app.mood) RETURNS SETOF text[]",
+])
+def test_a_retyped_single_out_parameter_keeps_its_result_type(head: str) -> None:
+    # A single OUT / INOUT parameter is the result type, so retyping it to
+    # text retypes the result too (pg_get_functiondef always prints RETURNS).
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION {head} LANGUAGE plpgsql AS $x$DECLARE w int;\n"
+        "BEGIN SELECT a, b INTO w, o FROM app.secret; END$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+@pytest.mark.parametrize("head", [
+    "public.f(INOUT r app.pair)",
+    "public.f(p app.pair) RETURNS void",
+    "public.f() RETURNS void",
+])
+def test_a_composite_with_an_assigned_field_keeps_its_type(head: str) -> None:
+    # Every plain-typed variable becomes text for a multi-target INTO (pglast
+    # 8) — except one whose field the body assigns.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    import pglast  # noqa: PLC0415
+
+    # A label-qualified field (`o.c.b`) keeps its variable too — pglast 7
+    # cannot assign a declared unknown composite's field at all.
+    var, decl = (("r", "") if "INOUT" in head else ("p", "") if "app.pair" in head
+                 else ("o.c", " c app.pair;"))
+    if decl and pglast.__version__.startswith("v7"):
+        pytest.skip("pglast 7 rejects a field assignment on an unknown composite")
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION {head} LANGUAGE plpgsql AS $x$<<o>> DECLARE s app.status; t text;"
+        f"{decl}\nBEGIN SELECT x.status, x.token INTO s, t FROM app.secret x; {var}.b := t;\n"
+        "DELETE FROM app.audit WHERE msg = t; END$x$")
+    assert incomplete is None
+    rendered = [RawStream()(s) for s in stmts]
+    assert any("app.secret" in r for r in rendered)
+    assert any("app.audit" in r for r in rendered)
+
+
+def test_a_cursor_sharing_a_retyped_name_keeps_its_query() -> None:
+    # Only a plain type becomes `text`: a cursor of the same name keeps its
+    # declaration, so `FOR r IN values(1)` still reads app.secret.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x$\n"
+        "DECLARE r record; n int;\nBEGIN\n"
+        "  DECLARE values public.app_role;\n"
+        "  BEGIN SELECT org_id, role INTO n, values FROM public.members; END;\n"
+        "  DECLARE values CURSOR (k int) FOR SELECT * FROM app.secret WHERE id = k;\n"
+        "  BEGIN FOR r IN values(1) LOOP NULL; END LOOP; END;\nEND$x$")
+    if incomplete is None:
+        assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
+def test_a_variadic_plpgsql_function_is_traced() -> None:
+    # pglast 8's PL/pgSQL parser rejects every VARIADIC parameter.
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        "CREATE FUNCTION public.f(VARIADIC a integer[]) RETURNS void LANGUAGE plpgsql "
+        "AS $x$BEGIN PERFORM 1 FROM app.v; END$x$")
+    assert incomplete is None
+    assert [RawStream()(s) for s in stmts] == ["SELECT 1 FROM app.v"]
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    ("DECLARE u auth.users; BEGIN END", "DECLARE u users; BEGIN END"),
+    ('DECLARE "U" CONSTANT "auth"."users" := NULL; BEGIN END',
+     'DECLARE "U" CONSTANT "users" := NULL; BEGIN END'),
+    # A default expression, a string and a comment are never touched.
+    ("DECLARE s app.st := 'x'::app.st; BEGIN END", "DECLARE s st := 'x'::app.st; BEGIN END"),
+    ("DECLARE s text := E'\\'; DECLARE x app.t'; BEGIN END", None),
+    ("DECLARE /* u app.t; */ n int; BEGIN END", None),
+    # A nested block's DECLARE section too; statements are left alone.
+    ("BEGIN PERFORM 1 FROM app.t; DECLARE d app.t; BEGIN NULL; END; END",
+     "BEGIN PERFORM 1 FROM app.t; DECLARE d t; BEGIN NULL; END; END"),
+    ("<<outer>> DECLARE d app.t; BEGIN NULL; END", "<<outer>> DECLARE d t; BEGIN NULL; END"),
+])
+def test_type_edits(body: str, expected: str | None) -> None:
+    from pgrls.access import _plpgsql_tokens, _type_edits  # noqa: PLC0415
+
+    toks = _plpgsql_tokens(body)
+    assert toks is not None
+    edits = _type_edits(body, toks)
+    for start, stop, text in reversed(edits):
+        body = body[:start] + text + body[stop:]
+    assert (body if edits else None) == expected
+
+
+@pytest.mark.parametrize("body", [
+    # pglast 8 takes a variable of a type it does not know for a record, which
+    # cannot be one of several INTO targets (measured).
+    "DECLARE v_id uuid; v_role app_member_role; BEGIN "
+    "SELECT id, role INTO v_id, v_role FROM app.secret WHERE user_id = auth.uid(); END",
+    "DECLARE v_id uuid; v_role app.member_role := 'a'; c refcursor; BEGIN "
+    "FETCH c INTO v_id, v_role; PERFORM 1 FROM app.secret; END",
+    "DECLARE n app_dom; BEGIN UPDATE app.secret SET v = 1; GET DIAGNOSTICS n = ROW_COUNT; END",
+    # Postgres folds only ASCII letters.
+    "DECLARE \u00c4rger app_mood := (SELECT mood FROM app.secret LIMIT 1); BEGIN NULL; END",
+    # First of several targets: the error names no variable.
+    "DECLARE v_role app_role; v_org uuid; BEGIN "
+    "SELECT role, org_id INTO v_role, v_org FROM app.secret WHERE user_id = auth.uid(); END",
+    "<<o>> DECLARE v app_role; w int; BEGIN SELECT 1, 'a' INTO w, o.v FROM app.secret; END",
+    "DECLARE r record; v app_role; w int; BEGIN SELECT role, 1 INTO v, w FROM app.m; "
+    "FOR r IN SELECT * FROM app.secret LOOP NULL; END LOOP; END",
+    # …and as the first of several FOR targets, a bare syntax error.
+    "DECLARE r app_role; o uuid; BEGIN FOR r, o IN SELECT m.role, m.org_id FROM app.secret m "
+    "LOOP NULL; END LOOP; END",
+])
+def test_an_unknown_typed_variable_is_read_on_either_major(body: str) -> None:
+    from pglast.stream import RawStream  # noqa: PLC0415
+
+    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+
+    stmts, incomplete = _plpgsql_statements(
+        f"CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql AS $x${body}$x$")
+    assert incomplete is None
+    assert any("app.secret" in RawStream()(s) for s in stmts)
+
+
 def test_dynamic_sql_is_listed_but_the_static_part_still_counts() -> None:
     body = """CREATE FUNCTION public.f() RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $x$
 BEGIN
@@ -3490,6 +3841,32 @@ def _fn(qname: str, *, owner: str = "own", body: str | None = "SELECT 1",
                         search_path=search_path, atomic=atomic, body=body)
 
 
+@pytest.mark.parametrize("body", [
+    "BEGIN PERFORM 1 FROM app.t; END",
+    "BEGIN RETURN (SELECT x FROM app.t LIMIT 1); END",
+    "BEGIN RETURN QUERY SELECT x FROM app.t; END",
+    "BEGIN RETURN NEXT (SELECT x FROM app.t LIMIT 1); END",
+    "BEGIN PERFORM 1 FROM app.t; RETURN NEXT; END",
+    "BEGIN NEW.tenant := (SELECT x FROM app.t LIMIT 1); RETURN NEW; END",
+    "DECLARE u auth.users; BEGIN SELECT * INTO u FROM app.t; RETURN u.id; END",
+])
+def test_plpgsql_body_is_read_whatever_it_returns(body: str) -> None:
+    # Only prosrc is captured, and the PL/pgSQL parser checks RETURN against
+    # the declared return type, so each shape needs a matching wrapper.
+    from pgrls.matrix_proof import _body_statements_of, _has_node_in  # noqa: PLC0415
+
+    stmts = _body_statements_of(_fn("app.helper", body=body, language="plpgsql"))
+    assert stmts is not None
+    assert any(_has_node_in(s, lambda n: getattr(n, "relname", None) == "t") for s in stmts)
+
+
+def test_plpgsql_body_that_does_not_parse_is_unknown() -> None:
+    from pgrls.matrix_proof import _body_statements_of  # noqa: PLC0415
+
+    assert _body_statements_of(_fn("app.helper", body="BEGIN SELEC 1; END",
+                                   language="plpgsql")) is None
+
+
 # A helper keyed on current_user, which a login session cannot forge — so the
 # schema-changing gates are what stands between it and PROVEN.
 _SAFE_BODY = "SELECT tenant FROM app.users WHERE name = current_user"
@@ -4709,3 +5086,21 @@ def test_live_a_request_header_policy_is_not_proven_but_a_tenant_setting_is(
             cur.execute("DROP TABLE IF EXISTS public.hdr_e, public.hdr_d")
             cur.execute("DROP OWNED BY pgrls_pm_auth")
         drop()
+
+
+def test_a_parser_that_returns_invalid_json_is_unparseable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # pglast 8.3 / 8.4 return invalid JSON from parse_plpgsql for a trigger
+    # function (excluded from the pin; still never a crash).
+    import json
+
+    import pglast
+
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements
+
+    def broken(_sql: str) -> object:
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+    monkeypatch.setattr(pglast, "parse_plpgsql", broken)
+    assert _plpgsql_statements(
+        "CREATE FUNCTION public.f() RETURNS trigger LANGUAGE plpgsql "
+        "AS $x$BEGIN RETURN NEW; END$x$") == ([], _PLPGSQL_UNPARSEABLE)

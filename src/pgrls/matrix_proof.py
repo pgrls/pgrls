@@ -314,10 +314,11 @@ def _unqualified_relations(body: str) -> set[str] | None:
 def _body_statements_of(fn: UserFunction) -> list[Any] | None:
     """The statements a user-defined function's body runs, parsed — None
     when they cannot all be known (another language, dynamic SQL, a parse
-    error). An atomic body's ``CREATE FUNCTION`` is parsed whole."""
+    error, ``#option dump`` on pglast 8, a record variable's declaration
+    pgrls cannot read). An atomic body's ``CREATE FUNCTION`` is parsed whole."""
     from pglast import parse_sql  # noqa: PLC0415
 
-    from pgrls.access import _plpgsql_statements  # noqa: PLC0415
+    from pgrls.access import _PLPGSQL_UNPARSEABLE, _plpgsql_statements  # noqa: PLC0415
 
     if fn.body is None:
         return None
@@ -327,11 +328,18 @@ def _body_statements_of(fn: UserFunction) -> list[Any] | None:
         except Exception:  # noqa: BLE001
             return None
     if fn.language == "plpgsql":
-        stmts, incomplete = _plpgsql_statements(
-            "CREATE FUNCTION pgrls_body() RETURNS void LANGUAGE plpgsql AS "
-            f"$pgrls_body${fn.body}$pgrls_body$"
-        )
-        return None if incomplete else stmts
+        # Only the body (prosrc) is captured, not the return type, and the
+        # PL/pgSQL parser checks RETURN against it (pglast 8 rejects
+        # `RETURN 1` in a void function; both majors reject RETURN QUERY /
+        # NEXT outside SETOF) — so try the shapes a body can have.
+        for returns in ("void", "text", "SETOF text", "TABLE(pgrls_out text)", "trigger"):
+            stmts, incomplete = _plpgsql_statements(
+                f"CREATE FUNCTION pgrls_body() RETURNS {returns} LANGUAGE plpgsql AS "
+                f"$pgrls_body${fn.body}$pgrls_body$"
+            )
+            if incomplete != _PLPGSQL_UNPARSEABLE:
+                return None if incomplete else stmts
+        return None
     return None
 
 
@@ -1187,7 +1195,7 @@ class _Prover:
         """Every relation name (as written) the body of `fname` and the
         user-defined functions it calls read — a bare name a body defines as a
         CTE left out of that body's — or None when a body cannot be read
-        (another language, dynamic SQL, a parse error)."""
+        (see `_body_statements_of`)."""
         from pglast.ast import CommonTableExpr, RangeVar  # noqa: PLC0415
 
         out: set[str] = set()

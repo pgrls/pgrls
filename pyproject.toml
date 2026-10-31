@@ -29,7 +29,10 @@ classifiers = [
 dependencies = [
     "click>=8.2",
     "psycopg[binary]>=3.1",
-    "pglast>=7.20,<8",
+    # pglast 8.3 / 8.4 return invalid JSON from parse_plpgsql for a trigger
+    # function, and 8.5's deparser still crashes on `x OPERATOR(s.op) ANY
+    # (…)` and drops parentheses 8.6 restores; 8.0-8.2 are not on PyPI.
+    "pglast>=7.20,!=8.0.*,!=8.1.*,!=8.2.*,!=8.3.*,!=8.4.*,!=8.5.*,<9",
     # z3-solver ships precompiled wheels (fast, no C++ toolchain) and
     # powers the semantic verifier path — `pgrls diff` predicate analysis
     # (the concrete leaking-row counterexample) and the SEC038
@@ -142,15 +145,19 @@ strict = true
 
 # pglast (the Postgres SQL parser pgrls uses for AST-based rules
 # and the diff predicate matcher) was untyped through v6 and is only
-# partially typed in v7 (untyped node constructors, Optional fields),
+# partially typed in v7 and v8 (untyped node constructors, Optional fields),
 # so mypy --strict would report every `from pglast import …` line or
 # every node access. Treat it as untyped at the import-resolver level
 # so real type errors elsewhere stay loud, without sprinkling
-# per-import `# type: ignore` comments.
+# per-import `# type: ignore` comments. v8 ships `.pyi` stubs for every
+# module (v7 only `parser.pyi`), and mypy reads stubs even under
+# `follow_imports = "skip"` unless `follow_imports_for_stubs` is set —
+# so it is, keeping pglast `Any` on both majors.
 [[tool.mypy.overrides]]
 module = ["pglast", "pglast.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
+follow_imports_for_stubs = true
 
 # `z3-solver` (the Python wrapper around Z3) doesn't ship type
 # stubs as of 4.13. Suppress at the import-resolver level so the

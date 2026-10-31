@@ -30,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 
 import json
+import re
 from dataclasses import replace
 from typing import Any, Literal
 
@@ -475,7 +476,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 continue
             for col in parent.columns:
                 if not any(c.name == col.name for c in builder.columns):
+                    if col.name in parent.no_inherit_not_null:
+                        col = replace(col, is_nullable=True)
                     builder.columns.append(col)
+            # An inherited NOT NULL keeps the parent's constraint name, which
+            # the child can drop once detached.
+            for conname, cols in parent.not_null_names.items():
+                builder.not_null_names.setdefault(conname, set()).update(cols)
+            builder.former_names.extend(parent.former_names)
         for elt in stmt.tableElts or ():
             if type(elt).__name__ != "ColumnDef":
                 continue
@@ -489,17 +497,28 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                         is_nullable=not _column_def_is_not_null(elt),
                     )
                 )
+                _record_not_null_names(builder, elt)
+                if _only_no_inherit_not_null(getattr(elt, "constraints", None) or ()):
+                    builder.no_inherit_not_null.add(colname)
         # A table-level `PRIMARY KEY (a, b)` constraint makes its columns NOT
-        # NULL just as an inline `PRIMARY KEY` does.
-        for pk_col in _table_constraint_pk_columns(stmt):
-            builder.set_not_null(pk_col)
+        # NULL just as an inline `PRIMARY KEY` does, and so does PG18's
+        # table-level `NOT NULL c`.
+        for elt in stmt.tableElts or ():
+            for col_name in _constraint_not_null_columns(elt, creating=True):
+                builder.set_not_null(col_name)
+                # Only a NOT NULL's name is recorded: dropping a primary key leaves
+                # its columns NOT NULL.
+                if elt.contype == ConstrType.CONSTR_NOTNULL and elt.conname:
+                    builder.not_null_names.setdefault(elt.conname, set()).add(col_name)
+                if _only_no_inherit_not_null([elt]):
+                    builder.no_inherit_not_null.add(col_name)
 
     # Pass 2: ALTER TABLE (RLS toggles), CREATE POLICY, GRANT, RENAME.
     for index, raw in enumerate(statements):
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
-            _apply_alter_table(stmt, tables, default_schema)
+            _apply_alter_table(stmt, tables, default_schema, index)
         elif kind == "CreatePolicyStmt":
             _apply_create_policy(stmt, tables, default_schema)
         elif kind == "AlterPolicyStmt":
@@ -509,7 +528,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         elif kind == "GrantStmt":
             _apply_grant(stmt, tables, default_schema)
         elif kind == "RenameStmt":
-            _apply_rename(stmt, tables, default_schema)
+            _apply_rename(stmt, tables, default_schema, index)
         # Every other statement shape is skipped tolerantly.
 
     return Schema(tables=tuple(b.build() for b in tables.values()))
@@ -532,6 +551,16 @@ class _TableBuilder:
         self.column_grants: list[ColumnGrant] = []
         self.partition_of: tuple[str, str] | None = None
         self.inherits: list[tuple[str, str]] = []
+        # Named NOT NULL constraints (PG18 can drop one by name) → columns.
+        self.not_null_names: dict[str, set[str]] = {}
+        # Every name the table, or a parent it inherits a NOT NULL from, has
+        # had: an unnamed NOT NULL keeps the name it got at the time.
+        self.former_names: list[str] = [name]
+        # Columns NOT NULL only through a `NO INHERIT` constraint: an
+        # `INHERITS` child does not get it.
+        self.no_inherit_not_null: set[str] = set()
+        # `NOT VALID` NOT NULL constraints → columns, until validated.
+        self.invalid_not_null: dict[str, set[str]] = {}
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -539,6 +568,37 @@ class _TableBuilder:
             if col.name == colname:
                 self.columns[i] = replace(col, is_nullable=not not_null)
                 return
+
+    def not_null_columns(self, conname: str) -> set[str]:
+        """The columns a NOT NULL constraint of this name can be for: those it
+        was named for, and — Postgres names an unnamed one
+        `<table>_<column>_not_null`, shortening either name to fit and adding
+        a digit on a clash — any column that name could be for. Erring wide
+        only reads a column as nullable."""
+        out = set(self.not_null_names.get(conname, ()))
+        m = _AUTO_NOT_NULL.fullmatch(conname)
+        if m is not None:
+            stem = m.group(1)
+            out.update(
+                c.name for c in self.columns
+                if any(any(t.startswith(stem[:cut]) for t in self.former_names)
+                       and stem[cut + 1:] and c.name.startswith(stem[cut + 1:])
+                       for cut, ch in enumerate(stem) if ch == "_")
+            )
+        return out
+
+    def drop_constraint(self, conname: str) -> None:
+        """`DROP CONSTRAINT`: a NOT NULL one makes its column nullable again."""
+        for col in self.not_null_columns(conname):
+            self.set_not_null(col, not_null=False)
+        self.not_null_names.pop(conname, None)
+
+    def rename_constraint(self, old: str, new: str) -> None:
+        """`RENAME CONSTRAINT`: the NOT NULL keeps its column."""
+        self.not_null_names.setdefault(new, set()).update(self.not_null_columns(old))
+        self.not_null_names.pop(old, None)
+        if old in self.invalid_not_null:
+            self.invalid_not_null[new] = self.invalid_not_null.pop(old)
 
     def drop_column(self, colname: str) -> None:
         self.columns = [c for c in self.columns if c.name != colname]
@@ -578,18 +638,47 @@ def _column_def_is_not_null(column_def: Any) -> bool:
     return False
 
 
-def _table_constraint_pk_columns(stmt: Any) -> list[str]:
-    """Column names named by a table-level `PRIMARY KEY (...)` constraint."""
+def _only_no_inherit_not_null(constraints: Any) -> bool:
+    """Whether `constraints` make a column NOT NULL only through a PG18
+    `NOT NULL … NO INHERIT`, which an `INHERITS` child does not get."""
+    kinds = [(getattr(c, "contype", None), bool(getattr(c, "is_no_inherit", False)))
+             for c in constraints if type(c).__name__ == "Constraint"]
+    return ((ConstrType.CONSTR_NOTNULL, True) in kinds
+            and not any(k == ConstrType.CONSTR_PRIMARY
+                        or (k == ConstrType.CONSTR_NOTNULL and not no_inherit)
+                        for k, no_inherit in kinds))
+
+
+_AUTO_NOT_NULL = re.compile(r"(.+)_not_null\d*")
+
+
+def _record_not_null_names(builder: _TableBuilder, column_def: Any) -> None:
+    """Remember the name of an inline `CONSTRAINT <name> NOT NULL`."""
+    for con in getattr(column_def, "constraints", None) or ():
+        if (getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL
+                and getattr(con, "conname", None)):
+            builder.not_null_names.setdefault(con.conname, set()).add(column_def.colname)
+
+
+def _constraint_not_null_columns(con: Any, *, creating: bool = False) -> list[str]:
+    """Column names a table-level constraint makes NOT NULL: a `PRIMARY KEY
+    (...)`, or PG18's `NOT NULL c` (pglast 8). An `ALTER TABLE … NOT VALID`
+    NOT NULL leaves existing NULLs in place, so its column stays nullable — as
+    introspection reads it; in `CREATE TABLE` there are no rows, and Postgres
+    stores it validated (measured on PG18)."""
+    if type(con).__name__ != "Constraint":
+        return []
+    contype = getattr(con, "contype", None)
+    if contype == ConstrType.CONSTR_NOTNULL:
+        if getattr(con, "skip_validation", False) and not creating:
+            return []
+    elif contype != ConstrType.CONSTR_PRIMARY:
+        return []
     out: list[str] = []
-    for elt in getattr(stmt, "tableElts", None) or ():
-        if type(elt).__name__ != "Constraint":
-            continue
-        if getattr(elt, "contype", None) != ConstrType.CONSTR_PRIMARY:
-            continue
-        for key in getattr(elt, "keys", None) or ():
-            name = getattr(key, "sval", None) or getattr(key, "str", None)
-            if isinstance(name, str):
-                out.append(name)
+    for key in getattr(con, "keys", None) or ():
+        name = getattr(key, "sval", None) or getattr(key, "str", None)
+        if isinstance(name, str):
+            out.append(name)
     return out
 
 
@@ -597,15 +686,51 @@ def _apply_rename(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    index: int = -1,
 ) -> None:
     """Apply `ALTER TABLE <old> RENAME TO <new>`.
 
     Without this the model keeps the pre-rename name, so every finding on the
     table pointed at a relation that does not exist after the migration — a
-    `pgrls pr` annotation naming a phantom table. Renames of anything other
-    than a table (columns, policies, constraints) are left alone.
+    `pgrls pr` annotation naming a phantom table. Also applies `ALTER POLICY …
+    RENAME TO` and `ALTER TABLE … RENAME CONSTRAINT` (so a later `DROP
+    CONSTRAINT` of a NOT NULL still finds its column); other renames
+    (columns, indexes, …) are left alone. A renamed parent takes the
+    children created before it along.
     """
     rename_type = getattr(stmt, "renameType", None)
+    if rename_type == ObjectType.OBJECT_TABCONSTRAINT:
+        key = _relation_key(stmt.relation, default_schema)
+        old_name = getattr(stmt, "subname", None)
+        newname = getattr(stmt, "newname", None)
+        builder = tables.get(key) if key is not None else None
+        if key is not None and builder is not None and old_name and newname:
+            builder.rename_constraint(old_name, newname)
+            # The inherited copies on its children are renamed with it, and
+            # so is a child's own constraint of that name (measured on PG18)
+            # — a child that joined through `ALTER TABLE … INHERIT`, which
+            # pgrls does not follow, included: every table holding the name
+            # gets the new one too. A child that left (NO INHERIT / DETACH)
+            # keeps the old name as well — erring wide only reads a column as
+            # nullable.
+            for other in tables.values():
+                if other is not builder and old_name in other.not_null_names:
+                    other.not_null_names.setdefault(newname, set()).update(
+                        other.not_null_names[old_name])
+            todo = [ck for ck, cb in tables.items()
+                    if key in cb.inherits or cb.partition_of == key]
+            seen: set[tuple[str, str]] = {key}
+            while todo:
+                k = todo.pop()
+                if k in seen:
+                    continue
+                seen.add(k)
+                if (b := tables.get(k)) is not None:
+                    b.not_null_names.setdefault(newname, set()).update(
+                        b.not_null_columns(old_name))
+                todo.extend(ck for ck, cb in tables.items()
+                            if k in cb.inherits or cb.partition_of == k)
+        return
     if rename_type == ObjectType.OBJECT_POLICY:
         # `ALTER POLICY <old> ON <table> RENAME TO <new>`. Without this the
         # model kept the OLD name, so a later `ALTER POLICY <new> ON <table>
@@ -636,6 +761,15 @@ def _apply_rename(
         return
     new = (old[0], newname)
     builder.name = newname
+    builder.former_names.append(newname)
+    # Its children follow it to the new name — those created before the
+    # rename; a later one names a new table that took the old name.
+    for child in tables.values():
+        if child.created_at >= index >= 0:
+            continue
+        child.inherits = [new if p == old else p for p in child.inherits]
+        if child.partition_of == old:
+            child.partition_of = new
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder
@@ -750,6 +884,7 @@ def _apply_alter_table(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    index: int = -1,
 ) -> None:
     key = _relation_key(stmt.relation, default_schema)
     if key is None:
@@ -764,6 +899,15 @@ def _apply_alter_table(
         tables[key] = builder
     for cmd in stmt.cmds or ():
         subtype = getattr(cmd, "subtype", None)
+        if subtype in (AlterTableType.AT_DropColumn, AlterTableType.AT_SetNotNull,
+                       AlterTableType.AT_DropNotNull):
+            # The column's NOT VALID NOT NULL, if any, is gone or moot —
+            # `SET NOT NULL` validates it in place, keeping its name.
+            target = getattr(cmd, "name", None) or ""
+            for invalid, cols in builder.invalid_not_null.items():
+                if target in cols and subtype == AlterTableType.AT_SetNotNull:
+                    builder.not_null_names.setdefault(invalid, set()).add(target)
+                cols.discard(target)
         if subtype == AlterTableType.AT_EnableRowSecurity:
             builder.rls_enabled = True
         elif subtype == AlterTableType.AT_ForceRowSecurity:
@@ -785,6 +929,7 @@ def _apply_alter_table(
                             is_nullable=not _column_def_is_not_null(col),
                         )
                     )
+                    _record_not_null_names(builder, col)
         elif subtype == AlterTableType.AT_DropColumn:
             # Without this the model keeps a column the migration removed, so
             # column-keyed rules (SEC030's discriminator, SEC045's sensitive
@@ -800,6 +945,42 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif (subtype in (AlterTableType.AT_AddConstraint,
+                          AlterTableType.AT_ValidateConstraint)
+              and 0 <= index < builder.created_at):
+            # Before the table's last CREATE (a DROP and re-CREATE): it
+            # constrained the old table, not this one — skipping it only
+            # reads a column as nullable.
+            continue
+        elif subtype == AlterTableType.AT_AddConstraint:
+            con = getattr(cmd, "def_", None)
+            builder.invalid_not_null.pop(getattr(con, "conname", None) or "", None)
+            if (getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL
+                    and getattr(con, "skip_validation", False)
+                    and (conname := getattr(con, "conname", None))):
+                builder.invalid_not_null[conname] = {
+                    name for key in getattr(con, "keys", None) or ()
+                    if isinstance(name := getattr(key, "sval", None), str)
+                }
+            for col_name in _constraint_not_null_columns(con):
+                builder.set_not_null(col_name)
+                # Only a NOT NULL's name is recorded: dropping a primary key leaves
+                # its columns NOT NULL.
+                conname = getattr(con, "conname", None)
+                if getattr(con, "contype", None) == ConstrType.CONSTR_NOTNULL and conname:
+                    builder.not_null_names.setdefault(conname, set()).add(col_name)
+        elif subtype == AlterTableType.AT_DropConstraint:
+            name = getattr(cmd, "name", None)
+            if name:
+                builder.invalid_not_null.pop(name, None)
+                builder.drop_constraint(name)
+        elif subtype == AlterTableType.AT_ValidateConstraint:
+            # A validated `NOT VALID` NOT NULL makes its column NOT NULL.
+            name = getattr(cmd, "name", None)
+            if name:
+                for col in builder.invalid_not_null.pop(name, set()):
+                    builder.set_not_null(col)
+                    builder.not_null_names.setdefault(name, set()).add(col)
         # Other ALTER subcommands are ignored.
 
 

@@ -2142,7 +2142,7 @@ Detection treats every membership edge as `SET ROLE`-capable. On
 PostgreSQL 16+ a grant `WITH SET FALSE` does not permit `SET ROLE`,
 so SEC029 can over-report there — a deliberate bias toward surfacing
 a potential bypass route (allowlist a false positive) over missing
-one, and it keeps the introspection query identical across PG15-17.
+one, and it keeps the introspection query identical across PG15-18.
 
 Allowlist the *member* role by name (roles are unqualified, as in
 SEC016's allowlist) when the membership is intentional and the member
@@ -2231,6 +2231,13 @@ Detection is structural and conservative:
   weren't captured (a hand-built fixture, or a pre-v5 snapshot) is
   skipped — nullability is unknowable, so the rule stays silent until
   the schema is re-introspected.
+* **A NOT VALID NOT NULL counts as nullable (PostgreSQL 18+).**
+  `ALTER TABLE … ADD CONSTRAINT <name> NOT NULL <column> NOT VALID` leaves
+  existing NULL rows in place, so SEC030 still fires. Backfill the NULLs,
+  then `ALTER TABLE … VALIDATE CONSTRAINT <name>` (`pgrls fix`'s
+  `SET NOT NULL` validates it too). Offline (the DB-free sources), an
+  unnamed `ADD NOT NULL c NOT VALID` is not cleared by a `VALIDATE` of its
+  generated name — use `SET NOT NULL`.
 
 Configure the auth-context function set (replaces the default) via
 `[lint.rules.SEC030].auth_functions`. Allowlist tables where a

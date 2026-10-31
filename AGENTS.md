@@ -305,15 +305,17 @@ never through EXECUTE), rewrite rules (run with the relation owner's
 privileges), partitioned / inheritance parents, and foreign-key CASCADE /
 SET NULL / SET DEFAULT actions (UNDECIDED: which rows depends on the data).
 Doors are found in every schema. A door whose SQL it cannot trace (dynamic
-SQL, another language, a call into an unseen function or operator, a
-SQL-running built-in, `DO` / `CALL` / a change of search_path or role) is
-listed separately with who can open it — a `DENIED` cell does not rule it
-out; a body that sets another parameter makes its filtered doors UNDECIDED
-(a timeout, planner or logging setting excepted), and so does the same filter
-reached two ways when it depends on who runs it — it reads `current_user` /
-checks a privilege and one path is a SECURITY DEFINER function/trigger/rule,
-or it sub-selects a table whose own RLS applies to whoever evaluates it (a
-definer view included).
+SQL, another language, a PL/pgSQL body it cannot fully read (one that
+does not parse, one with a record variable whose declaration it cannot
+read back, or one that sets `#option dump` on pglast 8), a call into an
+unseen function or operator, a SQL-running built-in, `DO` / `CALL` / a
+change of search_path or role) is listed separately with who can open it —
+a `DENIED` cell does not rule it out; a body that sets another parameter
+makes its filtered doors UNDECIDED (a timeout, planner or logging setting
+excepted), and so does the same filter reached two ways when it depends on
+who runs it — it reads `current_user` / checks a privilege and one path is
+a SECURITY DEFINER function/trigger/rule, or it sub-selects a table whose
+own RLS applies to whoever evaluates it (a definer view included).
 A separate section lists sensitive-looking columns (SEC045's patterns, plus
 configured ones) each role can read, and how. `UNDECIDED` means the rows
 cannot be bounded — treat it as "possibly reachable", never as denied.
@@ -1109,7 +1111,7 @@ These are intentional in the current release. Do not invent capabilities.
 - **Postgres only.** No support for other databases or for
   MySQL/MariaDB emulation layers.
 - **Postgres 15+.** Older PG releases (10–14) are no longer
-  supported. The CI matrix runs against PG15, PG16, and PG17.
+  supported. The CI matrix runs against PG15, PG16, PG17, and PG18.
   `security_invoker` (the VIEW001 fix target) is a PG15+ reloption,
   which is the proximate reason for the floor bump.
 - **SAT-style predicate implication is built in.** v0.2's diff

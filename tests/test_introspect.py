@@ -229,6 +229,59 @@ def test_populates_table_columns(
     assert set(things.columns) == {"id", "tenant_id", "name"}
 
 
+def test_not_valid_not_null_column_is_nullable(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # PG18 sets attnotnull for a NOT VALID NOT NULL constraint while existing
+    # NULLs stay in the table (measured), so SEC030 must still see the column
+    # as nullable. A validated NOT NULL stays not-nullable on every version.
+    apply_sql("CREATE TABLE public.things (id INT NOT NULL, tenant_id UUID);")
+    if pg_conn.info.server_version >= 180000:
+        apply_sql(
+            """
+            INSERT INTO public.things VALUES (1, NULL);
+            ALTER TABLE public.things
+                ADD CONSTRAINT tenant_nn NOT NULL tenant_id NOT VALID;
+            """
+        )
+    schema = introspect(pg_conn, schemas=["public"])
+    things = next(t for t in schema.tables if t.name == "things")
+    nullable = {c.name: c.is_nullable for c in things.column_details}
+    assert nullable == {"id": False, "tenant_id": True}
+
+
+def test_not_valid_not_null_on_a_partition_parent_reaches_the_child(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # PG18: a NOT VALID NOT NULL added to a partitioned parent is NOT VALID on
+    # each partition too (measured), and VALIDATE on the parent validates both.
+    if pg_conn.info.server_version < 180000:
+        pytest.skip("NOT VALID NOT NULL constraints are PG18+")
+    apply_sql(
+        """
+        CREATE TABLE public.p (id INT, tenant_id UUID) PARTITION BY LIST (id);
+        CREATE TABLE public.p1 PARTITION OF public.p FOR VALUES IN (1);
+        INSERT INTO public.p VALUES (1, NULL);
+        ALTER TABLE public.p ADD CONSTRAINT p_nn NOT NULL tenant_id NOT VALID;
+        """
+    )
+
+    def nullable() -> dict[str, bool]:
+        schema = introspect(pg_conn, schemas=["public"])
+        return {t.name: next(c.is_nullable for c in t.column_details
+                             if c.name == "tenant_id")
+                for t in schema.tables}
+
+    assert nullable() == {"p": True, "p1": True}
+    apply_sql(
+        """
+        UPDATE public.p SET tenant_id = gen_random_uuid();
+        ALTER TABLE public.p VALIDATE CONSTRAINT p_nn;
+        """
+    )
+    assert nullable() == {"p": False, "p1": False}
+
+
 def test_columns_skips_dropped_columns(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:
