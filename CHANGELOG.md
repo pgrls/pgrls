@@ -57,10 +57,11 @@ breaking changes — they will be called out in this file.
 
 ### Fixed
 - **`pgrls diff` no longer calls a changed predicate `unchanged` when pglast
-  prints both alike.** pglast's deparser drops parentheses an operand
-  needs — on pglast 7 an AND / OR / NOT operand of `BETWEEN`, `IN (…)`,
-  `= ANY (…)` or `IS [NOT] NULL`, and a comparison operand of `BETWEEN` or
-  `IN (…)`; on pglast 8 one of `BETWEEN` — so `(a OR b) BETWEEN x AND y` and
+  prints both alike.** pglast's deparser drops parentheses some operands
+  need — on pglast 6 and 7, for example, a boolean (AND / OR / NOT),
+  comparison or `IS [NOT] DISTINCT FROM` operand of `BETWEEN`, `IN (…)`,
+  `op ANY / ALL (…)` (which is how Postgres stores `IN` and `NOT IN`) or
+  `IS [NOT] NULL`; pglast 8 drops far fewer — so `(a OR b) BETWEEN x AND y` and
   `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
   `pgrls diff` compared those strings, so a real change was not reported.
   Predicates are now compared on their parse trees, and the Z3 translation
@@ -71,26 +72,27 @@ breaking changes — they will be called out in this file.
   a different predicate than the file wrote) and for the SQL `pgrls fix`
   emits: the `ALTER POLICY` of the SEC004, SEC011, SEC019, SEC020 and
   PERF001 fixers, and PERF004's index expression. A fixer could emit a
-  policy that admits more rows than the one it rewrote — PERF001 turned
-  `user_id = auth.uid() AND ((a OR b) BETWEEN false AND true)` into
-  `… AND a OR b BETWEEN FALSE AND TRUE`, which Postgres reads as
-  `(… AND a) OR (b BETWEEN …)`. Both now keep the parentheses the tree
+  policy that admits more rows than the one it rewrote — on a live database,
+  PERF001 rewrote a policy created as
+  `user_id = auth.uid() AND ((a OR b) NOT IN (false, true))` as
+  `user_id = (SELECT auth.uid()) AND a OR b <> ALL(ARRAY[FALSE, TRUE])`,
+  which Postgres reads as `(… AND a) OR (b <> ALL …)`. Both now keep the parentheses the tree
   needs; a fixer whose rewrite has no SQL that parses back to it now leaves
   the finding instead, while the rebuilt `--sql-file` / `pgrls pr` text
   uses the clause as the file wrote it for a shape pglast cannot print
   faithfully (on pglast 7, a subscripted or field-selected constant such as
   `(-1)[1]`, which pglast prints without its parentheses), which the rules
-  skipped. **If `pgrls fix` rewrote a policy with such an operand** in an
-  earlier release — applied with `--apply`, from a `--output` migration, or
-  by hand from the dry-run SQL — look in the `ALTER POLICY` it emitted for
-  that operand with its parentheses gone, or compare the policy's
-  `pg_get_expr(polqual, polrelid)` / `pg_get_expr(polwithcheck, polrelid)`
-  with its definition before the fix: the widened policy is valid SQL, so a
-  later `pgrls lint` does not flag it. A PERF004 index expression could lose
+  skipped. **If `pgrls fix` rewrote a policy in an earlier release** whose
+  predicate nests a boolean or comparison inside another operator —
+  applied with `--apply`, from a `--output` migration, or by hand from the
+  dry-run SQL — compare the policy's `pg_get_expr(polqual, polrelid)` /
+  `pg_get_expr(polwithcheck, polrelid)` in `pg_policy` with its definition
+  before the fix (the list above gives examples, not every shape): the
+  widened policy is valid SQL, so a later `pgrls lint` does not flag it. A PERF004 index expression could lose
   them the same way; that changes no access, but the index may not serve
   the policy.
-- **A predicate pglast cannot print at all** — on pglast 7,
-  `x OPERATOR(schema.op) ANY (…)`, the form `pg_dump` writes — no longer
+- **A predicate pglast cannot print at all** — on pglast 6 and 7,
+  `x OPERATOR(schema.op) ANY / ALL (…)`, the form `pg_dump` writes — no longer
   crashes `pgrls diff` or `pgrls fix`, and is no longer dropped from a
   `--sql-file` / `pgrls pr` source. That source modelled such a policy with
   no USING / WITH CHECK clause at all, with no warning, so the rules missed

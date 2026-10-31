@@ -1100,7 +1100,7 @@ def _deparse_or_none(node: Any, written: str | None = None) -> str | None:
     Returns the deparsed fragment (which `parse_expr` then re-parses into the
     canonical AST shape the rules expect), or `None` when the clause is absent.
     When no rendering parses back to the node — pglast's printer drops
-    parentheses it needs, or (pglast 7, ``x OPERATOR(s.op) ANY (…)``) cannot
+    parentheses it needs, or (pglast 7, ``x OPERATOR(s.op) ANY / ALL (…)``) cannot
     print it at all — the clause as the statement wrote it (`written`) is
     used instead, so the rules see the predicate the SQL wrote. Without a
     `written` that parses back to the node it falls back to pglast's

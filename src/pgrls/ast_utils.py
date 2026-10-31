@@ -879,12 +879,13 @@ def _same_tree(sql: str, node: Any) -> bool:
 def faithful_sql(node: Any) -> str:
     """SQL text for an expression node that parses back to the same AST:
     pglast's rendering when it does, else one with each of its operands
-    parenthesized (pglast's deparser drops parentheses an operand of
-    ``BETWEEN`` — on pglast 7 also ``IS NULL`` — needs, so two different
-    predicates can print the same). Falls back to pglast's rendering when
-    neither round-trips; raises when pglast cannot render the node at all
-    (pglast 7's printer fails on ``x OPERATOR(s.op) ANY (…)``) and no
-    grouping round-trips."""
+    parenthesized (pglast's deparser drops parentheses some operands need —
+    of ``BETWEEN``, and on pglast 7 also of ``IN``, ``op ANY / ALL``,
+    ``IS NULL`` and others — so two different predicates can print the
+    same). Falls back to pglast's rendering when neither round-trips;
+    raises when pglast cannot render the node at all (pglast 7's printer
+    fails on ``x OPERATOR(s.op) ANY / ALL (…)``) and no grouping
+    round-trips."""
     try:
         text: str | None = _render(node)
     except Exception:  # noqa: BLE001 — pglast's own printer can fail
