@@ -56,6 +56,16 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
+  that a SECURITY DEFINER body calls by a built-in's name.** A quoted name
+  holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one
+  identifier, a function in the search path, but was read as that schema's
+  function; and a quoted SQL keyword (`"greatest"(…)`, `"coalesce"(…)`,
+  `"trim"(…)`, `"current_date"()`) has no built-in behind it, but was on the
+  list of built-ins that read no table. Either way a door into a function
+  that read a FORCE'd table was traced as harmless and the cell PROVEN
+  (measured on PG17). Such a call now makes the door one pgrls does not see
+  into.
 - The `pgrls diff --explain` text for a `REQUIRES_REVIEW` predicate change
   no longer says to install `pgrls[diff-z3]`, which has been part of a plain
   install since 0.16.0.

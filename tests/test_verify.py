@@ -4504,6 +4504,18 @@ def _call(sql: str):
     ("SELECT pg_catalog.casefold('A')", False),
     ("SELECT pg_catalog.uuidv7()", False),
     ("SELECT public.casefold('A')", True),
+    # A quoted name holding a dot is one identifier — a user function in the
+    # search path, not the schema-qualified built-in or auth function.
+    ('SELECT "pg_catalog.casefold"(\'A\')', True),
+    ('SELECT "pg_catalog.count"(1)', True),
+    ('SELECT "auth.uid"()', True),
+    # A SQL keyword called by a quoted name is a user function: there is no
+    # built-in `greatest` / `coalesce` / `trim` / `current_date`.
+    ('SELECT "greatest"(1, 2)', True),
+    ('SELECT "coalesce"(1, 2)', True),
+    ('SELECT "trim"(\'a\')', True),
+    # Unquoted, they never were calls by that name.
+    ("SELECT trim('a')", False),
 ])
 def test_opaque_call_trusts_builtins_only_when_unqualified_or_pg_catalog(
     sql: str, opaque: bool
