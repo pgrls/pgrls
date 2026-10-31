@@ -39,7 +39,9 @@ it flags the second.
 
 What the encoder translates: columns, literals, comparisons and arithmetic
 (on the diff path not where Z3 and Postgres disagree — ``/`` and ``%``,
-arithmetic on text, ordering on text, which collations decide),
+arithmetic on anything but integers, ordering on text, which collations
+decide, and a cast that may change the value, such as ``varchar(3)`` or
+``float4``, which is a value of its own),
 AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
@@ -392,7 +394,7 @@ def _const_to_z3(node: A_Const) -> Any:
     if isinstance(val, Integer):
         return z3.IntVal(val.ival)
     if isinstance(val, String):
-        return z3.StringVal(val.sval)
+        return _z3_string(val.sval)
     if isinstance(val, Boolean):
         return z3.BoolVal(val.boolval)
     if isinstance(val, Float):
@@ -407,6 +409,39 @@ def _const_to_z3(node: A_Const) -> Any:
     # NULL on either side of a comparison, return None and let the
     # caller fall through to requires_review.
     return None
+
+
+def _z3_string(text: str) -> Any:
+    """`text` as a Z3 string constant. ``StringVal`` reads ``\\u{…}`` escapes
+    in its argument (``'\\u{41}'`` would be ``'A'``), so each backslash goes
+    in escaped — a policy's ``'\\u{41}'`` is those seven characters."""
+    return z3.StringVal(text.replace("\\", "\\u{5c}"))
+
+
+def _z3_value(val: object) -> Any:
+    """A decoded witness value as a Z3 constant to pin a column to — a
+    string through `_z3_string`, which Z3's own coercion would not use."""
+    return _z3_string(val) if isinstance(val, str) else val
+
+
+# Cast targets that keep every value of the sort they map to: a cast to one
+# of these, with no type modifier, leaves the value as it is. Any other —
+# `varchar(3)` truncates, `char` / `bpchar` ignore trailing spaces,
+# `numeric(4,1)` and `float4` round, `oid` wraps a negative integer — makes
+# a value of its own.
+_EXACT_CAST_TARGETS = frozenset({
+    "text", "varchar", "int", "int4", "integer", "int8", "bigint", "bool",
+    "boolean", "numeric", "decimal",
+})
+
+
+def _exact_cast(typename: Any) -> bool:
+    """Whether a cast to `typename` keeps the value (see `_EXACT_CAST_TARGETS`)."""
+    return (
+        _typename_last_segment(typename) in _EXACT_CAST_TARGETS
+        and not getattr(typename, "typmods", None)
+        and not getattr(typename, "arrayBounds", None)
+    )
 
 
 def _typename_last_segment(typename: Any) -> str | None:
@@ -652,7 +687,7 @@ def _diff_witness_is_sufficient(
         var = ctx.column(key, _py_value_sort(val))
         if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
             return False
-        pins.extend((var == val, z3.Not(ctx.null_flag(key))))
+        pins.extend((var == _z3_value(val), z3.Not(ctx.null_flag(key))))
     solver = z3.Solver()
     solver.set("timeout", 1000)
     for a in assertions:
@@ -1080,7 +1115,7 @@ def _anon_3vl(
         configured = ctx.set_gucs[(_first_string_arg(node) or "").lower()]
         return _Val(
             value=(
-                z3.StringVal(configured)
+                _z3_string(configured)
                 if configured is not None
                 else ctx.opaque(_canon(node), z3.StringSort())
             ),
@@ -1617,9 +1652,10 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     On the diff path (`any_session`), where both predicates' readings must be
     exact for an equivalence or an implication to hold, also:
 
-    * arithmetic on a non-number — Z3's ``+`` on two strings concatenates;
+    * arithmetic on anything but integers — Z3's ``+`` on two strings
+      concatenates, and its reals have no NaN / ±Infinity and never round;
     * ``/`` and ``%`` — Postgres truncates an integer quotient toward zero
-      (``-1 % 2`` is -1, Z3's is 1) and rounds a numeric one, Z3 is exact;
+      (``-1 % 2`` is -1, Z3's is 1);
     * ``<`` / ``>`` / ``<=`` / ``>=`` on text — Postgres orders it by
       collation, Z3 by code point (``'B' < 'b'`` is FALSE under en_US), and
       an equality elsewhere can pin either side to a literal."""
@@ -1629,7 +1665,10 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     if not any_session:
         return False
     if op in _ARITHMETIC_OPS:
-        if not all(s in (z3.IntSort(), z3.RealSort()) for s in sorts):
+        # Only integers: Z3's reals have no NaN or ±Infinity, which a
+        # `numeric` / `float8` value can be (`n * 0.0 = 0.0` is not TRUE
+        # for NaN), and they never round as `float8` does.
+        if not all(s == z3.IntSort() for s in sorts):
             return True
         return op in ("/", "%")
     return op in ("<", ">", "<=", ">=") and z3.StringSort() in sorts
@@ -1768,6 +1807,14 @@ def _anon_typecast(
     if inner is None:
         return None
     target_sort = _typename_segments_to_sort(node.typeName)
+    if ctx.any_session and target_sort is not None and not _exact_cast(node.typeName):
+        # The diff path compares two readings, so a cast that may change the
+        # value (`varchar(3)`, `float4`, `oid`) is a value of its own.
+        return _Val(
+            value=ctx.opaque(_canon(node), target_sort),
+            is_null=inner.is_null,
+            unset=inner.unset,
+        )
     if target_sort is None:
         # Unknown target type — opaque value, keep the inner null-flag.
         return _Val(
@@ -1792,7 +1839,9 @@ def _anon_typecast(
             value=ctx.session_var(_canon(node), target_sort),
             is_null=inner.is_null,
         )
-    folded = _fold_literal_cast(
+    # On the diff path only to an integer or a boolean: a decimal literal
+    # cast to `numeric` is exact, but its float reading need not be.
+    folded = None if ctx.any_session and target_sort == z3.RealSort() else _fold_literal_cast(
         inner.value, target_sort, _typename_last_segment(node.typeName)
     )
     if folded is not None:
@@ -1913,7 +1962,7 @@ def _anon_witness_is_sufficient(
         var = ctx.column(key, _py_value_sort(val))
         if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
             return False
-        pins.append(var == val)
+        pins.append(var == _z3_value(val))
         pins.append(z3.Not(ctx.null_flag(key)))
     solver = z3.Solver()
     solver.set("timeout", 1000)
@@ -2235,7 +2284,7 @@ def _cross_tenant_witness_sufficient(
         var = ctx.column(key, _py_value_sort(val))
         if var is None:  # pragma: no cover - _py_value_sort inverts the bound sort
             return False
-        pins.append(var == val)
+        pins.append(var == _z3_value(val))
         pins.append(z3.Not(ctx.null_flag(key)))
     solver = z3.Solver()
     solver.set("timeout", 1000)

@@ -197,15 +197,14 @@ def test_in_list_string_subset_is_semantic_tightened():
 
 
 # ---------------------------------------------------------------------------
-# NULL tests (opaque markers)
+# NULL tests (a column's null-flag)
 # ---------------------------------------------------------------------------
 
 
 def test_is_null_with_added_predicate_is_semantic_tightened():
     # `col IS NULL` ⊃ `col IS NULL AND tenant = 'a'`. The added
-    # AND-conjunct only restricts. NULL is treated as opaque so the
-    # tenant-comparison and the IS NULL marker share the same column
-    # variable per the translator's binding policy.
+    # AND-conjunct only restricts. The IS NULL test reads `col`'s null-flag,
+    # the same in both predicates.
     assert (
         _classify("col IS NULL", "col IS NULL AND tenant = 'a'")
         == "semantic_tightened"
@@ -996,10 +995,32 @@ def test_three_valued_classification(base: str, head: str, verdict: str) -> None
      "AND f() IS NULL) OR c))"),
     # Postgres rounds a numeric quotient.
     ("(x = 1.0 AND (x / 3.0) * 3.0 = x) OR c", "x = 1.0 OR c"),
-    ('"f()" IS NULL', "f() IS NULL"),                   # a column, not the call
+    # Z3's reals have no NaN / Infinity.
+    ("n * 0.0 = 0.0", "n IS NOT NULL"),
+    # A cast that can change the value: precision, truncation, padding, wrap.
+    ("f = 0.1", "f = '0.1'::float4"),
+    ("n = 1.234", "n = '1.234'::numeric(4,1)"),
+    ("c = 'abcdef'", "c = 'abcdef'::varchar(3)"),
+    ("c = 'abc'", "c = 'abc'::char"),
+    ("(a + 0) > 0", "(a + 0)::oid > 0"),
+    # A policy's backslash is a backslash, not an escape.
+    ("s = 'A'", "s = '\\u{41}'"),
 ])
 def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str) -> None:
     assert _classify(base, head) is None
+
+
+def test_a_quoted_column_named_like_a_call_has_its_own_null_flag() -> None:
+    assert _classify('"f()" IS NULL', "f() IS NULL") is None
+
+
+def test_a_value_keeping_cast_still_translates() -> None:
+    assert _classify("a = '5'::int", "a = 5") == "semantic_equivalent"
+    assert _classify("t = 'x'::text", "t = 'x'") == "semantic_equivalent"
+
+
+def test_a_leaking_row_keeps_a_policys_backslash() -> None:
+    assert _counterexample("s = 'B'", "s = 'B' OR s = '\\u{41}'") == {"s": "\\u{41}"}
 
 
 def test_integer_arithmetic_still_translates() -> None:
