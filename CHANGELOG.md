@@ -56,6 +56,16 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`pgrls diff` no longer calls a changed predicate `unchanged` when pglast
+  prints both alike.** pglast's deparser drops parentheses an operand of
+  `BETWEEN`, `IS NULL` and the like needs — `(a OR b) BETWEEN x AND y` and
+  `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
+  `pgrls diff` compared those strings, so a real change emitted no Change.
+  Predicates are now compared on their parse trees, and the Z3 comparison
+  no longer gives two such expressions one variable. The same rendering
+  was used for the DB-free sources' policy text (which the rules then
+  re-parsed) and for the SQL `pgrls fix` emits; both now keep every
+  parenthesis the tree needs.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

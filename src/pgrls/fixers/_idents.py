@@ -39,7 +39,7 @@ from typing import Any
 
 import pglast
 from pglast.ast import ColumnDef
-from pglast.stream import RawStream
+from pgrls.ast_utils import faithful_sql
 
 _PLAIN_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
@@ -150,9 +150,10 @@ def alter_policy(
 
     `USING` precedes `WITH CHECK`; each clause is 4-space indented
     and only rendered when its AST is provided. Each clause AST is
-    round-tripped through `pglast.stream.RawStream` so pglast's
-    escaping is applied consistently regardless of where the SQL
-    originated. The identifier and qualified-name quoting is the
+    rendered by `ast_utils.faithful_sql` — pglast's rendering, with the
+    parentheses it can drop restored, so the emitted policy means what
+    the AST does — and pglast's escaping is applied consistently
+    regardless of where the SQL originated. The identifier and qualified-name quoting is the
     same `quote_ident` / `quote_qualified` this module owns.
 
     At least one clause is expected; with neither, the result is a
@@ -161,9 +162,9 @@ def alter_policy(
     """
     clauses: list[str] = []
     if using_ast is not None:
-        clauses.append(f"    USING ({RawStream()(using_ast)})")
+        clauses.append(f"    USING ({faithful_sql(using_ast)})")
     if with_check_ast is not None:
-        clauses.append(f"    WITH CHECK ({RawStream()(with_check_ast)})")
+        clauses.append(f"    WITH CHECK ({faithful_sql(with_check_ast)})")
     return (
         f"ALTER POLICY {quote_ident(policy_name)} "
         f"ON {quote_qualified(table.schema, table.name)}\n"

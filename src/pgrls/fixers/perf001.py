@@ -53,9 +53,8 @@ from typing import Any
 
 from pglast.ast import FuncCall, Node, ResTarget, SelectStmt, String, SubLink
 from pglast.enums import LimitOption, SetOperation, SubLinkType
-from pglast.stream import RawStream
 
-from pgrls.ast_utils import subselect_is_correlated
+from pgrls.ast_utils import faithful_sql, subselect_is_correlated
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified
 from pgrls.model import Schema, policy_id
@@ -239,7 +238,7 @@ class PERF001Fixer:
                         copy.deepcopy(ast), names
                     )
                     if changed:
-                        new_clauses[key] = RawStream()(new_ast)
+                        new_clauses[key] = faithful_sql(new_ast)
                 if not new_clauses:
                     continue
 

@@ -1579,3 +1579,17 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
     )
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
     assert "SEC008" in res.output and "public.t.q" in res.output, res.output
+
+
+def test_offline_policy_keeps_the_parentheses_its_predicate_needs():
+    # The DB-free source renders each predicate from its AST; pglast's
+    # deparser drops the parentheses `(a OR b) BETWEEN …` needs, which would
+    # hand the rules a different predicate than the SQL wrote.
+    from pgrls.ast_utils import parse_expr
+    from pgrls.schema_sources import schema_from_sql
+
+    source = "(tenant_id = 1 OR is_public) BETWEEN true AND true"
+    schema = schema_from_sql(
+        "CREATE TABLE t (tenant_id int, is_public bool);"
+        f" CREATE POLICY p ON t USING ({source});", schemas=("public",))
+    assert parse_expr(schema.tables[0].policies[0].using_sql) == parse_expr(source)

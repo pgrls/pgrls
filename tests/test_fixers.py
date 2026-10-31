@@ -4712,3 +4712,19 @@ def test_sec015_default_path_includes_the_functions_own_schema_for_security() ->
     assert _rewritten_path(None, "a.b") == 'pg_catalog, "a.b", pg_temp'
     # An existing path is preserved with pg_temp pinned last, as before.
     assert _rewritten_path("s15, pg_temp", "s15") == "s15, pg_temp"
+
+
+def test_alter_policy_keeps_the_parentheses_its_predicate_needs() -> None:
+    # pglast's deparser prints `(a OR b) BETWEEN …` without the parentheses,
+    # which would make `pgrls fix --apply` install a different predicate.
+    import pglast
+    from types import SimpleNamespace
+
+    from pgrls.ast_utils import parse_expr
+    from pgrls.fixers._idents import alter_policy
+
+    source = "(tenant_id = 1 OR is_public) BETWEEN true AND true"
+    sql = alter_policy(SimpleNamespace(schema="public", name="t"), "p",
+                       using_ast=parse_expr(source))
+    stmt = pglast.parse_sql(sql)[0].stmt
+    assert stmt.qual == parse_expr(source)

@@ -179,9 +179,8 @@ from pglast.enums import (
     SQLValueFunctionOp,
     SubLinkType,
 )
-from pglast.stream import RawStream
 
-from pgrls.ast_utils import func_name_parts, is_never_null_current_setting
+from pgrls.ast_utils import canonical_key, func_name_parts, is_never_null_current_setting
 
 
 # Comparison operator strings appearing in `A_Expr.name[0].sval` for
@@ -847,9 +846,10 @@ def _opaque_expression(node: Any, ctx: _Context, *, sort: Any) -> Any:
 
 
 def _canon(node: Any) -> str:
-    """Canonical RawStream rendering of an AST node."""
-    rendered: str = RawStream()(node)
-    return rendered
+    """The key of an AST node: its SQL text, tagged when pglast's rendering
+    would stand for another tree too — so two different expressions never
+    share a Z3 variable."""
+    return canonical_key(node)
 
 
 def _in_to_z3(node: A_Expr, ctx: _Context) -> Any:

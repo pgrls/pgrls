@@ -1095,8 +1095,9 @@ def _deparse_or_none(node: Any) -> str | None:
     if node is None:
         return None
     try:
-        # `str(...)`: RawStream is untyped (mypy override) → bare call is `Any`.
-        return str(RawStream()(node))
+        # pglast's rendering can drop parentheses an operand needs, which
+        # would hand the rules a different predicate than the SQL wrote.
+        return ast_utils.faithful_sql(node)
     except Exception:
         return None
 

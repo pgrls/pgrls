@@ -4,7 +4,9 @@ from __future__ import annotations
 import pytest
 
 from pgrls.ast_utils import (
+    canonical_key,
     extract_column_refs,
+    faithful_sql,
     extract_range_vars,
     find_func_calls,
     is_literal_false,
@@ -605,3 +607,30 @@ def test_function_body_sql_leaves_other_bodies_alone() -> None:
     # A plpgsql `BEGIN … END` block (no ATOMIC) is NOT a SQL-standard body and
     # must not be unwrapped — it is opaque to the parser either way.
     assert function_body_sql("BEGIN RETURN 1; END").startswith("BEGIN")
+
+
+@pytest.mark.parametrize("sql", [
+    "(tenant_id = 1 OR is_public) BETWEEN true AND true",
+    "tenant_id = 1 OR (is_public BETWEEN true AND true)",
+    "(owner = 1 AND x) IS NULL",
+    "NOT (a OR b) BETWEEN 1 AND 2",
+    "(a OR b) = ANY (ARRAY[(x IS DISTINCT FROM y) IS NULL])",
+    "f((a OR b) BETWEEN 1 AND 2, c)",
+    "CASE WHEN (a OR b) IS NULL THEN 1 END",
+    "tenant_id = (SELECT auth.uid())",
+])
+def test_faithful_sql_parses_back_to_the_same_tree(sql: str) -> None:
+    node = parse_expr(sql)
+    assert parse_expr(faithful_sql(node)) == node
+
+
+def test_faithful_sql_is_pglasts_rendering_when_that_is_faithful() -> None:
+    assert faithful_sql(parse_expr("tenant_id=(select auth.uid())")) == (
+        "tenant_id = (SELECT auth.uid())")
+
+
+def test_canonical_key_tells_apart_trees_that_print_alike() -> None:
+    a = parse_expr("(tenant_id = 1 OR is_public) BETWEEN true AND true")
+    b = parse_expr("tenant_id = 1 OR (is_public BETWEEN true AND true)")
+    assert canonical_key(a) != canonical_key(b)
+    assert canonical_key(parse_expr("x=1")) == canonical_key(parse_expr("x = 1"))

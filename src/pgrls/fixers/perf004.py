@@ -57,9 +57,8 @@ from typing import Any
 
 from pglast.ast import A_Const, A_Expr, BoolExpr, ColumnRef, FuncCall, Node, String
 from pglast.enums import A_Expr_Kind
-from pglast.stream import RawStream
 
-from pgrls.ast_utils import extract_column_refs, func_name_parts
+from pgrls.ast_utils import extract_column_refs, faithful_sql, func_name_parts
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table, policy_id
@@ -378,7 +377,7 @@ class PERF004Fixer:
                     if ast is None:
                         continue
                     for fc in _top_funccalls_wrapping(ast, table, flagged):
-                        expr_sql = RawStream()(fc)
+                        expr_sql = faithful_sql(fc)
                         if expr_sql in seen_expressions:
                             continue
                         seen_expressions.add(expr_sql)

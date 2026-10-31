@@ -9,14 +9,18 @@ stays internal until v1.0.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sys
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any
 
 import pglast
-from pglast.ast import A_Const, A_Star, BoolExpr, Boolean, ColumnRef, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
+from pglast.ast import A_ArrayExpr, A_Const, A_Expr, A_Indirection, A_Star, BoolExpr, Boolean, BooleanTest, CaseExpr, CoalesceExpr, CollateClause, ColumnRef, MinMaxExpr, RowExpr, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
 from pglast.enums import BoolExprType, NullTestType, SetOperation, SQLValueFunctionOp
+from pglast.stream import RawStream
 
 
 _LINT_AST_RULES_TAIL = (
@@ -734,3 +738,100 @@ def _returns_as_selects(sql: str) -> str:
         previous = tok
     out.append(sql[last:])
     return "".join(out)
+
+
+@lru_cache(maxsize=4096)
+def _quiet_parse(sql: str) -> Any | None:
+    """`parse_expr` without its warning: the expression node, or None (cached
+    — compare the result, never mutate it)."""
+    try:
+        parsed = pglast.parse_sql(f"SELECT ({sql}) AS _expr")
+    except pglast.parser.ParseError:
+        return None
+    stmt = parsed[0].stmt
+    if not isinstance(stmt, SelectStmt) or not stmt.targetList:
+        return None
+    return stmt.targetList[0].val
+
+
+def _render(node: Any) -> str:
+    # `str(...)`: RawStream is untyped (mypy override) → bare call is `Any`.
+    return str(RawStream()(node))
+
+
+# Expression nodes an operand can be: each is set apart in its own
+# parentheses when a node is re-rendered, so pglast's precedence cannot
+# regroup it. Leaves (columns, constants) need none.
+_GROUPABLE = (
+    A_Expr, BoolExpr, NullTest, BooleanTest, FuncCall, TypeCast, CaseExpr,
+    A_ArrayExpr, CoalesceExpr, MinMaxExpr, A_Indirection,
+    CollateClause, RowExpr, SubLink,
+)
+
+
+def _parenthesized(node: Any) -> str:
+    """`node` rendered with every expression below it in its own
+    parentheses — the precedence pglast's deparser can get wrong (``(a OR
+    b) BETWEEN x AND y`` printed as ``a OR b BETWEEN x AND y``) cannot
+    regroup them. Each such expression is swapped for a placeholder column,
+    pglast renders the rest, and the placeholder becomes the expression's
+    own `faithful_sql` in parentheses, which adds no node to the tree."""
+    holes: list[Any] = []
+
+    def hole(child: Any) -> Any:
+        holes.append(child)
+        return ColumnRef(fields=(String(sval=f"pgrls_hole_{len(holes) - 1}"),))
+
+    def rebuild(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return type(value)(rebuild(v) for v in value)
+        if isinstance(value, _GROUPABLE):
+            return hole(value)
+        if isinstance(value, Node):
+            return type(value)(**{k: rebuild(getattr(value, k)) for k in value})
+        return value
+
+    shell = type(node)(**{k: rebuild(getattr(node, k)) for k in node})
+    text = _render(shell)
+
+    def fill(match: re.Match[str]) -> str:
+        return f"({faithful_sql(holes[int(match.group(1))])})"
+
+    return re.sub(r"\bpgrls_hole_(\d+)\b", fill, text)
+
+
+def faithful_sql(node: Any) -> str:
+    """SQL text for an expression node that parses back to the same AST:
+    pglast's rendering when it does, else one with every operator operand
+    parenthesized (pglast's deparser drops parentheses an operand of
+    ``BETWEEN`` / ``IS NULL`` needs, so two different predicates can print
+    the same). Falls back to pglast's rendering when neither round-trips."""
+    text = _render(node)
+    if _quiet_parse(text) == node:
+        return text
+    grouped = _parenthesized(node)
+    return grouped if _quiet_parse(grouped) == node else text
+
+
+def _shape(value: Any) -> Any:
+    """`value` (a pglast node dict) without source positions."""
+    if isinstance(value, dict):
+        return {k: _shape(v) for k, v in value.items()
+                if k != "location" and not k.endswith(("_list_start", "_list_end"))}
+    if isinstance(value, (list, tuple)):
+        return [_shape(v) for v in value]
+    return value
+
+
+def canonical_key(node: Any) -> str:
+    """A string that is equal for two expression nodes exactly when their
+    ASTs are (source positions aside): their `faithful_sql` when it parses
+    back to the node — so one text cannot stand for two trees — else that
+    text tagged with a digest of the tree."""
+    text = faithful_sql(node)
+    if _quiet_parse(text) == node:
+        return text
+    digest = hashlib.sha256(
+        json.dumps(_shape(node(skip_none=True)), sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+    return f"{text} /* ast {digest} */"

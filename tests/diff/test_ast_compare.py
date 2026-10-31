@@ -5,6 +5,8 @@ and requires-review cases. Each test pins exactly one return value.
 """
 from __future__ import annotations
 
+import pytest
+
 from pgrls.diff.ast_compare import compare_predicates, counterexample_for
 
 
@@ -184,6 +186,20 @@ def test_extra_outer_parens_returns_unchanged():
     # `(a = 1)` and `a = 1` parse to the same expression — the wrapper
     # parens are redundant, RawStream strips them.
     assert compare_predicates("(a = 1)", "a = 1") == "unchanged"
+
+
+@pytest.mark.parametrize(("base", "head"), [
+    # pglast's deparser drops the parentheses the left side needs, so both
+    # print as `… OR is_public BETWEEN TRUE AND TRUE`: a real change must
+    # not read as unchanged.
+    ("(tenant_id = 1 OR is_public) BETWEEN true AND true",
+     "tenant_id = 1 OR (is_public BETWEEN true AND true)"),
+    ("(owner = 1 AND x) IS NULL", "owner = 1 AND (x IS NULL)"),
+    ("NOT ((a OR b) BETWEEN 1 AND 2)", "NOT (a OR (b BETWEEN 1 AND 2))"),
+])
+def test_predicates_that_print_alike_are_not_unchanged(base: str, head: str) -> None:
+    assert compare_predicates(base, head) != "unchanged"
+    assert compare_predicates(base, base) == "unchanged"
 
 
 def test_outer_paren_wrap_around_and_chain_returns_unchanged():
