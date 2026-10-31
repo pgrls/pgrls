@@ -18,8 +18,9 @@ from functools import lru_cache
 from typing import Any
 
 import pglast
-from pglast.ast import A_ArrayExpr, A_Const, A_Expr, A_Indirection, A_Star, BoolExpr, Boolean, BooleanTest, CaseExpr, CoalesceExpr, CollateClause, ColumnRef, MinMaxExpr, RowExpr, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
+from pglast.ast import A_ArrayExpr, A_Const, A_Expr, A_Indirection, A_Star, BoolExpr, Boolean, BooleanTest, CaseExpr, CoalesceExpr, CollateClause, ColumnRef, JsonIsPredicate, MinMaxExpr, RowExpr, XmlExpr, DeleteStmt, FuncCall, InsertStmt, JoinExpr, Node, NullTest, RangeFunction, RangeSubselect, RangeVar, SelectStmt, SQLValueFunction, String, SubLink, TypeCast, UpdateStmt
 from pglast.enums import BoolExprType, NullTestType, SetOperation, SQLValueFunctionOp
+from pglast import ast as ast_nodes
 from pglast.stream import RawStream
 
 
@@ -765,11 +766,11 @@ def _render(node: Any) -> str:
 _GROUPABLE = (
     A_Expr, BoolExpr, NullTest, BooleanTest, FuncCall, TypeCast, CaseExpr,
     A_ArrayExpr, CoalesceExpr, MinMaxExpr, A_Indirection,
-    CollateClause, RowExpr, SubLink,
+    CollateClause, RowExpr, SubLink, JsonIsPredicate, XmlExpr,
 )
 
 
-def _parenthesized(node: Any) -> str:
+def _parenthesized(node: Any) -> str | None:
     """`node` rendered with each expression operand directly below it in its
     own parentheses (each rendered by its own `faithful_sql`) — the precedence pglast's deparser can get wrong (``(a OR
     b) BETWEEN x AND y`` printed as ``a OR b BETWEEN x AND y``) cannot
@@ -777,10 +778,14 @@ def _parenthesized(node: Any) -> str:
     pglast renders the rest, and the placeholder becomes the expression's
     own `faithful_sql` in parentheses, which adds no node to the tree."""
     holes: list[Any] = []
+    rendered = _render(node)
+    stem = "pgrls_hole"
+    while stem in rendered:
+        stem += "_"
 
     def hole(child: Any) -> Any:
         holes.append(child)
-        return ColumnRef(fields=(String(sval=f"pgrls_hole_{len(holes) - 1}"),))
+        return ColumnRef(fields=(String(sval=f"{stem}{len(holes) - 1}"),))
 
     def rebuild(value: Any) -> Any:
         if isinstance(value, (list, tuple)):
@@ -792,12 +797,44 @@ def _parenthesized(node: Any) -> str:
         return value
 
     shell = type(node)(**{k: rebuild(getattr(node, k)) for k in node})
-    text = _render(shell)
+    try:
+        # A printer that needs a particular child shape (SIMILAR TO's
+        # escape call) cannot print a placeholder in its place.
+        text = _render(shell)
+    except Exception:  # noqa: BLE001
+        return None
 
     def fill(match: re.Match[str]) -> str:
         return f"({faithful_sql(holes[int(match.group(1))])})"
 
-    return re.sub(r"\bpgrls_hole_(\d+)\b", fill, text)
+    return re.sub(rf"\b{stem}(\d+)\b", fill, text)
+
+
+def _shape(value: Any) -> Any:
+    """`value` (a pglast node dict) as `==` compares it: without source
+    positions or the attributes pglast leaves out of comparison, and with an
+    unset field the same as its default (a tree a fixer builds leaves
+    ``isnull`` / ``groupDistinct`` unset where the parser writes False)."""
+    if isinstance(value, dict):
+        node_type = getattr(ast_nodes, str(value.get("@", "")), None)
+        ignored = getattr(node_type, "_ATTRS_TO_IGNORE_IN_COMPARISON", ()) or ()
+        return {k: _shape(v) for k, v in value.items()
+                if k not in ignored and k != "location"
+                and not k.endswith(("list_start", "list_end"))
+                and v not in (None, False, 0, "", (), [])}
+    if isinstance(value, (list, tuple)):
+        return [_shape(v) for v in value]
+    return value
+
+
+def _tree(node: Any) -> str:
+    return json.dumps(_shape(node(skip_none=True)), sort_keys=True, default=str)
+
+
+def _same_tree(sql: str, node: Any) -> bool:
+    """Whether `sql` parses back to `node`."""
+    parsed = _quiet_parse(sql)
+    return parsed is not None and _tree(parsed) == _tree(node)
 
 
 def faithful_sql(node: Any) -> str:
@@ -807,20 +844,10 @@ def faithful_sql(node: Any) -> str:
     ``BETWEEN`` / ``IS NULL`` needs, so two different predicates can print
     the same). Falls back to pglast's rendering when neither round-trips."""
     text = _render(node)
-    if _quiet_parse(text) == node:
+    if _same_tree(text, node):
         return text
     grouped = _parenthesized(node)
-    return grouped if _quiet_parse(grouped) == node else text
-
-
-def _shape(value: Any) -> Any:
-    """`value` (a pglast node dict) without source positions."""
-    if isinstance(value, dict):
-        return {k: _shape(v) for k, v in value.items()
-                if k != "location" and not k.endswith(("_list_start", "_list_end"))}
-    if isinstance(value, (list, tuple)):
-        return [_shape(v) for v in value]
-    return value
+    return grouped if grouped is not None and _same_tree(grouped, node) else text
 
 
 def canonical_key(node: Any) -> str:
@@ -829,9 +856,7 @@ def canonical_key(node: Any) -> str:
     back to the node — so one text cannot stand for two trees — else that
     text tagged with a digest of the tree."""
     text = faithful_sql(node)
-    if _quiet_parse(text) == node:
+    if _same_tree(text, node):
         return text
-    digest = hashlib.sha256(
-        json.dumps(_shape(node(skip_none=True)), sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
+    digest = hashlib.sha256(_tree(node).encode()).hexdigest()[:16]
     return f"{text} /* ast {digest} */"

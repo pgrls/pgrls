@@ -4728,3 +4728,19 @@ def test_alter_policy_keeps_the_parentheses_its_predicate_needs() -> None:
                        using_ast=parse_expr(source))
     stmt = pglast.parse_sql(sql)[0].stmt
     assert stmt.qual == parse_expr(source)
+
+
+@pytest.mark.parametrize(("fixer", "using", "rewritten"), [
+    # The tree a fixer builds leaves fields the parser sets (`groupDistinct`,
+    # `isnull`) unset; its SQL must still keep the parentheses `(a OR b)
+    # BETWEEN …` needs, or the applied policy admits rows it did not.
+    (PERF001Fixer, "user_id = auth.uid() AND ((a OR b) BETWEEN false AND true)",
+     "user_id = (SELECT auth.uid()) AND ((a OR b) BETWEEN false AND true)"),
+    (SEC019Fixer, "user_id = current_setting('app.t') AND ((a OR b) BETWEEN false AND true)",
+     "user_id = current_setting('app.t', true) AND ((a OR b) BETWEEN false AND true)"),
+])
+def test_fixer_sql_keeps_the_predicates_grouping(fixer: Any, using: str, rewritten: str) -> None:
+    import pglast
+
+    [f] = fixer().fix(_wrap_policy(_policy(using)), {})
+    assert pglast.parse_sql(f.sql)[0].stmt.qual == parse_expr(rewritten)

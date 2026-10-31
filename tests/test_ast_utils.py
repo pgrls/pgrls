@@ -634,3 +634,21 @@ def test_canonical_key_tells_apart_trees_that_print_alike() -> None:
     b = parse_expr("tenant_id = 1 OR (is_public BETWEEN true AND true)")
     assert canonical_key(a) != canonical_key(b)
     assert canonical_key(parse_expr("x=1")) == canonical_key(parse_expr("x = 1"))
+
+
+@pytest.mark.parametrize("sql", [
+    # Text that looks like a placeholder, and a printer that needs a
+    # particular child shape (SIMILAR TO): no crash, a faithful or pglast's
+    # own rendering.
+    "CASE WHEN (a OR b) IS NULL THEN 'pgrls_hole_3' END = 'x'",
+    "(a OR b) BETWEEN 'pgrls_hole_9' AND y",
+    "((a OR b) BETWEEN x AND y)::text SIMILAR TO 'z'",
+])
+def test_faithful_sql_never_crashes(sql: str) -> None:
+    assert faithful_sql(parse_expr(sql))
+
+
+def test_canonical_key_ignores_source_positions() -> None:
+    a = parse_expr("EXISTS (SELECT 1 FROM unnest(ARRAY[1]) u WHERE (a OR b) BETWEEN x AND y)")
+    b = parse_expr("EXISTS (SELECT 1   FROM unnest( ARRAY[1] ) u WHERE (a OR b) BETWEEN x AND y)")
+    assert canonical_key(a) == canonical_key(b)
