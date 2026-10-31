@@ -403,15 +403,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
     # are not SQL; each is blanked so offsets into `sql` still hold.
     sql, commands = _split_psql_meta_commands(sql)
-    # pg_dumpall output `\\connect`s to one database after another; read as
-    # one schema, a database's table would merge with a same-named one in
-    # another and its findings could vanish. (`pg_dump --create` connects once.)
-    if sum(1 for c in commands if re.match(r"\\c(onnect)?(\s|$)", c)) > 1:
-        raise SchemaSourceError(
-            "bad_sql",
-            "the SQL connects to more than one database (pg_dumpall output); "
-            "dump each database with pg_dump and lint each file.",
-        )
+    connect = _check_psql_meta_commands(commands)
     try:
         statements = pglast.parse_sql(sql)
     except pglast.parser.ParseError as exc:
@@ -419,6 +411,20 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             "bad_sql",
             f"could not parse the provided SQL: {exc}.",
         ) from exc
+
+    if connect is not None and any(
+        # Where the statement ends: its start can include the gap before it.
+        ((raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)) < connect
+        and type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
+        for raw in statements
+    ):
+        # A `\\connect` after objects were created switches database: what
+        # follows is another database's schema, which must not merge.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL creates objects and then \\connects to another database; "
+            "lint each database's schema separately.",
+        )
 
     default_schema = schemas[0] if schemas else "public"
     # Relations the input creates that are not tables: pg_dump writes
@@ -875,6 +881,57 @@ def _non_table_relation(stmt: Any) -> Any:
     return None
 
 
+# psql meta-commands that leave the SQL around them as it is: pg_dump's
+# `\\restrict` pair, and settings or output that change no statement. Any
+# other — `\\i` (another file), `\\if` (a branch not taken), `\\gexec`
+# (generated SQL), `\\.` (the end of COPY data) — means the SQL pgrls would
+# read is not the SQL that runs, so it is refused rather than blanked.
+_HARMLESS_PSQL_COMMANDS = frozenset({
+    "restrict", "unrestrict", "set", "unset", "echo", "qecho", "warn",
+    "pset", "timing", "encoding",
+})
+# Statements `pg_dump --create` writes before its one `\\connect`.
+_DATABASE_LEVEL_STATEMENTS = frozenset({
+    "VariableSetStmt", "SelectStmt", "CreatedbStmt", "AlterDatabaseStmt",
+    "AlterDatabaseSetStmt", "AlterOwnerStmt", "CommentStmt", "DropdbStmt",
+})
+
+
+def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
+    """Refuse the meta-commands pgrls cannot model (raising
+    `SchemaSourceError`); the offset of the one `\\connect` allowed, if any —
+    pg_dumpall writes one per database, whose schemas must not merge."""
+    connects: list[int] = []
+    for offset, line in commands:
+        # psql runs several commands on one line separated by `\\`.
+        for part in re.split(r"\\\\", line):
+            m = re.match(r"\s*\\([A-Za-z]+|\.)", part)
+            if m is None:
+                continue
+            name = m.group(1)
+            if name == ".":
+                raise SchemaSourceError(
+                    "bad_sql",
+                    "the SQL holds COPY data (a pg_dump with data); dump the "
+                    "schema with pg_dump --schema-only.",
+                )
+            if name in ("c", "connect"):
+                connects.append(offset)
+            elif name not in _HARMLESS_PSQL_COMMANDS:
+                raise SchemaSourceError(
+                    "bad_sql",
+                    f"the SQL uses the psql command \\{name}, which pgrls does not "
+                    "model (the SQL it reads would not be the SQL that runs).",
+                )
+    if len(connects) > 1:
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL connects to more than one database (pg_dumpall output); "
+            "dump each database with pg_dump and lint each file.",
+        )
+    return connects[0] if connects else None
+
+
 def _without_psql_meta_commands(sql: str) -> str:
     """`sql` with each psql meta-command line (one whose first non-blank
     character is a backslash, outside a string, quoted identifier, dollar
@@ -882,11 +939,11 @@ def _without_psql_meta_commands(sql: str) -> str:
     return _split_psql_meta_commands(sql)[0]
 
 
-def _split_psql_meta_commands(sql: str) -> tuple[str, list[str]]:
-    """`_without_psql_meta_commands`'s text, and the meta-command lines it
-    blanked."""
+def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
+    """`_without_psql_meta_commands`'s text, and each meta-command line it
+    blanked, with its offset."""
     out = list(sql)
-    commands: list[str] = []
+    commands: list[tuple[int, str]] = []
     i, n = 0, len(sql)
     line_start = True
     while i < n:
@@ -901,7 +958,7 @@ def _split_psql_meta_commands(sql: str) -> tuple[str, list[str]]:
         if c == "\\" and line_start:
             j = sql.find("\n", i)
             j = n if j < 0 else j
-            commands.append(sql[i:j].strip())
+            commands.append((i, sql[i:j].strip()))
             out[i:j] = " " * (j - i)
             i = j
             continue

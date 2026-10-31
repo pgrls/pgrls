@@ -1635,11 +1635,11 @@ def test_psql_meta_commands_are_blanked_only_outside_literals():
         "\\set ON_ERROR_STOP on\n"
         "CREATE TABLE t (a text DEFAULT 'x\n\\still a string');\n"
         "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $b$\n\\in a body\nSELECT 1 $b$;\n"
-        "  \\connect other\n"
+        "  \\echo done\n"
     )
     out = _without_psql_meta_commands(sql)
     assert len(out) == len(sql)
-    assert "ON_ERROR_STOP" not in out and "connect" not in out
+    assert "ON_ERROR_STOP" not in out and "done" not in out
     assert "\\still a string" in out and "\\in a body" in out
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
 
@@ -1697,3 +1697,29 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # `pg_dump --create` connects once: that file lints.
     sql.write_text("\\connect a\nCREATE TABLE public.t (id int);\n")
     assert CliRunner().invoke(main, ["lint", "--sql-file", str(sql)]).exit_code == 1
+
+
+@pytest.mark.parametrize(("sql", "why"), [
+    # COPY data: blanking `\\.` would read the rows as SQL.
+    ("CREATE TABLE t (b text);\nCOPY t (b) FROM stdin;\n\\.\n", "COPY data"),
+    # Another file, a branch not taken, generated SQL: not the SQL that runs.
+    ("\\i other.sql\nCREATE TABLE t (id int);\n", "\\i,"),
+    ("\\if :prod\nALTER TABLE t DISABLE ROW LEVEL SECURITY;\n\\endif\n", "\\if,"),
+    ("SELECT 'ALTER TABLE t DISABLE ROW LEVEL SECURITY'\n\\gexec\n", "\\gexec,"),
+    # A connect after objects switches database.
+    ("CREATE TABLE a (id int);\n\\connect other\nCREATE TABLE b (id int);\n", "connects to another"),
+])
+def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    with pytest.raises(SchemaSourceError, match=why.replace("\\", "\\\\")):
+        schema_from_sql(sql)
+
+
+def test_harmless_psql_commands_are_skipped():
+    from pgrls.schema_sources import schema_from_sql
+
+    sql = ("\\set ON_ERROR_STOP on\n\\echo start\n"
+           "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+
