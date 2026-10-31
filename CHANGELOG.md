@@ -59,14 +59,19 @@ breaking changes — they will be called out in this file.
 - **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
-  which is not SQL, so the whole file failed to parse; psql meta-command
-  lines it can ignore (`\restrict`, `\echo`, `\set` of psql's own
-  settings such as `ON_ERROR_STOP`, a `\connect` after `CREATE DATABASE`,
-  …), each alone on its line, are now skipped, the LSP's ranges too. Any other is refused with an error naming it, since the SQL pgrls
+  which is not SQL, so the whole file failed to parse. psql meta-command
+  lines it can ignore (`\restrict`, `\echo`, `\pset`, a `\connect` after
+  `CREATE DATABASE`, …), each alone on its line and between statements as
+  Postgres's own lexer reads the file, are now skipped, the LSP's ranges
+  too. Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
-  COPY rows), `\i`, `\if`, `\gexec`, a `\set` of a variable the SQL can
-  read, a second command on the line, and `pg_dumpall` output, which
-  connects to one database after another (dump each with `pg_dump`). And every `ALTER … OWNER TO` the dump
+  COPY rows), `\i`, `\if`, `\gexec`, `\set` and `\encoding`, a second
+  command on the line, a line Postgres reads as inside a string, SQL that
+  names one of psql's own variables (`:ROW_COUNT`), and `pg_dumpall`
+  output, which connects to one database after another (dump each with
+  `pg_dump`). Any SQL file that sets `client_encoding` to an encoding such
+  as SJIS or BIG5, or turns `standard_conforming_strings` off, is refused
+  too: Postgres then ends strings where pgrls does not. And every `ALTER … OWNER TO` the dump
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
   not a table, or one that changes nothing pgrls models (`OWNER TO`) on a

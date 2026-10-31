@@ -1632,14 +1632,14 @@ def test_psql_meta_commands_are_blanked_only_outside_literals():
     from pgrls.schema_sources import _without_psql_meta_commands, schema_from_sql
 
     sql = (
-        "\\set ON_ERROR_STOP on\n"
+        "\\restrict key\n"
         "CREATE TABLE t (a text DEFAULT 'x\n\\still a string');\n"
         "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $b$\n\\in a body\nSELECT 1 $b$;\n"
         "  \\echo done\n"
     )
     out = _without_psql_meta_commands(sql)
     assert len(out) == len(sql)
-    assert "ON_ERROR_STOP" not in out and "done" not in out
+    assert "key" not in out and "done" not in out
     assert "\\still a string" in out and "\\in a body" in out
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
 
@@ -1713,12 +1713,19 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # as SQL; a second backslash starts another; a backtick runs a shell.
     ("\\echo hi \\\\ ALTER TABLE t DISABLE ROW LEVEL SECURITY;\n", "psql command"),
     ("\\echo hi \\i other.sql\n", "psql command"),
-    ("\\set ON_ERROR_STOP `id`\n", "psql command"),
+    ("\\pset title `id`\n", "psql command"),
     ("\\;ALTER TABLE t DISABLE ROW LEVEL SECURITY;\n", "psql command"),
     ("\\! psql -c 'select 1'\n", "psql command"),
-    # A script's own variable can be interpolated into the SQL after it.
+    # psql interpolates its variables into the SQL after them, including
+    # its own settings (`:ON_ERROR_STOP`) and those it sets itself.
     ("\\set n 2\nSELECT (ARRAY[1,2,3])[1:n];\n", "psql command"),
-    ("\\set AUTOCOMMIT off\n", "psql command"),
+    ("\\set ON_ERROR_STOP 1\n", "psql command"),
+    ("\\set ECHO a\n\\connect :ECHO\nCREATE TABLE t (id int);\n", "psql command"),
+    ("\\connect :DBNAME\nCREATE TABLE t (id int);\n", "psql command"),
+    ("\\echo x\nCREATE TABLE t (id int);\nSELECT (ARRAY[1])[1:ROW_COUNT] FROM t;\n", "its own variable"),
+    ("\\echo x\nSELECT :'USER', 1 FROM (SELECT 1) s(\"USER\");\n", "psql command|its own variable|parse"),
+    # psql splits lines by the client encoding.
+    ("\\encoding SJIS\nCREATE TABLE t (id int);\n", "psql command"),
 ])
 def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
@@ -1727,10 +1734,68 @@ def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
         schema_from_sql(sql)
 
 
+@pytest.mark.parametrize("sql", [
+    # Postgres ends a `--` comment at a lone CR, so the string that follows
+    # holds the `\\echo` line.
+    "SELECT 1; -- c\rSELECT '\n\\echo x'; CREATE TABLE hidden (id int); --\n';\n",
+    # A dollar-quote tag can be any non-ASCII character, and so can an
+    # identifier's (`·$a$` is one identifier).
+    "SELECT $\U0001f600$\n\\echo x $\U0001f600$; CREATE TABLE hidden (id int); "
+    "SELECT $\U0001f600$\n$\U0001f600$;\n",
+    "SELECT 1 AS \u00b7$a$, '\n$a$\n\\echo x'; CREATE TABLE hidden (id int); --\n';\n",
+])
+def test_a_psql_line_inside_a_string_is_not_skipped(sql):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    try:
+        tables = [t.name for t in schema_from_sql(sql).tables]
+    except SchemaSourceError:
+        return
+    assert tables == ["hidden"]
+
+
+def test_a_skipped_line_must_lie_between_tokens():
+    # Whatever the line splitter decides, a blanked line Postgres's lexer
+    # reads as inside a string is refused.
+    from pgrls.schema_sources import SchemaSourceError, _check_blanked_lines
+
+    sql = "SELECT '\n          \n';\n"
+    with pytest.raises(SchemaSourceError, match="inside a string"):
+        _check_blanked_lines(sql, [(9, "\\echo x")])
+    _check_blanked_lines("SELECT 1;\n          \n", [(10, "\\echo x")])
+
+
+@pytest.mark.parametrize(("sql", "refused"), [
+    ("SET client_encoding = 'SJIS';\n", True),
+    ("SET NAMES 'Big-5';\n", True),
+    ("SET client_encoding = 'win932';\n", True),
+    ("SET standard_conforming_strings = off;\n", True),
+    ("SET standard_conforming_strings = 0;\n", True),
+    ("SET standard_conforming_strings = fa;\n", True),
+    ("SET client_encoding = 'UTF8';\n", False),
+    ("SET client_encoding = 'LATIN1';\n", False),
+    ("SET standard_conforming_strings = on;\n", False),
+    ("SET standard_conforming_strings = tru;\n", False),
+    ("SET standard_conforming_strings TO DEFAULT;\n", False),
+])
+def test_a_setting_that_changes_how_strings_read_is_refused(sql, refused):
+    # Under SJIS a multibyte character can end in a backslash byte, and with
+    # standard_conforming_strings off `\\'` escapes: Postgres would end
+    # strings where pgrls does not.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    sql += "CREATE TABLE t (id int);\n"
+    if refused:
+        with pytest.raises(SchemaSourceError, match="reads strings differently"):
+            schema_from_sql(sql)
+    else:
+        assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+
+
 def test_harmless_psql_commands_are_skipped():
     from pgrls.schema_sources import schema_from_sql
 
-    sql = ("\\set ON_ERROR_STOP on\n\\echo start\n"
+    sql = ("\\restrict k\n\\echo start\n"
            "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # pg_dump --create connects again after the database's own settings.

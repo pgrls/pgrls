@@ -378,8 +378,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
       `rls_enabled` / `force_rls`; ``ALTER TABLE … ATTACH / DETACH
       PARTITION`` sets / clears the child's `partition_of` (the form
       ``pg_dump`` writes partitions in). An ALTER on a view, sequence or other
-      non-table relation is ignored, and psql meta-command lines
-      (``\\restrict``) are skipped.
+      non-table relation is ignored. psql meta-command lines that do not
+      change the SQL (``\\restrict``, ``\\echo``, a ``\\connect`` to one
+      database) are skipped; any other is refused.
     * ``CREATE POLICY`` → a `Policy` (name, command, permissive vs
       ``AS RESTRICTIVE``, ``TO`` roles, and USING / WITH CHECK parsed into the
       ASTs `verify` and the AST rules need).
@@ -406,11 +407,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     connect = _check_psql_meta_commands(commands)
     try:
         statements = pglast.parse_sql(sql)
+        if commands:
+            _check_blanked_lines(sql, commands)
     except pglast.parser.ParseError as exc:
         raise SchemaSourceError(
             "bad_sql",
             f"could not parse the provided SQL: {exc}.",
         ) from exc
+    _check_lexer_settings(statements)
 
     if connect is not None and any(
         # Where the statement ends: its start can include the gap before it.
@@ -887,16 +891,18 @@ def _non_table_relation(stmt: Any) -> Any:
 # other — `\\i` (another file), `\\if` (a branch not taken), `\\gexec`
 # (generated SQL), `\\.` (the end of COPY data) — means the SQL pgrls would
 # read is not the SQL that runs, so it is refused rather than blanked.
+# `\\set` is not here: psql interpolates its variables into the SQL that
+# follows (`:n`), and `\\encoding` changes how psql splits the lines.
 _HARMLESS_PSQL_COMMANDS = frozenset({
     "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
-    "encoding",
 })
-# psql's own settings `\\set` may change: a variable of the script's own
-# could be interpolated into the SQL that follows (`:n`), and `AUTOCOMMIT`
-# would leave the script uncommitted.
-_HARMLESS_PSQL_SETTINGS = frozenset({
-    "ON_ERROR_STOP", "ON_ERROR_ROLLBACK", "ECHO", "ECHO_HIDDEN", "QUIET",
-    "VERBOSITY", "SHOW_CONTEXT",
+# Client encodings in which a byte of a multibyte character can be a quote or
+# a backslash (the client-only ones, by every name Postgres accepts): under
+# one, Postgres and psql end strings where pgrls, reading UTF-8, does not.
+_UNSAFE_CLIENT_ENCODINGS = frozenset({
+    "sjis", "mskanji", "shiftjis", "win932", "windows932", "shiftjis2004",
+    "big5", "win950", "windows950", "gbk", "win936", "windows936", "cp936",
+    "gb18030", "uhc", "win949", "windows949", "cp949", "johab",
 })
 # Statements `pg_dump --create` writes before its `\\connect`.
 _DATABASE_LEVEL_STATEMENTS = frozenset({
@@ -927,19 +933,15 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
                 "the SQL holds COPY data (a pg_dump with data); dump the "
                 "schema with pg_dump --schema-only.",
             )
-        setting = rest.split(maxsplit=1)[0] if rest else ""
-        known = (
-            name in _HARMLESS_PSQL_COMMANDS
-            or name in ("c", "connect")
-            or (name in ("set", "unset") and setting in _HARMLESS_PSQL_SETTINGS)
-        )
+        connect = name in ("c", "connect")
+        known = name in _HARMLESS_PSQL_COMMANDS or (connect and ":" not in rest)
         if m is None or "\\" in rest or "`" in rest or not known:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "
                 "does not model (the SQL it reads would not be the SQL that runs).",
             )
-        if name in ("c", "connect"):
+        if connect:
             connects.append((offset, rest))
     if len({target for _, target in connects}) > 1:
         raise SchemaSourceError(
@@ -948,6 +950,64 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> int | None:
             "dump each database with pg_dump and lint each file.",
         )
     return connects[0][0] if connects else None
+
+
+def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
+    """Refuse when Postgres's own lexer reads a blanked meta-command line as
+    part of a string, quoted name or comment — psql, which lexes the same way,
+    would then not have run it as a command — or when the SQL names one of
+    psql's own variables (`:ROW_COUNT`), which psql interpolates before
+    sending it. Raises `pglast.parser.ParseError` on SQL that does not lex."""
+    tokens = pglast.parser.scan(sql)
+    k = 0
+    for offset, line in commands:
+        while k < len(tokens) and tokens[k].end < offset:
+            k += 1
+        if k < len(tokens) and tokens[k].start < offset:
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the psql command {line[:60]!r} sits inside a string, quoted "
+                "name or comment, where psql would not run it; pgrls cannot "
+                "tell which lines psql runs.",
+            )
+    for colon, name in zip(tokens, tokens[1:]):
+        text = sql[name.start:name.end + 1].strip("'\"")
+        if (colon.name == "ASCII_58" and name.start == colon.end + 1
+                and name.name in ("IDENT", "SCONST")
+                and re.fullmatch(r"[A-Z][A-Z0-9_]*", text)):
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL holds {sql[colon.start:name.end + 1]!r}, which psql "
+                "replaces with the value of its own variable; pgrls cannot "
+                "tell what SQL psql sends.",
+            )
+
+
+def _check_lexer_settings(statements: Any) -> None:
+    """Refuse a `SET` that changes how Postgres reads the strings after it:
+    a client encoding whose characters can hold a quote or backslash byte, or
+    `standard_conforming_strings` off. pgrls reads the SQL as UTF-8 with
+    standard strings, so it would end strings where Postgres does not."""
+    for raw in statements:
+        stmt = raw.stmt
+        if not isinstance(stmt, _pgast.VariableSetStmt) or not stmt.args:
+            continue
+        val = stmt.args[0].val
+        value = str(getattr(val, "sval", None) or getattr(val, "ival", "")).lower()
+        unsafe = (
+            stmt.name == "client_encoding"
+            and re.sub(r"[^a-z0-9]", "", value) in _UNSAFE_CLIENT_ENCODINGS
+        ) or (
+            stmt.name == "standard_conforming_strings"
+            and not (value in ("on", "1") or (value and ("true".startswith(value)
+                                                         or "yes".startswith(value))))
+        )
+        if unsafe:
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL sets {stmt.name} to {value!r}, under which Postgres "
+                "reads strings differently from how pgrls reads them.",
+            )
 
 
 def _without_psql_meta_commands(sql: str) -> str:
@@ -982,8 +1042,8 @@ def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
             continue
         line_start = False
         if sql.startswith("--", i):
-            j = sql.find("\n", i)
-            i = n if j < 0 else j
+            m = _LINE_END.search(sql, i)
+            i = n if m is None else m.start()
         elif sql.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:
@@ -996,7 +1056,7 @@ def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
         elif c in "'\"":
             # `E'…'` takes backslash escapes; `date'…'` does not.
             escapes = c == "'" and i > 0 and sql[i - 1] in "eE" and not (
-                i > 1 and (sql[i - 2].isalnum() or sql[i - 2] in "_$"))
+                i > 1 and _is_ident_char(sql[i - 2]))
             i += 1
             while i < n:
                 if escapes and sql[i] == "\\":
@@ -1009,7 +1069,7 @@ def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
                 else:
                     i += 1
         elif (m := _DOLLAR_QUOTE.match(sql, i)) is not None and not (
-            i and (sql[i - 1].isalnum() or sql[i - 1] in "_$")
+            i and _is_ident_char(sql[i - 1])
         ):
             j = sql.find(m.group(0), m.end())
             i = n if j < 0 else j + len(m.group(0))
@@ -1018,7 +1078,13 @@ def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
     return "".join(out), commands
 
 
-_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\x80-\uffff][A-Za-z_0-9\x80-\uffff]*)?\$")
+_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z_0-9\x80-\U0010ffff]*)?\$")
+_LINE_END = re.compile(r"[\r\n]")
+
+
+def _is_ident_char(c: str) -> bool:
+    # Postgres takes every non-ASCII character as part of an identifier.
+    return not c.isascii() or c.isalnum() or c in "_$"
 
 
 def _apply_create_policy(
