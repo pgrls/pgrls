@@ -152,9 +152,8 @@ def test_or_mixing_comparison_and_bare_boolean_funccall_returns_none():
     # Regression: `is_admin()` translates as an opaque String marker, so
     # `z3.Or(<Int-comparison Bool>, <String opaque>)` raised an uncaught
     # `z3.Z3Exception: sort mismatch` and crashed `pgrls diff` on a
-    # realistic policy edit. `_to_z3` now catches it at the boolean-
-    # connective site and degrades to None (→ requires_review), like
-    # every other untranslatable operator.
+    # realistic policy edit. The boolean connective now degrades to None
+    # (→ requires_review), like every other untranslatable operator.
     assert _classify("tenant_id = 2", "tenant_id = 1 OR is_admin()") is None
 
 
@@ -497,7 +496,7 @@ def test_counterexample_present_on_or_loosen():
     cx = _counterexample(base, head)
     assert cx is not None
     # Every key is a REAL column — no synthetic vars leaked.
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     # SOUNDNESS: the row genuinely satisfies head ∧ ¬base.
     assert _row_satisfies_head_not_base(base, head, cx)
 
@@ -534,7 +533,7 @@ def test_counterexample_present_on_incomparable_pair():
     assert _classify(base, head) is None
     cx = _counterexample(base, head)
     assert cx is not None
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     # SOUNDNESS: the returned row genuinely lies in head ∖ base.
     assert _row_satisfies_head_not_base(base, head, cx)
 
@@ -581,7 +580,7 @@ def test_counterexample_for_loosen_via_public_helper():
 
     cx = counterexample_for("tenant_id = 1", "tenant_id = 1 OR tenant_id = 2")
     assert cx is not None
-    assert all(not k.startswith(("_isnull__", "_opaque__")) for k in cx)
+    assert all(not k.startswith(("_nullflag__", "_opaque__")) for k in cx)
     assert _row_satisfies_head_not_base(
         "tenant_id = 1", "tenant_id = 1 OR tenant_id = 2", cx
     )
@@ -589,7 +588,7 @@ def test_counterexample_for_loosen_via_public_helper():
 
 # ---------------------------------------------------------------------------
 # H2 (SEC038) — `anon_read_counterexample`: the Kleene 3VL anonymous-read
-# validity prover. Additive; the 2-valued path above is untouched.
+# validity prover — the encoder the diff path above shares.
 #
 # Contract: returns a dict (a proof artifact) iff the USING predicate is
 # anon-VALID — TRUE for every row under an anonymous session (every auth
@@ -925,26 +924,23 @@ def test_string_arithmetic_predicate_degrades_instead_of_crashing() -> None:
     assert counterexample(cc, cc) is None
 
 
-def test_reserved_marker_prefix_column_cannot_alias_the_null_marker() -> None:
-    # R15 #3: the synthetic NULL marker for column `x` is minted as
-    # z3.Bool("_isnull__x"); a REAL column literally named `_isnull__x`
-    # (legal via a quoted identifier) is bound as z3.Const("_isnull__x",
-    # Bool) and — since Z3 keys a constant by name+sort — would alias the
-    # marker in the `base AND NOT head` implication query, silently
-    # collapsing distinct predicates to `semantic_equivalent` (a
-    # suppressed diff Change; by symmetry a missed DANGEROUS loosening).
-    # `_column_key` now refuses to bind a reserved-prefix column, so the
-    # predicate degrades to requires_review (None) — never a false
-    # equivalence.
-    assert _classify("x IS NULL AND y = 1", '"_isnull__x" AND y = 1') is None
+def test_reserved_marker_prefix_column_cannot_alias_the_null_flag() -> None:
+    # R15 #3: the null-flag for column `x` is minted as
+    # z3.Bool("_nullflag__x"); a REAL column literally named `_nullflag__x`
+    # (legal via a quoted identifier) would be bound as
+    # z3.Const("_nullflag__x", Bool) and — since Z3 keys a constant by
+    # name+sort — alias the flag, collapsing distinct predicates to
+    # `semantic_equivalent`. `_column_key` refuses to bind a reserved-prefix
+    # column, so the predicate degrades to requires_review (None).
+    assert _classify("x IS NULL AND y = 1", '"_nullflag__x" AND y = 1') is None
     # _column_key returns "" for every reserved synthetic prefix...
     from pgrls.diff._z3_compare import _column_key
 
-    for name in ("_isnull__x", "_opaque__foo", "_nullflag__z"):
+    for name in ("_opaque__foo", "_nullflag__z", "_session__a"):
         ref = parse_expr(f'"{name}" = 1').lexpr
         assert _column_key(ref) == "", name
     # ...but a near-miss / ordinary name still binds normally.
-    assert _column_key(parse_expr('"_isnullx" = 1').lexpr) == "_isnullx"
+    assert _column_key(parse_expr('"_nullflagx" = 1').lexpr) == "_nullflagx"
     assert _column_key(parse_expr("owner_id = 1").lexpr) == "owner_id"
 
 
@@ -984,6 +980,32 @@ def test_a_null_test_is_tied_to_its_columns_value() -> None:
 ])
 def test_three_valued_classification(base: str, head: str, verdict: str) -> None:
     assert _classify(base, head) == verdict
+
+
+@pytest.mark.parametrize(("base", "head"), [
+    # Z3 and Postgres disagree here, so the comparison abstains.
+    ("COALESCE(a, b) = 1", "COALESCE(a, b) = 2"),       # bare columns: no sort
+    ("COALESCE(a, b) = 1", "COALESCE(a, b) > 0"),
+    ("a % 2 = 1 OR a % 2 = 0", "a IS NOT NULL"),        # -1 % 2 is -1 in PG
+    ("a / 2 = -1", "a = -2 OR a = -1"),                 # PG truncates
+    ("a + b >= a", "a IS NOT NULL AND b IS NOT NULL"),  # Z3 + on text concatenates
+    ("'B' < 'b'", "c <> true"),                         # collation order
+    ('"f()" IS NULL', "f() IS NULL"),                   # a column, not the call
+])
+def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str) -> None:
+    assert _classify(base, head) is None
+
+
+def test_an_opaque_ordering_and_numeric_division_still_translate() -> None:
+    assert _classify("created_at > now()", "created_at > now() AND x = 1") == "semantic_tightened"
+    assert _classify("price / 2.0 > 1.0", "price > 2.0") == "semantic_equivalent"
+
+
+def test_a_bare_column_coalesce_is_no_anonymous_leak() -> None:
+    # `COALESCE(level, tier) < 2` modelled the two as Bools coerced to 0/1,
+    # which made this policy read as TRUE for every row (a false SEC038).
+    assert anon_read_counterexample(parse_expr(
+        "COALESCE(level, tier) < 2 OR (level IS NULL AND tier IS NULL)")) is None
 
 
 def test_a_null_admitting_widening_names_the_null_row() -> None:

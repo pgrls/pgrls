@@ -64,8 +64,13 @@ breaking changes — they will be called out in this file.
   admits a row only when it is exactly TRUE — NULL hides a row as FALSE
   does — so these are `DANGEROUS` loosenings, and the leaking row can name a
   NULL column (`{a=NULL}`). The same model ties an `IS NULL` test to its
-  column, so `col IS NOT NULL AND col = x` → `col = x` is no longer flagged
-  as a loosening, and it also decides `IS [NOT] DISTINCT FROM`.
+  column, so `(col IS NOT NULL AND col = 5) OR b = 1` → `col = 5 OR b = 1`
+  is no longer flagged as a loosening, and it also decides `IS [NOT]
+  DISTINCT FROM`. Where Z3 and Postgres disagree — integer `/` and `%`
+  (Postgres truncates), arithmetic on text, ordering against a text literal
+  (Postgres uses the collation), a `COALESCE` of bare columns — the
+  comparison now abstains instead of deciding wrongly, which also fixes a
+  false SEC038 on `COALESCE(level, tier) < 2 OR …`.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

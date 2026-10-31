@@ -37,13 +37,21 @@ where ``a`` is NULL), and ``col IS NOT NULL AND col = x`` is equivalent to
 equivalent, and with an ``IS NULL`` disconnected from the column's value
 it flags the second.
 
-What the encoder translates: columns, literals, comparisons and arithmetic,
+What the encoder translates: columns, literals, comparisons and arithmetic
+(not where Z3 and Postgres disagree — integer ``/`` and ``%``, arithmetic on
+text, ordering against a text literal, which collations decide),
 AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
 by base and head). On the diff path a ``CASE``, or a ``COALESCE`` it cannot
-model exactly, is an opaque value too. Anything else returns None and the
-caller falls through to ``requires_review``.
+model exactly, is an opaque value too. Opaque values are text, so only a
+comparison with text translates. Anything else returns None and the caller
+falls through to ``requires_review``.
+
+A column's type is inferred from what it is compared with: against an
+integer literal it is an integer, so ``a >= 2`` and ``a > 1`` are
+equivalent — wrong for a ``numeric`` column, where 1.5 passes only the
+second. The diff compares policy text and does not see column types.
 
 Type unification per column: the first comparison fixes the type.
 A subsequent reference with a conflicting type (e.g. ``col = 5``
@@ -159,13 +167,12 @@ _REAL_TYPES = frozenset({
 })
 _BOOL_TYPES = frozenset({"bool", "boolean"})
 
-# Z3 decl-name prefixes for the synthetic vars the context mints: the
-# retired 2-valued NULL marker (still reserved), opaque-expression vars
-# (`opaque`), and the Kleene null-flag (`null_flag`). A REAL column is bound via
-# `column()` under its verbatim key, and Z3 identifies a constant by
-# name+sort — so a real column literally named `_isnull__x` (legal: a
-# double-quoted identifier may contain anything but NUL) would alias the
-# NULL marker synthesized for column `x` in the implication query, making
+# Z3 decl-name prefixes for the synthetic vars the context mints:
+# opaque-expression vars (`opaque`) and the Kleene null-flag (`null_flag`).
+# A REAL column is bound via `column()` under its verbatim key, and Z3
+# identifies a constant by name+sort — so a real column literally named
+# `_nullflag__x` (legal: a double-quoted identifier may contain anything
+# but NUL) would alias the null-flag minted for column `x`, making
 # distinct predicates look `semantic_equivalent` (a silently-suppressed
 # diff Change, and by symmetry a missed DANGEROUS loosening). Embedding a
 # NUL in the prefix does NOT help — Z3 truncates decl names at NUL — so
@@ -173,7 +180,6 @@ _BOOL_TYPES = frozenset({"bool", "boolean"})
 # with these prefixes (it returns "" → the predicate degrades to
 # requires_review, the safe direction). Single source of truth so the
 # minting sites and that guard cannot drift. (R15 #3)
-_NULL_MARKER_PREFIX = "_isnull__"
 _OPAQUE_PREFIX = "_opaque__"
 _NULLFLAG_PREFIX = "_nullflag__"
 # Cross-tenant verifier (`prove_cross_tenant_isolation`) only: the free,
@@ -184,7 +190,6 @@ _NULLFLAG_PREFIX = "_nullflag__"
 # reserved set and `_column_key` refuses to bind it.
 _SESSION_PREFIX = "_session__"
 _RESERVED_MARKER_PREFIXES: tuple[str, ...] = (
-    _NULL_MARKER_PREFIX,
     _OPAQUE_PREFIX,
     _NULLFLAG_PREFIX,
     _SESSION_PREFIX,
@@ -212,7 +217,7 @@ class _Context:
         # Decl names are
         # prefixed `_nullflag__` and never land in `_vars`, so
         # `is_real_column` excludes them and `_decode_model` drops them
-        # from the witness exactly like `_isnull__*` / `_opaque__*`.
+        # from the witness exactly like `_opaque__*`.
         self._nullflag_vars: dict[str, Any] = {}
         # Cross-tenant verifier only. `session_mode` flips the anon-NULL
         # leaf (every auth call NULL) to a free NON-NULL *session symbol*
@@ -247,8 +252,8 @@ class _Context:
         # a read of a custom GUC is a free value (any session may have set
         # it), never the unset-GUC raise the anon prover models.
         self.any_session: bool = False
-        # Diff path: columns only ever tested for NULL, which bind no value
-        # variable but still belong in a witness row.
+        # Diff path: columns tested for NULL. One that is never compared
+        # binds no value variable, yet a witness row may need it NULL.
         self.null_tested: set[str] = set()
         self._session_vars: dict[str, Any] = {}
         self.tenant_pairs: list[tuple[Any, Any]] = []
@@ -299,13 +304,19 @@ class _Context:
         ``_nullflag__`` and the var never enters ``_vars``, so
         ``is_real_column`` returns False for it and ``_decode_model``
         drops it from the witness — keeping the emitted row real-columns
-        only, exactly like ``_isnull__*`` / ``_opaque__*``.
+        only, exactly like ``_opaque__*``.
         """
         existing = self._nullflag_vars.get(key)
         if existing is None:
             existing = z3.Bool(f"{_NULLFLAG_PREFIX}{key}")
             self._nullflag_vars[key] = existing
         return existing
+
+    def opaque_null_flag(self, key: str) -> Any:
+        """``null_flag`` of the opaque expression keyed ``key`` — under the
+        reserved ``_opaque__`` prefix, so it never aliases the null-flag of a
+        column whose (quoted) name happens to equal ``key``."""
+        return self.null_flag(f"{_OPAQUE_PREFIX}{key}")
 
     def is_real_column(self, name: str) -> bool:
         """True iff `name` is a real column var (not a null/opaque marker).
@@ -317,7 +328,7 @@ class _Context:
         decl whose name is a key of ``_vars`` is authoritatively a real
         column; everything else is a synthetic marker. Preferred over
         prefix-string matching, which a user column literally named
-        ``_isnull__x`` could otherwise spoof.
+        ``_nullflag__x`` could otherwise spoof.
         """
         return name in self._vars
 
@@ -362,7 +373,7 @@ def _column_key(node: ColumnRef) -> str:
     # would alias the marker var in the implication query (Z3 keys a
     # constant by name+sort), silently making distinct predicates look
     # equivalent. Such a column name is pathological but legal (a quoted
-    # identifier may be literally `_isnull__x`), so refuse to bind it:
+    # identifier may be literally `_nullflag__x`), so refuse to bind it:
     # return "" and the caller degrades the predicate to requires_review
     # (the safe direction). See `_RESERVED_MARKER_PREFIXES`.
     if key.startswith(_RESERVED_MARKER_PREFIXES):
@@ -512,7 +523,7 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     """Render a Z3 model into ``{column_key: python_value}``.
 
     Keeps only real columns (``ctx.is_real_column``) — synthetic
-    ``_isnull__*`` / ``_opaque__*`` markers are dropped — and decodes
+    ``_nullflag__*`` / ``_opaque__*`` / ``_session__*`` vars are dropped — and decodes
     each value by its Z3 sort, one-to-one with the constructors in
     ``_const_to_z3`` (Int → ``as_long``, String → ``as_string``,
     Bool → ``z3.is_true``, Real → ``float(as_fraction())``). Any other
@@ -524,7 +535,7 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     for decl in model.decls():
         name = decl.name()
         if not ctx.is_real_column(name):
-            continue  # skip _isnull__ / _opaque__ synthetic vars
+            continue  # skip the synthetic vars
         value = model[decl]
         sort = value.sort()
         if sort == z3.IntSort():
@@ -571,9 +582,11 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     * ``head ∧ ¬base`` is UNSAT — the head admits no row the base rejected
       (an equivalent or tightened change); or
     * the real-column projection of the model is not a *self-sufficient*
-      witness — the leak depends on a NULL test or an opaque
-      (function / GUC / COALESCE / CASE) value that the column-only row
-      cannot honestly express. In that case we emit NO counterexample
+      witness — the leak depends on an opaque (function / GUC / COALESCE /
+      CASE) value the row cannot express, or on a column being NOT NULL
+      that the predicates only test for NULL (the row pins a column NULL,
+      but has no value to give one that must not be). In that case we
+      emit NO counterexample
       (degrade to the label-only DANGEROUS verdict) rather than a row
       that does not actually leak. Soundness over cleverness.
 
@@ -1038,7 +1051,7 @@ def _anon_3vl(
             is_null=(
                 z3.BoolVal(False)
                 if is_never_null_current_setting(node)
-                else ctx.null_flag(_canon(node))
+                else ctx.opaque_null_flag(_canon(node))
             ),
         )
     if (
@@ -1091,7 +1104,7 @@ def _anon_3vl(
                         z3.BoolVal(False)
                         if _first_string_arg(node) is not None
                         # a computed name could be either: stay undecided
-                        else ctx.null_flag(_canon(node))
+                        else ctx.opaque_null_flag(_canon(node))
                     ),
                 )
         return _Val(
@@ -1172,7 +1185,7 @@ def _anon_3vl(
             )
         return _Val(
             value=ctx.opaque(key, z3.StringSort()),
-            is_null=ctx.null_flag(key),
+            is_null=ctx.opaque_null_flag(key),
         )
 
     # --- boolean connectives (Kleene tables).
@@ -1237,16 +1250,22 @@ def _anon_3vl(
 
     # --- COALESCE: value is the first non-null arg; null iff all null.
     if isinstance(node, CoalesceExpr):
-        exact = _anon_coalesce(node, ctx, auth_funcs, assertions)
+        args = list(node.args or ())
+        bare_column = any(isinstance(a, ColumnRef) for a in args)
+        # A bare column argument has no sort of its own: modelled exactly it
+        # defaults to Bool, and `COALESCE(a, b) = 5` then compares a Bool
+        # with an Int. The diff path keeps such a COALESCE — or one it
+        # cannot model exactly for another reason — an opaque value shared
+        # by base and head, like CASE below, without binding those columns.
+        exact = None if ctx.any_session and bare_column else _anon_coalesce(
+            node, ctx, auth_funcs, assertions)
         if exact is None and ctx.any_session:
-            # The diff path keeps a COALESCE it cannot model exactly (a bare
-            # column argument has no sort of its own) as an opaque value,
-            # shared by base and head — like CASE below.
-            if any(_anon_3vl(a, ctx, auth_funcs, assertions) is None
-                   for a in node.args or ()):
+            if any(not isinstance(a, ColumnRef)
+                   and _anon_3vl(a, ctx, auth_funcs, assertions) is None
+                   for a in args):
                 return None
             key = _canon(node)
-            return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.null_flag(key))
+            return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.opaque_null_flag(key))
         return exact
 
     # --- CASE: v1 soundness abort (no CASE corpus negative; Oracle §3.5).
@@ -1260,7 +1279,7 @@ def _anon_3vl(
             if _anon_3vl(part, ctx, auth_funcs, assertions) is None:
                 return None
         key = _canon(node)
-        return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.null_flag(key))
+        return _Val(value=ctx.opaque(key, z3.StringSort()), is_null=ctx.opaque_null_flag(key))
 
     # --- TypeCast. Handle both a scalar (_Val) and a boolean (_TV) inner
     # (amendment #4: P4 `(... IS NULL)::bool` feeds a _TV inner). A cast
@@ -1412,6 +1431,8 @@ def _anon_distinct(
     )
     if left is None or right is None or left.unset or right.unset:
         return None
+    if _unlike_sql("=", left.value, right.value):
+        return None
     try:
         differ = z3.Or(
             left.is_null != right.is_null,
@@ -1537,6 +1558,9 @@ def _anon_binop(
     if ctx.session_mode and op == "=":
         _record_tenant_pair(ctx, left, right)
 
+    if _unlike_sql(op, left.value, right.value):
+        return None
+
     if comparison_fn is not None:
         if left.unset or right.unset:
             # One side reads a GUC that is unset for an anonymous session,
@@ -1574,6 +1598,30 @@ def _anon_binop(
         return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null))
 
     return None  # unreachable (guarded above) — satisfies the type checker
+
+
+def _unlike_sql(op: str, left: Any, right: Any) -> bool:
+    """Whether Z3's reading of `left op right` would differ from Postgres's,
+    so the comparison must not be translated:
+
+    * a Bool against a non-Bool — an encoding artifact (a bare column
+      defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects;
+    * arithmetic on a non-number — Z3's ``+`` on two strings concatenates;
+    * integer ``/`` and ``%`` — Postgres truncates toward zero, Z3 rounds
+      toward negative infinity (``-1 % 2`` is -1 in Postgres, 1 in Z3);
+    * ``<`` / ``>`` / ``<=`` / ``>=`` against a string literal — Postgres
+      orders text by its collation, Z3 by code point (``'B' < 'b'`` is FALSE
+      under en_US)."""
+    sorts = (left.sort(), right.sort())
+    if (sorts[0] == z3.BoolSort()) != (sorts[1] == z3.BoolSort()):
+        return True
+    if op in _ARITHMETIC_OPS:
+        if not all(s in (z3.IntSort(), z3.RealSort()) for s in sorts):
+            return True
+        return op in ("/", "%") and z3.IntSort() in sorts
+    return op in ("<", ">", "<=", ">=") and (
+        z3.is_string_value(left) or z3.is_string_value(right)
+    )
 
 
 def _resolve_3vl_operands(
