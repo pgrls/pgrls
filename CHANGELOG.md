@@ -61,7 +61,9 @@ breaking changes — they will be called out in this file.
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse; psql meta-command
   lines are now skipped (the LSP's ranges too). A dump with data
-  (`COPY … FROM stdin`) still does not parse. And every `ALTER … OWNER TO` the dump
+  (`COPY … FROM stdin`) still does not parse, and `pg_dumpall` output,
+  which connects to one database after another, is refused with a clear
+  error (dump each database with `pg_dump`). And every `ALTER … OWNER TO` the dump
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
   not a table, or one that changes nothing pgrls models (`OWNER TO`) on a

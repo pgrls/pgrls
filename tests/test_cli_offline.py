@@ -1582,8 +1582,9 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
 
 
 # A schema-only pg_dump (17.11) of a table, a view, a matview and a
-# sequence, trimmed: the psql meta-commands it opens and closes with, and an
-# `ALTER … OWNER TO` for every relation.
+# sequence, trimmed — the psql meta-commands it opens and closes with, and an
+# `ALTER … OWNER TO` for every relation — plus an `ALTER TABLE` on the view,
+# which Postgres accepts and older dumps write.
 _PG_DUMP = """\
 --
 -- PostgreSQL database dump
@@ -1681,3 +1682,18 @@ def test_a_typed_literal_is_no_escape_string():
     # the backslash line inside the next string is left alone.
     sql = "COMMENT ON TABLE t IS date'x\\' || '\n\\keep me\n';"
     assert _without_psql_meta_commands(sql) == sql
+
+
+def test_pg_dumpall_output_is_refused(tmp_path):
+    # Read as one schema, one database's table would merge with a same-named
+    # table in another, and its SEC001 would vanish.
+    sql = tmp_path / "all.sql"
+    sql.write_text(
+        "\\connect a\nCREATE TABLE public.t (id int);\nGRANT SELECT ON public.t TO PUBLIC;\n"
+        "\\connect b\nCREATE TABLE public.t (id int);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "more than one database" in res.output, res.output
+    # `pg_dump --create` connects once: that file lints.
+    sql.write_text("\\connect a\nCREATE TABLE public.t (id int);\n")
+    assert CliRunner().invoke(main, ["lint", "--sql-file", str(sql)]).exit_code == 1

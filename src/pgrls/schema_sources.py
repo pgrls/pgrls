@@ -402,7 +402,16 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
     # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
     # are not SQL; each is blanked so offsets into `sql` still hold.
-    sql = _without_psql_meta_commands(sql)
+    sql, commands = _split_psql_meta_commands(sql)
+    # pg_dumpall output `\\connect`s to one database after another; read as
+    # one schema, a database's table would merge with a same-named one in
+    # another and its findings could vanish. (`pg_dump --create` connects once.)
+    if sum(1 for c in commands if re.match(r"\\c(onnect)?(\s|$)", c)) > 1:
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL connects to more than one database (pg_dumpall output); "
+            "dump each database with pg_dump and lint each file.",
+        )
     try:
         statements = pglast.parse_sql(sql)
     except pglast.parser.ParseError as exc:
@@ -870,7 +879,14 @@ def _without_psql_meta_commands(sql: str) -> str:
     """`sql` with each psql meta-command line (one whose first non-blank
     character is a backslash, outside a string, quoted identifier, dollar
     quote or comment) blanked to spaces, so statement offsets are kept."""
+    return _split_psql_meta_commands(sql)[0]
+
+
+def _split_psql_meta_commands(sql: str) -> tuple[str, list[str]]:
+    """`_without_psql_meta_commands`'s text, and the meta-command lines it
+    blanked."""
     out = list(sql)
+    commands: list[str] = []
     i, n = 0, len(sql)
     line_start = True
     while i < n:
@@ -885,6 +901,7 @@ def _without_psql_meta_commands(sql: str) -> str:
         if c == "\\" and line_start:
             j = sql.find("\n", i)
             j = n if j < 0 else j
+            commands.append(sql[i:j].strip())
             out[i:j] = " " * (j - i)
             i = j
             continue
@@ -923,7 +940,7 @@ def _without_psql_meta_commands(sql: str) -> str:
             i = n if j < 0 else j + len(m.group(0))
         else:
             i += 1
-    return "".join(out)
+    return "".join(out), commands
 
 
 _DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\x80-\uffff][A-Za-z_0-9\x80-\uffff]*)?\$")
