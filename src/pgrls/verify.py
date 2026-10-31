@@ -1939,8 +1939,7 @@ def _has_range_function(stmt: Any) -> bool:
 # called bare — it would be cleared rather than abstained, negligible in
 # practice and in line with how bare auth-function names are already trusted.
 # That argument needs, at the least, the builtin to exist on every supported
-# server, so
-# PostgreSQL 18's additions (`casefold`, `uuidv7`, `array_sort`, `crc32`, …)
+# server, so PostgreSQL 18's additions (`casefold`, `uuidv7`, `array_sort`, `crc32`, …)
 # are left out: on 15–17 a bare call to one can only be a user function — a
 # polyfill under the same name — and pgrls does not know the server version.
 # Measured on PG17: a door calling a user `casefold()` that read a FORCE'd
