@@ -1737,6 +1737,8 @@ def test_pg_dumpall_output_is_refused(tmp_path):
      "psql command"),
     # `:USER` lexes as a keyword, and psql replaces it all the same.
     ("\\echo x\nSELECT (ARRAY[1, 2])[1:USER];\n", "its own variable"),
+    # psql ends the name at `$`; the server lexes `USER$x` as one name.
+    ("\\echo x\nSELECT (ARRAY[1, 2])[1:USER$x];\n", "its own variable"),
     ("\\encoding LATIN1\nCREATE TABLE t (id int);\n", "psql command"),
     # psql rolls an open transaction back when it reconnects.
     ("CREATE DATABASE d;\n\\connect d\nCREATE TABLE t (id int);\nBEGIN;\n"
@@ -1786,9 +1788,12 @@ def test_a_sql_file_keeps_a_lone_cr(tmp_path):
 def test_a_sql_file_that_is_not_utf8_is_a_tool_error(tmp_path):
     from pgrls.cli import main
 
+    data = 'CREATE TABLE "\u00e9" (id int);\n'.encode("latin-1")
     sql = tmp_path / "latin1.sql"
-    sql.write_bytes('CREATE TABLE "\u00e9" (id int);\n'.encode("latin-1"))
+    sql.write_bytes(data)
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "cannot read" in res.output, res.output
+    res = CliRunner().invoke(main, ["lint", "--sql-file", "-"], input=data)
     assert res.exit_code == 2 and "cannot read" in res.output, res.output
 
 

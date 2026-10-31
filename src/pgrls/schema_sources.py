@@ -944,7 +944,8 @@ _DATABASE_LEVEL_STATEMENTS = frozenset({
 
 def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     """Refuse the meta-commands pgrls cannot model (raising
-    `SchemaSourceError`); the offset of each `\\connect` — every one must name the same database (pg_dump --create repeats it after the
+    `SchemaSourceError`); the offset of each `\\connect` — every one must
+    name the same database (pg_dump --create repeats it after the
     database's settings), since pg_dumpall writes one per database, whose
     schemas must not merge.
 
@@ -1017,9 +1018,12 @@ def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
             )
     for colon, name in zip(tokens, tokens[1:]):
         text = sql[name.start:name.end + 1].strip("'\"")
+        # psql takes the name up to the first character outside
+        # `[A-Za-z0-9_]` and non-ASCII (`:USER$x` is `:USER`, then `$x`);
         # `:USER` lexes as a keyword, not an identifier.
+        var = re.match(r"[A-Za-z0-9_\x80-\U0010ffff]*", text)
         if (colon.name == "ASCII_58" and name.start == colon.end + 1
-                and re.fullmatch(r"[A-Z][A-Z0-9_]*", text)):
+                and var is not None and re.fullmatch(r"[A-Z][A-Z0-9_]*", var.group())):
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL holds {sql[colon.start:name.end + 1]!r}, which psql "
