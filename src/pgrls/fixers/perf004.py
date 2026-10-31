@@ -11,9 +11,10 @@ index that matches the predicate exactly:
 
 The fixer walks the policy AST, finds each top-level `FuncCall` that
 wraps a column the rule flags, and renders the call back to SQL
-with `ast_utils.exact_sql` (none when no SQL parses back to it). One CREATE INDEX is emitted per
-distinct (table, expression-text) pair — multiple policies hitting
-the same `lower(email)` collapse to one statement.
+with `ast_utils.exact_sql` (an expression with no SQL that parses
+back to it gets no index). One CREATE INDEX is emitted per distinct
+(table, expression-text) pair — multiple policies hitting the same
+`lower(email)` collapse to one statement.
 
 Only the OUTERMOST `FuncCall` containing the column is emitted: for
 `lower(upper(email))`, the index has to match the full expression

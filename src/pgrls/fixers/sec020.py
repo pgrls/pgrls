@@ -30,8 +30,8 @@ Detection reuses the rule's own `_is_open_write_asymmetry` so the
 fixer flags exactly what SEC020 reports — a single definition of
 the finding. The `USING` predicate is rendered from its AST
 (`ast_utils.exact_sql`, which keeps every parenthesis the tree
-needs, and declines when no SQL parses back to it) rather than echoed verbatim — symmetric with the PERF001
-fixer, so pglast's escaping is applied consistently regardless of
+needs, and declines when no SQL parses back to it) rather than
+echoed verbatim — symmetric with the PERF001 fixer, so pglast's escaping is applied consistently regardless of
 where the SQL originated.
 
 Before mirroring, a constant-true disjunct (`x = 1 OR true`) is

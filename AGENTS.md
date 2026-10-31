@@ -369,7 +369,10 @@ the markdown form drops cleanly into a weekly engineering update.
 `pgrls fix` generates remediation SQL for the rules whose fix is
 mechanical. Default mode is dry-run — it prints the SQL but does
 not modify the database. Pass `--apply` to execute, or `--output
-<file>` to write the SQL to a file instead of stdout.
+<file>` to write the SQL to a file instead of stdout. A
+policy-rewriting fixer (SEC004 / SEC011 / SEC019 / SEC020 / PERF001)
+or PERF004 also declines when no SQL text parses back to its rewrite,
+leaving the finding.
 
 ```bash
 pgrls fix --database-url "$DATABASE_URL"               # dry-run
@@ -529,7 +532,8 @@ Currently fixable:
   `date_trunc(...)`, nested calls). Walks the policy AST, finds
   the outermost `FuncCall` wrapping each flagged column, renders it
   back to SQL (pglast's rendering, with any parentheses it drops
-  restored — none when no SQL parses back to it), and emits one CREATE INDEX
+  restored; an expression with no SQL that parses back to it gets no
+  index), and emits one CREATE INDEX
   per distinct expression (deduped across policies that share the
   same wrap). The existing plain index on the bare column stays in
   place; the new expression index runs in parallel for the

@@ -62,7 +62,7 @@ breaking changes — they will be called out in this file.
   `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
   `pgrls diff` compared those strings, so a real change was not reported.
   Predicates are now compared on their parse trees, and the Z3 translation
-  (`pgrls diff`, `verify`, `matrix --prove`) no longer gives two such
+  (`pgrls diff`, `verify`, `matrix --prove`, SEC038) no longer gives two such
   expressions one variable. The same rendering
   was used for the policy text pgrls rebuilds from a `--sql-file` /
   `pgrls pr` source (which the rules then re-parsed, so they could analyse
@@ -74,9 +74,11 @@ breaking changes — they will be called out in this file.
   `… AND a OR b BETWEEN FALSE AND TRUE`, which Postgres reads as
   `(… AND a) OR (b BETWEEN …)`. Both now keep the parentheses the tree
   needs; a fixer whose rewrite has no SQL that parses back to it now leaves
-  the finding instead, while the rebuilt `--sql-file` text falls back to
-  pglast's rendering for a shape pglast cannot print faithfully (such as a
-  boolean operand of `SIMILAR TO`, which Postgres rejects). Re-check any
+  the finding instead, while the rebuilt `--sql-file` / `pgrls pr` text
+  falls back to pglast's rendering for a shape pglast cannot print
+  faithfully (on pglast 7, a constant subscripted or field-selected without
+  its parentheses, `(-1)[1]`), so for that shape the source can still be
+  analysed as the regrouped predicate. Re-check any
   policy with such a nested operand that `pgrls fix` rewrote (`--apply`, or
   a migration written with `--output`).
 - `pgrls matrix --format html` in a dark colour scheme: table headers and

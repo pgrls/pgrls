@@ -4755,13 +4755,28 @@ def test_fixer_sql_keeps_the_predicates_grouping(fixer: Any, using: str, rewritt
     assert _tree(pglast.parse_sql(f.sql)[0].stmt.qual) == _tree(parse_expr(rewritten))
 
 
-def test_a_fixer_leaves_the_finding_when_no_sql_parses_back_to_its_rewrite() -> None:
-    # pglast prints this SIMILAR TO operand without the parentheses it needs
-    # and no placeholder can stand in its place: the fixer must not emit SQL
-    # that means something else.
+@pytest.mark.parametrize(("fixer", "using"), [
+    (SEC011Fixer, "user_id = 1 OR true"),
+    (SEC019Fixer, "user_id = current_setting('app.t')"),
+    (PERF001Fixer, "user_id = auth.uid()"),
+])
+def test_a_fixer_leaves_the_finding_when_no_sql_parses_back_to_its_rewrite(
+    fixer: Any, using: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When no SQL text parses back to the rewrite (a shape pglast cannot print
+    # faithfully), the fixer must not emit pglast's lossy rendering — that
+    # would apply a different, possibly wider, predicate.
+    import pgrls.fixers._idents
+    import pgrls.fixers.perf001
+
+    monkeypatch.setattr(pgrls.fixers._idents, "exact_sql", lambda node: None)
+    monkeypatch.setattr(pgrls.fixers.perf001, "exact_sql", lambda node: None)
+    assert fixer().fix(_wrap_policy(_policy(using)), {}) == []
+
+
+def test_like_and_similar_to_escape_keep_their_operands_grouping() -> None:
     from pgrls.ast_utils import exact_sql
 
-    using = ("(((a OR b) BETWEEN false AND true)::text SIMILAR TO 'z' "
-             "AND user_id = 1) OR true")
-    assert exact_sql(parse_expr("((a OR b) BETWEEN false AND true)::text SIMILAR TO 'z'")) is None
-    assert SEC011Fixer().fix(_wrap_policy(_policy(using)), {}) == []
+    for sql in ("((a OR b) BETWEEN false AND true)::text SIMILAR TO 'z'",
+                "((a OR b) IS NULL)::text LIKE 'z' ESCAPE '#'"):
+        assert exact_sql(parse_expr(sql)) is not None, sql

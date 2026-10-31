@@ -42,6 +42,9 @@ would not leave a real check to fall back to:
   remaining "check" admits every row anyway, so there is no real predicate to
   restore. (SEC011 — `OR true` — owns that rewrite; SEC004 declines rather
   than emit a still-open `USING (true)`.)
+* the rewrite has no SQL that parses back to it (`alter_policy` returns
+  None): emitting pglast's lossy rendering could install a different,
+  possibly wider, predicate.
 
 **Opinionated, like SEC011 / SEC019.** Removing the disjunct assumes the
 `auth_func() IS NULL` branch was the inverted-auth mistake SEC004 targets —

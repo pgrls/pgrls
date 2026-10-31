@@ -803,6 +803,11 @@ def _parenthesized(node: Any) -> str | None:
                 for item in value.functions or ())
             return type(value)(**{k: functions if k == "functions" else rebuild(getattr(value, k))
                                   for k in value})
+        if isinstance(value, FuncCall) and func_name_parts(value)[-1:] in (
+                ("similar_to_escape",), ("like_escape",)):
+            # The printer of `SIMILAR TO` / `LIKE … ESCAPE` needs its escape
+            # call in place: rebuild its arguments instead.
+            return inside(value)
         if isinstance(value, _GROUPABLE):
             return hole(value)
         if isinstance(value, Node):
