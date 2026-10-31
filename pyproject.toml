@@ -30,8 +30,9 @@ dependencies = [
     "click>=8.2",
     "psycopg[binary]>=3.1",
     # pglast 8.3 / 8.4 return invalid JSON from parse_plpgsql for a trigger
-    # function; 8.0-8.2 were never released.
-    "pglast>=7.20,!=8.0.*,!=8.1.*,!=8.2.*,!=8.3.*,!=8.4.*,<9",
+    # function, and 8.5's deparser still crashes on `x OPERATOR(s.op) ANY
+    # (…)` and drops parentheses 8.6 restores; 8.0-8.2 are not on PyPI.
+    "pglast>=7.20,!=8.0.*,!=8.1.*,!=8.2.*,!=8.3.*,!=8.4.*,!=8.5.*,<9",
     # z3-solver ships precompiled wheels (fast, no C++ toolchain) and
     # powers the semantic verifier path — `pgrls diff` predicate analysis
     # (the concrete leaking-row counterexample) and the SEC038
