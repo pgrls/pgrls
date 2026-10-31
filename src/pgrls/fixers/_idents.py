@@ -39,6 +39,7 @@ from typing import Any
 
 import pglast
 from pglast.ast import ColumnDef
+
 from pgrls.ast_utils import faithful_sql
 
 _PLAIN_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -153,8 +154,9 @@ def alter_policy(
     rendered by `ast_utils.faithful_sql` — pglast's rendering, with the
     parentheses it can drop restored, so the emitted policy means what
     the AST does — and pglast's escaping is applied consistently
-    regardless of where the SQL originated. The identifier and qualified-name quoting is the
-    same `quote_ident` / `quote_qualified` this module owns.
+    regardless of where the SQL originated. The identifier and
+    qualified-name quoting is the same `quote_ident` /
+    `quote_qualified` this module owns.
 
     At least one clause is expected; with neither, the result is a
     bare `ALTER POLICY … ON …;` (no fixer emits that — they all

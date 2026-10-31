@@ -202,7 +202,7 @@ class SEC019Fixer:
 
                 # Only re-emit the clause(s) that actually changed, so
                 # the migration is the minimal diff. `alter_policy`
-                # renders each provided clause through RawStream and
+                # renders each provided clause with `faithful_sql` and
                 # orders USING before WITH CHECK.
                 stmt = alter_policy(
                     table,

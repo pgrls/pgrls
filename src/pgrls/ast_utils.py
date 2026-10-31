@@ -770,8 +770,8 @@ _GROUPABLE = (
 
 
 def _parenthesized(node: Any) -> str:
-    """`node` rendered with every expression below it in its own
-    parentheses — the precedence pglast's deparser can get wrong (``(a OR
+    """`node` rendered with each expression operand directly below it in its
+    own parentheses (each rendered by its own `faithful_sql`) — the precedence pglast's deparser can get wrong (``(a OR
     b) BETWEEN x AND y`` printed as ``a OR b BETWEEN x AND y``) cannot
     regroup them. Each such expression is swapped for a placeholder column,
     pglast renders the rest, and the placeholder becomes the expression's
@@ -802,7 +802,7 @@ def _parenthesized(node: Any) -> str:
 
 def faithful_sql(node: Any) -> str:
     """SQL text for an expression node that parses back to the same AST:
-    pglast's rendering when it does, else one with every operator operand
+    pglast's rendering when it does, else one with each of its operands
     parenthesized (pglast's deparser drops parentheses an operand of
     ``BETWEEN`` / ``IS NULL`` needs, so two different predicates can print
     the same). Falls back to pglast's rendering when neither round-trips."""

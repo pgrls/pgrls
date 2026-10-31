@@ -11,7 +11,7 @@ index that matches the predicate exactly:
 
 The fixer walks the policy AST, finds each top-level `FuncCall` that
 wraps a column the rule flags, and renders the call back to SQL
-through `pglast.stream.RawStream`. One CREATE INDEX is emitted per
+with `ast_utils.faithful_sql`. One CREATE INDEX is emitted per
 distinct (table, expression-text) pair — multiple policies hitting
 the same `lower(email)` collapse to one statement.
 

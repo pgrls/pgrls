@@ -47,7 +47,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 from pgrls.ast_utils import faithful_sql
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_ident, quote_qualified

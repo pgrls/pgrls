@@ -21,7 +21,8 @@ the rule uses.
 intentionally NOT wrapped: see `_funccall_matches` for the
 rationale. PERF001's *check* walks them; the fixer does not.
 
-The new SQL is round-tripped via `pglast.stream.RawStream`. Output
+The new SQL is rendered by `ast_utils.faithful_sql` (pglast's
+rendering, with any parentheses it drops restored). Output
 emits only the clause(s) actually rewritten:
 
     ALTER POLICY <name> ON <schema>.<table>
