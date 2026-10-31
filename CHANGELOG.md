@@ -29,15 +29,15 @@ breaking changes — they will be called out in this file.
     session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
     SQL and PL/pgSQL bodies (whatever their return type, though one that
-    assigns to one of its parameters or RETURNS TABLE columns, or declares
-    an `ALIAS FOR $n`, is still unreadable — only the body is captured),
-    views to their tables, and
-    what those tables' policies read in turn, with an unresolvable relation
-    or unreadable body counting against it. A login
-    session must also have no pre-16 CREATEROLE, read no setting it can set
-    for itself, and be unable to redefine or shadow what the filter calls
-    (owned functions or relations, CREATE on a schema or the database, a
-    helper reading a table by bare name without `pg_temp` last);
+    assigns to — or reads `INTO` — one of its parameters or `RETURNS
+    TABLE` columns, or declares an `ALIAS FOR $n`, is still unreadable —
+    only the body is captured), views to their tables, and what those
+    tables' policies read in turn, with an unresolvable relation or
+    unreadable body counting against it. A login session must also have
+    no pre-16 CREATEROLE, read no setting it can set for itself, and be
+    unable to redefine or shadow what the filter calls (owned functions or
+    relations, CREATE on a schema or the database, a helper reading a table
+    by bare name without `pg_temp` last);
     the owner of an untraced door the session can open counts toward these
     for every column.
   - `LEAK` — the role's own session reads such a row, shown when one
@@ -60,11 +60,12 @@ breaking changes — they will be called out in this file.
   end to end.
 - **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
   17 and 18, and the dependency pin allows pglast 7 or 8
-  (`pglast>=7.20,<9`); pglast 8 parses the PG18 grammar. On pglast 8:
+  (`pglast>=7.20,<9`; CI tests both); pglast 8 parses the PG18 grammar.
+  On pglast 8:
   - `pgrls matrix` still counts a door's `RETURNING` (on `INSERT` /
     `UPDATE` / `DELETE`) as a read — pglast 8 moved it into a new
     `ReturningClause` node;
-  - a PL/pgSQL body that names a type qualified with a schema other than
+  - a PL/pgSQL function that names a type qualified with a schema other than
     `pg_catalog` / `public` (a parameter or return type, which
     `pg_get_functiondef` qualifies when the type is off the search_path,
     or a `DECLARE`), that has a VARIADIC parameter, or that puts a variable
@@ -88,8 +89,8 @@ breaking changes — they will be called out in this file.
     does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
-- **`pgrls matrix` no longer misses SQL in a PL/pgSQL variable's default or
-  an assignment target's subscript.** pglast leaves the default of a
+- **`pgrls matrix` no longer misses SQL in a PL/pgSQL record variable's
+  default or an assignment target's subscript.** pglast leaves the default of a
   variable it models as a record out of the parse — a `record` on either
   major, and on pglast 8 also any type it does not know (an enum, a domain,
   a composite) — so a door that read a table only in
