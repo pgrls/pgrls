@@ -58,7 +58,7 @@ breaking changes — they will be called out in this file.
 ### Fixed
 - **`pgrls diff` no longer calls a changed predicate `unchanged` when pglast
   prints both alike.** pglast's deparser drops parentheses an operand of
-  `BETWEEN`, `IS NULL` and the like needs — `(a OR b) BETWEEN x AND y` and
+  `BETWEEN` needs (and, on pglast 7, of `IS NULL` and the like) — `(a OR b) BETWEEN x AND y` and
   `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
   `pgrls diff` compared those strings, so a real change was not reported.
   Predicates are now compared on their parse trees, and the Z3 translation
@@ -75,16 +75,19 @@ breaking changes — they will be called out in this file.
   `(… AND a) OR (b BETWEEN …)`. Both now keep the parentheses the tree
   needs; a fixer whose rewrite has no SQL that parses back to it now leaves
   the finding instead, while the rebuilt `--sql-file` / `pgrls pr` text
-  falls back to pglast's rendering for a shape pglast cannot print
+  uses the clause as the file wrote it for a shape pglast cannot print
   faithfully (on pglast 7, a constant subscripted or field-selected without
-  its parentheses, `(-1)[1]`), so for that shape the source can still be
-  analysed as the regrouped predicate. Re-check any
+  its parentheses, `(-1)[1]`), which the rules skipped. Re-check any
   policy with such a nested operand that `pgrls fix` rewrote (`--apply`, or
   a migration written with `--output`).
-- `pgrls diff` and `pgrls fix` no longer crash on a predicate pglast cannot
-  print at all — on pglast 7, `x OPERATOR(schema.op) ANY (…)`, the form
-  `pg_dump` writes. `pgrls diff` compares it on its parse tree; a fixer
-  leaves the finding rather than rewrite it.
+- **A predicate pglast cannot print at all** — on pglast 7,
+  `x OPERATOR(schema.op) ANY (…)`, the form `pg_dump` writes — no longer
+  crashes `pgrls diff` or `pgrls fix`, and is no longer dropped from a
+  `--sql-file` / `pgrls pr` source. That source modelled such a policy with
+  no USING / WITH CHECK clause at all, with no warning, so the rules missed
+  what it said and `pgrls pr` reported a widened clause as no change. The
+  clause as the file wrote it is used instead; `pgrls diff` compares it on
+  its parse tree, and a fixer leaves the finding rather than rewrite it.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

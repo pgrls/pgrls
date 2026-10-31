@@ -880,10 +880,11 @@ def faithful_sql(node: Any) -> str:
     """SQL text for an expression node that parses back to the same AST:
     pglast's rendering when it does, else one with each of its operands
     parenthesized (pglast's deparser drops parentheses an operand of
-    ``BETWEEN`` / ``IS NULL`` needs, so two different predicates can print
-    the same). Falls back to pglast's rendering when neither round-trips;
-    raises when pglast cannot render the node at all (pglast 7's printer
-    fails on ``x OPERATOR(s.op) ANY (…)``) and no grouping renders it."""
+    ``BETWEEN`` — on pglast 7 also ``IS NULL`` — needs, so two different
+    predicates can print the same). Falls back to pglast's rendering when
+    neither round-trips; raises when pglast cannot render the node at all
+    (pglast 7's printer fails on ``x OPERATOR(s.op) ANY (…)``) and no
+    grouping round-trips."""
     try:
         text: str | None = _render(node)
     except Exception:  # noqa: BLE001 — pglast's own printer can fail
@@ -915,8 +916,8 @@ def canonical_key(node: Any) -> str:
     when it parses back to the node — so one text cannot stand for two
     trees — else that text tagged with a digest of the tree. Same-shaped
     trees usually, but not always, share a key: ``p AND (q AND r)`` keeps
-    its parentheses. A node pglast cannot render at all is keyed by its
-    digest alone."""
+    its parentheses. A node pglast cannot render at all is keyed by its node
+    type and digest."""
     try:
         text = faithful_sql(node)
     except ValueError:

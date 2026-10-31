@@ -2,8 +2,8 @@
 
 Recognizes a small set of structural transformations:
 
-  * unchanged             — identical parse trees (whitespace and redundant
-                            parentheses aside)
+  * unchanged             — identical parse trees (whitespace and
+                            parentheses the parser discards aside)
   * tightened_and         — base AND new_clause (more conditions)
   * loosened_and_drop     — head AND dropped_clause (fewer conditions)
   * loosened_or           — base OR new_disjunct (more alternatives)

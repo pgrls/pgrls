@@ -887,7 +887,7 @@ Driven by `pgrls.diff.ast_compare.compare_predicates`:
 
 | AST pattern (old → new) | Classification |
 |---|---|
-| Identical parse trees (whitespace / redundant-parenthesis-only diff) | (no Change emitted) |
+| Identical parse trees (a whitespace diff, or parentheses the parser discards) | (no Change emitted) |
 | `P` → `P AND Q` (new AND clause added) | SAFE |
 | `P AND Q` → `P` (AND clause removed) | DANGEROUS |
 | `P` → `P OR Q` (new OR disjunct added) | DANGEROUS |
@@ -941,10 +941,10 @@ out (no Change emitted). The mapping:
 | `loosened_or`               | `DANGEROUS`       |
 | `requires_review`           | `REQUIRES_REVIEW` |
 
-The five recognized AST patterns (whitespace / redundant-parenthesis-only
-is the trivial no-op case; the four real diffs follow):
+The five recognized AST patterns (a whitespace diff, or parentheses the
+parser discards, is the trivial no-op case; the four real diffs follow):
 
-**Literal-equal (whitespace / redundant-parenthesis-only diff).** When both sides parse to
+**Literal-equal (whitespace, or parentheses the parser discards).** When both sides parse to
 identical pglast ASTs the predicate is unchanged. No Change emitted.
 
 ```sql

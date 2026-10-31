@@ -1593,3 +1593,29 @@ def test_offline_policy_keeps_the_parentheses_its_predicate_needs():
         "CREATE TABLE t (tenant_id int, is_public bool);"
         f" CREATE POLICY p ON t USING ({source});", schemas=("public",))
     assert parse_expr(schema.tables[0].policies[0].using_sql) == parse_expr(source)
+
+
+def test_offline_policy_pglast_cannot_print_keeps_the_clause_it_wrote(monkeypatch):
+    # pglast 7's printer raises on `x OPERATOR(s.op) ANY (…)`, which pg_dump
+    # writes; the clause was then dropped, so the rules (and `pgrls pr`) saw
+    # a policy with no USING at all. The clause as written is used instead.
+    import pgrls.ast_utils
+    from pgrls.ast_utils import parse_expr
+    from pgrls.schema_sources import schema_from_sql
+
+    def broken(node):
+        raise TypeError("printer failed")
+
+    monkeypatch.setattr(pgrls.ast_utils, "_render", broken)
+    using = "(auth.uid() IS NULL) OR (tenant_id OPERATOR(pg_catalog.=) ANY (ARRAY[1]))"
+    check = "tenant_id = ANY (ARRAY['é'])"
+    schema = schema_from_sql(
+        "/* ü */ CREATE TABLE t (tenant_id int); -- é\n"
+        f"CREATE POLICY \"using\" ON t FOR ALL TO \"with\" USING ({using} -- c\n)"
+        " WITH CHECK (true);\n"
+        f"ALTER POLICY \"using\" ON t WITH CHECK (/* x */ {check})",
+        schemas=("public",))
+    policy = schema.tables[0].policies[0]
+    assert policy.using_sql == using
+    assert parse_expr(policy.with_check_sql) == parse_expr(check)
+    assert policy.using_ast is not None
