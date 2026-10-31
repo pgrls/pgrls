@@ -56,6 +56,14 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`--sql-file` / `pgrls pr` read `pg_dump` output.** A schema-only dump
+  from `pg_dump` 17.6 or later opens with a `\restrict <key>` psql
+  meta-command, which is not SQL, so the whole file failed to parse; psql
+  meta-command lines are now skipped. And every `ALTER … OWNER TO` the dump
+  writes for a sequence, view or materialized view created a phantom table
+  in the model, with a false SEC001 on it: an `ALTER` on a relation that is
+  not a table, or one that changes nothing pgrls models (`OWNER TO`) on a
+  name it has not seen, no longer creates one.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

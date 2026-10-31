@@ -1579,3 +1579,79 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
     )
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
     assert "SEC008" in res.output and "public.t.q" in res.output, res.output
+
+
+# A schema-only pg_dump (17.11) of a table, a view, a matview and a
+# sequence, trimmed: the psql meta-commands it opens and closes with, and an
+# `ALTER … OWNER TO` for every relation.
+_PG_DUMP = """\
+--
+-- PostgreSQL database dump
+--
+
+\\restrict olnOXz8SM3l4TC2vQ3Eo3ko9YcqR12IfgchMvua3keYdHKgZdSM2a4sC3CchbT9
+
+SET statement_timeout = 0;
+SELECT pg_catalog.set_config('search_path', '', false);
+CREATE TABLE public.docs (id integer NOT NULL, tenant_id integer NOT NULL, body text);
+ALTER TABLE public.docs OWNER TO postgres;
+CREATE SEQUENCE public.docs_id_seq AS integer START WITH 1 INCREMENT BY 1 CACHE 1;
+ALTER SEQUENCE public.docs_id_seq OWNER TO postgres;
+ALTER SEQUENCE public.docs_id_seq OWNED BY public.docs.id;
+CREATE MATERIALIZED VIEW public.mv AS SELECT count(*) AS n FROM public.docs WITH NO DATA;
+ALTER MATERIALIZED VIEW public.mv OWNER TO postgres;
+CREATE VIEW public.v_docs WITH (security_invoker='true') AS SELECT id, body FROM public.docs;
+ALTER VIEW public.v_docs OWNER TO postgres;
+ALTER TABLE public.v_docs OWNER TO postgres;
+ALTER TABLE ONLY public.docs ADD CONSTRAINT docs_pkey PRIMARY KEY (id);
+ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON public.docs FOR SELECT TO anon USING ((tenant_id = 1));
+GRANT SELECT ON TABLE public.docs TO anon;
+
+--
+-- PostgreSQL database dump complete
+--
+
+\\unrestrict olnOXz8SM3l4TC2vQ3Eo3ko9YcqR12IfgchMvua3keYdHKgZdSM2a4sC3CchbT9
+
+"""
+
+
+def test_pg_dump_output_lints_without_phantom_tables(tmp_path):
+    sql = tmp_path / "dump.sql"
+    sql.write_text(_PG_DUMP)
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--format", "json"])
+    assert res.exit_code in (0, 1), res.output
+    locations = {v["location"] for v in json.loads(res.stdout)["violations"]}
+    # Only the real table: no finding on the sequence, view or matview.
+    assert locations and all(loc.startswith("public.docs") for loc in locations), locations
+
+
+def test_psql_meta_commands_are_blanked_only_outside_literals():
+    from pgrls.schema_sources import _without_psql_meta_commands, schema_from_sql
+
+    sql = (
+        "\\set ON_ERROR_STOP on\n"
+        "CREATE TABLE t (a text DEFAULT 'x\n\\still a string');\n"
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $b$\n\\in a body\nSELECT 1 $b$;\n"
+        "  \\connect other\n"
+    )
+    out = _without_psql_meta_commands(sql)
+    assert len(out) == len(sql)
+    assert "ON_ERROR_STOP" not in out and "connect" not in out
+    assert "\\still a string" in out and "\\in a body" in out
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+
+
+def test_alter_table_on_an_unseen_name_needs_a_modelled_change():
+    from pgrls.schema_sources import schema_from_sql
+
+    # An RLS toggle on a table defined elsewhere still records; an OWNER TO
+    # alone says nothing about the relation.
+    names = [t.name for t in schema_from_sql(
+        "ALTER TABLE a ENABLE ROW LEVEL SECURITY;\n"
+        "ALTER TABLE b OWNER TO postgres;\n"
+        "CREATE SEQUENCE c;\nALTER TABLE c OWNER TO postgres;\n"
+        "ALTER SEQUENCE d OWNER TO postgres;\n"
+    ).tables]
+    assert names == ["a"]

@@ -30,7 +30,9 @@ from __future__ import annotations
 import dataclasses
 
 import json
+import re
 from dataclasses import replace
+from collections.abc import Set as AbstractSet
 from typing import Any, Literal
 
 import pglast
@@ -393,6 +395,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     `schema_source_warnings` names them so the caller doesn't mistake their
     silence for a clean bill of health.
     """
+    # pg_dump writes psql meta-commands (`\\restrict <key>` since 17.6), which
+    # are not SQL; each is blanked so offsets into `sql` still hold.
+    sql = _without_psql_meta_commands(sql)
     try:
         statements = pglast.parse_sql(sql)
     except pglast.parser.ParseError as exc:
@@ -402,6 +407,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         ) from exc
 
     default_schema = schemas[0] if schemas else "public"
+    # Relations the input creates that are not tables: pg_dump writes
+    # `ALTER … OWNER TO` for each, and an ALTER on one must not invent a table.
+    non_tables = {
+        key for raw in statements
+        if (key := _relation_key(_non_table_relation(raw.stmt), default_schema)) is not None
+    }
 
     # Build tables first (CREATE TABLE), then layer ALTER / CREATE POLICY /
     # GRANT onto them, so a policy or grant that precedes its table in the input
@@ -499,7 +510,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
-            _apply_alter_table(stmt, tables, default_schema)
+            _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables)
         elif kind == "CreatePolicyStmt":
             _apply_create_policy(stmt, tables, default_schema)
         elif kind == "AlterPolicyStmt":
@@ -750,7 +761,11 @@ def _apply_alter_table(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    *,
+    non_tables: AbstractSet[tuple[str, str]] = frozenset(),
 ) -> None:
+    if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
+        return  # ALTER SEQUENCE / VIEW / MATERIALIZED VIEW / INDEX / …
     key = _relation_key(stmt.relation, default_schema)
     if key is None:
         return
@@ -759,7 +774,15 @@ def _apply_alter_table(
         # An ALTER on a table we never saw a CREATE for (e.g. the agent pasted
         # only the ALTER). Create a shell so the RLS toggle still records — a
         # table with RLS on and no columns/policies is a legitimate (if
-        # incomplete) thing to lint.
+        # incomplete) thing to lint. Not for a relation the input created as
+        # something else (Postgres takes `ALTER TABLE` on a view or a
+        # sequence), nor for an ALTER that changes nothing modelled
+        # (`OWNER TO`): either would invent a table.
+        if key in non_tables or not any(
+            getattr(cmd, "subtype", None) in _MODELLED_ALTER_SUBTYPES
+            for cmd in stmt.cmds or ()
+        ):
+            return
         builder = _TableBuilder(schema=key[0], name=key[1])
         tables[key] = builder
     for cmd in stmt.cmds or ():
@@ -801,6 +824,91 @@ def _apply_alter_table(
             if name:
                 builder.set_not_null(name, not_null=False)
         # Other ALTER subcommands are ignored.
+
+
+# The `ALTER TABLE` subcommands `_apply_alter_table` applies.
+_MODELLED_ALTER_SUBTYPES = frozenset({
+    AlterTableType.AT_EnableRowSecurity, AlterTableType.AT_ForceRowSecurity,
+    AlterTableType.AT_DisableRowSecurity, AlterTableType.AT_NoForceRowSecurity,
+    AlterTableType.AT_AddColumn, AlterTableType.AT_DropColumn,
+    AlterTableType.AT_SetNotNull, AlterTableType.AT_DropNotNull,
+})
+
+
+def _non_table_relation(stmt: Any) -> Any:
+    """The RangeVar a `CREATE VIEW` / `MATERIALIZED VIEW` / `SEQUENCE` /
+    `FOREIGN TABLE` statement creates, else None."""
+    kind = type(stmt).__name__
+    if kind == "ViewStmt":
+        return getattr(stmt, "view", None)
+    if kind == "CreateTableAsStmt" and getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
+        return getattr(getattr(stmt, "into", None), "rel", None)
+    if kind == "CreateSeqStmt":
+        return getattr(stmt, "sequence", None)
+    if kind == "CreateForeignTableStmt":
+        return getattr(getattr(stmt, "base", None), "relation", None)
+    return None
+
+
+def _without_psql_meta_commands(sql: str) -> str:
+    """`sql` with each psql meta-command line (one whose first non-blank
+    character is a backslash, outside a string, quoted identifier, dollar
+    quote or comment) blanked to spaces, so statement offsets are kept."""
+    out = list(sql)
+    i, n = 0, len(sql)
+    line_start = True
+    while i < n:
+        c = sql[i]
+        if c == "\n":
+            line_start = True
+            i += 1
+            continue
+        if c in " \t\r\f" and line_start:
+            i += 1
+            continue
+        if c == "\\" and line_start:
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            out[i:j] = " " * (j - i)
+            i = j
+            continue
+        line_start = False
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j
+        elif sql.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif c in "'\"":
+            escapes = c == "'" and i > 0 and sql[i - 1] in "eE"
+            i += 1
+            while i < n:
+                if escapes and sql[i] == "\\":
+                    i += 2
+                elif sql.startswith(c * 2, i):
+                    i += 2
+                elif sql[i] == c:
+                    i += 1
+                    break
+                else:
+                    i += 1
+        elif (m := _DOLLAR_QUOTE.match(sql, i)) is not None and not (
+            i and (sql[i - 1].isalnum() or sql[i - 1] in "_$")
+        ):
+            j = sql.find(m.group(0), m.end())
+            i = n if j < 0 else j + len(m.group(0))
+        else:
+            i += 1
+    return "".join(out)
+
+
+_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\x80-\uffff][A-Za-z_0-9\x80-\uffff]*)?\$")
 
 
 def _apply_create_policy(
