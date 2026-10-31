@@ -429,7 +429,10 @@ def _exact_real(text: str) -> Any:
     """`text`'s number as a Z3 real when it is Postgres numeric syntax and a
     `float4` holds it exactly — so a `numeric`, a `float8` and a `float4`
     read it alike — else None."""
-    if not re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*", text):
+    m = re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)(?:[eE]([+-]?\d+))?\s*", text, re.ASCII)
+    # A float4 holds nothing past 1e39 or with more digits than its exact
+    # subnormals have; `Fraction` would build `1e999999999` exactly first.
+    if m is None or len(m.group(1)) > 200 or abs(int(m.group(2) or 0)) > 200:
         return None
     exact = fractions.Fraction(text.strip())
     try:
@@ -623,7 +626,7 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
     ``_const_to_z3`` (Int → ``as_long``, String → ``as_string``,
     Bool → ``z3.is_true``, Real → ``float(as_fraction())``, left out when
     it is beyond a double's range; a witness gate declines a row whose
-    float is not the model's value). Any other sort is omitted
+    float no longer witnesses the leak). Any other sort is omitted
     (defensive). ``model.decls()`` yields only the
     constants Z3 actually assigned; a don't-care column is simply
     absent and is never fabricated.
@@ -1688,6 +1691,23 @@ def _anon_binop(
             is_null=z3.Or(left.is_null, right.is_null),
         )
 
+    sorts = {left.value.sort(), right.value.sort()}
+    if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%")):
+        # Off the diff path too, a result Z3 does not compute as Postgres
+        # does — on reals (no NaN / ±Infinity, no rounding), `/` and `%`
+        # (Postgres truncates), `+` on text — is a value of its own, the
+        # same for the same expression (the diff path abstained above).
+        if sorts <= {z3.IntSort(), z3.RealSort()}:
+            sort = z3.RealSort() if z3.RealSort() in sorts else z3.IntSort()
+        elif sorts == {z3.StringSort()}:
+            sort = z3.StringSort()
+        else:
+            return None
+        return _Val(
+            value=ctx.opaque(_canon(node), sort),
+            is_null=z3.Or(left.is_null, right.is_null),
+        )
+
     if arithmetic_fn is not None:
         try:
             value = arithmetic_fn(left.value, right.value)
@@ -1710,7 +1730,8 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     column defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects.
 
     On the diff path (`any_session`), where both predicates' readings must be
-    exact for an equivalence or an implication to hold, also:
+    exact for an equivalence or an implication to hold, also (off it, the
+    arithmetic is a value of its own instead, see `_anon_binop`):
 
     * arithmetic on anything but integers — Z3's ``+`` on two strings
       concatenates, and its reals have no NaN / ±Infinity and never round;
@@ -1821,6 +1842,8 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
     text = value.as_string()
     try:
         if target_sort == z3.IntSort():
+            if not re.fullmatch(r"\s*[+-]?\d+\s*", text, re.ASCII):
+                return None  # Postgres reads no other digits (`'١٢'`)
             number = int(text)
             low, high = _INT_RANGES.get(type_name or "", _INT_RANGES["int8"])
             return z3.IntVal(number) if low <= number <= high else None
@@ -1847,11 +1870,12 @@ def _anon_typecast(
     Bool-sorted scalar whose value carries its truth and whose null-flag
     carries through — there is no separate ``_TV`` branch here. A cast of
     NULL is NULL, so the inner ``is_null`` always propagates. When the
-    target sort matches the inner value's sort the cast is a no-op —
-    on the diff path only for a cast that keeps the value (`_exact_cast`)
-    of a value that keeps its type (`_keeps_its_type`); otherwise the
-    value is opaque under the target sort (an unknown target keeps a
-    String opaque) but the null-flag is preserved.
+    target sort matches the inner value's sort the cast is a no-op only
+    for a cast that keeps the value (`_exact_cast`; off the diff path also
+    a `uuid` or non-`oid` integer cast) — and on the diff path only of a
+    value that keeps its type (`_keeps_its_type`); otherwise the value is
+    opaque under the target sort (an unknown target keeps a String opaque)
+    but the null-flag is preserved.
 
     One exception under the cross-tenant verifier (``session_mode``): a
     sort-changing cast of the session identity stays a free, NON-NULL
@@ -1873,7 +1897,9 @@ def _anon_typecast(
     if lossy and not ctx.any_session:
         # Off the diff path a `uuid` cast (the session identity's) and an
         # integer one (which raises rather than changes) keep the value as
-        # before; `oid` wraps a negative integer.
+        # before; `oid` wraps a negative integer. (A `uuid` cast does fold
+        # case and braces, which the text model does not — the documented
+        # uuid limit.)
         lossy = not (
             _bare_type(node.typeName, "uuid")
             or (target_sort == z3.IntSort()
@@ -1920,8 +1946,8 @@ def _anon_typecast(
             value=ctx.session_var(_canon(node), target_sort),
             is_null=inner.is_null,
         )
-    # On the diff path only to an integer or a boolean: a decimal literal
-    # cast to `numeric` is exact, but its float reading need not be.
+    # On the diff path only to an integer or a boolean: a real fold is
+    # what a captured GUC value needs, and only the provers capture one.
     folded = None if ctx.any_session and target_sort == z3.RealSort() else _fold_literal_cast(
         inner.value, target_sort, _typename_last_segment(node.typeName)
     )

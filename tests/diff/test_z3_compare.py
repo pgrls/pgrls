@@ -824,14 +824,16 @@ def test_anon_clean_on_string_sorted_arithmetic_no_crash() -> None:
     # (now()/current_setting/an unknown-target cast) and for `col OP col`
     # (both default to StringSort). Before the fix this escaped the
     # operator-application catch and crashed SEC038 (and, via the cli
-    # dispatch loop, the WHOLE lint run). Each predicate must now degrade
-    # to None (untranslatable -> NO-OP), not raise. The headline case is
-    # a benign, idiomatic "recent rows" window policy.
+    # dispatch loop, the WHOLE lint run). The result is now a value of its
+    # own, so nothing raises: the benign, idiomatic "recent rows" window
+    # policy is not anon-valid.
     assert _anon("created_at > now() - interval '7 days'") is None
     assert _anon("created_at <> now() - interval '7 days'") is None
-    # `col OP col` arithmetic (both sides default to StringSort):
+    # `col OP col` arithmetic (both sides default to StringSort) beside an
+    # `auth.uid() IS NULL` disjunct, TRUE for every anonymous row: a real
+    # total leak, which the arithmetic used to hide.
     for op in ("-", "*", "/", "%"):
-        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") is None, op
+        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") == {}, op
 
 
 def test_anon_clean_on_bool_sorted_comparison_no_crash() -> None:
@@ -998,11 +1000,11 @@ def test_three_valued_classification(base: str, head: str, verdict: str) -> None
     # Z3's reals have no NaN / Infinity.
     ("n * 0.0 = 0.0", "n IS NOT NULL"),
     # A cast that can change the value: precision, truncation, padding, wrap.
-    ("f = 0.1", "f = '0.1'::float4"),
-    ("n = 1.234", "n = '1.234'::numeric(4,1)"),
+    ("f = 0.5", "f = '0.5'::float4"),
+    ("n = 1.25", "n = '1.25'::numeric(3,1)"),
     ("c = 'abcdef'", "c = 'abcdef'::varchar(3)"),
     ("c = 'abc'", "c = 'abc'::char"),
-    ("(a + 0) > 0", "(a + 0)::oid > 0"),
+    ("a > 0", "a::oid > 0"),
     # A policy's backslash is a backslash, not an escape.
     ("s = 'A'", "s = '\\u{41}'"),
     # Numeric literals past double precision are distinct.
@@ -1075,7 +1077,7 @@ def test_a_decimal_a_single_holds_still_translates() -> None:
     "a = 1.00000000000000001 AND 1.00000000000000001 > 1.0 AND a <= 1.0",
     "c IN (0.1, 0.1) AND c <> 0.1",
     # A cast that changes the value is a value of its own on every path.
-    "tenant_id = auth.uid() OR 0.1 <> 0.1::float4",
+    "tenant_id = auth.uid() OR 0.5 <> 0.5::float4",
     "tenant_id = auth.uid() OR '16777217'::float4 = 16777216.0",
     "tenant_id = auth.uid() OR '1.25'::numeric(3,1) <> 1.25",
 ])
@@ -1084,6 +1086,40 @@ def test_the_provers_do_not_prove_what_a_column_type_decides(using) -> None:
 
     assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
     assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+
+
+@pytest.mark.parametrize("using", [
+    # Postgres reads `Infinity + 0.5` as `Infinity`, and rounds a float8 sum.
+    "tenant_id = auth.uid() OR f + 0.5 = f",
+    "tenant_id = auth.uid() OR (f + 0.25 = 0.5 AND f <> 0.25)",
+    # Postgres truncates: `-1 % 2` is -1.
+    "tenant_id = auth.uid() OR (a % 2) = -1",
+])
+def test_arithmetic_z3_does_not_compute_as_postgres_proves_nothing(using) -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated"
+
+
+def test_arithmetic_beside_the_identity_keeps_the_proof() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    for using in ("tenant_id = auth.uid() AND price * 2.5 > 10",
+                  "tenant_id = auth.uid() AND created_at > now() - interval '7 days'"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+
+
+def test_a_huge_exponent_is_refused_at_once() -> None:
+    import time
+
+    from pgrls.diff._z3_compare import _exact_real
+
+    start = time.monotonic()
+    assert _exact_real("1e999999999") is None
+    assert _classify("x < 1e999999999", "x < 2e999999999") is None
+    assert time.monotonic() - start < 5
 
 
 def test_a_uuid_or_integer_cast_of_the_identity_keeps_the_proof() -> None:
@@ -1100,6 +1136,7 @@ def test_a_guc_value_postgres_would_not_read_is_not_folded() -> None:
     from pgrls.diff._z3_compare import _exact_real
 
     assert _exact_real("1/2") is None
+    assert _exact_real("\u0661.5") is None  # Arabic-Indic digit
     assert _exact_real(" .5 ") is not None
 
 
