@@ -68,9 +68,12 @@ breaking changes — they will be called out in this file.
   is no longer flagged as a loosening, and it also decides `IS [NOT]
   DISTINCT FROM`. Where Z3 and Postgres disagree — `/` and `%` (Postgres
   truncates), arithmetic on anything but integers (Z3's reals have no NaN
-  and never round), ordering on text (Postgres uses the collation), a cast
-  that may change the value (`varchar(3)`, `float4`, `numeric(4,1)`,
-  `oid`) — the diff now abstains instead of deciding wrongly. A Bool
+  and never round), ordering on text (Postgres uses the collation) — the
+  diff now abstains instead of deciding wrongly, and a cast that may change
+  the value (`varchar(3)`, `float4`, `numeric(4,1)`, `oid`, or any cast of a
+  function's result) is a value of its own. A numeric literal is read
+  exactly: through a float, `c = 9007199254740992` and
+  `c = 9007199254740993` were one value, and `1e400` crashed. A Bool
   compared with a number is no longer coerced to 0 / 1 on any path, which
   also fixes a false SEC038 on `COALESCE(level, tier) < 2 OR …`. A leaking
   row holding a character outside the BMP prints it, not Z3's `\u{…}`, and

@@ -1005,6 +1005,14 @@ def test_three_valued_classification(base: str, head: str, verdict: str) -> None
     ("(a + 0) > 0", "(a + 0)::oid > 0"),
     # A policy's backslash is a backslash, not an escape.
     ("s = 'A'", "s = '\\u{41}'"),
+    # Numeric literals past double precision are distinct.
+    ("c = 9007199254740992", "c = 9007199254740993"),
+    ("n = 0.1", "n = 0.10000000000000000001"),
+    # A cast of a value whose type is unknown can change it, even to a type
+    # of the same sort.
+    ("s::float8 = 0.3", "s::float8::numeric = 0.3"),
+    ("s::oid < 0", "s::oid::int4 < 0"),
+    ("abs(n)::text = '5'", "abs(n) = '5'"),
 ])
 def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str) -> None:
     assert _classify(base, head) is None
@@ -1012,6 +1020,11 @@ def test_where_z3_and_postgres_disagree_nothing_is_decided(base: str, head: str)
 
 def test_a_quoted_column_named_like_a_call_has_its_own_null_flag() -> None:
     assert _classify('"f()" IS NULL', "f() IS NULL") is None
+
+
+def test_a_huge_numeric_literal_does_not_crash() -> None:
+    assert _classify("n > 1e400 OR o = 1", "n > 1e400 AND o = 1") == "semantic_tightened"
+    assert anon_read_counterexample(parse_expr("n > 1e400 OR o = current_setting('app.u', true)")) is None
 
 
 def test_a_value_keeping_cast_still_translates() -> None:

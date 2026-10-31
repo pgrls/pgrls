@@ -40,8 +40,9 @@ it flags the second.
 What the encoder translates: columns, literals, comparisons and arithmetic
 (on the diff path not where Z3 and Postgres disagree — ``/`` and ``%``,
 arithmetic on anything but integers, ordering on text, which collations
-decide, and a cast that may change the value, such as ``varchar(3)`` or
-``float4``, which is a value of its own),
+decide; a cast that may change the value, such as ``varchar(3)`` or
+``float4``, or of a value whose type pgrls does not know, is an opaque value
+of its own),
 AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
@@ -398,10 +399,15 @@ def _const_to_z3(node: A_Const) -> Any:
     if isinstance(val, Boolean):
         return z3.BoolVal(val.boolval)
     if isinstance(val, Float):
-        # pglast keeps Float values as a string; parse to Python float.
+        # pglast keeps a Float as its text — an integer too big for an int4
+        # among them. Read it exactly: through a Python float, two literals
+        # past double precision became one value (and `1e400` raised).
+        text = val.fval or ""
         try:
-            return z3.RealVal(float(val.fval))
-        except (ValueError, TypeError):
+            if re.fullmatch(r"[+-]?\d+", text):
+                return z3.IntVal(int(text))
+            return z3.RealVal(text)
+        except (ValueError, TypeError, z3.Z3Exception):
             return None
     # Anything else (NULL literal, BitString, etc.) — out of scope.
     # In particular, `col = NULL` is always-false in Postgres but
@@ -414,7 +420,7 @@ def _const_to_z3(node: A_Const) -> Any:
 def _z3_string(text: str) -> Any:
     """`text` as a Z3 string constant. ``StringVal`` reads ``\\u{…}`` escapes
     in its argument (``'\\u{41}'`` would be ``'A'``), so each backslash goes
-    in escaped — a policy's ``'\\u{41}'`` is those seven characters."""
+    in escaped — a policy's ``'\\u{41}'`` is those six characters."""
     return z3.StringVal(text.replace("\\", "\\u{5c}"))
 
 
@@ -424,11 +430,13 @@ def _z3_value(val: object) -> Any:
     return _z3_string(val) if isinstance(val, str) else val
 
 
-# Cast targets that keep every value of the sort they map to: a cast to one
+# Cast targets that keep the value of a column, a literal or another such
+# cast (an out-of-range integer raises rather than changing): a cast to one
 # of these, with no type modifier, leaves the value as it is. Any other —
-# `varchar(3)` truncates, `char` / `bpchar` ignore trailing spaces,
-# `numeric(4,1)` and `float4` round, `oid` wraps a negative integer — makes
-# a value of its own.
+# `varchar(3)` truncates, `char` is `char(1)`, `bpchar` ignores trailing
+# spaces, `numeric(4,1)` and `float4` round, `oid` wraps a negative integer
+# — makes a value of its own (an opaque one, which the same cast in both
+# predicates shares).
 _EXACT_CAST_TARGETS = frozenset({
     "text", "varchar", "int", "int4", "integer", "int8", "bigint", "bool",
     "boolean", "numeric", "decimal",
@@ -442,6 +450,17 @@ def _exact_cast(typename: Any) -> bool:
         and not getattr(typename, "typmods", None)
         and not getattr(typename, "arrayBounds", None)
     )
+
+
+def _keeps_its_type(node: Any) -> bool:
+    """Whether `node` is a column, a literal, or a value-keeping cast of one —
+    a value a further cast to an exact target reads as the diff path models
+    it."""
+    node = _unwrap_scalar_sublink(node)
+    if isinstance(node, (ColumnRef, A_Const)):
+        return True
+    return (isinstance(node, TypeCast) and _exact_cast(node.typeName)
+            and _keeps_its_type(node.arg))
 
 
 def _typename_last_segment(typename: Any) -> str | None:
@@ -1787,9 +1806,11 @@ def _anon_typecast(
     Bool-sorted scalar whose value carries its truth and whose null-flag
     carries through — there is no separate ``_TV`` branch here. A cast of
     NULL is NULL, so the inner ``is_null`` always propagates. When the
-    target sort matches the inner value's sort the cast is a no-op;
-    otherwise the value is opaque under the target sort (an unknown
-    target keeps a String opaque) but the null-flag is preserved.
+    target sort matches the inner value's sort the cast is a no-op —
+    on the diff path only for a cast that keeps the value (`_exact_cast`)
+    of a value that keeps its type (`_keeps_its_type`); otherwise the
+    value is opaque under the target sort (an unknown target keeps a
+    String opaque) but the null-flag is preserved.
 
     One exception under the cross-tenant verifier (``session_mode``): a
     sort-changing cast of the session identity stays a free, NON-NULL
@@ -1819,6 +1840,15 @@ def _anon_typecast(
         # Unknown target type — opaque value, keep the inner null-flag.
         return _Val(
             value=ctx.opaque(_canon(node), z3.StringSort()),
+            is_null=inner.is_null,
+            unset=inner.unset,
+        )
+    if ctx.any_session and not _keeps_its_type(node.arg):
+        # A cast of a value whose Postgres type pgrls does not know — a
+        # function's result, a lossy or unknown cast — may change it even to
+        # a type of the same sort (`s::float8::numeric`, `abs(n)::text`).
+        return _Val(
+            value=ctx.opaque(_canon(node), target_sort),
             is_null=inner.is_null,
             unset=inner.unset,
         )
