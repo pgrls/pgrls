@@ -56,6 +56,36 @@ breaking changes — they will be called out in this file.
   end to end.
 
 ### Fixed
+- **`--sql-file` / `pgrls pr` read `pg_dump --schema-only` output.** A
+  dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
+  15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
+  which is not SQL, so the whole file failed to parse. psql meta-command
+  lines it can ignore (`\restrict`, `\echo`, `\pset`, a `\connect` after
+  `CREATE DATABASE`, …), each alone on its line and between statements as
+  Postgres's own lexer reads the file, are now skipped, the LSP's ranges
+  too. Any other is refused with an error naming it, since the SQL pgrls
+  would read is not the SQL that runs: a dump with data (`\.` ends its
+  COPY rows), `\i`, `\if`, `\gexec`, `\set`, a `\connect` in any form
+  but the two pg_dump writes (a conninfo string can set `options` or
+  `client_encoding`), a second command on the line, a line Postgres reads
+  as inside a string, SQL that names one of psql's own variables
+  (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
+  after another (dump each with `pg_dump`), or a `\connect` inside an open
+  transaction, which psql rolls back. `--sql-file` now reads a lone CR as
+  psql does (part of the line), and a file that is not UTF-8 is a tool
+  error rather than a traceback. Any SQL file that sets `client_encoding`
+  to an encoding such as SJIS or BIG5, or to anything but UTF-8 /
+  SQL_ASCII when the file holds non-ASCII text (an `\encoding` included),
+  or turns `standard_conforming_strings` off (by `SET`, `ALTER DATABASE /
+  ROLE … SET`, `set_config()` or `UPDATE pg_settings`), is refused too:
+  Postgres then reads the text differently from pgrls. And every `ALTER … OWNER TO` the dump
+  writes for a sequence, view or materialized view created a phantom table
+  in the model, with a false SEC001 on it: an `ALTER` on a relation that is
+  not a table, or one that changes nothing pgrls models (`OWNER TO`) on a
+  name it has not seen, no longer creates one. A partition the dump
+  attaches with `ALTER TABLE … ATTACH PARTITION` is now its parent's
+  partition (`DETACH PARTITION` undoes it), not a standalone table with a
+  false SEC001.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

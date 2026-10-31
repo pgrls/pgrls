@@ -1579,3 +1579,291 @@ def test_offline_alter_policy_rename_is_followed(tmp_path) -> None:
     )
     res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--rule", "SEC008"])
     assert "SEC008" in res.output and "public.t.q" in res.output, res.output
+
+
+# A schema-only pg_dump (17.11) of a table, a view, a matview and a
+# sequence, trimmed — the psql meta-commands it opens and closes with, and an
+# `ALTER … OWNER TO` for every relation — plus an `ALTER TABLE` on the view,
+# which Postgres accepts and older dumps write.
+_PG_DUMP = """\
+--
+-- PostgreSQL database dump
+--
+
+\\restrict olnOXz8SM3l4TC2vQ3Eo3ko9YcqR12IfgchMvua3keYdHKgZdSM2a4sC3CchbT9
+
+SET statement_timeout = 0;
+SELECT pg_catalog.set_config('search_path', '', false);
+CREATE TABLE public.docs (id integer NOT NULL, tenant_id integer NOT NULL, body text);
+ALTER TABLE public.docs OWNER TO postgres;
+CREATE SEQUENCE public.docs_id_seq AS integer START WITH 1 INCREMENT BY 1 CACHE 1;
+ALTER SEQUENCE public.docs_id_seq OWNER TO postgres;
+ALTER SEQUENCE public.docs_id_seq OWNED BY public.docs.id;
+CREATE MATERIALIZED VIEW public.mv AS SELECT count(*) AS n FROM public.docs WITH NO DATA;
+ALTER MATERIALIZED VIEW public.mv OWNER TO postgres;
+CREATE VIEW public.v_docs WITH (security_invoker='true') AS SELECT id, body FROM public.docs;
+ALTER VIEW public.v_docs OWNER TO postgres;
+ALTER TABLE public.v_docs OWNER TO postgres;
+ALTER TABLE ONLY public.docs ADD CONSTRAINT docs_pkey PRIMARY KEY (id);
+ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON public.docs FOR SELECT TO anon USING ((tenant_id = 1));
+GRANT SELECT ON TABLE public.docs TO anon;
+
+--
+-- PostgreSQL database dump complete
+--
+
+\\unrestrict olnOXz8SM3l4TC2vQ3Eo3ko9YcqR12IfgchMvua3keYdHKgZdSM2a4sC3CchbT9
+
+"""
+
+
+def test_pg_dump_output_lints_without_phantom_tables(tmp_path):
+    sql = tmp_path / "dump.sql"
+    sql.write_text(_PG_DUMP)
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--format", "json"])
+    assert res.exit_code in (0, 1), res.output
+    locations = {v["location"] for v in json.loads(res.stdout)["violations"]}
+    # Only the real table: no finding on the sequence, view or matview.
+    assert locations and all(loc.startswith("public.docs") for loc in locations), locations
+
+
+def test_psql_meta_commands_are_blanked_only_outside_literals():
+    from pgrls.schema_sources import _without_psql_meta_commands, schema_from_sql
+
+    sql = (
+        "\\restrict key\n"
+        "CREATE TABLE t (a text DEFAULT 'x\n\\still a string');\n"
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $b$\n\\in a body\nSELECT 1 $b$;\n"
+        "  \\echo done\n"
+    )
+    out = _without_psql_meta_commands(sql)
+    assert len(out) == len(sql)
+    assert "key" not in out and "done" not in out
+    assert "\\still a string" in out and "\\in a body" in out
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+
+
+def test_alter_table_on_an_unseen_name_needs_a_modelled_change():
+    from pgrls.schema_sources import schema_from_sql
+
+    # An RLS toggle on a table defined elsewhere still records; an OWNER TO
+    # alone says nothing about the relation.
+    names = [t.name for t in schema_from_sql(
+        "ALTER TABLE a ENABLE ROW LEVEL SECURITY;\n"
+        "ALTER TABLE b OWNER TO postgres;\n"
+        "CREATE SEQUENCE c;\nALTER TABLE c OWNER TO postgres;\n"
+        "ALTER SEQUENCE d OWNER TO postgres;\n"
+    ).tables]
+    assert names == ["a"]
+
+
+def test_pg_dump_attaches_partitions_with_alter_table():
+    from pgrls.schema_sources import schema_from_sql
+
+    # pg_dump writes a partition as a plain CREATE TABLE plus ATTACH; the
+    # child is no standalone RLS-off table (a false SEC001).
+    schema = schema_from_sql(
+        "CREATE TABLE public.ev (id int, t int) PARTITION BY RANGE (t);\n"
+        "CREATE TABLE public.ev_2025 (id int, t int);\n"
+        "CREATE TABLE public.ev_old (id int, t int);\n"
+        "ALTER TABLE ONLY public.ev ATTACH PARTITION public.ev_2025 FOR VALUES FROM (1) TO (2);\n"
+        "ALTER TABLE public.ev ATTACH PARTITION public.ev_old FOR VALUES FROM (0) TO (1);\n"
+        "ALTER TABLE public.ev DETACH PARTITION public.ev_old;\n"
+        "ALTER TABLE public.ev ENABLE ROW LEVEL SECURITY;\n")
+    parents = {t.name: t.partition_of for t in schema.tables}
+    assert parents == {"ev": None, "ev_2025": ("public", "ev"), "ev_old": None}
+
+
+def test_a_typed_literal_is_no_escape_string():
+    from pgrls.schema_sources import _without_psql_meta_commands
+
+    # `date'x\'` ends at its second quote (only `E'…'` takes escapes), so
+    # the backslash line inside the next string is left alone.
+    sql = "COMMENT ON TABLE t IS date'x\\' || '\n\\keep me\n';"
+    assert _without_psql_meta_commands(sql) == sql
+
+
+def test_pg_dumpall_output_is_refused(tmp_path):
+    # Read as one schema, one database's table would merge with a same-named
+    # table in another, and its SEC001 would vanish.
+    sql = tmp_path / "all.sql"
+    sql.write_text(
+        "\\connect a\nCREATE TABLE public.t (id int);\nGRANT SELECT ON public.t TO PUBLIC;\n"
+        "\\connect b\nCREATE TABLE public.t (id int);\n"
+        "ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "more than one database" in res.output, res.output
+    # `pg_dump --create` connects once: that file lints.
+    sql.write_text("\\connect a\nCREATE TABLE public.t (id int);\n")
+    assert CliRunner().invoke(main, ["lint", "--sql-file", str(sql)]).exit_code == 1
+
+
+@pytest.mark.parametrize(("sql", "why"), [
+    # COPY data: blanking `\\.` would read the rows as SQL.
+    ("CREATE TABLE t (b text);\nCOPY t (b) FROM stdin;\n\\.\n", "COPY data"),
+    # Another file, a branch not taken, generated SQL: not the SQL that runs.
+    ("\\i other.sql\nCREATE TABLE t (id int);\n", "psql command"),
+    ("\\if :prod\nALTER TABLE t DISABLE ROW LEVEL SECURITY;\n\\endif\n", "psql command"),
+    ("SELECT 'ALTER TABLE t DISABLE ROW LEVEL SECURITY'\n\\gexec\n", "psql command"),
+    # A connect after objects switches database.
+    ("CREATE TABLE a (id int);\n\\connect other\nCREATE TABLE b (id int);\n", "connects to another"),
+    ("SELECT 1 AS id INTO t;\n\\connect other\nCREATE TABLE b (id int);\n", "connects to another"),
+    # One line, more than one command: `\\\\` ends a command and the rest runs
+    # as SQL; a second backslash starts another; a backtick runs a shell.
+    ("\\echo hi \\\\ ALTER TABLE t DISABLE ROW LEVEL SECURITY;\n", "psql command"),
+    ("\\echo hi \\i other.sql\n", "psql command"),
+    ("\\pset title `id`\n", "psql command"),
+    ("\\;ALTER TABLE t DISABLE ROW LEVEL SECURITY;\n", "psql command"),
+    ("\\! psql -c 'select 1'\n", "psql command"),
+    # psql interpolates its variables into the SQL after them, including
+    # its own settings (`:ON_ERROR_STOP`) and those it sets itself.
+    ("\\set n 2\nSELECT (ARRAY[1,2,3])[1:n];\n", "psql command"),
+    ("\\set ON_ERROR_STOP 1\n", "psql command"),
+    ("\\set ECHO a\n\\connect :ECHO\nCREATE TABLE t (id int);\n", "psql command"),
+    ("\\connect :DBNAME\nCREATE TABLE t (id int);\n", "psql command"),
+    ("\\echo x\nCREATE TABLE t (id int);\nSELECT (ARRAY[1])[1:ROW_COUNT] FROM t;\n", "its own variable"),
+    ("\\echo x\nSELECT :'USER', 1 FROM (SELECT 1) s(\"USER\");\n", "psql command|its own variable|parse"),
+    # psql splits lines by the client encoding.
+    ("\\encoding SJIS\nCREATE TABLE t (id int);\n", "psql command"),
+    # A conninfo string can set what the server reads strings by, or reach
+    # another server: only pg_dump's own forms are skipped.
+    ("\\connect \"dbname=d options='-c standard_conforming_strings=off'\"\n", "psql command"),
+    ("\\connect -reuse-previous=on \"dbname=d client_encoding=SJIS\"\n", "psql command"),
+    ("\\connect dbname=d\n", "psql command"),
+    ("\\connect d app otherhost\n", "psql command"),
+    # psql reads a line to its LF: the rest after a CR is the command's.
+    ("CREATE TABLE t (id int);\n\\echo hi\rALTER TABLE t ENABLE ROW LEVEL SECURITY;\n",
+     "psql command"),
+    # `:USER` lexes as a keyword, and psql replaces it all the same.
+    ("\\echo x\nSELECT (ARRAY[1, 2])[1:USER];\n", "its own variable"),
+    # psql ends the name at `$`; the server lexes `USER$x` as one name.
+    ("\\echo x\nSELECT (ARRAY[1, 2])[1:USER$x];\n", "its own variable"),
+    ("\\encoding LATIN1\nCREATE TABLE t (id int);\n", "psql command"),
+    # psql rolls an open transaction back when it reconnects.
+    ("CREATE DATABASE d;\n\\connect d\nCREATE TABLE t (id int);\nBEGIN;\n"
+     "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n\\connect d\n", "open transaction"),
+])
+def test_psql_commands_pgrls_cannot_model_are_refused(sql, why):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    with pytest.raises(SchemaSourceError, match=why.replace("\\", "\\\\")):
+        schema_from_sql(sql)
+
+
+@pytest.mark.parametrize("sql", [
+    # Postgres ends a `--` comment at a lone CR, so the string that follows
+    # holds the `\\echo` line.
+    "SELECT 1; -- c\rSELECT '\n\\echo x'; CREATE TABLE hidden (id int); --\n';\n",
+    # A dollar-quote tag can be any non-ASCII character, and so can an
+    # identifier's (`·$a$` is one identifier).
+    "SELECT $\U0001f600$\n\\echo x $\U0001f600$; CREATE TABLE hidden (id int); "
+    "SELECT $\U0001f600$\n$\U0001f600$;\n",
+    "SELECT 1 AS \u00b7$a$, '\n$a$\n\\echo x'; CREATE TABLE hidden (id int); --\n';\n",
+])
+def test_a_psql_line_inside_a_string_is_not_skipped(sql):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    try:
+        tables = [t.name for t in schema_from_sql(sql).tables]
+    except SchemaSourceError:
+        return
+    assert tables == ["hidden"]
+
+
+def test_a_sql_file_keeps_a_lone_cr(tmp_path):
+    # Read with universal newlines, `\\echo hi\rALTER …` became two lines
+    # and the ALTER, which psql never runs, was linted.
+    from pgrls.cli import main
+
+    sql = tmp_path / "cr.sql"
+    sql.write_bytes(b"CREATE TABLE t (id int);\n\\echo hi\rALTER TABLE t ENABLE ROW LEVEL SECURITY;\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "psql command" in res.output, res.output
+    sql.write_bytes(b"CREATE TABLE t (id int);\r\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\r\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql), "--format", "json"])
+    assert res.exit_code in (0, 1), res.output
+
+
+def test_a_sql_file_that_is_not_utf8_is_a_tool_error(tmp_path):
+    from pgrls.cli import main
+
+    data = 'CREATE TABLE "\u00e9" (id int);\n'.encode("latin-1")
+    sql = tmp_path / "latin1.sql"
+    sql.write_bytes(data)
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(sql)])
+    assert res.exit_code == 2 and "cannot read" in res.output, res.output
+    res = CliRunner().invoke(main, ["lint", "--sql-file", "-"], input=data)
+    assert res.exit_code == 2 and "cannot read" in res.output, res.output
+
+
+def test_a_skipped_line_must_lie_between_tokens():
+    # Whatever the line splitter decides, a blanked line Postgres's lexer
+    # reads as inside a string is refused.
+    from pgrls.schema_sources import SchemaSourceError, _check_blanked_lines
+
+    sql = "SELECT '\n          \n';\n"
+    with pytest.raises(SchemaSourceError, match="inside a string"):
+        _check_blanked_lines(sql, [(9, "\\echo x")])
+    _check_blanked_lines("SELECT 1;\n          \n", [(10, "\\echo x")])
+
+
+@pytest.mark.parametrize(("sql", "refused"), [
+    ("SET client_encoding = 'SJIS';\n", True),
+    ("SET NAMES 'Big-5';\n", True),
+    ("SET client_encoding = 'win932';\n", True),
+    ("SET standard_conforming_strings = off;\n", True),
+    ("SET standard_conforming_strings = 0;\n", True),
+    ("SET standard_conforming_strings = fa;\n", True),
+    # A database's or role's setting applies once psql reconnects.
+    ("ALTER DATABASE d SET standard_conforming_strings = off;\n", True),
+    ("ALTER ROLE r IN DATABASE d SET client_encoding = 'SJIS';\n", True),
+    ("SELECT set_config('standard_conforming_strings', 'off', false);\n", True),
+    ("SELECT set_config('client_encoding', current_setting('x'), false);\n", True),
+    ("SELECT set_config(current_setting('x'), 'off', false);\n", "set_config"),
+    ("SELECT pg_catalog.set_config('search_path', '', false);\n", False),
+    # Under any encoding but UTF-8 / SQL_ASCII a non-ASCII character is read
+    # as others (`é` as `Ã©` under LATIN1).
+    ("SET client_encoding = 'LATIN1';\nCREATE TABLE \"\u00e9\" (id int);\n", True),
+    ("SET client_encoding = 'SQL_ASCII';\nCREATE TABLE \"\u00e9\" (id int);\n", False),
+    # A rule on pg_settings sets what it names.
+    ("UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\n",
+     "pg_settings"),
+    ("SET client_encoding = 'UTF8';\n", False),
+    ("SET client_encoding = 'LATIN1';\n", False),
+    ("SET standard_conforming_strings = on;\n", False),
+    ("SET standard_conforming_strings = tru;\n", False),
+    ("SET standard_conforming_strings TO DEFAULT;\n", False),
+])
+def test_a_setting_that_changes_how_strings_read_is_refused(sql, refused):
+    # Under SJIS a multibyte character can end in a backslash byte, and with
+    # standard_conforming_strings off `\\'` escapes: Postgres would end
+    # strings where pgrls does not.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    sql += "CREATE TABLE t (id int);\n"
+    if refused:
+        why = refused if isinstance(refused, str) else "reads its text differently"
+        with pytest.raises(SchemaSourceError, match=why):
+            schema_from_sql(sql)
+    else:
+        assert "t" in [t.name for t in schema_from_sql(sql).tables]
+
+
+def test_harmless_psql_commands_are_skipped():
+    from pgrls.schema_sources import schema_from_sql
+
+    sql = ("\\restrict k\n\\echo start\n"
+           "CREATE DATABASE d;\n\\connect d\n\\pset pager off\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # pg_dump --create's form for a name that needs quoting, after an
+    # `\\encoding` of the server's.
+    sql = ('CREATE DATABASE "my-app";\n\\encoding SQL_ASCII\n'
+           '\\connect -reuse-previous=on "dbname=\'my-app\'"\nCREATE TABLE t (id int);\n')
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    # pg_dump --create connects again after the database's own settings.
+    sql = ("CREATE DATABASE d;\n\\connect d\nALTER DATABASE d SET work_mem = '4MB';\n"
+           "ALTER ROLE app IN DATABASE d SET work_mem = '4MB';\n\\connect d\n"
+           "CREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+

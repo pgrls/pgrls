@@ -30,7 +30,9 @@ from __future__ import annotations
 import dataclasses
 
 import json
+import re
 from dataclasses import replace
+from collections.abc import Set as AbstractSet
 from typing import Any, Literal
 
 import pglast
@@ -43,6 +45,7 @@ from pglast.enums.parsenodes import (
     GrantTargetType,
     ObjectType,
     RoleSpecType,
+    TransactionStmtKind,
 )
 from pglast.stream import RawStream
 
@@ -373,7 +376,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
       An unqualified relation defaults to the first entry in `schemas`
       (``public`` by default), keyed on ``(schema, name)``.
     * ``ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`` → sets the table's
-      `rls_enabled` / `force_rls`.
+      `rls_enabled` / `force_rls`; ``ALTER TABLE … ATTACH / DETACH
+      PARTITION`` sets / clears the child's `partition_of` (the form
+      ``pg_dump`` writes partitions in). An ALTER on a view, sequence or other
+      non-table relation is ignored. psql meta-command lines that do not
+      change the SQL (``\\restrict``, ``\\echo``, a ``\\connect`` to one
+      database) are skipped; any other is refused.
     * ``CREATE POLICY`` → a `Policy` (name, command, permissive vs
       ``AS RESTRICTIVE``, ``TO`` roles, and USING / WITH CHECK parsed into the
       ASTs `verify` and the AST rules need).
@@ -393,15 +401,69 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     `schema_source_warnings` names them so the caller doesn't mistake their
     silence for a clean bill of health.
     """
+    # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
+    # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
+    # are not SQL; each is blanked so offsets into `sql` still hold.
+    sql, commands = _split_psql_meta_commands(sql)
+    connects = _check_psql_meta_commands(commands)
+    connect = connects[0] if connects else None
     try:
         statements = pglast.parse_sql(sql)
+        if commands:
+            _check_blanked_lines(sql, commands)
     except pglast.parser.ParseError as exc:
         raise SchemaSourceError(
             "bad_sql",
             f"could not parse the provided SQL: {exc}.",
         ) from exc
+    _check_lexer_settings(statements, non_ascii=not sql.isascii())
+
+    def end(raw: Any) -> int:
+        # Where the statement ends: its start can include the gap before it.
+        return (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)
+
+    # Whether a transaction is open after each statement: psql rolls one
+    # back when it reconnects.
+    in_transaction, states = False, []
+    for raw in statements:
+        if isinstance(raw.stmt, _pgast.TransactionStmt):
+            if raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
+                                 TransactionStmtKind.TRANS_STMT_START):
+                in_transaction = True
+            elif raw.stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
+                                   TransactionStmtKind.TRANS_STMT_ROLLBACK,
+                                   TransactionStmtKind.TRANS_STMT_PREPARE):
+                in_transaction = bool(raw.stmt.chain)
+        states.append((end(raw), in_transaction))
+    for c in connects:
+        if [state for e, state in states if e < c][-1:] == [True]:
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL \\connects inside an open transaction, which psql "
+                "rolls back; pgrls cannot tell what was kept.",
+            )
+
+    if connect is not None and any(
+        end(raw) < connect
+        and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
+             or getattr(raw.stmt, "intoClause", None) is not None)  # SELECT … INTO
+        for raw in statements
+    ):
+        # A `\\connect` after objects were created switches database: what
+        # follows is another database's schema, which must not merge.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL creates objects and then \\connects to another database; "
+            "lint each database's schema separately.",
+        )
 
     default_schema = schemas[0] if schemas else "public"
+    # Relations the input creates that are not tables: pg_dump writes
+    # `ALTER … OWNER TO` for each, and an ALTER on one must not invent a table.
+    non_tables = {
+        key for raw in statements
+        if (key := _relation_key(_non_table_relation(raw.stmt), default_schema)) is not None
+    }
 
     # Build tables first (CREATE TABLE), then layer ALTER / CREATE POLICY /
     # GRANT onto them, so a policy or grant that precedes its table in the input
@@ -499,7 +561,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
-            _apply_alter_table(stmt, tables, default_schema)
+            _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables)
         elif kind == "CreatePolicyStmt":
             _apply_create_policy(stmt, tables, default_schema)
         elif kind == "AlterPolicyStmt":
@@ -750,7 +812,11 @@ def _apply_alter_table(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
     default_schema: str,
+    *,
+    non_tables: AbstractSet[tuple[str, str]] = frozenset(),
 ) -> None:
+    if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
+        return  # ALTER SEQUENCE / VIEW / MATERIALIZED VIEW / INDEX / …
     key = _relation_key(stmt.relation, default_schema)
     if key is None:
         return
@@ -759,7 +825,15 @@ def _apply_alter_table(
         # An ALTER on a table we never saw a CREATE for (e.g. the agent pasted
         # only the ALTER). Create a shell so the RLS toggle still records — a
         # table with RLS on and no columns/policies is a legitimate (if
-        # incomplete) thing to lint.
+        # incomplete) thing to lint. Not for a relation the input created as
+        # something else (Postgres takes `ALTER TABLE` on a view or a
+        # sequence), nor for an ALTER that changes nothing modelled
+        # (`OWNER TO`): either would invent a table.
+        if key in non_tables or not any(
+            getattr(cmd, "subtype", None) in _MODELLED_ALTER_SUBTYPES
+            for cmd in stmt.cmds or ()
+        ):
+            return
         builder = _TableBuilder(schema=key[0], name=key[1])
         tables[key] = builder
     for cmd in stmt.cmds or ():
@@ -800,7 +874,307 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif subtype in (AlterTableType.AT_AttachPartition, AlterTableType.AT_DetachPartition):
+            # pg_dump writes each partition as a plain CREATE TABLE plus
+            # `ALTER TABLE ONLY <parent> ATTACH PARTITION <child>`; without
+            # this the child looked like a standalone table with RLS off.
+            child = tables.get(_relation_key(
+                getattr(getattr(cmd, "def_", None), "name", None), default_schema) or ("", ""))
+            if child is not None:
+                if subtype == AlterTableType.AT_AttachPartition:
+                    child.partition_of = key
+                elif child.partition_of == key:
+                    child.partition_of = None
         # Other ALTER subcommands are ignored.
+
+
+# The `ALTER TABLE` subcommands `_apply_alter_table` applies.
+_MODELLED_ALTER_SUBTYPES = frozenset({
+    AlterTableType.AT_EnableRowSecurity, AlterTableType.AT_ForceRowSecurity,
+    AlterTableType.AT_DisableRowSecurity, AlterTableType.AT_NoForceRowSecurity,
+    AlterTableType.AT_AddColumn, AlterTableType.AT_DropColumn,
+    AlterTableType.AT_SetNotNull, AlterTableType.AT_DropNotNull,
+})
+
+
+def _non_table_relation(stmt: Any) -> Any:
+    """The RangeVar a `CREATE VIEW` / `MATERIALIZED VIEW` / `SEQUENCE` /
+    `FOREIGN TABLE` statement creates, else None."""
+    kind = type(stmt).__name__
+    if kind == "ViewStmt":
+        return getattr(stmt, "view", None)
+    if kind == "CreateTableAsStmt" and getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
+        return getattr(getattr(stmt, "into", None), "rel", None)
+    if kind == "CreateSeqStmt":
+        return getattr(stmt, "sequence", None)
+    if kind == "CreateForeignTableStmt":
+        return getattr(getattr(stmt, "base", None), "relation", None)
+    return None
+
+
+# psql meta-commands that leave the SQL around them as it is: pg_dump's
+# `\\restrict` pair, and settings or output that change no statement. Any
+# other — `\\i` (another file), `\\if` (a branch not taken), `\\gexec`
+# (generated SQL), `\\.` (the end of COPY data) — means the SQL pgrls would
+# read is not the SQL that runs, so it is refused rather than blanked.
+# `\\set` is not here: psql interpolates its variables into the SQL that
+# follows (`:n`). `\\encoding` and `\\connect` are checked on their own.
+_HARMLESS_PSQL_COMMANDS = frozenset({
+    "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
+})
+# Client encodings in which a byte of a multibyte character can be a quote or
+# a backslash (the client-only ones, by every name Postgres accepts): under
+# one, Postgres and psql end strings where pgrls, reading UTF-8, does not.
+_UNSAFE_CLIENT_ENCODINGS = frozenset({
+    "sjis", "mskanji", "shiftjis", "win932", "windows932", "shiftjis2004",
+    "big5", "win950", "windows950", "gbk", "win936", "windows936", "cp936",
+    "gb18030", "uhc", "win949", "windows949", "cp949", "johab",
+})
+# Client encodings under which Postgres reads the UTF-8 text pgrls reads as
+# pgrls does (SQL_ASCII converts nothing). Under any other, a non-ASCII
+# character is read as other characters (`é` as `Ã©` under LATIN1).
+_UTF8_ENCODINGS = frozenset({"utf8", "unicode", "sqlascii"})
+# Statements `pg_dump --create` writes before its `\\connect`.
+_DATABASE_LEVEL_STATEMENTS = frozenset({
+    "VariableSetStmt", "SelectStmt", "CreatedbStmt", "AlterDatabaseStmt",
+    "AlterDatabaseSetStmt", "AlterOwnerStmt", "CommentStmt", "DropdbStmt",
+    "AlterRoleSetStmt",
+})
+
+
+def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
+    """Refuse the meta-commands pgrls cannot model (raising
+    `SchemaSourceError`); the offset of each `\\connect` — every one must
+    name the same database (pg_dump --create repeats it after the
+    database's settings), since pg_dumpall writes one per database, whose
+    schemas must not merge.
+
+    A line is skipped only when it is ONE known command and nothing else: a
+    second backslash starts another command (`\\echo x \\i f`), and `\\\\`
+    ends the command so the rest of the line runs as SQL; a backtick runs a
+    shell command. Any of those is refused, as is any other command.
+
+    A `\\connect` is skipped only in the forms pg_dump writes — a bare
+    database name, or `-reuse-previous=on "dbname='…'"` — since a conninfo
+    string can also set `options` or `client_encoding`, which change how
+    the server reads the strings after it; an `\\encoding` only to an
+    encoding `_check_lexer_settings` would accept."""
+    connects: list[tuple[int, str]] = []
+    for offset, line in commands:
+        m = re.match(r"\\([A-Za-z]+|\.)(?:\s+(.*))?$", line.strip(), re.DOTALL)
+        name, rest = (m.group(1), (m.group(2) or "").strip()) if m else ("", "")
+        if name == ".":
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL holds COPY data (a pg_dump with data); dump the "
+                "schema with pg_dump --schema-only.",
+            )
+        connect = name in ("c", "connect")
+        target = None
+        if connect and (c := re.fullmatch(
+            r'([^\s"\'=:\-][^\s"\'=:]*)|-reuse-previous=on "dbname=\'([^\'"\\:]*)\'"',
+            rest,
+        )):
+            target = c.group(1) or c.group(2)
+        known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
+            name == "encoding"
+            and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
+        )
+        # psql reads a line to its LF: a CR is part of the command's arguments.
+        if m is None or "\\" in rest or "`" in rest or "\r" in rest or not known:
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "
+                "does not model (the SQL it reads would not be the SQL that runs).",
+            )
+        if connect:
+            connects.append((offset, target or ""))
+    if len({target for _, target in connects}) > 1:
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL connects to more than one database (pg_dumpall output); "
+            "dump each database with pg_dump and lint each file.",
+        )
+    return [offset for offset, _ in connects]
+
+
+def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
+    """Refuse when Postgres's own lexer reads a blanked meta-command line as
+    part of a string, quoted name or comment — psql, which lexes the same way,
+    would then not have run it as a command — or when the SQL names one of
+    psql's own variables (`:ROW_COUNT`), which psql interpolates before
+    sending it. Raises `pglast.parser.ParseError` on SQL that does not lex."""
+    tokens = pglast.parser.scan(sql)
+    k = 0
+    for offset, line in commands:
+        while k < len(tokens) and tokens[k].end < offset:
+            k += 1
+        if k < len(tokens) and tokens[k].start < offset:
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the psql command {line[:60]!r} sits inside a string, quoted "
+                "name or comment, where psql would not run it; pgrls cannot "
+                "tell which lines psql runs.",
+            )
+    for colon, name in zip(tokens, tokens[1:]):
+        text = sql[name.start:name.end + 1].strip("'\"")
+        # psql takes the name up to the first character outside
+        # `[A-Za-z0-9_]` and non-ASCII (`:USER$x` is `:USER`, then `$x`);
+        # `:USER` lexes as a keyword, not an identifier.
+        var = re.match(r"[A-Za-z0-9_\x80-\U0010ffff]*", text)
+        if (colon.name == "ASCII_58" and name.start == colon.end + 1
+                and var is not None and re.fullmatch(r"[A-Z][A-Z0-9_]*", var.group())):
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL holds {sql[colon.start:name.end + 1]!r}, which psql "
+                "replaces with the value of its own variable; pgrls cannot "
+                "tell what SQL psql sends.",
+            )
+
+
+def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
+    """Refuse SQL that sets what changes how Postgres reads the strings after
+    it — a client encoding whose characters can hold a quote or backslash
+    byte, or `standard_conforming_strings` off — by `SET`, `ALTER DATABASE /
+    ROLE … SET` (which a `\\connect` brings in) or `set_config()`. pgrls
+    reads the SQL as UTF-8 with standard strings, so it would end strings
+    where Postgres does not. With `non_ascii`, any client encoding but UTF-8
+    or SQL_ASCII is refused: Postgres reads those characters as others.
+    `UPDATE pg_settings` is refused too. A setting changed by code (a `DO`
+    block, a function) is not seen."""
+    for raw in statements:
+        for node in _subnodes(raw.stmt):
+            if (isinstance(node, _pgast.UpdateStmt) and node.relation is not None
+                    and node.relation.relname == "pg_settings"):
+                raise SchemaSourceError(
+                    "bad_sql",
+                    "the SQL updates pg_settings, which changes settings pgrls "
+                    "cannot follow.",
+                )
+            if isinstance(node, _pgast.VariableSetStmt) and node.args:
+                name, arg = node.name, node.args[0]
+            elif (isinstance(node, _pgast.FuncCall)
+                  and ast_utils.func_name_parts(node)[1] == "set_config"):
+                args = node.args or ()
+                if not args or not isinstance(args[0], _pgast.A_Const):
+                    raise SchemaSourceError(
+                        "bad_sql",
+                        "the SQL calls set_config() on a setting it does not name; "
+                        "pgrls cannot tell how Postgres reads the strings after it.",
+                    )
+                name = str(getattr(args[0].val, "sval", "")).lower()
+                arg = args[1] if len(args) > 1 else None
+            else:
+                continue
+            if name not in ("client_encoding", "standard_conforming_strings"):
+                continue
+            val = arg.val if isinstance(arg, _pgast.A_Const) else None
+            value = str(getattr(val, "sval", None) or getattr(val, "ival", "")).lower()
+            encoding = re.sub(r"[^a-z0-9]", "", value)
+            unsafe = val is None or (
+                name == "client_encoding"
+                and (encoding in _UNSAFE_CLIENT_ENCODINGS
+                     or (non_ascii and encoding not in _UTF8_ENCODINGS))
+            ) or (
+                name == "standard_conforming_strings"
+                and not (value in ("on", "1") or (value and ("true".startswith(value)
+                                                             or "yes".startswith(value))))
+            )
+            if unsafe:
+                raise SchemaSourceError(
+                    "bad_sql",
+                    f"the SQL sets {name} to {value or 'a computed value'!r}, under "
+                    "which Postgres reads its text differently from how pgrls "
+                    "reads it (as UTF-8 with standard strings).",
+                )
+
+
+def _subnodes(node: Any) -> Any:
+    """`node` and every node beneath it."""
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _subnodes(item)
+    elif isinstance(node, _pgast.Node):
+        yield node
+        for field in node:
+            yield from _subnodes(getattr(node, field, None))
+
+
+def _without_psql_meta_commands(sql: str) -> str:
+    """`sql` with each psql meta-command line (one whose first non-blank
+    character is a backslash, outside a string, quoted identifier, dollar
+    quote or comment) blanked to spaces, so statement offsets are kept."""
+    return _split_psql_meta_commands(sql)[0]
+
+
+def _split_psql_meta_commands(sql: str) -> tuple[str, list[tuple[int, str]]]:
+    """`_without_psql_meta_commands`'s text, and each meta-command line it
+    blanked, with its offset."""
+    out = list(sql)
+    commands: list[tuple[int, str]] = []
+    i, n = 0, len(sql)
+    line_start = True
+    while i < n:
+        c = sql[i]
+        if c == "\n":
+            line_start = True
+            i += 1
+            continue
+        if c in " \t\r\f" and line_start:
+            i += 1
+            continue
+        if c == "\\" and line_start:
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            commands.append((i, sql[i:j].strip()))
+            out[i:j] = " " * (j - i)
+            i = j
+            continue
+        line_start = False
+        if sql.startswith("--", i):
+            m = _LINE_END.search(sql, i)
+            i = n if m is None else m.start()
+        elif sql.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif c in "'\"":
+            # `E'…'` takes backslash escapes; `date'…'` does not.
+            escapes = c == "'" and i > 0 and sql[i - 1] in "eE" and not (
+                i > 1 and _is_ident_char(sql[i - 2]))
+            i += 1
+            while i < n:
+                if escapes and sql[i] == "\\":
+                    i += 2
+                elif sql.startswith(c * 2, i):
+                    i += 2
+                elif sql[i] == c:
+                    i += 1
+                    break
+                else:
+                    i += 1
+        elif (m := _DOLLAR_QUOTE.match(sql, i)) is not None and not (
+            i and _is_ident_char(sql[i - 1])
+        ):
+            j = sql.find(m.group(0), m.end())
+            i = n if j < 0 else j + len(m.group(0))
+        else:
+            i += 1
+    return "".join(out), commands
+
+
+_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z_0-9\x80-\U0010ffff]*)?\$")
+_LINE_END = re.compile(r"[\r\n]")
+
+
+def _is_ident_char(c: str) -> bool:
+    # Postgres takes every non-ASCII character as part of an identifier.
+    return not c.isascii() or c.isalnum() or c in "_$"
 
 
 def _apply_create_policy(

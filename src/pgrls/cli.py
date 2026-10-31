@@ -983,12 +983,21 @@ def _resolve_offline_schema(
         total = 0
         for entry in sql_file:
             if entry == "-":
-                chunk = sys.stdin.read()
+                try:
+                    # As bytes, like a file: no newline translation, and
+                    # text that is not UTF-8 is a tool error.
+                    raw = getattr(sys.stdin, "buffer", None)
+                    chunk = (raw.read().decode("utf-8") if raw is not None
+                             else sys.stdin.read())
+                except UnicodeDecodeError as exc:
+                    raise ToolError(f"cannot read --sql-file -: {exc}") from exc
             else:
                 try:
-                    with open(entry, encoding="utf-8") as fh:
+                    # newline="": psql reads a line to its LF, so a lone CR
+                    # must reach the meta-command check as it is.
+                    with open(entry, encoding="utf-8", newline="") as fh:
                         chunk = fh.read()
-                except OSError as exc:
+                except (OSError, UnicodeDecodeError) as exc:
                     raise ToolError(
                         f"cannot read --sql-file {entry!r}: {exc}"
                     ) from exc
