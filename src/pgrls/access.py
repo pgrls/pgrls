@@ -1159,9 +1159,11 @@ def _datums(tree: Any) -> list[tuple[str, dict[str, Any]]]:
     return out
 
 
-def _loop_variables(tree: Any) -> set[tuple[str | None, int]]:
-    """The variables an integer or cursor ``FOR`` loop declares itself."""
-    out: set[tuple[str | None, int]] = set()
+def _loop_variables(tree: Any) -> set[int]:
+    """The record variables (by ``dno``) a cursor ``FOR`` loop declares
+    itself — keyed by number, not name and line, since a declared record can
+    share both with one."""
+    out: set[int] = set()
 
     def walk(node: Any) -> None:
         if isinstance(node, list):
@@ -1169,10 +1171,10 @@ def _loop_variables(tree: Any) -> set[tuple[str | None, int]]:
                 walk(item)
         elif isinstance(node, dict):
             for key, value in node.items():
-                if key in ("PLpgSQL_stmt_fori", "PLpgSQL_stmt_forc") and isinstance(value, dict):
+                if key == "PLpgSQL_stmt_forc" and isinstance(value, dict):
                     for fields in (value.get("var") or {}).values():
-                        if isinstance(fields, dict) and fields.get("lineno"):
-                            out.add((fields.get("refname"), int(fields["lineno"])))
+                        if isinstance(fields, dict) and fields.get("dno") is not None:
+                            out.add(int(fields["dno"]))
                 walk(value)
 
     walk(tree)
@@ -1191,9 +1193,9 @@ def _rec_defaults(parsed: _Parsed) -> list[str] | None:
     for kind, rec in _datums(parsed.tree):
         if kind != "PLpgSQL_rec":
             continue
-        key = (rec.get("refname"), int(rec["lineno"]))
-        if key in loops and key not in parsed.decls:
+        if rec.get("dno") is not None and int(rec["dno"]) in loops:
             continue
+        key = (rec.get("refname"), int(rec["lineno"]))
         span = parsed.decls.get(key)
         if span is None:
             return None

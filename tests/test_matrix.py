@@ -1424,6 +1424,15 @@ def test_option_dump_is_not_parsed_on_pglast_8() -> None:
     # over the same name on its line.
     "#variable_conflict use_column\nDECLARE r record := (SELECT v FROM app.secret LIMIT 1); "
     "BEGIN FOR r IN SELECT 1 LOOP END LOOP; END",
+    # The same, with an integer or a cursor loop over the same name on its
+    # line: that loop's variable is not the declared record.
+    "#variable_conflict use_column\nDECLARE i record := (SELECT v FROM app.secret LIMIT 1); "
+    "BEGIN FOR i IN 1..1 LOOP END LOOP; END",
+    "#variable_conflict use_column\nDECLARE c CURSOR FOR SELECT 1; "
+    "i record := (SELECT v FROM app.secret LIMIT 1); BEGIN FOR i IN c LOOP END LOOP; END",
+    # A name past 63 bytes, which Postgres truncates.
+    f"DECLARE {'i' * 70} record := (SELECT v FROM app.secret LIMIT 1); "
+    f"BEGIN FOR {'i' * 70} IN 1..1 LOOP END LOOP; END",
 ])
 def test_an_unreadable_record_default_is_incomplete(body: str) -> None:
     from pgrls.access import _plpgsql_statements  # noqa: PLC0415
