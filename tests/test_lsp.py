@@ -463,3 +463,12 @@ def test_missing_lsp_extra_raises_clean_error(monkeypatch) -> None:
     result = CliRunner().invoke(main, ["lsp"])
     assert result.exit_code == 2
     assert "pgrls[lsp]" in result.output
+
+
+def test_a_pg_dump_buffer_keeps_its_ranges() -> None:
+    # A psql meta-command (pg_dump's `\restrict`) must not cost the ranges:
+    # findings still land on their defining statement, not on line 0.
+    text = ("\\restrict k\n\n" + _PUBLIC_POLICY + "\n\\unrestrict k\n")
+    by_code = {d.code: d for d in diagnose(text)}
+    assert by_code["SEC002"].range.start.line == 2
+    assert by_code["SEC003"].range.start.line == 4

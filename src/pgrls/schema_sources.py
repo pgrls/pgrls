@@ -395,7 +395,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     `schema_source_warnings` names them so the caller doesn't mistake their
     silence for a clean bill of health.
     """
-    # pg_dump writes psql meta-commands (`\\restrict <key>` since 17.6), which
+    # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
+    # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
     # are not SQL; each is blanked so offsets into `sql` still hold.
     sql = _without_psql_meta_commands(sql)
     try:

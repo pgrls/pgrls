@@ -42,6 +42,7 @@ from pgrls.rules import (
 from pgrls.schema_sources import (
     SchemaSourceError,
     _relation_key,
+    _without_psql_meta_commands,
     inert_rule_ids,
     schema_from_sql,
 )
@@ -199,6 +200,8 @@ def _object_spans(text: str) -> _Spans:
     so a `CREATE` keeps its span even if a later `ALTER` references the object.
     """
     spans = _Spans()
+    # As `schema_from_sql` reads it: psql meta-commands blanked, offsets kept.
+    text = _without_psql_meta_commands(text)
     try:
         statements = pglast.parse_sql(text)
     except pglast.parser.ParseError:
