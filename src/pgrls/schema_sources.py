@@ -1201,11 +1201,11 @@ class _Resolver:
         elif isinstance(stmt, _pgast.ReassignOwnedStmt):
             # Their schemas pass to the new role; one the connecting role
             # owns does too if it is among them, which pgrls cannot tell.
-            old = {getattr(r, "rolename", None) for r in stmt.roles or ()}
-            new = getattr(stmt.newrole, "rolename", None)
+            from_roles = {getattr(r, "rolename", None) for r in stmt.roles or ()}
+            to_role = getattr(stmt.newrole, "rolename", None)
             for schema, owner in list(self.owners.items()):
-                if owner in old:
-                    self.owners[schema] = new
+                if owner in from_roles:
+                    self.owners[schema] = to_role
                 elif owner is None:
                     self.owners[schema] = _SOME_ROLE
         elif (isinstance(stmt, _pgast.RenameStmt)
