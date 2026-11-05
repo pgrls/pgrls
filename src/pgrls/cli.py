@@ -4529,7 +4529,8 @@ def verify(
     `USING` that `FOR UPDATE`/`FOR ALL` reuses) and the old-row gate (`USING`,
     for `UPDATE`/`DELETE`/`ALL`)? Three honest verdicts:
     `PROVEN` (the property is unsatisfiable under the threat model), `LEAK` (it
-    *is* violated — with a concrete counterexample), or `UNVERIFIED` (Z3
+    *is* violated — with a counterexample row when one characterizes it), or
+    `UNVERIFIED` (Z3
     unavailable, the predicate is outside the decidable fragment, it timed out,
     or — cross-tenant/write — there is no single scoping equality on an
     identity/discriminator column to verify (the prover's tenant-axis set:

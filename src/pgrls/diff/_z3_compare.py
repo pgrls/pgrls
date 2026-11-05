@@ -129,8 +129,8 @@ from pgrls.ast_utils import func_name_parts, is_never_null_current_setting
 # the supported subset. Each maps to a Z3 lambda the translator
 # applies to the (left, right) pair. Equality and inequality work
 # across all supported types; ordered comparisons (`<`, `>`, etc.)
-# work for Int and Real but not Bool — we defer the type check to
-# Z3 itself, which raises if the operands' sorts disagree.
+# work for Int and Real but not Bool — Z3 raises on two Bools, but coerces
+# a Bool against a number to 0 / 1, which `_unlike_sql` catches first.
 _COMPARISON_OPS: dict[str, Any] = {
     "=":  lambda a, b: a == b,
     "!=": lambda a, b: a != b,
@@ -1669,7 +1669,16 @@ def _anon_binop(
         _record_tenant_pair(ctx, left, right)
 
     if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session):
-        return None
+        if ctx.any_session or comparison_fn is None:
+            return None
+        if left.unset or right.unset:
+            return _TV(is_true=z3.BoolVal(False), is_null=z3.BoolVal(True))
+        # Off the diff path, a fresh truth of its own: free where both
+        # operands are non-NULL, so a proof holds only if it holds for either
+        # outcome, and a leak resting on it has no witness row.
+        null = z3.Or(left.is_null, right.is_null)
+        truth = ctx.opaque(f"comparison#{len(ctx._opaque_vars)}", z3.BoolSort())
+        return _TV(is_true=z3.And(z3.Not(null), truth), is_null=null)
 
     if comparison_fn is not None:
         if left.unset or right.unset:
@@ -1696,6 +1705,11 @@ def _anon_binop(
             is_null=z3.Or(left.is_null, right.is_null),
         )
 
+    if arithmetic_fn is not None and (left.unset or right.unset):
+        # An unset GUC raises before its NULL could reach an `IS NULL` or a
+        # COALESCE, which read only the null-flag: no reading of the result
+        # (a value, or one marked unset) is right for both, so abstain.
+        return None
     sorts = {left.value.sort(), right.value.sort()}
     if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%")):
         # Off the diff path too, a result Z3 does not compute as Postgres
@@ -1705,15 +1719,12 @@ def _anon_binop(
         # chain; a fresh value only frees it further). Arithmetic on
         # anything else — text standing for a timestamp or an interval,
         # whose order is not text's — abstains, as the diff path did above.
-        if not sorts <= {z3.IntSort(), z3.RealSort()} or left.unset or right.unset:
-            # An unset GUC raises before its NULL could reach an `IS NULL`
-            # or a COALESCE, which read only the null-flag.
+        if not sorts <= {z3.IntSort(), z3.RealSort()}:
             return None
         sort = z3.RealSort() if z3.RealSort() in sorts else z3.IntSort()
         return _Val(
             value=ctx.opaque(f"arithmetic#{len(ctx._opaque_vars)}", sort),
             is_null=z3.Or(left.is_null, right.is_null),
-            unset=left.unset or right.unset,
         )
 
     if arithmetic_fn is not None:
@@ -1725,18 +1736,23 @@ def _anon_binop(
             # where now()/interval resolve to opaque String operands).
             # Z3 raises a plain TypeError, not Z3Exception. NO-OP.
             return None
-        return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null),
-                    unset=left.unset or right.unset)
+        return _Val(value=value, is_null=z3.Or(left.is_null, right.is_null))
 
     return None  # unreachable (guarded above) — satisfies the type checker
 
 
 def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     """Whether Z3's reading of `left op right` would differ from Postgres's,
-    so the comparison must not be translated.
+    so the comparison must not be translated (on the diff path it abstains;
+    off it, it is a truth of its own, see `_anon_binop`).
 
-    On every path: a Bool against a non-Bool — an encoding artifact (a bare
-    column defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects.
+    On every path:
+
+    * a Bool against a non-Bool — an encoding artifact (a bare column
+      defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects;
+    * ``<`` / ``>`` / ``<=`` / ``>=`` on text — Postgres orders it by
+      collation, Z3 by code point (``'B' < 'b'`` is FALSE under en_US), and
+      an equality elsewhere can pin either side to a literal.
 
     On the diff path (`any_session`), where both predicates' readings must be
     exact for an equivalence or an implication to hold, also (off it,
@@ -1746,12 +1762,11 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     * arithmetic on anything but integers — Z3's ``+`` on two strings
       concatenates, and its reals have no NaN / ±Infinity and never round;
     * ``/`` and ``%`` — Postgres truncates an integer quotient toward zero
-      (``-1 % 2`` is -1, Z3's is 1);
-    * ``<`` / ``>`` / ``<=`` / ``>=`` on text — Postgres orders it by
-      collation, Z3 by code point (``'B' < 'b'`` is FALSE under en_US), and
-      an equality elsewhere can pin either side to a literal."""
+      (``-1 % 2`` is -1, Z3's is 1)."""
     sorts = (left.sort(), right.sort())
     if (sorts[0] == z3.BoolSort()) != (sorts[1] == z3.BoolSort()):
+        return True
+    if op in ("<", ">", "<=", ">=") and z3.StringSort() in sorts:
         return True
     if not any_session:
         return False
@@ -1762,7 +1777,7 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
         if not all(s == z3.IntSort() for s in sorts):
             return True
         return op in ("/", "%")
-    return op in ("<", ">", "<=", ">=") and z3.StringSort() in sorts
+    return False
 
 
 def _resolve_3vl_operands(

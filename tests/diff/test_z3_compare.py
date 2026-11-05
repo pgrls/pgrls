@@ -1091,6 +1091,9 @@ def test_the_provers_do_not_prove_what_a_column_type_decides(using) -> None:
     "tenant_id = auth.uid() OR (f + 0.25 = 0.5 AND f <> 0.25)",
     # Postgres truncates: `-1 % 2` is -1.
     "tenant_id = auth.uid() OR (a % 2) = -1",
+    # Postgres orders text by collation: under en_US `'ab'` is both
+    # `< 'B'` and `> 'a'`.
+    "tenant_id = auth.uid() OR (s < 'B' AND s > 'a')",
     # Text standing for a timestamp or an interval does not order as text
     # (`'10 days' < '7 days'` by code point).
     "tenant_id = auth.uid() OR (now() - created_at > '7 days' AND now() - created_at < '10 days')",
@@ -1108,6 +1111,8 @@ def test_arithmetic_z3_does_not_compute_as_postgres_proves_nothing(using) -> Non
     "COALESCE(current_setting('app.v', true)::numeric % current_setting('app.u')::numeric, 0.5) "
     "= ANY(ARRAY[0.5])",
     "current_setting('app.t')::int + 0 = 5 OR current_setting('app.t')::int + 0 <> 5",
+    "(current_setting('app.t')::int + 0 = 5) IS NULL",
+    "COALESCE(current_setting('app.t')::int + 0 = 5, true)",
 ])
 def test_arithmetic_on_an_unset_guc_is_not_an_anonymous_leak(using) -> None:
     assert _anon(using) is None
@@ -1117,6 +1122,8 @@ def test_arithmetic_beside_the_identity_keeps_the_proof() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
     for using in ("tenant_id = auth.uid() AND price * 2.5 > 10",
+                  "tenant_id = auth.uid() AND COALESCE(a, b) = 1",
+                  "tenant_id = auth.uid() AND status < 'm'",
                   "tenant_id = auth.uid() AND " + " + ".join(["f"] + ["0.5"] * 200) + " > 1"):
         assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
         assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using

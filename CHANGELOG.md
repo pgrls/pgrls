@@ -77,26 +77,30 @@ breaking changes — they will be called out in this file.
   holds it exactly (`0.5`, not `0.1`: a `numeric`, a `float8` and, in an
   `IN` list, a `float4` column read it differently), and a literal past the
   double range (`1e400`) no longer crashes.
-- **`pgrls verify`, `matrix --prove` and SEC038 follow the same rules where
-  Z3 and Postgres disagree.** A Bool compared with a number is no longer
-  coerced to 0 / 1, which fixes a false SEC038 on `COALESCE(level, tier) <
-  2 OR …`; a cast that may change the value (`::float4`, `::numeric(3,1)`,
-  `::varchar(3)`, `::citext`) is a value of its own (a `uuid` or integer
-  cast of the session identity still keeps it), and so is arithmetic Z3
-  does not compute as Postgres does (on reals, `/`, `%`). Proofs that relied
-  on those are no longer made: `tenant_id = auth.uid() AND COALESCE(a, b) =
-  1` goes from PROVEN to unverified (UNKNOWN in the matrix), `tenant_id =
-  auth.uid() OR f + 0.5 = f` (true for `Infinity`) from PROVEN to LEAK, and
-  `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`,
-  which the float reading made an empty range, from PROVEN to LEAK under
-  `--mode anon`. Integer arithmetic on an unset setting now keeps the
-  setting unset, so `current_setting('app.t')::int + 0 = 5 OR … <> 5` is
-  no longer a false SEC038 (Postgres raises). A leak found through a decimal no `float4` holds (`… OR n <
-  0.1`) is now unverified, so `verify` exits 0 on it. The cost runs the
-  other way too: like a function call already, such a cast or
-  arithmetic beside an `OR` is reported as a conditional LEAK (no witness
-  row) even where Postgres admits no row (`… OR (a % 2) = 5`), so a `verify`
-  gate that passed can now fail.
+- **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
+  where it differs from Postgres's.** A comparison Z3 would read otherwise —
+  a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text
+  (Postgres orders by collation) — is a truth of its own; a cast that may
+  change the value (`::float4`, `::numeric(3,1)`, `::varchar(3)`,
+  `::citext`) is a value of its own (a `uuid` or integer cast of the session
+  identity still keeps it), and so is arithmetic on reals, `/` and `%`. A
+  proof whose other conjunct isolates still holds (`tenant_id = auth.uid()
+  AND status < 'm'`), and one that rested on Z3's reading is no longer made:
+  `tenant_id = auth.uid() OR (s < 'B' AND s > 'a')` (both hold for `'ab'`
+  under en_US), `… OR f + 0.5 = f` (true for `Infinity`) and
+  `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`
+  (an empty range only through a float) go from PROVEN to LEAK, and the
+  false SEC038 on `COALESCE(level, tier) < 2 OR …` is gone. Arithmetic on a
+  setting an anonymous session leaves unset abstains, since Postgres raises
+  there: `current_setting('app.t')::int + 0 = 5 OR … <> 5` is no longer a
+  false SEC038, but a proof resting on such arithmetic (`auth.uid() IS NOT
+  NULL AND amount < current_setting('app.limit')::numeric * 2`) is now
+  unverified, and so is a leak found only through a decimal no `float4`
+  holds (`… OR n < 0.1`), on which `verify` exits 0. The cost runs the
+  other way too: like a function call already, such a value beside an `OR`
+  is reported as a conditional LEAK (no witness row) even where Postgres
+  admits no row (`… OR (a % 2) = 5`), so a `verify` gate that passed can
+  now fail.
 - Leaking rows from every prover print a character past Latin-1 (U+00FF) as
   itself, not Z3's `\u{…}`, and keep a backslash in a policy's string
   literal (`'\u{41}'` was taken for `'A'`).
