@@ -443,25 +443,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # to this statement so the drop gate sees the LAST create. That
             # makes existence correct for every ordering: `CREATE; DROP;
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
-            # A column it gives another type has that type after a DROP
-            # (the DDL errors otherwise), and either after IF NOT EXISTS: the
-            # diff reads a string compared with a column by its type.
             tables[key].created_at = index
-            unsure = bool(getattr(stmt, "if_not_exists", False))
-            for elt in stmt.tableElts or ():
-                if type(elt).__name__ == "ColumnDef":
-                    _retype_column(tables[key], elt.colname, _column_type(elt), unsure=unsure)
-                elif type(elt).__name__ == "TableLikeClause":
-                    for c in list(tables[key].columns):
-                        _retype_column(tables[key], c.name, None, unsure=True)
-            for rel in stmt.inhRelations or ():
-                parent = tables.get(_relation_key(rel, default_schema) or ("", ""))
-                if parent is not None:
-                    parent.attached.append(key)  # a later ALTER … TYPE reaches it
-                for c in list(tables[key].columns):
-                    source = next((p.data_type for p in parent.columns if p.name == c.name),
-                                  None) if parent is not None else None
-                    _retype_column(tables[key], c.name, source, unsure=unsure or source is None)
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
         tables[key] = builder
@@ -530,7 +512,116 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_rename(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
 
+    # The diff reads a string compared with a column by the column's type
+    # (`text` and `citext` read `'a'::text` otherwise), which the passes above
+    # do not follow in order; replay what changes it.
+    types = _column_types_in_order(statements, default_schema)
+    for key, builder in tables.items():
+        if key in types:
+            builder.columns = [replace(c, data_type=types[key].get(c.name, c.data_type))
+                               for c in builder.columns]
     return Schema(tables=tuple(b.build() for b in tables.values()))
+
+
+def _column_types_in_order(
+    statements: Any, default_schema: str,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Each table's column types as the statements leave them, in order:
+    CREATE (its own columns, a parent's for PARTITION OF / INHERITS; `LIKE`
+    copies a type pgrls marks `unknown`), DROP, RENAME, ADD / DROP / RENAME
+    COLUMN and ALTER COLUMN … TYPE (which reaches the partitions and
+    children attached then: PARTITION OF, INHERITS, ATTACH, INHERIT, until
+    DETACH / NO INHERIT)."""
+    types: dict[tuple[str, str], dict[str, str]] = {}
+    children: dict[tuple[str, str], set[tuple[str, str]]] = {}
+
+    def below(key: tuple[str, str]) -> list[tuple[str, str]]:
+        seen, pending = [], [key]
+        while pending:
+            k = pending.pop()
+            if k not in seen:
+                seen.append(k)
+                pending.extend(children.get(k, ()))
+        return seen
+
+    for raw in statements:
+        stmt = raw.stmt
+        if isinstance(stmt, _pgast.CreateStmt):
+            key = _relation_key(stmt.relation, default_schema)
+            if key is None or (getattr(stmt, "if_not_exists", False) and key in types):
+                continue
+            cols: dict[str, str] = {}
+            for rel in stmt.inhRelations or ():
+                parent = _relation_key(rel, default_schema)
+                if parent is not None:
+                    cols.update(types.get(parent, {}))
+                    children.setdefault(parent, set()).add(key)
+            for elt in stmt.tableElts or ():
+                if type(elt).__name__ == "ColumnDef" and elt.colname:
+                    cols[elt.colname] = _column_type(elt) or "unknown"
+                elif type(elt).__name__ == "TableLikeClause":
+                    source = _relation_key(elt.relation, default_schema)
+                    cols.update({c: "unknown" for c in types.get(source or ("", ""), {})})
+            types[key] = cols
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
+            for namelist in stmt.objects or ():
+                parts = _drop_name_parts(namelist)
+                if parts:
+                    key = _drop_table_key(parts, default_schema)
+                    types.pop(key, None)
+                    children.pop(key, None)
+                    for kids in children.values():
+                        kids.discard(key)
+        elif isinstance(stmt, _pgast.RenameStmt) and stmt.newname:
+            key = _relation_key(stmt.relation, default_schema)
+            if key is None or key not in types:
+                continue
+            if stmt.renameType == ObjectType.OBJECT_TABLE:
+                new = (key[0], stmt.newname)
+                types[new] = types.pop(key)
+                children[new] = children.pop(key, set())
+                for kids in children.values():
+                    if key in kids:
+                        kids.discard(key)
+                        kids.add(new)
+            elif stmt.renameType == ObjectType.OBJECT_COLUMN and stmt.subname:
+                for k in below(key):
+                    if stmt.subname in types.get(k, {}):
+                        types[k][stmt.newname] = types[k].pop(stmt.subname)
+        elif isinstance(stmt, _pgast.AlterTableStmt):
+            key = _relation_key(stmt.relation, default_schema)
+            if key is None:
+                continue
+            for cmd in stmt.cmds or ():
+                subtype = getattr(cmd, "subtype", None)
+                if subtype == AlterTableType.AT_AlterColumnType:
+                    col = getattr(cmd, "def_", None)
+                    new_type = (_column_type(col) if type(col).__name__ == "ColumnDef" else None)
+                    for k in below(key):
+                        if cmd.name in types.get(k, {}):
+                            types[k][cmd.name] = new_type or "unknown"
+                elif subtype == AlterTableType.AT_AddColumn:
+                    col = getattr(cmd, "def_", None)
+                    if isinstance(col, _pgast.ColumnDef) and col.colname:
+                        for k in below(key):
+                            types.setdefault(k, {})[col.colname] = _column_type(col) or "unknown"
+                elif subtype == AlterTableType.AT_DropColumn and cmd.name:
+                    for k in below(key):
+                        types.get(k, {}).pop(cmd.name, None)
+                elif subtype in (AlterTableType.AT_AttachPartition,
+                                 AlterTableType.AT_DetachPartition):
+                    child = _relation_key(getattr(getattr(cmd, "def_", None), "name", None),
+                                          default_schema)
+                    if child is not None:
+                        kids = children.setdefault(key, set())
+                        (kids.add if subtype == AlterTableType.AT_AttachPartition
+                         else kids.discard)(child)
+                elif subtype in (AlterTableType.AT_AddInherit, AlterTableType.AT_DropInherit):
+                    parent = _relation_key(getattr(cmd, "def_", None), default_schema)
+                    if parent is not None:
+                        kids = children.setdefault(parent, set())
+                        (kids.add if subtype == AlterTableType.AT_AddInherit else kids.discard)(key)
+    return types
 
 
 class _TableBuilder:
@@ -550,12 +641,6 @@ class _TableBuilder:
         self.column_grants: list[ColumnGrant] = []
         self.partition_of: tuple[str, str] | None = None
         self.inherits: list[tuple[str, str]] = []
-        # Tables an ALTER attached as a partition or child (`ATTACH
-        # PARTITION`, `INHERIT`): a column type change reaches them too.
-        self.attached: list[tuple[str, str]] = []
-        # Its partitions and children an ALTER took off it (`DETACH
-        # PARTITION`, `NO INHERIT`): a later type change does not reach them.
-        self.detached: set[tuple[str, str]] = set()
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -660,13 +745,6 @@ def _apply_rename(
         return
     new = (old[0], newname)
     builder.name = newname
-    # Its partitions and children still name it by the old name; a type
-    # change to it under the new one reaches them (`attached`).
-    for key, other in tables.items():
-        if other.partition_of == old or old in other.inherits:
-            builder.attached.append(key)
-        other.attached = [new if k == old else k for k in other.attached]
-        other.detached = {new if k == old else k for k in other.detached}
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder
@@ -831,59 +909,7 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
-        elif subtype == AlterTableType.AT_AttachPartition:
-            child = _relation_key(getattr(getattr(cmd, "def_", None), "name", None),
-                                  default_schema)
-            if child is not None:
-                builder.attached.append(child)
-                builder.detached.discard(child)
-        elif subtype == AlterTableType.AT_DetachPartition:
-            child = _relation_key(getattr(getattr(cmd, "def_", None), "name", None),
-                                  default_schema)
-            if child is not None:
-                builder.detached.add(child)
-        elif subtype in (AlterTableType.AT_AddInherit, AlterTableType.AT_DropInherit):
-            parent = _relation_key(getattr(cmd, "def_", None), default_schema)
-            if parent is not None and parent in tables:
-                if subtype == AlterTableType.AT_AddInherit:
-                    tables[parent].attached.append(key)
-                    tables[parent].detached.discard(key)
-                else:
-                    tables[parent].detached.add(key)
-        elif subtype == AlterTableType.AT_AlterColumnType:
-            # The diff reads a string compared with a column by its type
-            # (`text` and `citext` read `'a'::text` otherwise).
-            name = getattr(cmd, "name", None)
-            col = getattr(cmd, "def_", None)
-            data_type = _column_type(col) if type(col).__name__ == "ColumnDef" else None
-            # Its partitions and inheritance children change with it.
-            pending, seen = [key], set()
-            while pending:
-                parent = pending.pop()
-                if parent in seen or parent not in tables:
-                    continue
-                seen.add(parent)
-                tables[parent].columns = [
-                    replace(c, data_type=data_type or "unknown") if c.name == name else c
-                    for c in tables[parent].columns
-                ]
-                pending.extend(k for k, b in tables.items()
-                               if (b.partition_of == parent or parent in b.inherits)
-                               and k not in tables[parent].detached)
-                pending.extend(k for k in tables[parent].attached
-                               if k not in tables[parent].detached)
         # Other ALTER subcommands are ignored.
-
-
-def _retype_column(builder: _TableBuilder, name: str | None, data_type: str | None,
-                   *, unsure: bool) -> None:
-    """Give column `name` the type a re-CREATE gives it (`unknown` where it
-    may have kept the one it has)."""
-    builder.columns = [
-        replace(c, data_type=data_type if data_type and not unsure else "unknown")
-        if c.name == name and c.data_type != data_type else c
-        for c in builder.columns
-    ]
 
 
 def _apply_create_policy(

@@ -1450,12 +1450,31 @@ def test_offline_alter_column_type_is_applied():
     assert [(c.name, c.data_type) for c in t.column_details][-1] == ("role", "citext")
 
 
+@pytest.mark.parametrize("sql, table", [
+    # The ALTER before the DROP is the old table's.
+    ("CREATE TABLE t (id int, role citext); ALTER TABLE t ALTER COLUMN role TYPE text;"
+     " DROP TABLE t; CREATE TABLE t (id int, role citext);", "t"),
+    # The rebuild's new t is not the renamed old one.
+    ("CREATE TABLE t (id int, role citext); ALTER TABLE t RENAME TO t_old;"
+     " CREATE TABLE t (id int, role text);", "t_old"),
+    # A child re-created as a partition is attached again.
+    ("CREATE TABLE p (id int, role text) PARTITION BY RANGE (id);"
+     " CREATE TABLE t PARTITION OF p FOR VALUES FROM (0) TO (100); ALTER TABLE p DETACH PARTITION t;"
+     " DROP TABLE t; CREATE TABLE t PARTITION OF p FOR VALUES FROM (0) TO (100);"
+     " ALTER TABLE p ALTER COLUMN role TYPE citext;", "t"),
+])
+def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
+    from pgrls.schema_sources import schema_from_sql
+    (t,) = [t for t in schema_from_sql(sql).tables if t.name == table]
+    assert {c.name: c.data_type for c in t.column_details}["role"] == "citext"
+
+
 def test_a_column_type_follows_a_re_create_and_reaches_children():
     from pgrls.schema_sources import schema_from_sql
     t = _only("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);")
     assert [c.data_type for c in t.column_details] == ["citext"]
     t = _only("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);")
-    assert [c.data_type for c in t.column_details] == ["unknown"]
+    assert [c.data_type for c in t.column_details] == ["text"]  # a no-op
     schema = schema_from_sql(
         "CREATE TABLE m (k int, role text) PARTITION BY LIST (k);"
         " CREATE TABLE m1 PARTITION OF m FOR VALUES IN (1); CREATE TABLE c () INHERITS (m1);"
