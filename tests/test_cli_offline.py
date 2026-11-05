@@ -2273,6 +2273,11 @@ def test_harmless_psql_commands_are_skipped():
                f'\\connect -reuse-previous=on "dbname=\'{written}\'"\n'
                'CREATE TABLE t (id int);\n')
         assert [t.name for t in schema_from_sql(sql).tables] == ["t"], name
+    # pg_dump --create --clean of a template database clears its flag first.
+    sql = ("UPDATE pg_catalog.pg_database SET datistemplate = false WHERE datname = 'd';\n"
+           "DROP DATABASE IF EXISTS d;\nCREATE DATABASE d WITH TEMPLATE = template0;\n"
+           "\\connect d\nCREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # A script's settings of psql's own error and output handling.
     sql = "\\set ON_ERROR_STOP on\n\\set QUIET\nCREATE TABLE t (id int);\n"
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]

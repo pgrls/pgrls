@@ -512,7 +512,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             "and connects to it; pgrls cannot see the template's objects.",
         )
     if connect is not None and any(
-        end(raw) < connect
+        end(raw) < connect and not _clears_a_template_flag(raw.stmt)
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
              or getattr(raw.stmt, "intoClause", None) is not None  # SELECT … INTO
              # A CTE that writes (a database's settings into its catalog).
@@ -1622,6 +1622,30 @@ _UNSAFE_CLIENT_ENCODINGS = frozenset({
 # character is read as other characters (`é` as `Ã©` under LATIN1).
 _UTF8_ENCODINGS = frozenset({"utf8", "unicode", "sqlascii"})
 _WRITES = (_pgast.InsertStmt, _pgast.UpdateStmt, _pgast.DeleteStmt, _pgast.MergeStmt)
+
+
+def _clears_a_template_flag(stmt: Any) -> bool:
+    """`UPDATE pg_catalog.pg_database SET datistemplate = false WHERE datname
+    = '<name>'`, which `pg_dump --create --clean` writes to drop a template
+    database: no setting of the next session."""
+    target = stmt.targetList[0] if isinstance(stmt, _pgast.UpdateStmt) and len(
+        stmt.targetList or ()) == 1 else None
+    where = getattr(stmt, "whereClause", None)
+    return (
+        target is not None
+        and stmt.relation.relname == "pg_database"
+        and stmt.relation.schemaname in (None, "pg_catalog")
+        and not stmt.fromClause and not stmt.withClause and not stmt.returningList
+        and target.name == "datistemplate" and not target.indirection
+        and isinstance(target.val, _pgast.A_Const)
+        and getattr(target.val.val, "boolval", None) is False
+        and isinstance(where, _pgast.A_Expr) and where.kind == A_Expr_Kind.AEXPR_OP
+        and [getattr(n, "sval", None) for n in where.name or ()] == ["="]
+        and isinstance(where.lexpr, _pgast.ColumnRef)
+        and [getattr(f, "sval", None) for f in where.lexpr.fields or ()] == ["datname"]
+        and isinstance(where.rexpr, _pgast.A_Const)
+        and isinstance(getattr(where.rexpr.val, "sval", None), str)
+    )
 # Statements `pg_dump --create` writes before its `\\connect`.
 _DATABASE_LEVEL_STATEMENTS = frozenset({
     "VariableSetStmt", "SelectStmt", "CreatedbStmt", "AlterDatabaseStmt",
