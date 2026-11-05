@@ -1749,6 +1749,8 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("\\connect d\nCREATE TABLE t (id int);\nBEGIN;\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
      "CREATE FUNCTION begin() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\nCOMMIT;\n"
      "\\connect d\nCREATE TABLE u (id int);\n", "connects to another"),
+    # The template's objects are copied into the database.
+    ("CREATE DATABASE d TEMPLATE base;\n\\connect d\nCREATE TABLE t (id int);\n", "template"),
     # pglast stops reading at a NUL; psql drops only the rest of its line.
     ("CREATE TABLE a (id int);\n-- \x00\nCREATE TABLE b (id int);\n", "NUL"),
 ])
@@ -1834,6 +1836,10 @@ def test_a_skipped_line_must_lie_between_tokens():
     # as others (`é` as `Ã©` under LATIN1).
     ("SET client_encoding = 'LATIN1';\nCREATE TABLE \"\u00e9\" (id int);\n", True),
     ("SET client_encoding = 'SQL_ASCII';\nCREATE TABLE \"\u00e9\" (id int);\n", False),
+    # Postgres stores `x = NULL` as `x IS NULL`.
+    ("SET transform_null_equals = on;\n", True),
+    ("ALTER DATABASE d SET transform_null_equals = true;\n", True),
+    ("SET transform_null_equals = off;\n", False),
     # A rule on pg_settings sets what it names.
     ("UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\n",
      "pg_settings"),

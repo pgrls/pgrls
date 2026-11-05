@@ -364,10 +364,13 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
 
     Parses `sql` with `pglast` and walks the statements TOLERANTLY: any
     statement shape this builder doesn't model (functions, views, indexes, FKs,
-    roles, ALTER DEFAULT PRIVILEGES, …) is silently skipped. The ONLY thing that
-    raises is a pglast `ParseError` on the whole input — surfaced as a
-    `bad_sql` `SchemaSourceError` so the agent learns its DDL didn't parse
-    rather than receiving a falsely-clean "no findings".
+    roles, ALTER DEFAULT PRIVILEGES, …) is silently skipped. What raises — a
+    `bad_sql` `SchemaSourceError`, so the agent learns its SQL could not be
+    read rather than receiving a falsely-clean "no findings" — is a pglast
+    `ParseError` on the whole input, and SQL whose effect pgrls cannot model:
+    a psql meta-command other than the harmless ones, a setting that changes
+    how Postgres reads the text, objects or a transaction before the last
+    `\\connect`.
 
     What IS modeled:
 
@@ -380,7 +383,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
       ``pg_dump`` writes partitions in). An ALTER on a view, sequence or other
       non-table relation is ignored. psql meta-command lines that do not
       change the SQL (``\\restrict``, ``\\echo``, a ``\\connect`` to one
-      database) are skipped; any other is refused.
+      database after only database-level statements) are skipped; any
+      other is refused.
     * ``CREATE POLICY`` → a `Policy` (name, command, permissive vs
       ``AS RESTRICTIVE``, ``TO`` roles, and USING / WITH CHECK parsed into the
       ASTs `verify` and the AST rules need).
@@ -427,6 +431,19 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         # Where the statement ends: its start can include the gap before it.
         return (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(sql)
 
+    if connect is not None and any(
+        isinstance(raw.stmt, _pgast.CreatedbStmt) and any(
+            opt.defname == "template" and getattr(opt.arg, "sval", None) != "template0"
+            for opt in raw.stmt.options or ())
+        for raw in statements
+    ):
+        # The database copies the template's objects, which the SQL does not
+        # show.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL creates a database from a template other than template0 "
+            "and connects to it; pgrls cannot see the template's objects.",
+        )
     if connect is not None and any(
         end(raw) < connect
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
@@ -1018,9 +1035,10 @@ def _check_blanked_lines(sql: str, commands: list[tuple[int, str]]) -> None:
 
 
 def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
-    """Refuse SQL that sets what changes how Postgres reads the strings after
-    it — a client encoding whose characters can hold a quote or backslash
-    byte, or `standard_conforming_strings` off — by `SET`, `ALTER DATABASE /
+    """Refuse SQL that sets what changes how Postgres reads the SQL after it
+    — a client encoding whose characters can hold a quote or backslash byte,
+    `standard_conforming_strings` off, or `transform_null_equals` on (which
+    stores `x = NULL` as `x IS NULL`) — by `SET`, `ALTER DATABASE /
     ROLE … SET` (which a `\\connect` brings in) or `set_config()`. pgrls
     reads the SQL as UTF-8 with standard strings, so it would end strings
     where Postgres does not. With `non_ascii`, any client encoding but UTF-8
@@ -1051,26 +1069,28 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
                 arg = args[1] if len(args) > 1 else None
             else:
                 continue
-            if name not in ("client_encoding", "standard_conforming_strings"):
+            if name not in ("client_encoding", "standard_conforming_strings",
+                            "transform_null_equals"):
                 continue
             val = arg.val if isinstance(arg, _pgast.A_Const) else None
             value = str(getattr(val, "sval", None) or getattr(val, "ival", "")).lower()
             encoding = re.sub(r"[^a-z0-9]", "", value)
+            true = value in ("on", "1") or bool(value) and (
+                "true".startswith(value) or "yes".startswith(value))
             unsafe = val is None or (
                 name == "client_encoding"
                 and (encoding in _UNSAFE_CLIENT_ENCODINGS
                      or (non_ascii and encoding not in _UTF8_ENCODINGS))
-            ) or (
-                name == "standard_conforming_strings"
-                and not (value in ("on", "1") or (value and ("true".startswith(value)
-                                                             or "yes".startswith(value))))
+            ) or (name == "standard_conforming_strings" and not true) or (
+                # It stores `x = NULL` as `x IS NULL`.
+                name == "transform_null_equals" and true
             )
             if unsafe:
                 raise SchemaSourceError(
                     "bad_sql",
                     f"the SQL sets {name} to {value or 'a computed value'!r}, under "
                     "which Postgres reads its text differently from how pgrls "
-                    "reads it (as UTF-8 with standard strings).",
+                    "reads it.",
                 )
 
 

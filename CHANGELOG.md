@@ -72,14 +72,17 @@ breaking changes — they will be called out in this file.
   (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
   after another (dump each with `pg_dump`), or a `\connect` after anything
   but database-level statements (psql rolls an open transaction back, and
-  ends statements by its own rules). A NUL character is refused too. `--sql-file` now reads a lone CR as
+  ends statements by its own rules), or one to a database created from a
+  template other than `template0`. A NUL character, where `main` silently
+  stopped reading, is refused too. `--sql-file` now reads a lone CR as
   psql does (part of the line), and a file that is not UTF-8 is a tool
   error rather than a traceback. Any SQL file that sets `client_encoding`
   to an encoding such as SJIS or BIG5, or to anything but UTF-8 /
   SQL_ASCII when the file holds non-ASCII text (an `\encoding` included),
-  or turns `standard_conforming_strings` off (by `SET`, `ALTER DATABASE /
-  ROLE … SET`, `set_config()` or `UPDATE pg_settings`), is refused too:
-  Postgres then reads the text differently from pgrls. And every `ALTER … OWNER TO` the dump
+  or turns `standard_conforming_strings` off or `transform_null_equals` on
+  (by `SET`, `ALTER DATABASE / ROLE … SET`, `set_config()` or `UPDATE
+  pg_settings`), is refused too: Postgres then reads the text differently
+  from pgrls. And every `ALTER … OWNER TO` the dump
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
   not a table, or one that changes nothing pgrls models (`OWNER TO`) on a
