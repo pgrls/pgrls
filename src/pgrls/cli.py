@@ -2744,7 +2744,7 @@ def _apply_migration_for_diff(
     # default :latest pull is stable but a migration that depends on
     # PG version-specific syntax could surprise the user. Read from
     # PGRLS_DIFF_APPLY_PG_IMAGE for explicit override, else
-    # postgres:17-alpine (the highest in the project's CI matrix).
+    # postgres:17-alpine (a CI-tested major).
     base_image = os.environ.get(
         "PGRLS_DIFF_APPLY_PG_IMAGE", "postgres:17-alpine"
     )
