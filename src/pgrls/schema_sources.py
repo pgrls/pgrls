@@ -1041,7 +1041,7 @@ class _Resolver:
                 "bad_sql",
                 "the SQL connects to a database or as a role that sets "
                 "search_path; pgrls cannot tell which schema an unqualified "
-                "name is in. Set it after the \\\\connect, or qualify the names.",
+                "name is in. Set it after the \\connect, or qualify the names.",
             )
         role = self._get("role") or self._get("auth")
         for entry in path:
@@ -1103,7 +1103,7 @@ class _Resolver:
                 f"dropped a relation, and then names {name!r}, which resolves to "
                 f"another one if it did; pgrls cannot tell which. Qualify the name.",
             )
-        if name in self.temp and "pg_temp" not in (self.path or ()):
+        if name in self.temp and self.path is not None and "pg_temp" not in self.path:
             return _NOWHERE, True  # searched first unless the path names it
         # Lazily: an entry past the one that holds the name is never reached
         # (a `pg_temp` entry holding a temp table of the name is refused).

@@ -1500,6 +1500,17 @@ def test_a_path_naming_pg_temp_after_a_schema_finds_the_schema_first():
     assert t.qualified_name == "public.accounts" and t.rls_enabled is True
 
 
+def test_a_temp_table_on_a_connected_databases_path_is_refused():
+    # The database may set `public, pg_temp`, which finds public.a first.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match=r"sets search_path.*after the \\connect,"):
+        schema_from_sql(
+            "CREATE DATABASE d;\nALTER DATABASE d SET search_path = public, pg_temp;\n"
+            "\\connect d\nCREATE TABLE public.a (id int);\n"
+            "CREATE TEMP TABLE a (id int);\nALTER TABLE a DISABLE ROW LEVEL SECURITY;\n"
+        )
+
+
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
     # The second CREATE re-walked tableElts and appended the columns again.
     t = _only(
