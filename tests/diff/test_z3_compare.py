@@ -440,6 +440,17 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      "g::int IN (16777216, 16777217, 1::real)") is None
     assert _classify("g IN (9007199254740993, 1::float8)",
                      "g IN (9007199254740993, 9007199254740992, 1::float8)") is None
+    # A COALESCE or IN list with a float cast in it rounds its column too:
+    # no verdict.
+    assert prove_anon_isolation(parse_expr(
+        "COALESCE(id, 2::real) = 16777216 AND id = 16777217"))[0] != "isolated"
+    assert _classify("tenant_id = 16777217 AND false",
+                     "COALESCE(tenant_id, 0::real) = 16777216 AND tenant_id = 16777217") is None
+    assert _classify("tenant_id::real IN (16777217, 1)",
+                     "tenant_id::real IN (16777217, 16777216, 1)") is None
+    # The integer check reads an exact cast of an integer as that integer.
+    assert _classify("a IN (16777217, 1) AND a > 0::numeric",
+                     "a IN (16777217, 1) AND a >= 0::numeric") is None
     # ... and a nested IN does not end the outer one's rule.
     nested = "COALESCE(g, (a IN (1, 2))::int::float4)"
     assert _classify(f"{nested} = 1",

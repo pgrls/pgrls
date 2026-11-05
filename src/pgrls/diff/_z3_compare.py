@@ -244,7 +244,6 @@ class _Context:
         # How deep the translation is among values Postgres gives one type
         # (see `_real_integer`).
         self.unified = 0
-        self.lossy = 0
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -310,16 +309,13 @@ class _Context:
         self.session_null_tests: set[str] = set()
 
     @contextlib.contextmanager
-    def unifying(self, unified: bool, lossy: bool = False) -> Any:
-        """Translate among values Postgres gives one type, when `unified` —
-        a float one, when `lossy` (an element cast to `float4` / `float8`)."""
+    def unifying(self, unified: bool) -> Any:
+        """Translate among values Postgres gives one type, when `unified`."""
         self.unified += unified
-        self.lossy += lossy
         try:
             yield
         finally:
             self.unified -= unified
-            self.lossy -= lossy
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -508,13 +504,8 @@ def _is_constant(node: Any) -> bool:
 
 def _integer(number: int, ctx: _Context) -> Any:
     """An integer literal: as a real (`_real_integer`), or in the integer
-    pass as an integer — but not one a float element among values Postgres
-    gives one type rounds (`IN (16777217, 1::real)` is `real[]`)."""
-    if not ctx.integers:
-        return _real_integer(number, ctx)
-    if ctx.lossy and abs(number) > 2**24:
-        return None
-    return z3.IntVal(number)
+    pass as an integer."""
+    return z3.IntVal(number) if ctx.integers else _real_integer(number, ctx)
 
 
 def _has_lossy_cast(node: Any) -> bool:
@@ -1778,9 +1769,12 @@ def _anon_coalesce(
     defaults to; with no sibling to give one, the caller keeps the COALESCE
     opaque."""
     args = list(node.args or ())
+    if any(_has_lossy_cast(a) for a in args):
+        # Postgres gives every argument the float type a cast gives one,
+        # rounding a column's value too (`COALESCE(id, 0::real)`).
+        return None
     # Its arguments take one type, a column's beside a literal.
-    with ctx.unifying(not all(_is_constant(a) for a in args),
-                      any(_has_lossy_cast(a) for a in args)):
+    with ctx.unifying(not all(_is_constant(a) for a in args)):
         others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
                   if not isinstance(_unwrap_scalar_sublink(a), ColumnRef)]
     if not others or any(v is None for v in others):
@@ -1942,6 +1936,12 @@ def _anon_any_array(
         return None
     if not elements:
         return None
+    if any(_has_lossy_cast(e) for e in elements) or (
+            node.kind == A_Expr_Kind.AEXPR_IN and _has_lossy_cast(node.lexpr)):
+        # The list takes the float type a cast gives one element (or, for
+        # `IN`, its left side), rounding the others: `IN (16777217, 1::real)`
+        # is a `real[]`.
+        return None
     acc: _TV | None = None
     for elem in elements:
         cmp_node = A_Expr(
@@ -1953,7 +1953,7 @@ def _anon_any_array(
         # An `IN` list takes one type with its left side, and an array
         # one with a non-constant element.
         with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
-                _is_constant(e) for e in elements), any(_has_lossy_cast(e) for e in elements)):
+                _is_constant(e) for e in elements)):
             tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
@@ -2264,6 +2264,9 @@ def _anon_typecast(
     if inner is None:
         return None
     target_sort = _typename_segments_to_sort(node.typeName)
+    if (ctx.integers and target_sort == z3.RealSort() and _exact_cast(node.typeName)
+            and z3.is_int_value(inner.value)):
+        return inner  # the integer pass: `5::numeric` is 5
     if (target_sort == z3.IntSort() and not ctx.integers and _exact_cast(node.typeName)
             and z3.is_rational_value(inner.value) and inner.value.denominator_as_long() == 1
             and _in_int_range(inner.value.numerator_as_long(), node.typeName)):
