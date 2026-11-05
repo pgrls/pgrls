@@ -737,10 +737,11 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
     void = _rolled_back(statements)
     live = [raw for index, raw in enumerate(statements) if index not in void]
     schemas = [raw.stmt for raw in live if isinstance(raw.stmt, _pgast.CreateSchemaStmt)]
-    # A DROP TABLE takes a partitioned table's partitions with it.
-    partitioned = any(isinstance(stmt, _pgast.CreateStmt) and stmt.partspec is not None
-                      for raw in live
-                      for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ())))
+    # A DROP TABLE takes a partitioned table's partitions with it, and a
+    # DROP TABLE or COLUMN the sequences it owns (`serial`, identity,
+    # `OWNED BY`).
+    dependents = any(_makes_dependents(stmt) for raw in live
+                     for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ())))
     if any(stmt.schemaname is None and getattr(stmt.authrole, "rolename", None) is None
            for stmt in schemas):
         raise SchemaSourceError(
@@ -786,6 +787,8 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
         if isinstance(stmt, _pgast.CreateSchemaStmt):
             schema = _schema_created(stmt)
             resolver.schemas.add(schema)
+            resolver.unsure.discard(schema)
+            resolver.owners[schema] = getattr(stmt.authrole, "rolename", None)
             for element in stmt.schemaElts or ():
                 # Its elements go in it, and see it first.
                 with resolver.first(schema):
@@ -796,7 +799,7 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
             continue
         resolver.track(stmt)
         resolver.qualify(stmt)
-        if _runs_code(stmt) or _may_drop_unseen(stmt, partitioned):
+        if _runs_code(stmt) or _may_drop_unseen(stmt, dependents):
             resolver.code_ran = True
         out.append(_Stmt(stmt, raw))
     return out
@@ -879,6 +882,10 @@ class _Resolver:
         self.named = set(named) | {"public"}
         self.schemas: set[str] = set()
         self.dropped: set[str] = set()
+        # A schema's owner as the SQL gives it (None: the connecting role),
+        # and the schemas a `DROP OWNED` may have dropped.
+        self.owners: dict[str, str | None] = {}
+        self.unsure: set[str] = set()
         self.relations: set[tuple[str, str]] = set()
         self.temp: set[str] = set()
         self.commit_drop: set[str] = set()  # temporary, ON COMMIT DROP
@@ -1024,6 +1031,13 @@ class _Resolver:
         self.relations -= {(_NOWHERE, name) for name in names}
 
     def exists(self, schema: str) -> bool:
+        if schema in self.unsure:
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL resolves a name on search_path schema {schema!r} after a "
+                f"DROP OWNED that may have dropped it (pgrls does not know the role "
+                f"psql connects as); qualify the names.",
+            )
         if schema in self.schemas:
             return True
         if schema in self.maybe and schema not in self.dropped:
@@ -1138,15 +1152,22 @@ class _Resolver:
             except StopIteration:
                 return found
             except SchemaSourceError:
-                if found:
+                if found and not self.code_ran:
                     return found
-                raise
+                raise  # the first may be gone, and Postgres would go on
             if (entry, name) in self.relations:
                 found.append(entry)
 
     def qualify(self, stmt: Any) -> None:
         """Qualify each relation `stmt` creates or names, and follow what it
         creates, drops and renames."""
+        given = {id(rel) for rel, _ in _named_relations(stmt) if rel.schemaname}
+        if isinstance(stmt, _pgast.ViewStmt) and stmt.view.relpersistence != "t" and any(
+                isinstance(n, _pgast.RangeVar) and n.relname in self.temp
+                and n.schemaname in (None, "", "pg_temp")
+                for n in _subnodes(stmt.query)):
+            # A view on a temporary table is temporary too.
+            stmt.view.relpersistence = "t"
         for rel, creates in _named_relations(stmt):
             if creates:
                 if rel.relpersistence == "t" or rel.schemaname == "pg_temp":
@@ -1167,6 +1188,22 @@ class _Resolver:
             self._qualify_policy(stmt)
         elif isinstance(stmt, _pgast.DropStmt):
             self._drop(stmt)
+        elif (isinstance(stmt, _pgast.AlterOwnerStmt)
+              and stmt.objectType == ObjectType.OBJECT_SCHEMA):
+            self.owners[str(getattr(stmt.object, "sval", ""))] = getattr(
+                stmt.newowner, "rolename", None)
+        elif isinstance(stmt, _pgast.DropOwnedStmt):
+            # It drops the schemas the roles own; one owned by the connecting
+            # role (or by CURRENT_USER) may be among them.
+            roles = {getattr(r, "rolename", None) for r in stmt.roles or ()}
+            for schema in set(self.schemas):
+                owner = self.owners.get(schema)
+                if owner is not None and owner in roles:
+                    self.schemas.discard(schema)
+                    self.dropped.add(schema)
+                    self.relations -= {r for r in self.relations if r[0] == schema}
+                elif owner is None or None in roles:
+                    self.unsure.add(schema)
         elif (isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None
               and stmt.newschema):
             # A view, sequence, matview or foreign table moves (a table's
@@ -1178,8 +1215,10 @@ class _Resolver:
                 self.relations.discard(old)
                 self.relations.add((stmt.newschema, old[1]))
         elif (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
-              # `ALTER INDEX t RENAME` renames a table too.
-              and stmt.renameType in _RELATION_KINDS | {ObjectType.OBJECT_INDEX}
+              # `ALTER INDEX app.t RENAME` renames a table too; an unqualified
+              # name may be an index pgrls does not track.
+              and (stmt.renameType in _RELATION_KINDS or (
+                  stmt.renameType == ObjectType.OBJECT_INDEX and id(stmt.relation) in given))
               and stmt.newname):
             old = (stmt.relation.schemaname, stmt.relation.relname)
             if old in self.relations:
@@ -1211,11 +1250,13 @@ class _Resolver:
         if stmt.removeType == ObjectType.OBJECT_SCHEMA:
             for item in stmt.objects or ():
                 schema = str(getattr(item, "sval", ""))
-                held = {r for r in self.relations if r[0] == schema}
-                if stmt.behavior == DropBehavior.DROP_CASCADE or not held:
-                    self.schemas.discard(schema)
-                    self.dropped.add(schema)
-                    self.relations -= held
+                # Without CASCADE it errors unless it is empty, so what the
+                # model holds there is already gone (taken with a parent, a
+                # CASCADE or code).
+                self.schemas.discard(schema)
+                self.dropped.add(schema)
+                self.unsure.discard(schema)
+                self.relations -= {r for r in self.relations if r[0] == schema}
             return
         if stmt.removeType not in _RELATION_KINDS and stmt.removeType != ObjectType.OBJECT_POLICY:
             return
@@ -1281,15 +1322,42 @@ def _drops_on_commit(stmt: Any) -> bool:
     return bool(on_commit == OnCommitAction.ONCOMMIT_DROP)
 
 
-def _may_drop_unseen(stmt: Any, partitioned: bool) -> bool:
+def _makes_dependents(stmt: Any) -> bool:
+    """Whether `stmt` makes a relation dropped with a table or column: a
+    partitioned table, or a sequence a column owns."""
+    if isinstance(stmt, _pgast.CreateStmt) and stmt.partspec is not None:
+        return True
+    if not isinstance(stmt, (_pgast.CreateStmt, _pgast.AlterTableStmt,
+                             _pgast.CreateSeqStmt, _pgast.AlterSeqStmt)):
+        return False
+    for node in _subnodes(stmt):
+        if isinstance(node, _pgast.DefElem) and node.defname == "owned_by":
+            return True
+        if isinstance(node, _pgast.Constraint) and node.contype == ConstrType.CONSTR_IDENTITY:
+            return True
+        if isinstance(node, _pgast.ColumnDef) and node.typeName is not None and any(
+                getattr(n, "sval", "") in ("serial", "bigserial", "smallserial",
+                                           "serial2", "serial4", "serial8")
+                for n in node.typeName.names or ()):
+            return True
+    return False
+
+
+def _may_drop_unseen(stmt: Any, dependents: bool) -> bool:
     """Whether `stmt` may drop a relation it does not name: a CASCADE (a view
-    on the table), a partitioned table's partitions (when the SQL creates
-    one), `DROP OWNED`."""
+    on the table), `DROP OWNED`, an extension's members; when the SQL makes
+    relations that go with a table or column (`dependents`: a partition, a
+    sequence it owns), a DROP TABLE or DROP COLUMN."""
     if isinstance(stmt, _pgast.DropOwnedStmt):
         return True
+    if isinstance(stmt, _pgast.AlterTableStmt):
+        return any(getattr(cmd, "subtype", None) == AlterTableType.AT_DropColumn
+                   and (dependents or cmd.behavior == DropBehavior.DROP_CASCADE)
+                   for cmd in stmt.cmds or ())
     return isinstance(stmt, _pgast.DropStmt) and (
         stmt.behavior == DropBehavior.DROP_CASCADE
-        or (partitioned and stmt.removeType == ObjectType.OBJECT_TABLE))
+        or stmt.removeType == ObjectType.OBJECT_EXTENSION
+        or (dependents and stmt.removeType == ObjectType.OBJECT_TABLE))
 
 
 def _runs_code(stmt: Any) -> bool:
@@ -1801,11 +1869,17 @@ def _non_table_relation(stmt: Any) -> Any:
 # list.
 _PSQL_SPACE = " \t\n\r\f"
 _PG_SPACE = _PSQL_SPACE
+_HARMLESS_PSQL_COMMANDS = frozenset({
+    "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
+})
+
+
 def _psql_accepts(name: str, rest: str, restricted: str | None) -> bool:
     """Whether psql runs harmless meta-command `name` with arguments `rest`
     without an error, which under ON_ERROR_STOP would stop the run there."""
     if name == "restrict":
-        return bool(rest) and restricted is None
+        # pg_dump's key is alphanumeric; psql strips quotes (`''` is none).
+        return re.fullmatch(r"[A-Za-z0-9]+", rest, re.ASCII) is not None and restricted is None
     if name == "unrestrict":
         return restricted is not None
     if name == "timing":
@@ -1830,9 +1904,8 @@ _PSQL_FORMATS = frozenset({
     "aligned", "asciidoc", "csv", "html", "latex", "latex-longtable", "troff-ms",
     "unaligned", "wrapped",
 })
-_HARMLESS_PSQL_COMMANDS = frozenset({
-    "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
-})
+
+
 # Client encodings in which a byte of a multibyte character can be a quote or
 # a backslash (the client-only ones, by every name Postgres accepts): under
 # one, Postgres and psql end strings where pgrls, reading UTF-8, does not.

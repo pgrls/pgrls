@@ -1529,7 +1529,8 @@ def test_a_view_moved_out_of_the_path_no_longer_answers_a_name():
 def test_a_name_a_drop_may_have_freed_is_refused(drop):
     # The view app.docs may be gone, so `docs` may be public.docs.
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
-    with pytest.raises(SchemaSourceError, match="more than one schema on its search_path"):
+    with pytest.raises(SchemaSourceError,
+                       match="more than one schema on its search_path|DROP OWNED that may"):
         schema_from_sql(
             "CREATE SCHEMA app; CREATE TABLE public.docs (id int);"
             " CREATE TABLE app.base (a int); CREATE VIEW app.docs AS SELECT a FROM app.base;"
@@ -1583,6 +1584,42 @@ def test_a_harmless_psql_command_psql_rejects_is_refused(line):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
     with pytest.raises(SchemaSourceError, match="psql"):
         schema_from_sql(f"\\set ON_ERROR_STOP on\n{line}\nCREATE TABLE t (id int);\n")
+
+
+@pytest.mark.parametrize("sql, expected", [
+    # A view on a temporary table is temporary: dropping it leaves app.v.
+    ("CREATE SCHEMA app; CREATE TABLE app.v (id int); CREATE TEMP TABLE tmp (id int);"
+     " SET search_path = app, public; CREATE VIEW v AS SELECT * FROM tmp; DROP VIEW v;"
+     " ALTER TABLE v ENABLE ROW LEVEL SECURITY;", "app.v"),
+    # A DROP SCHEMA succeeds only once what it held is gone.
+    ("CREATE SCHEMA app; CREATE TABLE app.p (d int) PARTITION BY RANGE (d);"
+     " CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (1) TO (2);"
+     " DROP TABLE app.p; DROP SCHEMA app; SET search_path = app, public;"
+     " CREATE TABLE t (id int); ALTER TABLE t ENABLE ROW LEVEL SECURITY;", "public.t"),
+    # An unqualified ALTER INDEX may name an index: the table keeps its name.
+    ("CREATE SCHEMA app; CREATE TABLE public.x (id int); CREATE TABLE app.b (id int);"
+     " CREATE INDEX x ON app.b (id); SET search_path = app, public;"
+     " ALTER INDEX x RENAME TO x_idx; ALTER TABLE x ENABLE ROW LEVEL SECURITY;", "public.x"),
+])
+def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
+    from pgrls.schema_sources import schema_from_sql
+    assert {t.qualified_name: t.rls_enabled for t in schema_from_sql(sql).tables}[expected] is True
+
+
+@pytest.mark.parametrize("sql", [
+    # DROP OWNED may drop app, owned by the connecting role.
+    "CREATE SCHEMA app; SET search_path = app, public; DROP OWNED BY r; CREATE TABLE t (id int);",
+    # app.x may be gone with its parent, and then `mid` decides.
+    "CREATE SCHEMA app; CREATE TABLE public.x (id int); CREATE TABLE app.parent (id int);"
+    " CREATE TABLE app.x () INHERITS (app.parent); DROP TABLE app.parent CASCADE;"
+    " SET search_path = app, mid, public; ALTER TABLE x DISABLE ROW LEVEL SECURITY;"
+    " CREATE SCHEMA IF NOT EXISTS mid;",
+    "\\restrict ''\nCREATE TABLE t (id int);\n\\unrestrict ''\n",
+])
+def test_what_pgrls_cannot_tell_is_refused(sql):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError):
+        schema_from_sql(sql)
 
 
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():

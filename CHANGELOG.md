@@ -75,7 +75,7 @@ breaking changes — they will be called out in this file.
   meta-command but `\unrestrict` with its key, so any other there is
   refused (pg_dump writes `\unrestrict` before each `\connect`), and so is
   one psql rejects with an error, at which `ON_ERROR_STOP` stops the run
-  (a `\restrict` with no key or inside another, an `\unrestrict` outside
+  (a `\restrict` with no alphanumeric key or inside another, an `\unrestrict` outside
   one, a `\pset` or `\timing` argument psql does not take). Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
   COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
@@ -132,14 +132,18 @@ breaking changes — they will be called out in this file.
   did not exist and missed those on `public.*`. What a `ROLLBACK` (or
   `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)
   undoes is left out of the model, and a temporary table is no table (nor,
-  once `DISCARD`ed or dropped at COMMIT, hides one). A view, sequence,
-  matview or foreign table's `SET SCHEMA`, and a rename through `ALTER
-  INDEX`, are followed. A name more than one schema on the path holds is
-  refused, since the first may be gone or moved by something pgrls does
-  not follow (a `CASCADE`, a partition dropped with its parent, `DROP
-  OWNED`, an owned sequence or an extension's member dropped with it, a
-  view Postgres made temporary); after code or such a DROP, so is a name a
-  temporary table and another hold. A search path pgrls
+  once `DISCARD`ed or dropped at COMMIT, hides one; a view on one is
+  temporary too). A view, sequence, matview or foreign table's `SET
+  SCHEMA`, and a rename through a qualified `ALTER INDEX`, are followed; a
+  `DROP SCHEMA` is taken to succeed (so what the model held there was
+  gone), and `DROP OWNED` drops the schemas the SQL gave those roles (one
+  the connecting role may own is then refused). A name more than one
+  schema on the path holds is refused, since the first may be gone or
+  moved by something pgrls does not follow (a `CASCADE`, a partition
+  dropped with its parent, `DROP OWNED`, an owned sequence or an
+  extension's member dropped with it); after code or such a DROP, so is a
+  name a temporary table and another hold, and one found ahead of a path
+  entry pgrls cannot follow. A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
   `pg_temp` on it ahead of the schema that holds a name, a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
