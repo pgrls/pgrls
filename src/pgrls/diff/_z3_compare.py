@@ -244,6 +244,7 @@ class _Context:
         # How deep the translation is among values Postgres gives one type
         # (see `_real_integer`).
         self.unified = 0
+        self.lossy = 0
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -309,13 +310,16 @@ class _Context:
         self.session_null_tests: set[str] = set()
 
     @contextlib.contextmanager
-    def unifying(self, unified: bool) -> Any:
-        """Translate among values Postgres gives one type, when `unified`."""
+    def unifying(self, unified: bool, lossy: bool = False) -> Any:
+        """Translate among values Postgres gives one type, when `unified` —
+        a float one, when `lossy` (an element cast to `float4` / `float8`)."""
         self.unified += unified
+        self.lossy += lossy
         try:
             yield
         finally:
             self.unified -= unified
+            self.lossy -= lossy
 
     def column(self, key: str, sort: Any) -> Any:
         """Return the Z3 variable for `key`, binding it on first use.
@@ -464,7 +468,7 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
     `_integers_agree`)."""
     val = node.val
     if isinstance(val, Integer):
-        return z3.IntVal(val.ival) if ctx.integers else _real_integer(val.ival, ctx)
+        return _integer(val.ival, ctx)
     if isinstance(val, String):
         return _z3_string(val.sval)
     if isinstance(val, Boolean):
@@ -476,7 +480,7 @@ def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
         text = val.fval or ""
         try:
             if re.fullmatch(r"[+-]?\d+", text):
-                return z3.IntVal(int(text)) if ctx.integers else _real_integer(int(text), ctx)
+                return _integer(int(text), ctx)
         except (ValueError, TypeError, z3.Z3Exception):
             return None
         # A decimal reads differently against a `numeric` (exactly), a
@@ -500,6 +504,25 @@ def _is_constant(node: Any) -> bool:
             return False
         node = node.arg
     return isinstance(node, A_Const)
+
+
+def _integer(number: int, ctx: _Context) -> Any:
+    """An integer literal: as a real (`_real_integer`), or in the integer
+    pass as an integer — but not one a float element among values Postgres
+    gives one type rounds (`IN (16777217, 1::real)` is `real[]`)."""
+    if not ctx.integers:
+        return _real_integer(number, ctx)
+    if ctx.lossy and abs(number) > 2**24:
+        return None
+    return z3.IntVal(number)
+
+
+def _has_lossy_cast(node: Any) -> bool:
+    while isinstance(node, TypeCast):
+        if not _exact_cast(node.typeName):
+            return True
+        node = node.arg
+    return False
 
 
 def _real_integer(number: int, ctx: _Context) -> Any:
@@ -1756,7 +1779,8 @@ def _anon_coalesce(
     opaque."""
     args = list(node.args or ())
     # Its arguments take one type, a column's beside a literal.
-    with ctx.unifying(not all(_is_constant(a) for a in args)):
+    with ctx.unifying(not all(_is_constant(a) for a in args),
+                      any(_has_lossy_cast(a) for a in args)):
         others = [_as_val(_anon_3vl(a, ctx, auth_funcs, assertions)) for a in args
                   if not isinstance(_unwrap_scalar_sublink(a), ColumnRef)]
     if not others or any(v is None for v in others):
@@ -1929,7 +1953,7 @@ def _anon_any_array(
         # An `IN` list takes one type with its left side, and an array
         # one with a non-constant element.
         with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
-                _is_constant(e) for e in elements)):
+                _is_constant(e) for e in elements), any(_has_lossy_cast(e) for e in elements)):
             tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
@@ -2311,9 +2335,9 @@ def _anon_typecast(
     folded = None if ctx.any_session and target_sort == z3.RealSort() else _fold_literal_cast(
         inner.value, target_sort, _typename_last_segment(node.typeName)
     )
-    if folded is not None and z3.is_int_value(folded) and not ctx.integers:
-        # `'…'::int8` is an integer literal too (see `_real_integer`).
-        folded = _real_integer(folded.as_long(), ctx)
+    if folded is not None and z3.is_int_value(folded):
+        # `'…'::int8` is an integer literal too (see `_integer`).
+        folded = _integer(folded.as_long(), ctx)
     if folded is not None:
         # A captured GUC value cast to the column's type is exactly that
         # constant — `col = current_setting('app.n')::int` with `app.n` set to

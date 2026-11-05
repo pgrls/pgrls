@@ -432,6 +432,14 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      "tenant_id IN (100000001, 100000002, 100000003)") == "semantic_loosened"
     assert prove_anon_isolation(parse_expr(
         "tenant_id = (SELECT auth.uid()) OR org_id IN (100000001, 100000002)"))[0] == "leak"
+    # ... and the integer check does not read an integer a float element
+    # of the list rounds (`IN (16777217, 1::real)` is a `real[]`).
+    assert prove_anon_isolation(parse_expr("id IN (16777217, 1::real) AND id = 16777217"))[0] \
+        == "unverified"
+    assert _classify("g::int IN (16777217, 1::real)",
+                     "g::int IN (16777216, 16777217, 1::real)") is None
+    assert _classify("g IN (9007199254740993, 1::float8)",
+                     "g IN (9007199254740993, 9007199254740992, 1::float8)") is None
     # ... and a nested IN does not end the outer one's rule.
     nested = "COALESCE(g, (a IN (1, 2))::int::float4)"
     assert _classify(f"{nested} = 1",

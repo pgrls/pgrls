@@ -90,7 +90,8 @@ breaking changes — they will be called out in this file.
   (`(-256)::oid`) or raises is no constant, and a literal cast to `float4`
   (`1::real`) gives its neighbours that type. Where the reals decide nothing
   (an integer a `float4` may round, arithmetic) a loosening or a leak on the
-  integers still stands; an equivalence there needs review (`col + 1 > 0` →
+  integers still stands, unless a float element of the list would round
+  that integer (`IN (16777217, 1::real)` is a `real[]`); an equivalence there needs review (`col + 1 > 0` →
   `col > -1`).
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
