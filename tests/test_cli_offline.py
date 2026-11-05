@@ -1529,7 +1529,7 @@ def test_a_view_moved_out_of_the_path_no_longer_answers_a_name():
 def test_a_name_a_drop_may_have_freed_is_refused(drop):
     # The view app.docs may be gone, so `docs` may be public.docs.
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
-    with pytest.raises(SchemaSourceError, match="a DROP that may have dropped"):
+    with pytest.raises(SchemaSourceError, match="more than one schema on its search_path"):
         schema_from_sql(
             "CREATE SCHEMA app; CREATE TABLE public.docs (id int);"
             " CREATE TABLE app.base (a int); CREATE VIEW app.docs AS SELECT a FROM app.base;"
@@ -1544,6 +1544,45 @@ def test_a_connect_inside_a_restrict_is_refused():
     with pytest.raises(SchemaSourceError, match="inside a"):
         schema_from_sql("\\restrict abc\nSET search_path = app, public;\n"
                         "\\connect db\nCREATE TABLE t (id int);\n\\unrestrict abc\n")
+
+
+def test_an_unqualified_view_moved_or_a_table_renamed_by_alter_index_is_followed():
+    from pgrls.schema_sources import schema_from_sql
+    for move in ("SET search_path = app; ALTER VIEW docs SET SCHEMA stage;",
+                 "ALTER INDEX app.docs RENAME TO gone;"):
+        kind = "VIEW app.docs AS SELECT 1 AS a" if "VIEW" in move else "TABLE app.docs (a int)"
+        schema = schema_from_sql(
+            f"CREATE SCHEMA app; CREATE SCHEMA stage; CREATE TABLE public.docs (id int);"
+            f" CREATE {kind}; {move} SET search_path = app, public;"
+            " ALTER TABLE docs ENABLE ROW LEVEL SECURITY;"
+        )
+        assert {t.qualified_name: t.rls_enabled for t in schema.tables}["public.docs"] is True, move
+
+
+def test_a_name_two_path_schemas_hold_is_refused():
+    # DROP COLUMN … CASCADE may have taken the view app.t (so `t` is
+    # public.t); pgrls does not follow every such removal.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="more than one schema on its search_path"):
+        schema_from_sql(
+            "CREATE SCHEMA app; CREATE TABLE public.t (id int); CREATE TABLE app.base (c int);"
+            " CREATE VIEW app.t AS SELECT c FROM app.base;"
+            " ALTER TABLE app.base DROP COLUMN c CASCADE; SET search_path = app, public;"
+            " ALTER TABLE t DISABLE ROW LEVEL SECURITY;"
+        )
+
+
+@pytest.mark.parametrize("line", [
+    "\\restrict abc\n\\echo hello\n\\unrestrict abc",   # psql refuses it there
+    "\\unrestrict zzz",                                      # not restricted
+    "\\restrict",                                            # no key
+    "\\pset format bogus", "\\pset nosuchoption", "\\timing maybe",
+])
+def test_a_harmless_psql_command_psql_rejects_is_refused(line):
+    # Under ON_ERROR_STOP psql stops at it, so the rest does not run.
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    with pytest.raises(SchemaSourceError, match="psql"):
+        schema_from_sql(f"\\set ON_ERROR_STOP on\n{line}\nCREATE TABLE t (id int);\n")
 
 
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
@@ -1721,7 +1760,7 @@ def test_psql_meta_commands_are_blanked_only_outside_literals():
         "\\restrict key\n"
         "CREATE TABLE t (a text DEFAULT 'x\n\\still a string');\n"
         "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $b$\n\\in a body\nSELECT 1 $b$;\n"
-        "  \\echo done\n"
+        "\\unrestrict key\n  \\echo done\n"
     )
     out = _without_psql_meta_commands(sql)
     assert len(out) == len(sql)
@@ -2059,10 +2098,11 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("CREATE SCHEMA AUTHORIZATION CURRENT_USER;\n", "connects as"),
     ("CREATE SCHEMA AUTHORIZATION SESSION_USER CREATE TABLE x (id int);\n", "connects as"),
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
-    # After code that may have dropped one of two tables a name could find.
+    # A name two schemas on the path hold: the first may be gone (here by
+    # code) or moved by something pgrls does not follow.
     ("CREATE TABLE app.c (k int);\nCREATE TABLE public.c (k int);\nSET search_path = app, public;\n"
      "DO $$ BEGIN DROP TABLE app.c; END $$;\nALTER TABLE c DISABLE ROW LEVEL SECURITY;\n",
-     "runs code"),
+     "more than one schema"),
     ("CREATE TABLE public.c (k int);\nCREATE TEMP TABLE c (k int);\n"
      "DO $$ BEGIN DROP TABLE IF EXISTS pg_temp.c; END $$;\nALTER TABLE c DISABLE ROW LEVEL SECURITY;\n",
      "runs code"),
@@ -2093,7 +2133,7 @@ def test_a_policy_reads_a_table_where_the_search_path_found_it():
     # SEC025 reads an unqualified name in the policy's own schema.
     schema = schema_from_sql(
         "CREATE SCHEMA app;\nCREATE TABLE app.members (uid int);\n"
-        "CREATE TABLE public.members (uid int);\nCREATE TABLE public.docs (id int);\n"
+        "CREATE TABLE public.docs (id int);\n"
         "SET search_path TO app, public;\nALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n"
         "CREATE POLICY p ON public.docs USING (EXISTS (SELECT 1 FROM members m));\n")
     (docs,) = [t for t in schema.tables if t.name == "docs"]
@@ -2448,8 +2488,8 @@ def test_harmless_psql_commands_are_skipped():
     from pgrls.schema_sources import schema_from_sql
 
     # pg_dump --create lifts its `\\restrict` around the `\\connect`.
-    sql = ("\\restrict k\n\\echo start\nCREATE DATABASE d;\n\\unrestrict k\n\\connect d\n"
-           "\\restrict k\n\\pset pager off\nCREATE TABLE t (id int);\n\\unrestrict k\n")
+    sql = ("\\echo start\n\\restrict k\nCREATE DATABASE d;\n\\unrestrict k\n\\connect d\n"
+           "\\pset pager off\n\\restrict k\nCREATE TABLE t (id int);\n\\unrestrict k\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # pg_dump double-quotes a name that needs it, and psql skips a BOM.
     for name in ("MyApp", "user", "my.app", 'a""b'):

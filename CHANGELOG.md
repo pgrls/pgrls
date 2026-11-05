@@ -71,9 +71,12 @@ breaking changes — they will be called out in this file.
   too. They are split on ASCII whitespace, as psql splits them (`\c` and a
   no-break space is no `\connect`); a line holding a vertical tab, which
   psql 17 splits on and earlier ones do not, is refused, and so is a
-  search_path string holding one. Inside a `\restrict`, where psql runs
-  no meta-command but `\unrestrict` with its key, any other is refused
-  (pg_dump writes `\unrestrict` before each `\connect`). Any other is refused with an error naming it, since the SQL pgrls
+  search_path string holding one. Inside a `\restrict` psql runs no
+  meta-command but `\unrestrict` with its key, so any other there is
+  refused (pg_dump writes `\unrestrict` before each `\connect`), and so is
+  one psql rejects with an error, at which `ON_ERROR_STOP` stops the run
+  (a `\restrict` with no key or inside another, an `\unrestrict` outside
+  one, a `\pset` or `\timing` argument psql does not take). Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
   COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
   but those pg_dump writes (a name, bare or double-quoted, or
@@ -114,11 +117,7 @@ breaking changes — they will be called out in this file.
   changes nothing when no DROP (a `CASCADE` of a function, type, access
   method or extension can take a table too), `DROP OWNED`, rename of a
   relation or code — a `DO` block, a `CALL`, a function called — lies
-  between, which could have taken it; after such code, or a DROP that may
-  take a relation it does not name (a `CASCADE`, a partitioned table's
-  partitions, `DROP OWNED`), a name that would resolve to another relation
-  if one was dropped is refused; a view, sequence, matview or foreign
-  table's `SET SCHEMA` is followed), and it
+  between, which could have taken it), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
@@ -133,7 +132,14 @@ breaking changes — they will be called out in this file.
   did not exist and missed those on `public.*`. What a `ROLLBACK` (or
   `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)
   undoes is left out of the model, and a temporary table is no table (nor,
-  once `DISCARD`ed or dropped at COMMIT, hides one). A search path pgrls
+  once `DISCARD`ed or dropped at COMMIT, hides one). A view, sequence,
+  matview or foreign table's `SET SCHEMA`, and a rename through `ALTER
+  INDEX`, are followed. A name more than one schema on the path holds is
+  refused, since the first may be gone or moved by something pgrls does
+  not follow (a `CASCADE`, a partition dropped with its parent, `DROP
+  OWNED`, an owned sequence or an extension's member dropped with it, a
+  view Postgres made temporary); after code or such a DROP, so is a name a
+  temporary table and another hold. A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
   `pg_temp` on it ahead of the schema that holds a name, a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD

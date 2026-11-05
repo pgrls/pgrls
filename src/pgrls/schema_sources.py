@@ -1099,23 +1099,50 @@ class _Resolver:
     def find(self, name: str) -> tuple[str, bool]:
         """The schema a reference to `name` finds it in, and whether it is
         one the SQL created (else where a CREATE would go)."""
-        if self.code_ran and (name in self.temp) + sum(
-                (entry, name) in self.relations for entry in self._entries()) > 1:
+        if name in self.temp and self.path is not None and "pg_temp" not in self.path:
+            # Searched first unless the path names it.
+            if self.code_ran and self._holders(name):
+                raise SchemaSourceError(
+                    "bad_sql",
+                    f"the SQL runs code (a DO block, a CALL, a function) or a DROP "
+                    f"that may have dropped a relation it does not name (a CASCADE, "
+                    f"a partition, DROP OWNED), and then names {name!r}, which is a "
+                    f"temporary table's and another's; pgrls cannot tell which "
+                    f"remains. Qualify the name.",
+                )
+            return _NOWHERE, True
+        holders = self._holders(name)
+        if len(holders) > 1:
+            # The first may be gone or moved by something pgrls does not
+            # follow (a CASCADE, an extension's or an owned sequence's drop,
+            # a view made temporary): Postgres would then find the next.
             raise SchemaSourceError(
                 "bad_sql",
-                f"the SQL runs code (a DO block, a CALL, a function) or a DROP that "
-                f"may have dropped a relation it does not name (a CASCADE, a "
-                f"partition, DROP OWNED), and then names {name!r}, which resolves to "
-                f"another one if it did; pgrls cannot tell which. Qualify the name.",
+                f"the SQL names {name!r}, which more than one schema on its "
+                f"search_path holds ({', '.join(map(repr, holders))}); pgrls cannot "
+                f"tell whether the first is still there. Qualify the name.",
             )
-        if name in self.temp and self.path is not None and "pg_temp" not in self.path:
-            return _NOWHERE, True  # searched first unless the path names it
-        # Lazily: an entry past the one that holds the name is never reached
-        # (a `pg_temp` entry holding a temp table of the name is refused).
-        for entry in self._entries():
-            if (entry, name) in self.relations:
-                return entry, True
+        if holders:
+            return holders[0], True
         return self.create_schema(), False
+
+    def _holders(self, name: str) -> list[str]:
+        """The schemas on the path that hold `name`, in order, up to an
+        entry pgrls cannot follow (refused only if none was found before
+        it: Postgres stops at the first)."""
+        found: list[str] = []
+        entries = self._entries()
+        while True:
+            try:
+                entry = next(entries)
+            except StopIteration:
+                return found
+            except SchemaSourceError:
+                if found:
+                    return found
+                raise
+            if (entry, name) in self.relations:
+                found.append(entry)
 
     def qualify(self, stmt: Any) -> None:
         """Qualify each relation `stmt` creates or names, and follow what it
@@ -1144,12 +1171,16 @@ class _Resolver:
               and stmt.newschema):
             # A view, sequence, matview or foreign table moves (a table's
             # move is refused).
+            if not stmt.relation.schemaname:
+                stmt.relation.schemaname = self.find(stmt.relation.relname)[0]
             old = (stmt.relation.schemaname, stmt.relation.relname)
             if old in self.relations:
                 self.relations.discard(old)
                 self.relations.add((stmt.newschema, old[1]))
         elif (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
-              and stmt.renameType in _RELATION_KINDS and stmt.newname):
+              # `ALTER INDEX t RENAME` renames a table too.
+              and stmt.renameType in _RELATION_KINDS | {ObjectType.OBJECT_INDEX}
+              and stmt.newname):
             old = (stmt.relation.schemaname, stmt.relation.relname)
             if old in self.relations:
                 self.relations.discard(old)
@@ -1770,6 +1801,35 @@ def _non_table_relation(stmt: Any) -> Any:
 # list.
 _PSQL_SPACE = " \t\n\r\f"
 _PG_SPACE = _PSQL_SPACE
+def _psql_accepts(name: str, rest: str, restricted: str | None) -> bool:
+    """Whether psql runs harmless meta-command `name` with arguments `rest`
+    without an error, which under ON_ERROR_STOP would stop the run there."""
+    if name == "restrict":
+        return bool(rest) and restricted is None
+    if name == "unrestrict":
+        return restricted is not None
+    if name == "timing":
+        return rest.lower() in ("", *_PSQL_BOOLEANS)
+    if name == "pset":
+        option, _, value = rest.partition(" ")
+        value = value.strip(_PSQL_SPACE)
+        if option in ("pager", "footer", "tuples_only", "t", "expanded", "x"):
+            return value.lower() in ("", *_PSQL_BOOLEANS,
+                                     *(("always",) if option == "pager" else ()),
+                                     *(("auto",) if option in ("expanded", "x") else ()))
+        if option == "format":
+            return value.lower() in _PSQL_FORMATS
+        if option == "border":
+            return value.isascii() and value.isdigit()
+        return option == "null"
+    return True
+
+
+_PSQL_BOOLEANS = ("on", "off", "true", "false", "yes", "no", "1", "0")
+_PSQL_FORMATS = frozenset({
+    "aligned", "asciidoc", "csv", "html", "latex", "latex-longtable", "troff-ms",
+    "unaligned", "wrapped",
+})
 _HARMLESS_PSQL_COMMANDS = frozenset({
     "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
 })
@@ -1905,7 +1965,8 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
                 target = re.sub(r"\\(.)", r"\1", value.group(1))
                 # Inside psql's double quotes a backslash or backtick is text.
                 conninfo = True
-        known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
+        known = (name in _HARMLESS_PSQL_COMMANDS and _psql_accepts(name, rest, restricted)) \
+            or target is not None or (
             name == "encoding"
             and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
         ) or (
@@ -1923,17 +1984,18 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "
                 "does not model (the SQL it reads would not be the SQL that runs).",
             )
-        if restricted is not None and name not in _HARMLESS_PSQL_COMMANDS:
-            # psql then runs no meta-command but `\\unrestrict` with its key:
-            # a `\\connect` there does not reconnect.
+        if restricted is not None and not (name == "unrestrict" and rest == restricted):
+            # psql then runs no meta-command but `\\unrestrict` with its key
+            # (a `\\connect` there does not reconnect), and an error stops a
+            # run under ON_ERROR_STOP.
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL uses the psql command {line.strip()[:60]!r} inside a "
                 "\\restrict, where psql refuses it; pgrls does not model that.",
             )
-        if name == "restrict" and restricted is None:
+        if name == "restrict":
             restricted = rest
-        elif name == "unrestrict" and rest == restricted:
+        elif name == "unrestrict":
             restricted = None
         if connect:
             assert target is not None  # `known` above
