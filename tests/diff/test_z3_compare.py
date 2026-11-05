@@ -1316,6 +1316,17 @@ def test_a_setting_named_by_a_column_is_no_identity() -> None:
         assert prove_cross_tenant_isolation(parse_expr(using))[0] != "isolated", using
 
 
+def test_a_computed_missing_ok_reads_the_setting_or_null() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    # Unset under anon, so NULL or it raises; the session's own value, or
+    # NULL, for a tenant.
+    for using in ("tenant_id = current_setting('app.t', flag)",
+                  "tenant_id = current_setting('app.t', a = 1)"):
+        assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
+        assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+
+
 def test_a_scalar_select_of_an_auth_call_still_unwraps() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 

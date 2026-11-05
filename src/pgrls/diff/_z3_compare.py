@@ -970,6 +970,15 @@ def _first_string_arg(node: Any) -> str | None:
     return val.sval if isinstance(val, String) else None
 
 
+def _computes_missing_ok(node: Any) -> bool:
+    """`current_setting(<literal name>, <missing_ok not a literal>)`."""
+    qualified, _bare = func_name_parts(node)
+    args = node.args or ()
+    return (qualified in ("current_setting", "pg_catalog.current_setting")
+            and len(args) == 2 and _first_string_arg(node) is not None
+            and not has_literal_setting_arguments(node))
+
+
 def _is_builtin_current_setting_call(node: Any) -> bool:
     """A call of the built-in `current_setting` with literal arguments; one
     with a computed name or missing_ok is an opaque value."""
@@ -1299,6 +1308,20 @@ def _anon_3vl(
             ),
             is_null=z3.BoolVal(False),
         )
+    if (isinstance(node, FuncCall) and _computes_missing_ok(node)
+            and func_name_parts(node)[0] in auth_funcs | {"pg_catalog.current_setting"}
+            and "current_setting" in auth_funcs):
+        # `current_setting('app.t', <computed>)`: the setting as an auth
+        # leaf reads it, or NULL where missing_ok is (it is STRICT).
+        name = (_first_string_arg(node) or "").lower()
+        if ctx.session_mode:
+            return _Val(value=ctx.session_var(_canon(node), z3.StringSort()),
+                        is_null=ctx.opaque_null_flag(_canon(node)))
+        if (not ctx.any_session and _reads_unset_guc_under_anon(node)
+                and name not in ctx.set_gucs):
+            # Unset under anon: NULL, or it raises (no rows).
+            return _Val(value=ctx.opaque(_canon(node), z3.StringSort()),
+                        is_null=z3.BoolVal(True))
     if _is_anon_null_leaf(node, auth_funcs):
         if ctx.session_mode:
             # `session_var` never returns None for a fresh StringSort key.
