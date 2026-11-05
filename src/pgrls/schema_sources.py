@@ -1095,9 +1095,8 @@ class _Resolver:
     def find(self, name: str) -> tuple[str, bool]:
         """The schema a reference to `name` finds it in, and whether it is
         one the SQL created (else where a CREATE would go)."""
-        entries = list(self._entries())
         if self.code_ran and (name in self.temp) + sum(
-                (entry, name) in self.relations for entry in entries) > 1:
+                (entry, name) in self.relations for entry in self._entries()) > 1:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL runs code (a DO block, a CALL, a function) that may have "
@@ -1106,7 +1105,8 @@ class _Resolver:
             )
         if name in self.temp:
             return _NOWHERE, True
-        for entry in entries:
+        # Lazily: an entry past the one that holds the name is never reached.
+        for entry in self._entries():
             if (entry, name) in self.relations:
                 return entry, True
         return self.create_schema(), False

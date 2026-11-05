@@ -1475,6 +1475,20 @@ def test_offline_rename_onto_a_later_created_name_is_applied():
     assert t.rls_enabled is True
 
 
+@pytest.mark.parametrize("path, later", [
+    ("public, pg_temp", ""),
+    ("public, extensions", " CREATE SCHEMA IF NOT EXISTS extensions;"),
+])
+def test_a_name_found_on_the_path_is_not_refused_for_a_later_entry(path, later):
+    # Postgres stops at the first schema holding the name, so a later entry
+    # pgrls cannot follow is never reached.
+    t = _only(
+        f"SET search_path = {path}; CREATE TABLE t (id int);"
+        f" ALTER TABLE t ENABLE ROW LEVEL SECURITY;{later}"
+    )
+    assert t.qualified_name == "public.t" and t.rls_enabled is True
+
+
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
     # The second CREATE re-walked tableElts and appended the columns again.
     t = _only(
