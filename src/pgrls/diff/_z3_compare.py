@@ -551,12 +551,15 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
         return
     operands = [left, *rights]
     nodes = [n for operand in operands for n in _ast_nodes(operand)]
+    sides = [_string_operand(operand) for operand in operands]
+    with_column = sum(bool(columns) for columns, _ in sides)
     if not any((isinstance(n, A_Const) and isinstance(getattr(n, "val", None), String))
                or (isinstance(n, TypeCast) and _typename_last_segment(n.typeName) in _STRING_TYPES)
-               for n in nodes):
-        return  # no string in it
-    sides = [_string_operand(operand) for operand in operands]
-    typed = any(kind == "typed" for _, kind in sides)
+               for n in nodes) and with_column < 2:
+        return  # no string in it, nor a column against a column
+    # A column against another (`citext_col = text_col`) compares in a type
+    # either may decide, as a typed string does.
+    typed = any(kind == "typed" for _, kind in sides) or with_column > 1
     for n in nodes:
         if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
             ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(typed)
@@ -923,8 +926,8 @@ def _reads_strings_alike(column: str, typed: set[bool],
 
 
 def _reads_alike(data_type: str | None) -> bool:
-    if data_type is None:
-        return False
+    if data_type is None or '"' in data_type:
+        return False  # a quoted name is a user type's (`"Text"`)
     name = re.sub(r"\(.*\)", "", data_type.lower()).strip()
     return name.split(".")[-1].strip('"').strip() in _ALIKE_TYPES
 

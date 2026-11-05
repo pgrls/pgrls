@@ -404,6 +404,15 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
         for kind in ("citext", "char(4)"):
             assert diff(base, head, email=kind, x=kind, b="boolean") == "requires_review", (
                 base, kind)
+    # A column against a column of another string type compares in a type
+    # either may decide (`citext_col IS NOT DISTINCT FROM text_col` is text).
+    assert diff("x IS NOT DISTINCT FROM y AND y = 'a'", "x = 'a' AND y = 'a'",
+                x="citext", y="text") == "requires_review"
+    assert diff("x = (SELECT y) AND y = 'a'", "x = 'a' AND y = 'a'",
+                x="citext", y="text") == "requires_review"
+    # A quoted type name is a user type's, whatever it spells.
+    assert diff("email = ANY (ARRAY['A'::text])", "email = 'A'", email='"Text"') == (
+        "requires_review")
     # The canonical tenant clause shared by both sides still cancels.
     tenant = "tenant_id = current_setting('app.tenant_id')::uuid"
     assert diff(f"{tenant} AND status = 'active'",

@@ -1444,6 +1444,12 @@ def test_offline_alter_table_drop_column_is_applied():
     assert [c.name for c in t.column_details] == ["id"]
 
 
+def test_offline_alter_column_type_is_applied():
+    # The diff reads a string compared with a column by its type.
+    t = _only("CREATE TABLE t (id int, role text); ALTER TABLE t ALTER COLUMN role TYPE citext;")
+    assert [(c.name, c.data_type) for c in t.column_details][-1] == ("role", "citext")
+
+
 def test_offline_alter_table_rename_is_applied():
     # The finding used to be reported against the pre-rename name — a
     # `pgrls pr` annotation naming a table that does not exist.

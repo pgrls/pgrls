@@ -108,8 +108,8 @@ def compare_predicates(
         Optional ``{column: data_type}`` of the policy's table. Z3 reads a
         string compared with a column by the column's type: a ``text`` one
         alike in every spelling, a ``citext`` or ``char(n)`` one not at all.
-        Without it, a column compared with anything but a bare literal
-        decides nothing.
+        Without it, a column compared both with a bare literal and with
+        anything else (a typed string, another column) decides nothing.
 
     Returns
     -------

@@ -127,10 +127,12 @@ breaking changes — they will be called out in this file.
   `COALESCE('A', '')` and a list alike; any other (`citext`, `char(n)`,
   a user type) compares a typed string (a cast, a sub-select, a function's
   result, a list's common type) otherwise than a bare literal, so a
-  comparison of it with a typed string decides nothing (`main` read
-  `col = 'a'::text` and `col = 'a'` as no change). Without column types (a
-  snapshot from before they were captured) a column read against both a
-  bare and a typed string decides nothing.
+  comparison of it with a typed string or another column decides nothing
+  (`main` read `col = 'a'::text` and `col = 'a'` as no change). The
+  offline model now follows `ALTER COLUMN … TYPE`, so the type is the one
+  the migration leaves. Without column types (a snapshot from before they
+  were captured) a column read against both a bare literal and a typed
+  string or another column decides nothing.
   In an `IN` list or array such a comparison decides nothing: the value
   takes the list's type there (`x IN (v::int, 1)` rounds `v` to a `real`
   `x`'s float4; `x = v::int` compares in float8).

@@ -800,6 +800,16 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif subtype == AlterTableType.AT_AlterColumnType:
+            # The diff reads a string compared with a column by its type
+            # (`text` and `citext` read `'a'::text` otherwise).
+            name = getattr(cmd, "name", None)
+            col = getattr(cmd, "def_", None)
+            data_type = _column_type(col) if type(col).__name__ == "ColumnDef" else None
+            builder.columns = [
+                replace(c, data_type=data_type or "<altered>") if c.name == name else c
+                for c in builder.columns
+            ]
         # Other ALTER subcommands are ignored.
 
 
