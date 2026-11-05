@@ -523,6 +523,31 @@ def _floats_meet(left: Any, right: Any) -> bool:
             or (_floatish(right) and not _is_constant(left)))
 
 
+def _cast_value_meets_column(left: Any, right: Any) -> bool:
+    """Whether a column meets a value cast to a number type that is not a
+    literal (`amount = current_setting('app.v')::numeric`): Postgres converts
+    the value to the column's type, a float's too, rounding it, and the text
+    of an offline snapshot does not say which (a live one writes the cast)."""
+    return ((_is_column(left) and _casts_a_value(right))
+            or (_is_column(right) and _casts_a_value(left)))
+
+
+def _is_column(node: Any) -> bool:
+    return isinstance(_unwrap_scalar_sublink(node), ColumnRef)
+
+
+def _casts_a_value(node: Any) -> bool:
+    return any(isinstance(n, TypeCast) and not _is_constant(n.arg)
+               and _typename_last_segment(n.typeName) in _NUMBER_TYPES
+               for n in _ast_nodes(node))
+
+
+_NUMBER_TYPES = frozenset({
+    "int2", "int4", "int8", "int", "integer", "bigint", "smallint", "numeric", "decimal",
+    "float4", "float8", "oid",
+})
+
+
 def _floatish(node: Any) -> bool:
     """Whether `node` holds a value of a float type: a float cast, or a
     built-in that returns one (for some argument type)."""
@@ -1795,7 +1820,7 @@ def _anon_coalesce(
     defaults to; with no sibling to give one, the caller keeps the COALESCE
     opaque."""
     args = list(node.args or ())
-    if sum(_floatish(a) or any(isinstance(n, ColumnRef) for n in _ast_nodes(a))
+    if sum(_floatish(a) or _casts_a_value(a) or any(isinstance(n, ColumnRef) for n in _ast_nodes(a))
            for a in args) > 1:
         # Two columns (or a column and a float): Postgres gives the
         # COALESCE the type of either (a float column's), rounding the
@@ -1896,7 +1921,8 @@ def _anon_distinct(
     if left is None or right is None or left.unset or right.unset:
         return None
     if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session) or _floats_meet(
-            node.lexpr, node.rexpr):
+            node.lexpr, node.rexpr) or (
+            ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)):
         return None
     try:
         differ = z3.Or(
@@ -2039,7 +2065,8 @@ def _anon_binop(
         _record_tenant_pair(ctx, left, right)
 
     if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session) or _floats_meet(
-            node.lexpr, node.rexpr):
+            node.lexpr, node.rexpr) or (
+            ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)):
         if ctx.any_session or comparison_fn is None:
             return None
         if left.unset or right.unset:

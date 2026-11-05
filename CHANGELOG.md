@@ -98,7 +98,12 @@ breaking changes — they will be called out in this file.
   two columns (one may be a float column, whose type the other then
   takes), an array with a column in it, and a comparison of a column with
   a float (`a = 1::float8` or `a = pi()` reads a `numeric` `a` through a
-  double): off the diff path that comparison is a truth of its own.
+  double): off the diff path that comparison is a truth of its own. In a
+  diff, a column compared with a value cast to a number type that is not a
+  literal (`amount = current_setting('app.v')::numeric`) decides nothing
+  too: Postgres reads the value through the column's type, a float's
+  too, which an offline snapshot's text does not show (so wrapping
+  `current_setting(…)::bigint` in a sub-select needs review, as on `main`).
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text

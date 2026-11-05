@@ -466,6 +466,12 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
     for using in ("COALESCE(x, a + 0) = 1 AND x > 1", "a = pi() AND b = pi() AND a <> b",
                   "x = ANY(ARRAY[a + 0, 1]) AND x > 1 AND (a + 0) IS NULL"):
         assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
+    # A column meeting a value cast to a number type (not a literal) takes it
+    # through the column's type, a float's too, which the text does not say.
+    assert _classify("amount = 1 AND current_setting('app.v')::numeric = 1",
+                     "amount = 1 AND amount = current_setting('app.v')::numeric") is None
+    assert _classify("x IS NULL AND current_setting('a.b')::numeric = 1",
+                     "x IS NULL AND COALESCE(x, current_setting('a.b')::numeric) = 1") is None
     # The integer check reads an exact cast of an integer as that integer.
     assert _classify("a IN (16777217, 1) AND a > 0::numeric",
                      "a IN (16777217, 1) AND a >= 0::numeric") is None
