@@ -941,7 +941,8 @@ class _Resolver:
             name = args[0] if args else None
             while isinstance(name, _pgast.TypeCast):
                 name = name.arg
-            if str(getattr(getattr(name, "val", None), "sval", "")).lower() != "search_path":
+            setting = str(getattr(getattr(name, "val", None), "sval", "")).lower()
+            if setting not in ("search_path", "role", "session_authorization"):
                 continue
             value, is_local = (_uncast(args[i]) if len(args) > i else None for i in (1, 2))
             if not (_is_plain_select_of(stmt, node)
@@ -951,10 +952,19 @@ class _Resolver:
                     and isinstance(getattr(is_local.val, "boolval", None), bool)):
                 raise SchemaSourceError(
                     "bad_sql",
-                    "the SQL sets search_path with set_config() other than in "
+                    f"the SQL sets {setting} with set_config() other than in "
                     "a plain SELECT of literals; pgrls cannot tell which schema "
                     "an unqualified name is in.",
                 )
+            if setting != "search_path":
+                # As SET ROLE / SET SESSION AUTHORIZATION (for `$user`).
+                role = value.val.sval
+                role = None if role.lower() in ("", "none", "default") else _truncated(role)
+                if setting == "session_authorization":
+                    self._set("auth", role, local=is_local.val.boolval)
+                self._set("role", role if setting == "role" else None,
+                          local=is_local.val.boolval)
+                continue
             names = _identifier_list(value.val.sval)
             if names is not None:  # else Postgres refuses it
                 self._set("search_path", tuple(_truncated(n) for n in names),
@@ -1204,13 +1214,21 @@ def _is_plain_select_of(stmt: Any, call: Any) -> bool:
 
 def _identifier_list(value: str) -> tuple[str, ...] | None:
     """The names in a comma-separated identifier list, as Postgres splits a
-    search_path string (unquoted names downcased); None if malformed."""
+    search_path string (on ASCII whitespace; unquoted names downcased);
+    None if malformed."""
+    if "\v" in value:
+        # Postgres 17 splits on a vertical tab, earlier ones do not.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL sets search_path to a string holding a vertical tab, which "
+            "Postgres versions split differently.",
+        )
     names: list[str] = []
     i, n = 0, len(value)
-    if not value.strip():
+    if not value.strip(_PG_SPACE):
         return ()
     while True:
-        while i < n and value[i].isspace():
+        while i < n and value[i] in _PG_SPACE:
             i += 1
         if i < n and value[i] == '"':
             parts, j = [], i + 1
@@ -1228,12 +1246,12 @@ def _identifier_list(value: str) -> tuple[str, ...] | None:
             names.append("".join(parts))
         else:
             j = i
-            while i < n and value[i] != "," and not value[i].isspace():
+            while i < n and value[i] != "," and value[i] not in _PG_SPACE:
                 i += 1
             if i == j:
                 return None
             names.append("".join(c.lower() if "A" <= c <= "Z" else c for c in value[j:i]))
-        while i < n and value[i].isspace():
+        while i < n and value[i] in _PG_SPACE:
             i += 1
         if i == n:
             return tuple(names)
@@ -1621,8 +1639,11 @@ def _non_table_relation(stmt: Any) -> Any:
 # read is not the SQL that runs, so it is refused rather than blanked.
 # `\\set` is not here: psql interpolates its variables into the SQL that
 # follows (`:n`). `\\encoding` and `\\connect` are checked on their own.
-# The whitespace psql splits a meta-command on.
-_PSQL_SPACE = " \t\n\r\f\v"
+# The whitespace psql splits a meta-command on (a vertical tab too since
+# psql 17, so a line holding one is refused), and Postgres an identifier
+# list.
+_PSQL_SPACE = " \t\n\r\f"
+_PG_SPACE = _PSQL_SPACE
 _HARMLESS_PSQL_COMMANDS = frozenset({
     "restrict", "unrestrict", "echo", "qecho", "warn", "pset", "timing",
 })
@@ -1769,7 +1790,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
         )
         # psql reads a line to its LF: a CR is part of the command's arguments.
         if m is None or (("\\" in rest or "`" in rest) and not conninfo) \
-                or "\r" in rest or not known:
+                or "\r" in rest or "\v" in line or not known:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "

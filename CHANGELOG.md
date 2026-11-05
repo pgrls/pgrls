@@ -64,13 +64,14 @@ breaking changes — they will be called out in this file.
   dump from `pg_dump` since the August 2025 minor releases (13.22, 14.19,
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse. psql meta-command
-  lines it can ignore (split on ASCII whitespace, as psql splits them:
-  `\c` and a no-break space is no `\connect`) (`\restrict`, `\echo`,
-  `\pset`, `\set ON_ERROR_STOP
+  lines it can ignore (`\restrict`, `\echo`, `\pset`, `\set ON_ERROR_STOP
   on` and psql's other error and output settings, a `\connect` after
   `CREATE DATABASE`, …), each alone on its line and between statements as
   Postgres's own lexer reads the file, are now skipped, the LSP's ranges
-  too. Any other is refused with an error naming it, since the SQL pgrls
+  too. They are split on ASCII whitespace, as psql splits them (`\c` and a
+  no-break space is no `\connect`); a line holding a vertical tab, which
+  psql 17 splits on and earlier ones do not, is refused, and so is a
+  search_path string holding one. Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
   COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, any other `\set`, a `\connect` in any form
   but those pg_dump writes (a name, bare or double-quoted, or

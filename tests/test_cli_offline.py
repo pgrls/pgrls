@@ -1806,6 +1806,14 @@ def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
     ("SELECT set_config('search_path', 'APP, public', false);\nCREATE TABLE x (id int);\n", "app"),
     # pg_dump's: an unqualified CREATE then has nowhere to go.
     ("SELECT pg_catalog.set_config('search_path', '', false);\nCREATE TABLE x (id int);\n", None),
+    # A search_path string splits on ASCII whitespace: a no-break space is
+    # part of a name.
+    ("CREATE SCHEMA \"\u00a0app\";\n"
+     "SELECT set_config('search_path', '\u00a0app, public', false);\nCREATE TABLE x (id int);\n",
+     "\u00a0app"),
+    # set_config() of the role is SET ROLE.
+    ("CREATE SCHEMA AUTHORIZATION alice;\nSELECT set_config('role', 'alice', false);\n"
+     "CREATE TABLE x (id int);\n", "alice"),
     # A schema's elements go in it; a temporary table is no table, and one
     # gone no longer hides the name.
     ("CREATE SCHEMA app CREATE TABLE x (id int);\n", "app"),
@@ -1896,6 +1904,10 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
      "CREATE SCHEMA alice;\nCREATE TABLE x (id int);\n", "sets the role"),
     # psql splits a meta-command on ASCII whitespace: `\\c\u00a0d` is no `\\c`.
     ("SET search_path = app, public;\n\\c\u00a0d\nCREATE TABLE x (id int);\n", "psql command"),
+    # ... and only psql 17 splits on a vertical tab, so does Postgres's list.
+    ("SET search_path = app, public;\n\\c\vd\nCREATE TABLE x (id int);\n", "psql command"),
+    ("SELECT set_config('search_path', 'app,\vpublic', false);\nCREATE TABLE x (id int);\n",
+     "vertical tab"),
 ])
 def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
