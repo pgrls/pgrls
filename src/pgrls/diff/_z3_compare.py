@@ -1365,16 +1365,17 @@ def _anon_3vl(
     # --- COALESCE: value is the first non-null arg; null iff all null.
     if isinstance(node, CoalesceExpr):
         args = list(node.args or ())
-        bare_column = any(isinstance(a, ColumnRef) for a in args)
-        # A bare column argument has no sort of its own: modelled exactly it
-        # defaults to Bool, and `COALESCE(a, b) = 5` then compares a Bool
-        # with an Int. The diff path keeps such a COALESCE — or one it
-        # cannot model exactly for another reason — an opaque value shared
-        # by base and head, like CASE below, without binding those columns.
-        exact = None if ctx.any_session and bare_column else _anon_coalesce(
-            node, ctx, auth_funcs, assertions)
-        if exact is None and ctx.any_session:
-            if any(not isinstance(a, ColumnRef)
+        # A bare column argument (`(SELECT x)` too) has no sort of its own:
+        # modelled exactly it defaults to Bool, so `COALESCE(a, b) = 5`
+        # compares a Bool with an Int, and three text columns could hold only
+        # two values. Such a COALESCE is an opaque value on every path, like
+        # CASE below, without binding those columns; the diff path also
+        # makes one it cannot model exactly for another reason opaque,
+        # shared by base and head.
+        bare_column = any(isinstance(_unwrap_scalar_sublink(a), ColumnRef) for a in args)
+        exact = None if bare_column else _anon_coalesce(node, ctx, auth_funcs, assertions)
+        if exact is None and (ctx.any_session or bare_column):
+            if any(not isinstance(_unwrap_scalar_sublink(a), ColumnRef)
                    and _anon_3vl(a, ctx, auth_funcs, assertions) is None
                    for a in args):
                 return None
@@ -1753,7 +1754,9 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     On every path:
 
     * a Bool against a non-Bool — an encoding artifact (a bare column
-      defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects;
+      defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects — and
+      text against a number (an opaque value against a literal), which Z3
+      cannot compare at all;
     * ``<`` / ``>`` / ``<=`` / ``>=`` on text — Postgres orders it by
       collation, Z3 by code point (``'B' < 'b'`` is FALSE under en_US), and
       an equality elsewhere can pin either side to a literal.
@@ -1769,6 +1772,8 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
       (``-1 % 2`` is -1, Z3's is 1)."""
     sorts = (left.sort(), right.sort())
     if (sorts[0] == z3.BoolSort()) != (sorts[1] == z3.BoolSort()):
+        return True
+    if sorts[0] != sorts[1] and not set(sorts) <= {z3.IntSort(), z3.RealSort()}:
         return True
     if op in ("<", ">", "<=", ">=") and z3.StringSort() in sorts:
         return True

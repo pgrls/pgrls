@@ -1208,6 +1208,22 @@ def test_the_anon_and_cross_tenant_provers_keep_their_proofs() -> None:
         assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
 
 
+def test_a_coalesce_of_bare_columns_is_a_value_of_its_own() -> None:
+    # Modelled exactly, its bare columns defaulted to Bool and three text
+    # columns could hold only two values — `(SELECT x)` included.
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
+    c = "coalesce((SELECT {0}), (SELECT {0}))".format
+    base = (f"x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL AND ({c('x')} = {c('y')} "
+            f"OR {c('y')} = {c('z')} OR {c('x')} = {c('z')})")
+    assert _classify(base, "NOT (x IS NULL OR y IS NULL OR z IS NULL)") != "semantic_equivalent"
+    using = ("coalesce(x, x) <> coalesce(y, y) AND coalesce(y, y) <> coalesce(z, z) "
+             "AND coalesce(x, x) <> coalesce(z, z)")
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+    assert prove_cross_tenant_isolation(
+        parse_expr(f"tenant_id = auth.uid() OR ({using})"))[0] != "isolated"
+
+
 def test_a_bare_column_coalesce_is_no_total_anonymous_leak() -> None:
     # `COALESCE(level, tier) < 2` modelled the two as Bools coerced to 0/1,
     # which made this policy read as TRUE for every row (a false SEC038).

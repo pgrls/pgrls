@@ -83,14 +83,17 @@ breaking changes — they will be called out in this file.
   (Postgres orders by collation) — is a truth of its own; a cast that may
   change the value (`::float4`, `::numeric(3,1)`, `::varchar(3)`,
   `::citext`) is a value of its own (a bare `uuid` cast, and an integer cast
-  other than `oid`, still keep it), and so is arithmetic on reals, `/` and
-  `%`. Beside such a value or truth, a proof whose other conjunct isolates
+  other than `oid`, still keep it), and so are arithmetic on reals, `/` and
+  `%`, and a `COALESCE` of bare columns (modelled exactly, they defaulted to
+  Bools, so three text columns could hold only two values). Beside such a
+  value or truth, a proof whose other conjunct isolates
   still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that
   rested on Z3's reading is no longer made:
   `tenant_id = auth.uid() OR (s < 'B' AND s > 'a')` (both hold for `'ab'`
   under en_US), `… OR f + 0.5 = f` (true for `Infinity`) and
   `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`
-  (an empty range only through a float) go from PROVEN to LEAK, and the
+  (an empty range only through a float) go from PROVEN to LEAK, as does
+  `coalesce(x, x) <> coalesce(y, y) AND … <> coalesce(z, z) AND …`, and the
   false SEC038 on `COALESCE(level, tier) < 2 OR …` is gone. Arithmetic on a
   setting an anonymous session leaves unset abstains, since Postgres raises
   there: `current_setting('app.t')::int + 0 = 5 OR … <> 5` is no longer a
