@@ -248,10 +248,10 @@ class _Context:
         # Inside a list one of whose members rounds the others (off the diff
         # path), so no comparison in it is read exactly.
         self.kin_rounded = 0
-        # Diff path: per column name, whether each comparison of it with a
-        # string read the string bare (False) or typed (True); see
+        # Diff path: per column name, how each comparison of it with a
+        # string read the string (`bare`, `typed`, `as <type>`); see
         # `_note_string_read`.
-        self.string_reads: dict[str, set[bool]] = {}
+        self.string_reads: dict[str, set[str]] = {}
         self.list_members: set[int] = set()
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
@@ -553,16 +553,28 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
     nodes = [n for operand in operands for n in _ast_nodes(operand)]
     sides = [_string_operand(operand) for operand in operands]
     with_column = sum(bool(columns) for columns, _ in sides)
+    typed_sides = [operand for operand, (_, kind) in zip(operands, sides) if kind == "typed"]
     if not any((isinstance(n, A_Const) and isinstance(getattr(n, "val", None), String))
                or (isinstance(n, TypeCast) and _typename_last_segment(n.typeName) in _STRING_TYPES)
-               for n in nodes) and with_column < 2:
-        return  # no string in it, nor a column against a column
-    # A column against another (`citext_col = text_col`) compares in a type
-    # either may decide, as a typed string does.
-    typed = any(kind == "typed" for _, kind in sides) or with_column > 1
+               for n in nodes) and with_column < 2 and not (with_column and typed_sides):
+        return  # no string, nor a column against a column or a function
+    # A column against another (`citext_col = text_col`) or a function's
+    # result (`email = auth.email()`) compares in a type either may decide,
+    # as a typed string does; a literal cast to one type (`'admin'::app_role`,
+    # as `pg_get_expr` writes one) reads as a bare literal does against a
+    # column of that type.
+    casts = {_type_key(side.typeName) for side in typed_sides
+             if isinstance(side, TypeCast) and isinstance(side.arg, A_Const)}
+    if with_column > 1 or (typed_sides and (len(casts) != 1 or len(typed_sides) != sum(
+            isinstance(side, TypeCast) and isinstance(side.arg, A_Const) for side in typed_sides))):
+        kind = "typed"
+    elif typed_sides:
+        kind = "as " + casts.pop()
+    else:
+        kind = "bare"
     for n in nodes:
         if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
-            ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(typed)
+            ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(kind)
 
 
 def _string_operand(node: Any) -> tuple[frozenset[str], str]:
@@ -910,7 +922,7 @@ def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False,
     return ctx, assertions, base, head
 
 
-def _reads_strings_alike(column: str, typed: set[bool],
+def _reads_strings_alike(column: str, kinds: set[str],
                          column_types: Mapping[str, str] | None) -> bool:
     """Whether Z3's one reading of a string compared with `column` is
     Postgres's in every spelling: a `text` column (or a number, `uuid`, a
@@ -918,18 +930,44 @@ def _reads_strings_alike(column: str, typed: set[bool],
     `(SELECT 'A')` and an `IN` list alike; any other known one (a `citext`
     or `char(n)` one, which reads a bare literal as itself and a typed one
     as text, and lists otherwise again) is read only against bare literals,
-    where it reads them as `main` does. Without column types (a snapshot
-    from before they were captured) a column is not read against both."""
+    where it reads them as `main` does (and against a literal cast to its
+    own type, `'admin'::app_role`). Without column types (a snapshot from
+    before they were captured) a column is not read against both a bare
+    literal and anything else. A column's collation is not in the
+    snapshots: a nondeterministic one (`text COLLATE ci`) compares strings
+    otherwise, which the diff does not see, as on `main`."""
     if column_types is None:
-        return len(typed) == 1
-    return _reads_alike(column_types.get(column)) or True not in typed
+        return len({"bare" if kind == "bare" else "typed" for kind in kinds}) == 1
+    data_type = column_types.get(column)
+    if _reads_alike(data_type):
+        return True
+    own = "as " + _type_key(data_type) if data_type is not None else None
+    return all(kind in ("bare", own) for kind in kinds)
 
 
 def _reads_alike(data_type: str | None) -> bool:
     if data_type is None or '"' in data_type:
         return False  # a quoted name is a user type's (`"Text"`)
+    return _type_key(data_type) in _ALIKE_TYPES
+
+
+def _type_key(data_type: Any) -> str:
+    """A type's name to compare by: lower case, its modifiers dropped, a
+    `pg_catalog.` prefix (only) dropped (`app.text` is a user type), and the
+    aliases a `TypeName` and `format_type` spell otherwise made one."""
+    if not isinstance(data_type, str):
+        names = [n.sval for n in getattr(data_type, "names", None) or () if isinstance(n, String)]
+        if names == ["char"]:
+            return '"char"'  # the one-byte type; `char(n)` parses as `bpchar`
+        data_type = ".".join(names)
     name = re.sub(r"\(.*\)", "", data_type.lower()).strip()
-    return name.split(".")[-1].strip('"').strip() in _ALIKE_TYPES
+    name = re.sub(r"\s+", " ", name.removeprefix("pg_catalog."))
+    return _TYPE_ALIASES.get(name, name)
+
+
+_TYPE_ALIASES = {"character": "bpchar", "char": "bpchar", "character varying": "varchar",
+                 "int": "int4", "integer": "int4", "bigint": "int8", "smallint": "int2",
+                 "boolean": "bool", "double precision": "float8", "real": "float4"}
 
 
 _ALIKE_TYPES = frozenset({

@@ -410,6 +410,18 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
                 x="citext", y="text") == "requires_review"
     assert diff("x = (SELECT y) AND y = 'a'", "x = 'a' AND y = 'a'",
                 x="citext", y="text") == "requires_review"
+    # So does a function's result (`auth.email()` is text).
+    assert diff("email IS NOT DISTINCT FROM auth.email() AND auth.email() = 'a'",
+                "email IS NOT DISTINCT FROM 'a' AND auth.email() = 'a'",
+                email="citext") == "requires_review"
+    # A literal cast to the column's own type (`pg_get_expr`'s enum literal)
+    # reads as a bare one: widening an enum role is still DANGEROUS.
+    assert diff("org = 1 AND role = 'admin'::app_role",
+                "org = 1 AND (role = 'admin'::app_role OR role = 'member'::app_role)",
+                org="bigint", role="app_role") == "semantic_loosened"
+    # Only `pg_catalog.text` is text: `app.text` may be a domain over citext.
+    assert diff("email = ANY (ARRAY['a'::text, 'b'::text])", "email IN ('a', 'b')",
+                email="app.text") == "requires_review"
     # A quoted type name is a user type's, whatever it spells.
     assert diff("email = ANY (ARRAY['A'::text])", "email = 'A'", email='"Text"') == (
         "requires_review")

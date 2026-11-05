@@ -443,7 +443,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # to this statement so the drop gate sees the LAST create. That
             # makes existence correct for every ordering: `CREATE; DROP;
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
+            # A column it gives another type has that type after a DROP
+            # (the DDL errors otherwise), and either after IF NOT EXISTS: the
+            # diff reads a string compared with a column by its type.
             tables[key].created_at = index
+            for elt in stmt.tableElts or ():
+                if type(elt).__name__ == "ColumnDef":
+                    _retype_column(tables[key], elt.colname, _column_type(elt),
+                                   unsure=bool(getattr(stmt, "if_not_exists", False)))
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
         tables[key] = builder
@@ -806,11 +813,31 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             col = getattr(cmd, "def_", None)
             data_type = _column_type(col) if type(col).__name__ == "ColumnDef" else None
-            builder.columns = [
-                replace(c, data_type=data_type or "<altered>") if c.name == name else c
-                for c in builder.columns
-            ]
+            # Its partitions and inheritance children change with it.
+            pending, seen = [key], set()
+            while pending:
+                parent = pending.pop()
+                if parent in seen or parent not in tables:
+                    continue
+                seen.add(parent)
+                tables[parent].columns = [
+                    replace(c, data_type=data_type or "unknown") if c.name == name else c
+                    for c in tables[parent].columns
+                ]
+                pending.extend(k for k, b in tables.items()
+                               if b.partition_of == parent or parent in b.inherits)
         # Other ALTER subcommands are ignored.
+
+
+def _retype_column(builder: _TableBuilder, name: str | None, data_type: str | None,
+                   *, unsure: bool) -> None:
+    """Give column `name` the type a re-CREATE gives it (`unknown` where it
+    may have kept the one it has)."""
+    builder.columns = [
+        replace(c, data_type=data_type if data_type and not unsure else "unknown")
+        if c.name == name and c.data_type != data_type else c
+        for c in builder.columns
+    ]
 
 
 def _apply_create_policy(

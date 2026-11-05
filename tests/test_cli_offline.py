@@ -1450,6 +1450,20 @@ def test_offline_alter_column_type_is_applied():
     assert [(c.name, c.data_type) for c in t.column_details][-1] == ("role", "citext")
 
 
+def test_a_column_type_follows_a_re_create_and_reaches_children():
+    from pgrls.schema_sources import schema_from_sql
+    t = _only("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);")
+    assert [c.data_type for c in t.column_details] == ["citext"]
+    t = _only("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);")
+    assert [c.data_type for c in t.column_details] == ["unknown"]
+    schema = schema_from_sql(
+        "CREATE TABLE m (k int, role text) PARTITION BY LIST (k);"
+        " CREATE TABLE m1 PARTITION OF m FOR VALUES IN (1); CREATE TABLE c () INHERITS (m1);"
+        " ALTER TABLE m ALTER COLUMN role TYPE citext;")
+    assert {t.name: [c.data_type for c in t.column_details if c.name == "role"]
+            for t in schema.tables} == {"m": ["citext"], "m1": ["citext"], "c": ["citext"]}
+
+
 def test_offline_alter_table_rename_is_applied():
     # The finding used to be reported against the pre-rename name — a
     # `pgrls pr` annotation naming a table that does not exist.
