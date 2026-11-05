@@ -1899,7 +1899,17 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\n"
      "CREATE TABLE public.p1 PARTITION OF public.p FOR VALUES IN "
      "(length(set_config('search_path', 'app', false)));\n", "set_config"),
-    # A cast to a type named `text` the SQL creates may change the literal.
+    # ... inside a CREATE SCHEMA too, and EXECUTE's parameters run WITH NO
+    # DATA.
+    ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\n"
+     "CREATE SCHEMA side CREATE TABLE p1 PARTITION OF public.p FOR VALUES IN "
+     "(length(set_config('search_path', 'app', false)));\n", "set_config"),
+    ("PREPARE ps(text) AS SELECT $1 AS a;\nCREATE TABLE public.x AS EXECUTE "
+     "ps(set_config('search_path', 'app', false)) WITH NO DATA;\n", "set_config"),
+    # A cast to a type named `text` the SQL creates (or renames one to) may
+    # change the literal.
+    ("CREATE DOMAIN public.d AS varchar(3);\nALTER DOMAIN public.d RENAME TO text;\n",
+     "built-in"),
     ("CREATE SCHEMA text;\nCREATE DOMAIN text.text AS varchar(3);\n"
      "SELECT set_config('search_path', 'appx'::text.text, false);\n", "built-in"),
     # The database a `\\connect` reaches may set it.

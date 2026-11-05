@@ -758,6 +758,7 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
             for element in stmt.schemaElts or ():
                 # Its elements go in it, and see it first.
                 with resolver.first(schema):
+                    resolver.track(element)
                     resolver.qualify(element)
                 out.append(_Stmt(element, raw))
             out.append(_Stmt(stmt, raw))
@@ -1161,16 +1162,20 @@ def _uncast(node: Any) -> Any:
 def _keeps_literal(typename: Any) -> bool:
     # The built-in type: a user type of the name is refused (`_type_named`).
     names = [getattr(n, "sval", None) for n in typename.names or ()]
-    return (len(names) in (1, 2) and names[0] in ("pg_catalog", names[-1])
-            and names[-1] in _LITERAL_CASTS
-            and not typename.typmods and not typename.arrayBounds)
+    return (len(names) == 1 or (len(names) == 2 and names[0] == "pg_catalog")) \
+        and names[-1] in _LITERAL_CASTS \
+        and not typename.typmods and not typename.arrayBounds
 
 
 _LITERAL_CASTS = frozenset({"text", "bool", "boolean", "varchar"})
 
 
 def _type_named(stmt: Any) -> str | None:
-    """The name of the type or domain `stmt` creates, else None."""
+    """The name of the type or domain `stmt` creates (or renames one to),
+    else None."""
+    if (isinstance(stmt, _pgast.RenameStmt)
+            and stmt.renameType in (ObjectType.OBJECT_TYPE, ObjectType.OBJECT_DOMAIN)):
+        return str(stmt.newname or "") or None
     if isinstance(stmt, (_pgast.CreateDomainStmt,)):
         names = stmt.domainname
     elif isinstance(stmt, (_pgast.CreateEnumStmt, _pgast.CreateRangeStmt)):
@@ -1197,7 +1202,8 @@ def _only_defines(stmt: Any) -> bool:
     not as it runs — anything else (a cursor, PREPARE, ALTER … USING, ADD
     COLUMN … DEFAULT on a table with rows) may run them now."""
     if isinstance(stmt, _pgast.CreateTableAsStmt):
-        return bool(stmt.into.skipData)
+        # `AS EXECUTE` evaluates its parameters even WITH NO DATA.
+        return bool(stmt.into.skipData) and not isinstance(stmt.query, _pgast.ExecuteStmt)
     if isinstance(stmt, _pgast.AlterTableStmt):
         return all(getattr(cmd, "subtype", None) == AlterTableType.AT_ColumnDefault
                    for cmd in stmt.cmds or ())
