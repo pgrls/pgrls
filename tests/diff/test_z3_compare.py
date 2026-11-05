@@ -422,6 +422,12 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
     # Only `pg_catalog.text` is text: `app.text` may be a domain over citext.
     assert diff("email = ANY (ARRAY['a'::text, 'b'::text])", "email IN ('a', 'b')",
                 email="app.text") == "requires_review"
+    # A value that is no column is read by its own type: a function's
+    # (unknown) or a cast's (`email::citext` on a text column).
+    assert diff("(SELECT app.current_role()) = 'admin'::text", "(SELECT app.current_role()) = 'admin'",
+                ) == "requires_review"
+    assert diff("email::citext IS NOT DISTINCT FROM 'B'::text", "email::citext IS NOT DISTINCT FROM 'B'",
+                email="text") == "requires_review"
     # A quoted type name is a user type's, whatever it spells.
     assert diff("email = ANY (ARRAY['A'::text])", "email = 'A'", email='"Text"') == (
         "requires_review")

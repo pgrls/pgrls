@@ -121,25 +121,27 @@ breaking changes — they will be called out in this file.
   So does `x = ANY(ARRAY['US '])` with a bare string literal (or a cast
   that may change `x`): the literals make a `text[]`, so a `char(n)` or
   `citext` `x` compares as text there and as itself in `x = 'US '`. A
-  string compared with a column is read by the column's type, which the
-  diff now takes from the snapshots: a `text` or `varchar` column (or a
-  number, `uuid`, a time) reads `'A'`, `'A'::text`, `(SELECT 'A')`,
-  `COALESCE('A', '')` and a list alike; any other (`citext`, `char(n)`,
-  a user type) compares a typed string (a cast, a sub-select, a function's
-  result, a list's common type) otherwise than a bare literal, so a
-  comparison of it with a typed string or another column decides nothing
-  or a function's result decides nothing, a literal cast to the column's
-  own type (`role = 'admin'::app_role`, as `pg_get_expr` writes an enum
-  literal) reading as a bare one (`main` read `col = 'a'::text` and
-  `col = 'a'` as no change); only `pg_catalog.text` is text (`app.text`
-  may be a domain). The offline model now follows `ALTER COLUMN … TYPE`,
-  into the table's partitions and inheritance children, and a re-`CREATE`
-  (`unknown` after one `IF NOT EXISTS` may have skipped), so the type is the
-  one the migration leaves. A column's collation is not in the snapshots:
-  a nondeterministic one (`text COLLATE ci`) compares strings otherwise,
-  which the diff does not see, as on `main`. Without column types (a snapshot from before they
-  were captured) a column read against both a bare literal and a typed
-  string or another column decides nothing.
+  string compared with a value is read by the value's type, which the
+  diff now takes from the snapshots for a column and from the cast for a
+  cast (`email::citext`): a `text` or `varchar` one (or a number, `uuid`,
+  a time) reads `'A'`, `'A'::text`, `(SELECT 'A')`, `COALESCE('A', '')`
+  and a list alike; any other (`citext`, `char(n)`, a user type) compares a
+  typed string (a cast, a sub-select, a list's common type), another column
+  or a function's result otherwise than a bare literal, so such a
+  comparison of it decides nothing — a literal cast to its own type
+  (`role = 'admin'::app_role`, as `pg_get_expr` writes an enum literal)
+  reads as a bare one (`main` read `col = 'a'::text` and `col = 'a'` as no
+  change). Only `pg_catalog.text` is text (`app.text` may be a domain). A
+  value whose type the text does not show (a function's result, a
+  sub-select) decides nothing when it is read two ways. The offline model
+  now follows `ALTER COLUMN … TYPE`, into the table's partitions and
+  inheritance children (`ATTACH PARTITION` and `INHERIT` ones too), and a
+  re-`CREATE` (`unknown` where an `IF NOT EXISTS` may have skipped, or
+  `LIKE` copies), so the type is the one the migration leaves. A column's
+  collation is not in the snapshots: a nondeterministic one (`text COLLATE
+  ci`) compares strings otherwise, which the diff does not see, as on
+  `main`. Without column types (a snapshot from before they were captured)
+  a column read two ways decides nothing.
   In an `IN` list or array such a comparison decides nothing: the value
   takes the list's type there (`x IN (v::int, 1)` rounds `v` to a `real`
   `x`'s float4; `x = v::int` compares in float8).

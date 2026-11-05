@@ -1462,6 +1462,17 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
         " ALTER TABLE m ALTER COLUMN role TYPE citext;")
     assert {t.name: [c.data_type for c in t.column_details if c.name == "role"]
             for t in schema.tables} == {"m": ["citext"], "m1": ["citext"], "c": ["citext"]}
+    # ... to an attached partition and a late child too, and a re-CREATE as
+    # a partition takes the parent's.
+    schema = schema_from_sql(
+        "CREATE TABLE m (k int, role text) PARTITION BY LIST (k); CREATE TABLE m1 (k int, role text);"
+        " ALTER TABLE m ATTACH PARTITION m1 FOR VALUES IN (1); CREATE TABLE c (k int, role text);"
+        " ALTER TABLE c INHERIT m1; ALTER TABLE m ALTER COLUMN role TYPE citext;"
+        " CREATE TABLE r (k int, role text); DROP TABLE r;"
+        " CREATE TABLE r PARTITION OF m FOR VALUES IN (2);")
+    assert {t.name: [c.data_type for c in t.column_details if c.name == "role"]
+            for t in schema.tables} == {"m": ["citext"], "m1": ["citext"], "c": ["citext"],
+                                         "r": ["citext"]}
 
 
 def test_offline_alter_table_rename_is_applied():

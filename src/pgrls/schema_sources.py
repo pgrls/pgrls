@@ -447,10 +447,21 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # (the DDL errors otherwise), and either after IF NOT EXISTS: the
             # diff reads a string compared with a column by its type.
             tables[key].created_at = index
+            unsure = bool(getattr(stmt, "if_not_exists", False))
             for elt in stmt.tableElts or ():
                 if type(elt).__name__ == "ColumnDef":
-                    _retype_column(tables[key], elt.colname, _column_type(elt),
-                                   unsure=bool(getattr(stmt, "if_not_exists", False)))
+                    _retype_column(tables[key], elt.colname, _column_type(elt), unsure=unsure)
+                elif type(elt).__name__ == "TableLikeClause":
+                    for c in list(tables[key].columns):
+                        _retype_column(tables[key], c.name, None, unsure=True)
+            for rel in stmt.inhRelations or ():
+                parent = tables.get(_relation_key(rel, default_schema) or ("", ""))
+                if parent is not None:
+                    parent.attached.append(key)  # a later ALTER … TYPE reaches it
+                for c in list(tables[key].columns):
+                    source = next((p.data_type for p in parent.columns if p.name == c.name),
+                                  None) if parent is not None else None
+                    _retype_column(tables[key], c.name, source, unsure=unsure or source is None)
             continue
         builder = _TableBuilder(schema=key[0], name=key[1], created_at=index)
         tables[key] = builder
@@ -539,6 +550,9 @@ class _TableBuilder:
         self.column_grants: list[ColumnGrant] = []
         self.partition_of: tuple[str, str] | None = None
         self.inherits: list[tuple[str, str]] = []
+        # Tables an ALTER attached as a partition or child (`ATTACH
+        # PARTITION`, `INHERIT`): a column type change reaches them too.
+        self.attached: list[tuple[str, str]] = []
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -807,6 +821,15 @@ def _apply_alter_table(
             name = getattr(cmd, "name", None)
             if name:
                 builder.set_not_null(name, not_null=False)
+        elif subtype == AlterTableType.AT_AttachPartition:
+            child = _relation_key(getattr(getattr(cmd, "def_", None), "name", None),
+                                  default_schema)
+            if child is not None:
+                builder.attached.append(child)
+        elif subtype == AlterTableType.AT_AddInherit:
+            parent = _relation_key(getattr(cmd, "def_", None), default_schema)
+            if parent is not None and parent in tables:
+                tables[parent].attached.append(key)
         elif subtype == AlterTableType.AT_AlterColumnType:
             # The diff reads a string compared with a column by its type
             # (`text` and `citext` read `'a'::text` otherwise).
@@ -826,6 +849,7 @@ def _apply_alter_table(
                 ]
                 pending.extend(k for k, b in tables.items()
                                if b.partition_of == parent or parent in b.inherits)
+                pending.extend(tables[parent].attached)
         # Other ALTER subcommands are ignored.
 
 

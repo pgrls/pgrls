@@ -252,6 +252,7 @@ class _Context:
         # string read the string (`bare`, `typed`, `as <type>`); see
         # `_note_string_read`.
         self.string_reads: dict[str, set[str]] = {}
+        self.value_reads: dict[tuple[str, str | None], set[str]] = {}
         self.list_members: set[int] = set()
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
@@ -550,67 +551,79 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
     if not ctx.any_session:
         return
     operands = [left, *rights]
-    nodes = [n for operand in operands for n in _ast_nodes(operand)]
-    sides = [_string_operand(operand) for operand in operands]
-    with_column = sum(bool(columns) for columns, _ in sides)
-    typed_sides = [operand for operand, (_, kind) in zip(operands, sides) if kind == "typed"]
-    if not any((isinstance(n, A_Const) and isinstance(getattr(n, "val", None), String))
-               or (isinstance(n, TypeCast) and _typename_last_segment(n.typeName) in _STRING_TYPES)
-               for n in nodes) and with_column < 2 and not (with_column and typed_sides):
-        return  # no string, nor a column against a column or a function
-    # A column against another (`citext_col = text_col`) or a function's
-    # result (`email = auth.email()`) compares in a type either may decide,
-    # as a typed string does; a literal cast to one type (`'admin'::app_role`,
-    # as `pg_get_expr` writes one) reads as a bare literal does against a
-    # column of that type.
-    casts = {_type_key(side.typeName) for side in typed_sides
-             if isinstance(side, TypeCast) and isinstance(side.arg, A_Const)}
-    if with_column > 1 or (typed_sides and (len(casts) != 1 or len(typed_sides) != sum(
-            isinstance(side, TypeCast) and isinstance(side.arg, A_Const) for side in typed_sides))):
+    values = [op for op in operands if _literal_kind(op) is None]
+    if not values:
+        # Literals alone: one cast that may change its value (`'x'::citext`)
+        # is a value of that type to Z3, compared as the others decide.
+        values = [op for op in operands
+                  if isinstance(inner := _unwrap_scalar_sublink(op), TypeCast)
+                  and not _exact_cast(inner.typeName)][:1]
+    literals: list[str] = [k for op in operands if op not in values
+                           and (k := _literal_kind(op)) is not None and k != "other"]
+    if len(values) > 1:
+        # A value against another (`citext_col = text_col`, `email =
+        # auth.email()`) compares in a type either may decide.
         kind = "typed"
-    elif typed_sides:
-        kind = "as " + casts.pop()
+    elif not values or not literals and not any(_has_typed_arm(v) for v in values):
+        return  # no string in it
     else:
-        kind = "bare"
-    for n in nodes:
-        if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
-            ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(kind)
+        if all(k == "bare" for k in literals):
+            kind = "bare"
+        elif len(set(literals)) == 1 and literals[0].startswith("as "):
+            # A literal cast to one type (`'admin'::app_role`, as
+            # `pg_get_expr` writes one) reads as a bare literal does against
+            # a value of it.
+            kind = literals[0]
+        else:
+            kind = "typed"
+        if any(_has_typed_arm(v) for v in values):
+            # `COALESCE(x, 'a'::citext)` takes a type its arm may decide.
+            kind = "arm " + kind
+    for value in values:
+        for n in _ast_nodes(value):
+            if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
+                ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(kind)
+        # A value that is no column (`app.current_role()`, `email::citext`) is
+        # read by its own type: a cast's, else one the text does not show.
+        inner = _unwrap_scalar_sublink(value)
+        if not isinstance(inner, ColumnRef):
+            hint = _type_key(inner.typeName) if isinstance(inner, TypeCast) else None
+            ctx.value_reads.setdefault((_canon(inner), hint), set()).add(kind)
 
 
-def _string_operand(node: Any) -> tuple[frozenset[str], str]:
-    """The columns `node` yields as its value and how it is typed: `column`
-    (it takes a column's type), `bare` (an untyped string literal), `typed`
-    (a string of a known type, or anything else: a function, a cast), or
-    `other` (a number, a NULL)."""
+def _literal_kind(node: Any) -> str | None:
+    """How `node` is typed if it is a literal: `bare` (an untyped string),
+    `as <type>` (one cast), `typed` (`(SELECT 'A')`, `COALESCE('A', '')`),
+    `other` (a number, a NULL); None for a value (a column, a function)."""
     inner = _unwrap_scalar_sublink(node)
-    if inner is not node and isinstance(inner, A_Const):
-        # `(SELECT 'A')` is text, as a select list makes a bare literal.
-        return frozenset(), "typed"
-    node = inner
-    if isinstance(node, ColumnRef):
-        last = node.fields[-1] if node.fields else None
-        return (frozenset({last.sval}) if isinstance(last, String) else frozenset()), "column"
-    if isinstance(node, A_Const):
-        return frozenset(), "bare" if isinstance(getattr(node, "val", None), String) else "other"
-    arms: list[Any] | None = None
+    if isinstance(inner, A_Const):
+        if inner is not node:
+            return "typed"  # a select list makes a bare literal text
+        return "bare" if isinstance(getattr(inner, "val", None), String) else "other"
+    if isinstance(inner, TypeCast) and isinstance(inner.arg, A_Const):
+        return "as " + _type_key(inner.typeName)
+    arms = _arms(inner)
+    if arms is not None and arms and all(_literal_kind(arm) is not None for arm in arms):
+        return "typed"  # its literals take one type, text if all are bare
+    return None
+
+
+def _has_typed_arm(node: Any) -> bool:
+    """Whether a COALESCE / GREATEST / LEAST / CASE of a value has a typed
+    literal arm, which may decide the type it compares in."""
+    arms = _arms(_unwrap_scalar_sublink(node))
+    return arms is not None and any(
+        (k := _literal_kind(arm)) is not None and k not in ("bare", "other") or _has_typed_arm(arm)
+        for arm in arms)
+
+
+def _arms(node: Any) -> list[Any] | None:
     if isinstance(node, (CoalesceExpr, MinMaxExpr)):
-        arms = list(node.args or ())
-    elif isinstance(node, CaseExpr):
-        arms = [w.result for w in node.args or ()] + [node.defresult]
-    if arms is not None:
-        # Its arms take one common type, which a typed arm may decide (the
-        # text may not show which); of a column and bare literals, the
-        # column's; of bare literals only, text.
-        parts = [_string_operand(arm) for arm in arms if arm is not None]
-        columns = frozenset().union(*(c for c, _ in parts))
-        kinds = {k for _, k in parts}
-        if "typed" in kinds or not columns and "bare" in kinds:
-            return columns, "typed"
-        return columns, "column" if columns else "other"
-    columns = frozenset(n.fields[-1].sval for n in _ast_nodes(node)
-                        if isinstance(n, ColumnRef) and n.fields
-                        and isinstance(n.fields[-1], String))
-    return columns, "typed"
+        return list(node.args or ())
+    if isinstance(node, CaseExpr):
+        return [w.result for w in node.args or ()] + (
+            [node.defresult] if node.defresult is not None else [])
+    return None
 
 
 def _blanks_its_kin(members: Sequence[Any], ctx: Any) -> bool:
@@ -916,10 +929,20 @@ def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False,
     base = _lift_to_tv(_anon_3vl(base_node, ctx, set(), assertions), assertions)
     head = _lift_to_tv(_anon_3vl(head_node, ctx, set(), assertions), assertions)
     if base is None or head is None or any(
-            not _reads_strings_alike(column, typed, column_types)
-            for column, typed in ctx.string_reads.items()):
+            not _reads_strings_alike(column, kinds, column_types)
+            for column, kinds in ctx.string_reads.items()) or any(
+            not _reads_value_alike(hint, kinds) for (_, hint), kinds in ctx.value_reads.items()):
         return None
     return ctx, assertions, base, head
+
+
+def _reads_value_alike(hint: str | None, kinds: set[str]) -> bool:
+    """`_reads_strings_alike` for a value that is no column, of type `hint`
+    (a cast's) or one the text does not show (a function's, a sub-select's):
+    then every comparison of it must read the string one way."""
+    if hint is None:
+        return len(kinds) <= 1
+    return hint in _ALIKE_TYPES or kinds <= {"bare", "as " + hint}
 
 
 def _reads_strings_alike(column: str, kinds: set[str],
@@ -937,7 +960,7 @@ def _reads_strings_alike(column: str, kinds: set[str],
     snapshots: a nondeterministic one (`text COLLATE ci`) compares strings
     otherwise, which the diff does not see, as on `main`."""
     if column_types is None:
-        return len({"bare" if kind == "bare" else "typed" for kind in kinds}) == 1
+        return len(kinds) <= 1
     data_type = column_types.get(column)
     if _reads_alike(data_type):
         return True
