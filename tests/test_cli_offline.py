@@ -1516,6 +1516,7 @@ def test_offline_inherits_child_records_parents_and_columns():
         ("create-drop-create", "CREATE TABLE public.t (id int); DROP TABLE public.t; CREATE TABLE public.t (id int);", ["public.t"]),
         # …while a genuine drop must still drop.
         ("genuine drop", "CREATE TABLE public.t (id int); DROP TABLE public.t;", []),
+        ("ctas after a drop", "CREATE TABLE public.t (id int); DROP TABLE public.t; CREATE TABLE public.t AS SELECT 1 AS id;", ["public.t"]),
         ("create-create-drop", "CREATE TABLE public.t (id int); CREATE TABLE IF NOT EXISTS public.t (id int); DROP TABLE public.t;", []),
         ("drop one of two", "CREATE TABLE public.a (id int); CREATE TABLE public.b (id int); DROP TABLE public.a;", ["public.b"]),
     ],
@@ -1686,6 +1687,14 @@ def test_a_create_if_not_exists_of_a_table_there_does_not_undo_a_detach():
         sql = base + "ALTER TABLE public.p DETACH PARTITION public.c;\n" + after
         parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
         assert parents["c"] is None, after
+    # A table gone with its schema, or by DROP OWNED, is created anew.
+    for gone in ("DROP SCHEMA s CASCADE;\nCREATE SCHEMA s;\n", "DROP OWNED BY mig;\n"):
+        sql = ("CREATE SCHEMA s;\nCREATE TABLE public.p (k int) PARTITION BY LIST (k);\n"
+               "CREATE TABLE s.c (k int);\n"
+               "ALTER TABLE public.p ATTACH PARTITION s.c FOR VALUES IN (1);\n" + gone
+               + "CREATE TABLE IF NOT EXISTS s.c (k int);\n")
+        parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+        assert parents["c"] is None, gone
     # ... nor an ATTACH.
     sql = ("CREATE TABLE public.p (k int) PARTITION BY LIST (k);\nCREATE TABLE public.c (k int);\n"
            "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES IN (1);\n"

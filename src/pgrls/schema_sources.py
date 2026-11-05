@@ -559,14 +559,30 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # still attaches. Two passes keep that order-independent.
     tables: dict[tuple[str, str], _TableBuilder] = {}
 
-    # Where each table is dropped, so a CREATE … IF NOT EXISTS of one still
-    # there is told from a re-create.
+    # Where a table may go away — a DROP of it or its schema, a DROP OWNED,
+    # a rename of it — so a CREATE … IF NOT EXISTS of one still there is told
+    # from a re-create.
     drops: dict[tuple[str, str], list[int]] = {}
+    gone_any: list[int] = []  # DROP OWNED: any table
+    gone_schema: dict[str, list[int]] = {}
     for index, raw in enumerate(statements):
-        if isinstance(raw.stmt, _pgast.DropStmt) and raw.stmt.removeType == ObjectType.OBJECT_TABLE:
-            for namelist in raw.stmt.objects or ():
+        stmt = raw.stmt
+        if isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_TABLE:
+            for namelist in stmt.objects or ():
                 if parts := _drop_name_parts(namelist):
                     drops.setdefault(_drop_table_key(parts, default_schema), []).append(index)
+        elif isinstance(stmt, _pgast.DropStmt) and stmt.removeType == ObjectType.OBJECT_SCHEMA:
+            for item in stmt.objects or ():
+                gone_schema.setdefault(str(getattr(item, "sval", "")), []).append(index)
+        elif isinstance(stmt, _pgast.DropOwnedStmt):
+            gone_any.append(index)
+        elif (isinstance(stmt, _pgast.RenameStmt) and stmt.renameType == ObjectType.OBJECT_TABLE
+              and (key := _relation_key(stmt.relation, default_schema)) is not None):
+            drops.setdefault(key, []).append(index)
+
+    def gone_between(key: tuple[str, str], after: int, before: int) -> bool:
+        return any(after < d < before for d in (
+            *drops.get(key, ()), *gone_schema.get(key[0], ()), *gone_any))
 
     # Pass 1: CREATE TABLE (plus the two data-derived forms).
     for index, raw in enumerate(statements):
@@ -585,7 +601,12 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             if created is None:
                 continue
             key = _relation_key(created, default_schema)
-            if key is None or key in tables:
+            if key is None:
+                continue
+            if key in tables:
+                # A re-create after a DROP is the table now (see below).
+                if gone_between(key, tables[key].created_at, index):
+                    tables[key].created_at = index
                 continue
             tables[key] = _TableBuilder(
                 schema=key[0], name=key[1], created_at=index
@@ -605,8 +626,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             # CREATE` keeps the table, `CREATE; CREATE; DROP` removes it.
             # One `IF NOT EXISTS` skips while the table is there (with no
             # DROP since), so an ATTACH / DETACH before it still applies.
-            if stmt.if_not_exists and not any(
-                    tables[key].created_at < d < index for d in drops.get(key, ())):
+            if stmt.if_not_exists and not gone_between(key, tables[key].created_at, index):
                 continue
             tables[key].created_at = index
             continue
