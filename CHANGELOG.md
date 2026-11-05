@@ -65,7 +65,7 @@ breaking changes — they will be called out in this file.
   15.14, 16.10, 17.6) opens with a `\restrict <key>` psql meta-command,
   which is not SQL, so the whole file failed to parse. psql meta-command
   lines it can ignore (`\restrict`, `\echo`, `\pset`, `\set ON_ERROR_STOP
-  on` and psql's other error and output settings, a `\connect` after
+  on` and psql's other error and output settings, to a value psql takes, a `\connect` after
   `CREATE DATABASE`, …), each alone on its line and between statements as
   Postgres's own lexer reads the file, are now skipped, the LSP's ranges
   too. They are split on ASCII whitespace, as psql splits them (`\c` and a
@@ -116,7 +116,9 @@ breaking changes — they will be called out in this file.
   too, which a DROP before it removed; a `CREATE … IF NOT EXISTS` of it
   changes nothing when no DROP (a `CASCADE` of a function, type, access
   method or extension can take a table too), `DROP OWNED`, rename of a
-  relation or code — a `DO` block, a `CALL`, a function called — lies
+  relation or code — a `DO` block, a `CALL`, a function called, a write or
+  a read of a relation (a trigger, rule or view may run code), an event
+  trigger — lies
   between, which could have taken it), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
@@ -149,7 +151,10 @@ breaking changes — they will be called out in this file.
   name a temporary table and another hold, and one found ahead of a path
   entry pgrls cannot follow. A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
-  `pg_temp` on it ahead of the schema that holds a name, a `set_config()` of the path or the role anywhere but a
+  `pg_temp` on it ahead of the schema that holds a name, a schema on it
+  that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
+  may have no `USAGE` on (Postgres skips it; one the role owns, was granted
+  `USAGE` on, or `public` is followed), a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
   COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),
   `CREATE TABLE … AS EXECUTE`; a definition — a view, a new table's

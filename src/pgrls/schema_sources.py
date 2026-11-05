@@ -911,6 +911,10 @@ class _Resolver:
         self.owners: dict[str, str | None] = {}
         self.unsure: set[str] = set()
         self.dropped_owned = False
+        # `GRANT USAGE ON SCHEMA s TO r` (r None: PUBLIC), and the schemas
+        # whose USAGE for PUBLIC the SQL revoked.
+        self.usage: set[tuple[str, str | None]] = set()
+        self.revoked: set[tuple[str, str | None]] = set()
         self.relations: set[tuple[str, str]] = set()
         self.temp: set[str] = set()
         self.commit_drop: set[str] = set()  # temporary, ON COMMIT DROP
@@ -1133,10 +1137,29 @@ class _Resolver:
                     "follow; qualify the names.",
                 )
             if self.exists(entry):  # Postgres skips one that does not
+                self._check_usage(entry)
                 yield entry
 
-    def create_schema(self) -> str:
-        """Where an unqualified CREATE puts its relation."""
+    def _check_usage(self, schema: str) -> None:
+        """Postgres also skips a schema the running role has no USAGE on;
+        after a SET ROLE / SET SESSION AUTHORIZATION, refuse one the SQL does
+        not show the role may use (owns it, or was granted USAGE on it)."""
+        role = self._get("role") or self._get("auth")
+        if role is None or role == _SOME_ROLE:
+            return
+        if (schema == "public" and (schema, None) not in self.revoked) or self.owners.get(
+                schema) == role or (schema, role) in self.usage or (schema, None) in self.usage:
+            return
+        raise SchemaSourceError(
+            "bad_sql",
+            f"the SQL runs as role {role!r} and resolves a name on search_path schema "
+            f"{schema!r}, which the role may have no USAGE on (Postgres then skips it); "
+            f"pgrls cannot tell. Qualify the names.",
+        )
+
+    def create_schema(self, *, looking_up: bool = False) -> str:
+        """Where an unqualified CREATE puts its relation (or where a name
+        not found would be, `looking_up`)."""
         first: str | None = next(iter(self._entries()), None)
         if first is None or first == "pg_catalog":
             # "no schema has been selected to create in", or a catalog
@@ -1146,9 +1169,10 @@ class _Resolver:
             # Postgres creates in it if it exists, else in the next one.
             raise SchemaSourceError(
                 "bad_sql",
-                f"the SQL creates a relation on a search_path whose first schema "
-                f"({first!r}) it neither creates nor names a relation in; "
-                f"pgrls cannot tell whether it exists. Qualify the names.",
+                f"the SQL {'names' if looking_up else 'creates'} a relation on a "
+                f"search_path whose first schema ({first!r}) it neither creates nor "
+                f"names a relation in; pgrls cannot tell whether it exists. Qualify "
+                f"the names.",
             )
         return first
 
@@ -1180,7 +1204,10 @@ class _Resolver:
             )
         if holders:
             return holders[0], True
-        return self.create_schema(), False
+        entries = list(self._entries())
+        if len(entries) == 1:
+            return entries[0], False  # the one place it can be (else it errors)
+        return self.create_schema(looking_up=True), False
 
     def _holders(self, name: str) -> list[str]:
         """The schemas on the path that hold `name`, in order, up to an
@@ -1233,6 +1260,18 @@ class _Resolver:
         elif (isinstance(stmt, _pgast.AlterOwnerStmt)
               and stmt.objectType == ObjectType.OBJECT_SCHEMA):
             self.owners[str(getattr(stmt.object, "sval", ""))] = self.role_of(stmt.newowner)
+        elif (isinstance(stmt, _pgast.GrantStmt) and stmt.objtype == ObjectType.OBJECT_SCHEMA
+              and (stmt.privileges is None or any(
+                  getattr(p, "priv_name", None) == "usage" for p in stmt.privileges))):
+            for item in stmt.objects or ():
+                schema = str(getattr(item, "sval", ""))
+                for grantee in stmt.grantees or ():
+                    who = (None if grantee.roletype == RoleSpecType.ROLESPEC_PUBLIC
+                           else self.role_of(grantee))
+                    (self.usage.add if stmt.is_grant else self.usage.discard)((schema, who))
+                    if who is None:
+                        (self.revoked.discard if stmt.is_grant else self.revoked.add)(
+                            (schema, None))
         elif isinstance(stmt, _pgast.ReassignOwnedStmt):
             # Their schemas pass to the new role; one that may be among them
             # (the connecting role is no name pgrls knows) passes to one
@@ -1422,10 +1461,19 @@ def _may_drop_unseen(stmt: Any, dependents: bool) -> bool:
 
 def _runs_code(stmt: Any) -> bool:
     """Whether `stmt` runs code pgrls does not see into: a `DO` block, a
-    `CALL`, an `EXECUTE`, or a call of a function not `pg_catalog.`-named
-    (pg_dump's own) in a statement that runs it now."""
-    if isinstance(stmt, (_pgast.DoStmt, _pgast.CallStmt, _pgast.ExecuteStmt)):
+    `CALL`, an `EXECUTE`, a write or a read of a relation (which a trigger,
+    rule or view may run code on), an event trigger, or a call of a function
+    not `pg_catalog.`-named (pg_dump's own) in a statement that runs it now."""
+    if isinstance(stmt, (_pgast.DoStmt, _pgast.CallStmt, _pgast.ExecuteStmt,
+                         # A trigger or rule may fire, or (an event trigger)
+                         # fire on every later statement.
+                         _pgast.InsertStmt, _pgast.UpdateStmt, _pgast.DeleteStmt,
+                         _pgast.MergeStmt, _pgast.TruncateStmt, _pgast.CopyStmt,
+                         _pgast.RefreshMatViewStmt, _pgast.CreateEventTrigStmt)):
         return True
+    if not _only_defines(stmt) and any(
+            isinstance(n, _pgast.SelectStmt) and n.fromClause for n in _subnodes(stmt)):
+        return True  # a view it reads may call a function
     return not _only_defines(stmt) and any(
         isinstance(n, _pgast.FuncCall)
         and not (ast_utils.func_name_parts(n)[0] or "").startswith("pg_catalog.")
@@ -1960,6 +2008,26 @@ def _psql_accepts(name: str, rest: str, restricted: str | None) -> bool:
 
 
 _PSQL_BOOLEANS = ("on", "off", "true", "false", "yes", "no", "1", "0")
+# psql's own settings that change no SQL, and the values each takes (a
+# `:NAME` in the SQL is refused elsewhere); one psql rejects stops a run
+# under ON_ERROR_STOP.
+_PSQL_SETTINGS = {
+    "ON_ERROR_STOP": _PSQL_BOOLEANS, "QUIET": _PSQL_BOOLEANS,
+    "ECHO": ("none", "errors", "queries", "all"),
+    "ECHO_HIDDEN": (*_PSQL_BOOLEANS, "noexec"),
+    "VERBOSITY": ("default", "verbose", "terse", "sqlstate"),
+    "SHOW_CONTEXT": ("never", "errors", "always"),
+}
+
+
+def _psql_sets(rest: str) -> bool:
+    """Whether `\\set rest` sets one of `_PSQL_SETTINGS` to a value psql takes."""
+    m = re.fullmatch(r"([A-Z_]+)(?:\s+([A-Za-z0-9_]+))?", rest, re.ASCII)
+    if m is None:
+        return False
+    values = _PSQL_SETTINGS.get(m.group(1), ())
+    # No value is the empty string, which a boolean one reads as on.
+    return (m.group(2) or "").lower() in values or (m.group(2) is None and "on" in values)
 _PSQL_FORMATS = frozenset({
     "aligned", "asciidoc", "csv", "html", "latex", "latex-longtable", "troff-ms",
     "unaligned", "wrapped",
@@ -2105,9 +2173,7 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
         ) or (
             # psql's own settings that change no SQL (a `:NAME` in the SQL
             # is refused below).
-            name == "set" and re.fullmatch(
-                r"(ON_ERROR_STOP|ECHO|ECHO_HIDDEN|QUIET|VERBOSITY|SHOW_CONTEXT)"
-                r"(\s+[A-Za-z0-9_]+)?", rest, re.ASCII) is not None
+            name == "set" and _psql_sets(rest)
         )
         # psql reads a line to its LF: a CR is part of the command's arguments.
         if m is None or (("\\" in rest or "`" in rest) and not conninfo) \

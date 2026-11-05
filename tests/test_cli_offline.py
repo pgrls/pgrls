@@ -1578,6 +1578,7 @@ def test_a_name_two_path_schemas_hold_is_refused():
     "\\unrestrict zzz",                                      # not restricted
     "\\restrict",                                            # no key
     "\\pset format bogus", "\\pset nosuchoption", "\\timing maybe",
+    "\\set ECHO bogus", "\\set VERBOSITY loud", "\\set ECHO",
 ])
 def test_a_harmless_psql_command_psql_rejects_is_refused(line):
     # Under ON_ERROR_STOP psql stops at it, so the rest does not run.
@@ -1653,11 +1654,29 @@ def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     # A schema there before the SQL, whose owner it does not know.
     "CREATE TABLE app.x (id int); DROP OWNED BY r1; SET search_path = app, public;"
     " CREATE TABLE t (id int);",
+    # A role that may have no USAGE on app, which Postgres then skips.
+    "CREATE SCHEMA audit; SET SESSION AUTHORIZATION app_user;"
+    " SET search_path = audit, public; CREATE TABLE items (id int);",
+    # An INSERT may fire a trigger that drops the temporary t.
+    "CREATE TABLE public.t (id int); CREATE TEMP TABLE t (id int); CREATE TABLE public.log (id int);"
+    " INSERT INTO public.log VALUES (1); GRANT SELECT ON t TO anon;",
 ])
 def test_what_pgrls_cannot_tell_is_refused(sql):
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
     with pytest.raises(SchemaSourceError):
         schema_from_sql(sql)
+
+
+def test_a_usable_schema_and_a_lone_path_entry_resolve():
+    # app_user owns app, or was granted USAGE: Postgres searches it.
+    for grant in ("CREATE SCHEMA app AUTHORIZATION app_user;",
+                  "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO app_user;"):
+        t = _only(f"{grant} CREATE TABLE app.items (id int); SET ROLE app_user;"
+                  " SET search_path = app, public; ALTER TABLE items ENABLE ROW LEVEL SECURITY;")
+        assert t.qualified_name == "app.items" and t.rls_enabled is True, grant
+    # A path of one schema has one place a name can be (else it errors).
+    t = _only("SET search_path TO app; ALTER TABLE users ENABLE ROW LEVEL SECURITY;")
+    assert t.qualified_name == "app.users"
 
 
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
