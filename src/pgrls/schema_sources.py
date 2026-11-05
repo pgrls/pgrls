@@ -1103,9 +1103,10 @@ class _Resolver:
                 f"dropped a relation, and then names {name!r}, which resolves to "
                 f"another one if it did; pgrls cannot tell which. Qualify the name.",
             )
-        if name in self.temp:
-            return _NOWHERE, True
-        # Lazily: an entry past the one that holds the name is never reached.
+        if name in self.temp and "pg_temp" not in (self.path or ()):
+            return _NOWHERE, True  # searched first unless the path names it
+        # Lazily: an entry past the one that holds the name is never reached
+        # (a `pg_temp` entry holding a temp table of the name is refused).
         for entry in self._entries():
             if (entry, name) in self.relations:
                 return entry, True

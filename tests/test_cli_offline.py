@@ -1489,6 +1489,17 @@ def test_a_name_found_on_the_path_is_not_refused_for_a_later_entry(path, later):
     assert t.qualified_name == "public.t" and t.rls_enabled is True
 
 
+def test_a_path_naming_pg_temp_after_a_schema_finds_the_schema_first():
+    # `public, pg_temp`: Postgres searches public before the temp table, so
+    # the policy lands on public.accounts, not on the temp table that hid it.
+    t = _only(
+        "SET search_path = public, pg_temp; CREATE TABLE accounts (id int);"
+        " CREATE TEMP TABLE accounts (id int);"
+        " ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;"
+    )
+    assert t.qualified_name == "public.accounts" and t.rls_enabled is True
+
+
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
     # The second CREATE re-walked tableElts and appended the columns again.
     t = _only(

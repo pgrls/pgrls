@@ -130,7 +130,7 @@ breaking changes — they will be called out in this file.
   undoes is left out of the model, and a temporary table is no table (nor,
   once `DISCARD`ed or dropped at COMMIT, hides one). A search path pgrls
   cannot follow is refused: one a `\connect`ed database or role may set,
-  `pg_temp` on it, a `set_config()` of the path or the role anywhere but a
+  `pg_temp` on it ahead of the schema that holds a name, a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
   COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),
   `CREATE TABLE … AS EXECUTE`; a definition — a view, a new table's
