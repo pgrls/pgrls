@@ -1840,6 +1840,10 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("SET transform_null_equals = on;\n", True),
     ("ALTER DATABASE d SET transform_null_equals = true;\n", True),
     ("SET transform_null_equals = off;\n", False),
+    # A quoted name is still the setting: Postgres ignores its case.
+    ('SET "Transform_Null_Equals" = on;\n', True),
+    ('ALTER DATABASE d SET "Standard_Conforming_Strings" = off;\n', True),
+    ('SET "Client_Encoding" = \'SJIS\';\n', True),
     # A rule on pg_settings sets what it names.
     ("UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\n",
      "pg_settings"),

@@ -438,7 +438,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         for raw in statements
     ):
         # The database copies the template's objects, which the SQL does not
-        # show.
+        # show. (`template1`, the default, is taken to be as pg_dump leaves it:
+        # a database linted by its own dump would not show those either.)
         raise SchemaSourceError(
             "bad_sql",
             "the SQL creates a database from a template other than template0 "
@@ -1055,7 +1056,8 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
                     "cannot follow.",
                 )
             if isinstance(node, _pgast.VariableSetStmt) and node.args:
-                name, arg = node.name, node.args[0]
+                # Postgres looks a setting up ignoring case, even quoted.
+                name, arg = (node.name or "").lower(), node.args[0]
             elif (isinstance(node, _pgast.FuncCall)
                   and ast_utils.func_name_parts(node)[1] == "set_config"):
                 args = node.args or ()
