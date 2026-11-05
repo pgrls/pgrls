@@ -101,8 +101,8 @@ Supported AST nodes (Phases 1 + 3 + 4):
   ``auth.uid()``, ``current_setting('app.tenant')``) can be
   compared via implication. Aggregates and window functions abort.
 * ``CoalesceExpr`` and ``CaseExpr`` (Phase 3) — treated as opaque
-  uninterpreted Z3 String constants, keyed by their canonical
-  RawStream rendering. Two predicates with ``COALESCE(col, 'x')``
+  uninterpreted Z3 String constants, keyed by their
+  ``canonical_key``. Two predicates with ``COALESCE(col, 'x')``
   on each side reuse the same Z3 variable; nuanced reasoning about
   the WHEN/ELSE branches is deferred to a later phase. Sound but
   coarse: predicates that differ only inside the COALESCE/CASE
@@ -179,9 +179,8 @@ from pglast.enums import (
     SQLValueFunctionOp,
     SubLinkType,
 )
-from pglast.stream import RawStream
 
-from pgrls.ast_utils import func_name_parts, is_never_null_current_setting
+from pgrls.ast_utils import canonical_key, func_name_parts, is_never_null_current_setting
 
 
 # Comparison operator strings appearing in `A_Expr.name[0].sval` for
@@ -795,10 +794,10 @@ def _func_call_to_z3(node: FuncCall, ctx: _Context) -> Any:
 
     Args may be literals, ColumnRefs, or other supported nodes;
     each must translate via ``_to_z3`` (which is itself recursive).
-    The argument list is canonicalized via RawStream so cosmetic
+    The call is keyed via ``_canon`` (``canonical_key``) so cosmetic
     differences (whitespace, redundant parens) collapse. Two calls
     that differ only in canonical arg ordering are NOT considered
-    equal — RawStream preserves source order.
+    equal — ``canonical_key`` preserves source order.
     """
     if node.agg_filter is not None:
         return None  # FILTER (WHERE ...) — out of scope
@@ -835,7 +834,7 @@ def _opaque_expression(node: Any, ctx: _Context, *, sort: Any) -> Any:
     """Generic opaque-Z3-variable wrapper for nodes whose semantics
     Phase 3 doesn't fully model (currently CoalesceExpr, CaseExpr).
 
-    Two identical RawStream renderings on base and head produce the
+    Two equal canonical keys (the same AST) on base and head produce the
     same Z3 variable, so predicates like ``COALESCE(col, 'default')
     = 'foo'`` are comparable across base and head when they appear
     verbatim. Predicates whose CASE/COALESCE bodies differ get
@@ -847,9 +846,10 @@ def _opaque_expression(node: Any, ctx: _Context, *, sort: Any) -> Any:
 
 
 def _canon(node: Any) -> str:
-    """Canonical RawStream rendering of an AST node."""
-    rendered: str = RawStream()(node)
-    return rendered
+    """``canonical_key``: the node's faithful SQL, tagged with an AST digest
+    only when no rendering parses back to it — so two different expressions
+    never share a Z3 variable."""
+    return canonical_key(node)
 
 
 def _in_to_z3(node: A_Expr, ctx: _Context) -> Any:
@@ -2770,7 +2770,8 @@ def cross_tenant_session_identity(
     prover verified (a LEAK verdict guarantees exactly one pair). The session
     SQL is the canonical rendering of the auth expression the discriminator is
     compared to — recovered from the session symbol's decl name (keyed by
-    ``_canon`` = the RawStream SQL) — e.g. ``auth.uid()`` or
+    ``_canon`` = ``canonical_key``: the faithful SQL, which may be
+    parenthesized or, rarely, end in an ``/* ast … */`` tag) — e.g. ``auth.uid()`` or
     ``current_setting('app.tenant_id', TRUE)``.
 
     Returns None when Z3 is unavailable, the predicate is untranslatable, or

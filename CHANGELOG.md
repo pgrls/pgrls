@@ -28,12 +28,16 @@ breaking changes — they will be called out in this file.
     PostgREST pre-request hook copies such a value — or one from a table the
     session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
-    SQL and PL/pgSQL bodies, views to their tables, and what those tables'
-    policies read in turn, with an unresolvable relation or unreadable body
-    counting against it. A login session must also have no pre-16
-    CREATEROLE, read no setting it can set for itself, and be unable to
-    redefine or shadow what the filter calls (owned functions or relations, CREATE on a schema or the
-    database, a helper reading a table by bare name without `pg_temp` last);
+    SQL and PL/pgSQL bodies (whatever their return type, though one that
+    assigns to — or reads `INTO` — one of its parameters or `RETURNS
+    TABLE` columns is still unreadable, and one that declares an `ALIAS
+    FOR $n` can be — only the body is captured), views to their tables, and what those
+    tables' policies read in turn, with an unresolvable relation or
+    unreadable body counting against it. A login session must also have
+    no pre-16 CREATEROLE, read no setting it can set for itself, and be
+    unable to redefine or shadow what the filter calls (owned functions or
+    relations, CREATE on a schema or the database, a helper reading a table
+    by bare name without `pg_temp` last);
     the owner of an untraced door the session can open counts toward these
     for every column.
   - `LEAK` — the role's own session reads such a row, shown when one
@@ -54,6 +58,39 @@ breaking changes — they will be called out in this file.
   `proof_summary`. `--auth-function` names a project's own auth helper.
   SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
   end to end.
+- **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
+  17 and 18, and the dependency pin allows pglast 7.20+ or 8.6+ (pglast
+  8.3 / 8.4 return invalid JSON for a trigger function's body, and 8.5's
+  deparser still has bugs 8.6 fixed; CI tests pglast 7 on PostgreSQL 17
+  and pglast 8 on every version). pglast 8 parses the
+  PG18 grammar, so reading PG18-only DDL offline (`--sql-file`,
+  `pgrls pr`) needs it: `pip install -U pgrls pglast` on an existing
+  install. On pglast 8:
+  - `pgrls matrix` still counts a door's `RETURNING` (on `INSERT` /
+    `UPDATE` / `DELETE`) as a read — pglast 8 moved it into a new
+    `ReturningClause` node;
+  - a PL/pgSQL function that names a type qualified with a schema other than
+    `pg_catalog` / `public` (a parameter or return type, which
+    `pg_get_functiondef` qualifies when the type is off the search_path,
+    or a `DECLARE`), that has a VARIADIC parameter, or that puts a variable
+    or parameter of a type pglast 8 does not know (an enum, a domain) among
+    several `INTO` or `FOR` targets, is read rather than listed as
+    untraced: pgrls drops the qualifier, reads VARIADIC as a plain
+    parameter and declares such a variable or parameter `text` — none of
+    which changes which SQL the body runs;
+  - a PL/pgSQL body with `#option dump` is listed as untraced (pglast 8
+    prints its parse tree to stdout);
+  - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
+    the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
+    `ADD CONSTRAINT … NOT NULL`. A named `ADD CONSTRAINT … NOT NULL …
+    NOT VALID` stays nullable until `VALIDATE CONSTRAINT` or `SET NOT NULL`,
+    as on a live database; an unnamed `ADD NOT NULL c NOT VALID` stays
+    nullable until `SET NOT NULL` (pgrls does not follow a `VALIDATE` of
+    its generated name, so SEC030 errs toward firing); and an `INHERITS`
+    child does not get a parent's `NOT NULL … NO INHERIT`. Constraint
+    names are tracked erring toward nullable: a renamed constraint's new
+    name also reaches any other table holding the old one, since pgrls
+    does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
 - **Offline analysis says that an extension's tables are not seen.** pg_dump
@@ -181,6 +218,97 @@ breaking changes — they will be called out in this file.
   refused: policies name the table by its old schema. An ATTACH Postgres
   refuses (of an inheritance child, of a table already attached, to a
   parent not partitioned) is not modelled.
+- **`pgrls matrix` / `--prove` / `verify` no longer trust a user function
+  called by a built-in's name**, in two forms. A quoted name
+  holding a dot (`"pg_catalog.casefold"(…)`, `"auth.uid"()`) is one
+  identifier, a function in the search path, but was read as that schema's
+  function; and a quoted SQL keyword (`"greatest"(…)`, `"coalesce"(…)`,
+  `"trim"(…)`, `"current_date"()`) has no built-in behind it, but was on the
+  list of built-ins that read no table. Either way a door into a function
+  that read a FORCE'd table was traced as harmless and the cell PROVEN
+  (measured on PG17). Such a call now makes the door one pgrls does not see
+  into; in a policy predicate reached two ways (say, directly and through a
+  definer view), the `matrix` cell reads UNDECIDED rather than COND, and
+  `--prove`, where it had proved the cell, reports UNKNOWN. Taking a
+  call's schema from its name parts also trusts a three-part
+  `<db>.pg_catalog.lower(…)`, which Postgres resolves only in the current
+  database. A bare built-in name that resolves to a better-fitting user
+  overload (`public.lower(integer)` for `lower(1)`) is still trusted.
+- The `pgrls diff --explain` text for a `REQUIRES_REVIEW` predicate change
+  no longer says to install `pgrls[diff-z3]`, which has been part of a plain
+  install since 0.16.0.
+- **`pgrls diff` no longer calls a changed predicate `unchanged` when pglast
+  prints both alike.** pglast's deparser drops parentheses some operands
+  need — on pglast 6 and 7, for example, a boolean (AND / OR / NOT),
+  comparison or `IS [NOT] DISTINCT FROM` operand of `BETWEEN`, `IN (…)`,
+  `op ANY / ALL (…)` (which is how Postgres stores `IN` and `NOT IN`) or
+  `IS [NOT] NULL`; pglast 8 drops far fewer — so `(a OR b) BETWEEN x AND y` and
+  `a OR (b BETWEEN x AND y)` both print as `a OR b BETWEEN x AND y` — and
+  `pgrls diff` compared those strings, so a real change was not reported.
+  Predicates are now compared on their parse trees, and the Z3 translation
+  (`pgrls diff`, `verify`, `matrix --prove`, SEC038) no longer gives two such
+  expressions one variable. The same rendering
+  was used for the policy text pgrls rebuilds from a `--sql-file` /
+  `pgrls pr` source (which the rules then re-parsed, so they could analyse
+  a different predicate than the file wrote) and for the SQL `pgrls fix`
+  emits: the `ALTER POLICY` of the SEC004, SEC011, SEC019, SEC020 and
+  PERF001 fixers, and PERF004's index expression. A fixer could emit a
+  policy that admits more rows than the one it rewrote — on a live database,
+  PERF001 rewrote a policy created as
+  `user_id = auth.uid() AND ((a OR b) NOT IN (false, true))` as
+  `user_id = (SELECT auth.uid()) AND a OR b <> ALL(ARRAY[FALSE, TRUE])`,
+  which Postgres reads as `(… AND a) OR (b <> ALL …)`. Both now keep the parentheses the tree
+  needs; a fixer whose rewrite has no SQL that parses back to it now leaves
+  the finding instead, while the rebuilt `--sql-file` / `pgrls pr` text
+  uses the clause as the file wrote it for a shape pglast cannot print
+  faithfully (on pglast 7, a subscripted or field-selected constant such as
+  `(-1)[1]`, which pglast prints without its parentheses), which the rules
+  skipped. **If `pgrls fix` rewrote a policy in an earlier release** whose
+  predicate nests a boolean or comparison inside another operator —
+  applied with `--apply`, from a `--output` migration, or by hand from the
+  dry-run SQL — compare the policy's `pg_get_expr(polqual, polrelid)` /
+  `pg_get_expr(polwithcheck, polrelid)` in `pg_policy` with its definition
+  before the fix (the list above gives examples, not every shape): the
+  widened policy is valid SQL, so a later `pgrls lint` does not flag it. A PERF004 index expression could lose
+  them the same way; that changes no access, but the index may not serve
+  the policy.
+- **A predicate pglast cannot print at all** — on pglast 6 and 7,
+  `x OPERATOR(schema.op) ANY / ALL (…)`, the form `pg_dump` writes — no longer
+  crashes `pgrls diff` or `pgrls fix`, and is no longer dropped from a
+  `--sql-file` / `pgrls pr` source. That source modelled such a policy with
+  no USING / WITH CHECK clause at all, with no warning, so the rules missed
+  what it said and `pgrls pr` reported a widened clause as no change. The
+  clause as the file wrote it is used instead; `pgrls diff` compares it on
+  its parse tree, and a fixer leaves the finding rather than rewrite it. A
+  widening that merged this way does not show in later base↔head checks;
+  run `pgrls lint --sql-file` over the current migrations to see it.
+- **`pgrls matrix` no longer misses SQL in a PL/pgSQL record variable's
+  default or an assignment target's subscript.** pglast leaves the default of a
+  variable it models as a record out of the parse — a `record` on either
+  major, and on pglast 8 also any type it does not know (an enum, a domain,
+  a composite) — so a door that read a table only in
+  `DECLARE r record := (SELECT … FROM t)` showed no reach of `t`. pgrls now
+  reads such a default from the declaration itself, once the PL/pgSQL
+  parser confirms where each declaration starts and ends; a door whose
+  record declarations it cannot read is listed as untraced, with the
+  reason. pgrls also discarded the subscript of an assignment target
+  (`a[(SELECT …)] := 1`); it is now read too.
+- **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
+  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL makes its column nullable
+  again** — whether the constraint was named on the table, inherited from
+  a parent, renamed, or auto-named `<table>_<column>_not_null`
+  (PostgreSQL 18 stores a NOT NULL as a constraint). A parent's drop still
+  does not reach its children offline, as before. The DB-free sources
+  ignored both, so SEC030 flagged a primary-key column or missed a column
+  whose NOT NULL was dropped.
+- **DB-free sources: a renamed parent keeps its partitions and `INHERITS`
+  children.** `ALTER TABLE <parent> RENAME TO …` left each child pointing
+  at the old name, so SEC001 reported a partition whose renamed parent
+  enforces RLS as having an ancestor outside the scanned schemas.
+- **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as
+  nullable.** Postgres 18 sets `attnotnull` for such a constraint while
+  existing NULLs stay in the table, so pgrls read the column as not-nullable
+  and SEC030 (and its `pgrls fix`) missed a nullable tenant column.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

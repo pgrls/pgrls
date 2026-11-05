@@ -151,8 +151,8 @@ class SEC038:
     def check(
         self, schema: Schema, options: dict[str, Any]
     ) -> list[Violation]:
-        # Lazy import: the Z3 codepath is an optional extra, and the
-        # rules package must stay import-dependency-free (mirrors how the
+        # Lazy import: the rules package must stay import-dependency-free
+        # even though Z3 is a core dependency (mirrors how the
         # CLI imports the diff Z3 module lazily). When z3 is absent,
         # Z3_AVAILABLE is False and the rule NO-OPs (HARD CONSTRAINT).
         from pgrls.diff._z3_compare import (

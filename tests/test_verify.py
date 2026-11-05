@@ -4497,6 +4497,29 @@ def _call(sql: str):
     ("SELECT pg_catalog.set_config('request.jwt.claims', '{}', true)", True),
     # A schema-qualified known auth function stays trusted by its full name.
     ("SELECT auth.uid()", False),
+    # PostgreSQL 18's additions are trusted only pg_catalog-qualified: on
+    # 15–17 a bare call to one can only be a user function.
+    ("SELECT casefold('A')", True),
+    ("SELECT uuidv7()", True),
+    ("SELECT pg_catalog.casefold('A')", False),
+    ("SELECT pg_catalog.uuidv7()", False),
+    ("SELECT public.casefold('A')", True),
+    # A quoted name holding a dot is one identifier — a user function in the
+    # search path, not the schema-qualified built-in or auth function.
+    ('SELECT "pg_catalog.casefold"(\'A\')', True),
+    ('SELECT "pg_catalog.count"(1)', True),
+    ('SELECT "auth.uid"()', True),
+    # A SQL keyword called by a quoted name is a user function: there is no
+    # built-in `greatest` / `coalesce` / `trim` / `current_date`.
+    ('SELECT "greatest"(1, 2)', True),
+    ('SELECT "coalesce"(1, 2)', True),
+    ('SELECT "trim"(\'a\')', True),
+    # Unquoted, they never were calls by that name.
+    ("SELECT trim('a')", False),
+    # A three-part name's schema is its second part (Postgres refuses any
+    # database but the current one).
+    ("SELECT postgres.pg_catalog.lower('A')", False),
+    ("SELECT postgres.public.lower('A')", True),
 ])
 def test_opaque_call_trusts_builtins_only_when_unqualified_or_pg_catalog(
     sql: str, opaque: bool

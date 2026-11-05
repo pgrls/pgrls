@@ -4712,3 +4712,97 @@ def test_sec015_default_path_includes_the_functions_own_schema_for_security() ->
     assert _rewritten_path(None, "a.b") == 'pg_catalog, "a.b", pg_temp'
     # An existing path is preserved with pg_temp pinned last, as before.
     assert _rewritten_path("s15, pg_temp", "s15") == "s15, pg_temp"
+
+
+def test_alter_policy_keeps_the_parentheses_its_predicate_needs() -> None:
+    # pglast's deparser prints `(a OR b) BETWEEN …` without the parentheses,
+    # which would make `pgrls fix --apply` install a different predicate.
+    import pglast
+    from types import SimpleNamespace
+
+    from pgrls.ast_utils import parse_expr
+    from pgrls.fixers._idents import alter_policy
+
+    source = "(tenant_id = 1 OR is_public) BETWEEN true AND true"
+    sql = alter_policy(SimpleNamespace(schema="public", name="t"), "p",
+                       using_ast=parse_expr(source))
+    stmt = pglast.parse_sql(sql)[0].stmt
+    assert stmt.qual == parse_expr(source)
+
+
+@pytest.mark.parametrize(("fixer", "using", "rewritten"), [
+    # The tree a fixer builds leaves fields the parser sets (`groupDistinct`,
+    # `isnull`) unset; its SQL must still keep the parentheses `(a OR b)
+    # BETWEEN …` needs, or the applied policy admits rows it did not.
+    (PERF001Fixer, "user_id = auth.uid() AND ((a OR b) BETWEEN false AND true)",
+     "user_id = (SELECT auth.uid()) AND ((a OR b) BETWEEN false AND true)"),
+    (SEC019Fixer, "user_id = current_setting('app.t') AND ((a OR b) BETWEEN false AND true)",
+     "user_id = current_setting('app.t', true) AND ((a OR b) BETWEEN false AND true)"),
+    # Dropping `OR true` leaves an AND inside an AND, which no text parses
+    # back to (the parser flattens it) — still the same predicate.
+    (SEC011Fixer, "(((a OR b) BETWEEN false AND true AND user_id = 1) OR true) AND c",
+     "((a OR b) BETWEEN false AND true) AND user_id = 1 AND c"),
+    (SEC011Fixer, "EXISTS (SELECT 1 FROM jsonb_array_elements(j) e "
+     "WHERE (a OR b) BETWEEN false AND true) OR true",
+     "EXISTS (SELECT 1 FROM jsonb_array_elements(j) e WHERE (a OR b) BETWEEN false AND true)"),
+])
+def test_fixer_sql_keeps_the_predicates_grouping(fixer: Any, using: str, rewritten: str) -> None:
+    import pglast
+
+    from pgrls.ast_utils import _tree
+
+    [f] = fixer().fix(_wrap_policy(_policy(using)), {})
+    assert _tree(pglast.parse_sql(f.sql)[0].stmt.qual) == _tree(parse_expr(rewritten))
+
+
+@pytest.mark.parametrize(("fixer", "using"), [
+    (SEC011Fixer, "user_id = 1 OR true"),
+    (SEC019Fixer, "user_id = current_setting('app.t')"),
+    (PERF001Fixer, "user_id = auth.uid()"),
+])
+def test_a_fixer_leaves_the_finding_when_no_sql_parses_back_to_its_rewrite(
+    fixer: Any, using: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When no SQL text parses back to the rewrite (a shape pglast cannot print
+    # faithfully), the fixer must not emit pglast's lossy rendering — that
+    # would apply a different, possibly wider, predicate.
+    import pgrls.fixers._idents
+    import pgrls.fixers.perf001
+
+    monkeypatch.setattr(pgrls.fixers._idents, "exact_sql", lambda node: None)
+    monkeypatch.setattr(pgrls.fixers.perf001, "exact_sql", lambda node: None)
+    assert fixer().fix(_wrap_policy(_policy(using)), {}) == []
+
+
+def test_sec020_mirrored_check_keeps_the_predicates_grouping() -> None:
+    import pglast
+
+    from pgrls.ast_utils import _tree
+
+    using = "(owner = 1 OR a) BETWEEN true AND true"
+    [f] = SEC020Fixer().fix(
+        _wrap_policy(_policy(using, command="ALL", with_check="true")), {})
+    assert _tree(pglast.parse_sql(f.sql)[0].stmt.with_check) == _tree(parse_expr(using))
+
+
+@pytest.mark.parametrize(("fixer", "policy"), [
+    (SEC004Fixer, _policy("auth.uid() IS NULL OR user_id = 1")),
+    (SEC020Fixer, _policy("user_id = 1", command="ALL", with_check="true")),
+])
+def test_sec004_and_sec020_leave_the_finding_when_no_sql_parses_back(
+    fixer: Any, policy: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pgrls.fixers._idents
+    import pgrls.fixers.sec020
+
+    monkeypatch.setattr(pgrls.fixers._idents, "exact_sql", lambda node: None)
+    monkeypatch.setattr(pgrls.fixers.sec020, "exact_sql", lambda node: None)
+    assert fixer().fix(_wrap_policy(policy), {}) == []
+
+
+def test_like_and_similar_to_escape_keep_their_operands_grouping() -> None:
+    from pgrls.ast_utils import exact_sql
+
+    for sql in ("((a OR b) BETWEEN false AND true)::text SIMILAR TO 'z'",
+                "((a OR b) IS NULL)::text LIKE 'z' ESCAPE '#'"):
+        assert exact_sql(parse_expr(sql)) is not None, sql
