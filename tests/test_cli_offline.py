@@ -1461,6 +1461,20 @@ def test_offline_rename_carries_later_alters():
     assert t.rls_enabled is True
 
 
+def test_offline_rename_onto_a_later_created_name_is_applied():
+    # The model holds every CREATE of the file before the renames replay, so
+    # a later `CREATE TABLE IF NOT EXISTS users` (skipped live) must not stop
+    # the rename onto `users`: the RLS state stayed on `users_tmp`.
+    t = _only(
+        "CREATE TABLE IF NOT EXISTS users_tmp (id int);"
+        " ALTER TABLE users_tmp ENABLE ROW LEVEL SECURITY;"
+        " ALTER TABLE users_tmp RENAME TO users;"
+        " CREATE TABLE IF NOT EXISTS users (id int);"
+    )
+    assert t.qualified_name == "public.users"
+    assert t.rls_enabled is True
+
+
 def test_offline_create_table_if_not_exists_does_not_duplicate_columns():
     # The second CREATE re-walked tableElts and appended the columns again.
     t = _only(

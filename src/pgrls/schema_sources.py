@@ -1492,8 +1492,6 @@ def _move_table(
 ) -> None:
     """Give the table at `old` the name `new`, and its partitions and
     children their parent's new name."""
-    if new in tables:
-        return  # Postgres refuses a rename onto a name in use
     builder = tables.pop(old, None)
     if builder is None:
         return
