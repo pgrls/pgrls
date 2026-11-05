@@ -433,7 +433,8 @@ def _exact_real(text: str) -> Any:
     m = re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)(?:[eE]([+-]?\d+))?\s*", text, re.ASCII)
     # A float4 holds nothing past 1e39 or with more digits than its exact
     # subnormals have; `Fraction` would build `1e999999999` exactly first.
-    if m is None or len(m.group(1)) > 200 or abs(int(m.group(2) or 0)) > 200:
+    if (m is None or len(m.group(1)) > 200 or len(m.group(2) or "") > 5
+            or abs(int(m.group(2) or 0)) > 200):
         return None
     exact = fractions.Fraction(text.strip())
     try:
@@ -1696,17 +1697,18 @@ def _anon_binop(
     if arithmetic_fn is not None and (sorts != {z3.IntSort()} or op in ("/", "%")):
         # Off the diff path too, a result Z3 does not compute as Postgres
         # does — on reals (no NaN / ±Infinity, no rounding), `/` and `%`
-        # (Postgres truncates), `+` on text — is a value of its own, the
-        # same for the same expression (the diff path abstained above).
-        if sorts <= {z3.IntSort(), z3.RealSort()}:
-            sort = z3.RealSort() if z3.RealSort() in sorts else z3.IntSort()
-        elif sorts == {z3.StringSort()}:
-            sort = z3.StringSort()
-        else:
+        # (Postgres truncates) — is a fresh value of its own each time
+        # (not keyed by its rendering, which recursed a second time down a
+        # deep chain; a fresh value only frees it further). Arithmetic on anything else — text standing for
+        # a timestamp or an interval, whose order is not text's —
+        # abstains, as the diff path did above.
+        if not sorts <= {z3.IntSort(), z3.RealSort()}:
             return None
+        sort = z3.RealSort() if z3.RealSort() in sorts else z3.IntSort()
         return _Val(
-            value=ctx.opaque(_canon(node), sort),
+            value=ctx.opaque(f"arithmetic#{len(ctx._opaque_vars)}", sort),
             is_null=z3.Or(left.is_null, right.is_null),
+            unset=left.unset or right.unset,
         )
 
     if arithmetic_fn is not None:
@@ -1731,8 +1733,9 @@ def _unlike_sql(op: str, left: Any, right: Any, *, any_session: bool) -> bool:
     column defaults to Bool) that Z3 coerces to 0 / 1 rather than rejects.
 
     On the diff path (`any_session`), where both predicates' readings must be
-    exact for an equivalence or an implication to hold, also (off it, the
-    arithmetic is a value of its own instead, see `_anon_binop`):
+    exact for an equivalence or an implication to hold, also (off it,
+    arithmetic on numbers is a value of its own instead and on text still
+    abstains, see `_anon_binop`):
 
     * arithmetic on anything but integers — Z3's ``+`` on two strings
       concatenates, and its reals have no NaN / ±Infinity and never round;

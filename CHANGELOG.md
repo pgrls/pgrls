@@ -90,11 +90,8 @@ breaking changes — they will be called out in this file.
   `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`,
   which the float reading made an empty range, from PROVEN to LEAK under
   `--mode anon`. A leak found through a decimal no `float4` holds (`… OR n <
-  0.1`) is now unverified, so `verify` exits 0 on it. A time window such as
-  `created_at > now() - interval '7 days'`, unverified before, is now
-  decided, and SEC038 now fires on a policy whose arithmetic sat beside an
-  `auth.uid() IS NULL` disjunct (`a - b > c OR auth.uid() IS NULL`). The
-  cost runs the other way too: like a function call already, such a cast or
+  0.1`) is now unverified, so `verify` exits 0 on it. The cost runs the
+  other way too: like a function call already, such a cast or
   arithmetic beside an `OR` is reported as a conditional LEAK (no witness
   row) even where Postgres admits no row (`… OR (a % 2) = 5`), so a `verify`
   gate that passed can now fail.

@@ -824,16 +824,14 @@ def test_anon_clean_on_string_sorted_arithmetic_no_crash() -> None:
     # (now()/current_setting/an unknown-target cast) and for `col OP col`
     # (both default to StringSort). Before the fix this escaped the
     # operator-application catch and crashed SEC038 (and, via the cli
-    # dispatch loop, the WHOLE lint run). The result is now a value of its
-    # own, so nothing raises: the benign, idiomatic "recent rows" window
-    # policy is not anon-valid.
+    # dispatch loop, the WHOLE lint run). Each predicate must now degrade
+    # to None (untranslatable -> NO-OP), not raise. The headline case is
+    # a benign, idiomatic "recent rows" window policy.
     assert _anon("created_at > now() - interval '7 days'") is None
     assert _anon("created_at <> now() - interval '7 days'") is None
-    # `col OP col` arithmetic (both sides default to StringSort) beside an
-    # `auth.uid() IS NULL` disjunct, TRUE for every anonymous row: a real
-    # total leak, which the arithmetic used to hide.
+    # `col OP col` arithmetic (both sides default to StringSort):
     for op in ("-", "*", "/", "%"):
-        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") == {}, op
+        assert _anon(f"a {op} b > c OR (SELECT auth.uid()) IS NULL") is None, op
 
 
 def test_anon_clean_on_bool_sorted_comparison_no_crash() -> None:
@@ -1093,6 +1091,9 @@ def test_the_provers_do_not_prove_what_a_column_type_decides(using) -> None:
     "tenant_id = auth.uid() OR (f + 0.25 = 0.5 AND f <> 0.25)",
     # Postgres truncates: `-1 % 2` is -1.
     "tenant_id = auth.uid() OR (a % 2) = -1",
+    # Text standing for a timestamp or an interval does not order as text
+    # (`'10 days' < '7 days'` by code point).
+    "tenant_id = auth.uid() OR (now() - created_at > '7 days' AND now() - created_at < '10 days')",
 ])
 def test_arithmetic_z3_does_not_compute_as_postgres_proves_nothing(using) -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
@@ -1105,7 +1106,7 @@ def test_arithmetic_beside_the_identity_keeps_the_proof() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
     for using in ("tenant_id = auth.uid() AND price * 2.5 > 10",
-                  "tenant_id = auth.uid() AND created_at > now() - interval '7 days'"):
+                  "tenant_id = auth.uid() AND " + " + ".join(["f"] + ["0.5"] * 200) + " > 1"):
         assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
         assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
 
@@ -1117,6 +1118,7 @@ def test_a_huge_exponent_is_refused_at_once() -> None:
 
     start = time.monotonic()
     assert _exact_real("1e999999999") is None
+    assert _exact_real("1e" + "9" * 5000) is None  # past int()'s digit limit
     assert _classify("x < 1e999999999", "x < 2e999999999") is None
     assert time.monotonic() - start < 5
 
