@@ -11,9 +11,10 @@ index that matches the predicate exactly:
 
 The fixer walks the policy AST, finds each top-level `FuncCall` that
 wraps a column the rule flags, and renders the call back to SQL
-through `pglast.stream.RawStream`. One CREATE INDEX is emitted per
-distinct (table, expression-text) pair — multiple policies hitting
-the same `lower(email)` collapse to one statement.
+with `ast_utils.exact_sql` (an expression with no SQL that parses
+back to it gets no index). One CREATE INDEX is emitted per distinct
+(table, expression-text) pair — multiple policies hitting the same
+`lower(email)` collapse to one statement.
 
 Only the OUTERMOST `FuncCall` containing the column is emitted: for
 `lower(upper(email))`, the index has to match the full expression
@@ -57,9 +58,8 @@ from typing import Any
 
 from pglast.ast import A_Const, A_Expr, BoolExpr, ColumnRef, FuncCall, Node, String
 from pglast.enums import A_Expr_Kind
-from pglast.stream import RawStream
 
-from pgrls.ast_utils import extract_column_refs, func_name_parts
+from pgrls.ast_utils import exact_sql, extract_column_refs, func_name_parts
 from pgrls.fixers import Fix
 from pgrls.fixers._idents import quote_qualified
 from pgrls.model import Schema, Table, policy_id
@@ -378,8 +378,8 @@ class PERF004Fixer:
                     if ast is None:
                         continue
                     for fc in _top_funccalls_wrapping(ast, table, flagged):
-                        expr_sql = RawStream()(fc)
-                        if expr_sql in seen_expressions:
+                        expr_sql = exact_sql(fc)
+                        if expr_sql is None or expr_sql in seen_expressions:
                             continue
                         seen_expressions.add(expr_sql)
                         out.append(
