@@ -73,14 +73,15 @@ def diagnose(text: str, *, config: Config | None = None) -> list[lsp.Diagnostic]
     unconfigured default is used (every rule at its default severity, no
     allowlists) — the shape a plain `pgrls lint --sql-file` produces.
     """
+    if config is None:
+        config = Config()
     try:
-        schema = schema_from_sql(text)
+        # Scoped by the project's schemas, as `pgrls lint --sql-file` is.
+        schema = schema_from_sql(text, schemas=tuple(config.schemas) or ("public",),
+                                 default_schema="public")
     except SchemaSourceError:
         # Unparseable mid-edit buffer: publish nothing, don't surface an error.
         return []
-
-    if config is None:
-        config = Config()
 
     inert = inert_rule_ids("sql")
     overrides = config.severity_overrides

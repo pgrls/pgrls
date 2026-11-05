@@ -472,3 +472,17 @@ def test_a_pg_dump_buffer_keeps_its_ranges() -> None:
     by_code = {d.code: d for d in diagnose(text)}
     assert by_code["SEC002"].range.start.line == 2
     assert by_code["SEC003"].range.start.line == 4
+
+
+def test_the_lsp_is_scoped_by_the_projects_schemas():
+    from pgrls.config import Config
+    from pgrls.lsp.diagnostics import diagnose
+
+    # As `pgrls lint --sql-file` with the same `[database] schemas`: a
+    # parent outside them is left out, and the child's walk stops there.
+    sql = ("CREATE TABLE a.p (id int) PARTITION BY LIST (id);\n"
+           "ALTER TABLE a.p ENABLE ROW LEVEL SECURITY;\n"
+           "CREATE TABLE b.c PARTITION OF a.p FOR VALUES IN (1);\n")
+    found = [(d.code, d.message) for d in diagnose(sql, config=Config(schemas=["b"]))]
+    assert [code for code, _ in found] == ["SEC001"], found
+    assert "b.c" in found[0][1] and "leaves the scanned schemas" in found[0][1]

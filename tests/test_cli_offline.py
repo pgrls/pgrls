@@ -1745,6 +1745,13 @@ def test_offline_lint_reads_the_configured_schemas(tmp_path):
                                     "--sql-file", str(sql), "--format", "json"])
     locations = {v["location"] for v in json.loads(res.stdout)["violations"]}
     assert "a.p" in locations, res.output
+    # ... without moving an unqualified name out of psql's `public`.
+    (tmp_path / "pgrls.toml").write_text('[database]\nschemas = ["app", "public"]\n')
+    sql.write_text("CREATE TABLE t (id int);\n")
+    res = CliRunner().invoke(main, ["lint", "--config", str(tmp_path / "pgrls.toml"),
+                                    "--sql-file", str(sql), "--format", "json"])
+    locations = {v["location"] for v in json.loads(res.stdout)["violations"]}
+    assert "public.t" in locations and "app.t" not in locations, res.output
 
 
 def test_a_partition_of_a_parent_outside_the_schemas_keeps_its_link():
