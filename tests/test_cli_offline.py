@@ -2031,6 +2031,32 @@ def test_a_setting_that_changes_how_strings_read_is_refused(sql, refused):
         assert "t" in [t.name for t in schema_from_sql(sql).tables]
 
 
+@pytest.mark.parametrize("sql", [
+    # A COPY and a `\\.` line inside a string, a function body or a comment
+    # are no COPY data: only a line pg_dump writes, outside them, is.
+    "CREATE FUNCTION h() RETURNS text LANGUAGE sql AS $$ SELECT 'COPY t FROM stdin;\n1\n\\.\n' $$;\n",
+    "CREATE TABLE u (id int);\nCOMMENT ON TABLE u IS 'Load with psql:\nCOPY u FROM stdin;\n1\n\\.\n';\n",
+    "/* COPY t FROM stdin;\n\\.\n*/\nCREATE TABLE u (id int);\n",
+])
+def test_copy_text_outside_a_dump_with_data_is_read(sql):
+    from pgrls.schema_sources import schema_from_sql
+
+    assert "t" in [t.name for t in schema_from_sql("CREATE TABLE t (id int);\n" + sql).tables]
+
+
+def test_the_copy_data_check_is_linear():
+    import time
+
+    from pgrls.schema_sources import schema_from_sql
+
+    rows = "".join(f"INSERT INTO t VALUES ('ad copy number {i} from the stdin desk');\n"
+                   for i in range(8000))
+    sql = "CREATE TABLE t (a text);\n" + rows + "INSERT INTO t VALUES ('x\n\\.\ny');\n"
+    start = time.monotonic()
+    schema_from_sql(sql)
+    assert time.monotonic() - start < 10
+
+
 def test_harmless_psql_commands_are_skipped():
     from pgrls.schema_sources import schema_from_sql
 

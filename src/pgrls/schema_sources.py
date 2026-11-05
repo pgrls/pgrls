@@ -409,10 +409,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     `schema_source_warnings` names them so the caller doesn't mistake their
     silence for a clean bill of health.
     """
-    # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
-    # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
-    # are not SQL; each is blanked so offsets into `sql` still hold.
-    if re.search(r"(?m)^\\\.[ \t\r]*$", sql) and re.search(r"(?is)\bCOPY\b.*?\bFROM\s+stdin\b", sql):
+    if _holds_copy_data(sql):
         # Before anything reads its rows (a `\\N` NULL, an apostrophe) as SQL.
         raise SchemaSourceError(
             "bad_sql",
@@ -422,6 +419,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     if "\x00" in sql:
         # pglast stops at a NUL; psql drops only the rest of that line.
         raise SchemaSourceError("bad_sql", "the SQL holds a NUL character.")
+    # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
+    # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
+    # are not SQL; each is blanked so offsets into `sql` still hold.
     sql, commands = _split_psql_meta_commands(sql)
     connects = _check_psql_meta_commands(commands)
     # The last one: psql ends statements by its own rules (a `begin` in a
@@ -1038,6 +1038,23 @@ _DATABASE_LEVEL_STATEMENTS = frozenset({
     "AlterDatabaseSetStmt", "AlterOwnerStmt", "CommentStmt", "DropdbStmt",
     "AlterRoleSetStmt",
 })
+
+
+def _holds_copy_data(sql: str) -> bool:
+    """Whether `sql` is a dump with data: a line `COPY … FROM stdin;`, as
+    pg_dump writes it, outside any string or comment (the text before it
+    lexes whole), and a `\\.` line after it."""
+    for i, m in enumerate(re.finditer(r"(?im)^COPY\b[^;\n]*\bFROM\s+stdin\b[^\n]*$", sql)):
+        if i == 3:  # a dump's first COPY is the real one
+            return False
+        if not re.search(r"(?m)^\\\.[ \t\r]*$", sql[m.end():]):
+            return False
+        try:
+            pglast.parser.scan(_without_psql_meta_commands(sql[:m.start()]))
+        except pglast.parser.ParseError:
+            continue
+        return True
+    return False
 
 
 def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
