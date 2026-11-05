@@ -135,12 +135,12 @@ breaking changes — they will be called out in this file.
   value whose type the text does not show (a function's result, a
   sub-select) decides nothing when it is read two ways, one in a `COALESCE`
   or `CASE` arm (which takes the arms' common type) never matching a direct
-  read of it. The offline model now follows `ALTER COLUMN … TYPE`, into the
-  table's partitions and inheritance children (`ATTACH PARTITION` and
-  `INHERIT` ones too, not ones `DETACH`ed or `NO INHERIT`ed, through a
-  rename of the parent), and a
-  re-`CREATE` (`unknown` where an `IF NOT EXISTS` may have skipped, or
-  `LIKE` copies), so the type is the one the migration leaves. A column's
+  read of it. The offline model now replays, in statement
+  order, what changes a column's type (`CREATE`, a `PARTITION OF` /
+  `INHERITS` parent's columns, `DROP`, `RENAME`, `ADD` / `DROP` / `RENAME
+  COLUMN`, `ALTER COLUMN … TYPE` into the partitions and children attached
+  then, `ATTACH` / `DETACH` / `INHERIT` / `NO INHERIT`; a `LIKE` copy is
+  `unknown`), so the type is the one the migration leaves. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
   ci`) compares strings otherwise, which the diff does not see, as on
   `main`. Without column types (a snapshot from before they were captured)
