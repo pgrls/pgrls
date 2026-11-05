@@ -2260,6 +2260,15 @@ def test_harmless_psql_commands_are_skipped():
                'CREATE TABLE t (id int);\n')
         assert [t.name for t in schema_from_sql(sql).tables] == ["t"], name
     assert [t.name for t in schema_from_sql("\ufeffCREATE TABLE t (id int);\n").tables] == ["t"]
+    # ... and its conninfo form for any other name, conninfo-escaped inside
+    # psql's double quotes.
+    for name, written in (("my:app", "my:app"), ('a"b', 'a""b'), ("it's", "it\\'s"),
+                          ("back\\slash", "back\\\\slash")):
+        quoted = name.replace('"', '""')
+        sql = (f'CREATE DATABASE "{quoted}";\n'
+               f'\\connect -reuse-previous=on "dbname=\'{written}\'"\n'
+               'CREATE TABLE t (id int);\n')
+        assert [t.name for t in schema_from_sql(sql).tables] == ["t"], name
     # A script's settings of psql's own error and output handling.
     sql = "\\set ON_ERROR_STOP on\n\\set QUIET\nCREATE TABLE t (id int);\n"
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
@@ -2278,3 +2287,15 @@ def test_harmless_psql_commands_are_skipped():
            "CREATE TABLE t (id int);\n")
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
 
+
+
+def test_each_sql_file_may_open_with_a_byte_order_mark(tmp_path):
+    from pgrls.cli import main
+
+    # psql skips the BOM of each file it reads.
+    (tmp_path / "001.sql").write_text("CREATE TABLE public.a (id int);\n")
+    (tmp_path / "002.sql").write_bytes(b"\xef\xbb\xbfCREATE TABLE public.b (id int);\n")
+    res = CliRunner().invoke(main, ["lint", "--sql-file", str(tmp_path / "001.sql"),
+                                    "--sql-file", str(tmp_path / "002.sql"), "--format", "json"])
+    locations = {v["location"] for v in json.loads(res.stdout)["violations"]}
+    assert {"public.a", "public.b"} <= locations, res.output

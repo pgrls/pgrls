@@ -1003,6 +1003,8 @@ def _resolve_offline_schema(
                     raise ToolError(
                         f"cannot read --sql-file {entry!r}: {exc}"
                     ) from exc
+            # psql skips a byte-order mark opening each file it reads.
+            chunk = chunk.removeprefix("\ufeff")
             total += len(chunk.encode("utf-8"))
             if total > _OFFLINE_MAX_BYTES:
                 raise ToolError(

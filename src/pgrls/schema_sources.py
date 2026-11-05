@@ -1679,13 +1679,18 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
         connect = name in ("c", "connect")
         target = None
         if connect and (c := re.fullmatch(
-            r'([^\s"\'=:\-][^\s"\'=:]*)|"((?:[^"\\=:]|"")+)"'
-            r'|-reuse-previous=on "dbname=\'([^\'"\\:]*)\'"',
-            rest,
+            r'([^\s"\'=:\-][^\s"\'=:]*)|"((?:[^"\\=:]|"")+)"', rest,
         )):
             # psql takes a double-quoted name as it is (`""` a quote); one
-            # holding `=` would be a conninfo string.
-            target = c.group(1) or (c.group(2) or "").replace('""', '"') or c.group(3)
+            # holding `=` or a URI's `:` would be a conninfo string.
+            target = c.group(1) or (c.group(2) or "").replace('""', '"')
+        elif connect and (c := re.fullmatch(r'-reuse-previous=on "((?:[^"]|"")*)"', rest)):
+            # pg_dump's form for any other name: a conninfo string whose one
+            # keyword is the name, quoted as conninfo quotes (`\'`, `\\`)
+            # inside psql's double quotes; psql reads no variable there.
+            value = re.fullmatch(r"dbname='((?:[^'\\]|\\.)*)'", c.group(1).replace('""', '"'))
+            if value is not None:
+                target = re.sub(r"\\(.)", r"\1", value.group(1))
         known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
             name == "encoding"
             and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
@@ -1697,7 +1702,8 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
                 r"(\s+[A-Za-z0-9_]+)?", rest) is not None
         )
         # psql reads a line to its LF: a CR is part of the command's arguments.
-        if m is None or "\\" in rest or "`" in rest or "\r" in rest or not known:
+        if m is None or ("\\" in rest and not (connect and target is not None)) \
+                or "`" in rest or "\r" in rest or not known:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "
