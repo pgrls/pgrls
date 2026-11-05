@@ -55,15 +55,14 @@ def _or_clauses(node: Any) -> list[Any]:
 
 def _canon(node: Any) -> str:
     """Canonicalize a pglast node to a stable SQL string via RawStream."""
-    # pglast v6 (the pinned range) ships without type stubs, so
-    # mypy --strict treats `RawStream()(node)` as `Any -> Any`.
-    # The explicit `: str` annotation on the local pins the
-    # boundary — a real type error elsewhere in the file still
-    # surfaces, while the unavoidable Any-leak from pglast is
-    # absorbed locally without a per-call `# type: ignore`. If
-    # pglast ever ships `py.typed` (or this project pins to a
-    # typed v7+), the annotation simply becomes a redundant
-    # narrow and mypy stays happy.
+    # pglast is treated as untyped (see the mypy override in
+    # pyproject.toml), so mypy --strict treats `RawStream()(node)`
+    # as `Any -> Any`. The explicit `: str` annotation on the local
+    # pins the boundary — a real type error elsewhere in the file
+    # still surfaces, while the unavoidable Any-leak from pglast is
+    # absorbed locally without a per-call `# type: ignore`. If the
+    # mypy override is ever dropped, the annotation simply becomes
+    # a redundant narrow and mypy stays happy.
     rendered: str = RawStream()(node)
     return rendered
 

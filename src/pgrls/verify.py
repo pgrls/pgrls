@@ -1995,7 +1995,7 @@ _SQL_RUNNING_BUILTINS: frozenset[str] = frozenset({
     "ts_stat", "ts_rewrite",
 })
 
-# Operator symbols pg_catalog ships on PG15–17 (the same 74 on each, read from
+# Operator symbols pg_catalog ships on PG15–18 (the same 74 on each, read from
 # pg_operator), plus the distance operators pgvector adds (`<#>`, `<=>`, `<+>`,
 # `<~>`, `<%>`; its `<->` is also a pg_catalog symbol), which compute a
 # distance and read no table. Any other symbol, or one schema-qualified

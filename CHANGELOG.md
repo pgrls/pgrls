@@ -28,12 +28,16 @@ breaking changes — they will be called out in this file.
     PostgREST pre-request hook copies such a value — or one from a table the
     session can write — into), and no auth function it calls reads a table
     the session can write or whose own row security it can steer — following
-    SQL and PL/pgSQL bodies, views to their tables, and what those tables'
-    policies read in turn, with an unresolvable relation or unreadable body
-    counting against it. A login session must also have no pre-16
-    CREATEROLE, read no setting it can set for itself, and be unable to
-    redefine or shadow what the filter calls (owned functions or relations, CREATE on a schema or the
-    database, a helper reading a table by bare name without `pg_temp` last);
+    SQL and PL/pgSQL bodies (whatever their return type, though one that
+    assigns to — or reads `INTO` — one of its parameters or `RETURNS
+    TABLE` columns is still unreadable, and one that declares an `ALIAS
+    FOR $n` can be — only the body is captured), views to their tables, and what those
+    tables' policies read in turn, with an unresolvable relation or
+    unreadable body counting against it. A login session must also have
+    no pre-16 CREATEROLE, read no setting it can set for itself, and be
+    unable to redefine or shadow what the filter calls (owned functions or
+    relations, CREATE on a schema or the database, a helper reading a table
+    by bare name without `pg_temp` last);
     the owner of an untraced door the session can open counts toward these
     for every column.
   - `LEAK` — the role's own session reads such a row, shown when one
@@ -54,8 +58,68 @@ breaking changes — they will be called out in this file.
   `proof_summary`. `--auth-function` names a project's own auth helper.
   SELECT only; the exit code stays 0. `examples/proven-access-map/` runs it
   end to end.
+- **PostgreSQL 18 and pglast 8.** CI now tests against PostgreSQL 15, 16,
+  17 and 18, and the dependency pin allows pglast 7.20+ or 8.6+ (pglast
+  8.3 / 8.4 return invalid JSON for a trigger function's body, and 8.5's
+  deparser still has bugs 8.6 fixed; CI tests pglast 7 on PostgreSQL 17
+  and pglast 8 on every version). pglast 8 parses the
+  PG18 grammar, so reading PG18-only DDL offline (`--sql-file`,
+  `pgrls pr`) needs it: `pip install -U pgrls pglast` on an existing
+  install. On pglast 8:
+  - `pgrls matrix` still counts a door's `RETURNING` (on `INSERT` /
+    `UPDATE` / `DELETE`) as a read — pglast 8 moved it into a new
+    `ReturningClause` node;
+  - a PL/pgSQL function that names a type qualified with a schema other than
+    `pg_catalog` / `public` (a parameter or return type, which
+    `pg_get_functiondef` qualifies when the type is off the search_path,
+    or a `DECLARE`), that has a VARIADIC parameter, or that puts a variable
+    or parameter of a type pglast 8 does not know (an enum, a domain) among
+    several `INTO` or `FOR` targets, is read rather than listed as
+    untraced: pgrls drops the qualifier, reads VARIADIC as a plain
+    parameter and declares such a variable or parameter `text` — none of
+    which changes which SQL the body runs;
+  - a PL/pgSQL body with `#option dump` is listed as untraced (pglast 8
+    prints its parse tree to stdout);
+  - the DB-free sources (`--sql-file`, `snapshot --sql-file`, `pgrls pr`,
+    the MCP and LSP servers) read PG18's table-level `NOT NULL c` and
+    `ADD CONSTRAINT … NOT NULL`. A named `ADD CONSTRAINT … NOT NULL …
+    NOT VALID` stays nullable until `VALIDATE CONSTRAINT` or `SET NOT NULL`,
+    as on a live database; an unnamed `ADD NOT NULL c NOT VALID` stays
+    nullable until `SET NOT NULL` (pgrls does not follow a `VALIDATE` of
+    its generated name, so SEC030 errs toward firing); and an `INHERITS`
+    child does not get a parent's `NOT NULL … NO INHERIT`. Constraint
+    names are tracked erring toward nullable: a renamed constraint's new
+    name also reaches any other table holding the old one, since pgrls
+    does not follow `ALTER TABLE … INHERIT`.
 
 ### Fixed
+- **`pgrls matrix` no longer misses SQL in a PL/pgSQL record variable's
+  default or an assignment target's subscript.** pglast leaves the default of a
+  variable it models as a record out of the parse — a `record` on either
+  major, and on pglast 8 also any type it does not know (an enum, a domain,
+  a composite) — so a door that read a table only in
+  `DECLARE r record := (SELECT … FROM t)` showed no reach of `t`. pgrls now
+  reads such a default from the declaration itself, once the PL/pgSQL
+  parser confirms where each declaration starts and ends; a door whose
+  record declarations it cannot read is listed as untraced, with the
+  reason. pgrls also discarded the subscript of an assignment target
+  (`a[(SELECT …)] := 1`); it is now read too.
+- **DB-free sources: `ALTER TABLE … ADD PRIMARY KEY` marks its columns
+  NOT NULL, and `DROP CONSTRAINT` of a NOT NULL makes its column nullable
+  again** — whether the constraint was named on the table, inherited from
+  a parent, renamed, or auto-named `<table>_<column>_not_null`
+  (PostgreSQL 18 stores a NOT NULL as a constraint). A parent's drop still
+  does not reach its children offline, as before. The DB-free sources
+  ignored both, so SEC030 flagged a primary-key column or missed a column
+  whose NOT NULL was dropped.
+- **DB-free sources: a renamed parent keeps its partitions and `INHERITS`
+  children.** `ALTER TABLE <parent> RENAME TO …` left each child pointing
+  at the old name, so SEC001 reported a partition whose renamed parent
+  enforces RLS as having an ancestor outside the scanned schemas.
+- **SEC030 on PostgreSQL 18: a `NOT VALID` NOT NULL column now counts as
+  nullable.** Postgres 18 sets `attnotnull` for such a constraint while
+  existing NULLs stay in the table, so pgrls read the column as not-nullable
+  and SEC030 (and its `pgrls fix`) missed a nullable tenant column.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
