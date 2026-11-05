@@ -539,7 +539,9 @@ def _ordered_truth(op: str, left: Any, right: Any, ctx: _Context,
     its own over the two, the same one wherever the same two are compared,
     either way round, so a clause both sides share cancels and `=` → `>=`
     is a loosening. Exactly one of `<`, `=`, `>` holds, as in any btree
-    type's order (NaN included)."""
+    type's order (NaN included); a type with no btree order may break it
+    (`lseg`'s `=` compares endpoints, its `<` lengths), as on `main`, which
+    read such a pair through Z3's own order."""
     lhs, rhs = _canon(left), _canon(right)
     if lhs > rhs:
         lhs, rhs, op = rhs, lhs, _MIRRORED.get(op, op)
