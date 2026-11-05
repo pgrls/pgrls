@@ -569,6 +569,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         index for index, raw in enumerate(statements)
         if isinstance(raw.stmt, (_pgast.DropStmt, _pgast.DropOwnedStmt))
         or (isinstance(raw.stmt, _pgast.RenameStmt) and raw.stmt.relation is not None)
+        or _runs_code(raw.stmt)  # a DROP in a DO block, a procedure, a function
     ]
 
     def gone_between(after: int, before: int) -> bool:
@@ -791,6 +792,8 @@ def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
             continue
         resolver.track(stmt)
         resolver.qualify(stmt)
+        if _runs_code(stmt):
+            resolver.code_ran = True
         out.append(_Stmt(stmt, raw))
     return out
 
@@ -884,6 +887,9 @@ class _Resolver:
         self.in_transaction = False
         self.inherited = False
         self.inherited_role = False
+        # Code ran (a DO block, a CALL, a function): it may have dropped a
+        # relation the model still has.
+        self.code_ran = False
         self.started = False
         self.override: list[str] = []
 
@@ -1089,9 +1095,18 @@ class _Resolver:
     def find(self, name: str) -> tuple[str, bool]:
         """The schema a reference to `name` finds it in, and whether it is
         one the SQL created (else where a CREATE would go)."""
+        entries = list(self._entries())
+        if self.code_ran and (name in self.temp) + sum(
+                (entry, name) in self.relations for entry in entries) > 1:
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL runs code (a DO block, a CALL, a function) that may have "
+                f"dropped a relation, and then names {name!r}, which resolves to "
+                f"another one if it did; pgrls cannot tell which. Qualify the name.",
+            )
         if name in self.temp:
             return _NOWHERE, True
-        for entry in self._entries():
+        for entry in entries:
             if (entry, name) in self.relations:
                 return entry, True
         return self.create_schema(), False
@@ -1219,6 +1234,18 @@ def _drops_on_commit(stmt: Any) -> bool:
     on_commit = (stmt.oncommit if isinstance(stmt, _pgast.CreateStmt)
                  else getattr(getattr(stmt, "into", None), "onCommit", None))
     return bool(on_commit == OnCommitAction.ONCOMMIT_DROP)
+
+
+def _runs_code(stmt: Any) -> bool:
+    """Whether `stmt` runs code pgrls does not see into: a `DO` block, a
+    `CALL`, an `EXECUTE`, or a call of a function not `pg_catalog.`-named
+    (pg_dump's own) in a statement that runs it now."""
+    if isinstance(stmt, (_pgast.DoStmt, _pgast.CallStmt, _pgast.ExecuteStmt)):
+        return True
+    return not _only_defines(stmt) and any(
+        isinstance(n, _pgast.FuncCall)
+        and not (ast_utils.func_name_parts(n)[0] or "").startswith("pg_catalog.")
+        for n in _subnodes(stmt))
 
 
 def _only_defines(stmt: Any) -> bool:
@@ -1465,12 +1492,12 @@ def _move_table(
 ) -> None:
     """Give the table at `old` the name `new`, and its partitions and
     children their parent's new name."""
+    if new in tables:
+        return  # Postgres refuses a rename onto a name in use
     builder = tables.pop(old, None)
     if builder is None:
         return
     builder.schema, builder.name = new
-    # A rename onto an occupied name cannot happen in valid DDL; if the input
-    # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder
     for other in tables.values():
         if other.partition_of == old:

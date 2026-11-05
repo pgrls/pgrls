@@ -110,8 +110,10 @@ breaking changes — they will be called out in this file.
   (one created again after it is a table of its own, a `CREATE TABLE … AS`
   too, which a DROP before it removed; a `CREATE … IF NOT EXISTS` of it
   changes nothing when no DROP (a `CASCADE` of a function, type, access
-  method or extension can take a table too), `DROP OWNED` or rename of a
-  relation lies between, which could have taken it), and it
+  method or extension can take a table too), `DROP OWNED`, rename of a
+  relation or code — a `DO` block, a `CALL`, a function called — lies
+  between, which could have taken it; after such code a name that would
+  resolve to another relation if one was dropped is refused), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's

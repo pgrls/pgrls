@@ -1699,7 +1699,9 @@ def test_a_create_if_not_exists_of_a_table_there_does_not_undo_a_detach():
     # taken, or a CREATE TABLE ... AS of the name.
     for gone in ("DROP TABLE public.top;\n", "DROP TYPE ty CASCADE;\n", "DROP EXTENSION hstore;\n",
                  "ALTER INDEX public.c RENAME TO d;\n", "DROP ACCESS METHOD heap2 CASCADE;\n",
-                 "DROP FUNCTION f(int) CASCADE;\n"):
+                 "DROP FUNCTION f(int) CASCADE;\n",
+                 # Code may drop it too.
+                 "DO $$ BEGIN DROP TABLE public.c; END $$;\n", "CALL dr();\n", "SELECT dr();\n"):
         sql = ("CREATE TABLE public.top (k int) PARTITION BY LIST (k);\n"
                "CREATE TABLE public.p PARTITION OF public.top FOR VALUES IN (1) PARTITION BY LIST (k);\n"
                "CREATE TABLE public.c (k int);\n"
@@ -1972,6 +1974,13 @@ def test_a_temporary_table_still_there_still_hides_the_name(kept):
     ("CREATE SCHEMA AUTHORIZATION CURRENT_USER;\n", "connects as"),
     ("CREATE SCHEMA AUTHORIZATION SESSION_USER CREATE TABLE x (id int);\n", "connects as"),
     ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
+    # After code that may have dropped one of two tables a name could find.
+    ("CREATE TABLE app.c (k int);\nCREATE TABLE public.c (k int);\nSET search_path = app, public;\n"
+     "DO $$ BEGIN DROP TABLE app.c; END $$;\nALTER TABLE c DISABLE ROW LEVEL SECURITY;\n",
+     "runs code"),
+    ("CREATE TABLE public.c (k int);\nCREATE TEMP TABLE c (k int);\n"
+     "DO $$ BEGIN DROP TABLE IF EXISTS pg_temp.c; END $$;\nALTER TABLE c DISABLE ROW LEVEL SECURITY;\n",
+     "runs code"),
     # A transaction still open at a \\connect is rolled back there.
     ("BEGIN;\nCREATE DATABASE d;\n\\connect d\nCREATE TABLE x (id int);\n", "transaction"),
     ("CREATE DATABASE d;\nBEGIN;\n\\connect d\nALTER DATABASE d SET search_path TO app;\n"
