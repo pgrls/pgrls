@@ -524,9 +524,22 @@ def _floats_meet(left: Any, right: Any) -> bool:
 
 
 def _floatish(node: Any) -> bool:
-    return any(isinstance(n, TypeCast)
-               and _typename_last_segment(n.typeName) in ("float4", "float8")
+    """Whether `node` holds a value of a float type: a float cast, or a
+    built-in that returns one (for some argument type)."""
+    return any((isinstance(n, TypeCast)
+                and _typename_last_segment(n.typeName) in ("float4", "float8"))
+               or (isinstance(n, FuncCall) and func_name_parts(n)[1] in _FLOAT_FUNCTIONS)
                for n in _ast_nodes(node))
+
+
+# Built-ins that return a float for some argument type.
+_FLOAT_FUNCTIONS = frozenset({
+    "pi", "sqrt", "cbrt", "power", "pow", "exp", "ln", "log", "log10", "float4", "float8",
+    "date_part", "degrees", "radians", "sin", "cos", "tan", "cot", "asin", "acos", "atan",
+    "atan2", "sind", "cosd", "tand", "cotd", "asind", "acosd", "atand", "atan2d", "sinh",
+    "cosh", "tanh", "asinh", "acosh", "atanh", "random", "random_normal", "erf", "erfc",
+    "to_timestamp", "extract",
+})
 
 
 def _real_integer(number: int, ctx: _Context) -> Any:
@@ -1782,6 +1795,12 @@ def _anon_coalesce(
     defaults to; with no sibling to give one, the caller keeps the COALESCE
     opaque."""
     args = list(node.args or ())
+    if sum(_floatish(a) or any(isinstance(n, ColumnRef) for n in _ast_nodes(a))
+           for a in args) > 1:
+        # Two columns (or a column and a float): Postgres gives the
+        # COALESCE the type of either (a float column's), rounding the
+        # other, which the text does not show.
+        return None
     if any(_has_lossy_cast(a) for a in args):
         # Postgres gives every argument the float type a cast gives one,
         # rounding a column's value too (`COALESCE(id, 0::real)`).
@@ -1951,7 +1970,12 @@ def _anon_any_array(
     if not elements:
         return None
     if any(_has_lossy_cast(e) for e in elements) or (
-            node.kind == A_Expr_Kind.AEXPR_IN and _has_lossy_cast(node.lexpr)):
+            node.kind == A_Expr_Kind.AEXPR_IN and _has_lossy_cast(node.lexpr)) or (
+            # An array takes one type from its elements, a column's too
+            # (`ARRAY[a + 0, 1]` is a float8[] for a float `a`), rounding
+            # the left side; an `IN` list compares one with each.
+            isinstance(arr, A_ArrayExpr)
+            and any(isinstance(n, ColumnRef) for e in elements for n in _ast_nodes(e))):
         # The list takes the float type a cast gives one element (or, for
         # `IN`, its left side), rounding the others: `IN (16777217, 1::real)`
         # is a `real[]`.

@@ -94,9 +94,11 @@ breaking changes — they will be called out in this file.
   `col > -1`). A `COALESCE`, `IN` list or array with a float cast in it
   (`COALESCE(id, 0::real)`, `IN (16777217, 1::real)`, or one in a sub-select
   or float arithmetic), which Postgres gives that float type, rounding its
-  column and its integers too, decides nothing, and so does a comparison of
-  a column with a float (`a = 1::float8` reads a `numeric` `a` through a
-  double): off the diff path it is a truth of its own.
+  column and its integers too, decides nothing, and so does a `COALESCE` of
+  two columns (one may be a float column, whose type the other then
+  takes), an array with a column in it, and a comparison of a column with
+  a float (`a = 1::float8` or `a = pi()` reads a `numeric` `a` through a
+  double): off the diff path that comparison is a truth of its own.
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text

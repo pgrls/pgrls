@@ -460,6 +460,12 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      ) is None
     assert prove_cross_tenant_isolation(parse_expr(
         "tenant_id = auth.uid() AND amount > 0.5::float8"))[0] == "isolated"
+    # ... and so does one with two values of its own (a float column's type
+    # rounds the other), a float built-in, and an array with a column in it.
+    assert _classify("x <= 1", "COALESCE(x, f, 1) <= 1 AND x IS NOT NULL") is None
+    for using in ("COALESCE(x, a + 0) = 1 AND x > 1", "a = pi() AND b = pi() AND a <> b",
+                  "x = ANY(ARRAY[a + 0, 1]) AND x > 1 AND (a + 0) IS NULL"):
+        assert prove_anon_isolation(parse_expr(using))[0] != "isolated", using
     # The integer check reads an exact cast of an integer as that integer.
     assert _classify("a IN (16777217, 1) AND a > 0::numeric",
                      "a IN (16777217, 1) AND a >= 0::numeric") is None
