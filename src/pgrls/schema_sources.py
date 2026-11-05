@@ -607,14 +607,19 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             _apply_grant(stmt, tables, default_schema)
         elif kind == "RenameStmt":
             _apply_rename(stmt, tables, default_schema)
+        elif kind == "AlterObjectSchemaStmt":
+            _apply_set_schema(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
 
-    # Live lint sees a partition whose parent is outside the linted schemas
-    # as one with no parent in scope, and lints it on its own.
-    for builder in tables.values():
-        if builder.partition_of is not None and builder.partition_of[0] not in schemas:
-            builder.partition_of = None
-    return Schema(tables=tuple(b.build() for b in tables.values()))
+    # Live lint does not see a table outside the linted schemas: a partition
+    # keeps its link to such a parent, and its ancestor walk stops there.
+    unseen: set[tuple[str, str]] = set()
+    for key in [k for k in tables if k[0] in schemas]:
+        up = tables[key].partition_of
+        while up is not None and up in tables and up[0] not in schemas:
+            unseen.add(up)
+            up = tables[up].partition_of
+    return Schema(tables=tuple(b.build() for k, b in tables.items() if k not in unseen))
 
 
 class _TableBuilder:
@@ -733,14 +738,40 @@ def _apply_rename(
     newname = getattr(stmt, "newname", None)
     if old is None or not newname:
         return
+    _move_table(tables, old, (old[0], newname))
+
+
+def _apply_set_schema(
+    stmt: Any,
+    tables: dict[tuple[str, str], _TableBuilder],
+    default_schema: str,
+) -> None:
+    """Apply `ALTER TABLE <t> SET SCHEMA <s>`."""
+    if getattr(stmt, "objectType", None) != ObjectType.OBJECT_TABLE or not stmt.newschema:
+        return
+    old = _relation_key(stmt.relation, default_schema)
+    if old is not None:
+        _move_table(tables, old, (stmt.newschema, old[1]))
+
+
+def _move_table(
+    tables: dict[tuple[str, str], _TableBuilder],
+    old: tuple[str, str],
+    new: tuple[str, str],
+) -> None:
+    """Give the table at `old` the name `new`, and its partitions and
+    children their parent's new name."""
     builder = tables.pop(old, None)
     if builder is None:
         return
-    new = (old[0], newname)
-    builder.name = newname
+    builder.schema, builder.name = new
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder
+    for other in tables.values():
+        if other.partition_of == old:
+            other.partition_of = new
+        other.inherits = [new if p == old else p for p in other.inherits]
 
 
 def _merge_grants(grants: list[Grant]) -> tuple[Grant, ...]:
@@ -921,9 +952,11 @@ def _apply_alter_table(
             # this the child looked like a standalone table with RLS off.
             child = tables.get(_relation_key(
                 getattr(getattr(cmd, "def_", None), "name", None), default_schema) or ("", ""))
-            # Only the child as it stood then: one created later (after a DROP,
-            # or before which the ATTACH failed) is a table of its own.
-            if child is not None and child.created_at <= stmt_index:
+            # Only the child and parent as they stood then: one created later
+            # (after a DROP, or before which the ATTACH failed) is a table of
+            # its own.
+            if (child is not None and child.created_at <= stmt_index
+                    and builder.created_at <= stmt_index):
                 if subtype == AlterTableType.AT_AttachPartition:
                     child.partition_of = key
                 elif child.partition_of == key:

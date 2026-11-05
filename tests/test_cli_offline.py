@@ -1687,16 +1687,32 @@ def test_an_attach_reaches_only_the_child_as_it_stood():
         "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n"
         "ALTER TABLE ONLY p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);\n"
         "CREATE TABLE c (id int);\n",
+        # ... and so is one attached to a parent that does not exist yet.
+        "CREATE TABLE c (id int);\n"
+        "ALTER TABLE ONLY p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);\n"
+        "CREATE TABLE p (id int) PARTITION BY RANGE (id);\n",
     ):
         parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
         assert parents["c"] is None, sql
 
 
-def test_a_partition_of_a_parent_outside_the_schemas_stands_alone():
+def test_a_partition_follows_its_parent_renamed_or_moved():
     from pgrls.schema_sources import schema_from_sql
 
-    # Live lint of `public` cannot see `s.p`, so it lints `public.c` (RLS
-    # off) on its own; so does the offline model, whichever form the SQL uses.
+    attach = ("CREATE TABLE a.p (id int) PARTITION BY RANGE (id);\nCREATE TABLE a.c (id int);\n"
+              "ALTER TABLE ONLY a.p ATTACH PARTITION a.c FOR VALUES FROM (0) TO (10);\n")
+    schema = schema_from_sql(attach + "ALTER TABLE a.p RENAME TO q;\n", schemas=("a",))
+    assert {t.qualified_name: t.partition_of for t in schema.tables}["a.c"] == ("a", "q")
+    schema = schema_from_sql(attach + "ALTER TABLE a.p SET SCHEMA b;\n", schemas=("a", "b"))
+    assert {t.qualified_name: t.partition_of for t in schema.tables}["a.c"] == ("b", "p")
+
+
+def test_a_partition_of_a_parent_outside_the_schemas_keeps_its_link():
+    from pgrls.schema_sources import schema_from_sql
+
+    # Live lint of `public` does not see `s.p`: `public.c` keeps its link
+    # and its ancestor walk stops there; the offline model leaves `s.p` out,
+    # whichever form the SQL uses.
     for sql in (
         "CREATE SCHEMA s;\nCREATE TABLE s.p (id int) PARTITION BY RANGE (id);\n"
         "ALTER TABLE s.p ENABLE ROW LEVEL SECURITY;\nCREATE TABLE public.c (id int);\n"
@@ -1706,7 +1722,7 @@ def test_a_partition_of_a_parent_outside_the_schemas_stands_alone():
         "CREATE TABLE public.c PARTITION OF s.p FOR VALUES FROM (0) TO (10);\n",
     ):
         tables = {t.qualified_name: t for t in schema_from_sql(sql, schemas=("public",)).tables}
-        assert tables["public.c"].partition_of is None
+        assert tables["public.c"].partition_of == ("s", "p") and "s.p" not in tables
         both = {t.qualified_name: t
                 for t in schema_from_sql(sql, schemas=("public", "s")).tables}
         assert both["public.c"].partition_of == ("s", "p")
