@@ -338,8 +338,11 @@ def test_typecast_to_text_of_string_literal_is_semantic_equivalent():
     # both sides reduce to the same Z3 expression.
     # (v0.4.0/v0.4.1 returned None.)
     assert (
-        _classify("col = 'a'::text", "col = 'a'") == "semantic_equivalent"
+        _classify("col = 'a'::text AND n = 1", "col = 'a'::text") == "semantic_loosened"
     )
+    # Against the bare `'a'` it is no change only for a text column: a
+    # `citext` or `char(n)` one compares `'a'::text` as text, `'a'` as itself.
+    assert _classify("col = 'a'::text", "col = 'a'") is None
 
 
 def test_typecast_to_int_of_int_literal_is_semantic_equivalent():
@@ -533,6 +536,20 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      "lvl <= current_setting('a.b')::int") == "semantic_loosened"
     assert _classify("t >= current_setting('a.b')::int OR t = 1",
                      "NOT (t < current_setting('a.b')::int) OR t = 1") == "semantic_equivalent"
+    # A column read against a typed string (`'A'::text`, `(SELECT 'A')`,
+    # `COALESCE('A', '')`, a typed list member) and a bare one compares as text
+    # in one and as itself (`citext`, `char(n)`) in the other.
+    for base, head in (("email = ANY (ARRAY['A'::text])", "email = 'A'"),
+                       ("email IN ('A', 'b'::text)", "email IN ('A', 'b')"),
+                       ("email = (SELECT 'A')", "email = 'A'"),
+                       ("email = COALESCE('A', '')", "email = 'A'"),
+                       ("COALESCE(email, ''::text) = 'A'", "COALESCE(email, '') = 'A'"),
+                       ("x = 'a'", "x = ANY(ARRAY['a'::text, 'A'::text])")):
+        assert _classify(base, head) is None, (base, head)
+    # Read one way on both sides, a change still decides.
+    assert _classify("status = ANY (ARRAY['active'::text])",
+                     "status = ANY (ARRAY['active'::text, 'trial'::text])") == "semantic_loosened"
+    assert _classify("status = 'a'", "status IN ('a', 'b')") == "semantic_loosened"
     # `x = ANY(ARRAY['US '])` compares as text (a `text[]`), `x = 'US '` as
     # `x`'s type: a `char(n)` or `citext` `x` reads them differently.
     for left in ("code::bpchar", "email::citext", "code"):
@@ -1355,7 +1372,8 @@ def test_a_guc_value_postgres_would_not_read_is_not_folded() -> None:
 
 def test_a_value_keeping_cast_still_translates() -> None:
     assert _classify("a = '5'::int", "a = 5") == "semantic_equivalent"
-    assert _classify("t = 'x'::text", "t = 'x'") == "semantic_equivalent"
+    assert _classify("t = 'x'::text AND n = 1", "t = 'x'::text AND n = 1 AND m = 2") == (
+        "semantic_tightened")
 
 
 def test_a_leaking_row_keeps_a_policys_backslash() -> None:

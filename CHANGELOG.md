@@ -120,7 +120,14 @@ breaking changes — they will be called out in this file.
   `current_setting(…)::bigint` in a sub-select needs review, as on `main`.
   So does `x = ANY(ARRAY['US '])` with a bare string literal (or a cast
   that may change `x`): the literals make a `text[]`, so a `char(n)` or
-  `citext` `x` compares as text there and as itself in `x = 'US '`.
+  `citext` `x` compares as text there and as itself in `x = 'US '`; and a
+  diff that compares one column with a typed string (`'A'::text`,
+  `(SELECT 'A')`, `COALESCE('A', '')`, a typed list member, a function's
+  result) and with a bare literal (`email = 'A'`) decides nothing, for the
+  same reason — `col = 'a'::text` against `col = 'a'` too, which `main`
+  read as no change (so a live snapshot, whose literals `pg_get_expr`
+  casts, diffed against an offline one needs review where it compares a
+  column with a string).
   In an `IN` list or array such a comparison decides nothing: the value
   takes the list's type there (`x IN (v::int, 1)` rounds `v` to a `real`
   `x`'s float4; `x = v::int` compares in float8).

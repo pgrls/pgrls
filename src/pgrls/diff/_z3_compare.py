@@ -110,6 +110,7 @@ from pglast.ast import (
     Float,
     FuncCall,
     Integer,
+    MinMaxExpr,
     NullTest,
     ResTarget,
     SelectStmt,
@@ -247,6 +248,11 @@ class _Context:
         # Inside a list one of whose members rounds the others (off the diff
         # path), so no comparison in it is read exactly.
         self.kin_rounded = 0
+        # Diff path: per column name, whether each comparison of it with a
+        # string read the string bare (False) or typed (True); see
+        # `_note_string_read`.
+        self.string_reads: dict[str, set[bool]] = {}
+        self.string_scope = 0
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -530,6 +536,61 @@ def _rounds_its_kin(node: Any, ctx: _Context) -> bool:
     return any(isinstance(n, TypeCast) and not _exact_cast(n.typeName)
                and _typename_last_segment(n.typeName) in _NUMBER_TYPES
                for n in _ast_nodes(node))
+
+
+def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
+    """In a diff, note how `left` compared with each of `rights` (one, or an
+    `IN` list's members, which take one type) reads each column the operands
+    yield against a string: bare (`email = 'A'`, `COALESCE(x, 'a') = 'A'`),
+    where the literal takes the column's type, or typed (`'A'::text`,
+    `(SELECT 'A')`, `COALESCE('A', '')`, a typed list member, a function's
+    result), where a `citext` or `char(n)` column compares as text. The text
+    may not show the column's type, so a column read both ways decides
+    nothing (`_diff_truths`)."""
+    if not ctx.any_session or ctx.string_scope:
+        return
+    sides = [_string_operand(left), *(_string_operand(r) for r in rights)]
+    if not any(kind == "bare" for _, kind in sides) and not any(
+            kind == "typed" for _, kind in sides):
+        return  # column against column, or no string at all
+    typed = any(kind == "typed" for _, kind in sides)
+    for columns, _ in sides:
+        for column in columns:
+            ctx.string_reads.setdefault(column, set()).add(typed)
+
+
+def _string_operand(node: Any) -> tuple[frozenset[str], str]:
+    """The columns `node` yields as its value and how it is typed: `column`
+    (it takes a column's type), `bare` (an untyped string literal), `typed`
+    (a string of a known type, or anything else: a function, a cast), or
+    `other` (a number, a NULL)."""
+    inner = _unwrap_scalar_sublink(node)
+    if inner is not node and isinstance(inner, A_Const):
+        # `(SELECT 'A')` is text, as a select list makes a bare literal.
+        return frozenset(), "typed"
+    node = inner
+    if isinstance(node, ColumnRef):
+        last = node.fields[-1] if node.fields else None
+        return (frozenset({last.sval}) if isinstance(last, String) else frozenset()), "column"
+    if isinstance(node, A_Const):
+        return frozenset(), "bare" if isinstance(getattr(node, "val", None), String) else "other"
+    arms: list[Any] | None = None
+    if isinstance(node, (CoalesceExpr, MinMaxExpr)):
+        arms = list(node.args or ())
+    elif isinstance(node, CaseExpr):
+        arms = [w.result for w in node.args or ()] + [node.defresult]
+    if arms is not None:
+        # Its arms take one type: a typed arm's, else a column's, else text.
+        parts = [_string_operand(arm) for arm in arms if arm is not None]
+        columns = frozenset().union(*(c for c, _ in parts))
+        kinds = {k for _, k in parts}
+        if "typed" in kinds or not columns and "bare" in kinds:
+            return columns, "typed"
+        return columns, "column" if columns else "other"
+    columns = frozenset(n.fields[-1].sval for n in _ast_nodes(node)
+                        if isinstance(n, ColumnRef) and n.fields
+                        and isinstance(n.fields[-1], String))
+    return columns, "typed"
 
 
 def _blanks_its_kin(members: Sequence[Any], ctx: Any) -> bool:
@@ -833,7 +894,7 @@ def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False
     assertions: list[Any] = []
     base = _lift_to_tv(_anon_3vl(base_node, ctx, set(), assertions), assertions)
     head = _lift_to_tv(_anon_3vl(head_node, ctx, set(), assertions), assertions)
-    if base is None or head is None:
+    if base is None or head is None or any(len(reads) > 1 for reads in ctx.string_reads.values()):
         return None
     return ctx, assertions, base, head
 
@@ -1979,6 +2040,7 @@ def _anon_distinct(
     )
     if left is None or right is None or left.unset or right.unset:
         return None
+    _note_string_read(ctx, node.lexpr, [node.rexpr])
     if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session) or _floats_meet(
             node.lexpr, node.rexpr):
         return None
@@ -2083,6 +2145,8 @@ def _anon_any_array(
         # is a `real[]`. Off the diff path each comparison is then a truth
         # of its own (`_anon_binop`), as a float meeting a column is.
         return None
+    # The list is read as a whole: a typed member types the bare ones too.
+    _note_string_read(ctx, node.lexpr, elements)
     acc: _TV | None = None
     for elem in elements:
         cmp_node = A_Expr(
@@ -2096,10 +2160,12 @@ def _anon_any_array(
         with ctx.unifying(node.kind == A_Expr_Kind.AEXPR_IN or not all(
                 _is_constant(e) for e in elements)):
             ctx.kin_rounded += rounded
+            ctx.string_scope += 1
             try:
                 tv = _anon_binop(cmp_node, ctx, auth_funcs, assertions)
             finally:
                 ctx.kin_rounded -= rounded
+                ctx.string_scope -= 1
         # `=` yields a _TV; anything else (None, or a _Val) → abstain whole.
         if not isinstance(tv, _TV):
             return None
@@ -2137,6 +2203,8 @@ def _anon_binop(
     )
     if left is None or right is None:
         return None
+    if comparison_fn is not None:
+        _note_string_read(ctx, node.lexpr, [node.rexpr])
 
     # Cross-tenant verifier: capture a `<column> = <session symbol>`
     # scoping equality (the tenant predicate `pgrls generate` emits) so the
