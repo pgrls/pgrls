@@ -1731,6 +1731,22 @@ def test_an_attach_that_would_close_a_cycle_is_left_out():
         assert tables["a.c"].partition_of == ("b", "x")
 
 
+def test_an_unqualified_name_lands_in_public_whatever_the_scope():
+    from pgrls.schema_sources import schema_from_sql
+
+    # psql puts it there; moved into `app`, the partition below would have a
+    # parent `app.q` in scope and its SEC001 (live: the chain leaves the
+    # scanned schemas) would be lost.
+    sql = ("CREATE TABLE q (id int) PARTITION BY LIST (id);\n"
+           "ALTER TABLE q ENABLE ROW LEVEL SECURITY;\n"
+           "CREATE TABLE app.qc (id int);\n"
+           "ALTER TABLE ONLY q ATTACH PARTITION app.qc FOR VALUES IN (1);\n")
+    tables = {t.qualified_name: t for t in schema_from_sql(sql, schemas=("app",)).tables}
+    assert set(tables) == {"app.qc"} and tables["app.qc"].partition_of == ("public", "q")
+    names = {t.qualified_name for t in schema_from_sql(sql, schemas=("app", "public")).tables}
+    assert names == {"app.qc", "public.q"}
+
+
 def test_offline_lint_reads_the_configured_schemas(tmp_path):
     from pgrls.cli import main
 

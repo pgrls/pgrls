@@ -98,8 +98,9 @@ breaking changes — they will be called out in this file.
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
-  ancestor walk stops there; an unqualified name still lands in `public`
-  unless `--schemas` names another first. `ALTER TABLE … SET SCHEMA` is refused: policies name the
+  ancestor walk stops there. An unqualified name lands in `public`, where
+  psql puts it: `--schemas app,public` (and MCP's `schemas`) moved it into
+  `app`, so findings named tables that did not exist. `ALTER TABLE … SET SCHEMA` is refused: policies name the
   table by its old schema.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names

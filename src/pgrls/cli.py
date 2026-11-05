@@ -960,13 +960,10 @@ def _resolve_offline_schema(
     if not sql_file and snapshot is None:
         return None
     # The schemas a live run would lint: `--schemas`, else `[database]
-    # schemas` (the model leaves out a partition's parents beyond them). Only
-    # `--schemas` also names where an unqualified name lands; otherwise it
-    # is psql's `public`.
+    # schemas` (the model leaves out a partition's parents beyond them).
     schemas = tuple(
         _offline_effective_config(config_path=config_path, schemas_csv=schemas_csv).schemas
     ) or None
-    default_schema = None if schemas_csv else "public"
     if snapshot is not None:
         try:
             snap_size = os.path.getsize(snapshot)
@@ -1017,8 +1014,7 @@ def _resolve_offline_schema(
         sql_text = "\n".join(parts)
     try:
         schema, source, snapshot_version = resolve_schema(
-            sql=sql_text, snapshot=snapshot, schemas=schemas,
-            default_schema=default_schema,
+            sql=sql_text, snapshot=snapshot, schemas=schemas
         )
     except SchemaSourceError as exc:
         where = (
