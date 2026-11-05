@@ -1111,10 +1111,14 @@ def _ast_nodes(node: Any) -> Any:
 
 def _may_yield_no_row(target: Any, auth_funcs: set[str]) -> bool:
     """Whether the target of a scalar sub-select calls anything that may be
-    set-returning: any call but an auth leaf (`auth.uid()`,
-    `current_setting(...)`), whose arguments are walked too."""
-    return any(isinstance(n, FuncCall) and not _is_anon_null_leaf(n, auth_funcs)
-               for n in _ast_nodes(target))
+    set-returning: any call but an auth function (the configured ones and
+    the defaults, on the diff path too, which configures none) or the
+    built-in `current_setting`; the arguments are walked too."""
+    known = auth_funcs | _DEFAULT_AUTH_FUNCTIONS
+    return any(
+        isinstance(n, FuncCall) and not _is_anon_null_leaf(n, known)
+        and func_name_parts(n)[0] not in ("current_setting", "pg_catalog.current_setting")
+        for n in _ast_nodes(target))
 
 
 def _as_val(x: Any) -> Any:
@@ -1188,7 +1192,8 @@ def _anon_3vl(
         result = _anon_3vl(inner, ctx, auth_funcs, assertions)
         if result is None:
             return None
-        no_row = ctx.opaque(f"no_row {_canon(node)}", z3.BoolSort())
+        # Keyed by the target: Postgres renders `(SELECT f() AS f)`.
+        no_row = ctx.opaque(f"no_row {_canon(inner)}", z3.BoolSort())
         if no_row is None:
             return None
         if isinstance(result, _TV):

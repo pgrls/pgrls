@@ -290,3 +290,20 @@ def test_counterexample_for_returns_none_on_empty_side():
 def test_counterexample_for_returns_none_on_parse_failure():
     # Unparseable SQL → parse_expr returns None → None, no raise.
     assert counterexample_for("WHERE :::", "a = 1") is None
+
+
+def test_a_predicate_too_deep_for_the_stack_needs_review() -> None:
+    import sys
+
+    from pgrls.ast_utils import parse_expr
+    from pgrls.diff.ast_compare import compare_predicates
+
+    deep = "(" * 150 + "x = 1" + " OR y = 2)" * 150
+    head = parse_expr(deep)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(300)
+    try:
+        result = compare_predicates(parse_expr("x = 1"), head)
+    finally:
+        sys.setrecursionlimit(limit)
+    assert result == "requires_review"

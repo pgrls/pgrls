@@ -93,9 +93,11 @@ breaking changes — they will be called out in this file.
   it can be NULL otherwise: one with `LIMIT` / `OFFSET` (`(SELECT a LIMIT
   0) IS NULL AND a IS NOT NULL` was a false PROVEN), `ORDER BY` or a
   `WINDOW` is not unwrapped, and one whose target calls anything but an
-  auth function (any call may be set-returning, and yield no row) may also
-  be NULL, so `(SELECT srf() IS NULL)` is not taken to be TRUE or FALSE. A
-  predicate nested past the stack is unverified, not a crash.
+  auth function or `current_setting` (any other call may be set-returning,
+  and yield no row) may also be NULL, so `(SELECT srf() IS NULL)` is not
+  taken to be TRUE or FALSE; wrapping `auth.uid()` in a sub-select, as
+  PERF001's fix does, stays no change. A predicate nested past the stack is
+  unverified, or needs review in a diff, not a crash.
   Beside such a
   value or truth, a proof whose other conjunct isolates
   still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that

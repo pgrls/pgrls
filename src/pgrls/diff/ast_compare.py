@@ -144,8 +144,11 @@ def compare_predicates(
         return "requires_review"
 
     # Canonicalize and compare.
-    base_canon = _canon(base_node)
-    head_canon = _canon(head_node)
+    try:
+        base_canon = _canon(base_node)
+        head_canon = _canon(head_node)
+    except RecursionError:
+        return "requires_review"  # nested past the stack (Postgres takes it)
 
     if base_canon == head_canon:
         return "unchanged"

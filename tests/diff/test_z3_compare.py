@@ -1266,6 +1266,20 @@ def test_a_sub_select_a_set_returning_call_can_empty_is_no_expression(base, head
     assert _classify(base, head) not in ("semantic_equivalent", "semantic_tightened")
 
 
+@pytest.mark.parametrize(("base", "head"), [
+    # Wrapping an auth call in a sub-select (what PERF001's fix writes) is
+    # no change, on the diff path too.
+    ("(SELECT auth.uid()) = user_id", "auth.uid() = user_id"),
+    ("tenant = (SELECT current_setting('app.tenant', true))",
+     "tenant = current_setting('app.tenant', true)"),
+    ("tenant = 'public' AND current_setting('app.tenant', true) IS NULL",
+     "tenant = 'public' AND (SELECT current_setting('app.tenant', TRUE)) IS NULL"),
+])
+def test_wrapping_an_auth_call_is_no_change(base, head) -> None:
+    assert _classify(base, head) == "semantic_equivalent"
+    assert _classify(head, base) == "semantic_equivalent"
+
+
 def test_a_scalar_select_of_an_auth_call_still_unwraps() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
@@ -1274,6 +1288,10 @@ def test_a_scalar_select_of_an_auth_call_still_unwraps() -> None:
                   "user_id = (SELECT auth.uid()) AND (SELECT auth.uid() IS NOT NULL)"):
         assert prove_anon_isolation(parse_expr(using))[0] == "isolated", using
         assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated", using
+    # One-argument current_setting raises on an unset GUC, never NULL.
+    using = "tenant = (SELECT current_setting('app.t')) OR (SELECT current_setting('app.t')) IS NULL"
+    assert prove_anon_isolation(parse_expr(using))[0] == "isolated"
+    assert prove_cross_tenant_isolation(parse_expr(using))[0] == "isolated"
     # The inverted-auth leak, written with sub-selects, stays a total leak.
     assert anon_read_counterexample(parse_expr(
         "user_id = (SELECT auth.uid()) OR (SELECT auth.uid() IS NULL)")) == {}
