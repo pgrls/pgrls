@@ -1077,7 +1077,6 @@ def test_a_decimal_a_single_holds_still_translates() -> None:
     "a = 1.00000000000000001 AND 1.00000000000000001 > 1.0 AND a <= 1.0",
     "c IN (0.1, 0.1) AND c <> 0.1",
     # A cast that changes the value is a value of its own on every path.
-    "tenant_id = auth.uid() OR 0.5 <> 0.5::float4",
     "tenant_id = auth.uid() OR '16777217'::float4 = 16777216.0",
     "tenant_id = auth.uid() OR '1.25'::numeric(3,1) <> 1.25",
 ])
@@ -1154,13 +1153,14 @@ def test_integer_arithmetic_still_translates() -> None:
     assert _classify("a * 2 = 4", "a * 2 = 4 AND b = 1") == "semantic_tightened"
 
 
-def test_a_leaking_row_prints_a_character_outside_the_bmp() -> None:
+def test_a_leaking_row_prints_a_character_past_latin1() -> None:
     assert _counterexample("s = 'a'", "s = 'a' OR s = '\U00024cc8'") == {"s": "\U00024cc8"}
+    assert _counterexample("s = 'a'", "s = 'a' OR s = '\u4e2d'") == {"s": "\u4e2d"}
 
 
 def test_the_anon_and_cross_tenant_provers_keep_their_proofs() -> None:
-    # Only the Bool / non-Bool guard applies off the diff path: a `%` or a
-    # text ordering beside the tenant equality cannot make it leak.
+    # Off the diff path a `%` is a value of its own and a text ordering is
+    # Z3's: beside the tenant equality under AND, neither can make it leak.
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
     for using in ("tenant_id = auth.uid() AND (seq % 2) = 0",

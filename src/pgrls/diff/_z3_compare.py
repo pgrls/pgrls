@@ -48,8 +48,9 @@ AND / OR / NOT, ``IS [NOT] NULL``, ``IS [NOT] DISTINCT FROM``, ``[NOT]
 BETWEEN``, ``= ANY (ARRAY[…])`` / ``IN (…)`` over literals, casts,
 ``COALESCE``, and function calls (an opaque value per distinct call, shared
 by base and head). On the diff path a ``CASE``, or a ``COALESCE`` it cannot
-model exactly, is an opaque value too. Opaque values are text: compared
-with something else they translate only through a cast. Anything else
+model exactly, is an opaque value too. An opaque call or CASE is text:
+compared with something else it translates only through a cast; an opaque
+cast or arithmetic result takes its own type. Anything else
 returns None and the caller
 falls through to ``requires_review``.
 
@@ -641,7 +642,7 @@ def _decode_model(model: Any, ctx: _Context) -> dict[str, object]:
         if sort == z3.IntSort():
             row[name] = value.as_long()
         elif sort == z3.StringSort():
-            # `as_string` escapes a character outside the BMP as `\\u{…}`.
+            # `as_string` escapes every character past U+00FF as `\\u{…}`.
             row[name] = re.sub(r"\\u\{([0-9a-fA-F]+)\}",
                                lambda m: chr(int(m.group(1), 16)), value.as_string())
         elif sort == z3.BoolSort():
@@ -1832,7 +1833,8 @@ def _fold_literal_cast(value: Any, target_sort: Any, type_name: str | None) -> A
     accept it and read it alike whatever it is compared with: in range for
     the integer type, and for a real one that `_exact_real` reads (not
     `'NaN'` / `'Infinity'`, which Z3 reals do not have). The caller folds
-    only for a cast that keeps the value (`_exact_cast`). Anything else
+    only for a cast that keeps the value (`_exact_cast`, and off the diff
+    path an integer one). Anything else
     returns None and stays opaque: declining to decide is the
     safe direction, and modelling the raise as "isolated" is not this
     function's job.

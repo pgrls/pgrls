@@ -93,8 +93,12 @@ breaking changes — they will be called out in this file.
   0.1`) is now unverified, so `verify` exits 0 on it. A time window such as
   `created_at > now() - interval '7 days'`, unverified before, is now
   decided, and SEC038 now fires on a policy whose arithmetic sat beside an
-  `auth.uid() IS NULL` disjunct (`a - b > c OR auth.uid() IS NULL`).
-- Leaking rows from every prover print a character outside the BMP as
+  `auth.uid() IS NULL` disjunct (`a - b > c OR auth.uid() IS NULL`). The
+  cost runs the other way too: like a function call already, such a cast or
+  arithmetic beside an `OR` is reported as a conditional LEAK (no witness
+  row) even where Postgres admits no row (`… OR (a % 2) = 5`), so a `verify`
+  gate that passed can now fail.
+- Leaking rows from every prover print a character past Latin-1 (U+00FF) as
   itself, not Z3's `\u{…}`, and keep a backslash in a policy's string
   literal (`'\u{41}'` was taken for `'A'`).
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
