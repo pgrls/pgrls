@@ -486,3 +486,10 @@ def test_the_lsp_is_scoped_by_the_projects_schemas():
     found = [(d.code, d.message) for d in diagnose(sql, config=Config(schemas=["b"]))]
     assert [code for code, _ in found] == ["SEC001"], found
     assert "b.c" in found[0][1] and "leaves the scanned schemas" in found[0][1]
+
+
+def test_spans_resolve_names_on_the_search_path_the_buffer_sets():
+    text = ("CREATE SCHEMA app;\nSET search_path TO app;\n"
+            "CREATE TABLE profiles (id int);\n")
+    (diag,) = [d for d in diagnose(text) if d.code == "SEC001"]
+    assert diag.range.start.line == 2

@@ -42,6 +42,7 @@ from pgrls.rules import (
 from pgrls.schema_sources import (
     SchemaSourceError,
     _relation_key,
+    _statement_paths,
     _without_psql_meta_commands,
     inert_rule_ids,
     schema_from_sql,
@@ -78,8 +79,9 @@ def diagnose(text: str, *, config: Config | None = None) -> list[lsp.Diagnostic]
     try:
         # Scoped by the project's schemas, as `pgrls lint --sql-file` is.
         schema = schema_from_sql(text, schemas=tuple(config.schemas) or ("public",))
-    except SchemaSourceError:
-        # Unparseable mid-edit buffer: publish nothing, don't surface an error.
+    except (SchemaSourceError, RecursionError):
+        # Unparseable mid-edit buffer (or one too deep to walk): publish
+        # nothing, don't surface an error.
         return []
 
     inert = inert_rule_ids("sql")
@@ -207,9 +209,13 @@ def _object_spans(text: str) -> _Spans:
     except pglast.parser.ParseError:
         return spans
 
-    default_schema = "public"
+    # Unqualified names resolve as `schema_from_sql` resolves them.
+    try:
+        paths = _statement_paths(statements, after=lambda raw: True)
+    except SchemaSourceError:
+        return spans
     length = len(text)
-    for raw in statements:
+    for raw, search_path in zip(statements, paths):
         stmt = raw.stmt
         loc = raw.stmt_location or 0
         # pglast's `stmt_location` points at the whitespace / comment before the
@@ -233,11 +239,11 @@ def _object_spans(text: str) -> _Spans:
         if kind in ("CreateStmt", "AlterTableStmt"):
             # AlterTableStmt covers a table defined only by ALTER in this buffer
             # (a migration file); `setdefault` lets a CREATE win if present too.
-            rk = _relation_key(stmt.relation, default_schema)
+            rk = _relation_key(stmt.relation, search_path, create=kind == "CreateStmt")
             if rk is not None:
                 spans.table.setdefault(f"{rk[0]}.{rk[1]}", span)
         elif kind == "CreatePolicyStmt":
-            rk = _relation_key(stmt.table, default_schema)
+            rk = _relation_key(stmt.table, search_path)
             pname = getattr(stmt, "policy_name", None)
             if rk is not None and pname:
                 spans.policy.setdefault(f"{rk[0]}.{rk[1]}.{pname}", span)
@@ -256,7 +262,7 @@ def _object_spans(text: str) -> _Spans:
             for obj in stmt.objects or ():
                 if type(obj).__name__ != "RangeVar":
                     continue
-                rk = _relation_key(obj, default_schema)
+                rk = _relation_key(obj, search_path)
                 if rk is None:
                     continue
                 for column in columns:

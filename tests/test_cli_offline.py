@@ -1747,6 +1747,75 @@ def test_an_unqualified_name_lands_in_public_whatever_the_scope():
     assert names == {"app.qc", "public.q"}
 
 
+def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
+    import pytest
+
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    def tables(sql):
+        return {t.qualified_name: t for t in schema_from_sql(sql, schemas=("app", "public")).tables}
+
+    # Created where the path puts it, not merged into `public.profiles`.
+    got = tables("CREATE TABLE public.profiles (id int);\n"
+                 "ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;\n"
+                 "SET search_path TO app;\nCREATE TABLE profiles (id int, ssn text);\n"
+                 "GRANT SELECT ON profiles TO PUBLIC;\n")
+    assert not got["app.profiles"].rls_enabled and got["app.profiles"].grants
+    assert got["public.profiles"].rls_enabled and not got["public.profiles"].grants
+    # A reference finds the table where the path has it, a later schema too.
+    got = tables("CREATE TABLE public.t (id int);\nSET search_path TO app, public;\n"
+                 "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
+                 "ALTER TABLE t RENAME TO u;\nALTER TABLE u FORCE ROW LEVEL SECURITY;\n")
+    assert set(got) == {"public.u"} and got["public.u"].force_rls
+    # A local one lasts to the end of its transaction, and outside one, not at
+    # all; `$user`, a quoted list item, RESET and set_config() as Postgres reads them.
+    for sql, where in (
+        ("BEGIN;\nSET LOCAL search_path TO app;\nCOMMIT;\nCREATE TABLE x (id int);\n", "public"),
+        ("BEGIN;\nSET LOCAL search_path TO app;\nCREATE TABLE x (id int);\nCOMMIT;\n", "app"),
+        ("SET LOCAL search_path TO app;\nCREATE TABLE x (id int);\n", "public"),
+        ('SET search_path TO "$user", app;\nCREATE TABLE x (id int);\n', "app"),
+        ("SET search_path = 'app, b';\nCREATE TABLE x (id int);\n", "app, b"),
+        ("SET search_path TO app;\nRESET search_path;\nCREATE TABLE x (id int);\n", "public"),
+        ("SET SCHEMA 'app';\nCREATE TABLE x (id int);\n", "app"),
+        ("SELECT set_config('search_path', 'APP, public', false);\nCREATE TABLE x (id int);\n",
+         "app"),
+        ("SELECT pg_catalog.set_config('search_path', '', false);\nCREATE TABLE x (id int);\n",
+         "public"),
+    ):
+        assert [t.schema for t in schema_from_sql(sql).tables] == [where], sql
+    with pytest.raises(SchemaSourceError, match="search_path to a computed value"):
+        schema_from_sql("SELECT set_config('search_path', current_user, false);\n")
+
+
+def test_a_deep_view_does_not_overflow_the_walk():
+    from pgrls.lsp.diagnostics import diagnose
+    from pgrls.schema_sources import schema_from_sql
+
+    # Valid SQL a few thousand nodes deep: the settings check walks it.
+    sql = ("CREATE TABLE public.t (a int);\nCREATE VIEW public.v AS "
+           + " UNION ALL ".join(f"SELECT {i} AS a" for i in range(3000)) + ";\n"
+           "CREATE VIEW public.w AS SELECT " + " + ".join(["a"] * 3000) + " FROM public.t;\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
+    assert any(d.code == "SEC001" for d in diagnose(sql))
+
+
+def test_an_attach_postgres_refuses_is_not_modelled():
+    from pgrls.schema_sources import schema_from_sql
+
+    # An inheritance child, a table already attached, a parent not partitioned.
+    for attach in ("CREATE TABLE c (id int) INHERITS (base);\n"
+                   "ALTER TABLE ONLY p ATTACH PARTITION c FOR VALUES IN (1);\n",
+                   "CREATE TABLE c PARTITION OF q FOR VALUES IN (1);\n"
+                   "ALTER TABLE ONLY p ATTACH PARTITION c FOR VALUES IN (1);\n",
+                   "CREATE TABLE c (id int);\n"
+                   "ALTER TABLE ONLY base ATTACH PARTITION c FOR VALUES IN (1);\n"):
+        sql = ("CREATE TABLE base (id int);\n"
+               "CREATE TABLE p (id int) PARTITION BY LIST (id);\n"
+               "CREATE TABLE q (id int) PARTITION BY LIST (id);\n" + attach)
+        parents = {t.name: t.partition_of for t in schema_from_sql(sql).tables}
+        assert parents["c"] in (None, ("public", "q")), attach
+
+
 def test_offline_lint_reads_the_configured_schemas(tmp_path):
     from pgrls.cli import main
 
