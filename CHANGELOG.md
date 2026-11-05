@@ -82,10 +82,11 @@ breaking changes — they will be called out in this file.
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text
   (Postgres orders by collation) — is a truth of its own; a cast that may
   change the value (`::float4`, `::numeric(3,1)`, `::varchar(3)`,
-  `::citext`) is a value of its own (a bare `uuid` cast and an integer cast
-  but `oid` still keep it), and so is arithmetic on reals, `/` and `%`. A
-  proof whose other conjunct isolates still holds (`tenant_id = auth.uid()
-  AND status < 'm'`), and one that rested on Z3's reading is no longer made:
+  `::citext`) is a value of its own (a bare `uuid` cast, and an integer cast
+  other than `oid`, still keep it), and so is arithmetic on reals, `/` and
+  `%`. Beside such a value or truth, a proof whose other conjunct isolates
+  still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that
+  rested on Z3's reading is no longer made:
   `tenant_id = auth.uid() OR (s < 'B' AND s > 'a')` (both hold for `'ab'`
   under en_US), `… OR f + 0.5 = f` (true for `Infinity`) and
   `n < '-0.10000000000000000001'::numeric AND n > '-0.10000000000000000002'::numeric`
@@ -100,11 +101,11 @@ breaking changes — they will be called out in this file.
   AND created_at + interval '7 days' > now()`, as `-` already was), or
   beside a decimal no `float4` holds; these go from PROVEN to unverified,
   which fails a `verify --strict` gate. A leak found only through such a
-  decimal (`… OR n < 0.1`) is unverified too, and `verify` exits 0 on it. The cost runs the
-  other way too: like a function call already, such a value beside an `OR`
-  is reported as a conditional LEAK (no witness row) even where Postgres
-  admits no row (`… OR (a % 2) = 5`), so a `verify` gate that passed can
-  now fail.
+  decimal (`… OR n < 0.1`) is unverified too, and `verify` exits 0 on it.
+  The cost runs the other way too: like a function call already, such a
+  value or truth beside an `OR` is reported as a conditional LEAK (no
+  witness row) even where Postgres admits no row (`… OR (a % 2) = 5`), so
+  a `verify` gate that passed can now fail.
 - Leaking rows from every prover print a character past Latin-1 (U+00FF) as
   itself, not Z3's `\u{…}`, and keep a backslash in a policy's string
   literal (`'\u{41}'` was taken for `'A'`).

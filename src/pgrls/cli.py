@@ -4549,7 +4549,8 @@ def verify(
     witness row is one the policy predicate admits (or, for the anonymous-role
     RLS exemption — BYPASSRLS/superuser, or the table owner's privileges
     without FORCE — that Postgres grants); a conditional leak (no single row)
-    can rest on a value the prover treats as opaque and may over-report. The provers reason about the policy predicate and the policy's
+    can rest on a value or comparison the prover treats as opaque (a text
+    ordering among them) and may over-report. The provers reason about the policy predicate and the policy's
     TO roles, not about table GRANTs, so a predicate admitting every row on a
     table anon cannot SELECT is still a LEAK (an over-report in the safe
     direction; --mode reachability is where the grant is decided). Exits
