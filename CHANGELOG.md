@@ -138,10 +138,13 @@ breaking changes — they will be called out in this file.
   read of it. The offline model gives the diff a column's type only where it is
   sure of it: the table's name is made once in the input and never
   dropped, renamed, moved or attached (so no search_path, temporary table
-  or rebuild can make the name another table), the type is from its own
-  column list or a later `ALTER COLUMN … TYPE` / `ADD COLUMN`, and the SQL
-  defines no type of that name; any other (a parent's or `LIKE`'s column,
-  a `CREATE TABLE … AS`) is `unknown`, which decides nothing. A column's
+  or rebuild can make the name another table, and an `ALTER` naming it,
+  however qualified, reaches it), the type is from its own column list or
+  a later `ALTER COLUMN … TYPE` / `ADD COLUMN`, and the SQL defines (or
+  renames a type to) no type of that name; any other (a parent's or
+  `LIKE`'s column, a `CREATE TABLE … AS`, a name an `IMPORT FOREIGN SCHEMA`
+  may make, every one after an unlimited import) is `unknown`, which
+  decides nothing. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
   ci`) compares strings otherwise, which the diff does not see, as on
   `main`. Without column types (a snapshot from before they were captured)

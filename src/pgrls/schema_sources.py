@@ -41,6 +41,7 @@ from pglast.enums.parsenodes import (
     AlterTableType,
     ConstrType,
     GrantTargetType,
+    ImportForeignSchemaType,
     ObjectType,
     RoleSpecType,
 )
@@ -516,16 +517,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # (`text` and `citext` read `'a'::text` otherwise), which the passes above
     # do not follow in order; replay what changes it, and where the replay
     # is not sure of a column's type, it is `unknown` (which decides nothing).
-    types = _column_types_in_order(statements, default_schema)
-    for key, builder in tables.items():
-        builder.columns = [replace(c, data_type=types.get(key, {}).get(c.name, "unknown"))
+    types = _column_types_in_order(statements)
+    for builder in tables.values():
+        builder.columns = [replace(c, data_type=types.get(builder.name, {}).get(c.name, "unknown"))
                            for c in builder.columns]
     return Schema(tables=tuple(b.build() for b in tables.values()))
 
 
-def _column_types_in_order(
-    statements: Any, default_schema: str,
-) -> dict[tuple[str, str], dict[str, str]]:
+def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
     """The column types the diff may trust (`pgrls diff` reads a string
     compared with a column by the column's type): those of a table whose
     name the input makes once and never drops, renames or moves (so no
@@ -546,8 +545,19 @@ def _column_types_in_order(
         if isinstance(stmt, _pgast.CreateStmt) and (stmt.inhRelations or any(
                 isinstance(e, _pgast.TableLikeClause) for e in stmt.tableElts or ())):
             tainted.add(stmt.relation.relname)
-        if isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None:
+        if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
+                and stmt.renameType not in (ObjectType.OBJECT_COLUMN,
+                                            ObjectType.OBJECT_TABCONSTRAINT)):
             tainted.update({stmt.relation.relname, stmt.newname or ""})
+        elif (isinstance(stmt, _pgast.RenameStmt) and stmt.newname
+              and stmt.renameType in (ObjectType.OBJECT_TYPE, ObjectType.OBJECT_DOMAIN)):
+            shadowed.add(stmt.newname.lower())  # a type renamed to `text`
+        elif isinstance(stmt, _pgast.ImportForeignSchemaStmt):
+            # Foreign tables it makes, which an unqualified name may find; all
+            # but those it lists, unless it lists them.
+            if stmt.list_type != ImportForeignSchemaType.FDW_IMPORT_SCHEMA_LIMIT_TO:
+                return {}
+            tainted.update(rel.relname for rel in stmt.table_list or ())
         elif isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None:
             tainted.add(stmt.relation.relname)
         elif isinstance(stmt, _pgast.DropStmt):
@@ -576,23 +586,22 @@ def _column_types_in_order(
         bare = data_type.lower().split("(")[0].strip()
         return "unknown" if bare in shadowed else data_type
 
-    types: dict[tuple[str, str], dict[str, str]] = {}
+    # Keyed by the bare name: one made once is the table any ALTER naming it
+    # reaches (whatever the search_path or qualifier), or the ALTER fails.
+    types: dict[str, dict[str, str]] = {}
     for raw in statements:
         stmt = raw.stmt
         for create in (stmt, *(getattr(stmt, "schemaElts", None) or ())):
             if isinstance(create, _pgast.CreateStmt) and create.relation.relname in simple:
-                schema = (stmt.schemaname if create is not stmt and stmt.schemaname
-                          else default_schema)
-                key = _relation_key(create.relation, schema)
-                if key is not None:
-                    types[key] = {e.colname: typed(e) for e in create.tableElts or ()
-                                  if isinstance(e, _pgast.ColumnDef) and e.colname}
+                types[create.relation.relname] = {
+                    e.colname: typed(e) for e in create.tableElts or ()
+                    if isinstance(e, _pgast.ColumnDef) and e.colname}
         if isinstance(stmt, _pgast.RenameStmt) and stmt.renameType == ObjectType.OBJECT_COLUMN:
-            key = _relation_key(stmt.relation, default_schema)
+            key = stmt.relation.relname if stmt.relation is not None else ""
             if key in types and stmt.subname in types[key] and stmt.newname:
                 types[key][stmt.newname] = types[key].pop(stmt.subname)
         elif isinstance(stmt, _pgast.AlterTableStmt):
-            key = _relation_key(stmt.relation, default_schema)
+            key = stmt.relation.relname
             if key not in types:
                 continue
             for cmd in stmt.cmds or ():

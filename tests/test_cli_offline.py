@@ -1486,6 +1486,12 @@ def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
     # A CREATE TABLE AS lists no types.
     "CREATE TABLE c AS SELECT 1 AS id, 'a'::citext AS role;"
     " ALTER TABLE c ADD COLUMN IF NOT EXISTS role text;",
+    # A domain renamed to `text` is no built-in.
+    "CREATE SCHEMA app; CREATE DOMAIN app.d AS citext; ALTER DOMAIN app.d RENAME TO text;"
+    " CREATE TABLE c (id int, role text);",
+    # An imported foreign table may be what an unqualified name finds.
+    "CREATE TABLE c (id int, role citext); IMPORT FOREIGN SCHEMA public FROM SERVER s INTO app;"
+    " ALTER TABLE c ALTER COLUMN role TYPE text;",
 ])
 def test_a_column_type_pgrls_cannot_tell_is_unknown(sql):
     from pgrls.schema_sources import schema_from_sql
@@ -1505,6 +1511,11 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
 
     assert roles("CREATE TABLE t (role text); ALTER TABLE t ALTER COLUMN role TYPE citext;") == {
         "t": {"citext"}}
+    # An ALTER reaches the one table of the name, however it is qualified.
+    # (The model also keeps a shell for `app.t`, with no columns.)
+    schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"
+                             " CREATE TABLE t (role text); ALTER TABLE app.t ALTER COLUMN role TYPE citext;")
+    assert {c.data_type for t in schema.tables for c in t.column_details} == {"citext"}
     for sql, column in (
         ("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);", "role"),
         ("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);", "role"),
