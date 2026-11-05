@@ -1748,9 +1748,7 @@ def test_an_unqualified_name_lands_in_public_whatever_the_scope():
 
 
 def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
-    import pytest
-
-    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+    from pgrls.schema_sources import schema_from_sql
 
     def tables(sql):
         return {t.qualified_name: t for t in schema_from_sql(sql, schemas=("app", "public")).tables}
@@ -1758,33 +1756,101 @@ def test_an_unqualified_name_resolves_on_the_search_path_the_sql_sets():
     # Created where the path puts it, not merged into `public.profiles`.
     got = tables("CREATE TABLE public.profiles (id int);\n"
                  "ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;\n"
-                 "SET search_path TO app;\nCREATE TABLE profiles (id int, ssn text);\n"
-                 "GRANT SELECT ON profiles TO PUBLIC;\n")
+                 "CREATE SCHEMA app;\nSET search_path TO app;\n"
+                 "CREATE TABLE profiles (id int, ssn text);\nGRANT SELECT ON profiles TO PUBLIC;\n")
     assert not got["app.profiles"].rls_enabled and got["app.profiles"].grants
     assert got["public.profiles"].rls_enabled and not got["public.profiles"].grants
-    # A reference finds the table where the path has it, a later schema too.
-    got = tables("CREATE TABLE public.t (id int);\nSET search_path TO app, public;\n"
-                 "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
-                 "ALTER TABLE t RENAME TO u;\nALTER TABLE u FORCE ROW LEVEL SECURITY;\n")
-    assert set(got) == {"public.u"} and got["public.u"].force_rls
-    # A local one lasts to the end of its transaction, and outside one, not at
-    # all; `$user`, a quoted list item, RESET and set_config() as Postgres reads them.
-    for sql, where in (
-        ("BEGIN;\nSET LOCAL search_path TO app;\nCOMMIT;\nCREATE TABLE x (id int);\n", "public"),
-        ("BEGIN;\nSET LOCAL search_path TO app;\nCREATE TABLE x (id int);\nCOMMIT;\n", "app"),
-        ("SET LOCAL search_path TO app;\nCREATE TABLE x (id int);\n", "public"),
-        ('SET search_path TO "$user", app;\nCREATE TABLE x (id int);\n', "app"),
-        ("SET search_path = 'app, b';\nCREATE TABLE x (id int);\n", "app, b"),
-        ("SET search_path TO app;\nRESET search_path;\nCREATE TABLE x (id int);\n", "public"),
-        ("SET SCHEMA 'app';\nCREATE TABLE x (id int);\n", "app"),
-        ("SELECT set_config('search_path', 'APP, public', false);\nCREATE TABLE x (id int);\n",
-         "app"),
-        ("SELECT pg_catalog.set_config('search_path', '', false);\nCREATE TABLE x (id int);\n",
-         "public"),
-    ):
-        assert [t.schema for t in schema_from_sql(sql).tables] == [where], sql
-    with pytest.raises(SchemaSourceError, match="search_path to a computed value"):
-        schema_from_sql("SELECT set_config('search_path', current_user, false);\n")
+    # A reference finds the table where the path has it, a later schema too,
+    # as the tables stand then: one created later, or dropped, is not found.
+    got = tables("CREATE TABLE public.t (id int);\nCREATE SCHEMA app;\n"
+                 "SET search_path TO app, public;\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
+                 "ALTER TABLE t RENAME TO u;\nALTER TABLE u FORCE ROW LEVEL SECURITY;\n"
+                 "CREATE TABLE app.t (id int);\n")
+    assert got["public.u"].rls_enabled and got["public.u"].force_rls
+    assert not got["app.t"].rls_enabled
+    got = tables("CREATE TABLE public.t (id int);\nCREATE SCHEMA app;\nCREATE TABLE app.t (id int);\n"
+                 "DROP TABLE app.t;\nSET search_path TO app, public;\n"
+                 "ALTER TABLE t ENABLE ROW LEVEL SECURITY;\n")
+    assert set(got) == {"public.t"} and got["public.t"].rls_enabled
+
+
+@pytest.mark.parametrize(("sql", "where"), [
+    # A local one lasts to the end of its transaction, and outside one, not
+    # at all.
+    ("BEGIN;\nSET LOCAL search_path TO app;\nCOMMIT;\nCREATE TABLE x (id int);\n", "public"),
+    ("BEGIN;\nSET LOCAL search_path TO app;\nCREATE TABLE x (id int);\nCOMMIT;\n", "app"),
+    ("SET LOCAL search_path TO app;\nCREATE TABLE x (id int);\n", "public"),
+    ("BEGIN;\nCOMMIT AND CHAIN;\nSET LOCAL search_path TO app;\nCREATE TABLE x (id int);\n"
+     "COMMIT;\n", "app"),
+    # A rolled-back one is undone, as is what it created.
+    ("BEGIN;\nSET search_path TO app;\nROLLBACK;\nCREATE TABLE x (id int);\n", "public"),
+    ("BEGIN;\nSAVEPOINT s;\nSET search_path TO app;\nROLLBACK TO SAVEPOINT s;\n"
+     "CREATE TABLE x (id int);\nCOMMIT;\n", "public"),
+    ("BEGIN;\nCREATE TABLE app.y (id int);\nROLLBACK;\nCREATE TABLE x (id int);\n", "public"),
+    ("BEGIN;\nCREATE TABLE app.y (id int);\nCREATE TABLE x (id int);\n", None),
+    ("SET search_path TO app;\nDISCARD ALL;\nCREATE TABLE x (id int);\n", "public"),
+    ("SET search_path TO app;\nRESET search_path;\nCREATE TABLE x (id int);\n", "public"),
+    # `$user` is the role the SQL sets, when it has a schema; a schema the
+    # path names before it exists, and a quoted list item, as Postgres reads
+    # them; a name cut to 63 bytes.
+    ('SET search_path TO "$user", app;\nCREATE TABLE x (id int);\n', "app"),
+    ("CREATE SCHEMA AUTHORIZATION alice;\nSET ROLE alice;\nCREATE TABLE x (id int);\n", "alice"),
+    ("SET search_path TO later, app;\nCREATE TABLE x (id int);\nCREATE SCHEMA later;\n", "app"),
+    ("CREATE SCHEMA gone;\nDROP SCHEMA gone;\nSET search_path TO gone, app;\n"
+     "CREATE TABLE x (id int);\n", "app"),
+    ("CREATE SCHEMA \"app, b\";\nSET search_path = 'app, b';\nCREATE TABLE x (id int);\n",
+     "app, b"),
+    ("CREATE SCHEMA " + "a" * 70 + ";\nSET search_path TO '" + "a" * 70 + "';\n"
+     "CREATE TABLE x (id int);\n", "a" * 63),
+    ("SET SCHEMA 'app';\nCREATE TABLE x (id int);\n", "app"),
+    ("SELECT set_config('search_path', 'APP, public', false);\nCREATE TABLE x (id int);\n", "app"),
+    # pg_dump's: an unqualified CREATE then has nowhere to go.
+    ("SELECT pg_catalog.set_config('search_path', '', false);\nCREATE TABLE x (id int);\n", None),
+    # A schema's elements go in it; a temporary table is no table.
+    ("CREATE SCHEMA app CREATE TABLE x (id int);\n", "app"),
+    ("CREATE TEMP TABLE x (id int);\n", None),
+])
+def test_the_search_path_follows_the_session(sql, where):
+    from pgrls.schema_sources import schema_from_sql
+
+    sql = "CREATE SCHEMA IF NOT EXISTS app;\n" + sql if "CREATE SCHEMA app " not in sql else sql
+    got = [t.schema for t in schema_from_sql(sql).tables if t.name == "x"]
+    assert got == ([where] if where else []), sql
+
+
+@pytest.mark.parametrize(("sql", "why"), [
+    # Postgres creates in it only if it exists.
+    ("SET search_path TO nosuch, public;\nCREATE TABLE x (id int);\n", "neither creates"),
+    # set_config() anywhere but a plain SELECT of literals may not run, or
+    # run where pgrls does not look.
+    ("SELECT set_config('search_path', 'app', false) WHERE false;\n", "set_config"),
+    ("SELECT set_config('search_path', 'app', 'true');\n", "set_config"),
+    ("CREATE TABLE j AS SELECT set_config('search_path', 'app', false);\n", "set_config"),
+    ("SELECT set_config('search_path', current_user, false);\n", "set_config"),
+    # The database a `\\connect` reaches may set it.
+    ("CREATE DATABASE d;\nALTER DATABASE d SET search_path TO app;\n\\connect d\n"
+     "CREATE TABLE x (id int);\n", "connects to a database"),
+    ("SET search_path TO pg_temp, public;\nCREATE TABLE x (id int);\n", "pg_temp"),
+    ("BEGIN;\nCREATE TABLE x (id int);\nPREPARE TRANSACTION 'x';\n", "PREPARE TRANSACTION"),
+])
+def test_a_search_path_pgrls_cannot_follow_is_refused(sql, why):
+    from pgrls.schema_sources import SchemaSourceError, schema_from_sql
+
+    with pytest.raises(SchemaSourceError, match=why):
+        schema_from_sql(sql)
+
+
+def test_a_policy_reads_a_table_where_the_search_path_found_it():
+    from pgrls.schema_sources import schema_from_sql
+
+    # SEC025 reads an unqualified name in the policy's own schema.
+    schema = schema_from_sql(
+        "CREATE SCHEMA app;\nCREATE TABLE app.members (uid int);\n"
+        "CREATE TABLE public.members (uid int);\nCREATE TABLE public.docs (id int);\n"
+        "SET search_path TO app, public;\nALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;\n"
+        "CREATE POLICY p ON public.docs USING (EXISTS (SELECT 1 FROM members m));\n")
+    (docs,) = [t for t in schema.tables if t.name == "docs"]
+    assert "app.members" in docs.policies[0].using_sql
 
 
 def test_a_deep_view_does_not_overflow_the_walk():
@@ -2091,7 +2157,7 @@ def test_a_setting_that_changes_how_strings_read_is_refused(sql, refused):
     # strings where pgrls does not.
     from pgrls.schema_sources import SchemaSourceError, schema_from_sql
 
-    sql += "CREATE TABLE t (id int);\n"
+    sql += "CREATE TABLE public.t (id int);\n"
     if refused:
         why = refused if isinstance(refused, str) else "reads its text differently"
         with pytest.raises(SchemaSourceError, match=why):

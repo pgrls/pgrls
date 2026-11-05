@@ -41,9 +41,10 @@ from pgrls.rules import (
 )
 from pgrls.schema_sources import (
     SchemaSourceError,
+    _check_psql_meta_commands,
+    _model_statements,
     _relation_key,
-    _statement_paths,
-    _without_psql_meta_commands,
+    _split_psql_meta_commands,
     inert_rule_ids,
     schema_from_sql,
 )
@@ -202,21 +203,22 @@ def _object_spans(text: str) -> _Spans:
     so a `CREATE` keeps its span even if a later `ALTER` references the object.
     """
     spans = _Spans()
-    # As `schema_from_sql` reads it: psql meta-commands blanked, offsets kept.
-    text = _without_psql_meta_commands(text)
+    # As `schema_from_sql` reads it: psql meta-commands blanked, offsets kept,
+    # and names resolved on the search path the buffer sets.
     try:
+        text, commands = _split_psql_meta_commands(text)
+        connects = _check_psql_meta_commands(commands)
         statements = pglast.parse_sql(text)
-    except pglast.parser.ParseError:
+        model = _model_statements(statements, after=lambda raw: not connects or (
+            (raw.stmt_location or 0) + raw.stmt_len if raw.stmt_len else len(text)
+        ) >= connects[-1])
+    except (pglast.parser.ParseError, SchemaSourceError):
         return spans
 
-    # Unqualified names resolve as `schema_from_sql` resolves them.
-    try:
-        paths = _statement_paths(statements, after=lambda raw: True)
-    except SchemaSourceError:
-        return spans
+    default_schema = "public"
     length = len(text)
-    for raw, search_path in zip(statements, paths):
-        stmt = raw.stmt
+    for item in model:
+        stmt, raw = item.stmt, item.raw
         loc = raw.stmt_location or 0
         # pglast's `stmt_location` points at the whitespace / comment before the
         # statement — advance past leading blanks AND SQL comments so the range
@@ -239,11 +241,11 @@ def _object_spans(text: str) -> _Spans:
         if kind in ("CreateStmt", "AlterTableStmt"):
             # AlterTableStmt covers a table defined only by ALTER in this buffer
             # (a migration file); `setdefault` lets a CREATE win if present too.
-            rk = _relation_key(stmt.relation, search_path, create=kind == "CreateStmt")
+            rk = _relation_key(stmt.relation, default_schema)
             if rk is not None:
                 spans.table.setdefault(f"{rk[0]}.{rk[1]}", span)
         elif kind == "CreatePolicyStmt":
-            rk = _relation_key(stmt.table, search_path)
+            rk = _relation_key(stmt.table, default_schema)
             pname = getattr(stmt, "policy_name", None)
             if rk is not None and pname:
                 spans.policy.setdefault(f"{rk[0]}.{rk[1]}.{pname}", span)
@@ -262,7 +264,7 @@ def _object_spans(text: str) -> _Spans:
             for obj in stmt.objects or ():
                 if type(obj).__name__ != "RangeVar":
                     continue
-                rk = _relation_key(obj, search_path)
+                rk = _relation_key(obj, default_schema)
                 if rk is None:
                     continue
                 for column in columns:

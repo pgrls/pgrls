@@ -27,6 +27,7 @@ that absence-of-finding is NOT proof.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 
 import json
@@ -42,9 +43,12 @@ from pglast.enums.parsenodes import (
     A_Expr_Kind,
     AlterTableType,
     ConstrType,
+    DiscardMode,
+    DropBehavior,
     GrantTargetType,
     ObjectType,
     RoleSpecType,
+    SetOperation,
     TransactionStmtKind,
     VariableSetKind,
 )
@@ -191,7 +195,7 @@ def resolve_schema(
 
     `schemas` applies to the `database_url` (which schemas to introspect) and
     `sql` (which schemas are in scope; an unqualified relation resolves on
-    the search_path the SQL sets, `public` until then) paths; it is
+    the search path the SQL sets, as Postgres resolves it) paths; it is
     ignored for `snapshot` (a snapshot already pins its captured schemas).
     Defaults to `("public",)`.
     """
@@ -379,9 +383,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     What IS modeled:
 
     * ``CREATE TABLE`` → a `Table` with `Column`s (name + Postgres data type).
-      An unqualified relation resolves on the search_path the SQL sets at
-      top level (``public`` until then), whatever `schemas` lists; keyed on
-      ``(schema, name)``.
+      An unqualified relation resolves on the search path the SQL sets, as
+      the statements run, whatever `schemas` lists (`_model_statements`);
+      keyed on ``(schema, name)``. What a ROLLBACK undoes is left out.
     * ``ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`` → sets the table's
       `rls_enabled` / `force_rls`; ``ALTER TABLE … ATTACH / DETACH
       PARTITION`` sets / clears the child's `partition_of` (the form
@@ -515,17 +519,16 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             "separately.",
         )
 
-    # Where an unqualified name resolves at each statement: the search_path
-    # the SQL last set (psql's `"$user", public` until then), whatever the
-    # linted scope, against the relations the input creates.
-    paths = _statement_paths(statements,
-                             after=lambda raw: connect is None or end(raw) >= connect)
+    # Every relation name is qualified by now, as Postgres resolves it on the
+    # search path the SQL sets (whatever the linted scope).
+    statements = _model_statements(
+        statements, after=lambda raw: connect is None or end(raw) >= connect)
+    default_schema = "public"
     # Relations the input creates that are not tables: pg_dump writes
     # `ALTER … OWNER TO` for each, and an ALTER on one must not invent a table.
     non_tables = {
-        key for index, raw in enumerate(statements)
-        if (key := _relation_key(_non_table_relation(raw.stmt), paths[index],
-                                 create=True)) is not None
+        key for raw in statements
+        if (key := _relation_key(_non_table_relation(raw.stmt), default_schema)) is not None
     }
 
     # Build tables first (CREATE TABLE), then layer ALTER / CREATE POLICY /
@@ -549,14 +552,14 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             created = _data_derived_relation(stmt)
             if created is None:
                 continue
-            key = _relation_key(created, paths[index], create=True)
+            key = _relation_key(created, default_schema)
             if key is None or key in tables:
                 continue
             tables[key] = _TableBuilder(
                 schema=key[0], name=key[1], created_at=index
             )
             continue
-        key = _relation_key(stmt.relation, paths[index], create=True)
+        key = _relation_key(stmt.relation, default_schema)
         if key is None:
             continue
         if key in tables:
@@ -581,7 +584,7 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         parents = [
             p
             for p in (
-                _relation_key(rel, paths[index])
+                _relation_key(rel, default_schema)
                 for rel in (stmt.inhRelations or ())
             )
             if p is not None
@@ -625,18 +628,18 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         stmt = raw.stmt
         kind = type(stmt).__name__
         if kind == "AlterTableStmt":
-            _apply_alter_table(stmt, tables, paths[index], non_tables=non_tables,
+            _apply_alter_table(stmt, tables, default_schema, non_tables=non_tables,
                                stmt_index=index)
         elif kind == "CreatePolicyStmt":
-            _apply_create_policy(stmt, tables, paths[index])
+            _apply_create_policy(stmt, tables, default_schema)
         elif kind == "AlterPolicyStmt":
-            _apply_alter_policy(stmt, tables, paths[index])
+            _apply_alter_policy(stmt, tables, default_schema)
         elif kind == "DropStmt":
-            _apply_drop(stmt, tables, paths[index], stmt_index=index)
+            _apply_drop(stmt, tables, default_schema, stmt_index=index)
         elif kind == "GrantStmt":
-            _apply_grant(stmt, tables, paths[index])
+            _apply_grant(stmt, tables, default_schema)
         elif kind == "RenameStmt":
-            _apply_rename(stmt, tables, paths[index])
+            _apply_rename(stmt, tables, default_schema)
         # Every other statement shape is skipped tolerantly.
 
     # Live lint does not see a table outside the linted schemas: a partition
@@ -648,7 +651,481 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         while up is not None and up in tables and up[0] not in schemas and up not in unseen:
             unseen.add(up)
             up = tables[up].partition_of
-    return Schema(tables=tuple(b.build() for k, b in tables.items() if k not in unseen))
+    return Schema(tables=tuple(b.build() for k, b in tables.items()
+                               if k not in unseen and k[0] != _NOWHERE))
+
+
+class _Stmt:
+    """A statement the model replays: a top-level one, or an element of a
+    `CREATE SCHEMA` (with the top-level `raw` it is part of)."""
+
+    __slots__ = ("stmt", "raw")
+
+    def __init__(self, stmt: Any, raw: Any) -> None:
+        self.stmt = stmt
+        self.raw = raw
+
+
+# Where a relation the session cannot keep goes (a temporary one, or one
+# created with no schema to go in): left out of the model.
+_NOWHERE = "pg_temp"
+_DEFAULT_SEARCH_PATH = ("$user", "public")
+# Postgres cuts a name to NAMEDATALEN - 1 bytes.
+_NAME_BYTES = 63
+
+
+def _model_statements(statements: Any, *, after: Any) -> list[_Stmt]:
+    """The statements the model replays — those no ROLLBACK undid, with the
+    elements of a `CREATE SCHEMA` as statements of their own — with every
+    relation they create or name qualified as Postgres resolves it on the
+    search path the SQL sets (`SET [LOCAL] search_path` / `SET SCHEMA`,
+    `RESET`, `DISCARD ALL`, a plain `SELECT set_config('search_path', …)`;
+    `$user` after a `SET ROLE` / `SET SESSION AUTHORIZATION`). The settings
+    of statements `after` rejects (before a `\\\\connect`) are another
+    session's. SQL whose search path pgrls cannot follow is refused. One set
+    by running code (a `DO` block, a function) is not seen."""
+    void = _rolled_back(statements)
+    live = [raw for index, raw in enumerate(statements) if index not in void]
+    resolver = _Resolver(
+        created={_schema_created(raw.stmt) for raw in live
+                 if isinstance(raw.stmt, _pgast.CreateSchemaStmt)},
+        named={node.schemaname for raw in live for node in _subnodes(raw.stmt)
+               if isinstance(node, _pgast.RangeVar) and node.schemaname})
+    out: list[_Stmt] = []
+    for raw in live:
+        if not after(raw):
+            # Another session's: what it leaves the next one is a database's
+            # or role's search_path setting.
+            if isinstance(raw.stmt, (_pgast.AlterDatabaseSetStmt, _pgast.AlterRoleSetStmt)) and (
+                raw.stmt.setstmt.kind == VariableSetKind.VAR_RESET_ALL
+                or (raw.stmt.setstmt.name or "").lower() == "search_path"
+            ):
+                resolver.inherited = True
+            continue
+        resolver.start()
+        stmt = raw.stmt
+        if isinstance(stmt, _pgast.CreateSchemaStmt):
+            schema = _schema_created(stmt)
+            resolver.schemas.add(schema)
+            for element in stmt.schemaElts or ():
+                # Its elements go in it, and see it first.
+                with resolver.first(schema):
+                    resolver.qualify(element)
+                out.append(_Stmt(element, raw))
+            out.append(_Stmt(stmt, raw))
+            continue
+        resolver.track(stmt)
+        resolver.qualify(stmt)
+        out.append(_Stmt(stmt, raw))
+    return out
+
+
+def _schema_created(stmt: Any) -> str:
+    """The schema a `CREATE SCHEMA` creates (`AUTHORIZATION r` alone names
+    it for the role)."""
+    return _truncated(stmt.schemaname or getattr(stmt.authrole, "rolename", None) or "")
+
+
+def _truncated(name: str) -> str:
+    raw = name.encode()
+    if len(raw) <= _NAME_BYTES:
+        return name
+    return raw[:_NAME_BYTES].decode(errors="ignore")
+
+
+def _rolled_back(statements: Any) -> frozenset[int]:
+    """The indexes of the statements a `ROLLBACK` (or `ROLLBACK TO
+    SAVEPOINT`, or the end of the input in an open transaction) undoes."""
+    void: set[int] = set()
+    start: int | None = None
+    savepoints: list[tuple[str, int]] = []
+    for index, raw in enumerate(statements):
+        stmt = raw.stmt
+        if not isinstance(stmt, _pgast.TransactionStmt):
+            continue
+        kind = stmt.kind
+        if kind in (TransactionStmtKind.TRANS_STMT_BEGIN, TransactionStmtKind.TRANS_STMT_START):
+            if start is None:
+                start = index
+        elif kind == TransactionStmtKind.TRANS_STMT_COMMIT and start is not None:
+            start, savepoints = (index if stmt.chain else None), []
+        elif kind == TransactionStmtKind.TRANS_STMT_ROLLBACK and start is not None:
+            # AND CHAIN opens the next transaction: that statement stands.
+            void.update(range(start, index if stmt.chain else index + 1))
+            start, savepoints = (index if stmt.chain else None), []
+        elif kind == TransactionStmtKind.TRANS_STMT_SAVEPOINT and start is not None:
+            savepoints.append((stmt.savepoint_name, index))
+        elif kind in (TransactionStmtKind.TRANS_STMT_RELEASE,
+                      TransactionStmtKind.TRANS_STMT_ROLLBACK_TO) and start is not None:
+            names = [name for name, _ in savepoints]
+            if stmt.savepoint_name not in names:
+                continue
+            at = len(names) - 1 - names[::-1].index(stmt.savepoint_name)
+            if kind == TransactionStmtKind.TRANS_STMT_ROLLBACK_TO:
+                void.update(range(savepoints[at][1] + 1, index + 1))
+                del savepoints[at + 1:]
+            else:
+                del savepoints[at:]
+        elif kind in (TransactionStmtKind.TRANS_STMT_PREPARE,
+                      TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED,
+                      TransactionStmtKind.TRANS_STMT_ROLLBACK_PREPARED):
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL prepares a transaction (PREPARE TRANSACTION), whose "
+                "effects pgrls cannot tell apart.",
+            )
+    if start is not None:
+        # psql's session ends, and Postgres rolls the open transaction back.
+        void.update(range(start, len(statements)))
+    return frozenset(void)
+
+
+class _Resolver:
+    """The session state that decides where a relation name resolves, as the
+    statements run in order."""
+
+    def __init__(self, *, created: AbstractSet[str], named: AbstractSet[str]) -> None:
+        # The schemas the SQL creates, and of those, the ones created so far.
+        # One it never creates is taken to be there already (`public`, or
+        # one a migration's earlier SQL made), unless it drops it; one it
+        # does not even name a relation in may not be (see create_schema).
+        self.created = created
+        self.named = set(named) | {"public"}
+        self.schemas: set[str] = set()
+        self.dropped: set[str] = set()
+        self.relations: set[tuple[str, str]] = set()
+        self.temp: set[str] = set()
+        self.session: tuple[str, ...] | None = _DEFAULT_SEARCH_PATH
+        self.local: tuple[str, ...] | None = None
+        self.has_local = False
+        self.role: str | None = None
+        self.local_role: str | None = None
+        self.has_local_role = False
+        self.in_transaction = False
+        self.inherited = False
+        self.started = False
+        self.override: list[str] = []
+
+    def start(self) -> None:
+        if not self.started:
+            self.started = True
+            if self.inherited:
+                # The database or role it connects as may set it.
+                self.session = None
+
+    @property
+    def path(self) -> tuple[str, ...] | None:
+        path = self.local if self.has_local else self.session
+        if path is None:
+            return None
+        return tuple(self.override) + path
+
+    @contextlib.contextmanager
+    def first(self, schema: str) -> Any:
+        self.override.insert(0, schema)
+        try:
+            yield
+        finally:
+            self.override.pop(0)
+
+    def track(self, stmt: Any) -> None:
+        """Follow what `stmt` sets."""
+        if isinstance(stmt, _pgast.TransactionStmt):
+            if stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
+                             TransactionStmtKind.TRANS_STMT_START):
+                self.in_transaction = True
+            elif stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
+                               TransactionStmtKind.TRANS_STMT_ROLLBACK):
+                # A rolled-back transaction's BEGIN was left out, so AND
+                # CHAIN alone says one is open.
+                self.in_transaction = bool(stmt.chain)
+                self.has_local = self.has_local_role = False
+            return
+        if isinstance(stmt, _pgast.DiscardStmt) and stmt.target == DiscardMode.DISCARD_ALL:
+            self._set_path(_DEFAULT_SEARCH_PATH, local=False)
+            self._set_role(None, local=False)
+            return
+        if isinstance(stmt, _pgast.VariableSetStmt):
+            name = (stmt.name or "").lower()
+            if stmt.kind == VariableSetKind.VAR_RESET_ALL:
+                self._set_path(self._default(), local=False)
+                self._set_role(None, local=False)
+            elif name == "search_path":
+                if stmt.kind in (VariableSetKind.VAR_SET_DEFAULT, VariableSetKind.VAR_RESET):
+                    self._set_path(self._default(), local=bool(stmt.is_local))
+                elif stmt.kind == VariableSetKind.VAR_SET_VALUE:
+                    # Each item is one schema, a quoted string too (Postgres
+                    # quotes it).
+                    self._set_path(tuple(_truncated(str(getattr(a.val, "sval", "")))
+                                         for a in stmt.args or ()), local=bool(stmt.is_local))
+            elif name in ("role", "session_authorization"):
+                value = (str(getattr(stmt.args[0].val, "sval", ""))
+                         if stmt.kind == VariableSetKind.VAR_SET_VALUE and stmt.args else None)
+                self._set_role(None if value is None or value == "none" else _truncated(value),
+                               local=bool(stmt.is_local))
+            return
+        if isinstance(stmt, (_pgast.CreateFunctionStmt, _pgast.AlterFunctionStmt)):
+            return  # its body runs when it is called
+        for node in _subnodes(stmt):
+            if not (isinstance(node, _pgast.FuncCall)
+                    and ast_utils.func_name_parts(node)[1] == "set_config"):
+                continue
+            args: tuple[Any, ...] = tuple(node.args or ())
+            name = args[0] if args else None
+            while isinstance(name, _pgast.TypeCast):
+                name = name.arg
+            if str(getattr(getattr(name, "val", None), "sval", "")).lower() != "search_path":
+                continue
+            value = args[1] if len(args) > 1 else None
+            local = args[2] if len(args) > 2 else None
+            if not (_is_plain_select_of(stmt, node)
+                    and isinstance(value, _pgast.A_Const)
+                    and isinstance(getattr(value.val, "sval", None), str)
+                    and isinstance(local, _pgast.A_Const)
+                    and isinstance(getattr(local.val, "boolval", None), bool)):
+                raise SchemaSourceError(
+                    "bad_sql",
+                    "the SQL sets search_path with set_config() other than in "
+                    "a plain SELECT of literals; pgrls cannot tell which schema "
+                    "an unqualified name is in.",
+                )
+            names = _identifier_list(value.val.sval)
+            if names is not None:  # else Postgres refuses it
+                self._set_path(tuple(_truncated(n) for n in names), local=local.val.boolval)
+
+    def _default(self) -> tuple[str, ...] | None:
+        # What RESET goes back to: the session's default.
+        return None if self.inherited else _DEFAULT_SEARCH_PATH
+
+    def _set_path(self, path: tuple[str, ...] | None, *, local: bool) -> None:
+        if not local:
+            self.session, self.has_local = path, False
+        elif self.in_transaction:
+            # Outside a transaction it lasts only its own statement.
+            self.local, self.has_local = path, True
+
+    def _set_role(self, role: str | None, *, local: bool) -> None:
+        if not local:
+            self.role, self.has_local_role = role, False
+        elif self.in_transaction:
+            self.local_role, self.has_local_role = role, True
+
+    def exists(self, schema: str) -> bool:
+        return schema in self.schemas or (
+            schema not in self.created and schema not in self.dropped)
+
+    def _entries(self) -> list[str]:
+        """The schemas on the path that exist, `$user` named; refuses a
+        path pgrls cannot follow."""
+        path = self.path
+        if path is None:
+            raise SchemaSourceError(
+                "bad_sql",
+                "the SQL connects to a database or as a role that sets "
+                "search_path; pgrls cannot tell which schema an unqualified "
+                "name is in. Set it after the \\\\connect, or qualify the names.",
+            )
+        role = self.local_role if self.has_local_role else self.role
+        entries = []
+        for entry in path:
+            if entry == "$user":
+                # A role is taken to have no schema of its own unless the
+                # SQL creates one (the connecting role's is not known).
+                if role is None or role not in self.schemas:
+                    continue
+                entry = role
+            if entry == "pg_temp":
+                raise SchemaSourceError(
+                    "bad_sql",
+                    "the SQL puts pg_temp on search_path, which pgrls does not "
+                    "follow; qualify the names.",
+                )
+            if self.exists(entry):  # Postgres skips one that does not
+                entries.append(entry)
+        return entries
+
+    def create_schema(self) -> str:
+        """Where an unqualified CREATE puts its relation."""
+        entries = self._entries()
+        if not entries or entries[0] == "pg_catalog":
+            # "no schema has been selected to create in", or a catalog
+            # Postgres refuses to create in.
+            return _NOWHERE
+        if entries[0] not in self.created and entries[0] not in self.named:
+            # Postgres creates in it if it exists, else in the next one.
+            raise SchemaSourceError(
+                "bad_sql",
+                f"the SQL creates a relation on a search_path whose first schema "
+                f"({entries[0]!r}) it neither creates nor names a relation in; "
+                f"pgrls cannot tell whether it exists. Qualify the names.",
+            )
+        return entries[0]
+
+    def find(self, name: str) -> tuple[str, bool]:
+        """The schema a reference to `name` finds it in, and whether it is
+        one the SQL created (else where a CREATE would go)."""
+        if name in self.temp:
+            return _NOWHERE, True
+        for entry in self._entries():
+            if (entry, name) in self.relations:
+                return entry, True
+        return self.create_schema(), False
+
+    def qualify(self, stmt: Any) -> None:
+        """Qualify each relation `stmt` creates or names, and follow what it
+        creates, drops and renames."""
+        for rel, creates in _named_relations(stmt):
+            if creates:
+                if rel.relpersistence == "t" or rel.schemaname == "pg_temp":
+                    rel.schemaname = _NOWHERE
+                    self.temp.add(rel.relname)
+                elif not rel.schemaname:
+                    rel.schemaname = self.create_schema()
+                self.relations.add((rel.schemaname, rel.relname))
+            elif not rel.schemaname:
+                rel.schemaname = self.find(rel.relname)[0]
+        if isinstance(stmt, (_pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt)):
+            self._qualify_policy(stmt)
+        elif isinstance(stmt, _pgast.DropStmt):
+            self._drop(stmt)
+        elif (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
+              and stmt.renameType in _RELATION_KINDS and stmt.newname):
+            old = (stmt.relation.schemaname, stmt.relation.relname)
+            if old in self.relations:
+                self.relations.discard(old)
+                self.relations.add((old[0], stmt.newname))
+            if old[0] == _NOWHERE:
+                self.temp.discard(old[1])
+                self.temp.add(stmt.newname)
+
+    def _qualify_policy(self, stmt: Any) -> None:
+        # A table a policy reads resolves when the policy is created; one
+        # in another schema than the policy's own is named with it, which
+        # is how the rules read an unqualified name.
+        own = stmt.table.schemaname
+        nodes = [n for clause in (stmt.qual, stmt.with_check) if clause is not None
+                 for n in _subnodes(clause)]
+        ctes = {n.ctename for n in nodes if isinstance(n, _pgast.CommonTableExpr)}
+        for node in nodes:
+            if isinstance(node, _pgast.RangeVar) and not node.schemaname \
+                    and node.relname not in ctes:
+                schema, found = self.find(node.relname)
+                if found and schema != own:
+                    node.schemaname = schema
+
+    def _drop(self, stmt: Any) -> None:
+        if stmt.removeType == ObjectType.OBJECT_SCHEMA:
+            for item in stmt.objects or ():
+                schema = str(getattr(item, "sval", ""))
+                held = {r for r in self.relations if r[0] == schema}
+                if stmt.behavior == DropBehavior.DROP_CASCADE or not held:
+                    self.schemas.discard(schema)
+                    self.dropped.add(schema)
+                    self.relations -= held
+            return
+        if stmt.removeType not in _RELATION_KINDS and stmt.removeType != ObjectType.OBJECT_POLICY:
+            return
+        objects = []
+        for item in stmt.objects or ():
+            parts = list(item) if isinstance(item, (list, tuple)) else []
+            table = parts[:-1] if stmt.removeType == ObjectType.OBJECT_POLICY else parts
+            if len(table) == 1 and isinstance(table[0], _pgast.String):
+                schema = self.find(table[0].sval)[0]
+                parts.insert(0, _pgast.String(sval=schema))
+            if stmt.removeType != ObjectType.OBJECT_POLICY and len(parts) == 2:
+                key = (parts[0].sval, parts[1].sval)
+                self.relations.discard(key)
+                if key[0] == _NOWHERE:
+                    self.temp.discard(key[1])
+            objects.append(tuple(parts) if parts else item)
+        stmt.objects = tuple(objects)
+
+
+# Relation kinds a name resolves among.
+_RELATION_KINDS = frozenset({
+    ObjectType.OBJECT_TABLE, ObjectType.OBJECT_VIEW, ObjectType.OBJECT_MATVIEW,
+    ObjectType.OBJECT_SEQUENCE, ObjectType.OBJECT_FOREIGN_TABLE,
+})
+
+
+def _named_relations(stmt: Any) -> list[tuple[Any, bool]]:
+    """The RangeVars `stmt` creates (True) or names as its target (False)."""
+    out: list[tuple[Any, bool]] = []
+    if isinstance(stmt, _pgast.CreateStmt):
+        out.append((stmt.relation, True))
+        out.extend((rel, False) for rel in stmt.inhRelations or ())
+    elif isinstance(stmt, _pgast.CreateForeignTableStmt):
+        out.append((stmt.base.relation, True))
+    elif (created := _data_derived_relation(stmt) or _non_table_relation(stmt)) is not None:
+        out.append((created, True))
+    elif isinstance(stmt, _pgast.AlterTableStmt):
+        out.append((stmt.relation, False))
+        for cmd in stmt.cmds or ():
+            name = getattr(getattr(cmd, "def_", None), "name", None)
+            if isinstance(name, _pgast.RangeVar):
+                out.append((name, False))
+    elif isinstance(stmt, (_pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt)):
+        out.append((stmt.table, False))
+    elif isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None:
+        out.append((stmt.relation, False))
+    elif isinstance(stmt, _pgast.GrantStmt):
+        out.extend((obj, False) for obj in stmt.objects or ()
+                   if isinstance(obj, _pgast.RangeVar))
+    return [(rel, creates) for rel, creates in out if rel is not None]
+
+
+def _is_plain_select_of(stmt: Any, call: Any) -> bool:
+    """Whether `stmt` is a `SELECT` of `call` that runs it once: no FROM,
+    WHERE or other clause that could skip or repeat it."""
+    return (
+        isinstance(stmt, _pgast.SelectStmt)
+        and stmt.op == SetOperation.SETOP_NONE
+        and not any(getattr(stmt, f, None) for f in (
+            "fromClause", "whereClause", "groupClause", "havingClause", "limitCount",
+            "limitOffset", "withClause", "valuesLists", "intoClause", "distinctClause",
+            "windowClause"))
+        and any(getattr(t, "val", None) is call for t in stmt.targetList or ())
+    )
+
+
+def _identifier_list(value: str) -> tuple[str, ...] | None:
+    """The names in a comma-separated identifier list, as Postgres splits a
+    search_path string (unquoted names downcased); None if malformed."""
+    names: list[str] = []
+    i, n = 0, len(value)
+    if not value.strip():
+        return ()
+    while True:
+        while i < n and value[i].isspace():
+            i += 1
+        if i < n and value[i] == '"':
+            parts, j = [], i + 1
+            while True:
+                k = value.find('"', j)
+                if k < 0:
+                    return None
+                if value[k + 1:k + 2] == '"':
+                    parts.append(value[j:k + 1])
+                    j = k + 2
+                    continue
+                parts.append(value[j:k])
+                i = k + 1
+                break
+            names.append("".join(parts))
+        else:
+            j = i
+            while i < n and value[i] != "," and not value[i].isspace():
+                i += 1
+            if i == j:
+                return None
+            names.append("".join(c.lower() if "A" <= c <= "Z" else c for c in value[j:i]))
+        while i < n and value[i].isspace():
+            i += 1
+        if i == n:
+            return tuple(names)
+        if value[i] != ",":
+            return None
+        i += 1
 
 
 class _TableBuilder:
@@ -735,7 +1212,7 @@ def _table_constraint_pk_columns(stmt: Any) -> list[str]:
 def _apply_rename(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
-    search_path: _SearchPath,
+    default_schema: str,
 ) -> None:
     """Apply `ALTER TABLE <old> RENAME TO <new>`.
 
@@ -751,7 +1228,7 @@ def _apply_rename(
         # USING (true)` found no policy to loosen and the loosening was
         # silently discarded — an offline `pgrls pr` / `--sql-file verify`
         # kept proving the pre-rename predicate.
-        key = _relation_key(stmt.relation, search_path)
+        key = _relation_key(stmt.relation, default_schema)
         old_name = getattr(stmt, "subname", None)
         newname = getattr(stmt, "newname", None)
         if key is None or not old_name or not newname:
@@ -766,7 +1243,7 @@ def _apply_rename(
         return
     if rename_type != ObjectType.OBJECT_TABLE:
         return
-    old = _relation_key(stmt.relation, search_path)
+    old = _relation_key(stmt.relation, default_schema)
     newname = getattr(stmt, "newname", None)
     if old is None or not newname:
         return
@@ -862,175 +1339,16 @@ def _merge_column_grants(
     )
 
 
-class _SearchPath:
-    """The schemas an unqualified name resolves on at one statement, against
-    `known`: the relations the input creates (it fills the set in later)."""
-
-    def __init__(self, schemas: tuple[str, ...], known: AbstractSet[tuple[str, str]]) -> None:
-        # `$user` (a schema named for a role pgrls does not know), pg_catalog
-        # and pg_temp are left out; with none left, `public`.
-        self.schemas = tuple(
-            s for s in schemas if s not in ("$user", "pg_catalog", "pg_temp")) or ("public",)
-        self.known = known
-
-    def find(self, name: str) -> str:
-        """The schema a reference to `name` finds it in: the first on the
-        path the input creates it in, else the first."""
-        return next((s for s in self.schemas if (s, name) in self.known), self.schemas[0])
-
-
-_DEFAULT_SEARCH_PATH = ("$user", "public")
-
-
-def _statement_paths(statements: Any, *, after: Any) -> list[_SearchPath]:
-    """The search path at each statement, resolving against the relations
-    the statements create (by their new name after a rename too)."""
-    known: set[tuple[str, str]] = set()
-    paths = _search_paths(statements, known, after=after)
-    for index, raw in enumerate(statements):
-        stmt = raw.stmt
-        created = (stmt.relation if isinstance(stmt, _pgast.CreateStmt)
-                   else _data_derived_relation(stmt) or _non_table_relation(stmt))
-        if (key := _relation_key(created, paths[index], create=True)) is not None:
-            known.add(key)
-    for index, raw in enumerate(statements):
-        stmt = raw.stmt
-        if (isinstance(stmt, _pgast.RenameStmt) and stmt.renameType == ObjectType.OBJECT_TABLE
-                and stmt.newname
-                and (key := _relation_key(stmt.relation, paths[index])) is not None):
-            known.add((key[0], stmt.newname))
-    return paths
-
-
-def _search_paths(
-    statements: Any, known: AbstractSet[tuple[str, str]], *, after: Any
-) -> list[_SearchPath]:
-    """The search path in effect at each statement, as the SQL sets it at
-    top level: `SET [LOCAL] search_path` / `SET SCHEMA`, `RESET`, and
-    `SELECT set_config('search_path', …)`. A local one lasts to the end of
-    its transaction; the settings of statements `after` rejects (those
-    before a `\\connect`) are another session's. One set by running code
-    (a `DO` block, a function) is not seen."""
-    session: tuple[str, ...] = _DEFAULT_SEARCH_PATH
-    local: tuple[str, ...] | None = None
-    in_transaction = False
-    paths = []
-    for raw in statements:
-        stmt = raw.stmt
-        if isinstance(stmt, _pgast.TransactionStmt):
-            if stmt.kind in (TransactionStmtKind.TRANS_STMT_BEGIN,
-                             TransactionStmtKind.TRANS_STMT_START):
-                in_transaction = True
-            elif stmt.kind in (TransactionStmtKind.TRANS_STMT_COMMIT,
-                               TransactionStmtKind.TRANS_STMT_ROLLBACK,
-                               TransactionStmtKind.TRANS_STMT_PREPARE):
-                in_transaction, local = False, None
-        setting = _search_path_set(stmt) if after(raw) else None
-        if setting is not None:
-            schemas, is_local = setting
-            if not is_local:
-                session, local = schemas, None
-            elif in_transaction:
-                # Outside a transaction it lasts only its own statement.
-                local = schemas
-        paths.append(_SearchPath(local if local is not None else session, known))
-    return paths
-
-
-def _search_path_set(stmt: Any) -> tuple[tuple[str, ...], bool] | None:
-    """`(schemas, is_local)` for a statement that sets search_path, else None."""
-    if isinstance(stmt, _pgast.VariableSetStmt):
-        if stmt.kind == VariableSetKind.VAR_RESET_ALL:
-            return _DEFAULT_SEARCH_PATH, False
-        if (stmt.name or "").lower() != "search_path":
-            return None
-        if stmt.kind in (VariableSetKind.VAR_SET_DEFAULT, VariableSetKind.VAR_RESET):
-            return _DEFAULT_SEARCH_PATH, bool(stmt.is_local)
-        if stmt.kind != VariableSetKind.VAR_SET_VALUE:
-            return None
-        # Each item is one schema, a quoted string too (Postgres quotes it).
-        return tuple(str(getattr(arg.val, "sval", "")) for arg in stmt.args or ()), bool(
-            stmt.is_local)
-    if not isinstance(stmt, _pgast.SelectStmt):
-        return None
-    found = None
-    for node in _subnodes(stmt):
-        if not (isinstance(node, _pgast.FuncCall)
-                and ast_utils.func_name_parts(node)[1] == "set_config"):
-            continue
-        args = node.args or ()
-        if not (args and isinstance(args[0], _pgast.A_Const)
-                and str(getattr(args[0].val, "sval", "")).lower() == "search_path"):
-            continue
-        value = args[1] if len(args) > 1 else None
-        if not (isinstance(value, _pgast.A_Const)
-                and isinstance(getattr(value.val, "sval", None), str)):
-            raise SchemaSourceError(
-                "bad_sql",
-                "the SQL sets search_path to a computed value; pgrls cannot "
-                "tell which schema an unqualified name is in.",
-            )
-        schemas = _identifier_list(value.val.sval)
-        if schemas is None:
-            continue  # Postgres refuses the value; the path is unchanged.
-        is_local = len(args) > 2 and bool(getattr(getattr(args[2], "val", None), "boolval", False))
-        found = (schemas, is_local)
-    return found
-
-
-def _identifier_list(value: str) -> tuple[str, ...] | None:
-    """The names in a comma-separated identifier list, as Postgres splits a
-    search_path string (unquoted names downcased); None if malformed."""
-    names: list[str] = []
-    i, n = 0, len(value)
-    if not value.strip():
-        return ()
-    while True:
-        while i < n and value[i].isspace():
-            i += 1
-        if i < n and value[i] == '"':
-            parts, j = [], i + 1
-            while True:
-                k = value.find('"', j)
-                if k < 0:
-                    return None
-                if value[k + 1:k + 2] == '"':
-                    parts.append(value[j:k + 1])
-                    j = k + 2
-                    continue
-                parts.append(value[j:k])
-                i = k + 1
-                break
-            names.append("".join(parts))
-        else:
-            j = i
-            while i < n and value[i] != "," and not value[i].isspace():
-                i += 1
-            if i == j:
-                return None
-            names.append("".join(c.lower() if "A" <= c <= "Z" else c for c in value[j:i]))
-        while i < n and value[i].isspace():
-            i += 1
-        if i == n:
-            return tuple(names)
-        if value[i] != ",":
-            return None
-        i += 1
-
-
 def _relation_key(
-    relation: Any, search_path: _SearchPath, *, create: bool = False
+    relation: Any, default_schema: str
 ) -> tuple[str, str] | None:
-    """`(schema, name)` for a RangeVar, resolving an unqualified name on
-    `search_path`: where a CREATE puts it with `create`, else where a
-    reference finds it."""
+    """`(schema, name)` for a RangeVar, defaulting an unqualified schema."""
     if relation is None:
         return None
     name = getattr(relation, "relname", None)
     if not name:
         return None
-    schema = getattr(relation, "schemaname", None) or (
-        search_path.schemas[0] if create else search_path.find(name))
+    schema = getattr(relation, "schemaname", None) or default_schema
     return (schema, name)
 
 
@@ -1060,14 +1378,14 @@ def _column_type(column_def: Any) -> str | None:
 def _apply_alter_table(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
-    search_path: _SearchPath,
+    default_schema: str,
     *,
     non_tables: AbstractSet[tuple[str, str]] = frozenset(),
     stmt_index: int,
 ) -> None:
     if getattr(stmt, "objtype", None) != ObjectType.OBJECT_TABLE:
         return  # ALTER SEQUENCE / VIEW / MATERIALIZED VIEW / INDEX / …
-    key = _relation_key(stmt.relation, search_path)
+    key = _relation_key(stmt.relation, default_schema)
     if key is None:
         return
     builder = tables.get(key)
@@ -1129,7 +1447,7 @@ def _apply_alter_table(
             # `ALTER TABLE ONLY <parent> ATTACH PARTITION <child>`; without
             # this the child looked like a standalone table with RLS off.
             child = tables.get(_relation_key(
-                getattr(getattr(cmd, "def_", None), "name", None), search_path) or ("", ""))
+                getattr(getattr(cmd, "def_", None), "name", None), default_schema) or ("", ""))
             # Only the child and parent as they stood then: one created later
             # (after a DROP, or before which the ATTACH failed) is a table of
             # its own.
@@ -1507,9 +1825,9 @@ def _is_ident_char(c: str) -> bool:
 def _apply_create_policy(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
-    search_path: _SearchPath,
+    default_schema: str,
 ) -> None:
-    key = _relation_key(getattr(stmt, "table", None), search_path)
+    key = _relation_key(getattr(stmt, "table", None), default_schema)
     if key is None:
         return
     builder = tables.get(key)
@@ -1556,7 +1874,7 @@ def _apply_create_policy(
 def _apply_alter_policy(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
-    search_path: _SearchPath,
+    default_schema: str,
 ) -> None:
     """Apply ``ALTER POLICY`` — replace the named policy's USING / WITH CHECK /
     roles in place, leaving clauses the statement omits unchanged (Postgres
@@ -1566,7 +1884,7 @@ def _apply_alter_policy(
     `pgrls diff` gate built on it. Statements replay in source order (`CREATE`
     then `ALTER` are both in pass 2), so the accumulated policy is the net one.
     """
-    key = _relation_key(getattr(stmt, "table", None), search_path)
+    key = _relation_key(getattr(stmt, "table", None), default_schema)
     if key is None:
         return
     builder = tables.get(key)
@@ -1611,7 +1929,7 @@ def _apply_alter_policy(
 def _apply_drop(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
-    search_path: _SearchPath,
+    default_schema: str,
     *,
     stmt_index: int = 1 << 30,
 ) -> None:
@@ -1634,7 +1952,7 @@ def _apply_drop(
             parts = _drop_name_parts(namelist)
             if len(parts) < 2:
                 continue  # a policy name is `[…table…, policy]`.
-            builder = tables.get(_drop_table_key(parts[:-1], search_path))
+            builder = tables.get(_drop_table_key(parts[:-1], default_schema))
             if builder is not None:
                 policy_name = parts[-1]
                 builder.policies = [
@@ -1645,7 +1963,7 @@ def _apply_drop(
             parts = _drop_name_parts(namelist)
             if not parts:
                 continue
-            key = _drop_table_key(parts, search_path)
+            key = _drop_table_key(parts, default_schema)
             builder = tables.get(key)
             if builder is None:
                 continue
@@ -1666,20 +1984,20 @@ def _drop_name_parts(namelist: Any) -> list[str]:
 
 
 def _drop_table_key(
-    table_parts: list[str], search_path: _SearchPath
+    table_parts: list[str], default_schema: str
 ) -> tuple[str, str]:
     """`(schema, table)` from a table's name parts (`[schema, table]` or
     `[table]`), defaulting an unqualified schema — the same keying as
     `_relation_key`."""
     if len(table_parts) == 1:
-        return (search_path.find(table_parts[0]), table_parts[0])
+        return (default_schema, table_parts[0])
     return (table_parts[-2], table_parts[-1])
 
 
 def _apply_grant(
     stmt: Any,
     tables: dict[tuple[str, str], _TableBuilder],
-    search_path: _SearchPath,
+    default_schema: str,
 ) -> None:
     """Record a direct `GRANT <privs> ON <table> TO <roles>` as a `Grant`.
 
@@ -1706,7 +2024,7 @@ def _apply_grant(
     for obj in stmt.objects or ():
         if type(obj).__name__ != "RangeVar":
             continue
-        key = _relation_key(obj, search_path)
+        key = _relation_key(obj, default_schema)
         if key is None:
             continue
         builder = tables.get(key)

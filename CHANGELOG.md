@@ -98,16 +98,26 @@ breaking changes — they will be called out in this file.
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
-  ancestor walk stops there. An unqualified name resolves on the
-  search_path the SQL sets (`SET [LOCAL] search_path`, `SET SCHEMA`,
-  `RESET`, `set_config('search_path', …)`; `public` until then), whatever
-  the scope: `--schemas app` or `app,public` (and MCP's `schemas`) moved
-  every one into `app`, so findings named tables that did not exist and
-  missed those on `public.*`. A path set to a computed value is refused, and
-  one set by running code (a `DO` block) is not seen. `ALTER TABLE … SET
-  SCHEMA` is refused: policies name the table by its old schema. An ATTACH
-  Postgres refuses (of an inheritance child, of a table already attached,
-  to a parent not partitioned) is not modelled.
+  ancestor walk stops there. An unqualified name resolves as Postgres
+  resolves it, whatever the scope: on the search path the SQL sets as it
+  runs (`SET [LOCAL] search_path`, `SET SCHEMA`, `RESET`, `DISCARD ALL`, a
+  plain `SELECT set_config('search_path', …)`, `$user` after `SET ROLE`),
+  skipping a schema not created yet, and against the tables as they stand
+  at that statement; a table a policy reads resolves there too, and the
+  elements of `CREATE SCHEMA` go in it. `--schemas app` or `app,public` (and
+  MCP's `schemas`) moved every one into `app`, so findings named tables that
+  did not exist and missed those on `public.*`. What a `ROLLBACK` (or
+  `ROLLBACK TO SAVEPOINT`, or the end of the file in an open transaction)
+  undoes is left out of the model, and a temporary table is no table. A
+  search path pgrls cannot follow is refused: one a `\connect`ed database
+  or role may set, `pg_temp` on it, a `set_config()` anywhere but a plain
+  `SELECT` of literals, a CREATE whose first schema the SQL neither creates
+  nor names a relation in, and `PREPARE TRANSACTION`; one set by running
+  code (a `DO` block, a function) is not seen, and a role is taken to have no
+  schema of its own unless the SQL creates one. `ALTER TABLE … SET SCHEMA`
+  is refused: policies name the table by its old schema. An ATTACH Postgres
+  refuses (of an inheritance child, of a table already attached, to a
+  parent not partitioned) is not modelled.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.
