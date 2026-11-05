@@ -1696,7 +1696,7 @@ def test_an_attach_reaches_only_the_child_as_it_stood():
         assert parents["c"] is None, sql
 
 
-def test_a_partition_follows_its_parent_renamed_or_moved():
+def test_a_partition_follows_its_parent_renamed():
     from pgrls.schema_sources import schema_from_sql
 
     attach = ("CREATE TABLE a.p (id int) PARTITION BY RANGE (id);\nCREATE TABLE a.c (id int);\n"
@@ -1816,8 +1816,11 @@ def test_pg_dumpall_output_is_refused(tmp_path):
 
 
 @pytest.mark.parametrize(("sql", "why"), [
-    # COPY data: blanking `\\.` would read the rows as SQL.
+    # COPY data: blanking `\\.` would read the rows as SQL — said before a
+    # `\\N` NULL or an apostrophe in them gets in the way.
     ("CREATE TABLE t (b text);\nCOPY t (b) FROM stdin;\n\\.\n", "COPY data"),
+    ("CREATE TABLE t (a text, b text);\nCOPY t (a, b) FROM stdin;\n\\N\tx\nit's\ty\n\\.\n",
+     "COPY data"),
     # Another file, a branch not taken, generated SQL: not the SQL that runs.
     ("\\i other.sql\nCREATE TABLE t (id int);\n", "psql command"),
     ("\\if :prod\nALTER TABLE t DISABLE ROW LEVEL SECURITY;\n\\endif\n", "psql command"),
@@ -1989,6 +1992,14 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("CREATE VIEW s AS SELECT * FROM pg_catalog.pg_settings;\n"
      "UPDATE s SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
     ("SELECT name, setting FROM pg_settings;\n", False),
+    # A table of the same name in another schema is not it.
+    ("CREATE TABLE app.pg_settings (name text, setting text);\n"
+     "UPDATE app.pg_settings SET setting = 'on';\n", False),
+    # A function's SET clause applies while it runs; its body runs when called.
+    ("CREATE FUNCTION f() RETURNS int LANGUAGE sql SET standard_conforming_strings = off "
+     "AS 'select 1';\n", False),
+    ("CREATE FUNCTION g(k text, v text) RETURNS void LANGUAGE sql "
+     "BEGIN ATOMIC SELECT set_config(k, v, true); END;\n", False),
     # A dump's view over it is read, beside an UPDATE of something else.
     ("CREATE VIEW s AS SELECT name, setting FROM pg_catalog.pg_settings;\n"
      "CREATE TABLE d (id int, n int);\nCREATE FUNCTION f() RETURNS void LANGUAGE sql "

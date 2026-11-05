@@ -412,6 +412,13 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # pg_dump writes psql meta-commands (`\\restrict <key>` since the August
     # 2025 minor releases: 13.22, 14.19, 15.14, 16.10, 17.6), which
     # are not SQL; each is blanked so offsets into `sql` still hold.
+    if re.search(r"(?m)^\\\.[ \t\r]*$", sql) and re.search(r"(?is)\bCOPY\b.*?\bFROM\s+stdin\b", sql):
+        # Before anything reads its rows (a `\\N` NULL, an apostrophe) as SQL.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL holds COPY data (a pg_dump with data); dump the "
+            "schema with pg_dump --schema-only.",
+        )
     if "\x00" in sql:
         # pglast stops at a NUL; psql drops only the rest of that line.
         raise SchemaSourceError("bad_sql", "the SQL holds a NUL character.")
@@ -438,7 +445,8 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
         raise SchemaSourceError(
             "bad_sql",
             "the SQL moves a table to another schema (ALTER TABLE … SET SCHEMA), "
-            "which pgrls does not model; lint the schema after the move.",
+            "which pgrls does not model; lint a dump of the schema after the "
+            "move, or the live database.",
         )
     if any(isinstance(raw.stmt, _pgast.CopyStmt) and raw.stmt.is_from
            and raw.stmt.filename is None and not raw.stmt.is_program
@@ -1047,8 +1055,8 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
     A `\\connect` is skipped only in the forms pg_dump writes — a bare
     database name, or `-reuse-previous=on "dbname='…'"` — since a conninfo
     string can also set `options` or `client_encoding`, which change how
-    the server reads the strings after it; an `\\encoding` only to an
-    encoding `_check_lexer_settings` would accept."""
+    the server reads the strings after it; an `\\encoding` only to UTF8 or
+    SQL_ASCII."""
     connects: list[tuple[int, str]] = []
     for offset, line in commands:
         m = re.match(r"\\([A-Za-z]+|\.)(?:\s+(.*))?$", line.strip(), re.DOTALL)
@@ -1078,7 +1086,8 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
                 "does not model (the SQL it reads would not be the SQL that runs).",
             )
         if connect:
-            connects.append((offset, target or ""))
+            assert target is not None  # `known` above
+            connects.append((offset, target))
     if len({target for _, target in connects}) > 1:
         raise SchemaSourceError(
             "bad_sql",
@@ -1137,7 +1146,15 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
     trees = [list(_subnodes(raw.stmt)) for raw in statements]
     # A rule on pg_settings sets what an UPDATE of it names, through a view
     # over it too: the relations the SQL defines over it, by name.
-    over = {"pg_settings"}
+    over: set[str] = set()
+
+    def reaches(rel: Any) -> bool:
+        # `pg_catalog.pg_settings` (first on every search path), or a view
+        # the SQL defines over it.
+        return rel is not None and (
+            rel.relname in over
+            or (rel.relname == "pg_settings" and rel.schemaname in (None, "pg_catalog")))
+
     # A view inside CREATE SCHEMA counts too.
     views = [(view.view.relname, list(_subnodes(view.query)))
              for nodes in trees for view in nodes if isinstance(view, _pgast.ViewStmt)]
@@ -1145,17 +1162,18 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
         more = {
             name for name, reads in views
             if name not in over
-            and any(isinstance(n, _pgast.RangeVar) and n.relname in over for n in reads)
+            and any(isinstance(n, _pgast.RangeVar) and reaches(n) for n in reads)
         }
         if not more:
             break
         over |= more
     for raw, nodes in zip(statements, trees):
+        if isinstance(raw.stmt, (_pgast.CreateFunctionStmt, _pgast.AlterFunctionStmt)):
+            # A function's SET clause applies while it runs, and its body only
+            # when called: neither changes how the file is read.
+            continue
         if any(
-            (isinstance(n, _pgast.UpdateStmt) and n.relation is not None
-             and n.relation.relname in over)
-            or (isinstance(n, _pgast.RenameStmt) and n.relation is not None
-                and n.relation.relname in over)
+            isinstance(n, (_pgast.UpdateStmt, _pgast.RenameStmt)) and reaches(n.relation)
             for n in nodes
         ):
             raise SchemaSourceError(
