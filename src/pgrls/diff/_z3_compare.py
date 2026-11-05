@@ -532,13 +532,24 @@ def _cast_value_meets_column(left: Any, right: Any) -> bool:
             or (_holds_column(right) and _casts_a_value(left)))
 
 
-def _comparison_key(op: str, left: Any, right: Any) -> str:
-    """The opaque key of `left op right`, the same for its commuted spelling
-    (`v = a` is `a = v`, `v < a` is `a > v`)."""
+def _ordered_truth(op: str, left: Any, right: Any, ctx: _Context,
+                   assertions: list[Any]) -> Any:
+    """`left op right` for two non-NULL values compared in a type the text
+    does not show (a column meeting a cast value, in a diff): an order of
+    its own over the two, the same one wherever the same two are compared,
+    either way round, so a clause both sides share cancels and `=` → `>=`
+    is a loosening. Exactly one of `<`, `=`, `>` holds, as in any btree
+    type's order (NaN included)."""
     lhs, rhs = _canon(left), _canon(right)
     if lhs > rhs:
         lhs, rhs, op = rhs, lhs, _MIRRORED.get(op, op)
-    return f"comparison {lhs} {op} {rhs}"
+    key = f"order {lhs!r} {rhs!r}"
+    known = f"{key} =" in ctx._opaque_vars
+    lt, eq, gt = (ctx.opaque(f"{key} {o}", z3.BoolSort()) for o in "<=>")
+    if not known:
+        assertions.append(z3.PbEq([(lt, 1), (eq, 1), (gt, 1)], 1))
+    return {"=": eq, "<>": z3.Not(eq), "!=": z3.Not(eq), "<": lt, ">": gt,
+            "<=": z3.Or(lt, eq), ">=": z3.Or(gt, eq)}[op]
 
 
 _MIRRORED = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
@@ -1938,9 +1949,8 @@ def _anon_distinct(
             node.lexpr, node.rexpr):
         return None
     if ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr):
-        # As in `_anon_binop`: the values' (in)equality is a truth of its
-        # own, the same one wherever the same text is.
-        values_differ = ctx.opaque(_comparison_key("<>", node.lexpr, node.rexpr), z3.BoolSort())
+        # As in `_anon_binop`: the values' order is one of its own.
+        values_differ = _ordered_truth("<>", node.lexpr, node.rexpr, ctx, assertions)
         differ = z3.If(z3.Or(left.is_null, right.is_null),
                        left.is_null != right.is_null, values_differ)
         if node.kind == A_Expr_Kind.AEXPR_NOT_DISTINCT:
@@ -2089,20 +2099,21 @@ def _anon_binop(
     cast_meets = ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)
     if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session) or _floats_meet(
             node.lexpr, node.rexpr) or cast_meets:
-        if comparison_fn is None or (ctx.any_session and not cast_meets):
+        if comparison_fn is None or (ctx.any_session and (not cast_meets or ctx.unified)):
+            # In an `IN` list or array the value takes the list's type, not
+            # the column's: `x IN (v::int, 1)` rounds `v` to a `real` `x`'s
+            # float4, while `x = v::int` compares in float8.
             return None
         if left.unset or right.unset:
             return _TV(is_true=z3.BoolVal(False), is_null=z3.BoolVal(True))
         # Off the diff path, a fresh truth of its own: free where both
         # operands are non-NULL, so a proof holds only if it holds for either
         # outcome, and a leak resting on it has no witness row.
-        # In a diff, a column meeting a cast value is one truth wherever the
-        # same text is (the same row, the same column type), so a clause
-        # both sides share still cancels.
         null = z3.Or(left.is_null, right.is_null)
-        key = (_comparison_key(op, node.lexpr, node.rexpr) if cast_meets
-               else f"comparison#{len(ctx._opaque_vars)}")
-        truth = ctx.opaque(key, z3.BoolSort())
+        if cast_meets:
+            truth = _ordered_truth(op, node.lexpr, node.rexpr, ctx, assertions)
+        else:
+            truth = ctx.opaque(f"comparison#{len(ctx._opaque_vars)}", z3.BoolSort())
         return _TV(is_true=z3.And(z3.Not(null), truth), is_null=null)
 
     if comparison_fn is not None:

@@ -101,13 +101,17 @@ breaking changes — they will be called out in this file.
   double): off the diff path that comparison is a truth of its own. In a
   diff, an expression holding a column (`amount`, `COALESCE(amount, 0)`)
   compared with a value cast to a number type that is not a literal
-  (`current_setting('app.v')::numeric`) is a truth of its own too, the same
-  one wherever the same comparison is, either way round: Postgres reads the
-  value through the column's type, a float's too, which an offline
-  snapshot's text does not show. So a clause both sides share still
-  cancels (`tenant_id = current_setting(…)::bigint AND level < 3` → `… < 4`
-  is DANGEROUS), while wrapping `current_setting(…)::bigint` in a
-  sub-select needs review, as on `main`.
+  (`current_setting('app.v')::numeric`) is read as an order of its own
+  over the two (exactly one of `<`, `=`, `>`), the same one wherever the
+  same two are compared, either way round: Postgres reads the value through
+  the column's type, a float's too, which an offline snapshot's text does
+  not show. So a clause both sides share still cancels
+  (`tenant_id = current_setting(…)::bigint AND level < 3` → `… < 4` is
+  DANGEROUS) and `=` → `>=` is a loosening, while wrapping
+  `current_setting(…)::bigint` in a sub-select needs review, as on `main`.
+  In an `IN` list or array such a comparison decides nothing: the value
+  takes the list's type there (`x IN (v::int, 1)` rounds `v` to a `real`
+  `x`'s float4; `x = v::int` compares in float8).
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text

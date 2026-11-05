@@ -486,6 +486,16 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
         "semantic_equivalent")
     assert _classify(f"{tenant} OR is_shared", f"is_shared OR {tenant} OR {tenant}") == (
         "semantic_equivalent")
+    # It is an order: `=` → `>=` is a loosening, `<` → `<=` too.
+    assert _classify(tenant, tenant.replace("=", ">=", 1)) == "semantic_loosened"
+    assert _classify("lvl < current_setting('a.b')::int",
+                     "lvl <= current_setting('a.b')::int") == "semantic_loosened"
+    assert _classify("t >= current_setting('a.b')::int OR t = 1",
+                     "NOT (t < current_setting('a.b')::int) OR t = 1") == "semantic_equivalent"
+    # In an `IN` list the value takes the list's type (a `real` column's
+    # float4), not the column's, so it is not the same comparison.
+    assert _classify("amount = current_setting('app.v')::numeric OR amount = 1",
+                     "amount IN (current_setting('app.v')::numeric, 1)") is None
     # The integer check reads an exact cast of an integer as that integer.
     assert _classify("a IN (16777217, 1) AND a > 0::numeric",
                      "a IN (16777217, 1) AND a >= 0::numeric") is None
