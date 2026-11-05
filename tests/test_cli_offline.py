@@ -1760,17 +1760,11 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     # psql reads what follows in the new database's encoding ...
     ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nCREATE TABLE \"donn\u00e9es\" (id int);\n",
      "encoding other than UTF8"),
-    # ... and a SET that does not last for the session, or one put back, is
-    # no set-back.
-    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET LOCAL client_encoding = 'UTF8';\n"
-     "CREATE TABLE \"donn\u00e9es\" (id int);\n", "encoding other than UTF8"),
+    # ... and set back to UTF8, Postgres still converts the text to the
+    # database's encoding and folds unquoted names by its locale.
     ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
-     "RESET ALL;\nCREATE TABLE \"donn\u00e9es\" (id int);\n", "encoding other than UTF8"),
-    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
-     "SET client_encoding TO DEFAULT;\nCREATE TABLE \"donn\u00e9es\" (id int);\n",
+     "CREATE TABLE public.t (id int);\nALTER TABLE public.t ENABLE ROW LEVEL SECURITY /* \u0100 */;\n",
      "encoding other than UTF8"),
-    ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
-     "DISCARD ALL;\nCREATE TABLE \"donn\u00e9es\" (id int);\n", "encoding other than UTF8"),
     # The template's objects are copied into the database.
     ("CREATE DATABASE d TEMPLATE base;\n\\connect d\nCREATE TABLE t (id int);\n", "template"),
     # pglast stops reading at a NUL; psql drops only the rest of its line.
@@ -1915,10 +1909,10 @@ def test_harmless_psql_commands_are_skipped():
     sql = ('CREATE DATABASE "my-app";\n\\encoding SQL_ASCII\n'
            '\\connect -reuse-previous=on "dbname=\'my-app\'"\nCREATE TABLE t (id int);\n')
     assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
-    # ... unless the SQL sets it back first, as pg_dump -E UTF8 does.
+    # A database in another encoding is read when the text after is ASCII.
     sql = ("CREATE DATABASE d ENCODING 'LATIN1';\n\\connect d\nSET client_encoding = 'UTF8';\n"
-           'CREATE TABLE "donn\u00e9es" (id int);\n')
-    assert [t.name for t in schema_from_sql(sql).tables] == ["donn\u00e9es"]
+           "CREATE TABLE t (id int);\n")
+    assert [t.name for t in schema_from_sql(sql).tables] == ["t"]
     # pg_dump --create connects again after the database's own settings.
     sql = ("CREATE DATABASE d;\n\\connect d\nALTER DATABASE d SET work_mem = '4MB';\n"
            "ALTER ROLE app IN DATABASE d SET work_mem = '4MB';\n\\connect d\n"

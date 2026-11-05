@@ -75,8 +75,8 @@ breaking changes — they will be called out in this file.
   as one; psql rolls an open transaction back, and ends statements by its
   own rules), one to a database it creates with an encoding other than UTF8
   or SQL_ASCII when non-ASCII text follows (psql then reads it in that
-  encoding, unless the SQL sets `client_encoding` back for the session first
-  and never resets it, as `pg_dump -E UTF8` does), or one to a database created with an
+  encoding; even set back to UTF8, Postgres converts the text to it and
+  folds unquoted names by its locale), or one to a database created with an
   explicit template other than `template0`. A NUL character, where reading
   used to stop silently, is refused too. `--sql-file` now reads a lone CR as
   psql does (part of the line), and a file that is not UTF-8 is a tool
