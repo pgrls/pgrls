@@ -372,28 +372,31 @@ def test_subquery_in_is_unsupported_returns_none():
     )
 
 
-def test_arithmetic_in_predicate_is_semantic_equivalent():
-    # Phase 4: `col + 1 > 0` is equivalent to `col > -1` (Z3 proves
-    # both implications). v0.4.0/v0.4.1 returned None because the
-    # arithmetic translator wasn't implemented.
-    assert (
-        _classify("col + 1 > 0", "col > -1") == "semantic_equivalent"
-    )
+def test_arithmetic_on_a_column_of_unknown_type_decides_nothing():
+    # `col + 1 > 0` is `col > -1` over the integers, but the text does not
+    # say `col` is one, and over a `numeric` / `float8` (NaN, Infinity,
+    # rounding) Z3's reals are not Postgres's: the diff abstains.
+    assert _classify("col + 1 > 0", "col > -1") is None
+    assert _classify("col + 1 > 0", "col + 5 > 0") is None
+    assert _classify("col - 3 > 0", "col > 3") is None
 
 
-def test_arithmetic_widening_constant_is_semantic_loosened():
-    # `col + 5 > 0` (i.e. col > -5) is strictly looser than
-    # `col + 1 > 0` (col > -1).
-    assert (
-        _classify("col + 1 > 0", "col + 5 > 0") == "semantic_loosened"
-    )
+def test_an_integer_literal_does_not_make_its_column_an_integer():
+    # `score >= 1` and `score > 0` are one over the integers, not over a
+    # `numeric` (0.5): an offline snapshot's text does not say which.
+    assert _classify("tenant_id = (SELECT auth.uid()) AND score >= 1",
+                     "tenant_id = (SELECT auth.uid()) AND score > 0") is None
+    assert _classify("false", "n * 2 = 1") is None
+    # A loosening on the integers is one on every numeric type.
+    assert _classify("a >= 1", "a >= 0") == "semantic_loosened"
+    assert _counterexample("a >= 1", "a >= 0") == {"a": 0}
+    # ... and the provers: an empty integer range may hold a numeric row.
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
-
-def test_arithmetic_subtraction_is_supported():
-    # `col - 3 > 0` ⟺ `col > 3`.
-    assert (
-        _classify("col - 3 > 0", "col > 3") == "semantic_equivalent"
-    )
+    using = parse_expr("user_id = auth.uid() OR (n > 0 AND n < 1)")
+    assert prove_anon_isolation(using)[0] == "unverified"
+    assert prove_cross_tenant_isolation(using)[0] == "unverified"
+    assert prove_anon_isolation(parse_expr("user_id = auth.uid() OR n = 2")) == ("leak", {"n": 2})
 
 
 # ---------------------------------------------------------------------------
@@ -1197,11 +1200,6 @@ def test_a_leaking_row_keeps_a_policys_backslash() -> None:
     assert _counterexample("s = 'B'", "s = 'B' OR s = '\\u{41}'") == {"s": "\\u{41}"}
 
 
-def test_integer_arithmetic_still_translates() -> None:
-    assert _classify("a + 1 > 3", "a > 2") == "semantic_equivalent"
-    assert _classify("a * 2 = 4", "a * 2 = 4 AND b = 1") == "semantic_tightened"
-
-
 def test_a_character_past_z3s_alphabet_decides_nothing() -> None:
     # Z3's strings end at U+2FFFF: past it StringVal makes the text of the
     # escape, which a policy's literal `'\u{30000}'` is too.
@@ -1433,7 +1431,7 @@ def test_null_handling_keeps_the_verifiers_invariants() -> None:
     # Arithmetic equivalence holds (a naive guard flipped this to
     # `tightened`):
     assert (
-        classify_via_z3(parse_expr("col - 3 > 0"), parse_expr("col > 3"))
+        classify_via_z3(parse_expr("NOT (col <= 3)"), parse_expr("col > 3"))
         == "semantic_equivalent"
     )
     # A genuine NULL-admitting loosening is flagged DANGEROUS, with the

@@ -71,12 +71,18 @@ breaking changes — they will be called out in this file.
   and never round), ordering on text (Postgres uses the collation) — the
   diff now abstains instead of deciding wrongly, and a cast that may change
   the value (`varchar(3)`, `float4`, `numeric(4,1)`, `oid`, or any cast of a
-  function's result) is a value of its own. An integer literal is read
-  exactly (through a float, `c = 9007199254740992` and
-  `c = 9007199254740993` were one value), a decimal only when a `float4`
-  holds it exactly (`0.5`, not `0.1`: a `numeric`, a `float8` and, in an
-  `IN` list, a `float4` column read it differently), and a literal past the
-  double range (`1e400`) no longer crashes.
+  function's result) is a value of its own. A number is read as a real,
+  since the column it is compared with may be a `numeric` or a `float8`
+  (the text of an offline snapshot or a migration has no casts to say so):
+  `score >= 1` → `score > 0` was no change on a `numeric` column (0.5), and
+  is a loosening only if it is one on the integers too, so such a change
+  needs review; a literal is read only when a `float4` holds it exactly
+  (`0.5` or `16777216`, not `0.1`: a `numeric`, a `float8` and, in an `IN`
+  list, a `float4` column read it differently; through a float,
+  `c = 9007199254740992` and `c = 9007199254740993` were one value), and a
+  literal past the double range (`1e400`) no longer crashes. A leaking row
+  is an integer one, which leaks whatever the type. Arithmetic on a column
+  of unknown type now needs review (`col + 1 > 0` → `col > -1`).
 - **`pgrls verify`, `matrix --prove` and SEC038 no longer take Z3's reading
   where it differs from Postgres's.** A comparison Z3 would read otherwise —
   a Bool against a number (Z3 coerced it to 0 / 1), an ordering on text

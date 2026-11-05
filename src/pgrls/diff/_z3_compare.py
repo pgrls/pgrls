@@ -237,6 +237,8 @@ class _Context:
 
     def __init__(self) -> None:
         self._vars: dict[str, Any] = {}  # column-key → z3.ExprRef
+        # Integer literals as integers (see `_const_to_z3`).
+        self.integers = False
         # A column's last name → how it is spelled (see `_column_key`).
         self.spellings: dict[str, tuple[str, ...]] = {}
         # Phase 3 — opaque expressions (function calls,
@@ -305,8 +307,12 @@ class _Context:
         """Return the Z3 variable for `key`, binding it on first use.
 
         On a subsequent call with a different `sort`, returns None to
-        signal a type-conflict abort.
+        signal a type-conflict abort. A number is a real unless
+        `self.integers` (see `_const_to_z3`): compared with an integer, a
+        column may still be a `numeric` one.
         """
+        if sort == z3.IntSort() and not self.integers:
+            sort = z3.RealSort()
         existing = self._vars.get(key)
         if existing is None:
             var = z3.Const(key, sort)
@@ -384,8 +390,11 @@ class _Context:
         ``_decode_model`` drops it from the witness, exactly like
         ``_opaque__*``. Bound to ``sort`` on first use; a later call with a
         different sort returns None (type-conflict abort), mirroring
-        ``column`` / ``opaque``.
+        ``column`` / ``opaque``. A number is a real unless
+        ``self.integers``, as for ``column``.
         """
+        if sort == z3.IntSort() and not self.integers:
+            sort = z3.RealSort()
         existing = self._session_vars.get(key)
         if existing is None:
             var = z3.Const(f"{_SESSION_PREFIX}{key}", sort)
@@ -426,11 +435,18 @@ def _column_key(node: ColumnRef, ctx: _Context) -> str:
     return key
 
 
-def _const_to_z3(node: A_Const) -> Any:
-    """Translate an A_Const literal to a Z3 expression. Returns None for unsupported."""
+def _const_to_z3(node: A_Const, ctx: _Context) -> Any:
+    """Translate an A_Const literal to a Z3 expression. Returns None for unsupported.
+
+    An integer is a real unless `ctx.integers`: the column it is compared
+    with may be a `numeric` or a `float8` (`score >= 1` and `score > 0`
+    differ at 0.5), which the policy text does not say unless a cast does;
+    read as a real it is what every numeric type agrees on (a float4 holds
+    it exactly). The integer reading only refines a verdict (see
+    `_integers_agree`)."""
     val = node.val
     if isinstance(val, Integer):
-        return z3.IntVal(val.ival)
+        return z3.IntVal(val.ival) if ctx.integers else _exact_real(str(val.ival))
     if isinstance(val, String):
         return _z3_string(val.sval)
     if isinstance(val, Boolean):
@@ -442,7 +458,7 @@ def _const_to_z3(node: A_Const) -> Any:
         text = val.fval or ""
         try:
             if re.fullmatch(r"[+-]?\d+", text):
-                return z3.IntVal(int(text))
+                return z3.IntVal(int(text)) if ctx.integers else _exact_real(text)
         except (ValueError, TypeError, z3.Z3Exception):
             return None
         # A decimal reads differently against a `numeric` (exactly), a
@@ -637,7 +653,8 @@ def _write_bare(nodes: list[Any]) -> list[tuple[Any, Any]]:
 
 
 @_bare_columns("base_node", "head_node")
-def _diff_truths(base_node: Any, head_node: Any) -> tuple[_Context, list[Any], _TV, _TV] | None:
+def _diff_truths(base_node: Any, head_node: Any, *, integers: bool = False
+                 ) -> tuple[_Context, list[Any], _TV, _TV] | None:
     """Both predicates as Kleene truths over one context (so a column or an
     opaque expression is the same variable in both), with the assertions
     their free boolean leaves need — None when either does not translate.
@@ -648,6 +665,7 @@ def _diff_truths(base_node: Any, head_node: Any) -> tuple[_Context, list[Any], _
     call or GUC is assumed NULL or unset)."""
     ctx = _Context()
     ctx.any_session = True
+    ctx.integers = integers
     assertions: list[Any] = []
     base = _lift_to_tv(_anon_3vl(base_node, ctx, set(), assertions), assertions)
     head = _lift_to_tv(_anon_3vl(head_node, ctx, set(), assertions), assertions)
@@ -699,7 +717,17 @@ def classify_via_z3(base_node: Any, head_node: Any) -> _Z3Result | None:
     """
     if not Z3_AVAILABLE:
         return None
-    truths = _diff_truths(base_node, head_node)
+    verdict = _classify(base_node, head_node, integers=False)
+    if verdict == "semantic_loosened" and _classify(
+            base_node, head_node, integers=True) != "semantic_loosened":
+        # Loosened only where a column is not an integer one, which the
+        # text does not say.
+        return None
+    return verdict
+
+
+def _classify(base_node: Any, head_node: Any, *, integers: bool) -> _Z3Result | None:
+    truths = _diff_truths(base_node, head_node, integers=integers)
     if truths is None:
         return None
     _, assertions, base, head = truths
@@ -825,7 +853,8 @@ def counterexample(base_node: Any, head_node: Any) -> dict[str, object] | None:
     """
     if not Z3_AVAILABLE:
         return None
-    truths = _diff_truths(base_node, head_node)
+    # An integer row leaks whatever numeric type a column is.
+    truths = _diff_truths(base_node, head_node, integers=True)
     if truths is None:
         return None
     ctx, assertions, base, head = truths
@@ -1427,7 +1456,7 @@ def _anon_3vl(
 
     # --- literals.
     if isinstance(node, A_Const):
-        v = _const_to_z3(node)
+        v = _const_to_z3(node, ctx)
         if v is None:
             return None  # literal NULL / unsupported
         # Bool literal at top level is a truth; the caller's _lift_to_tv
@@ -2155,6 +2184,18 @@ def _anon_typecast(
     if inner is None:
         return None
     target_sort = _typename_segments_to_sort(node.typeName)
+    if (target_sort == z3.IntSort() and not ctx.integers and z3.is_rational_value(inner.value)
+            and inner.value.denominator_as_long() == 1):
+        return inner  # `5::int` is 5
+    if (target_sort == z3.IntSort() and not ctx.integers
+            and _is_real_column_term(ctx, inner.value)):
+        # Over the reals (see `_const_to_z3`) an integer cast of a column
+        # that may be a `numeric` rounds it: an integer of its own.
+        return _Val(
+            value=ctx.opaque(_canon(node), target_sort),
+            is_null=inner.is_null,
+            unset=inner.unset,
+        )
     lossy = target_sort is not None and not _exact_cast(node.typeName)
     if lossy and not ctx.any_session:
         # Off the diff path a `uuid` cast (the session identity's) and an
@@ -2458,7 +2499,6 @@ def anon_leak_is_total(
     return True
 
 
-@_bare_columns("using_node")
 def _prove_anon_session(
     using_node: Any,
     auth: set[str],
@@ -2468,7 +2508,33 @@ def _prove_anon_session(
 ) -> tuple[str, dict[str, object] | None]:
     """`prove_anon_isolation` for ONE session model (see `_Context.anon_jwt`)
     in ONE inherited-GUC state (see `_Context.set_gucs`)."""
+    return _integers_agree(lambda integers: _prove_anon_session_once(
+        using_node, auth, anon_jwt=anon_jwt, set_gucs=set_gucs, integers=integers))
+
+
+def _integers_agree(prove: Callable[[bool], tuple[str, Any]]) -> tuple[str, Any]:
+    """`prove` over the reals (see `_const_to_z3`), whose `isolated` holds
+    for an integer column too; a leak stands only if an integer row leaks
+    as well (else it may hold only where a column is not an integer one),
+    and its witness is that row."""
+    verdict = prove(False)
+    if verdict[0] != "leak":
+        return verdict
+    again = prove(True)
+    return again if again[0] == "leak" else ("unverified", None)
+
+
+@_bare_columns("using_node")
+def _prove_anon_session_once(
+    using_node: Any,
+    auth: set[str],
+    *,
+    anon_jwt: bool,
+    set_gucs: Mapping[str, str | None] | None,
+    integers: bool,
+) -> tuple[str, dict[str, object] | None]:
     ctx = _Context()
+    ctx.integers = integers
     ctx.anon_jwt = anon_jwt
     ctx.set_gucs = dict(set_gucs or {})
     assertions: list[Any] = []
@@ -2729,12 +2795,25 @@ def _cross_tenant_witness(
 
 
 @_abstains_when_too_deep(("unverified", None))
-@_bare_columns("using_node")
 def prove_cross_tenant_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
     *,
     identity_columns: frozenset[str] | None = None,
+) -> tuple[str, dict[str, object] | None]:
+    """See `_prove_cross_tenant_once`; over the reals, refined by the
+    integers (see `_integers_agree`)."""
+    return _integers_agree(lambda integers: _prove_cross_tenant_once(
+        using_node, auth_functions, identity_columns=identity_columns, integers=integers))
+
+
+@_bare_columns("using_node")
+def _prove_cross_tenant_once(
+    using_node: Any,
+    auth_functions: set[str] | None = None,
+    *,
+    identity_columns: frozenset[str] | None = None,
+    integers: bool = False,
 ) -> tuple[str, dict[str, object] | None]:
     """Prove whether one tenant's session can read another tenant's row.
 
@@ -2796,6 +2875,7 @@ def prove_cross_tenant_isolation(
         else set(_DEFAULT_AUTH_FUNCTIONS)
     )
     ctx = _Context()
+    ctx.integers = integers
     ctx.session_mode = True
     assertions: list[Any] = []
     tv = _lift_to_tv(_anon_3vl(using_node, ctx, auth, assertions), assertions)
