@@ -528,12 +528,26 @@ def _cast_value_meets_column(left: Any, right: Any) -> bool:
     literal (`amount = current_setting('app.v')::numeric`): Postgres converts
     the value to the column's type, a float's too, rounding it, and the text
     of an offline snapshot does not say which (a live one writes the cast)."""
-    return ((_is_column(left) and _casts_a_value(right))
-            or (_is_column(right) and _casts_a_value(left)))
+    return ((_holds_column(left) and _casts_a_value(right))
+            or (_holds_column(right) and _casts_a_value(left)))
 
 
-def _is_column(node: Any) -> bool:
-    return isinstance(_unwrap_scalar_sublink(node), ColumnRef)
+def _comparison_key(op: str, left: Any, right: Any) -> str:
+    """The opaque key of `left op right`, the same for its commuted spelling
+    (`v = a` is `a = v`, `v < a` is `a > v`)."""
+    lhs, rhs = _canon(left), _canon(right)
+    if lhs > rhs:
+        lhs, rhs, op = rhs, lhs, _MIRRORED.get(op, op)
+    return f"comparison {lhs} {op} {rhs}"
+
+
+_MIRRORED = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+
+
+def _holds_column(node: Any) -> bool:
+    """Whether a column is anywhere in `node`: `COALESCE(amount, 0)` has
+    `amount`'s type."""
+    return any(isinstance(n, ColumnRef) for n in _ast_nodes(node))
 
 
 def _casts_a_value(node: Any) -> bool:
@@ -1921,9 +1935,17 @@ def _anon_distinct(
     if left is None or right is None or left.unset or right.unset:
         return None
     if _unlike_sql("=", left.value, right.value, any_session=ctx.any_session) or _floats_meet(
-            node.lexpr, node.rexpr) or (
-            ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)):
+            node.lexpr, node.rexpr):
         return None
+    if ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr):
+        # As in `_anon_binop`: the values' (in)equality is a truth of its
+        # own, the same one wherever the same text is.
+        values_differ = ctx.opaque(_comparison_key("<>", node.lexpr, node.rexpr), z3.BoolSort())
+        differ = z3.If(z3.Or(left.is_null, right.is_null),
+                       left.is_null != right.is_null, values_differ)
+        if node.kind == A_Expr_Kind.AEXPR_NOT_DISTINCT:
+            differ = z3.Not(differ)
+        return _TV(is_true=differ, is_null=z3.BoolVal(False))
     try:
         differ = z3.Or(
             left.is_null != right.is_null,
@@ -2064,18 +2086,23 @@ def _anon_binop(
     if ctx.session_mode and op == "=":
         _record_tenant_pair(ctx, left, right)
 
+    cast_meets = ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)
     if _unlike_sql(op, left.value, right.value, any_session=ctx.any_session) or _floats_meet(
-            node.lexpr, node.rexpr) or (
-            ctx.any_session and _cast_value_meets_column(node.lexpr, node.rexpr)):
-        if ctx.any_session or comparison_fn is None:
+            node.lexpr, node.rexpr) or cast_meets:
+        if comparison_fn is None or (ctx.any_session and not cast_meets):
             return None
         if left.unset or right.unset:
             return _TV(is_true=z3.BoolVal(False), is_null=z3.BoolVal(True))
         # Off the diff path, a fresh truth of its own: free where both
         # operands are non-NULL, so a proof holds only if it holds for either
         # outcome, and a leak resting on it has no witness row.
+        # In a diff, a column meeting a cast value is one truth wherever the
+        # same text is (the same row, the same column type), so a clause
+        # both sides share still cancels.
         null = z3.Or(left.is_null, right.is_null)
-        truth = ctx.opaque(f"comparison#{len(ctx._opaque_vars)}", z3.BoolSort())
+        key = (_comparison_key(op, node.lexpr, node.rexpr) if cast_meets
+               else f"comparison#{len(ctx._opaque_vars)}")
+        truth = ctx.opaque(key, z3.BoolSort())
         return _TV(is_true=z3.And(z3.Not(null), truth), is_null=null)
 
     if comparison_fn is not None:

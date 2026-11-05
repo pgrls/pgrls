@@ -472,6 +472,20 @@ def test_an_integer_literal_does_not_make_its_column_an_integer():
                      "amount = 1 AND amount = current_setting('app.v')::numeric") is None
     assert _classify("x IS NULL AND current_setting('a.b')::numeric = 1",
                      "x IS NULL AND COALESCE(x, current_setting('a.b')::numeric) = 1") is None
+    for head in ("COALESCE(amount, 0) = current_setting('app.v')::numeric",
+                 "COALESCE((SELECT amount), 0) <= current_setting('app.v')::numeric",
+                 "COALESCE(amount, 0) IN (current_setting('app.v')::numeric)",
+                 "COALESCE(amount, 0) BETWEEN current_setting('app.v')::numeric AND 2"):
+        assert _classify("amount = 1 AND current_setting('app.v')::numeric = 1",
+                         f"amount = 1 AND {head}") is None, head
+    # Such a comparison is still one truth wherever the same text is, either
+    # way round: the canonical tenant clause both sides share cancels.
+    tenant = "tenant_id = current_setting('app.tenant_id')::bigint"
+    assert _classify(f"{tenant} AND level < 3", f"{tenant} AND level < 4") == "semantic_loosened"
+    assert _classify(tenant, "current_setting('app.tenant_id')::bigint = tenant_id") == (
+        "semantic_equivalent")
+    assert _classify(f"{tenant} OR is_shared", f"is_shared OR {tenant} OR {tenant}") == (
+        "semantic_equivalent")
     # The integer check reads an exact cast of an integer as that integer.
     assert _classify("a IN (16777217, 1) AND a > 0::numeric",
                      "a IN (16777217, 1) AND a >= 0::numeric") is None
