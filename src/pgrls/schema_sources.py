@@ -1678,8 +1678,9 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
             )
         connect = name in ("c", "connect")
         target = None
+        conninfo = False
         if connect and (c := re.fullmatch(
-            r'([^\s"\'=:\-][^\s"\'=:]*)|"((?:[^"\\=:]|"")+)"', rest,
+            r'([^\s"\'=:\\-][^\s"\'=:\\]*)|"((?:[^"\\=:]|"")+)"', rest,
         )):
             # psql takes a double-quoted name as it is (`""` a quote); one
             # holding `=` or a URI's `:` would be a conninfo string.
@@ -1691,6 +1692,8 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
             value = re.fullmatch(r"dbname='((?:[^'\\]|\\.)*)'", c.group(1).replace('""', '"'))
             if value is not None:
                 target = re.sub(r"\\(.)", r"\1", value.group(1))
+                # Inside psql's double quotes a backslash or backtick is text.
+                conninfo = True
         known = name in _HARMLESS_PSQL_COMMANDS or target is not None or (
             name == "encoding"
             and re.sub(r"[^a-z0-9]", "", rest.lower()) in _UTF8_ENCODINGS
@@ -1702,8 +1705,8 @@ def _check_psql_meta_commands(commands: list[tuple[int, str]]) -> list[int]:
                 r"(\s+[A-Za-z0-9_]+)?", rest) is not None
         )
         # psql reads a line to its LF: a CR is part of the command's arguments.
-        if m is None or ("\\" in rest and not (connect and target is not None)) \
-                or "`" in rest or "\r" in rest or not known:
+        if m is None or (("\\" in rest or "`" in rest) and not conninfo) \
+                or "\r" in rest or not known:
             raise SchemaSourceError(
                 "bad_sql",
                 f"the SQL uses the psql command {line.strip()[:60]!r}, which pgrls "

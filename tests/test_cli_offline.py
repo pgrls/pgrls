@@ -2032,6 +2032,10 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("\\set ECHO a\n\\connect :ECHO\nCREATE TABLE t (id int);\n", "psql command"),
     ("\\connect :DBNAME\nCREATE TABLE t (id int);\n", "psql command"),
     ('\\connect "dbname=x options=-c"\nCREATE TABLE t (id int);\n', "psql command"),
+    # psql ends a bare name at a backslash and runs the rest of the line.
+    ("\\connect app\\\\CREATE/**/TABLE/**/public.leak(id/**/int);\nCREATE TABLE t (id int);\n",
+     "psql command"),
+    ("\\connect \\\\CREATE/**/TABLE/**/public.leak(id/**/int);\n", "psql command"),
     ("\\echo x\nCREATE TABLE t (id int);\nSELECT (ARRAY[1])[1:ROW_COUNT] FROM t;\n", "its own variable"),
     ("\\echo x\nSELECT :'USER', 1 FROM (SELECT 1) s(\"USER\");\n", "psql command|its own variable|parse"),
     # psql splits lines by the client encoding.
@@ -2262,7 +2266,7 @@ def test_harmless_psql_commands_are_skipped():
     assert [t.name for t in schema_from_sql("\ufeffCREATE TABLE t (id int);\n").tables] == ["t"]
     # ... and its conninfo form for any other name, conninfo-escaped inside
     # psql's double quotes.
-    for name, written in (("my:app", "my:app"), ('a"b', 'a""b'), ("it's", "it\\'s"),
+    for name, written in (("my:app", "my:app"), ('a"b', 'a""b'), ("it's", "it\\'s"), ("a`b", "a`b"),
                           ("back\\slash", "back\\\\slash")):
         quoted = name.replace('"', '""')
         sql = (f'CREATE DATABASE "{quoted}";\n'
