@@ -109,9 +109,9 @@ breaking changes — they will be called out in this file.
   false SEC001 — when the child and parent were created before the ATTACH
   (one created again after it is a table of its own, a `CREATE TABLE … AS`
   too, which a DROP before it removed; a `CREATE … IF NOT EXISTS` of it
-  changes nothing when no DROP of a table, schema, type, domain or extension,
-  `DROP OWNED` or rename of a relation lies between, which could have taken
-  it), and it
+  changes nothing when no DROP (a `CASCADE` of a function, type, access
+  method or extension can take a table too), `DROP OWNED` or rename of a
+  relation lies between, which could have taken it), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's

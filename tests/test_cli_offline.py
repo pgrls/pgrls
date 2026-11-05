@@ -1698,7 +1698,8 @@ def test_a_create_if_not_exists_of_a_table_there_does_not_undo_a_detach():
     # ... and so is one a DROP of an ancestor, a type or an extension may have
     # taken, or a CREATE TABLE ... AS of the name.
     for gone in ("DROP TABLE public.top;\n", "DROP TYPE ty CASCADE;\n", "DROP EXTENSION hstore;\n",
-                 "ALTER INDEX public.c RENAME TO d;\n"):
+                 "ALTER INDEX public.c RENAME TO d;\n", "DROP ACCESS METHOD heap2 CASCADE;\n",
+                 "DROP FUNCTION f(int) CASCADE;\n"):
         sql = ("CREATE TABLE public.top (k int) PARTITION BY LIST (k);\n"
                "CREATE TABLE public.p PARTITION OF public.top FOR VALUES IN (1) PARTITION BY LIST (k);\n"
                "CREATE TABLE public.c (k int);\n"

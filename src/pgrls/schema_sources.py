@@ -559,16 +559,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     # still attaches. Two passes keep that order-independent.
     tables: dict[tuple[str, str], _TableBuilder] = {}
 
-    # Where any table may go away — a DROP of a table, schema, type, domain
-    # or extension (CASCADE reaches partitions and typed tables in any
+    # Where any table may go away — any DROP (a CASCADE of a function in a
+    # partition key, an access method or an extension reaches tables in any
     # schema), a DROP OWNED, a rename of a relation — so a CREATE … IF NOT
     # EXISTS of one still there is told from a re-create. Conservative: the
     # skip only stands with none of these between (pg_dump writes no IF NOT
     # EXISTS).
     removals = [
         index for index, raw in enumerate(statements)
-        if (isinstance(raw.stmt, _pgast.DropStmt) and raw.stmt.removeType in _REMOVING_DROPS)
-        or isinstance(raw.stmt, _pgast.DropOwnedStmt)
+        if isinstance(raw.stmt, (_pgast.DropStmt, _pgast.DropOwnedStmt))
         or (isinstance(raw.stmt, _pgast.RenameStmt) and raw.stmt.relation is not None)
     ]
 
@@ -1240,13 +1239,6 @@ def _only_defines(stmt: Any) -> bool:
         _pgast.ViewStmt, _pgast.CreateStmt, _pgast.CreatePolicyStmt, _pgast.AlterPolicyStmt,
         _pgast.RuleStmt, _pgast.CreateTrigStmt, _pgast.CreateDomainStmt,
         _pgast.CreateFunctionStmt, _pgast.AlterFunctionStmt))
-
-
-# DROPs that may take a table with them.
-_REMOVING_DROPS = frozenset({
-    ObjectType.OBJECT_TABLE, ObjectType.OBJECT_SCHEMA, ObjectType.OBJECT_TYPE,
-    ObjectType.OBJECT_DOMAIN, ObjectType.OBJECT_EXTENSION, ObjectType.OBJECT_FOREIGN_TABLE,
-})
 
 
 # Relation kinds a name resolves among.
