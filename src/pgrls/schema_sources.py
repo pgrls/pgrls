@@ -599,6 +599,11 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 # EXISTS skips while it is there.
                 if not (getattr(stmt, "if_not_exists", False)
                         and not gone_between(tables[key].created_at, index)):
+                    if not _renamed_between(statements, key, tables[key].created_at, index,
+                                            default_schema):
+                        # A table made from a query is no partition or child.
+                        tables[key].partition_of = None
+                        tables[key].inherits = []
                     tables[key].created_at = index
                 continue
             tables[key] = _TableBuilder(
@@ -639,6 +644,10 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
                 new_inherits = [p for p in new_inherits if p in tables[key].inherits]
             if new_parent is not None and _is_below(tables, new_parent, key):
                 new_parent = None  # an ATTACH would refuse the cycle
+            if _renamed_between(statements, key, previous, index, default_schema):
+                # The model merges it with the table renamed away, whose
+                # links these would wrongly become: keep the old ones.
+                continue
             tables[key].partition_of = new_parent
             tables[key].inherits = [p for p in new_inherits if not _is_below(tables, p, key)]
             continue
@@ -1167,8 +1176,9 @@ class _Resolver:
         role = self._get("role") or self._get("auth")
         if role is None or role == _SOME_ROLE:
             return
-        if (schema == "public" and (schema, None) not in self.revoked) or self.owners.get(
-                schema) == role or (schema, role) in self.usage or (schema, None) in self.usage:
+        if (schema == "public" and (schema, None) not in self.revoked) or (
+                self.owners.get(schema) == role and (schema, role) not in self.revoked) or (
+                schema, role) in self.usage or (schema, None) in self.usage:
             return
         raise SchemaSourceError(
             "bad_sql",
@@ -1293,9 +1303,8 @@ class _Resolver:
                     who = (None if grantee.roletype == RoleSpecType.ROLESPEC_PUBLIC
                            else self.role_of(grantee))
                     (self.usage.add if stmt.is_grant else self.usage.discard)((schema, who))
-                    if who is None:
-                        (self.revoked.discard if stmt.is_grant else self.revoked.add)(
-                            (schema, None))
+                    # (An owner may revoke its own USAGE too.)
+                    (self.revoked.discard if stmt.is_grant else self.revoked.add)((schema, who))
         elif isinstance(stmt, _pgast.ReassignOwnedStmt):
             # Their schemas pass to the new role; one that may be among them
             # (the connecting role is no name pgrls knows) passes to one
@@ -1312,6 +1321,10 @@ class _Resolver:
             for schema, owner in list(self.owners.items()):
                 if owner is not None and owner == stmt.subname:
                     self.owners[schema] = stmt.newname
+            rename = {stmt.subname: stmt.newname}
+            self.usage = {(s, rename.get(r, r) if r is not None else None) for s, r in self.usage}
+            self.revoked = {(s, rename.get(r, r) if r is not None else None)
+                            for s, r in self.revoked}
         elif isinstance(stmt, _pgast.DropOwnedStmt):
             # It drops the schemas the roles own; one whose owner may be
             # among them is then unsure, and so is any schema the SQL gave
@@ -1882,6 +1895,16 @@ def _dropped_between(statements: Any, key: tuple[str, str], after: int, before: 
         for raw in statements[after + 1:before])
 
 
+def _renamed_between(statements: Any, key: tuple[str, str], after: int, before: int,
+                     default_schema: str) -> bool:
+    """Whether a rename of `key` away lies between the two statements."""
+    return any(
+        isinstance(raw.stmt, _pgast.RenameStmt) and raw.stmt.relation is not None
+        and raw.stmt.renameType in _RELATION_KINDS
+        and _relation_key(raw.stmt.relation, default_schema) == key
+        for raw in statements[after + 1:before])
+
+
 def _is_below(tables: dict[tuple[str, str], _TableBuilder], start: tuple[str, str],
               key: tuple[str, str]) -> bool:
     """Whether `key` is `start` or among its parents, its parents' parents
@@ -1976,6 +1999,12 @@ def _apply_alter_table(
             # Only the child and parent as they stood then: one created later
             # (after a DROP, or before which the ATTACH failed) is a table of
             # its own.
+            if child is not None and subtype == AlterTableType.AT_DetachPartition:
+                # A link it removes, whichever table it was: one a later
+                # re-CREATE may or may not have made again stays off.
+                if child.partition_of == key:
+                    child.partition_of = None
+                continue
             if (child is not None and child.created_at <= stmt_index
                     and builder.created_at <= stmt_index):
                 if subtype == AlterTableType.AT_AttachPartition:

@@ -1665,6 +1665,11 @@ def test_relations_postgres_removes_or_keeps_are_followed(sql, expected):
     "CREATE SCHEMA app AUTHORIZATION r1; CREATE SCHEMA ext; CREATE TABLE app.t (id int);"
     " CREATE TABLE ext.t (id int); GRANT USAGE ON SCHEMA ext TO grp; SET ROLE r1;"
     " SET search_path = app, ext; ALTER TABLE t ENABLE ROW LEVEL SECURITY;",
+    # An owner may revoke its own USAGE; a renamed role takes its grants.
+    "CREATE SCHEMA app AUTHORIZATION r1; SET ROLE r1; REVOKE USAGE ON SCHEMA app FROM r1;"
+    " SET search_path = app, public; CREATE TABLE t (id int);",
+    "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO ua; ALTER ROLE ua RENAME TO ub;"
+    " SET ROLE ua; SET search_path = app, public; CREATE TABLE t (id int);",
     # DROP OWNED revokes r1's USAGE on app.
     "CREATE SCHEMA app AUTHORIZATION r2; GRANT USAGE ON SCHEMA app TO r1; DROP OWNED BY r1;"
     " SET search_path = app, public; SET ROLE r1; CREATE TABLE t (id int);",
@@ -1706,6 +1711,31 @@ def test_an_if_not_exists_that_may_skip_keeps_a_table_standalone():
         " ALTER TABLE a DETACH PARTITION b; DROP TABLE IF EXISTS a;"
         " CREATE TABLE IF NOT EXISTS a PARTITION OF b FOR VALUES FROM (0) TO (10);")
     assert len(schema.tables) == 2
+
+
+@pytest.mark.parametrize("sql", [
+    # A DETACH before an IF NOT EXISTS that may skip still applies.
+    "CREATE TABLE public.p (id int) PARTITION BY RANGE (id); CREATE TABLE public.c (id int);"
+    " DROP TABLE public.c; CREATE TABLE public.c PARTITION OF public.p FOR VALUES FROM (0) TO (10);"
+    " ALTER TABLE public.p DETACH PARTITION public.c; DROP VIEW IF EXISTS x;"
+    " CREATE TABLE IF NOT EXISTS public.c PARTITION OF public.p FOR VALUES FROM (0) TO (10);",
+    # A table made again from a query is a table of its own.
+    "CREATE TABLE public.p (id int) PARTITION BY LIST (id);"
+    " CREATE TABLE public.c PARTITION OF public.p FOR VALUES IN (1); DROP TABLE public.c;"
+    " CREATE TABLE public.c AS SELECT 1 AS id;",
+])
+def test_a_table_that_ends_standalone_is_no_partition(sql):
+    from pgrls.schema_sources import schema_from_sql
+    assert {t.name: t.partition_of for t in schema_from_sql(sql).tables}["c"] is None
+
+
+def test_a_renamed_table_keeps_its_links_when_its_old_name_is_made_again():
+    from pgrls.schema_sources import schema_from_sql
+    schema = schema_from_sql(
+        "CREATE TABLE public.p (id int) PARTITION BY RANGE (id); CREATE TABLE public.b (id int);"
+        " ALTER TABLE public.b RENAME TO a;"
+        " CREATE TABLE public.b PARTITION OF public.p FOR VALUES FROM (1) TO (2);")
+    assert {t.name: t.partition_of for t in schema.tables}["a"] is None
 
 
 def test_a_usable_schema_and_a_lone_path_entry_resolve():

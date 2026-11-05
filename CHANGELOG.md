@@ -120,8 +120,10 @@ breaking changes — they will be called out in this file.
   a read of a relation (a trigger, rule or view may run code), an event
   trigger — lies
   between, which could have taken it; a table made again is a partition
-  or child only as its `CREATE` says, and one an `IF NOT EXISTS` may have
-  skipped only as both it and the table there would be), and it
+  or child only as its `CREATE` says (a `CREATE TABLE … AS` none), one an
+  `IF NOT EXISTS` may have skipped only as both it and the table there
+  would be, a `DETACH` before either still applying, and one made under the
+  name of a table renamed away is merged with it, as before), and it
   follows its parent through a rename. A partition's parents outside the
   linted schemas (`--schemas`, else `[database] schemas`, in the LSP too)
   are left out of the model, as live lint does not see them, so the child's
@@ -156,8 +158,9 @@ breaking changes — they will be called out in this file.
   `pg_temp` on it ahead of the schema that holds a name, a schema on it
   that a role the SQL runs as (`SET ROLE` / `SET SESSION AUTHORIZATION`)
   may have no `USAGE` on where it holds the name (Postgres skips it; one
-  the role owns, was granted `USAGE` on, or a `public` the SQL did not drop
-  and make again is followed), a `set_config()` of the path or the role anywhere but a
+  the role owns and did not revoke `USAGE` on, was granted `USAGE` on
+  (under its name then, through a rename), or a `public` the SQL did not
+  drop and make again is followed), a `set_config()` of the path or the role anywhere but a
   plain `SELECT` of literals (a cursor, `PREPARE`, `ALTER … USING`, `ADD
   COLUMN … DEFAULT`, a partition bound (in a `CREATE SCHEMA` too),
   `CREATE TABLE … AS EXECUTE`; a definition — a view, a new table's
