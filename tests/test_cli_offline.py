@@ -1749,6 +1749,14 @@ def test_pg_dumpall_output_is_refused(tmp_path):
     ("\\connect d\nCREATE TABLE t (id int);\nBEGIN;\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n"
      "CREATE FUNCTION begin() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\nCOMMIT;\n"
      "\\connect d\nCREATE TABLE u (id int);\n", "connects to another"),
+    # A CTE that writes can set the next database's settings in its catalog.
+    ("CREATE DATABASE d;\nWITH x AS (INSERT INTO pg_catalog.pg_db_role_setting "
+     "SELECT oid, 0, '{transform_null_equals=on}' FROM pg_database WHERE datname = 'd' "
+     "RETURNING 1) SELECT count(*) FROM x;\n\\connect d\nCREATE TABLE t (id int);\n",
+     "connects to another"),
+    # psql reads COPY rows from the file, up to `\\.`.
+    ("CREATE TABLE t (x text);\nCOPY t FROM stdin;\nALTER TABLE t ENABLE ROW LEVEL SECURITY;\n",
+     "stdin"),
     # The template's objects are copied into the database.
     ("CREATE DATABASE d TEMPLATE base;\n\\connect d\nCREATE TABLE t (id int);\n", "template"),
     # pglast stops reading at a NUL; psql drops only the rest of its line.
@@ -1851,6 +1859,8 @@ def test_a_skipped_line_must_lie_between_tokens():
     ("CREATE VIEW s AS SELECT * FROM pg_catalog.pg_settings;\n"
      "UPDATE s SET setting = 'on' WHERE name = 'transform_null_equals';\n", "pg_settings"),
     ("SELECT name, setting FROM pg_settings;\n", False),
+    # A dump's view over it, with no UPDATE in the SQL, is read.
+    ("CREATE VIEW s AS SELECT name, setting FROM pg_catalog.pg_settings;\n", False),
     ("SET client_encoding = 'UTF8';\n", False),
     ("SET client_encoding = 'LATIN1';\n", False),
     ("SET standard_conforming_strings = on;\n", False),

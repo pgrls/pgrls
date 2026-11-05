@@ -426,6 +426,15 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
             f"could not parse the provided SQL: {exc}.",
         ) from exc
     _check_lexer_settings(statements, non_ascii=not sql.isascii())
+    if any(isinstance(raw.stmt, _pgast.CopyStmt) and raw.stmt.is_from
+           and raw.stmt.filename is None and not raw.stmt.is_program
+           for raw in statements):
+        # psql reads the rows from the file itself, up to a `\\.` line.
+        raise SchemaSourceError(
+            "bad_sql",
+            "the SQL copies rows from stdin, which psql reads from the file "
+            "itself; dump the schema with pg_dump --schema-only.",
+        )
 
     def end(raw: Any) -> int:
         # Where the statement ends: its start can include the gap before it.
@@ -448,7 +457,9 @@ def schema_from_sql(sql: str, schemas: tuple[str, ...] = ("public",)) -> Schema:
     if connect is not None and any(
         end(raw) < connect
         and (type(raw.stmt).__name__ not in _DATABASE_LEVEL_STATEMENTS
-             or getattr(raw.stmt, "intoClause", None) is not None)  # SELECT … INTO
+             or getattr(raw.stmt, "intoClause", None) is not None  # SELECT … INTO
+             # A CTE that writes (a database's settings into its catalog).
+             or any(isinstance(node, _WRITES) for node in _subnodes(raw.stmt)))
         for raw in statements
     ):
         # A `\\connect` after objects were created (or a transaction begun)
@@ -937,6 +948,7 @@ _UNSAFE_CLIENT_ENCODINGS = frozenset({
 # pgrls does (SQL_ASCII converts nothing). Under any other, a non-ASCII
 # character is read as other characters (`é` as `Ã©` under LATIN1).
 _UTF8_ENCODINGS = frozenset({"utf8", "unicode", "sqlascii"})
+_WRITES = (_pgast.InsertStmt, _pgast.UpdateStmt, _pgast.DeleteStmt, _pgast.MergeStmt)
 # Statements `pg_dump --create` writes before its `\\connect`.
 _DATABASE_LEVEL_STATEMENTS = frozenset({
     "VariableSetStmt", "SelectStmt", "CreatedbStmt", "AlterDatabaseStmt",
@@ -1044,16 +1056,20 @@ def _check_lexer_settings(statements: Any, *, non_ascii: bool) -> None:
     reads the SQL as UTF-8 with standard strings, so it would end strings
     where Postgres does not. With `non_ascii`, any client encoding but UTF-8
     or SQL_ASCII is refused: Postgres reads those characters as others.
-    `UPDATE pg_settings` is refused too. A setting changed by code (a `DO`
-    block, a function) is not seen."""
-    for raw in statements:
-        nodes = list(_subnodes(raw.stmt))
-        # A rule on pg_settings sets what an UPDATE names, and a view or rule
-        # over it carries that on: only a plain query may read it.
+    An UPDATE of `pg_settings`, and with an UPDATE in the SQL anything but a
+    plain query over it (a view or rule an UPDATE could go through), is
+    refused too. A setting changed by code (a `DO` block, a function) is not
+    seen."""
+    trees = [list(_subnodes(raw.stmt)) for raw in statements]
+    updates = any(isinstance(node, _pgast.UpdateStmt) for nodes in trees for node in nodes)
+    for raw, nodes in zip(statements, trees):
+        # A rule on pg_settings sets what an UPDATE of it names, and a view or
+        # rule over it carries that on: with an UPDATE in the SQL, only a
+        # plain query may read it (a dump's view over it has none).
         if any(isinstance(node, _pgast.RangeVar) and node.relname == "pg_settings"
                for node in nodes) and (
-            not isinstance(raw.stmt, _pgast.SelectStmt)
-            or any(isinstance(node, _pgast.UpdateStmt) for node in nodes)
+            any(isinstance(node, _pgast.UpdateStmt) for node in nodes)
+            or (updates and not isinstance(raw.stmt, _pgast.SelectStmt))
         ):
             raise SchemaSourceError(
                 "bad_sql",

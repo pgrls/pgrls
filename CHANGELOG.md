@@ -65,14 +65,15 @@ breaking changes — they will be called out in this file.
   Postgres's own lexer reads the file, are now skipped, the LSP's ranges
   too. Any other is refused with an error naming it, since the SQL pgrls
   would read is not the SQL that runs: a dump with data (`\.` ends its
-  COPY rows), `\i`, `\if`, `\gexec`, `\set`, a `\connect` in any form
+  COPY rows, and any `COPY … FROM stdin` reads them from the file), `\i`, `\if`, `\gexec`, `\set`, a `\connect` in any form
   but the two pg_dump writes (a conninfo string can set `options` or
   `client_encoding`), a second command on the line, a line Postgres reads
   as inside a string, SQL beside a meta-command that names one of psql's
   own variables (`:ROW_COUNT`), and `pg_dumpall` output, which connects to one database
   after another (dump each with `pg_dump`), or a `\connect` after anything
-  but database-level statements (psql rolls an open transaction back, and
-  ends statements by its own rules), or one to a database created with an
+  but database-level statements, a `SELECT` with a CTE that writes
+  excepted (psql rolls an open transaction back, and ends statements by its
+  own rules), or one to a database created with an
   explicit template other than `template0`. A NUL character, where reading
   used to stop silently, is refused too. `--sql-file` now reads a lone CR as
   psql does (part of the line), and a file that is not UTF-8 is a tool
@@ -80,8 +81,8 @@ breaking changes — they will be called out in this file.
   to an encoding such as SJIS or BIG5, or to anything but UTF-8 /
   SQL_ASCII when the file holds non-ASCII text (an `\encoding` included),
   or turns `standard_conforming_strings` off or `transform_null_equals` on
-  (by `SET`, `ALTER DATABASE / ROLE … SET`, `set_config()` or `pg_settings`,
-  through a view on it too), is refused too: Postgres then reads the text differently
+  (by `SET`, `ALTER DATABASE / ROLE … SET`, `set_config()` or an `UPDATE`
+  of `pg_settings`, through a view or rule over it too), is refused too: Postgres then reads the text differently
   from pgrls. And every `ALTER … OWNER TO` the dump
   writes for a sequence, view or materialized view created a phantom table
   in the model, with a false SEC001 on it: an `ALTER` on a relation that is
