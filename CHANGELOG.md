@@ -139,8 +139,12 @@ breaking changes — they will be called out in this file.
   order, what changes a column's type (`CREATE`, a `PARTITION OF` /
   `INHERITS` parent's columns, `DROP`, `RENAME`, `ADD` / `DROP` / `RENAME
   COLUMN`, `ALTER COLUMN … TYPE` into the partitions and children attached
-  then, `ATTACH` / `DETACH` / `INHERIT` / `NO INHERIT`; a `LIKE` copy is
-  `unknown`), so the type is the one the migration leaves. A column's
+  then, `ATTACH` / `DETACH` / `INHERIT` / `NO INHERIT`, a `LIKE` source's,
+  tables in a `CREATE SCHEMA`), and where it cannot tell (a `CREATE` of a
+  table it still holds, as an `IF NOT EXISTS` that may have skipped, a
+  `CASCADE`, a parent's `DROP`, `SET SCHEMA` or another schema on the
+  search path leaves; a child's column a parent's `DROP COLUMN` may leave;
+  a `CREATE TABLE … AS`) a type is `unknown`, which decides nothing. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
   ci`) compares strings otherwise, which the diff does not see, as on
   `main`. Without column types (a snapshot from before they were captured)

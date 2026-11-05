@@ -226,7 +226,8 @@ def session_predicate(
 def _column_type(table: Table, column: str) -> str | None:
     for col in table.column_details:
         if col.name == column:
-            return col.data_type
+            # Offline input may not say (`unknown`): cast to no type then.
+            return None if col.data_type == "unknown" else col.data_type
     return None
 
 

@@ -1462,11 +1462,35 @@ def test_offline_alter_column_type_is_applied():
      " CREATE TABLE t PARTITION OF p FOR VALUES FROM (0) TO (100); ALTER TABLE p DETACH PARTITION t;"
      " DROP TABLE t; CREATE TABLE t PARTITION OF p FOR VALUES FROM (0) TO (100);"
      " ALTER TABLE p ALTER COLUMN role TYPE citext;", "t"),
+    # ADD COLUMN IF NOT EXISTS keeps the column there.
+    ("CREATE TABLE t (id int, role citext); ALTER TABLE t ADD COLUMN IF NOT EXISTS role text;", "t"),
+    # A table made in a CREATE SCHEMA is seen.
+    ("CREATE SCHEMA app CREATE TABLE t (id int, role citext);"
+     " CREATE TABLE IF NOT EXISTS app.t (id int, role text);", "t"),
 ])
 def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
     from pgrls.schema_sources import schema_from_sql
-    (t,) = [t for t in schema_from_sql(sql).tables if t.name == table]
-    assert {c.name: c.data_type for c in t.column_details}["role"] == "citext"
+    (t,) = [t for t in schema_from_sql(sql, schemas=("public", "app")).tables if t.name == table]
+    assert {c.name: c.data_type for c in t.column_details}["role"] in ("citext", "unknown")
+
+
+@pytest.mark.parametrize("sql", [
+    # A child keeps a column of its own, or one an ONLY drop leaves.
+    "CREATE TABLE p (id int, role text); CREATE TABLE c () INHERITS (p);"
+    " ALTER TABLE p ALTER COLUMN role TYPE citext; ALTER TABLE ONLY p DROP COLUMN role;",
+    # A partitioned parent's DROP takes its partition; one made IF NOT EXISTS
+    # after is new (which pgrls cannot always tell).
+    "CREATE TABLE p (id int, role text) PARTITION BY LIST (id);"
+    " CREATE TABLE c PARTITION OF p FOR VALUES IN (1); DROP TABLE p;"
+    " CREATE TABLE IF NOT EXISTS c (id int, role citext);",
+    # A CREATE TABLE AS lists no types.
+    "CREATE TABLE c AS SELECT 1 AS id, 'a'::citext AS role;"
+    " ALTER TABLE c ADD COLUMN IF NOT EXISTS role text;",
+])
+def test_a_column_type_pgrls_cannot_tell_is_unknown(sql):
+    from pgrls.schema_sources import schema_from_sql
+    (t,) = [t for t in schema_from_sql(sql).tables if t.name == "c"]
+    assert {c.name: c.data_type for c in t.column_details}.get("role", "unknown") == "unknown"
 
 
 def test_a_column_type_follows_a_re_create_and_reaches_children():
@@ -1474,7 +1498,8 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
     t = _only("CREATE TABLE t (role text); DROP TABLE t; CREATE TABLE t (role citext);")
     assert [c.data_type for c in t.column_details] == ["citext"]
     t = _only("CREATE TABLE t (role text); CREATE TABLE IF NOT EXISTS t (role citext);")
-    assert [c.data_type for c in t.column_details] == ["text"]  # a no-op
+    # A no-op if t is still there, which pgrls cannot always tell.
+    assert [c.data_type for c in t.column_details] == ["unknown"]
     schema = schema_from_sql(
         "CREATE TABLE m (k int, role text) PARTITION BY LIST (k);"
         " CREATE TABLE m1 PARTITION OF m FOR VALUES IN (1); CREATE TABLE c () INHERITS (m1);"
