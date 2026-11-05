@@ -1489,6 +1489,8 @@ def test_a_column_type_is_the_one_the_statements_leave_in_order(sql, table):
     # A domain renamed to `text` is no built-in.
     "CREATE SCHEMA app; CREATE DOMAIN app.d AS citext; ALTER DOMAIN app.d RENAME TO text;"
     " CREATE TABLE c (id int, role text);",
+    # A base (or shell) type named `text` shadows the built-in.
+    "CREATE TYPE public.text; CREATE TABLE c (id int, role text);",
     # An imported foreign table may be what an unqualified name finds.
     "CREATE TABLE c (id int, role citext); IMPORT FOREIGN SCHEMA public FROM SERVER s INTO app;"
     " ALTER TABLE c ALTER COLUMN role TYPE text;",
@@ -1511,6 +1513,11 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
 
     assert roles("CREATE TABLE t (role text); ALTER TABLE t ALTER COLUMN role TYPE citext;") == {
         "t": {"citext"}}
+    # A policy's or trigger's rename, and a DROP before the CREATE, leave the
+    # table the one table of its name.
+    assert roles("DROP TABLE IF EXISTS t CASCADE; CREATE TABLE t (role text);"
+                 " ALTER POLICY p ON t RENAME TO q; ALTER TRIGGER g ON t RENAME TO h;") == {
+        "t": {"text"}}
     # An ALTER reaches the one table of the name, however it is qualified.
     # (The model also keeps a shell for `app.t`, with no columns.)
     schema = schema_from_sql("CREATE SCHEMA app; SET search_path = app, public;"

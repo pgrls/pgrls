@@ -534,20 +534,23 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
     TABLE … AS`), and a type named like a built-in the SQL also defines are
     `unknown`, which decides nothing."""
     made: dict[str, int] = {}
+    first: dict[str, int] = {}
     tainted: set[str] = set()
     shadowed: set[str] = set()
     elements = [stmt for raw in statements
                 for stmt in (raw.stmt, *(getattr(raw.stmt, "schemaElts", None) or ()))]
-    for stmt in elements:
+    for index, stmt in enumerate(elements):
         target = _made_relation(stmt)
         if target is not None:
             made[target] = made.get(target, 0) + 1
+            first.setdefault(target, index)
         if isinstance(stmt, _pgast.CreateStmt) and (stmt.inhRelations or any(
                 isinstance(e, _pgast.TableLikeClause) for e in stmt.tableElts or ())):
             tainted.add(stmt.relation.relname)
         if (isinstance(stmt, _pgast.RenameStmt) and stmt.relation is not None
-                and stmt.renameType not in (ObjectType.OBJECT_COLUMN,
-                                            ObjectType.OBJECT_TABCONSTRAINT)):
+                and stmt.renameType in _RELATION_RENAMES):
+            # (A policy's, trigger's, rule's or column's rename names its
+            # table but leaves it the table it is.)
             tainted.update({stmt.relation.relname, stmt.newname or ""})
         elif (isinstance(stmt, _pgast.RenameStmt) and stmt.newname
               and stmt.renameType in (ObjectType.OBJECT_TYPE, ObjectType.OBJECT_DOMAIN)):
@@ -561,8 +564,9 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
         elif isinstance(stmt, _pgast.AlterObjectSchemaStmt) and stmt.relation is not None:
             tainted.add(stmt.relation.relname)
         elif isinstance(stmt, _pgast.DropStmt):
+            # One before the name is made drops a table the input never shows.
             tainted.update(parts[-1] for parts in map(_drop_name_parts, stmt.objects or ())
-                           if parts)
+                           if parts and first.get(parts[-1], index) < index)
         elif isinstance(stmt, _pgast.AlterTableStmt):
             for cmd in stmt.cmds or ():
                 if getattr(cmd, "subtype", None) in (AlterTableType.AT_AttachPartition,
@@ -572,8 +576,10 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
                     if child is not None:
                         tainted.add(child.relname)
         elif isinstance(stmt, (_pgast.CreateDomainStmt, _pgast.CompositeTypeStmt,
-                               _pgast.CreateEnumStmt, _pgast.CreateRangeStmt)):
+                               _pgast.CreateEnumStmt, _pgast.CreateRangeStmt)) or (
+                isinstance(stmt, _pgast.DefineStmt) and stmt.kind == ObjectType.OBJECT_TYPE):
             names = (stmt.domainname if isinstance(stmt, _pgast.CreateDomainStmt)
+                     else stmt.defnames if isinstance(stmt, _pgast.DefineStmt)
                      else getattr(stmt, "typeName", None) or getattr(stmt, "typevar", None))
             last = (names.relname if isinstance(names, _pgast.RangeVar)
                     else getattr((names or [None])[-1], "sval", None))
@@ -616,6 +622,13 @@ def _column_types_in_order(statements: Any) -> dict[str, dict[str, str]]:
                 elif subtype == AlterTableType.AT_DropColumn and cmd.name:
                     types[key].pop(cmd.name, None)
     return types
+
+
+# Renames of a relation itself (`ALTER INDEX` renames a table too).
+_RELATION_RENAMES = frozenset({
+    ObjectType.OBJECT_TABLE, ObjectType.OBJECT_VIEW, ObjectType.OBJECT_MATVIEW,
+    ObjectType.OBJECT_SEQUENCE, ObjectType.OBJECT_FOREIGN_TABLE, ObjectType.OBJECT_INDEX,
+})
 
 
 def _made_relation(stmt: Any) -> str | None:

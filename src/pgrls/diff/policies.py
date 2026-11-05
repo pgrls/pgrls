@@ -105,7 +105,11 @@ def _column_types(base_table: Table, head_table: Table) -> dict[str, str] | None
             seen = types.setdefault(column.name, column.data_type)
             if seen != column.data_type:
                 types[column.name] = "<changed>"
-    return types
+    # One side's column the other lacks (dropped, or one a snapshot or the
+    # offline model could not list) has no one type.
+    both = ({c.name for c in base_table.column_details}
+            & {c.name for c in head_table.column_details})
+    return {name: (t if name in both else "<changed>") for name, t in types.items()}
 
 
 def _grade_rename(using_result: str, check_result: str) -> Classification:

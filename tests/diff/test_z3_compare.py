@@ -434,6 +434,11 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
     # A quoted type name is a user type's, whatever it spells.
     assert diff("email = ANY (ARRAY['A'::text])", "email = 'A'", email='"Text"') == (
         "requires_review")
+    # A column whose type is unknown is read one way only, as with no types:
+    # the canonical tenant clause still cancels.
+    assert diff("tenant_id = current_setting('app.t')::bigint AND status = 'active'",
+                "tenant_id = current_setting('app.t')::bigint AND status IN ('active', 'pending')",
+                tenant_id="unknown", status="unknown") == "semantic_loosened"
     # The canonical tenant clause shared by both sides still cancels.
     tenant = "tenant_id = current_setting('app.tenant_id')::uuid"
     assert diff(f"{tenant} AND status = 'active'",

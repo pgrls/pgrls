@@ -972,9 +972,11 @@ def _reads_strings_alike(column: str, kinds: set[str],
     literal and anything else. A column's collation is not in the
     snapshots: a nondeterministic one (`text COLLATE ci`) compares strings
     otherwise, which the diff does not see, as on `main`."""
-    if column_types is None:
+    data_type = None if column_types is None else column_types.get(column)
+    if data_type in (None, "unknown"):
+        # A type the snapshots do not give (or the offline model is not
+        # sure of): read the column one way only.
         return len(kinds) <= 1
-    data_type = column_types.get(column)
     if _reads_alike(data_type):
         return True
     own = "as " + _type_key(data_type) if data_type is not None else None
