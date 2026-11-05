@@ -1030,33 +1030,38 @@ def _unwrap_scalar_sublink(node: Any) -> Any:
     (corpus ``sec004-is-null-in-subquery-safe``) must stay opaque so that
     case stays clean.
     """
-    if not isinstance(node, SubLink):
-        return node
-    if node.subLinkType != SubLinkType.EXPR_SUBLINK:
-        return node
-    sel = node.subselect
-    if not isinstance(sel, SelectStmt):
-        return node
-    target_list = sel.targetList
-    if not target_list or len(target_list) != 1:
-        return node
-    # `sel.op` is a SetOperation IntEnum; SETOP_NONE == 0 is a plain
-    # SELECT. Reject UNION/INTERSECT/EXCEPT and any FROM/WHERE/aggregation
-    # shape — those aren't a bare scalar.
-    if (
-        sel.fromClause
-        or sel.whereClause
-        or int(sel.op) != 0
-        or sel.distinctClause
-        or sel.groupClause
-        or sel.havingClause
-    ):
-        return node
-    target = target_list[0]
-    if not isinstance(target, ResTarget):
-        return node
-    # `(SELECT (SELECT x))` is `x` too.
-    return _unwrap_scalar_sublink(target.val)
+    # `(SELECT (SELECT x))` is `x` too — a loop, not a recursion, so a deep
+    # nesting cannot exhaust the stack.
+    while True:
+        if not isinstance(node, SubLink):
+            return node
+        if node.subLinkType != SubLinkType.EXPR_SUBLINK:
+            return node
+        sel = node.subselect
+        if not isinstance(sel, SelectStmt):
+            return node
+        target_list = sel.targetList
+        if not target_list or len(target_list) != 1:
+            return node
+        # `sel.op` is a SetOperation IntEnum; SETOP_NONE == 0 is a plain
+        # SELECT. Reject UNION/INTERSECT/EXCEPT and any FROM/WHERE/
+        # aggregation shape — those aren't a bare scalar — and a LIMIT /
+        # OFFSET, which can make it NULL (`(SELECT x LIMIT 0)`).
+        if (
+            sel.fromClause
+            or sel.whereClause
+            or int(sel.op) != 0
+            or sel.distinctClause
+            or sel.groupClause
+            or sel.havingClause
+            or sel.limitCount is not None
+            or sel.limitOffset is not None
+        ):
+            return node
+        target = target_list[0]
+        if not isinstance(target, ResTarget):
+            return node
+        node = target.val
 
 
 def _as_val(x: Any) -> Any:

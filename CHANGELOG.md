@@ -87,7 +87,11 @@ breaking changes — they will be called out in this file.
   `%`, and a `COALESCE` of nothing but bare columns (modelled exactly, they
   defaulted to Bools, so three text columns could hold only two values);
   beside another argument a bare column takes its type (`coalesce(is_public,
-  false)` stays exact), and `(SELECT (SELECT x))` is a bare column too.
+  false)` stays exact), and `(SELECT (SELECT x))` is a bare column too
+  (used directly as a condition, `AND coalesce(b, c)`, such a COALESCE
+  abstains). A `(SELECT x LIMIT …)` or `OFFSET` is no longer read as `x`:
+  `(SELECT a LIMIT 0)` is NULL, so `(SELECT a LIMIT 0) IS NULL AND a IS
+  NOT NULL` was a false PROVEN.
   Beside such a
   value or truth, a proof whose other conjunct isolates
   still holds (`tenant_id = auth.uid() AND status < 'm'`), and one that

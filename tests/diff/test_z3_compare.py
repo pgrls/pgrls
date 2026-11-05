@@ -1233,6 +1233,29 @@ def test_a_doubly_wrapped_column_is_no_bool() -> None:
     assert prove_anon_isolation(parse_expr(using))[0] == "leak"
 
 
+@pytest.mark.parametrize("using", [
+    # `(SELECT x LIMIT 0)` and `(SELECT x OFFSET 1)` are NULL, not `x`.
+    "(SELECT a LIMIT 0) IS NULL AND (SELECT a) IS NOT NULL",
+    "tenant_id = auth.uid() OR ((SELECT a OFFSET 1) IS NULL AND a IS NOT NULL)",
+    "(SELECT (SELECT x) LIMIT 0) IS NULL AND x IS NOT NULL",
+])
+def test_a_limited_scalar_select_is_no_column(using) -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
+    assert prove_anon_isolation(parse_expr(using))[0] != "isolated"
+
+
+def test_a_limited_scalar_select_is_no_change_of_nothing() -> None:
+    assert _classify("(SELECT x LIMIT 0) = 'a'", "x = 'a'") is None
+
+
+def test_a_deeply_nested_scalar_select_does_not_crash() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
+    using = "(SELECT " * 1200 + "a" + ")" * 1200 + " = 1"
+    prove_anon_isolation(parse_expr(using))
+
+
 def test_a_coalesce_column_takes_its_siblings_sort() -> None:
     # The nullable-flag idiom stays exact: `is_public` is a Bool beside `false`.
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
