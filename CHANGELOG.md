@@ -103,9 +103,13 @@ breaking changes — they will be called out in this file.
   identity: it is NULL where the argument is, so `… OR current_setting(cfg)
   IS NULL` and `tenant_id = current_setting('app.t', flag) OR …` were PROVEN
   (on `main` too) and, in a diff, no change; a literal name with a computed
-  `missing_ok` reads the setting or NULL. A column written both bare and
-  qualified (`a` and `t.a`, as `pg_get_expr` renders a sub-select) decides
-  nothing, instead of being two columns and a leaking row that cannot exist. Two calls of a built-in VOLATILE
+  `missing_ok` reads the setting or NULL, and the anon-key caller's JWT
+  claims are read as set, by a name in any case. A column written both bare
+  and qualified (`a` and `t.a`, as `pg_get_expr` renders a sub-select) is
+  one column, not two and a leaking row that cannot exist, and a helper's
+  column argument (`(SELECT private.tier(user_id))` beside `user_id =
+  auth.uid()`) no longer clashes with the column's comparison. Two calls of
+  a built-in VOLATILE
   function (`random()`, `clock_timestamp()`, `gen_random_uuid()`,
   `array_shuffle()`, …) are two
   values; a user function is taken to return one value wherever the same

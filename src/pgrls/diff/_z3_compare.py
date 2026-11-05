@@ -76,6 +76,7 @@ import ctypes
 import dataclasses
 import fractions
 import functools
+import inspect
 import math
 import re
 import struct
@@ -401,9 +402,8 @@ def _column_key(node: ColumnRef, ctx: _Context) -> str:
     A column reference's `fields` is a tuple of `String` nodes (or
     `A_Star` for wildcards, which we don't support). Returns None
     for unsupported shapes, and for a column `ctx` has seen spelled
-    otherwise: `pg_get_expr` writes `t.a` in a sub-select and `a`
-    outside it, one column (or `t.a` may be a field of a composite `t`),
-    which as two variables gave a leaking row that cannot exist.
+    otherwise (`t.a` and `m.a`, which `_bare_columns` leaves as they are):
+    as two variables they gave a leaking row that cannot exist.
     """
     parts = []
     for field in node.fields or ():
@@ -580,6 +580,63 @@ def _canon(node: Any) -> str:
 _Z3Result = Literal["semantic_equivalent", "semantic_tightened", "semantic_loosened"]
 
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _bare_columns(*names: str) -> Callable[[_F], _F]:
+    """Run the decorated prover with the named predicate arguments' columns
+    written bare, and restore them after: `pg_get_expr` qualifies a column
+    in a sub-select (`t.a`) and not outside it (`a`), one column. Outside a
+    sub-select with a FROM, a qualified column can only be the policy's own
+    table's (a composite's field needs `(c).f`), so the qualifiers must
+    agree; if they do not, the columns stay as they are (and `_column_key`
+    declines to read a column spelled two ways). In place, not a copy: a
+    copy of a predicate a few hundred levels deep overflows the stack."""
+
+    def wrap(fn: _F) -> _F:
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def run(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind_partial(*args, **kwargs).arguments
+            undo = _write_bare([bound.get(name) for name in names])
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                for ref, fields in undo:
+                    ref.fields = fields
+        return cast(_F, run)
+    return wrap
+
+
+def _write_bare(nodes: list[Any]) -> list[tuple[Any, Any]]:
+    """Write each qualified column in `nodes` bare (see `_bare_columns`),
+    returning what to restore."""
+    refs: dict[int, tuple[Any, Any]] = {}
+    qualifier = None
+    stack: list[Any] = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (list, tuple)):
+            stack.extend(node)
+        elif isinstance(node, SelectStmt) and node.fromClause:
+            continue  # its columns can be another table's
+        elif isinstance(node, ColumnRef):
+            fields = tuple(node.fields or ())
+            if len(fields) > 1 and all(isinstance(f, String) for f in fields):
+                q = tuple(f.sval for f in fields[:-1])
+                if qualifier not in (None, q):
+                    return []
+                qualifier = q
+                refs[id(node)] = (node, node.fields)
+        elif isinstance(node, Node):
+            stack.extend(getattr(node, f, None) for f in node)
+    for ref, fields in refs.values():
+        ref.fields = tuple(fields)[-1:]
+    return list(refs.values())
+
+
+@_bare_columns("base_node", "head_node")
 def _diff_truths(base_node: Any, head_node: Any) -> tuple[_Context, list[Any], _TV, _TV] | None:
     """Both predicates as Kleene truths over one context (so a column or an
     opaque expression is the same variable in both), with the assertions
@@ -599,7 +656,6 @@ def _diff_truths(base_node: Any, head_node: Any) -> tuple[_Context, list[Any], _
     return ctx, assertions, base, head
 
 
-_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _abstains_when_too_deep(result: Any) -> Callable[[_F], _F]:
@@ -1034,7 +1090,8 @@ def _anon_jwt_claim(node: Any) -> str | None:
     if qualified == "auth.jwt":
         return "jwt"
     if _is_builtin_current_setting_call(node):
-        name = _first_string_arg(node)
+        # Postgres reads a setting's name ignoring case.
+        name = (_first_string_arg(node) or "").lower()
         if name == "request.jwt.claim.role":
             return "role"
         if name == "request.jwt.claims":
@@ -1392,10 +1449,16 @@ def _anon_3vl(
 
     # --- non-auth function call: opaque value + FREE null-flag (a
     # non-auth function is NOT known-NULL under anon). Sanity-translate
-    # args so an unparseable signature aborts.
+    # args so an unparseable signature aborts. A bare column argument is not
+    # bound: it has no sort here, and as a Bool it clashed with the same
+    # column compared elsewhere (`user_id = auth.uid() AND f(user_id)`).
     if isinstance(node, FuncCall):
         for arg in (node.args or ()):
-            if _anon_3vl(arg, ctx, auth_funcs, assertions) is None:
+            arg = _unwrap_scalar_sublink(arg)
+            if isinstance(arg, ColumnRef):
+                if not _column_key(arg, ctx):
+                    return None
+            elif _anon_3vl(arg, ctx, auth_funcs, assertions) is None:
                 return None
         key = _canon(node)
         # A never-NULL builtin current_setting (the one-arg form, or two-arg
@@ -2165,6 +2228,7 @@ def _anon_typecast(
 
 
 @_abstains_when_too_deep(None)
+@_bare_columns("using_node")
 def anon_read_counterexample(
     using_node: Any, auth_functions: set[str] | None = None
 ) -> dict[str, object] | None:
@@ -2394,6 +2458,7 @@ def anon_leak_is_total(
     return True
 
 
+@_bare_columns("using_node")
 def _prove_anon_session(
     using_node: Any,
     auth: set[str],
@@ -2664,6 +2729,7 @@ def _cross_tenant_witness(
 
 
 @_abstains_when_too_deep(("unverified", None))
+@_bare_columns("using_node")
 def prove_cross_tenant_isolation(
     using_node: Any,
     auth_functions: set[str] | None = None,
@@ -2790,6 +2856,7 @@ def prove_cross_tenant_isolation(
 
 
 @_abstains_when_too_deep(None)
+@_bare_columns("using_node")
 def cross_tenant_session_identity(
     using_node: Any, auth_functions: set[str] | None = None
 ) -> tuple[str, str] | None:

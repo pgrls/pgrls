@@ -943,10 +943,26 @@ def test_reserved_marker_prefix_column_cannot_alias_the_null_flag() -> None:
     assert _column_key(parse_expr("owner_id = 1").lexpr, _Context()) == "owner_id"
 
 
-def test_a_column_spelled_two_ways_decides_nothing() -> None:
+def test_a_column_spelled_two_ways_is_one_column() -> None:
+    from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
+
     # pg_get_expr writes `t.a` in a sub-select and `a` outside it: one
     # column, which as two gave a leaking row that cannot exist.
-    assert _classify("a = 1 AND b = 1", "((a = 1) AND ((b = 1) OR (( SELECT t.a) = 2)))") is None
+    assert _classify("a = 1 AND b = 1",
+                     "((a = 1) AND ((b = 1) OR (( SELECT t.a) = 2)))") == "semantic_equivalent"
+    assert _classify("coalesce(a, b) = 'x' AND c = 1",
+                     "coalesce(a, b) = 'x' AND (c = 1 OR (SELECT COALESCE(t.a, t.b)) = 'y')"
+                     ) == "semantic_equivalent"
+    assert prove_anon_isolation(parse_expr(
+        "COALESCE(a, b) = 'x' AND (SELECT COALESCE(t.a, t.b)) <> 'x'"))[0] == "isolated"
+    # ... and a column a helper reads stays the one compared (Supabase's wrap).
+    using = ("((user_id = ( SELECT auth.uid() AS uid)) AND "
+             "(( SELECT private.tier(v1.user_id) AS tier) = 'pro'::text))")
+    for bare in (using, "user_id = auth.uid() AND private.tier(user_id) = 'pro'"):
+        assert prove_anon_isolation(parse_expr(bare))[0] == "isolated", bare
+        assert prove_cross_tenant_isolation(parse_expr(bare))[0] == "isolated", bare
+    # Two qualifiers are two relations: nothing is decided.
+    assert _classify("t.a = 1 AND m.a = 2", "t.a = 1") is None
 
 
 def test_a_null_test_is_tied_to_its_columns_value() -> None:
@@ -1325,9 +1341,12 @@ def test_a_setting_named_by_a_column_is_no_identity() -> None:
 def test_a_computed_missing_ok_reads_the_setting_or_null() -> None:
     from pgrls.diff._z3_compare import prove_anon_isolation, prove_cross_tenant_isolation
 
-    # The anon-key caller's claims are set: its role is 'anon'.
+    # The anon-key caller's claims are set: its role is 'anon' (a setting's
+    # name is read ignoring case).
     for using in ("current_setting('request.jwt.claims', flag) IS NOT NULL",
-                  "current_setting('request.jwt.claim.role', flag) = 'anon'"):
+                  "current_setting('request.jwt.claim.role', flag) = 'anon'",
+                  "current_setting('REQUEST.JWT.CLAIM.ROLE', true) = 'anon'",
+                  "current_setting('Request.Jwt.Claims', true) IS NOT NULL"):
         assert prove_anon_isolation(parse_expr(using))[0] == "leak", using
 
     # Unset under anon, so NULL or it raises; the session's own value, or
