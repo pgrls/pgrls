@@ -584,11 +584,14 @@ def _note_string_read(ctx: Any, left: Any, rights: Sequence[Any]) -> None:
             if isinstance(n, ColumnRef) and n.fields and isinstance(n.fields[-1], String):
                 ctx.string_reads.setdefault(n.fields[-1].sval, set()).add(kind)
         # A value that is no column (`app.current_role()`, `email::citext`) is
-        # read by its own type: a cast's, else one the text does not show.
-        inner = _unwrap_scalar_sublink(value)
-        if not isinstance(inner, ColumnRef):
-            hint = _type_key(inner.typeName) if isinstance(inner, TypeCast) else None
-            ctx.value_reads.setdefault((_canon(inner), hint), set()).add(kind)
+        # read by its own type: a cast's, else one the text does not show;
+        # one in a COALESCE / CASE arm in the arms' common type, never as a
+        # direct read of it (Z3 reads them as one value).
+        for inner, depth in _values_within(value):
+            if not isinstance(inner, ColumnRef):
+                hint = _type_key(inner.typeName) if isinstance(inner, TypeCast) else None
+                ctx.value_reads.setdefault((_canon(inner), hint), set()).add(
+                    "arm " * depth + kind)
 
 
 def _literal_kind(node: Any) -> str | None:
@@ -615,6 +618,16 @@ def _has_typed_arm(node: Any) -> bool:
     return arms is not None and any(
         (k := _literal_kind(arm)) is not None and k not in ("bare", "other") or _has_typed_arm(arm)
         for arm in arms)
+
+
+def _values_within(node: Any, depth: int = 0) -> Any:
+    """`node` (through a scalar sub-select) and, for a COALESCE / GREATEST /
+    LEAST / CASE, the values in its arms, each with how many arms deep."""
+    inner = _unwrap_scalar_sublink(node)
+    yield inner, depth
+    for arm in _arms(inner) or ():
+        if _literal_kind(arm) is None:
+            yield from _values_within(arm, depth + 1)
 
 
 def _arms(node: Any) -> list[Any] | None:

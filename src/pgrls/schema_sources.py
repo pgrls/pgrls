@@ -553,6 +553,9 @@ class _TableBuilder:
         # Tables an ALTER attached as a partition or child (`ATTACH
         # PARTITION`, `INHERIT`): a column type change reaches them too.
         self.attached: list[tuple[str, str]] = []
+        # Its partitions and children an ALTER took off it (`DETACH
+        # PARTITION`, `NO INHERIT`): a later type change does not reach them.
+        self.detached: set[tuple[str, str]] = set()
 
     def set_not_null(self, colname: str, *, not_null: bool = True) -> None:
         """Flip one column's nullability in place (`SET`/`DROP NOT NULL`)."""
@@ -657,6 +660,13 @@ def _apply_rename(
         return
     new = (old[0], newname)
     builder.name = newname
+    # Its partitions and children still name it by the old name; a type
+    # change to it under the new one reaches them (`attached`).
+    for key, other in tables.items():
+        if other.partition_of == old or old in other.inherits:
+            builder.attached.append(key)
+        other.attached = [new if k == old else k for k in other.attached]
+        other.detached = {new if k == old else k for k in other.detached}
     # A rename onto an occupied name cannot happen in valid DDL; if the input
     # is invalid anyway, the later definition wins rather than being dropped.
     tables[new] = builder
@@ -826,10 +836,20 @@ def _apply_alter_table(
                                   default_schema)
             if child is not None:
                 builder.attached.append(child)
-        elif subtype == AlterTableType.AT_AddInherit:
+                builder.detached.discard(child)
+        elif subtype == AlterTableType.AT_DetachPartition:
+            child = _relation_key(getattr(getattr(cmd, "def_", None), "name", None),
+                                  default_schema)
+            if child is not None:
+                builder.detached.add(child)
+        elif subtype in (AlterTableType.AT_AddInherit, AlterTableType.AT_DropInherit):
             parent = _relation_key(getattr(cmd, "def_", None), default_schema)
             if parent is not None and parent in tables:
-                tables[parent].attached.append(key)
+                if subtype == AlterTableType.AT_AddInherit:
+                    tables[parent].attached.append(key)
+                    tables[parent].detached.discard(key)
+                else:
+                    tables[parent].detached.add(key)
         elif subtype == AlterTableType.AT_AlterColumnType:
             # The diff reads a string compared with a column by its type
             # (`text` and `citext` read `'a'::text` otherwise).
@@ -848,8 +868,10 @@ def _apply_alter_table(
                     for c in tables[parent].columns
                 ]
                 pending.extend(k for k, b in tables.items()
-                               if b.partition_of == parent or parent in b.inherits)
-                pending.extend(tables[parent].attached)
+                               if (b.partition_of == parent or parent in b.inherits)
+                               and k not in tables[parent].detached)
+                pending.extend(k for k in tables[parent].attached
+                               if k not in tables[parent].detached)
         # Other ALTER subcommands are ignored.
 
 

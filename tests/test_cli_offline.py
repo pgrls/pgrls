@@ -1473,6 +1473,18 @@ def test_a_column_type_follows_a_re_create_and_reaches_children():
     assert {t.name: [c.data_type for c in t.column_details if c.name == "role"]
             for t in schema.tables} == {"m": ["citext"], "m1": ["citext"], "c": ["citext"],
                                          "r": ["citext"]}
+    # A detached partition and a child taken off keep theirs; a renamed
+    # parent's children follow it.
+    schema = schema_from_sql(
+        "CREATE TABLE p (k int, c citext) PARTITION BY LIST (k);"
+        " CREATE TABLE ch PARTITION OF p FOR VALUES IN (1); ALTER TABLE p DETACH PARTITION ch;"
+        " CREATE TABLE q (c citext); CREATE TABLE qc () INHERITS (q); ALTER TABLE qc NO INHERIT q;"
+        " CREATE TABLE r (c text); CREATE TABLE rc () INHERITS (r); ALTER TABLE r RENAME TO r2;"
+        " ALTER TABLE p ALTER COLUMN c TYPE text; ALTER TABLE q ALTER COLUMN c TYPE text;"
+        " ALTER TABLE r2 ALTER COLUMN c TYPE citext;")
+    assert {t.name: [c.data_type for c in t.column_details if c.name == "c"]
+            for t in schema.tables if t.name in ("ch", "qc", "rc")} == {
+        "ch": ["citext"], "qc": ["citext"], "rc": ["citext"]}
 
 
 def test_offline_alter_table_rename_is_applied():

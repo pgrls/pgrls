@@ -428,6 +428,9 @@ def test_a_string_compared_with_a_column_reads_by_the_columns_type():
                 ) == "requires_review"
     assert diff("email::citext IS NOT DISTINCT FROM 'B'::text", "email::citext IS NOT DISTINCT FROM 'B'",
                 email="text") == "requires_review"
+    # ... in a COALESCE arm too, which takes the arms' common type.
+    assert diff("app.current_role() = 'admin'::text",
+                "(SELECT COALESCE(app.current_role(), '')) = 'admin'") == "requires_review"
     # A quoted type name is a user type's, whatever it spells.
     assert diff("email = ANY (ARRAY['A'::text])", "email = 'A'", email='"Text"') == (
         "requires_review")

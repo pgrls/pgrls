@@ -133,9 +133,12 @@ breaking changes — they will be called out in this file.
   reads as a bare one (`main` read `col = 'a'::text` and `col = 'a'` as no
   change). Only `pg_catalog.text` is text (`app.text` may be a domain). A
   value whose type the text does not show (a function's result, a
-  sub-select) decides nothing when it is read two ways. The offline model
-  now follows `ALTER COLUMN … TYPE`, into the table's partitions and
-  inheritance children (`ATTACH PARTITION` and `INHERIT` ones too), and a
+  sub-select) decides nothing when it is read two ways, one in a `COALESCE`
+  or `CASE` arm (which takes the arms' common type) never matching a direct
+  read of it. The offline model now follows `ALTER COLUMN … TYPE`, into the
+  table's partitions and inheritance children (`ATTACH PARTITION` and
+  `INHERIT` ones too, not ones `DETACH`ed or `NO INHERIT`ed, through a
+  rename of the parent), and a
   re-`CREATE` (`unknown` where an `IF NOT EXISTS` may have skipped, or
   `LIKE` copies), so the type is the one the migration leaves. A column's
   collation is not in the snapshots: a nondeterministic one (`text COLLATE
