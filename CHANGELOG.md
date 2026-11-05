@@ -108,7 +108,9 @@ breaking changes — they will be called out in this file.
   a `verify` gate that passed can now fail.
 - Leaking rows from every prover print a character past Latin-1 (U+00FF) as
   itself, not Z3's `\u{…}`, and keep a backslash in a policy's string
-  literal (`'\u{41}'` was taken for `'A'`).
+  literal (`'\u{41}'` was taken for `'A'`). A character past U+2FFFF, where
+  Z3's strings end, makes its comparison abstain: Z3 read it as the text of
+  its escape, so `label = '𰀀' AND label <> '\u{30000}'` was a false PROVEN.
 - `pgrls matrix --format html` in a dark colour scheme: table headers and
   `code` cells kept their light backgrounds under light text, so table names
   and role names were unreadable.

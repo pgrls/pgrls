@@ -451,7 +451,11 @@ def _exact_real(text: str) -> Any:
 def _z3_string(text: str) -> Any:
     """`text` as a Z3 string constant. ``StringVal`` reads ``\\u{…}`` escapes
     in its argument (``'\\u{41}'`` would be ``'A'``), so each backslash goes
-    in escaped — a policy's ``'\\u{41}'`` is those six characters."""
+    in escaped — a policy's ``'\\u{41}'`` is those six characters. None for
+    a character past U+2FFFF, where Z3's alphabet ends: it would stand for
+    the text of its own escape."""
+    if any(ord(c) > 0x2FFFF for c in text):
+        return None
     return z3.StringVal(text.replace("\\", "\\u{5c}"))
 
 
@@ -1181,10 +1185,10 @@ def _anon_3vl(
         # uncaptured value (`None`) falls back to an opaque non-null one,
         # which can only decline to prove isolation, never claim it.
         configured = ctx.set_gucs[(_first_string_arg(node) or "").lower()]
+        value = _z3_string(configured) if configured is not None else None
         return _Val(
             value=(
-                _z3_string(configured)
-                if configured is not None
+                value if value is not None
                 else ctx.opaque(_canon(node), z3.StringSort())
             ),
             is_null=z3.BoolVal(False),

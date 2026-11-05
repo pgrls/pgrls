@@ -1180,6 +1180,17 @@ def test_integer_arithmetic_still_translates() -> None:
     assert _classify("a * 2 = 4", "a * 2 = 4 AND b = 1") == "semantic_tightened"
 
 
+def test_a_character_past_z3s_alphabet_decides_nothing() -> None:
+    # Z3's strings end at U+2FFFF: past it StringVal makes the text of the
+    # escape, which a policy's literal `'\u{30000}'` is too.
+    from pgrls.diff._z3_compare import prove_anon_isolation
+
+    assert _classify("tenant = '\\u{e0067}'", "tenant = '\U000e0067'") is None
+    assert prove_anon_isolation(parse_expr(
+        "label = '\U00030000' AND label <> '\\u{30000}'"))[0] != "isolated"
+    assert _counterexample("label = 'a'", "label = 'a' OR label = '\U00030000'") is None
+
+
 def test_a_leaking_row_prints_a_character_past_latin1() -> None:
     assert _counterexample("s = 'a'", "s = 'a' OR s = '\U00024cc8'") == {"s": "\U00024cc8"}
     assert _counterexample("s = 'a'", "s = 'a' OR s = '\u4e2d'") == {"s": "\u4e2d"}
